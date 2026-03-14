@@ -231,18 +231,20 @@ Reference: [arXiv:2602.16284](https://arxiv.org/abs/2602.16284)
 
 ## Model Catalog
 
-18 models across five tiers. Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
+Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
 
-| Tier | Model | VRAM | Peers | Quant |
-|------|-------|------|-------|-------|
-| Small | `openhydra-qwen3.5-0.8b` | 2 GB | 1 | fp32/int4 |
-| Small | `openhydra-llama3.2-1b` | 3 GB | 1 | fp32/int4 |
-| Medium | `openhydra-llama3.1-8b` | 16 GB | 2 | int8 |
-| Medium | `openhydra-mistral-7b` | 14 GB | 2 | int8 |
-| Code | `openhydra-qwen2.5-coder-7b` | 14 GB | 2 | int8 |
-| Reasoning | `openhydra-qwen3-8b` | 16 GB | 2 | int8 |
-| Large | `openhydra-llama3.1-70b` | 140 GB | 8 | int4 |
-| Large | `openhydra-qwen3-72b` | 144 GB | 8 | int4 |
+| Tier | Model | VRAM | Peers | Quant | Status |
+|------|-------|------|-------|-------|--------|
+| Frontier | `openhydra-qwen3.5-27b` | 16 GB | 4 | int4 | ✅ Available |
+| Advanced | `openhydra-qwen3.5-9b` | 18 GB | 2 | int8 | ✅ Available |
+| Standard | `openhydra-qwen3.5-4b` | 9 GB | 1 | int4 | ✅ Available |
+| Basic | `openhydra-qwen3.5-2b` | 5 GB | 1 | fp32 | ✅ Available |
+| Basic | `openhydra-qwen3.5-0.8b` | 2 GB | 1 | fp32 | ✅ Available |
+| | `openhydra-llama3.1-8b` | 16 GB | 2 | int8 | 🔜 Coming Soon |
+| | `openhydra-llama3.1-70b` | 140 GB | 8 | int4 | 🔜 Coming Soon |
+| | `openhydra-mistral-7b` | 14 GB | 2 | int8 | 🔜 Coming Soon |
+| | `openhydra-qwen2.5-coder-7b` | 14 GB | 2 | int8 | 🔜 Coming Soon |
+| | `openhydra-qwen3-8b` | 16 GB | 2 | int8 | 🔜 Coming Soon |
 
 Full catalog: [`models.catalog.json`](models.catalog.json)
 
