@@ -1,0 +1,86 @@
+OpenHydra Dual License
+======================
+
+Copyright 2026 OpenHydra Contributors
+
+This repository uses a dual-license open-core model.
+
+────────────────────────────────────────────────────────────────────────────────
+ APACHE LICENSE 2.0  —  Inference Engine (peer/, dht/)
+────────────────────────────────────────────────────────────────────────────────
+
+The following directories are licensed under the Apache License, Version 2.0:
+
+  peer/          Peer gRPC inference server, model shard, KV compaction, TLS
+  dht/           Distributed hash-table bootstrap service
+
+You may use, modify, and distribute this code in proprietary or open-source
+projects, with or without modification, subject to the terms of the Apache
+License 2.0.  A patent grant from every contributor is included.
+
+Full license text: licenses/Apache-2.0.txt
+SPDX identifier:  Apache-2.0
+
+────────────────────────────────────────────────────────────────────────────────
+ GNU AFFERO GENERAL PUBLIC LICENSE v3  —  Network Services & Application
+────────────────────────────────────────────────────────────────────────────────
+
+The following directories are licensed under the GNU Affero General Public
+License, Version 3 (AGPLv3):
+
+  coordinator/   HTTP API server, routing engine, interactive CLI, ledger bridge
+  desktop/       Tauri desktop application (Rust + JS frontend)
+  economy/       Barter credits and HYDRA token ledger
+  verification/  Mystery-shopper and redundant-execution verification
+  compression/   Tensor autoencoder and lz4 codec
+  grounding/     Client-side DuckDuckGo RAG
+  torrent/       Genesis bootstrap and seeding arbitration
+  sdk/           Python and TypeScript SDK wrappers
+  scripts/       Operator tooling and benchmarks
+  ops/           Infrastructure-as-code and deployment tooling
+  web/           Single-file web chat UI
+  landing/       Marketing landing page
+
+The AGPLv3 requires that if you modify this software and run it as a network
+service (SaaS, API, hosted inference), you must make the complete corresponding
+source code available to every user of that service under the same license.
+This closes the "application service provider" loophole present in GPLv3.
+
+Full license text: licenses/AGPL-3.0.txt
+SPDX identifier:  AGPL-3.0-only
+
+────────────────────────────────────────────────────────────────────────────────
+ HYDRA Token / Tokenomics
+────────────────────────────────────────────────────────────────────────────────
+
+The Solidity smart contracts, token economics parameters, and on-chain
+governance configuration for the HYDRA token are maintained in a separate
+private repository and are NOT covered by either license above.
+
+────────────────────────────────────────────────────────────────────────────────
+ Third-Party Licenses
+────────────────────────────────────────────────────────────────────────────────
+
+OpenHydra depends on third-party libraries that carry their own licenses.
+Key runtime dependencies and their SPDX identifiers:
+
+  grpcio / protobuf   Apache-2.0
+  cryptography        Apache-2.0 OR BSD-3-Clause
+  transformers        Apache-2.0
+  torch               BSD-3-Clause
+  scipy               BSD-3-Clause
+  prompt_toolkit      BSD-3-Clause
+  tauri               MIT OR Apache-2.0
+
+All dependency licenses are compatible with the dual-license structure above.
+
+────────────────────────────────────────────────────────────────────────────────
+ Commercial Licensing
+────────────────────────────────────────────────────────────────────────────────
+
+If the AGPLv3 terms are incompatible with your business requirements — for
+example, you wish to embed the coordinator or desktop application in a
+proprietary product without open-sourcing your modifications — a commercial
+license is available.  Contact: legal@openhydra.network
+
+────────────────────────────────────────────────────────────────────────────────

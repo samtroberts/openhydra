@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhydra"
+version = "0.1.0"
+description = "OpenHydra decentralised P2P inference network"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "grpcio>=1.62,<2",
+  "grpcio-tools>=1.62,<2",
+  "protobuf>=4.25,<7",
+  "cryptography>=42,<47",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+  "pytest-asyncio>=0.23",
+]
+postgres = [
+  "psycopg2-binary>=2.9,<3",
+]
+# Phase 1/2 KV cache compaction (arXiv:2602.16284 — Attention Matching).
+# transformers pin matches the reference repo; scipy is needed for Phase 2 β
+# fitting via NNLS (Phase 1 works without it using the log-ratio fallback).
+kv-compaction = [
+  "transformers>=4.40,<5",
+  "scipy>=1.11",
+]
+shell = [
+  "prompt_toolkit>=3.0",
+]
+docs = [
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.24",
+  "mkdocs-mermaid2-plugin>=1.1",
+]
+# Phase 1 MLX backend — Apple Silicon (M1/M2/M3/M4) high-throughput inference.
+# ~100-200 tok/s on Qwen3.5-0.8B vs ~1.3 tok/s with pytorch_auto/MPS.
+# Install with: pip install "openhydra[mlx]"
+mlx = [
+  "mlx>=0.20",
+  "mlx-lm>=0.20",
+]
+
+[project.scripts]
+openhydra              = "coordinator.client_cli:main"
+openhydra-node         = "coordinator.node:main"
+openhydra-coordinator  = "coordinator.api_server:main"
+openhydra-peer         = "peer.server:main"
+openhydra-dht          = "dht.bootstrap:main"
+openhydra-genesis      = "torrent.genesis:main"
+openhydra-shell        = "coordinator.interactive_cli:main"
+
+# Standalone root-level modules (imported by coordinator/peer/dht at runtime)
+[tool.setuptools]
+py-modules = ["openhydra_defaults", "openhydra_logging", "openhydra_secrets"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests*", "scripts*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"

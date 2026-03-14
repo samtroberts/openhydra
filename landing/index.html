@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenHydra — Run AI in a herd, not a data centre</title>
+<meta name="description" content="OpenHydra splits big language models across volunteer laptops — BitTorrent-style. Run Qwen 3.5, earn HYDRA tokens, and skip the $20/month API bill.">
+<meta property="og:title" content="OpenHydra — Run AI in a herd, not a data centre">
+<meta property="og:description" content="BitTorrent-style distributed LLM inference. Inspired by Petals. Powered by Qwen 3.5.">
+<meta property="og:image" content="logo-512.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,600;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:      #fbf6f0;
+    --surface: #f4ece1;
+    --s2:      #ece3d4;
+    --s3:      #e4d9c8;
+    --border:  #ddd3be;
+    --text:    #2a2318;
+    --muted:   #8a7a63;
+    --dim:     #b8a990;
+    --max-w:   800px;
+    --r:       10px;
+  }
+  html,body { background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif; font-size:16px; line-height:1.6; -webkit-font-smoothing:antialiased; }
+  a { color:var(--text); text-decoration:underline; text-underline-offset:3px; }
+  a:hover { opacity:.65; }
+  h1,h2,h3 { font-family:'Lora',Georgia,serif; line-height:1.2; letter-spacing:-.01em; }
+
+  /* NAV */
+  nav { position:sticky; top:0; z-index:100; height:56px; border-bottom:1px solid var(--border); background:rgba(251,246,240,.9); backdrop-filter:blur(10px); display:flex; align-items:center; }
+  .nav-inner { max-width:var(--max-w); width:100%; margin:0 auto; padding:0 1.5rem; display:flex; justify-content:space-between; align-items:center; }
+  .nav-brand { display:flex; align-items:center; gap:.5rem; text-decoration:none; color:var(--text); }
+  .nav-brand:hover { opacity:.8; }
+  .nav-brand img { width:26px; height:26px; object-fit:contain; }
+  .nav-wordmark { font-weight:600; font-size:.93rem; }
+  .nav-links { display:flex; gap:1.5rem; }
+  .nav-link { font-size:.83rem; color:var(--muted); text-decoration:none; transition:color .15s; }
+  .nav-link:hover { color:var(--text); }
+
+  /* HERO */
+  .hero { max-width:var(--max-w); margin:0 auto; padding:5rem 1.5rem 3rem; display:flex; flex-direction:column; align-items:center; text-align:center; gap:1.5rem; }
+  .hero-logo { width:148px; height:148px; object-fit:contain; }
+  .inspo-badge { display:inline-flex; align-items:center; gap:.5rem; font-size:.7rem; font-weight:500; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); border:1px solid var(--border); background:var(--surface); padding:.28rem .85rem; border-radius:999px; text-decoration:none; transition:background .15s; }
+  .inspo-badge:hover { background:var(--s2); opacity:1; }
+  h1 { font-size:clamp(2.1rem,6vw,3.6rem); font-weight:600; color:var(--text); max-width:640px; }
+  h1 em { font-style:italic; }
+  .hero-sub { font-size:1.04rem; font-weight:300; color:var(--muted); max-width:550px; line-height:1.85; }
+  .hero-sub strong { color:var(--text); font-weight:500; }
+
+  /* install */
+  .install-row { display:flex; align-items:center; gap:.75rem; background:var(--surface); border:1px solid var(--border); border-radius:var(--r); padding:.6rem 1rem; font-family:'JetBrains Mono',monospace; font-size:.8rem; color:var(--text); max-width:520px; width:100%; }
+  .install-prompt { color:var(--dim); user-select:none; }
+  .copy-btn { margin-left:auto; background:none; border:none; cursor:pointer; color:var(--muted); font-size:.95rem; padding:2px; transition:color .15s; }
+  .copy-btn:hover,.copy-btn.ok { color:var(--text); }
+  .hero-ctas { display:flex; gap:.75rem; flex-wrap:wrap; justify-content:center; }
+  .btn { display:inline-flex; align-items:center; gap:.35rem; padding:.62rem 1.35rem; border-radius:8px; font-size:.87rem; font-weight:500; font-family:'Inter',sans-serif; text-decoration:none; cursor:pointer; border:none; white-space:nowrap; transition:opacity .15s,transform .12s; }
+  .btn:hover { opacity:.78; transform:translateY(-1px); }
+  .btn-dark { background:var(--text); color:var(--bg); }
+  .btn-outline { background:transparent; color:var(--text); border:1.5px solid var(--border); }
+  .btn-outline:hover { border-color:var(--muted); }
+
+  /* SHARED */
+  .divider { border:none; border-top:1px solid var(--border); max-width:var(--max-w); margin:0 auto; }
+  .section { max-width:var(--max-w); margin:0 auto; padding:3.5rem 1.5rem; }
+  .section-label { font-size:.7rem; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); margin-bottom:.6rem; }
+  h2 { font-size:clamp(1.5rem,3vw,2rem); font-weight:600; color:var(--text); margin-bottom:.85rem; }
+  h2 em { font-style:italic; font-weight:400; }
+  .section-intro { font-size:.97rem; color:var(--muted); max-width:520px; line-height:1.8; margin-bottom:2.5rem; }
+
+  /* GRIDS */
+  .three-col,.features-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:var(--r); overflow:hidden; }
+  .card { background:var(--surface); padding:1.5rem 1.25rem; transition:background .2s; }
+  .card:hover { background:var(--s2); }
+  .card-emoji { font-size:1.75rem; display:block; margin-bottom:.7rem; }
+  .card-title { font-family:'Lora',serif; font-size:1rem; font-weight:600; color:var(--text); margin-bottom:.45rem; }
+  .card-desc { font-size:.81rem; color:var(--muted); line-height:1.65; }
+
+  /* STEPS */
+  .steps { display:flex; flex-direction:column; border:1px solid var(--border); border-radius:var(--r); overflow:hidden; }
+  .step { display:flex; align-items:flex-start; gap:1.25rem; padding:1.5rem; background:var(--surface); border-bottom:1px solid var(--border); }
+  .step:last-child { border-bottom:none; }
+  .step-num { width:30px; height:30px; flex-shrink:0; border:1.5px solid var(--border); border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:.75rem; font-weight:700; color:var(--muted); font-family:'JetBrains Mono',monospace; background:var(--bg); }
+  .step-body { flex:1; }
+  .step-title { font-size:.94rem; font-weight:600; color:var(--text); margin-bottom:.3rem; }
+  .step-desc { font-size:.82rem; color:var(--muted); line-height:1.65; }
+  .step-code { margin-top:.65rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:.55rem .9rem; font-family:'JetBrains Mono',monospace; font-size:.79rem; color:var(--text); overflow-x:auto; white-space:pre; }
+
+  /* INSPIRATION */
+  .inspo-cards { display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin-bottom:1.5rem; }
+  .inspo-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); padding:1.5rem; }
+  .inspo-who { font-size:.7rem; font-weight:600; text-transform:uppercase; letter-spacing:.12em; color:var(--dim); margin-bottom:.4rem; }
+  .inspo-name { font-family:'Lora',serif; font-size:1.1rem; font-weight:600; color:var(--text); margin-bottom:.5rem; }
+  .inspo-quote { font-size:.83rem; color:var(--muted); line-height:1.65; font-style:italic; }
+  .inspo-link { display:inline-block; margin-top:.75rem; font-size:.78rem; color:var(--muted); text-underline-offset:3px; }
+
+  /* LLAMA FACTS */
+  .llama-facts { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); padding:1.75rem; font-size:.87rem; line-height:1.9; color:var(--muted); }
+  .llama-facts p+p { margin-top:.6rem; }
+  .llama-facts strong { color:var(--text); }
+
+  /* CTA BAND */
+  .cta-band { border-top:1px solid var(--border); padding:4rem 1.5rem; text-align:center; }
+  .cta-band-inner { max-width:var(--max-w); margin:0 auto; display:flex; flex-direction:column; align-items:center; gap:1.25rem; }
+  .cta-band h2 { max-width:500px; margin-bottom:0; }
+  .cta-band p { font-size:.93rem; color:var(--muted); max-width:440px; line-height:1.75; }
+
+  /* FOOTER */
+  footer { border-top:1px solid var(--border); background:var(--surface); padding:2rem 1.5rem; }
+  .footer-inner { max-width:var(--max-w); margin:0 auto; display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap; }
+  .footer-brand { display:flex; align-items:center; gap:.5rem; }
+  .footer-brand img { width:22px; height:22px; object-fit:contain; }
+  .footer-name { font-size:.85rem; font-weight:600; color:var(--muted); }
+  .footer-links { display:flex; gap:1.25rem; flex-wrap:wrap; }
+  .footer-link { font-size:.8rem; color:var(--muted); text-decoration:none; }
+  .footer-link:hover { color:var(--text); }
+  .footer-copy { font-size:.75rem; color:var(--dim); margin-top:1rem; text-align:center; max-width:var(--max-w); margin-left:auto; margin-right:auto; }
+  .footer-copy a { color:var(--dim); }
+
+  @media (max-width:640px) {
+    .three-col,.features-grid { grid-template-columns:1fr; }
+    .inspo-cards { grid-template-columns:1fr; }
+    .footer-inner { flex-direction:column; align-items:flex-start; }
+    h1 { font-size:2rem; }
+    .hero { padding-top:3rem; }
+    .step { flex-direction:column; gap:.75rem; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="/" class="nav-brand">
+      <img src="logo.png" alt="OpenHydra">
+      <span class="nav-wordmark">OpenHydra</span>
+    </a>
+    <div class="nav-links">
+      <a href="https://github.com/openhydra-ai/openhydra#quick-start" class="nav-link">Docs</a>
+      <a href="https://github.com/openhydra-ai/openhydra/releases" class="nav-link">Download</a>
+      <a href="https://github.com/openhydra-ai/openhydra" class="nav-link" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="hero">
+  <img src="logo.png" alt="OpenHydra three-headed llama" class="hero-logo">
+  <a href="https://petals.dev" class="inspo-badge" target="_blank" rel="noopener">🌸 Inspired by Petals &amp; BitTorrent</a>
+  <h1>Run AI in a herd,<br><em>not a data centre</em></h1>
+  <p class="hero-sub">
+    OpenHydra splits big language models across volunteer laptops — <strong>BitTorrent-style</strong>.
+    Your machine serves a slice of Qwen&nbsp;3.5. You earn HYDRA tokens.
+    Nobody needs a credit card. No cloud required.
+  </p>
+  <div class="install-row">
+    <span class="install-prompt">$</span>
+    <span>git clone https://github.com/openhydra-ai/openhydra.git</span>
+    <button class="copy-btn" onclick="copyIt(this,'git clone https://github.com/openhydra-ai/openhydra.git')" title="Copy">⎘</button>
+  </div>
+  <div class="hero-ctas">
+    <a href="https://github.com/openhydra-ai/openhydra#quick-start" class="btn btn-dark" style="min-width:11rem;justify-content:center;">Get started &rarr;</a>
+    <a href="https://github.com/openhydra-ai/openhydra/releases" class="btn btn-outline" style="min-width:11rem;justify-content:center;">&#8681; Desktop app <span style="font-size:.55rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;opacity:.45;margin-left:.2rem;">&middot; Soon</span></a>
+  </div>
+</div>
+
+<!-- Mac Mini "OpenClaw" Banner -->
+<div style="max-width: 800px; margin: 2rem auto 0 auto; padding: 1.5rem 2rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); display: flex; align-items: flex-start; gap: 1.25rem;">
+  <div style="font-size: 1.75rem; line-height: 1;">&#127823;</div>
+  <div>
+    <h3 style="font-family: 'Lora', Georgia, serif; font-size: 1.05rem; font-weight: 600; color: var(--text); margin: 0 0 0.35rem 0; letter-spacing: -0.01em;">
+      Calling all Mac Mini &ldquo;OpenClaw&rdquo; buyers
+    </h3>
+    <p style="font-family: 'Inter', sans-serif; font-size: .87rem; color: var(--muted); margin: 0; line-height: 1.65;">
+      Did you buy a stack of M4 Mac Minis to run local models? Welcome home. OpenHydra&rsquo;s architecture is explicitly designed to pool Apple Silicon&rsquo;s Unified Memory across the internet. Leave your Mac running in the background, seed the swarm, and let your hardware earn HYDRA credits while you sleep.
+    </p>
+  </div>
+</div>
+
+<hr class="divider">
+
+<div class="section">
+  <p class="section-label">The five-year-old version</p>
+  <h2>OK but what <em>actually</em> is this?</h2>
+  <p class="section-intro">Glad you asked. It&rsquo;s honestly not that complicated once you stop calling it &ldquo;AI infrastructure&rdquo;.</p>
+  <div class="three-col">
+    <div class="card">
+      <span class="card-emoji">🎒</span>
+      <div class="card-title">Big models are heavy</div>
+      <p class="card-desc">A 70-billion parameter model weighs ~140&nbsp;GB. That&rsquo;s not fitting on your laptop. But split across 8 laptops? Now we&rsquo;re talking.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">🌊</span>
+      <div class="card-title">Swarm it, don&rsquo;t hoard it</div>
+      <p class="card-desc">Like BitTorrent, everyone in the herd serves a shard. Your laptop handles one piece of the inference. Together the whole model runs.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">🪙</span>
+      <div class="card-title">And you earn credits</div>
+      <p class="card-desc">Your node earns barter credits and HYDRA tokens for every request it serves. These are in-network credits &mdash; not crypto, not fiat &mdash; redeemable for inference on the swarm. A mystery-shopper bot checks quality. Good llamas get priority routing. Cheaters get slashed.</p>
+    </div>
+  </div>
+  <p style="margin-top:1.5rem;font-size:.84rem;color:var(--muted);text-align:center;">
+    Small models like <strong>Qwen&nbsp;3.5&nbsp;0.8B</strong> run on a single laptop. Bigger ones like Qwen&nbsp;3&nbsp;72B need 8 peers. The default install gets you going with Qwen&nbsp;3.5 immediately &mdash; no beefy GPU required.
+  </p>
+</div>
+
+<hr class="divider">
+
+<div class="section">
+  <p class="section-label">How it works</p>
+  <h2>Three steps to joining <em>the herd</em></h2>
+  <p class="section-intro">It&rsquo;s three commands. Even your grandma could do it. (We&rsquo;re not sure why your grandma would want distributed AI, but we respect the ambition.)</p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">01</div>
+      <div class="step-body">
+        <div class="step-title">Install and set up</div>
+        <p class="step-desc">Clone, virtualenv, compile protobufs. Standard Python setup. You&rsquo;ve done worse.</p>
+        <div class="step-code">git clone https://github.com/openhydra-ai/openhydra.git
+cd openhydra &amp;&amp; make venv &amp;&amp; source .venv/bin/activate
+make install &amp;&amp; make proto</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">02</div>
+      <div class="step-body">
+        <div class="step-title">Start your node &mdash; auto-joins the global swarm</div>
+        <p class="step-desc">One command. Your node automatically connects to bootstrap nodes on three continents (EU, US, AP) via the Hivemind Kademlia DHT. The default model is <strong>Qwen&nbsp;3.5&nbsp;0.8B</strong> &mdash; lightweight enough to run on a potato, smart enough to actually be useful.</p>
+        <div class="step-code">openhydra-node --peer-id your-name</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">03</div>
+      <div class="step-body">
+        <div class="step-title">Chat. Earn. Repeat.</div>
+        <p class="step-desc">Use the OpenAI-compatible API, earn HYDRA tokens for every request your node serves, and quietly feel good about contributing to decentralised AI.</p>
+        <div class="step-code">curl http://localhost:8080/v1/chat/completions \
+  -d '{"model":"openhydra-qwen3.5-0.8b","messages":[{"role":"user","content":"hi"}]}'</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<div class="section">
+  <p class="section-label">What you get</p>
+  <h2>Features, <em>listed professionally</em></h2>
+  <p class="section-intro">We also have a proper features page in the docs, but here&rsquo;s the version where we&rsquo;re allowed to be slightly smug.</p>
+  <div class="features-grid">
+    <div class="card">
+      <span class="card-emoji">&#9889;</span>
+      <div class="card-title">Drop-in OpenAI &amp; Ollama API</div>
+      <p class="card-desc">Change one URL. Your existing code works. <code style="font-family:monospace;font-size:.82em">/v1/chat/completions</code> with SSE streaming, plus Ollama-compatible <code style="font-family:monospace;font-size:.82em">/api/chat</code> for Open WebUI and Continue.dev.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">&#129504;</span>
+      <div class="card-title">KV cache compaction</div>
+      <p class="card-desc">4-phase Attention Matching keeps long conversations alive without nuking your VRAM. Based on arXiv:2602.16284 &mdash; we read the papers so you don&rsquo;t have to.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">&#128279;</span>
+      <div class="card-title">Dual-stack DHT routing</div>
+      <p class="card-desc">HTTP DHT + Hivemind Kademlia across three continents. Auto-join on startup. If one bootstrap goes down, the llamas find another way. No single point of failure.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">&#128421;</span>
+      <div class="card-title">Desktop node app <span style="display:inline-block;font-family:'Inter',sans-serif;font-size:.6rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;background:var(--s3);color:var(--muted);padding:.15rem .45rem;border-radius:4px;margin-left:.4rem;vertical-align:middle;">Coming Soon</span></div>
+      <p class="card-desc">Tauri v2 app for macOS, Windows, and Linux. Click &ldquo;Start Node&rdquo;. Watch credits accumulate. Currently CLI-only &mdash; the desktop GUI is in active development.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">&#128737;</span>
+      <div class="card-title">Onion routing &amp; encryption</div>
+      <p class="card-desc">Ed25519 identity, X25519 ECDH + AES-256-GCM per hop, concentric onion routing, and differential privacy noise. No peer sees your full query. Overhead: 0.02%.</p>
+    </div>
+    <div class="card">
+      <span class="card-emoji">&#127758;</span>
+      <div class="card-title">Python &amp; TypeScript SDKs <span style="display:inline-block;font-family:'Inter',sans-serif;font-size:.6rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;background:var(--s3);color:var(--muted);padding:.15rem .45rem;border-radius:4px;margin-left:.4rem;vertical-align:middle;">Coming Soon</span></div>
+      <p class="card-desc">Zero-dependency Python client. Browser-native TypeScript SDK. The internal SDK scaffolding exists &mdash; public release and docs are coming in v1.1.</p>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<div class="section">
+  <p class="section-label">Standing on the shoulders of giants</p>
+  <h2>We didn&rsquo;t invent this. <em>We just added llamas.</em></h2>
+  <p class="section-intro">OpenHydra builds directly on two brilliant ideas. We want to be upfront about our inspirations, because intellectual honesty is cool (and mandatory if you don&rsquo;t want to get ratio&rsquo;d on HackerNews).</p>
+  <div class="inspo-cards">
+    <div class="inspo-card">
+      <div class="inspo-who">Academic inspiration</div>
+      <div class="inspo-name">&#127800; Petals</div>
+      <p class="inspo-quote">&ldquo;Run large language models at home, BitTorrent&#8209;style.&rdquo; Petals proved that volunteer compute can serve real LLM inference across the internet. We took that idea and bolted on a token economy, a desktop app, and a very strong llama motif.</p>
+      <a href="https://petals.dev" class="inspo-link" target="_blank" rel="noopener">petals.dev &rarr;</a>
+    </div>
+    <div class="inspo-card">
+      <div class="inspo-who">Protocol inspiration</div>
+      <div class="inspo-name">&#127754; BitTorrent</div>
+      <p class="inspo-quote">Since 2001, BitTorrent has proved you can distribute enormous files to billions of people without a central server. If it works for a band&rsquo;s entire discography, it can work for Qwen&nbsp;3.5 tokens. Same energy.</p>
+      <a href="https://bittorrent.com" class="inspo-link" target="_blank" rel="noopener">bittorrent.com &rarr;</a>
+    </div>
+  </div>
+  <div class="llama-facts">
+    <p>&#129422; <strong>Fun llama fact #1:</strong> Real llamas are pack animals because they share the load across the herd. The weakest llama doesn&rsquo;t carry the whole tent. This is also the core architectural principle of OpenHydra.</p>
+    <p>&#129422; <strong>Fun llama fact #2:</strong> A group of llamas is called a <em>herd</em>. OpenHydra&rsquo;s network of peers is also called a herd. We are very consistent in our metaphors and proud of this.</p>
+    <p>&#129422; <strong>Fun llama fact #3:</strong> The Hydra in Greek mythology had multiple heads &mdash; cut one off and two grow back. Our bootstrap nodes work the same way. (Please don&rsquo;t cut our bootstrap nodes.)</p>
+    <p>&#129422; <strong>Fun llama fact #4:</strong> Llamas can spit up to 10 feet when stressed. Our nodes politely return HTTP&nbsp;503 instead. Both are valid responses to being overwhelmed.</p>
+  </div>
+</div>
+
+<hr class="divider">
+
+<div class="section">
+  <p class="section-label">What runs on it</p>
+  <h2>It&rsquo;s Qwen all the way down <em>(mostly)</em></h2>
+  <p class="section-intro">The default is Qwen&nbsp;3.5&nbsp;0.8B &mdash; tiny enough for any laptop. Larger models shard automatically across multiple peers. NF4 quantisation cuts VRAM by 4x. Add any HuggingFace model by editing <code style="font-family:monospace;font-size:.85em">models.catalog.json</code>.</p>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;">
+    <div style="background:var(--surface);padding:1.1rem 1.2rem;">
+      <div style="font-size:.68rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:.35rem;">Default &middot; 1 peer &middot; 2 GB</div>
+      <div style="font-weight:600;color:var(--text);font-size:.9rem;margin-bottom:.2rem;">Qwen&nbsp;3.5&nbsp;0.8B</div>
+      <div style="font-size:.77rem;color:var(--muted);">Runs on a potato. The default.</div>
+    </div>
+    <div style="background:var(--surface);padding:1.1rem 1.2rem;">
+      <div style="font-size:.68rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:.35rem;">Compact &middot; 1 peer &middot; 5 GB</div>
+      <div style="font-weight:600;color:var(--text);font-size:.9rem;margin-bottom:.2rem;">Qwen&nbsp;3.5&nbsp;2B</div>
+      <div style="font-size:.77rem;color:var(--muted);">Strong multilingual. Single peer.</div>
+    </div>
+    <div style="background:var(--surface);padding:1.1rem 1.2rem;">
+      <div style="font-size:.68rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:.35rem;">Mid-range &middot; 1 peer &middot; 9 GB</div>
+      <div style="font-weight:600;color:var(--text);font-size:.9rem;margin-bottom:.2rem;">Qwen&nbsp;3.5&nbsp;4B</div>
+      <div style="font-size:.77rem;color:var(--muted);">Reasoning on a single peer.</div>
+    </div>
+    <div style="background:var(--surface);padding:1.1rem 1.2rem;">
+      <div style="font-size:.68rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:.35rem;">Advanced &middot; 2 peers &middot; 18 GB</div>
+      <div style="font-weight:600;color:var(--text);font-size:.9rem;margin-bottom:.2rem;">Qwen&nbsp;3.5&nbsp;9B</div>
+      <div style="font-size:.77rem;color:var(--muted);">High-quality reasoning. int8 quantised.</div>
+    </div>
+    <div style="background:var(--surface);padding:1.1rem 1.2rem;">
+      <div style="font-size:.68rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:.35rem;">Frontier &middot; 4 peers &middot; 16 GB/peer</div>
+      <div style="font-weight:600;color:var(--text);font-size:.9rem;margin-bottom:.2rem;">Qwen&nbsp;3.5&nbsp;27B</div>
+      <div style="font-size:.77rem;color:var(--muted);">int4 quantised. Bring your friends.</div>
+    </div>
+  </div>
+  <p style="margin-top:1rem;font-size:.78rem;color:var(--muted);text-align:center;">
+    5 models in the default catalog. Add any HuggingFace model to <code style="font-family:monospace;font-size:.85em">models.catalog.json</code>.
+    If the requested model lacks peers, the coordinator gracefully degrades to the nearest available smaller model.
+  </p>
+</div>
+
+<div class="cta-band">
+  <div class="cta-band-inner">
+    <img src="logo.png" alt="" style="width:84px;height:84px;object-fit:contain;">
+    <h2>Ready to join the herd?</h2>
+    <p>Your laptop is sitting there doing nothing useful. It could be serving AI tokens and earning credits on the swarm. Three-headed llamas are waiting for you.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/openhydra-ai/openhydra#quick-start" class="btn btn-dark">Read the docs &rarr;</a>
+      <a href="https://github.com/openhydra-ai/openhydra" class="btn btn-outline" target="_blank" rel="noopener">Star on GitHub</a>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <div class="footer-inner">
+    <div class="footer-brand">
+      <img src="logo.png" alt="OpenHydra">
+      <span class="footer-name">OpenHydra</span>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/openhydra-ai/openhydra#quick-start" class="footer-link">Docs</a>
+      <a href="https://github.com/openhydra-ai/openhydra#rest-api" class="footer-link">API</a>
+      <a href="https://github.com/openhydra-ai/openhydra/blob/main/docs/whitepaper.md" class="footer-link">Whitepaper</a>
+      <a href="https://github.com/openhydra-ai/openhydra" class="footer-link" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/openhydra-ai/openhydra/blob/main/CONTRIBUTING.md" class="footer-link">Contributing</a>
+    </div>
+  </div>
+  <p class="footer-copy">
+    &copy; 2026 OpenHydra contributors.
+    <a href="https://github.com/openhydra-ai/openhydra/blob/main/LICENSE">AGPL-3</a> (coordinator/desktop) &middot;
+    <a href="https://github.com/openhydra-ai/openhydra/blob/main/licenses/LICENSE.Apache-2.0">Apache-2</a> (peer/dht).
+    Inspired by <a href="https://petals.dev" target="_blank" rel="noopener">Petals</a>
+    and <a href="https://bittorrent.com" target="_blank" rel="noopener">BitTorrent</a>.
+    Built with <a href="https://claude.com/product/claude-code" target="_blank" rel="noopener"><img src="claude-logo.png" alt="Claude Code" style="height:1em;width:1em;vertical-align:-0.15em;border-radius:3px;"></a> in the open.
+  </p>
+</footer>
+
+<script>
+  function copyIt(btn, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      const o = btn.textContent; btn.textContent = '&#10003;'; btn.classList.add('ok');
+      setTimeout(() => { btn.textContent = o; btn.classList.remove('ok'); }, 1600);
+    });
+  }
+</script>
+</body>
+</html>

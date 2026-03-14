@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import time
+import uuid
+
+import grpc
+
+from compression.autoencoder import CompressionProfile, TensorAutoencoder
+from coordinator.path_finder import PeerEndpoint
+from coordinator.transport import TransportConfig, create_channel
+from peer.crypto import (
+    build_activation_envelope,
+    build_activation_envelope_with_pubkey,
+    build_onion_route_envelope,
+    build_onion_route_envelope_with_pubkeys,
+    required_layers_for_level,
+    verify_privacy_audit_tag,
+)
+from peer import peer_pb2
+from peer import peer_pb2_grpc
+from peer.model_shard import ModelShard
+
+
+@dataclass(frozen=True)
+class StageTrace:
+    peer_id: str
+    latency_ms: float
+    stage_index: int
+    attempt: int = 1
+    failed_peer_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _StageResult:
+    activation: list[float]
+    latency_ms: float
+    latent_dim: int = 0
+
+
+@dataclass(frozen=True)
+class ChainResult:
+    request_id: str
+    text: str
+    activation: list[float]
+    traces: list[StageTrace]
+    latency_ms: float
+    compression: dict[str, float | int | bool | str] | None = None
+    encryption: dict[str, float | int | bool | str] | None = None
+    kv: dict[str, float | int | bool | str | None] | None = None
+
+
+class InferenceChain:
+    """Sequential activation-forwarding chain with optional stage failover."""
+
+    def __init__(
+        self,
+        pipeline: list[PeerEndpoint],
+        timeout_ms: int = 500,
+        transport_config: TransportConfig | None = None,
+        tensor_autoencoder_enabled: bool = False,
+        tensor_autoencoder_latent_dim: int = 1024,
+        advanced_encryption_enabled: bool = False,
+        advanced_encryption_seed: str = "openhydra-tier3-dev-seed",
+        advanced_encryption_level: str = "standard",
+    ):
+        if not pipeline:
+            raise ValueError("pipeline must contain at least one peer")
+        self.pipeline = pipeline
+        self.timeout_s = timeout_ms / 1000.0
+        self.transport_config = transport_config or TransportConfig()
+        self.tensor_autoencoder_enabled = bool(tensor_autoencoder_enabled)
+        self.advanced_encryption_enabled = bool(advanced_encryption_enabled)
+        self.advanced_encryption_seed = str(advanced_encryption_seed)
+        self.advanced_encryption_level = str(advanced_encryption_level)
+        self._last_stage_kv_cache_hit = False
+        self._autoencoder: TensorAutoencoder | None = None
+        if self.tensor_autoencoder_enabled:
+            self._autoencoder = TensorAutoencoder(
+                CompressionProfile(latent_dim=max(1, int(tensor_autoencoder_latent_dim)))
+            )
+        self._last_onion_route_state: dict[str, object] | None = None
+        self._last_onion_next_peer_id: str | None = None
+        self._last_privacy_audit: dict[str, float | int | bool | str] | None = None
+
+    def _request_stage(
+        self,
+        peer: PeerEndpoint,
+        request_id: str,
+        prompt: str,
+        activation: list[float],
+        stage_index: int,
+        total_stages: int,
+        max_tokens: int,
+        kv_session_id: str | None = None,
+        kv_store_activation: bool = False,
+        kv_use_cached_activation: bool = False,
+        onion_route_state: dict[str, object] | None = None,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+        deadline: float | None = None,
+    ) -> _StageResult:
+        plain_activation = activation
+        wire_activation = activation
+        encrypted_activation = b""
+        encryption_nonces: list[bytes] = []
+        encryption_ephemeral_public_keys: list[bytes] = []
+        encryption_suite = ""
+        encryption_layers = 0
+        compression_codec = ""
+        compression_original_dim = 0
+        compression_latent_dim = 0
+        kv_session = str(kv_session_id or "").strip()
+        kv_store = bool(kv_store_activation and kv_session)
+        kv_use_cached = bool(kv_use_cached_activation and kv_session)
+        onion_route_ciphertext = b""
+        onion_route_nonces: list[bytes] = []
+        onion_route_ephemeral_public_keys: list[bytes] = []
+        onion_route_suite = ""
+        onion_route_layers = 0
+        if onion_route_state is not None:
+            onion_route_ciphertext = bytes(onion_route_state.get("ciphertext", b""))
+            onion_route_nonces = [bytes(item) for item in list(onion_route_state.get("nonces", []))]
+            onion_route_ephemeral_public_keys = [
+                bytes(item) for item in list(onion_route_state.get("ephemeral_public_keys", []))
+            ]
+            onion_route_suite = str(onion_route_state.get("suite", "") or "")
+            onion_route_layers = max(0, int(onion_route_state.get("layers", 0) or 0))
+        peer_runtime_backend = str(getattr(peer, "runtime_backend", "")).strip().lower()
+        use_placeholder_autoencoder = (
+            self._autoencoder is not None
+            and stage_index > 0
+            and activation
+            and not peer_runtime_backend.startswith("pytorch")
+        )
+
+        if use_placeholder_autoencoder:
+            latent = self._autoencoder.encode(activation)
+            wire_activation = latent
+            compression_codec = "tensor_autoencoder_mean_pool"
+            compression_original_dim = len(activation)
+            compression_latent_dim = len(latent)
+
+        if self.advanced_encryption_enabled and wire_activation:
+            peer_pubkey_hex = str(getattr(peer, "public_key_hex", "") or "")
+            if peer_pubkey_hex:
+                try:
+                    raw_pub = bytes.fromhex(peer_pubkey_hex)
+                except ValueError:
+                    raw_pub = b""
+            else:
+                raw_pub = b""
+
+            if raw_pub:
+                envelope = build_activation_envelope_with_pubkey(
+                    wire_activation,
+                    raw_public_key_bytes=raw_pub,
+                    peer_id=peer.peer_id,
+                    request_id=request_id,
+                    stage_index=stage_index,
+                    level=self.advanced_encryption_level,
+                )
+            else:
+                envelope = build_activation_envelope(
+                    wire_activation,
+                    peer_id=peer.peer_id,
+                    request_id=request_id,
+                    stage_index=stage_index,
+                    shared_secret_seed=self.advanced_encryption_seed,
+                    level=self.advanced_encryption_level,
+                )
+            plain_activation = []
+            encrypted_activation = envelope.ciphertext
+            encryption_nonces = list(envelope.nonces)
+            encryption_ephemeral_public_keys = list(envelope.ephemeral_public_keys)
+            encryption_suite = envelope.suite
+            encryption_layers = envelope.layers
+        else:
+            plain_activation = wire_activation
+
+        req = peer_pb2.ForwardRequest(
+            request_id=request_id,
+            prompt=prompt if stage_index == 0 else "",
+            activation=plain_activation,
+            stage_index=stage_index,
+            total_stages=total_stages,
+            max_tokens=max_tokens,
+            encrypted_activation=encrypted_activation,
+            encryption_nonces=encryption_nonces,
+            encryption_ephemeral_public_keys=encryption_ephemeral_public_keys,
+            encryption_suite=encryption_suite,
+            encryption_layers=encryption_layers,
+            compression_codec=compression_codec,
+            compression_original_dim=compression_original_dim,
+            compression_latent_dim=compression_latent_dim,
+            kv_session_id=kv_session,
+            kv_store_activation=kv_store,
+            kv_use_cached_activation=kv_use_cached,
+            onion_route_ciphertext=onion_route_ciphertext,
+            onion_route_nonces=onion_route_nonces,
+            onion_route_ephemeral_public_keys=onion_route_ephemeral_public_keys,
+            onion_route_suite=onion_route_suite,
+            onion_route_layers=onion_route_layers,
+            decode_do_sample=bool(decode_do_sample),
+            decode_temperature=float(decode_temperature or 0.0),
+            decode_top_p=float(decode_top_p or 0.0),
+            decode_top_k=max(0, int(decode_top_k or 0)),
+            decode_seed=int(decode_seed or 0),
+            # Phase 3: pass shard layer range so the peer can validate it matches
+            # its startup configuration and surface the info in its own logs.
+            shard_layer_start=max(0, int(getattr(peer, "layer_start", 0) or 0)),
+            shard_layer_end=max(0, int(getattr(peer, "layer_end", 0) or 0)),
+            shard_total_layers=max(0, int(getattr(peer, "total_layers", 0) or 0)),
+        )
+
+        # --- Deadline-aware per-stage timeout ---
+        # Use remaining wall-clock time when a request deadline was propagated;
+        # never exceed the configured per-hop ceiling (self.timeout_s).
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"deadline_exceeded: no time remaining before gRPC Forward "
+                    f"to peer {peer.peer_id} stage {stage_index}"
+                )
+            effective_timeout = min(self.timeout_s, remaining)
+        else:
+            effective_timeout = self.timeout_s
+
+        t0 = time.perf_counter()
+        with create_channel(peer.address, self.transport_config) as channel:
+            stub = peer_pb2_grpc.PeerStub(channel)
+            response = stub.Forward(req, timeout=effective_timeout)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_stage_kv_cache_hit = bool(getattr(response, "kv_cache_hit", False))
+        if response.error:
+            raise RuntimeError(f"peer {peer.peer_id} failed at stage {stage_index}: {response.error}")
+        self._last_onion_next_peer_id = str(getattr(response, "onion_next_peer_id", "") or "")
+        remaining_ciphertext = bytes(getattr(response, "onion_route_ciphertext", b""))
+        if remaining_ciphertext:
+            self._last_onion_route_state = {
+                "ciphertext": remaining_ciphertext,
+                "nonces": [bytes(item) for item in list(getattr(response, "onion_route_nonces", []))],
+                "ephemeral_public_keys": [
+                    bytes(item) for item in list(getattr(response, "onion_route_ephemeral_public_keys", []))
+                ],
+                "suite": str(getattr(response, "onion_route_suite", "") or ""),
+                "layers": max(0, int(getattr(response, "onion_route_layers", 0) or 0)),
+            }
+        else:
+            self._last_onion_route_state = None
+
+        dp_applied = bool(getattr(response, "dp_noise_applied", False))
+        dp_configured_variance = max(0.0, float(getattr(response, "dp_noise_configured_variance", 0.0) or 0.0))
+        dp_observed_variance = max(0.0, float(getattr(response, "dp_noise_observed_variance", 0.0) or 0.0))
+        dp_observed_std = max(0.0, float(getattr(response, "dp_noise_observed_std", 0.0) or 0.0))
+        dp_payload_index = max(0, int(getattr(response, "dp_noise_payload_index", 0) or 0))
+        dp_audit_tag = str(getattr(response, "dp_noise_audit_tag", "") or "")
+        dp_audit_tag_valid = False
+        if dp_applied and dp_payload_index > 0 and dp_audit_tag:
+            dp_audit_tag_valid = verify_privacy_audit_tag(
+                peer_id=peer.peer_id,
+                request_id=request_id,
+                stage_index=int(stage_index),
+                payload_index=dp_payload_index,
+                configured_variance=dp_configured_variance,
+                observed_variance=dp_observed_variance,
+                observed_std=dp_observed_std,
+                audit_tag=dp_audit_tag,
+                shared_secret_seed=self.advanced_encryption_seed,
+            )
+        self._last_privacy_audit = {
+            "applied": dp_applied,
+            "configured_variance": dp_configured_variance,
+            "observed_variance": dp_observed_variance,
+            "observed_std": dp_observed_std,
+            "payload_index": dp_payload_index,
+            "audit_tag": dp_audit_tag,
+            "audit_tag_valid": dp_audit_tag_valid,
+        }
+
+        response_latent_dim = max(0, int(getattr(response, "compression_latent_dim", 0) or 0))
+        if response_latent_dim <= 0:
+            response_latent_dim = len(activation)
+
+        return _StageResult(
+            activation=list(response.activation),
+            latency_ms=latency_ms,
+            latent_dim=response_latent_dim,
+        )
+
+    def _stage_candidates(
+        self,
+        stage_peer: PeerEndpoint,
+        failover_pool: list[PeerEndpoint],
+        max_failovers_per_stage: int,
+    ) -> list[PeerEndpoint]:
+        candidates = [stage_peer]
+        for peer in failover_pool:
+            if peer.peer_id == stage_peer.peer_id:
+                continue
+            if any(p.peer_id == peer.peer_id for p in candidates):
+                continue
+            candidates.append(peer)
+            if len(candidates) >= 1 + max_failovers_per_stage:
+                break
+        return candidates
+
+    def run(
+        self,
+        prompt: str,
+        max_tokens: int = 24,
+        request_id: str | None = None,
+        failover_pool: list[PeerEndpoint] | None = None,
+        max_failovers_per_stage: int = 0,
+        initial_activation: list[float] | None = None,
+        kv_session_id: str | None = None,
+        kv_use_cached_activation: bool = False,
+        kv_store_activation: bool = False,
+        kv_cache_stage_index: int = 0,
+        kv_cache_all_stages: bool = False,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+        deadline: float | None = None,
+    ) -> ChainResult:
+        rid = request_id or str(uuid.uuid4())
+        activation: list[float] = list(initial_activation or [])
+        traces: list[StageTrace] = []
+        compression_input = 0
+        compression_latent = 0
+        compression_hops = 0
+        encryption_hops = 0
+        onion_layers_peeled = 0
+        privacy_audit_required = bool(
+            self.advanced_encryption_enabled
+            and str(self.advanced_encryption_level).strip().lower() == "maximum"
+            and len(self.pipeline) > 1
+        )
+        privacy_audit_records: list[dict[str, float | int | bool | str]] = []
+        privacy_audit_violations: list[str] = []
+        kv_session = str(kv_session_id or "").strip()
+        kv_cache_hit = False
+        kv_cache_peer_id: str | None = None
+        onion_enabled = bool(
+            self.advanced_encryption_enabled
+            and str(self.advanced_encryption_level).strip().lower() in {"enhanced", "maximum"}
+            and len(self.pipeline) > 1
+        )
+        onion_route_state: dict[str, object] | None = None
+        if onion_enabled:
+            route_peer_ids = [peer.peer_id for peer in self.pipeline]
+            peer_pubkeys: dict[str, bytes] = {}
+            for peer in self.pipeline:
+                hex_key = str(getattr(peer, "public_key_hex", "") or "")
+                if not hex_key:
+                    continue
+                try:
+                    peer_pubkeys[peer.peer_id] = bytes.fromhex(hex_key)
+                except ValueError:
+                    continue
+
+            if len(peer_pubkeys) == len(self.pipeline):
+                onion_envelope = build_onion_route_envelope_with_pubkeys(
+                    route_peer_ids,
+                    peer_public_keys=peer_pubkeys,
+                    request_id=rid,
+                )
+            else:
+                onion_envelope = build_onion_route_envelope(
+                    route_peer_ids,
+                    request_id=rid,
+                    shared_secret_seed=self.advanced_encryption_seed,
+                )
+            onion_route_state = {
+                "ciphertext": onion_envelope.ciphertext,
+                "nonces": list(onion_envelope.nonces),
+                "ephemeral_public_keys": list(onion_envelope.ephemeral_public_keys),
+                "suite": onion_envelope.suite,
+                "layers": onion_envelope.layers,
+            }
+
+        started = time.perf_counter()
+        pool = failover_pool or []
+        for stage_index, stage_peer in enumerate(self.pipeline):
+            candidates = self._stage_candidates(stage_peer, pool, max_failovers_per_stage)
+            errors: list[str] = []
+            failed_peer_id: str | None = None
+            use_kv_stage = bool(
+                kv_session and (
+                    bool(kv_cache_all_stages)
+                    or stage_index == int(kv_cache_stage_index)
+                )
+            )
+            stage_use_cached = bool(use_kv_stage and kv_use_cached_activation)
+            stage_store_activation = bool(use_kv_stage and kv_store_activation)
+
+            for attempt, candidate in enumerate(candidates, start=1):
+                try:
+                    stage_input = list(activation)
+                    candidate_backend = str(getattr(candidate, "runtime_backend", "")).strip().lower()
+                    compressed_transfer = (
+                        self._autoencoder is not None
+                        and stage_index > 0
+                        and bool(stage_input)
+                        and not candidate_backend.startswith("pytorch")
+                    )
+                    encrypted_transfer = self.advanced_encryption_enabled and stage_index > 0 and bool(stage_input)
+                    self._last_stage_kv_cache_hit = False
+                    stage_kwargs: dict[str, object] = {}
+                    if use_kv_stage:
+                        stage_kwargs.update(
+                            {
+                                "kv_session_id": kv_session,
+                                "kv_store_activation": stage_store_activation,
+                                "kv_use_cached_activation": stage_use_cached,
+                            }
+                        )
+                    if onion_enabled:
+                        stage_kwargs["onion_route_state"] = onion_route_state
+                    if (
+                        decode_do_sample is not None
+                        or decode_temperature is not None
+                        or decode_top_p is not None
+                        or decode_top_k is not None
+                        or decode_seed is not None
+                    ):
+                        stage_kwargs.update(
+                            {
+                                "decode_do_sample": decode_do_sample,
+                                "decode_temperature": decode_temperature,
+                                "decode_top_p": decode_top_p,
+                                "decode_top_k": decode_top_k,
+                                "decode_seed": decode_seed,
+                            }
+                        )
+
+                    stage_result = self._request_stage(
+                        peer=candidate,
+                        request_id=rid,
+                        prompt=prompt,
+                        activation=stage_input,
+                        stage_index=stage_index,
+                        total_stages=len(self.pipeline),
+                        max_tokens=max_tokens,
+                        deadline=deadline,
+                        **stage_kwargs,
+                    )
+                    if isinstance(stage_result, tuple):
+                        activation = list(stage_result[0])
+                        latency_ms = float(stage_result[1])
+                        stage_latent_dim = len(stage_input)
+                    else:
+                        activation = list(stage_result.activation)
+                        latency_ms = float(stage_result.latency_ms)
+                        stage_latent_dim = max(0, int(stage_result.latent_dim))
+                    if stage_use_cached and self._last_stage_kv_cache_hit:
+                        kv_cache_hit = True
+                        kv_cache_peer_id = candidate.peer_id
+                    if onion_enabled:
+                        expected_next_peer_id = (
+                            self.pipeline[stage_index + 1].peer_id
+                            if (stage_index + 1) < len(self.pipeline)
+                            else ""
+                        )
+                        observed_next_peer_id = str(self._last_onion_next_peer_id or "")
+                        if observed_next_peer_id != expected_next_peer_id:
+                            raise RuntimeError(
+                                "onion_route_mismatch:"
+                                f"stage={stage_index};expected={expected_next_peer_id};observed={observed_next_peer_id}"
+                            )
+                        onion_layers_peeled += 1
+                        onion_route_state = self._last_onion_route_state
+                    stage_privacy = dict(self._last_privacy_audit or {})
+                    if stage_privacy:
+                        stage_privacy["stage_index"] = int(stage_index)
+                        stage_privacy["peer_id"] = candidate.peer_id
+                        stage_privacy["required"] = bool(
+                            privacy_audit_required and stage_index < (len(self.pipeline) - 1)
+                        )
+                        expected_variance = max(0.0, float(getattr(candidate, "privacy_noise_variance", 0.0)))
+                        stage_privacy["expected_variance"] = expected_variance
+                        verified = True
+                        if bool(stage_privacy["required"]):
+                            configured = float(stage_privacy.get("configured_variance", 0.0))
+                            applied = bool(stage_privacy.get("applied", False))
+                            tag_valid = bool(stage_privacy.get("audit_tag_valid", False))
+                            expected_floor = expected_variance if expected_variance > 0.0 else 1e-12
+                            verified = applied and tag_valid and configured >= expected_floor
+                            if not verified:
+                                privacy_audit_violations.append(
+                                    f"stage={stage_index};peer={candidate.peer_id};"
+                                    f"applied={applied};tag_valid={tag_valid};"
+                                    f"configured_variance={configured};expected={expected_floor}"
+                                )
+                        stage_privacy["verified"] = bool(verified)
+                        privacy_audit_records.append(stage_privacy)
+                    traces.append(
+                        StageTrace(
+                            peer_id=candidate.peer_id,
+                            latency_ms=latency_ms,
+                            stage_index=stage_index,
+                            attempt=attempt,
+                            failed_peer_id=failed_peer_id,
+                        )
+                    )
+                    if compressed_transfer and self._autoencoder is not None:
+                        compression_input += len(stage_input)
+                        compression_latent += stage_latent_dim
+                        compression_hops += 1
+                    if encrypted_transfer:
+                        encryption_hops += 1
+                    break
+                except (grpc.RpcError, RuntimeError) as exc:
+                    failed_peer_id = candidate.peer_id
+                    errors.append(f"{candidate.peer_id}: {exc}")
+            else:
+                detail = "; ".join(errors)
+                raise RuntimeError(f"stage {stage_index} failed after retries: {detail}")
+
+        decode_model_id: str | None = None
+        last_stage = self.pipeline[-1]
+        _backend = str(getattr(last_stage, "runtime_backend", "")).strip().lower()
+        if _backend.startswith("pytorch") or _backend == "mlx":
+            candidate_model = str(getattr(last_stage, "runtime_model_id", "")).strip()
+            if not candidate_model:
+                candidate_model = str(getattr(last_stage, "model_id", "")).strip()
+            decode_model_id = candidate_model or None
+
+        output = ModelShard.decode_text(
+            activation,
+            max_tokens=max_tokens,
+            tokenizer_model_id=decode_model_id,
+        )
+        if privacy_audit_violations:
+            raise RuntimeError("privacy_audit_failed:" + ";".join(privacy_audit_violations))
+        total_ms = (time.perf_counter() - started) * 1000.0
+        ratio = float(compression_latent / compression_input) if compression_input else 1.0
+        compression = {
+            "enabled": self._autoencoder is not None,
+            "method": ("tensor_autoencoder_mean_pool" if self._autoencoder is not None else "none"),
+            "hops_compressed": compression_hops,
+            "total_input_elements": compression_input,
+            "total_latent_elements": compression_latent,
+            "avg_compression_ratio": round(ratio, 6),
+            "approx_reduction_pct": round((1.0 - ratio) * 100.0, 6),
+        }
+        encryption = {
+            "enabled": self.advanced_encryption_enabled,
+            "level": (self.advanced_encryption_level if self.advanced_encryption_enabled else "off"),
+            "suite": (_suite_name(self.advanced_encryption_level) if self.advanced_encryption_enabled else "none"),
+            "layers_per_hop": (
+                required_layers_for_level(self.advanced_encryption_level)
+                if self.advanced_encryption_enabled
+                else 0
+            ),
+            "encrypted_hops": encryption_hops,
+            "onion_routing": onion_enabled,
+            "onion_layers": (len(self.pipeline) if onion_enabled else 0),
+            "onion_layers_peeled": onion_layers_peeled,
+            "privacy_audit_required": privacy_audit_required,
+            "privacy_audit_verified": (
+                all(bool(item.get("verified", True)) for item in privacy_audit_records if bool(item.get("required")))
+                if privacy_audit_required
+                else True
+            ),
+            "privacy_audit_records": privacy_audit_records,
+        }
+        kv = {
+            "enabled": bool(kv_session),
+            "session_id": (kv_session or None),
+            "cache_stage_index": (int(kv_cache_stage_index) if kv_session else None),
+            "cache_all_stages": bool(kv_session and kv_cache_all_stages),
+            "cache_requested": bool(kv_session and kv_use_cached_activation),
+            "cache_hit": bool(kv_session and kv_use_cached_activation and kv_cache_hit),
+            "cache_peer_id": kv_cache_peer_id,
+            "store_requested": bool(kv_session and kv_store_activation),
+        }
+        return ChainResult(
+            request_id=rid,
+            text=output,
+            activation=activation,
+            traces=traces,
+            latency_ms=total_ms,
+            compression=compression,
+            encryption=encryption,
+            kv=kv,
+        )
+
+
+def _suite_name(level: str) -> str:
+    normalized = str(level or "standard").strip().lower()
+    if normalized == "standard":
+        return "x25519_hkdf_sha256_aes256_gcm"
+    return f"x25519_hkdf_sha256_aes256_gcm_onion_{normalized}"

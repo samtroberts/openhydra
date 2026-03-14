@@ -1,0 +1,1753 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+from concurrent import futures
+import logging
+from pathlib import Path
+import threading
+import time
+from typing import Any
+
+from openhydra_defaults import PRODUCTION_BOOTSTRAP_URLS
+from openhydra_logging import configure_logging
+
+logger = logging.getLogger(__name__)
+
+# Production Hivemind DHT signpost nodes (EU / US / AP).
+# Peers connect to these to join the Kademlia DHT for decentralised discovery.
+# Peer IDs are stable across restarts (identity key persisted on each Nanode).
+# To update: deploy with identity_path, then read peer_id from journalctl.
+_DEFAULT_HIVEMIND_SIGNPOSTS: list[str] = [
+    # EU — 172.105.69.49
+    "/ip4/172.105.69.49/tcp/38751/p2p/QmaEBYaG3gm8W1neRMvyyuUmeYgM8cKVe54Sy4wPE4XhBY",
+    # US — 45.79.190.172
+    "/ip4/45.79.190.172/tcp/38751/p2p/QmPMFTzpJ5NE1FsSCjdMPgRYMhe488sXmrGfGV7tJ1ykc2",
+    # AP — 172.104.164.98
+    "/ip4/172.104.164.98/tcp/38751/p2p/QmPWABM7D1j41UzCtyk3r3X2yH3HPZf1UZPDJ9qTyQYYqG",
+]
+
+import grpc
+
+from compression.autoencoder import CompressionProfile, TensorAutoencoder
+from peer.daemon_monitor import (
+    DaemonController,
+    DaemonMode,
+    MonitorConfig,
+    ResourceBudget,
+)
+from peer.crypto import (
+    cryptography_available,
+    decrypt_activation_envelope,
+    decrypt_activation_envelope_with_privkey,
+    load_or_create_identity_keyfile,
+    peel_onion_route_layer,
+    peel_onion_route_layer_with_privkey,
+    private_key_from_identity,
+    sign_geo_challenge,
+)
+from peer.batching import BatchingQueue
+from peer.dht_announce import Announcement, announce_http_many
+from peer.p2p_model_cache import P2PModelCache
+from peer.seeder_http import ModelSeedServer
+from peer.hardware import detect_hardware_profile
+from peer.model_shard import ModelShard, ToyShardConfig
+from peer.tls import load_server_credentials
+from peer import peer_pb2
+from peer import peer_pb2_grpc
+from openhydra_secrets import is_insecure_secret_value, load_secret_store
+from torrent.session import SessionBootstrapConfig, TorrentSessionManager
+from torrent.seeder import ArbitrationConfig
+
+GRPC_MAX_MESSAGE_BYTES = 100 * 1024 * 1024
+GRPC_SERVER_OPTIONS: list[tuple[str, int]] = [
+    ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_BYTES),
+    ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_BYTES),
+]
+_QUANTIZATION_FLAG_TO_MODE = {
+    "none": "fp32",
+    "8bit": "int8",
+    "4bit": "int4",
+}
+
+
+def _exponential_backoff_delay(
+    attempt: int,
+    *,
+    base_seconds: float = 1.0,
+    cap_seconds: float = 60.0,
+) -> float:
+    clamped = max(0, min(10, int(attempt)))
+    return min(float(cap_seconds), float(base_seconds) * (2.0 ** clamped))
+
+
+def _resolve_quantization_mode(quantization: str, quantization_mode: str | None) -> str:
+    legacy = str(quantization_mode or "").strip().lower()
+    if legacy in {"fp32", "int8", "int4"}:
+        return legacy
+    normalized = str(quantization or "none").strip().lower()
+    return _QUANTIZATION_FLAG_TO_MODE.get(normalized, "fp32")
+
+
+def _resolve_deployment_security_settings(parser: argparse.ArgumentParser, args: argparse.Namespace) -> dict[str, str]:
+    profile = str(getattr(args, "deployment_profile", "dev") or "dev").strip().lower()
+    if profile not in {"dev", "prod"}:
+        parser.error("unsupported deployment profile")
+
+    try:
+        secret_store = load_secret_store(getattr(args, "secrets_file", None))
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
+    advanced_seed = str(getattr(args, "advanced_encryption_seed", "") or "").strip()
+    geo_seed = str(getattr(args, "geo_challenge_seed", "") or "").strip()
+
+    if is_insecure_secret_value(advanced_seed):
+        advanced_seed = str(secret_store.get("OPENHYDRA_ADVANCED_ENCRYPTION_SEED", advanced_seed) or "").strip()
+    if is_insecure_secret_value(geo_seed):
+        geo_seed = str(secret_store.get("OPENHYDRA_GEO_CHALLENGE_SEED", geo_seed) or "").strip()
+
+    if profile == "prod":
+        if not bool(getattr(args, "tls_enable", False)):
+            parser.error("prod profile requires --tls-enable")
+        if not bool(getattr(args, "tls_require_client_auth", False)):
+            parser.error("prod profile requires --tls-require-client-auth")
+        if not getattr(args, "tls_cert_path", None):
+            parser.error("prod profile requires --tls-cert-path")
+        if not getattr(args, "tls_key_path", None):
+            parser.error("prod profile requires --tls-key-path")
+        if not getattr(args, "tls_client_ca_path", None):
+            parser.error("prod profile requires --tls-client-ca-path")
+        if is_insecure_secret_value(advanced_seed):
+            parser.error(
+                "prod profile requires a strong encryption seed via "
+                "--advanced-encryption-seed or OPENHYDRA_ADVANCED_ENCRYPTION_SEED"
+            )
+        if is_insecure_secret_value(geo_seed):
+            parser.error(
+                "prod profile requires a strong geo challenge seed via "
+                "--geo-challenge-seed or OPENHYDRA_GEO_CHALLENGE_SEED"
+            )
+
+    return {
+        "deployment_profile": profile,
+        "advanced_encryption_seed": advanced_seed or str(getattr(args, "advanced_encryption_seed")),
+        "geo_challenge_seed": geo_seed or str(getattr(args, "geo_challenge_seed")),
+    }
+
+
+class PeerService(peer_pb2_grpc.PeerServicer):
+    def __init__(
+        self,
+        peer_id: str,
+        model_id: str,
+        shard_index: int,
+        total_shards: int,
+        daemon_mode: str,
+        broken: bool,
+        initial_resource_budget: ResourceBudget | None = None,
+        advanced_encryption_enabled: bool = False,
+        advanced_encryption_seed: str = "openhydra-tier3-dev-seed",
+        kv_cache_max_entries: int = 1024,
+        runtime_backend: str = "toy_auto",
+        runtime_target: str = "auto",
+        quantization_mode: str = "fp32",
+        runtime_model_id: str = "Qwen/Qwen3.5-0.8B",
+        tensor_autoencoder_enabled: bool = False,
+        tensor_autoencoder_latent_dim: int = 1024,
+        privacy_noise_variance: float = 0.0,
+        geo_challenge_seed: str = "openhydra-geo-dev-seed",
+        expert_tags: tuple[str, ...] = (),
+        expert_layer_indices: tuple[int, ...] = (),
+        expert_router: bool = False,
+        peer_public_key: str = "",
+        peer_private_key: Any = None,
+        kv_compaction_enabled: bool = False,
+        kv_compaction_method: str = "hak",
+        kv_compaction_ratio: float = 0.10,
+        kv_compaction_beta: bool = False,
+        kv_compaction_head_budget_path: str = "",
+        kv_compaction_online: bool = False,
+        kv_compaction_online_max_tokens: int = 512,
+        kv_compaction_mode: str = "off",
+        kv_compaction_auto_threshold: int = 512,
+        kv_radix_cache_enabled: bool = False,
+        kv_radix_cache_max_entries: int = 128,
+        kv_radix_cache_min_prefix_len: int = 16,
+        warmup_on_start: bool = False,
+        mlx_eval_timeout_s: float = 30.0,
+        batch_window_ms: float = 50.0,
+        max_batch_size: int = 8,
+    ):
+        self.peer_id = peer_id
+        self.model_id = model_id
+        self.shard_index = shard_index
+        self.total_shards = total_shards
+        self.daemon_mode = daemon_mode
+        self.advanced_encryption_enabled = bool(advanced_encryption_enabled)
+        self.advanced_encryption_seed = str(advanced_encryption_seed)
+        self.geo_challenge_seed = str(geo_challenge_seed)
+        if self.advanced_encryption_enabled and not cryptography_available():
+            raise RuntimeError("cryptography_not_available: install 'cryptography>=42'")
+        self.shard = ModelShard(
+            ToyShardConfig(
+                model_id=model_id,
+                shard_index=shard_index,
+                total_shards=total_shards,
+                broken=broken,
+                runtime_backend=str(runtime_backend),
+                runtime_target=str(runtime_target),
+                quantization_mode=str(quantization_mode),
+                runtime_model_id=str(runtime_model_id),
+                runtime_layer_indices=tuple(expert_layer_indices),
+                runtime_kv_cache_max_entries=max(1, int(kv_cache_max_entries)),
+                runtime_kv_compaction_enabled=bool(kv_compaction_enabled),
+                runtime_kv_compaction_method=str(kv_compaction_method or "hak"),
+                runtime_kv_compaction_ratio=max(0.01, min(1.0, float(kv_compaction_ratio))),
+                runtime_kv_compaction_beta=bool(kv_compaction_beta),
+                runtime_kv_compaction_head_budget_path=str(kv_compaction_head_budget_path or ""),
+                runtime_kv_compaction_online=bool(kv_compaction_online),
+                runtime_kv_compaction_online_max_tokens=max(4, int(kv_compaction_online_max_tokens)),
+                runtime_kv_compaction_mode=str(kv_compaction_mode),
+                runtime_kv_compaction_auto_threshold=max(1, int(kv_compaction_auto_threshold)),
+                runtime_kv_radix_cache_enabled=bool(kv_radix_cache_enabled),
+                runtime_kv_radix_cache_max_entries=max(1, int(kv_radix_cache_max_entries)),
+                runtime_kv_radix_cache_min_prefix_len=max(1, int(kv_radix_cache_min_prefix_len)),
+                runtime_warmup_on_start=bool(warmup_on_start),
+                runtime_mlx_eval_timeout_s=max(1.0, float(mlx_eval_timeout_s)),
+                runtime_tensor_autoencoder_enabled=bool(tensor_autoencoder_enabled),
+                runtime_tensor_autoencoder_latent_dim=max(1, int(tensor_autoencoder_latent_dim)),
+                runtime_privacy_noise_variance=max(0.0, float(privacy_noise_variance)),
+                runtime_privacy_audit_seed=str(advanced_encryption_seed),
+                runtime_peer_id=str(peer_id),
+            )
+        )
+        self.runtime_profile = dict(self.shard.runtime_profile())
+        self.batch_queue = BatchingQueue(
+            self.shard,
+            batch_window_ms=float(batch_window_ms),
+            max_batch_size=max(1, int(max_batch_size)),
+        )
+        self.expert_tags = tuple(str(tag).strip().lower() for tag in expert_tags if str(tag).strip())
+        self.expert_layer_indices = tuple(sorted({int(idx) for idx in expert_layer_indices if int(idx) >= 0}))
+        self.expert_router = bool(expert_router)
+        self.peer_public_key = str(peer_public_key or "")
+        self._peer_private_key = peer_private_key
+        self._inflight = 0
+        self._lock = threading.Lock()
+        self._resource_budget = initial_resource_budget or ResourceBudget(
+            vram_fraction=1.0,
+            cpu_fraction=1.0,
+            should_yield=False,
+            reason="default",
+        )
+        self.kv_cache_max_entries = max(1, int(kv_cache_max_entries))
+        self._kv_cache: dict[str, list[float]] = {}
+        self.last_request_thread_id: int | None = None
+        self.last_inference_thread_id: int | None = None
+        self.onion_layers_peeled = 0
+        self.last_onion_next_peer_id: str | None = None
+        self.onion_next_peer_history: list[str] = []
+
+    def inflight_count(self) -> int:
+        with self._lock:
+            return self._inflight
+
+    def set_resource_budget(self, budget: ResourceBudget) -> None:
+        with self._lock:
+            self._resource_budget = budget
+
+    def resource_budget(self) -> ResourceBudget:
+        with self._lock:
+            return ResourceBudget(
+                vram_fraction=self._resource_budget.vram_fraction,
+                cpu_fraction=self._resource_budget.cpu_fraction,
+                should_yield=self._resource_budget.should_yield,
+                reason=self._resource_budget.reason,
+            )
+
+    def _kv_cache_get(self, session_id: str) -> list[float] | None:
+        if not session_id:
+            return None
+        with self._lock:
+            cached = self._kv_cache.get(session_id)
+            if not cached:
+                return None
+            # Reinsert key to approximate LRU behavior in insertion-ordered dicts.
+            self._kv_cache.pop(session_id, None)
+            self._kv_cache[session_id] = list(cached)
+            return list(cached)
+
+    def _kv_cache_set(self, session_id: str, activation: list[float]) -> None:
+        if not session_id or not activation:
+            return
+        values = [float(item) for item in activation]
+        with self._lock:
+            self._kv_cache.pop(session_id, None)
+            self._kv_cache[session_id] = values
+            while len(self._kv_cache) > self.kv_cache_max_entries:
+                oldest_key = next(iter(self._kv_cache))
+                self._kv_cache.pop(oldest_key, None)
+
+    def _load_pct(self) -> float:
+        with self._lock:
+            inflight = self._inflight
+            budget = self._resource_budget
+
+        base = min(100.0, inflight * 12.5)
+        if budget.should_yield:
+            return max(95.0, base)
+
+        cpu_fraction = max(0.0, min(1.0, budget.cpu_fraction))
+        budget_pressure = (1.0 - cpu_fraction) * 15.0
+        return min(100.0, base + budget_pressure)
+
+    def Ping(self, request: peer_pb2.PingRequest, context: grpc.ServicerContext) -> peer_pb2.PingResponse:
+        geo_nonce = str(getattr(request, "geo_nonce", "") or "").strip()
+        geo_claimed_region = str(getattr(request, "geo_claimed_region", "") or "")
+        geo_nonce_signature = ""
+        if geo_nonce:
+            geo_nonce_signature = sign_geo_challenge(
+                peer_id=self.peer_id,
+                nonce=geo_nonce,
+                claimed_region=geo_claimed_region,
+                shared_secret_seed=self.geo_challenge_seed,
+            )
+        return peer_pb2.PingResponse(
+            peer_id=self.peer_id,
+            ok=True,
+            load_pct=self._load_pct(),
+            daemon_mode=self.daemon_mode,
+            geo_nonce_signature=geo_nonce_signature,
+        )
+
+    def Forward(self, request: peer_pb2.ForwardRequest, context: grpc.ServicerContext) -> peer_pb2.ForwardResponse:
+        self.last_request_thread_id = threading.get_ident()
+        with self._lock:
+            self._inflight += 1
+
+        try:
+            max_tokens = int(request.max_tokens or 24)
+            decode_do_sample = bool(getattr(request, "decode_do_sample", False))
+            decode_temperature = float(getattr(request, "decode_temperature", 0.0) or 0.0)
+            decode_top_p = float(getattr(request, "decode_top_p", 0.0) or 0.0)
+            decode_top_k = int(getattr(request, "decode_top_k", 0) or 0)
+            decode_seed = int(getattr(request, "decode_seed", 0) or 0)
+            kv_session_id = str(getattr(request, "kv_session_id", "") or "").strip()
+            kv_store_activation = bool(getattr(request, "kv_store_activation", False) and kv_session_id)
+            kv_use_cached_activation = bool(getattr(request, "kv_use_cached_activation", False) and kv_session_id)
+            kv_cache_hit = False
+            onion_route_ciphertext = b""
+            onion_route_nonces: list[bytes] = []
+            onion_route_ephemeral_public_keys: list[bytes] = []
+            onion_route_suite = ""
+            onion_route_layers = 0
+            onion_next_peer_id = ""
+            with self._lock:
+                self.last_onion_next_peer_id = None
+
+            if request.onion_route_ciphertext:
+                if self._peer_private_key is not None:
+                    onion_layer = peel_onion_route_layer_with_privkey(
+                        ciphertext=bytes(request.onion_route_ciphertext),
+                        nonces=[bytes(item) for item in request.onion_route_nonces],
+                        ephemeral_public_keys=[bytes(item) for item in request.onion_route_ephemeral_public_keys],
+                        private_key=self._peer_private_key,
+                        peer_id=self.peer_id,
+                        request_id=request.request_id,
+                        stage_index=int(request.stage_index),
+                    )
+                else:
+                    onion_layer = peel_onion_route_layer(
+                        ciphertext=bytes(request.onion_route_ciphertext),
+                        nonces=[bytes(item) for item in request.onion_route_nonces],
+                        ephemeral_public_keys=[bytes(item) for item in request.onion_route_ephemeral_public_keys],
+                        peer_id=self.peer_id,
+                        request_id=request.request_id,
+                        stage_index=int(request.stage_index),
+                        shared_secret_seed=self.advanced_encryption_seed,
+                    )
+                onion_route_ciphertext = onion_layer.remaining_ciphertext
+                onion_route_nonces = list(onion_layer.remaining_nonces)
+                onion_route_ephemeral_public_keys = list(onion_layer.remaining_ephemeral_public_keys)
+                onion_route_suite = onion_layer.remaining_suite
+                onion_route_layers = max(0, int(onion_layer.remaining_layers))
+                onion_next_peer_id = str(onion_layer.next_peer_id or "")
+                with self._lock:
+                    self.onion_layers_peeled += 1
+                    self.last_onion_next_peer_id = onion_next_peer_id
+                    self.onion_next_peer_history.append(onion_next_peer_id)
+                    if len(self.onion_next_peer_history) > 64:
+                        self.onion_next_peer_history = self.onion_next_peer_history[-64:]
+
+            # ── Phase 3: shard layer-range validation ─────────────────────────
+            # The coordinator embeds the layer range it expects this peer to run
+            # in shard_layer_start / shard_layer_end / shard_total_layers.
+            # When those fields are non-zero we verify they match our startup
+            # config and log the stage routing for observability.
+            req_shard_start = int(getattr(request, "shard_layer_start", 0) or 0)
+            req_shard_end = int(getattr(request, "shard_layer_end", 0) or 0)
+            req_shard_total = int(getattr(request, "shard_total_layers", 0) or 0)
+            if req_shard_end > 0:
+                my_layer_start = int(self.runtime_profile.get("layer_start", 0) or 0)
+                my_layer_end = int(self.runtime_profile.get("layer_end", 0) or 0)
+                if my_layer_end > 0 and (
+                    req_shard_start != my_layer_start or req_shard_end != my_layer_end
+                ):
+                    raise RuntimeError(
+                        f"shard_layer_mismatch: coordinator expects "
+                        f"[{req_shard_start},{req_shard_end}) "
+                        f"but peer covers [{my_layer_start},{my_layer_end})"
+                    )
+                logger.debug(
+                    "shard_forward: peer=%s stage=%d/%d layers=[%d,%d) total=%d",
+                    self.peer_id,
+                    int(request.stage_index),
+                    int(request.total_stages),
+                    req_shard_start,
+                    req_shard_end,
+                    req_shard_total,
+                )
+            # ──────────────────────────────────────────────────────────────────
+
+            if request.encrypted_activation:
+                if self._peer_private_key is not None:
+                    activation_in = decrypt_activation_envelope_with_privkey(
+                        ciphertext=bytes(request.encrypted_activation),
+                        nonces=[bytes(item) for item in request.encryption_nonces],
+                        ephemeral_public_keys=[bytes(item) for item in request.encryption_ephemeral_public_keys],
+                        private_key=self._peer_private_key,
+                        peer_id=self.peer_id,
+                        request_id=request.request_id,
+                        stage_index=int(request.stage_index),
+                    )
+                else:
+                    activation_in = decrypt_activation_envelope(
+                        ciphertext=bytes(request.encrypted_activation),
+                        nonces=[bytes(item) for item in request.encryption_nonces],
+                        ephemeral_public_keys=[bytes(item) for item in request.encryption_ephemeral_public_keys],
+                        peer_id=self.peer_id,
+                        request_id=request.request_id,
+                        stage_index=int(request.stage_index),
+                        shared_secret_seed=self.advanced_encryption_seed,
+                    )
+            else:
+                if self.advanced_encryption_enabled and int(request.stage_index) > 0:
+                    raise RuntimeError("encrypted_activation_required")
+                activation_in = list(request.activation)
+
+            compression_codec = str(request.compression_codec or "").strip()
+            if compression_codec:
+                if compression_codec != "tensor_autoencoder_mean_pool":
+                    raise RuntimeError(f"unsupported_compression_codec:{compression_codec}")
+                original_dim = int(request.compression_original_dim or 0)
+                if original_dim <= 0:
+                    raise RuntimeError("invalid_compression_original_dim")
+                latent_dim = int(request.compression_latent_dim or max(1, len(activation_in)))
+                decoder = TensorAutoencoder(CompressionProfile(latent_dim=max(1, latent_dim)))
+                activation_in = decoder.decode(activation_in, target_dim=original_dim)
+
+            if self.shard.uses_pytorch_runtime:
+                # Offload PyTorch matrix compute to a worker thread to protect async control planes.
+                activation = asyncio.run(
+                    self.shard.forward_async(
+                        request.prompt,
+                        activation_in,
+                        max_tokens,
+                        stage_index=int(request.stage_index),
+                        total_stages=int(request.total_stages),
+                        kv_session_id=kv_session_id,
+                        kv_store_activation=kv_store_activation,
+                        kv_use_cached_activation=kv_use_cached_activation,
+                        request_id=str(request.request_id),
+                        decode_do_sample=decode_do_sample,
+                        decode_temperature=decode_temperature,
+                        decode_top_p=decode_top_p,
+                        decode_top_k=decode_top_k,
+                        decode_seed=(decode_seed if decode_seed > 0 else None),
+                    )
+                )
+                kv_cache_hit = bool(self.shard.last_kv_cache_hit)
+            else:
+                if kv_use_cached_activation:
+                    cached = self._kv_cache_get(kv_session_id)
+                    if not cached:
+                        raise RuntimeError("kv_cache_miss")
+                    activation_in = cached
+                    kv_cache_hit = True
+                activation = self.batch_queue.forward(
+                    request.prompt,
+                    activation_in,
+                    max_tokens,
+                    stage_index=int(request.stage_index),
+                    total_stages=int(request.total_stages),
+                    request_id=str(request.request_id),
+                    decode_do_sample=decode_do_sample,
+                    decode_temperature=decode_temperature,
+                    decode_top_p=decode_top_p,
+                    decode_top_k=decode_top_k,
+                    decode_seed=(decode_seed if decode_seed > 0 else None),
+                )
+                if kv_store_activation:
+                    self._kv_cache_set(kv_session_id, activation)
+            self.last_inference_thread_id = self.shard.last_forward_thread_id
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                activation=activation,
+                stage_index=request.stage_index,
+                error="",
+                kv_cache_hit=kv_cache_hit,
+                onion_route_ciphertext=onion_route_ciphertext,
+                onion_route_nonces=onion_route_nonces,
+                onion_route_ephemeral_public_keys=onion_route_ephemeral_public_keys,
+                onion_route_suite=onion_route_suite,
+                onion_route_layers=onion_route_layers,
+                onion_next_peer_id=onion_next_peer_id,
+                dp_noise_applied=bool(self.shard.privacy_noise_last_applied),
+                dp_noise_configured_variance=float(self.shard.privacy_noise_variance),
+                dp_noise_observed_variance=float(self.shard.privacy_noise_last_observed_variance),
+                dp_noise_observed_std=float(self.shard.privacy_noise_last_observed_std),
+                dp_noise_payload_index=int(self.shard.privacy_noise_last_payload_index),
+                dp_noise_audit_tag=str(self.shard.privacy_noise_last_audit_tag),
+                compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
+            )
+        except Exception as exc:  # pragma: no cover
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                activation=[],
+                stage_index=request.stage_index,
+                error=str(exc),
+                kv_cache_hit=False,
+                onion_route_ciphertext=b"",
+                onion_route_nonces=[],
+                onion_route_ephemeral_public_keys=[],
+                onion_route_suite="",
+                onion_route_layers=0,
+                onion_next_peer_id="",
+                dp_noise_applied=False,
+                dp_noise_configured_variance=0.0,
+                dp_noise_observed_variance=0.0,
+                dp_noise_observed_std=0.0,
+                dp_noise_payload_index=0,
+                dp_noise_audit_tag="",
+                compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
+            )
+        finally:
+            with self._lock:
+                self._inflight = max(0, self._inflight - 1)
+
+    def GetPeerStatus(
+        self,
+        request: peer_pb2.PeerStatusRequest,
+        context: grpc.ServicerContext,
+    ) -> peer_pb2.PeerStatusResponse:
+        return peer_pb2.PeerStatusResponse(
+            peer_id=self.peer_id,
+            model_id=self.model_id,
+            shard_index=self.shard_index,
+            total_shards=self.total_shards,
+            load_pct=self._load_pct(),
+            healthy=True,
+            daemon_mode=self.daemon_mode,
+            dp_noise_configured_variance=float(self.shard.privacy_noise_variance),
+            dp_noise_payloads=int(self.shard.privacy_noise_payloads),
+            dp_noise_observed_variance_ema=float(self.shard.privacy_noise_observed_variance_ema),
+            dp_noise_last_audit_tag=str(self.shard.privacy_noise_last_audit_tag),
+        )
+
+
+def _seeding_loop(
+    *,
+    stop_event: threading.Event,
+    service: PeerService,
+    session_manager: TorrentSessionManager,
+    advertised_bandwidth_mbps: float,
+    update_interval_sec: int,
+) -> None:
+    while not stop_event.is_set():
+        inference_active = service.inflight_count() > 0
+        observed = 0.0
+        if advertised_bandwidth_mbps > 0:
+            observed = advertised_bandwidth_mbps * (service._load_pct() / 100.0)
+
+        session_manager.update(
+            inference_active=inference_active,
+            inference_observed_mbps=observed,
+        )
+        stop_event.wait(max(1, update_interval_sec))
+
+
+def _daemon_budget_loop(
+    *,
+    stop_event: threading.Event,
+    service: PeerService,
+    controller: DaemonController,
+    refresh_interval_sec: int,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            budget = controller.refresh()
+            service.set_resource_budget(budget)
+        except Exception as exc:  # pragma: no cover
+            logging.debug("daemon monitor refresh failed: %s", exc)
+        stop_event.wait(max(1, refresh_interval_sec))
+
+
+def _probe_available_vram_mb() -> int:
+    """Return free GPU VRAM in MB.  Returns 0 when undeterminable.
+
+    Priority:
+      1. CUDA:  ``torch.cuda.mem_get_info`` (exact free bytes)
+      2. Metal: ``mlx.metal.device_info`` recommendedMaxWorkingSetSize
+                (safe-to-use total; used as a proxy since MLX allocates lazily)
+      3. Fallback: 0 (coordinator treats this as "assume capable")
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_bytes, _total = torch.cuda.mem_get_info(0)
+            return int(free_bytes // (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        import mlx.core as mx
+        info = mx.metal.device_info()
+        return int(info.get("recommendedMaxWorkingSetSize", 0) // (1024 * 1024))
+    except Exception:
+        pass
+    return 0
+
+
+def _sign_announce_safe(private_key: object, peer_id: str, host: str, port: int, model_id: str) -> str:
+    """Sign an announce payload; returns empty string on any error."""
+    try:
+        from peer.identity import sign_announce as _sign_announce
+        return _sign_announce(private_key, peer_id, host, port, model_id)  # type: ignore[arg-type]
+    except Exception:
+        return ""
+
+
+def _announce_loop(
+    *,
+    stop_event: threading.Event,
+    service: PeerService,
+    dht_urls: list[str] | tuple[str, ...],
+    advertise_host: str,
+    port: int,
+    operator_id: str | None,
+    region: str | None,
+    bandwidth_mbps: float,
+    announce_interval_sec: int,
+    announce_ttl_sec: int,
+    session_manager: TorrentSessionManager | None,
+    announced_reputation_score: float,
+    announced_staked_balance: float,
+    peer_public_key: str = "",
+    announce_private_key: object = None,
+    announce_public_key_hex: str = "",
+    seeder_http_port: int = 0,
+    p2p_cache: P2PModelCache | None = None,
+    local_fast_path_port: int = 0,
+    hivemind_adapter: Any = None,
+) -> None:
+    announce_interval = max(1.0, float(announce_interval_sec))
+    announced_once = False
+    consecutive_failures = 0
+    outage_window_s = 0.0
+    while not stop_event.is_set():
+        seeding_snapshot: dict[str, Any] = (
+            session_manager.snapshot() if session_manager is not None else {
+                "seeding_enabled": False,
+                "arbitration": {
+                    "effective_seed_upload_limit_mbps": 0.0,
+                    "target_seed_upload_limit_mbps": 0.0,
+                    "inference_active": False,
+                },
+            }
+        )
+        arbitration = dict(seeding_snapshot.get("arbitration") or {})
+        runtime_profile = dict(service.runtime_profile or {})
+
+        announcement = Announcement(
+            peer_id=service.peer_id,
+            model_id=service.model_id,
+            host=advertise_host,
+            port=port,
+            operator_id=operator_id,
+            region=region,
+            load_pct=service._load_pct(),
+            daemon_mode=service.daemon_mode,
+            bandwidth_mbps=bandwidth_mbps,
+            seeding_enabled=bool(seeding_snapshot.get("seeding_enabled", False)),
+            seed_upload_limit_mbps=float(arbitration.get("effective_seed_upload_limit_mbps", 0.0)),
+            seed_target_upload_limit_mbps=float(arbitration.get("target_seed_upload_limit_mbps", 0.0)),
+            seed_inference_active=bool(arbitration.get("inference_active", False)),
+            runtime_backend=str(runtime_profile.get("backend", "toy_cpu")),
+            runtime_target=str(runtime_profile.get("target", "cpu")),
+            runtime_model_id=str(runtime_profile.get("runtime_model_id", "")),
+            quantization_mode=str(runtime_profile.get("quantization_mode", "fp32")),
+            quantization_bits=int(runtime_profile.get("quantization_bits", 0)),
+            runtime_gpu_available=bool(runtime_profile.get("gpu_available", False)),
+            runtime_estimated_tokens_per_sec=float(runtime_profile.get("estimated_tokens_per_sec", 0.0)),
+            runtime_estimated_memory_mb=int(runtime_profile.get("estimated_memory_mb", 0)),
+            privacy_noise_variance=float(service.shard.privacy_noise_variance),
+            privacy_noise_payloads=int(service.shard.privacy_noise_payloads),
+            privacy_noise_observed_variance_ema=float(service.shard.privacy_noise_observed_variance_ema),
+            privacy_noise_last_audit_tag=str(service.shard.privacy_noise_last_audit_tag),
+            reputation_score=max(0.0, float(announced_reputation_score)),
+            staked_balance=max(0.0, float(announced_staked_balance)),
+            expert_tags=tuple(service.expert_tags),
+            expert_layer_indices=tuple(service.expert_layer_indices),
+            expert_router=bool(service.expert_router),
+            peer_public_key=str(peer_public_key or ""),
+            public_key=str(announce_public_key_hex or ""),
+            signature=(_sign_announce_safe(announce_private_key, service.peer_id, advertise_host, port, service.model_id) if announce_private_key is not None else ""),
+            available_vram_mb=_probe_available_vram_mb(),
+            layer_start=int(runtime_profile.get("layer_start", 0)),
+            layer_end=int(runtime_profile.get("layer_end", 0)),
+            total_layers=int(runtime_profile.get("total_layers", 0)),
+            seeder_http_port=int(seeder_http_port),
+            cached_model_ids=tuple(p2p_cache.announce_cached_models() if p2p_cache is not None else []),
+            local_fast_path_port=int(local_fast_path_port),
+        )
+        try:
+            # HTTP DHT announce (legacy path).
+            if dht_urls:
+                successes, failures = announce_http_many(
+                    announcement,
+                    dht_urls=dht_urls,
+                    ttl_seconds=announce_ttl_sec,
+                    heartbeat=announced_once,
+                )
+                if not successes:
+                    sample_error = next(iter(failures.values())) if failures else RuntimeError("dht_announce_no_targets")
+                    raise RuntimeError(sample_error)
+                for failed_url, exc in failures.items():
+                    logging.warning("DHT announce partial failure for %s via %s (%s)", service.peer_id, failed_url, exc)
+                if consecutive_failures > 0:
+                    logging.info(
+                        "DHT announce recovered for %s after %s retries",
+                        service.peer_id,
+                        consecutive_failures,
+                    )
+                if not announced_once:
+                    logging.info("peer %s announced to %s DHT endpoints", service.peer_id, len(successes))
+
+            # Hivemind DHT announce (dual-stack path).
+            if hivemind_adapter is not None:
+                try:
+                    from dataclasses import asdict as _asdict
+                    _hm_payload = _asdict(announcement)
+                    _hm_payload["updated_unix_ms"] = int(time.time() * 1000)
+                    hivemind_adapter.announce(_hm_payload, ttl_seconds=announce_ttl_sec)
+                except Exception as hm_exc:
+                    logging.debug("hivemind_announce_error: %s", hm_exc)
+
+            announced_once = True
+            consecutive_failures = 0
+            outage_window_s = 0.0
+            delay_s = announce_interval
+
+            # Poll for layer rebalance directives.
+            try:
+                from coordinator.rebalancer import poll_directives_from_dht, RebalanceDirective
+                rebalance_directives = poll_directives_from_dht(
+                    peer_id=service.peer_id,
+                    dht_urls=list(dht_urls),
+                    timeout_s=2.0,
+                )
+                for directive in rebalance_directives:
+                    if directive.is_expired:
+                        continue
+                    # Safety guard: only apply when idle (no inflight requests).
+                    if service.inflight_count() > 0:
+                        logging.info(
+                            "rebalance_deferred: inflight=%d directive=[%d,%d)",
+                            service.inflight_count(),
+                            directive.new_layer_start,
+                            directive.new_layer_end,
+                        )
+                        break
+                    logging.info(
+                        "rebalance_applying: peer=%s [%d,%d) reason=%s",
+                        service.peer_id,
+                        directive.new_layer_start,
+                        directive.new_layer_end,
+                        directive.reason,
+                    )
+                    # Drain guard: set load to 100% to prevent routing.
+                    service.set_resource_budget(ResourceBudget(
+                        vram_fraction=0.0,
+                        cpu_fraction=0.0,
+                        should_yield=True,
+                        reason="resharding",
+                    ))
+                    # Brief drain period.
+                    import time as _time_mod
+                    _time_mod.sleep(min(5.0, max(0.5, float(announce_interval / 12.0))))
+
+                    # Apply the reshard.
+                    ok = service.shard.reshard(
+                        directive.new_layer_start,
+                        directive.new_layer_end,
+                        directive.total_layers,
+                    )
+                    if ok:
+                        # Update the runtime profile so next announce reflects new range.
+                        service.runtime_profile = dict(service.shard.runtime_profile())
+                        logging.info(
+                            "rebalance_success: peer=%s new_range=[%d,%d)",
+                            service.peer_id,
+                            directive.new_layer_start,
+                            directive.new_layer_end,
+                        )
+                    else:
+                        logging.warning(
+                            "rebalance_failed: peer=%s directive=[%d,%d)",
+                            service.peer_id,
+                            directive.new_layer_start,
+                            directive.new_layer_end,
+                        )
+                    # Restore normal budget.
+                    service.set_resource_budget(ResourceBudget(
+                        vram_fraction=1.0,
+                        cpu_fraction=1.0,
+                        should_yield=False,
+                        reason="default",
+                    ))
+                    break  # Only apply one directive per cycle.
+            except Exception as exc:
+                logging.debug("rebalance_poll_error: %s", exc)
+
+        except Exception as exc:  # pragma: no cover
+            consecutive_failures += 1
+            delay_s = _exponential_backoff_delay(
+                consecutive_failures - 1,
+                base_seconds=1.0,
+                cap_seconds=max(announce_interval, 300.0),
+            )
+            outage_window_s += delay_s
+            # If outage exceeds TTL, force a fresh announce instead of heartbeat on recovery.
+            if outage_window_s >= max(announce_interval, float(max(1, announce_ttl_sec))):
+                announced_once = False
+            logging.warning(
+                "DHT announce transient failure for %s (%s); retrying in %.1fs",
+                service.peer_id,
+                exc,
+                delay_s,
+            )
+
+        stop_event.wait(delay_s)
+
+
+def _build_torrent_session_manager(
+    *,
+    model_id: str,
+    seed_cache_dir: str,
+    seed_local_path: str | None,
+    seed_source_url: str | None,
+    seed_expected_sha256: str | None,
+    seed_force_refresh: bool,
+    seed_piece_bytes: int,
+    seed_base_upload_mbps: float,
+    seed_inference_fraction: float,
+    seed_min_upload_mbps: float,
+    seed_smoothing_alpha: float,
+) -> TorrentSessionManager:
+    bootstrap = SessionBootstrapConfig(
+        model_id=model_id,
+        cache_dir=seed_cache_dir,
+        local_path=seed_local_path,
+        source_url=seed_source_url,
+        expected_sha256=seed_expected_sha256,
+        force_refresh=seed_force_refresh,
+        piece_bytes=max(1, seed_piece_bytes),
+    )
+    arbitration = ArbitrationConfig(
+        base_upload_mbps=max(1.0, seed_base_upload_mbps),
+        inference_seed_fraction=max(0.01, min(1.0, seed_inference_fraction)),
+        min_seed_upload_mbps=max(0.1, seed_min_upload_mbps),
+        smoothing_alpha=max(0.01, min(1.0, seed_smoothing_alpha)),
+    )
+    manager = TorrentSessionManager(bootstrap=bootstrap, arbitration=arbitration)
+    manager.bootstrap()
+    manager.update(inference_active=False, inference_observed_mbps=0.0)
+    return manager
+
+
+def serve(
+    host: str,
+    port: int,
+    peer_id: str,
+    model_id: str,
+    shard_index: int,
+    total_shards: int,
+    daemon_mode: str = "polite",
+    broken: bool = False,
+    dht_url: str | None = None,
+    dht_urls: list[str] | tuple[str, ...] | None = None,
+    advertise_host: str | None = None,
+    operator_id: str | None = None,
+    region: str | None = None,
+    bandwidth_mbps: float = 0.0,
+    announce_interval_sec: int = 60,
+    announce_ttl_sec: int = 300,
+    tls_enable: bool = False,
+    tls_cert_path: str | None = None,
+    tls_key_path: str | None = None,
+    tls_client_ca_path: str | None = None,
+    tls_require_client_auth: bool = False,
+    seed_enable: bool = False,
+    seed_cache_dir: str = ".cache/openhydra",
+    seed_local_path: str | None = None,
+    seed_source_url: str | None = None,
+    seed_expected_sha256: str | None = None,
+    seed_force_refresh: bool = False,
+    seed_piece_bytes: int = 1 * 1024 * 1024,
+    seed_base_upload_mbps: float = 100.0,
+    seed_inference_fraction: float = 0.10,
+    seed_min_upload_mbps: float = 1.0,
+    seed_smoothing_alpha: float = 0.35,
+    seed_update_interval_sec: int = 1,
+    daemon_idle_threshold_sec: int = 5 * 60,
+    daemon_refresh_interval_sec: int = 5,
+    daemon_high_load_threshold: float = 0.85,
+    daemon_assume_idle_when_unknown: bool = True,
+    advanced_encryption_enabled: bool = False,
+    advanced_encryption_seed: str = "openhydra-tier3-dev-seed",
+    kv_cache_max_entries: int = 1024,
+    runtime_backend: str = "toy_auto",
+    runtime_target: str = "auto",
+    quantization_mode: str = "fp32",
+    runtime_model_id: str = "Qwen/Qwen3.5-0.8B",
+    tensor_autoencoder_enabled: bool = False,
+    tensor_autoencoder_latent_dim: int = 1024,
+    privacy_noise_variance: float = 0.0,
+    geo_challenge_seed: str = "openhydra-geo-dev-seed",
+    announced_reputation_score: float = 0.0,
+    announced_staked_balance: float = 0.0,
+    expert_tags: tuple[str, ...] = (),
+    expert_layer_indices: tuple[int, ...] = (),
+    expert_router: bool = False,
+    data_dir: str = ".openhydra",
+    identity_path: str = ".openhydra/identity.key",
+    kv_compaction_enabled: bool = False,
+    kv_compaction_method: str = "hak",
+    kv_compaction_ratio: float = 0.10,
+    kv_compaction_beta: bool = False,
+    kv_compaction_head_budget_path: str = "",
+    kv_compaction_online: bool = False,
+    kv_compaction_online_max_tokens: int = 512,
+    kv_compaction_mode: str | None = None,
+    kv_compaction_auto_threshold: int = 512,
+    kv_radix_cache_enabled: bool = False,
+    kv_radix_cache_max_entries: int = 128,
+    kv_radix_cache_min_prefix_len: int = 16,
+    warmup_on_start: bool = False,
+    mlx_eval_timeout_s: float = 30.0,
+    batch_window_ms: float = 50.0,
+    max_batch_size: int = 8,
+    p2p_enable: bool = False,
+    seeder_port: int = 0,
+    p2p_cache_dir: str | None = None,
+    enable_local_fast_path: bool = False,
+    hivemind_initial_peers: list[str] | None = None,
+) -> None:
+    resolved_dht_urls: list[str] = []
+    seen_dht_urls: set[str] = set()
+    for raw in list(dht_urls or []):
+        for token in str(raw).split(","):
+            value = token.strip()
+            if not value or value in seen_dht_urls:
+                continue
+            seen_dht_urls.add(value)
+            resolved_dht_urls.append(value)
+    if dht_url:
+        for token in str(dht_url).split(","):
+            value = token.strip()
+            if not value or value in seen_dht_urls:
+                continue
+            seen_dht_urls.add(value)
+            resolved_dht_urls.append(value)
+
+    from peer.identity import load_or_create_identity as _load_or_create_identity
+    _identity = _load_or_create_identity(identity_path)
+    if not peer_id or peer_id in ("peer-auto", ""):
+        peer_id = _identity["peer_id"]
+    _announce_private_key = _identity["private_key"]
+    _announce_public_key_hex = _identity["public_key_hex"]
+
+    hardware_profile = detect_hardware_profile()
+    logging.info("peer %s hardware profile: %s", peer_id, hardware_profile.to_dict())
+
+    # ── The Great Pruning: enforce GPU accelerator for production ──────────
+    _is_toy_backend = runtime_backend.startswith("toy")
+    if hardware_profile.accelerator == "cpu" and not _is_toy_backend:
+        logging.critical(
+            "FATAL: no GPU accelerator detected (Metal/CUDA/ROCm required). "
+            "This node cannot serve real models on CPU. "
+            "Use --toy for development without a GPU."
+        )
+        raise SystemExit(1)
+
+    peer_public_key_hex = ""
+    peer_priv_key_obj = None
+    if cryptography_available():
+        keyfile_path = Path(data_dir) / "peer_identity" / f"{peer_id}.key"
+        try:
+            peer_identity = load_or_create_identity_keyfile(keyfile_path)
+            peer_priv_key_obj = private_key_from_identity(peer_identity)
+            peer_public_key_hex = peer_identity.public_key
+            logging.info(
+                "peer %s loaded identity from %s (pubkey=%s...)",
+                peer_id,
+                keyfile_path,
+                peer_public_key_hex[:16],
+            )
+        except Exception as exc:
+            logging.warning(
+                "peer %s: failed to load/create identity keyfile at %s (%s); "
+                "falling back to seed-based encryption",
+                peer_id,
+                keyfile_path,
+                exc,
+            )
+
+    daemon_mode_enum = DaemonMode(daemon_mode)
+    daemon_controller = DaemonController(
+        MonitorConfig(
+            mode=daemon_mode_enum,
+            idle_threshold_sec=max(1, daemon_idle_threshold_sec),
+            high_load_threshold=max(0.1, min(1.0, daemon_high_load_threshold)),
+            assume_idle_when_unknown=daemon_assume_idle_when_unknown,
+        )
+    )
+    initial_budget = daemon_controller.refresh()
+
+    # Auto mode (6.1): resolve kv_compaction_mode from CLI flag or legacy bool
+    _resolved_kv_mode: str = str(kv_compaction_mode or "").strip().lower()
+    if _resolved_kv_mode not in {"off", "auto", "on"}:
+        # kv_compaction_mode was None or unset — derive from legacy flag
+        _resolved_kv_mode = "on" if bool(kv_compaction_enabled) else "off"
+
+    # ── Phase 5: P2P model distribution ───────────────────────────────────────
+    # Resolution happens BEFORE PeerService so the resolved local path can be
+    # passed as runtime_model_id (HuggingFace from_pretrained already supports
+    # local directory paths, so no changes to runtimes are needed).
+    _p2p_seeder: ModelSeedServer | None = None
+    _p2p_cache: P2PModelCache | None = None
+    _actual_seeder_port: int = 0
+    _effective_runtime_model_id: str = str(runtime_model_id)
+
+    if p2p_enable:
+        _p2p_cache_root = Path(p2p_cache_dir or f"{data_dir}/p2p_cache")
+        _manifest_cache_dir = Path(data_dir) / "hf_manifests"
+        _manifest_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        _p2p_cache = P2PModelCache(
+            cache_root=_p2p_cache_root,
+            manifest_cache_dir=_manifest_cache_dir,
+            dht_urls=resolved_dht_urls,
+        )
+
+        # Try to find the model on a peer before falling back to HF Hub.
+        _p2p_resolved = _p2p_cache.resolve(runtime_model_id)
+        if _p2p_resolved is not None:
+            _effective_runtime_model_id = str(_p2p_resolved)
+            logging.info(
+                "peer %s p2p_resolved model=%s path=%s",
+                peer_id,
+                runtime_model_id,
+                _effective_runtime_model_id,
+            )
+
+        # Start the seeder regardless (serves any models already in cache_root).
+        _p2p_seeder = ModelSeedServer(cache_root=_p2p_cache_root, port=seeder_port)
+        _actual_seeder_port = _p2p_seeder.start()
+
+    service = PeerService(
+        peer_id=peer_id,
+        model_id=model_id,
+        shard_index=shard_index,
+        total_shards=total_shards,
+        daemon_mode=daemon_mode,
+        broken=broken,
+        initial_resource_budget=initial_budget,
+        advanced_encryption_enabled=advanced_encryption_enabled,
+        advanced_encryption_seed=advanced_encryption_seed,
+        kv_cache_max_entries=max(1, int(kv_cache_max_entries)),
+        runtime_backend=str(runtime_backend),
+        runtime_target=str(runtime_target),
+        quantization_mode=str(quantization_mode),
+        runtime_model_id=_effective_runtime_model_id,
+        tensor_autoencoder_enabled=bool(tensor_autoencoder_enabled),
+        tensor_autoencoder_latent_dim=max(1, int(tensor_autoencoder_latent_dim)),
+        privacy_noise_variance=max(0.0, float(privacy_noise_variance)),
+        geo_challenge_seed=str(geo_challenge_seed),
+        expert_tags=tuple(expert_tags),
+        expert_layer_indices=tuple(expert_layer_indices),
+        expert_router=bool(expert_router),
+        peer_public_key=peer_public_key_hex,
+        peer_private_key=peer_priv_key_obj,
+        kv_compaction_enabled=bool(kv_compaction_enabled),
+        kv_compaction_method=str(kv_compaction_method or "hak"),
+        kv_compaction_ratio=max(0.01, min(1.0, float(kv_compaction_ratio))),
+        kv_compaction_beta=bool(kv_compaction_beta),
+        kv_compaction_head_budget_path=str(kv_compaction_head_budget_path or ""),
+        kv_compaction_online=bool(kv_compaction_online),
+        kv_compaction_online_max_tokens=max(4, int(kv_compaction_online_max_tokens)),
+        kv_compaction_mode=_resolved_kv_mode,
+        kv_compaction_auto_threshold=max(1, int(kv_compaction_auto_threshold)),
+        kv_radix_cache_enabled=bool(kv_radix_cache_enabled),
+        kv_radix_cache_max_entries=max(1, int(kv_radix_cache_max_entries)),
+        kv_radix_cache_min_prefix_len=max(1, int(kv_radix_cache_min_prefix_len)),
+        warmup_on_start=bool(warmup_on_start),
+        mlx_eval_timeout_s=max(1.0, float(mlx_eval_timeout_s)),
+        batch_window_ms=float(batch_window_ms),
+        max_batch_size=max(1, int(max_batch_size)),
+    )
+
+    session_manager: TorrentSessionManager | None = None
+    if seed_enable:
+        session_manager = _build_torrent_session_manager(
+            model_id=model_id,
+            seed_cache_dir=seed_cache_dir,
+            seed_local_path=seed_local_path,
+            seed_source_url=seed_source_url,
+            seed_expected_sha256=seed_expected_sha256,
+            seed_force_refresh=seed_force_refresh,
+            seed_piece_bytes=seed_piece_bytes,
+            seed_base_upload_mbps=seed_base_upload_mbps,
+            seed_inference_fraction=seed_inference_fraction,
+            seed_min_upload_mbps=seed_min_upload_mbps,
+            seed_smoothing_alpha=seed_smoothing_alpha,
+        )
+        logging.info("peer %s seeded genesis artifact at %s", peer_id, session_manager.genesis_result.artifact_path)
+
+    bind_addr = f"{host}:{port}"
+    bind_attempt = 0
+    lifecycle_restart_attempt = 0
+    shutdown_requested = False
+    while not shutdown_requested:
+        server = None
+        while not shutdown_requested:
+            candidate = grpc.server(futures.ThreadPoolExecutor(max_workers=16), options=GRPC_SERVER_OPTIONS)
+            peer_pb2_grpc.add_PeerServicer_to_server(service, candidate)
+            try:
+                if tls_enable:
+                    if not tls_cert_path or not tls_key_path:
+                        raise ValueError("tls-cert-path and tls-key-path are required when tls is enabled")
+                    credentials = load_server_credentials(
+                        cert_path=tls_cert_path,
+                        key_path=tls_key_path,
+                        client_ca_path=tls_client_ca_path,
+                        require_client_auth=tls_require_client_auth,
+                    )
+                    bound_port = int(candidate.add_secure_port(bind_addr, credentials))
+                    logging.info("peer %s TLS enabled (mTLS=%s)", peer_id, tls_require_client_auth)
+                else:
+                    bound_port = int(candidate.add_insecure_port(bind_addr))
+                if bound_port <= 0:
+                    raise RuntimeError(f"bind_failed:{bind_addr}")
+                candidate.start()
+                bind_attempt = 0
+                server = candidate
+                logging.info("peer %s listening on %s", peer_id, bind_addr)
+                break
+            except KeyboardInterrupt:
+                candidate.stop(grace=0)
+                shutdown_requested = True
+                break
+            except Exception as exc:
+                bind_attempt += 1
+                delay_s = _exponential_backoff_delay(bind_attempt - 1, base_seconds=1.0, cap_seconds=60.0)
+                logging.warning(
+                    "peer %s failed to bind/start (%s); retrying in %.1fs",
+                    peer_id,
+                    exc,
+                    delay_s,
+                )
+                candidate.stop(grace=0)
+                time.sleep(delay_s)
+
+        if shutdown_requested or server is None:
+            break
+
+        stop_event = threading.Event()
+        daemon_thread = threading.Thread(
+            target=_daemon_budget_loop,
+            kwargs={
+                "stop_event": stop_event,
+                "service": service,
+                "controller": daemon_controller,
+                "refresh_interval_sec": max(1, daemon_refresh_interval_sec),
+            },
+            daemon=True,
+        )
+        daemon_thread.start()
+
+        seeding_thread: threading.Thread | None = None
+        if session_manager is not None:
+            seeding_thread = threading.Thread(
+                target=_seeding_loop,
+                kwargs={
+                    "stop_event": stop_event,
+                    "service": service,
+                    "session_manager": session_manager,
+                    "advertised_bandwidth_mbps": max(0.0, bandwidth_mbps),
+                    "update_interval_sec": max(1, seed_update_interval_sec),
+                },
+                daemon=True,
+            )
+            seeding_thread.start()
+
+        # Local fast-path TCP server (Phase A).
+        _fast_path_port = 0
+        _fast_path_server = None
+        if enable_local_fast_path:
+            try:
+                from peer.local_fast_path import FastPathServer
+
+                def _fast_path_handler(activation: list[float]) -> list[float]:
+                    return list(service.shard.forward(
+                        prompt="",
+                        activation=activation,
+                        max_tokens=1,
+                        stage_index=0,
+                        total_stages=1,
+                    ))
+
+                _fast_path_server = FastPathServer(
+                    handler=_fast_path_handler,
+                    bind_host=host,
+                    port=0,  # OS-assigned ephemeral port.
+                )
+                _fast_path_server.start()
+                _fast_path_port = _fast_path_server.port
+                logging.info("local_fast_path: enabled on port %d", _fast_path_port)
+            except Exception as exc:
+                logging.warning("local_fast_path: failed to start: %s", exc)
+
+        # Hivemind dual-stack DHT adapter (Feature 8).
+        _hivemind_adapter = None
+        if hivemind_initial_peers:
+            try:
+                from dht.hivemind_bridge import HivemindDHTAdapter
+                _hivemind_adapter = HivemindDHTAdapter(
+                    initial_peers=list(hivemind_initial_peers),
+                    start=True,
+                )
+                if _hivemind_adapter.is_alive:
+                    logging.info(
+                        "hivemind_dht: connected to %d signpost(s)",
+                        len(hivemind_initial_peers),
+                    )
+                else:
+                    logging.warning("hivemind_dht: failed to connect — HTTP-only mode")
+                    _hivemind_adapter = None
+            except Exception as exc:
+                logging.warning("hivemind_dht: init failed: %s — HTTP-only mode", exc)
+
+        announce_thread: threading.Thread | None = None
+        if resolved_dht_urls or _hivemind_adapter is not None:
+            effective_host = advertise_host or ("127.0.0.1" if host in {"0.0.0.0", "::"} else host)
+            announce_thread = threading.Thread(
+                target=_announce_loop,
+                kwargs={
+                    "stop_event": stop_event,
+                    "service": service,
+                    "dht_urls": resolved_dht_urls,
+                    "advertise_host": effective_host,
+                    "port": port,
+                    "operator_id": operator_id,
+                    "region": region,
+                    "bandwidth_mbps": bandwidth_mbps,
+                    "announce_interval_sec": announce_interval_sec,
+                    "announce_ttl_sec": announce_ttl_sec,
+                    "session_manager": session_manager,
+                    "announced_reputation_score": max(0.0, float(announced_reputation_score)),
+                    "announced_staked_balance": max(0.0, float(announced_staked_balance)),
+                    "peer_public_key": service.peer_public_key,
+                    "announce_private_key": _announce_private_key,
+                    "announce_public_key_hex": _announce_public_key_hex,
+                    "seeder_http_port": _actual_seeder_port,
+                    "p2p_cache": _p2p_cache,
+                    "local_fast_path_port": _fast_path_port,
+                    "hivemind_adapter": _hivemind_adapter,
+                },
+                daemon=True,
+            )
+            announce_thread.start()
+
+        restart_delay_s = 0.0
+        try:
+            while True:
+                timed_out = bool(server.wait_for_termination(timeout=1.0))
+                if timed_out:
+                    continue
+                raise RuntimeError("grpc_server_terminated")
+        except KeyboardInterrupt:
+            shutdown_requested = True
+        except Exception as exc:
+            lifecycle_restart_attempt += 1
+            restart_delay_s = _exponential_backoff_delay(
+                lifecycle_restart_attempt - 1,
+                base_seconds=1.0,
+                cap_seconds=120.0,
+            )
+            logging.warning(
+                "peer %s runtime interruption (%s); restarting in %.1fs",
+                peer_id,
+                exc,
+                restart_delay_s,
+            )
+        finally:
+            stop_event.set()
+            daemon_thread.join(timeout=2.0)
+            if announce_thread is not None:
+                announce_thread.join(timeout=2.0)
+            if seeding_thread is not None:
+                seeding_thread.join(timeout=2.0)
+            if _fast_path_server is not None:
+                try:
+                    _fast_path_server.stop()
+                except Exception:
+                    pass
+            if _hivemind_adapter is not None:
+                try:
+                    _hivemind_adapter.shutdown()
+                except Exception:
+                    pass
+            shutdown_event = server.stop(grace=2)
+            try:
+                shutdown_event.wait(timeout=3.0)
+            except Exception:
+                pass
+
+        if shutdown_requested:
+            break
+
+        if restart_delay_s > 0.0:
+            time.sleep(restart_delay_s)
+
+
+def main() -> None:
+    def _parse_csv_tags(value: str) -> tuple[str, ...]:
+        raw = [item.strip().lower() for item in str(value).split(",")]
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+        return tuple(out)
+
+    def _parse_csv_ints(value: str) -> tuple[int, ...]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for token in [item.strip() for item in str(value).split(",")]:
+            if not token:
+                continue
+            try:
+                idx = int(token)
+            except ValueError:
+                continue
+            if idx < 0 or idx in seen:
+                continue
+            seen.add(idx)
+            out.append(idx)
+        return tuple(sorted(out))
+
+    def _parse_dht_urls(raw_values: list[str] | None) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in list(raw_values or []):
+            for token in str(raw).split(","):
+                value = token.strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                out.append(value)
+        return out
+
+    parser = argparse.ArgumentParser(description="OpenHydra Tier 1/2 peer server")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--deployment-profile", choices=["dev", "prod"], default="dev")
+    parser.add_argument("--secrets-file", default=None, help="Path to KEY=VALUE secrets file (0600 permissions required)")
+    parser.add_argument("--peer-id", required=True)
+    parser.add_argument("--model-id", default="Qwen/Qwen3.5-0.8B",
+                        help="Model ID announced to the DHT (must match --runtime-model-id)")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--total-shards", type=int, default=1)
+    parser.add_argument("--daemon-mode", default="polite", choices=["polite", "power_user", "dedicated"])
+    parser.add_argument("--broken", action="store_true", help="Enable deterministic bad outputs for testing")
+    parser.add_argument(
+        "--dht-url",
+        action="append",
+        default=None,
+        help=(
+            "DHT bootstrap URL(s) — repeat the flag or use comma-separated values. "
+            "Defaults to the three production OpenHydra bootstrap nodes. "
+            "Passing even one --dht-url replaces the entire default list, "
+            "which lets operators run isolated private networks."
+        ),
+    )
+    parser.add_argument("--advertise-host", default=None, help="Host/IP peers should use to reach this node")
+    parser.add_argument("--operator-id", default=None)
+    parser.add_argument("--region", default=None, help="Optional region tag for DHT geo-aware lookup")
+    parser.add_argument("--bandwidth-mbps", type=float, default=0.0)
+    parser.add_argument("--announce-interval-sec", type=int, default=60)
+    parser.add_argument("--announce-ttl-sec", type=int, default=300)
+    parser.add_argument("--tls-enable", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--tls-cert-path", default=None)
+    parser.add_argument("--tls-key-path", default=None)
+    parser.add_argument("--tls-client-ca-path", default=None)
+    parser.add_argument("--tls-require-client-auth", action=argparse.BooleanOptionalAction, default=False)
+
+    parser.add_argument("--seed-enable", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--seed-cache-dir", default=".cache/openhydra")
+    parser.add_argument("--seed-local-path", default=None)
+    parser.add_argument("--seed-source-url", default=None)
+    parser.add_argument("--seed-expected-sha256", default=None)
+    parser.add_argument("--seed-force-refresh", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--seed-piece-bytes", type=int, default=1 * 1024 * 1024)
+    parser.add_argument("--seed-base-upload-mbps", type=float, default=100.0)
+    parser.add_argument("--seed-inference-fraction", type=float, default=0.10)
+    parser.add_argument("--seed-min-upload-mbps", type=float, default=1.0)
+    parser.add_argument("--seed-smoothing-alpha", type=float, default=0.35)
+    parser.add_argument("--seed-update-interval-sec", type=int, default=1)
+    parser.add_argument("--daemon-idle-threshold-sec", type=int, default=5 * 60)
+    parser.add_argument("--daemon-refresh-interval-sec", type=int, default=5)
+    parser.add_argument("--daemon-high-load-threshold", type=float, default=0.85)
+    parser.add_argument("--daemon-assume-idle-when-unknown", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--advanced-encryption-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--advanced-encryption-seed", default="openhydra-tier3-dev-seed")
+    parser.add_argument("--kv-cache-max-entries", type=int, default=1024)
+
+    # ── KV cache compaction (Phases 1-4) ─────────────────────────────────────
+    parser.add_argument(
+        "--kv-compaction-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable KV cache compaction via Attention Matching (arXiv:2602.16284).",
+    )
+    parser.add_argument(
+        "--kv-compaction-method",
+        choices=["hak", "omp"],
+        default="hak",
+        help="Key-selection algorithm: 'hak' (Highest Attention Keys, fast) or "
+             "'omp' (Orthogonal Matching Pursuit, more accurate). Default: hak.",
+    )
+    parser.add_argument(
+        "--kv-compaction-ratio",
+        type=float,
+        default=0.10,
+        help="Fraction of KV tokens to keep after compaction (default: 0.10 = 10%%). "
+             "Overridden per-head when --kv-compaction-head-budget-path is set.",
+    )
+    parser.add_argument(
+        "--kv-compaction-beta",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Phase 2: fit scalar log-space bias corrections (β) and refit compact "
+             "values (Cv) via least-squares.  Requires scipy.",
+    )
+    parser.add_argument(
+        "--kv-compaction-head-budget-path",
+        default="",
+        metavar="PATH",
+        help="Phase 3: path to a JSON file with per-layer / per-kv-head token "
+             "budget ratios.  Pre-built files for Qwen3-4B and Llama-3.1-8B are "
+             "in peer/kv_compaction/head_budgets/.",
+    )
+    parser.add_argument(
+        "--kv-compaction-online",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Phase 4: compact mid-trajectory (at every cache-write) when the "
+             "stored sequence length exceeds --kv-compaction-online-max-tokens.",
+    )
+    parser.add_argument(
+        "--kv-compaction-online-max-tokens",
+        type=int,
+        default=512,
+        help="Phase 4: physical KV cache size limit for online compaction (default: 512).",
+    )
+    parser.add_argument(
+        "--kv-compaction-mode",
+        choices=["off", "auto", "on"],
+        default=None,
+        help="Three-position KV compaction toggle: 'off' (disabled), 'auto' (compact only "
+             "when stored sequence exceeds --kv-compaction-auto-threshold tokens), "
+             "'on' (always compact). Overrides --kv-compaction-enabled.",
+    )
+    parser.add_argument(
+        "--kv-compaction-auto-threshold",
+        type=int,
+        default=512,
+        help="Auto mode: minimum stored sequence length (tokens) before compaction "
+             "activates (default: 512). Only used with --kv-compaction-mode auto.",
+    )
+
+    # ── Radix prefix cache (Phase H) ──────────────────────────────────────────
+    parser.add_argument(
+        "--kv-radix-cache-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Phase H: enable radix (longest-prefix) KV cache for cross-session prefix reuse.",
+    )
+    parser.add_argument(
+        "--kv-radix-cache-max-entries",
+        type=int,
+        default=128,
+        help="Phase H: maximum number of token sequences stored in the radix cache (default: 128).",
+    )
+    parser.add_argument(
+        "--kv-radix-cache-min-prefix-len",
+        type=int,
+        default=16,
+        help="Phase H: minimum prefix length (tokens) required for radix cache store/retrieve (default: 16).",
+    )
+
+    parser.add_argument(
+        "--runtime-backend",
+        choices=["toy_auto", "toy_cpu", "toy_gpu_sim", "pytorch_auto", "pytorch_cpu", "pytorch_cuda", "mlx"],
+        default="pytorch_auto",
+        help="Model runtime backend. Defaults to pytorch_auto (requires torch + transformers). "
+             "Use mlx for high-throughput inference on Apple Silicon (requires mlx, mlx-lm). "
+             "Use --toy for a lightweight fake-token backend during development.",
+    )
+    parser.add_argument(
+        "--toy",
+        action="store_true",
+        default=False,
+        help="Use the lightweight ToyRuntime (fake tokens) instead of a real model. "
+             "Equivalent to --runtime-backend toy_auto. For development and testing only.",
+    )
+    parser.add_argument(
+        "--warmup-on-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run a single dummy forward pass on startup to JIT-compile GPU kernels. "
+            "On Apple MPS this moves ~30 s of Metal shader compilation from the first "
+            "request (TTFT) to peer startup where it is expected.  Recommended for "
+            "production deployments using pytorch_auto or pytorch_cuda."
+        ),
+    )
+    parser.add_argument(
+        "--mlx-eval-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "Timeout in seconds for individual MLX Metal GPU operations.  If an "
+            "mx.eval() call does not complete within this deadline the watchdog "
+            "raises TimeoutError and marks the runtime unhealthy.  Only relevant "
+            "when runtime_backend='mlx' (default: 30)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-window-ms",
+        type=float,
+        default=50.0,
+        help=(
+            "Milliseconds to wait for additional requests before flushing a batch. "
+            "Concurrent requests that arrive within this window are coalesced into a "
+            "single GPU forward pass (default: 50)."
+        ),
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Maximum number of requests per batch.  When this limit is reached the "
+            "batch flushes immediately without waiting for the window to expire. "
+            "Guards against OOM on small-VRAM nodes (default: 8)."
+        ),
+    )
+    # ── Phase 5: P2P model distribution ───────────────────────────────────────
+    parser.add_argument(
+        "--p2p-enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable P2P model distribution.  When active, the peer will try to "
+            "download model weights from other peers before falling back to "
+            "HuggingFace Hub, and will expose its own cache for other peers to "
+            "download via HTTP Range requests."
+        ),
+    )
+    parser.add_argument(
+        "--seeder-port",
+        type=int,
+        default=0,
+        help=(
+            "HTTP port for the P2P model seeder (default: 0 = OS-assigned). "
+            "Only used when --p2p-enable is set."
+        ),
+    )
+    parser.add_argument(
+        "--p2p-cache-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Directory for P2P-downloaded model cache "
+            "(default: {--data-dir}/p2p_cache). "
+            "Only used when --p2p-enable is set."
+        ),
+    )
+
+    parser.add_argument(
+        "--enable-local-fast-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable raw TCP fast-path for same-LAN tensor transfer (Phase A). "
+            "When enabled, the peer binds an additional TCP socket and advertises "
+            "it in the DHT so LAN neighbours can bypass gRPC for activation transfer."
+        ),
+    )
+    parser.add_argument(
+        "--hivemind-initial-peers",
+        nargs="*",
+        default=_DEFAULT_HIVEMIND_SIGNPOSTS,
+        metavar="MADDR",
+        help=(
+            "Hivemind multiaddr(s) of bootstrap signpost nodes for dual-stack "
+            "DHT. Defaults to the 3 production signpost nodes (EU/US/AP). "
+            "Pass --hivemind-initial-peers (empty) to disable Hivemind DHT."
+        ),
+    )
+
+    parser.add_argument("--runtime-target", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--quantization", choices=["none", "8bit", "4bit"], default="none")
+    parser.add_argument(
+        "--quantization-mode",
+        choices=["fp32", "int8", "int4"],
+        default=None,
+        help="Legacy alias for --quantization; kept for backward compatibility",
+    )
+    parser.add_argument(
+        "--runtime-model-id",
+        default="Qwen/Qwen3.5-0.8B",
+        help="HuggingFace model id for pytorch_* runtime backends",
+    )
+    parser.add_argument("--tensor-autoencoder-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--tensor-autoencoder-latent-dim", type=int, default=1024)
+    parser.add_argument("--privacy-noise-variance", type=float, default=0.0)
+    parser.add_argument("--announced-reputation-score", type=float, default=0.0)
+    parser.add_argument("--announced-staked-balance", type=float, default=0.0)
+    parser.add_argument("--geo-challenge-seed", default="openhydra-geo-dev-seed")
+    parser.add_argument("--expert-tags", default="", help="Comma-separated expert tags, e.g. coding,math,legal")
+    parser.add_argument("--expert-layer-indices", default="", help="Comma-separated layer indices for expert placement")
+    parser.add_argument("--expert-router", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--data-dir",
+        default=".openhydra",
+        help="Directory for persistent peer state (identity keyfiles, ledger, etc.)",
+    )
+    parser.add_argument(
+        "--identity-path",
+        default=".openhydra/identity.key",
+        help="Path to Ed25519 identity keypair file (created on first run, mode 0600).",
+    )
+
+    args = parser.parse_args()
+    # --toy is a convenience alias for --runtime-backend toy_auto
+    if args.toy:
+        args.runtime_backend = "toy_auto"
+    # Fall back to the production bootstrap nodes when the user passes no
+    # --dht-url flags.  Passing even one flag opts out of the defaults
+    # entirely so private/test networks work without surprise extra URLs.
+    dht_urls = _parse_dht_urls(args.dht_url) or list(PRODUCTION_BOOTSTRAP_URLS)
+    deployment_settings = _resolve_deployment_security_settings(parser, args)
+    resolved_quantization_mode = _resolve_quantization_mode(args.quantization, args.quantization_mode)
+
+    configure_logging(json_logs=str(deployment_settings.get("deployment_profile", "dev")) == "prod")
+    serve(
+        host=args.host,
+        port=args.port,
+        peer_id=args.peer_id,
+        model_id=args.model_id,
+        shard_index=args.shard_index,
+        total_shards=args.total_shards,
+        daemon_mode=args.daemon_mode,
+        broken=args.broken,
+        dht_urls=dht_urls,
+        dht_url=(dht_urls[0] if dht_urls else None),
+        advertise_host=args.advertise_host,
+        operator_id=args.operator_id,
+        region=args.region,
+        bandwidth_mbps=max(0.0, args.bandwidth_mbps),
+        announce_interval_sec=max(5, args.announce_interval_sec),
+        announce_ttl_sec=max(10, args.announce_ttl_sec),
+        tls_enable=args.tls_enable,
+        tls_cert_path=args.tls_cert_path,
+        tls_key_path=args.tls_key_path,
+        tls_client_ca_path=args.tls_client_ca_path,
+        tls_require_client_auth=args.tls_require_client_auth,
+        seed_enable=args.seed_enable,
+        seed_cache_dir=args.seed_cache_dir,
+        seed_local_path=args.seed_local_path,
+        seed_source_url=args.seed_source_url,
+        seed_expected_sha256=args.seed_expected_sha256,
+        seed_force_refresh=args.seed_force_refresh,
+        seed_piece_bytes=max(1, args.seed_piece_bytes),
+        seed_base_upload_mbps=max(1.0, args.seed_base_upload_mbps),
+        seed_inference_fraction=max(0.01, min(1.0, args.seed_inference_fraction)),
+        seed_min_upload_mbps=max(0.1, args.seed_min_upload_mbps),
+        seed_smoothing_alpha=max(0.01, min(1.0, args.seed_smoothing_alpha)),
+        seed_update_interval_sec=max(1, args.seed_update_interval_sec),
+        daemon_idle_threshold_sec=max(1, args.daemon_idle_threshold_sec),
+        daemon_refresh_interval_sec=max(1, args.daemon_refresh_interval_sec),
+        daemon_high_load_threshold=max(0.1, min(1.0, args.daemon_high_load_threshold)),
+        daemon_assume_idle_when_unknown=args.daemon_assume_idle_when_unknown,
+        advanced_encryption_enabled=args.advanced_encryption_enabled,
+        advanced_encryption_seed=str(deployment_settings["advanced_encryption_seed"]),
+        kv_cache_max_entries=max(1, args.kv_cache_max_entries),
+        runtime_backend=str(args.runtime_backend),
+        runtime_target=str(args.runtime_target),
+        quantization_mode=resolved_quantization_mode,
+        runtime_model_id=str(args.runtime_model_id),
+        tensor_autoencoder_enabled=bool(args.tensor_autoencoder_enabled),
+        tensor_autoencoder_latent_dim=max(1, int(args.tensor_autoencoder_latent_dim)),
+        privacy_noise_variance=max(0.0, float(args.privacy_noise_variance)),
+        geo_challenge_seed=str(deployment_settings["geo_challenge_seed"]),
+        announced_reputation_score=max(0.0, float(args.announced_reputation_score)),
+        announced_staked_balance=max(0.0, float(args.announced_staked_balance)),
+        expert_tags=_parse_csv_tags(args.expert_tags),
+        expert_layer_indices=_parse_csv_ints(args.expert_layer_indices),
+        expert_router=bool(args.expert_router),
+        data_dir=str(args.data_dir),
+        identity_path=str(args.identity_path),
+        kv_compaction_enabled=bool(args.kv_compaction_enabled),
+        kv_compaction_method=str(args.kv_compaction_method),
+        kv_compaction_ratio=max(0.01, min(1.0, float(args.kv_compaction_ratio))),
+        kv_compaction_beta=bool(args.kv_compaction_beta),
+        kv_compaction_head_budget_path=str(args.kv_compaction_head_budget_path or ""),
+        kv_compaction_online=bool(args.kv_compaction_online),
+        kv_compaction_online_max_tokens=max(4, int(args.kv_compaction_online_max_tokens)),
+        kv_compaction_mode=args.kv_compaction_mode,  # None | "off" | "auto" | "on"
+        kv_compaction_auto_threshold=max(1, int(args.kv_compaction_auto_threshold)),
+        kv_radix_cache_enabled=bool(args.kv_radix_cache_enabled),
+        kv_radix_cache_max_entries=max(1, int(args.kv_radix_cache_max_entries)),
+        kv_radix_cache_min_prefix_len=max(1, int(args.kv_radix_cache_min_prefix_len)),
+        warmup_on_start=bool(args.warmup_on_start),
+        mlx_eval_timeout_s=float(args.mlx_eval_timeout),
+        batch_window_ms=float(args.batch_window_ms),
+        max_batch_size=max(1, int(args.max_batch_size)),
+        p2p_enable=bool(args.p2p_enable),
+        seeder_port=max(0, int(args.seeder_port)),
+        p2p_cache_dir=args.p2p_cache_dir or None,
+        enable_local_fast_path=bool(args.enable_local_fast_path),
+        hivemind_initial_peers=list(args.hivemind_initial_peers) if args.hivemind_initial_peers else None,
+    )
+
+
+if __name__ == "__main__":
+    main()

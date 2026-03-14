@@ -1,0 +1,138 @@
+services:
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: openhydra:latest
+    entrypoint: []
+    command:
+      - python
+      - -m
+      - dht.bootstrap
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8468"
+      - --ttl-seconds
+      - "300"
+    ports:
+      - "8468:8468"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8468/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+    networks:
+      - openhydra_net
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=openhydra
+      - POSTGRES_USER=openhydra
+      - POSTGRES_PASSWORD=openhydra
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./ops/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openhydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - openhydra_net
+
+  node:
+    image: openhydra:latest
+    entrypoint: []
+    depends_on:
+      bootstrap:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://openhydra:openhydra@postgres:5432/openhydra
+    command:
+      - openhydra-node
+      - --peer-id
+      - node-a
+      - --model-id
+      - openhydra-toy-345m
+      - --shard-index
+      - "0"
+      - --total-shards
+      - "1"
+      - --grpc-port
+      - "50051"
+      - --api-port
+      - "8080"
+      - --api-host
+      - "0.0.0.0"
+      - --advertise-host
+      - node
+      - --dht-url
+      - http://bootstrap:8468
+      - --runtime-backend
+      - toy_auto
+    ports:
+      - "50051:50051"   # gRPC — reachable by other nodes for inference forwarding
+      - "8080:8080"     # HTTP API — local-only in production; exposed here for testnet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/metrics"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    networks:
+      - openhydra_net
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      node:
+        condition: service_healthy
+    networks:
+      - openhydra_net
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=openhydra
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/openhydra_dashboard.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana/openhydra_dashboard.json:/var/lib/grafana/dashboards/openhydra_dashboard.json:ro
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    networks:
+      - openhydra_net
+
+networks:
+  openhydra_net:
+    driver: bridge
+
+volumes:
+  prometheus_data: {}
+  grafana_data: {}
+  postgres_data: {}

@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package openhydra.peer;
+
+service Peer {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  rpc GetPeerStatus(PeerStatusRequest) returns (PeerStatusResponse);
+}
+
+message PingRequest {
+  int64 sent_unix_ms = 1;
+  string geo_nonce = 2;
+  string geo_claimed_region = 3;
+}
+
+message PingResponse {
+  string peer_id = 1;
+  bool ok = 2;
+  double load_pct = 3;
+  string daemon_mode = 4;
+  string geo_nonce_signature = 5;
+}
+
+message ForwardRequest {
+  string request_id = 1;
+  string prompt = 2;
+  repeated float activation = 3;
+  uint32 stage_index = 4;
+  uint32 total_stages = 5;
+  uint32 max_tokens = 6;
+  bytes encrypted_activation = 7;
+  repeated bytes encryption_nonces = 8;
+  repeated bytes encryption_ephemeral_public_keys = 9;
+  string encryption_suite = 10;
+  uint32 encryption_layers = 11;
+  string compression_codec = 12;
+  uint32 compression_original_dim = 13;
+  uint32 compression_latent_dim = 14;
+  string kv_session_id = 15;
+  bool kv_store_activation = 16;
+  bool kv_use_cached_activation = 17;
+  bytes onion_route_ciphertext = 18;
+  repeated bytes onion_route_nonces = 19;
+  repeated bytes onion_route_ephemeral_public_keys = 20;
+  string onion_route_suite = 21;
+  uint32 onion_route_layers = 22;
+  bool decode_do_sample = 23;
+  float decode_temperature = 24;
+  float decode_top_p = 25;
+  uint32 decode_top_k = 26;
+  int64 decode_seed = 27;
+  // Phase 3: Layer-sharding routing hint.
+  // 0 = use the peer's own startup configuration.
+  // When non-zero the coordinator is explicitly telling this peer which slice
+  // of the model to run, enabling validation and observability.
+  uint32 shard_layer_start = 28;   // first transformer layer this peer runs (inclusive)
+  uint32 shard_layer_end = 29;     // one past the last layer (exclusive)
+  uint32 shard_total_layers = 30;  // full model depth (e.g. 32 for LLaMA-3-8B)
+}
+
+message ForwardResponse {
+  string request_id = 1;
+  string peer_id = 2;
+  repeated float activation = 3;
+  uint32 stage_index = 4;
+  string error = 5;
+  bool kv_cache_hit = 6;
+  bytes onion_route_ciphertext = 7;
+  repeated bytes onion_route_nonces = 8;
+  repeated bytes onion_route_ephemeral_public_keys = 9;
+  string onion_route_suite = 10;
+  uint32 onion_route_layers = 11;
+  string onion_next_peer_id = 12;
+  bool dp_noise_applied = 13;
+  double dp_noise_configured_variance = 14;
+  double dp_noise_observed_variance = 15;
+  double dp_noise_observed_std = 16;
+  uint64 dp_noise_payload_index = 17;
+  string dp_noise_audit_tag = 18;
+  uint32 compression_latent_dim = 19;
+}
+
+message PeerStatusRequest {}
+
+message PeerStatusResponse {
+  string peer_id = 1;
+  string model_id = 2;
+  uint32 shard_index = 3;
+  uint32 total_shards = 4;
+  double load_pct = 5;
+  bool healthy = 6;
+  string daemon_mode = 7;
+  double dp_noise_configured_variance = 8;
+  uint64 dp_noise_payloads = 9;
+  double dp_noise_observed_variance_ema = 10;
+  string dp_noise_last_audit_tag = 11;
+}

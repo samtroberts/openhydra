@@ -1,0 +1,130 @@
+# HA overlay — use with:
+#   docker-compose -f docker-compose.yml -f docker-compose.ha.yml up -d
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Disable the single-replica coordinator from the base compose file so that
+  # only coordinator-1 and coordinator-2 run in HA mode.
+  # ---------------------------------------------------------------------------
+  coordinator:
+    profiles:
+      - disabled
+
+  # ---------------------------------------------------------------------------
+  # coordinator-1 and coordinator-2 are identical replicas of the base
+  # coordinator service. nginx handles all inbound traffic; neither replica
+  # exposes a port directly to the host.
+  #
+  # Both replicas share the `openhydra_state` named volume so that the SQLite
+  # ledger files are readable by either instance (the application must use
+  # WAL mode or an equivalent locking strategy for concurrent access).
+  # ---------------------------------------------------------------------------
+  coordinator-1:
+    image: openhydra:latest
+    entrypoint: []
+    depends_on:
+      bootstrap:
+        condition: service_healthy
+      peer:
+        condition: service_started
+    command:
+      - python
+      - -m
+      - coordinator.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --dht-url
+      - http://bootstrap:8468
+      - --required-replicas
+      - "1"
+      - --pipeline-width
+      - "1"
+      - --allow-degradation-default
+      - --ledger-path
+      - /data/credits.db
+      - --hydra-token-ledger-path
+      - /data/hydra_tokens.db
+      - --health-store-path
+      - /data/health.json
+    volumes:
+      - openhydra_state:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/metrics"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    networks:
+      - openhydra_net
+
+  coordinator-2:
+    image: openhydra:latest
+    entrypoint: []
+    depends_on:
+      bootstrap:
+        condition: service_healthy
+      peer:
+        condition: service_started
+    command:
+      - python
+      - -m
+      - coordinator.api_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --dht-url
+      - http://bootstrap:8468
+      - --required-replicas
+      - "1"
+      - --pipeline-width
+      - "1"
+      - --allow-degradation-default
+      - --ledger-path
+      - /data/credits.db
+      - --hydra-token-ledger-path
+      - /data/hydra_tokens.db
+      - --health-store-path
+      - /data/health.json
+    volumes:
+      - openhydra_state:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/metrics"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    networks:
+      - openhydra_net
+
+  # ---------------------------------------------------------------------------
+  # nginx — load balancer / reverse proxy in front of the two coordinators
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      coordinator-1:
+        condition: service_healthy
+      coordinator-2:
+        condition: service_healthy
+    volumes:
+      - ./ops/ha/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - openhydra_net
+
+# -----------------------------------------------------------------------------
+# Named volume shared by both coordinator replicas for SQLite ledger files
+# -----------------------------------------------------------------------------
+volumes:
+  openhydra_state: {}
