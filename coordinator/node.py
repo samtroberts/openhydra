@@ -159,6 +159,7 @@ def main() -> None:
     )
 
     # Auto-detect the best runtime backend for this machine.
+    # Supported platforms: Apple Silicon (MLX), NVIDIA CUDA, AMD ROCm.
     if args.runtime_backend == "auto":
         import platform
         if platform.system() == "Darwin":
@@ -167,16 +168,29 @@ def main() -> None:
         else:
             try:
                 import torch
-                if torch.cuda.is_available():
+                _is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+                if _is_rocm and torch.cuda.is_available():
                     args.runtime_backend = "pytorch_auto"
                     _gpu_name = torch.cuda.get_device_name(0)
-                    logger.info("auto_backend: detected CUDA GPU (%s) — using pytorch_auto", _gpu_name)
+                    logger.info("auto_backend: detected AMD ROCm GPU (%s) — using pytorch_auto", _gpu_name)
+                elif torch.cuda.is_available():
+                    args.runtime_backend = "pytorch_auto"
+                    _gpu_name = torch.cuda.get_device_name(0)
+                    logger.info("auto_backend: detected NVIDIA CUDA GPU (%s) — using pytorch_auto", _gpu_name)
                 else:
                     args.runtime_backend = "pytorch_auto"
-                    logger.info("auto_backend: no GPU detected — using pytorch_auto (CPU fallback)")
+                    logger.warning(
+                        "auto_backend: no supported GPU detected. "
+                        "OpenHydra is designed for Apple Silicon (MLX), NVIDIA CUDA, or AMD ROCm GPUs. "
+                        "Falling back to pytorch_auto (CPU) — expect significantly slower inference."
+                    )
             except ImportError:
-                args.runtime_backend = "pytorch_auto"
-                logger.info("auto_backend: torch not found — using pytorch_auto")
+                logger.error(
+                    "auto_backend: PyTorch is not installed. "
+                    "Install PyTorch with GPU support: https://pytorch.org/get-started/locally/ "
+                    "(NVIDIA: pip install torch, AMD ROCm: pip install torch --index-url https://download.pytorch.org/whl/rocm6.2)"
+                )
+                raise SystemExit(1)
 
     logger.info(
         "openhydra_node_starting peer_id=%s model=%s grpc_port=%d api=%s:%d dht=%s backend=%s",
