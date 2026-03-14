@@ -447,6 +447,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 decoder = TensorAutoencoder(CompressionProfile(latent_dim=max(1, latent_dim)))
                 activation_in = decoder.decode(activation_in, target_dim=original_dim)
 
+            logger.info("forward_dispatch: peer=%s stage=%d/%d backend=%s",
+                       self.peer_id, int(request.stage_index), int(request.total_stages),
+                       "pytorch" if self.shard.uses_pytorch_runtime else "batch_queue")
             if self.shard.uses_pytorch_runtime:
                 # Offload PyTorch matrix compute to a worker thread to protect async control planes.
                 activation = asyncio.run(

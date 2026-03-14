@@ -34,8 +34,10 @@ Quickstart
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import tempfile
 import threading
 import time
 
@@ -113,8 +115,8 @@ def main() -> None:
     )
 
     # --- Runtime ---
-    parser.add_argument("--runtime-backend", default="toy_auto",
-                        help="Inference runtime backend (default: toy_auto).")
+    parser.add_argument("--runtime-backend", default="auto",
+                        help="Inference runtime backend (default: auto — detects mlx on Mac, pytorch_auto on CUDA/CPU).")
     parser.add_argument("--daemon-mode", default="polite",
                         choices=["polite", "aggressive", "passive"],
                         help="Peer resource policy (default: polite).")
@@ -156,10 +158,30 @@ def main() -> None:
         else (os.environ.get("OPENHYDRA_API_KEY", "").strip() or None)
     )
 
+    # Auto-detect the best runtime backend for this machine.
+    if args.runtime_backend == "auto":
+        import platform
+        if platform.system() == "Darwin":
+            args.runtime_backend = "mlx"
+            logger.info("auto_backend: detected macOS — using MLX (Metal acceleration)")
+        else:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    args.runtime_backend = "pytorch_auto"
+                    _gpu_name = torch.cuda.get_device_name(0)
+                    logger.info("auto_backend: detected CUDA GPU (%s) — using pytorch_auto", _gpu_name)
+                else:
+                    args.runtime_backend = "pytorch_auto"
+                    logger.info("auto_backend: no GPU detected — using pytorch_auto (CPU fallback)")
+            except ImportError:
+                args.runtime_backend = "pytorch_auto"
+                logger.info("auto_backend: torch not found — using pytorch_auto")
+
     logger.info(
-        "openhydra_node_starting peer_id=%s model=%s grpc_port=%d api=%s:%d dht=%s",
+        "openhydra_node_starting peer_id=%s model=%s grpc_port=%d api=%s:%d dht=%s backend=%s",
         args.peer_id, args.model_id, args.grpc_port,
-        args.api_host, args.api_port, dht_urls,
+        args.api_host, args.api_port, dht_urls, args.runtime_backend,
     )
 
     # Start the peer gRPC server in a background daemon thread.
@@ -190,12 +212,45 @@ def main() -> None:
     )
     time.sleep(1.0)
 
+    # Auto-generate a local peers config so the coordinator can always find
+    # its co-located peer — no --peers-config needed for single-node usage.
+    peers_config_path = args.peers_config
+    if not peers_config_path:
+        _local_peer = [{
+            "peer_id": args.peer_id,
+            "host": "127.0.0.1",
+            "port": args.grpc_port,
+            "model_id": args.model_id,
+            "operator_id": "local",
+            "runtime_backend": args.runtime_backend,
+        }]
+        _tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="openhydra_peers_",
+            delete=False,
+        )
+        json.dump(_local_peer, _tmp)
+        _tmp.close()
+        peers_config_path = _tmp.name
+        logger.info("auto_peers_config: %s (local peer %s on :%d)",
+                     peers_config_path, args.peer_id, args.grpc_port)
+
+    # Resolve model catalog path — look for models.catalog.json in cwd,
+    # then fall back to None (uses engine defaults).
+    _catalog_path: str | None = "models.catalog.json"
+    if not os.path.exists(_catalog_path):
+        _catalog_path = None
+
     # Build the coordinator engine config with only the fields we override;
     # EngineConfig is a frozen dataclass and all other fields carry their defaults.
     engine_config = EngineConfig(
         dht_urls=dht_urls,
         deployment_profile=args.deployment_profile,
-        peers_config_path=args.peers_config,
+        peers_config_path=peers_config_path,
+        model_catalog_path=_catalog_path,
+        required_replicas=1,
+        pipeline_width=1,
+        timeout_ms=60000,
+        max_latency_ms=60000,
     )
 
     # Start the coordinator HTTP API on the main thread (blocking).

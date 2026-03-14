@@ -607,9 +607,10 @@ class MLXRuntime:
         if not items:
             return []
 
-        if any(int(item.total_stages) > 1 for item in items):
+        _stages = [int(item.total_stages) for item in items]
+        if any(s > 1 for s in _stages):
             raise NotImplementedError(
-                "mlx_runtime: multi-stage layer sharding not supported; "
+                f"mlx_runtime: multi-stage layer sharding not supported (got total_stages={_stages}); "
                 "use total_shards=1 with --runtime-backend mlx."
             )
 

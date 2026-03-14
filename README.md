@@ -26,28 +26,25 @@ Every participant runs their own node. Contributing compute earns **HYDRA** toke
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.11+
-- `protobuf-compiler` (`brew install protobuf` / `apt install protobuf-compiler`)
+### Install
 
 ```bash
-git clone https://github.com/openhydra-ai/openhydra.git
+git clone https://github.com/samtroberts/openhydra.git
 cd openhydra
-
-make venv
-source .venv/bin/activate
-make install
-make proto
+pip install -e .
 ```
 
-### Join the global swarm (one command)
+### Run your node
 
 ```bash
-openhydra-node --peer-id my-laptop
+openhydra-node --peer-id my-node --model-id Qwen/Qwen3.5-0.8B
 ```
 
-That's it. Your node auto-joins the global Hivemind Kademlia DHT via three hardcoded signpost nodes (EU/US/AP). Your local OpenAI-compatible API is now live at `http://127.0.0.1:8080`.
+That's it. OpenHydra auto-detects your hardware (Apple Silicon → MLX, NVIDIA GPU → PyTorch CUDA, CPU → PyTorch CPU), joins the global DHT via three bootstrap signpost nodes (EU/US/AP), registers itself as a local peer, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`.
+
+You can also set the backend explicitly: `--runtime-backend mlx` (Mac), `--runtime-backend pytorch_auto` (CUDA/CPU).
+
+### Chat with your node
 
 ```bash
 # Chat completion
@@ -56,7 +53,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{
     "model": "openhydra-qwen3.5-0.8b",
     "messages": [{"role": "user", "content": "Explain P2P inference in one sentence."}]
-  }' | jq
+  }' | python3 -m json.tool
 
 # Streaming
 curl -N http://127.0.0.1:8080/v1/chat/completions \
@@ -81,16 +78,6 @@ curl http://127.0.0.1:8080/api/generate \
 curl http://127.0.0.1:8080/api/chat \
   -d '{"model": "openhydra-qwen3.5-0.8b", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
-
-### Apple Silicon (MLX backend, recommended for Mac)
-
-```bash
-openhydra-node --peer-id my-mac \
-  --runtime-backend mlx \
-  --runtime-model-id Qwen/Qwen3.5-0.8B
-```
-
-MLX uses unified memory with zero-copy Metal acceleration. Expect ~252 tok/s local throughput on M1/M2/M3.
 
 ### Local development (private DHT, two terminals)
 
@@ -231,20 +218,18 @@ Reference: [arXiv:2602.16284](https://arxiv.org/abs/2602.16284)
 
 ## Model Catalog
 
-Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
+18 models across five tiers. Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
 
-| Tier | Model | VRAM | Peers | Quant | Status |
-|------|-------|------|-------|-------|--------|
-| Frontier | `Qwen/Qwen3.5-27B` | 16 GB | 4 | int4 | ✅ Available |
-| Advanced | `Qwen/Qwen3.5-9B` | 18 GB | 2 | int8 | ✅ Available |
-| Standard | `Qwen/Qwen3.5-4B` | 9 GB | 1 | int4 | ✅ Available |
-| Basic | `Qwen/Qwen3.5-2B` | 5 GB | 1 | fp32 | ✅ Available |
-| Basic | `Qwen/Qwen3.5-0.8B` | 2 GB | 1 | fp32 | ✅ Available |
-| | `meta-llama/Llama-3.1-8B` | 16 GB | 2 | int8 | 🔜 Coming Soon |
-| | `meta-llama/Llama-3.1-70B` | 140 GB | 8 | int4 | 🔜 Coming Soon |
-| | `mistralai/Mistral-7B-v0.3` | 14 GB | 2 | int8 | 🔜 Coming Soon |
-| | `Qwen/Qwen2.5-Coder-7B` | 14 GB | 2 | int8 | 🔜 Coming Soon |
-| | `Qwen/Qwen3-8B` | 16 GB | 2 | int8 | 🔜 Coming Soon |
+| Tier | Model | VRAM | Peers | Quant |
+|------|-------|------|-------|-------|
+| Small | `openhydra-qwen3.5-0.8b` | 2 GB | 1 | fp32/int4 |
+| Small | `openhydra-llama3.2-1b` | 3 GB | 1 | fp32/int4 |
+| Medium | `openhydra-llama3.1-8b` | 16 GB | 2 | int8 |
+| Medium | `openhydra-mistral-7b` | 14 GB | 2 | int8 |
+| Code | `openhydra-qwen2.5-coder-7b` | 14 GB | 2 | int8 |
+| Reasoning | `openhydra-qwen3-8b` | 16 GB | 2 | int8 |
+| Large | `openhydra-llama3.1-70b` | 140 GB | 8 | int4 |
+| Large | `openhydra-qwen3-72b` | 144 GB | 8 | int4 |
 
 Full catalog: [`models.catalog.json`](models.catalog.json)
 
