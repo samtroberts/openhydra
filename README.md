@@ -235,16 +235,16 @@ Graceful degradation built in &mdash; if the requested model lacks peers, the co
 
 | Tier | Model | VRAM | Peers | Quant | Status |
 |------|-------|------|-------|-------|--------|
-| Frontier | `openhydra-qwen3.5-27b` | 16 GB | 4 | int4 | ✅ Available |
-| Advanced | `openhydra-qwen3.5-9b` | 18 GB | 2 | int8 | ✅ Available |
-| Standard | `openhydra-qwen3.5-4b` | 9 GB | 1 | int4 | ✅ Available |
-| Basic | `openhydra-qwen3.5-2b` | 5 GB | 1 | fp32 | ✅ Available |
-| Basic | `openhydra-qwen3.5-0.8b` | 2 GB | 1 | fp32 | ✅ Available |
-| | `openhydra-llama3.1-8b` | 16 GB | 2 | int8 | 🔜 Coming Soon |
-| | `openhydra-llama3.1-70b` | 140 GB | 8 | int4 | 🔜 Coming Soon |
-| | `openhydra-mistral-7b` | 14 GB | 2 | int8 | 🔜 Coming Soon |
-| | `openhydra-qwen2.5-coder-7b` | 14 GB | 2 | int8 | 🔜 Coming Soon |
-| | `openhydra-qwen3-8b` | 16 GB | 2 | int8 | 🔜 Coming Soon |
+| Frontier | `Qwen/Qwen3.5-27B` | 16 GB | 4 | int4 | ✅ Available |
+| Advanced | `Qwen/Qwen3.5-9B` | 18 GB | 2 | int8 | ✅ Available |
+| Standard | `Qwen/Qwen3.5-4B` | 9 GB | 1 | int4 | ✅ Available |
+| Basic | `Qwen/Qwen3.5-2B` | 5 GB | 1 | fp32 | ✅ Available |
+| Basic | `Qwen/Qwen3.5-0.8B` | 2 GB | 1 | fp32 | ✅ Available |
+| | `meta-llama/Llama-3.1-8B` | 16 GB | 2 | int8 | 🔜 Coming Soon |
+| | `meta-llama/Llama-3.1-70B` | 140 GB | 8 | int4 | 🔜 Coming Soon |
+| | `mistralai/Mistral-7B-v0.3` | 14 GB | 2 | int8 | 🔜 Coming Soon |
+| | `Qwen/Qwen2.5-Coder-7B` | 14 GB | 2 | int8 | 🔜 Coming Soon |
+| | `Qwen/Qwen3-8B` | 16 GB | 2 | int8 | 🔜 Coming Soon |
 
 Full catalog: [`models.catalog.json`](models.catalog.json)
 
