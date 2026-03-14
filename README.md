@@ -11,7 +11,7 @@
 
 ---
 
-OpenHydra is a fully decentralised peer-to-peer inference network that pools idle hardware &mdash; your MacBook, a gaming PC, a cloud VM &mdash; into a single virtual GPU cluster capable of running models far larger than any single device could hold. There is no central server, no single company that sees your queries, and no single point of failure.
+OpenHydra is a fully decentralised peer-to-peer inference network that pools idle hardware &mdash; your MacBook, an NVIDIA gaming PC, an AMD workstation, a cloud VM &mdash; into a single virtual GPU cluster capable of running models far larger than any single device could hold. There is no central server, no single company that sees your queries, and no single point of failure.
 
 Every participant runs their own node. Contributing compute earns **HYDRA** tokens and barter credits. Spending compute gives you access to frontier-class models across the swarm.
 
@@ -20,7 +20,7 @@ Every participant runs their own node. Contributing compute earns **HYDRA** toke
 - **No VRAM ceiling.** A 70B model that needs 140 GB of VRAM runs across 8 peers, each contributing 18 GB.
 - **No central server.** Every node is both client and server. The network is the computer.
 - **Privacy by default.** Concentric onion routing + AES-256-GCM activation encryption + differential privacy noise. No peer sees your full query.
-- **Works today.** 867 tests passing. MLX on Apple Silicon (~252 tok/s local, ~10 tok/s net over network). PyTorch + NF4 quantization on CUDA. Production DHT live on 3 continents.
+- **Works today.** 867 tests passing. MLX on Apple Silicon (~252 tok/s local, ~10 tok/s net over network). PyTorch + NF4 quantization on NVIDIA CUDA and AMD ROCm. Production DHT live on 3 continents.
 
 ---
 
@@ -40,9 +40,17 @@ pip install -e .
 openhydra-node --peer-id my-node --model-id Qwen/Qwen3.5-0.8B
 ```
 
-That's it. OpenHydra auto-detects your hardware (Apple Silicon → MLX, NVIDIA GPU → PyTorch CUDA, CPU → PyTorch CPU), joins the global DHT via three bootstrap signpost nodes (EU/US/AP), registers itself as a local peer, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`.
+That's it. OpenHydra auto-detects your hardware (Apple Silicon → MLX, NVIDIA GPU → PyTorch CUDA, AMD GPU → PyTorch ROCm), joins the global DHT via three bootstrap signpost nodes (EU/US/AP), registers itself as a local peer, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`.
 
-You can also set the backend explicitly: `--runtime-backend mlx` (Mac), `--runtime-backend pytorch_auto` (CUDA/CPU).
+**Supported platforms:**
+
+| Platform | Backend | Install |
+|----------|---------|---------|
+| 🍎 Apple Silicon (M1–M4) | MLX (Metal) | `pip install mlx mlx-lm` |
+| 🟢 NVIDIA GPU (CUDA) | PyTorch | `pip install torch` |
+| 🔴 AMD GPU (ROCm) | PyTorch | `pip install torch --index-url https://download.pytorch.org/whl/rocm6.2` |
+
+You can also set the backend explicitly: `--runtime-backend mlx` (Mac), `--runtime-backend pytorch_auto` (NVIDIA/AMD).
 
 ### Chat with your node
 
@@ -218,18 +226,15 @@ Reference: [arXiv:2602.16284](https://arxiv.org/abs/2602.16284)
 
 ## Model Catalog
 
-18 models across five tiers. Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
+Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
 
-| Tier | Model | VRAM | Peers | Quant |
-|------|-------|------|-------|-------|
-| Small | `openhydra-qwen3.5-0.8b` | 2 GB | 1 | fp32/int4 |
-| Small | `openhydra-llama3.2-1b` | 3 GB | 1 | fp32/int4 |
-| Medium | `openhydra-llama3.1-8b` | 16 GB | 2 | int8 |
-| Medium | `openhydra-mistral-7b` | 14 GB | 2 | int8 |
-| Code | `openhydra-qwen2.5-coder-7b` | 14 GB | 2 | int8 |
-| Reasoning | `openhydra-qwen3-8b` | 16 GB | 2 | int8 |
-| Large | `openhydra-llama3.1-70b` | 140 GB | 8 | int4 |
-| Large | `openhydra-qwen3-72b` | 144 GB | 8 | int4 |
+| Tier | Model | HuggingFace ID | VRAM | Peers | Quant | Status |
+|------|-------|----------------|------|-------|-------|--------|
+| Frontier | Qwen 3.5 27B | `Qwen/Qwen3.5-27B` | 16 GB × 4 | 4 | int4 | ✅ Available |
+| Advanced | Qwen 3.5 9B | `Qwen/Qwen3.5-9B` | 18 GB × 2 | 2 | int8 | ✅ Available |
+| Standard | Qwen 3.5 4B | `Qwen/Qwen3.5-4B` | 9 GB | 1 | int4 | ✅ Available |
+| Basic | Qwen 3.5 2B | `Qwen/Qwen3.5-2B` | 5 GB | 1 | fp32 | ✅ Available |
+| Basic | Qwen 3.5 0.8B | `Qwen/Qwen3.5-0.8B` | 2 GB | 1 | fp32 | ✅ Available |
 
 Full catalog: [`models.catalog.json`](models.catalog.json)
 
