@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alerting rules loaded from the rules directory.
+# The /etc/prometheus/rules/ directory must be bind-mounted into the
+# Prometheus container (e.g. ./ops/prometheus/rules:/etc/prometheus/rules:ro).
+# Add the volume to your docker-compose.yml when wiring this up.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: openhydra_node
+    static_configs:
+      - targets: ['node:8080']
+        # For local dev outside Docker, replace with: ['localhost:8080']
+    metrics_path: /metrics
+
+  # NOTE: The DHT bootstrap node at bootstrap:8468/health exposes a health
+  # JSON payload, not Prometheus text format. It cannot be scraped natively
+  # by Prometheus without a custom exporter or json_exporter sidecar.
+  # Leaving this as a placeholder — uncomment and configure json_exporter
+  # (https://github.com/prometheus-community/json_exporter) if you want
+  # to surface bootstrap health metrics in Grafana.
+  #
+  # - job_name: openhydra_dht_bootstrap
+  #   static_configs:
+  #     - targets: ['bootstrap:8468']
+  #   metrics_path: /health
+  #   # The /health endpoint returns JSON, not Prometheus exposition format.
+  #   # A json_exporter relabeling config is required to parse it.

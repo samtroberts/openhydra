@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenHydra — Chat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+
+<!-- ============================================================
+     STYLES
+     Design tokens match landing/index.html:
+       bg #0a0a0a, surface #141414, text #e8e8e8, teal #00d4b8
+     ============================================================ -->
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0a0a0a;
+    --surface:  #141414;
+    --surface2: #1c1c1c;
+    --text:     #e8e8e8;
+    --muted:    #6b6b6b;
+    --border:   #1c1c1c;
+    --teal:     #00d4b8;
+    --teal-dim: rgba(0, 212, 184, 0.15);
+    --red:      #ff4c4c;
+    --radius:   8px;
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  /* ── Layout shell ─────────────────────────────────────────── */
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+
+  /* ── Header ───────────────────────────────────────────────── */
+  header {
+    flex-shrink: 0;
+    height: 52px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 1.25rem;
+    gap: 0.75rem;
+    z-index: 10;
+  }
+
+  .logo {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--teal);
+    letter-spacing: -0.01em;
+    flex: 1;
+  }
+
+  /* Network status badge */
+  #net-badge {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--muted);
+    padding: 0.3rem 0.7rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    transition: color 0.2s, border-color 0.2s;
+    white-space: nowrap;
+    cursor: default;
+    user-select: none;
+  }
+  #net-badge.healthy { color: #4ade80; border-color: rgba(74, 222, 128, 0.3); }
+  #net-badge.error   { color: var(--red); border-color: rgba(255, 76, 76, 0.3); }
+
+  .dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .dot.pulse {
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
+  }
+
+  /* Settings gear button */
+  #settings-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--muted);
+    padding: 0.35rem;
+    border-radius: var(--radius);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s, background 0.15s;
+    flex-shrink: 0;
+  }
+  #settings-btn:hover { color: var(--text); background: var(--surface2); }
+  #settings-btn svg { width: 18px; height: 18px; }
+
+  /* ── Node-offline banner ──────────────────────────────────── */
+  #offline-banner {
+    display: none;
+    flex-shrink: 0;
+    background: rgba(255, 76, 76, 0.1);
+    border-bottom: 1px solid rgba(255, 76, 76, 0.25);
+    padding: 0.55rem 1.25rem;
+    font-size: 0.82rem;
+    color: #ff8080;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  #offline-banner.visible { display: block; }
+  #offline-banner code {
+    color: var(--text);
+    background: rgba(255,255,255,0.07);
+    padding: 0.1em 0.45em;
+    border-radius: 4px;
+  }
+
+  /* ── Chat area ────────────────────────────────────────────── */
+  #chat-area {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.5rem 1.25rem 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    scroll-behavior: smooth;
+  }
+
+  /* Custom scrollbar */
+  #chat-area::-webkit-scrollbar { width: 5px; }
+  #chat-area::-webkit-scrollbar-track { background: transparent; }
+  #chat-area::-webkit-scrollbar-thumb { background: var(--surface2); border-radius: 99px; }
+
+  /* Max-width wrapper for messages */
+  .msg-row {
+    display: flex;
+    width: 100%;
+  }
+  .msg-row.user     { justify-content: flex-end; }
+  .msg-row.assistant { justify-content: flex-start; }
+
+  /* Bubble */
+  .bubble {
+    max-width: min(680px, 85%);
+    padding: 0.7rem 1rem;
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+    line-height: 1.65;
+    position: relative;
+  }
+  .bubble.user {
+    background: var(--teal);
+    color: #0a0a0a;
+    border-bottom-right-radius: 2px;
+    font-weight: 400;
+  }
+  .bubble.assistant {
+    background: var(--surface);
+    color: var(--text);
+    border-bottom-left-radius: 2px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border: 1px solid var(--border);
+  }
+  .bubble.error {
+    background: rgba(255, 76, 76, 0.1);
+    border: 1px solid rgba(255, 76, 76, 0.3);
+    color: #ff8080;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+  }
+
+  /* Copy button (appears on hover over assistant bubble) */
+  .bubble-wrap {
+    position: relative;
+    max-width: min(680px, 85%);
+  }
+  .copy-msg-btn {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    cursor: pointer;
+    color: var(--muted);
+    padding: 0.2rem 0.4rem;
+    font-size: 0.7rem;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    white-space: nowrap;
+  }
+  .bubble-wrap:hover .copy-msg-btn { opacity: 1; }
+  .copy-msg-btn:hover { color: var(--teal); }
+  .copy-msg-btn.copied { color: var(--teal); opacity: 1; }
+
+  /* Typing indicator */
+  .typing-dots {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0.15rem 0.1rem;
+  }
+  .typing-dots span {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--muted);
+    animation: blink 1.2s ease-in-out infinite;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.2; transform: scale(0.85); }
+    40%            { opacity: 1;   transform: scale(1); }
+  }
+
+  /* Empty state */
+  #empty-state {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.6rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+    font-weight: 300;
+    pointer-events: none;
+    padding-bottom: 4rem;
+  }
+  #empty-state svg { opacity: 0.25; }
+  #empty-state p   { text-align: center; }
+
+  /* ── Input area ───────────────────────────────────────────── */
+  #input-area {
+    flex-shrink: 0;
+    padding: 0.85rem 1.25rem 1rem;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+
+  .input-row {
+    display: flex;
+    gap: 0.65rem;
+    align-items: flex-end;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.5rem 0.65rem;
+    transition: border-color 0.15s;
+  }
+  .input-row:focus-within { border-color: var(--teal); }
+
+  #msg-input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    resize: none;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.9rem;
+    color: var(--text);
+    line-height: 1.5;
+    max-height: calc(1.5em * 6 + 0.5rem); /* 6 lines */
+    min-height: 1.5em;
+    overflow-y: auto;
+  }
+  #msg-input::placeholder { color: var(--muted); }
+  #msg-input::-webkit-scrollbar { width: 3px; }
+  #msg-input::-webkit-scrollbar-thumb { background: var(--surface2); border-radius: 99px; }
+
+  /* Send / Stop button */
+  #send-btn, #stop-btn {
+    flex-shrink: 0;
+    padding: 0.45rem 1rem;
+    border-radius: 6px;
+    border: none;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: filter 0.15s, transform 0.1s;
+    letter-spacing: 0.01em;
+    line-height: 1;
+    align-self: flex-end;
+  }
+  #send-btn {
+    background: var(--teal);
+    color: #0a0a0a;
+  }
+  #send-btn:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+  #send-btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+  #stop-btn {
+    background: transparent;
+    color: var(--red);
+    border: 1px solid rgba(255, 76, 76, 0.4);
+    display: none;
+  }
+  #stop-btn.visible { display: block; }
+  #stop-btn:hover { background: rgba(255, 76, 76, 0.08); }
+
+  /* ── Settings panel (slide-in from right) ─────────────────── */
+  #overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 100;
+    backdrop-filter: blur(2px);
+  }
+  #overlay.open { display: block; }
+
+  #settings-panel {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(360px, 92vw);
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    z-index: 101;
+    display: flex;
+    flex-direction: column;
+    transform: translateX(100%);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    overflow-y: auto;
+  }
+  #settings-panel.open { transform: translateX(0); }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1.1rem 1.25rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .panel-header h2 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  #close-settings {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--muted);
+    padding: 0.25rem;
+    border-radius: 5px;
+    display: flex;
+    transition: color 0.15s, background 0.15s;
+  }
+  #close-settings:hover { color: var(--text); background: var(--surface2); }
+  #close-settings svg { width: 18px; height: 18px; }
+
+  .panel-body {
+    padding: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.35rem;
+    flex: 1;
+  }
+
+  .field { display: flex; flex-direction: column; gap: 0.4rem; }
+
+  .field label {
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .field input, .field select {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.55rem 0.75rem;
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.88rem;
+    outline: none;
+    transition: border-color 0.15s;
+    width: 100%;
+  }
+  .field input:focus, .field select:focus { border-color: var(--teal); }
+  .field select { cursor: pointer; }
+  .field select option { background: var(--surface2); }
+
+  /* Pipeline width slider */
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .field input[type="range"] {
+    flex: 1;
+    -webkit-appearance: none;
+    background: var(--surface2);
+    height: 4px;
+    border-radius: 99px;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+  .field input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--teal);
+    cursor: pointer;
+    transition: transform 0.1s;
+  }
+  .field input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
+  #pipeline-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    color: var(--teal);
+    min-width: 1.5ch;
+    text-align: right;
+  }
+
+  /* Panel buttons */
+  .btn-panel {
+    padding: 0.6rem 1rem;
+    border-radius: 6px;
+    border: none;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.88rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: filter 0.15s, transform 0.1s;
+    width: 100%;
+  }
+  .btn-new-convo {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-new-convo:hover { border-color: #444; background: var(--surface2); }
+
+  .panel-footer {
+    padding: 1rem 1.25rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+
+  /* ── Responsive ───────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    header { padding: 0 0.85rem; }
+    #chat-area { padding: 1rem 0.75rem 0.5rem; }
+    #input-area { padding: 0.65rem 0.75rem 0.85rem; }
+    .bubble { max-width: 92%; }
+    .bubble-wrap { max-width: 92%; }
+    #net-badge .dot-label { display: none; } /* hide text on very small screens */
+  }
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     HTML STRUCTURE
+     ============================================================ -->
+<div id="app">
+
+  <!-- Header -->
+  <header>
+    <span class="logo">OpenHydra</span>
+
+    <div id="net-badge" title="Network status">
+      <span class="dot pulse" id="status-dot"></span>
+      <span class="dot-label" id="status-text">connecting...</span>
+    </div>
+
+    <button id="settings-btn" title="Settings" aria-label="Open settings">
+      <!-- Gear icon -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- Node offline banner -->
+  <div id="offline-banner">
+    Node not running — start with: <code>openhydra-node --peer-id my-node</code>
+  </div>
+
+  <!-- Chat messages area -->
+  <div id="chat-area">
+    <!-- Empty state shown when no messages -->
+    <div id="empty-state">
+      <!-- Hydra / network icon -->
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" color="#00d4b8">
+        <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+        <path d="M2 17l10 5 10-5"/>
+        <path d="M2 12l10 5 10-5"/>
+      </svg>
+      <p>Start a conversation with OpenHydra</p>
+    </div>
+  </div>
+
+  <!-- Input area -->
+  <div id="input-area">
+    <div class="input-row">
+      <textarea
+        id="msg-input"
+        placeholder="Message OpenHydra… (Enter to send, Shift+Enter for newline)"
+        rows="1"
+        autocomplete="off"
+        spellcheck="true"
+      ></textarea>
+      <button id="stop-btn" title="Stop generation">Stop</button>
+      <button id="send-btn" title="Send message">Send</button>
+    </div>
+  </div>
+
+</div><!-- #app -->
+
+<!-- Settings overlay + panel -->
+<div id="overlay"></div>
+<aside id="settings-panel" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="panel-header">
+    <h2>Settings</h2>
+    <button id="close-settings" aria-label="Close settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="panel-body">
+    <div class="field">
+      <label for="api-endpoint">API Endpoint</label>
+      <input type="url" id="api-endpoint" placeholder="http://localhost:8080" spellcheck="false">
+    </div>
+
+    <div class="field">
+      <label for="model-select">Model</label>
+      <select id="model-select">
+        <option value="">— loading models —</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="pipeline-width">Pipeline Width</label>
+      <div class="slider-row">
+        <input type="range" id="pipeline-width" min="1" max="8" value="1" step="1">
+        <span id="pipeline-val">1</span>
+      </div>
+    </div>
+
+    <button class="btn-panel btn-new-convo" id="new-convo-btn">New conversation</button>
+  </div>
+
+  <div class="panel-footer">
+    Conversation history (last 50 messages) and settings are saved to localStorage.
+  </div>
+</aside>
+
+
+<!-- ============================================================
+     SCRIPT
+     ============================================================ -->
+<script>
+'use strict';
+
+// ── Constants & state ──────────────────────────────────────────
+const LS_ENDPOINT  = 'oh_endpoint';
+const LS_MODEL     = 'oh_model';
+const LS_PIPELINE  = 'oh_pipeline';
+const LS_HISTORY   = 'oh_history';
+const MAX_HISTORY  = 50;
+const POLL_INTERVAL = 10_000; // 10 s
+
+let endpoint      = localStorage.getItem(LS_ENDPOINT)  || 'http://localhost:8080';
+let selectedModel = localStorage.getItem(LS_MODEL)     || '';
+let pipelineWidth = parseInt(localStorage.getItem(LS_PIPELINE) || '1', 10);
+
+// Conversation history array of {role, content}
+let history = [];
+try { history = JSON.parse(localStorage.getItem(LS_HISTORY) || '[]'); } catch (_) {}
+
+// Active SSE abort controller
+let abortCtrl = null;
+
+// ── DOM refs ───────────────────────────────────────────────────
+const chatArea       = document.getElementById('chat-area');
+const emptyState     = document.getElementById('empty-state');
+const msgInput       = document.getElementById('msg-input');
+const sendBtn        = document.getElementById('send-btn');
+const stopBtn        = document.getElementById('stop-btn');
+const netBadge       = document.getElementById('net-badge');
+const statusDot      = document.getElementById('status-dot');
+const statusText     = document.getElementById('status-text');
+const offlineBanner  = document.getElementById('offline-banner');
+const settingsBtn    = document.getElementById('settings-btn');
+const overlay        = document.getElementById('overlay');
+const settingsPanel  = document.getElementById('settings-panel');
+const closeSettings  = document.getElementById('close-settings');
+const apiEndpointEl  = document.getElementById('api-endpoint');
+const modelSelect    = document.getElementById('model-select');
+const pipelineSlider = document.getElementById('pipeline-width');
+const pipelineVal    = document.getElementById('pipeline-val');
+const newConvoBtn    = document.getElementById('new-convo-btn');
+
+// ── Initialise settings UI from persisted state ────────────────
+apiEndpointEl.value = endpoint;
+pipelineSlider.value = pipelineWidth;
+pipelineVal.textContent = pipelineWidth;
+
+// ── Render persisted history on load ──────────────────────────
+function renderHistory() {
+  // Remove non-empty-state children first
+  const rows = chatArea.querySelectorAll('.msg-row');
+  rows.forEach(r => r.remove());
+
+  history.forEach(msg => {
+    if (msg.role === 'user') {
+      appendUserBubble(msg.content, false);
+    } else if (msg.role === 'assistant') {
+      appendAssistantBubble(msg.content, false);
+    }
+  });
+  updateEmptyState();
+  scrollToBottom();
+}
+
+// ── Empty state visibility ─────────────────────────────────────
+function updateEmptyState() {
+  const hasMessages = chatArea.querySelector('.msg-row') !== null;
+  emptyState.style.display = hasMessages ? 'none' : 'flex';
+}
+
+// ── Scroll helpers ─────────────────────────────────────────────
+function scrollToBottom() {
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function isNearBottom() {
+  return chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 120;
+}
+
+// ── Append user bubble ─────────────────────────────────────────
+function appendUserBubble(text, save = true) {
+  const row = document.createElement('div');
+  row.className = 'msg-row user';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble user';
+  bubble.textContent = text;
+
+  row.appendChild(bubble);
+  chatArea.appendChild(row);
+  updateEmptyState();
+  scrollToBottom();
+
+  if (save) {
+    history.push({ role: 'user', content: text });
+    saveHistory();
+  }
+  return bubble;
+}
+
+// ── Append assistant bubble ────────────────────────────────────
+// Returns { wrap, bubble } so streaming can update content.
+function appendAssistantBubble(text = '', save = true) {
+  const row = document.createElement('div');
+  row.className = 'msg-row assistant';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'bubble-wrap';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble assistant';
+
+  // If text is empty we'll show the typing indicator initially
+  if (text === '') {
+    const dots = document.createElement('div');
+    dots.className = 'typing-dots';
+    dots.innerHTML = '<span></span><span></span><span></span>';
+    dots.dataset.typing = 'true';
+    bubble.appendChild(dots);
+  } else {
+    bubble.textContent = text;
+  }
+
+  // Copy button
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'copy-msg-btn';
+  copyBtn.title = 'Copy to clipboard';
+  copyBtn.innerHTML = `
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+    </svg>
+    Copy`;
+  copyBtn.addEventListener('click', () => {
+    const content = bubble.textContent;
+    navigator.clipboard.writeText(content).then(() => {
+      copyBtn.textContent = 'Copied!';
+      copyBtn.classList.add('copied');
+      setTimeout(() => {
+        copyBtn.innerHTML = `
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+          Copy`;
+        copyBtn.classList.remove('copied');
+      }, 1800);
+    }).catch(() => {});
+  });
+
+  wrap.appendChild(bubble);
+  wrap.appendChild(copyBtn);
+  row.appendChild(wrap);
+  chatArea.appendChild(row);
+  updateEmptyState();
+  scrollToBottom();
+
+  if (save && text !== '') {
+    history.push({ role: 'assistant', content: text });
+    saveHistory();
+  }
+
+  return { wrap, bubble };
+}
+
+// ── Append error bubble ────────────────────────────────────────
+function appendErrorBubble(text) {
+  const row = document.createElement('div');
+  row.className = 'msg-row assistant';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble error';
+  bubble.textContent = text;
+
+  row.appendChild(bubble);
+  chatArea.appendChild(row);
+  updateEmptyState();
+  scrollToBottom();
+}
+
+// ── LocalStorage helpers ───────────────────────────────────────
+function saveHistory() {
+  const trimmed = history.slice(-MAX_HISTORY);
+  history = trimmed;
+  try { localStorage.setItem(LS_HISTORY, JSON.stringify(history)); } catch (_) {}
+}
+
+function saveSettings() {
+  localStorage.setItem(LS_ENDPOINT, endpoint);
+  localStorage.setItem(LS_MODEL, selectedModel);
+  localStorage.setItem(LS_PIPELINE, String(pipelineWidth));
+}
+
+// ── Network status polling ─────────────────────────────────────
+async function pollNetworkStatus() {
+  try {
+    const res = await fetch(`${endpoint}/v1/network/status`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const peers = typeof data.peer_count === 'number' ? data.peer_count : '?';
+    setNetBadge('healthy', `${peers} peer${peers !== 1 ? 's' : ''}`);
+    offlineBanner.classList.remove('visible');
+  } catch (_) {
+    setNetBadge('error', 'unreachable');
+    checkNodeOffline();
+  }
+}
+
+async function checkNodeOffline() {
+  try {
+    const res = await fetch(`${endpoint}/readyz`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) offlineBanner.classList.add('visible');
+    else offlineBanner.classList.remove('visible');
+  } catch (_) {
+    offlineBanner.classList.add('visible');
+  }
+}
+
+function setNetBadge(state, text) {
+  netBadge.className = state; // 'healthy' | 'error' | '' (connecting)
+  statusText.textContent = text;
+  if (state === 'healthy') {
+    statusDot.classList.add('pulse');
+  } else {
+    statusDot.classList.remove('pulse');
+  }
+}
+
+// ── Load models from API ───────────────────────────────────────
+async function loadModels() {
+  try {
+    const res = await fetch(`${endpoint}/v1/models`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const models = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+
+    modelSelect.innerHTML = '';
+    if (models.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '— no models found —';
+      modelSelect.appendChild(opt);
+    } else {
+      models.forEach(m => {
+        const id = typeof m === 'string' ? m : (m.id || m.name || String(m));
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        if (id === selectedModel) opt.selected = true;
+        modelSelect.appendChild(opt);
+      });
+      // If no stored model matched, use first
+      if (!selectedModel || !models.find(m => (m.id || m.name || m) === selectedModel)) {
+        const first = typeof models[0] === 'string' ? models[0] : (models[0].id || models[0].name || '');
+        selectedModel = first;
+        modelSelect.value = first;
+        saveSettings();
+      }
+    }
+  } catch (_) {
+    modelSelect.innerHTML = '<option value="">— could not load models —</option>';
+  }
+}
+
+// ── Send message & stream response ────────────────────────────
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text) return;
+  if (abortCtrl) return; // already streaming
+
+  // Reset textarea
+  msgInput.value = '';
+  msgInput.style.height = 'auto';
+
+  // Push user message to UI + history
+  appendUserBubble(text);
+
+  // Create assistant bubble with typing indicator
+  const { bubble } = appendAssistantBubble('');
+  let accumulated = '';
+
+  // Swap send/stop buttons
+  sendBtn.disabled = true;
+  stopBtn.classList.add('visible');
+
+  abortCtrl = new AbortController();
+
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+
+    const res = await fetch(`${endpoint}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: history.slice(0, -0).map(m => ({ role: m.role, content: m.content })),
+        // history already has the user message we just added
+        stream: true,
+        pipeline_width: pipelineWidth,
+      }),
+      signal: abortCtrl.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => `HTTP ${res.status}`);
+      clearTyping(bubble);
+      bubble.className = 'bubble error';
+      bubble.textContent = `Error ${res.status}: ${errText}`;
+      return;
+    }
+
+    // Remove typing indicator on first content
+    let firstToken = true;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process complete SSE lines
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep incomplete last line
+
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line || !line.startsWith('data:')) continue;
+
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') { reader.cancel(); break; }
+
+        let parsed;
+        try { parsed = JSON.parse(payload); } catch (_) { continue; }
+
+        const delta = parsed?.choices?.[0]?.delta?.content;
+        if (typeof delta !== 'string') continue;
+
+        if (firstToken) {
+          clearTyping(bubble);
+          firstToken = false;
+        }
+
+        accumulated += delta;
+        bubble.textContent = accumulated;
+
+        if (isNearBottom()) scrollToBottom();
+      }
+    }
+
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      // User stopped — keep partial text
+      if (!accumulated) {
+        bubble.className = 'bubble error';
+        bubble.textContent = 'Generation stopped.';
+      }
+    } else {
+      clearTyping(bubble);
+      bubble.className = 'bubble error';
+      bubble.textContent = `Connection error: ${err.message}`;
+    }
+  } finally {
+    abortCtrl = null;
+    sendBtn.disabled = false;
+    stopBtn.classList.remove('visible');
+
+    // Save assistant turn if we got content
+    if (accumulated) {
+      history.push({ role: 'assistant', content: accumulated });
+      saveHistory();
+    }
+    scrollToBottom();
+  }
+}
+
+// Remove the typing dots and clear bubble content
+function clearTyping(bubble) {
+  const dots = bubble.querySelector('.typing-dots');
+  if (dots) dots.remove();
+  bubble.textContent = '';
+}
+
+// ── Settings panel ─────────────────────────────────────────────
+function openSettings() {
+  loadModels();
+  overlay.classList.add('open');
+  settingsPanel.classList.add('open');
+  apiEndpointEl.focus();
+}
+
+function closeSettingsPanel() {
+  overlay.classList.remove('open');
+  settingsPanel.classList.remove('open');
+}
+
+// Persist settings changes immediately on input
+apiEndpointEl.addEventListener('change', () => {
+  endpoint = apiEndpointEl.value.trim().replace(/\/$/, '') || 'http://localhost:8080';
+  apiEndpointEl.value = endpoint;
+  saveSettings();
+  pollNetworkStatus();
+  loadModels();
+});
+
+modelSelect.addEventListener('change', () => {
+  selectedModel = modelSelect.value;
+  saveSettings();
+});
+
+pipelineSlider.addEventListener('input', () => {
+  pipelineWidth = parseInt(pipelineSlider.value, 10);
+  pipelineVal.textContent = pipelineWidth;
+  saveSettings();
+});
+
+newConvoBtn.addEventListener('click', () => {
+  history = [];
+  try { localStorage.removeItem(LS_HISTORY); } catch (_) {}
+  const rows = chatArea.querySelectorAll('.msg-row');
+  rows.forEach(r => r.remove());
+  updateEmptyState();
+  closeSettingsPanel();
+  msgInput.focus();
+});
+
+settingsBtn.addEventListener('click', openSettings);
+closeSettings.addEventListener('click', closeSettingsPanel);
+overlay.addEventListener('click', closeSettingsPanel);
+
+// Close on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && settingsPanel.classList.contains('open')) {
+    closeSettingsPanel();
+  }
+});
+
+// ── Input textarea auto-grow ───────────────────────────────────
+msgInput.addEventListener('input', () => {
+  msgInput.style.height = 'auto';
+  const lineH = parseFloat(getComputedStyle(msgInput).lineHeight) || 22;
+  const maxH  = lineH * 6 + 8;
+  msgInput.style.height = Math.min(msgInput.scrollHeight, maxH) + 'px';
+});
+
+// ── Send on Enter (Shift+Enter = newline) ──────────────────────
+msgInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+sendBtn.addEventListener('click', sendMessage);
+
+stopBtn.addEventListener('click', () => {
+  if (abortCtrl) {
+    abortCtrl.abort();
+  }
+});
+
+// ── Boot ───────────────────────────────────────────────────────
+(function init() {
+  renderHistory();
+  pollNetworkStatus();
+  loadModels();
+  setInterval(pollNetworkStatus, POLL_INTERVAL);
+  msgInput.focus();
+})();
+</script>
+</body>
+</html>

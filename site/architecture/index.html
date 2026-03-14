@@ -1,0 +1,3740 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Decentralised peer-to-peer LLM inference network">
+      
+      
+      
+        <link rel="canonical" href="https://openhydra.co/docs/architecture/">
+      
+      
+        <link rel="prev" href="..">
+      
+      
+        <link rel="next" href="../quickstart/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.4">
+    
+    
+      
+        <title>Architecture - OpenHydra</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#openhydra-architecture-complete-technical-reference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="OpenHydra" class="md-header__button md-logo" aria-label="OpenHydra" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            OpenHydra
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/openhydra-ai/openhydra" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    openhydra-ai/openhydra
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Architecture
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../quickstart/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Quick Start
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../api-reference/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../operator-guide/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Operator Guide
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../sdk/python/" class="md-tabs__link">
+          
+  
+  
+  SDK
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../petals-comparison/" class="md-tabs__link">
+          
+  
+  
+  Comparisons
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../contributing/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Contributing
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="OpenHydra" class="md-nav__button md-logo" aria-label="OpenHydra" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    OpenHydra
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/openhydra-ai/openhydra" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    openhydra-ai/openhydra
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#table-of-contents" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Table of Contents
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-system-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. System Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-module-map" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Module Map
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Module Map">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#entry-points" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Entry Points
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#codebase-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Codebase Statistics
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-request-lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Request Lifecycle
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Request Lifecycle">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#peer-sharding-request-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Sharding &amp; Request Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#non-streaming-v1completions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Non-streaming (/v1/completions)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#streaming-streamtrue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming (stream:true)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-dht-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. DHT Layer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. DHT Layer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dht-ring-bootstrap-peer-registration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DHT Ring — Bootstrap &amp; Peer Registration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#inmemorydhtnode-dhtnodepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        InMemoryDhtNode (dht/node.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dhtbootstraphandler-dhtbootstrappy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DhtBootstrapHandler (dht/bootstrap.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dht-cache-coordinatorenginepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DHT Cache (coordinator/engine.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-coordinator-engine" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Coordinator Engine
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Coordinator Engine">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#engineconfig-key-fields" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        EngineConfig (key fields)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-scoring-peer_selectorpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Scoring (peer_selector.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pipeline-assembly-concentration_guardpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pipeline Assembly (concentration_guard.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kv-affinity-enginepy_get_kv_affinity_peer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        KV Affinity (engine.py:_get_kv_affinity_peer)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#degradation-coordinatordegradationpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Degradation (coordinator/degradation.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-inference-chain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Inference Chain
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Inference Chain">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#inferencechain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        InferenceChain
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#chainresult" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ChainResult
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-peer-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Peer Server
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="7. Peer Server">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#startup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Startup
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#modelshard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ModelShard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pytorchruntime" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PyTorchRuntime
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#device-selection-peerhardwarepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Device Selection (peer/hardware.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dht-announce-peerdht_announcepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DHT Announce (peer/dht_announce.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-kv-cache-compaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. KV Cache Compaction
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. KV Cache Compaction">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#kv-compaction-decision-tree" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        KV Compaction Decision Tree
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#four-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Four Phases
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#selection-algorithms-_algorithmspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Selection Algorithms (_algorithms.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reference-queries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reference Queries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#compactionconfig-_configpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CompactionConfig (_config.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#radix-cache-_radix_cachepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Radix Cache (_radix_cache.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-economy-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Economy Layer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="9. Economy Layer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#appchain-economy-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        AppChain Economy Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#barter-credit-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Barter Credit System
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sqlitecreditledger-economybarterpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SqliteCreditLedger (economy/barter.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#state-channels-economystate_channelpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        State Channels (economy/state_channel.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#token-model-economytokenpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Token Model (economy/token.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ledger-bridge-coordinatorledger_bridgepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ledger Bridge (coordinator/ledger_bridge.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-grounding-rag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Grounding / RAG
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="10. Grounding / RAG">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pipeline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Compression
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="11. Compression">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lz4-codec-compressionlz4_codecpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LZ4 Codec (compression/lz4_codec.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#autoencoder-compressionautoencoderpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Autoencoder (compression/autoencoder.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-verification" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Verification
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#13-security-tls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13. Security &amp; TLS
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="13. Security &amp; TLS">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#peer-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Identity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#geo-challenge-peercryptopy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Geo-Challenge (peer/crypto.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#activation-encryption-onion-routing-peercryptopy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Activation Encryption &amp; Onion Routing (peer/crypto.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mtls-peertlspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        mTLS (peer/tls.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#differential-privacy-peerprivacypy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Differential Privacy (peer/privacy.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rate-limiting-coordinatorapi_serverpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rate Limiting (coordinator/api_server.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#secret-management-openhydra_secretspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Secret Management (openhydra_secrets.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#14-speculative-decoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        14. Speculative Decoding
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="14. Speculative Decoding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#architecture_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#drafttokenmodel-toy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DraftTokenModel (toy)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pytorchdraftmodel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PyTorchDraftModel
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#15-deployment" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        15. Deployment
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="15. Deployment">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bootstrap-nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bootstrap Nodes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#docker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Docker
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-registration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Registration
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#16-configuration-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        16. Configuration Reference
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="16. Configuration Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#coordinator-cli-flags-coordinatorapi_serverpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Coordinator CLI flags (coordinator/api_server.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-cli-flags-peerserverpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer CLI flags (peer/server.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#model-catalog-modelscatalogjson" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model Catalog (models.catalog.json)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api-reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operator-guide/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operator Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SDK
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    SDK
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdk/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sdk/typescript/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    TypeScript
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Comparisons
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Comparisons
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../petals-comparison/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Petals
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../beta-launch-strategy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Beta Launch Strategy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#table-of-contents" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Table of Contents
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-system-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. System Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-module-map" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Module Map
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Module Map">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#entry-points" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Entry Points
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#codebase-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Codebase Statistics
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-request-lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Request Lifecycle
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Request Lifecycle">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#peer-sharding-request-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Sharding &amp; Request Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#non-streaming-v1completions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Non-streaming (/v1/completions)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#streaming-streamtrue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming (stream:true)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-dht-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. DHT Layer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. DHT Layer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dht-ring-bootstrap-peer-registration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DHT Ring — Bootstrap &amp; Peer Registration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#inmemorydhtnode-dhtnodepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        InMemoryDhtNode (dht/node.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dhtbootstraphandler-dhtbootstrappy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DhtBootstrapHandler (dht/bootstrap.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dht-cache-coordinatorenginepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DHT Cache (coordinator/engine.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-coordinator-engine" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Coordinator Engine
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Coordinator Engine">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#engineconfig-key-fields" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        EngineConfig (key fields)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-scoring-peer_selectorpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Scoring (peer_selector.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pipeline-assembly-concentration_guardpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pipeline Assembly (concentration_guard.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kv-affinity-enginepy_get_kv_affinity_peer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        KV Affinity (engine.py:_get_kv_affinity_peer)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#degradation-coordinatordegradationpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Degradation (coordinator/degradation.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-inference-chain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Inference Chain
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Inference Chain">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#inferencechain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        InferenceChain
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#chainresult" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ChainResult
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-peer-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Peer Server
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="7. Peer Server">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#startup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Startup
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#modelshard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ModelShard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pytorchruntime" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PyTorchRuntime
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#device-selection-peerhardwarepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Device Selection (peer/hardware.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dht-announce-peerdht_announcepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DHT Announce (peer/dht_announce.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-kv-cache-compaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. KV Cache Compaction
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="8. KV Cache Compaction">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#kv-compaction-decision-tree" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        KV Compaction Decision Tree
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#four-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Four Phases
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#selection-algorithms-_algorithmspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Selection Algorithms (_algorithms.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reference-queries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reference Queries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#compactionconfig-_configpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CompactionConfig (_config.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#radix-cache-_radix_cachepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Radix Cache (_radix_cache.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-economy-layer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Economy Layer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="9. Economy Layer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#appchain-economy-flow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        AppChain Economy Flow
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#barter-credit-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Barter Credit System
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sqlitecreditledger-economybarterpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SqliteCreditLedger (economy/barter.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#state-channels-economystate_channelpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        State Channels (economy/state_channel.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#token-model-economytokenpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Token Model (economy/token.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ledger-bridge-coordinatorledger_bridgepy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ledger Bridge (coordinator/ledger_bridge.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-grounding-rag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Grounding / RAG
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="10. Grounding / RAG">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pipeline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Compression
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="11. Compression">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lz4-codec-compressionlz4_codecpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LZ4 Codec (compression/lz4_codec.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#autoencoder-compressionautoencoderpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Autoencoder (compression/autoencoder.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-verification" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Verification
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#13-security-tls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13. Security &amp; TLS
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="13. Security &amp; TLS">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#peer-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Identity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#geo-challenge-peercryptopy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Geo-Challenge (peer/crypto.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#activation-encryption-onion-routing-peercryptopy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Activation Encryption &amp; Onion Routing (peer/crypto.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#mtls-peertlspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        mTLS (peer/tls.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#differential-privacy-peerprivacypy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Differential Privacy (peer/privacy.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rate-limiting-coordinatorapi_serverpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rate Limiting (coordinator/api_server.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#secret-management-openhydra_secretspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Secret Management (openhydra_secrets.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#14-speculative-decoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        14. Speculative Decoding
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="14. Speculative Decoding">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#architecture_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#drafttokenmodel-toy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DraftTokenModel (toy)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pytorchdraftmodel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PyTorchDraftModel
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#15-deployment" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        15. Deployment
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="15. Deployment">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#bootstrap-nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bootstrap Nodes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#docker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Docker
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-registration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer Registration
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#16-configuration-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        16. Configuration Reference
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="16. Configuration Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#coordinator-cli-flags-coordinatorapi_serverpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Coordinator CLI flags (coordinator/api_server.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#peer-cli-flags-peerserverpy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Peer CLI flags (peer/server.py)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#model-catalog-modelscatalogjson" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model Catalog (models.catalog.json)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="openhydra-architecture-complete-technical-reference">OpenHydra Architecture — Complete Technical Reference<a class="headerlink" href="#openhydra-architecture-complete-technical-reference" title="Permanent link">&para;</a></h1>
+<blockquote>
+<p>Last updated: auto-generated from full codebase audit.
+Companion: <code>docs/petals-comparison.md</code> for the Petals vs OpenHydra deep-dive.</p>
+</blockquote>
+<hr />
+<h2 id="table-of-contents">Table of Contents<a class="headerlink" href="#table-of-contents" title="Permanent link">&para;</a></h2>
+<ol>
+<li><a href="#1-system-overview">System Overview</a></li>
+<li><a href="#2-module-map">Module Map</a></li>
+<li><a href="#3-request-lifecycle">Request Lifecycle</a></li>
+<li><a href="#4-dht-layer">DHT Layer</a></li>
+<li><a href="#5-coordinator-engine">Coordinator Engine</a></li>
+<li><a href="#6-inference-chain">Inference Chain</a></li>
+<li><a href="#7-peer-server">Peer Server</a></li>
+<li><a href="#8-kv-cache-compaction">KV Cache Compaction</a></li>
+<li><a href="#9-economy-layer">Economy Layer</a></li>
+<li><a href="#10-grounding-rag">Grounding / RAG</a></li>
+<li><a href="#11-compression">Compression</a></li>
+<li><a href="#12-verification">Verification</a></li>
+<li><a href="#13-security-tls">Security &amp; TLS</a></li>
+<li><a href="#14-speculative-decoding">Speculative Decoding</a></li>
+<li><a href="#15-deployment">Deployment</a></li>
+<li><a href="#16-configuration-reference">Configuration Reference</a></li>
+</ol>
+<hr />
+<h2 id="1-system-overview">1. System Overview<a class="headerlink" href="#1-system-overview" title="Permanent link">&para;</a></h2>
+<p>OpenHydra is a <strong>decentralised distributed LLM inference network</strong>. Multiple volunteer peers each run a full (or quantised) copy of a model. A centralised coordinator routes user requests to the best available peers, streams tokens back via SSE, and tracks contribution credits.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>                              ┌──────────────────────┐
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>                              │   Client / SDK        │
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>                              │  (OpenAI-compatible)  │
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>                              └──────────┬───────────┘
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                                         │ HTTPS POST /v1/chat/completions
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>                                         ▼
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>                              ┌──────────────────────┐
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>                              │    Coordinator        │
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>                              │  (coordinator/)       │
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>                              │  ┌────────────────┐   │
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>                              │  │  CoordinatorEngine│  │
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>                              │  │  - Peer ranking  │  │
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>                              │  │  - Pipeline asm  │  │
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>                              │  │  - KV affinity   │  │
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>                              │  │  - Speculation   │  │
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>                              │  │  - Verification  │  │
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>                              │  │  - Degradation   │  │
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>                              │  └────────────────┘   │
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>                              └───┬────────────────┬──┘
+<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>                                  │ gRPC            │ gRPC
+<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>                    ┌─────────────▼──┐        ┌────▼──────────────┐
+<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>                    │   Peer 0        │        │   Peer N           │
+<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a>                    │  (peer/)        │        │  (peer/)           │
+<a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a>                    │  PyTorchRuntime │        │  PyTorchRuntime    │
+<a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a>                    │  KV Compaction  │        │  KV Compaction     │
+<a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a>                    └────────────────┘        └───────────────────┘
+<a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a>                              ▲
+<a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a>                              │ HTTP lookup
+<a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a>                    ┌─────────┴────────┐
+<a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a>                    │  DHT Bootstrap    │
+<a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a>                    │  (dht/)           │
+<a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a>                    │  3 nodes: EU/US/AP│
+<a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a>                    └──────────────────┘
+</code></pre></div>
+<p><strong>Key design choices:</strong>
+- <strong>Coordinator is stateful</strong> for one request but stateless across requests (no per-user memory beyond KV affinity cache).
+- <strong>Peers are stateless</strong> beyond their loaded model weights and KV compaction cache.
+- <strong>DHT is an HTTP overlay</strong> (not libp2p), with 3 fixed bootstrap Linode nodes acting as an announcement board.
+- Each peer runs a <strong>full model</strong> — there is currently no layer-level decomposition (see <code>docs/petals-comparison.md</code>).</p>
+<hr />
+<h2 id="2-module-map">2. Module Map<a class="headerlink" href="#2-module-map" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>openhydra/
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>├── coordinator/          # Routing, API, inference orchestration
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>│   ├── engine.py         # CoordinatorEngine (3017 lines) — core logic
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>│   ├── api_server.py     # HTTP server + CLI, 58 KB
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>│   ├── chain.py          # InferenceChain — sequential gRPC execution
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>│   ├── node.py           # Unified daemon: runs peer + coordinator together
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>│   ├── peer_selector.py  # Peer ranking/scoring
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>│   ├── path_finder.py    # DHT queries, TCP keep-alive session
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>│   ├── concentration_guard.py  # Anti-monopoly pipeline assembly
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>│   ├── degradation.py    # Fallback to lighter models
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>│   ├── speculative.py    # Draft model + token verification
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>│   ├── bandwidth_roles.py     # Prefill vs decode peer roles
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>│   ├── health_scorer.py  # Peer health tracking
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>│   ├── ledger_bridge.py  # Economy integration
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>│   ├── replication_monitor.py # Under-replication alerting
+<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>│   ├── mystery_shopper.py     # Background quality probes
+<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>│   ├── interactive_cli.py     # prompt_toolkit TUI (/chat, /ask, /status, /balance, /models)
+<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>│   ├── client_cli.py     # One-shot CLI inference
+<a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a>│   ├── transport.py      # gRPC channel factory
+<a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>│   └── stun_client.py    # NAT traversal
+<a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a>│
+<a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a>├── dht/                  # Peer discovery overlay
+<a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a>│   ├── bootstrap.py      # HTTP DHT server (ThreadingHTTPServer)
+<a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a>│   └── node.py           # InMemoryDhtNode — in-process DHT storage
+<a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a>│
+<a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a>├── peer/                 # Inference execution node
+<a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a>│   ├── server.py         # gRPC server, 62 KB
+<a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a>│   ├── model_shard.py    # ModelShard — full inference runtime, 74 KB
+<a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a>│   ├── peer.proto        # gRPC service definition (ForwardRequest/Response)
+<a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a>│   ├── dht_announce.py   # Background DHT heartbeat thread
+<a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a>│   ├── hardware.py       # Device/VRAM detection
+<a id="__codelineno-1-32" name="__codelineno-1-32" href="#__codelineno-1-32"></a>│   ├── identity.py       # Ed25519 peer keys (~/.openhydra/identity.key)
+<a id="__codelineno-1-33" name="__codelineno-1-33" href="#__codelineno-1-33"></a>│   ├── crypto.py         # X25519 ECDH, AES-GCM, onion routing, 28 KB
+<a id="__codelineno-1-34" name="__codelineno-1-34" href="#__codelineno-1-34"></a>│   ├── privacy.py        # Differential privacy noise + audit tags
+<a id="__codelineno-1-35" name="__codelineno-1-35" href="#__codelineno-1-35"></a>│   ├── pytorch_activation_compressor.py  # Activation compression
+<a id="__codelineno-1-36" name="__codelineno-1-36" href="#__codelineno-1-36"></a>│   ├── tls.py            # mTLS certificate management
+<a id="__codelineno-1-37" name="__codelineno-1-37" href="#__codelineno-1-37"></a>│   ├── daemon_monitor.py # Daemon modes: polite / power_user / dedicated
+<a id="__codelineno-1-38" name="__codelineno-1-38" href="#__codelineno-1-38"></a>│   ├── kv_compaction/    # KV cache compression subsystem
+<a id="__codelineno-1-39" name="__codelineno-1-39" href="#__codelineno-1-39"></a>│   │   ├── _algorithms.py     # HAK + OMP selection algorithms
+<a id="__codelineno-1-40" name="__codelineno-1-40" href="#__codelineno-1-40"></a>│   │   ├── _beta_inject.py    # Attention bias patching
+<a id="__codelineno-1-41" name="__codelineno-1-41" href="#__codelineno-1-41"></a>│   │   ├── _cache.py          # CompactedKVCache wrapper
+<a id="__codelineno-1-42" name="__codelineno-1-42" href="#__codelineno-1-42"></a>│   │   ├── _compactor.py      # compact_past_key_values() entry point
+<a id="__codelineno-1-43" name="__codelineno-1-43" href="#__codelineno-1-43"></a>│   │   ├── _config.py         # CompactionConfig dataclass
+<a id="__codelineno-1-44" name="__codelineno-1-44" href="#__codelineno-1-44"></a>│   │   ├── _query_capture.py  # AttentionQueryCapture hook
+<a id="__codelineno-1-45" name="__codelineno-1-45" href="#__codelineno-1-45"></a>│   │   └── _radix_cache.py    # Radix tree cache indexing
+<a id="__codelineno-1-46" name="__codelineno-1-46" href="#__codelineno-1-46"></a>│   └── models/
+<a id="__codelineno-1-47" name="__codelineno-1-47" href="#__codelineno-1-47"></a>│       ├── llama/        # Llama-specific model helpers
+<a id="__codelineno-1-48" name="__codelineno-1-48" href="#__codelineno-1-48"></a>│       └── qwen3/        # Qwen3-specific model helpers
+<a id="__codelineno-1-49" name="__codelineno-1-49" href="#__codelineno-1-49"></a>│
+<a id="__codelineno-1-50" name="__codelineno-1-50" href="#__codelineno-1-50"></a>├── economy/              # Two-layer economic system
+<a id="__codelineno-1-51" name="__codelineno-1-51" href="#__codelineno-1-51"></a>│   ├── barter.py         # Tier 1: CreditLedger + SqliteCreditLedger
+<a id="__codelineno-1-52" name="__codelineno-1-52" href="#__codelineno-1-52"></a>│   ├── state_channel.py  # Off-chain micro-payment channels
+<a id="__codelineno-1-53" name="__codelineno-1-53" href="#__codelineno-1-53"></a>│   ├── token.py          # Tier 2: HYDRA token (supply cap 69M), 27 KB
+<a id="__codelineno-1-54" name="__codelineno-1-54" href="#__codelineno-1-54"></a>│   └── postgres.py       # Optional Postgres ledger backend, 21 KB
+<a id="__codelineno-1-55" name="__codelineno-1-55" href="#__codelineno-1-55"></a>│
+<a id="__codelineno-1-56" name="__codelineno-1-56" href="#__codelineno-1-56"></a>├── verification/         # Three-tier verification system
+<a id="__codelineno-1-57" name="__codelineno-1-57" href="#__codelineno-1-57"></a>│   ├── auditor.py        # Tier 3: AuditSampler (Bernoulli spot-check)
+<a id="__codelineno-1-58" name="__codelineno-1-58" href="#__codelineno-1-58"></a>│   ├── mystery_shopper.py# Tier 1: random re-execution placeholder
+<a id="__codelineno-1-59" name="__codelineno-1-59" href="#__codelineno-1-59"></a>│   ├── redundant.py      # Tier 2: N-peer majority vote placeholder
+<a id="__codelineno-1-60" name="__codelineno-1-60" href="#__codelineno-1-60"></a>│   └── reputation.py     # Reputation score computation
+<a id="__codelineno-1-61" name="__codelineno-1-61" href="#__codelineno-1-61"></a>│
+<a id="__codelineno-1-62" name="__codelineno-1-62" href="#__codelineno-1-62"></a>├── grounding/            # Retrieval-Augmented Generation
+<a id="__codelineno-1-63" name="__codelineno-1-63" href="#__codelineno-1-63"></a>│   └── client_rag.py     # GroundingClient (DuckDuckGo instant answers)
+<a id="__codelineno-1-64" name="__codelineno-1-64" href="#__codelineno-1-64"></a>│
+<a id="__codelineno-1-65" name="__codelineno-1-65" href="#__codelineno-1-65"></a>├── compression/          # Activation compression codecs
+<a id="__codelineno-1-66" name="__codelineno-1-66" href="#__codelineno-1-66"></a>│   ├── autoencoder.py    # Stride-based mean-pool encoder (latent_dim=1024)
+<a id="__codelineno-1-67" name="__codelineno-1-67" href="#__codelineno-1-67"></a>│   └── lz4_codec.py      # LZ4 fast compression placeholder
+<a id="__codelineno-1-68" name="__codelineno-1-68" href="#__codelineno-1-68"></a>│
+<a id="__codelineno-1-69" name="__codelineno-1-69" href="#__codelineno-1-69"></a>├── torrent/              # Model weight distribution
+<a id="__codelineno-1-70" name="__codelineno-1-70" href="#__codelineno-1-70"></a>│   ├── genesis.py        # Torrent manifest generator for model weights
+<a id="__codelineno-1-71" name="__codelineno-1-71" href="#__codelineno-1-71"></a>│   ├── seeder.py         # Seeding incentive arbitration
+<a id="__codelineno-1-72" name="__codelineno-1-72" href="#__codelineno-1-72"></a>│   └── session.py        # Torrent session bootstrap config
+<a id="__codelineno-1-73" name="__codelineno-1-73" href="#__codelineno-1-73"></a>│
+<a id="__codelineno-1-74" name="__codelineno-1-74" href="#__codelineno-1-74"></a>├── sdk/
+<a id="__codelineno-1-75" name="__codelineno-1-75" href="#__codelineno-1-75"></a>│   ├── python/           # Python client SDK
+<a id="__codelineno-1-76" name="__codelineno-1-76" href="#__codelineno-1-76"></a>│   │   └── openhydra_sdk/client.py
+<a id="__codelineno-1-77" name="__codelineno-1-77" href="#__codelineno-1-77"></a>│   └── typescript/       # TypeScript/Node.js SDK (WIP)
+<a id="__codelineno-1-78" name="__codelineno-1-78" href="#__codelineno-1-78"></a>│
+<a id="__codelineno-1-79" name="__codelineno-1-79" href="#__codelineno-1-79"></a>├── web/                  # Browser chat UI
+<a id="__codelineno-1-80" name="__codelineno-1-80" href="#__codelineno-1-80"></a>├── desktop/              # Tauri v2 (Rust + JS) native desktop app
+<a id="__codelineno-1-81" name="__codelineno-1-81" href="#__codelineno-1-81"></a>├── landing/              # Static marketing site
+<a id="__codelineno-1-82" name="__codelineno-1-82" href="#__codelineno-1-82"></a>├── ops/                  # Infrastructure as code
+<a id="__codelineno-1-83" name="__codelineno-1-83" href="#__codelineno-1-83"></a>│   ├── bootstrap/        # Bootstrap node provisioning + nginx template
+<a id="__codelineno-1-84" name="__codelineno-1-84" href="#__codelineno-1-84"></a>│   ├── terraform/        # Cloud IaC
+<a id="__codelineno-1-85" name="__codelineno-1-85" href="#__codelineno-1-85"></a>│   ├── monitoring/       # Prometheus + Grafana
+<a id="__codelineno-1-86" name="__codelineno-1-86" href="#__codelineno-1-86"></a>│   └── increase_ulimit.sh
+<a id="__codelineno-1-87" name="__codelineno-1-87" href="#__codelineno-1-87"></a>├── scripts/
+<a id="__codelineno-1-88" name="__codelineno-1-88" href="#__codelineno-1-88"></a>│   ├── slo_chaos_test.py       # p95 &lt; 1.5s SLO validation
+<a id="__codelineno-1-89" name="__codelineno-1-89" href="#__codelineno-1-89"></a>│   ├── bench_kv_compaction.py  # KV cache benchmarks
+<a id="__codelineno-1-90" name="__codelineno-1-90" href="#__codelineno-1-90"></a>│   └── optimize_head_budgets.py
+<a id="__codelineno-1-91" name="__codelineno-1-91" href="#__codelineno-1-91"></a>├── tests/                # 411 pytest tests, 9 skipped
+<a id="__codelineno-1-92" name="__codelineno-1-92" href="#__codelineno-1-92"></a>├── openhydra_defaults.py # Central constants + production bootstrap URLs
+<a id="__codelineno-1-93" name="__codelineno-1-93" href="#__codelineno-1-93"></a>├── openhydra_logging.py  # JSON (prod) / text (dev) structured logging
+<a id="__codelineno-1-94" name="__codelineno-1-94" href="#__codelineno-1-94"></a>├── openhydra_secrets.py  # Secret store (0600 files, env override)
+<a id="__codelineno-1-95" name="__codelineno-1-95" href="#__codelineno-1-95"></a>├── models.catalog.json   # Model registry (19 models)
+<a id="__codelineno-1-96" name="__codelineno-1-96" href="#__codelineno-1-96"></a>├── Dockerfile
+<a id="__codelineno-1-97" name="__codelineno-1-97" href="#__codelineno-1-97"></a>├── docker-compose.yml         # Single-node
+<a id="__codelineno-1-98" name="__codelineno-1-98" href="#__codelineno-1-98"></a>└── docker-compose.ha.yml      # High-availability multi-peer
+</code></pre></div>
+<h3 id="entry-points">Entry Points<a class="headerlink" href="#entry-points" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Module</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>openhydra-node</code></td>
+<td><code>coordinator.node</code></td>
+<td><strong>Primary</strong>: unified peer + coordinator in one process</td>
+</tr>
+<tr>
+<td><code>openhydra-peer</code></td>
+<td><code>peer.server</code></td>
+<td>Peer gRPC server only</td>
+</tr>
+<tr>
+<td><code>openhydra-coordinator</code></td>
+<td><code>coordinator.api_server</code></td>
+<td>Coordinator HTTP API only</td>
+</tr>
+<tr>
+<td><code>openhydra-dht</code></td>
+<td><code>dht.bootstrap</code></td>
+<td>DHT bootstrap tracker</td>
+</tr>
+<tr>
+<td><code>openhydra-shell</code></td>
+<td><code>coordinator.interactive_cli</code></td>
+<td>Interactive TUI</td>
+</tr>
+<tr>
+<td><code>openhydra</code></td>
+<td><code>coordinator.client_cli</code></td>
+<td>One-shot CLI inference</td>
+</tr>
+<tr>
+<td><code>openhydra-genesis</code></td>
+<td><code>torrent.genesis</code></td>
+<td>Torrent manifest generator</td>
+</tr>
+</tbody>
+</table>
+<h3 id="codebase-statistics">Codebase Statistics<a class="headerlink" href="#codebase-statistics" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Files</th>
+<th>Size</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>coordinator/</td>
+<td>18</td>
+<td>~80 KB</td>
+<td>HTTP API + engine + routing</td>
+</tr>
+<tr>
+<td>peer/</td>
+<td>18</td>
+<td>~40 KB</td>
+<td>Model shard + gRPC server</td>
+</tr>
+<tr>
+<td>dht/</td>
+<td>2</td>
+<td>~40 KB</td>
+<td>DHT bootstrap + lookup</td>
+</tr>
+<tr>
+<td>economy/</td>
+<td>4</td>
+<td>~60 KB</td>
+<td>Barter + HYDRA ledgers</td>
+</tr>
+<tr>
+<td>verification/</td>
+<td>4</td>
+<td>~800 B</td>
+<td>Auditing scaffolds</td>
+</tr>
+<tr>
+<td>grounding/</td>
+<td>1</td>
+<td>~190 B</td>
+<td>RAG via DuckDuckGo</td>
+</tr>
+<tr>
+<td>compression/</td>
+<td>2</td>
+<td>~350 B</td>
+<td>Tensor autoencoder placeholder</td>
+</tr>
+<tr>
+<td>torrent/</td>
+<td>3</td>
+<td>~10 KB</td>
+<td>Genesis + seeding</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>~100</strong></td>
+<td><strong>~290 KB</strong></td>
+<td>Core inference engine</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-request-lifecycle">3. Request Lifecycle<a class="headerlink" href="#3-request-lifecycle" title="Permanent link">&para;</a></h2>
+<h3 id="peer-sharding-request-flow">Peer Sharding &amp; Request Flow<a class="headerlink" href="#peer-sharding-request-flow" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>sequenceDiagram
+    participant C as Client / SDK
+    participant CO as Coordinator
+    participant DHT as DHT Bootstrap
+    participant P0 as PeerShard[0]
+    participant P1 as PeerShard[1]
+    participant PN as PeerShard[N]
+
+    C-&gt;&gt;CO: POST /v1/chat/completions
+    CO-&gt;&gt;DHT: GET /lookup?model_id=...
+    DHT--&gt;&gt;CO: [{peer_id, endpoint, latency_ms, ...}]
+
+    Note over CO: Rank peers, assemble pipeline,&lt;br/&gt;apply degradation/concentration guard
+
+    CO-&gt;&gt;P0: gRPC ForwardRequest(prompt_tokens)
+    P0--&gt;&gt;CO: ForwardResponse(activation[0])
+    CO-&gt;&gt;P1: gRPC ForwardRequest(activation[0])
+    P1--&gt;&gt;CO: ForwardResponse(activation[1])
+    CO-&gt;&gt;PN: gRPC ForwardRequest(activation[N-1])
+    PN--&gt;&gt;CO: ForwardResponse(final_activation)
+
+    Note over CO: Decode token, verify,&lt;br/&gt;earn credits for peers
+
+    CO--&gt;&gt;C: SSE token stream</code></pre>
+<h3 id="non-streaming-v1completions">Non-streaming (<code>/v1/completions</code>)<a class="headerlink" href="#non-streaming-v1completions" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Client
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>  │  POST /v1/chat/completions {model, messages, stream:false}
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  ▼
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>api_server.py  →  CoordinatorEngine.infer_chat()
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  │
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>  ├─ 1. Convert messages → prompt string (_messages_to_model_prompt)
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>  ├─ 2. Validate priority credits (ledger)
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>  ├─ 3. Compute deadline = now + max_latency_ms
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>  │
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>  ├─ _prepare_inference()
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>  │   ├─ a. Grounding/RAG  (GroundingClient.search, 3s timeout)
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>  │   ├─ b. DHT lookup     (_discover_for_model → _cached_dht_peers, 3s timeout)
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>  │   ├─ c. Peer ranking   (peer_selector.rank_peers)
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>  │   ├─ d. Degradation    (DegradationPolicy.select)
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>  │   ├─ e. Pipeline asm   (concentration_guard.assemble_pipeline)
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>  │   ├─ f. Bandwidth asm  (_apply_bandwidth_asymmetry)
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>  │   └─ g. MoE geo-shard  (_apply_moe_geo_sharding)
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>  │
+<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>  ├─ _run_chain(primary_pipeline)      ─────────────┐
+<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>  ├─ _run_chain(secondary_pipeline) [threaded]       │ InferenceChain
+<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>  └─ _run_chain(tertiary_pipeline)  [threaded]       │
+<a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>                                                     │
+<a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>                                    ┌────────────────▼────┐
+<a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>                                    │   InferenceChain     │
+<a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a>                                    │   for peer in pipeline:
+<a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a>                                    │     stage 0: forward(prompt_tokens)
+<a id="__codelineno-2-27" name="__codelineno-2-27" href="#__codelineno-2-27"></a>                                    │     stage N: forward(activation)
+<a id="__codelineno-2-28" name="__codelineno-2-28" href="#__codelineno-2-28"></a>                                    │   Returns ChainResult(activation, traces)
+<a id="__codelineno-2-29" name="__codelineno-2-29" href="#__codelineno-2-29"></a>                                    └─────────────────────┘
+<a id="__codelineno-2-30" name="__codelineno-2-30" href="#__codelineno-2-30"></a>  │
+<a id="__codelineno-2-31" name="__codelineno-2-31" href="#__codelineno-2-31"></a>  ├─ Verification (compare primary/secondary/tertiary)
+<a id="__codelineno-2-32" name="__codelineno-2-32" href="#__codelineno-2-32"></a>  ├─ Ledger: earn credits for winning peer
+<a id="__codelineno-2-33" name="__codelineno-2-33" href="#__codelineno-2-33"></a>  └─ Return {response, latency_ms, pipeline, verification, ...}
+</code></pre></div>
+<h3 id="streaming-streamtrue">Streaming (<code>stream:true</code>)<a class="headerlink" href="#streaming-streamtrue" title="Permanent link">&para;</a></h3>
+<p>Same preparation path. After <code>_prepare_inference</code>, enters <code>infer_stream()</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>infer_stream()
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>  ├─ Round 0: _run_chain(prompt)  →  activation[0]
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>  │            decode activation → token[0]
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>  │            yield token[0]  (first token → TTFT measured here)
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>  │
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>  ├─ Round 1: prefetch _run_chain(activation[0]) in ThreadPoolExecutor
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>  │            while prefetch runs, yield token[0] to client
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>  │            when prefetch done: activation[1] → token[1], yield
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>  │
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>  └─ ... until max_tokens or EOS
+</code></pre></div>
+<p><strong>Pipeline-parallel prefetch:</strong> rounds N and N+1 overlap — the gRPC call for round N+1 is in flight while round N's token is being sent to the client.</p>
+<hr />
+<h2 id="4-dht-layer">4. DHT Layer<a class="headerlink" href="#4-dht-layer" title="Permanent link">&para;</a></h2>
+<h3 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&para;</a></h3>
+<p>OpenHydra uses a <strong>custom HTTP-based DHT</strong> (not libp2p/Kademlia). Three permanent bootstrap nodes serve as a shared announcement board.</p>
+<h3 id="dht-ring-bootstrap-peer-registration">DHT Ring — Bootstrap &amp; Peer Registration<a class="headerlink" href="#dht-ring-bootstrap-peer-registration" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>flowchart LR
+    subgraph Bootstrap Nodes
+        EU["EU Bootstrap&lt;br/&gt;172.105.69.49:8468"]
+        US["US Bootstrap&lt;br/&gt;45.79.190.172:8468"]
+        AP["AP Bootstrap&lt;br/&gt;172.104.164.98:8468"]
+    end
+
+    P1[Peer A] --&gt;|POST /register| EU
+    P2[Peer B] --&gt;|POST /register| US
+    P3[Peer C] --&gt;|POST /register| AP
+
+    CO[Coordinator] --&gt;|GET /lookup?model_id=X| EU
+    CO --&gt;|GET /lookup?model_id=X| US
+    CO --&gt;|GET /lookup?model_id=X| AP
+
+    EU -.-&gt;|peer list response| CO
+    US -.-&gt;|peer list response| CO
+    AP -.-&gt;|peer list response| CO
+
+    EU &lt;--&gt;|cross-sync TTL 300s| US
+    US &lt;--&gt;|cross-sync TTL 300s| AP</code></pre>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Peer startup:
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>  POST http://&lt;bootstrap&gt;:8468/register
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>  Body: {peer_id, model_id, endpoint_url, shard_index, total_shards, tags, ...}
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>  TTL: 300s (peers re-announce every ~60s via dht_announce.py)
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>Coordinator lookup:
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>  GET http://&lt;bootstrap&gt;:8468/lookup?model_id=openhydra-qwen3.5-0.8b
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>  Response: [{peer_id, endpoint_url, latency_ms, reputation, ...}, ...]
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>Bootstrap nodes (production):
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>  EU:  172.105.69.49:8468   (via nginx 443 → :8468)
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>  US:  45.79.190.172:8468
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>  AP:  172.104.164.98:8468
+</code></pre></div>
+<h3 id="inmemorydhtnode-dhtnodepy">InMemoryDhtNode (<code>dht/node.py</code>)<a class="headerlink" href="#inmemorydhtnode-dhtnodepy" title="Permanent link">&para;</a></h3>
+<p>In-process storage with per-model peer lists. Keys are <code>model:&lt;model_id&gt;</code> and <code>model:&lt;model_id&gt;:dsht:&lt;replica_index&gt;</code>. Entries expire after <code>ttl_seconds</code> (default 300s).</p>
+<h3 id="dhtbootstraphandler-dhtbootstrappy">DhtBootstrapHandler (<code>dht/bootstrap.py</code>)<a class="headerlink" href="#dhtbootstraphandler-dhtbootstrappy" title="Permanent link">&para;</a></h3>
+<p><code>BaseHTTPRequestHandler</code> subclass serving:
+- <code>POST /register</code> — peer self-registration
+- <code>GET /lookup?model_id=X</code> — coordinator peer discovery
+- <code>GET /health</code> — liveness check
+- <code>GET /metrics</code> — peer count per model</p>
+<p><strong>HTTP/1.1 keep-alive</strong> (<code>protocol_version = "HTTP/1.1"</code>) and <strong>30s idle timeout</strong> (<code>timeout = 30</code>) are set to prevent C10K exhaustion with 5000+ concurrent peers.</p>
+<h3 id="dht-cache-coordinatorenginepy">DHT Cache (<code>coordinator/engine.py</code>)<a class="headerlink" href="#dht-cache-coordinatorenginepy" title="Permanent link">&para;</a></h3>
+<p>The coordinator maintains a <code>_dht_peer_cache</code> (120s TTL) to avoid hammering bootstrap nodes on every request. <code>list_models()</code> reads from this cache; only inference path (<code>/v1/chat/completions</code>) triggers a live DHT lookup.</p>
+<hr />
+<h2 id="5-coordinator-engine">5. Coordinator Engine<a class="headerlink" href="#5-coordinator-engine" title="Permanent link">&para;</a></h2>
+<p><strong>File:</strong> <code>coordinator/engine.py</code> (3017 lines)</p>
+<h3 id="engineconfig-key-fields">EngineConfig (key fields)<a class="headerlink" href="#engineconfig-key-fields" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dht_lookup_timeout_s</code></td>
+<td>3.0</td>
+<td>Per-bootstrap HTTP timeout</td>
+</tr>
+<tr>
+<td><code>dht_lookup_cache_ttl_s</code></td>
+<td>120.0</td>
+<td>DHT peer cache TTL</td>
+</tr>
+<tr>
+<td><code>pipeline_width</code></td>
+<td>3</td>
+<td>Peers in primary pipeline</td>
+</tr>
+<tr>
+<td><code>max_pipeline_width</code></td>
+<td>16</td>
+<td>Hard cap</td>
+</tr>
+<tr>
+<td><code>timeout_ms</code></td>
+<td>500</td>
+<td>Per-hop gRPC timeout</td>
+</tr>
+<tr>
+<td><code>max_latency_ms</code></td>
+<td>5000</td>
+<td>Total request deadline</td>
+</tr>
+<tr>
+<td><code>max_failovers_per_stage</code></td>
+<td>1</td>
+<td>Retry peers per stage</td>
+</tr>
+<tr>
+<td><code>kv_affinity_ttl_seconds</code></td>
+<td>1800</td>
+<td>Session affinity TTL</td>
+</tr>
+<tr>
+<td><code>kv_affinity_enabled</code></td>
+<td>True</td>
+<td>Sticky peer routing</td>
+</tr>
+<tr>
+<td><code>grounding_enabled</code></td>
+<td>False</td>
+<td>RAG injection</td>
+</tr>
+<tr>
+<td><code>grounding_timeout_s</code></td>
+<td>3.0</td>
+<td>RAG fetch timeout</td>
+</tr>
+<tr>
+<td><code>required_replicas</code></td>
+<td>3</td>
+<td>Min peers for a model to be "healthy"</td>
+</tr>
+</tbody>
+</table>
+<h3 id="peer-scoring-peer_selectorpy">Peer Scoring (<code>peer_selector.py</code>)<a class="headerlink" href="#peer-scoring-peer_selectorpy" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Tier 1 (only one candidate): latency inverse</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">score</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="nb">max</span><span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">latency_ms</span><span class="p">)</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1"># Tier 2+ (multiple candidates): weighted multi-factor</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">score</span> <span class="o">=</span> <span class="p">(</span><span class="mf">0.45</span> <span class="o">*</span> <span class="n">latency_score</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>       <span class="o">+</span> <span class="mf">0.30</span> <span class="o">*</span> <span class="n">load_headroom_score</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>       <span class="o">+</span> <span class="mf">0.25</span> <span class="o">*</span> <span class="n">reputation_score</span><span class="p">)</span>
+</code></pre></div>
+<p>Peers are sorted by score descending. Top-N become the primary pipeline; remainder are the failover pool.</p>
+<h3 id="pipeline-assembly-concentration_guardpy">Pipeline Assembly (<code>concentration_guard.py</code>)<a class="headerlink" href="#pipeline-assembly-concentration_guardpy" title="Permanent link">&para;</a></h3>
+<p><code>assemble_pipeline(ranked_candidates, pipeline_width, cap_fraction=0.33)</code>:
+- Fills pipeline slots greedily from ranked candidates
+- Enforces: no single <code>operator_id</code> may hold more than 33% of the pipeline
+- Returns <code>(pipeline, failover_pool)</code></p>
+<h3 id="kv-affinity-enginepy_get_kv_affinity_peer">KV Affinity (<code>engine.py:_get_kv_affinity_peer</code>)<a class="headerlink" href="#kv-affinity-enginepy_get_kv_affinity_peer" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Key: (session_id, model_id)</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="c1"># On hit: re-select the same peer as prefill stage 0</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="c1"># On miss / expiry: fresh selection, store result for next request</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1"># TTL: kv_affinity_ttl_seconds (30 min default)</span>
+</code></pre></div>
+<h3 id="degradation-coordinatordegradationpy">Degradation (<code>coordinator/degradation.py</code>)<a class="headerlink" href="#degradation-coordinatordegradationpy" title="Permanent link">&para;</a></h3>
+<p><code>DegradationPolicy.select()</code> iterates the model catalog (ordered large→small). If the requested model has fewer healthy peers than <code>required_peers</code>, it falls back to the next lighter model with sufficient peers.</p>
+<hr />
+<h2 id="6-inference-chain">6. Inference Chain<a class="headerlink" href="#6-inference-chain" title="Permanent link">&para;</a></h2>
+<p><strong>File:</strong> <code>coordinator/chain.py</code></p>
+<h3 id="inferencechain">InferenceChain<a class="headerlink" href="#inferencechain" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">class</span><span class="w"> </span><span class="nc">InferenceChain</span><span class="p">:</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>    <span class="n">pipeline</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PeerEndpoint</span><span class="p">]</span>   <span class="c1"># primary N peers</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    <span class="n">failover_pool</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PeerEndpoint</span><span class="p">]</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>    <span class="n">timeout_s</span><span class="p">:</span> <span class="nb">float</span>               <span class="c1"># per-hop, from timeout_ms / 1000</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="n">deadline</span><span class="p">:</span> <span class="nb">float</span>                <span class="c1"># absolute UNIX timestamp</span>
+</code></pre></div>
+<p><strong>Stage execution loop:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>for stage_index, primary_peer in enumerate(pipeline):
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>    candidates = [primary_peer] + failover_peers[:max_failovers_per_stage]
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>    for attempt, peer in enumerate(candidates):
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>        remaining = deadline - time.time()
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>        effective_timeout = min(timeout_s, remaining)
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>        try:
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>            grpc_stub = get_stub(peer.endpoint_url)
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>            if stage_index == 0:
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>                result = stub.Forward(InferRequest(prompt=prompt, ...))
+<a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>            else:
+<a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>                result = stub.Forward(InferRequest(activation=prev_activation, ...))
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>            traces.append(StageTrace(peer_id, latency_ms, attempt))
+<a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a>            break
+<a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a>        except grpc.RpcError:
+<a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>            continue  # try next candidate
+<a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a>    else:
+<a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a>        raise RuntimeError(f&quot;stage {stage_index} failed&quot;)
+</code></pre></div>
+<p><strong>Stage 0</strong> sends the raw prompt tokens. <strong>Stages 1..N</strong> send the activation tensor returned by the previous stage. The last stage returns a decoded text response.</p>
+<h3 id="chainresult">ChainResult<a class="headerlink" href="#chainresult" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">class</span><span class="w"> </span><span class="nc">ChainResult</span><span class="p">:</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>    <span class="n">response</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>    <span class="n">activation</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="n">latency_ms</span><span class="p">:</span> <span class="nb">float</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>    <span class="n">traces</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">StageTrace</span><span class="p">]</span>    <span class="c1"># one per pipeline stage</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>    <span class="n">peer_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a>    <span class="n">token_count</span><span class="p">:</span> <span class="nb">int</span>
+</code></pre></div>
+<hr />
+<h2 id="7-peer-server">7. Peer Server<a class="headerlink" href="#7-peer-server" title="Permanent link">&para;</a></h2>
+<p><strong>Files:</strong> <code>peer/server.py</code>, <code>peer/model_shard.py</code></p>
+<h3 id="startup">Startup<a class="headerlink" href="#startup" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>python3<span class="w"> </span>-m<span class="w"> </span>peer.server<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span>--peer-id<span class="w"> </span>my-peer<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">  </span>--port<span class="w"> </span><span class="m">50051</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">  </span>--model-id<span class="w"> </span>openhydra-qwen3.5-0.8b<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="w">  </span>--runtime-backend<span class="w"> </span>pytorch_auto<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="w">  </span>--runtime-target<span class="w"> </span>auto<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="w">  </span>--runtime-model-id<span class="w"> </span>Qwen/Qwen3.5-0.8B<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="w">  </span>--shard-index<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="w">  </span>--total-shards<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="w">  </span>--bootstrap-nodes<span class="w"> </span>eu:8468,us:8468
+</code></pre></div>
+<h3 id="modelshard">ModelShard<a class="headerlink" href="#modelshard" title="Permanent link">&para;</a></h3>
+<p>The <code>ModelShard</code> class implements the gRPC <code>PeerServicer</code> interface. It manages:</p>
+<ol>
+<li><strong>Backend selection</strong> — <code>pytorch_auto</code>, <code>pytorch_cpu</code>, <code>pytorch_cuda</code>, <code>toy_auto</code>, <code>toy_cpu</code>, <code>toy_gpu_sim</code></li>
+<li><strong>Model loading</strong> — delegates to <code>PyTorchRuntime</code> or <code>ToyRuntime</code></li>
+<li><strong>Inference dispatch</strong> — <code>forward()</code> / <code>forward_async()</code></li>
+<li><strong>Activation encoding</strong> — float list serialisation for gRPC transport</li>
+<li><strong>KV compaction integration</strong> — calls <code>compact_past_key_values()</code> per request</li>
+</ol>
+<h3 id="pytorchruntime">PyTorchRuntime<a class="headerlink" href="#pytorchruntime" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">class</span><span class="w"> </span><span class="nc">PyTorchRuntime</span><span class="p">:</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_id</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">quantization</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_id</span><span class="p">)</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_id</span><span class="p">,</span>
+<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>            <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="n">low_cpu_mem_usage</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_model</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a>        <span class="c1"># NOTE: No warmup call — first request pays MPS/CUDA kernel</span>
+<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>        <span class="c1"># compilation cost (~30s on MPS). See docs/petals-comparison.md.</span>
+<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a>
+<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">max_tokens</span><span class="p">,</span> <span class="n">temperature</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>        <span class="n">inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+<a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a>            <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="o">=</span><span class="n">max_tokens</span><span class="p">)</span>
+<a id="__codelineno-11-14" name="__codelineno-11-14" href="#__codelineno-11-14"></a>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">output</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+</code></pre></div>
+<h3 id="device-selection-peerhardwarepy">Device Selection (<code>peer/hardware.py</code>)<a class="headerlink" href="#device-selection-peerhardwarepy" title="Permanent link">&para;</a></h3>
+<p>Priority order: CUDA → MPS (Apple Silicon) → CPU. VRAM is queried to select quantization level.</p>
+<h3 id="dht-announce-peerdht_announcepy">DHT Announce (<code>peer/dht_announce.py</code>)<a class="headerlink" href="#dht-announce-peerdht_announcepy" title="Permanent link">&para;</a></h3>
+<p>Background thread. Every <code>announce_interval_s</code> (default 60s), posts a heartbeat to all configured bootstrap nodes. Includes: <code>peer_id</code>, <code>endpoint_url</code>, <code>model_id</code>, <code>shard_index</code>, <code>total_shards</code>, <code>latency_p50_ms</code>, <code>reputation_score</code>, <code>tags</code>.</p>
+<hr />
+<h2 id="8-kv-cache-compaction">8. KV Cache Compaction<a class="headerlink" href="#8-kv-cache-compaction" title="Permanent link">&para;</a></h2>
+<p><strong>Directory:</strong> <code>peer/kv_compaction/</code></p>
+<p>This is one of OpenHydra's most sophisticated subsystems, implementing research-grade KV cache compression to extend effective context length without proportional memory growth.</p>
+<h3 id="kv-compaction-decision-tree">KV Compaction Decision Tree<a class="headerlink" href="#kv-compaction-decision-tree" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>flowchart TD
+    REQ["Incoming KV cache&lt;br/&gt;(seq_len tokens)"] --&gt; MODE{compaction mode?}
+
+    MODE --&gt;|off| PASS["Return cache unchanged"]
+    MODE --&gt;|on| COMPACT["Run compaction"]
+    MODE --&gt;|auto| AUTO{"seq_len &gt;&lt;br/&gt;auto_threshold?"}
+
+    AUTO --&gt;|"seq_len &lt; threshold"| PASS
+    AUTO --&gt;|"seq_len &gt;= threshold"| COMPACT
+
+    COMPACT --&gt; PHASE1["Phase 1: Token Selection&lt;br/&gt;HAK or OMP algorithm&lt;br/&gt;Keep target_ratio of tokens"]
+    PHASE1 --&gt; BETA{beta_enabled?}
+
+    BETA --&gt;|no| OUT1["Return DynamicCache&lt;br/&gt;(standard format)"]
+    BETA --&gt;|yes| PHASE2["Phase 2: Beta Bias Correction&lt;br/&gt;Log-space bias + Cv refit"]
+    PHASE2 --&gt; OUT2["Return CompactedKVCache&lt;br/&gt;(requires model patching)"]
+
+    PHASE1 --&gt; BUDGET{head_budget_path&lt;br/&gt;specified?}
+    BUDGET --&gt;|yes| PHASE3["Phase 3: Per-layer/per-head&lt;br/&gt;token budgets from JSON"]
+    BUDGET --&gt;|no| BETA
+
+    COMPACT --&gt; ONLINE{online_enabled?}
+    ONLINE --&gt;|yes| PHASE4["Phase 4: Online Mode&lt;br/&gt;Compact whenever seq_len &gt;&lt;br/&gt;online_max_tokens"]
+    PHASE4 --&gt; PHASE1</code></pre>
+<h3 id="four-phases">Four Phases<a class="headerlink" href="#four-phases" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Description</th>
+<th>Return Type</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1 (no-beta)</strong></td>
+<td>Select t tokens per head using HAK or OMP</td>
+<td>Standard <code>DynamicCache</code></td>
+</tr>
+<tr>
+<td><strong>2 (beta)</strong></td>
+<td>Fit log-space bias corrections β, refit Cv</td>
+<td><code>CompactedKVCache</code> (requires model patching)</td>
+</tr>
+<tr>
+<td><strong>3 (nonuniform)</strong></td>
+<td>Per-layer/per-head token budgets from JSON</td>
+<td>Same as phase 1/2</td>
+</tr>
+<tr>
+<td><strong>4 (online)</strong></td>
+<td>Compact whenever seq_len &gt; online_max_tokens</td>
+<td>Unbounded context</td>
+</tr>
+</tbody>
+</table>
+<h3 id="selection-algorithms-_algorithmspy">Selection Algorithms (<code>_algorithms.py</code>)<a class="headerlink" href="#selection-algorithms-_algorithmspy" title="Permanent link">&para;</a></h3>
+<p><strong>HAK (Hybrid Attention Kernel):</strong> Selects key vectors that best span the query subspace. Maximises attention coverage with a greedy column selection.</p>
+<p><strong>OMP (Orthogonal Matching Pursuit):</strong> Iteratively selects the key vector most correlated with the residual query signal. More precise than HAK at lower budgets.</p>
+<h3 id="reference-queries">Reference Queries<a class="headerlink" href="#reference-queries" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>Option A (preferred): Real W_q(hidden) queries captured by AttentionQueryCapture
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>  → Correct query subspace, accurate selection
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>Option B (fallback): Last n_ref key vectors used as proxy queries
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>  → Cheaper, slightly worse selection quality
+</code></pre></div>
+<h3 id="compactionconfig-_configpy">CompactionConfig (<code>_config.py</code>)<a class="headerlink" href="#compactionconfig-_configpy" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="k">class</span><span class="w"> </span><span class="nc">CompactionConfig</span><span class="p">:</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>    <span class="n">target_ratio</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.25</span>      <span class="c1"># Keep 25% of tokens</span>
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="n">method</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hak&quot;</span>             <span class="c1"># &quot;hak&quot; or &quot;omp&quot;</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">n_ref_queries</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>          <span class="c1"># Reference queries for selection</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>    <span class="n">min_source_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>     <span class="c1"># Skip compaction if seq &lt; 64</span>
+<a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>    <span class="n">min_kept_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span>        <span class="c1"># Always keep at least 4 tokens</span>
+<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>    <span class="n">beta_enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>      <span class="c1"># Enable Phase 2</span>
+<a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a>    <span class="n">online_enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>    <span class="c1"># Enable Phase 4</span>
+<a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a>    <span class="n">online_max_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">512</span>    <span class="c1"># Phase 4 target</span>
+<a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a>    <span class="n">mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;on&quot;</span>                <span class="c1"># &quot;on&quot;, &quot;auto&quot;</span>
+<a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a>    <span class="n">auto_threshold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">512</span>       <span class="c1"># Skip in auto mode if seq &lt; this</span>
+<a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a>    <span class="n">head_budget_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>      <span class="c1"># Path to per-head budget JSON</span>
+</code></pre></div>
+<h3 id="radix-cache-_radix_cachepy">Radix Cache (<code>_radix_cache.py</code>)<a class="headerlink" href="#radix-cache-_radix_cachepy" title="Permanent link">&para;</a></h3>
+<p>A radix tree structure for prompt prefix caching. Shared prompt prefixes reuse cached KV computations, reducing latency for common prefixes (e.g., system prompts).</p>
+<hr />
+<h2 id="9-economy-layer">9. Economy Layer<a class="headerlink" href="#9-economy-layer" title="Permanent link">&para;</a></h2>
+<p><strong>Directory:</strong> <code>economy/</code></p>
+<h3 id="appchain-economy-flow">AppChain Economy Flow<a class="headerlink" href="#appchain-economy-flow" title="Permanent link">&para;</a></h3>
+<pre class="mermaid"><code>flowchart TD
+    USER["User Request"] --&gt;|spend credits| COORD["Coordinator"]
+    COORD --&gt;|route to pipeline| PEERS["Peer Pipeline"]
+    PEERS --&gt;|serve tokens| COORD
+
+    subgraph Barter Layer
+        EARN["Earn: 1000 tokens = 1 credit"]
+        DECAY["Decay: 5%/day"]
+        LEDGER["SQLite WAL Ledger"]
+        EARN --&gt; LEDGER
+        DECAY --&gt; LEDGER
+    end
+
+    subgraph HYDRA Token Layer
+        MINT["Mint HYDRA&lt;br/&gt;(supply cap 69M)"]
+        STAKE["Stake/Slash"]
+        VERIFY["Mystery Shopper&lt;br/&gt;Verification"]
+        MINT --&gt; STAKE
+        VERIFY --&gt;|"slash dishonest peers"| STAKE
+        VERIFY --&gt;|"reward honest peers"| MINT
+    end
+
+    COORD --&gt;|"earn credits"| EARN
+    LEDGER --&gt;|"barter credits ↔ HYDRA"| MINT
+    PEERS --&gt;|"spot-check"| VERIFY
+
+    subgraph State Channels
+        SC["Off-chain micropayments&lt;br/&gt;Batched settlement"]
+    end
+
+    COORD &lt;--&gt;|"high-frequency txns"| SC
+    SC --&gt;|"reconcile"| LEDGER</code></pre>
+<h3 id="barter-credit-system">Barter Credit System<a class="headerlink" href="#barter-credit-system" title="Permanent link">&para;</a></h3>
+<p>OpenHydra implements a <strong>contribution-proportional access</strong> model. Peers earn credits by serving tokens; users spend credits to request inference.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>Rate:    1000 tokens served = 1 credit earned
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>Decay:   5% per day (prevents hoarding)
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>Storage: SQLite WAL-mode DB (SqliteCreditLedger)
+</code></pre></div>
+<h3 id="sqlitecreditledger-economybarterpy">SqliteCreditLedger (<code>economy/barter.py</code>)<a class="headerlink" href="#sqlitecreditledger-economybarterpy" title="Permanent link">&para;</a></h3>
+<p>Thread-safe SQLite ledger with:
+- <code>BEGIN IMMEDIATE</code> transactions for write safety
+- Per-row timestamp for accurate decay calculation
+- Legacy JSON migration support
+- WAL mode + <code>synchronous=NORMAL</code> for performance</p>
+<h3 id="state-channels-economystate_channelpy">State Channels (<code>economy/state_channel.py</code>)<a class="headerlink" href="#state-channels-economystate_channelpy" title="Permanent link">&para;</a></h3>
+<p>Off-chain payment channels between coordinator and peers. Allows batched credit settlement without per-request database writes. Channels are reconciled periodically.</p>
+<h3 id="token-model-economytokenpy">Token Model (<code>economy/token.py</code>)<a class="headerlink" href="#token-model-economytokenpy" title="Permanent link">&para;</a></h3>
+<p>Defines the economic parameters: base credit price per token, reputation multipliers, priority tiers.</p>
+<h3 id="ledger-bridge-coordinatorledger_bridgepy">Ledger Bridge (<code>coordinator/ledger_bridge.py</code>)<a class="headerlink" href="#ledger-bridge-coordinatorledger_bridgepy" title="Permanent link">&para;</a></h3>
+<p>Connects the coordinator engine to the economy layer. After each successful inference:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">ledger</span><span class="o">.</span><span class="n">earn</span><span class="p">(</span><span class="n">winning_peer_id</span><span class="p">,</span> <span class="n">tokens_served</span><span class="o">=</span><span class="n">token_count</span><span class="p">)</span>
+</code></pre></div></p>
+<hr />
+<h2 id="10-grounding-rag">10. Grounding / RAG<a class="headerlink" href="#10-grounding-rag" title="Permanent link">&para;</a></h2>
+<p><strong>File:</strong> <code>grounding/client_rag.py</code></p>
+<h3 id="pipeline">Pipeline<a class="headerlink" href="#pipeline" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>infer_chat() → _prepare_inference() → GroundingClient.search(prompt)
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>  │
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>  ├─ Check GroundingCache (TTL: 900s, JSON file)
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>  ├─ On miss: DuckDuckGo Instant Answer API
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>  │   https://api.duckduckgo.com/?q=&lt;prompt&gt;&amp;format=json
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>  │   Extracts: AbstractText, Answer, RelatedTopics
+<a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>  ├─ On network failure: pseudo_search() fallback
+<a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a>  │   (keyword extraction → &quot;Context about &lt;word&gt;&quot;)
+<a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a>  └─ Inject: prompt += &quot;\n\n[Grounding]\n- snippet1\n- snippet2\n...&quot;
+</code></pre></div>
+<h3 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">class</span><span class="w"> </span><span class="nc">GroundingConfig</span><span class="p">:</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a>    <span class="n">cache_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;.openhydra/grounding_cache.json&quot;</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a>    <span class="n">cache_ttl_seconds</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">900</span>
+<a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a>    <span class="n">timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">3.0</span>
+<a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a>    <span class="n">use_network</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+<a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a>    <span class="n">fallback_enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></div>
+<p>Grounding adds up to 3s to TTFT when enabled. It is <strong>disabled by default</strong> (<code>grounding_enabled=False</code> in <code>EngineConfig</code>).</p>
+<hr />
+<h2 id="11-compression">11. Compression<a class="headerlink" href="#11-compression" title="Permanent link">&para;</a></h2>
+<p><strong>Directory:</strong> <code>compression/</code></p>
+<h3 id="lz4-codec-compressionlz4_codecpy">LZ4 Codec (<code>compression/lz4_codec.py</code>)<a class="headerlink" href="#lz4-codec-compressionlz4_codecpy" title="Permanent link">&para;</a></h3>
+<p>Fast lossless compression for activation tensors in transit between coordinator and peers. Applied to the float list serialisation before gRPC transport.</p>
+<h3 id="autoencoder-compressionautoencoderpy">Autoencoder (<code>compression/autoencoder.py</code>)<a class="headerlink" href="#autoencoder-compressionautoencoderpy" title="Permanent link">&para;</a></h3>
+<p>Learned lossy compression. A small neural network trained to encode/decode activation vectors at a target compression ratio. Used for high-latency peer links where bandwidth is the bottleneck.</p>
+<hr />
+<h2 id="12-verification">12. Verification<a class="headerlink" href="#12-verification" title="Permanent link">&para;</a></h2>
+<p><strong>Directory:</strong> <code>verification/</code></p>
+<p>The coordinator runs inference on <strong>primary</strong>, <strong>secondary</strong>, and <strong>tertiary</strong> pipelines in parallel (threaded). Outputs are compared; the consensus winner is returned to the client.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="c1"># In engine.py _run_chain calls:</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="n">primary</span>   <span class="o">=</span> <span class="n">_run_chain</span><span class="p">(</span><span class="n">primary_pipeline</span><span class="p">)</span>    <span class="c1"># blocking</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="n">secondary</span> <span class="o">=</span> <span class="n">executor</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">_run_chain</span><span class="p">,</span> <span class="n">secondary_pipeline</span><span class="p">)</span>
+<a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="n">tertiary</span>  <span class="o">=</span> <span class="n">executor</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">_run_chain</span><span class="p">,</span> <span class="n">tertiary_pipeline</span><span class="p">)</span>
+<a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a>
+<a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="c1"># Comparison:</span>
+<a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a><span class="k">if</span> <span class="n">primary</span><span class="o">.</span><span class="n">response</span> <span class="o">==</span> <span class="n">secondary</span><span class="o">.</span><span class="n">response</span><span class="p">:</span>
+<a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a>    <span class="n">winner</span> <span class="o">=</span> <span class="n">primary</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9" href="#__codelineno-18-9"></a><span class="k">elif</span> <span class="n">secondary</span><span class="o">.</span><span class="n">response</span> <span class="o">==</span> <span class="n">tertiary</span><span class="o">.</span><span class="n">response</span><span class="p">:</span>
+<a id="__codelineno-18-10" name="__codelineno-18-10" href="#__codelineno-18-10"></a>    <span class="n">winner</span> <span class="o">=</span> <span class="n">secondary</span>
+<a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a><span class="k">else</span><span class="p">:</span>
+<a id="__codelineno-18-12" name="__codelineno-18-12" href="#__codelineno-18-12"></a>    <span class="n">winner</span> <span class="o">=</span> <span class="n">primary</span>  <span class="c1"># default to primary on split</span>
+</code></pre></div>
+<p>This provides <strong>Byzantine fault tolerance at the output level</strong> — a malicious or faulty peer cannot silently corrupt output without a discrepancy being detected.</p>
+<hr />
+<h2 id="13-security-tls">13. Security &amp; TLS<a class="headerlink" href="#13-security-tls" title="Permanent link">&para;</a></h2>
+<p><strong>Files:</strong> <code>peer/tls.py</code>, <code>peer/identity.py</code>, <code>peer/crypto.py</code></p>
+<h3 id="peer-identity">Peer Identity<a class="headerlink" href="#peer-identity" title="Permanent link">&para;</a></h3>
+<p>Each peer generates an Ed25519 keypair on first start (<code>peer/identity.py</code>), stored at <code>~/.openhydra/identity.key</code> (mode 0600). The public key becomes the <code>peer_id</code>. Announcements to DHT are signed with this key.</p>
+<h3 id="geo-challenge-peercryptopy">Geo-Challenge (<code>peer/crypto.py</code>)<a class="headerlink" href="#geo-challenge-peercryptopy" title="Permanent link">&para;</a></h3>
+<p>Bootstrap nodes issue geo-challenges to verify peer location claims. The peer signs a nonce + timestamp + claimed region with its private key (SHA-256 proof-of-work). The bootstrap node verifies before accepting the location tag. This provides lightweight Sybil resistance.</p>
+<h3 id="activation-encryption-onion-routing-peercryptopy">Activation Encryption &amp; Onion Routing (<code>peer/crypto.py</code>)<a class="headerlink" href="#activation-encryption-onion-routing-peercryptopy" title="Permanent link">&para;</a></h3>
+<p><code>peer/crypto.py</code> (28 KB) implements:
+- <strong>X25519 ECDH</strong> key exchange for per-activation ephemeral symmetric keys
+- <strong>AES-GCM</strong> symmetric encryption of activation tensors in transit
+- <strong>Onion routing</strong>: layered encryption envelopes that are peeled at each pipeline stage — no single peer sees both the origin and destination of an inference</p>
+<h3 id="mtls-peertlspy">mTLS (<code>peer/tls.py</code>)<a class="headerlink" href="#mtls-peertlspy" title="Permanent link">&para;</a></h3>
+<p>Production deployment uses mutual TLS between coordinator and peers. Certificates are provisioned via the bootstrap operator scripts in <code>ops/bootstrap/</code>.</p>
+<h3 id="differential-privacy-peerprivacypy">Differential Privacy (<code>peer/privacy.py</code>)<a class="headerlink" href="#differential-privacy-peerprivacypy" title="Permanent link">&para;</a></h3>
+<p>Gaussian noise injection into activation vectors before returning to the coordinator. A matching audit tag allows independent auditors to verify the noise level without seeing the raw activations. Provides plausible deniability about which tokens the peer processed.</p>
+<h3 id="rate-limiting-coordinatorapi_serverpy">Rate Limiting (<code>coordinator/api_server.py</code>)<a class="headerlink" href="#rate-limiting-coordinatorapi_serverpy" title="Permanent link">&para;</a></h3>
+<p><code>_RateLimiter</code> enforces a per-IP sliding-window limit of <strong>120 requests per 60 seconds</strong>. Hard limits: 4096 max tokens per request, 32 KB max prompt size.</p>
+<h3 id="secret-management-openhydra_secretspy">Secret Management (<code>openhydra_secrets.py</code>)<a class="headerlink" href="#secret-management-openhydra_secretspy" title="Permanent link">&para;</a></h3>
+<p>Secrets loaded from <code>.env</code> or 0600-permission files. In <code>prod</code> profile, insecure placeholder values (<code>"dev"</code>, <code>"changeme"</code>, etc.) are rejected at startup.</p>
+<hr />
+<h2 id="14-speculative-decoding">14. Speculative Decoding<a class="headerlink" href="#14-speculative-decoding" title="Permanent link">&para;</a></h2>
+<p><strong>File:</strong> <code>coordinator/speculative.py</code></p>
+<h3 id="architecture_1">Architecture<a class="headerlink" href="#architecture_1" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>Coordinator has local draft model (PyTorchDraftModel, tiny-gpt2 by default)
+<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>  │
+<a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a>  ├─ propose_token_ids(context, k=4)  →  [t1, t2, t3, t4] (draft tokens)
+<a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a>  │
+<a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a>  ├─ Send draft + prompt to peer for verification
+<a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a>  │  Peer returns: verified_token_ids (authoritative)
+<a id="__codelineno-19-7" name="__codelineno-19-7" href="#__codelineno-19-7"></a>  │
+<a id="__codelineno-19-8" name="__codelineno-19-8" href="#__codelineno-19-8"></a>  └─ select_verified_token_ids(verified, draft)
+<a id="__codelineno-19-9" name="__codelineno-19-9" href="#__codelineno-19-9"></a>       → Accept prefix that matches draft, take first mismatch from verified
+<a id="__codelineno-19-10" name="__codelineno-19-10" href="#__codelineno-19-10"></a>       → Net effect: if draft is right 75% of the time, throughput ~= 4x
+</code></pre></div>
+<h3 id="drafttokenmodel-toy">DraftTokenModel (toy)<a class="headerlink" href="#drafttokenmodel-toy" title="Permanent link">&para;</a></h3>
+<p>Deterministic SHA-256-based token proposer. Used in tests and when no PyTorch is available.</p>
+<h3 id="pytorchdraftmodel">PyTorchDraftModel<a class="headerlink" href="#pytorchdraftmodel" title="Permanent link">&para;</a></h3>
+<p>Loads a small HuggingFace model (<code>sshleifer/tiny-gpt2</code> by default) locally on the coordinator. Runs on CPU. Proposes up to 16 draft tokens per round.</p>
+<hr />
+<h2 id="15-deployment">15. Deployment<a class="headerlink" href="#15-deployment" title="Permanent link">&para;</a></h2>
+<h3 id="bootstrap-nodes">Bootstrap Nodes<a class="headerlink" href="#bootstrap-nodes" title="Permanent link">&para;</a></h3>
+<p><strong>Location:</strong> Linode VMs (EU: Frankfurt, US: Dallas, AP: Singapore)
+<strong>Stack:</strong> Ubuntu 22.04 → nginx (443 SSL) → DHT process (:8468)
+<strong>Scripts:</strong> <code>ops/bootstrap/nginx-bootstrap.conf.template</code>, <code>ops/increase_ulimit.sh</code></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="c1"># Deploy/update a bootstrap node</span>
+<a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>ssh<span class="w"> </span>root@&lt;bootstrap-ip&gt;<span class="w"> </span><span class="s1">&#39;bash /tmp/increase_ulimit.sh&#39;</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a><span class="c1"># nginx config: access_log off; (prevents ~2MB/min log growth)</span>
+<a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="c1"># LimitNOFILE=65536 in bootstrap.service</span>
+<a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a><span class="c1"># fs.file-max=500000 in /etc/sysctl.conf</span>
+</code></pre></div>
+<h3 id="docker">Docker<a class="headerlink" href="#docker" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="c1"># Single peer + coordinator</span>
+<a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a>docker-compose<span class="w"> </span>up
+<a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a>
+<a id="__codelineno-21-4" name="__codelineno-21-4" href="#__codelineno-21-4"></a><span class="c1"># HA multi-peer</span>
+<a id="__codelineno-21-5" name="__codelineno-21-5" href="#__codelineno-21-5"></a>docker-compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.ha.yml<span class="w"> </span>up
+</code></pre></div>
+<h3 id="peer-registration">Peer Registration<a class="headerlink" href="#peer-registration" title="Permanent link">&para;</a></h3>
+<p>A peer announces itself by POSTing to each bootstrap node every 60 seconds. If a peer misses 5 consecutive announce windows (300s), its entry expires and coordinators stop routing to it.</p>
+<hr />
+<h2 id="16-configuration-reference">16. Configuration Reference<a class="headerlink" href="#16-configuration-reference" title="Permanent link">&para;</a></h2>
+<h3 id="coordinator-cli-flags-coordinatorapi_serverpy">Coordinator CLI flags (<code>coordinator/api_server.py</code>)<a class="headerlink" href="#coordinator-cli-flags-coordinatorapi_serverpy" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--port</code></td>
+<td>8080</td>
+<td>HTTP listen port</td>
+</tr>
+<tr>
+<td><code>--host</code></td>
+<td>0.0.0.0</td>
+<td>Bind address</td>
+</tr>
+<tr>
+<td><code>--model-catalog</code></td>
+<td>models.catalog.json</td>
+<td>Model registry file</td>
+</tr>
+<tr>
+<td><code>--peers</code></td>
+<td>—</td>
+<td>Static peer list JSON (bypasses DHT)</td>
+</tr>
+<tr>
+<td><code>--pipeline-width</code></td>
+<td>3</td>
+<td>Peers per pipeline</td>
+</tr>
+<tr>
+<td><code>--required-replicas</code></td>
+<td>3</td>
+<td>Min healthy peers per model</td>
+</tr>
+<tr>
+<td><code>--timeout-ms</code></td>
+<td>500</td>
+<td>Per-hop gRPC timeout</td>
+</tr>
+<tr>
+<td><code>--max-latency-ms</code></td>
+<td>5000</td>
+<td>Total request deadline</td>
+</tr>
+<tr>
+<td><code>--dht-lookup-timeout</code></td>
+<td>3.0</td>
+<td>DHT HTTP timeout (s)</td>
+</tr>
+<tr>
+<td><code>--dht-lookup-cache-ttl</code></td>
+<td>120.0</td>
+<td>DHT cache TTL (s)</td>
+</tr>
+<tr>
+<td><code>--deployment-profile</code></td>
+<td>dev</td>
+<td><code>dev</code> or <code>prod</code> (prod requires TLS)</td>
+</tr>
+<tr>
+<td><code>--grounding-enabled</code></td>
+<td>False</td>
+<td>Enable RAG injection</td>
+</tr>
+<tr>
+<td><code>--tls-enable</code></td>
+<td>False</td>
+<td>Enable mTLS</td>
+</tr>
+</tbody>
+</table>
+<h3 id="peer-cli-flags-peerserverpy">Peer CLI flags (<code>peer/server.py</code>)<a class="headerlink" href="#peer-cli-flags-peerserverpy" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--peer-id</code></td>
+<td>—</td>
+<td>Unique peer identifier</td>
+</tr>
+<tr>
+<td><code>--port</code></td>
+<td>50051</td>
+<td>gRPC listen port</td>
+</tr>
+<tr>
+<td><code>--model-id</code></td>
+<td>—</td>
+<td>OpenHydra model ID</td>
+</tr>
+<tr>
+<td><code>--runtime-backend</code></td>
+<td>pytorch_auto</td>
+<td>Backend: <code>pytorch_auto</code>, <code>pytorch_cpu</code>, <code>pytorch_cuda</code>, <code>toy_auto</code></td>
+</tr>
+<tr>
+<td><code>--runtime-target</code></td>
+<td>auto</td>
+<td>Device: <code>auto</code>, <code>cpu</code>, <code>cuda</code>, <code>mps</code></td>
+</tr>
+<tr>
+<td><code>--runtime-model-id</code></td>
+<td>—</td>
+<td>HuggingFace model ID</td>
+</tr>
+<tr>
+<td><code>--shard-index</code></td>
+<td>0</td>
+<td>This peer's shard index</td>
+</tr>
+<tr>
+<td><code>--total-shards</code></td>
+<td>1</td>
+<td>Total shards for this model</td>
+</tr>
+<tr>
+<td><code>--quantization</code></td>
+<td>fp32</td>
+<td><code>fp32</code>, <code>int8</code>, <code>int4</code></td>
+</tr>
+<tr>
+<td><code>--bootstrap-nodes</code></td>
+<td>127.0.0.1:8468</td>
+<td>Comma-separated bootstrap addresses</td>
+</tr>
+<tr>
+<td><code>--announce-interval</code></td>
+<td>60</td>
+<td>DHT heartbeat interval (s)</td>
+</tr>
+<tr>
+<td><code>--tls-enable</code></td>
+<td>False</td>
+<td>Enable mTLS</td>
+</tr>
+</tbody>
+</table>
+<h3 id="model-catalog-modelscatalogjson">Model Catalog (<code>models.catalog.json</code>)<a class="headerlink" href="#model-catalog-modelscatalogjson" title="Permanent link">&para;</a></h3>
+<p>Each entry:
+<div class="highlight"><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="p">{</span>
+<a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a><span class="w">  </span><span class="nt">&quot;model_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;openhydra-qwen3.5-0.8b&quot;</span><span class="p">,</span>
+<a id="__codelineno-22-3" name="__codelineno-22-3" href="#__codelineno-22-3"></a><span class="w">  </span><span class="nt">&quot;hf_model_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Qwen/Qwen3.5-0.8B&quot;</span><span class="p">,</span>
+<a id="__codelineno-22-4" name="__codelineno-22-4" href="#__codelineno-22-4"></a><span class="w">  </span><span class="nt">&quot;required_peers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<a id="__codelineno-22-5" name="__codelineno-22-5" href="#__codelineno-22-5"></a><span class="w">  </span><span class="nt">&quot;min_vram_gb&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<a id="__codelineno-22-6" name="__codelineno-22-6" href="#__codelineno-22-6"></a><span class="w">  </span><span class="nt">&quot;recommended_quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;fp32&quot;</span><span class="p">,</span>
+<a id="__codelineno-22-7" name="__codelineno-22-7" href="#__codelineno-22-7"></a><span class="w">  </span><span class="nt">&quot;context_length&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">32768</span><span class="p">,</span>
+<a id="__codelineno-22-8" name="__codelineno-22-8" href="#__codelineno-22-8"></a><span class="w">  </span><span class="nt">&quot;languages&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;en&quot;</span><span class="p">],</span>
+<a id="__codelineno-22-9" name="__codelineno-22-9" href="#__codelineno-22-9"></a><span class="w">  </span><span class="nt">&quot;tags&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;chat&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;small&quot;</span><span class="p">],</span>
+<a id="__codelineno-22-10" name="__codelineno-22-10" href="#__codelineno-22-10"></a><span class="w">  </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Qwen 3.5 0.8B parameter model&quot;</span>
+<a id="__codelineno-22-11" name="__codelineno-22-11" href="#__codelineno-22-11"></a><span class="p">}</span>
+</code></pre></div></p>
+<hr />
+<p><em>For comparison with Petals architecture and recommended improvements, see <code>docs/petals-comparison.md</code>.</em></p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2024 OpenHydra contributors — dual-licensed AGPL-3 / Apache-2
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/openhydra-ai/openhydra" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.highlight", "search.suggest", "content.code.copy", "content.code.annotate"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -1,0 +1,175 @@
+# OpenHydra Prometheus alerting rules
+#
+# Metric name reference (from coordinator/api_server.py _render_metrics):
+#
+#   openhydra_http_requests_total          — counter, all HTTP requests
+#   openhydra_http_request_errors_total    — counter, requests with HTTP status >= 400
+#   openhydra_http_request_latency_seconds_sum   — counter, sum of latencies (seconds)
+#   openhydra_http_request_latency_seconds_count — counter, number of latency observations
+#   openhydra_http_request_latency_seconds_avg   — gauge,   rolling average (seconds)
+#   openhydra_dht_lookup_attempts_total    — counter, total DHT lookup attempts
+#   openhydra_dht_lookup_successes_total   — counter, successful DHT lookups
+#   openhydra_dht_lookup_failures_total    — counter, failed DHT lookups
+#   openhydra_dht_lookup_success_rate      — gauge,   pre-computed ratio in [0, 1]
+#   openhydra_hydra_bridge_total_supply    — gauge,   current HYDRA bridge supply
+#   openhydra_hydra_bridge_supply_cap      — gauge,   HYDRA bridge supply cap
+#   openhydra_hydra_bridge_total_minted_total — counter, total HYDRA minted
+#   openhydra_hydra_bridge_total_burned_total — counter, total HYDRA burned
+#
+# NOTE: HTTP metrics carry NO status-code label. Errors are tracked via the
+# separate openhydra_http_request_errors_total counter (status >= 400).
+# The requested alert template using status=~"5.." labels does not apply;
+# the rules below use the actual error counter instead, which captures all
+# 4xx and 5xx responses. This is a superset of 5xx-only but is the only
+# signal available from the current instrumentation.
+#
+# NOTE: The DHT success-rate alerts use the pre-computed
+# openhydra_dht_lookup_success_rate gauge (range 0–1) rather than deriving
+# a ratio from the counters, because the gauge is already smoothed by the
+# engine and avoids divide-by-zero issues when attempts are zero.
+#
+# NOTE: Supply cap alerts use openhydra_hydra_bridge_supply_cap (the live
+# cap gauge) rather than the hardcoded 69 000 000 literal, so they remain
+# correct if the cap is changed at runtime.
+
+groups:
+  - name: openhydra
+    rules:
+
+      # -----------------------------------------------------------------------
+      # Availability
+      # -----------------------------------------------------------------------
+
+      - alert: CoordinatorDown
+        expr: up{job="openhydra_node"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenHydra node is down"
+          description: >-
+            No metrics have been scraped from the openhydra_node job for 1
+            minute. The coordinator API server may be crashed or unreachable.
+
+      # -----------------------------------------------------------------------
+      # HTTP error rate
+      # (openhydra_http_request_errors_total counts status >= 400; no 5xx label)
+      # -----------------------------------------------------------------------
+
+      - alert: HighErrorRate
+        expr: >-
+          rate(openhydra_http_request_errors_total[5m])
+          /
+          rate(openhydra_http_requests_total[5m])
+          > 0.02
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenHydra HTTP error rate is elevated (> 2 %)"
+          description: >-
+            More than 2 % of HTTP requests are returning status >= 400 over
+            the last 5 minutes. Current ratio:
+            {{ printf "%.2f" $value | mul 100 }} %.
+
+      - alert: CriticalErrorRate
+        expr: >-
+          rate(openhydra_http_request_errors_total[5m])
+          /
+          rate(openhydra_http_requests_total[5m])
+          > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenHydra HTTP error rate is critical (> 5 %)"
+          description: >-
+            More than 5 % of HTTP requests are returning status >= 400 over
+            the last 5 minutes. Current ratio:
+            {{ printf "%.2f" $value | mul 100 }} %.
+
+      # -----------------------------------------------------------------------
+      # HTTP latency
+      # (derived from the sum/count counters; _avg gauge is also available but
+      #  the sum/count approach is more robust across scrape gaps)
+      # -----------------------------------------------------------------------
+
+      - alert: HighLatency
+        expr: >-
+          rate(openhydra_http_request_latency_seconds_sum[5m])
+          /
+          rate(openhydra_http_request_latency_seconds_count[5m])
+          > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenHydra average HTTP latency exceeds 800 ms"
+          description: >-
+            The average HTTP request latency is above 800 ms over the last 5
+            minutes. Current average: {{ printf "%.0f" ($value | mul 1000) }} ms.
+
+      # -----------------------------------------------------------------------
+      # DHT success rate
+      # (openhydra_dht_lookup_success_rate is a pre-computed gauge in [0, 1])
+      # -----------------------------------------------------------------------
+
+      - alert: LowDHTSuccessRate
+        expr: openhydra_dht_lookup_success_rate < 0.80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenHydra DHT lookup success rate below 80 %"
+          description: >-
+            The DHT lookup success rate has been below 80 % for 5 minutes.
+            Current rate: {{ printf "%.1f" ($value | mul 100) }} %.
+
+      - alert: CriticalDHTSuccessRate
+        expr: openhydra_dht_lookup_success_rate < 0.70
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenHydra DHT lookup success rate below 70 %"
+          description: >-
+            The DHT lookup success rate has been below 70 % for 5 minutes.
+            Peer discovery is severely degraded.
+            Current rate: {{ printf "%.1f" ($value | mul 100) }} %.
+
+      # -----------------------------------------------------------------------
+      # HYDRA supply cap
+      # (uses live openhydra_hydra_bridge_supply_cap gauge, not a hardcoded literal)
+      # -----------------------------------------------------------------------
+
+      - alert: HydraSupplyCapWarning
+        expr: >-
+          openhydra_hydra_bridge_total_supply
+          /
+          openhydra_hydra_bridge_supply_cap
+          > 0.90
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HYDRA bridge supply above 90 % of cap"
+          description: >-
+            The HYDRA bridge total supply has exceeded 90 % of the configured
+            supply cap. Current usage:
+            {{ printf "%.2f" ($value | mul 100) }} %.
+
+      - alert: HydraSupplyCapCritical
+        expr: >-
+          openhydra_hydra_bridge_total_supply
+          /
+          openhydra_hydra_bridge_supply_cap
+          > 0.99
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HYDRA bridge supply above 99 % of cap — minting will halt"
+          description: >-
+            The HYDRA bridge total supply has exceeded 99 % of the configured
+            supply cap. New token minting will be blocked imminently.
+            Current usage: {{ printf "%.2f" ($value | mul 100) }} %.

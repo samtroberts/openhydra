@@ -1,0 +1,24 @@
+apiVersion: 1
+
+# Grafana Unified Alerting contact point provisioning.
+#
+# To activate Slack notifications, set the SLACK_WEBHOOK_URL environment
+# variable in the Grafana container (e.g. via docker-compose environment:
+# or a secrets file) before starting Grafana.
+#
+# This file must be mounted into the Grafana container at:
+#   /etc/grafana/provisioning/alerting/contact_points.yml
+# and grafana.ini must have [unified_alerting] enabled (the default in
+# Grafana >= 9).
+
+contactPoints:
+  - orgId: 1
+    name: openhydra-alerts
+    receivers:
+      - uid: openhydra-slack
+        type: slack
+        settings:
+          url: "${SLACK_WEBHOOK_URL}"  # Set SLACK_WEBHOOK_URL env var
+          title: "OpenHydra Alert: {{ .CommonLabels.alertname }}"
+          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+        disableResolveMessage: false
