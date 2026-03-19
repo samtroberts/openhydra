@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenHydra — Run AI in a herd, not a data centre</title>
-<meta name="description" content="OpenHydra splits big language models across volunteer laptops — BitTorrent-style. Run Qwen 3.5, earn HYDRA tokens, and skip the $20/month API bill.">
-<meta property="og:title" content="OpenHydra — Run AI in a herd, not a data centre">
-<meta property="og:description" content="BitTorrent-style distributed LLM inference. Inspired by Petals. Powered by Qwen 3.5.">
+<title>OpenHydra — Turn on. Tune in. Drop in.</title>
+<meta name="description" content="Your laptop joins the global AI swarm in one click. Auto-detects Mac, NVIDIA, AMD GPUs. Earn HYDRA tokens. No configuration required.">
+<meta property="og:title" content="OpenHydra — Turn on. Tune in. Drop in.">
+<meta property="og:description" content="One-click peer-to-peer AI inference. Your Mac or GPU auto-joins the swarm. Earn tokens. No cloud required.">
 <meta property="og:image" content="logo-512.png">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
@@ -153,21 +153,21 @@
 
 <div class="hero">
   <img src="logo.png" alt="OpenHydra three-headed llama" class="hero-logo">
-  <a href="https://petals.dev" class="inspo-badge" target="_blank" rel="noopener">🌸 Inspired by Petals &amp; BitTorrent</a>
-  <h1>Run AI in a herd,<br><em>not a data centre</em></h1>
+  <span class="inspo-badge">&#127800; 21st Century Counterculture</span>
+  <h1>Turn on. Tune in.<br><em>Drop in.</em></h1>
   <p class="hero-sub">
-    OpenHydra splits big language models across volunteer laptops — <strong>BitTorrent-style</strong>.
-    Your machine serves a slice of Qwen&nbsp;3.5. You earn HYDRA tokens.
-    Nobody needs a credit card. No cloud required.
+    Open the app. Your <strong>Mac, NVIDIA, or AMD GPU</strong> auto-joins the global AI swarm in seconds.
+    No configuration. No terminal. No PhD required.
+    You&rsquo;re instantly contributing compute and earning <strong>HYDRA tokens</strong>.
   </p>
+  <div class="hero-ctas">
+    <a href="https://github.com/samtroberts/openhydra/releases" class="btn btn-dark" style="min-width:12rem;justify-content:center;">&#8681; Download for Mac</a>
+    <a href="https://github.com/samtroberts/openhydra/releases" class="btn btn-outline" style="min-width:12rem;justify-content:center;">&#8681; Download for Windows</a>
+  </div>
   <div class="install-row">
     <span class="install-prompt">$</span>
-    <span>git clone https://github.com/openhydra-ai/openhydra.git</span>
-    <button class="copy-btn" onclick="copyIt(this,'git clone https://github.com/openhydra-ai/openhydra.git')" title="Copy">⎘</button>
-  </div>
-  <div class="hero-ctas">
-    <a href="https://github.com/openhydra-ai/openhydra#quick-start" class="btn btn-dark" style="min-width:11rem;justify-content:center;">Get started &rarr;</a>
-    <a href="https://github.com/openhydra-ai/openhydra/releases" class="btn btn-outline" style="min-width:11rem;justify-content:center;">&#8681; Desktop app <span style="font-size:.55rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;opacity:.45;margin-left:.2rem;">&middot; Soon</span></a>
+    <span>pip install openhydra &amp;&amp; openhydra-node --peer-id my-node</span>
+    <button class="copy-btn" onclick="copyIt(this,'pip install openhydra && openhydra-node --peer-id my-node')" title="Copy">⎘</button>
   </div>
 </div>
 
@@ -216,34 +216,28 @@
 
 <div class="section">
   <p class="section-label">How it works</p>
-  <h2>Three steps to joining <em>the herd</em></h2>
-  <p class="section-intro">It&rsquo;s three commands. Even your grandma could do it. (We&rsquo;re not sure why your grandma would want distributed AI, but we respect the ambition.)</p>
+  <h2>Three steps. <em>Zero configuration.</em></h2>
+  <p class="section-intro">We eliminated every barrier between you and the swarm. No terminal. No VRAM calculations. No model selection anxiety. You just open the app.</p>
   <div class="steps">
     <div class="step">
       <div class="step-num">01</div>
       <div class="step-body">
-        <div class="step-title">Install and set up</div>
-        <p class="step-desc">Clone, virtualenv, compile protobufs. Standard Python setup. You&rsquo;ve done worse.</p>
-        <div class="step-code">git clone https://github.com/openhydra-ai/openhydra.git
-cd openhydra &amp;&amp; make venv &amp;&amp; source .venv/bin/activate
-make install &amp;&amp; make proto</div>
+        <div class="step-title">Open the app &mdash; you&rsquo;re already in</div>
+        <p class="step-desc">Double-click. That&rsquo;s the hard part. The app auto-detects your hardware and immediately joins the base swarm running <strong>Qwen&nbsp;3.5&nbsp;0.8B</strong> &mdash; just 2&nbsp;GB of RAM. Green light. You&rsquo;re contributing to the global network. You didn&rsquo;t need to know what a &ldquo;parameter&rdquo; is.</p>
       </div>
     </div>
     <div class="step">
       <div class="step-num">02</div>
       <div class="step-body">
-        <div class="step-title">Start your node &mdash; auto-joins the global swarm</div>
-        <p class="step-desc">One command. Your node automatically connects to bootstrap nodes on three continents (EU, US, AP) via the Hivemind Kademlia DHT. The default model is <strong>Qwen&nbsp;3.5&nbsp;0.8B</strong> &mdash; lightweight enough to run on a potato, smart enough to actually be useful.</p>
-        <div class="step-code">openhydra-node --peer-id your-name</div>
+        <div class="step-title">Get auto-promoted</div>
+        <p class="step-desc">Got a beefy Mac or GPU? The app notices. It gently nudges you: &ldquo;Your hardware can power the <strong>Frontier Swarm (27B)</strong>. Upgrade your contribution and earn 4&times; rewards.&rdquo; One click. The network just got smarter because you showed up.</p>
       </div>
     </div>
     <div class="step">
       <div class="step-num">03</div>
       <div class="step-body">
-        <div class="step-title">Chat. Earn. Repeat.</div>
-        <p class="step-desc">Use the OpenAI-compatible API, earn HYDRA tokens for every request your node serves, and quietly feel good about contributing to decentralised AI.</p>
-        <div class="step-code">curl http://localhost:8080/v1/chat/completions \
-  -d '{"model":"openhydra-qwen3.5-0.8b","messages":[{"role":"user","content":"hi"}]}'</div>
+        <div class="step-title">Earn while you idle</div>
+        <p class="step-desc">Your laptop serves AI tokens in the background. You earn <strong>HYDRA credits</strong> for every request. The swarm handles routing, verification, and privacy. You just leave the app open. Nobody needed a data centre.</p>
       </div>
     </div>
   </div>
@@ -273,8 +267,8 @@ make install &amp;&amp; make proto</div>
     </div>
     <div class="card">
       <span class="card-emoji">&#128421;</span>
-      <div class="card-title">Desktop node app <span style="display:inline-block;font-family:'Inter',sans-serif;font-size:.6rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;background:var(--s3);color:var(--muted);padding:.15rem .45rem;border-radius:4px;margin-left:.4rem;vertical-align:middle;">Coming Soon</span></div>
-      <p class="card-desc">Tauri v2 app for macOS, Windows, and Linux. Click &ldquo;Start Node&rdquo;. Watch credits accumulate. Currently CLI-only &mdash; the desktop GUI is in active development.</p>
+      <div class="card-title">Desktop app</div>
+      <p class="card-desc">Tauri v2 app for macOS and Windows. Open it, you&rsquo;re in. Auto-detects your GPU, recommends the optimal model, and joins the swarm. Zero terminal required.</p>
     </div>
     <div class="card">
       <span class="card-emoji">&#128737;</span>
@@ -359,11 +353,11 @@ make install &amp;&amp; make proto</div>
 <div class="cta-band">
   <div class="cta-band-inner">
     <img src="logo.png" alt="" style="width:84px;height:84px;object-fit:contain;">
-    <h2>Ready to join the herd?</h2>
-    <p>Your laptop is sitting there doing nothing useful. It could be serving AI tokens and earning credits on the swarm. Three-headed llamas are waiting for you.</p>
+    <h2>Your laptop is a supercomputer <em>waiting to happen.</em></h2>
+    <p>It&rsquo;s sitting there doing nothing useful right now. One click and it joins a global swarm of volunteers running frontier AI models together. No cloud. No credit card. Just llamas.</p>
     <div class="hero-ctas">
-      <a href="https://github.com/openhydra-ai/openhydra#quick-start" class="btn btn-dark">Read the docs &rarr;</a>
-      <a href="https://github.com/openhydra-ai/openhydra" class="btn btn-outline" target="_blank" rel="noopener">Star on GitHub</a>
+      <a href="https://github.com/samtroberts/openhydra/releases" class="btn btn-dark">&#8681; Download now</a>
+      <a href="https://github.com/samtroberts/openhydra" class="btn btn-outline" target="_blank" rel="noopener">Star on GitHub</a>
     </div>
   </div>
 </div>

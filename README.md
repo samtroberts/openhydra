@@ -1,56 +1,55 @@
 <p align="center">
   <h1 align="center">OpenHydra</h1>
-  <p align="center"><strong>BitTorrent for LLMs &mdash; run frontier models across volunteer laptops.</strong></p>
+  <p align="center"><strong>Turn on. Tune in. Drop in.</strong></p>
+  <p align="center"><em>Your laptop is a supercomputer waiting to happen.</em></p>
 </p>
 
 <p align="center">
-  <a href="https://github.com/openhydra-ai/openhydra/actions"><img src="https://github.com/openhydra-ai/openhydra/actions/workflows/python-app.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/samtroberts/openhydra/releases"><img src="https://img.shields.io/badge/download-Desktop%20App-00d4b8.svg" alt="Download"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0%20%2F%20AGPL%203.0-green.svg" alt="License"></a>
 </p>
 
 ---
 
-OpenHydra is a fully decentralised peer-to-peer inference network that pools idle hardware &mdash; your MacBook, an NVIDIA gaming PC, an AMD workstation, a cloud VM &mdash; into a single virtual GPU cluster capable of running models far larger than any single device could hold. There is no central server, no single company that sees your queries, and no single point of failure.
+OpenHydra is a peer-to-peer inference network that turns idle hardware into a global AI swarm. Any Mac, NVIDIA GPU, or AMD GPU can join. No central server. No API keys. No $20/month subscription. Just open the app and you're contributing compute.
 
-Every participant runs their own node. Contributing compute earns **HYDRA** tokens and barter credits. Spending compute gives you access to frontier-class models across the swarm.
+**The moment you open OpenHydra, you join the base swarm** running Qwen 3.5 0.8B &mdash; just 2 GB of RAM. Everyone gets an instant green light. If your hardware can handle more, the app auto-promotes you to larger models with higher rewards. Zero configuration required.
 
 **Why OpenHydra?**
 
-- **No VRAM ceiling.** A 70B model that needs 140 GB of VRAM runs across 8 peers, each contributing 18 GB.
+- **One click to join.** Open the app. Your hardware auto-joins the swarm. No terminal, no model selection, no VRAM calculations.
+- **No VRAM ceiling.** A 70B model that needs 140 GB runs across 8 peers, each contributing 18 GB.
 - **No central server.** Every node is both client and server. The network is the computer.
-- **Privacy by default.** Concentric onion routing + AES-256-GCM activation encryption + differential privacy noise. No peer sees your full query.
-- **Works today.** 867 tests passing. MLX on Apple Silicon (~252 tok/s local, ~10 tok/s net over network). PyTorch + NF4 quantization on NVIDIA CUDA and AMD ROCm. Production DHT live on 3 continents.
+- **Privacy by default.** Onion routing + AES-256-GCM encryption + differential privacy. No peer sees your full query.
+- **Earn while you idle.** HYDRA tokens and barter credits for every request your node serves.
 
 ---
 
 ## Quick Start
 
-### Install
+### Desktop App (recommended)
+
+**[Download for Mac](https://github.com/samtroberts/openhydra/releases)** &nbsp;|&nbsp; **[Download for Windows](https://github.com/samtroberts/openhydra/releases)**
+
+Open the app. It auto-detects your hardware, joins the base swarm (Qwen 3.5 0.8B), and starts earning. If you have heavy hardware, it recommends upgrading to larger models for higher rewards.
+
+### CLI Install
 
 ```bash
-git clone https://github.com/samtroberts/openhydra.git
-cd openhydra
-pip install -e .
+pip install openhydra
+openhydra-node --peer-id my-node
 ```
 
-### Run your node
-
-```bash
-openhydra-node --peer-id my-node --model-id Qwen/Qwen3.5-0.8B
-```
-
-That's it. OpenHydra auto-detects your hardware (Apple Silicon → MLX, NVIDIA GPU → PyTorch CUDA, AMD GPU → PyTorch ROCm), joins the global DHT via three bootstrap signpost nodes (EU/US/AP), registers itself as a local peer, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`.
+That's it. One command. OpenHydra auto-detects your hardware (Apple Silicon &rarr; MLX, NVIDIA &rarr; CUDA, AMD &rarr; ROCm), joins the global DHT, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`. The default model is Qwen 3.5 0.8B &mdash; lightweight enough for any machine.
 
 **Supported platforms:**
 
-| Platform | Backend | Install |
-|----------|---------|---------|
-| 🍎 Apple Silicon (M1–M4) | MLX (Metal) | `pip install mlx mlx-lm` |
-| 🟢 NVIDIA GPU (CUDA) | PyTorch | `pip install torch` |
-| 🔴 AMD GPU (ROCm) | PyTorch | `pip install torch --index-url https://download.pytorch.org/whl/rocm6.2` |
-
-You can also set the backend explicitly: `--runtime-backend mlx` (Mac), `--runtime-backend pytorch_auto` (NVIDIA/AMD).
+| Platform | Backend | Notes |
+|----------|---------|-------|
+| 🍎 Apple Silicon (M1&ndash;M4) | MLX (Metal) | Zero-copy unified memory. ~252 tok/s. |
+| 🟢 NVIDIA GPU (CUDA) | PyTorch | Any CUDA-capable GPU. NF4 quantization. |
+| 🔴 AMD GPU (ROCm) | PyTorch | ROCm 6.2+. Same PyTorch backend. |
 
 ### Chat with your node
 
