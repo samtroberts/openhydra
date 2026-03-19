@@ -9,7 +9,7 @@ peer-to-peer LLM inference network with a single button click — no terminal re
 |---|---|---|
 | Rust | 1.77+ | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | Node.js | 18+ | https://nodejs.org |
-| OpenHydra | latest | `pip install openhydra` or `pip install -e ..` (from repo root) |
+| OpenHydra | latest | `pip install openhydra-network` or `pip install -e ..` (from repo root) |
 
 ### macOS extras
 ```bash
@@ -112,8 +112,7 @@ Settings are persisted in `localStorage` under the key `openhydra_settings`:
 ## Troubleshooting
 
 **"Failed to start DHT"**
-Ensure `openhydra-dht` is on your PATH. Run `pip install openhydra` or install from
-the repo root with `pip install -e .`.
+Ensure `openhydra-dht` is on your PATH. Run `pip install openhydra-network` or install from the repo root with `pip install -e .`.
 
 **"Failed to start node"**
 Same as above — ensure `openhydra-node` is on PATH.

@@ -32,10 +32,10 @@ try {
 
 if ($hasNvidia) {
     Write-Output "installing_cuda"
-    pip install openhydra torch --quiet
+    pip install openhydra-network torch --quiet
 } else {
     Write-Output "installing_cpu"
-    pip install openhydra torch --quiet
+    pip install openhydra-network torch --quiet
 }
 
 Write-Output "bootstrap_complete"
