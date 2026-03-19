@@ -261,6 +261,7 @@ class TestCompactPastKeyValuesDynamic:
             assert k.shape[-2] < 128
 
     def test_none_returns_none(self):
+        _make_torch()  # skip if torch unavailable
         from peer.kv_compaction import compact_past_key_values, CompactionConfig
         cfg = CompactionConfig(enabled=True)
         assert compact_past_key_values(None, cfg) is None
