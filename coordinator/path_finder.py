@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
@@ -191,6 +192,70 @@ class PeerEndpoint:
     def address(self) -> str:
         return f"{self.host}:{self.port}"
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PeerEndpoint":
+        """Construct a PeerEndpoint from a raw dict (DHT record, JSON config, etc.).
+
+        Handles type coercion, default values, and expert admission gating.
+        Unknown keys in *data* are silently ignored.  Accepts both
+        ``public_key_hex`` and the DHT-native ``peer_public_key`` key.
+        """
+        from coordinator.peer_utils import normalize_layer_indices, normalize_tags
+
+        admission = bool(data.get("expert_admission_approved", True))
+        geo_rtt = data.get("geo_challenge_rtt_ms")
+        return cls(
+            peer_id=str(data.get("peer_id", "")).strip(),
+            host=str(data.get("host", "")).strip(),
+            port=int(data.get("port", 0)),
+            model_id=data.get("model_id"),
+            operator_id=(None if data.get("operator_id") in (None, "") else str(data["operator_id"])),
+            region=(None if data.get("region") in (None, "") else str(data["region"])),
+            bandwidth_mbps=float(data.get("bandwidth_mbps", 0.0)),
+            seeding_enabled=bool(data.get("seeding_enabled", False)),
+            seed_upload_limit_mbps=float(data.get("seed_upload_limit_mbps", 0.0)),
+            seed_target_upload_limit_mbps=float(data.get("seed_target_upload_limit_mbps", 0.0)),
+            seed_inference_active=bool(data.get("seed_inference_active", False)),
+            runtime_backend=str(data.get("runtime_backend", "toy_cpu")),
+            runtime_target=str(data.get("runtime_target", "cpu")),
+            runtime_model_id=str(data.get("runtime_model_id", "")),
+            quantization_mode=str(data.get("quantization_mode", "fp32")),
+            quantization_bits=int(data.get("quantization_bits", 0)),
+            runtime_gpu_available=bool(data.get("runtime_gpu_available", False)),
+            runtime_estimated_tokens_per_sec=float(data.get("runtime_estimated_tokens_per_sec", 0.0)),
+            runtime_estimated_memory_mb=int(data.get("runtime_estimated_memory_mb", 0)),
+            privacy_noise_variance=float(data.get("privacy_noise_variance", 0.0)),
+            privacy_noise_payloads=int(data.get("privacy_noise_payloads", 0)),
+            privacy_noise_observed_variance_ema=float(data.get("privacy_noise_observed_variance_ema", 0.0)),
+            privacy_noise_last_audit_tag=str(data.get("privacy_noise_last_audit_tag", "")),
+            reputation_score=float(data.get("reputation_score", 0.0)),
+            staked_balance=float(data.get("staked_balance", 0.0)),
+            expert_tags=normalize_tags(data.get("expert_tags", [])) if admission else (),
+            expert_layer_indices=normalize_layer_indices(data.get("expert_layer_indices", [])) if admission else (),
+            expert_router=bool(data.get("expert_router", False)) if admission else False,
+            expert_admission_approved=admission,
+            expert_admission_reason=str(data.get("expert_admission_reason", "approved")),
+            geo_verified=bool(data.get("geo_verified", False)),
+            geo_challenge_rtt_ms=float(geo_rtt) if geo_rtt is not None else None,
+            geo_penalty_score=float(data.get("geo_penalty_score", 0.0)),
+            public_key_hex=str(data.get("public_key_hex", "") or data.get("peer_public_key", "") or ""),
+            available_vram_mb=int(data.get("available_vram_mb", 0)),
+            layer_start=int(data.get("layer_start", 0)),
+            layer_end=int(data.get("layer_end", 0)),
+            total_layers=int(data.get("total_layers", 0)),
+            seeder_http_port=int(data.get("seeder_http_port", 0)),
+            cached_model_ids=tuple(
+                str(m) for m in list(data.get("cached_model_ids", []) or [])
+                if str(m).strip()
+            ),
+            local_fast_path_port=int(data.get("local_fast_path_port", 0)),
+        )
+
+    def replace(self, **overrides: Any) -> "PeerEndpoint":
+        """Return a copy with given fields replaced (frozen dataclass helper)."""
+        import dataclasses as _dc
+        return _dc.replace(self, **overrides)
+
 
 @dataclass(frozen=True)
 class PeerHealth:
@@ -204,63 +269,7 @@ class PeerHealth:
 
 def load_peer_config(path: str | Path) -> list[PeerEndpoint]:
     raw = json.loads(Path(path).read_text())
-    peers: list[PeerEndpoint] = []
-    for item in raw:
-        peers.append(
-            PeerEndpoint(
-                peer_id=item["peer_id"],
-                host=item["host"],
-                port=int(item["port"]),
-                model_id=item.get("model_id"),
-                operator_id=item.get("operator_id"),
-                region=item.get("region"),
-                bandwidth_mbps=float(item.get("bandwidth_mbps", 0.0)),
-                seeding_enabled=bool(item.get("seeding_enabled", False)),
-                seed_upload_limit_mbps=float(item.get("seed_upload_limit_mbps", 0.0)),
-                seed_target_upload_limit_mbps=float(item.get("seed_target_upload_limit_mbps", 0.0)),
-                seed_inference_active=bool(item.get("seed_inference_active", False)),
-                runtime_backend=str(item.get("runtime_backend", "toy_cpu")),
-                runtime_target=str(item.get("runtime_target", "cpu")),
-                runtime_model_id=str(item.get("runtime_model_id", "")),
-                quantization_mode=str(item.get("quantization_mode", "fp32")),
-                quantization_bits=int(item.get("quantization_bits", 0)),
-                runtime_gpu_available=bool(item.get("runtime_gpu_available", False)),
-                runtime_estimated_tokens_per_sec=float(item.get("runtime_estimated_tokens_per_sec", 0.0)),
-                runtime_estimated_memory_mb=int(item.get("runtime_estimated_memory_mb", 0)),
-                privacy_noise_variance=float(item.get("privacy_noise_variance", 0.0)),
-                privacy_noise_payloads=int(item.get("privacy_noise_payloads", 0)),
-                privacy_noise_observed_variance_ema=float(item.get("privacy_noise_observed_variance_ema", 0.0)),
-                privacy_noise_last_audit_tag=str(item.get("privacy_noise_last_audit_tag", "")),
-                reputation_score=float(item.get("reputation_score", 0.0)),
-                staked_balance=float(item.get("staked_balance", 0.0)),
-                expert_tags=(
-                    _normalize_tags(item.get("expert_tags", []))
-                    if bool(item.get("expert_admission_approved", True))
-                    else ()
-                ),
-                expert_layer_indices=(
-                    _normalize_layer_indices(item.get("expert_layer_indices", []))
-                    if bool(item.get("expert_admission_approved", True))
-                    else ()
-                ),
-                expert_router=(
-                    bool(item.get("expert_router", False))
-                    if bool(item.get("expert_admission_approved", True))
-                    else False
-                ),
-                expert_admission_approved=bool(item.get("expert_admission_approved", True)),
-                expert_admission_reason=str(item.get("expert_admission_reason", "approved")),
-                geo_verified=bool(item.get("geo_verified", False)),
-                geo_challenge_rtt_ms=(
-                    float(item.get("geo_challenge_rtt_ms"))
-                    if item.get("geo_challenge_rtt_ms") is not None
-                    else None
-                ),
-                geo_penalty_score=float(item.get("geo_penalty_score", 0.0)),
-                public_key_hex=str(item.get("public_key_hex", "") or ""),
-            )
-        )
-    return peers
+    return [PeerEndpoint.from_dict(item) for item in raw]
 
 
 def _normalize_dht_urls(
@@ -419,70 +428,7 @@ def load_peers_from_dht(
         port = item.get("port")
         if not peer_id or not host or port is None:
             continue
-        peers.append(
-            PeerEndpoint(
-                peer_id=peer_id,
-                host=host,
-                port=int(port),
-                model_id=item.get("model_id"),
-                operator_id=item.get("operator_id"),
-                region=item.get("region"),
-                bandwidth_mbps=float(item.get("bandwidth_mbps", 0.0)),
-                seeding_enabled=bool(item.get("seeding_enabled", False)),
-                seed_upload_limit_mbps=float(item.get("seed_upload_limit_mbps", 0.0)),
-                seed_target_upload_limit_mbps=float(item.get("seed_target_upload_limit_mbps", 0.0)),
-                seed_inference_active=bool(item.get("seed_inference_active", False)),
-                runtime_backend=str(item.get("runtime_backend", "toy_cpu")),
-                runtime_target=str(item.get("runtime_target", "cpu")),
-                runtime_model_id=str(item.get("runtime_model_id", "")),
-                quantization_mode=str(item.get("quantization_mode", "fp32")),
-                quantization_bits=int(item.get("quantization_bits", 0)),
-                runtime_gpu_available=bool(item.get("runtime_gpu_available", False)),
-                runtime_estimated_tokens_per_sec=float(item.get("runtime_estimated_tokens_per_sec", 0.0)),
-                runtime_estimated_memory_mb=int(item.get("runtime_estimated_memory_mb", 0)),
-                privacy_noise_variance=float(item.get("privacy_noise_variance", 0.0)),
-                privacy_noise_payloads=int(item.get("privacy_noise_payloads", 0)),
-                privacy_noise_observed_variance_ema=float(item.get("privacy_noise_observed_variance_ema", 0.0)),
-                privacy_noise_last_audit_tag=str(item.get("privacy_noise_last_audit_tag", "")),
-                reputation_score=float(item.get("reputation_score", 0.0)),
-                staked_balance=float(item.get("staked_balance", 0.0)),
-                expert_tags=(
-                    _normalize_tags(item.get("expert_tags", []))
-                    if bool(item.get("expert_admission_approved", True))
-                    else ()
-                ),
-                expert_layer_indices=(
-                    _normalize_layer_indices(item.get("expert_layer_indices", []))
-                    if bool(item.get("expert_admission_approved", True))
-                    else ()
-                ),
-                expert_router=(
-                    bool(item.get("expert_router", False))
-                    if bool(item.get("expert_admission_approved", True))
-                    else False
-                ),
-                expert_admission_approved=bool(item.get("expert_admission_approved", True)),
-                expert_admission_reason=str(item.get("expert_admission_reason", "approved")),
-                geo_verified=bool(item.get("geo_verified", False)),
-                geo_challenge_rtt_ms=(
-                    float(item.get("geo_challenge_rtt_ms"))
-                    if item.get("geo_challenge_rtt_ms") is not None
-                    else None
-                ),
-                geo_penalty_score=float(item.get("geo_penalty_score", 0.0)),
-                public_key_hex=str(item.get("peer_public_key", "") or ""),
-                available_vram_mb=int(item.get("available_vram_mb", 0)),
-                layer_start=int(item.get("layer_start", 0)),
-                layer_end=int(item.get("layer_end", 0)),
-                total_layers=int(item.get("total_layers", 0)),
-                seeder_http_port=int(item.get("seeder_http_port", 0)),
-                cached_model_ids=tuple(
-                    str(m) for m in list(item.get("cached_model_ids", []) or [])
-                    if str(m).strip()
-                ),
-                local_fast_path_port=int(item.get("local_fast_path_port", 0)),
-            )
-        )
+        peers.append(PeerEndpoint.from_dict(item))
     return peers
 
 
