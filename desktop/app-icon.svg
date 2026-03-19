@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="80" fill="#0a0a0a"/>
+  <text x="256" y="300" font-size="280" text-anchor="middle" font-family="system-ui">🦙</text>
+  <text x="256" y="420" font-size="60" text-anchor="middle" fill="#00d4b8" font-family="system-ui" font-weight="bold">HYDRA</text>
+</svg>

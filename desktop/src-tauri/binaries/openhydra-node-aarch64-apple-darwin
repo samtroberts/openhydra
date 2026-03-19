@@ -1,0 +1,26 @@
+#!/bin/bash
+# OpenHydra sidecar wrapper for macOS (Apple Silicon)
+# Delegates to the Python venv binary, or exits 100 to trigger bootstrap.
+
+set -euo pipefail
+
+SUPPORT_DIR="${HOME}/Library/Application Support/OpenHydra"
+VENV_DIR="${SUPPORT_DIR}/venv"
+VENV_BIN="${VENV_DIR}/bin/openhydra-node"
+
+# Special bootstrap mode: run bootstrap.sh directly
+if [ "${1:-}" = "--bootstrap" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")/../resources" && pwd)"
+    exec bash "${SCRIPT_DIR}/bootstrap.sh"
+fi
+
+# Check if venv exists and has the binary
+if [ ! -f "${VENV_BIN}" ]; then
+    echo "openhydra-node not found at ${VENV_BIN}" >&2
+    echo "Triggering first-time setup..." >&2
+    exit 100
+fi
+
+# Activate and run
+source "${VENV_DIR}/bin/activate"
+exec "${VENV_BIN}" "$@"
