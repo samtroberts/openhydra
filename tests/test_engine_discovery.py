@@ -415,3 +415,114 @@ def test_discover_finds_peer_by_hf_id_when_catalog_alias_requested(tmp_path, mon
     )
     assert payload["model"]["requested"] == "openhydra-qwen3.5-0.8b"
     assert payload["response"] == "hello from qwen"
+
+
+# ---------------------------------------------------------------------------
+# Field-preservation tests for _dedupe_peer_entries (v0.1.1 bug fix)
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_preserves_sharding_fields(tmp_path):
+    """_dedupe_peer_entries must NOT drop layer_start/end/total_layers."""
+    engine = CoordinatorEngine(
+        EngineConfig(
+            peers_config_path="/tmp/unused.json",
+            ledger_path=str(tmp_path / "credits.json"),
+            health_store_path=str(tmp_path / "health.json"),
+            barter_decay_per_day=0.0,
+        )
+    )
+    peer = PeerEndpoint(
+        peer_id="shard-peer",
+        host="10.0.0.1",
+        port=5001,
+        model_id="openhydra-qwen3.5-0.8b",
+        layer_start=0,
+        layer_end=16,
+        total_layers=32,
+        available_vram_mb=8192,
+    )
+    result = engine._dedupe_peer_entries([peer])
+    assert len(result) == 1
+    p = result[0]
+    assert p.layer_start == 0
+    assert p.layer_end == 16
+    assert p.total_layers == 32
+    assert p.available_vram_mb == 8192
+
+
+def test_dedupe_preserves_p2p_and_identity_fields(tmp_path):
+    """_dedupe_peer_entries must NOT drop P2P seeder, geo, or identity fields."""
+    engine = CoordinatorEngine(
+        EngineConfig(
+            peers_config_path="/tmp/unused.json",
+            ledger_path=str(tmp_path / "credits.json"),
+            health_store_path=str(tmp_path / "health.json"),
+            barter_decay_per_day=0.0,
+        )
+    )
+    peer = PeerEndpoint(
+        peer_id="p2p-peer",
+        host="10.0.0.2",
+        port=5002,
+        model_id="openhydra-qwen3.5-0.8b",
+        seeder_http_port=9000,
+        cached_model_ids=("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"),
+        local_fast_path_port=8081,
+        public_key_hex="abcdef1234567890",
+        geo_verified=True,
+        geo_challenge_rtt_ms=42.5,
+        geo_penalty_score=0.1,
+    )
+    result = engine._dedupe_peer_entries([peer])
+    assert len(result) == 1
+    p = result[0]
+    assert p.seeder_http_port == 9000
+    assert p.cached_model_ids == ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B")
+    assert p.local_fast_path_port == 8081
+    assert p.public_key_hex == "abcdef1234567890"
+    assert p.geo_verified is True
+    assert p.geo_challenge_rtt_ms == 42.5
+    assert p.geo_penalty_score == 0.1
+
+
+def test_load_candidate_peers_preserves_sharding_fields(monkeypatch, tmp_path):
+    """Fields must survive through _load_candidate_peers → _dedupe_peer_entries."""
+    engine = CoordinatorEngine(
+        EngineConfig(
+            peers_config_path=None,
+            dht_url="http://127.0.0.1:8468",
+            ledger_path=str(tmp_path / "credits.json"),
+            health_store_path=str(tmp_path / "health.json"),
+            barter_decay_per_day=0.0,
+        )
+    )
+
+    monkeypatch.setattr(
+        "coordinator.engine.load_peers_from_dht",
+        lambda dht_url, model_id, timeout_s, preferred_region=None, limit=None, sloppy_factor=None, dsht_replicas=None: [
+            PeerEndpoint(
+                peer_id="shard-dht",
+                host="10.0.0.3",
+                port=5003,
+                layer_start=8,
+                layer_end=16,
+                total_layers=32,
+                seeder_http_port=9001,
+                cached_model_ids=("Qwen/Qwen3.5-4B",),
+                public_key_hex="deadbeef",
+                geo_verified=True,
+            ),
+        ],
+    )
+
+    peers = engine._load_candidate_peers()
+    assert len(peers) >= 1
+    p = [x for x in peers if x.peer_id == "shard-dht"][0]
+    assert p.layer_start == 8
+    assert p.layer_end == 16
+    assert p.total_layers == 32
+    assert p.seeder_http_port == 9001
+    assert p.cached_model_ids == ("Qwen/Qwen3.5-4B",)
+    assert p.public_key_hex == "deadbeef"
+    assert p.geo_verified is True
