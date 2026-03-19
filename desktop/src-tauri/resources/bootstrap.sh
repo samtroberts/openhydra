@@ -30,18 +30,18 @@ OS=$(uname -s)
 
 if [ "$OS" = "Darwin" ]; then
     echo "installing_mlx"
-    pip install openhydra mlx mlx-lm --quiet
+    pip install "openhydra-network[mlx]" --quiet
 elif [ "$OS" = "Linux" ]; then
     # Check for NVIDIA vs AMD
     if command -v nvidia-smi &>/dev/null; then
         echo "installing_cuda"
-        pip install openhydra torch --quiet
+        pip install openhydra-network torch --quiet
     elif [ -d "/opt/rocm" ]; then
         echo "installing_rocm"
-        pip install openhydra torch --index-url https://download.pytorch.org/whl/rocm6.2 --quiet
+        pip install openhydra-network torch --index-url https://download.pytorch.org/whl/rocm6.2 --quiet
     else
         echo "installing_cpu"
-        pip install openhydra torch --quiet
+        pip install openhydra-network torch --quiet
     fi
 fi
 

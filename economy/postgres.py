@@ -6,7 +6,7 @@ SqliteHydraTokenEconomy but persist data in a PostgreSQL database via
 psycopg2.  The entire module is guarded by _PSYCOPG2_AVAILABLE so that
 importing this file never hard-fails on a machine without psycopg2.
 
-Install the extra:  pip install openhydra[postgres]
+Install the extra:  pip install openhydra-network[postgres]
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _require_psycopg2() -> None:
     if not _PSYCOPG2_AVAILABLE:
         raise RuntimeError(
             "psycopg2 is not installed. "
-            "Install it with: pip install openhydra[postgres]"
+            "Install it with: pip install openhydra-network[postgres]"
         )
 
 

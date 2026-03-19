@@ -37,7 +37,7 @@ Open the app. It auto-detects your hardware, joins the base swarm (Qwen 3.5 0.8B
 ### CLI Install
 
 ```bash
-pip install openhydra
+pip install openhydra-network
 openhydra-node --peer-id my-node
 ```
 
