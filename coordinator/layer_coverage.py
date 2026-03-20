@@ -238,6 +238,11 @@ class PeerMetrics:
     estimated_tps: float = 0.0
     reputation_score: float = 50.0
     load_pct: float = 0.0
+    # Phase 2A: KV cache availability (0 = unknown or full).
+    available_kv_slots: int = 0
+    # Phase 2A: Measured RTT (ms) from this peer to downstream peers.
+    # Keyed by downstream peer_id; populated from DHT announcement.
+    next_hop_rtts: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -250,12 +255,15 @@ class PipelineWeights:
              + w_infer × infer_time_ms
              + w_rep   × (1.0 - reputation/100) × rep_penalty
              + w_load  × load_pct × load_penalty
+             + w_kv    × kv_alloc_delay      (if available_kv_slots <= 0)
+             + w_s2s   × next_hop_rtt_ms     (if server-to-server RTT measured)
 
     where ``infer_time_ms = (span / estimated_tps) * 1000`` when TPS > 0,
     else a conservative fallback.
 
     Defaults are tuned for a WAN swarm of 10–50 peers where latency and
-    inference time dominate; reputation and load act as tie-breakers.
+    inference time dominate; reputation, load, KV pressure, and S2S RTT
+    act as tie-breakers and pipeline-topology optimisers.
     """
 
     w_rtt: float = 1.0
@@ -265,6 +273,12 @@ class PipelineWeights:
     rep_penalty: float = 500.0    # ms-equivalent penalty for a 0-reputation peer
     load_penalty: float = 300.0   # ms-equivalent penalty for a 100%-loaded peer
     unknown_tps_fallback: float = 1.0   # tokens/sec assumed when TPS is unknown
+    # Phase 2A: KV cache pressure — penalise peers with no free KV slots.
+    w_kv: float = 2.0
+    kv_alloc_delay: float = 10_000.0  # ms-equivalent penalty when cache is full
+    # Phase 2A: Server-to-server RTT — prefer pipelines where consecutive
+    # peers have low measured latency between each other.
+    w_s2s: float = 0.8
 
 
 def _dijkstra_edge_cost(
@@ -272,28 +286,51 @@ def _dijkstra_edge_cost(
     metrics: PeerMetrics,
     weights: PipelineWeights,
 ) -> float:
-    """Compute the cost of routing through *lr* given its *metrics*.
+    """Compute the per-peer cost of routing through *lr* given its *metrics*.
 
-    Returns a positive float in "millisecond-equivalent" units.
+    Five cost factors (factors 1–5) in millisecond-equivalent units:
+
+    1. **RTT** — client-to-peer round-trip latency.
+    2. **Inference time** — estimated time to process this peer's layer span.
+    3. **Reputation** — penalty for low-trust peers.
+    4. **Load** — penalty for heavily-loaded peers.
+    5. **KV cache pressure** — large penalty when peer has no free KV slots,
+       forcing the coordinator to consider alternatives with warm caches.
+
+    Factor 6 (server-to-server RTT) is applied at the graph level in
+    ``find_optimal_pipeline`` using the upstream peer's ``next_hop_rtts``.
+
+    Args:
+        lr: The layer range this peer covers.
+        metrics: Runtime metrics for the peer (latency, TPS, reputation, etc.).
+        weights: Tunable weights for each cost factor.
+
+    Returns:
+        Positive float: total weighted cost in ms-equivalent units.
     """
-    # RTT component.
+    # Factor 1: RTT component.
     rtt_cost = weights.w_rtt * max(0.0, metrics.latency_ms)
 
-    # Inference-time component: time to process this peer's layer span.
+    # Factor 2: Inference-time component.
     tps = metrics.estimated_tps if metrics.estimated_tps > 0 else weights.unknown_tps_fallback
     span = max(1, lr.span)
     infer_ms = (span / tps) * 1000.0
     infer_cost = weights.w_infer * infer_ms
 
-    # Reputation penalty: lower reputation → higher cost.
+    # Factor 3: Reputation penalty.
     rep = max(0.0, min(100.0, metrics.reputation_score))
     rep_cost = weights.w_rep * (1.0 - rep / 100.0) * weights.rep_penalty
 
-    # Load penalty: higher load → higher cost.
+    # Factor 4: Load penalty.
     load = max(0.0, min(1.0, metrics.load_pct))
     load_cost = weights.w_load * load * weights.load_penalty
 
-    return rtt_cost + infer_cost + rep_cost + load_cost
+    # Factor 5: KV cache pressure — penalise peers with no free slots.
+    kv_cost = 0.0
+    if metrics.available_kv_slots <= 0:
+        kv_cost = weights.w_kv * weights.kv_alloc_delay
+
+    return rtt_cost + infer_cost + rep_cost + load_cost + kv_cost
 
 
 def find_optimal_pipeline(
@@ -379,7 +416,7 @@ def find_optimal_pipeline(
             for pid, r in valid.items():
                 if r.layer_start <= 0:
                     m = peer_metrics.get(pid, _DEFAULT_METRICS)
-                    edge = _dijkstra_edge_cost(r, m, weights)
+                    edge = _dijkstra_edge_cost(r, m, weights)  # no S2S from source
                     new_cost = cost + edge
                     if new_cost < dist[pid]:
                         dist[pid] = new_cost
@@ -397,12 +434,21 @@ def find_optimal_pipeline(
                     heapq.heappush(pq, (cost, "__sink__"))
 
             # Edges to other peers whose layer_start is reachable.
+            # Factor 6 (S2S RTT): the upstream peer (node) measures RTT to
+            # each downstream peer and stores it in its next_hop_rtts dict.
+            # We pass node's metrics so the cost function can look up the
+            # S2S RTT from node → pid.
+            node_metrics = peer_metrics.get(node, _DEFAULT_METRICS)
             for pid, r_next in valid.items():
                 if pid == node:
                     continue
                 if r_next.layer_start <= r_node.layer_end:
                     m = peer_metrics.get(pid, _DEFAULT_METRICS)
                     edge = _dijkstra_edge_cost(r_next, m, weights)
+                    # Add S2S RTT from the UPSTREAM node → downstream pid.
+                    s2s_rtt = node_metrics.next_hop_rtts.get(pid, 0.0)
+                    if s2s_rtt > 0:
+                        edge += weights.w_s2s * s2s_rtt
                     new_cost = cost + edge
                     if new_cost < dist[pid]:
                         dist[pid] = new_cost

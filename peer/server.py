@@ -242,6 +242,11 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             reason="default",
         )
         self.kv_cache_max_entries = max(1, int(kv_cache_max_entries))
+        # Phase 2A: Server-to-server RTT measurements.
+        # Populated after Forward() calls by pinging the next hop.
+        # Keyed by downstream peer_id → measured RTT in ms.
+        self._next_hop_rtts: dict[str, float] = {}
+        self._next_hop_rtts_lock = threading.Lock()
         self._kv_cache: dict[str, list[float]] = {}
         self.last_request_thread_id: int | None = None
         self.last_inference_thread_id: int | None = None
@@ -541,6 +546,30 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             with self._lock:
                 self._inflight = max(0, self._inflight - 1)
 
+    def record_next_hop_rtt(self, downstream_peer_id: str, rtt_ms: float) -> None:
+        """Record the measured RTT to a downstream peer for S2S routing.
+
+        Called after Forward() completes to store the latency to the next
+        hop in the pipeline.  This data is broadcast in the next DHT
+        announce cycle so coordinators can build S2S-aware pipelines.
+
+        Args:
+            downstream_peer_id: The peer_id of the downstream hop.
+            rtt_ms: Measured round-trip time in milliseconds.
+        """
+        if not downstream_peer_id or rtt_ms <= 0:
+            return
+        with self._next_hop_rtts_lock:
+            self._next_hop_rtts[downstream_peer_id] = round(rtt_ms, 2)
+
+    def get_next_hop_rtts_json(self) -> str:
+        """Return JSON-encoded S2S RTT dict for DHT announcement."""
+        with self._next_hop_rtts_lock:
+            if not self._next_hop_rtts:
+                return ""
+            import json as _json
+            return _json.dumps(self._next_hop_rtts)
+
     def GetPeerStatus(
         self,
         request: peer_pb2.PeerStatusRequest,
@@ -708,6 +737,8 @@ def _announce_loop(
             public_key=str(announce_public_key_hex or ""),
             signature=(_sign_announce_safe(announce_private_key, service.peer_id, advertise_host, port, service.model_id) if announce_private_key is not None else ""),
             available_vram_mb=_probe_available_vram_mb(),
+            available_kv_slots=max(0, service.kv_cache_max_entries - len(getattr(service, '_kv_cache', {}))),
+            next_hop_rtts_json=service.get_next_hop_rtts_json(),
             layer_start=int(runtime_profile.get("layer_start", 0)),
             layer_end=int(runtime_profile.get("layer_end", 0)),
             total_layers=int(runtime_profile.get("total_layers", 0)),

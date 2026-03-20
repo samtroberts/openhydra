@@ -65,6 +65,13 @@ class Announcement:
     # Phase A: local fast-path TCP port for same-LAN raw tensor transfer.
     # 0 = disabled (no fast-path server running).
     local_fast_path_port: int = 0
+    # Phase 2A: KV cache availability — number of free cache slots.
+    # 0 = unknown or full.  Coordinators penalise 0-slot peers in routing.
+    available_kv_slots: int = 0
+    # Phase 2A: Server-to-server measured RTT (ms) to downstream peers.
+    # JSON-encoded dict[str, float] keyed by downstream peer_id.
+    # Empty string = no measurements available.
+    next_hop_rtts_json: str = ""
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:
