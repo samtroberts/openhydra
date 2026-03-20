@@ -136,6 +136,13 @@ class InferenceService:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
     ) -> dict[str, Any]:
+        """Normalize and clamp decode control parameters into a clean dict.
+
+        Only includes keys whose values were explicitly provided (non-None).
+
+        Returns:
+            Dict of validated decode control parameters.
+        """
         out: dict[str, Any] = {}
         if decode_do_sample is not None:
             out["decode_do_sample"] = bool(decode_do_sample)
@@ -151,6 +158,7 @@ class InferenceService:
 
     @staticmethod
     def _normalize_decode_kwarg_aliases(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Map short-form decode kwargs (e.g. ``temperature``) to canonical names."""
         out = dict(kwargs)
         alias_map = {
             "do_sample": "decode_do_sample",
@@ -167,6 +175,7 @@ class InferenceService:
 
     @staticmethod
     def _pipeline_uses_pytorch_runtime(pipeline: list[PeerEndpoint]) -> bool:
+        """Return True if every peer in the pipeline uses a PyTorch backend."""
         if not pipeline:
             return False
         backends = [str(peer.runtime_backend or "").strip().lower() for peer in pipeline]
@@ -181,6 +190,7 @@ class InferenceService:
 
     @staticmethod
     def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+        """Convert a list of chat messages to a plain ``role: content`` prompt."""
         lines = []
         for item in messages:
             role = str(item.get("role", "user")).strip() or "user"
@@ -235,6 +245,18 @@ class InferenceService:
         *,
         model_id: str | None = None,
     ) -> str:
+        """Convert chat messages to a model-specific prompt using chat templates.
+
+        Attempts to use the model's tokenizer chat template for proper
+        formatting; falls back to the plain ``role: content`` format.
+
+        Args:
+            messages: List of chat message dicts with ``role`` and ``content``.
+            model_id: Optional model ID to resolve the tokenizer for.
+
+        Returns:
+            Formatted prompt string.
+        """
         fallback = self._messages_to_prompt(messages)
         if not bool(self.config.pytorch_chat_template_enabled):
             return fallback
@@ -511,6 +533,35 @@ class InferenceService:
         decode_seed: int | None = None,
         deadline: float | None = None,
     ):
+        """Build and execute an InferenceChain through the gRPC pipeline.
+
+        Constructs the chain with the configured transport, encryption, and
+        compression settings, runs it with failover support, and records
+        health outcomes for each peer.  Also increments KV and inference
+        proxy counters.
+
+        Args:
+            prompt: The text prompt to send through the pipeline.
+            candidates: Full candidate pool for failover.
+            pipeline: Ordered peers forming the active pipeline.
+            max_tokens: Maximum tokens to generate.
+            request_id: Optional unique request identifier.
+            initial_activation: Optional activation seed vector.
+            kv_session_id: Optional KV cache session identifier.
+            kv_use_cached_activation: Whether to use cached activations.
+            kv_store_activation: Whether to store activations in the cache.
+            kv_cache_stage_index: Pipeline stage index for KV caching.
+            kv_cache_all_stages: Whether to cache at all pipeline stages.
+            decode_do_sample: Enable sampling during decoding.
+            decode_temperature: Sampling temperature.
+            decode_top_p: Nucleus sampling threshold.
+            decode_top_k: Top-k sampling parameter.
+            decode_seed: Random seed for reproducible sampling.
+            deadline: Absolute deadline (epoch seconds) for the request.
+
+        Returns:
+            A ``ChainResult`` with generated text, traces, and metadata.
+        """
         # Resolve InferenceChain through the engine module so that
         # monkeypatching coordinator.engine.InferenceChain works in tests.
         import coordinator.engine as _engine_mod
@@ -588,6 +639,20 @@ class InferenceService:
         tertiary: ChainResult | None,
         verification: Any,
     ) -> dict[str, list[str]]:
+        """Apply verification outcomes to peer health and stake.
+
+        Rewards peers matching the winner, penalises divergent ones with
+        stake slashing or aggressive reputation penalties.
+
+        Args:
+            primary: The primary inference chain result.
+            secondary: Optional secondary chain result.
+            tertiary: Optional tertiary chain result.
+            verification: The mystery-shopper verification outcome.
+
+        Returns:
+            Dict with ``rewarded_peers`` and ``penalized_peers`` lists.
+        """
         if not verification.audited:
             return {"rewarded_peers": [], "penalized_peers": []}
 
@@ -640,6 +705,7 @@ class InferenceService:
     # ------------------------------------------------------------------
 
     def _replication_dict(self, model_id: str, healthy_peers: int) -> dict[str, Any]:
+        """Evaluate and serialize replication status for a model."""
         status = self.replication_monitor.evaluate(
             model_id,
             healthy_peers,
@@ -648,6 +714,7 @@ class InferenceService:
         return self.replication_monitor.to_dict(status)
 
     def _discovered_peer_rows(self, health) -> list[dict[str, Any]]:
+        """Build detailed per-peer row dicts for API serialization."""
         scored_lookup = {item.peer.peer_id: item for item in self._last_scored_peers}
         rows = []
         for item in health:
@@ -698,6 +765,7 @@ class InferenceService:
     # ------------------------------------------------------------------
 
     def _grounding_meta(self, *, enabled: bool, snippets: list[str], grounding_result: Any | None) -> dict[str, Any]:
+        """Build the grounding metadata dict for the inference response."""
         return {
             "enabled": enabled,
             "snippets": snippets,
@@ -708,6 +776,7 @@ class InferenceService:
         }
 
     def _model_meta(self, decision: DegradationDecision) -> dict[str, Any]:
+        """Build the model metadata dict including degradation and QoS info."""
         return {
             "requested": decision.requested_model,
             "served": decision.served_model,
@@ -734,6 +803,25 @@ class InferenceService:
         expert_tags: list[str] | None = None,
         expert_layer_indices: list[int] | None = None,
     ) -> InferencePreparation:
+        """Prepare everything needed before running an inference chain.
+
+        Performs grounding injection, peer discovery, pipeline assembly
+        (sharded or full-model), bandwidth asymmetry reordering, and MoE
+        geo-sharding.
+
+        Args:
+            prompt: The raw user prompt.
+            pipeline_width: Desired pipeline width (peers per pipeline).
+            grounding: Whether to enable RAG grounding.
+            model_id: Requested model identifier.
+            allow_degradation: Whether model degradation fallback is allowed.
+            session_id: Optional session ID for KV affinity.
+            expert_tags: Optional explicit expert tags for MoE routing.
+            expert_layer_indices: Optional explicit layer indices for MoE routing.
+
+        Returns:
+            An ``InferencePreparation`` dataclass with all assembled state.
+        """
         requested_model = model_id or self.config.default_model
         allow_deg = self.config.allow_degradation_default if allow_degradation is None else bool(allow_degradation)
 
@@ -835,6 +923,40 @@ class InferenceService:
         decode_seed: int | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        """Execute a single-shot inference request with full verification.
+
+        Runs the primary pipeline, then triggers mystery-shopper verification
+        (secondary and optionally tertiary redundant executions).  Applies
+        verification feedback, earns barter credits, mints HYDRA rewards,
+        and returns the complete response with pipeline traces and metadata.
+
+        Args:
+            prompt: The text prompt.
+            max_tokens: Maximum tokens to generate (capped by elastic ceiling).
+            pipeline_width: Number of peers per pipeline.
+            grounding: Whether to enable RAG grounding.
+            priority: Whether to spend priority credits.
+            client_id: Client identifier for credit operations.
+            model_id: Requested model identifier.
+            allow_degradation: Whether model degradation is allowed.
+            session_id: Optional session ID for KV affinity.
+            expert_tags: Optional expert tags for MoE routing.
+            expert_layer_indices: Optional layer indices for MoE routing.
+            decode_do_sample: Enable sampling during decoding.
+            decode_temperature: Sampling temperature.
+            decode_top_p: Nucleus sampling threshold.
+            decode_top_k: Top-k sampling parameter.
+            decode_seed: Random seed for reproducible sampling.
+            request_id: Optional unique request identifier.
+
+        Returns:
+            Dict with ``response``, ``pipeline``, ``verification``,
+            ``model``, ``grounding``, and other metadata.
+
+        Raises:
+            RuntimeError: If priority credits are insufficient or no peers found.
+            ValueError: If max_tokens exceeds the elastic ceiling.
+        """
         request_id = request_id or str(uuid.uuid4())
         max_tokens = int(max_tokens or 1024)
         logger.info(
@@ -1045,6 +1167,40 @@ class InferenceService:
         decode_seed: int | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        """Execute a streaming inference request, yielding tokens incrementally.
+
+        Supports four execution modes: PyTorch speculative decode, PyTorch
+        autoregressive, speculative decode (toy), and iterative decode.
+        Includes KV cache seeding, peer-native cache reuse, pipeline-parallel
+        prefetching, and adaptive speculative batch sizing.
+
+        Args:
+            prompt: The text prompt.
+            max_tokens: Maximum tokens to stream.
+            pipeline_width: Number of peers per pipeline.
+            grounding: Whether to enable RAG grounding.
+            priority: Whether to spend priority credits.
+            client_id: Client identifier for credit operations.
+            model_id: Requested model identifier.
+            allow_degradation: Whether model degradation is allowed.
+            session_id: Optional session ID for KV affinity.
+            expert_tags: Optional expert tags for MoE routing.
+            expert_layer_indices: Optional layer indices for MoE routing.
+            decode_do_sample: Enable sampling during decoding.
+            decode_temperature: Sampling temperature.
+            decode_top_p: Nucleus sampling threshold.
+            decode_top_k: Top-k sampling parameter.
+            decode_seed: Random seed for reproducible sampling.
+            request_id: Optional unique request identifier.
+
+        Returns:
+            Dict with ``stream`` (a generator yielding token strings),
+            ``model``, ``grounding``, ``streaming`` config, and metadata.
+
+        Raises:
+            RuntimeError: If priority credits are insufficient or no peers found.
+            ValueError: If max_tokens exceeds the elastic ceiling.
+        """
         request_id = request_id or str(uuid.uuid4())
         logger.info(
             "infer_stream_start req_id=%s model=%s client=%s",
@@ -1708,6 +1864,18 @@ class InferenceService:
     # ------------------------------------------------------------------
 
     def infer_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        """Single-shot chat inference from a list of messages.
+
+        Converts messages to a model-specific prompt using chat templates,
+        applies default decode controls, and delegates to ``infer()``.
+
+        Args:
+            messages: List of chat message dicts with ``role`` and ``content``.
+            **kwargs: Additional arguments forwarded to ``infer()``.
+
+        Returns:
+            The full inference response dict.
+        """
         kwargs = self._normalize_decode_kwarg_aliases(kwargs)
         requested_model = str(kwargs.get("model_id", self.config.default_model) or self.config.default_model)
         prompt = self._engine._messages_to_model_prompt(messages, model_id=requested_model)
@@ -1724,6 +1892,18 @@ class InferenceService:
         return self.infer(prompt=prompt, **kwargs)
 
     def infer_chat_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        """Streaming chat inference from a list of messages.
+
+        Converts messages to a model-specific prompt using chat templates,
+        applies default decode controls, and delegates to ``infer_stream()``.
+
+        Args:
+            messages: List of chat message dicts with ``role`` and ``content``.
+            **kwargs: Additional arguments forwarded to ``infer_stream()``.
+
+        Returns:
+            The streaming inference response dict with a token generator.
+        """
         kwargs = self._normalize_decode_kwarg_aliases(kwargs)
         requested_model = str(kwargs.get("model_id", self.config.default_model) or self.config.default_model)
         prompt = self._engine._messages_to_model_prompt(messages, model_id=requested_model)

@@ -52,6 +52,20 @@ class TokenizationService:
     # ------------------------------------------------------------------
 
     def _load_generation_tokenizer(self, model_id: str) -> Any:
+        """Load and cache a HuggingFace tokenizer for the given model ID.
+
+        Uses a normalised model ID as the cache key so that repeated calls
+        with the same model avoid redundant downloads.
+
+        Args:
+            model_id: HuggingFace model identifier (e.g. ``"Qwen/Qwen3.5-0.8B"``).
+
+        Returns:
+            A ``transformers.AutoTokenizer`` instance.
+
+        Raises:
+            RuntimeError: If the ``transformers`` package is not installed.
+        """
         normalized = str(model_id or self.config.pytorch_generation_model_id).strip() or "gpt2"
         cached = self._tokenizer_cache.get(normalized)
         if cached is not None:
@@ -74,6 +88,18 @@ class TokenizationService:
     # ------------------------------------------------------------------
 
     def _load_pytorch_draft_model(self, *, tokenizer_model_id: str) -> PyTorchDraftModel:
+        """Load and cache a PyTorch draft model for speculative decoding.
+
+        The cache key is ``(draft_model_id, tokenizer_model_id)`` so that
+        different tokenizer pairings each get their own instance.
+
+        Args:
+            tokenizer_model_id: HuggingFace model ID whose tokenizer the
+                draft model should share.
+
+        Returns:
+            A cached ``PyTorchDraftModel`` instance.
+        """
         draft_model_id = str(self.config.pytorch_speculative_draft_model_id or "sshleifer/tiny-gpt2").strip() or "sshleifer/tiny-gpt2"
         tokenizer_model = str(tokenizer_model_id or self.config.pytorch_generation_model_id or "gpt2").strip() or "gpt2"
         key = (draft_model_id, tokenizer_model)
@@ -93,6 +119,17 @@ class TokenizationService:
     # ------------------------------------------------------------------
 
     def _resolve_runtime_model_id(self, model_id: str) -> str:
+        """Resolve a user-facing model ID to its HuggingFace runtime model ID.
+
+        Resolution order: catalog lookup, pass-through if it contains ``/``,
+        then fall back to the configured default model.
+
+        Args:
+            model_id: The user-requested model identifier.
+
+        Returns:
+            A HuggingFace model ID suitable for loading weights/tokenizer.
+        """
         requested = str(model_id or "").strip()
         if not requested:
             return str(self.config.pytorch_generation_model_id or "gpt2").strip() or "gpt2"
@@ -104,6 +141,18 @@ class TokenizationService:
         return str(self.config.pytorch_generation_model_id or "gpt2").strip() or "gpt2"
 
     def _resolve_pipeline_runtime_model_id(self, pipeline: list[PeerEndpoint], served_model: str) -> str:
+        """Determine the runtime model ID from the pipeline peers.
+
+        Checks each peer in order for a non-empty ``runtime_model_id`` and
+        returns the first match; falls back to ``_resolve_runtime_model_id``.
+
+        Args:
+            pipeline: Ordered list of peers in the inference pipeline.
+            served_model: The served model identifier (used as fallback).
+
+        Returns:
+            The runtime model ID string.
+        """
         for peer in pipeline:
             runtime_model_id = str(getattr(peer, "runtime_model_id", "") or "").strip()
             if runtime_model_id:

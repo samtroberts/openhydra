@@ -149,6 +149,20 @@ class PipelineService:
     # ------------------------------------------------------------------
 
     def _select_pipeline(self, candidates: list, pipeline_width: int | None = None) -> list:
+        """Assemble a full-model inference pipeline from ranked candidates.
+
+        Uses the concentration guard to enforce operator diversity constraints.
+
+        Args:
+            candidates: Ranked list of candidate peers.
+            pipeline_width: Number of peers per pipeline (defaults to config).
+
+        Returns:
+            Ordered list of peers forming the pipeline.
+
+        Raises:
+            RuntimeError: If no peers are selected.
+        """
         width = max(1, pipeline_width or self.config.pipeline_width)
         pipeline = assemble_pipeline(
             candidates,
@@ -173,9 +187,18 @@ class PipelineService:
     # ------------------------------------------------------------------
 
     def _role_for_peer(self, peer: PeerEndpoint) -> str:
+        """Classify a peer's bandwidth role (prefill_capable, balanced, decode_only)."""
         return classify_role(peer.bandwidth_mbps, thresholds=self.role_thresholds)
 
     def _reorder_for_decode_tail(self, peers: list[PeerEndpoint]) -> list[PeerEndpoint]:
+        """Move decode-only peers to the tail of the pipeline.
+
+        Args:
+            peers: Pipeline peer list to reorder.
+
+        Returns:
+            Reordered peer list with decode-only peers at the end.
+        """
         if len(peers) <= 1:
             return peers
         decode_only = [peer for peer in peers if self._role_for_peer(peer) == "decode_only"]
@@ -195,6 +218,23 @@ class PipelineService:
         session_id: str | None = None,
         model_id: str | None = None,
     ) -> tuple[list[PeerEndpoint], dict[str, Any]]:
+        """Reorder the pipeline to place the best prefill peer first.
+
+        When the estimated prompt length exceeds the prefill threshold, selects
+        a prefill-capable peer (preferring the KV-affinity sticky peer if
+        available) and places it at position 0.  Decode-only peers are pushed
+        to the tail.
+
+        Args:
+            pipeline: Current pipeline to reorder.
+            ranked_candidates: All ranked candidate peers.
+            prompt_tokens_est: Estimated prompt token count.
+            session_id: Optional session ID for KV affinity lookup.
+            model_id: Optional model ID for KV affinity lookup.
+
+        Returns:
+            Tuple of (reordered_pipeline, bandwidth_policy_dict).
+        """
         served_model = model_id or self.config.default_model
         kv_affinity_requested = bool(self.config.kv_affinity_enabled and session_id)
         previous_prefill_peer_id = self._engine._get_kv_affinity_peer(session_id, served_model)

@@ -121,6 +121,14 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _load_model_catalog(self) -> list[ModelAvailability]:
+        """Load the model catalog from a JSON file or create a single-model default.
+
+        Returns:
+            List of ``ModelAvailability`` entries.
+
+        Raises:
+            RuntimeError: If the catalog file is missing or contains no valid entries.
+        """
         if not self.config.model_catalog_path:
             return [ModelAvailability(model_id=self.config.default_model, required_peers=self.config.required_replicas)]
 
@@ -179,6 +187,14 @@ class DiscoveryService:
         return catalogue
 
     def _catalog_hf_model_id(self, model_id: str) -> str | None:
+        """Look up the HuggingFace model ID for a catalog entry.
+
+        Args:
+            model_id: The user-facing model identifier.
+
+        Returns:
+            The HuggingFace model ID string, or ``None`` if not found.
+        """
         key = str(model_id or "").strip()
         if not key:
             return None
@@ -189,15 +205,18 @@ class DiscoveryService:
         return value or None
 
     def _catalog_model_ids(self) -> list[str]:
+        """Return all model IDs in the catalog."""
         return [item.model_id for item in self.model_catalog]
 
     def _required_replicas(self, model_id: str) -> int:
+        """Return the required replica count for a model, falling back to config default."""
         item = self.catalogue_by_model.get(model_id)
         if item is None:
             return self.config.required_replicas
         return item.required_peers
 
     def _normalize_peer_model(self, peer: PeerEndpoint) -> str:
+        """Return the peer's model ID, falling back to the default model."""
         return peer.model_id or self.config.default_model
 
     # ------------------------------------------------------------------
@@ -205,6 +224,16 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _dedupe_peer_entries(self, peers: list[PeerEndpoint]) -> list[PeerEndpoint]:
+        """Deduplicate peer entries by ``(peer_id, model_id)`` key.
+
+        Later entries for the same key overwrite earlier ones.
+
+        Args:
+            peers: Raw list of peer endpoints (may contain duplicates).
+
+        Returns:
+            Deduplicated list of peer endpoints.
+        """
         deduped: dict[tuple[str, str], PeerEndpoint] = {}
         for peer in peers:
             model_id = self._normalize_peer_model(peer)
@@ -217,6 +246,14 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _configured_dht_urls(self) -> list[str]:
+        """Return the list of DHT bootstrap URLs to query.
+
+        Merges ``config.dht_urls`` and ``config.dht_url``, falling back to
+        the production bootstrap nodes when no URLs are configured.
+
+        Returns:
+            Ordered, deduplicated list of DHT URL strings.
+        """
         sources: list[str] = []
         seen: set[str] = set()
         for item in list(getattr(self.config, "dht_urls", [])):
@@ -239,6 +276,22 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _load_candidate_peers(self, model_ids: list[str] | None = None) -> list[PeerEndpoint]:
+        """Load candidate peers from config file and/or DHT bootstrap nodes.
+
+        Queries each configured DHT URL for every model in the filter set,
+        caching results and falling back to the cache on errors.  Results
+        are deduplicated before returning.
+
+        Args:
+            model_ids: Optional list of model IDs to filter for.  Defaults to
+                all catalog model IDs.
+
+        Returns:
+            Deduplicated list of discovered peer endpoints.
+
+        Raises:
+            RuntimeError: If no peers are found from any source.
+        """
         peers: list[PeerEndpoint] = []
         model_filter = set(model_ids or self._catalog_model_ids())
 
@@ -311,6 +364,12 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _cache_dht_peers(self, *, model_id: str, peers: list[PeerEndpoint]) -> None:
+        """Store a DHT peer list in the in-memory cache with a TTL.
+
+        Args:
+            model_id: The model ID to cache peers under.
+            peers: The peer endpoints to cache.
+        """
         normalized_model = str(model_id or "").strip()
         if not normalized_model or not peers:
             return
@@ -324,6 +383,14 @@ class DiscoveryService:
             }
 
     def _cached_dht_peers(self, *, model_id: str) -> list[PeerEndpoint]:
+        """Retrieve cached DHT peers for a model, returning empty on miss/expiry.
+
+        Args:
+            model_id: The model ID to look up.
+
+        Returns:
+            List of cached peer endpoints, or empty list if expired or absent.
+        """
         normalized_model = str(model_id or "").strip()
         if not normalized_model:
             return []
@@ -348,6 +415,14 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _scan_network(self, model_ids: list[str] | None = None):
+        """Load peers, ping-survey them, and return healthy peers with counts.
+
+        Args:
+            model_ids: Optional model ID filter for peer loading.
+
+        Returns:
+            Tuple of (healthy_items, available_peer_counts_by_model).
+        """
         peers = self._load_candidate_peers(model_ids=model_ids)
         finder = PathFinder(
             timeout_ms=min(self.config.timeout_ms, 1200),
@@ -366,6 +441,7 @@ class DiscoveryService:
         return healthy, available_peer_counts
 
     def _record_ping_health(self, survey) -> None:
+        """Record ping health outcomes for all peers in a survey result."""
         for item in survey:
             self.health.record_ping(item.peer.peer_id, healthy=item.healthy, latency_ms=item.latency_ms)
 
@@ -374,6 +450,7 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _verification_feedback_by_model(self, health) -> dict[str, dict[str, Any]]:
+        """Aggregate verification metrics for every model in the catalog."""
         out: dict[str, dict[str, Any]] = {}
         for model in self.model_catalog:
             out[model.model_id] = self._verification_metrics_for_model(model.model_id, health)
@@ -416,6 +493,24 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _discover_for_model(self, requested_model: str, allow_degradation: bool):
+        """Full discovery orchestration for a requested model.
+
+        Scans the network, applies verification QoS gating, evaluates
+        degradation policy, ranks healthy peers by reputation and stake,
+        and returns ranked candidates ready for pipeline assembly.
+
+        Args:
+            requested_model: The user-requested model identifier.
+            allow_degradation: Whether to allow fallback to a different model
+                when the requested one has insufficient peers.
+
+        Returns:
+            Tuple of (model_health, ranked_candidates, degradation_decision,
+            available_peer_counts).
+
+        Raises:
+            RuntimeError: If no viable model or peers are available.
+        """
         requested_model = str(requested_model or self.config.default_model).strip() or self.config.default_model
         scan_models = list(self._catalog_model_ids())
         if bool(self.config.allow_dynamic_model_ids) and requested_model not in scan_models:
@@ -598,6 +693,7 @@ class DiscoveryService:
     # ------------------------------------------------------------------
 
     def _discover(self):
+        """Convenience wrapper: discover peers for the default model."""
         health, candidates, _, _ = self._engine._discover_for_model(
             requested_model=self.config.default_model,
             allow_degradation=self.config.allow_degradation_default,

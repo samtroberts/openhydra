@@ -73,8 +73,13 @@ jobs:
 
       - name: Ruff check
         # E/W/F: pycodestyle errors, warnings, pyflakes. E501 (line length) ignored.
-        # --exit-zero so lint failures are advisory until we enforce them.
-        run: ruff check . --select E,W,F --ignore E501 --exit-zero
+        run: ruff check . --select E,W,F --ignore E501
+
+      - name: Type check (basic)
+        run: |
+          pip install basedpyright
+          basedpyright coordinator/ peer/ economy/ --level basic
+        continue-on-error: true
 
   # ── Docs site (MkDocs Material) ──────────────────────────────────────────────
   docs:

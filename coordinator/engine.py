@@ -370,6 +370,7 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _hydra_stake_balance(self, pubkey: str) -> float:
+        """Return the staked HYDRA balance for a public key (0.0 on error)."""
         try:
             snapshot = self.hydra.account_snapshot(pubkey)
         except RuntimeError:
@@ -377,6 +378,7 @@ class CoordinatorEngine:
         return max(0.0, float(snapshot.get("stake", 0.0)))
 
     def _hydra_slash_stake(self, pubkey: str, amount: float) -> float:
+        """Slash up to ``amount`` staked tokens from a peer (0.0 on error)."""
         requested = max(0.0, float(amount))
         if requested <= 0.0:
             return 0.0
@@ -391,6 +393,7 @@ class CoordinatorEngine:
         return max(0.0, float(payload.get("slashed", 0.0)))
 
     def _load_model_catalog(self) -> list[ModelAvailability]:
+        """Load the model catalog from JSON or create a single-model default."""
         if not self.config.model_catalog_path:
             return [ModelAvailability(model_id=self.config.default_model, required_peers=self.config.required_replicas)]
         path = Path(self.config.model_catalog_path)
@@ -431,6 +434,7 @@ class CoordinatorEngine:
         return catalogue
 
     def _catalog_hf_model_id(self, model_id: str) -> str | None:
+        """Look up the HuggingFace model ID for a catalog entry."""
         key = str(model_id or "").strip()
         if not key:
             return None
@@ -441,9 +445,11 @@ class CoordinatorEngine:
         return value or None
 
     def _normalize_peer_model(self, peer: PeerEndpoint) -> str:
+        """Return the peer's model ID, falling back to the default model."""
         return peer.model_id or self.config.default_model
 
     def _required_replicas(self, model_id: str) -> int:
+        """Return required replica count for a model from the catalog."""
         item = self.catalogue_by_model.get(model_id)
         return item.required_peers if item is not None else self.config.required_replicas
 
@@ -510,9 +516,11 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _messages_to_model_prompt(self, messages: list[dict[str, Any]], *, model_id: str | None = None) -> str:
+        """Delegate to InferenceService for chat template rendering."""
         return self._inference_svc._messages_to_model_prompt(messages, model_id=model_id)
 
     def infer_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        """Single-shot chat inference with default decode controls."""
         kwargs = self._normalize_decode_kwarg_aliases(kwargs)
         requested_model = str(kwargs.get("model_id", self.config.default_model) or self.config.default_model)
         prompt = self._messages_to_model_prompt(messages, model_id=requested_model)
@@ -529,6 +537,7 @@ class CoordinatorEngine:
         return self.infer(prompt=prompt, **kwargs)
 
     def infer_chat_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        """Streaming chat inference with default decode controls."""
         kwargs = self._normalize_decode_kwarg_aliases(kwargs)
         requested_model = str(kwargs.get("model_id", self.config.default_model) or self.config.default_model)
         prompt = self._messages_to_model_prompt(messages, model_id=requested_model)
@@ -549,9 +558,11 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _load_generation_tokenizer(self, model_id: str) -> Any:
+        """Delegate to TokenizationService."""
         return self._tokenization_svc._load_generation_tokenizer(model_id)
 
     def _load_pytorch_draft_model(self, *, tokenizer_model_id: str) -> PyTorchDraftModel:
+        """Delegate to TokenizationService."""
         return self._tokenization_svc._load_pytorch_draft_model(tokenizer_model_id=tokenizer_model_id)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -559,24 +570,31 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _kv_affinity_key(self, session_id: str, model_id: str) -> tuple[str, str]:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._kv_affinity_key(session_id, model_id)
 
     def _purge_expired_kv_affinity(self) -> None:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._purge_expired_kv_affinity()
 
     def _get_kv_affinity_peer(self, session_id: str | None, model_id: str) -> str | None:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._get_kv_affinity_peer(session_id, model_id)
 
     def _set_kv_affinity_peer(self, session_id: str | None, model_id: str, peer_id: str | None) -> bool:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._set_kv_affinity_peer(session_id, model_id, peer_id)
 
     def _get_kv_affinity_activation(self, session_id: str | None, model_id: str) -> list[float] | None:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._get_kv_affinity_activation(session_id, model_id)
 
     def _get_kv_affinity_activation_peer(self, session_id: str | None, model_id: str) -> str | None:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._get_kv_affinity_activation_peer(session_id, model_id)
 
     def _set_kv_affinity_activation(self, session_id: str | None, model_id: str, activation: list[float] | None) -> bool:
+        """Delegate to KvAffinityService."""
         return self._kv_affinity_svc._set_kv_affinity_activation(session_id, model_id, activation)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -584,23 +602,29 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _record_ping_health(self, survey) -> None:
+        """Delegate to HealthService."""
         return self._health_svc._record_ping_health(survey)
 
     def _verification_feedback_by_model(self, health) -> dict[str, dict[str, Any]]:
+        """Delegate to HealthService."""
         return self._health_svc._verification_feedback_by_model(health)
 
     def _verification_metrics_for_model(self, model_id: str, health) -> dict[str, Any]:
+        """Delegate to HealthService."""
         return self._health_svc._verification_metrics_for_model(model_id, health)
 
     def _apply_verification_feedback(self, *, primary: ChainResult, secondary: ChainResult | None,
                                      tertiary: ChainResult | None, verification: Any) -> dict[str, list[str]]:
+        """Delegate to HealthService."""
         return self._health_svc._apply_verification_feedback(
             primary=primary, secondary=secondary, tertiary=tertiary, verification=verification)
 
     def _replication_dict(self, model_id: str, healthy_peers: int) -> dict[str, Any]:
+        """Delegate to HealthService."""
         return self._health_svc._replication_dict(model_id, healthy_peers)
 
     def _discovered_peer_rows(self, health) -> list[dict[str, Any]]:
+        """Delegate to HealthService."""
         return self._health_svc._discovered_peer_rows(health)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -609,22 +633,27 @@ class CoordinatorEngine:
 
     @staticmethod
     def _normalize_expert_tags(raw: Any) -> list[str]:
+        """Delegate to MoeService."""
         return MoeService._normalize_expert_tags(raw)
 
     @staticmethod
     def _normalize_expert_layer_indices(raw: Any) -> list[int]:
+        """Delegate to MoeService."""
         return MoeService._normalize_expert_layer_indices(raw)
 
     def _extract_prompt_expert_tags(self, prompt: str) -> list[str]:
+        """Delegate to MoeService."""
         return self._moe_svc._extract_prompt_expert_tags(prompt)
 
     def _extract_prompt_expert_layer_indices(self, prompt: str) -> list[int]:
+        """Delegate to MoeService."""
         return self._moe_svc._extract_prompt_expert_layer_indices(prompt)
 
     def _apply_moe_geo_sharding(self, pipeline: list[PeerEndpoint], ranked_candidates: list[PeerEndpoint], *,
                                 prompt: str, requested_expert_tags: list[str] | None,
                                 requested_expert_layer_indices: list[int] | None = None,
                                 locked_first_peer_id: str | None = None) -> tuple[list[PeerEndpoint], dict[str, Any]]:
+        """Delegate to MoeService."""
         return self._moe_svc._apply_moe_geo_sharding(
             pipeline, ranked_candidates, prompt=prompt, requested_expert_tags=requested_expert_tags,
             requested_expert_layer_indices=requested_expert_layer_indices,
@@ -635,36 +664,47 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _dedupe_peer_entries(self, peers: list[PeerEndpoint]) -> list[PeerEndpoint]:
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._dedupe_peer_entries(peers)
 
     def _configured_dht_urls(self) -> list[str]:
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._configured_dht_urls()
 
     def _load_candidate_peers(self, model_ids: list[str] | None = None) -> list[PeerEndpoint]:
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._load_candidate_peers(model_ids=model_ids)
 
     def _cache_dht_peers(self, *, model_id: str, peers: list[PeerEndpoint]) -> None:
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._cache_dht_peers(model_id=model_id, peers=peers)
 
     def _cached_dht_peers(self, *, model_id: str) -> list[PeerEndpoint]:
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._cached_dht_peers(model_id=model_id)
 
     def _scan_network(self, model_ids: list[str] | None = None):
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._scan_network(model_ids=model_ids)
 
     def _discover_for_model(self, requested_model: str, allow_degradation: bool):
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._discover_for_model(requested_model, allow_degradation)
 
     def _discover(self):
+        """Delegate to DiscoveryService."""
         return self._discovery_svc._discover()
 
     def _resolve_runtime_model_id(self, model_id: str) -> str:
+        """Delegate to TokenizationService."""
         return self._tokenization_svc._resolve_runtime_model_id(model_id)
 
     def _resolve_pipeline_runtime_model_id(self, pipeline: list[PeerEndpoint], served_model: str) -> str:
+        """Delegate to TokenizationService."""
         return self._tokenization_svc._resolve_pipeline_runtime_model_id(pipeline, served_model)
 
     def _catalog_model_ids(self) -> list[str]:
+        """Return all model IDs in the catalog."""
         return [item.model_id for item in self.model_catalog]
 
     # ══════════════════════════════════════════════════════════════════════
@@ -672,20 +712,25 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _select_pipeline_sharded(self, health: list) -> list[PeerEndpoint] | None:
+        """Delegate to PipelineService."""
         return self._pipeline_svc._select_pipeline_sharded(health)
 
     def _select_pipeline(self, candidates: list, pipeline_width: int | None = None) -> list:
+        """Delegate to PipelineService."""
         return self._pipeline_svc._select_pipeline(candidates, pipeline_width=pipeline_width)
 
     def _role_for_peer(self, peer: PeerEndpoint) -> str:
+        """Delegate to PipelineService."""
         return self._pipeline_svc._role_for_peer(peer)
 
     def _reorder_for_decode_tail(self, peers: list[PeerEndpoint]) -> list[PeerEndpoint]:
+        """Delegate to PipelineService."""
         return self._pipeline_svc._reorder_for_decode_tail(peers)
 
     def _apply_bandwidth_asymmetry(self, pipeline: list[PeerEndpoint], ranked_candidates: list[PeerEndpoint],
                                    prompt_tokens_est: int, *, session_id: str | None = None,
                                    model_id: str | None = None) -> tuple[list[PeerEndpoint], dict[str, Any]]:
+        """Delegate to PipelineService."""
         return self._pipeline_svc._apply_bandwidth_asymmetry(
             pipeline, ranked_candidates, prompt_tokens_est,
             session_id=session_id, model_id=model_id)
@@ -695,9 +740,11 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _grounding_meta(self, *, enabled: bool, snippets: list[str], grounding_result: Any | None) -> dict[str, Any]:
+        """Delegate to InferenceService."""
         return self._inference_svc._grounding_meta(enabled=enabled, snippets=snippets, grounding_result=grounding_result)
 
     def _model_meta(self, decision: DegradationDecision) -> dict[str, Any]:
+        """Delegate to InferenceService."""
         return self._inference_svc._model_meta(decision)
 
     def _run_chain(self, prompt: str, candidates: list, pipeline: list, max_tokens: int,
@@ -708,6 +755,7 @@ class CoordinatorEngine:
                    decode_temperature: float | None = None, decode_top_p: float | None = None,
                    decode_top_k: int | None = None, decode_seed: int | None = None,
                    deadline: float | None = None):
+        """Delegate to InferenceService."""
         return self._inference_svc._run_chain(
             prompt, candidates, pipeline, max_tokens, request_id=request_id,
             initial_activation=initial_activation, kv_session_id=kv_session_id,
@@ -721,6 +769,7 @@ class CoordinatorEngine:
                            model_id: str | None, allow_degradation: bool | None,
                            session_id: str | None, expert_tags: list[str] | None = None,
                            expert_layer_indices: list[int] | None = None) -> InferencePreparation:
+        """Delegate to InferenceService."""
         return self._inference_svc._prepare_inference(
             prompt=prompt, pipeline_width=pipeline_width, grounding=grounding,
             model_id=model_id, allow_degradation=allow_degradation,
@@ -735,6 +784,7 @@ class CoordinatorEngine:
               decode_temperature: float | None = None, decode_top_p: float | None = None,
               decode_top_k: int | None = None, decode_seed: int | None = None,
               request_id: str | None = None) -> dict[str, Any]:
+        """Execute a single-shot inference request. Delegate to InferenceService."""
         return self._inference_svc.infer(
             prompt=prompt, max_tokens=max_tokens, pipeline_width=pipeline_width,
             grounding=grounding, priority=priority, client_id=client_id,
@@ -752,6 +802,7 @@ class CoordinatorEngine:
                      decode_temperature: float | None = None, decode_top_p: float | None = None,
                      decode_top_k: int | None = None, decode_seed: int | None = None,
                      request_id: str | None = None) -> dict[str, Any]:
+        """Execute a streaming inference request. Delegate to InferenceService."""
         return self._inference_svc.infer_stream(
             prompt=prompt, max_tokens=max_tokens, pipeline_width=pipeline_width,
             grounding=grounding, priority=priority, client_id=client_id,
@@ -766,6 +817,7 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def list_models(self) -> dict[str, Any]:
+        """Return the model catalog. Delegate to StatusService."""
         if not hasattr(self, "_status_svc"):
             # Fallback for partial engines created via __new__ without __init__.
             return self._list_models_inline()
@@ -805,9 +857,11 @@ class CoordinatorEngine:
         return {"object": "list", "data": data}
 
     def network_status(self) -> dict[str, Any]:
+        """Return live network health status. Delegate to StatusService."""
         return self._status_svc.network_status()
 
     def metrics_snapshot(self) -> dict[str, float | int]:
+        """Return operational counter snapshot. Delegate to StatusService."""
         return self._status_svc.metrics_snapshot()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -815,48 +869,63 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def _record_channel_provider_spend(self, channel_id: str, provider_peer_id: str, amount: float) -> None:
+        """Delegate to EconomyService."""
         self._economy._record_channel_provider_spend(channel_id, provider_peer_id, amount)
 
     def _set_channel_payee_spend(self, channel_id: str, payee_peer_id: str, total_spent: float) -> None:
+        """Delegate to EconomyService."""
         self._economy._set_channel_payee_spend(channel_id, payee_peer_id, total_spent)
 
     def _bridge_settle_channel_close(self, close_payload: dict[str, Any]) -> dict[str, Any]:
+        """Delegate to EconomyService."""
         return self._economy._bridge_settle_channel_close(close_payload)
 
     def account_balance(self, client_id: str) -> dict[str, Any]:
+        """Return combined barter + HYDRA balance. Delegate to EconomyService."""
         return self._economy.account_balance(client_id)
 
     def hydra_status(self) -> dict[str, Any]:
+        """Return HYDRA economy summary. Delegate to EconomyService."""
         return self._economy.hydra_status()
 
     def hydra_account(self, client_id: str) -> dict[str, Any]:
+        """Return HYDRA account snapshot. Delegate to EconomyService."""
         return self._economy.hydra_account(client_id)
 
     def hydra_governance_params(self) -> dict[str, Any]:
+        """Return governance parameters. Delegate to EconomyService."""
         return self._economy.hydra_governance_params()
 
     def hydra_governance_vote(self, pubkey: str, proposal_id: str, vote: str) -> dict[str, Any]:
+        """Submit a governance vote. Delegate to EconomyService."""
         return self._economy.hydra_governance_vote(pubkey, proposal_id, vote)
 
     def hydra_transfer(self, from_client_id: str, to_client_id: str, amount: float) -> dict[str, Any]:
+        """Transfer HYDRA tokens. Delegate to EconomyService."""
         return self._economy.hydra_transfer(from_client_id, to_client_id, amount)
 
     def hydra_stake(self, client_id: str, amount: float) -> dict[str, Any]:
+        """Stake HYDRA tokens. Delegate to EconomyService."""
         return self._economy.hydra_stake(client_id, amount)
 
     def hydra_unstake(self, client_id: str, amount: float) -> dict[str, Any]:
+        """Unstake HYDRA tokens. Delegate to EconomyService."""
         return self._economy.hydra_unstake(client_id, amount)
 
     def hydra_open_channel(self, channel_id: str, payer: str, payee: str, deposit: float, ttl_seconds: int | None = None) -> dict[str, Any]:
+        """Open a state channel. Delegate to EconomyService."""
         return self._economy.hydra_open_channel(channel_id, payer, payee, deposit, ttl_seconds)
 
     def hydra_charge_channel(self, channel_id: str, amount: float, provider_peer_id: str | None = None) -> dict[str, Any]:
+        """Charge a state channel. Delegate to EconomyService."""
         return self._economy.hydra_charge_channel(channel_id, amount, provider_peer_id)
 
     def hydra_reconcile_channel(self, channel_id: str, total_spent: float, nonce: int) -> dict[str, Any]:
+        """Reconcile a state channel. Delegate to EconomyService."""
         return self._economy.hydra_reconcile_channel(channel_id, total_spent, nonce)
 
     def hydra_close_channel(self, channel_id: str) -> dict[str, Any]:
+        """Close a state channel and settle. Delegate to EconomyService."""
         return self._economy.hydra_close_channel(channel_id)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -864,6 +933,7 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
 
     def close(self) -> None:
+        """Shut down all persistent resources (health store, ledgers)."""
         self.health.close()
         self.ledger.close()
         self.hydra.close()

@@ -69,6 +69,7 @@ class HealthService:
     # ------------------------------------------------------------------
 
     def _record_ping_health(self, survey) -> None:
+        """Record ping health outcomes for all peers in a survey result."""
         for item in survey:
             self.health.record_ping(item.peer.peer_id, healthy=item.healthy, latency_ms=item.latency_ms)
 
@@ -77,12 +78,30 @@ class HealthService:
     # ------------------------------------------------------------------
 
     def _verification_feedback_by_model(self, health) -> dict[str, dict[str, Any]]:
+        """Aggregate verification metrics for every model in the catalog.
+
+        Args:
+            health: List of peer-health items from the latest network scan.
+
+        Returns:
+            Dict mapping each ``model_id`` to its verification metrics.
+        """
         out: dict[str, dict[str, Any]] = {}
         for model in self.model_catalog:
             out[model.model_id] = self._verification_metrics_for_model(model.model_id, health)
         return out
 
     def _verification_metrics_for_model(self, model_id: str, health) -> dict[str, Any]:
+        """Compute verification success/failure counts for a single model.
+
+        Args:
+            model_id: The model to evaluate.
+            health: List of peer-health items from the latest network scan.
+
+        Returns:
+            Dict with ``verified_peers``, ``total_verifications_ok``,
+            ``verification_success_rate``, and related counters.
+        """
         health_snapshot = self.health.snapshot()
         model_peers = [item.peer for item in health if self._normalize_peer_model(item.peer) == model_id]
         verification_ok = 0
@@ -126,6 +145,21 @@ class HealthService:
         tertiary: ChainResult | None,
         verification: Any,
     ) -> dict[str, list[str]]:
+        """Apply verification outcomes to peer health scores and stake.
+
+        Rewards peers whose output matched the winning result and penalises
+        those that diverged.  Penalised peers with staked tokens get slashed;
+        those without stake receive aggressive reputation penalties instead.
+
+        Args:
+            primary: The primary inference chain result.
+            secondary: Optional secondary (redundant) chain result.
+            tertiary: Optional tertiary (auditor) chain result.
+            verification: The ``MysteryShopper`` verification outcome.
+
+        Returns:
+            Dict with ``rewarded_peers`` and ``penalized_peers`` lists.
+        """
         if not verification.audited:
             return {"rewarded_peers": [], "penalized_peers": []}
 
@@ -178,6 +212,17 @@ class HealthService:
     # ------------------------------------------------------------------
 
     def _discovered_peer_rows(self, health) -> list[dict[str, Any]]:
+        """Build a detailed row dict for every discovered peer in a health scan.
+
+        Each row includes latency, bandwidth role, runtime profile, expert
+        metadata, privacy noise stats, and reputation/routing scores.
+
+        Args:
+            health: List of peer-health items from the latest network scan.
+
+        Returns:
+            List of per-peer dicts suitable for API serialization.
+        """
         scored_lookup = {item.peer.peer_id: item for item in self._last_scored_peers_getter()}
         rows = []
         for item in health:
@@ -228,6 +273,15 @@ class HealthService:
     # ------------------------------------------------------------------
 
     def _replication_dict(self, model_id: str, healthy_peers: int) -> dict[str, Any]:
+        """Evaluate and serialize replication status for a model.
+
+        Args:
+            model_id: The model to evaluate.
+            healthy_peers: Number of currently healthy peers serving this model.
+
+        Returns:
+            Dict with replication status fields (e.g. ``under_replicated``).
+        """
         status = self.replication_monitor.evaluate(
             model_id,
             healthy_peers,

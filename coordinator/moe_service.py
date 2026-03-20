@@ -34,6 +34,16 @@ class MoeService:
 
     @staticmethod
     def _normalize_expert_tags(raw: Any) -> list[str]:
+        """Normalize raw expert tag input into a deduplicated lowercase list.
+
+        Accepts a comma-separated string, an iterable, or ``None``.
+
+        Args:
+            raw: Raw tag input (str, iterable, or None).
+
+        Returns:
+            Ordered list of unique, lowercased tag strings.
+        """
         if raw is None:
             return []
         if isinstance(raw, str):
@@ -54,6 +64,17 @@ class MoeService:
 
     @staticmethod
     def _normalize_expert_layer_indices(raw: Any) -> list[int]:
+        """Normalize raw layer-index input into a sorted, deduplicated list.
+
+        Accepts a comma-separated string, an iterable, or ``None``.
+        Negative indices are silently dropped.
+
+        Args:
+            raw: Raw layer index input (str, iterable, or None).
+
+        Returns:
+            Sorted list of unique non-negative layer indices.
+        """
         if raw is None:
             return []
         if isinstance(raw, str):
@@ -83,12 +104,28 @@ class MoeService:
     # ------------------------------------------------------------------
 
     def _extract_prompt_expert_tags(self, prompt: str) -> list[str]:
+        """Extract ``expert:<tag>`` hints from the prompt text.
+
+        Args:
+            prompt: The user prompt to scan for expert hints.
+
+        Returns:
+            Normalized list of extracted expert tag strings.
+        """
         if not self.config.moe_geo_prompt_hints_enabled:
             return []
         tags = re.findall(r"expert:([a-z0-9][a-z0-9_-]{0,31})", str(prompt).lower())
         return self._normalize_expert_tags(tags)
 
     def _extract_prompt_expert_layer_indices(self, prompt: str) -> list[int]:
+        """Extract ``layer:<N>`` hints from the prompt text.
+
+        Args:
+            prompt: The user prompt to scan for layer hints.
+
+        Returns:
+            Sorted list of extracted layer indices.
+        """
         if not self.config.moe_geo_prompt_hints_enabled:
             return []
         layers = re.findall(r"(?:expert[-_]?layer|layer):([0-9]{1,5})", str(prompt).lower())
@@ -108,6 +145,28 @@ class MoeService:
         requested_expert_layer_indices: list[int] | None = None,
         locked_first_peer_id: str | None = None,
     ) -> tuple[list[PeerEndpoint], dict[str, Any]]:
+        """Reorder the pipeline to prioritize expert-matching peers.
+
+        Combines explicit expert tags/layers with prompt-hint extraction,
+        scores candidate peers by tag overlap, layer overlap, router bonus,
+        region match, and bandwidth, then reorders the pipeline to place the
+        best-matching expert peers first.
+
+        The first peer may be locked (e.g. by KV affinity) and will not be
+        displaced.
+
+        Args:
+            pipeline: The current inference pipeline to potentially reorder.
+            ranked_candidates: All ranked candidate peers available.
+            prompt: The effective prompt (used for hint extraction).
+            requested_expert_tags: Explicit expert tags from the request.
+            requested_expert_layer_indices: Explicit layer indices.
+            locked_first_peer_id: Peer ID that must stay at position 0.
+
+        Returns:
+            Tuple of (reordered_pipeline, policy_dict) where the policy dict
+            describes matching details and whether reordering was applied.
+        """
         enabled = bool(self.config.moe_geo_enabled)
         min_tag_matches = max(1, int(self.config.moe_geo_min_tag_matches))
         min_layer_matches = max(1, int(self.config.moe_geo_min_layer_matches))
