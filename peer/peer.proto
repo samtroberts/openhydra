@@ -6,6 +6,10 @@ service Peer {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc Forward(ForwardRequest) returns (ForwardResponse);
   rpc GetPeerStatus(PeerStatusRequest) returns (PeerStatusResponse);
+  // Phase 3A: Bidirectional streaming for persistent sessions.
+  // Reuses the same ForwardRequest/ForwardResponse messages.
+  // The stream maintains KV cache state across the session lifetime.
+  rpc ForwardStream(stream ForwardRequest) returns (stream ForwardResponse);
 }
 
 message PingRequest {
