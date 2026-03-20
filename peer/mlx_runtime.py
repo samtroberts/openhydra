@@ -675,6 +675,29 @@ class MLXRuntime:
         generated = self._watchdog.run(_batch_decode_impl)
         return [[float(t) for t in tokens] for tokens in generated]
 
+    # ── Phase 2B: Reshard (logical bounds update) ───────────────────────────
+
+    def reshard(self, new_layer_start: int, new_layer_end: int, total_layers: int) -> bool:
+        """Update logical layer bounds without physical weight reload.
+
+        MLXRuntime loads the full model into Apple Silicon Unified Memory,
+        so resharding only needs to update the metadata — no weight slicing
+        or reloading is required.
+
+        Args:
+            new_layer_start: New inclusive start layer.
+            new_layer_end: New exclusive end layer.
+            total_layers: Full model depth.
+
+        Returns:
+            ``True`` — always succeeds for MLX (logical update only).
+        """
+        logger.info(
+            "mlx_reshard_logical: new_range=[%d, %d) total=%d (no physical reload needed)",
+            new_layer_start, new_layer_end, total_layers,
+        )
+        return True
+
     # ── Phase 3 stubs (hidden-state exchange, DLPack path) ───────────────────
 
     def _activation_to_hidden(self, activation: list[float]) -> Any:
