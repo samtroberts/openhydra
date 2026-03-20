@@ -124,6 +124,12 @@ def main() -> None:
                         choices=["dev", "prod"],
                         help="Deployment profile — dev or prod (default: dev).")
 
+    # --- MLX parallelism ---
+    parser.add_argument("--mlx-world-size", type=int, default=1,
+                        help="Number of MLX devices for pipeline parallelism (default: 1 = single device).")
+    parser.add_argument("--mlx-rank", type=int, default=0,
+                        help="This device's rank in the MLX pipeline (0-indexed, default: 0).")
+
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
                         help="Bearer token for the HTTP API. Also read from OPENHYDRA_API_KEY.")
