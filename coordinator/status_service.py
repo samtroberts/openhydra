@@ -505,4 +505,25 @@ class StatusService:
             "kv_store_ops_total":       kv_store_ops,
             "kv_retrieve_ops_total":    kv_retrieve_ops,
             "inference_requests_total": inference_reqs,
+            # Pass 6: KV compaction SLO metrics (aggregated from peers)
+            "compact_tokens_saved_total": self._aggregate_compact_stat("compact_tokens_saved_total"),
+            "compact_latency_total_ms":  self._aggregate_compact_stat("compact_latency_total_ms"),
         }
+
+    def _aggregate_compact_stat(self, field_name: str) -> float:
+        """Sum a compaction stat across all known peers.
+
+        Args:
+            field_name: Attribute name on PeerEndpoint (e.g. 'compact_tokens_saved_total').
+
+        Returns:
+            Aggregate sum across all discovered peers.
+        """
+        total = 0.0
+        try:
+            peers = self._engine._load_candidate_peers()
+            for p in peers:
+                total += float(getattr(p, field_name, 0) or 0)
+        except Exception:
+            pass
+        return total

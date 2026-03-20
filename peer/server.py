@@ -756,6 +756,7 @@ def _announce_loop(
         )
         arbitration = dict(seeding_snapshot.get("arbitration") or {})
         runtime_profile = dict(service.runtime_profile or {})
+        _cstats = service.compaction_stats()
 
         announcement = Announcement(
             peer_id=service.peer_id,
@@ -794,6 +795,8 @@ def _announce_loop(
             available_vram_mb=_probe_available_vram_mb(),
             available_kv_slots=max(0, service.kv_cache_max_entries - len(getattr(service, '_kv_cache', {}))),
             next_hop_rtts_json=service.get_next_hop_rtts_json(),
+            compact_tokens_saved_total=int(_cstats.get("compact_tokens_saved", 0)),
+            compact_latency_total_ms=round(float(_cstats.get("compact_latency_s", 0.0)) * 1000, 1),
             layer_start=int(runtime_profile.get("layer_start", 0)),
             layer_end=int(runtime_profile.get("layer_end", 0)),
             total_layers=int(runtime_profile.get("total_layers", 0)),

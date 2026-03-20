@@ -693,6 +693,26 @@ class MLXRuntime:
         generated = self._watchdog.run(_batch_decode_impl)
         return [[float(t) for t in tokens] for tokens in generated]
 
+    # ── Pass 6: VRAM monitoring ─────────────────────────────────────────────
+
+    def _vram_usage_pct(self) -> float:
+        """Return current Metal GPU memory utilisation as a fraction [0.0, 1.0].
+
+        Uses ``mx.metal.get_active_memory()`` / recommended working set size.
+        Returns ``0.0`` if Metal memory info is unavailable.
+        """
+        try:
+            mx = self._mx
+            if hasattr(mx, "metal") and hasattr(mx.metal, "get_active_memory"):
+                active = mx.metal.get_active_memory()
+                info = mx.metal.device_info()
+                total = info.get("recommendedMaxWorkingSetSize", 0)
+                if total > 0:
+                    return active / total
+        except Exception:
+            pass
+        return 0.0
+
     # ── Phase 2B: Reshard (logical bounds update) ───────────────────────────
 
     def reshard(self, new_layer_start: int, new_layer_end: int, total_layers: int) -> bool:
