@@ -210,6 +210,24 @@ class MLXRuntime:
         _layers = getattr(_inner, "layers", None) or []
         self._total_layers = int(len(_layers))
 
+        # ── Phase 4A: Pipeline parallelism ────────────────────────────────
+        self._mlx_world_size = int(getattr(config, "mlx_world_size", 1))
+        self._mlx_rank = int(getattr(config, "mlx_rank", 0))
+        self._parallel: Any = None
+        if self._mlx_world_size > 1:
+            from peer.mlx_parallel import PipelineParallelMLX
+            self._parallel = PipelineParallelMLX(
+                model=self._model,
+                world_size=self._mlx_world_size,
+                rank=self._mlx_rank,
+                async_eval=True,
+            )
+            logging.info(
+                "mlx_parallel_enabled: rank=%d/%d layers=[%d,%d)",
+                self._parallel.rank, self._parallel.world_size,
+                self._parallel.layer_start, self._parallel.layer_end,
+            )
+
         # Memory estimate: bit width → bytes per parameter.
         # Use 16 as default when bits == 0 (floating-point modes without explicit bits).
         _bits_pp = self.quantization_bits if self.quantization_bits > 0 else 16
