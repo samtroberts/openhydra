@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -136,6 +136,20 @@ def _normalize_layer_indices(raw: object) -> tuple[int, ...]:
     return tuple(sorted(out))
 
 
+def _parse_next_hop_rtts(raw: object) -> dict[str, float]:
+    """Parse next_hop_rtts from either a JSON string or a dict."""
+    if isinstance(raw, dict):
+        return {str(k): float(v) for k, v in raw.items() if str(k).strip() and float(v) > 0}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {str(k): float(v) for k, v in parsed.items() if str(k).strip() and float(v) > 0}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
 @dataclass(frozen=True)
 class PeerEndpoint:
     peer_id: str
@@ -187,6 +201,10 @@ class PeerEndpoint:
     # Phase A: local fast-path TCP port for same-LAN raw tensor transfer.
     # 0 = disabled (no fast-path server running).
     local_fast_path_port: int = 0
+    # Phase 2A: KV cache availability — 0 = unknown or full.
+    available_kv_slots: int = 0
+    # Phase 2A: Server-to-server measured RTT (ms) to downstream peers.
+    next_hop_rtts: dict[str, float] = field(default_factory=dict)
 
     @property
     def address(self) -> str:
@@ -249,6 +267,8 @@ class PeerEndpoint:
                 if str(m).strip()
             ),
             local_fast_path_port=int(data.get("local_fast_path_port", 0)),
+            available_kv_slots=int(data.get("available_kv_slots", 0)),
+            next_hop_rtts=_parse_next_hop_rtts(data.get("next_hop_rtts_json", "") or data.get("next_hop_rtts", {})),
         )
 
     def replace(self, **overrides: Any) -> "PeerEndpoint":

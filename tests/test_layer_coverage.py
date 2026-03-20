@@ -893,3 +893,161 @@ class TestLayerCoverageMapDijkstraIntegration:
         cmap = LayerCoverageMap([], 32)
         pipeline = cmap.best_pipeline(peer_metrics={})
         assert pipeline is None
+
+
+# ── Phase 2A: 6-Factor Dijkstra Routing Tests ──────────────────────────────
+
+
+class TestDijkstraKvCachePenalty:
+    """Factor 5: Peers with no free KV slots get a heavy cost penalty."""
+
+    def test_kv_penalty_applied_when_slots_zero(self):
+        """A peer with available_kv_slots=0 should cost significantly more."""
+        lr = LayerRange(peer_id="p1", layer_start=0, layer_end=32, total_layers=32)
+        weights = PipelineWeights()
+
+        m_with_slots = PeerMetrics(latency_ms=10.0, estimated_tps=100.0, available_kv_slots=5)
+        m_no_slots = PeerMetrics(latency_ms=10.0, estimated_tps=100.0, available_kv_slots=0)
+
+        cost_with = _dijkstra_edge_cost(lr, m_with_slots, weights)
+        cost_without = _dijkstra_edge_cost(lr, m_no_slots, weights)
+
+        # The no-slots peer should be penalized by w_kv × kv_alloc_delay = 2.0 × 10000 = 20000ms
+        assert cost_without > cost_with
+        assert cost_without - cost_with == pytest.approx(weights.w_kv * weights.kv_alloc_delay)
+
+    def test_kv_penalty_not_applied_when_slots_positive(self):
+        """Peers with available KV slots should not incur the penalty."""
+        lr = LayerRange(peer_id="p1", layer_start=0, layer_end=32, total_layers=32)
+        weights = PipelineWeights()
+
+        m1 = PeerMetrics(latency_ms=10.0, estimated_tps=100.0, available_kv_slots=1)
+        m10 = PeerMetrics(latency_ms=10.0, estimated_tps=100.0, available_kv_slots=10)
+
+        cost1 = _dijkstra_edge_cost(lr, m1, weights)
+        cost10 = _dijkstra_edge_cost(lr, m10, weights)
+
+        # Both should have the same cost (no penalty either way)
+        assert cost1 == pytest.approx(cost10)
+
+    def test_dijkstra_prefers_peer_with_kv_slots(self):
+        """Optimal pipeline should prefer a peer with free KV slots."""
+        # Two peers covering [0, 32): one with slots, one without
+        ranges = [
+            LayerRange(peer_id="cached", layer_start=0, layer_end=32, total_layers=32),
+            LayerRange(peer_id="full", layer_start=0, layer_end=32, total_layers=32),
+        ]
+        metrics = {
+            "cached": PeerMetrics(latency_ms=10.0, estimated_tps=100.0, available_kv_slots=5),
+            "full": PeerMetrics(latency_ms=10.0, estimated_tps=100.0, available_kv_slots=0),
+        }
+        pipeline = find_optimal_pipeline(ranges, total_layers=32, peer_metrics=metrics)
+        assert pipeline is not None
+        assert len(pipeline) == 1
+        assert pipeline[0].peer_id == "cached"
+
+
+class TestDijkstraServerToServerRtt:
+    """Factor 6: Prefer pipelines where consecutive peers have low S2S RTT."""
+
+    def test_s2s_rtt_favors_low_latency_path(self):
+        """Given two possible 2-hop pipelines, prefer the one where the
+        upstream peer has low measured RTT to the downstream peer."""
+        # Peer A covers [0, 16), peers B and C cover [16, 32)
+        # A has measured RTT: A→B = 5ms, A→C = 500ms
+        ranges = [
+            LayerRange(peer_id="A", layer_start=0, layer_end=16, total_layers=32),
+            LayerRange(peer_id="B", layer_start=16, layer_end=32, total_layers=32),
+            LayerRange(peer_id="C", layer_start=16, layer_end=32, total_layers=32),
+        ]
+        metrics = {
+            "A": PeerMetrics(latency_ms=10.0, estimated_tps=100.0,
+                             next_hop_rtts={"B": 5.0, "C": 500.0}),
+            "B": PeerMetrics(latency_ms=10.0, estimated_tps=100.0),
+            "C": PeerMetrics(latency_ms=10.0, estimated_tps=100.0),
+        }
+        pipeline = find_optimal_pipeline(ranges, total_layers=32, peer_metrics=metrics)
+        assert pipeline is not None
+        assert len(pipeline) == 2
+        assert pipeline[0].peer_id == "A"
+        assert pipeline[1].peer_id == "B"  # B preferred due to low S2S RTT
+
+    def test_s2s_rtt_no_measurement_is_zero_cost(self):
+        """When no S2S RTT is measured, the factor should add zero cost."""
+        lr = LayerRange(peer_id="p1", layer_start=0, layer_end=32, total_layers=32)
+        weights = PipelineWeights()
+
+        m_no_s2s = PeerMetrics(latency_ms=10.0, estimated_tps=100.0)
+        m_with_s2s = PeerMetrics(latency_ms=10.0, estimated_tps=100.0,
+                                  next_hop_rtts={"other": 100.0})
+
+        # The edge cost function itself doesn't apply S2S (that's at graph level),
+        # so both should have the same per-peer cost
+        cost_no = _dijkstra_edge_cost(lr, m_no_s2s, weights)
+        cost_with = _dijkstra_edge_cost(lr, m_with_s2s, weights)
+        assert cost_no == pytest.approx(cost_with)
+
+
+class TestDijkstraSixFactorIntegration:
+    """Full integration test with all 6 factors active simultaneously."""
+
+    def test_six_factor_pipeline_selection(self):
+        """Build a 3-hop pipeline where all 6 factors influence the choice."""
+        # 3 stages: [0,10), [10,20), [20,30)
+        # Two options for the middle stage: "fast" and "slow"
+        # "fast" has: better TPS, better reputation, lower load, KV slots, and low S2S RTT from stage1
+        # "slow" has: worse on all counts
+        ranges = [
+            LayerRange(peer_id="stage1", layer_start=0, layer_end=10, total_layers=30),
+            LayerRange(peer_id="fast", layer_start=10, layer_end=20, total_layers=30),
+            LayerRange(peer_id="slow", layer_start=10, layer_end=20, total_layers=30),
+            LayerRange(peer_id="stage3", layer_start=20, layer_end=30, total_layers=30),
+        ]
+        metrics = {
+            "stage1": PeerMetrics(
+                latency_ms=5.0, estimated_tps=200.0, reputation_score=90.0,
+                load_pct=0.1, available_kv_slots=10,
+                next_hop_rtts={"fast": 3.0, "slow": 200.0},
+            ),
+            "fast": PeerMetrics(
+                latency_ms=5.0, estimated_tps=200.0, reputation_score=95.0,
+                load_pct=0.1, available_kv_slots=8,
+                next_hop_rtts={"stage3": 2.0},
+            ),
+            "slow": PeerMetrics(
+                latency_ms=50.0, estimated_tps=10.0, reputation_score=20.0,
+                load_pct=0.9, available_kv_slots=0,  # no KV slots!
+            ),
+            "stage3": PeerMetrics(
+                latency_ms=5.0, estimated_tps=200.0, reputation_score=90.0,
+                load_pct=0.1, available_kv_slots=5,
+            ),
+        }
+        pipeline = find_optimal_pipeline(ranges, total_layers=30, peer_metrics=metrics)
+        assert pipeline is not None
+        assert len(pipeline) == 3
+        assert pipeline[0].peer_id == "stage1"
+        assert pipeline[1].peer_id == "fast"   # all 6 factors favor "fast"
+        assert pipeline[2].peer_id == "stage3"
+
+    def test_six_factor_cost_is_sum_of_all_components(self):
+        """Verify the edge cost formula includes all 5 per-peer factors."""
+        lr = LayerRange(peer_id="p1", layer_start=0, layer_end=10, total_layers=10)
+        weights = PipelineWeights(
+            w_rtt=1.0, w_infer=1.5, w_rep=0.5, w_load=0.3,
+            w_kv=2.0, kv_alloc_delay=10_000.0,
+        )
+        m = PeerMetrics(
+            latency_ms=20.0, estimated_tps=50.0, reputation_score=60.0,
+            load_pct=0.5, available_kv_slots=0,
+        )
+        cost = _dijkstra_edge_cost(lr, m, weights)
+
+        # Manually compute expected cost
+        rtt = 1.0 * 20.0                             # 20.0
+        infer = 1.5 * (10 / 50.0) * 1000.0           # 300.0
+        rep = 0.5 * (1.0 - 60.0 / 100.0) * 500.0     # 100.0
+        load = 0.3 * 0.5 * 300.0                      # 45.0
+        kv = 2.0 * 10_000.0                            # 20000.0
+        expected = rtt + infer + rep + load + kv       # 20465.0
+        assert cost == pytest.approx(expected)
