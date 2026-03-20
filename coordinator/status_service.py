@@ -143,6 +143,15 @@ class StatusService:
     # ------------------------------------------------------------------
 
     def list_models(self) -> dict[str, Any]:
+        """Return the model catalog with cached peer counts (no DHT scan).
+
+        Peer counts are served from the in-memory DHT cache populated during
+        inference, so they become accurate after the first request without
+        blocking this endpoint.
+
+        Returns:
+            OpenAI-compatible ``{"object": "list", "data": [...]}`` response.
+        """
         # Serve directly from the static catalog -- no DHT scan.
         # DHT scanning is deferred to the inference path (/v1/chat/completions),
         # where peer discovery is actually needed.  Peer counts here are served
@@ -179,6 +188,15 @@ class StatusService:
     # ------------------------------------------------------------------
 
     def network_status(self) -> dict[str, Any]:
+        """Perform a live network scan and return comprehensive health status.
+
+        Includes per-model replication, concentration, bandwidth roles,
+        seeding, runtime profiles, expert profiles, verification feedback,
+        HYDRA economy summary, auto-scaler state, and layer coverage.
+
+        Returns:
+            Dict with all network status fields.
+        """
         try:
             health, counts = self._engine._scan_network(model_ids=self._catalog_model_ids())
         except RuntimeError:
@@ -457,6 +475,14 @@ class StatusService:
     # ------------------------------------------------------------------
 
     def metrics_snapshot(self) -> dict[str, float | int]:
+        """Return a point-in-time snapshot of operational counters.
+
+        Includes DHT lookup stats, HYDRA bridge supply figures, and
+        KV/inference proxy counters.
+
+        Returns:
+            Dict of metric name to numeric value.
+        """
         with self._metrics_lock:
             dht_attempts = int(self._dht_lookup_attempts_ref[0])
             dht_successes = int(self._dht_lookup_successes_ref[0])

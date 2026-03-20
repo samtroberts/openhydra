@@ -40,6 +40,7 @@ class KvAffinityService:
     # ------------------------------------------------------------------
 
     def _purge_expired_kv_affinity(self) -> None:
+        """Remove all KV affinity entries whose TTL has expired."""
         if not self._kv_affinity:
             return
         now = time.time()
@@ -56,6 +57,16 @@ class KvAffinityService:
     # ------------------------------------------------------------------
 
     def _get_kv_affinity_peer(self, session_id: str | None, model_id: str) -> str | None:
+        """Look up the preferred prefill peer for a session/model pair.
+
+        Args:
+            session_id: The client session identifier (``None`` disables lookup).
+            model_id: The model being requested.
+
+        Returns:
+            The peer ID that holds the KV cache, or ``None`` if no affinity
+            exists or the feature is disabled.
+        """
         if not self.config.kv_affinity_enabled or not session_id:
             return None
         self._purge_expired_kv_affinity()
@@ -66,6 +77,18 @@ class KvAffinityService:
         return peer_id or None
 
     def _set_kv_affinity_peer(self, session_id: str | None, model_id: str, peer_id: str | None) -> bool:
+        """Record or update the prefill peer affinity for a session/model pair.
+
+        Preserves any existing activation cache entry while refreshing the TTL.
+
+        Args:
+            session_id: The client session identifier.
+            model_id: The model being served.
+            peer_id: The peer that now holds the KV cache.
+
+        Returns:
+            ``True`` if the affinity was stored, ``False`` if skipped.
+        """
         if not self.config.kv_affinity_enabled or not session_id or not peer_id:
             return False
         now = time.time()
@@ -89,6 +112,16 @@ class KvAffinityService:
     # ------------------------------------------------------------------
 
     def _get_kv_affinity_activation(self, session_id: str | None, model_id: str) -> list[float] | None:
+        """Retrieve the cached activation seed for a session/model pair.
+
+        Args:
+            session_id: The client session identifier.
+            model_id: The model being requested.
+
+        Returns:
+            A list of floats representing the cached activation, or ``None``
+            if unavailable.
+        """
         if not self.config.kv_affinity_enabled or not session_id:
             return None
         self._purge_expired_kv_affinity()
@@ -107,6 +140,15 @@ class KvAffinityService:
         return out or None
 
     def _get_kv_affinity_activation_peer(self, session_id: str | None, model_id: str) -> str | None:
+        """Return the peer ID that produced the cached activation for this session.
+
+        Args:
+            session_id: The client session identifier.
+            model_id: The model being requested.
+
+        Returns:
+            Peer ID string, or ``None`` if no activation cache exists.
+        """
         if not self.config.kv_affinity_enabled or not session_id:
             return None
         self._purge_expired_kv_affinity()
@@ -122,6 +164,19 @@ class KvAffinityService:
         model_id: str,
         activation: list[float] | None,
     ) -> bool:
+        """Store an activation seed in the KV affinity cache.
+
+        Updates the entry's TTL and records the producing peer so that
+        cross-peer relay can be detected on subsequent lookups.
+
+        Args:
+            session_id: The client session identifier.
+            model_id: The model being served.
+            activation: The activation vector to cache.
+
+        Returns:
+            ``True`` if stored, ``False`` if skipped.
+        """
         if not self.config.kv_affinity_enabled or not session_id or not activation:
             return False
         key = self._kv_affinity_key(session_id, model_id)
