@@ -479,6 +479,13 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             "# HELP openhydra_inference_requests_total Total inference requests dispatched.",
             "# TYPE openhydra_inference_requests_total counter",
             f"openhydra_inference_requests_total {int(engine_metrics.get('inference_requests_total', 0))}",
+            # Pass 6: KV compaction SLO metrics
+            "# HELP openhydra_compact_tokens_saved_total Lifetime tokens pruned by KV compaction.",
+            "# TYPE openhydra_compact_tokens_saved_total counter",
+            f"openhydra_compact_tokens_saved_total {int(engine_metrics.get('compact_tokens_saved_total', 0))}",
+            "# HELP openhydra_compact_latency_ms_total Lifetime compaction overhead in milliseconds.",
+            "# TYPE openhydra_compact_latency_ms_total counter",
+            f"openhydra_compact_latency_ms_total {round(float(engine_metrics.get('compact_latency_total_ms', 0.0)), 1)}",
         ]
         return "\n".join(lines) + "\n"
 

@@ -403,6 +403,9 @@ class PyTorchRuntime:
         self._compact_kv_cache_hits: int = 0
         self._compact_kv_cache_misses: int = 0
         self._compact_lock = threading.Lock()
+        # ── Auto-mode VRAM-aware counters (Pass 6) ────────────────────────
+        self._auto_skip_count: int = 0
+        self._auto_trigger_count: int = 0
 
         try:
             import torch
@@ -731,7 +734,26 @@ class PyTorchRuntime:
                 "compact_latency_s":     round(self._compact_latency_s, 6),
                 "kv_cache_hits":         self._compact_kv_cache_hits,
                 "kv_cache_misses":       self._compact_kv_cache_misses,
+                "auto_skip_count":       self._auto_skip_count,
+                "auto_trigger_count":    self._auto_trigger_count,
             }
+
+    def _vram_usage_pct(self) -> float:
+        """Return current GPU VRAM utilisation as a fraction [0.0, 1.0].
+
+        CUDA: ``torch.cuda.memory_allocated() / total_mem``.
+        CPU/other: returns ``0.0`` (compaction never triggers on VRAM pressure).
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0)
+                total = torch.cuda.get_device_properties(0).total_mem
+                if total > 0:
+                    return allocated / total
+        except Exception:
+            pass
+        return 0.0
 
     @staticmethod
     def _detect_decoder_architecture(model: Any) -> _DecoderArchitecture:
@@ -943,8 +965,25 @@ class PyTorchRuntime:
         key = str(session_id or "").strip()
         if not key or past_key_values is None:
             return
-        # ── Phase 1-4: optionally compact before storing ─────────────────────
+        # ── Phase 1-4 + Pass 6: optionally compact before storing ────────────
         if self._compaction_config is not None:
+            # ── Pass 6: VRAM-aware auto mode ─────────────────────────────
+            _mode = getattr(self._compaction_config, "mode", "on")
+            if _mode == "auto":
+                _vram_pct = self._vram_usage_pct()
+                _seq_len = self._past_sequence_length(past_key_values)
+                _threshold = getattr(self._compaction_config, "auto_threshold", 512)
+                if _vram_pct < 0.75 and _seq_len <= _threshold:
+                    # VRAM comfortable + short sequence → skip compaction
+                    with self._compact_lock:
+                        self._auto_skip_count += 1
+                    self._kv_cache.pop(str(session_id or "").strip(), None)
+                    self._kv_cache[str(session_id or "").strip()] = {"past_key_values": past_key_values}
+                    while len(self._kv_cache) > self._kv_cache_max_entries:
+                        self._kv_cache.popitem(last=False)
+                    return
+                with self._compact_lock:
+                    self._auto_trigger_count += 1
             try:
                 import time as _time
                 from peer.kv_compaction import compact_past_key_values

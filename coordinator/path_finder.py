@@ -205,6 +205,9 @@ class PeerEndpoint:
     available_kv_slots: int = 0
     # Phase 2A: Server-to-server measured RTT (ms) to downstream peers.
     next_hop_rtts: dict[str, float] = field(default_factory=dict)
+    # Pass 6: KV compaction SLO metrics — lifetime counters.
+    compact_tokens_saved_total: int = 0
+    compact_latency_total_ms: float = 0.0
 
     @property
     def address(self) -> str:
@@ -269,6 +272,8 @@ class PeerEndpoint:
             local_fast_path_port=int(data.get("local_fast_path_port", 0)),
             available_kv_slots=int(data.get("available_kv_slots", 0)),
             next_hop_rtts=_parse_next_hop_rtts(data.get("next_hop_rtts_json", "") or data.get("next_hop_rtts", {})),
+            compact_tokens_saved_total=int(data.get("compact_tokens_saved_total", 0)),
+            compact_latency_total_ms=float(data.get("compact_latency_total_ms", 0.0)),
         )
 
     def replace(self, **overrides: Any) -> "PeerEndpoint":

@@ -72,6 +72,9 @@ class Announcement:
     # JSON-encoded dict[str, float] keyed by downstream peer_id.
     # Empty string = no measurements available.
     next_hop_rtts_json: str = ""
+    # Pass 6: KV compaction SLO metrics — lifetime counters.
+    compact_tokens_saved_total: int = 0
+    compact_latency_total_ms: float = 0.0
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:
