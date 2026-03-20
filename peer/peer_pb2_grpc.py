@@ -49,6 +49,11 @@ class PeerStub(object):
                 request_serializer=peer_dot_peer__pb2.PeerStatusRequest.SerializeToString,
                 response_deserializer=peer_dot_peer__pb2.PeerStatusResponse.FromString,
                 _registered_method=True)
+        self.ForwardStream = channel.stream_stream(
+                '/openhydra.peer.Peer/ForwardStream',
+                request_serializer=peer_dot_peer__pb2.ForwardRequest.SerializeToString,
+                response_deserializer=peer_dot_peer__pb2.ForwardResponse.FromString,
+                _registered_method=True)
 
 
 class PeerServicer(object):
@@ -72,6 +77,15 @@ class PeerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ForwardStream(self, request_iterator, context):
+        """Phase 3A: Bidirectional streaming for persistent sessions.
+        Reuses the same ForwardRequest/ForwardResponse messages.
+        The stream maintains KV cache state across the session lifetime.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PeerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -89,6 +103,11 @@ def add_PeerServicer_to_server(servicer, server):
                     servicer.GetPeerStatus,
                     request_deserializer=peer_dot_peer__pb2.PeerStatusRequest.FromString,
                     response_serializer=peer_dot_peer__pb2.PeerStatusResponse.SerializeToString,
+            ),
+            'ForwardStream': grpc.stream_stream_rpc_method_handler(
+                    servicer.ForwardStream,
+                    request_deserializer=peer_dot_peer__pb2.ForwardRequest.FromString,
+                    response_serializer=peer_dot_peer__pb2.ForwardResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -172,6 +191,33 @@ class Peer(object):
             '/openhydra.peer.Peer/GetPeerStatus',
             peer_dot_peer__pb2.PeerStatusRequest.SerializeToString,
             peer_dot_peer__pb2.PeerStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ForwardStream(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/openhydra.peer.Peer/ForwardStream',
+            peer_dot_peer__pb2.ForwardRequest.SerializeToString,
+            peer_dot_peer__pb2.ForwardResponse.FromString,
             options,
             channel_credentials,
             insecure,

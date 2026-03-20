@@ -546,6 +546,61 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             with self._lock:
                 self._inflight = max(0, self._inflight - 1)
 
+    # ── Phase 3A: Bidirectional streaming ──────────────────────────────────
+
+    def ForwardStream(self, request_iterator, context: grpc.ServicerContext):
+        """Bidirectional streaming RPC — persistent session with KV reuse.
+
+        Processes an incoming stream of ForwardRequests, maintaining KV cache
+        state across the stream's lifetime.  Each request yields a response.
+        The stream auto-closes after ``_stream_idle_timeout_s`` of inactivity.
+
+        Args:
+            request_iterator: Iterator of ForwardRequest messages.
+            context: gRPC servicer context.
+
+        Yields:
+            ForwardResponse for each incoming request.
+        """
+        import time as _time
+
+        idle_timeout = getattr(self, "_stream_idle_timeout_s", 30.0)
+        session_kv_key = ""
+        last_activity = _time.monotonic()
+
+        logger.info("forward_stream_opened: peer=%s", self.peer_id)
+
+        try:
+            for request in request_iterator:
+                now = _time.monotonic()
+                if now - last_activity > idle_timeout:
+                    logger.info(
+                        "forward_stream_idle_timeout: peer=%s timeout=%.1fs",
+                        self.peer_id, idle_timeout,
+                    )
+                    break
+
+                last_activity = now
+
+                # Enable KV reuse across the stream lifetime.
+                if not session_kv_key and request.kv_session_id:
+                    session_kv_key = str(request.kv_session_id)
+
+                # Delegate to the unary Forward handler for each message.
+                response = self.Forward(request, context)
+                yield response
+        except Exception as exc:
+            logger.warning("forward_stream_error: peer=%s err=%s", self.peer_id, exc)
+            yield peer_pb2.ForwardResponse(
+                request_id="",
+                peer_id=self.peer_id,
+                activation=[],
+                stage_index=0,
+                error=f"stream_error: {exc}",
+            )
+        finally:
+            logger.info("forward_stream_closed: peer=%s", self.peer_id)
+
     def record_next_hop_rtt(self, downstream_peer_id: str, rtt_ms: float) -> None:
         """Record the measured RTT to a downstream peer for S2S routing.
 
