@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import ssl
 import time
 from typing import Any
 from urllib import parse, request
@@ -90,7 +91,13 @@ class GroundingClient:
             headers={"User-Agent": "OpenHydra/0.1 (grounding)"},
             method="GET",
         )
-        with request.urlopen(req, timeout=self.config.timeout_s) as response:
+        ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+        except (ImportError, OSError):
+            pass
+        with request.urlopen(req, timeout=self.config.timeout_s, context=ctx) as response:
             return json.loads(response.read().decode("utf-8"))
 
     @staticmethod

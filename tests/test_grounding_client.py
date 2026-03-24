@@ -42,7 +42,7 @@ def test_grounding_client_parses_duckduckgo_payload(monkeypatch, tmp_path):
         ],
     }
 
-    monkeypatch.setattr("grounding.client_rag.request.urlopen", lambda req, timeout=0: _FakeResponse(payload))
+    monkeypatch.setattr("grounding.client_rag.request.urlopen", lambda req, **kw: _FakeResponse(payload))
 
     result = client.search("What is OpenHydra?", max_snippets=3)
     assert result.provider == "duckduckgo"
@@ -60,7 +60,7 @@ def test_grounding_client_uses_cache(monkeypatch, tmp_path):
     client = GroundingClient(config)
 
     payload = {"AbstractText": "Cached snippet."}
-    monkeypatch.setattr("grounding.client_rag.request.urlopen", lambda req, timeout=0: _FakeResponse(payload))
+    monkeypatch.setattr("grounding.client_rag.request.urlopen", lambda req, **kw: _FakeResponse(payload))
 
     first = client.search("cache query", max_snippets=2)
     assert first.provider == "duckduckgo"

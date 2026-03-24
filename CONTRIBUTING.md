@@ -53,7 +53,7 @@ Open a [GitHub Issue](../../issues/new?template=feature_request.md) with:
 
 ```bash
 # 1. Clone
-git clone https://github.com/openhydra-ai/openhydra.git
+git clone https://github.com/samtroberts/openhydra.git
 cd openhydra
 
 # 2. Create virtual environment
@@ -86,17 +86,23 @@ make test
 ## Running Tests
 
 ```bash
-# Fast suite (no real PyTorch inference, ~15 s)
-make test
+# Fast suite (~2 min, 982+ tests)
+python -m pytest tests/ -q
+
+# With coverage report
+python -m pytest tests/ --cov=coordinator --cov=peer --cov=economy --cov=dht
 
 # Full suite including real-tensor tests (requires PyTorch + HF model download)
-OPENHYDRA_RUN_REAL_TENSOR_TEST=1 pytest -q
+OPENHYDRA_RUN_REAL_TENSOR_TEST=1 python -m pytest tests/ -q
 
 # Single module
-pytest tests/test_kv_compaction.py -v
+python -m pytest tests/test_kv_compaction.py -v
+
+# Lint check (style + security rules)
+pip install ruff && ruff check . --config pyproject.toml
 ```
 
-All pull requests must pass `make test` before review.
+All pull requests must pass the test suite with zero failures before review.
 
 ---
 
@@ -122,12 +128,9 @@ refactor(coordinator): extract rate-limit logic into middleware
 
 ## License Agreement
 
-By contributing to OpenHydra you agree that your contributions will be licensed under the same terms as the file(s) you modify:
+By contributing to OpenHydra you agree that your contributions will be licensed under the **Apache License 2.0**.
 
-- Contributions to `peer/` or `dht/` → **Apache License 2.0**
-- Contributions to all other directories → **GNU Affero General Public License v3**
-
-See [LICENSE](LICENSE) for the full dual-license structure.
+See [LICENSE](LICENSE) for the full license text.
 
 ---
 

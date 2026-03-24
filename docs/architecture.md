@@ -918,3 +918,44 @@ Each entry:
 ---
 
 *For comparison with Petals architecture and recommended improvements, see `docs/petals-comparison.md`.*
+
+---
+
+## Appendix: Technical Moats (Post-Equalization Sprint)
+
+The following capabilities were added during the Petals/Exo equalization sprint and represent OpenHydra's unique competitive advantages.
+
+### 6-Factor Dijkstra Routing (Phase 2A)
+
+The pipeline selection algorithm computes edge costs using six weighted factors:
+
+```
+cost(u, v) = w_l × latency_ms
+           + w_r × (1 / max(reputation, 0.01))
+           + w_d × (1 / max(daemon_score, 0.01))
+           + w_t × (1 / max(estimated_tps, 0.01))
+           + w_kv × kv_pressure_penalty(v)
+           + w_s2s × server_to_server_rtt(u, v)
+```
+
+Factors 5-6 (KV cache pressure, server-to-server RTT) exceed Petals' 5-factor routing, enabling better pipeline assembly under load.
+
+### Swarm Rebalancing (Phase 2B)
+
+`SwarmRebalancer` detects throughput bottlenecks across the layer coverage map and generates migration directives. Peers poll for directives, drain inflight requests (safety guard: `inflight == 0`), then call `shard.reshard()`. The swarm self-heals.
+
+### Bidirectional gRPC Streaming (Phase 3A)
+
+`ForwardStream` RPC enables persistent connections with session state (KV cache) maintained across the stream's lifetime. `StreamPool` manages connection reuse with 30s idle timeout. Graceful fallback to unary `Forward()` if a peer doesn't support streaming.
+
+### MLX Tensor Parallelism + Overlapped Prefill (Phase 4A+4B)
+
+`PipelineParallelMLX` distributes transformer layers across Apple Silicon devices using largest-remainder allocation. Communication via `mx.distributed.send()`/`recv_like()`. Overlapped prefill with `mx.async_eval()` enables Rank 0 to begin network transmission while the GPU is still evaluating.
+
+### Live Q-Tensor KV Compaction (Pass 6.1)
+
+VRAM-aware auto mode: monitors utilization, bypasses compaction below 75% to save compute, activates Attention Matching pruning above 75%. Metrics (`tokens_saved_total`, `compaction_latency_ms`) exported to Prometheus and DHT heartbeats.
+
+### Service Decomposition (Phase 1A)
+
+`CoordinatorEngine` decomposed from 3,244 → 869 lines. Nine focused services with back-references preserving test monkeypatch compatibility. Zero test changes during extraction.

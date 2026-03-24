@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/samtroberts/openhydra/releases"><img src="https://img.shields.io/badge/download-Desktop%20App-00d4b8.svg" alt="Download"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0%20%2F%20AGPL%203.0-green.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
 </p>
 
 ---
@@ -313,16 +313,9 @@ tests/             867 tests (858 unit + 9 real-model integration)
 
 OpenHydra uses a **dual open-core license**:
 
-| Component | Directories | License | Rationale |
-|-----------|-------------|---------|-----------|
-| **Inference engine** | `peer/`, `dht/` | [Apache 2.0](Apache-2.0.txt) | Maximum adoption. Use in proprietary products. Patent grant included. |
-| **Network services** | `coordinator/`, `economy/`, `verification/`, `desktop/` | [AGPL v3](AGPL-3.0.txt) | Network copyleft. Running a modified coordinator as a hosted API requires publishing source. |
+The entire OpenHydra stack is licensed under [Apache 2.0](LICENSE) — maximum adoption, use in proprietary products, patent grant included.
 
-This structure ensures cloud providers cannot close-source the orchestration layer while keeping the peer engine maximally permissive for hardware vendors, embedded systems, and proprietary integrations.
-
-Full details: [LICENSE](LICENSE)
-
-Commercial licensing: `sam@openhydra.co`
+We believe open infrastructure wins. The BitTorrent of AI should be free for everyone.
 
 ---
 
