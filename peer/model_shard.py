@@ -164,7 +164,8 @@ class ToyShardConfig:
     # MLX watchdog: maximum seconds for any single MLX computation (mx.eval,
     # stream_generate loop, forward_batch decode loop).  If exceeded, the
     # computation is treated as a GPU hang and a TimeoutError is raised.
-    runtime_mlx_eval_timeout_s: float = 30.0
+    # Default raised from 30s to 120s to support 8 GB machines under memory pressure.
+    runtime_mlx_eval_timeout_s: float = 120.0
 
 
 @dataclass(frozen=True)

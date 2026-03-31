@@ -142,6 +142,9 @@ def main() -> None:
                         help="Number of MLX devices for pipeline parallelism (default: 1 = single device).")
     parser.add_argument("--mlx-rank", type=int, default=0,
                         help="This device's rank in the MLX pipeline (0-indexed, default: 0).")
+    parser.add_argument("--mlx-eval-timeout", type=float, default=120.0,
+                        help="Maximum seconds for a single MLX computation before the watchdog "
+                             "kills it (default: 120). Increase on memory-constrained machines.")
 
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
@@ -234,6 +237,7 @@ def main() -> None:
             "runtime_backend": args.runtime_backend,
             "advertise_host": args.advertise_host,
             "identity_path": args.identity_path,
+            "mlx_eval_timeout_s": args.mlx_eval_timeout,
             # All other peer params use peer/server.py defaults.
         },
         name="openhydra-peer",

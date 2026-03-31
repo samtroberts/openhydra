@@ -188,7 +188,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         kv_radix_cache_max_entries: int = 128,
         kv_radix_cache_min_prefix_len: int = 16,
         warmup_on_start: bool = False,
-        mlx_eval_timeout_s: float = 30.0,
+        mlx_eval_timeout_s: float = 120.0,
         batch_window_ms: float = 50.0,
         max_batch_size: int = 8,
     ):
@@ -319,6 +319,26 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         cpu_fraction = max(0.0, min(1.0, budget.cpu_fraction))
         budget_pressure = (1.0 - cpu_fraction) * 15.0
         return min(100.0, base + budget_pressure)
+
+    def compaction_stats(self) -> dict:
+        """Return KV compaction statistics for DHT announcement.
+
+        Returns an empty dict when compaction is not active or not
+        supported by the current runtime backend.  The announce loop
+        uses ``compact_tokens_saved`` and ``compact_latency_s`` keys.
+        """
+        shard = getattr(self, "shard", None)
+        if shard is None:
+            return {}
+        # PyTorchRuntime exposes compaction stats via kv_compaction attr
+        runtime = getattr(shard, "_runtime", None)
+        stats_fn = getattr(runtime, "compaction_stats", None)
+        if callable(stats_fn):
+            try:
+                return dict(stats_fn())
+            except Exception:
+                return {}
+        return {}
 
     def Ping(self, request: peer_pb2.PingRequest, context: grpc.ServicerContext) -> peer_pb2.PingResponse:
         geo_nonce = str(getattr(request, "geo_nonce", "") or "").strip()
@@ -1051,7 +1071,7 @@ def serve(
     kv_radix_cache_max_entries: int = 128,
     kv_radix_cache_min_prefix_len: int = 16,
     warmup_on_start: bool = False,
-    mlx_eval_timeout_s: float = 30.0,
+    mlx_eval_timeout_s: float = 120.0,
     batch_window_ms: float = 50.0,
     max_batch_size: int = 8,
     p2p_enable: bool = False,
@@ -1647,12 +1667,13 @@ def main() -> None:
     parser.add_argument(
         "--mlx-eval-timeout",
         type=float,
-        default=30.0,
+        default=120.0,
         help=(
             "Timeout in seconds for individual MLX Metal GPU operations.  If an "
             "mx.eval() call does not complete within this deadline the watchdog "
             "raises TimeoutError and marks the runtime unhealthy.  Only relevant "
-            "when runtime_backend='mlx' (default: 30)."
+            "when runtime_backend='mlx' (default: 120).  Raised from 30 to "
+            "accommodate 8 GB machines under memory pressure."
         ),
     )
     parser.add_argument(
