@@ -6,8 +6,14 @@ export default function RamSlider() {
 
   return (
     <div>
-      <label className="block text-xs text-gray-400 mb-1.5">
-        RAM Allocation: <span className="text-gray-100 font-mono">{state.config.ramAllocation} GB</span>
+      <label className="block text-[10px] text-gray-500 font-medium uppercase tracking-wider mb-1.5">
+        RAM Allocation
+        <span className="ml-1.5 text-gray-300 font-mono text-xs normal-case">
+          {state.config.ramAllocation} GB
+        </span>
+        <span className="ml-1 text-gray-600 font-normal normal-case">
+          / {state.systemRam} GB
+        </span>
       </label>
       <input
         type="range"
@@ -16,7 +22,7 @@ export default function RamSlider() {
         value={state.config.ramAllocation}
         onChange={(e) => updateConfig({ ramAllocation: Number(e.target.value) })}
         disabled={disabled}
-        className="w-full accent-[#00d4b8] disabled:opacity-50"
+        className="w-full accent-cyan-500 disabled:opacity-40 disabled:cursor-not-allowed h-1.5"
       />
     </div>
   );
