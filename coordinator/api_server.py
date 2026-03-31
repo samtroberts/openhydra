@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -309,10 +310,27 @@ def _resolve_runtime_profile_settings(parser: argparse.ArgumentParser, args: arg
     }
 
 
+def _safe_free_memory() -> None:
+    """Free Python objects and MLX Metal buffer pool.
+
+    Called during mode transitions to prevent OOM on constrained
+    hardware (8 GB M1).  Safe to call even if MLX is not installed.
+    """
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.metal.clear_cache()
+    except (ImportError, AttributeError, ModuleNotFoundError):
+        pass
+
+
 class OpenHydraHandler(BaseHTTPRequestHandler):
     engine: CoordinatorEngine | None = None
+    local_engine: Any = None  # LocalInferenceEngine when in local mode
     _api_key: str | None = None           # None → auth disabled
     _rate_limiter: _RateLimiter | None = None
+    _mode_switching: bool = False          # 503 drain gate during mode transition
+    _mode_switch_lock = threading.Lock()   # Serialize concurrent mode switches
     _metrics_lock = threading.Lock()
     _http_requests_total: int = 0
     _http_request_errors_total: int = 0
@@ -404,6 +422,405 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
         if self.engine is None:
             raise RuntimeError("engine is not initialized")
         return self.engine
+
+    # ------------------------------------------------------------------
+    # Hybrid Local/Swarm routing (Pillar 2)
+    # ------------------------------------------------------------------
+
+    def _active_engine(self) -> Any:
+        """Return the currently active engine (local takes priority).
+
+        In Local Mode, returns the LocalInferenceEngine.
+        In Swarm Mode, returns the CoordinatorEngine.
+        Raises RuntimeError if neither is available.
+        """
+        le = self.__class__.local_engine
+        if le is not None:
+            return le
+        if self.__class__.engine is not None:
+            return self.__class__.engine
+        raise RuntimeError("no engine available (neither local nor swarm)")
+
+    def _is_local_mode(self) -> bool:
+        """Return True if the local inference engine is active."""
+        return self.__class__.local_engine is not None
+
+    def _handle_chat_completions(self) -> None:
+        """Handle POST /v1/chat/completions for both local and swarm engines."""
+        # 503 drain gate: reject during mode transition
+        if self.__class__._mode_switching:
+            self._send_json(
+                {"error": "mode switching in progress — retry shortly"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                headers={"Retry-After": "5"},
+            )
+            return
+        body = self._read_json()
+        stream = bool(body.get("stream", False))
+        messages = list(body.get("messages") or [])
+        max_tokens = int(body.get("max_tokens", 128))
+        temperature = float(body.get("temperature", 1.0))
+        top_p = float(body.get("top_p", 1.0))
+        stop = body.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+
+        if self._is_local_mode():
+            le = self.__class__.local_engine
+            if stream:
+                chunks = le.chat_stream(
+                    messages, max_tokens=max_tokens, temperature=temperature,
+                    top_p=top_p, stop=stop,
+                )
+                self._send_local_sse(chunks)
+            else:
+                result = le.chat(
+                    messages, max_tokens=max_tokens, temperature=temperature,
+                    top_p=top_p, stop=stop,
+                )
+                self._send_json(result)
+        else:
+            # Swarm mode — delegate to existing CoordinatorEngine path
+            engine = self._require_engine()
+            request_id = str(uuid.uuid4())
+            if stream:
+                payload = self._chat_stream_payload(body, request_id)
+                model_meta = payload.get("model", {})
+                served_model = str(model_meta.get("served", body.get("model", "")))
+                self._send_sse(
+                    request_id=payload["request_id"],
+                    model_id=served_model,
+                    chunks=payload["stream"],
+                )
+            else:
+                payload = self._chat_payload(body, request_id)
+                model_meta = payload.get("model", {})
+                served_model = str(model_meta.get("served", body.get("model", "")))
+                self._send_json({
+                    "id": payload["request_id"],
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": served_model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": payload["response"]},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": len(payload["response"].split()),
+                        "total_tokens": len(payload["response"].split()),
+                    },
+                    "openhydra": payload,
+                })
+
+    def _send_local_sse(self, chunks) -> None:
+        """Stream LocalInferenceEngine chunks as SSE events."""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        last_chunk = None
+        for chunk in chunks:
+            last_chunk = chunk
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self._last_response_status = int(HTTPStatus.OK)
+
+    def _handle_list_models(self) -> None:
+        """Handle GET /v1/models for both local and swarm engines."""
+        if self._is_local_mode():
+            models = self.__class__.local_engine.list_models()
+            # Wrap in OpenAI format if not already
+            if isinstance(models, list):
+                self._send_json({"object": "list", "data": models})
+            else:
+                self._send_json(models)
+        else:
+            engine = self._require_engine()
+            payload = engine.list_models()
+            self._send_json(payload)
+
+    def _handle_tags_ollama(self) -> None:
+        """Handle GET /api/tags for both engines in Ollama format."""
+        if self._is_local_mode():
+            models = self.__class__.local_engine.list_models()
+            if isinstance(models, list):
+                model_list = models
+            else:
+                model_list = models.get("data", [])
+        else:
+            engine = self._require_engine()
+            payload = engine.list_models()
+            model_list = payload.get("data", [])
+
+        ollama_models = [
+            {
+                "name": str(m.get("id", "")),
+                "model": str(m.get("id", "")),
+                "modified_at": "2025-01-01T00:00:00Z",
+                "size": 0,
+                "digest": "",
+                "details": {
+                    "format": "",
+                    "family": "",
+                    "families": None,
+                    "parameter_size": "",
+                    "quantization_level": str(m.get("meta", {}).get("quantization", "")),
+                },
+            }
+            for m in model_list
+        ]
+        self._send_json({"models": ollama_models})
+
+    def _handle_show_ollama(self) -> None:
+        """Handle POST /api/show — return model configuration details."""
+        body = self._read_json()
+        model_name = str(body.get("name", ""))
+
+        if self._is_local_mode():
+            models = self.__class__.local_engine.list_models()
+            model_list = models if isinstance(models, list) else models.get("data", [])
+        else:
+            engine = self._require_engine()
+            model_list = engine.list_models().get("data", [])
+
+        model_info = {}
+        for m in model_list:
+            if m.get("id") == model_name:
+                model_info = m
+                break
+
+        self._send_json({
+            "modelfile": f"FROM {model_name}",
+            "modelinfo": {
+                "general.architecture": model_info.get("meta", {}).get("backend", "transformer"),
+                "general.name": model_name,
+                "general.quantization": model_info.get("meta", {}).get("quantization", "fp32"),
+            },
+            "parameters": "",
+            "template": "",
+        })
+
+    def _handle_ps_ollama(self) -> None:
+        """Handle GET /api/ps — return currently loaded models."""
+        if self._is_local_mode():
+            models = self.__class__.local_engine.list_models()
+            model_list = models if isinstance(models, list) else models.get("data", [])
+        else:
+            engine = self._require_engine()
+            model_list = engine.list_models().get("data", [])
+
+        running = [
+            {
+                "name": str(m.get("id", "")),
+                "model": str(m.get("id", "")),
+                "size": 0,
+                "digest": "",
+                "expires_at": "2099-01-01T00:00:00Z",
+            }
+            for m in model_list
+        ]
+        self._send_json({"models": running})
+
+    def _handle_generate_ollama(self, stream: bool = False) -> None:
+        """Handle POST /api/generate for both engines in Ollama format."""
+        body = self._read_json()
+        prompt = str(body.get("prompt", ""))
+        model = str(body.get("model", ""))
+        opts = _parse_ollama_options(dict(body.get("options") or {}))
+        max_tokens = int(opts.pop("max_tokens", 24))
+
+        if self._is_local_mode():
+            le = self.__class__.local_engine
+            result = le.infer(prompt, max_tokens=max_tokens, **opts)
+            content = result["choices"][0]["message"]["content"]
+            created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            self._send_json({
+                "model": le.model_id,
+                "created_at": created_at,
+                "response": content,
+                "done": True,
+                "total_duration": 0,
+                "load_duration": 0,
+                "prompt_eval_count": result["usage"]["prompt_tokens"],
+                "eval_count": result["usage"]["completion_tokens"],
+                "eval_duration": 0,
+            })
+        else:
+            engine = self._require_engine()
+            request_id = str(uuid.uuid4())
+            rid_headers: dict[str, str] = {}
+            self._generate_ollama(
+                body=body, request_id=request_id,
+                rid_headers=rid_headers, stream=stream,
+            )
+
+    def _handle_chat_ollama(self, stream: bool = False) -> None:
+        """Handle POST /api/chat for both engines in Ollama format."""
+        body = self._read_json()
+        messages = list(body.get("messages") or [])
+        model = str(body.get("model", ""))
+        opts = _parse_ollama_options(dict(body.get("options") or {}))
+        max_tokens = int(opts.pop("max_tokens", 24))
+
+        if self._is_local_mode():
+            le = self.__class__.local_engine
+            result = le.chat(messages, max_tokens=max_tokens, **opts)
+            content = result["choices"][0]["message"]["content"]
+            created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            self._send_json({
+                "model": le.model_id,
+                "created_at": created_at,
+                "message": {"role": "assistant", "content": content},
+                "done": True,
+                "total_duration": 0,
+                "load_duration": 0,
+                "prompt_eval_count": result["usage"]["prompt_tokens"],
+                "eval_count": result["usage"]["completion_tokens"],
+                "eval_duration": 0,
+            })
+        else:
+            engine = self._require_engine()
+            request_id = str(uuid.uuid4())
+            rid_headers: dict[str, str] = {}
+            self._chat_ollama(
+                body=body, request_id=request_id,
+                rid_headers=rid_headers, stream=stream,
+            )
+
+    # ------------------------------------------------------------------
+    # Mode switch (Pillar 3: The Toggle)
+    # ------------------------------------------------------------------
+
+    def _handle_mode_switch(self) -> None:
+        """Handle POST /v1/internal/mode — switch between local and swarm.
+
+        Only accepts requests from 127.0.0.1 (localhost).
+        Sets the 503 drain gate during transition.
+        """
+        # Security: only accept from localhost
+        client_ip = str(self.client_address[0])
+        if client_ip not in ("127.0.0.1", "::1"):
+            self._send_json(
+                {"error": "mode switch only allowed from localhost"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        body = self._read_json()
+        mode = str(body.get("mode", "")).strip().lower()
+
+        if mode not in ("local", "swarm"):
+            self._send_json(
+                {"error": f"invalid mode '{mode}'; must be 'local' or 'swarm'"},
+                status=HTTPStatus(400),
+            )
+            return
+
+        model_id = str(body.get("model_id", "")).strip() or None
+        cls = self.__class__
+
+        # Noop if already in the requested mode
+        if mode == "local" and cls.local_engine is not None:
+            self._send_json({"status": "ok", "mode": "local",
+                             "model_id": cls.local_engine.model_id})
+            return
+        if mode == "swarm" and cls.local_engine is None:
+            swarm_model = ""
+            if cls.engine and hasattr(cls.engine, "config"):
+                swarm_model = str(getattr(cls.engine.config, "default_model", ""))
+            self._send_json({"status": "ok", "mode": "swarm",
+                             "model_id": swarm_model})
+            return
+
+        # Serialize concurrent switches
+        with cls._mode_switch_lock:
+            cls._mode_switching = True
+            try:
+                if mode == "local":
+                    self._switch_to_local(model_id=model_id)
+                else:
+                    self._switch_to_swarm(model_id=model_id)
+            finally:
+                cls._mode_switching = False
+
+        active_model_id = ""
+        if cls.local_engine is not None:
+            active_model_id = cls.local_engine.model_id
+        elif cls.engine and hasattr(cls.engine, "config"):
+            active_model_id = str(getattr(cls.engine.config, "default_model", ""))
+        self._send_json({"status": "ok", "mode": mode, "model_id": active_model_id})
+
+    def _switch_to_local(self, model_id: str | None = None) -> None:
+        """Transition from swarm to local mode.
+
+        Memory-safe sequence:
+        1. Determine target model ID (explicit or hardware default)
+        2. Free memory (gc.collect + Metal cache clear)
+        3. Create new ModelShard + LocalInferenceEngine
+
+        Args:
+            model_id: Explicit model to load.  Falls back to the
+                coordinator's default_model if not provided.
+        """
+        from coordinator.local_engine import LocalInferenceEngine
+        from peer.model_shard import ModelShard, ToyShardConfig
+
+        cls = self.__class__
+
+        # 1. Resolve target model
+        if not model_id:
+            model_id = "openhydra-toy-345m"
+            if cls.engine and hasattr(cls.engine, "config"):
+                model_id = str(getattr(cls.engine.config, "default_model", model_id))
+
+        # 2. Free memory before allocating new model
+        _safe_free_memory()
+
+        # 3. Create new shard + engine
+        shard = ModelShard(ToyShardConfig(
+            model_id=model_id,
+            runtime_backend="toy_auto",
+        ))
+        cls.local_engine = LocalInferenceEngine(
+            model_id=model_id,
+            shard=shard,
+        )
+
+    def _switch_to_swarm(self, model_id: str | None = None) -> None:
+        """Transition from local to swarm mode.
+
+        Memory-safe sequence:
+        1. Call unload() on local engine (releases shard + runtime)
+        2. Set local_engine to None (drop Python reference)
+        3. gc.collect() + Metal cache clear
+
+        Args:
+            model_id: Reserved for future use (target swarm model).
+        """
+        cls = self.__class__
+        if cls.local_engine is not None:
+            unload = getattr(cls.local_engine, "unload", None)
+            if callable(unload):
+                unload()
+            cls.local_engine = None
+
+        # Free memory after unloading
+        _safe_free_memory()
+
+    def _handle_mode_status(self) -> None:
+        """Handle GET /v1/internal/mode — return current mode."""
+        mode = "local" if self.__class__.local_engine is not None else "swarm"
+        self._send_json({
+            "mode": mode,
+            "switching": bool(self.__class__._mode_switching),
+        })
 
     @classmethod
     def _record_http_request_metrics(

@@ -5,6 +5,7 @@ import { fetchHealth, fetchBalance } from "../lib/api";
 import { MODEL_CATALOG } from "../lib/models";
 
 export type NodeStatus = "stopped" | "starting" | "running" | "error" | "bootstrapping";
+export type NodeMode = "local" | "swarm";
 
 interface LogEntry {
   stream: "stdout" | "stderr";
@@ -26,6 +27,8 @@ interface NodeState {
   balance: { hydra: number; credits: number };
   healthy: boolean;
   systemRam: number;
+  mode: NodeMode;
+  modeSwitching: boolean;
 }
 
 type Action =
@@ -35,7 +38,9 @@ type Action =
   | { type: "SET_CONFIG"; config: Partial<NodeConfig> }
   | { type: "SET_BALANCE"; balance: { hydra: number; credits: number } }
   | { type: "SET_HEALTHY"; healthy: boolean }
-  | { type: "SET_RAM"; ram: number };
+  | { type: "SET_RAM"; ram: number }
+  | { type: "MODE_SWITCH_START" }
+  | { type: "MODE_SWITCH_DONE"; mode: NodeMode };
 
 const MAX_LOGS = 500;
 
@@ -56,6 +61,10 @@ function reducer(state: NodeState, action: Action): NodeState {
       return { ...state, healthy: action.healthy };
     case "SET_RAM":
       return { ...state, systemRam: action.ram };
+    case "MODE_SWITCH_START":
+      return { ...state, modeSwitching: true };
+    case "MODE_SWITCH_DONE":
+      return { ...state, mode: action.mode, modeSwitching: false };
     default:
       return state;
   }
@@ -75,6 +84,8 @@ const initialState: NodeState = {
   balance: { hydra: 0, credits: 0 },
   healthy: false,
   systemRam: 0, // Fetched from Rust backend on startup via get_system_ram()
+  mode: "local" as NodeMode, // Default to local mode (Trojan Horse strategy)
+  modeSwitching: false,
 };
 
 interface NodeContextValue {
@@ -83,6 +94,7 @@ interface NodeContextValue {
   stopNode: () => Promise<void>;
   clearLogs: () => void;
   updateConfig: (config: Partial<NodeConfig>) => void;
+  switchMode: (mode: NodeMode) => Promise<void>;
 }
 
 const NodeContext = createContext<NodeContextValue | null>(null);
@@ -155,6 +167,30 @@ export function NodeProvider({ children }: { children: ReactNode }) {
   const clearLogs = useCallback(() => dispatch({ type: "CLEAR_LOGS" }), []);
   const updateConfig = useCallback((c: Partial<NodeConfig>) => dispatch({ type: "SET_CONFIG", config: c }), []);
 
+  const switchMode = useCallback(async (mode: NodeMode) => {
+    if (state.modeSwitching || state.mode === mode) return;
+    dispatch({ type: "MODE_SWITCH_START" });
+    try {
+      await invoke<string>("switch_mode", {
+        mode,
+        port: state.config.apiPort,
+        modelId: state.config.modelId,
+      });
+      dispatch({ type: "MODE_SWITCH_DONE", mode });
+      dispatch({
+        type: "APPEND_LOG",
+        entry: { stream: "stdout", line: `Mode switched to ${mode} (model: ${state.config.modelId})`, ts: Date.now() },
+      });
+    } catch (err) {
+      // Fallback: set mode directly if daemon isn't running
+      dispatch({ type: "MODE_SWITCH_DONE", mode });
+      dispatch({
+        type: "APPEND_LOG",
+        entry: { stream: "stderr", line: `Mode switch via daemon failed (${err}), set locally`, ts: Date.now() },
+      });
+    }
+  }, [state.modeSwitching, state.mode, state.config.apiPort, state.config.modelId]);
+
   // Health polling
   useEffect(() => {
     if (state.status === "running") {
@@ -203,7 +239,7 @@ export function NodeProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <NodeContext.Provider value={{ state, startNode, stopNode, clearLogs, updateConfig }}>
+    <NodeContext.Provider value={{ state, startNode, stopNode, clearLogs, updateConfig, switchMode }}>
       {children}
     </NodeContext.Provider>
   );
