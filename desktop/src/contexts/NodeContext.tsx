@@ -1,5 +1,6 @@
 import { createContext, useContext, useReducer, useRef, useCallback, useEffect, type ReactNode } from "react";
 import { Command, type Child } from "@tauri-apps/plugin-shell";
+import { invoke } from "@tauri-apps/api/core";
 import { fetchHealth, fetchBalance } from "../lib/api";
 import { MODEL_CATALOG } from "../lib/models";
 
@@ -64,7 +65,7 @@ const defaultConfig: NodeConfig = {
   modelId: MODEL_CATALOG[0].hfId,
   peerId: `hydra-${Math.random().toString(36).slice(2, 8)}`,
   apiPort: 8080,
-  ramAllocation: 8,
+  ramAllocation: 4, // Updated dynamically after system RAM detection
 };
 
 const initialState: NodeState = {
@@ -73,7 +74,7 @@ const initialState: NodeState = {
   config: defaultConfig,
   balance: { hydra: 0, credits: 0 },
   healthy: false,
-  systemRam: 16,
+  systemRam: 0, // Fetched from Rust backend on startup via get_system_ram()
 };
 
 interface NodeContextValue {
@@ -177,6 +178,29 @@ export function NodeProvider({ children }: { children: ReactNode }) {
     }
     return () => clearInterval(balanceInterval.current);
   }, [state.status]);
+
+  // Detect physical RAM from Rust backend on startup
+  useEffect(() => {
+    invoke<number>("get_system_ram")
+      .then((ram) => {
+        if (ram > 0) {
+          dispatch({ type: "SET_RAM", ram });
+          // Auto-set RAM allocation to half of physical RAM (sensible default)
+          const allocation = Math.max(2, Math.floor(ram / 2));
+          dispatch({ type: "SET_CONFIG", config: { ramAllocation: allocation } });
+        }
+      })
+      .catch(() => {
+        // Fallback for browser dev mode (no Tauri runtime): detect via navigator
+        const navMem = (navigator as unknown as { deviceMemory?: number }).deviceMemory;
+        if (navMem && navMem > 0) {
+          dispatch({ type: "SET_RAM", ram: navMem });
+        } else {
+          // Last resort fallback — use 8 GB as conservative default
+          dispatch({ type: "SET_RAM", ram: 8 });
+        }
+      });
+  }, []);
 
   return (
     <NodeContext.Provider value={{ state, startNode, stopNode, clearLogs, updateConfig }}>

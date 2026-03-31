@@ -1,9 +1,14 @@
 use sysinfo::System;
 
+/// Returns total **physical** RAM in whole GB (rounded to nearest).
+/// Uses sysinfo crate which reads hw.memsize on macOS — excludes swap.
 #[tauri::command]
 fn get_system_ram() -> u64 {
     let sys = System::new_all();
-    sys.total_memory() / (1024 * 1024 * 1024) // bytes to GB
+    let bytes = sys.total_memory(); // Physical RAM only, no swap
+    // Round to nearest GB to handle slight OS reporting variations
+    // (e.g. 8GB Mac reports 8,589,934,592 bytes = exactly 8 GB)
+    (bytes + (512 * 1024 * 1024)) / (1024 * 1024 * 1024)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
