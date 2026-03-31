@@ -525,9 +525,9 @@ def test_watchdog_config_flows_from_toyshard():
     cfg = ToyShardConfig(runtime_mlx_eval_timeout_s=15.0)
     assert cfg.runtime_mlx_eval_timeout_s == 15.0
 
-    # Default must be 30.0.
+    # Default raised to 120.0 to support 8 GB machines under memory pressure.
     cfg_default = ToyShardConfig()
-    assert cfg_default.runtime_mlx_eval_timeout_s == 30.0
+    assert cfg_default.runtime_mlx_eval_timeout_s == 120.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

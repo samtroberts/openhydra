@@ -69,10 +69,12 @@ class _MlxWatchdog:
           to prevent queue buildup.
 
     Args:
-        default_timeout_s: Maximum seconds per computation (default 30.0).
+        default_timeout_s: Maximum seconds per computation (default 120.0).
+            Raised from 30s to 120s to accommodate 8 GB machines where
+            Metal GPU operations stall under memory pressure / swap.
     """
 
-    def __init__(self, default_timeout_s: float = 30.0) -> None:
+    def __init__(self, default_timeout_s: float = 120.0) -> None:
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="mlx-watchdog",
