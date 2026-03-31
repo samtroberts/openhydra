@@ -51,6 +51,13 @@ Open a [GitHub Issue](../../issues/new?template=feature_request.md) with:
 
 ## Development Setup
 
+### Prerequisites
+
+- **Python 3.11+**
+- **C/C++ compiler**: `xcode-select --install` (macOS) or `apt install build-essential libssl-dev` (Linux)
+- **Apple Silicon**: `pip install "openhydra-network[mlx]"` for GPU acceleration
+- **NVIDIA**: `pip install torch --index-url https://download.pytorch.org/whl/cu124`
+
 ```bash
 # 1. Clone
 git clone https://github.com/samtroberts/openhydra.git

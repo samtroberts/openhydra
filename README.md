@@ -34,14 +34,40 @@ OpenHydra is a peer-to-peer inference network that turns idle hardware into a gl
 
 Open the app. It auto-detects your hardware, joins the base swarm (Qwen 3.5 0.8B), and starts earning. If you have heavy hardware, it recommends upgrading to larger models for higher rewards.
 
-### CLI Install
+### CLI Install (macOS Apple Silicon)
 
 ```bash
-pip install openhydra-network
+# Install build tools (one-time)
+xcode-select --install
+
+# Create virtual environment
+python3 -m venv ~/.openhydra-venv && source ~/.openhydra-venv/bin/activate
+
+# Install with MLX support (Apple Silicon GPU acceleration)
+pip install "openhydra-network[mlx]"
+
+# Start your node
 openhydra-node --peer-id my-node
 ```
 
-That's it. One command. OpenHydra auto-detects your hardware (Apple Silicon &rarr; MLX, NVIDIA &rarr; CUDA, AMD &rarr; ROCm), joins the global DHT, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`. The default model is Qwen 3.5 0.8B &mdash; lightweight enough for any machine.
+### CLI Install (NVIDIA / Linux)
+
+```bash
+# System dependencies (one-time)
+sudo apt-get install -y build-essential python3-dev python3-venv libssl-dev
+
+# Create virtual environment
+python3 -m venv ~/.openhydra-venv && source ~/.openhydra-venv/bin/activate
+
+# Install PyTorch with CUDA, then OpenHydra
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install openhydra-network
+
+# Start your node
+openhydra-node --peer-id my-node
+```
+
+OpenHydra auto-detects your hardware (Apple Silicon &rarr; MLX, NVIDIA &rarr; CUDA, AMD &rarr; ROCm), joins the global DHT, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`. The default model is Qwen 3.5 0.8B &mdash; lightweight enough for any machine.
 
 **Supported platforms:**
 
@@ -306,6 +332,85 @@ ops/               Terraform, Docker Compose, Prometheus/Grafana, TLS, deploy sc
 scripts/           SLO chaos test, KV benchmark, head-budget optimizer, canary rollout
 tests/             867 tests (858 unit + 9 real-model integration)
 ```
+
+---
+
+## Troubleshooting
+
+<details>
+<summary><strong>"error: command 'gcc' failed"</strong> during pip install</summary>
+
+grpcio and cryptography require a C compiler. Install build tools first:
+
+```bash
+# macOS
+xcode-select --install
+
+# Ubuntu/Debian
+sudo apt-get install build-essential python3-dev libssl-dev
+```
+</details>
+
+<details>
+<summary><strong>"ModuleNotFoundError: No module named 'torch'"</strong></summary>
+
+PyTorch is not bundled because different platforms need different builds. Install it explicitly:
+
+```bash
+# Apple Silicon (use MLX instead — faster)
+pip install "openhydra-network[mlx]"
+
+# NVIDIA CUDA 12.4
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# CPU only (slow but works everywhere)
+pip install torch
+```
+</details>
+
+<details>
+<summary><strong>"Address already in use: 0.0.0.0:8080"</strong></summary>
+
+Another process is using port 8080. Use a different port:
+
+```bash
+lsof -i :8080          # Find what's using it
+openhydra-node --peer-id my-node --api-port 8081
+```
+</details>
+
+<details>
+<summary><strong>macOS: "OpenHydra.app is damaged and can't be opened"</strong></summary>
+
+macOS Gatekeeper blocks unsigned apps. Fix:
+
+```bash
+# Option 1: Right-click > Open (one-time bypass)
+# Option 2: Remove quarantine attribute
+xattr -cr /Applications/OpenHydra.app
+```
+</details>
+
+<details>
+<summary><strong>Slow inference (&lt; 1 tok/s on Apple Silicon)</strong></summary>
+
+MLX is not installed, so OpenHydra fell back to PyTorch CPU (100x slower):
+
+```bash
+pip install "openhydra-network[mlx]"
+# Restart the node — expected: ~252 tok/s (vs ~1.3 tok/s on CPU)
+```
+</details>
+
+<details>
+<summary><strong>"No viable model found" / 503</strong></summary>
+
+The coordinator can't find peers. Ensure DHT connectivity:
+
+```bash
+openhydra-node --peer-id my-node --dht-url https://bootstrap-eu.openhydra.co
+```
+</details>
 
 ---
 

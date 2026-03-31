@@ -141,6 +141,50 @@ jobs:
       - name: Build docs (strict)
         run: mkdocs build --strict
 
+  # ── Desktop app (macOS .dmg) ─────────────────────────────────────────────────
+  desktop-macos:
+    name: Desktop (macOS aarch64)
+    runs-on: macos-14  # Apple Silicon runner
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: cd desktop && npm ci
+
+      - name: Build Tauri app
+        run: cd desktop && npx tauri build --target aarch64-apple-darwin
+
+      - name: Fix code signature (ad-hoc signing with sealed resources)
+        run: |
+          APP_PATH="desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/OpenHydra.app"
+          # Sign sidecar binaries first, then the full bundle
+          find "$APP_PATH/Contents/MacOS" -type f ! -name "openhydra-desktop" -exec codesign --force --sign - {} \;
+          codesign --force --deep --sign - "$APP_PATH"
+          # Verify sealed resources are present
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "Code signature verified successfully"
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenHydra-macOS-aarch64
+          path: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          retention-days: 30
+
   # ── Landing page HTML ────────────────────────────────────────────────────────
   landing:
     name: Landing page

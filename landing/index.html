@@ -166,9 +166,15 @@
   </div>
   <div class="install-row">
     <span class="install-prompt">$</span>
-    <span>pip install openhydra-network &amp;&amp; openhydra-node --peer-id my-node</span>
-    <button class="copy-btn" onclick="copyIt(this,'pip install openhydra-network && openhydra-node --peer-id my-node')" title="Copy">⎘</button>
+    <span>pip install "openhydra-network[mlx]" &amp;&amp; openhydra-node --peer-id my-node</span>
+    <button class="copy-btn" onclick="copyIt(this,'pip install &quot;openhydra-network[mlx]&quot; && openhydra-node --peer-id my-node')" title="Copy">⎘</button>
   </div>
+  <p style="font-size:.75rem;color:var(--muted);margin-top:.5rem;max-width:520px;text-align:center;line-height:1.6;">
+    macOS: requires <code style="font-family:monospace;font-size:.9em;">xcode-select --install</code> first.
+    Linux: <code style="font-family:monospace;font-size:.9em;">apt install build-essential libssl-dev</code>,
+    then <code style="font-family:monospace;font-size:.9em;">pip install torch</code> separately for NVIDIA/AMD.
+    <a href="https://github.com/samtroberts/openhydra#troubleshooting" style="color:var(--muted);">Troubleshooting &rarr;</a>
+  </p>
 </div>
 
 <!-- Mac Mini "OpenClaw" Banner -->
