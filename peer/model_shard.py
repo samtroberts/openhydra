@@ -27,19 +27,8 @@ from typing import Any
 from peer.pytorch_activation_compressor import PyTorchActivationCompressor
 from peer.privacy import PyTorchDifferentialPrivacyNoise
 
-ACTIVATION_SIZE = 64
-
-_VOCAB = [
-    "hydra", "swarm", "tensor", "latency", "peer", "pipeline", "decode", "prefill",
-    "routing", "reputation", "redundant", "verify", "bandwidth", "cache", "token",
-    "context", "throughput", "resilient", "distributed", "inference", "model", "layer",
-    "session", "fallback", "degrade", "secure", "signal", "quorum", "consensus",
-    "operator", "diversity", "fairness", "compute", "queue", "scheduler", "checkpoint",
-    "vector", "attention", "entropy", "stable", "adaptive", "transparent", "daemon",
-    "polite", "credits", "governance", "network", "uplink", "response", "prompt",
-    "quality", "balance", "retry", "health", "fault", "audit", "score", "cluster",
-    "edge", "stream", "orchestrate", "shard", "fabric", "trust", "mesh",
-]
+_TINYLLAMA_MODEL_ID = "nickypro/tinyllama-15M"
+_TINYLLAMA_CACHE_DIR = os.path.expanduser("~/.cache/openhydra/models/tinyllama-15M")
 
 _QUANTIZATION_BITS = {
     "fp32": 0,
@@ -110,14 +99,14 @@ def _tokenizer_eos_ids(tokenizer: Any) -> tuple[set[int], int]:
 
 @dataclass(frozen=True)
 class ToyShardConfig:
-    model_id: str = "openhydra-toy-345m"
+    model_id: str = "tinyllama-15M"
     shard_index: int = 0
     total_shards: int = 1
     broken: bool = False
     runtime_backend: str = "toy_auto"
     runtime_target: str = "auto"
     quantization_mode: str = "fp32"
-    runtime_model_id: str = "Qwen/Qwen3.5-0.8B"
+    runtime_model_id: str = "nickypro/tinyllama-15M"
     runtime_trust_remote_code: bool | None = None
     runtime_layer_indices: tuple[int, ...] = ()
     runtime_max_context_tokens: int = 64
@@ -198,69 +187,69 @@ class _DecoderArchitecture:
 
 
 class ToyRuntime:
+    """Lightweight real LLM runtime using tinyllama-15M (15M params, 29 MB).
+
+    Replaces the legacy hash-based mock with a real LLaMA model that
+    generates coherent text.  Loads from a local HuggingFace cache on
+    first use (~3s download if not cached).  CPU-only inference at
+    ~50 tok/s — fast enough for tests and development.
+
+    Model: nickypro/tinyllama-15M (LLaMA architecture, safetensors)
+    """
+
     def __init__(self, config: ToyShardConfig):
         self.config = config
-        salt_material = f"{config.model_id}:{config.shard_index}:{config.total_shards}".encode()
-        self._salt = hashlib.sha256(salt_material).digest()
-        self._runtime_profile = self._build_runtime_profile(config)
         self.last_forward_thread_id: int | None = None
 
-    @staticmethod
-    def _digest(text: str) -> bytes:
-        return hashlib.sha256(text.encode("utf-8")).digest()
+        # Ensure model is cached locally
+        cache_dir = _TINYLLAMA_CACHE_DIR
+        safetensors_path = os.path.join(cache_dir, "model.safetensors")
+        if not os.path.exists(safetensors_path):
+            logging.info("tinyllama: downloading %s to %s", _TINYLLAMA_MODEL_ID, cache_dir)
+            from huggingface_hub import snapshot_download
+            snapshot_download(_TINYLLAMA_MODEL_ID, local_dir=cache_dir)
+
+        # Load model + tokenizer
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "ToyRuntime requires 'torch' and 'transformers': pip install torch transformers"
+            ) from exc
+
+        self._torch = torch
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            cache_dir, local_files_only=True,
+            trust_remote_code=_default_trust_remote_code(config.runtime_model_id or _TINYLLAMA_MODEL_ID),
+        )
+        self._model = AutoModelForCausalLM.from_pretrained(
+            cache_dir, local_files_only=True,
+            trust_remote_code=_default_trust_remote_code(config.runtime_model_id or _TINYLLAMA_MODEL_ID),
+        )
+        self._model.eval()
+
+        # Discover total layers for profile
+        _layers = getattr(getattr(self._model, "model", self._model), "layers", [])
+        self._total_layers = len(_layers) if _layers else 8
+
+        self._runtime_profile = self._build_runtime_profile(config)
 
     @classmethod
     def _build_runtime_profile(cls, config: ToyShardConfig) -> RuntimeProfile:
         gpu_available = _gpu_available_hint()
-
-        requested_target = str(config.runtime_target or "auto").strip().lower()
-        if requested_target not in {"auto", "cpu", "cuda"}:
-            requested_target = "auto"
-        target = requested_target
-        if target == "auto":
-            target = "cuda" if gpu_available else "cpu"
-        if target == "cuda" and not gpu_available:
-            target = "cpu"
-
-        requested_backend = str(config.runtime_backend or "toy_auto").strip().lower()
-        if requested_backend not in {"toy_auto", "toy_cpu", "toy_gpu_sim"}:
-            requested_backend = "toy_auto"
-        if requested_backend == "toy_auto":
-            backend = "toy_gpu_sim" if target == "cuda" else "toy_cpu"
-        else:
-            backend = requested_backend
-        if backend == "toy_gpu_sim" and target != "cuda":
-            backend = "toy_cpu"
-
         quantization_mode = _normalize_quantization_mode(config.quantization_mode)
         quantization_bits = _QUANTIZATION_BITS[quantization_mode]
 
-        base_tps = 96.0
-        if backend == "toy_gpu_sim":
-            base_tps *= 2.75
-        if quantization_bits == 8:
-            base_tps *= 1.3
-        elif quantization_bits == 4:
-            base_tps *= 1.75
-        shard_penalty = max(0.65, 1.0 - (max(0, int(config.shard_index)) * 0.03))
-        est_tps = round(max(8.0, base_tps * shard_penalty), 3)
-
-        base_mem = 1400 if backend == "toy_cpu" else 2200
-        if quantization_bits == 8:
-            base_mem = int(round(base_mem * 0.58))
-        elif quantization_bits == 4:
-            base_mem = int(round(base_mem * 0.37))
-        est_mem = max(128, int(base_mem))
-
         return RuntimeProfile(
-            backend=backend,
-            target=target,
+            backend="tinyllama",
+            target="cpu",
             quantization_mode=quantization_mode,
             quantization_bits=quantization_bits,
             gpu_available=gpu_available,
-            estimated_tokens_per_sec=est_tps,
-            estimated_memory_mb=est_mem,
-            runtime_model_id=str(config.model_id),
+            estimated_tokens_per_sec=50.0,
+            estimated_memory_mb=60,
+            runtime_model_id=_TINYLLAMA_MODEL_ID,
             layer_start=int(config.shard_index),
             layer_end=int(config.shard_index + 1),
         )
@@ -269,11 +258,7 @@ class ToyRuntime:
         return self._runtime_profile.to_dict()
 
     def reshard(self, new_layer_start: int, new_layer_end: int, total_layers: int) -> bool:
-        """Reshard the ToyRuntime to cover [new_layer_start, new_layer_end).
-
-        ToyRuntime is a mock runtime — resharding simply updates the
-        runtime profile metadata.  Returns ``True`` on success.
-        """
+        """Update shard metadata (no physical resharding for ToyRuntime)."""
         self._runtime_profile = RuntimeProfile(
             backend=self._runtime_profile.backend,
             target=self._runtime_profile.target,
@@ -287,40 +272,12 @@ class ToyRuntime:
             layer_end=int(new_layer_end),
             total_layers=int(total_layers),
         )
-        logging.info(
-            "toy_reshard: [%d, %d) total=%d",
-            new_layer_start, new_layer_end, total_layers,
-        )
         return True
 
     def encode_prompt(self, prompt: str, max_tokens: int) -> list[float]:
-        digest = self._digest(f"{prompt}|{max_tokens}")
-        activation: list[float] = []
-        for i in range(ACTIVATION_SIZE):
-            b = digest[i % len(digest)]
-            c = self._salt[i % len(self._salt)]
-            centered = ((b ^ c) - 127) / 127.0
-            activation.append(centered)
-        return activation
-
-    def _mix(self, activation: list[float]) -> list[float]:
-        out: list[float] = []
-        length = len(activation)
-        if length == 0:
-            return []
-
-        step = (self.config.shard_index + 1) % length
-        for i, val in enumerate(activation):
-            neighbor = activation[(i + step) % length]
-            bias = (self._salt[(i + self.config.shard_index) % len(self._salt)] - 127) / 1200.0
-            mixed = math.tanh(0.77 * val + 0.21 * neighbor + bias)
-            out.append(mixed)
-
-        if self.config.broken:
-            # Intentional deterministic corruption for Mystery Shopper tests.
-            out = [math.tanh(v * 3.0 + 0.35) for v in out]
-
-        return out
+        """Tokenize prompt and return token IDs as floats."""
+        ids = self._tokenizer.encode(str(prompt or ""), add_special_tokens=False)
+        return [float(t) for t in ids[:max(1, max_tokens)]]
 
     def forward(
         self,
@@ -339,19 +296,50 @@ class ToyRuntime:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
     ) -> list[float]:
+        """Run real inference and return generated token IDs as floats."""
         self.last_forward_thread_id = threading.get_ident()
-        base = activation or self.encode_prompt(prompt, max_tokens)
-        quantized_base = _apply_quantization(base, self._runtime_profile.quantization_bits)
-        mixed = self._mix(quantized_base)
-        return _apply_quantization(mixed, self._runtime_profile.quantization_bits)
+
+        # Tokenize the prompt
+        text = str(prompt or "")
+        if not text and activation:
+            # Activation contains token IDs from a previous stage
+            input_ids = self._torch.tensor(
+                [[max(0, int(round(v))) for v in activation]],
+                dtype=self._torch.long,
+            )
+        else:
+            input_ids = self._tokenizer(text, return_tensors="pt")["input_ids"]
+
+        gen_count = max(1, min(int(max_tokens), 256))
+
+        # Sampling config
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": gen_count,
+            "do_sample": bool(decode_do_sample) if decode_do_sample is not None else False,
+        }
+        if decode_temperature is not None and float(decode_temperature) > 0:
+            gen_kwargs["temperature"] = float(decode_temperature)
+            gen_kwargs["do_sample"] = True
+        if decode_top_p is not None and float(decode_top_p) > 0:
+            gen_kwargs["top_p"] = float(decode_top_p)
+        if decode_top_k is not None and int(decode_top_k) > 0:
+            gen_kwargs["top_k"] = int(decode_top_k)
+
+        # Intentional corruption for Mystery Shopper tests
+        if self.config.broken:
+            gen_kwargs["temperature"] = 99.0
+            gen_kwargs["do_sample"] = True
+
+        with self._torch.no_grad():
+            output = self._model.generate(input_ids=input_ids, **gen_kwargs)
+
+        # Return only the NEW tokens (exclude prompt tokens)
+        prompt_len = input_ids.shape[1]
+        new_tokens = output[0][prompt_len:].tolist()
+        return [float(t) for t in new_tokens]
 
     def forward_batch(self, items: list[Any]) -> list[list[float]]:
-        """Sequential forward batch for ToyRuntime.
-
-        ToyRuntime has no GPU, so batching provides no performance benefit.
-        This method exists to satisfy the forward_batch() contract expected
-        by BatchingQueue._dispatch(), allowing tests to spy on it.
-        """
+        """Sequential forward for each item (CPU model, no batching benefit)."""
         return [
             list(
                 self.forward(
@@ -372,7 +360,7 @@ class ToyRuntime:
         ]
 
     def compaction_stats(self) -> "dict[str, int | float]":
-        """Stub — ToyRuntime performs no real compaction."""
+        """Stub — ToyRuntime does not perform KV cache compaction."""
         return {
             "compact_calls": 0,
             "compact_tokens_before": 0,
@@ -2138,14 +2126,28 @@ class ModelShard:
                         return pieces
                     return []
 
-        words: list[str] = []
-        length = len(activation)
-        for i in range(count):
-            val = activation[i % length]
-            idx = int(((val + 1.0) / 2.0) * (len(_VOCAB) - 1))
-            idx = max(0, min(len(_VOCAB) - 1, idx))
-            words.append(_VOCAB[idx])
-        return words
+        # Fallback: try tinyllama tokenizer for ToyRuntime outputs
+        token_count = max(1, min(count, len(activation)))
+        token_ids_fallback: list[int] = []
+        for value in activation[:token_count]:
+            try:
+                token_ids_fallback.append(max(0, int(round(float(value)))))
+            except (TypeError, ValueError):
+                token_ids_fallback = []
+                break
+        if token_ids_fallback:
+            fallback_tokenizer = ModelShard._load_decode_tokenizer(_TINYLLAMA_MODEL_ID)
+            if fallback_tokenizer is None:
+                fallback_tokenizer = ModelShard._load_decode_tokenizer(_TINYLLAMA_CACHE_DIR)
+            if fallback_tokenizer is not None:
+                try:
+                    pieces = [fallback_tokenizer.decode([tid], skip_special_tokens=True) for tid in token_ids_fallback]
+                    if any(p for p in pieces):
+                        return pieces
+                except Exception:
+                    pass
+        # Last resort: debug representation
+        return [f"tok{int(round(float(v)))}" for v in activation[:count]]
 
     @staticmethod
     def render_text(tokens: list[str]) -> str:
