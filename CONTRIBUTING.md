@@ -93,7 +93,7 @@ make test
 ## Running Tests
 
 ```bash
-# Fast suite (~2 min, 982+ tests)
+# Fast suite (~2.5 min, 1045+ tests)
 python -m pytest tests/ -q
 
 # With coverage report
