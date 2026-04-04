@@ -227,10 +227,19 @@ class InferenceService:
             raise RuntimeError(
                 "pytorch_generation_tokenizer_unavailable: install optional dependency 'transformers'"
             ) from exc
-        tokenizer = AutoTokenizer.from_pretrained(
-            normalized,
-            trust_remote_code=self._default_trust_remote_code(normalized),
-        )
+        # Try local-first to avoid HF Hub HEAD requests (saves ~800ms/call).
+        # Fall back to network if local cache doesn't have the model yet.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                normalized,
+                trust_remote_code=self._default_trust_remote_code(normalized),
+                local_files_only=True,
+            )
+        except OSError:
+            tokenizer = AutoTokenizer.from_pretrained(
+                normalized,
+                trust_remote_code=self._default_trust_remote_code(normalized),
+            )
         self._tokenizer_cache[normalized] = tokenizer
         return tokenizer
 
@@ -986,6 +995,7 @@ class InferenceService:
         # respects the overall latency budget rather than getting a fresh window.
         deadline = time.time() + self.config.max_latency_ms / 1000.0
 
+        _t_prep_start = time.perf_counter()
         prep = self._engine._prepare_inference(
             prompt=prompt,
             pipeline_width=pipeline_width,
@@ -996,6 +1006,8 @@ class InferenceService:
             expert_tags=expert_tags,
             expert_layer_indices=expert_layer_indices,
         )
+        _t_prep_ms = (time.perf_counter() - _t_prep_start) * 1000
+        logger.info("PROFILE phase_A_prepare_inference=%.1fms", _t_prep_ms)
         # Elastic output cap: 2048 floor, up to 8192 if redundancy >= 3.0
         _served = prep.decision.served_model
         _available = prep.counts.get(_served, 0)
@@ -1014,6 +1026,7 @@ class InferenceService:
             decode_top_k=decode_top_k,
             decode_seed=decode_seed,
         )
+        _t_chain_start = time.perf_counter()
         primary = self._engine._run_chain(
             prep.effective_prompt,
             prep.candidates,
@@ -1023,79 +1036,98 @@ class InferenceService:
             deadline=deadline,
             **decode_controls,
         )
+        _t_chain_ms = (time.perf_counter() - _t_chain_start) * 1000
+        logger.info("PROFILE phase_B_run_chain=%.1fms", _t_chain_ms)
         prompt_tokens_est = estimate_prompt_tokens(prep.effective_prompt)
 
-        secondary_pipeline = self._engine._select_pipeline(self._rotate(prep.candidates, 1), pipeline_width=pipeline_width)
-        secondary_pipeline, secondary_bandwidth_policy = self._engine._apply_bandwidth_asymmetry(
-            secondary_pipeline,
-            self._rotate(prep.candidates, 1),
-            prompt_tokens_est=prompt_tokens_est,
-        )
-        secondary_pipeline, _ = self._engine._apply_moe_geo_sharding(
-            secondary_pipeline,
-            self._rotate(prep.candidates, 1),
-            prompt=prep.effective_prompt,
-            requested_expert_tags=list(prep.primary_moe_policy.get("requested_experts", [])),
-            requested_expert_layer_indices=list(prep.primary_moe_policy.get("requested_layer_indices", [])),
-            locked_first_peer_id=(
-                str(secondary_bandwidth_policy.get("prefill_peer_id", "")).strip()
-                if bool(secondary_bandwidth_policy.get("prefill_required"))
-                else None
-            ),
-        )
-        tertiary_pipeline = self._engine._select_pipeline(self._rotate(prep.candidates, 2), pipeline_width=pipeline_width)
-        tertiary_pipeline, tertiary_bandwidth_policy = self._engine._apply_bandwidth_asymmetry(
-            tertiary_pipeline,
-            self._rotate(prep.candidates, 2),
-            prompt_tokens_est=prompt_tokens_est,
-        )
-        tertiary_pipeline, _ = self._engine._apply_moe_geo_sharding(
-            tertiary_pipeline,
-            self._rotate(prep.candidates, 2),
-            prompt=prep.effective_prompt,
-            requested_expert_tags=list(prep.primary_moe_policy.get("requested_experts", [])),
-            requested_expert_layer_indices=list(prep.primary_moe_policy.get("requested_layer_indices", [])),
-            locked_first_peer_id=(
-                str(tertiary_bandwidth_policy.get("prefill_peer_id", "")).strip()
-                if bool(tertiary_bandwidth_policy.get("prefill_required"))
-                else None
-            ),
-        )
+        # ── Verification bypass: skip when fewer than 2 distinct peers ──
+        # On single-node deployments the "mystery shopper" re-executes on
+        # the same peer — pure waste (19+ seconds).  Only verify when a
+        # genuinely different peer can produce an independent result.
+        _unique_peer_ids = {p.peer_id for p in prep.candidates}
+        _skip_verification = len(_unique_peer_ids) < 2
 
         secondary_result: ChainResult | None = None
         tertiary_result: ChainResult | None = None
 
-        def run_secondary() -> ChainResult:
-            nonlocal secondary_result
-            secondary_result = self._engine._run_chain(
-                prep.effective_prompt,
-                self._rotate(prep.candidates, 1),
+        if _skip_verification:
+            logger.info(
+                "PROFILE phase_C_verification=SKIPPED (single-peer topology, %d unique peers)",
+                len(_unique_peer_ids),
+            )
+            verification = self.verifier.build_skip_result(primary)
+        else:
+            secondary_pipeline = self._engine._select_pipeline(self._rotate(prep.candidates, 1), pipeline_width=pipeline_width)
+            secondary_pipeline, secondary_bandwidth_policy = self._engine._apply_bandwidth_asymmetry(
                 secondary_pipeline,
-                max_tokens=max_tokens,
-                request_id=primary.request_id,
-                deadline=deadline,
-                **decode_controls,
+                self._rotate(prep.candidates, 1),
+                prompt_tokens_est=prompt_tokens_est,
             )
-            return secondary_result
-
-        def run_tertiary() -> ChainResult:
-            nonlocal tertiary_result
-            tertiary_result = self._engine._run_chain(
-                prep.effective_prompt,
-                self._rotate(prep.candidates, 2),
+            secondary_pipeline, _ = self._engine._apply_moe_geo_sharding(
+                secondary_pipeline,
+                self._rotate(prep.candidates, 1),
+                prompt=prep.effective_prompt,
+                requested_expert_tags=list(prep.primary_moe_policy.get("requested_experts", [])),
+                requested_expert_layer_indices=list(prep.primary_moe_policy.get("requested_layer_indices", [])),
+                locked_first_peer_id=(
+                    str(secondary_bandwidth_policy.get("prefill_peer_id", "")).strip()
+                    if bool(secondary_bandwidth_policy.get("prefill_required"))
+                    else None
+                ),
+            )
+            tertiary_pipeline = self._engine._select_pipeline(self._rotate(prep.candidates, 2), pipeline_width=pipeline_width)
+            tertiary_pipeline, tertiary_bandwidth_policy = self._engine._apply_bandwidth_asymmetry(
                 tertiary_pipeline,
-                max_tokens=max_tokens,
-                request_id=primary.request_id,
-                deadline=deadline,
-                **decode_controls,
+                self._rotate(prep.candidates, 2),
+                prompt_tokens_est=prompt_tokens_est,
             )
-            return tertiary_result
+            tertiary_pipeline, _ = self._engine._apply_moe_geo_sharding(
+                tertiary_pipeline,
+                self._rotate(prep.candidates, 2),
+                prompt=prep.effective_prompt,
+                requested_expert_tags=list(prep.primary_moe_policy.get("requested_experts", [])),
+                requested_expert_layer_indices=list(prep.primary_moe_policy.get("requested_layer_indices", [])),
+                locked_first_peer_id=(
+                    str(tertiary_bandwidth_policy.get("prefill_peer_id", "")).strip()
+                    if bool(tertiary_bandwidth_policy.get("prefill_required"))
+                    else None
+                ),
+            )
 
-        verification = self.verifier.verify(
-            primary,
-            run_secondary=run_secondary,
-            run_tertiary=(run_tertiary if len(prep.candidates) >= 3 else None),
-        )
+            def run_secondary() -> ChainResult:
+                nonlocal secondary_result
+                secondary_result = self._engine._run_chain(
+                    prep.effective_prompt,
+                    self._rotate(prep.candidates, 1),
+                    secondary_pipeline,
+                    max_tokens=max_tokens,
+                    request_id=primary.request_id,
+                    deadline=deadline,
+                    **decode_controls,
+                )
+                return secondary_result
+
+            def run_tertiary() -> ChainResult:
+                nonlocal tertiary_result
+                tertiary_result = self._engine._run_chain(
+                    prep.effective_prompt,
+                    self._rotate(prep.candidates, 2),
+                    tertiary_pipeline,
+                    max_tokens=max_tokens,
+                    request_id=primary.request_id,
+                    deadline=deadline,
+                    **decode_controls,
+                )
+                return tertiary_result
+
+            _t_verify_start = time.perf_counter()
+            verification = self.verifier.verify(
+                primary,
+                run_secondary=run_secondary,
+                run_tertiary=(run_tertiary if len(prep.candidates) >= 3 else None),
+            )
+            _t_verify_ms = (time.perf_counter() - _t_verify_start) * 1000
+            logger.info("PROFILE phase_C_verification=%.1fms", _t_verify_ms)
         verification_feedback = self._engine._apply_verification_feedback(
             primary=primary,
             secondary=secondary_result,

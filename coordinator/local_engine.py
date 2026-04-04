@@ -76,6 +76,10 @@ class LocalInferenceEngine:
         self.shard = shard
         self._lock = threading.Lock()
 
+        # Cache the runtime's tokenizer for chat template + token counting.
+        # MLXRuntime and PyTorchRuntime expose _tokenizer; ToyRuntime does not.
+        self._tokenizer = getattr(getattr(shard, "_runtime", None), "_tokenizer", None)
+
     # ── Model listing ───────────────────────────────────────────────────────
 
     def list_models(self) -> list[dict[str, Any]]:
@@ -126,11 +130,10 @@ class LocalInferenceEngine:
             decode_top_p=top_p,
         )
 
-        # Decode activation to text
-        text = ModelShard.decode_text(
-            activation,
-            max_tokens=max_tokens,
-        )
+        # Decode token IDs to text.
+        # Fast path: use cached tokenizer directly (skips ModelShard.decode_text
+        # which loads a fresh tokenizer via AutoTokenizer.from_pretrained).
+        text, completion_token_count = self._decode_activation(activation, max_tokens)
 
         # Apply stop sequences
         finish_reason = "length"
@@ -142,8 +145,9 @@ class LocalInferenceEngine:
                     finish_reason = "stop"
                     break
 
-        # Estimate completion tokens from the decoded text
-        completion_token_count = self._count_completion_tokens(text, max_tokens)
+        # Determine finish reason from token count
+        if finish_reason != "stop" and completion_token_count < max_tokens:
+            finish_reason = "stop"
 
         # Determine finish reason: if we generated fewer tokens than max, it's "stop"
         if finish_reason != "stop" and completion_token_count < max_tokens:
@@ -185,7 +189,7 @@ class LocalInferenceEngine:
             decode_top_p=top_p,
         )
 
-        text = ModelShard.decode_text(activation, max_tokens=max_tokens)
+        text, _ = self._decode_activation(activation, max_tokens)
 
         # Apply stop sequences
         finish_reason = "length"
@@ -285,14 +289,28 @@ class LocalInferenceEngine:
 
     # ── Private helpers ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _apply_chat_template(messages: list[dict[str, str]]) -> str:
-        """Flatten a messages list into a single prompt string.
+    def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
+        """Convert messages to a model-native prompt string.
 
-        Uses a simple default template.  Real tokenizer chat templates
-        (Jinja2) will be wired when we integrate with HuggingFace
-        tokenizers in Phase 2.
+        Uses the tokenizer's Jinja2 chat template when available (produces
+        proper ``<|im_start|>``/``<|im_end|>`` tags for Qwen, ``[INST]``
+        for Llama, etc.).  Falls back to a simple role-prefix format for
+        ToyRuntime or when the tokenizer lacks a template.
         """
+        # Try real tokenizer template first
+        if self._tokenizer is not None:
+            apply_fn = getattr(self._tokenizer, "apply_chat_template", None)
+            if callable(apply_fn):
+                try:
+                    clean = [
+                        {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
+                        for m in messages if m.get("content")
+                    ]
+                    return apply_fn(clean, tokenize=False, add_generation_prompt=True)
+                except Exception:
+                    pass  # Fall through to simple template
+
+        # Simple fallback (ToyRuntime, or broken tokenizer)
         parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -306,14 +324,54 @@ class LocalInferenceEngine:
         parts.append("Assistant:")
         return "\n".join(parts)
 
-    @staticmethod
-    def _count_prompt_tokens(prompt: str) -> int:
-        """Estimate prompt token count.
+    def _decode_activation(self, activation: list[float], max_tokens: int) -> tuple[str, int]:
+        """Decode token ID activations to text using the cached tokenizer.
 
-        Uses a simple word-split heuristic for ToyRuntime.  Real
-        tokenizer counting will be wired in Phase 2 when the tokenizer
-        is cached at init.
+        Fast path: decodes all token IDs in a single batch call to the
+        tokenizer (no per-token overhead, no AutoTokenizer.from_pretrained).
+
+        Falls back to ModelShard.decode_text() for ToyRuntime.
+
+        Returns:
+            (decoded_text, token_count)
         """
+        if not activation:
+            return "", 0
+
+        # Fast path: real tokenizer available (MLX/PyTorch)
+        if self._tokenizer is not None:
+            token_ids = [max(0, int(round(float(v)))) for v in activation[:max_tokens]]
+            # Filter out special tokens (EOS, BOS, pad, etc.)
+            special_ids: set[int] = set()
+            raw_special = getattr(self._tokenizer, "all_special_ids", None)
+            if raw_special is not None:
+                try:
+                    special_ids = {int(x) for x in raw_special}
+                except (TypeError, ValueError):
+                    pass
+            filtered = [tid for tid in token_ids if tid not in special_ids]
+            if filtered:
+                text = self._tokenizer.decode(filtered, skip_special_tokens=True)
+                return text.strip(), len(filtered)
+            return "", 0
+
+        # Slow fallback: ToyRuntime (no real tokenizer)
+        _runtime_model = getattr(
+            getattr(self.shard, "config", None), "runtime_model_id", None
+        )
+        text = ModelShard.decode_text(
+            activation, max_tokens=max_tokens,
+            tokenizer_model_id=_runtime_model or None,
+        )
+        return text, self._count_completion_tokens(text, max_tokens)
+
+    def _count_prompt_tokens(self, prompt: str) -> int:
+        """Count prompt tokens using the real tokenizer when available."""
+        if self._tokenizer is not None:
+            try:
+                return len(self._tokenizer.encode(prompt))
+            except Exception:
+                pass
         return len(prompt.split())
 
     @staticmethod

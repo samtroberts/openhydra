@@ -89,10 +89,18 @@ class TokenizationService:
             raise RuntimeError(
                 "pytorch_generation_tokenizer_unavailable: install optional dependency 'transformers'"
             ) from exc
-        tokenizer = AutoTokenizer.from_pretrained(
-            normalized,
-            trust_remote_code=_default_trust_remote_code(normalized),
-        )
+        # Try local-first to avoid HF Hub HEAD requests on every call.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                normalized,
+                trust_remote_code=_default_trust_remote_code(normalized),
+                local_files_only=True,
+            )
+        except OSError:
+            tokenizer = AutoTokenizer.from_pretrained(
+                normalized,
+                trust_remote_code=_default_trust_remote_code(normalized),
+            )
         self._tokenizer_cache[normalized] = tokenizer
         return tokenizer
 

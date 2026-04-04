@@ -445,8 +445,12 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
         """Return True if the local inference engine is active."""
         return self.__class__.local_engine is not None
 
-    def _handle_chat_completions(self) -> None:
-        """Handle POST /v1/chat/completions for both local and swarm engines."""
+    def _handle_chat_completions(self, body: dict[str, Any] | None = None) -> None:
+        """Handle POST /v1/chat/completions for both local and swarm engines.
+
+        Args:
+            body: Pre-parsed JSON body from do_POST.  If None, reads from stream.
+        """
         # 503 drain gate: reject during mode transition
         if self.__class__._mode_switching:
             self._send_json(
@@ -455,7 +459,8 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 headers={"Retry-After": "5"},
             )
             return
-        body = self._read_json()
+        if body is None:
+            body = self._read_json()
         stream = bool(body.get("stream", False))
         messages = list(body.get("messages") or [])
         max_tokens = int(body.get("max_tokens", 128))
@@ -698,11 +703,15 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
     # Mode switch (Pillar 3: The Toggle)
     # ------------------------------------------------------------------
 
-    def _handle_mode_switch(self) -> None:
+    def _handle_mode_switch(self, body: dict[str, Any] | None = None) -> None:
         """Handle POST /v1/internal/mode — switch between local and swarm.
 
         Only accepts requests from 127.0.0.1 (localhost).
         Sets the 503 drain gate during transition.
+
+        Args:
+            body: Pre-parsed JSON body (from do_POST router).  If None,
+                reads from the request stream (for direct calls in tests).
         """
         # Security: only accept from localhost
         client_ip = str(self.client_address[0])
@@ -713,7 +722,8 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             )
             return
 
-        body = self._read_json()
+        if body is None:
+            body = self._read_json()
         mode = str(body.get("mode", "")).strip().lower()
 
         if mode not in ("local", "swarm"):
@@ -783,10 +793,34 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
         # 2. Free memory before allocating new model
         _safe_free_memory()
 
-        # 3. Create new shard + engine
+        # 3. Detect best runtime backend for this platform
+        import platform as _plat
+        _backend = "toy_auto"
+        _quant = "fp32"
+        _runtime_model = model_id
+        try:
+            if _plat.system() == "Darwin":
+                import mlx.core  # noqa: F401 — probe availability
+                _backend = "mlx"
+                # Use pre-quantized 4-bit checkpoint for maximum TPS.
+                # Pre-quantized models load as QuantizedLinear layers —
+                # no runtime quantization overhead, ~4x memory savings.
+                _MLX_4BIT_MAP = {
+                    "Qwen/Qwen3.5-0.8B": "mlx-community/Qwen3.5-0.8B-4bit",
+                    "openhydra-qwen3.5-0.8b": "mlx-community/Qwen3.5-0.8B-4bit",
+                }
+                _runtime_model = _MLX_4BIT_MAP.get(model_id, model_id)
+                _quant = "fp32"  # Already quantized, don't re-quantize
+                logger.info("local_engine: MLX backend, model=%s", _runtime_model)
+        except ImportError:
+            pass
+
+        # 4. Create new shard + engine
         shard = ModelShard(ToyShardConfig(
             model_id=model_id,
-            runtime_backend="toy_auto",
+            runtime_backend=_backend,
+            runtime_model_id=_runtime_model,
+            quantization_mode=_quant,
         ))
         cls.local_engine = LocalInferenceEngine(
             model_id=model_id,
@@ -995,6 +1029,11 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             # Ollama-compatible endpoint: list models in Ollama /api/tags format.
             if parsed.path == "/api/tags":
                 self._tags_ollama(rid_headers=rid_headers)
+                return
+
+            # Internal mode status endpoint.
+            if parsed.path == "/v1/internal/mode":
+                self._handle_mode_status()
                 return
 
             self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND, headers=rid_headers)
@@ -1368,6 +1407,11 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                     return
 
             if parsed.path == "/v1/chat/completions":
+                # Hybrid routing: local engine bypasses the full coordinator stack
+                if self._is_local_mode():
+                    self._handle_chat_completions(body=body)
+                    return
+
                 payload = self._chat_stream_payload(body, request_id) if stream else self._chat_payload(body, request_id)
                 model_meta = payload.get("model", {})
                 served_model = str(model_meta.get("served", requested_model))
@@ -1571,6 +1615,10 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                     rid_headers=rid_headers,
                     stream=stream,
                 )
+                return
+
+            if parsed.path == "/v1/internal/mode":
+                self._handle_mode_switch(body=body)
                 return
 
             self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND, headers=rid_headers)

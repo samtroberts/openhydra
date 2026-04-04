@@ -516,19 +516,38 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         raise RuntimeError("kv_cache_miss")
                     activation_in = cached
                     kv_cache_hit = True
-                activation = self.batch_queue.forward(
-                    request.prompt,
-                    activation_in,
-                    max_tokens,
-                    stage_index=int(request.stage_index),
-                    total_stages=int(request.total_stages),
-                    request_id=str(request.request_id),
-                    decode_do_sample=decode_do_sample,
-                    decode_temperature=decode_temperature,
-                    decode_top_p=decode_top_p,
-                    decode_top_k=decode_top_k,
-                    decode_seed=(decode_seed if decode_seed > 0 else None),
-                )
+                # Fast path: bypass BatchingQueue when inflight count is
+                # low (single-peer / no concurrent requests).  Avoids
+                # ThreadPoolExecutor scheduling overhead that kills TPS
+                # on memory-constrained 8GB machines.
+                if self.inflight_count() <= 1:
+                    activation = list(self.shard.forward(
+                        request.prompt,
+                        activation_in,
+                        max_tokens,
+                        stage_index=int(request.stage_index),
+                        total_stages=int(request.total_stages),
+                        request_id=str(request.request_id),
+                        decode_do_sample=decode_do_sample,
+                        decode_temperature=decode_temperature,
+                        decode_top_p=decode_top_p,
+                        decode_top_k=decode_top_k,
+                        decode_seed=(decode_seed if decode_seed > 0 else None),
+                    ))
+                else:
+                    activation = self.batch_queue.forward(
+                        request.prompt,
+                        activation_in,
+                        max_tokens,
+                        stage_index=int(request.stage_index),
+                        total_stages=int(request.total_stages),
+                        request_id=str(request.request_id),
+                        decode_do_sample=decode_do_sample,
+                        decode_temperature=decode_temperature,
+                        decode_top_p=decode_top_p,
+                        decode_top_k=decode_top_k,
+                        decode_seed=(decode_seed if decode_seed > 0 else None),
+                    )
                 if kv_store_activation:
                     self._kv_cache_set(kv_session_id, activation)
             self.last_inference_thread_id = self.shard.last_forward_thread_id
