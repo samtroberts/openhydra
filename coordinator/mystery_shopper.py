@@ -58,6 +58,24 @@ class MysteryShopper:
     def should_run_auditor_spotcheck(self) -> bool:
         return self._auditor_sampler.should_sample()
 
+    def build_skip_result(self, primary: ChainResult) -> VerificationResult:
+        """Return a no-op verification result for single-peer topologies.
+
+        Skips all secondary/tertiary re-execution — no network calls,
+        no GPU compute.  The primary result is trusted unconditionally.
+        """
+        return VerificationResult(
+            audited=False,
+            match=True,
+            primary_text=primary.text,
+            secondary_text=None,
+            tertiary_text=None,
+            winner="primary",
+            mode="skipped_single_peer",
+            sample_rate=self.sample_rate,
+            auditor_triggered=False,
+        )
+
     @staticmethod
     def _same_output(primary: str, candidate: str) -> bool:
         return compare_outputs(primary, candidate).match

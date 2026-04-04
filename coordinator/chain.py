@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import time
 import uuid
 
@@ -194,6 +195,7 @@ class InferenceChain:
         else:
             plain_activation = wire_activation
 
+        _t_serial_start = time.perf_counter()
         req = peer_pb2.ForwardRequest(
             request_id=request_id,
             prompt=prompt if stage_index == 0 else "",
@@ -243,11 +245,15 @@ class InferenceChain:
         else:
             effective_timeout = self.timeout_s
 
+        _t_serial_ms = (time.perf_counter() - _t_serial_start) * 1000
+        _t_grpc_start = time.perf_counter()
         t0 = time.perf_counter()
         with create_channel(peer.address, self.transport_config) as channel:
             stub = peer_pb2_grpc.PeerStub(channel)
             response = stub.Forward(req, timeout=effective_timeout)
         latency_ms = (time.perf_counter() - t0) * 1000.0
+        _t_grpc_ms = (time.perf_counter() - _t_grpc_start) * 1000
+        _t_deser_start = time.perf_counter()
         self._last_stage_kv_cache_hit = bool(getattr(response, "kv_cache_hit", False))
         if response.error:
             raise RuntimeError(f"peer {peer.peer_id} failed at stage {stage_index}: {response.error}")
@@ -298,6 +304,13 @@ class InferenceChain:
         response_latent_dim = max(0, int(getattr(response, "compression_latent_dim", 0) or 0))
         if response_latent_dim <= 0:
             response_latent_dim = len(activation)
+
+        _t_deser_ms = (time.perf_counter() - _t_deser_start) * 1000
+        logging.info(
+            "PROFILE _request_stage: serial=%.1fms grpc=%.1fms deser=%.1fms total=%.1fms",
+            _t_serial_ms, _t_grpc_ms, _t_deser_ms,
+            _t_serial_ms + _t_grpc_ms + _t_deser_ms,
+        )
 
         return _StageResult(
             activation=list(response.activation),
@@ -545,11 +558,14 @@ class InferenceChain:
                 candidate_model = str(getattr(last_stage, "model_id", "")).strip()
             decode_model_id = candidate_model or None
 
+        _t_decode_start = time.perf_counter()
         output = ModelShard.decode_text(
             activation,
             max_tokens=max_tokens,
             tokenizer_model_id=decode_model_id,
         )
+        _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
+        logging.info("PROFILE phase_D_decode_text=%.1fms", _t_decode_ms)
         if privacy_audit_violations:
             raise RuntimeError("privacy_audit_failed:" + ";".join(privacy_audit_violations))
         total_ms = (time.perf_counter() - started) * 1000.0

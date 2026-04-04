@@ -214,6 +214,17 @@ def main() -> None:
                 )
                 raise SystemExit(1)
 
+    # On macOS MLX, auto-upgrade to pre-quantized 4-bit checkpoints.
+    # Pre-quantized models load as QuantizedLinear layers — no runtime
+    # quantization overhead, ~4x memory savings, ~2x faster generation.
+    _MLX_4BIT_MAP = {
+        "Qwen/Qwen3.5-0.8B": "mlx-community/Qwen3.5-0.8B-4bit",
+    }
+    _runtime_model_id = args.model_id
+    if args.runtime_backend == "mlx" and args.model_id in _MLX_4BIT_MAP:
+        _runtime_model_id = _MLX_4BIT_MAP[args.model_id]
+        logger.info("mlx_4bit_upgrade: %s -> %s", args.model_id, _runtime_model_id)
+
     logger.info(
         "openhydra_node_starting peer_id=%s model=%s grpc_port=%d api=%s:%d dht=%s backend=%s",
         args.peer_id, args.model_id, args.grpc_port,
@@ -230,6 +241,7 @@ def main() -> None:
             "port": args.grpc_port,
             "peer_id": args.peer_id,
             "model_id": args.model_id,
+            "runtime_model_id": _runtime_model_id,
             "shard_index": args.shard_index,
             "total_shards": args.total_shards,
             "dht_urls": dht_urls,

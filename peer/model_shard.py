@@ -2075,10 +2075,18 @@ class ModelShard:
             return None
 
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                normalized,
-                trust_remote_code=_default_trust_remote_code(normalized),
-            )
+            # Local-first to avoid HF Hub HEAD requests per decode call.
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    normalized,
+                    trust_remote_code=_default_trust_remote_code(normalized),
+                    local_files_only=True,
+                )
+            except OSError:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    normalized,
+                    trust_remote_code=_default_trust_remote_code(normalized),
+                )
         except Exception:
             return None
         cache[normalized] = tokenizer
