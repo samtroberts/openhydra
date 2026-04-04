@@ -2,11 +2,25 @@ import io
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from coordinator.api_server import (
     OpenHydraHandler,
     _RateLimiter,
     _validate_infer_params,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_handler_class_state():
+    """Reset OpenHydraHandler class variables between tests."""
+    OpenHydraHandler.local_engine = None
+    OpenHydraHandler.engine = None
+    OpenHydraHandler._mode_switching = False
+    yield
+    OpenHydraHandler.local_engine = None
+    OpenHydraHandler.engine = None
+    OpenHydraHandler._mode_switching = False
 
 
 def _build_handler():

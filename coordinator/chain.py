@@ -77,6 +77,7 @@ class InferenceChain:
         advanced_encryption_enabled: bool = False,
         advanced_encryption_seed: str = "openhydra-tier3-dev-seed",
         advanced_encryption_level: str = "standard",
+        activation_quantization_enabled: bool = False,
     ):
         if not pipeline:
             raise ValueError("pipeline must contain at least one peer")
@@ -84,6 +85,7 @@ class InferenceChain:
         self.timeout_s = timeout_ms / 1000.0
         self.transport_config = transport_config or TransportConfig()
         self.tensor_autoencoder_enabled = bool(tensor_autoencoder_enabled)
+        self.activation_quantization_enabled = bool(activation_quantization_enabled)
         self.advanced_encryption_enabled = bool(advanced_encryption_enabled)
         self.advanced_encryption_seed = str(advanced_encryption_seed)
         self.advanced_encryption_level = str(advanced_encryption_level)
@@ -158,6 +160,21 @@ class InferenceChain:
             compression_original_dim = len(activation)
             compression_latent_dim = len(latent)
 
+        # INT8 activation compression (P0-B): quantize before wire transfer
+        _quantized_activation = b""
+        _quantized_scales: list[float] = []
+        _activation_quantization = ""
+        if (
+            self.activation_quantization_enabled
+            and stage_index > 0
+            and wire_activation
+            and not self.advanced_encryption_enabled  # skip if encryption handles bytes
+        ):
+            from peer.activation_codec import quantize_int8
+            _quantized_activation, _quantized_scales = quantize_int8(wire_activation)
+            _activation_quantization = "int8"
+            plain_activation = []  # clear fp32 — use quantized bytes instead
+
         if self.advanced_encryption_enabled and wire_activation:
             peer_pubkey_hex = str(getattr(peer, "public_key_hex", "") or "")
             if peer_pubkey_hex:
@@ -229,6 +246,9 @@ class InferenceChain:
             shard_layer_start=max(0, int(getattr(peer, "layer_start", 0) or 0)),
             shard_layer_end=max(0, int(getattr(peer, "layer_end", 0) or 0)),
             shard_total_layers=max(0, int(getattr(peer, "total_layers", 0) or 0)),
+            quantized_activation=_quantized_activation,
+            quantized_scales=_quantized_scales,
+            activation_quantization=_activation_quantization,
         )
 
         # --- Deadline-aware per-stage timeout ---
@@ -312,11 +332,76 @@ class InferenceChain:
             _t_serial_ms + _t_grpc_ms + _t_deser_ms,
         )
 
+        # INT8 dequantization on response
+        resp_activation = list(response.activation)
+        resp_quant = str(getattr(response, "activation_quantization", "") or "")
+        if resp_quant == "int8" and getattr(response, "quantized_activation", b""):
+            from peer.activation_codec import dequantize_int8
+            resp_activation = dequantize_int8(
+                bytes(response.quantized_activation),
+                list(response.quantized_scales),
+            )
+
         return _StageResult(
-            activation=list(response.activation),
+            activation=resp_activation,
             latency_ms=latency_ms,
             latent_dim=response_latent_dim,
         )
+
+    def verify_tokens(
+        self,
+        prompt: str,
+        draft_token_ids: list[int],
+        request_id: str | None = None,
+        kv_session_id: str | None = None,
+        deadline: float | None = None,
+        **decode_controls: object,
+    ) -> list[int]:
+        """Send K draft tokens through the pipeline for batch verification.
+
+        Each peer verifies the draft tokens against its model and returns
+        the model's actual predictions.  Used by DSD (Decentralized
+        Speculative Decoding) to verify locally-generated draft tokens.
+
+        Returns:
+            List of verified token IDs (the model's actual next-token
+            predictions for each draft position).
+        """
+        rid = request_id or str(uuid.uuid4())
+        k = len(draft_token_ids)
+        if k == 0:
+            return []
+
+        # Use the last peer in the pipeline (full-model or last shard)
+        peer = self.pipeline[-1]
+
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return []
+            effective_timeout = min(self.timeout_s, remaining)
+        else:
+            effective_timeout = self.timeout_s
+
+        req = peer_pb2.ForwardRequest(
+            request_id=rid,
+            prompt=prompt,
+            activation=[],
+            stage_index=0,
+            total_stages=1,
+            max_tokens=1,
+            draft_token_ids=draft_token_ids,
+            verify_batch_size=k,
+        )
+
+        with create_channel(peer.address, self.transport_config) as channel:
+            stub = peer_pb2_grpc.PeerStub(channel)
+            response = stub.Forward(req, timeout=effective_timeout)
+
+        if response.error:
+            raise RuntimeError(f"verify failed: {response.error}")
+
+        return [int(t) for t in response.verified_token_ids]
 
     def _stage_candidates(
         self,

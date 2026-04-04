@@ -798,18 +798,15 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
         _backend = "toy_auto"
         _quant = "fp32"
         _runtime_model = model_id
+        _MLX_4BIT_MAP = {
+            "Qwen/Qwen3.5-0.8B": "mlx-community/Qwen3.5-0.8B-4bit",
+            "openhydra-qwen3.5-0.8b": "mlx-community/Qwen3.5-0.8B-4bit",
+        }
         try:
-            if _plat.system() == "Darwin":
+            if _plat.system() == "Darwin" and model_id in _MLX_4BIT_MAP:
                 import mlx.core  # noqa: F401 — probe availability
                 _backend = "mlx"
-                # Use pre-quantized 4-bit checkpoint for maximum TPS.
-                # Pre-quantized models load as QuantizedLinear layers —
-                # no runtime quantization overhead, ~4x memory savings.
-                _MLX_4BIT_MAP = {
-                    "Qwen/Qwen3.5-0.8B": "mlx-community/Qwen3.5-0.8B-4bit",
-                    "openhydra-qwen3.5-0.8b": "mlx-community/Qwen3.5-0.8B-4bit",
-                }
-                _runtime_model = _MLX_4BIT_MAP.get(model_id, model_id)
+                _runtime_model = _MLX_4BIT_MAP[model_id]
                 _quant = "fp32"  # Already quantized, don't re-quantize
                 logger.info("local_engine: MLX backend, model=%s", _runtime_model)
         except ImportError:
