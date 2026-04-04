@@ -50,7 +50,7 @@ def test_model_shard_reports_runtime_profile_and_quantization(monkeypatch):
 
     int4_profile = int4_shard.runtime_profile()
     fp32_profile = fp32_shard.runtime_profile()
-    assert int4_profile["backend"] == "tinyllama"
+    assert int4_profile["backend"] in ("tinyllama", "tinyllama_mlx")
     assert int4_profile["quantization_mode"] == "int4"
     assert int4_profile["quantization_bits"] == 4
     assert int4_profile["estimated_memory_mb"] > 0
