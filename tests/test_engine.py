@@ -138,14 +138,18 @@ def test_priority_requires_credits_and_earns_for_serving(tmp_path, monkeypatch):
 
 def _wire_single_peer(monkeypatch, engine):
     peer = PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=1)
-    health = [PeerHealth(peer=peer, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite")]
+    peer_b = PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=2)
+    health = [
+        PeerHealth(peer=peer, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite"),
+        PeerHealth(peer=peer_b, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite"),
+    ]
 
     monkeypatch.setattr(
         engine,
         "_discover_for_model",
         lambda requested_model, allow_degradation: (
             health,
-            [peer],
+            [peer, peer_b],
             type("Decision", (), {
                 "requested_model": requested_model,
                 "served_model": "openhydra-toy-345m",
@@ -154,7 +158,7 @@ def _wire_single_peer(monkeypatch, engine):
                 "reason": "ok",
                 "detail": "ok",
             })(),
-            {"openhydra-toy-345m": 1},
+            {"openhydra-toy-345m": 2},
         ),
     )
     monkeypatch.setattr(engine, "_select_pipeline", lambda candidates, pipeline_width=None: [peer])
@@ -827,6 +831,7 @@ def test_run_chain_passes_tensor_autoencoder_config(tmp_path, monkeypatch):
             advanced_encryption_enabled,
             advanced_encryption_seed,
             advanced_encryption_level,
+            activation_quantization_enabled=False,
         ):
             captured["pipeline"] = pipeline
             captured["timeout_ms"] = timeout_ms

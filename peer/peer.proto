@@ -61,6 +61,13 @@ message ForwardRequest {
   uint32 shard_layer_start = 28;   // first transformer layer this peer runs (inclusive)
   uint32 shard_layer_end = 29;     // one past the last layer (exclusive)
   uint32 shard_total_layers = 30;  // full model depth (e.g. 32 for LLaMA-3-8B)
+  // DSD: Decentralized Speculative Decoding (P0-A)
+  repeated int64 draft_token_ids = 31;   // K draft tokens for batch verification
+  uint32 verify_batch_size = 32;         // number of draft tokens to verify (0 = normal forward)
+  // INT8 activation compression (P0-B)
+  bytes quantized_activation = 33;       // packed INT8 activation bytes
+  string activation_quantization = 34;   // "int8" or "" (empty = fp32)
+  repeated float quantized_scales = 35;  // per-tensor scale factors for dequantization
 }
 
 message ForwardResponse {
@@ -83,6 +90,12 @@ message ForwardResponse {
   uint64 dp_noise_payload_index = 17;
   string dp_noise_audit_tag = 18;
   uint32 compression_latent_dim = 19;
+  // DSD: verified token IDs from batch verification
+  repeated int64 verified_token_ids = 20;
+  // INT8 activation compression
+  bytes quantized_activation = 21;
+  repeated float quantized_scales = 22;
+  string activation_quantization = 23;
 }
 
 message PeerStatusRequest {}

@@ -124,6 +124,10 @@ class EngineConfig:
     pipeline_parallel_workers: int = 1
     tensor_autoencoder_enabled: bool = False
     tensor_autoencoder_latent_dim: int = 1024
+    # P0-A: Decentralized Speculative Decoding for Swarm Mode
+    speculative_swarm_enabled: bool = False
+    # P0-B: INT8 activation quantization on the wire
+    activation_quantization_enabled: bool = False
     advanced_encryption_enabled: bool = False
     advanced_encryption_seed: str = "openhydra-tier3-dev-seed"
     advanced_encryption_level: str = "standard"

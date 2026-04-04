@@ -374,6 +374,27 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             kv_session_id = str(getattr(request, "kv_session_id", "") or "").strip()
             kv_store_activation = bool(getattr(request, "kv_store_activation", False) and kv_session_id)
             kv_use_cached_activation = bool(getattr(request, "kv_use_cached_activation", False) and kv_session_id)
+
+            # DSD: batch verification of draft tokens (P0-A)
+            verify_batch = int(getattr(request, "verify_batch_size", 0) or 0)
+            if verify_batch > 0 and request.draft_token_ids:
+                verified = self._verify_draft_tokens(
+                    prompt=request.prompt,
+                    draft_token_ids=[int(t) for t in request.draft_token_ids[:verify_batch]],
+                    decode_temperature=decode_temperature,
+                    decode_top_p=decode_top_p,
+                    decode_top_k=decode_top_k,
+                    decode_seed=decode_seed,
+                )
+                return peer_pb2.ForwardResponse(
+                    request_id=request.request_id,
+                    peer_id=self.peer_id,
+                    activation=[],
+                    stage_index=request.stage_index,
+                    error="",
+                    verified_token_ids=verified,
+                )
+
             kv_cache_hit = False
             onion_route_ciphertext = b""
             onion_route_nonces: list[bytes] = []
@@ -599,6 +620,44 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 self._inflight = max(0, self._inflight - 1)
 
     # ── Phase 3A: Bidirectional streaming ──────────────────────────────────
+
+    def _verify_draft_tokens(
+        self,
+        prompt: str,
+        draft_token_ids: list[int],
+        decode_temperature: float = 0.0,
+        decode_top_p: float = 0.0,
+        decode_top_k: int = 0,
+        decode_seed: int = 0,
+    ) -> list[int]:
+        """Verify K draft tokens by running each through the model.
+
+        For each draft token position, the model produces its own
+        next-token prediction.  These are compared against the draft
+        tokens by the coordinator's accept/reject logic.
+
+        Returns:
+            List of K verified token IDs (the model's actual predictions).
+        """
+        verified: list[int] = []
+        for draft_id in draft_token_ids:
+            # Run forward with the draft token as activation input
+            result = self.shard.forward(
+                prompt=prompt if not verified else "",
+                activation=[float(draft_id)],
+                max_tokens=1,
+                stage_index=0,
+                total_stages=1,
+                decode_temperature=decode_temperature,
+                decode_top_p=decode_top_p,
+                decode_top_k=decode_top_k,
+                decode_seed=(decode_seed if decode_seed > 0 else None),
+            )
+            if result:
+                verified.append(int(round(result[0])))
+            else:
+                verified.append(0)
+        return verified
 
     def ForwardStream(self, request_iterator, context: grpc.ServicerContext):
         """Bidirectional streaming RPC — persistent session with KV reuse.

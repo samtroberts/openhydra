@@ -597,6 +597,7 @@ class InferenceService:
             advanced_encryption_enabled=self.config.advanced_encryption_enabled,
             advanced_encryption_seed=str(self.config.advanced_encryption_seed),
             advanced_encryption_level=str(self.config.advanced_encryption_level),
+            activation_quantization_enabled=self.config.activation_quantization_enabled,
         )
         run_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,
@@ -1137,6 +1138,108 @@ class InferenceService:
 
         response_text = primary.text if verification.winner == "primary" else verification.secondary_text or primary.text
 
+        # ── DSD: Decentralized Speculative Decoding (P0-A) ──────────────
+        # After the primary chain pass, if DSD is enabled and the primary
+        # result has token IDs in its activation, generate additional
+        # tokens using speculative draft-then-verify rounds.
+        _dsd_stats: dict[str, int | float] = {}
+        if (
+            self.config.speculative_swarm_enabled
+            and primary.activation
+            and max_tokens > len(primary.activation)
+        ):
+            try:
+                from coordinator.speculative_swarm import (
+                    SwarmSpeculativeDecoder,
+                    SwarmSpecConfig,
+                )
+
+                spec_config = SwarmSpecConfig(
+                    draft_tokens=self.config.speculative_draft_tokens,
+                    adaptive_enabled=self.config.speculative_adaptive_enabled,
+                    min_draft_tokens=self.config.speculative_min_draft_tokens,
+                    max_draft_tokens=self.config.speculative_max_draft_tokens,
+                    acceptance_low_watermark=self.config.speculative_acceptance_low_watermark,
+                    acceptance_high_watermark=self.config.speculative_acceptance_high_watermark,
+                )
+
+                # Draft function: use ToyRuntime-style hash or the
+                # existing PyTorchDraftModel if available
+                def _draft_fn(ctx: list[int], k: int) -> list[int]:
+                    try:
+                        draft_model = self._engine._load_pytorch_draft_model()
+                        return draft_model.propose_token_ids(ctx, k)
+                    except Exception:
+                        # Fallback: simple deterministic draft
+                        base = ctx[-1] if ctx else 0
+                        return [(base + i + 1) % 50000 for i in range(k)]
+
+                decoder = SwarmSpeculativeDecoder(
+                    config=spec_config,
+                    draft_fn=_draft_fn,
+                )
+
+                # Rebuild chain for verify calls
+                import coordinator.engine as _engine_mod
+                _InferenceChain = getattr(_engine_mod, "InferenceChain", InferenceChain)
+                verify_chain = _InferenceChain(
+                    prep.primary_pipeline,
+                    timeout_ms=self.config.timeout_ms,
+                    transport_config=self.transport_config,
+                    activation_quantization_enabled=self.config.activation_quantization_enabled,
+                )
+
+                # Extract initial token IDs from primary activation
+                context_ids = [int(round(float(v))) for v in primary.activation]
+                generated_ids = list(context_ids)
+
+                for _round in range(32):  # cap at 32 DSD rounds
+                    remaining = max_tokens - len(generated_ids)
+                    if remaining <= 0:
+                        break
+                    k = min(decoder.current_k, remaining)
+                    draft_ids = decoder.propose(generated_ids, k)
+                    try:
+                        verified_ids = verify_chain.verify_tokens(
+                            prompt=prep.effective_prompt,
+                            draft_token_ids=draft_ids,
+                            request_id=primary.request_id,
+                            deadline=deadline,
+                        )
+                    except Exception:
+                        break  # Pipeline error — stop DSD, use what we have
+                    accepted, _ = decoder.accept_reject(draft_ids, verified_ids)
+                    if not accepted:
+                        break
+                    generated_ids.extend(accepted)
+
+                # Re-decode the extended token sequence
+                if len(generated_ids) > len(primary.activation):
+                    response_text = ModelShard.decode_text(
+                        [float(t) for t in generated_ids],
+                        max_tokens=max_tokens,
+                        tokenizer_model_id=self._resolve_pipeline_runtime_model_id(
+                            prep.primary_pipeline,
+                            prep.decision.served_model,
+                        ),
+                    )
+
+                stats = decoder.stats
+                _dsd_stats = {
+                    "rounds": stats.rounds,
+                    "draft_tokens": stats.draft_tokens,
+                    "accepted_tokens": stats.accepted_tokens,
+                    "acceptance_rate": stats.acceptance_rate or 0.0,
+                    "final_k": decoder.current_k,
+                }
+                logger.info(
+                    "PROFILE dsd_complete rounds=%d accepted=%d/%d rate=%.2f final_k=%d",
+                    stats.rounds, stats.accepted_tokens, stats.draft_tokens,
+                    stats.acceptance_rate or 0.0, decoder.current_k,
+                )
+            except ImportError:
+                pass  # speculative_swarm not available — skip DSD
+
         hydra_reward_rate = max(0.0, float(self.config.hydra_reward_per_1k_tokens))
         for trace in primary.traces:
             self.ledger.earn(trace.peer_id, tokens_served=max_tokens)
@@ -1185,6 +1288,7 @@ class InferenceService:
             "discovered_peers": self._engine._discovered_peer_rows(prep.health),
             # Phase 3: surface which pipeline path was used
             "pipeline_mode": prep.pipeline_mode,
+            "dsd": _dsd_stats,
         }
 
     # ------------------------------------------------------------------
