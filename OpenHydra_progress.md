@@ -1,6 +1,6 @@
 # OpenHydra Progress
 
-Last updated: 2026-03-24 (Pass 6 100% complete, Equalization Sprint complete, v0.1.0 + v0.1.1 released)
+Last updated: 2026-04-04 (v1.1 Hybrid Local/Swarm Mode complete, 75 TPS Local / 20 TPS Swarm on 8GB M1)
 
 ## Overall status
 
@@ -11,11 +11,91 @@ Last updated: 2026-03-24 (Pass 6 100% complete, Equalization Sprint complete, v0
 - Post-Tier-3 pass 5: ~100% (KV cache compaction via Attention Matching arXiv:2602.16284 — all four phases + Option A real-Q threading + Option B benchmark)
 - Post-Tier-3 pass 6: **100% complete** (all items done: CI hardening, security audit, Apache 2.0 relicense, architecture docs, CONTRIBUTING.md, issue templates)
 - Equalization Sprint: **100% complete** (4 phases: engine decomp, 6-factor routing + swarm rebalance, gRPC streaming, MLX parallelism)
-- Desktop App: **Shipped** (Tauri v2 + React, .dmg uploaded to GitHub Releases v0.1.0)
-- PyPI: **Published** as `openhydra-network` v0.1.0 at https://pypi.org/project/openhydra-network/
-- GitHub Release: **Live** at https://github.com/samtroberts/openhydra/releases/tag/v0.1.0
+- Pass 8 QA: **100% complete** (RAM detection fix, CI codesign, Golden Path install docs, troubleshooting guide, 8GB benchmark)
+- **v1.1 Hybrid Local/Swarm Mode: 100% complete** (4 pillars: LocalInferenceEngine, API emulation, mode toggle, VRAM reallocation)
+- **Performance optimization: 100% complete** (50x Swarm speedup, 75 TPS Local Mode)
+- Desktop App: **Shipped** (Tauri v2 + React + Tailwind, Local/Swarm toggle, premium zinc/cyan UI)
+- Landing page: **Live** at https://openhydra.co (GitHub Pages, gh-pages branch)
+- PyPI: **Published** as `openhydra-network` at https://pypi.org/project/openhydra-network/
+- GitHub Release: **Live** at https://github.com/samtroberts/openhydra/releases
 - License: **Apache 2.0** (entire stack — abandoned AGPL open-core model for maximum adoption)
-- Test status: `982 passed, 9 skipped` by default (`OPENHYDRA_RUN_REAL_TENSOR_TEST=0`), with `9` gated real-PyTorch tests available under (`OPENHYDRA_RUN_REAL_TENSOR_TEST=1`)
+- Test status: `1045 passed, 9 skipped` by default (`OPENHYDRA_RUN_REAL_TENSOR_TEST=0`), with `9` gated real-PyTorch tests available under (`OPENHYDRA_RUN_REAL_TENSOR_TEST=1`)
+
+## v1.1 Hybrid Local/Swarm Mode (2026-03-31 → 2026-04-04)
+
+### Pillar 1: Offline Engine Detachment
+- [x] `coordinator/local_engine.py` — `LocalInferenceEngine` calls `ModelShard.forward()` directly, zero gRPC/DHT/HF Hub
+- [x] Real tokenizer chat template via `tokenizer.apply_chat_template()` (Jinja2)
+- [x] Direct `_decode_activation()` — batch tokenizer decode, bypasses `_load_decode_tokenizer`
+- [x] 18 TDD tests (`tests/test_local_engine.py`)
+
+### Pillar 2: API Emulation
+- [x] `_active_engine()` / `_is_local_mode()` — transparent routing in `api_server.py`
+- [x] `_handle_chat_completions()` — local engine path bypasses full coordinator stack
+- [x] New Ollama endpoints: `/api/show`, `/api/ps`, `/api/tags` (both modes)
+- [x] `POST /v1/internal/mode` — mode switch endpoint (localhost-only, 503 drain gate)
+- [x] 22 TDD tests (`tests/test_api_emulation.py`)
+
+### Pillar 3: The Toggle
+- [x] 503 drain gate (`_mode_switching` flag) during transitions
+- [x] Localhost-only guard (rejects non-127.0.0.1 with 403)
+- [x] Thread-safe serialization (`_mode_switch_lock`)
+- [x] Rust Tauri `switch_mode(mode, port, model_id)` + `get_mode(port)` via `ureq` crate
+- [x] React `ModeToggle.tsx` — segmented Local/Swarm control with cyan glow, pulse animation
+- [x] `NodeContext.tsx` — `mode`, `modeSwitching` state, `switchMode()` callback
+- [x] 11 TDD tests (`tests/test_mode_switch.py`)
+
+### Pillar 4: VRAM Reallocation
+- [x] `_safe_free_memory()` — `gc.collect()` + `mx.metal.clear_cache()`
+- [x] Strict unload-before-load ordering
+- [x] Optional `model_id` in mode switch request body
+- [x] 12 TDD tests (`tests/test_vram_reallocation.py`)
+
+### Performance Optimization (50x Swarm speedup)
+- [x] **Routing bug fix**: `do_POST` was bypassing `LocalInferenceEngine` — added `_is_local_mode()` guard
+- [x] **4-bit auto-quantization**: `node.py` maps `Qwen/Qwen3.5-0.8B` → `mlx-community/Qwen3.5-0.8B-4bit` on macOS
+- [x] **Tokenizer caching**: `local_files_only=True` on all 3 tokenizer loading paths (inference_service, tokenization_service, model_shard)
+- [x] **Verification bypass**: `MysteryShopper.build_skip_result()` — skip when `<2 unique peers` (saves 19.5s)
+- [x] **Direct forward fast path**: `peer/server.py` bypasses `BatchingQueue` when `inflight_count() <= 1`
+- [x] **Profiling instrumentation**: Phase A/B/C/D timers in `inference_service.py` and `chain.py`
+
+### Benchmark Results (8GB M1 MacBook Air, Qwen 3.5 0.8B 4-bit)
+
+| Mode | TPS | TTFT | Notes |
+|------|-----|------|-------|
+| Raw mlx_lm (no OpenHydra) | 97.6 | 345ms | Theoretical ceiling |
+| Local Mode (HTTP API, warm) | 75.1 | 1,704ms | Production speed |
+| Local Mode (HTTP API, cold) | 54.3 | 2,357ms | Includes Metal shader warm-up |
+| Swarm Mode (optimized) | 19.9 | 1,896ms | 4-bit + no verify + direct forward |
+| Swarm Mode (original) | 0.4 | 25,981ms | Legacy Codex baseline |
+
+### Pass 8: QA & Release Candidate Testing (2026-04-01)
+- [x] RAM detection bug fix: hardcoded `systemRam: 16` → Rust `get_system_ram()` via Tauri `invoke()`
+- [x] CI codesign: `desktop-macos` job with `codesign --force --deep --sign -`
+- [x] Golden Path install docs in README (macOS + Linux sections)
+- [x] 6-item collapsible Troubleshooting section in README
+- [x] Prerequisites in CONTRIBUTING.md
+- [x] QA_Release_Audit.md and Launch_Benchmark_8GB.md
+
+### Premium UI Overhaul
+- [x] Zinc-900/50 cards with white/6% borders, rounded-xl containers
+- [x] Cyan accent glow on Swarm mode toggle
+- [x] Uppercase micro labels, system-ui typography
+- [x] WifiOff/Wifi icons on mode toggle
+- [x] "Switching engines..." pulse animation during transition
+
+### New Files Created
+- `coordinator/local_engine.py` (~300 lines)
+- `desktop/src/components/dashboard/ModeToggle.tsx`
+- `tests/test_local_engine.py` (18 tests)
+- `tests/test_api_emulation.py` (22 tests)
+- `tests/test_mode_switch.py` (11 tests)
+- `tests/test_vram_reallocation.py` (12 tests)
+- `scripts/benchmark_tps.py`
+- `scripts/raw_mlx_bench.py`
+- `plans/v1.1-hybrid-architecture.md`
+- `docs/QA_Release_Audit.md`
+- `docs/Launch_Benchmark_8GB.md`
 
 ## Roadmap checklist (architecture v6 aligned)
 
