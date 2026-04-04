@@ -1039,6 +1039,44 @@ class InferenceService:
         )
         _t_chain_ms = (time.perf_counter() - _t_chain_start) * 1000
         logger.info("PROFILE phase_B_run_chain=%.1fms", _t_chain_ms)
+
+        # Post-chain decode fix: if the chain returned ToyRuntime vocab text
+        # but the peer used a real runtime, re-decode using the coordinator's
+        # cached tokenizer.  This fixes the coordinator-side decode path
+        # where ModelShard.decode_text() falls back to _VOCAB.
+        # Post-chain decode fix: re-decode activation as real token IDs when
+        # the peer used a real runtime (PyTorch/MLX).  Only triggers when
+        # activations look like token IDs (values > 1, integers).
+        _has_real_token_ids = (
+            primary.activation
+            and len(primary.activation) >= 1
+            and any(abs(v) > 1.5 for v in primary.activation[:5])
+        )
+        if _has_real_token_ids and prep.primary_pipeline:
+            _last_peer = prep.primary_pipeline[-1]
+            _peer_backend = str(getattr(_last_peer, "runtime_backend", "")).strip().lower()
+            if _peer_backend.startswith("pytorch") or _peer_backend == "mlx" or _peer_backend == "tinyllama":
+                _runtime_model = self._resolve_pipeline_runtime_model_id(
+                    prep.primary_pipeline, prep.decision.served_model,
+                )
+                try:
+                    _tok = self._engine._load_generation_tokenizer(_runtime_model)
+                    _token_ids = [max(0, int(round(float(v)))) for v in primary.activation]
+                    _redecoded = _tok.decode(_token_ids, skip_special_tokens=True).strip()
+                    if _redecoded:
+                        primary = ChainResult(
+                            request_id=primary.request_id,
+                            text=_redecoded,
+                            activation=primary.activation,
+                            traces=primary.traces,
+                            latency_ms=primary.latency_ms,
+                            compression=primary.compression,
+                            encryption=primary.encryption,
+                            kv=primary.kv,
+                        )
+                except Exception:
+                    pass  # Tokenizer unavailable — keep chain's decode
+
         prompt_tokens_est = estimate_prompt_tokens(prep.effective_prompt)
 
         # ── Verification bypass: skip when fewer than 2 distinct peers ──

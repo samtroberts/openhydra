@@ -16,6 +16,17 @@ if _USE_REAL:
     os.environ["OPENHYDRA_RUN_REAL_TENSOR_TEST"] = "1"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def ensure_tinyllama_cached():
+    """Download tinyllama-15M on first test run (~29 MB, ~3s)."""
+    cache_dir = os.path.expanduser("~/.cache/openhydra/models/tinyllama-15M")
+    safetensors = os.path.join(cache_dir, "model.safetensors")
+    if not os.path.exists(safetensors):
+        from huggingface_hub import snapshot_download
+        snapshot_download("nickypro/tinyllama-15M", local_dir=cache_dir)
+    return cache_dir
+
+
 @pytest.fixture(scope="session")
 def real_mlx_runtime():
     """Session-scoped MLXRuntime with Qwen/Qwen3.5-0.8B — loads once per batch."""
