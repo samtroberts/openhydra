@@ -73,7 +73,7 @@ OpenHydra auto-detects your hardware (Apple Silicon &rarr; MLX, NVIDIA &rarr; CU
 
 | Platform | Backend | Notes |
 |----------|---------|-------|
-| 🍎 Apple Silicon (M1&ndash;M4) | MLX (Metal) | Zero-copy unified memory. ~252 tok/s. |
+| 🍎 Apple Silicon (M1&ndash;M4) | MLX (Metal) | Zero-copy unified memory. ~75 tok/s (API), ~98 tok/s (raw). Auto 4-bit quantization. |
 | 🟢 NVIDIA GPU (CUDA) | PyTorch | Any CUDA-capable GPU. NF4 quantization. |
 | 🔴 AMD GPU (ROCm) | PyTorch | ROCm 6.2+. Same PyTorch backend. |
 
@@ -259,7 +259,7 @@ Graceful degradation built in &mdash; if the requested model lacks peers, the co
 | Advanced | Qwen 3.5 9B | `Qwen/Qwen3.5-9B` | 18 GB × 2 | 2 | int8 | ✅ Available |
 | Standard | Qwen 3.5 4B | `Qwen/Qwen3.5-4B` | 9 GB | 1 | int4 | ✅ Available |
 | Basic | Qwen 3.5 2B | `Qwen/Qwen3.5-2B` | 5 GB | 1 | fp32 | ✅ Available |
-| Basic | Qwen 3.5 0.8B | `Qwen/Qwen3.5-0.8B` | 2 GB | 1 | fp32 | ✅ Available |
+| Basic | Qwen 3.5 0.8B | `Qwen/Qwen3.5-0.8B` | 2 GB | 1 | 4-bit (MLX) / fp32 | ✅ Available |
 
 Full catalog: [`models.catalog.json`](models.catalog.json)
 
@@ -287,8 +287,18 @@ Full catalog: [`models.catalog.json`](models.catalog.json)
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/api/tags` | List models (Ollama format) |
 | `POST` | `/api/generate` | Ollama generate |
 | `POST` | `/api/chat` | Ollama chat |
+| `POST` | `/api/show` | Model details |
+| `GET` | `/api/ps` | Running models |
+
+### Internal (localhost only)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/internal/mode` | Current mode (local/swarm) |
+| `POST` | `/v1/internal/mode` | Switch mode (`{"mode": "local"\|"swarm"}`) |
 
 ### Economy & Network
 
@@ -327,10 +337,10 @@ verification/      Mystery Shopper, redundant execution, auditor spot-checks, re
 compression/       LZ4 codec + learned tensor autoencoder
 grounding/         DuckDuckGo RAG with local cache fallback
 sdk/               Python and TypeScript SDK clients
-desktop/           Tauri v2 desktop app (Rust + vanilla JS)
+desktop/           Tauri v2 desktop app (Rust + React + Tailwind), Local/Swarm toggle
 ops/               Terraform, Docker Compose, Prometheus/Grafana, TLS, deploy scripts
 scripts/           SLO chaos test, KV benchmark, head-budget optimizer, canary rollout
-tests/             867 tests (858 unit + 9 real-model integration)
+tests/             1045+ tests (unit + integration + API emulation + mode switch)
 ```
 
 ---
@@ -464,6 +474,9 @@ OpenHydra stands on the shoulders of remarkable projects and research:
 | Done | MLX backend, NF4 quantization, request coalescing, P2P model cache |
 | Done | Layer sharding, auto-scaler, Hivemind Kademlia DHT, Ollama API |
 | Done | Open-core licensing, rate-limit headers, CI, documentation |
+| Done | v1.1 Hybrid Local/Swarm Mode (75 TPS local, 20 TPS swarm on 8GB M1) |
+| Done | 4-bit auto-quantization, tokenizer caching, verification bypass |
+| Done | Premium Tauri desktop UI with Local/Swarm toggle |
 | Next | On-chain DAO (Solidity state-channel contract on Arbitrum/Base) |
 | Next | SDK v1 (Python + TypeScript, streaming, retry, type-safe) |
 | Next | P2P agentic swarms (agent sessions, tool execution, MCP) |
