@@ -132,6 +132,7 @@ class SpecPipeScheduler:
         prompt: str,
         max_tokens: int = 1,
         request_id: str | None = None,
+        kv_session_id: str | None = None,
         **stage_kwargs: Any,
     ) -> list[int]:
         """Execute one SpecPipe round: real token + speculative tokens.
@@ -141,6 +142,11 @@ class SpecPipeScheduler:
         3. Concurrently dispatch speculative tokens to available stages
         4. Verify speculative results against real pipeline output
         5. Return accepted token IDs (real + accepted speculative)
+
+        Args:
+            kv_session_id: Session ID for KV cache persistence across rounds.
+                When set, each peer caches its KV state and reuses it on
+                the next round (avoiding full re-computation of the prompt).
 
         Returns:
             List of accepted token IDs for this round.
@@ -161,10 +167,18 @@ class SpecPipeScheduler:
                 logger.warning("specpipe_draft_failed: %s", exc)
                 draft_ids = []
 
-        # 2. Run the real token through ALL pipeline stages sequentially
-        # Stage 0 receives the prompt (for tokenization), subsequent stages
-        # receive the activation (hidden states) from the previous stage.
-        real_activation: list[float] = []
+        # 2. Run the real token through ALL pipeline stages sequentially.
+        # Round 0: stage 0 gets the prompt text (for tokenization).
+        # Round 1+: stage 0 gets the last token ID as activation (for KV-cached continuation).
+        _is_continuation = bool(kv_session_id and self._stats.rounds > 0)
+        if _is_continuation and context_ids:
+            # Send only the last generated token for KV-cached decode
+            real_activation = [float(context_ids[-1])]
+            _round_prompt = ""
+        else:
+            real_activation = []
+            _round_prompt = prompt
+
         real_token_id: int | None = None
 
         for stage_idx in range(n_stages):
@@ -173,11 +187,14 @@ class SpecPipeScheduler:
                 real_activation = self._stage_fn(
                     peer=peer,
                     activation=real_activation,
-                    prompt=prompt if stage_idx == 0 else "",
+                    prompt=_round_prompt if stage_idx == 0 else "",
                     stage_index=stage_idx,
                     total_stages=n_stages,
-                    max_tokens=max_tokens,
+                    max_tokens=1 if _is_continuation else max_tokens,
                     request_id=rid,
+                    kv_session_id=kv_session_id or "",
+                    kv_store_activation=bool(kv_session_id),
+                    kv_use_cached_activation=_is_continuation,
                     **stage_kwargs,
                 )
                 self._stats.total_stage_calls += 1

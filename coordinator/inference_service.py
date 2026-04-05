@@ -1052,11 +1052,16 @@ class InferenceService:
             )
 
             def _stage_fn(peer, activation, prompt="", stage_index=0,
-                          total_stages=1, max_tokens=1, request_id="", **kw):
+                          total_stages=1, max_tokens=1, request_id="",
+                          kv_session_id="", kv_store_activation=False,
+                          kv_use_cached_activation=False, **kw):
                 result = _chain._request_stage(
                     peer=peer, request_id=request_id, prompt=prompt,
                     activation=activation, stage_index=stage_index,
                     total_stages=total_stages, max_tokens=max_tokens,
+                    kv_session_id=kv_session_id or None,
+                    kv_store_activation=kv_store_activation,
+                    kv_use_cached_activation=kv_use_cached_activation,
                     deadline=deadline,
                 )
                 return list(result.activation) if hasattr(result, "activation") else list(result[0])
@@ -1143,11 +1148,13 @@ class InferenceService:
                     _full_prompt = _base_prompt
 
                 context = all_token_ids if all_token_ids else [0]
+                _kv_sid = f"specpipe-{request_id}" if request_id else None
                 accepted = scheduler.run_round(
                     context_ids=context,
                     prompt=_full_prompt,
                     max_tokens=max_tokens - len(all_token_ids),
                     request_id=request_id,
+                    kv_session_id=_kv_sid,
                 )
                 all_token_ids.extend(accepted)
                 if len(all_token_ids) >= max_tokens:
