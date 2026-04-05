@@ -1,0 +1,15 @@
+=== OPENHYDRA SWARM BENCHMARK ===
+Model: Qwen2.5-0.5B (24 layers, sharded 8/4/4/4/4)
+Pipeline: sharded (0 hops)
+SpecPipe: ENABLED
+Prompt: 6 words
+TTFT: 44243 ms
+Wall Time: 44.243 s
+Tokens: 4
+TPS: 0.09 tok/s
+
+=== PROMPT ===
+Once upon a time there was
+
+=== FULL INFERENCE OUTPUT ===
+a 《. �《自治区 1001.00月21.光缆相标歇明的正确式变列式
