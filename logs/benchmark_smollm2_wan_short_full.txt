@@ -1,0 +1,15 @@
+=== OPENHYDRA BENCHMARK RESULT ===
+Model: openhydra-smollm2-360m
+Pipeline: sharded (5 hops)
+Prompt: 12 words
+TTFT: 287 ms
+Wall Time: 3.803 s
+Tokens: 0
+TPS: 0.00 tok/s
+Validation: FAIL
+
+=== PROMPT ===
+The quick brown fox jumps over the lazy dog near the river.
+
+=== FULL INFERENCE OUTPUT ===
+
