@@ -1054,7 +1054,9 @@ class InferenceService:
             def _stage_fn(peer, activation, prompt="", stage_index=0,
                           total_stages=1, max_tokens=1, request_id="",
                           kv_session_id="", kv_store_activation=False,
-                          kv_use_cached_activation=False, **kw):
+                          kv_use_cached_activation=False,
+                          decode_temperature=None, decode_do_sample=None,
+                          decode_top_p=None, decode_top_k=None, **kw):
                 result = _chain._request_stage(
                     peer=peer, request_id=request_id, prompt=prompt,
                     activation=activation, stage_index=stage_index,
@@ -1062,6 +1064,10 @@ class InferenceService:
                     kv_session_id=kv_session_id or None,
                     kv_store_activation=kv_store_activation,
                     kv_use_cached_activation=kv_use_cached_activation,
+                    decode_temperature=decode_temperature,
+                    decode_do_sample=decode_do_sample,
+                    decode_top_p=decode_top_p,
+                    decode_top_k=decode_top_k,
                     deadline=deadline,
                 )
                 return list(result.activation) if hasattr(result, "activation") else list(result[0])
@@ -1107,7 +1113,8 @@ class InferenceService:
                         out = _draft_fn._model.generate(
                             input_ids=input_ids,
                             max_new_tokens=k,
-                            do_sample=False,
+                            do_sample=True,
+                            temperature=0.7,
                         )
                     new_ids = out[0][input_ids.shape[1]:].tolist()
                     return new_ids[:k]
