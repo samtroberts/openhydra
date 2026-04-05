@@ -545,7 +545,12 @@ class PyTorchRuntime:
         elif _is_sharded:
             self._dtype = torch.float16  # Override fp32 default for memory-constrained shards
             load_kwargs["torch_dtype"] = torch.float16
-            load_kwargs["device_map"] = {"": "cpu"}
+            # device_map={"": "cpu"} only needed on CUDA/ROCm nodes where we want
+            # explicit CPU placement for memory-constrained nanodes.
+            # On non-CUDA (Mac/CPU-only), skip it to avoid accelerate/transformers
+            # version conflicts (transformers >=5.3 requires compatible accelerate).
+            if target == "cuda":
+                load_kwargs["device_map"] = {"": "cpu"}
         else:
             load_kwargs["torch_dtype"] = self._dtype
 
@@ -1265,11 +1270,10 @@ class PyTorchRuntime:
             if position_ids is not None:
                 block_kwargs["position_ids"] = position_ids
             if self._decoder_family in {"llama", "qwen_llama"} and self._rotary_emb is not None and position_ids is not None:
-                try:
-                    block_kwargs["position_embeddings"] = self._rotary_emb(output, position_ids)
-                except Exception:
-                    # Keep runtime resilient across transformer minor-version signature changes.
-                    pass
+                # Compute rotary position embeddings (cos, sin) for each layer.
+                # This is REQUIRED for correct output — without it, transformer
+                # blocks receive position_embeddings=None and produce garbage.
+                block_kwargs["position_embeddings"] = self._rotary_emb(output, position_ids)
 
             block_out = block(output, **block_kwargs)
             if isinstance(block_out, tuple):
