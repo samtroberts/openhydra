@@ -96,6 +96,22 @@
     "description": "Qwen 2.5 0.5B — 500M params, non-thinking, ideal for sharding tests."
   },
   {
+    "model_id": "openhydra-smollm2-360m",
+    "hf_model_id": "HuggingFaceTB/SmolLM2-360M",
+    "draft_model_id": null,
+    "required_peers": 1,
+    "min_vram_gb": 1,
+    "shard_vram_gb": 0.4,
+    "shards_needed": 1,
+    "quality_tier": "nano",
+    "recommended_quantization": "bf16",
+    "num_layers": 32,
+    "context_length": 8192,
+    "languages": ["en"],
+    "tags": ["text", "small", "test", "shardable"],
+    "description": "SmolLM2 360M — HuggingFace 362M LlamaForCausalLM, 32 layers, ideal for sharding tests."
+  },
+  {
     "model_id": "openhydra-gemma3-270m",
     "hf_model_id": "google/gemma-3-270m",
     "draft_model_id": null,
