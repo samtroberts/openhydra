@@ -239,7 +239,10 @@ class DiscoveryService:
     def _dedupe_peer_entries(self, peers: list[PeerEndpoint]) -> list[PeerEndpoint]:
         """Deduplicate peer entries by ``(peer_id, model_id)`` key.
 
-        Later entries for the same key overwrite earlier ones.
+        When two entries exist for the same key, merge layer info from the
+        more-complete entry (typically the static config) into the survivor.
+        This prevents DHT peers (which may lack layer_start/layer_end) from
+        overwriting sharding metadata loaded from the peers config file.
 
         Args:
             peers: Raw list of peer endpoints (may contain duplicates).
@@ -251,7 +254,28 @@ class DiscoveryService:
         for peer in peers:
             model_id = self._normalize_peer_model(peer)
             key = (peer.peer_id, model_id)
-            deduped[key] = peer.replace(model_id=model_id)
+            existing = deduped.get(key)
+            new_peer = peer.replace(model_id=model_id)
+            if existing is not None:
+                # Merge: preserve layer info from whichever entry has it.
+                e_has_layers = int(existing.total_layers) > 0 and int(existing.layer_end) > 0
+                n_has_layers = int(new_peer.total_layers) > 0 and int(new_peer.layer_end) > 0
+                if e_has_layers and not n_has_layers:
+                    # Existing has layer info, new doesn't — keep existing.
+                    continue
+                if n_has_layers and not e_has_layers:
+                    # New has layer info, existing doesn't — use new.
+                    deduped[key] = new_peer
+                    continue
+                # Both have (or both lack) layer info — prefer the newer entry
+                # but carry forward layer info from existing if new lacks it.
+                if not n_has_layers and e_has_layers:
+                    new_peer = new_peer.replace(
+                        layer_start=existing.layer_start,
+                        layer_end=existing.layer_end,
+                        total_layers=existing.total_layers,
+                    )
+            deduped[key] = new_peer
         return list(deduped.values())
 
     # ------------------------------------------------------------------
