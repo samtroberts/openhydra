@@ -593,6 +593,25 @@ class PyTorchRuntime:
             explicit_indices=tuple(config.runtime_layer_indices),
         )
         self._selected_layers = [self._blocks[idx] for idx in self.layer_indices]
+
+        # Free unused layers to reduce memory on constrained devices (1GB nanodes).
+        # PyTorch loads the entire model, then we select only our shard's layers.
+        # Deleting unused blocks frees ~40 MB/layer for Qwen2.5-0.5B.
+        if len(self.layer_indices) < self.total_layers:
+            used_set = set(self.layer_indices)
+            freed = 0
+            for idx in range(self.total_layers):
+                if idx not in used_set:
+                    self._blocks[idx] = None
+                    freed += 1
+            if freed > 0:
+                import gc as _gc
+                _gc.collect()
+                logging.info(
+                    "pytorch_layer_cleanup: freed %d/%d unused layers",
+                    freed, self.total_layers,
+                )
+
         self._hidden_size = int(
             getattr(self._model.config, "hidden_size", 0)
             or getattr(self._model.config, "n_embd", 0)
