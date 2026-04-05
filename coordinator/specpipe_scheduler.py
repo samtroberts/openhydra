@@ -195,6 +195,8 @@ class SpecPipeScheduler:
                     kv_session_id=kv_session_id or "",
                     kv_store_activation=bool(kv_session_id),
                     kv_use_cached_activation=_is_continuation,
+                    decode_temperature=0.7,
+                    decode_do_sample=True,
                     **stage_kwargs,
                 )
                 self._stats.total_stage_calls += 1
