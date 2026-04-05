@@ -101,6 +101,8 @@ def main() -> None:
                         help="First transformer layer (inclusive). Overrides shard-index-based auto-split.")
     parser.add_argument("--layer-end", type=int, default=None,
                         help="One past the last transformer layer (exclusive). Use with --layer-start.")
+    parser.add_argument("--runtime-model-id", default=None,
+                        help="HuggingFace model ID or local path for the runtime (overrides --model-id for weight loading).")
 
     # --- Network ---
     parser.add_argument("--grpc-port", type=int, default=50051,
@@ -224,9 +226,9 @@ def main() -> None:
     _MLX_4BIT_MAP = {
         "Qwen/Qwen3.5-0.8B": "mlx-community/Qwen3.5-0.8B-4bit",
     }
-    _runtime_model_id = args.model_id
-    if args.runtime_backend == "mlx" and args.model_id in _MLX_4BIT_MAP:
-        _runtime_model_id = _MLX_4BIT_MAP[args.model_id]
+    _runtime_model_id = args.runtime_model_id or args.model_id
+    if args.runtime_backend == "mlx" and _runtime_model_id in _MLX_4BIT_MAP:
+        _runtime_model_id = _MLX_4BIT_MAP[_runtime_model_id]
         logger.info("mlx_4bit_upgrade: %s -> %s", args.model_id, _runtime_model_id)
 
     # Compute explicit layer indices from --layer-start/--layer-end
