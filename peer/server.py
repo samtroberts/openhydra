@@ -572,6 +572,15 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 if kv_store_activation:
                     self._kv_cache_set(kv_session_id, activation)
             self.last_inference_thread_id = self.shard.last_forward_thread_id
+
+            # TOPLOC: compute activation hash for integrity verification (P2-B)
+            _act_hash = b""
+            try:
+                from verification.toploc import activation_hash
+                _act_hash = activation_hash(activation)
+            except Exception:
+                pass
+
             return peer_pb2.ForwardResponse(
                 request_id=request.request_id,
                 peer_id=self.peer_id,
@@ -592,6 +601,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 dp_noise_payload_index=int(self.shard.privacy_noise_last_payload_index),
                 dp_noise_audit_tag=str(self.shard.privacy_noise_last_audit_tag),
                 compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
+                activation_hash=_act_hash,
             )
         except Exception as exc:  # pragma: no cover
             return peer_pb2.ForwardResponse(

@@ -58,6 +58,37 @@ class MysteryShopper:
     def should_run_auditor_spotcheck(self) -> bool:
         return self._auditor_sampler.should_sample()
 
+    def build_hash_verified_result(
+        self,
+        primary: ChainResult,
+        activation_hash: bytes,
+    ) -> VerificationResult:
+        """Verify via TOPLOC activation hash — no re-execution needed.
+
+        The peer includes a hash of its intermediate activations in the
+        gRPC response.  The coordinator verifies the hash against the
+        received activation vector.  If they match, the result is trusted
+        without running a secondary inference.
+
+        This replaces the expensive redundant execution (19.5s) with a
+        sub-millisecond hash comparison.
+        """
+        from verification.toploc import verify_hash
+
+        match = verify_hash(primary.activation, activation_hash)
+
+        return VerificationResult(
+            audited=True,
+            match=match,
+            primary_text=primary.text,
+            secondary_text=None,
+            tertiary_text=None,
+            winner="primary" if match else "untrusted",
+            mode="toploc_hash",
+            sample_rate=self.sample_rate,
+            auditor_triggered=False,
+        )
+
     def build_skip_result(self, primary: ChainResult) -> VerificationResult:
         """Return a no-op verification result for single-peer topologies.
 
