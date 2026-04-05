@@ -545,12 +545,7 @@ class PyTorchRuntime:
         elif _is_sharded:
             self._dtype = torch.float16  # Override fp32 default for memory-constrained shards
             load_kwargs["torch_dtype"] = torch.float16
-            # device_map={"": "cpu"} only needed on CUDA/ROCm nodes where we want
-            # explicit CPU placement for memory-constrained nanodes.
-            # On non-CUDA (Mac/CPU-only), skip it to avoid accelerate/transformers
-            # version conflicts (transformers >=5.3 requires compatible accelerate).
-            if target == "cuda":
-                load_kwargs["device_map"] = {"": "cpu"}
+            load_kwargs["device_map"] = {"": "cpu"}
         else:
             load_kwargs["torch_dtype"] = self._dtype
 

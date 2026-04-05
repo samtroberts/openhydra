@@ -51,15 +51,21 @@ _STDLIB_ATTRS: frozenset[str] = frozenset({
 class _JsonFormatter(logging.Formatter):
     """Format each :class:`logging.LogRecord` as a single-line JSON object."""
 
+    # Some third-party libraries (e.g. absl-py via gRPC) remap the stdlib
+    # level name WARNING → WARN.  Normalise back to the standard names so
+    # downstream log aggregation pipelines see consistent values.
+    _LEVEL_NORMALIZE: dict[str, str] = {"WARN": "WARNING"}
+
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         # Ensure exc_text / stack_info are populated on the record.
         super().format(record)
 
         ms = int(record.msecs)
         ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created))
+        level = self._LEVEL_NORMALIZE.get(record.levelname, record.levelname)
         doc: dict[str, Any] = {
             "ts": f"{ts}.{ms:03d}",
-            "level": record.levelname,
+            "level": level,
             "logger": record.name,
             "msg": record.getMessage(),
         }
