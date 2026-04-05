@@ -857,6 +857,21 @@ class PyTorchRuntime:
                 rotary_emb=getattr(llama_model, "rotary_emb", None),
             )
 
+        if (
+            llama_model is not None
+            and hasattr(llama_model, "layers")
+            and hasattr(llama_model, "embed_tokens")
+            and ("gemma" in arch_name or "gemma" in model_type)
+        ):
+            return _DecoderArchitecture(
+                family="llama",  # Gemma uses the same layer structure as LLaMA
+                layers=tuple(list(llama_model.layers)),
+                embed_tokens=llama_model.embed_tokens,
+                position_embeddings=None,
+                final_norm=getattr(llama_model, "norm", None),
+                rotary_emb=getattr(llama_model, "rotary_emb", None),
+            )
+
         if llama_model is not None and hasattr(llama_model, "layers") and hasattr(llama_model, "embed_tokens"):
             return _DecoderArchitecture(
                 family="llama",
