@@ -162,7 +162,9 @@ class SpecPipeScheduler:
                 draft_ids = []
 
         # 2. Run the real token through ALL pipeline stages sequentially
-        real_activation: list[float] = [float(context_ids[-1])] if context_ids else []
+        # Stage 0 receives the prompt (for tokenization), subsequent stages
+        # receive the activation (hidden states) from the previous stage.
+        real_activation: list[float] = []
         real_token_id: int | None = None
 
         for stage_idx in range(n_stages):
@@ -174,7 +176,7 @@ class SpecPipeScheduler:
                     prompt=prompt if stage_idx == 0 else "",
                     stage_index=stage_idx,
                     total_stages=n_stages,
-                    max_tokens=1,
+                    max_tokens=max_tokens,
                     request_id=rid,
                     **stage_kwargs,
                 )
@@ -187,39 +189,44 @@ class SpecPipeScheduler:
             real_token_id = int(round(real_activation[0]))
         self._stats.real_tokens += 1
 
-        # 3. Dispatch speculative tokens concurrently to idle stages
-        # Each spec token only needs to pass through a subset of stages
-        # For simplicity in v1: each spec token goes through the LAST stage only
-        # (where the token sampling happens)
+        # 3. Dispatch speculative tokens concurrently through FULL pipeline
+        # Each spec token traverses all stages, but different spec tokens
+        # run in parallel via the thread pool.
         verified_spec_ids: list[int] = []
         if draft_ids and n_stages > 0:
-            last_peer = self._pipeline[-1]
+
+            def _run_spec_through_pipeline(draft_id: int, spec_idx: int) -> int:
+                """Run one speculative token through all pipeline stages."""
+                activation = [float(draft_id)]
+                for stage_idx in range(n_stages):
+                    peer = self._pipeline[stage_idx]
+                    try:
+                        activation = self._stage_fn(
+                            peer=peer,
+                            activation=activation,
+                            prompt="" if stage_idx > 0 else prompt,
+                            stage_index=stage_idx,
+                            total_stages=n_stages,
+                            max_tokens=1,
+                            request_id=f"{rid}-spec-{spec_idx}",
+                            **stage_kwargs,
+                        )
+                        self._stats.total_stage_calls += 1
+                    except Exception as exc:
+                        logger.debug("specpipe_spec_stage_%d_failed: %s", stage_idx, exc)
+                        return 0
+                return int(round(activation[0])) if activation else 0
+
             spec_futures = []
             for i, draft_id in enumerate(draft_ids):
-                spec_activation = [float(draft_id)]
-                fut = self._executor.submit(
-                    self._stage_fn,
-                    peer=last_peer,
-                    activation=spec_activation,
-                    prompt="",
-                    stage_index=n_stages - 1,
-                    total_stages=n_stages,
-                    max_tokens=1,
-                    request_id=f"{rid}-spec-{i}",
-                    **stage_kwargs,
-                )
+                fut = self._executor.submit(_run_spec_through_pipeline, draft_id, i)
                 spec_futures.append((draft_id, fut))
                 self._stats.speculative_dispatched += 1
-                self._stats.total_stage_calls += 1
 
-            # Collect results
             for draft_id, fut in spec_futures:
                 try:
-                    result = fut.result(timeout=self._config.verify_timeout_ms / 1000.0)
-                    if result:
-                        verified_spec_ids.append(int(round(result[0])))
-                    else:
-                        verified_spec_ids.append(0)
+                    verified_id = fut.result(timeout=self._config.verify_timeout_ms / 1000.0)
+                    verified_spec_ids.append(verified_id)
                 except Exception:
                     verified_spec_ids.append(0)
 
