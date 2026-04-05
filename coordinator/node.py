@@ -151,6 +151,8 @@ def main() -> None:
     parser.add_argument("--mlx-eval-timeout", type=float, default=120.0,
                         help="Maximum seconds for a single MLX computation before the watchdog "
                              "kills it (default: 120). Increase on memory-constrained machines.")
+    parser.add_argument("--specpipe", action="store_true", default=False,
+                        help="Enable SpecPipe pipeline-filling speculation (P1-A).")
 
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
@@ -316,6 +318,7 @@ def main() -> None:
         pipeline_width=1,
         timeout_ms=60000,
         max_latency_ms=60000,
+        specpipe_enabled=bool(getattr(args, "specpipe", False)),
     )
 
     # Start the coordinator HTTP API on the main thread (blocking).

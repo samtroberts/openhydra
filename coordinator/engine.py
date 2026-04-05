@@ -128,6 +128,9 @@ class EngineConfig:
     speculative_swarm_enabled: bool = False
     # P0-B: INT8 activation quantization on the wire
     activation_quantization_enabled: bool = False
+    # P1-A: SpecPipe — pipeline-filling speculative decoding
+    specpipe_enabled: bool = False
+    specpipe_max_depth: int = 4
     advanced_encryption_enabled: bool = False
     advanced_encryption_seed: str = "openhydra-tier3-dev-seed"
     advanced_encryption_level: str = "standard"
