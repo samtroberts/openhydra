@@ -96,6 +96,8 @@ message ForwardResponse {
   bytes quantized_activation = 21;
   repeated float quantized_scales = 22;
   string activation_quantization = 23;
+  // TOPLOC: hash of activation for integrity verification (P2-B)
+  bytes activation_hash = 24;
 }
 
 message PeerStatusRequest {}

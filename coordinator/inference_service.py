@@ -1089,12 +1089,21 @@ class InferenceService:
         secondary_result: ChainResult | None = None
         tertiary_result: ChainResult | None = None
 
+        # TOPLOC fast path: use activation hash when available (P2-B)
+        _has_toploc_hash = bool(getattr(primary, "activation_hash", b""))
         if _skip_verification:
             logger.info(
                 "PROFILE phase_C_verification=SKIPPED (single-peer topology, %d unique peers)",
                 len(_unique_peer_ids),
             )
             verification = self.verifier.build_skip_result(primary)
+        elif _has_toploc_hash:
+            # TOPLOC: verify via hash instead of re-execution (P2-B)
+            logger.info("PROFILE phase_C_verification=TOPLOC (hash-based, no re-execution)")
+            verification = self.verifier.build_hash_verified_result(
+                primary=primary,
+                activation_hash=primary.activation_hash,
+            )
         else:
             secondary_pipeline = self._engine._select_pipeline(self._rotate(prep.candidates, 1), pipeline_width=pipeline_width)
             secondary_pipeline, secondary_bandwidth_policy = self._engine._apply_bandwidth_asymmetry(

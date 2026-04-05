@@ -50,6 +50,7 @@ class _StageResult:
     activation: list[float]
     latency_ms: float
     latent_dim: int = 0
+    activation_hash: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class ChainResult:
     compression: dict[str, float | int | bool | str] | None = None
     encryption: dict[str, float | int | bool | str] | None = None
     kv: dict[str, float | int | bool | str | None] | None = None
+    activation_hash: bytes = b""  # TOPLOC hash from last pipeline stage
 
 
 class InferenceChain:
@@ -342,10 +344,13 @@ class InferenceChain:
                 list(response.quantized_scales),
             )
 
+        _resp_hash = bytes(getattr(response, "activation_hash", b"") or b"")
+
         return _StageResult(
             activation=resp_activation,
             latency_ms=latency_ms,
             latent_dim=response_latent_dim,
+            activation_hash=_resp_hash,
         )
 
     def verify_tokens(
@@ -498,6 +503,7 @@ class InferenceChain:
 
         started = time.perf_counter()
         pool = failover_pool or []
+        _last_activation_hash = b""
         for stage_index, stage_peer in enumerate(self.pipeline):
             candidates = self._stage_candidates(stage_peer, pool, max_failovers_per_stage)
             errors: list[str] = []
@@ -570,6 +576,8 @@ class InferenceChain:
                         activation = list(stage_result.activation)
                         latency_ms = float(stage_result.latency_ms)
                         stage_latent_dim = max(0, int(stage_result.latent_dim))
+                    # Capture TOPLOC hash from last pipeline stage
+                    _last_activation_hash = getattr(stage_result, "activation_hash", b"") or b""
                     if stage_use_cached and self._last_stage_kv_cache_hit:
                         kv_cache_hit = True
                         kv_cache_peer_id = candidate.peer_id
@@ -642,6 +650,10 @@ class InferenceChain:
             if not candidate_model:
                 candidate_model = str(getattr(last_stage, "model_id", "")).strip()
             decode_model_id = candidate_model or None
+        logging.info(
+            "chain_decode: backend=%s runtime_model_id=%s decode_model_id=%s activation_len=%d",
+            _backend, getattr(last_stage, "runtime_model_id", ""), decode_model_id, len(activation),
+        )
 
         _t_decode_start = time.perf_counter()
         output = ModelShard.decode_text(
@@ -704,6 +716,7 @@ class InferenceChain:
             compression=compression,
             encryption=encryption,
             kv=kv,
+            activation_hash=bytes(_last_activation_hash),
         )
 
 
