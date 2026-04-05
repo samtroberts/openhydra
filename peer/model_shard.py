@@ -535,10 +535,17 @@ class PyTorchRuntime:
             "low_cpu_mem_usage": True,
         }
         quantized_weights_loaded = False
+        # For sharded deployments (total_shards > 1), force float16 + device_map
+        # to minimize peak memory on constrained devices (1GB nanodes).
+        _is_sharded = int(config.total_shards) > 1 or bool(config.runtime_layer_indices)
         if quantization_config is not None:
             load_kwargs["quantization_config"] = quantization_config
             load_kwargs["device_map"] = "auto"
             load_kwargs["torch_dtype"] = torch.float16
+        elif _is_sharded:
+            self._dtype = torch.float16  # Override fp32 default for memory-constrained shards
+            load_kwargs["torch_dtype"] = torch.float16
+            load_kwargs["device_map"] = {"": "cpu"}
         else:
             load_kwargs["torch_dtype"] = self._dtype
 
