@@ -1027,16 +1027,107 @@ class InferenceService:
             decode_top_k=decode_top_k,
             decode_seed=decode_seed,
         )
-        _t_chain_start = time.perf_counter()
-        primary = self._engine._run_chain(
-            prep.effective_prompt,
-            prep.candidates,
-            prep.primary_pipeline,
-            max_tokens=max_tokens,
-            request_id=request_id,
-            deadline=deadline,
-            **decode_controls,
+        # SpecPipe (P1-A): when enabled and pipeline has multiple stages,
+        # use concurrent speculative dispatch instead of sequential chain.
+        _specpipe_stats: dict[str, Any] = {}
+        _use_specpipe = (
+            self.config.specpipe_enabled
+            and len(prep.primary_pipeline) > 1
+            and prep.pipeline_mode == "sharded"
         )
+
+        _t_chain_start = time.perf_counter()
+
+        if _use_specpipe:
+            from coordinator.specpipe_scheduler import SpecPipeScheduler, SpecPipeConfig
+
+            # Build stage dispatch function from the chain
+            import coordinator.engine as _engine_mod
+            _InferenceChain = getattr(_engine_mod, "InferenceChain", InferenceChain)
+            _chain = _InferenceChain(
+                prep.primary_pipeline,
+                timeout_ms=self.config.timeout_ms,
+                transport_config=self.transport_config,
+                activation_quantization_enabled=self.config.activation_quantization_enabled,
+            )
+
+            def _stage_fn(peer, activation, prompt="", stage_index=0,
+                          total_stages=1, max_tokens=1, request_id="", **kw):
+                result = _chain._request_stage(
+                    peer=peer, request_id=request_id, prompt=prompt,
+                    activation=activation, stage_index=stage_index,
+                    total_stages=total_stages, max_tokens=max_tokens,
+                    deadline=deadline,
+                )
+                return list(result.activation) if hasattr(result, "activation") else list(result[0])
+
+            def _draft_fn(ctx, k):
+                # Simple hash-based draft (fast, local)
+                base = ctx[-1] if ctx else 0
+                return [(base + i + 1) % 50000 for i in range(k)]
+
+            spec_config = SpecPipeConfig(
+                enabled=True,
+                max_speculative_depth=min(self.config.specpipe_max_depth, len(prep.primary_pipeline) - 1),
+            )
+            scheduler = SpecPipeScheduler(
+                config=spec_config,
+                pipeline=prep.primary_pipeline,
+                draft_fn=_draft_fn,
+                stage_fn=_stage_fn,
+            )
+
+            # Run specpipe rounds until max_tokens
+            all_token_ids: list[int] = []
+            for _round in range(max(1, max_tokens)):
+                context = all_token_ids if all_token_ids else [0]
+                accepted = scheduler.run_round(
+                    context_ids=context,
+                    prompt=prep.effective_prompt if not all_token_ids else "",
+                    max_tokens=max_tokens - len(all_token_ids),
+                    request_id=request_id,
+                )
+                all_token_ids.extend(accepted)
+                if len(all_token_ids) >= max_tokens:
+                    break
+
+            scheduler.shutdown()
+            _specpipe_stats = {
+                "rounds": scheduler.stats.rounds,
+                "real_tokens": scheduler.stats.real_tokens,
+                "spec_dispatched": scheduler.stats.speculative_dispatched,
+                "spec_accepted": scheduler.stats.speculative_accepted,
+                "effective_per_round": scheduler.stats.effective_tokens_per_round,
+                "total_stage_calls": scheduler.stats.total_stage_calls,
+            }
+            logger.info("PROFILE specpipe: %s", _specpipe_stats)
+
+            # Build a ChainResult from the specpipe output
+            output_text = ModelShard.decode_text(
+                [float(t) for t in all_token_ids],
+                max_tokens=max_tokens,
+                tokenizer_model_id=self._resolve_pipeline_runtime_model_id(
+                    prep.primary_pipeline, prep.decision.served_model,
+                ),
+            )
+            primary = ChainResult(
+                request_id=request_id or str(uuid.uuid4()),
+                text=output_text,
+                activation=[float(t) for t in all_token_ids],
+                traces=[],
+                latency_ms=(time.perf_counter() - _t_chain_start) * 1000,
+            )
+        else:
+            primary = self._engine._run_chain(
+                prep.effective_prompt,
+                prep.candidates,
+                prep.primary_pipeline,
+                max_tokens=max_tokens,
+                request_id=request_id,
+                deadline=deadline,
+                **decode_controls,
+            )
+
         _t_chain_ms = (time.perf_counter() - _t_chain_start) * 1000
         logger.info("PROFILE phase_B_run_chain=%.1fms", _t_chain_ms)
 
