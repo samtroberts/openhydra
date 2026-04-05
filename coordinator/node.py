@@ -153,6 +153,8 @@ def main() -> None:
                              "kills it (default: 120). Increase on memory-constrained machines.")
     parser.add_argument("--specpipe", action="store_true", default=False,
                         help="Enable SpecPipe pipeline-filling speculation (P1-A).")
+    parser.add_argument("--chunked-prefill", action="store_true", default=False,
+                        help="Enable chunked prefill for long prompts (P1-B).")
 
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
@@ -319,6 +321,7 @@ def main() -> None:
         timeout_ms=60000,
         max_latency_ms=60000,
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
+        chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
     )
 
     # Start the coordinator HTTP API on the main thread (blocking).

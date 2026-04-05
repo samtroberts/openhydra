@@ -1027,6 +1027,41 @@ class InferenceService:
             decode_top_k=decode_top_k,
             decode_seed=decode_seed,
         )
+        # Chunked prefill (P1-B): split long prompts into chunks so other
+        # clients' requests can interleave between chunks.
+        _chunked_prefill_stats: dict[str, Any] = {}
+        if (
+            self.config.chunked_prefill_enabled
+            and len(prep.effective_prompt.split()) > self.config.chunked_prefill_chunk_size
+        ):
+            from coordinator.chunked_prefill import ChunkedPrefill, ChunkedPrefillConfig
+
+            _cp = ChunkedPrefill(ChunkedPrefillConfig(
+                chunk_size=self.config.chunked_prefill_chunk_size,
+            ))
+
+            def _cp_chain_fn(chunk_prompt, **kw):
+                return list(self._engine._run_chain(
+                    chunk_prompt,
+                    prep.candidates,
+                    prep.primary_pipeline,
+                    max_tokens=1,
+                    request_id=request_id,
+                    deadline=deadline,
+                    **{k: v for k, v in kw.items() if k in (
+                        "kv_session_id", "kv_store_activation", "kv_use_cached_activation",
+                    )},
+                    **decode_controls,
+                ).activation)
+
+            _prefill_activation = _cp.process(
+                prep.effective_prompt,
+                chain_fn=_cp_chain_fn,
+                session_id=f"cp-{request_id}",
+            )
+            _chunked_prefill_stats = _cp.stats
+            logger.info("PROFILE chunked_prefill: %s", _chunked_prefill_stats)
+
         # SpecPipe (P1-A): when enabled and pipeline has multiple stages,
         # use concurrent speculative dispatch instead of sequential chain.
         _specpipe_stats: dict[str, Any] = {}
