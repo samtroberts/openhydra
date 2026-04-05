@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenHydra Peer (Qwen2.5-0.5B Shard 3, layers 16-20)
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/openhydra/src
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTHONPATH=/opt/openhydra/src
+ExecStart=/opt/openhydra/.venv/bin/python3 -m coordinator.node --peer-id nano-singapore1 --model-id openhydra-qwen2.5-0.5b --runtime-model-id /opt/openhydra/.cache/models/Qwen2.5-0.5B --runtime-backend pytorch_auto --layer-start 16 --layer-end 20 --shard-index 3 --total-shards 5 --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 --dht-url http://172.104.164.98:8468 --advertise-host 139.162.16.181
+Restart=on-failure
+RestartSec=10
+MemoryMax=950M
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target

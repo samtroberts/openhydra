@@ -1,0 +1,17 @@
+NAME       TYPE       SIZE   USED PRIO
+/dev/sdb   partition  496M 485.7M   -2
+/swapfile2 file      1024M 296.1M   -3
+               total        used        free      shared  buff/cache   available
+Mem:           961Mi       862Mi       103Mi       316Ki       128Mi        99Mi
+Swap:          1.5Gi       781Mi       738Mi
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            97M  972K   96M   1% /run
+/dev/sda         25G  9.3G   14G  41% /
+tmpfs           481M  4.0K  481M   1% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+tmpfs            97M   12K   97M   1% /run/user/0
+Linux localhost 6.8.0-71-generic #71-Ubuntu SMP PREEMPT_DYNAMIC Tue Jul 22 16:52:38 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+Distributor ID:	Ubuntu
+Description:	Ubuntu 24.04.3 LTS
+Release:	24.04
+Codename:	noble

@@ -1,0 +1,50 @@
+2026-04-05T23:02:49+00:00 localhost python3[10938]: 2026-04-05T23:02:49 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:02:50+00:00 localhost python3[10938]: 2026-04-05T23:02:50 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:04+00:00 localhost python3[10938]: 2026-04-05T23:03:04 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:11+00:00 localhost python3[10938]: 2026-04-05T23:03:11 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:11+00:00 localhost python3[10938]: 2026-04-05T23:03:11 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:11+00:00 localhost python3[10938]: 2026-04-05T23:03:11 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:11+00:00 localhost python3[10938]: 2026-04-05T23:03:11 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:13+00:00 localhost python3[10938]: 2026-04-05T23:03:13 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:13+00:00 localhost python3[10938]: 2026-04-05T23:03:13 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:13+00:00 localhost python3[10938]: 2026-04-05T23:03:13 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:13+00:00 localhost python3[10938]: 2026-04-05T23:03:13 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:15+00:00 localhost python3[10938]: 2026-04-05T23:03:15 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:15+00:00 localhost python3[10938]: 2026-04-05T23:03:15 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:15+00:00 localhost python3[10938]: 2026-04-05T23:03:15 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:16+00:00 localhost python3[10938]: 2026-04-05T23:03:16 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:17+00:00 localhost python3[10938]: 2026-04-05T23:03:17 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:19+00:00 localhost python3[10938]: 2026-04-05T23:03:19 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:19+00:00 localhost python3[10938]: 2026-04-05T23:03:19 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:20+00:00 localhost python3[10938]: 2026-04-05T23:03:20 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:21+00:00 localhost python3[10938]: 2026-04-05T23:03:21 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:22+00:00 localhost python3[10938]: 2026-04-05T23:03:22 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:22+00:00 localhost python3[10938]: 2026-04-05T23:03:22 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:23+00:00 localhost python3[10938]: 2026-04-05T23:03:23 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:24+00:00 localhost python3[10938]: 2026-04-05T23:03:24 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:25+00:00 localhost python3[10938]: 2026-04-05T23:03:25 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:26+00:00 localhost python3[10938]: 2026-04-05T23:03:26 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:26+00:00 localhost python3[10938]: 2026-04-05T23:03:26 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:27+00:00 localhost python3[10938]: 2026-04-05T23:03:27 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:28+00:00 localhost python3[10938]: 2026-04-05T23:03:28 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:29+00:00 localhost python3[10938]: 2026-04-05T23:03:29 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:31+00:00 localhost python3[10938]: 2026-04-05T23:03:31 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:32+00:00 localhost python3[10938]: 2026-04-05T23:03:32 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:33+00:00 localhost python3[10938]: 2026-04-05T23:03:33 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:34+00:00 localhost python3[10938]: 2026-04-05T23:03:34 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:35+00:00 localhost python3[10938]: 2026-04-05T23:03:35 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:36+00:00 localhost python3[10938]: 2026-04-05T23:03:36 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:37+00:00 localhost python3[10938]: 2026-04-05T23:03:37 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:38+00:00 localhost python3[10938]: 2026-04-05T23:03:38 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:39+00:00 localhost python3[10938]: 2026-04-05T23:03:39 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:03:40+00:00 localhost python3[10938]: 2026-04-05T23:03:40 INFO     peer.server forward_dispatch: peer=nano-chennai stage=1/5 backend=pytorch
+2026-04-05T23:10:26+00:00 localhost python3[10938]: 2026-04-05T23:10:26 INFO     coordinator.api_server http 45.135.194.20 - code 501, message Unsupported method ('CONNECT')
+2026-04-05T23:10:26+00:00 localhost python3[10938]: 2026-04-05T23:10:26 INFO     coordinator.api_server http 45.135.194.20 - "CONNECT google.com:443 HTTP/1.1" 501 -
+2026-04-05T23:16:34+00:00 localhost python3[10938]: 2026-04-05T23:16:34 INFO     coordinator.api_server request_start req_id=7cc699cc-199a-4c6c-a2fa-894f5c0fa359 method=GET path=/login client=176.65.139.110
+2026-04-05T23:16:34+00:00 localhost python3[10938]: 2026-04-05T23:16:34 INFO     coordinator.api_server http 176.65.139.110 - "GET /login HTTP/1.1" 404 -
+2026-04-05T23:16:34+00:00 localhost python3[10938]: 2026-04-05T23:16:34 INFO     coordinator.api_server request_done req_id=7cc699cc-199a-4c6c-a2fa-894f5c0fa359 method=GET path=/login status=404 latency_ms=9.6
+2026-04-05T23:17:56+00:00 localhost python3[10938]: 2026-04-05T23:17:56 INFO     coordinator.api_server request_start req_id=4cb3635e-9075-4f8b-b1ec-2791d048aff6 method=GET path=/ client=172.236.228.227
+2026-04-05T23:17:56+00:00 localhost python3[10938]: 2026-04-05T23:17:56 INFO     coordinator.api_server http 172.236.228.227 - "GET / HTTP/1.1" 404 -
+2026-04-05T23:17:56+00:00 localhost python3[10938]: 2026-04-05T23:17:56 INFO     coordinator.api_server request_done req_id=4cb3635e-9075-4f8b-b1ec-2791d048aff6 method=GET path=/ status=404 latency_ms=2.6
+2026-04-05T23:26:48+00:00 localhost python3[10938]: 2026-04-05T23:26:48 INFO     coordinator.api_server http 176.65.139.94 - code 501, message Unsupported method ('CONNECT')
+2026-04-05T23:26:48+00:00 localhost python3[10938]: 2026-04-05T23:26:48 INFO     coordinator.api_server http 176.65.139.94 - "CONNECT www.google.com:443 HTTP/1.1" 501 -

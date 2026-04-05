@@ -1,0 +1,50 @@
+2026-04-05T23:03:20+00:00 localhost python3[8468]: 2026-04-05T23:03:20 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:20+00:00 localhost python3[8468]: 2026-04-05T23:03:20 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:21+00:00 localhost python3[8468]: 2026-04-05T23:03:21 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:22+00:00 localhost python3[8468]: 2026-04-05T23:03:22 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:23+00:00 localhost python3[8468]: 2026-04-05T23:03:23 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:24+00:00 localhost python3[8468]: 2026-04-05T23:03:24 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:24+00:00 localhost python3[8468]: 2026-04-05T23:03:24 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:25+00:00 localhost python3[8468]: 2026-04-05T23:03:25 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:26+00:00 localhost python3[8468]: 2026-04-05T23:03:26 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:27+00:00 localhost python3[8468]: 2026-04-05T23:03:27 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:28+00:00 localhost python3[8468]: 2026-04-05T23:03:28 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:29+00:00 localhost python3[8468]: 2026-04-05T23:03:29 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:30+00:00 localhost python3[8468]: 2026-04-05T23:03:30 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:32+00:00 localhost python3[8468]: 2026-04-05T23:03:32 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:32+00:00 localhost python3[8468]: 2026-04-05T23:03:32 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:33+00:00 localhost python3[8468]: 2026-04-05T23:03:33 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:34+00:00 localhost python3[8468]: 2026-04-05T23:03:34 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:36+00:00 localhost python3[8468]: 2026-04-05T23:03:36 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:36+00:00 localhost python3[8468]: 2026-04-05T23:03:36 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:38+00:00 localhost python3[8468]: 2026-04-05T23:03:38 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:38+00:00 localhost python3[8468]: 2026-04-05T23:03:38 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:40+00:00 localhost python3[8468]: 2026-04-05T23:03:40 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:03:40+00:00 localhost python3[8468]: 2026-04-05T23:03:40 INFO     peer.server forward_dispatch: peer=nano-singapore2 stage=4/5 backend=pytorch
+2026-04-05T23:05:22+00:00 localhost python3[8468]: 2026-04-05T23:05:22 INFO     coordinator.api_server request_start req_id=cd7596ca-1efa-481e-bde0-6178277788b9 method=POST path=/ client=193.32.162.28
+2026-04-05T23:05:22+00:00 localhost python3[8468]: 2026-04-05T23:05:22 INFO     coordinator.api_server http 193.32.162.28 - "POST / HTTP/1.1" 400 -
+2026-04-05T23:05:22+00:00 localhost python3[8468]: 2026-04-05T23:05:22 INFO     coordinator.api_server request_done req_id=cd7596ca-1efa-481e-bde0-6178277788b9 method=POST path=/ status=400 latency_ms=1.1
+2026-04-05T23:05:23+00:00 localhost python3[8468]: 2026-04-05T23:05:23 INFO     coordinator.api_server request_start req_id=3b34c58a-889f-4bb2-bf1e-062867de9152 method=POST path=/_next client=193.32.162.28
+2026-04-05T23:05:23+00:00 localhost python3[8468]: 2026-04-05T23:05:23 INFO     coordinator.api_server http 193.32.162.28 - "POST /_next HTTP/1.1" 400 -
+2026-04-05T23:05:23+00:00 localhost python3[8468]: 2026-04-05T23:05:23 INFO     coordinator.api_server request_done req_id=3b34c58a-889f-4bb2-bf1e-062867de9152 method=POST path=/_next status=400 latency_ms=0.5
+2026-04-05T23:05:23+00:00 localhost python3[8468]: 2026-04-05T23:05:23 INFO     coordinator.api_server request_start req_id=4b82c928-baf9-4285-baa7-bc7fc625c6f2 method=POST path=/api client=193.32.162.28
+2026-04-05T23:05:23+00:00 localhost python3[8468]: 2026-04-05T23:05:23 INFO     coordinator.api_server http 193.32.162.28 - "POST /api HTTP/1.1" 400 -
+2026-04-05T23:05:23+00:00 localhost python3[8468]: 2026-04-05T23:05:23 INFO     coordinator.api_server request_done req_id=4b82c928-baf9-4285-baa7-bc7fc625c6f2 method=POST path=/api status=400 latency_ms=0.4
+2026-04-05T23:05:24+00:00 localhost python3[8468]: 2026-04-05T23:05:24 INFO     coordinator.api_server request_start req_id=18336e21-6354-4568-b408-f83fbd99f1ac method=POST path=/_next/server client=193.32.162.28
+2026-04-05T23:05:24+00:00 localhost python3[8468]: 2026-04-05T23:05:24 INFO     coordinator.api_server http 193.32.162.28 - "POST /_next/server HTTP/1.1" 400 -
+2026-04-05T23:05:24+00:00 localhost python3[8468]: 2026-04-05T23:05:24 INFO     coordinator.api_server request_done req_id=18336e21-6354-4568-b408-f83fbd99f1ac method=POST path=/_next/server status=400 latency_ms=0.8
+2026-04-05T23:05:26+00:00 localhost python3[8468]: 2026-04-05T23:05:26 INFO     coordinator.api_server request_start req_id=8a2dd981-3146-4c7f-b19d-7f6d055048de method=POST path=/app client=193.32.162.28
+2026-04-05T23:05:26+00:00 localhost python3[8468]: 2026-04-05T23:05:26 INFO     coordinator.api_server http 193.32.162.28 - "POST /app HTTP/1.1" 400 -
+2026-04-05T23:05:26+00:00 localhost python3[8468]: 2026-04-05T23:05:26 INFO     coordinator.api_server request_done req_id=8a2dd981-3146-4c7f-b19d-7f6d055048de method=POST path=/app status=400 latency_ms=1.0
+2026-04-05T23:05:26+00:00 localhost python3[8468]: 2026-04-05T23:05:26 INFO     coordinator.api_server request_start req_id=7f499e6b-a5d9-4623-9423-5848daea8ff9 method=POST path=/api/route client=193.32.162.28
+2026-04-05T23:05:26+00:00 localhost python3[8468]: 2026-04-05T23:05:26 INFO     coordinator.api_server http 193.32.162.28 - "POST /api/route HTTP/1.1" 400 -
+2026-04-05T23:05:26+00:00 localhost python3[8468]: 2026-04-05T23:05:26 INFO     coordinator.api_server request_done req_id=7f499e6b-a5d9-4623-9423-5848daea8ff9 method=POST path=/api/route status=400 latency_ms=0.4
+2026-04-05T23:14:06+00:00 localhost python3[8468]: 2026-04-05T23:14:06 INFO     coordinator.api_server request_start req_id=f73604bf-b2ad-4e28-8ffd-9dd94a75bc36 method=GET path=/ client=66.228.53.136
+2026-04-05T23:14:06+00:00 localhost python3[8468]: 2026-04-05T23:14:06 INFO     coordinator.api_server http 66.228.53.136 - "GET / HTTP/1.1" 404 -
+2026-04-05T23:14:06+00:00 localhost python3[8468]: 2026-04-05T23:14:06 INFO     coordinator.api_server request_done req_id=f73604bf-b2ad-4e28-8ffd-9dd94a75bc36 method=GET path=/ status=404 latency_ms=0.3
+2026-04-05T23:23:22+00:00 localhost python3[8468]: 2026-04-05T23:23:22 INFO     coordinator.api_server http 45.91.64.6 - code 400, message Bad request version ("¯nãY»bhlÿ(=':©\x82ÙoÈ¢×\x93\x98´ï\x80å¹\x90\x00(À")
+2026-04-05T23:23:22+00:00 localhost python3[8468]: [77B blob data]
+2026-04-05T23:23:22+00:00 localhost python3[8468]: [113B blob data]
+2026-04-05T23:23:22+00:00 localhost python3[8468]: (À" 400 -
+2026-04-05T23:44:06+00:00 localhost python3[8468]: 2026-04-05T23:44:06 INFO     coordinator.api_server http 135.237.123.227 - code 400, message Bad request syntax ('MGLNDD_139.162.4.85_8080')
+2026-04-05T23:44:06+00:00 localhost python3[8468]: 2026-04-05T23:44:06 INFO     coordinator.api_server http 135.237.123.227 - "MGLNDD_139.162.4.85_8080" 400 -

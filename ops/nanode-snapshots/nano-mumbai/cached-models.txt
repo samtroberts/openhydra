@@ -1,0 +1,6 @@
+total 20
+drwxr-xr-x 5 root root  4096 Apr  5 20:08 .
+drwxr-xr-x 3 root root  4096 Apr  5 16:16 ..
+drwxr-xr-x 3  501 staff 4096 Apr  5 18:33 gemma-3-270m
+drwxr-xr-x 3 root root  4096 Apr  5 16:16 Qwen2.5-0.5B
+drwxr-xr-x 3  501 staff 4096 Apr  5 20:08 SmolLM2-360M
