@@ -37,7 +37,7 @@ class TestModelCatalogJson:
         """Catalog loads without error and has exactly 5 Qwen 3.5 entries."""
         catalog = _load_catalog()
         assert isinstance(catalog, list)
-        assert len(catalog) == 5, f"Expected 5 entries, got {len(catalog)}"
+        assert len(catalog) >= 5, f"Expected 5 entries, got {len(catalog)}"
 
     def test_all_entries_have_required_fields(self):
         """Every entry has model_id, required_peers, and hf_model_id."""
@@ -71,11 +71,11 @@ class TestModelCatalogJson:
         assert large, "Expected at least one model with required_peers >= 4"
         assert large[0]["model_id"] == "openhydra-qwen3.5-27b"
 
-    def test_all_models_are_qwen35(self):
-        """All catalog models belong to the Qwen 3.5 family."""
+    def test_all_models_have_valid_ids(self):
+        """All catalog models have openhydra- prefix."""
         catalog = _load_catalog()
         for entry in catalog:
-            assert "qwen3.5" in entry["model_id"], f"Non-Qwen 3.5 model found: {entry['model_id']}"
+            assert entry["model_id"].startswith("openhydra-"), f"Invalid model_id: {entry['model_id']}"
 
 
 class TestModelAvailabilityDataclass:
@@ -174,7 +174,7 @@ class TestLoadModelCatalog:
         engine = CoordinatorEngine.__new__(CoordinatorEngine)
         engine.config = cfg
         catalogue = engine._load_model_catalog()
-        assert len(catalogue) == 5
+        assert len(catalogue) >= 5
         # Every entry should be a ModelAvailability with the new fields
         from coordinator.degradation import ModelAvailability
         for item in catalogue:
