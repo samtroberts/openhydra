@@ -97,6 +97,10 @@ def main() -> None:
                         help="Shard index within the inference pipeline (default: 0).")
     parser.add_argument("--total-shards", type=int, default=1,
                         help="Total pipeline shards (default: 1).")
+    parser.add_argument("--layer-start", type=int, default=None,
+                        help="First transformer layer (inclusive). Overrides shard-index-based auto-split.")
+    parser.add_argument("--layer-end", type=int, default=None,
+                        help="One past the last transformer layer (exclusive). Use with --layer-start.")
 
     # --- Network ---
     parser.add_argument("--grpc-port", type=int, default=50051,
@@ -225,6 +229,15 @@ def main() -> None:
         _runtime_model_id = _MLX_4BIT_MAP[args.model_id]
         logger.info("mlx_4bit_upgrade: %s -> %s", args.model_id, _runtime_model_id)
 
+    # Compute explicit layer indices from --layer-start/--layer-end
+    _explicit_layer_indices: tuple[int, ...] = ()
+    if args.layer_start is not None and args.layer_end is not None:
+        _explicit_layer_indices = tuple(range(args.layer_start, args.layer_end))
+        logger.info(
+            "explicit_layer_range: [%d, %d) = %d layers",
+            args.layer_start, args.layer_end, len(_explicit_layer_indices),
+        )
+
     logger.info(
         "openhydra_node_starting peer_id=%s model=%s grpc_port=%d api=%s:%d dht=%s backend=%s",
         args.peer_id, args.model_id, args.grpc_port,
@@ -244,6 +257,7 @@ def main() -> None:
             "runtime_model_id": _runtime_model_id,
             "shard_index": args.shard_index,
             "total_shards": args.total_shards,
+            "expert_layer_indices": list(_explicit_layer_indices),
             "dht_urls": dht_urls,
             "daemon_mode": args.daemon_mode,
             "runtime_backend": args.runtime_backend,
