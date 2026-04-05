@@ -1061,32 +1061,53 @@ class InferenceService:
                 )
                 return list(result.activation) if hasattr(result, "activation") else list(result[0])
 
-            # Use tinyllama-15M as the local draft model (loaded via ToyRuntime)
+            # Use the SAME model (Qwen2.5-0.5B) as draft — ensures token
+            # IDs are compatible with the sharded target pipeline.
+            # The full model runs locally on the Mac for fast drafting
+            # while the pipeline shards handle verification.
             def _draft_fn(ctx, k):
                 try:
-                    from peer.model_shard import _get_tinyllama_cached
                     import torch
-                    _draft_model, _draft_tok = _get_tinyllama_cached()
+                    from transformers import AutoModelForCausalLM, AutoTokenizer
+                    import os
 
-                    # Build input from context token IDs
+                    # Module-level cache for the draft model
+                    if not hasattr(_draft_fn, "_model"):
+                        _cache = os.path.expanduser("~/.cache/openhydra/models/Qwen2.5-0.5B")
+                        if not os.path.exists(os.path.join(_cache, "model.safetensors")):
+                            from huggingface_hub import snapshot_download
+                            snapshot_download("Qwen/Qwen2.5-0.5B", local_dir=_cache)
+                        _draft_fn._tokenizer = AutoTokenizer.from_pretrained(
+                            _cache, local_files_only=True
+                        )
+                        _draft_fn._model = AutoModelForCausalLM.from_pretrained(
+                            _cache, local_files_only=True,
+                            torch_dtype=torch.float16, low_cpu_mem_usage=True,
+                        )
+                        _draft_fn._model.eval()
+                        logger.info("specpipe_draft: loaded Qwen2.5-0.5B as draft model")
+
+                    # Build input from context token IDs or prompt
                     if ctx and any(abs(c) > 1 for c in ctx):
-                        input_ids = torch.tensor([ctx[-min(64, len(ctx)):]], dtype=torch.long)
+                        input_ids = torch.tensor(
+                            [ctx[-min(128, len(ctx)):]],
+                            dtype=torch.long,
+                        )
                     else:
-                        # Fallback: encode the prompt
-                        input_ids = _draft_tok("Once upon a time", return_tensors="pt")["input_ids"]
+                        input_ids = _draft_fn._tokenizer(
+                            _base_prompt, return_tensors="pt"
+                        )["input_ids"]
 
                     with torch.no_grad():
-                        out = _draft_model.generate(
+                        out = _draft_fn._model.generate(
                             input_ids=input_ids,
                             max_new_tokens=k,
                             do_sample=False,
                         )
-                    # Return only the NEW token IDs
                     new_ids = out[0][input_ids.shape[1]:].tolist()
                     return new_ids[:k]
                 except Exception as exc:
-                    logger.warning("specpipe_draft_model_failed: %s", exc)
-                    # Fallback: hash-based draft
+                    logger.warning("specpipe_draft_failed: %s", exc)
                     base = ctx[-1] if ctx else 0
                     return [(base + i + 1) % 50000 for i in range(k)]
 
