@@ -131,6 +131,9 @@ class EngineConfig:
     # P1-A: SpecPipe — pipeline-filling speculative decoding
     specpipe_enabled: bool = False
     specpipe_max_depth: int = 4
+    # P1-B: Chunked prefill — split long prompts for pipeline interleaving
+    chunked_prefill_enabled: bool = False
+    chunked_prefill_chunk_size: int = 256
     advanced_encryption_enabled: bool = False
     advanced_encryption_seed: str = "openhydra-tier3-dev-seed"
     advanced_encryption_level: str = "standard"
