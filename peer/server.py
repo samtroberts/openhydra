@@ -1196,14 +1196,18 @@ def serve(
     logging.info("peer %s hardware profile: %s", peer_id, hardware_profile.to_dict())
 
     # ── The Great Pruning: enforce GPU accelerator for production ──────────
+    # Allow CPU for sharded mode (layer sharding on nanodes) and toy backend.
     _is_toy_backend = runtime_backend.startswith("toy")
-    if hardware_profile.accelerator == "cpu" and not _is_toy_backend:
+    _is_sharded = bool(expert_layer_indices) or int(total_shards) > 1
+    if hardware_profile.accelerator == "cpu" and not _is_toy_backend and not _is_sharded:
         logging.critical(
             "FATAL: no GPU accelerator detected (Metal/CUDA/ROCm required). "
             "This node cannot serve real models on CPU. "
-            "Use --toy for development without a GPU."
+            "Use --toy for development without a GPU, or use --layer-start/--layer-end for sharded CPU inference."
         )
         raise SystemExit(1)
+    if hardware_profile.accelerator == "cpu" and _is_sharded:
+        logging.info("peer %s: CPU-only sharded mode (layers via --layer-start/--layer-end)", peer_id)
 
     peer_public_key_hex = ""
     peer_priv_key_obj = None
