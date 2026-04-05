@@ -1061,10 +1061,34 @@ class InferenceService:
                 )
                 return list(result.activation) if hasattr(result, "activation") else list(result[0])
 
+            # Use tinyllama-15M as the local draft model (loaded via ToyRuntime)
             def _draft_fn(ctx, k):
-                # Simple hash-based draft (fast, local)
-                base = ctx[-1] if ctx else 0
-                return [(base + i + 1) % 50000 for i in range(k)]
+                try:
+                    from peer.model_shard import _get_tinyllama_cached
+                    import torch
+                    _draft_model, _draft_tok = _get_tinyllama_cached()
+
+                    # Build input from context token IDs
+                    if ctx and any(abs(c) > 1 for c in ctx):
+                        input_ids = torch.tensor([ctx[-min(64, len(ctx)):]], dtype=torch.long)
+                    else:
+                        # Fallback: encode the prompt
+                        input_ids = _draft_tok("Once upon a time", return_tensors="pt")["input_ids"]
+
+                    with torch.no_grad():
+                        out = _draft_model.generate(
+                            input_ids=input_ids,
+                            max_new_tokens=k,
+                            do_sample=False,
+                        )
+                    # Return only the NEW token IDs
+                    new_ids = out[0][input_ids.shape[1]:].tolist()
+                    return new_ids[:k]
+                except Exception as exc:
+                    logger.warning("specpipe_draft_model_failed: %s", exc)
+                    # Fallback: hash-based draft
+                    base = ctx[-1] if ctx else 0
+                    return [(base + i + 1) % 50000 for i in range(k)]
 
             spec_config = SpecPipeConfig(
                 enabled=True,
@@ -1078,12 +1102,29 @@ class InferenceService:
             )
 
             # Run specpipe rounds until max_tokens
+            # Build the full prompt including previously generated tokens
+            # so the model has context for continuation.
+            _base_prompt = prep.effective_prompt
+            _runtime_model = self._resolve_pipeline_runtime_model_id(
+                prep.primary_pipeline, prep.decision.served_model,
+            )
             all_token_ids: list[int] = []
             for _round in range(max(1, max_tokens)):
+                # Build continuation prompt: base prompt + decoded generated tokens
+                if all_token_ids:
+                    try:
+                        _tok = self._engine._load_generation_tokenizer(_runtime_model)
+                        _continuation = _tok.decode(all_token_ids, skip_special_tokens=True)
+                        _full_prompt = _base_prompt + _continuation
+                    except Exception:
+                        _full_prompt = _base_prompt
+                else:
+                    _full_prompt = _base_prompt
+
                 context = all_token_ids if all_token_ids else [0]
                 accepted = scheduler.run_round(
                     context_ids=context,
-                    prompt=prep.effective_prompt if not all_token_ids else "",
+                    prompt=_full_prompt,
                     max_tokens=max_tokens - len(all_token_ids),
                     request_id=request_id,
                 )
