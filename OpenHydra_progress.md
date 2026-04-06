@@ -1,6 +1,6 @@
 # OpenHydra Progress
 
-Last updated: 2026-04-04 (v1.1 Hybrid Local/Swarm Mode complete, 75 TPS Local / 20 TPS Swarm on 8GB M1)
+Last updated: 2026-04-06 (v1.2 Swarm Inference Optimization complete — DSD, SpecPipe, INT8, TOPLOC, Chunked Prefill, 5-node WAN sharded pipeline)
 
 ## Overall status
 
@@ -14,12 +14,14 @@ Last updated: 2026-04-04 (v1.1 Hybrid Local/Swarm Mode complete, 75 TPS Local / 
 - Pass 8 QA: **100% complete** (RAM detection fix, CI codesign, Golden Path install docs, troubleshooting guide, 8GB benchmark)
 - **v1.1 Hybrid Local/Swarm Mode: 100% complete** (4 pillars: LocalInferenceEngine, API emulation, mode toggle, VRAM reallocation)
 - **Performance optimization: 100% complete** (50x Swarm speedup, 75 TPS Local Mode)
+- **v1.2 Swarm Inference Optimization: 100% complete** (DSD, SpecPipe, INT8 compression, TOPLOC verification, Chunked Prefill, 5-node WAN pipeline, ToyRuntime real model replacement)
+- **5-Node WAN Sharded Pipeline: Tested** (Bangalore→Chennai→Mumbai→Singapore×2, Qwen2.5-0.5B, 0.43 TPS through 5-stage pipeline)
 - Desktop App: **Shipped** (Tauri v2 + React + Tailwind, Local/Swarm toggle, premium zinc/cyan UI)
 - Landing page: **Live** at https://openhydra.co (GitHub Pages, gh-pages branch)
 - PyPI: **Published** as `openhydra-network` at https://pypi.org/project/openhydra-network/
 - GitHub Release: **Live** at https://github.com/samtroberts/openhydra/releases
 - License: **Apache 2.0** (entire stack — abandoned AGPL open-core model for maximum adoption)
-- Test status: `1045 passed, 9 skipped` by default (`OPENHYDRA_RUN_REAL_TENSOR_TEST=0`), with `9` gated real-PyTorch tests available under (`OPENHYDRA_RUN_REAL_TENSOR_TEST=1`)
+- Test status: `1103 passed, 9 skipped` (all pass, 0 failures)
 
 ## v1.1 Hybrid Local/Swarm Mode (2026-03-31 → 2026-04-04)
 
@@ -96,6 +98,80 @@ Last updated: 2026-04-04 (v1.1 Hybrid Local/Swarm Mode complete, 75 TPS Local / 
 - `plans/v1.1-hybrid-architecture.md`
 - `docs/QA_Release_Audit.md`
 - `docs/Launch_Benchmark_8GB.md`
+
+## v1.2 Swarm Inference Optimization (2026-04-04 → 2026-04-06)
+
+### Swarm Optimization Techniques Implemented
+
+- [x] **Decentralized Speculative Decoding (DSD)** — local draft model proposes tokens, pipeline verifies in batch; `coordinator/speculative_swarm.py`
+- [x] **SpecPipe** — fills idle pipeline stages with speculative tokens concurrently via `ThreadPoolExecutor`; KV-cached continuation for rounds 2+; adaptive depth; `coordinator/specpipe_scheduler.py` (~220 lines)
+- [x] **INT8 Activation Compression** — quantize/dequantize hidden state activations on the wire; `peer/activation_codec.py`
+- [x] **TOPLOC Hash Verification** — SHA-256 activation hashing replaces redundant re-execution; `verification/toploc.py`
+- [x] **PALU Low-Rank SVD Compression** — SVD-based activation compression; `peer/palu_codec.py`
+- [x] **Chunked Prefill** — splits long prompts into chunks for pipeline interleaving; word-based or tokenizer-token splitting; `coordinator/chunked_prefill.py` (~160 lines)
+- [x] **RTT-Aware Peer Selection** — 5-factor Dijkstra routing with server-to-server RTT; `coordinator/peer_selector.py`
+- [x] **Coordinator-Level Batching** — request batching queue; `coordinator/request_batcher.py`
+
+### ToyRuntime Replacement
+
+- [x] **Replaced hash-based ToyRuntime with real tinyllama-15M** — `nickypro/tinyllama-15M` (15M params, 6 layers, LlamaForCausalLM)
+- [x] Module-level model caching (`_get_tinyllama_cached()`) prevents OOM in test suites
+- [x] Produces real English text: "a boy who loved to read. He often went to the library..."
+
+### 5-Node WAN Sharded Pipeline Deployment
+
+- [x] **4 Linode nanodes provisioned** — Chennai, Mumbai, Singapore ×2 ($5/mo each)
+- [x] **Non-equal layer sharding** — Mac: 8 layers, nanodes: 4 each (Qwen2.5-0.5B, 24 layers total)
+- [x] **1GB nanode memory optimization** — fp16 + device_map + layer cleanup + 1GB swap + MALLOC_ARENA_MAX=2
+- [x] **Model catalog expanded** to 9 entries — added Qwen2.5-0.5B, SmolLM2-360M, Gemma-3-270m, TinyLLaMA-15M
+
+### Critical Bug Fixes
+
+- [x] **position_embeddings transfer** — removed silent `try/except Exception: pass` in `_run_layers()` that swallowed rotary_emb errors, causing garbled CJK output through sharded pipeline
+- [x] **Peer dedup layer info loss** — `_dedupe_peer_entries()` let DHT peers (without layer info) overwrite static config peers, preventing sharded pipeline selection
+- [x] **accelerate compatibility** — upgraded to `accelerate>=1.13.0` for `transformers 5.3.0` + `device_map` + `base_model_tp_plan`
+- [x] **WARN→WARNING log normalization** — `_JsonFormatter` normalizes level names remapped by third-party libs (absl-py/gRPC)
+- [x] **CPU sharding guard** — allows CPU-only nanodes when `_is_sharded=True`
+- [x] **Model catalog routing** — `--runtime-model-id` separates catalog alias from HF weight loading
+- [x] **Chat template garbling** — switched to `tokenizer.apply_chat_template()` from naive string templates
+
+### Benchmark Results — 5-Stage WAN Pipeline (Qwen2.5-0.5B)
+
+| Metric | SHORT (10 words) | LONG (304 words) |
+|---|---|---|
+| Pipeline mode | sharded | sharded |
+| Stages | 5 | 5 |
+| TTFT | 40,704 ms | 53,713 ms |
+| Wall time | 40.7 s | 53.7 s |
+| Completion tokens | 10 | 23 |
+| TPS | 0.25 tok/s | 0.43 tok/s |
+
+### Nanodes (deleted after benchmarking)
+
+| Node | IP | Region | Layers | Status |
+|---|---|---|---|---|
+| nano-chennai | 172.232.97.56 | Chennai | [8, 12) | Deleted |
+| nano-mumbai | 172.236.187.59 | Mumbai | [12, 16) | Deleted |
+| nano-singapore1 | 139.162.16.181 | Singapore | [16, 20) | Deleted |
+| nano-singapore2 | 139.162.4.85 | Singapore | [20, 24) | Deleted |
+
+Full setup guide and snapshots preserved at `ops/nanode-snapshots/SETUP_GUIDE.md`.
+
+### New Files Created (v1.2)
+
+- `coordinator/specpipe_scheduler.py` (~220 lines) — SpecPipe scheduler
+- `coordinator/chunked_prefill.py` (~160 lines) — Chunked prefill
+- `coordinator/speculative_swarm.py` — DSD accept/reject logic
+- `coordinator/request_batcher.py` — Coordinator-level batching
+- `coordinator/peer_selector.py` — 5-factor RTT routing
+- `coordinator/mystery_shopper.py` — TOPLOC hash verification
+- `peer/activation_codec.py` — INT8 quantization codec
+- `peer/palu_codec.py` — Low-rank SVD compression
+- `verification/toploc.py` — SHA-256 activation hashing
+- `scripts/test_sharded_local.py` — Local 2-stage sharded pipeline test
+- `scripts/benchmarks/wan5_qwen25_05b_benchmark_2026-04-06.md` — WAN benchmark results
+- `ops/nanode-snapshots/SETUP_GUIDE.md` — Complete nanode recreation guide
+- `ops/nanode-snapshots/*/` — Per-node system state snapshots (4 nodes)
 
 ## Roadmap checklist (architecture v6 aligned)
 
@@ -201,6 +277,18 @@ Plan designed (pending approval) to transform OpenHydra from inference engine to
 Full roadmap in plan file. Key decisions: agent execution local-only (peers do inference, your machine runs code); MCP as tool standard; Apache 2.0 for maximum adoption; federated training = LoRA only (full pre-training is research-grade).
 
 ## Recent changes log
+
+### 2026-04-04 through 2026-04-06
+
+- **v1.2 Swarm Inference Optimization** (see v1.2 section above for full details):
+  - Implemented 8 swarm optimization techniques: DSD, SpecPipe, INT8, TOPLOC, PALU, Chunked Prefill, RTT routing, batching
+  - Replaced ToyRuntime hash-based mock with real tinyllama-15M model
+  - Deployed and tested 5-node WAN sharded pipeline (Bangalore→Chennai→Mumbai→Singapore×2)
+  - Expanded model catalog from 5 to 9 entries
+  - Fixed 7 critical bugs (position_embeddings, peer dedup, accelerate, logging, CPU sharding, model routing, chat templates)
+  - Nanode snapshots captured, setup guide written, nanodes deleted
+  - Test suite: `1103 passed, 9 skipped` (up from 1045)
+  - Key commits: `fadcc53`, `c109163`, `831c44f`
 
 ### 2026-03-19 through 2026-03-24
 
@@ -888,5 +976,9 @@ openhydra-peer --kv-compaction-enabled --kv-compaction-online \
 
 ## Highest-impact remaining work
 
-1. Tier 3 is complete; remaining work shifts to post-Tier-3 production operations (SLO instrumentation, DAO/on-chain integration, and multi-region rollout hardening).
-2. KV compaction Phase 2 β quality can be improved by passing actual query tensors from the forward pass instead of proxy-key reference queries (requires threading `Q` out of `_run_layers`).
+1. **Improve sharded pipeline TPS** — Current 0.25-0.43 TPS on 5-stage WAN is limited by sequential round-trips. Priorities: (a) SpecPipe tuning for higher acceptance rate, (b) parallel draft token evaluation, (c) KV cache persistence across rounds.
+2. **Larger model testing** — Qwen2.5-0.5B produces low-quality text. Test with 7B+ models across 8+ peers for coherent output.
+3. **On-chain / DAO integration** — `coordinator/ledger_bridge.py` defaults to `mock_mode=True`. Requires: Solidity state-channel contract, web3.py integration, stake resolver.
+4. **Multi-region soak testing** — Terraform IaC exists but has not been stress-tested with sustained multi-region load.
+5. **Rich interactive CLI** — Rewrite `coordinator/interactive_cli.py` to a Claude Code-style TUI with `prompt_toolkit`.
+6. **Tauri UI/UX polish** — Onboarding wizard, real-time peer map, model browser, earnings widget.
