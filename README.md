@@ -477,6 +477,8 @@ OpenHydra stands on the shoulders of remarkable projects and research:
 | Done | v1.1 Hybrid Local/Swarm Mode (75 TPS local, 20 TPS swarm on 8GB M1) |
 | Done | 4-bit auto-quantization, tokenizer caching, verification bypass |
 | Done | Premium Tauri desktop UI with Local/Swarm toggle |
+| Done | v1.2 Swarm Optimization: DSD, SpecPipe, INT8 compression, TOPLOC, Chunked Prefill |
+| Done | 5-node WAN sharded pipeline (Bangalore→Chennai→Mumbai→Singapore×2) |
 | Next | On-chain DAO (Solidity state-channel contract on Arbitrum/Base) |
 | Next | SDK v1 (Python + TypeScript, streaming, retry, type-safe) |
 | Next | P2P agentic swarms (agent sessions, tool execution, MCP) |
