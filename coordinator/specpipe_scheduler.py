@@ -410,6 +410,12 @@ class SpecPipeScheduler:
                     break
 
                 result_activation, _ = item
+                if tok_idx < 3:
+                    logger.debug(
+                        "pipelined_token_%d: activation_len=%d first_5=%s",
+                        tok_idx, len(result_activation),
+                        result_activation[:5] if len(result_activation) >= 5 else result_activation,
+                    )
                 token_id = int(round(result_activation[0]))
                 generated.append(token_id)
                 self._stats.real_tokens += 1
