@@ -373,7 +373,12 @@ class SpecPipeScheduler:
                     )
                     self._stats.total_stage_calls += 1
                     token_count += 1
-                    out_q.put((result, tok_idx))
+                    if stage_idx == n_stages - 1:
+                        # Last stage: push final result for collection
+                        out_q.put((result, tok_idx))
+                    else:
+                        # Intermediate stage: forward activation to next stage
+                        out_q.put((result, "", is_continuation, tok_idx))
                 except Exception as exc:
                     logger.warning(
                         "pipelined_stage_%d_failed: tok=%d err=%s",
