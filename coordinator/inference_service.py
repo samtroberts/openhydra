@@ -1027,11 +1027,26 @@ class InferenceService:
             decode_top_k=decode_top_k,
             decode_seed=decode_seed,
         )
+        # SpecPipe (P1-A): when enabled and pipeline has multiple stages,
+        # use concurrent speculative dispatch instead of sequential chain.
+        # Computed BEFORE chunked prefill so we can skip prefill when SpecPipe
+        # is active — SpecPipe handles its own prompt continuation and KV cache.
+        _specpipe_stats: dict[str, Any] = {}
+        _use_specpipe = (
+            self.config.specpipe_enabled
+            and len(prep.primary_pipeline) > 1
+            and prep.pipeline_mode == "sharded"
+        )
+
         # Chunked prefill (P1-B): split long prompts into chunks so other
         # clients' requests can interleave between chunks.
+        # Skip when SpecPipe is active — SpecPipe manages its own decode loop
+        # with KV-cached continuation, making chunked prefill redundant and
+        # wasteful (each chunk costs a full WAN pipeline traversal).
         _chunked_prefill_stats: dict[str, Any] = {}
         if (
-            self.config.chunked_prefill_enabled
+            not _use_specpipe
+            and self.config.chunked_prefill_enabled
             and len(prep.effective_prompt.split()) > self.config.chunked_prefill_chunk_size
         ):
             from coordinator.chunked_prefill import ChunkedPrefill, ChunkedPrefillConfig
@@ -1061,15 +1076,6 @@ class InferenceService:
             )
             _chunked_prefill_stats = _cp.stats
             logger.info("PROFILE chunked_prefill: %s", _chunked_prefill_stats)
-
-        # SpecPipe (P1-A): when enabled and pipeline has multiple stages,
-        # use concurrent speculative dispatch instead of sequential chain.
-        _specpipe_stats: dict[str, Any] = {}
-        _use_specpipe = (
-            self.config.specpipe_enabled
-            and len(prep.primary_pipeline) > 1
-            and prep.pipeline_mode == "sharded"
-        )
 
         _t_chain_start = time.perf_counter()
 
@@ -1136,7 +1142,7 @@ class InferenceService:
                     # Build input from context token IDs or prompt
                     if ctx and any(abs(c) > 1 for c in ctx):
                         input_ids = torch.tensor(
-                            [ctx[-min(128, len(ctx)):]],
+                            [ctx[-min(512, len(ctx)):]],
                             dtype=torch.long,
                         )
                     else:
@@ -1148,8 +1154,7 @@ class InferenceService:
                         out = _draft_fn._model.generate(
                             input_ids=input_ids,
                             max_new_tokens=k,
-                            do_sample=True,
-                            temperature=0.7,
+                            do_sample=False,
                         )
                     new_ids = out[0][input_ids.shape[1]:].tolist()
                     return new_ids[:k]
@@ -1176,31 +1181,39 @@ class InferenceService:
             _runtime_model = self._resolve_pipeline_runtime_model_id(
                 prep.primary_pipeline, prep.decision.served_model,
             )
-            all_token_ids: list[int] = []
-            for _round in range(max(1, max_tokens)):
-                # Build continuation prompt: base prompt + decoded generated tokens
-                if all_token_ids:
-                    try:
-                        _tok = self._engine._load_generation_tokenizer(_runtime_model)
-                        _continuation = _tok.decode(all_token_ids, skip_special_tokens=True)
-                        _full_prompt = _base_prompt + _continuation
-                    except Exception:
-                        _full_prompt = _base_prompt
-                else:
-                    _full_prompt = _base_prompt
+            _kv_sid = f"specpipe-{request_id}" if request_id else None
 
-                context = all_token_ids if all_token_ids else [0]
-                _kv_sid = f"specpipe-{request_id}" if request_id else None
-                accepted = scheduler.run_round(
-                    context_ids=context,
-                    prompt=_full_prompt,
-                    max_tokens=max_tokens - len(all_token_ids),
+            # Use pipelined execution for 3+ stages (overlaps tokens
+            # across stages for higher throughput).  Fall back to the
+            # round-based loop for 2-stage pipelines where pipelining
+            # overhead outweighs the benefit.
+            if len(prep.primary_pipeline) >= 3:
+                all_token_ids = scheduler.run_pipelined(
+                    context_ids=[0],
+                    prompt=_base_prompt,
+                    max_tokens=max_tokens,
                     request_id=request_id,
                     kv_session_id=_kv_sid,
                 )
-                all_token_ids.extend(accepted)
-                if len(all_token_ids) >= max_tokens:
-                    break
+            else:
+                all_token_ids = []
+                for _round in range(max(1, max_tokens)):
+                    if _round == 0:
+                        _full_prompt = _base_prompt
+                    else:
+                        _full_prompt = _base_prompt
+
+                    context = all_token_ids if all_token_ids else [0]
+                    accepted = scheduler.run_round(
+                        context_ids=context,
+                        prompt=_full_prompt,
+                        max_tokens=max_tokens - len(all_token_ids),
+                        request_id=request_id,
+                        kv_session_id=_kv_sid,
+                    )
+                    all_token_ids.extend(accepted)
+                    if len(all_token_ids) >= max_tokens:
+                        break
 
             scheduler.shutdown()
             _specpipe_stats = {

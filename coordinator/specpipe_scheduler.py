@@ -195,8 +195,8 @@ class SpecPipeScheduler:
                     kv_session_id=kv_session_id or "",
                     kv_store_activation=bool(kv_session_id),
                     kv_use_cached_activation=_is_continuation,
-                    decode_temperature=0.7,
-                    decode_do_sample=True,
+                    decode_temperature=0.0,
+                    decode_do_sample=False,
                     **stage_kwargs,
                 )
                 self._stats.total_stage_calls += 1
@@ -217,6 +217,9 @@ class SpecPipeScheduler:
             def _run_spec_through_pipeline(draft_id: int, spec_idx: int) -> int:
                 """Run one speculative token through all pipeline stages."""
                 activation = [float(draft_id)]
+                # Each spec token gets its own KV session to avoid
+                # polluting the real token's cache.
+                _spec_kv = f"{kv_session_id}-spec-{spec_idx}" if kv_session_id else ""
                 for stage_idx in range(n_stages):
                     peer = self._pipeline[stage_idx]
                     try:
@@ -228,6 +231,9 @@ class SpecPipeScheduler:
                             total_stages=n_stages,
                             max_tokens=1,
                             request_id=f"{rid}-spec-{spec_idx}",
+                            kv_session_id=_spec_kv,
+                            kv_store_activation=bool(_spec_kv),
+                            kv_use_cached_activation=False,
                             **stage_kwargs,
                         )
                         self._stats.total_stage_calls += 1
@@ -283,6 +289,156 @@ class SpecPipeScheduler:
         )
 
         return accepted
+
+    # ------------------------------------------------------------------
+    # Pipelined execution: stages process different tokens concurrently
+    # ------------------------------------------------------------------
+
+    def run_pipelined(
+        self,
+        context_ids: list[int],
+        prompt: str,
+        max_tokens: int = 16,
+        request_id: str | None = None,
+        kv_session_id: str | None = None,
+        **stage_kwargs: Any,
+    ) -> list[int]:
+        """Generate tokens with overlapped pipeline stages.
+
+        Instead of waiting for a token to traverse all N stages before
+        starting the next, each stage runs in its own worker thread with
+        an input queue.  After the pipeline fills (N stage latencies),
+        one token exits per stage latency — up to N× throughput.
+
+        Flow::
+
+            Stage 0: [T1] [T2] [T3] ...
+            Stage 1:      [T1] [T2] ...
+            Stage 2:           [T1] ...
+
+        Args:
+            context_ids: Initial token context (prompt token IDs).
+            prompt: Text prompt for stage 0 on the first token.
+            max_tokens: Number of tokens to generate.
+            request_id: Correlation ID for logging.
+            kv_session_id: KV cache session ID.  Each stage caches its
+                past_key_values under this ID for incremental decode.
+
+        Returns:
+            List of generated token IDs.
+        """
+        import queue
+        import threading
+
+        rid = request_id or str(uuid.uuid4())[:8]
+        n_stages = len(self._pipeline)
+        t_start = time.perf_counter()
+
+        # One queue per stage boundary: queue[0] feeds stage 0, queue[N] is output.
+        stage_queues: list[queue.Queue] = [queue.Queue(maxsize=4) for _ in range(n_stages + 1)]
+        stop_event = threading.Event()
+
+        def _stage_worker(stage_idx: int) -> None:
+            """Pull tokens from input queue, process, push to next queue."""
+            in_q = stage_queues[stage_idx]
+            out_q = stage_queues[stage_idx + 1]
+            peer = self._pipeline[stage_idx]
+            token_count = 0
+
+            while not stop_event.is_set():
+                try:
+                    item = in_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if item is None:  # Poison pill — shutdown
+                    out_q.put(None)
+                    break
+
+                activation, tok_prompt, is_continuation, tok_idx = item
+                try:
+                    result = self._stage_fn(
+                        peer=peer,
+                        activation=activation,
+                        prompt=tok_prompt if stage_idx == 0 else "",
+                        stage_index=stage_idx,
+                        total_stages=n_stages,
+                        max_tokens=1,
+                        request_id=f"{rid}-t{tok_idx}",
+                        kv_session_id=kv_session_id or "",
+                        kv_store_activation=bool(kv_session_id),
+                        kv_use_cached_activation=is_continuation,
+                        decode_temperature=0.0,
+                        decode_do_sample=False,
+                        **stage_kwargs,
+                    )
+                    self._stats.total_stage_calls += 1
+                    token_count += 1
+                    out_q.put((result, tok_idx))
+                except Exception as exc:
+                    logger.warning(
+                        "pipelined_stage_%d_failed: tok=%d err=%s",
+                        stage_idx, tok_idx, exc,
+                    )
+                    out_q.put((None, tok_idx))
+
+        # Start per-stage worker threads
+        workers = []
+        for s in range(n_stages):
+            t = threading.Thread(
+                target=_stage_worker, args=(s,),
+                name=f"pipe-stage-{s}", daemon=True,
+            )
+            t.start()
+            workers.append(t)
+
+        generated: list[int] = []
+
+        try:
+            # Token 0: full prompt (prefill)
+            stage_queues[0].put(([], prompt, False, 0))
+
+            for tok_idx in range(max_tokens):
+                # Wait for the token to exit the last stage
+                item = stage_queues[n_stages].get(timeout=30.0)
+                if item is None or item[0] is None:
+                    logger.warning("pipelined_token_%d_failed", tok_idx)
+                    break
+
+                result_activation, _ = item
+                token_id = int(round(result_activation[0]))
+                generated.append(token_id)
+                self._stats.real_tokens += 1
+                self._stats.rounds += 1
+
+                if tok_idx + 1 >= max_tokens:
+                    break
+
+                # Feed next token: KV-cached continuation (single token ID)
+                stage_queues[0].put(
+                    ([float(token_id)], "", True, tok_idx + 1)
+                )
+        except Exception as exc:
+            logger.warning("pipelined_generation_error: %s", exc)
+        finally:
+            # Send poison pills and wait for workers
+            stop_event.set()
+            for s in range(n_stages):
+                try:
+                    stage_queues[s].put(None, timeout=0.5)
+                except queue.Full:
+                    pass
+            for w in workers:
+                w.join(timeout=3.0)
+
+        elapsed = time.perf_counter() - t_start
+        self._stats.total_wall_ms += elapsed * 1000
+        logger.info(
+            "pipelined_done: tokens=%d wall=%.0fms tps=%.2f stages=%d",
+            len(generated), elapsed * 1000,
+            len(generated) / elapsed if elapsed > 0 else 0,
+            n_stages,
+        )
+        return generated
 
     def shutdown(self) -> None:
         """Shutdown the thread pool."""
