@@ -83,6 +83,13 @@ terraform.tfplan
 # ── Docker ────────────────────────────────────────────────────────────────────
 .docker/
 
+# ── Claude Code / Wrangler ────────────────────────────────────────────────
+.claude/
+.wrangler/
+
+# ── Nanode snapshots (contain system state, may have tokens in logs) ──────
+ops/nanode-snapshots/
+
 # ── OS / editors ──────────────────────────────────────────────────────────────
 .DS_Store
 .DS_Store?
