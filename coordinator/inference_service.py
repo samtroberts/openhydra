@@ -1187,7 +1187,7 @@ class InferenceService:
             # across stages for higher throughput).  Fall back to the
             # round-based loop for 2-stage pipelines where pipelining
             # overhead outweighs the benefit.
-            if len(prep.primary_pipeline) >= 3:
+            if len(prep.primary_pipeline) >= 2:
                 all_token_ids = scheduler.run_pipelined(
                     context_ids=[0],
                     prompt=_base_prompt,
