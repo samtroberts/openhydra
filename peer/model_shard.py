@@ -187,6 +187,60 @@ class _DecoderArchitecture:
     rotary_emb: Any | None = None
 
 
+def _count_model_layers(model_name: str) -> int:
+    """Read num_hidden_layers from a model's config.json without loading weights."""
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+        return int(getattr(config, "num_hidden_layers", 0))
+    except Exception:
+        return 0
+
+
+def _build_selective_device_map(
+    model_name: str,
+    layer_indices: tuple[int, ...],
+    target_device: int | str = 0,
+) -> dict[str, int | str]:
+    """Build a device_map that loads only the assigned layers into real memory.
+
+    Unassigned transformer layers are mapped to ``"disk"`` which causes
+    accelerate to offload them (effectively zero resident memory).
+    Only the assigned layers + shared components (embeddings, norm, lm_head)
+    are loaded onto the target device.
+
+    This reduces peak memory from full-model to approximately
+    ``shard_layers * layer_size + embeddings + lm_head``.
+
+    Args:
+        model_name: HuggingFace model ID or local path.
+        layer_indices: Tuple of layer indices this shard is assigned.
+        target_device: Device index (0 for first CPU/GPU) for real layers.
+
+    Requires ``accelerate>=1.13.0``.
+    """
+    total = _count_model_layers(model_name)
+    if total <= 0:
+        return {"": target_device}  # Fallback: load everything
+
+    layer_set = set(int(i) for i in layer_indices)
+    dm: dict[str, int | str] = {
+        "model.embed_tokens": target_device,
+        "model.norm": target_device,
+        "model.rotary_emb": target_device,
+        "lm_head": target_device,
+    }
+    for i in range(total):
+        dm[f"model.layers.{i}"] = target_device if i in layer_set else "disk"
+
+    loaded = len(layer_set & set(range(total)))
+    logging.info(
+        "selective_device_map: %d/%d layers on device %s, %d offloaded to disk",
+        loaded, total, target_device, total - loaded,
+    )
+    return dm
+
+
 _tinyllama_cache: dict[str, Any] = {}
 
 
@@ -545,17 +599,56 @@ class PyTorchRuntime:
         elif _is_sharded:
             self._dtype = torch.float16  # Override fp32 default for memory-constrained shards
             load_kwargs["torch_dtype"] = torch.float16
-            load_kwargs["device_map"] = {"": "cpu"}
+            # Selective weight loading: compute which layers this shard needs
+            # BEFORE loading the model, then map unneeded layers to "meta"
+            # device (zero memory). This reduces peak memory from full-model
+            # to shard-size + embeddings + lm_head.
+            _pre_layer_indices = self._resolve_layer_indices(
+                total_layers=_count_model_layers(self.model_name),
+                shard_index=max(0, int(config.shard_index)),
+                total_shards=max(1, int(config.total_shards)),
+                explicit_indices=tuple(config.runtime_layer_indices),
+            )
+            if _pre_layer_indices:
+                load_kwargs["device_map"] = _build_selective_device_map(
+                    model_name=self.model_name,
+                    layer_indices=_pre_layer_indices,
+                    target_device=0,
+                )
+                # offload_folder required for "disk"-mapped layers
+                import tempfile as _tempfile
+                self._offload_dir = _tempfile.mkdtemp(prefix="openhydra-offload-")
+                load_kwargs["offload_folder"] = self._offload_dir
+            else:
+                load_kwargs["device_map"] = {"": "cpu"}  # Fallback
         else:
             load_kwargs["torch_dtype"] = self._dtype
 
         try:
+            # Skip caching_allocator_warmup for selective loading — it tries
+            # to pre-allocate ALL real-device parameters as one contiguous
+            # block, which OOMs on memory-constrained devices even though the
+            # actual per-layer allocations would fit fine.
+            _patched_warmup = False
+            if _is_sharded and "device_map" in load_kwargs:
+                try:
+                    import transformers.modeling_utils as _tmu
+                    _orig_warmup = getattr(_tmu, "caching_allocator_warmup", None)
+                    if _orig_warmup is not None:
+                        _tmu.caching_allocator_warmup = lambda *a, **kw: None
+                        _patched_warmup = True
+                except Exception:
+                    pass
+
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 trust_remote_code=self._trust_remote_code,
                 **load_kwargs,
             )
             quantized_weights_loaded = quantization_config is not None
+
+            if _patched_warmup and _orig_warmup is not None:
+                _tmu.caching_allocator_warmup = _orig_warmup
         except Exception as exc:
             if quantization_config is None:
                 raise
@@ -581,7 +674,10 @@ class PyTorchRuntime:
         if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token is not None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
 
-        if not quantized_weights_loaded:
+        # Skip .to() when using selective device_map (accelerate manages placement)
+        # or when quantized weights are already on device.
+        _has_selective_map = isinstance(load_kwargs.get("device_map"), dict) and "disk" in load_kwargs["device_map"].values()
+        if not quantized_weights_loaded and not _has_selective_map:
             self._model.to(self._device)
         self._model.eval()
 
