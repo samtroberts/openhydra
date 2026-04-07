@@ -404,7 +404,7 @@ class SpecPipeScheduler:
 
             for tok_idx in range(max_tokens):
                 # Wait for the token to exit the last stage
-                item = stage_queues[n_stages].get(timeout=30.0)
+                item = stage_queues[n_stages].get(timeout=120.0)
                 if item is None or item[0] is None:
                     logger.warning("pipelined_token_%d_failed", tok_idx)
                     break
