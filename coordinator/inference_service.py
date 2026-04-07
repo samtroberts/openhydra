@@ -1226,14 +1226,28 @@ class InferenceService:
             }
             logger.info("PROFILE specpipe: %s", _specpipe_stats)
 
-            # Build a ChainResult from the specpipe output
-            output_text = ModelShard.decode_text(
-                [float(t) for t in all_token_ids],
-                max_tokens=max_tokens,
-                tokenizer_model_id=self._resolve_pipeline_runtime_model_id(
-                    prep.primary_pipeline, prep.decision.served_model,
-                ),
+            # Build a ChainResult from the specpipe output.
+            # Use the coordinator's tokenizer directly for reliable decode
+            # instead of ModelShard.decode_text() which has a 48-token cap
+            # and falls back to a vocab table for non-HF models.
+            _runtime_model = self._resolve_pipeline_runtime_model_id(
+                prep.primary_pipeline, prep.decision.served_model,
             )
+            logger.info(
+                "specpipe_decode: token_ids=%s model=%s",
+                all_token_ids[:10], _runtime_model,
+            )
+            try:
+                _decode_tok = self._engine._load_generation_tokenizer(_runtime_model)
+                output_text = _decode_tok.decode(
+                    all_token_ids, skip_special_tokens=True,
+                ).strip()
+            except Exception:
+                output_text = ModelShard.decode_text(
+                    [float(t) for t in all_token_ids],
+                    max_tokens=max_tokens,
+                    tokenizer_model_id=_runtime_model,
+                )
             primary = ChainResult(
                 request_id=request_id or str(uuid.uuid4()),
                 text=output_text,
