@@ -610,10 +610,12 @@ class PyTorchRuntime:
                 explicit_indices=tuple(config.runtime_layer_indices),
             )
             if _pre_layer_indices:
+                # Use device index 0 for CUDA, "cpu" string for CPU-only.
+                _sel_device: int | str = 0 if target == "cuda" else "cpu"
                 load_kwargs["device_map"] = _build_selective_device_map(
                     model_name=self.model_name,
                     layer_indices=_pre_layer_indices,
-                    target_device=0,
+                    target_device=_sel_device,
                 )
                 # offload_folder required for "disk"-mapped layers
                 import tempfile as _tempfile
@@ -676,7 +678,8 @@ class PyTorchRuntime:
 
         # Skip .to() when using selective device_map (accelerate manages placement)
         # or when quantized weights are already on device.
-        _has_selective_map = isinstance(load_kwargs.get("device_map"), dict) and "disk" in load_kwargs["device_map"].values()
+        _dm_values = set(load_kwargs.get("device_map", {}).values()) if isinstance(load_kwargs.get("device_map"), dict) else set()
+        _has_selective_map = bool(_dm_values & {"disk", "meta"})
         if not quantized_weights_loaded and not _has_selective_map:
             self._model.to(self._device)
         self._model.eval()
