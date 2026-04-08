@@ -221,9 +221,21 @@ class PeerEndpoint:
     # Pass 6: KV compaction SLO metrics — lifetime counters.
     compact_tokens_saved_total: int = 0
     compact_latency_total_ms: float = 0.0
+    # Petals parity Phase C: NAT traversal and relay.
+    nat_type: str = "unknown"
+    requires_relay: bool = False
+    relay_peer_id: str = ""
+    relay_address: str = ""
 
     @property
     def address(self) -> str:
+        """Return the effective address for gRPC connections.
+
+        If the peer requires a relay, return the relay address instead
+        of the peer's direct address.
+        """
+        if self.requires_relay and self.relay_address:
+            return self.relay_address
         return f"{self.host}:{self.port}"
 
     @classmethod
@@ -287,6 +299,10 @@ class PeerEndpoint:
             next_hop_rtts=_parse_next_hop_rtts(data.get("next_hop_rtts_json", "") or data.get("next_hop_rtts", {})),
             compact_tokens_saved_total=int(data.get("compact_tokens_saved_total", 0)),
             compact_latency_total_ms=float(data.get("compact_latency_total_ms", 0.0)),
+            nat_type=str(data.get("nat_type", "unknown")),
+            requires_relay=bool(data.get("requires_relay", False)),
+            relay_peer_id=str(data.get("relay_peer_id", "")),
+            relay_address=str(data.get("relay_address", "")),
         )
 
     def replace(self, **overrides: Any) -> "PeerEndpoint":
