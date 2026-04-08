@@ -80,6 +80,8 @@ class InferenceChain:
         advanced_encryption_seed: str = "openhydra-tier3-dev-seed",
         advanced_encryption_level: str = "standard",
         activation_quantization_enabled: bool = False,
+        stream_pool: Any | None = None,
+        session: Any | None = None,
     ):
         if not pipeline:
             raise ValueError("pipeline must contain at least one peer")
@@ -100,6 +102,9 @@ class InferenceChain:
         self._last_onion_route_state: dict[str, object] | None = None
         self._last_onion_next_peer_id: str | None = None
         self._last_privacy_audit: dict[str, float | int | bool | str] | None = None
+        # Phase B: Persistent streaming + session history
+        self._stream_pool = stream_pool
+        self._session = session
 
     def _request_stage(
         self,
@@ -270,11 +275,36 @@ class InferenceChain:
         _t_serial_ms = (time.perf_counter() - _t_serial_start) * 1000
         _t_grpc_start = time.perf_counter()
         t0 = time.perf_counter()
-        with create_channel(peer.address, self.transport_config) as channel:
-            stub = peer_pb2_grpc.PeerStub(channel)
-            response = stub.Forward(req, timeout=effective_timeout)
+
+        # Phase B: Try persistent streaming connection first (avoids
+        # per-request channel creation overhead ~5-15ms per hop).
+        _kv_sid = str(kv_session_id or "").strip()
+        _used_stream = False
+        if self._stream_pool and _kv_sid:
+            try:
+                handle = self._stream_pool.get_or_create(
+                    peer.peer_id, _kv_sid, peer.host, peer.port,
+                )
+                if handle is not None:
+                    response = self._stream_pool.send_and_receive(
+                        handle, req, timeout_s=effective_timeout,
+                    )
+                    _used_stream = True
+            except Exception as exc:
+                logger.debug("stream_fallback: peer=%s err=%s", peer.peer_id, exc)
+                _used_stream = False
+
+        if not _used_stream:
+            with create_channel(peer.address, self.transport_config) as channel:
+                stub = peer_pb2_grpc.PeerStub(channel)
+                response = stub.Forward(req, timeout=effective_timeout)
+
         latency_ms = (time.perf_counter() - t0) * 1000.0
         _t_grpc_ms = (time.perf_counter() - _t_grpc_start) * 1000
+
+        # Phase B: Record in session history for failover replay
+        if self._session is not None:
+            self._session.record(req, response)
         _t_deser_start = time.perf_counter()
         self._last_stage_kv_cache_hit = bool(getattr(response, "kv_cache_hit", False))
         if response.error:

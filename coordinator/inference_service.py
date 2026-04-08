@@ -588,6 +588,16 @@ class InferenceService:
         # monkeypatching coordinator.engine.InferenceChain works in tests.
         import coordinator.engine as _engine_mod
         _InferenceChain = getattr(_engine_mod, "InferenceChain", InferenceChain)
+        # Phase B: create InferenceSession for history replay on failover
+        _session = None
+        if self.config.streaming_sessions_enabled and kv_session_id:
+            from coordinator.stream_pool import InferenceSession
+            _session = InferenceSession(
+                session_id=str(kv_session_id),
+                model_id=str(pipeline[0].model_id or "") if pipeline else "",
+                prompt=prompt,
+            )
+
         chain = _InferenceChain(
             pipeline,
             timeout_ms=self.config.timeout_ms,
@@ -598,6 +608,8 @@ class InferenceService:
             advanced_encryption_seed=str(self.config.advanced_encryption_seed),
             advanced_encryption_level=str(self.config.advanced_encryption_level),
             activation_quantization_enabled=self.config.activation_quantization_enabled,
+            stream_pool=getattr(self, "_stream_pool", None),
+            session=_session,
         )
         run_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,

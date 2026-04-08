@@ -832,6 +832,7 @@ def test_run_chain_passes_tensor_autoencoder_config(tmp_path, monkeypatch):
             advanced_encryption_seed,
             advanced_encryption_level,
             activation_quantization_enabled=False,
+            **kwargs,
         ):
             captured["pipeline"] = pipeline
             captured["timeout_ms"] = timeout_ms
