@@ -131,6 +131,8 @@ class EngineConfig:
     # Petals parity Phase A: server-to-server push mode
     push_mode_enabled: bool = False
     push_callback_address: str = ""  # "host:port" where PushResult arrives
+    # Petals parity Phase B: stateful streaming sessions + history replay
+    streaming_sessions_enabled: bool = False
     # P1-A: SpecPipe — pipeline-filling speculative decoding
     specpipe_enabled: bool = False
     specpipe_max_depth: int = 4
@@ -390,6 +392,12 @@ class CoordinatorEngine:
             _last_scored_peers=self._last_scored_peers,
             engine=self,
         )
+        # Phase B: attach StreamPool for persistent streaming connections
+        if self.config.streaming_sessions_enabled:
+            from coordinator.stream_pool import StreamPool
+            self._inference_svc._stream_pool = StreamPool(
+                idle_timeout_s=30.0, max_streams=256,
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     # Kept: helpers used by __init__ (called before services exist)
