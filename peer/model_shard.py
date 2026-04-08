@@ -718,6 +718,29 @@ class PyTorchRuntime:
                     freed, self.total_layers,
                 )
 
+        # Remove accelerate dispatch hooks from kept modules.
+        # When using selective device_map with "disk" offloading, accelerate
+        # wraps EVERY module (including real on-device layers) with dispatch
+        # hooks that check on each forward() whether to load from disk.
+        # This adds 10-50ms overhead per layer per forward call — crippling
+        # for GPU inference where the actual compute is <5ms/layer.
+        # Removing hooks from kept modules restores native PyTorch speed.
+        if _has_selective_map:
+            try:
+                from accelerate.hooks import remove_hook_from_module
+                _hooks_removed = 0
+                for module in self._model.modules():
+                    if hasattr(module, "_hf_hook"):
+                        remove_hook_from_module(module)
+                        _hooks_removed += 1
+                if _hooks_removed > 0:
+                    logging.info(
+                        "accelerate_hooks_removed: %d modules unhooked for native speed",
+                        _hooks_removed,
+                    )
+            except Exception as exc:
+                logging.debug("accelerate_hook_removal_failed: %s", exc)
+
         self._hidden_size = int(
             getattr(self._model.config, "hidden_size", 0)
             or getattr(self._model.config, "n_embd", 0)
