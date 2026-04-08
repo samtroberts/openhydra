@@ -719,6 +719,164 @@ class InferenceChain:
             activation_hash=bytes(_last_activation_hash),
         )
 
+    # ── Push mode: server-to-server forwarding (Petals parity) ────────────
+
+    def run_push(
+        self,
+        prompt: str,
+        max_tokens: int = 1,
+        request_id: str | None = None,
+        deadline: float | None = None,
+        kv_session_id: str | None = None,
+        kv_store_activation: bool = False,
+        kv_use_cached_activation: bool = False,
+        callback_address: str = "",
+        **decode_controls: Any,
+    ) -> ChainResult:
+        """Execute the pipeline in push mode: peers forward directly to each other.
+
+        Instead of the coordinator mediating every hop, the first peer
+        forwards its output to the second peer, the second to the third,
+        etc.  The last peer sends the final result back to the coordinator
+        via the PushResult RPC.
+
+        This eliminates N-1 coordinator round-trips per token.
+        Falls back to ``run()`` if push mode fails.
+        """
+        from coordinator.push_receiver import register_push, await_push
+        from peer import peer_pb2
+
+        rid = request_id or str(uuid.uuid4())
+        n = len(self.pipeline)
+        t_start = time.perf_counter()
+
+        if n < 2 or not callback_address:
+            # Push mode needs 2+ stages and a callback address
+            return self.run(
+                prompt=prompt, max_tokens=max_tokens,
+                request_id=rid, deadline=deadline,
+                kv_session=kv_session_id,
+                kv_store_activation=kv_store_activation,
+                kv_use_cached_activation=kv_use_cached_activation,
+                **decode_controls,
+            )
+
+        # Build the route for remaining hops
+        route_hops = []
+        for i, peer in enumerate(self.pipeline):
+            route_hops.append(peer_pb2.PeerHop(
+                peer_id=peer.peer_id,
+                address=f"{peer.host}:{peer.port}",
+                stage_index=i,
+                shard_layer_start=int(getattr(peer, "layer_start", 0)),
+                shard_layer_end=int(getattr(peer, "layer_end", 0)),
+                shard_total_layers=int(getattr(peer, "total_layers", 0)),
+            ))
+
+        # Register the result callback
+        future = register_push(rid)
+
+        # Build request to the first peer with full route
+        first_peer = self.pipeline[0]
+        next_addr = f"{self.pipeline[1].host}:{self.pipeline[1].port}" if n > 1 else ""
+        next_id = self.pipeline[1].peer_id if n > 1 else ""
+
+        req = peer_pb2.ForwardRequest(
+            request_id=rid,
+            prompt=prompt,
+            activation=[],
+            stage_index=0,
+            total_stages=n,
+            max_tokens=max_tokens,
+            kv_session_id=kv_session_id or "",
+            kv_store_activation=kv_store_activation,
+            kv_use_cached_activation=kv_use_cached_activation,
+            decode_do_sample=bool(decode_controls.get("decode_do_sample", False)),
+            decode_temperature=float(decode_controls.get("decode_temperature", 0.0) or 0.0),
+            decode_top_p=float(decode_controls.get("decode_top_p", 0.0) or 0.0),
+            decode_top_k=int(decode_controls.get("decode_top_k", 0) or 0),
+            decode_seed=int(decode_controls.get("decode_seed", 0) or 0),
+            shard_layer_start=int(getattr(first_peer, "layer_start", 0)),
+            shard_layer_end=int(getattr(first_peer, "layer_end", 0)),
+            shard_total_layers=int(getattr(first_peer, "total_layers", 0)),
+            push_mode=True,
+            next_hop_address=next_addr,
+            next_hop_peer_id=next_id,
+            final_callback_address=callback_address,
+            final_callback_request_id=rid,
+            remaining_route=route_hops[1:],  # Skip first peer (that's where we're sending)
+        )
+
+        # Send to first peer (non-blocking from coordinator's perspective
+        # — the peer chain handles the rest)
+        try:
+            first_addr = f"{first_peer.host}:{first_peer.port}"
+            channel = grpc.insecure_channel(
+                first_addr,
+                options=[
+                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ],
+            )
+            stub = peer_pb2_grpc.PeerStub(channel)
+            stub.Forward(req, timeout=min(self.timeout_s, 60.0))
+            channel.close()
+        except Exception as exc:
+            logger.warning("push_initial_send_failed: %s: %s — falling back to run()", first_addr, exc)
+            from coordinator.push_receiver import cancel_push
+            cancel_push(rid)
+            return self.run(
+                prompt=prompt, max_tokens=max_tokens,
+                request_id=rid, deadline=deadline,
+                kv_session=kv_session_id,
+                kv_store_activation=kv_store_activation,
+                kv_use_cached_activation=kv_use_cached_activation,
+                **decode_controls,
+            )
+
+        # Wait for the final result from the last peer
+        timeout_s = 120.0
+        if deadline:
+            timeout_s = max(1.0, deadline - time.perf_counter())
+        try:
+            result_response = await_push(rid, timeout_s=timeout_s)
+        except Exception as exc:
+            logger.warning("push_await_failed: %s: %s — falling back to run()", rid, exc)
+            return self.run(
+                prompt=prompt, max_tokens=max_tokens,
+                request_id=rid, deadline=deadline,
+                kv_session=kv_session_id,
+                kv_store_activation=kv_store_activation,
+                kv_use_cached_activation=kv_use_cached_activation,
+                **decode_controls,
+            )
+
+        total_ms = (time.perf_counter() - t_start) * 1000
+        activation = list(result_response.activation) if hasattr(result_response, "activation") else []
+        output = ""
+        if activation:
+            output = ModelShard.decode_text(
+                activation,
+                max_tokens=max_tokens,
+                tokenizer_model_id=(
+                    str(getattr(self.pipeline[-1], "runtime_model_id", "") or "").strip()
+                    or None
+                ),
+            )
+
+        logger.info(
+            "push_chain_complete: req=%s stages=%d wall=%.0fms activation_len=%d",
+            rid, n, total_ms, len(activation),
+        )
+        return ChainResult(
+            request_id=rid,
+            text=output,
+            activation=activation,
+            traces=[],
+            latency_ms=total_ms,
+            activation_hash=bytes(getattr(result_response, "activation_hash", b"")),
+        )
+
 
 def _suite_name(level: str) -> str:
     normalized = str(level or "standard").strip().lower()

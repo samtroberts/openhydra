@@ -581,7 +581,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             except Exception:
                 pass
 
-            return peer_pb2.ForwardResponse(
+            response = peer_pb2.ForwardResponse(
                 request_id=request.request_id,
                 peer_id=self.peer_id,
                 activation=activation,
@@ -603,6 +603,42 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
                 activation_hash=_act_hash,
             )
+
+            # ── Push mode: forward to next peer or return to coordinator ──
+            if bool(getattr(request, "push_mode", False)):
+                next_addr = str(getattr(request, "next_hop_address", "") or "").strip()
+                callback_addr = str(getattr(request, "final_callback_address", "") or "").strip()
+                remaining = list(getattr(request, "remaining_route", []))
+
+                if next_addr:
+                    # Forward activation to next peer in chain
+                    self._push_to_next_hop(
+                        request=request,
+                        response=response,
+                        next_address=next_addr,
+                        remaining_route=remaining,
+                    )
+                    return peer_pb2.ForwardResponse(
+                        request_id=request.request_id,
+                        peer_id=self.peer_id,
+                        stage_index=request.stage_index,
+                        error="",
+                    )
+                elif callback_addr:
+                    # Last peer: send result back to coordinator
+                    self._push_final_result(
+                        response=response,
+                        callback_address=callback_addr,
+                        callback_request_id=str(getattr(request, "final_callback_request_id", "") or ""),
+                    )
+                    return peer_pb2.ForwardResponse(
+                        request_id=request.request_id,
+                        peer_id=self.peer_id,
+                        stage_index=request.stage_index,
+                        error="",
+                    )
+
+            return response
         except Exception as exc:  # pragma: no cover
             return peer_pb2.ForwardResponse(
                 request_id=request.request_id,
@@ -628,6 +664,122 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         finally:
             with self._lock:
                 self._inflight = max(0, self._inflight - 1)
+
+    # ── Push mode: server-to-server forwarding (Petals parity) ─────────────
+
+    def _push_to_next_hop(
+        self,
+        request: peer_pb2.ForwardRequest,
+        response: peer_pb2.ForwardResponse,
+        next_address: str,
+        remaining_route: list,
+    ) -> None:
+        """Forward activation to the next peer in the push chain."""
+        try:
+            from coordinator.transport import create_channel
+
+            # Build next request: carry the activation + remaining route
+            next_route = remaining_route[1:] if len(remaining_route) > 1 else []
+            next_next_addr = ""
+            next_next_id = ""
+            if next_route:
+                next_next_addr = str(next_route[0].address)
+                next_next_id = str(next_route[0].peer_id)
+
+            next_req = peer_pb2.ForwardRequest(
+                request_id=request.request_id,
+                prompt="",  # Only stage 0 gets the prompt
+                activation=list(response.activation),
+                stage_index=request.stage_index + 1,
+                total_stages=request.total_stages,
+                max_tokens=request.max_tokens,
+                kv_session_id=request.kv_session_id,
+                kv_store_activation=request.kv_store_activation,
+                kv_use_cached_activation=request.kv_use_cached_activation,
+                decode_do_sample=request.decode_do_sample,
+                decode_temperature=request.decode_temperature,
+                decode_top_p=request.decode_top_p,
+                decode_top_k=request.decode_top_k,
+                decode_seed=request.decode_seed,
+                shard_layer_start=next_route[0].shard_layer_start if next_route else 0,
+                shard_layer_end=next_route[0].shard_layer_end if next_route else 0,
+                shard_total_layers=next_route[0].shard_total_layers if next_route else 0,
+                push_mode=True,
+                next_hop_address=next_next_addr,
+                next_hop_peer_id=next_next_id,
+                final_callback_address=request.final_callback_address,
+                final_callback_request_id=request.final_callback_request_id,
+                remaining_route=next_route,
+            )
+
+            channel = grpc.insecure_channel(
+                next_address,
+                options=[
+                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ],
+            )
+            stub = peer_pb2_grpc.PeerStub(channel)
+            stub.Forward(next_req, timeout=60.0)
+            channel.close()
+            logger.info(
+                "push_forwarded: req=%s stage=%d -> %s",
+                request.request_id, request.stage_index, next_address,
+            )
+        except Exception as exc:
+            logger.warning("push_forward_failed: %s -> %s: %s", self.peer_id, next_address, exc)
+
+    def _push_final_result(
+        self,
+        response: peer_pb2.ForwardResponse,
+        callback_address: str,
+        callback_request_id: str,
+    ) -> None:
+        """Send final activation back to the coordinator via PushResult RPC."""
+        try:
+            if callback_request_id:
+                response = peer_pb2.ForwardResponse(
+                    request_id=callback_request_id,
+                    peer_id=response.peer_id,
+                    activation=list(response.activation),
+                    stage_index=response.stage_index,
+                    error=response.error,
+                    kv_cache_hit=response.kv_cache_hit,
+                    activation_hash=response.activation_hash,
+                )
+            channel = grpc.insecure_channel(
+                callback_address,
+                options=[
+                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                ],
+            )
+            stub = peer_pb2_grpc.PeerStub(channel)
+            stub.PushResult(response, timeout=10.0)
+            channel.close()
+            logger.info(
+                "push_result_sent: req=%s -> %s",
+                response.request_id, callback_address,
+            )
+        except Exception as exc:
+            logger.warning("push_result_failed: %s: %s", callback_address, exc)
+
+    def PushResult(self, request: peer_pb2.ForwardResponse, context: grpc.ServicerContext) -> peer_pb2.PushAck:
+        """Receive final result from last peer in push chain.
+
+        This handler is primarily used when this node is the coordinator.
+        The push_receiver module registers a callback for the request_id.
+        """
+        logger.info("push_result_received: req=%s from=%s", request.request_id, request.peer_id)
+        # Dispatch to the push receiver if registered
+        try:
+            from coordinator.push_receiver import _PUSH_RESULTS
+            future = _PUSH_RESULTS.pop(str(request.request_id), None)
+            if future is not None:
+                future.set_result(request)
+        except ImportError:
+            pass
+        return peer_pb2.PushAck(request_id=request.request_id, ok=True, error="")
 
     # ── Phase 3A: Bidirectional streaming ──────────────────────────────────
 

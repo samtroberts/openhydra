@@ -127,7 +127,10 @@ class EngineConfig:
     # P0-A: Decentralized Speculative Decoding for Swarm Mode
     speculative_swarm_enabled: bool = False
     # P0-B: INT8 activation quantization on the wire
-    activation_quantization_enabled: bool = False
+    activation_quantization_enabled: bool = True  # Enabled by default (Petals parity)
+    # Petals parity Phase A: server-to-server push mode
+    push_mode_enabled: bool = False
+    push_callback_address: str = ""  # "host:port" where PushResult arrives
     # P1-A: SpecPipe — pipeline-filling speculative decoding
     specpipe_enabled: bool = False
     specpipe_max_depth: int = 4
