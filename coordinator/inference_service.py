@@ -638,10 +638,29 @@ class InferenceService:
                     self._kv_retrieve_ops_total_ref[0] += 1
         # --
 
-        result = chain.run(
-            prompt,
-            **run_kwargs,
-        )
+        # Use push mode when enabled and pipeline has 2+ stages.
+        # Push mode eliminates coordinator-mediated round-trips between stages.
+        if (
+            self.config.push_mode_enabled
+            and len(pipeline) >= 2
+            and self.config.push_callback_address
+        ):
+            result = chain.run_push(
+                prompt,
+                max_tokens=max_tokens,
+                request_id=request_id,
+                deadline=deadline,
+                kv_session_id=kv_session_id,
+                kv_store_activation=kv_store_activation,
+                kv_use_cached_activation=kv_use_cached_activation,
+                callback_address=self.config.push_callback_address,
+                **decode_controls,
+            )
+        else:
+            result = chain.run(
+                prompt,
+                **run_kwargs,
+            )
 
         for trace in result.traces:
             self.health.record_inference(trace.peer_id, success=True, latency_ms=trace.latency_ms)

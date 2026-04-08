@@ -54,6 +54,11 @@ class PeerStub(object):
                 request_serializer=peer_dot_peer__pb2.ForwardRequest.SerializeToString,
                 response_deserializer=peer_dot_peer__pb2.ForwardResponse.FromString,
                 _registered_method=True)
+        self.PushResult = channel.unary_unary(
+                '/openhydra.peer.Peer/PushResult',
+                request_serializer=peer_dot_peer__pb2.ForwardResponse.SerializeToString,
+                response_deserializer=peer_dot_peer__pb2.PushAck.FromString,
+                _registered_method=True)
 
 
 class PeerServicer(object):
@@ -79,8 +84,13 @@ class PeerServicer(object):
 
     def ForwardStream(self, request_iterator, context):
         """Phase 3A: Bidirectional streaming for persistent sessions.
-        Reuses the same ForwardRequest/ForwardResponse messages.
-        The stream maintains KV cache state across the session lifetime.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PushResult(self, request, context):
+        """Petals parity Phase A: receives final activation from last peer in push chain.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -108,6 +118,11 @@ def add_PeerServicer_to_server(servicer, server):
                     servicer.ForwardStream,
                     request_deserializer=peer_dot_peer__pb2.ForwardRequest.FromString,
                     response_serializer=peer_dot_peer__pb2.ForwardResponse.SerializeToString,
+            ),
+            'PushResult': grpc.unary_unary_rpc_method_handler(
+                    servicer.PushResult,
+                    request_deserializer=peer_dot_peer__pb2.ForwardResponse.FromString,
+                    response_serializer=peer_dot_peer__pb2.PushAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -218,6 +233,33 @@ class Peer(object):
             '/openhydra.peer.Peer/ForwardStream',
             peer_dot_peer__pb2.ForwardRequest.SerializeToString,
             peer_dot_peer__pb2.ForwardResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PushResult(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openhydra.peer.Peer/PushResult',
+            peer_dot_peer__pb2.ForwardResponse.SerializeToString,
+            peer_dot_peer__pb2.PushAck.FromString,
             options,
             channel_credentials,
             insecure,

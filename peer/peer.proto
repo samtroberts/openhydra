@@ -7,9 +7,9 @@ service Peer {
   rpc Forward(ForwardRequest) returns (ForwardResponse);
   rpc GetPeerStatus(PeerStatusRequest) returns (PeerStatusResponse);
   // Phase 3A: Bidirectional streaming for persistent sessions.
-  // Reuses the same ForwardRequest/ForwardResponse messages.
-  // The stream maintains KV cache state across the session lifetime.
   rpc ForwardStream(stream ForwardRequest) returns (stream ForwardResponse);
+  // Petals parity Phase A: receives final activation from last peer in push chain.
+  rpc PushResult(ForwardResponse) returns (PushAck);
 }
 
 message PingRequest {
@@ -68,6 +68,35 @@ message ForwardRequest {
   bytes quantized_activation = 33;       // packed INT8 activation bytes
   string activation_quantization = 34;   // "int8" or "" (empty = fp32)
   repeated float quantized_scales = 35;  // per-tensor scale factors for dequantization
+  // Server-to-server push mode (Petals parity Phase A).
+  // When push_mode=true, the peer forwards its output directly to
+  // next_hop_address instead of returning it to the caller.  The last
+  // peer in the chain sends the final result to final_callback_address
+  // via the PushResult RPC.
+  bool push_mode = 36;
+  string next_hop_address = 37;          // "host:port" of next peer (empty = last stage)
+  string next_hop_peer_id = 38;          // peer_id of next peer for logging
+  string final_callback_address = 39;    // coordinator address for PushResult delivery
+  string final_callback_request_id = 40; // correlation ID for the PushResult
+  // Remaining route hops (each peer pops the first entry and forwards the rest)
+  repeated PeerHop remaining_route = 41;
+}
+
+// A single hop in the push-mode routing chain.
+message PeerHop {
+  string peer_id = 1;
+  string address = 2;       // "host:port"
+  uint32 stage_index = 3;
+  uint32 shard_layer_start = 4;
+  uint32 shard_layer_end = 5;
+  uint32 shard_total_layers = 6;
+}
+
+// Acknowledgement from coordinator after receiving PushResult.
+message PushAck {
+  string request_id = 1;
+  bool ok = 2;
+  string error = 3;
 }
 
 message ForwardResponse {
