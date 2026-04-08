@@ -1076,6 +1076,10 @@ def _announce_loop(
             seeder_http_port=int(seeder_http_port),
             cached_model_ids=tuple(p2p_cache.announce_cached_models() if p2p_cache is not None else []),
             local_fast_path_port=int(local_fast_path_port),
+            nat_type=str(getattr(service, '_nat_type', 'unknown')),
+            requires_relay=bool(getattr(service, '_requires_relay', False)),
+            relay_peer_id=str(getattr(service, '_relay_peer_id', '')),
+            relay_address=str(getattr(service, '_relay_address', '')),
         )
         try:
             # HTTP DHT announce (legacy path).

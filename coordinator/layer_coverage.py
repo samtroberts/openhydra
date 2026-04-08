@@ -256,6 +256,8 @@ class PeerMetrics:
     # Phase 2A: Measured RTT (ms) from this peer to downstream peers.
     # Keyed by downstream peer_id; populated from DHT announcement.
     next_hop_rtts: dict[str, float] = field(default_factory=dict)
+    # Phase C: NAT relay penalty — relayed peers get 20% throughput penalty.
+    requires_relay: bool = False
 
 
 @dataclass(frozen=True)
@@ -343,7 +345,13 @@ def _dijkstra_edge_cost(
     if metrics.available_kv_slots <= 0:
         kv_cost = weights.w_kv * weights.kv_alloc_delay
 
-    return rtt_cost + infer_cost + rep_cost + load_cost + kv_cost
+    # Factor 7: Relay penalty — relayed peers add ~20% latency from the
+    # extra hop through the relay node (matching Petals' relay_penalty).
+    relay_cost = 0.0
+    if metrics.requires_relay:
+        relay_cost = 0.20 * (rtt_cost + infer_cost)
+
+    return rtt_cost + infer_cost + rep_cost + load_cost + kv_cost + relay_cost
 
 
 def find_optimal_pipeline(

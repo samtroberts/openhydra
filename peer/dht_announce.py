@@ -88,6 +88,12 @@ class Announcement:
     # Pass 6: KV compaction SLO metrics — lifetime counters.
     compact_tokens_saved_total: int = 0
     compact_latency_total_ms: float = 0.0
+    # Petals parity Phase C: NAT traversal and relay.
+    # nat_type: "open", "full_cone", "restricted", "symmetric", "unknown"
+    nat_type: str = "unknown"
+    requires_relay: bool = False
+    relay_peer_id: str = ""        # peer_id of the relay handling this peer
+    relay_address: str = ""        # "host:port" of the relay (for routing)
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:
