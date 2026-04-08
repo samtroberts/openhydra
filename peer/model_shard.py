@@ -783,14 +783,33 @@ class PyTorchRuntime:
             int((param_count * bytes_per_param * quantization_factor) / (1024 * 1024)),
         )
 
-        base_tps = 12.0 if target == "cpu" else 42.0
-        if self.quantization_bits == 8:
-            base_tps *= 1.2
-        elif self.quantization_bits == 4:
-            base_tps *= 1.45
-        layer_fraction = (len(self.layer_indices) / float(max(1, self.total_layers))) if self.total_layers else 1.0
-        layer_penalty = max(0.35, layer_fraction)
-        estimated_tps = round(base_tps / layer_penalty, 3)
+        # Phase D: measure actual throughput instead of using static estimates.
+        # Falls back to a conservative static estimate if benchmarking fails.
+        estimated_tps = 0.0
+        try:
+            from peer.throughput_bench import benchmark_and_cache
+            _bench = benchmark_and_cache(
+                model=self._model,
+                tokenizer=self._tokenizer,
+                model_id=self.model_name,
+                device=target,
+                layer_count=len(self.layer_indices),
+                quantization=self.quantization_mode,
+            )
+            estimated_tps = _bench.compute_tps
+        except Exception as exc:
+            logging.debug("throughput_bench_skipped: %s", exc)
+        if estimated_tps <= 0:
+            # Static fallback (legacy formula)
+            base_tps = 12.0 if target == "cpu" else 42.0
+            if self.quantization_bits == 8:
+                base_tps *= 1.2
+            elif self.quantization_bits == 4:
+                base_tps *= 1.45
+            layer_fraction = (len(self.layer_indices) / float(max(1, self.total_layers))) if self.total_layers else 1.0
+            layer_penalty = max(0.35, layer_fraction)
+            estimated_tps = round(base_tps / layer_penalty, 3)
+            logging.info("throughput_static_fallback: tps=%.1f", estimated_tps)
 
         self._runtime_profile = RuntimeProfile(
             backend=backend,
