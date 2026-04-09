@@ -1190,6 +1190,40 @@ def _announce_loop(
             except Exception as exc:
                 logging.debug("rebalance_poll_error: %s", exc)
 
+            # Autonomous rebalancing: peer decides its own layer assignment.
+            _rebalancer = getattr(service, '_autonomous_rebalancer', None)
+            _rebalance_interval = int(getattr(service, '_rebalance_check_interval', 6))
+            _announce_count = getattr(service, '_announce_count', 0)
+            service._announce_count = _announce_count + 1
+            if (
+                _rebalancer is not None
+                and _announce_count > 0
+                and _announce_count % _rebalance_interval == 0
+            ):
+                try:
+                    from peer.autonomous_rebalancer import load_swarm_snapshot
+                    _rp = dict(service.runtime_profile or {})
+                    _my_start = int(_rp.get("layer_start", 0))
+                    _my_end = int(_rp.get("layer_end", 0))
+                    _my_tps = float(_rp.get("estimated_tokens_per_sec", 0))
+                    _total = int(_rp.get("total_layers", 0))
+                    if _my_end > _my_start and _total > 0 and _my_tps > 0:
+                        _swarm = load_swarm_snapshot(list(dht_urls), service.model_id)
+                        _decision = _rebalancer.check(
+                            my_peer_id=service.peer_id,
+                            my_layer_start=_my_start,
+                            my_layer_end=_my_end,
+                            my_tps=_my_tps,
+                            swarm_peers=_swarm,
+                            total_layers=_total,
+                        )
+                        if _decision is not None:
+                            _rebalancer.apply_with_jitter(
+                                service, _decision, _my_start, _my_end,
+                            )
+                except Exception as _rebal_exc:
+                    logging.debug("autonomous_rebalance_error: %s", _rebal_exc)
+
         except Exception as exc:  # pragma: no cover
             consecutive_failures += 1
             delay_s = _exponential_backoff_delay(
@@ -1323,6 +1357,10 @@ def serve(
     p2p_cache_dir: str | None = None,
     enable_local_fast_path: bool = False,
     hivemind_initial_peers: list[str] | None = None,
+    rebalance_enabled: bool = False,
+    rebalance_interval: int = 6,
+    rebalance_min_improvement: float = 1.15,
+    rebalance_cooldown_s: float = 300.0,
 ) -> None:
     resolved_dht_urls: list[str] = []
     seen_dht_urls: set[str] = set()
@@ -1481,6 +1519,20 @@ def serve(
         batch_window_ms=float(batch_window_ms),
         max_batch_size=max(1, int(max_batch_size)),
     )
+
+    # Autonomous rebalancer (Petals parity)
+    if rebalance_enabled:
+        from peer.autonomous_rebalancer import AutonomousRebalancer
+        service._autonomous_rebalancer = AutonomousRebalancer(
+            min_improvement=rebalance_min_improvement,
+            cooldown_s=rebalance_cooldown_s,
+        )
+        service._rebalance_check_interval = max(1, rebalance_interval)
+        service._announce_count = 0
+        logging.info(
+            "autonomous_rebalancer: enabled interval=%d min_improvement=%.2f cooldown=%ds",
+            rebalance_interval, rebalance_min_improvement, int(rebalance_cooldown_s),
+        )
 
     session_manager: TorrentSessionManager | None = None
     if seed_enable:
