@@ -1,6 +1,6 @@
 # OpenHydra Progress
 
-Last updated: 2026-04-06 (v1.2 Swarm Inference Optimization complete — DSD, SpecPipe, INT8, TOPLOC, Chunked Prefill, 5-node WAN sharded pipeline)
+Last updated: 2026-04-10 (Petals parity complete, Gemma 4 + Qwen 3.5 support, autonomous rebalancing, GPU benchmarks on Lightning.ai)
 
 ## Overall status
 
@@ -16,6 +16,12 @@ Last updated: 2026-04-06 (v1.2 Swarm Inference Optimization complete — DSD, Sp
 - **Performance optimization: 100% complete** (50x Swarm speedup, 75 TPS Local Mode)
 - **v1.2 Swarm Inference Optimization: 100% complete** (DSD, SpecPipe, INT8 compression, TOPLOC verification, Chunked Prefill, 5-node WAN pipeline, ToyRuntime real model replacement)
 - **5-Node WAN Sharded Pipeline: Tested** (Bangalore→Chennai→Mumbai→Singapore×2, Qwen2.5-0.5B, 0.43 TPS through 5-stage pipeline)
+- **Petals Parity: 100% complete** (4 phases: server-to-server push, streaming sessions, NAT relay, throughput benchmarking — +1,327 lines)
+- **GPU Benchmarks: Validated** on Lightning.ai Tesla T4 (18.8 TPS localhost, 0.54 TPS WAN, push mode 2.66x improvement)
+- **Selective Weight Loading: Working** (14GB Qwen2.5-7B on 8GB Mac — peak 1.5GB via disk-offload device_map)
+- **Gemma 4 + Qwen 3.5: Supported** (multimodal arch detection, transformers 5.5.3, 10 new catalog entries)
+- **Autonomous Rebalancing: Implemented** (peers autonomously decide layer assignment based on swarm throughput)
+- **Model catalog: 21 entries** (Qwen 2.5/3/3.5, Gemma 3/4, SmolLM2, TinyLLaMA — base + instruct variants)
 - Desktop App: **Shipped** (Tauri v2 + React + Tailwind, Local/Swarm toggle, premium zinc/cyan UI)
 - Landing page: **Live** at https://openhydra.co (GitHub Pages, gh-pages branch)
 - PyPI: **Published** as `openhydra-network` at https://pypi.org/project/openhydra-network/
@@ -173,6 +179,88 @@ Full setup guide and snapshots preserved at `ops/nanode-snapshots/SETUP_GUIDE.md
 - `ops/nanode-snapshots/SETUP_GUIDE.md` — Complete nanode recreation guide
 - `ops/nanode-snapshots/*/` — Per-node system state snapshots (4 nodes)
 
+## Petals Parity (2026-04-06 → 2026-04-10)
+
+Comprehensive analysis of Petals codebase identified 7 gaps. All closed in 4 phases (+1,327 lines):
+
+### Phase A: Server-to-Server Push + INT8 Compression (+509 lines)
+- [x] `peer/peer.proto` — push_mode, next_hop_address, PeerHop, PushAck, PushResult RPC
+- [x] `peer/server.py` — Forward() push forwarding, _push_to_next_hop(), _push_final_result()
+- [x] `coordinator/push_receiver.py` — thread-safe request_id→Future registry
+- [x] `coordinator/chain.py` — run_push() with route table, fallback to run()
+- [x] `coordinator/engine.py` — activation_quantization_enabled=True by default (was False)
+- [x] **Verified**: 2.66x TPS improvement (4.95→13.16 on localhost, 2-stage pipeline)
+
+### Phase B: Stateful Streaming Sessions + History Replay (+54 lines)
+- [x] `coordinator/chain.py` — StreamPool + InferenceSession wired into _request_stage()
+- [x] Session history recorded for failover replay on peer failure
+- [x] Persistent ForwardStream connections reused across decode steps
+
+### Phase C: NAT Traversal via STUN + Relay (+493 lines)
+- [x] `coordinator/stun_client.py` — real RFC 5389 STUN (replaced stub), classifies NAT type
+- [x] `coordinator/relay.py` — RelayServer + connect_to_relay() for NATted peers
+- [x] `peer/dht_announce.py` — nat_type, requires_relay, relay_address fields
+- [x] `coordinator/layer_coverage.py` — 20% relay penalty in Dijkstra cost function
+
+### Phase D: Throughput Self-Benchmarking (+271 lines)
+- [x] `peer/throughput_bench.py` — real forward-pass benchmark, replaces static formula
+- [x] Cache at ~/.openhydra/throughput_cache.json (24h TTL)
+- [x] Fallback to legacy static estimate on failure
+
+### Push Mode Benchmark (verified)
+
+| Mode | TPS | Improvement |
+|---|---|---|
+| Baseline (coordinator-mediated) | 4.95 | — |
+| **Push mode (peer-to-peer)** | **13.16** | **2.66x** |
+
+## GPU Benchmarks — Lightning.ai Tesla T4 (2026-04-07)
+
+### Raw GPU Performance
+| Model | Hardware | TPS | Notes |
+|---|---|---|---|
+| Qwen2.5-0.5B fp16 | T4 GPU | **30.5** | Single node, raw generate() |
+| Qwen2.5-7B NF4 | T4 GPU | **15.6** | 4-bit quantized, coherent output |
+| Per-layer latency | T4 GPU | **1.5ms** | vs 100-250ms on CPU nanodes |
+
+### Sharded Pipeline (2-stage localhost)
+| Config | TPS | Notes |
+|---|---|---|
+| GPU+CPU, no push | 4.95 | Coordinator-mediated |
+| GPU+CPU, push mode | **13.16** | Peer-to-peer forwarding |
+| GPU+CPU, pipelined | **18.8-23.1** | run_pipelined() overlapping tokens |
+
+### 3-Node WAN (Mac + 2× Lightning T4)
+| Model | Stages | TPS | Per-stage |
+|---|---|---|---|
+| Qwen2.5-0.5B | 2 (Mac+GPU) | 1.35 | Mac 65ms, GPU 900ms (SSH tunnel) |
+| Qwen2.5-7B | 3 (Mac+GPU+CPU) | 0.37 | Mac 1.5s, GPU 0.9s, CPU 1.5s |
+| Qwen3-8B | 3 (Mac+GPU+GPU) | **0.54** | Mac 50ms, GPU1 870ms, GPU2 700ms |
+
+### Selective Weight Loading
+| Model | Full size | Shard size | Fits 8GB Mac? |
+|---|---|---|---|
+| Qwen2.5-0.5B | 1.1 GB | ~300 MB | Yes (before and after) |
+| **Qwen2.5-7B** | **14 GB** | **1.5 GB** | **Yes (was OOM)** |
+
+## Gemma 4 + Qwen 3.5 Model Support (2026-04-10)
+
+- [x] `transformers` upgraded 5.3.0 → 5.5.3
+- [x] `_detect_decoder_architecture()` — unwraps multimodal `language_model` wrapper
+- [x] Gemma 4: E2B (35L), E4B (42L), E4B-it, 31B (60L) — multimodal (image+video+audio)
+- [x] Qwen 3.5: 0.8B (24L), 2B, 4B (32L), 9B (32L), 27B (64L) — thinking model
+- [x] Model catalog: 21 entries (was 9)
+- [x] Qwen3.5-0.8B verified: full PyTorchRuntime load + forward pass with selective loading
+- [x] Gemma 4 E2B verified: architecture detected as `llama` family, 35 layers
+
+## Autonomous Dynamic Rebalancing (2026-04-10)
+
+- [x] `peer/autonomous_rebalancer.py` — peers autonomously find optimal layer positions
+- [x] Algorithm: per-layer throughput analysis → hypothetical migration → 15% improvement threshold
+- [x] Safety: cooldown (5 min), position history (no ping-pong), jitter (prevents herding)
+- [x] CLI: `--rebalance-enabled`, `--rebalance-interval`, `--rebalance-min-improvement`, `--rebalance-cooldown`
+- [x] Wired into announce loop in `peer/server.py`
+
 ## Roadmap checklist (architecture v6 aligned)
 
 ### Tier 1
@@ -277,6 +365,25 @@ Plan designed (pending approval) to transform OpenHydra from inference engine to
 Full roadmap in plan file. Key decisions: agent execution local-only (peers do inference, your machine runs code); MCP as tool standard; Apache 2.0 for maximum adoption; federated training = LoRA only (full pre-training is research-grade).
 
 ## Recent changes log
+
+### 2026-04-06 through 2026-04-10
+
+- **Petals Parity** (4 phases, +1,327 lines):
+  - Phase A: Server-to-server push mode — 2.66x TPS improvement verified
+  - Phase B: Stateful streaming sessions + history replay for failover
+  - Phase C: NAT traversal via real STUN client + gRPC relay
+  - Phase D: Throughput self-benchmarking replaces static TPS formula
+- **GPU Benchmarks** on Lightning.ai Tesla T4 (free tier):
+  - Raw: 30.5 TPS (0.5B), 15.6 TPS (7B NF4)
+  - Pipelined localhost: 18.8-23.1 TPS
+  - 3-node WAN (Mac + 2× T4): 0.54 TPS (SSH tunnel overhead)
+  - Push mode verified: 4.95→13.16 TPS (2.66x)
+- **Selective Weight Loading**: 14GB model on 8GB Mac (peak 1.5GB via disk-offload device_map)
+- **Accelerate Hook Removal**: 5x speedup by stripping dispatch hooks after selective loading
+- **Gemma 4 + Qwen 3.5 Model Support**: transformers 5.5.3, multimodal arch detection, 10 new catalog entries (21 total)
+- **Autonomous Dynamic Rebalancing**: peers autonomously find optimal layer positions based on swarm throughput
+- **Instruction-Tuned Models**: Qwen2.5-7B-Instruct + Qwen3-8B added to catalog
+- Test suite: `1103 passed, 9 skipped` throughout
 
 ### 2026-04-04 through 2026-04-06
 
@@ -976,9 +1083,14 @@ openhydra-peer --kv-compaction-enabled --kv-compaction-online \
 
 ## Highest-impact remaining work
 
-1. **Improve sharded pipeline TPS** — Current 0.25-0.43 TPS on 5-stage WAN is limited by sequential round-trips. Priorities: (a) SpecPipe tuning for higher acceptance rate, (b) parallel draft token evaluation, (c) KV cache persistence across rounds.
-2. **Larger model testing** — Qwen2.5-0.5B produces low-quality text. Test with 7B+ models across 8+ peers for coherent output.
-3. **On-chain / DAO integration** — `coordinator/ledger_bridge.py` defaults to `mock_mode=True`. Requires: Solidity state-channel contract, web3.py integration, stake resolver.
+1. **On-chain / DAO integration** — `coordinator/ledger_bridge.py` defaults to `mock_mode=True`. Requires: Solidity state-channel contract, web3.py integration, stake resolver.
+2. **Multi-GPU sharded pipeline demo** — Deploy 7B+ instruct model across 4+ GPU peers with push mode for a compelling public demo (target: >5 TPS with coherent output).
+3. **Agent GUI** — Use OpenHydra's OpenAI-compatible API with Open WebUI or similar frontend. No code changes needed — already speaks the right protocol.
 4. **Multi-region soak testing** — Terraform IaC exists but has not been stress-tested with sustained multi-region load.
-5. **Rich interactive CLI** — Rewrite `coordinator/interactive_cli.py` to a Claude Code-style TUI with `prompt_toolkit`.
+5. **Combine SpecPipe + push mode** — Wire speculative tokens into the push pipeline for additional TPS gains on GPU-rich deployments.
 6. **Tauri UI/UX polish** — Onboarding wizard, real-time peer map, model browser, earnings widget.
+
+### Completed (previously listed as remaining)
+- ~~Improve sharded pipeline TPS~~ — Done: push mode (2.66x), pipelining (18.8 TPS), selective loading, hook removal
+- ~~Larger model testing~~ — Done: Qwen2.5-7B (28L), Qwen3-8B (36L) tested across 3 nodes
+- ~~Rich CLI~~ — Replaced by agent GUI approach (no custom TUI needed)
