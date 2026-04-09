@@ -479,6 +479,11 @@ OpenHydra stands on the shoulders of remarkable projects and research:
 | Done | Premium Tauri desktop UI with Local/Swarm toggle |
 | Done | v1.2 Swarm Optimization: DSD, SpecPipe, INT8 compression, TOPLOC, Chunked Prefill |
 | Done | 5-node WAN sharded pipeline (Bangalore→Chennai→Mumbai→Singapore×2) |
+| Done | Petals parity: server-to-server push (2.66x TPS), streaming sessions, NAT relay, throughput benchmarking |
+| Done | GPU benchmarks: 18.8 TPS localhost, 0.54 TPS WAN on Lightning.ai T4 |
+| Done | Selective weight loading: 14GB model on 8GB Mac (peak 1.5GB) |
+| Done | Gemma 4 + Qwen 3.5 model families (multimodal, thinking), 21 catalog entries |
+| Done | Autonomous dynamic rebalancing (peers self-optimize layer positions) |
 | Next | On-chain DAO (Solidity state-channel contract on Arbitrum/Base) |
 | Next | SDK v1 (Python + TypeScript, streaming, retry, type-safe) |
 | Next | P2P agentic swarms (agent sessions, tool execution, MCP) |

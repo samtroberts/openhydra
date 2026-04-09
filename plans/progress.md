@@ -1,6 +1,6 @@
 # OpenHydra Progress Tracker
 
-> Updated: 2026-04-06 (v1.2 Swarm Optimization complete — DSD, SpecPipe, 5-node WAN pipeline, 1103 tests)
+> Updated: 2026-04-10 (Petals parity complete, Gemma 4 + Qwen 3.5, autonomous rebalancing, GPU benchmarks, 1103 tests)
 
 ---
 
@@ -154,6 +154,43 @@
 | **1103 tests pass, 9 skipped** | :white_check_mark: | Up from 715; includes v1.1 + v1.2 tests |
 | 1GB nanode memory optimization | :white_check_mark: | fp16 + layer cleanup + 1GB swap + MALLOC_ARENA_MAX=2 |
 | accelerate>=1.13.0 in requirements.txt | :white_check_mark: | Required for transformers 5.3.0 |
+| transformers>=5.5.0 in requirements.txt | :white_check_mark: | Required for Gemma 4 + Qwen 3.5 |
+| Selective weight loading (disk offload) | :white_check_mark: | 14GB model on 8GB Mac |
+| Accelerate hook removal (5x speedup) | :white_check_mark: | remove_hook_from_module() after selective load |
+
+### Petals Parity (2026-04-06 → 2026-04-10)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Phase A: Server-to-server push | :white_check_mark: | +509 lines; 2.66x TPS verified |
+| Phase A: INT8 compression enabled | :white_check_mark: | Default on |
+| Phase B: Streaming sessions | :white_check_mark: | StreamPool + InferenceSession wired |
+| Phase B: History replay failover | :white_check_mark: | Session records req/resp for replay |
+| Phase C: STUN client (RFC 5389) | :white_check_mark: | Real UDP probe, replaces stub |
+| Phase C: gRPC relay server | :white_check_mark: | coordinator/relay.py |
+| Phase C: NAT fields in announcements | :white_check_mark: | nat_type, requires_relay, relay_address |
+| Phase C: 20% relay routing penalty | :white_check_mark: | Dijkstra cost function |
+| Phase D: Throughput self-benchmark | :white_check_mark: | peer/throughput_bench.py |
+| Phase D: Benchmark cache (24h TTL) | :white_check_mark: | ~/.openhydra/throughput_cache.json |
+| Push mode CLI flags | :white_check_mark: | --push-mode, --push-callback-address |
+
+### New Model Families (2026-04-10)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Gemma 4 architecture detection | :white_check_mark: | model.model.language_model.layers unwrap |
+| Qwen 3.5 support | :white_check_mark: | Works out of the box (qwen_llama family) |
+| Instruct models (Qwen2.5-7B-Instruct) | :white_check_mark: | Catalog entry, no code changes |
+| Model catalog expanded (21 entries) | :white_check_mark: | +10 Gemma 4 + Qwen 3.5 entries |
+
+### Autonomous Rebalancing (2026-04-10)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| should_rebalance() algorithm | :white_check_mark: | Per-layer throughput analysis |
+| AutonomousRebalancer class | :white_check_mark: | Cooldown, history, jitter |
+| Wired into announce loop | :white_check_mark: | peer/server.py |
+| CLI flags | :white_check_mark: | --rebalance-enabled, --rebalance-interval, etc. |
 
 ---
 
@@ -162,3 +199,5 @@
 | # | File | Topic | Status |
 |---|------|-------|--------|
 | 1 | `auto-scaling-policy.md` | Capability-aware auto-scaling | :white_check_mark: Design + implementation complete |
+| 2 | `swarm-inference-optimization.md` | Swarm inference optimization | :white_check_mark: All P0/P1/P2 implemented |
+| 3 | `autonomous-rebalancing.md` | Autonomous dynamic rebalancing | :white_check_mark: Designed + implemented |
