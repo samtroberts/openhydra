@@ -969,6 +969,28 @@ class PyTorchRuntime:
 
     @staticmethod
     def _detect_decoder_architecture(model: Any) -> _DecoderArchitecture:
+        # Multimodal models (Gemma 4, Qwen 3.5 VL) wrap the text decoder
+        # inside a `language_model` attribute.  Unwrap to reach the transformer.
+        _language_model = getattr(model, "language_model", None)
+        if _language_model is not None:
+            _inner = getattr(_language_model, "model", None)
+            if _inner is not None and hasattr(_inner, "layers") and hasattr(_inner, "embed_tokens"):
+                arch_name = type(model).__name__.lower()
+                model_type = str(getattr(getattr(model, "config", None), "model_type", "")).strip().lower()
+                _family = "llama"
+                if "gemma" in arch_name or "gemma" in model_type:
+                    _family = "llama"
+                elif "qwen" in arch_name or "qwen" in model_type:
+                    _family = "qwen_llama"
+                return _DecoderArchitecture(
+                    family=_family,
+                    layers=tuple(list(_inner.layers)),
+                    embed_tokens=_inner.embed_tokens,
+                    position_embeddings=None,
+                    final_norm=getattr(_inner, "norm", None),
+                    rotary_emb=getattr(_inner, "rotary_emb", None),
+                )
+
         transformer = getattr(model, "transformer", None)
         if transformer is not None and hasattr(transformer, "h") and hasattr(transformer, "wte"):
             return _DecoderArchitecture(
