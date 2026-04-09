@@ -80,6 +80,38 @@
     "description": "Qwen 3.5 0.8B — lightweight, ideal for single-peer deployment."
   },
   {
+    "model_id": "openhydra-qwen2.5-7b-instruct",
+    "hf_model_id": "Qwen/Qwen2.5-7B-Instruct",
+    "draft_model_id": "Qwen/Qwen2.5-0.5B",
+    "required_peers": 2,
+    "min_vram_gb": 16,
+    "shard_vram_gb": 4.0,
+    "shards_needed": 4,
+    "quality_tier": "standard",
+    "recommended_quantization": "fp16",
+    "num_layers": 28,
+    "context_length": 32768,
+    "languages": ["en", "multilingual"],
+    "tags": ["chat", "instruct", "medium", "shardable"],
+    "description": "Qwen 2.5 7B Instruct — instruction-tuned, coherent multi-turn chat. Ideal for sharded inference demos."
+  },
+  {
+    "model_id": "openhydra-qwen3-8b",
+    "hf_model_id": "Qwen/Qwen3-8B",
+    "draft_model_id": "Qwen/Qwen2.5-0.5B",
+    "required_peers": 2,
+    "min_vram_gb": 16,
+    "shard_vram_gb": 4.5,
+    "shards_needed": 4,
+    "quality_tier": "advanced",
+    "recommended_quantization": "fp16",
+    "num_layers": 36,
+    "context_length": 32768,
+    "languages": ["en", "multilingual"],
+    "tags": ["chat", "reasoning", "thinking", "medium", "shardable"],
+    "description": "Qwen 3 8B — thinking model with native reasoning. No instruct variant needed (base model uses thinking mode)."
+  },
+  {
     "model_id": "openhydra-qwen2.5-0.5b",
     "hf_model_id": "Qwen/Qwen2.5-0.5B",
     "draft_model_id": null,

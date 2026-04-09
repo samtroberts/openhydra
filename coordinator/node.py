@@ -155,6 +155,10 @@ def main() -> None:
                         help="Enable SpecPipe pipeline-filling speculation (P1-A).")
     parser.add_argument("--chunked-prefill", action="store_true", default=False,
                         help="Enable chunked prefill for long prompts (P1-B).")
+    parser.add_argument("--push-mode", action="store_true", default=False,
+                        help="Enable server-to-server push mode (Petals parity Phase A).")
+    parser.add_argument("--push-callback-address", default="",
+                        help="Host:port where PushResult RPC arrives (usually this node's gRPC address).")
 
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
@@ -322,6 +326,8 @@ def main() -> None:
         max_latency_ms=60000,
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
         chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
+        push_mode_enabled=bool(getattr(args, "push_mode", False)),
+        push_callback_address=str(getattr(args, "push_callback_address", "") or ""),
     )
 
     # Start the coordinator HTTP API on the main thread (blocking).
