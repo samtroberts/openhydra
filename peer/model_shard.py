@@ -970,10 +970,21 @@ class PyTorchRuntime:
     @staticmethod
     def _detect_decoder_architecture(model: Any) -> _DecoderArchitecture:
         # Multimodal models (Gemma 4, Qwen 3.5 VL) wrap the text decoder
-        # inside a `language_model` attribute.  Unwrap to reach the transformer.
+        # inside a `language_model` attribute.  The wrapping depth varies:
+        #   Gemma 4: model.model.language_model.layers
+        #   Others:  model.language_model.model.layers
+        # Try both paths.
         _language_model = getattr(model, "language_model", None)
+        if _language_model is None:
+            # Gemma 4: model.model.language_model
+            _model_attr = getattr(model, "model", None)
+            if _model_attr is not None:
+                _language_model = getattr(_model_attr, "language_model", None)
         if _language_model is not None:
-            _inner = getattr(_language_model, "model", None)
+            # language_model may have layers directly, or inside .model
+            _inner = _language_model
+            if not hasattr(_inner, "layers"):
+                _inner = getattr(_language_model, "model", None)
             if _inner is not None and hasattr(_inner, "layers") and hasattr(_inner, "embed_tokens"):
                 arch_name = type(model).__name__.lower()
                 model_type = str(getattr(getattr(model, "config", None), "model_type", "")).strip().lower()
