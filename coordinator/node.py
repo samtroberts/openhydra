@@ -159,6 +159,14 @@ def main() -> None:
                         help="Enable server-to-server push mode (Petals parity Phase A).")
     parser.add_argument("--push-callback-address", default="",
                         help="Host:port where PushResult RPC arrives (usually this node's gRPC address).")
+    parser.add_argument("--rebalance-enabled", action="store_true", default=False,
+                        help="Enable autonomous dynamic rebalancing (peers decide their own layers).")
+    parser.add_argument("--rebalance-interval", type=int, default=6,
+                        help="Check rebalance every N announce cycles (default 6 = ~60s).")
+    parser.add_argument("--rebalance-min-improvement", type=float, default=1.15,
+                        help="Minimum improvement ratio to trigger rebalance (default 1.15 = 15%%).")
+    parser.add_argument("--rebalance-cooldown", type=int, default=300,
+                        help="Seconds to wait after rebalance before checking again (default 300).")
 
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
@@ -274,6 +282,10 @@ def main() -> None:
             "advertise_host": args.advertise_host,
             "identity_path": args.identity_path,
             "mlx_eval_timeout_s": args.mlx_eval_timeout,
+            "rebalance_enabled": bool(getattr(args, "rebalance_enabled", False)),
+            "rebalance_interval": int(getattr(args, "rebalance_interval", 6)),
+            "rebalance_min_improvement": float(getattr(args, "rebalance_min_improvement", 1.15)),
+            "rebalance_cooldown_s": float(getattr(args, "rebalance_cooldown", 300)),
             # All other peer params use peer/server.py defaults.
         },
         name="openhydra-peer",
