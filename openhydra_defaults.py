@@ -34,3 +34,8 @@ PRODUCTION_BOOTSTRAP_URLS: tuple[str, ...] = (
     "http://bootstrap-eu.openhydra.co:8468",
     "http://bootstrap-ap.openhydra.co:8468",
 )
+
+# gRPC relay port for NAT-traversal. The relay service runs on the same
+# hosts as the DHT bootstrap but on a separate port. NATted peers connect
+# outbound to the relay and coordinators proxy Forward() calls through it.
+DEFAULT_RELAY_PORT: int = 50052
