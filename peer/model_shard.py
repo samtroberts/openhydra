@@ -2285,6 +2285,14 @@ class PyTorchRuntime:
                         shared_cache = DynamicCache()
                 else:
                     shared_cache = DynamicCache()
+                # Qwen3.5 linear_attn blocks check cache.has_previous_state
+                # (Mamba-style recurrent state). DynamicCache doesn't have
+                # this — patch it so linear_attn treats the first call as
+                # "no prior state" (initializes fresh) and subsequent calls
+                # as "has state" (reads from cache). The attribute is set
+                # to True after the first _run_layers pass completes.
+                if not hasattr(shared_cache, "has_previous_state"):
+                    shared_cache.has_previous_state = (past_key_values is not None)
             except Exception as _cache_exc:
                 logging.debug(
                     "run_layers_dynamic_cache_init_failed: %s — falling back to cache-less forward",
@@ -2333,6 +2341,10 @@ class PyTorchRuntime:
         if not use_cache:
             return output, None
         if shared_cache is not None:
+            # Mark that we now have state — next decode step's linear_attn
+            # blocks will read from the cache instead of initializing fresh.
+            if hasattr(shared_cache, "has_previous_state") and not callable(getattr(shared_cache, "has_previous_state", None)):
+                shared_cache.has_previous_state = True
             return output, shared_cache
         return output, tuple(present_key_values)
 
