@@ -2280,9 +2280,11 @@ class PyTorchRuntime:
                 # Qwen3_5DynamicCache (has `has_previous_state` for the
                 # Mamba-style linear attention). Generic DynamicCache
                 # crashes with AttributeError on those layers.
+                # Note: config.layer_types is only set after model loading,
+                # so we must use self._model.config (not AutoConfig).
                 _cfg = getattr(self._model, "config", None)
                 _cache_cls = None
-                if self._decoder_family == "qwen_llama" and _cfg is not None:
+                if _cfg is not None and hasattr(_cfg, "layer_types"):
                     try:
                         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
                         _cache_cls = Qwen3_5DynamicCache
