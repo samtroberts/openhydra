@@ -27,6 +27,21 @@ from typing import Any
 from peer.pytorch_activation_compressor import PyTorchActivationCompressor
 from peer.privacy import PyTorchDifferentialPrivacyNoise
 
+def _is_model_cached_locally(model_id: str) -> bool:
+    """Check if a HuggingFace model is already in the local cache.
+
+    When True, callers can pass ``local_files_only=True`` to
+    ``from_pretrained()`` to avoid hitting the HF Hub on every startup.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        # Check for config.json — if it's cached, the model is downloaded.
+        result = try_to_load_from_cache(model_id, "config.json")
+        return result is not None and isinstance(result, str)
+    except Exception:
+        return False
+
+
 _TINYLLAMA_MODEL_ID = "nickypro/tinyllama-15M"
 _TINYLLAMA_CACHE_DIR = os.path.expanduser("~/.cache/openhydra/models/tinyllama-15M")
 _TINYLLAMA_MLX_CACHE_DIR = os.path.expanduser("~/.cache/openhydra/models/tinyllama-15M-mlx")
@@ -208,7 +223,10 @@ def _count_model_layers(model_name: str) -> int:
     """
     try:
         from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+        config = AutoConfig.from_pretrained(
+            model_name, trust_remote_code=False,
+            local_files_only=_is_model_cached_locally(model_name),
+        )
         n = int(getattr(config, "num_hidden_layers", 0))
         if n > 0:
             return n
@@ -263,7 +281,10 @@ def _is_multimodal_model_type(model_name: str) -> bool:
     """
     try:
         from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+        config = AutoConfig.from_pretrained(
+            model_name, trust_remote_code=False,
+            local_files_only=_is_model_cached_locally(model_name),
+        )
         mt = str(getattr(config, "model_type", "")).strip().lower()
         return mt in _MULTIMODAL_MODEL_TYPES
     except Exception:
@@ -773,9 +794,16 @@ class PyTorchRuntime:
             else "pytorch_cpu"
         )
 
+        # Skip HuggingFace Hub API calls when the model is already cached.
+        # Saves 2-5s of startup time and avoids network dependency.
+        _local_only = _is_model_cached_locally(self.model_name)
+        if _local_only:
+            logging.info("model %s found in local cache — skipping HF Hub checks", self.model_name)
+
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=self._trust_remote_code,
+            local_files_only=_local_only,
         )
         quantization_config = None
         if self.quantization_bits in {4, 8}:
@@ -840,7 +868,10 @@ class PyTorchRuntime:
         _native_dtype = torch.float16
         try:
             from transformers import AutoConfig as _AC
-            _cfg_probe = _AC.from_pretrained(self.model_name, trust_remote_code=False)
+            _cfg_probe = _AC.from_pretrained(
+                self.model_name, trust_remote_code=False,
+                local_files_only=_local_only,
+            )
             _probe_dtype = getattr(_cfg_probe, "torch_dtype", None)
             if _probe_dtype is None and hasattr(_cfg_probe, "text_config"):
                 _probe_dtype = getattr(_cfg_probe.text_config, "torch_dtype", None)
@@ -933,6 +964,7 @@ class PyTorchRuntime:
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 trust_remote_code=self._trust_remote_code,
+                local_files_only=_local_only,
                 **load_kwargs,
             )
             quantized_weights_loaded = quantization_config is not None
@@ -958,6 +990,7 @@ class PyTorchRuntime:
                 low_cpu_mem_usage=True,
                 torch_dtype=self._dtype,
                 trust_remote_code=self._trust_remote_code,
+                local_files_only=_local_only,
             )
             quantized_weights_loaded = False
 

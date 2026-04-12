@@ -1,0 +1,3 @@
+[
+  {"peer_id": "my-mac", "host": "127.0.0.1", "port": 50051, "model_id": "openhydra-qwen3.5-0.8b", "operator_id": "local", "runtime_backend": "mlx"}
+]
