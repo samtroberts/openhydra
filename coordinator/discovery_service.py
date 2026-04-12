@@ -394,7 +394,9 @@ class DiscoveryService:
                 raise RuntimeError(f"dht_lookup_failed: {latest}") from latest
 
         # Rust Kademlia DHT discover (libp2p path).
-        if self._p2p_node is not None:
+        # Skip if we already have peers from config/HTTP DHT (Kademlia queries
+        # block for up to 10s each and are redundant when peers are known).
+        if self._p2p_node is not None and not peers:
             for model_id in model_filter:
                 try:
                     libp2p_peers = self._p2p_node.discover(model_id=model_id)
