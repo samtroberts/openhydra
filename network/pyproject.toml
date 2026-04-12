@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "openhydra-network"
+version = "0.1.0"
+description = "OpenHydra P2P networking — rust-libp2p with Python bindings"
+requires-python = ">=3.11"
+
+[tool.maturin]
+# Default features include pyo3 with extension-module.
+# No extra features needed.

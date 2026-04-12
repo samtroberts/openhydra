@@ -1659,8 +1659,14 @@ def serve(
     *,
     api_key: str | None = None,
     rate_limiter: _RateLimiter | None = None,
+    p2p_node: object | None = None,
 ) -> None:
     OpenHydraHandler.engine = CoordinatorEngine(config)
+    # Inject the Rust P2P node into the discovery service (if available).
+    if p2p_node is not None and OpenHydraHandler.engine is not None:
+        _dsvc = getattr(OpenHydraHandler.engine, "_discovery_svc", None)
+        if _dsvc is not None:
+            _dsvc._p2p_node = p2p_node
     OpenHydraHandler._api_key = api_key or None
     OpenHydraHandler._rate_limiter = rate_limiter
     if api_key:

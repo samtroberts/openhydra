@@ -1,0 +1,84 @@
+name: Rust Network Layer
+
+on:
+  push:
+    paths:
+      - 'network/**'
+      - '.github/workflows/rust-network.yml'
+  pull_request:
+    paths:
+      - 'network/**'
+
+jobs:
+  test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: network
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: network
+      - run: cargo test --no-default-features
+
+  build-wheels:
+    name: Build Wheels (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-14          # Apple Silicon
+            target: aarch64-apple-darwin
+          - os: macos-13          # Intel Mac
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+    defaults:
+      run:
+        working-directory: network
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install maturin
+      - name: Build wheel
+        run: |
+          if [[ "${{ matrix.target }}" == *"linux"* && "${{ matrix.target }}" == "aarch64"* ]]; then
+            pip install maturin[zig]
+            maturin build --release --target ${{ matrix.target }} --zig
+          else
+            maturin build --release --target ${{ matrix.target }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: network/target/wheels/*.whl
+
+  build-bootstrap:
+    name: Build Bootstrap Binary (Linux x86_64)
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: network
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: network
+      - name: Build bootstrap binary
+        run: |
+          cargo build --release --no-default-features --bin openhydra-bootstrap
+          ls -lh target/release/openhydra-bootstrap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhydra-bootstrap-linux-x86_64
+          path: network/target/release/openhydra-bootstrap

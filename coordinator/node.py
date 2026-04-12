@@ -57,7 +57,7 @@ import time
 import peer.server as peer_server
 from coordinator.api_server import serve as coordinator_serve
 from coordinator.engine import EngineConfig
-from openhydra_defaults import PRODUCTION_BOOTSTRAP_URLS
+from openhydra_defaults import PRODUCTION_BOOTSTRAP_URLS, PRODUCTION_LIBP2P_BOOTSTRAP_PEERS
 from openhydra_logging import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,32 @@ def main() -> None:
         help=(
             "DHT bootstrap URL. Repeat or comma-separate for multiple. "
             "Defaults to the production OpenHydra bootstrap nodes when omitted."
+        ),
+    )
+
+    # --- P2P (Rust libp2p) ---
+    parser.add_argument(
+        "--p2p-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the Rust libp2p networking layer for Kademlia DHT, "
+            "Circuit Relay v2, DCUtR hole-punching, AutoNAT, and mDNS. "
+            "Requires `pip install openhydra-network`."
+        ),
+    )
+    parser.add_argument(
+        "--p2p-listen", action="append", default=None, metavar="MULTIADDR",
+        help=(
+            "libp2p listen multiaddr. Repeat for multiple. "
+            "Default: /ip4/0.0.0.0/tcp/4001"
+        ),
+    )
+    parser.add_argument(
+        "--p2p-bootstrap", action="append", default=None, metavar="MULTIADDR",
+        help=(
+            "libp2p bootstrap peer multiaddr (with /p2p/ suffix). "
+            "Repeat for multiple."
         ),
     )
 
@@ -270,6 +296,33 @@ def main() -> None:
         args.api_host, args.api_port, dht_urls, args.runtime_backend,
     )
 
+    # ── P2P Node (Rust libp2p) ──
+    _p2p_node = None
+    if getattr(args, "p2p_enabled", False):
+        try:
+            from openhydra_network import P2PNode
+            _p2p_listen = getattr(args, "p2p_listen", None) or ["/ip4/0.0.0.0/tcp/4001"]
+            _p2p_bootstrap = getattr(args, "p2p_bootstrap", None) or list(PRODUCTION_LIBP2P_BOOTSTRAP_PEERS)
+            _p2p_node = P2PNode(
+                identity_key_path=args.identity_path,
+                listen_addrs=_p2p_listen,
+                bootstrap_peers=_p2p_bootstrap,
+            )
+            _p2p_node.start()
+            logger.info(
+                "p2p_node_started libp2p_peer_id=%s openhydra_peer_id=%s listen=%s",
+                _p2p_node.libp2p_peer_id,
+                _p2p_node.openhydra_peer_id,
+                _p2p_listen,
+            )
+        except ImportError:
+            logger.warning(
+                "p2p_enabled but openhydra_network not installed — "
+                "run: cd network && maturin build --release && pip install target/wheels/*.whl"
+            )
+        except Exception as _p2p_err:
+            logger.warning("p2p_node_start_failed: %s", _p2p_err)
+
     # Start the peer gRPC server in a background daemon thread.
     # daemon=True ensures it is reaped automatically when the main thread exits
     # (the coordinator's SIGTERM handler on the main thread handles clean shutdown).
@@ -294,6 +347,7 @@ def main() -> None:
             "rebalance_interval": int(getattr(args, "rebalance_interval", 6)),
             "rebalance_min_improvement": float(getattr(args, "rebalance_min_improvement", 1.15)),
             "rebalance_cooldown_s": float(getattr(args, "rebalance_cooldown", 300)),
+            "p2p_node": _p2p_node,
             # All other peer params use peer/server.py defaults.
         },
         name="openhydra-peer",
@@ -383,6 +437,7 @@ def main() -> None:
         port=args.api_port,
         config=engine_config,
         api_key=api_key,
+        p2p_node=_p2p_node,
     )
 
 

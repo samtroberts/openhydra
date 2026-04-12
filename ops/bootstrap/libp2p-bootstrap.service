@@ -1,0 +1,37 @@
+[Unit]
+Description=OpenHydra libp2p Bootstrap Node (Kademlia DHT + Circuit Relay v2)
+Documentation=https://github.com/your-org/openhydra
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openhydra
+Group=openhydra
+WorkingDirectory=/opt/openhydra
+
+# Each server's ExecStart is customized during deploy to include the
+# other two bootstrap peers. The deploy script writes a drop-in override.
+ExecStart=/opt/openhydra/bin/openhydra-bootstrap \
+    --identity /opt/openhydra/.libp2p_identity.key \
+    --listen /ip4/0.0.0.0/tcp/4001
+
+# Log level via RUST_LOG env var (default: info)
+Environment=RUST_LOG=info
+
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Systemd hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/openhydra
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openhydra-libp2p
+
+[Install]
+WantedBy=multi-user.target

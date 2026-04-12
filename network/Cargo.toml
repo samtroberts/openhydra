@@ -1,0 +1,67 @@
+[package]
+name = "openhydra-network"
+version = "0.1.0"
+edition = "2021"
+description = "OpenHydra P2P networking layer — rust-libp2p + PyO3"
+license = "Apache-2.0"
+
+[lib]
+name = "openhydra_network"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# libp2p — P2P networking stack
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "quic",
+    "noise",
+    "yamux",
+    "kad",
+    "relay",
+    "dcutr",
+    "autonat",
+    "identify",
+    "mdns",
+    "ed25519",
+    "macros",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Python bindings (only linked when building the cdylib via maturin)
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+
+# Crypto — compatible with OpenHydra's existing Ed25519 keys
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+futures = "0.3"
+
+[features]
+default = ["pyo3"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+
+[[bin]]
+name = "openhydra-bootstrap"
+path = "src/bootstrap_bin.rs"
