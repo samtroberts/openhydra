@@ -414,7 +414,7 @@ def main() -> None:
         required_replicas=1,
         pipeline_width=2,
         timeout_ms=60000,
-        max_latency_ms=60000,
+        max_latency_ms=600000,  # 10 min — stateless sharded decode is slow per token
         audit_rate=0.0,
         redundant_exec_rate=0.0,
         auditor_rate=0.0,
