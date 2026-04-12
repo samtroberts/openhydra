@@ -317,6 +317,16 @@ def main() -> None:
             "operator_id": "local",
             "runtime_backend": args.runtime_backend,
         }]
+        # Add layer range to the local peer so the coordinator's
+        # LayerCoverageMap sees it as a sharded peer from the first
+        # request (before DHT propagation). Without this, the local
+        # peer appears unsharded → coordinator falls back to full_model
+        # mode even when a remote sharded peer is discovered via DHT.
+        if _explicit_layer_indices:
+            _local_peer[0]["layer_start"] = int(_explicit_layer_indices[0])
+            _local_peer[0]["layer_end"] = int(_explicit_layer_indices[-1]) + 1
+            _local_peer[0]["total_layers"] = int(args.layer_end) if args.layer_end else 0
+            _local_peer[0]["runtime_model_id"] = str(_runtime_model_id)
         _tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="openhydra_peers_",
             delete=False,
@@ -341,12 +351,17 @@ def main() -> None:
         peers_config_path=peers_config_path,
         model_catalog_path=_catalog_path,
         required_replicas=1,
-        pipeline_width=1,
+        pipeline_width=2,
         timeout_ms=60000,
         max_latency_ms=60000,
         audit_rate=0.0,
         redundant_exec_rate=0.0,
         auditor_rate=0.0,
+        # Grounding disabled by default: the fallback path injects dummy
+        # "Context about {word}" snippets that waste tokens + confuse the
+        # model. Users can still enable per-request via "grounding": true.
+        grounding_fallback_enabled=False,
+        grounding_use_network=False,
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
         autoregressive_sharded_enabled=bool(getattr(args, "autoregressive_sharded", True)),
         chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
