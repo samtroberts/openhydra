@@ -1384,7 +1384,15 @@ class InferenceService:
                 # stomp on each other's peer-side caches. Falls back to a
                 # synthetic UUID if the caller didn't pass session_id.
                 _ar_kv_session = str(session_id or request_id or uuid.uuid4())
-                _ar_kv_mode = "kv_aware"
+                # Qwen3.5's hybrid Mamba+Attention architecture uses a
+                # specialized cache (Qwen3_5DynamicCache) with per-layer
+                # conv_states/ssm_states keyed by the FULL model's layer
+                # indices. Sharded _run_layers iterates only a subset of
+                # layers, causing cache index mismatches and garbage output.
+                # Force stateless mode for Qwen3.5 sharded pipelines.
+                _served_model = str(prep.decision.served_model or "").lower()
+                _is_hybrid_model = "qwen3.5" in _served_model or "qwen3_5" in _served_model
+                _ar_kv_mode = "stateless" if _is_hybrid_model else "kv_aware"
                 logger.info(
                     "autoregressive_sharded_start: stages=%d prompt_tokens=%d target=%d mode=%s session=%s",
                     len(prep.primary_pipeline), len(_ar_context_ids),
