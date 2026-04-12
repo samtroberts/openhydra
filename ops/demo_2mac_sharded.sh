@@ -51,24 +51,11 @@ else
     exit 1
 fi
 
-# Auto-detect LAN IP so the peer advertises a reachable address
-# (not 127.0.0.1 which only works on the same machine).
-LAN_IP=$(python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-try:
-    s.connect(('8.8.8.8', 80))
-    print(s.getsockname()[0])
-finally:
-    s.close()
-" 2>/dev/null || echo "0.0.0.0")
-
 echo "================================================================"
 echo "  OpenHydra 2-Mac Sharded Demo"
 echo "  Model:  $HF_MODEL ($TOTAL_LAYERS layers)"
 echo "  Role:   $ROLE (shard $SHARD_INDEX, layers $LAYER_START-$((LAYER_END - 1)))"
-echo "  LAN IP: $LAN_IP (auto-detected, advertised to DHT)"
-echo "  DHT:    auto-discovery (no IPs needed)"
+echo "  DHT:    auto-discovery (STUN detects reachable IP)"
 echo "================================================================"
 echo ""
 echo "Starting peer..."
@@ -86,5 +73,4 @@ python3 -m coordinator.node \
     --grpc-port "$GRPC_PORT" \
     --api-port "$API_PORT" \
     --api-host 0.0.0.0 \
-    --advertise-host "$LAN_IP" \
     --log-level INFO
