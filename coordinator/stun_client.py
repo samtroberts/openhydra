@@ -214,21 +214,23 @@ def probe_nat(
         if ip1 == ip2 and port1 == port2:
             # Same mapping to both servers → full cone or open
             nat_type = "full_cone"
-            requires_relay = False
         elif ip1 == ip2 and port1 != port2:
             # Same IP but different ports → symmetric NAT
             nat_type = "symmetric"
-            requires_relay = True
         else:
             # Different IPs → very unusual, treat as symmetric
             nat_type = "symmetric"
-            requires_relay = True
     else:
         # Only one server responded — can't determine type reliably
         nat_type = "unknown"
-        requires_relay = True
 
-    # Check if we might be directly reachable (open NAT / public IP)
+    # For gRPC (TCP), ALL NAT types except "open" need a relay.
+    # full_cone allows consistent UDP hole-punching but TCP connections
+    # to the external IP:port won't reach the peer's gRPC server
+    # (the STUN-reflected port is for the probe socket, not port 50051).
+    # Only peers with a genuine public IP (local == external) are
+    # directly reachable without relay.
+    requires_relay = True
     try:
         local_ip = socket.gethostbyname(socket.gethostname())
         if local_ip == ext_ip:
