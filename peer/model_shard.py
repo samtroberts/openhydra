@@ -739,23 +739,39 @@ class PyTorchRuntime:
             pass
 
         requested_target = str(config.runtime_target or "auto").strip().lower()
-        if requested_target not in {"auto", "cpu", "cuda"}:
+        if requested_target not in {"auto", "cpu", "cuda", "mps"}:
             requested_target = "auto"
         gpu_available = bool(torch.cuda.is_available())
+        mps_available = bool(
+            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        )
         target = requested_target
         if target == "auto":
-            target = "cuda" if gpu_available else "cpu"
+            if gpu_available:
+                target = "cuda"
+            elif mps_available:
+                target = "mps"
+            else:
+                target = "cpu"
         if target == "cuda" and not gpu_available:
+            target = "cpu"
+        if target == "mps" and not mps_available:
             target = "cpu"
 
         requested_backend = str(config.runtime_backend or "pytorch_auto").strip().lower()
-        if requested_backend not in {"pytorch_auto", "pytorch_cpu", "pytorch_cuda", "pytorch"}:
+        if requested_backend not in {"pytorch_auto", "pytorch_cpu", "pytorch_cuda", "pytorch_mps", "pytorch"}:
             requested_backend = "pytorch_auto"
         if requested_backend in {"pytorch_cpu"}:
             target = "cpu"
         elif requested_backend in {"pytorch_cuda"} and gpu_available:
             target = "cuda"
-        backend = "pytorch_cuda" if target == "cuda" else "pytorch_cpu"
+        elif requested_backend in {"pytorch_mps"} and mps_available:
+            target = "mps"
+        backend = (
+            "pytorch_cuda" if target == "cuda"
+            else "pytorch_mps" if target == "mps"
+            else "pytorch_cpu"
+        )
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
@@ -799,8 +815,15 @@ class PyTorchRuntime:
                     self.quantization_bits = 0
                     quantization_config = None
 
-        self._device = torch.device("cuda" if target == "cuda" else "cpu")
-        self._dtype = torch.float16 if target == "cuda" else torch.float32
+        if target == "cuda":
+            self._device = torch.device("cuda")
+            self._dtype = torch.float16
+        elif target == "mps":
+            self._device = torch.device("mps")
+            self._dtype = torch.float16  # MPS supports fp16 on all Apple Silicon
+        else:
+            self._device = torch.device("cpu")
+            self._dtype = torch.float32
 
         load_kwargs: dict[str, Any] = {
             "low_cpu_mem_usage": True,
@@ -862,6 +885,18 @@ class PyTorchRuntime:
                 load_kwargs["torch_dtype"] = _native_dtype
                 self._multimodal_strip_layers = tuple(_pre_layer_indices)
                 self._multimodal_strip_dtype = _native_dtype
+            elif _pre_layer_indices and target == "mps":
+                # MPS sharding: accelerate's ``device_map`` doesn't support
+                # MPS as a target device. Load everything to CPU first, then
+                # after load move ONLY the kept layers + shared components
+                # (embed_tokens, norm, lm_head) onto MPS. Mirrors the Gemma 4
+                # multimodal strip path. Phase 2's Identity swap cleans up
+                # the unused layers before the move.
+                load_kwargs["device_map"] = {"": "cpu"}
+                load_kwargs["low_cpu_mem_usage"] = True
+                load_kwargs["torch_dtype"] = _native_dtype
+                self._mps_strip_layers = tuple(_pre_layer_indices)
+                self._mps_strip_dtype = _native_dtype
             elif _pre_layer_indices:
                 # Use device index 0 for CUDA, "cpu" string for CPU-only.
                 _sel_device: int | str = 0 if target == "cuda" else "cpu"
@@ -935,7 +970,11 @@ class PyTorchRuntime:
         _multimodal_stripped = False
         _strip_layer_indices = getattr(self, "_multimodal_strip_layers", None)
         if _strip_layer_indices:
-            _strip_target: int | str = 0 if target == "cuda" else "cpu"
+            _strip_target: int | str = (
+                0 if target == "cuda"
+                else "mps" if target == "mps"
+                else "cpu"
+            )
             try:
                 _strip_dtype = getattr(self, "_multimodal_strip_dtype", None) or torch.float16
                 _replaced = _strip_multimodal_components(
@@ -956,6 +995,50 @@ class PyTorchRuntime:
                 )
             self._multimodal_strip_layers = None
 
+        # MPS sharded post-load: move kept layers + shared components from
+        # CPU → MPS after Identity-swapping the unused layers. This mirrors
+        # the multimodal strip flow but for any model family on Apple Silicon.
+        _mps_stripped = False
+        _mps_layer_indices = getattr(self, "_mps_strip_layers", None)
+        if _mps_layer_indices:
+            try:
+                _mps_dtype = getattr(self, "_mps_strip_dtype", None) or torch.float16
+                # Phase 2 Identity swap: eliminate meta-device modules
+                _id_replaced = _replace_offloaded_layers_with_identity(
+                    self._model, tuple(_mps_layer_indices),
+                )
+                # Move surviving layers to MPS
+                _decoder_layers = _find_decoder_layer_list(self._model)
+                if _decoder_layers is not None:
+                    for _li in _mps_layer_indices:
+                        if _li < len(_decoder_layers):
+                            _decoder_layers[_li].to(device="mps", dtype=_mps_dtype)
+                # Move shared components (embed_tokens, norm, rotary_emb, lm_head)
+                _inner = getattr(self._model, "model", self._model)
+                # For Qwen 3.5, AutoModelForCausalLM picks the text-only class,
+                # so _inner is the text model with .layers/.embed_tokens/.norm.
+                # For models with a .language_model wrapper, look there too.
+                _lm_inner = getattr(_inner, "language_model", None) or _inner
+                for _attr in ("embed_tokens", "norm", "rotary_emb"):
+                    _mod = getattr(_lm_inner, _attr, None)
+                    if _mod is not None and isinstance(_mod, torch.nn.Module):
+                        _mod.to(device="mps", dtype=_mps_dtype)
+                if hasattr(self._model, "lm_head") and self._model.lm_head is not None:
+                    self._model.lm_head.to(device="mps", dtype=_mps_dtype)
+                import gc as _gc
+                _gc.collect()
+                logging.info(
+                    "mps_shard_strip: model=%s kept=%d identity_replaced=%d device=mps",
+                    self.model_name, len(_mps_layer_indices), _id_replaced,
+                )
+                _mps_stripped = True
+            except Exception as _mps_exc:
+                logging.warning(
+                    "mps_shard_strip_failed: model=%s err=%s — falling back to CPU",
+                    self.model_name, _mps_exc,
+                )
+            self._mps_strip_layers = None
+
         # Skip .to() when using selective device_map (accelerate manages placement)
         # or when quantized weights are already on device.
         _dm = load_kwargs.get("device_map")
@@ -970,6 +1053,7 @@ class PyTorchRuntime:
             not quantized_weights_loaded
             and not _has_selective_map
             and not _multimodal_stripped
+            and not _mps_stripped
         ):
             self._model.to(self._device)
         self._model.eval()

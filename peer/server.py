@@ -2070,7 +2070,7 @@ def main() -> None:
         ),
     )
 
-    parser.add_argument("--runtime-target", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--runtime-target", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--quantization", choices=["none", "8bit", "4bit"], default="none")
     parser.add_argument(
         "--quantization-mode",
