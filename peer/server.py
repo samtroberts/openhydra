@@ -1882,6 +1882,23 @@ def serve(
         announce_thread: threading.Thread | None = None
         if resolved_dht_urls or _hivemind_adapter is not None or p2p_node is not None:
             effective_host = advertise_host or ("127.0.0.1" if host in {"0.0.0.0", "::"} else host)
+            # Auto-detect LAN IP when binding to 0.0.0.0 and no explicit advertise_host.
+            # Without this, the peer announces 127.0.0.1 which is unreachable from other machines.
+            if not advertise_host and effective_host == "127.0.0.1":
+                try:
+                    import socket as _sock
+                    _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                    _s.connect(("8.8.8.8", 80))
+                    _lan_ip = _s.getsockname()[0]
+                    _s.close()
+                    if _lan_ip and not _lan_ip.startswith("127."):
+                        effective_host = _lan_ip
+                        logging.info(
+                            "peer %s auto-detected LAN IP as advertise_host: %s",
+                            peer_id, effective_host,
+                        )
+                except Exception:
+                    pass
             # When behind NAT, use the detected external IP so other
             # peers across the internet can reach us.
             if p2p_node is not None and not advertise_host:
