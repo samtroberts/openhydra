@@ -2276,16 +2276,28 @@ class PyTorchRuntime:
         # sharded ``_run_layers`` can drive the same state machine.
         if use_cache and shared_cache is None:
             try:
-                from transformers.cache_utils import DynamicCache
+                # Qwen3.5 has hybrid Mamba+Attention layers that require
+                # Qwen3_5DynamicCache (has `has_previous_state` for the
+                # Mamba-style linear attention). Generic DynamicCache
+                # crashes with AttributeError on those layers.
                 _cfg = getattr(self._model, "config", None)
+                _cache_cls = None
+                if self._decoder_family == "qwen_llama" and _cfg is not None:
+                    try:
+                        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+                        _cache_cls = Qwen3_5DynamicCache
+                    except ImportError:
+                        pass
+                if _cache_cls is None:
+                    from transformers.cache_utils import DynamicCache
+                    _cache_cls = DynamicCache
                 if _cfg is not None:
                     try:
-                        shared_cache = DynamicCache(config=_cfg)
+                        shared_cache = _cache_cls(config=_cfg)
                     except TypeError:
-                        # Older transformers signatures: no config kwarg.
-                        shared_cache = DynamicCache()
+                        shared_cache = _cache_cls()
                 else:
-                    shared_cache = DynamicCache()
+                    shared_cache = _cache_cls()
             except Exception as _cache_exc:
                 logging.debug(
                     "run_layers_dynamic_cache_init_failed: %s — falling back to cache-less forward",
@@ -2486,6 +2498,13 @@ class PyTorchRuntime:
         cache_entry = self._kv_cache_get(session_id) if cache_requested else None
         cached_past = (cache_entry or {}).get("past_key_values")
         if cache_requested and cached_past is None:
+            logging.warning(
+                "kv_cache_miss: session=%s cache_keys=%s store=%s use=%s",
+                session_id[:20] if session_id else "",
+                list(self._kv_cache.keys())[:5],
+                kv_store_activation,
+                kv_use_cached_activation,
+            )
             raise RuntimeError("kv_cache_miss")
         self.last_kv_cache_hit = bool(cache_requested and cached_past is not None)
         cache_enabled = bool(session_id and (kv_store_activation or cache_requested))
@@ -2690,6 +2709,12 @@ class PyTorchRuntime:
                     cache_position=cache_position,
                 )
                 if bool(session_id and kv_store_activation):
+                    logging.debug(
+                        "kv_cache_store: session=%s next_past_type=%s is_none=%s",
+                        session_id[:20] if session_id else "",
+                        type(next_past).__name__,
+                        next_past is None,
+                    )
                     self._kv_cache_set(session_id, next_past)
                 if is_last:
                     output_count = 1

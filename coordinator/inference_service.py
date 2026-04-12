@@ -1054,10 +1054,6 @@ class InferenceService:
         # Phase 2: record demand signal for the auto-scaler.
         self.discovery_service._request_log.record(str(model_id or self.config.default_model))
 
-        # Compute an absolute deadline for this request so every gRPC hop
-        # respects the overall latency budget rather than getting a fresh window.
-        deadline = time.time() + self.config.max_latency_ms / 1000.0
-
         _t_prep_start = time.perf_counter()
         prep = self._engine._prepare_inference(
             prompt=prompt,
@@ -1071,6 +1067,10 @@ class InferenceService:
         )
         _t_prep_ms = (time.perf_counter() - _t_prep_start) * 1000
         logger.info("PROFILE phase_A_prepare_inference=%.1fms", _t_prep_ms)
+
+        # Compute the absolute deadline AFTER discovery/preparation completes,
+        # so the full latency budget is available for the actual inference chain.
+        deadline = time.time() + self.config.max_latency_ms / 1000.0
         # Elastic output cap: 2048 floor, up to 8192 if redundancy >= 3.0
         _served = prep.decision.served_model
         _available = prep.counts.get(_served, 0)
