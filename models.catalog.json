@@ -11,9 +11,16 @@
     "recommended_quantization": "int4",
     "num_layers": 48,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "reasoning", "large"],
-    "description": "Qwen 3.5 27B — frontier-class reasoning; requires 4 peers with int4."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "reasoning",
+      "large"
+    ],
+    "description": "Qwen 3.5 27B \u2014 frontier-class reasoning; requires 4 peers with int4."
   },
   {
     "model_id": "openhydra-qwen3.5-9b",
@@ -27,9 +34,16 @@
     "recommended_quantization": "int8",
     "num_layers": 48,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "reasoning", "medium"],
-    "description": "Qwen 3.5 9B — high-quality reasoning for 2-peer pipelines."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "reasoning",
+      "medium"
+    ],
+    "description": "Qwen 3.5 9B \u2014 high-quality reasoning for 2-peer pipelines."
   },
   {
     "model_id": "openhydra-qwen3.5-4b",
@@ -43,9 +57,15 @@
     "recommended_quantization": "int4",
     "num_layers": 36,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "medium"],
-    "description": "Qwen 3.5 4B — strong reasoning for single-peer deployment."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "medium"
+    ],
+    "description": "Qwen 3.5 4B \u2014 strong reasoning for single-peer deployment."
   },
   {
     "model_id": "openhydra-qwen3.5-2b",
@@ -57,11 +77,17 @@
     "shards_needed": 1,
     "quality_tier": "basic",
     "recommended_quantization": "fp32",
-    "num_layers": 28,
+    "num_layers": 24,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "small"],
-    "description": "Qwen 3.5 2B — compact model with strong multilingual capability."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "small"
+    ],
+    "description": "Qwen 3.5 2B \u2014 compact model with strong multilingual capability."
   },
   {
     "model_id": "openhydra-qwen3.5-0.8b",
@@ -75,9 +101,16 @@
     "recommended_quantization": "fp32",
     "num_layers": 24,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "small", "fast"],
-    "description": "Qwen 3.5 0.8B — lightweight, ideal for single-peer deployment."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "small",
+      "fast"
+    ],
+    "description": "Qwen 3.5 0.8B \u2014 lightweight, ideal for single-peer deployment."
   },
   {
     "model_id": "openhydra-qwen2.5-7b-instruct",
@@ -91,9 +124,17 @@
     "recommended_quantization": "fp16",
     "num_layers": 28,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "instruct", "medium", "shardable"],
-    "description": "Qwen 2.5 7B Instruct — instruction-tuned, coherent multi-turn chat. Ideal for sharded inference demos."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "instruct",
+      "medium",
+      "shardable"
+    ],
+    "description": "Qwen 2.5 7B Instruct \u2014 instruction-tuned, coherent multi-turn chat. Ideal for sharded inference demos."
   },
   {
     "model_id": "openhydra-qwen3-8b",
@@ -107,9 +148,18 @@
     "recommended_quantization": "fp16",
     "num_layers": 36,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["chat", "reasoning", "thinking", "medium", "shardable"],
-    "description": "Qwen 3 8B — thinking model with native reasoning. No instruct variant needed (base model uses thinking mode)."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "chat",
+      "reasoning",
+      "thinking",
+      "medium",
+      "shardable"
+    ],
+    "description": "Qwen 3 8B \u2014 thinking model with native reasoning. No instruct variant needed (base model uses thinking mode)."
   },
   {
     "model_id": "openhydra-qwen2.5-0.5b",
@@ -123,9 +173,17 @@
     "recommended_quantization": "fp16",
     "num_layers": 24,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["text", "small", "test", "shardable"],
-    "description": "Qwen 2.5 0.5B — 500M params, non-thinking, ideal for sharding tests."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "text",
+      "small",
+      "test",
+      "shardable"
+    ],
+    "description": "Qwen 2.5 0.5B \u2014 500M params, non-thinking, ideal for sharding tests."
   },
   {
     "model_id": "openhydra-gemma4-e2b",
@@ -139,9 +197,18 @@
     "recommended_quantization": "fp16",
     "num_layers": 35,
     "context_length": 128000,
-    "languages": ["en", "multilingual"],
-    "tags": ["multimodal", "vision", "reasoning", "small", "shardable"],
-    "description": "Gemma 4 E2B — 2B effective params, multimodal (image+video+audio), 128K context."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "multimodal",
+      "vision",
+      "reasoning",
+      "small",
+      "shardable"
+    ],
+    "description": "Gemma 4 E2B \u2014 2B effective params, multimodal (image+video+audio), 128K context."
   },
   {
     "model_id": "openhydra-gemma4-e4b",
@@ -155,9 +222,18 @@
     "recommended_quantization": "fp16",
     "num_layers": 42,
     "context_length": 128000,
-    "languages": ["en", "multilingual"],
-    "tags": ["multimodal", "vision", "reasoning", "medium", "shardable"],
-    "description": "Gemma 4 E4B — 4B effective params, multimodal (image+video+audio), 128K context, thinking mode."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "multimodal",
+      "vision",
+      "reasoning",
+      "medium",
+      "shardable"
+    ],
+    "description": "Gemma 4 E4B \u2014 4B effective params, multimodal (image+video+audio), 128K context, thinking mode."
   },
   {
     "model_id": "openhydra-gemma4-e4b-it",
@@ -171,9 +247,19 @@
     "recommended_quantization": "fp16",
     "num_layers": 42,
     "context_length": 128000,
-    "languages": ["en", "multilingual"],
-    "tags": ["multimodal", "vision", "instruct", "reasoning", "medium", "shardable"],
-    "description": "Gemma 4 E4B Instruct — instruction-tuned, multimodal, thinking mode."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "multimodal",
+      "vision",
+      "instruct",
+      "reasoning",
+      "medium",
+      "shardable"
+    ],
+    "description": "Gemma 4 E4B Instruct \u2014 instruction-tuned, multimodal, thinking mode."
   },
   {
     "model_id": "openhydra-qwen3.5-0.8b",
@@ -187,9 +273,17 @@
     "recommended_quantization": "fp16",
     "num_layers": 24,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["thinking", "small", "fast", "shardable"],
-    "description": "Qwen 3.5 0.8B — thinking model, 24 layers, hybrid linear attention."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "thinking",
+      "small",
+      "fast",
+      "shardable"
+    ],
+    "description": "Qwen 3.5 0.8B \u2014 thinking model, 24 layers, hybrid linear attention."
   },
   {
     "model_id": "openhydra-qwen3.5-4b",
@@ -203,9 +297,16 @@
     "recommended_quantization": "fp16",
     "num_layers": 32,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["thinking", "medium", "shardable"],
-    "description": "Qwen 3.5 4B — thinking model, 32 layers."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "thinking",
+      "medium",
+      "shardable"
+    ],
+    "description": "Qwen 3.5 4B \u2014 thinking model, 32 layers."
   },
   {
     "model_id": "openhydra-qwen3.5-9b",
@@ -219,9 +320,17 @@
     "recommended_quantization": "fp16",
     "num_layers": 32,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["thinking", "reasoning", "medium", "shardable"],
-    "description": "Qwen 3.5 9B — thinking model, 32 layers, strong reasoning."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "thinking",
+      "reasoning",
+      "medium",
+      "shardable"
+    ],
+    "description": "Qwen 3.5 9B \u2014 thinking model, 32 layers, strong reasoning."
   },
   {
     "model_id": "openhydra-qwen3.5-27b",
@@ -235,9 +344,17 @@
     "recommended_quantization": "int4",
     "num_layers": 64,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["thinking", "reasoning", "large", "shardable"],
-    "description": "Qwen 3.5 27B — frontier thinking model, 64 layers, requires 8-peer sharding."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "thinking",
+      "reasoning",
+      "large",
+      "shardable"
+    ],
+    "description": "Qwen 3.5 27B \u2014 frontier thinking model, 64 layers, requires 8-peer sharding."
   },
   {
     "model_id": "openhydra-smollm2-360m",
@@ -251,9 +368,16 @@
     "recommended_quantization": "bf16",
     "num_layers": 32,
     "context_length": 8192,
-    "languages": ["en"],
-    "tags": ["text", "small", "test", "shardable"],
-    "description": "SmolLM2 360M — HuggingFace 362M LlamaForCausalLM, 32 layers, ideal for sharding tests."
+    "languages": [
+      "en"
+    ],
+    "tags": [
+      "text",
+      "small",
+      "test",
+      "shardable"
+    ],
+    "description": "SmolLM2 360M \u2014 HuggingFace 362M LlamaForCausalLM, 32 layers, ideal for sharding tests."
   },
   {
     "model_id": "openhydra-gemma3-270m",
@@ -267,9 +391,17 @@
     "recommended_quantization": "fp16",
     "num_layers": 18,
     "context_length": 32768,
-    "languages": ["en", "multilingual"],
-    "tags": ["text", "small", "test", "shardable"],
-    "description": "Gemma 3 270M — Google's 270M base model, 18 layers, ideal for sharding tests."
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "text",
+      "small",
+      "test",
+      "shardable"
+    ],
+    "description": "Gemma 3 270M \u2014 Google's 270M base model, 18 layers, ideal for sharding tests."
   },
   {
     "model_id": "openhydra-tinyllama-15m",
@@ -283,8 +415,15 @@
     "recommended_quantization": "fp32",
     "num_layers": 6,
     "context_length": 2048,
-    "languages": ["en"],
-    "tags": ["text", "tiny", "test", "dev"],
-    "description": "TinyLLaMA 15M — 15M param dev/test model, used as default ToyRuntime."
+    "languages": [
+      "en"
+    ],
+    "tags": [
+      "text",
+      "tiny",
+      "test",
+      "dev"
+    ],
+    "description": "TinyLLaMA 15M \u2014 15M param dev/test model, used as default ToyRuntime."
   }
 ]
