@@ -195,6 +195,37 @@ class InferenceService:
         return bool(backends) and all(item.startswith("pytorch") for item in backends)
 
     @staticmethod
+    def _collect_eos_token_ids(tokenizer: Any) -> tuple[set[int], set[int]]:
+        """Extract (eos_token_ids, all_special_ids) from a HuggingFace tokenizer.
+
+        Returns two sets of non-negative ints. ``eos_token_ids`` covers single
+        ``eos_token_id`` plus list-valued eos specifications. ``special_ids``
+        is the tokenizer's ``all_special_ids`` used to filter out BOS/PAD/etc.
+        during decode. Both paths (non-streaming ``infer()`` outer loop and
+        streaming ``infer_chat_stream``) use this helper so they stay in sync.
+        """
+        eos_ids: set[int] = set()
+        special_ids: set[int] = set()
+        if tokenizer is None:
+            return eos_ids, special_ids
+        eos_raw = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(eos_raw, int):
+            eos_ids = {int(eos_raw)}
+        elif eos_raw is not None:
+            try:
+                eos_ids = {int(item) for item in list(eos_raw)}
+            except TypeError:
+                eos_ids = set()
+        eos_ids = {item for item in eos_ids if item >= 0}
+        special_raw = getattr(tokenizer, "all_special_ids", None)
+        if special_raw is not None:
+            try:
+                special_ids = {int(item) for item in list(special_raw) if int(item) >= 0}
+            except TypeError:
+                special_ids = set()
+        return eos_ids, special_ids
+
+    @staticmethod
     def _rotate(values: list, offset: int) -> list:
         if not values:
             return values
@@ -1286,6 +1317,225 @@ class InferenceService:
                 traces=[],
                 latency_ms=(time.perf_counter() - _t_chain_start) * 1000,
             )
+        elif (
+            self.config.autoregressive_sharded_enabled
+            and len(prep.primary_pipeline) > 1
+            and self._pipeline_uses_pytorch_runtime(prep.primary_pipeline)
+        ):
+            # Phase 1A + Phase 6 fix: non-streaming sharded PyTorch pipelines
+            # need an outer decode loop because the last-stage peer only
+            # returns ONE token per chain.run() call (it can't autoregress
+            # alone — it doesn't hold layers 0..N-1).
+            #
+            # Two code paths live here:
+            #
+            # (1) KV-aware (preferred) — prefill once with the full context
+            #     and ``kv_store_activation=True``, then each subsequent
+            #     decode step ships ONLY the previous token and reads the
+            #     peer-side KV cache via ``kv_use_cached_activation=True``.
+            #     Cost per generated token is a single layer-stack forward
+            #     on [1 token] at every peer → O(1) per token regardless of
+            #     context length. Enabled by default because Phase 2's
+            #     Identity-replacement pass stops ``DynamicCache`` iterations
+            #     from dispatching on meta tensors.
+            #
+            # (2) Stateless re-prefill (fallback) — if any KV-aware call
+            #     raises (cache miss, unsupported cache dtype, etc.), we
+            #     transparently rebuild from scratch at every decode step
+            #     with the full context. This was the original Phase 1 path.
+            #     It's O(N²) in output length but correct without depending
+            #     on any peer-side state.
+            _runtime_model = self._resolve_pipeline_runtime_model_id(
+                prep.primary_pipeline, prep.decision.served_model,
+            )
+            try:
+                _ar_tokenizer = self._engine._load_generation_tokenizer(_runtime_model)
+            except Exception as _tok_exc:
+                logger.warning(
+                    "autoregressive_sharded_tokenizer_unavailable: %s — falling back to single chain.run()",
+                    _tok_exc,
+                )
+                _ar_tokenizer = None
+
+            if _ar_tokenizer is not None:
+                _ar_eos_ids, _ar_special_ids = self._collect_eos_token_ids(_ar_tokenizer)
+                try:
+                    _ar_context_ids = [
+                        int(t) for t in _ar_tokenizer.encode(
+                            prep.effective_prompt, add_special_tokens=True,
+                        )
+                    ]
+                except Exception:
+                    _ar_context_ids = []
+                if not _ar_context_ids:
+                    _ar_context_ids = [
+                        int(next(iter(_ar_eos_ids))) if _ar_eos_ids else 0
+                    ]
+
+                _ar_generated: list[int] = []
+                _ar_traces: list[Any] = []
+                _ar_activation_hash = b""
+                _ar_last_kv: dict[str, Any] | None = None
+                _ar_last_compression: dict[str, Any] | None = None
+                _ar_last_encryption: dict[str, Any] | None = None
+                _ar_total_latency_ms = 0.0
+                _ar_target_tokens = max(1, int(max_tokens))
+                # KV session ID — per-request so concurrent requests don't
+                # stomp on each other's peer-side caches. Falls back to a
+                # synthetic UUID if the caller didn't pass session_id.
+                _ar_kv_session = str(session_id or request_id or uuid.uuid4())
+                _ar_kv_mode = "kv_aware"
+                logger.info(
+                    "autoregressive_sharded_start: stages=%d prompt_tokens=%d target=%d mode=%s session=%s",
+                    len(prep.primary_pipeline), len(_ar_context_ids),
+                    _ar_target_tokens, _ar_kv_mode, _ar_kv_session[:12],
+                )
+
+                def _step_stateless(all_token_ids: list[int]):
+                    """Full re-prefill fallback. Sends the full context every
+                    call and asks for 1 token back. Used when KV-aware path
+                    errors or when the peer doesn't support the KV session."""
+                    return self._engine._run_chain(
+                        "",
+                        prep.candidates,
+                        prep.primary_pipeline,
+                        max_tokens=1,
+                        request_id=request_id,
+                        deadline=deadline,
+                        initial_activation=[float(t) for t in all_token_ids],
+                        **decode_controls,
+                    )
+
+                def _step_prefill():
+                    """KV-aware prefill: ship the full context AND tell the
+                    peer to store the resulting K/V cache under our session
+                    ID. All subsequent calls will reuse this state."""
+                    return self._engine._run_chain(
+                        "",
+                        prep.candidates,
+                        prep.primary_pipeline,
+                        max_tokens=1,
+                        request_id=request_id,
+                        deadline=deadline,
+                        initial_activation=[float(t) for t in _ar_context_ids],
+                        kv_session_id=_ar_kv_session,
+                        kv_store_activation=True,
+                        kv_use_cached_activation=False,
+                        kv_cache_stage_index=0,
+                        kv_cache_all_stages=True,
+                        **decode_controls,
+                    )
+
+                def _step_decode(prev_token: int):
+                    """KV-aware decode step: ship ONLY the just-generated
+                    token. Peer reads its cached K/V for positions [0..N-1],
+                    computes K/V for position N on the fly, appends to the
+                    cache (kv_store_activation=True), returns a single
+                    sampled next-token id."""
+                    return self._engine._run_chain(
+                        "",
+                        prep.candidates,
+                        prep.primary_pipeline,
+                        max_tokens=1,
+                        request_id=request_id,
+                        deadline=deadline,
+                        initial_activation=[float(prev_token)],
+                        kv_session_id=_ar_kv_session,
+                        kv_store_activation=True,
+                        kv_use_cached_activation=True,
+                        kv_cache_stage_index=0,
+                        kv_cache_all_stages=True,
+                        **decode_controls,
+                    )
+
+                _prefill_done = False
+                for _ar_step in range(_ar_target_tokens):
+                    try:
+                        if _ar_kv_mode == "kv_aware":
+                            if not _prefill_done:
+                                _step_result = _step_prefill()
+                                _prefill_done = True
+                            else:
+                                # We have at least one generated token if we're here
+                                # past step 0; feed the last one into the decode path.
+                                _step_result = _step_decode(_ar_generated[-1])
+                        else:
+                            _step_result = _step_stateless(_ar_context_ids + _ar_generated)
+                    except RuntimeError as _kv_exc:
+                        if _ar_kv_mode == "kv_aware":
+                            # First failure flips us into stateless mode and
+                            # retries this token. All subsequent tokens stay
+                            # in stateless mode for the remainder of the
+                            # request (avoids oscillation). We log once at
+                            # warning level so the degradation is visible.
+                            logger.warning(
+                                "autoregressive_sharded_kv_fallback: step=%d err=%s — switching to stateless re-prefill",
+                                _ar_step, str(_kv_exc)[:200],
+                            )
+                            _ar_kv_mode = "stateless"
+                            try:
+                                _step_result = _step_stateless(
+                                    _ar_context_ids + _ar_generated
+                                )
+                            except Exception as _fallback_exc:
+                                logger.error(
+                                    "autoregressive_sharded_stateless_fallback_failed: %s",
+                                    _fallback_exc,
+                                )
+                                raise
+                        else:
+                            raise
+
+                    _ar_total_latency_ms += float(_step_result.latency_ms or 0.0)
+                    _ar_traces.extend(list(_step_result.traces or []))
+                    if _step_result.kv is not None:
+                        _ar_last_kv = _step_result.kv
+                    if _step_result.compression is not None:
+                        _ar_last_compression = _step_result.compression
+                    if _step_result.encryption is not None:
+                        _ar_last_encryption = _step_result.encryption
+                    if _step_result.activation_hash:
+                        _ar_activation_hash = _step_result.activation_hash
+                    if not _step_result.activation:
+                        break
+                    _next_id = int(round(float(_step_result.activation[0])))
+                    if _ar_eos_ids and _next_id in _ar_eos_ids:
+                        break
+                    _ar_generated.append(_next_id)
+
+                try:
+                    _ar_text = _ar_tokenizer.decode(
+                        _ar_generated, skip_special_tokens=True,
+                    )
+                except Exception:
+                    _ar_text = ""
+
+                primary = ChainResult(
+                    request_id=request_id or str(uuid.uuid4()),
+                    text=_ar_text,
+                    activation=[float(t) for t in _ar_generated],
+                    traces=_ar_traces,
+                    latency_ms=_ar_total_latency_ms,
+                    compression=_ar_last_compression,
+                    encryption=_ar_last_encryption,
+                    kv=_ar_last_kv,
+                    activation_hash=_ar_activation_hash,
+                )
+                logger.info(
+                    "autoregressive_sharded_done: tokens=%d latency_ms=%.1f mode=%s text=%r",
+                    len(_ar_generated), _ar_total_latency_ms, _ar_kv_mode, _ar_text[:120],
+                )
+            else:
+                # Tokenizer unavailable — fall through to the single chain.run() path.
+                primary = self._engine._run_chain(
+                    prep.effective_prompt,
+                    prep.candidates,
+                    prep.primary_pipeline,
+                    max_tokens=max_tokens,
+                    request_id=request_id,
+                    deadline=deadline,
+                    **decode_controls,
+                )
         else:
             primary = self._engine._run_chain(
                 prep.effective_prompt,
@@ -1709,26 +1959,9 @@ class InferenceService:
             if pytorch_autoregressive
             else None
         )
-        pytorch_eos_token_ids: set[int] = set()
-        pytorch_special_token_ids: set[int] = set()
-        if pytorch_tokenizer is not None:
-            eos_raw = getattr(pytorch_tokenizer, "eos_token_id", None)
-            if isinstance(eos_raw, int):
-                pytorch_eos_token_ids = {int(eos_raw)}
-            elif eos_raw is not None:
-                try:
-                    pytorch_eos_token_ids = {int(item) for item in list(eos_raw)}
-                except TypeError:
-                    pytorch_eos_token_ids = set()
-            pytorch_eos_token_ids = {item for item in pytorch_eos_token_ids if item >= 0}
-            special_raw = getattr(pytorch_tokenizer, "all_special_ids", None)
-            if special_raw is not None:
-                try:
-                    pytorch_special_token_ids = {
-                        int(item) for item in list(special_raw) if int(item) >= 0
-                    }
-                except TypeError:
-                    pytorch_special_token_ids = set()
+        pytorch_eos_token_ids, pytorch_special_token_ids = self._collect_eos_token_ids(
+            pytorch_tokenizer
+        )
         pytorch_eos_token_id = (min(pytorch_eos_token_ids) if pytorch_eos_token_ids else None)
         pytorch_speculative_enabled = bool(self.config.speculative_enabled and pytorch_autoregressive)
         pytorch_draft_model: PyTorchDraftModel | None = None
@@ -1822,7 +2055,141 @@ class InferenceService:
             prefetch_executor = ThreadPoolExecutor(max_workers=pipeline_parallel_workers) if pipeline_parallel_enabled else None
             pending_prefetch: dict[str, Any] | None = None
 
+            if pytorch_autoregressive and not pytorch_speculative_active:
+                # Phase 7 fix: use the same prefill→decode loop structure as
+                # the non-streaming ``infer()`` Phase 6 path. The previous
+                # verify/commit dance discarded the prefill's first sampled
+                # token and instead re-sent ``context_token_ids[-1]`` (the
+                # last PROMPT token) as the verify input — for Qwen 3.5 chat
+                # templates that token is the assistant turn marker, so the
+                # model immediately predicted EOS / a special token and the
+                # SSE stream emitted nothing before ``[DONE]``.
+                #
+                # The loop here is straightforward: prefill once with the
+                # full context, then for every decode step ship JUST the
+                # previously generated token and read peer-side KV state.
+                # All the same Phase 2 / Phase 6 fixes apply (Identity
+                # offload, ``DynamicCache`` materialisation, T4 conv1d
+                # fallback) so it benefits from the same ~3× speedup.
+                if pytorch_tokenizer is None:
+                    raise RuntimeError("pytorch_generation_tokenizer_unavailable")
+
+                context_token_ids = [int(token) for token in pytorch_tokenizer.encode(working_prompt, add_special_tokens=True)]
+                if not context_token_ids:
+                    fallback_token = (
+                        int(pytorch_eos_token_id)
+                        if pytorch_eos_token_id is not None
+                        else 0
+                    )
+                    context_token_ids = [fallback_token]
+                pytorch_session_id = str(session_id or request_id)
+                _stream_kv_mode = "kv_aware"
+
+                def _stream_step_prefill():
+                    return self._engine._run_chain(
+                        "",
+                        prep.candidates,
+                        prep.primary_pipeline,
+                        max_tokens=1,
+                        request_id=request_id,
+                        initial_activation=[float(t) for t in context_token_ids],
+                        kv_session_id=pytorch_session_id,
+                        kv_store_activation=True,
+                        kv_use_cached_activation=False,
+                        kv_cache_stage_index=0,
+                        kv_cache_all_stages=True,
+                        **pytorch_decode_controls,
+                    )
+
+                def _stream_step_decode(prev_token: int):
+                    return self._engine._run_chain(
+                        "",
+                        prep.candidates,
+                        prep.primary_pipeline,
+                        max_tokens=1,
+                        request_id=request_id,
+                        initial_activation=[float(prev_token)],
+                        kv_session_id=pytorch_session_id,
+                        kv_store_activation=True,
+                        kv_use_cached_activation=True,
+                        kv_cache_stage_index=0,
+                        kv_cache_all_stages=True,
+                        **pytorch_decode_controls,
+                    )
+
+                def _stream_step_stateless(all_token_ids: list[int]):
+                    return self._engine._run_chain(
+                        "",
+                        prep.candidates,
+                        prep.primary_pipeline,
+                        max_tokens=1,
+                        request_id=request_id,
+                        initial_activation=[float(t) for t in all_token_ids],
+                        **pytorch_decode_controls,
+                    )
+
+                _prefill_done = False
+                for _ in range(max_stream_tokens):
+                    try:
+                        if _stream_kv_mode == "kv_aware":
+                            if not _prefill_done:
+                                _step_result = _stream_step_prefill()
+                                _prefill_done = True
+                                kv_data_plane["cache_updated"] = True
+                            else:
+                                _step_result = _stream_step_decode(context_token_ids[-1])
+                        else:
+                            _step_result = _stream_step_stateless(context_token_ids)
+                    except RuntimeError as _kv_exc:
+                        if _stream_kv_mode == "kv_aware":
+                            logger.warning(
+                                "infer_stream_kv_fallback: err=%s — switching to stateless re-prefill",
+                                str(_kv_exc)[:200],
+                            )
+                            _stream_kv_mode = "stateless"
+                            kv_data_plane["peer_cache_misses"] = int(kv_data_plane["peer_cache_misses"]) + 1
+                            kv_data_plane["peer_cache_fallbacks"] = int(kv_data_plane["peer_cache_fallbacks"]) + 1
+                            _step_result = _stream_step_stateless(context_token_ids)
+                        else:
+                            raise
+
+                    if not _step_result.activation:
+                        break
+                    next_token_id = int(round(float(_step_result.activation[0])))
+                    if pytorch_eos_token_ids and next_token_id in pytorch_eos_token_ids:
+                        return
+                    context_token_ids.append(next_token_id)
+                    latest_activation = [float(next_token_id)]
+                    if next_token_id in pytorch_special_token_ids:
+                        if len(generated_tokens) >= max_stream_tokens:
+                            return
+                        continue
+                    token_text = str(
+                        pytorch_tokenizer.decode(
+                            [next_token_id],
+                            clean_up_tokenization_spaces=False,
+                        )
+                    )
+                    if token_text:
+                        generated_tokens.append(token_text)
+                        yield token_text
+                    for trace in _step_result.traces:
+                        self.ledger.earn(trace.peer_id, tokens_served=1)
+                        if hydra_reward_rate > 0.0:
+                            self.hydra.mint_for_inference(
+                                peer_id=trace.peer_id,
+                                tokens_served=1,
+                                reward_per_1k_tokens=hydra_reward_rate,
+                            )
+                    if len(generated_tokens) >= max_stream_tokens:
+                        return
+                return
+
             if pytorch_autoregressive:
+                # Speculative decoding path (non-streaming-Phase-6) — kept
+                # as-is for the speculative+streaming combination that has
+                # its own KV/draft-model logic. Only entered when
+                # ``--speculative`` is on AND streaming is requested.
                 if pytorch_tokenizer is None:
                     raise RuntimeError("pytorch_generation_tokenizer_unavailable")
 

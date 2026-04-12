@@ -185,16 +185,241 @@ class _DecoderArchitecture:
     position_embeddings: Any | None = None
     final_norm: Any | None = None
     rotary_emb: Any | None = None
+    # ── Gemma 4 sharded adapter extras (Phase 4) ───────────────────────
+    # Populated only when ``family == "gemma4"``; ignored by every other
+    # branch. These capture the layer-type-aware rotary + causal mask +
+    # per-layer-input plumbing that Gemma 4 needs but llama / qwen_llama
+    # don't. Carrying them inside ``_DecoderArchitecture`` keeps the
+    # architecture detection output self-contained — no extra attributes
+    # bolted onto ``PyTorchRuntime``.
+    layer_types: tuple[str, ...] = ()        # config.layer_types[i] → "full_attention" | "sliding_attention"
+    per_layer_embed: Any | None = None        # model.language_model.embed_tokens_per_layer
+    per_layer_proj: Any | None = None         # model.language_model.per_layer_model_projection
+    per_layer_norm: Any | None = None         # model.language_model.per_layer_projection_norm
+    hidden_size_per_layer: int = 0            # config.hidden_size_per_layer_input
+    text_model: Any | None = None             # Gemma4TextModel instance (for get_per_layer_inputs/project_per_layer_inputs)
 
 
 def _count_model_layers(model_name: str) -> int:
-    """Read num_hidden_layers from a model's config.json without loading weights."""
+    """Read num_hidden_layers from a model's config.json without loading weights.
+
+    For multimodal models (Gemma 4, Qwen 3.5 VL), the text decoder config
+    is nested under ``text_config``.
+    """
     try:
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
-        return int(getattr(config, "num_hidden_layers", 0))
+        n = int(getattr(config, "num_hidden_layers", 0))
+        if n > 0:
+            return n
+        # Multimodal models: layers count is inside text_config
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return int(getattr(text_config, "num_hidden_layers", 0))
+        return 0
     except Exception:
         return 0
+
+
+def _detect_layer_prefix(model_name: str) -> str:
+    """Device-map key prefix for transformer layers.
+
+    All supported families load into a text-only ``*ForCausalLM`` class that
+    exposes ``model.layers.N`` as the decoder module path. This holds for:
+
+    - LLaMA / Qwen 2.x / Qwen 3 / Gemma 2-3 — native text-only checkpoints
+    - Qwen 3.5 — ``AutoModelForCausalLM`` picks ``Qwen3_5ForCausalLM`` which
+      unwraps the multimodal checkpoint's ``model.language_model.*`` keys to
+      the text-only tree automatically
+    - Gemma 4 — takes a different path entirely (multimodal strip) because
+      its auto-class is ``Gemma4ForConditionalGeneration`` with vision/audio
+      towers that cannot be cleanly device-mapped.
+    """
+    return "model.layers"
+
+
+# Gemma 4 requires the CPU-strip-and-move path because the checkpoint keys
+# under ``model.language_model.embed_tokens_per_layer`` and the per-layer
+# projection cannot be cleanly device-mapped via accelerate. Qwen 3.5 has a
+# simpler multimodal wrapper — text decoder at ``model.language_model.*``,
+# vision at ``model.visual.*``, optional ``mtp`` head — and CAN be handled
+# via selective device_map without loading everything into CPU RAM.
+_MULTIMODAL_MODEL_TYPES = frozenset({"gemma4"})
+
+_MULTIMODAL_AUX_ATTRS = (
+    "vision_tower",
+    "audio_tower",
+    "embed_vision",
+    "embed_audio",
+    "multi_modal_projector",
+)
+
+
+def _is_multimodal_model_type(model_name: str) -> bool:
+    """True for model types whose checkpoints contain a vision/audio tower
+    alongside the text decoder (Gemma 4, Qwen 3.5 VL, ...).
+
+    Safe to call with just a local path — reads only ``config.json``.
+    """
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+        mt = str(getattr(config, "model_type", "")).strip().lower()
+        return mt in _MULTIMODAL_MODEL_TYPES
+    except Exception:
+        return False
+
+
+def _find_decoder_layer_list(model: Any) -> Any | None:
+    """Locate the decoder layers ``nn.ModuleList`` on a HuggingFace model.
+
+    Supports all structures OpenHydra currently handles:
+
+    - Standard ``Qwen3_5ForCausalLM`` / Qwen / LLaMA: ``model.model.layers``
+    - Gemma 4 ``ForConditionalGeneration``: ``model.model.language_model.layers``
+    - Single-level wrapper: ``model.language_model.layers``
+
+    Returns the module list (so callers can mutate entries in place) or
+    ``None`` if no known path matches.
+    """
+    # Path 1: model.model.layers (standard text-only CausalLM)
+    inner = getattr(model, "model", None)
+    if inner is not None and hasattr(inner, "layers"):
+        return inner.layers
+
+    # Path 2: model.model.language_model.layers (Gemma 4 multimodal wrapper)
+    if inner is not None:
+        lm = getattr(inner, "language_model", None)
+        if lm is not None and hasattr(lm, "layers"):
+            return lm.layers
+
+    # Path 3: model.language_model.layers (single-level wrapper)
+    lm = getattr(model, "language_model", None)
+    if lm is not None and hasattr(lm, "layers"):
+        return lm.layers
+
+    return None
+
+
+def _replace_offloaded_layers_with_identity(
+    model: Any,
+    kept_layer_indices: tuple[int, ...],
+) -> int:
+    """Replace every decoder layer whose index is **not** in
+    ``kept_layer_indices`` with ``nn.Identity()`` in the model's ``ModuleList``.
+
+    Why this exists
+    ---------------
+    For sharded peers we build an accelerate ``device_map`` that sends
+    unused layers to the ``"disk"`` device. This leaves meta-device
+    placeholder modules in the real model's ``nn.ModuleList``. ANY code
+    path that iterates the full list (``model.model.layers[:]``) and
+    touches those placeholders triggers the torch dispatcher error
+    ``GET was unable to find an engine to execute this computation``.
+
+    Concrete reproduction: with a Qwen3.5-9B peer running layers 0-15,
+    the KV-cache-aware decode path (streaming ``infer_chat_stream``)
+    passes ``use_cache=True`` and transformers' ``DynamicCache`` /
+    ``_update_causal_mask`` internals iterate all 32 layer slots,
+    eventually dispatching an op on a meta tensor → crash.
+
+    Replacing the out-of-shard entries with ``nn.Identity()`` is safe:
+
+    - Indexing (``layers[layer_idx]``) stays valid; the block's
+      ``layer_idx`` attribute (set at model construction) still matches
+      its position in the list.
+    - ``nn.Identity(*args, **kwargs)`` returns its first positional
+      argument unchanged, so any ``block(hidden, ...)`` call on a
+      replaced slot is a pass-through (not used by OpenHydra's
+      ``_run_layers``, which only iterates ``self._selected_layers``,
+      but harmless if anything else touches it).
+    - Identity modules have zero parameters and live on no device, so
+      iteration through ``model.modules()`` / ``model.parameters()``
+      no longer yields meta tensors.
+
+    Returns the number of layers that were replaced.
+    """
+    from torch import nn
+
+    layers = _find_decoder_layer_list(model)
+    if layers is None:
+        return 0
+
+    kept = set(int(i) for i in kept_layer_indices)
+    replaced = 0
+    for i in range(len(layers)):
+        if i in kept:
+            continue
+        existing = layers[i]
+        # Don't replace if it's already an Identity (idempotent) or if
+        # it's None (already cleared by legacy ``self._blocks[idx] = None``
+        # cleanup — the ModuleList still holds the original reference).
+        if isinstance(existing, nn.Identity):
+            continue
+        layers[i] = nn.Identity()
+        replaced += 1
+
+    if replaced > 0:
+        import gc
+        gc.collect()
+
+    return replaced
+
+
+def _strip_multimodal_components(
+    model: Any,
+    layer_indices: tuple[int, ...],
+    target_device: int | str,
+    dtype: Any,
+) -> int:
+    """In-place strip auxiliary multimodal components + unused text layers.
+
+    Replaces ``vision_tower``/``audio_tower``/``embed_*``/``multi_modal_projector``
+    on the outer model with ``None`` to drop their parameters, replaces unused
+    text-decoder layers with ``nn.Identity()`` placeholders via
+    ``_replace_offloaded_layers_with_identity``, and moves the remaining text
+    decoder + ``lm_head`` to ``target_device`` in the requested ``dtype``.
+
+    Returns the count of layers that were replaced with Identity placeholders.
+    """
+    import torch
+    from torch import nn
+
+    inner_model = getattr(model, "model", None)  # Gemma4Model / Qwen3_5Model
+    if inner_model is None:
+        return 0
+
+    # Text decoder lives at model.model.language_model (Gemma4TextModel,
+    # Qwen3_5TextModel, ...). Falls back to direct language_model if absent.
+    text_decoder = getattr(inner_model, "language_model", None)
+    if text_decoder is None:
+        text_decoder = getattr(model, "language_model", None)
+    if text_decoder is None or not hasattr(text_decoder, "layers"):
+        return 0
+
+    # Drop aux towers on the outer wrapper — each is a few GB.
+    for attr in _MULTIMODAL_AUX_ATTRS:
+        if hasattr(inner_model, attr) and isinstance(
+            getattr(inner_model, attr), nn.Module
+        ):
+            setattr(inner_model, attr, None)
+
+    # Replace out-of-shard layers with Identity so the ModuleList indexing
+    # stays valid. Shared helper with the standard sharded path.
+    replaced = _replace_offloaded_layers_with_identity(model, tuple(layer_indices))
+
+    # Move the surviving text decoder + lm_head to the target device.
+    if target_device == "cpu":
+        text_decoder.to(dtype=dtype)
+        if hasattr(model, "lm_head") and model.lm_head is not None:
+            model.lm_head.to(dtype=dtype)
+    else:
+        device_str = f"cuda:{target_device}" if isinstance(target_device, int) else target_device
+        text_decoder.to(device=device_str, dtype=dtype)
+        if hasattr(model, "lm_head") and model.lm_head is not None:
+            model.lm_head.to(device=device_str, dtype=dtype)
+
+    return replaced
 
 
 def _build_selective_device_map(
@@ -208,14 +433,6 @@ def _build_selective_device_map(
     accelerate to offload them (effectively zero resident memory).
     Only the assigned layers + shared components (embeddings, norm, lm_head)
     are loaded onto the target device.
-
-    This reduces peak memory from full-model to approximately
-    ``shard_layers * layer_size + embeddings + lm_head``.
-
-    Args:
-        model_name: HuggingFace model ID or local path.
-        layer_indices: Tuple of layer indices this shard is assigned.
-        target_device: Device index (0 for first CPU/GPU) for real layers.
 
     Requires ``accelerate>=1.13.0``.
     """
@@ -235,7 +452,7 @@ def _build_selective_device_map(
 
     loaded = len(layer_set & set(range(total)))
     logging.info(
-        "selective_device_map: %d/%d layers on device %s, %d offloaded to disk",
+        "selective_device_map: %d/%d layers on device %s, %d offloaded",
         loaded, total, target_device, total - loaded,
     )
     return dm
@@ -592,15 +809,33 @@ class PyTorchRuntime:
         # For sharded deployments (total_shards > 1), force float16 + device_map
         # to minimize peak memory on constrained devices (1GB nanodes).
         _is_sharded = int(config.total_shards) > 1 or bool(config.runtime_layer_indices)
+        # Probe the checkpoint's native dtype — if the model was trained in
+        # bfloat16 and has bf16 buffers we can't convert (e.g. Qwen 3.5's
+        # linear_attn state-space params), forcing fp16 causes matmul dtype
+        # mismatches partway through the forward pass. Prefer the native
+        # checkpoint dtype; fall back to fp16.
+        _native_dtype = torch.float16
+        try:
+            from transformers import AutoConfig as _AC
+            _cfg_probe = _AC.from_pretrained(self.model_name, trust_remote_code=False)
+            _probe_dtype = getattr(_cfg_probe, "torch_dtype", None)
+            if _probe_dtype is None and hasattr(_cfg_probe, "text_config"):
+                _probe_dtype = getattr(_cfg_probe.text_config, "torch_dtype", None)
+            if isinstance(_probe_dtype, str):
+                _probe_dtype = getattr(torch, _probe_dtype, None)
+            if _probe_dtype in (torch.bfloat16, torch.float16, torch.float32):
+                _native_dtype = _probe_dtype
+        except Exception:
+            pass
         if quantization_config is not None:
             load_kwargs["quantization_config"] = quantization_config
             load_kwargs["device_map"] = "auto"
-            load_kwargs["torch_dtype"] = torch.float16
+            load_kwargs["torch_dtype"] = _native_dtype
         elif _is_sharded:
-            self._dtype = torch.float16  # Override fp32 default for memory-constrained shards
-            load_kwargs["torch_dtype"] = torch.float16
+            self._dtype = _native_dtype  # Override fp32 default for memory-constrained shards
+            load_kwargs["torch_dtype"] = _native_dtype
             # Selective weight loading: compute which layers this shard needs
-            # BEFORE loading the model, then map unneeded layers to "meta"
+            # BEFORE loading the model, then map unneeded layers to "disk"
             # device (zero memory). This reduces peak memory from full-model
             # to shard-size + embeddings + lm_head.
             _pre_layer_indices = self._resolve_layer_indices(
@@ -609,7 +844,25 @@ class PyTorchRuntime:
                 total_shards=max(1, int(config.total_shards)),
                 explicit_indices=tuple(config.runtime_layer_indices),
             )
-            if _pre_layer_indices:
+
+            _is_multimodal = _is_multimodal_model_type(self.model_name)
+
+            if _pre_layer_indices and _is_multimodal:
+                # Multimodal checkpoints (Gemma 4) ship with vision/audio
+                # towers embedded in the same safetensors file, and their
+                # text decoder lives at ``model.model.language_model``
+                # rather than ``model.model``. Selective accelerate device_map
+                # chokes on this layout (dozens of aux components, mismatched
+                # prefixes). Strategy: load everything into CPU RAM in the
+                # checkpoint's native dtype, then ``_strip_multimodal_components``
+                # drops the vision/audio towers and out-of-shard layers before
+                # we move the text decoder onto the target device.
+                load_kwargs["device_map"] = {"": "cpu"}
+                load_kwargs["low_cpu_mem_usage"] = True
+                load_kwargs["torch_dtype"] = _native_dtype
+                self._multimodal_strip_layers = tuple(_pre_layer_indices)
+                self._multimodal_strip_dtype = _native_dtype
+            elif _pre_layer_indices:
                 # Use device index 0 for CUDA, "cpu" string for CPU-only.
                 _sel_device: int | str = 0 if target == "cuda" else "cpu"
                 load_kwargs["device_map"] = _build_selective_device_map(
@@ -676,13 +929,72 @@ class PyTorchRuntime:
         if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token is not None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
 
+        # Multimodal strip path: drop aux towers + unused layers, then move
+        # only the text decoder onto the target device. Skips the generic
+        # .to(device) below because we've already placed the kept modules.
+        _multimodal_stripped = False
+        _strip_layer_indices = getattr(self, "_multimodal_strip_layers", None)
+        if _strip_layer_indices:
+            _strip_target: int | str = 0 if target == "cuda" else "cpu"
+            try:
+                _strip_dtype = getattr(self, "_multimodal_strip_dtype", None) or torch.float16
+                _replaced = _strip_multimodal_components(
+                    self._model,
+                    layer_indices=_strip_layer_indices,
+                    target_device=_strip_target,
+                    dtype=_strip_dtype,
+                )
+                logging.info(
+                    "multimodal_strip: model=%s kept=%d replaced=%d target=%s",
+                    self.model_name, len(_strip_layer_indices), _replaced, _strip_target,
+                )
+                _multimodal_stripped = True
+            except Exception as _strip_exc:
+                logging.warning(
+                    "multimodal_strip_failed: model=%s err=%s — falling back to full .to()",
+                    self.model_name, _strip_exc,
+                )
+            self._multimodal_strip_layers = None
+
         # Skip .to() when using selective device_map (accelerate manages placement)
         # or when quantized weights are already on device.
-        _dm_values = set(load_kwargs.get("device_map", {}).values()) if isinstance(load_kwargs.get("device_map"), dict) else set()
-        _has_selective_map = bool(_dm_values & {"disk", "meta"})
-        if not quantized_weights_loaded and not _has_selective_map:
+        _dm = load_kwargs.get("device_map")
+        _has_selective_map = False
+        if isinstance(_dm, dict):
+            _dm_values = set(_dm.values())
+            _has_selective_map = bool(_dm_values & {"disk", "meta"})
+        elif isinstance(_dm, str) and _dm == "auto":
+            # device_map="auto" means accelerate placed everything; don't move
+            _has_selective_map = True
+        if (
+            not quantized_weights_loaded
+            and not _has_selective_map
+            and not _multimodal_stripped
+        ):
             self._model.to(self._device)
         self._model.eval()
+
+        # Phase 6 workaround (T4 + bf16 grouped-conv1d + small seq_len):
+        # Qwen 3.5's ``linear_attn`` layers contain a depthwise
+        # ``nn.Conv1d(C, C, kernel_size=4, groups=C, padding=3)`` module.
+        # cuDNN on T4 has no kernel for this exact shape in bfloat16 when
+        # ``seq_len < 4`` — it raises ``RuntimeError: GET was unable to
+        # find an engine to execute this computation``. This only matters
+        # for KV-aware decoding (where every decode step ships a single
+        # token through the layer); prefill with a long sequence works
+        # fine because seq_len >= 4.
+        #
+        # Proper fix: install ``causal-conv1d`` on the studio — it
+        # provides the fast kernel Qwen 3.5 prefers and sidesteps cuDNN
+        # entirely. Until that lands on every deployment target, we
+        # wrap every grouped ``nn.Conv1d`` whose input channels match
+        # its groups (= depthwise) with a fallback that retries the
+        # offending call with cuDNN disabled. The outer wrapper is a
+        # no-op when cuDNN succeeds, so prefill keeps the fast path.
+        try:
+            self._patch_depthwise_conv1d_t4_fallback()
+        except Exception as _patch_exc:
+            logging.debug("conv1d_t4_patch_skipped: %s", _patch_exc)
 
         decoder_arch = self._detect_decoder_architecture(self._model)
         self._decoder_family = str(decoder_arch.family)
@@ -691,6 +1003,19 @@ class PyTorchRuntime:
         self._final_norm = decoder_arch.final_norm
         self._rotary_emb = decoder_arch.rotary_emb
         self._blocks = list(decoder_arch.layers)
+        # Gemma 4 extras — only populated when family == "gemma4"
+        self._layer_types: tuple[str, ...] = tuple(decoder_arch.layer_types or ())
+        self._per_layer_embed = decoder_arch.per_layer_embed
+        self._per_layer_proj = decoder_arch.per_layer_proj
+        self._per_layer_norm = decoder_arch.per_layer_norm
+        self._hidden_size_per_layer = int(decoder_arch.hidden_size_per_layer or 0)
+        self._gemma4_text_model = decoder_arch.text_model
+        # Re-entrant scratch for a single forward pass — the per-layer
+        # inputs tensor derived from the prompt's input_ids. Populated
+        # by ``_compute_gemma4_per_layer_inputs`` and consumed by the
+        # ``family == "gemma4"`` branch in ``_run_layers``. Cleared at
+        # the top of each ``_forward_impl`` call.
+        self._pending_per_layer_inputs: Any | None = None
         self.total_layers = len(self._blocks)
         self.layer_indices = self._resolve_layer_indices(
             total_layers=self.total_layers,
@@ -718,6 +1043,35 @@ class PyTorchRuntime:
                     freed, self.total_layers,
                 )
 
+            # Phase 2B fix (sharded KV-cache meta-tensor leak): the
+            # ``self._blocks[idx] = None`` loop above only drops OUR local
+            # reference — the real ``nn.ModuleList`` at
+            # ``model.model.layers`` (or wherever ``_find_decoder_layer_list``
+            # locates it) still holds the original meta-device module that
+            # accelerate mapped to the ``"disk"`` device. Any code path that
+            # iterates the full ModuleList — DynamicCache internals,
+            # transformers' ``_update_causal_mask``, model-level
+            # ``parameters()`` iteration — then dispatches an aten op on a
+            # meta tensor and crashes with
+            # ``GET was unable to find an engine to execute this computation``.
+            # Replace every out-of-shard slot with ``nn.Identity()`` so the
+            # ModuleList no longer contains meta tensors.
+            if not _multimodal_stripped:
+                try:
+                    _id_replaced = _replace_offloaded_layers_with_identity(
+                        self._model, tuple(self.layer_indices),
+                    )
+                    if _id_replaced > 0:
+                        logging.info(
+                            "pytorch_layer_identity_swap: %d offloaded layers replaced with nn.Identity",
+                            _id_replaced,
+                        )
+                except Exception as _id_exc:
+                    logging.warning(
+                        "pytorch_layer_identity_swap_failed: %s — KV-cache paths may still crash on meta tensors",
+                        _id_exc,
+                    )
+
         # Remove accelerate dispatch hooks from kept modules.
         # When using selective device_map with "disk" offloading, accelerate
         # wraps EVERY module (including real on-device layers) with dispatch
@@ -741,10 +1095,20 @@ class PyTorchRuntime:
             except Exception as exc:
                 logging.debug("accelerate_hook_removal_failed: %s", exc)
 
+        # Hidden size — for multimodal wrapper configs (Gemma 4,
+        # Qwen 3.5 VL) the top-level ``config.hidden_size`` is ``None``
+        # because the decoder dim lives inside ``text_config``. Probe the
+        # nested config before falling back to the 768 default, otherwise
+        # stage-to-stage hidden payloads fail with
+        # ``invalid_hidden_payload:hidden_size`` when the peer defaults
+        # to 768 while the real tensor is 2560 (E4B-it).
+        _cfg = self._model.config
+        _text_cfg = getattr(_cfg, "text_config", None)
         self._hidden_size = int(
-            getattr(self._model.config, "hidden_size", 0)
-            or getattr(self._model.config, "n_embd", 0)
-            or getattr(self._model.config, "d_model", 0)
+            getattr(_cfg, "hidden_size", 0) or 0
+            or (getattr(_text_cfg, "hidden_size", 0) or 0 if _text_cfg is not None else 0)
+            or getattr(_cfg, "n_embd", 0) or 0
+            or getattr(_cfg, "d_model", 0) or 0
             or 768
         )
         lm_head = getattr(self._model, "lm_head", None)
@@ -967,6 +1331,71 @@ class PyTorchRuntime:
             pass
         return 0.0
 
+    def _patch_depthwise_conv1d_t4_fallback(self) -> None:
+        """Wrap every depthwise ``nn.Conv1d`` in the model with a fallback
+        that disables cuDNN when the default dispatcher raises on small
+        inputs.
+
+        Context: Qwen 3.5 ``linear_attn`` layers contain a depthwise
+        ``Conv1d(C, C, kernel_size=4, groups=C, padding=3)`` that's fine
+        during prefill (``seq_len >= 4``) but hits a missing cuDNN kernel
+        on T4 during single-token decode (``seq_len == 1``) with bf16.
+        The exact error is
+        ``RuntimeError: GET was unable to find an engine to execute this
+        computation``.
+
+        The wrapper replaces ``conv._conv_forward`` with a version that
+        first tries the native dispatcher; if that raises, it retries
+        inside a ``torch.backends.cudnn.flags(enabled=False)`` context.
+        The retry hits a slower but supported ``aten::_slow_conv_forward``
+        path which works for every shape.
+
+        Impact is surgical: only the tiny fraction of decode steps where
+        cuDNN fails pay the slow-path cost. Prefill and any seq_len >= 4
+        call keeps the fast path.
+        """
+        import torch
+        from torch import nn
+
+        _patched = 0
+        for mod in self._model.modules():
+            if not isinstance(mod, nn.Conv1d):
+                continue
+            # Only patch grouped depthwise convs (this is the Qwen 3.5
+            # linear_attn shape we care about; leaves regular convs alone).
+            if mod.groups != mod.in_channels:
+                continue
+
+            _original = mod._conv_forward
+
+            def _fallback_conv_forward(
+                input: Any, weight: Any, bias: Any,
+                _orig=_original,
+            ):
+                try:
+                    return _orig(input, weight, bias)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "GET was unable to find an engine" not in msg:
+                        raise
+                    # Retry with cuDNN disabled — torch's native
+                    # implementation has kernels for every shape.
+                    logging.debug(
+                        "conv1d_t4_cudnn_fallback: shape=%s dtype=%s",
+                        tuple(input.shape), input.dtype,
+                    )
+                    with torch.backends.cudnn.flags(enabled=False):
+                        return _orig(input, weight, bias)
+
+            mod._conv_forward = _fallback_conv_forward  # type: ignore[assignment]
+            _patched += 1
+
+        if _patched > 0:
+            logging.info(
+                "conv1d_t4_fallback_patched: %d depthwise Conv1d modules wrapped",
+                _patched,
+            )
+
     @staticmethod
     def _detect_decoder_architecture(model: Any) -> _DecoderArchitecture:
         # Multimodal models (Gemma 4, Qwen 3.5 VL) wrap the text decoder
@@ -987,9 +1416,43 @@ class PyTorchRuntime:
                 _inner = getattr(_language_model, "model", None)
             if _inner is not None and hasattr(_inner, "layers") and hasattr(_inner, "embed_tokens"):
                 arch_name = type(model).__name__.lower()
-                model_type = str(getattr(getattr(model, "config", None), "model_type", "")).strip().lower()
+                _cfg = getattr(model, "config", None)
+                model_type = str(getattr(_cfg, "model_type", "")).strip().lower()
                 _family = "llama"
-                if "gemma" in arch_name or "gemma" in model_type:
+                _layer_types: tuple[str, ...] = ()
+                _per_layer_embed: Any | None = None
+                _per_layer_proj: Any | None = None
+                _per_layer_norm: Any | None = None
+                _hidden_size_per_layer: int = 0
+                _text_model: Any | None = None
+                if "gemma4" in arch_name or model_type == "gemma4":
+                    # Gemma 4 needs layer-type-aware rotary + per-layer
+                    # input plumbing. Capture the text-config layer_types
+                    # list and the small per-layer modules so the
+                    # ``family="gemma4"`` branch in ``_run_layers`` can
+                    # dispatch correctly. These modules live on the text
+                    # decoder (`model.model.language_model`) which
+                    # ``_strip_multimodal_components`` moved onto the
+                    # target device alongside the real layers.
+                    _family = "gemma4"
+                    _text_model = _inner  # Gemma4TextModel — owns get_per_layer_inputs / project_per_layer_inputs
+                    # Gemma 4 config nests the text decoder config under
+                    # ``text_config`` (when loaded via the multimodal
+                    # ``Gemma4ForConditionalGeneration`` wrapper).
+                    _text_cfg = getattr(_cfg, "text_config", None) or _cfg
+                    _raw_types = getattr(_text_cfg, "layer_types", None)
+                    if _raw_types is not None:
+                        try:
+                            _layer_types = tuple(str(t) for t in _raw_types)
+                        except TypeError:
+                            _layer_types = ()
+                    _per_layer_embed = getattr(_inner, "embed_tokens_per_layer", None)
+                    _per_layer_proj = getattr(_inner, "per_layer_model_projection", None)
+                    _per_layer_norm = getattr(_inner, "per_layer_projection_norm", None)
+                    _hidden_size_per_layer = int(
+                        getattr(_text_cfg, "hidden_size_per_layer_input", 0) or 0
+                    )
+                elif "gemma" in arch_name or "gemma" in model_type:
                     _family = "llama"
                 elif "qwen" in arch_name or "qwen" in model_type:
                     _family = "qwen_llama"
@@ -1000,6 +1463,12 @@ class PyTorchRuntime:
                     position_embeddings=None,
                     final_norm=getattr(_inner, "norm", None),
                     rotary_emb=getattr(_inner, "rotary_emb", None),
+                    layer_types=_layer_types,
+                    per_layer_embed=_per_layer_embed,
+                    per_layer_proj=_per_layer_proj,
+                    per_layer_norm=_per_layer_norm,
+                    hidden_size_per_layer=_hidden_size_per_layer,
+                    text_model=_text_model,
                 )
 
         transformer = getattr(model, "transformer", None)
@@ -1405,6 +1874,285 @@ class PyTorchRuntime:
             input_ids = self._torch.tensor([[eos_token]], dtype=self._torch.long)
         return input_ids.to(self._device)
 
+    def _compute_gemma4_per_layer_inputs(
+        self,
+        prompt_token_ids: list[int] | tuple[int, ...] | None,
+    ) -> Any | None:
+        """Recompute the Gemma 4 per-layer inputs tensor from prompt token IDs.
+
+        Gemma 4 decoder blocks require a ``per_layer_input`` tensor of shape
+        ``[B, S, num_hidden_layers, hidden_size_per_layer_input]`` that is
+        derived from ``embed_tokens_per_layer(input_ids) → reshape → norm``
+        and then combined with a projection of ``inputs_embeds``. The layer
+        multiplies its slice (``per_layer_inputs[:, :, layer_idx, :]``) into
+        the hidden state — **it cannot be None or zero**, otherwise every
+        output collapses to garbage.
+
+        For sharded inference, every stage needs the same per_layer_inputs
+        tensor. We make the coordinator ship the original prompt token IDs
+        in the new ``prompt_token_ids`` field of ``ForwardRequest`` and each
+        peer recomputes the tensor locally — the small per-layer modules
+        (``embed_tokens_per_layer`` / ``per_layer_model_projection`` /
+        ``per_layer_projection_norm``) were all moved onto the target device
+        by ``_strip_multimodal_components`` at load time, so this is cheap.
+
+        Returns ``None`` for non-Gemma-4 models or when the necessary
+        modules aren't available. Callers in the ``family == "gemma4"``
+        branch of ``_run_layers`` must treat ``None`` as an error.
+        """
+        if self._decoder_family != "gemma4":
+            return None
+        if not prompt_token_ids:
+            return None
+        text_model = self._gemma4_text_model
+        if text_model is None:
+            return None
+        if self._per_layer_embed is None or self._per_layer_proj is None:
+            return None
+        try:
+            ids_list = [int(t) for t in prompt_token_ids]
+            if not ids_list:
+                return None
+            input_ids = self._torch.tensor(
+                [ids_list],
+                dtype=self._torch.long,
+                device=self._device,
+            )
+            # Embed lookup + Gemma4-specific scaling lives inside the
+            # ``Gemma4TextScaledWordEmbedding`` module, so calling the
+            # embedding directly gives already-scaled outputs.
+            inputs_embeds = self._embed_tokens(input_ids)
+            per_layer_raw = text_model.get_per_layer_inputs(input_ids, inputs_embeds)
+            per_layer_inputs = text_model.project_per_layer_inputs(
+                inputs_embeds, per_layer_raw,
+            )
+            return per_layer_inputs
+        except Exception as exc:
+            logging.warning(
+                "gemma4_per_layer_inputs_failed: %s — sharded Gemma 4 forward will error",
+                exc,
+            )
+            return None
+
+    def _run_layers_gemma4(
+        self,
+        hidden,
+        *,
+        past_key_values: Any | None = None,
+        use_cache: bool = False,
+        position_ids: Any | None = None,
+        attention_mask: Any | None = None,
+        cache_position: Any | None = None,
+    ) -> tuple[Any, Any | None]:
+        """Gemma 4 sharded decode branch — layer-type-aware rotary +
+        per-layer-input multiplication + full/sliding causal masks.
+
+        The standard llama / qwen_llama branch assumes a single rotary
+        (cos, sin) pair and treats the causal mask as either None or a
+        plain boolean mask. Gemma 4 alternates ``full_attention`` and
+        ``sliding_attention`` layers with DIFFERENT rotary frequencies
+        per type AND different causal mask shapes, and every block
+        multiplies its output by ``per_layer_input`` — a tensor derived
+        from the prompt's token IDs and indexed per-layer.
+
+        This branch mirrors ``Gemma4TextModel.forward`` layer-by-layer
+        but restricts the loop to ``self._selected_layers`` (our shard's
+        slice). It creates a local ``DynamicCache`` so the KV-shared
+        layers (config.num_kv_shared_layers > 0) can read the stored
+        full-length K/V from the non-shared layers earlier in the same
+        shard. This works cleanly when the shard range covers BOTH
+        "full-length KV storage" layers (i.e. ``store_full_length_kv``
+        is True, typically the last full_attention and the last
+        sliding_attention before ``first_kv_shared_layer_idx``) AND any
+        downstream shared layers. When the shard boundary splits these
+        — e.g. peer A runs layers 0..K where K < first_kv_shared_layer_idx
+        and peer B runs the rest — the cache state from peer A would
+        need to be serialized onto the wire and reconstructed on peer B
+        before its shared layers could run. That cross-peer cache
+        propagation is a separate Phase 5 effort; for now this branch
+        only works correctly when one shard holds the complete KV
+        chain. See ``plans/sharded-inference-fixes.md::Phase 4`` for the
+        full story.
+
+        KV-cache reuse across decode steps is intentionally
+        unimplemented for the first cut: Gemma 4 always re-prefills per
+        decode step until Phase 5 adds KV-aware pipelining.
+        """
+        text_model = self._gemma4_text_model
+        if text_model is None:
+            raise RuntimeError(
+                "gemma4_runtime_without_text_model_reference: "
+                "_detect_decoder_architecture did not capture Gemma4TextModel"
+            )
+
+        per_layer_inputs = self._pending_per_layer_inputs
+        if per_layer_inputs is None:
+            raise RuntimeError(
+                "gemma4_missing_per_layer_inputs: coordinator must pass "
+                "prompt_token_ids in ForwardRequest so each stage can "
+                "recompute per_layer_inputs locally"
+            )
+
+        # ── KV sharing + KV reuse plumbing ────────────────────────────
+        # Gemma 4 models with ``num_kv_shared_layers > 0`` (true for
+        # E4B-it which shares layers 24..41 with layers 22..23) REQUIRE
+        # a ``past_key_values`` object so that:
+        #   (1) non-shared attention layers with ``store_full_length_kv``
+        #       True can deposit their full-length K/V into
+        #       ``past_key_values.shared_layers``, and
+        #   (2) KV-shared attention layers can later read that K/V back.
+        # Passing ``past_key_values=None`` is the "works-for-test-models"
+        # default but produces garbage logits on E4B-it because layers
+        # 24..41 read random uninitialised state.
+        #
+        # Phase 7B: when the caller PROVIDES a ``past_key_values`` object
+        # (i.e. the peer's outer ``_forward_impl`` is doing KV-aware
+        # decoding and persists the cache across calls), we reuse it
+        # instead of creating a fresh one. The caller is responsible for
+        # storing the returned cache object via ``_kv_cache_set`` so the
+        # next decode step picks it up. Without this Gemma 4 always
+        # re-prefills per token (no decode speedup); with this each
+        # decode step ships a single token and the existing
+        # ``cache.shared_layers`` state stays valid for KV-shared layers.
+        local_cache: Any | None = None
+        if past_key_values is not None and not isinstance(past_key_values, (tuple, list)):
+            # Caller passed an existing DynamicCache — reuse it.
+            local_cache = past_key_values
+        else:
+            try:
+                from transformers.cache_utils import DynamicCache
+                local_cache = DynamicCache(config=text_model.config)
+            except Exception as _cache_exc:
+                logging.debug("gemma4_dynamic_cache_init_failed: %s", _cache_exc)
+                local_cache = None
+
+        _num_kv_shared_layers = int(
+            getattr(text_model.config, "num_kv_shared_layers", 0) or 0
+        )
+        if _num_kv_shared_layers > 0:
+            _first_shared = int(text_model.config.num_hidden_layers) - _num_kv_shared_layers
+            _shard_indices = set(int(i) for i in self.layer_indices)
+            _need_shared_kv = any(idx >= _first_shared for idx in _shard_indices)
+            _have_storing_kv = any(idx < _first_shared for idx in _shard_indices)
+            if _need_shared_kv and not _have_storing_kv:
+                raise RuntimeError(
+                    "gemma4_shard_split_breaks_kv_sharing: this shard "
+                    f"contains KV-shared layers (>= {_first_shared}) but "
+                    "no layers that store the shared K/V. Cross-peer KV "
+                    "sharing is not yet implemented. Run Gemma 4 unsharded "
+                    "via ops/bench/gemma4_direct_bench.py or keep the "
+                    "shard boundary below layer "
+                    f"{_first_shared} inclusive on every peer."
+                )
+
+        # Restrict the layer types we need for THIS shard's slice — avoids
+        # building masks / rotary for unused types on intermediate peers.
+        selected_types: set[str] = set()
+        for idx in self.layer_indices:
+            if idx < len(self._layer_types):
+                selected_types.add(self._layer_types[idx])
+            else:
+                selected_types.add("full_attention")
+
+        # Layer-type-aware rotary embeddings (per unique type)
+        position_embeddings: dict[str, Any] = {}
+        if self._rotary_emb is not None and position_ids is not None:
+            for lt in selected_types:
+                try:
+                    position_embeddings[lt] = self._rotary_emb(hidden, position_ids, lt)
+                except TypeError:
+                    # Some rotary impls reject the layer_type kwarg — fall
+                    # back to the 2-arg call. Should not happen for Gemma 4
+                    # but stays defensive.
+                    position_embeddings[lt] = self._rotary_emb(hidden, position_ids)
+
+        # Full + sliding causal masks — transformers exports helper
+        # functions keyed off the config. Lazy-import so the module is
+        # only loaded when we actually run a Gemma 4 shard.
+        causal_mask_mapping: dict[str, Any] = {}
+        try:
+            from transformers.models.gemma4.modeling_gemma4 import (
+                create_causal_mask,
+                create_sliding_window_causal_mask,
+            )
+        except Exception:
+            create_causal_mask = None  # type: ignore[assignment]
+            create_sliding_window_causal_mask = None  # type: ignore[assignment]
+
+        # Prefer the caller's past_key_values (KV-aware decode mode,
+        # future) over our local cache (prefill mode, current). The
+        # local cache is the most common case today.
+        _effective_pkv = past_key_values
+        if _effective_pkv is None and local_cache is not None:
+            _effective_pkv = local_cache
+        if isinstance(_effective_pkv, (tuple, list)):
+            _effective_pkv = None  # legacy tuple caches aren't compatible
+
+        mask_kwargs = {
+            "config": text_model.config,
+            "inputs_embeds": hidden,
+            "attention_mask": attention_mask,
+            "past_key_values": _effective_pkv,
+            "position_ids": position_ids,
+        }
+        if create_causal_mask is not None and "full_attention" in selected_types:
+            try:
+                causal_mask_mapping["full_attention"] = create_causal_mask(**mask_kwargs)
+            except Exception as exc:
+                logging.debug("gemma4_full_mask_fallback: %s", exc)
+        if create_sliding_window_causal_mask is not None and "sliding_attention" in selected_types:
+            try:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            except Exception as exc:
+                logging.debug("gemma4_sliding_mask_fallback: %s", exc)
+
+        output = hidden
+        for idx, block in zip(self.layer_indices, self._selected_layers):
+            layer_type = (
+                self._layer_types[idx] if idx < len(self._layer_types) else "full_attention"
+            )
+            pli_slice = None
+            if (
+                per_layer_inputs is not None
+                and hasattr(per_layer_inputs, "shape")
+                and len(per_layer_inputs.shape) >= 3
+                and idx < per_layer_inputs.shape[2]
+            ):
+                pli_slice = per_layer_inputs[:, :, idx, :]
+
+            block_kwargs: dict[str, Any] = {
+                "position_embeddings": position_embeddings.get(layer_type),
+                "attention_mask": causal_mask_mapping.get(layer_type, attention_mask),
+                "position_ids": position_ids,
+                # Pass the local DynamicCache so non-shared layers can
+                # populate ``past_key_values.shared_layers`` for later
+                # KV-shared layers to read. Falls back to the caller's
+                # ``past_key_values`` if they supplied one.
+                "past_key_values": _effective_pkv,
+            }
+            # Gemma 4 attention always needs ``use_cache=True`` when a
+            # cache is present because the KV-sharing branch reads from
+            # ``past_key_values.shared_layers``; without it the cache
+            # doesn't get populated.
+            if _effective_pkv is not None:
+                block_kwargs["use_cache"] = True
+            elif use_cache:
+                block_kwargs["use_cache"] = True
+            if cache_position is not None:
+                block_kwargs["cache_position"] = cache_position
+
+            block_out = block(output, pli_slice, **block_kwargs)
+            if isinstance(block_out, tuple):
+                output = block_out[0]
+            else:
+                output = block_out
+
+        # Phase 7B: return the (possibly mutated) cache so the caller's
+        # ``_forward_impl`` can persist it via ``_kv_cache_set`` for the
+        # next decode step. Returning ``None`` here would force a fresh
+        # cache on every call → no decode speedup vs Phase 1 stateless.
+        return output, _effective_pkv
+
     def _run_layers(
         self,
         hidden,
@@ -1415,9 +2163,52 @@ class PyTorchRuntime:
         attention_mask: Any | None = None,
         cache_position: Any | None = None,
     ):
+        # Dispatch to the Gemma 4 adapter when applicable. Keeps the
+        # standard llama / qwen_llama branch untouched.
+        if self._decoder_family == "gemma4":
+            return self._run_layers_gemma4(
+                hidden,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+            )
+
         output = hidden
         present_key_values: list[Any] = []
         shared_cache = past_key_values if (past_key_values is not None and not isinstance(past_key_values, (tuple, list))) else None
+
+        # Phase 6 fix: when the caller requests ``use_cache=True`` but
+        # didn't provide a ``past_key_values`` object, create a fresh
+        # ``DynamicCache`` here. Without this, each block runs with
+        # ``past_key_values=None`` and transformers' caching logic never
+        # sees a container to write K/V into — the function ends up
+        # returning a tuple of ``None``s, the caller persists garbage,
+        # and the next decode step silently produces wrong logits (not
+        # an exception, a plain numerical miss). Native ``Qwen3_5TextModel
+        # .forward`` does exactly this same "create cache on first call"
+        # step; we're just replicating it at the layer-loop level so our
+        # sharded ``_run_layers`` can drive the same state machine.
+        if use_cache and shared_cache is None:
+            try:
+                from transformers.cache_utils import DynamicCache
+                _cfg = getattr(self._model, "config", None)
+                if _cfg is not None:
+                    try:
+                        shared_cache = DynamicCache(config=_cfg)
+                    except TypeError:
+                        # Older transformers signatures: no config kwarg.
+                        shared_cache = DynamicCache()
+                else:
+                    shared_cache = DynamicCache()
+            except Exception as _cache_exc:
+                logging.debug(
+                    "run_layers_dynamic_cache_init_failed: %s — falling back to cache-less forward",
+                    _cache_exc,
+                )
+                shared_cache = None
+
         for idx, block in enumerate(self._selected_layers):
             layer_past = None
             if shared_cache is not None:
@@ -1593,6 +2384,7 @@ class PyTorchRuntime:
         decode_top_p: float | None = None,
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> list[float]:
         self.last_forward_thread_id = threading.get_ident()
         self.last_kv_cache_hit = False
@@ -1614,6 +2406,33 @@ class PyTorchRuntime:
         self.last_kv_cache_hit = bool(cache_requested and cached_past is not None)
         cache_enabled = bool(session_id and (kv_store_activation or cache_requested))
         next_past = None
+
+        # Gemma 4 sharded support: recompute the per-layer input sidecar
+        # from the prompt's token IDs. Both the first stage AND later
+        # stages need this tensor — stage 0 can derive it from its own
+        # activation payload, but every later stage needs the ORIGINAL
+        # prompt_token_ids shipped in the ForwardRequest since its
+        # activation is a hidden state, not token IDs. Clear the scratch
+        # field on every call so a previous request's tensor doesn't
+        # leak forward.
+        self._pending_per_layer_inputs = None
+        if self._decoder_family == "gemma4":
+            _gemma4_ids: list[int] | tuple[int, ...] | None = prompt_token_ids
+            if (not _gemma4_ids) and is_first and activation:
+                # Stage 0 fallback: the coordinator packed the token IDs
+                # into ``activation`` directly (legacy code path before
+                # the proto field existed). Use them as the canonical
+                # source so new coordinators and old ones both work.
+                try:
+                    _gemma4_ids = [
+                        max(0, int(round(float(v)))) for v in activation
+                    ]
+                except (TypeError, ValueError):
+                    _gemma4_ids = None
+            if _gemma4_ids:
+                self._pending_per_layer_inputs = self._compute_gemma4_per_layer_inputs(
+                    _gemma4_ids,
+                )
 
         with self._torch.no_grad():
             full_model_stage = bool(
@@ -1766,7 +2585,13 @@ class PyTorchRuntime:
                     position_ids = self._build_position_ids(seq_len=seq_len, past_len=past_len)
                 cache_position = position_ids.squeeze(0)
                 attention_mask = None
-                if self._decoder_family in {"llama", "qwen_llama"}:
+                if self._decoder_family in {"llama", "qwen_llama", "gemma4"}:
+                    # All three families need an explicit 2D bool mask
+                    # so ``create_causal_mask`` / ``_update_causal_mask``
+                    # can derive per-query causal masks downstream.
+                    # Gemma 4 additionally passes this to
+                    # ``create_sliding_window_causal_mask`` in the
+                    # ``_run_layers_gemma4`` branch.
                     total_len = max(1, int(past_len + seq_len))
                     attention_mask = self._torch.ones((1, total_len), dtype=self._torch.bool, device=self._device)
                 elif past_len > 0:
@@ -1825,6 +2650,7 @@ class PyTorchRuntime:
         decode_top_p: float | None = None,
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> list[float]:
         return self._forward_impl(
             prompt,
@@ -1841,6 +2667,7 @@ class PyTorchRuntime:
             decode_top_p=decode_top_p,
             decode_top_k=decode_top_k,
             decode_seed=decode_seed,
+            prompt_token_ids=prompt_token_ids,
         )
 
     async def forward_async(
@@ -1859,8 +2686,12 @@ class PyTorchRuntime:
         decode_top_p: float | None = None,
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> list[float]:
         loop = asyncio.get_running_loop()
+        # ``run_in_executor`` doesn't take **kwargs — pass positional args only
+        # and let ``_forward_impl`` receive ``prompt_token_ids`` via its own
+        # parameter at the tail of the signature.
         return await loop.run_in_executor(
             self._executor,
             self._forward_impl,
@@ -1878,6 +2709,7 @@ class PyTorchRuntime:
             decode_top_p,
             decode_top_k,
             decode_seed,
+            prompt_token_ids,
         )
 
     def forward_batch(self, items: list[Any]) -> list[list[float]]:
@@ -2115,24 +2947,28 @@ class ModelShard:
         decode_top_p: float | None = None,
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> list[float]:
+        # Only forward prompt_token_ids to runtimes that accept it. ToyRuntime
+        # and MLXRuntime ignore the Gemma 4 sidecar; PyTorchRuntime consumes
+        # it in its ``family == "gemma4"`` branch.
+        _kwargs: dict[str, Any] = {
+            "stage_index": stage_index,
+            "total_stages": total_stages,
+            "kv_session_id": kv_session_id,
+            "kv_store_activation": kv_store_activation,
+            "kv_use_cached_activation": kv_use_cached_activation,
+            "request_id": request_id,
+            "decode_do_sample": decode_do_sample,
+            "decode_temperature": decode_temperature,
+            "decode_top_p": decode_top_p,
+            "decode_top_k": decode_top_k,
+            "decode_seed": decode_seed,
+        }
+        if prompt_token_ids is not None and isinstance(self._runtime, PyTorchRuntime):
+            _kwargs["prompt_token_ids"] = prompt_token_ids
         return list(
-            self._runtime.forward(
-                prompt,
-                activation,
-                max_tokens,
-                stage_index=stage_index,
-                total_stages=total_stages,
-                kv_session_id=kv_session_id,
-                kv_store_activation=kv_store_activation,
-                kv_use_cached_activation=kv_use_cached_activation,
-                request_id=request_id,
-                decode_do_sample=decode_do_sample,
-                decode_temperature=decode_temperature,
-                decode_top_p=decode_top_p,
-                decode_top_k=decode_top_k,
-                decode_seed=decode_seed,
-            )
+            self._runtime.forward(prompt, activation, max_tokens, **_kwargs)
         )
 
     async def forward_async(
@@ -2151,44 +2987,48 @@ class ModelShard:
         decode_top_p: float | None = None,
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> list[float]:
         async_forward = getattr(self._runtime, "forward_async", None)
+        _kwargs: dict[str, Any] = {
+            "stage_index": stage_index,
+            "total_stages": total_stages,
+            "kv_session_id": kv_session_id,
+            "kv_store_activation": kv_store_activation,
+            "kv_use_cached_activation": kv_use_cached_activation,
+            "request_id": request_id,
+            "decode_do_sample": decode_do_sample,
+            "decode_temperature": decode_temperature,
+            "decode_top_p": decode_top_p,
+            "decode_top_k": decode_top_k,
+            "decode_seed": decode_seed,
+        }
+        if prompt_token_ids is not None and isinstance(self._runtime, PyTorchRuntime):
+            _kwargs["prompt_token_ids"] = prompt_token_ids
         if callable(async_forward):
             return list(
-                await async_forward(
-                    prompt,
-                    activation,
-                    max_tokens,
-                    stage_index=stage_index,
-                    total_stages=total_stages,
-                    kv_session_id=kv_session_id,
-                    kv_store_activation=kv_store_activation,
-                    kv_use_cached_activation=kv_use_cached_activation,
-                    request_id=request_id,
-                    decode_do_sample=decode_do_sample,
-                    decode_temperature=decode_temperature,
-                    decode_top_p=decode_top_p,
-                    decode_top_k=decode_top_k,
-                    decode_seed=decode_seed,
-                )
+                await async_forward(prompt, activation, max_tokens, **_kwargs)
             )
+        # asyncio.to_thread fallback for runtimes without a native async
+        # forward (ToyRuntime). These runtimes ignore prompt_token_ids.
+        _legacy_kwargs = {k: v for k, v in _kwargs.items() if k != "prompt_token_ids"}
         return list(
             await asyncio.to_thread(
                 self._runtime.forward,
                 prompt,
                 activation,
                 max_tokens,
-                stage_index,
-                total_stages,
-                kv_session_id,
-                kv_store_activation,
-                kv_use_cached_activation,
-                request_id,
-                decode_do_sample,
-                decode_temperature,
-                decode_top_p,
-                decode_top_k,
-                decode_seed,
+                _legacy_kwargs["stage_index"],
+                _legacy_kwargs["total_stages"],
+                _legacy_kwargs["kv_session_id"],
+                _legacy_kwargs["kv_store_activation"],
+                _legacy_kwargs["kv_use_cached_activation"],
+                _legacy_kwargs["request_id"],
+                _legacy_kwargs["decode_do_sample"],
+                _legacy_kwargs["decode_temperature"],
+                _legacy_kwargs["decode_top_p"],
+                _legacy_kwargs["decode_top_k"],
+                _legacy_kwargs["decode_seed"],
             )
         )
 
@@ -2429,5 +3269,11 @@ class ModelShard:
         if not words:
             return ""
         if tokenizer_model_id:
-            return "".join(words).strip()
+            # NOTE: do NOT ``.strip()`` here. A first-token generation of
+            # ``"\n\n"`` (common for Qwen 3.5 / other "thinking" models that
+            # emit a whitespace preamble before their real content) would
+            # otherwise collapse to "" and look like an empty response. The
+            # tokenizer already emits clean pieces; trimming is the caller's
+            # responsibility if they actually want it.
+            return "".join(words)
         return cls.render_text(words)

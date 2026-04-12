@@ -355,6 +355,20 @@ class SpecPipeScheduler:
                     break
 
                 activation, tok_prompt, is_continuation, tok_idx = item
+
+                # Sentinel propagation: an upstream stage signalled failure
+                # by sending (None, "", False, tok_idx). Forward the sentinel
+                # downstream in the tuple shape the next stage expects (last
+                # stage uses a 2-tuple, intermediate stages a 4-tuple) so
+                # the main thread can see the failure without crashing any
+                # worker on unpack.
+                if activation is None:
+                    if stage_idx == n_stages - 1:
+                        out_q.put((None, tok_idx))
+                    else:
+                        out_q.put((None, "", False, tok_idx))
+                    continue
+
                 try:
                     result = self._stage_fn(
                         peer=peer,
@@ -384,7 +398,14 @@ class SpecPipeScheduler:
                         "pipelined_stage_%d_failed: tok=%d err=%s",
                         stage_idx, tok_idx, exc,
                     )
-                    out_q.put((None, tok_idx))
+                    # Normalize the error sentinel to each stage's expected
+                    # tuple shape. Last stage downstream is the collector,
+                    # which reads 2-tuples; every other stage is another
+                    # worker, which unpacks a 4-tuple at the top of this loop.
+                    if stage_idx == n_stages - 1:
+                        out_q.put((None, tok_idx))
+                    else:
+                        out_q.put((None, "", False, tok_idx))
 
         # Start per-stage worker threads
         workers = []

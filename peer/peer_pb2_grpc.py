@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from peer import peer_pb2 as peer_dot_peer__pb2
+from peer import peer_pb2 as peer__pb2
 
 GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in peer/peer_pb2_grpc.py depends on'
+        + ' but the generated code in peer_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,28 +36,28 @@ class PeerStub(object):
         """
         self.Ping = channel.unary_unary(
                 '/openhydra.peer.Peer/Ping',
-                request_serializer=peer_dot_peer__pb2.PingRequest.SerializeToString,
-                response_deserializer=peer_dot_peer__pb2.PingResponse.FromString,
+                request_serializer=peer__pb2.PingRequest.SerializeToString,
+                response_deserializer=peer__pb2.PingResponse.FromString,
                 _registered_method=True)
         self.Forward = channel.unary_unary(
                 '/openhydra.peer.Peer/Forward',
-                request_serializer=peer_dot_peer__pb2.ForwardRequest.SerializeToString,
-                response_deserializer=peer_dot_peer__pb2.ForwardResponse.FromString,
+                request_serializer=peer__pb2.ForwardRequest.SerializeToString,
+                response_deserializer=peer__pb2.ForwardResponse.FromString,
                 _registered_method=True)
         self.GetPeerStatus = channel.unary_unary(
                 '/openhydra.peer.Peer/GetPeerStatus',
-                request_serializer=peer_dot_peer__pb2.PeerStatusRequest.SerializeToString,
-                response_deserializer=peer_dot_peer__pb2.PeerStatusResponse.FromString,
+                request_serializer=peer__pb2.PeerStatusRequest.SerializeToString,
+                response_deserializer=peer__pb2.PeerStatusResponse.FromString,
                 _registered_method=True)
         self.ForwardStream = channel.stream_stream(
                 '/openhydra.peer.Peer/ForwardStream',
-                request_serializer=peer_dot_peer__pb2.ForwardRequest.SerializeToString,
-                response_deserializer=peer_dot_peer__pb2.ForwardResponse.FromString,
+                request_serializer=peer__pb2.ForwardRequest.SerializeToString,
+                response_deserializer=peer__pb2.ForwardResponse.FromString,
                 _registered_method=True)
         self.PushResult = channel.unary_unary(
                 '/openhydra.peer.Peer/PushResult',
-                request_serializer=peer_dot_peer__pb2.ForwardResponse.SerializeToString,
-                response_deserializer=peer_dot_peer__pb2.PushAck.FromString,
+                request_serializer=peer__pb2.ForwardResponse.SerializeToString,
+                response_deserializer=peer__pb2.PushAck.FromString,
                 _registered_method=True)
 
 
@@ -101,28 +101,28 @@ def add_PeerServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Ping': grpc.unary_unary_rpc_method_handler(
                     servicer.Ping,
-                    request_deserializer=peer_dot_peer__pb2.PingRequest.FromString,
-                    response_serializer=peer_dot_peer__pb2.PingResponse.SerializeToString,
+                    request_deserializer=peer__pb2.PingRequest.FromString,
+                    response_serializer=peer__pb2.PingResponse.SerializeToString,
             ),
             'Forward': grpc.unary_unary_rpc_method_handler(
                     servicer.Forward,
-                    request_deserializer=peer_dot_peer__pb2.ForwardRequest.FromString,
-                    response_serializer=peer_dot_peer__pb2.ForwardResponse.SerializeToString,
+                    request_deserializer=peer__pb2.ForwardRequest.FromString,
+                    response_serializer=peer__pb2.ForwardResponse.SerializeToString,
             ),
             'GetPeerStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetPeerStatus,
-                    request_deserializer=peer_dot_peer__pb2.PeerStatusRequest.FromString,
-                    response_serializer=peer_dot_peer__pb2.PeerStatusResponse.SerializeToString,
+                    request_deserializer=peer__pb2.PeerStatusRequest.FromString,
+                    response_serializer=peer__pb2.PeerStatusResponse.SerializeToString,
             ),
             'ForwardStream': grpc.stream_stream_rpc_method_handler(
                     servicer.ForwardStream,
-                    request_deserializer=peer_dot_peer__pb2.ForwardRequest.FromString,
-                    response_serializer=peer_dot_peer__pb2.ForwardResponse.SerializeToString,
+                    request_deserializer=peer__pb2.ForwardRequest.FromString,
+                    response_serializer=peer__pb2.ForwardResponse.SerializeToString,
             ),
             'PushResult': grpc.unary_unary_rpc_method_handler(
                     servicer.PushResult,
-                    request_deserializer=peer_dot_peer__pb2.ForwardResponse.FromString,
-                    response_serializer=peer_dot_peer__pb2.PushAck.SerializeToString,
+                    request_deserializer=peer__pb2.ForwardResponse.FromString,
+                    response_serializer=peer__pb2.PushAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -150,8 +150,8 @@ class Peer(object):
             request,
             target,
             '/openhydra.peer.Peer/Ping',
-            peer_dot_peer__pb2.PingRequest.SerializeToString,
-            peer_dot_peer__pb2.PingResponse.FromString,
+            peer__pb2.PingRequest.SerializeToString,
+            peer__pb2.PingResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -177,8 +177,8 @@ class Peer(object):
             request,
             target,
             '/openhydra.peer.Peer/Forward',
-            peer_dot_peer__pb2.ForwardRequest.SerializeToString,
-            peer_dot_peer__pb2.ForwardResponse.FromString,
+            peer__pb2.ForwardRequest.SerializeToString,
+            peer__pb2.ForwardResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -204,8 +204,8 @@ class Peer(object):
             request,
             target,
             '/openhydra.peer.Peer/GetPeerStatus',
-            peer_dot_peer__pb2.PeerStatusRequest.SerializeToString,
-            peer_dot_peer__pb2.PeerStatusResponse.FromString,
+            peer__pb2.PeerStatusRequest.SerializeToString,
+            peer__pb2.PeerStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -231,8 +231,8 @@ class Peer(object):
             request_iterator,
             target,
             '/openhydra.peer.Peer/ForwardStream',
-            peer_dot_peer__pb2.ForwardRequest.SerializeToString,
-            peer_dot_peer__pb2.ForwardResponse.FromString,
+            peer__pb2.ForwardRequest.SerializeToString,
+            peer__pb2.ForwardResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -258,8 +258,8 @@ class Peer(object):
             request,
             target,
             '/openhydra.peer.Peer/PushResult',
-            peer_dot_peer__pb2.ForwardResponse.SerializeToString,
-            peer_dot_peer__pb2.PushAck.FromString,
+            peer__pb2.ForwardResponse.SerializeToString,
+            peer__pb2.PushAck.FromString,
             options,
             channel_credentials,
             insecure,

@@ -509,6 +509,15 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             logger.info("forward_dispatch: peer=%s stage=%d/%d backend=%s",
                        self.peer_id, int(request.stage_index), int(request.total_stages),
                        "pytorch" if self.shard.uses_pytorch_runtime else "batch_queue")
+            # Phase 4 (Gemma 4 sharded adapter): read the ``prompt_token_ids``
+            # sidecar. Every stage needs these to recompute the per-layer
+            # input tensor locally — without them, Gemma 4 layer forward
+            # multiplies by None and produces zero output. Non-Gemma-4
+            # families ignore the field entirely.
+            _prompt_token_ids: list[int] | None = None
+            if len(request.prompt_token_ids) > 0:
+                _prompt_token_ids = [int(t) for t in request.prompt_token_ids]
+
             if self.shard.uses_pytorch_runtime:
                 # Offload PyTorch matrix compute to a worker thread to protect async control planes.
                 activation = asyncio.run(
@@ -527,6 +536,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         decode_top_p=decode_top_p,
                         decode_top_k=decode_top_k,
                         decode_seed=(decode_seed if decode_seed > 0 else None),
+                        prompt_token_ids=_prompt_token_ids,
                     )
                 )
                 kv_cache_hit = bool(self.shard.last_kv_cache_hit)
@@ -640,6 +650,16 @@ class PeerService(peer_pb2_grpc.PeerServicer):
 
             return response
         except Exception as exc:  # pragma: no cover
+            # Log the full traceback so we can debug peer-side failures —
+            # the gRPC response only carries ``str(exc)`` which omits the
+            # stack and hides subtle issues (e.g. the Phase 6 KV-cache
+            # meta-tensor dispatcher path).
+            import traceback as _tb
+            logger.error(
+                "Forward_failed peer=%s stage=%d req=%s: %s\n%s",
+                self.peer_id, int(request.stage_index), request.request_id,
+                exc, _tb.format_exc(),
+            )
             return peer_pb2.ForwardResponse(
                 request_id=request.request_id,
                 peer_id=self.peer_id,

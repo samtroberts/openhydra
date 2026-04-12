@@ -153,6 +153,14 @@ def main() -> None:
                              "kills it (default: 120). Increase on memory-constrained machines.")
     parser.add_argument("--specpipe", action="store_true", default=False,
                         help="Enable SpecPipe pipeline-filling speculation (P1-A).")
+    parser.add_argument(
+        "--autoregressive-sharded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the outer autoregressive decode loop for non-streaming sharded PyTorch "
+             "pipelines (default: True). Set --no-autoregressive-sharded to restore the legacy "
+             "single-chain-call behavior while debugging.",
+    )
     parser.add_argument("--chunked-prefill", action="store_true", default=False,
                         help="Enable chunked prefill for long prompts (P1-B).")
     parser.add_argument("--push-mode", action="store_true", default=False,
@@ -337,6 +345,7 @@ def main() -> None:
         timeout_ms=60000,
         max_latency_ms=60000,
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
+        autoregressive_sharded_enabled=bool(getattr(args, "autoregressive_sharded", True)),
         chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
         push_mode_enabled=bool(getattr(args, "push_mode", False)),
         push_callback_address=str(getattr(args, "push_callback_address", "") or ""),

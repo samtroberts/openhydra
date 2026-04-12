@@ -170,7 +170,37 @@ def test_decode_text_uses_tokenizer_for_pytorch_token_ids(monkeypatch):
         max_tokens=6,
         tokenizer_model_id="Qwen/Qwen3.5-0.8B",
     )
-    assert text == "Paris"
+    # Must NOT strip — leading whitespace is meaningful output, and stripping
+    # collapses whitespace-only tokens to "" (see test_decode_text_preserves_whitespace_only_token).
+    assert text == " Paris"
+
+
+def test_decode_text_preserves_whitespace_only_token(monkeypatch):
+    """Regression: a single ``"\\n\\n"`` token must not collapse to ``""``.
+
+    Qwen 3.5 thinking models always emit ``"\\n\\n"`` as the first sampled
+    token (entering the ``<think>`` block). Before the fix, ``decode_text``
+    called ``"".join(words).strip()`` which turned ``"\\n\\n"`` into ``""``
+    and made every sharded request look like it had generated nothing.
+    """
+    class _Tokenizer:
+        all_special_ids: list[int] = []
+
+        def decode(self, token_ids, clean_up_tokenization_spaces=False):
+            return "\n\n"
+
+    monkeypatch.setattr(
+        ModelShard,
+        "_load_decode_tokenizer",
+        staticmethod(lambda model_id: _Tokenizer()),
+    )
+
+    text = ModelShard.decode_text(
+        [271.0],  # Qwen 3.5 "\n\n" token id
+        max_tokens=1,
+        tokenizer_model_id="Qwen/Qwen3.5-9B",
+    )
+    assert text == "\n\n"
 
 
 def test_decode_text_filters_special_token_ids(monkeypatch):
