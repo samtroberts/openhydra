@@ -136,6 +136,11 @@ class EngineConfig:
     # P1-A: SpecPipe — pipeline-filling speculative decoding
     specpipe_enabled: bool = False
     specpipe_max_depth: int = 4
+    # Non-streaming sharded decode loop — when True (default), non-streaming
+    # ``infer()`` runs an outer autoregressive loop over sharded PyTorch
+    # pipelines (re-prefills through every stage for each token). Set to
+    # False to restore pre-fix behavior (single chain.run() → one token).
+    autoregressive_sharded_enabled: bool = True
     # P1-B: Chunked prefill — split long prompts for pipeline interleaving
     chunked_prefill_enabled: bool = False
     chunked_prefill_chunk_size: int = 2048

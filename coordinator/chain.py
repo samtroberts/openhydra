@@ -125,6 +125,7 @@ class InferenceChain:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         deadline: float | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> _StageResult:
         plain_activation = activation
         wire_activation = activation
@@ -256,6 +257,11 @@ class InferenceChain:
             quantized_activation=_quantized_activation,
             quantized_scales=_quantized_scales,
             activation_quantization=_activation_quantization,
+            # Phase 4: Gemma 4 sharded adapter — ship the original prompt
+            # token IDs to every stage so downstream peers can recompute the
+            # per-layer input tensor locally. Unused by non-Gemma-4 families;
+            # empty list when the caller didn't supply ids.
+            prompt_token_ids=list(int(t) for t in (prompt_token_ids or [])),
         )
 
         # --- Deadline-aware per-stage timeout ---
@@ -474,9 +480,35 @@ class InferenceChain:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         deadline: float | None = None,
+        prompt_token_ids: list[int] | tuple[int, ...] | None = None,
     ) -> ChainResult:
         rid = request_id or str(uuid.uuid4())
         activation: list[float] = list(initial_activation or [])
+
+        # Phase 4 (Gemma 4 sharded adapter): derive the prompt-token sidecar
+        # that ships with every stage so downstream peers can recompute
+        # per-layer inputs locally. When the caller passes
+        # ``prompt_token_ids`` explicitly we use it as-is; otherwise we
+        # auto-detect the common case where ``initial_activation`` is a
+        # list of integer-valued floats (the Phase 1 non-streaming loop
+        # always passes token IDs this way). The sidecar is empty for
+        # non-PyTorch / non-Gemma-4 paths — peers just ignore it.
+        _chain_prompt_token_ids: list[int] = []
+        if prompt_token_ids:
+            try:
+                _chain_prompt_token_ids = [int(t) for t in prompt_token_ids]
+            except (TypeError, ValueError):
+                _chain_prompt_token_ids = []
+        elif initial_activation and all(
+            abs(float(v) - round(float(v))) < 1e-6 and float(v) >= 0
+            for v in initial_activation[:64]
+        ):
+            try:
+                _chain_prompt_token_ids = [
+                    int(round(float(v))) for v in initial_activation
+                ]
+            except (TypeError, ValueError):
+                _chain_prompt_token_ids = []
         traces: list[StageTrace] = []
         compression_input = 0
         compression_latent = 0
@@ -596,6 +628,7 @@ class InferenceChain:
                         total_stages=len(self.pipeline),
                         max_tokens=max_tokens,
                         deadline=deadline,
+                        prompt_token_ids=_chain_prompt_token_ids,
                         **stage_kwargs,
                     )
                     if isinstance(stage_result, tuple):

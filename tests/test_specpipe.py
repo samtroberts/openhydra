@@ -113,3 +113,72 @@ class TestSpecPipeConcurrency:
         scheduler.run_round(context_ids=[100], prompt="test")
         scheduler.shutdown()
         # Should not raise
+
+
+class TestSpecPipePipelinedErrorHandling:
+    """Regression: Phase 3 — stage-failure sentinel must not crash downstream
+    stages with ``ValueError: not enough values to unpack (expected 4, got 2)``.
+
+    Previously, ``run_pipelined._stage_worker`` put ``(None, tok_idx)`` into
+    the error path but intermediate stages always unpacked a 4-tuple, so any
+    stage 0 failure brought down stage 1 with an unpack error and the whole
+    generation died on the first bad token.
+    """
+
+    def test_stage0_failure_does_not_crash_downstream(self):
+        """Stage 0 raising on the first token must surface cleanly — the
+        scheduler returns the tokens it successfully generated (possibly 0)
+        without any stage worker crashing on a tuple-unpack.
+        """
+        failure_count = {"val": 0}
+
+        def failing_stage(**kw):
+            if kw.get("stage_index") == 0:
+                failure_count["val"] += 1
+                raise RuntimeError("stage 0 synthetic failure")
+            # Stage 1+ would otherwise run fine — but should never see
+            # a malformed tuple from stage 0's error path.
+            return [float(kw.get("activation", [0])[0]) + 1]
+
+        scheduler = _make_scheduler(n_stages=2, stage_fn=failing_stage)
+        generated = scheduler.run_pipelined(
+            context_ids=[100],
+            prompt="hello",
+            max_tokens=3,
+            request_id="test-stage0-fail",
+        )
+
+        # The scheduler should give up cleanly after the first failed token
+        # and return 0 tokens — the key invariant is that no worker raised
+        # ``ValueError: not enough values to unpack``.
+        assert generated == []
+        assert failure_count["val"] >= 1
+
+    def test_stage_sentinel_propagates_through_pipeline(self):
+        """A 3-stage pipeline with stage 0 failing must not leave stage 1 or
+        stage 2 workers stuck in a bad-unpack crash. Regression covers the
+        sentinel shape mismatch at ``_stage_worker`` line 357."""
+        call_log: list[int] = []
+        lock = threading.Lock()
+
+        def tracking_stage(**kw):
+            with lock:
+                call_log.append(int(kw.get("stage_index", -1)))
+            if kw.get("stage_index") == 0:
+                raise RuntimeError("boom at stage 0")
+            return [float(kw.get("activation", [0])[0]) + 1]
+
+        scheduler = _make_scheduler(n_stages=3, stage_fn=tracking_stage)
+        generated = scheduler.run_pipelined(
+            context_ids=[100],
+            prompt="hello",
+            max_tokens=2,
+            request_id="test-sentinel",
+        )
+
+        # Key invariant: no ValueError thrown. Generation returns nothing
+        # because stage 0 failed on every token, but the scheduler must
+        # have cleanly propagated the sentinel through stages 1 and 2.
+        assert generated == []
+        assert 0 in call_log  # Stage 0 was exercised
+        scheduler.shutdown()

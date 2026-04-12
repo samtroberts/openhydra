@@ -80,6 +80,13 @@ message ForwardRequest {
   string final_callback_request_id = 40; // correlation ID for the PushResult
   // Remaining route hops (each peer pops the first entry and forwards the rest)
   repeated PeerHop remaining_route = 41;
+  // Phase 4 (Gemma 4 sharded adapter): original prompt token IDs from the
+  // first stage. Carried through every hop so downstream peers can re-derive
+  // the per-layer input tensor locally (via ``embed_tokens_per_layer`` +
+  // ``per_layer_model_projection`` + ``per_layer_projection_norm``) without
+  // a wire format change to ``activation``. Unused by non-gemma4 families.
+  // When empty the peer falls back to the standard llama/qwen_llama path.
+  repeated int64 prompt_token_ids = 42;
 }
 
 // A single hop in the push-mode routing chain.

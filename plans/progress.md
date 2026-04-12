@@ -1,6 +1,6 @@
 # OpenHydra Progress Tracker
 
-> Updated: 2026-04-10 (Petals parity complete, Gemma 4 + Qwen 3.5, autonomous rebalancing, GPU benchmarks, 1103 tests)
+> Updated: 2026-04-12 (Phases 1+2+3+4+6+7 landed: streaming fixed, Gemma 4 KV reuse, T4 cuDNN workaround; both models coherent through coordinator; 1129 tests)
 
 ---
 
@@ -182,6 +182,99 @@
 | Qwen 3.5 support | :white_check_mark: | Works out of the box (qwen_llama family) |
 | Instruct models (Qwen2.5-7B-Instruct) | :white_check_mark: | Catalog entry, no code changes |
 | Model catalog expanded (21 entries) | :white_check_mark: | +10 Gemma 4 + Qwen 3.5 entries |
+
+### Sharded Inference Fixes — Phase 7 Streaming + Gemma 4 KV Reuse (2026-04-12)
+
+| Phase | Task | Status | Notes |
+|-------|------|--------|-------|
+| 7A | Streaming endpoint rewrite (`infer_stream` pytorch_autoregressive) | :white_check_mark: | Rewrote to use Phase 6 prefill+decode loop instead of legacy verify/commit dance. Legacy path sent `context_token_ids[-1]` (the last PROMPT token, e.g. `<\|im_start\|>assistant`) as verify input → model predicted EOS → 0 SSE chunks. New path correctly captures the prefill's sampled token and continues. Streaming Qwen3.5-9B: 24 chunks in 45.3s = **0.53 TPS** |
+| 7B | Gemma 4 KV reuse — persist `DynamicCache` across calls | :white_check_mark: | `_run_layers_gemma4` now accepts an existing `past_key_values` and returns it for storage. Previously created a fresh `DynamicCache` every call → effectively stateless re-prefill. With reuse: Gemma 4 E4B-it 20 tok = **0.60 TPS** (vs 0.50 stateless), 40 tok = **0.71 TPS** |
+| 7 | T4 cuDNN workaround (`_patch_depthwise_conv1d_t4_fallback`) | :white_check_mark: | (Shipped in Phase 6 session) cuDNN on T4 has no kernel for `Conv1d(C, C, k=4, groups=C)` in bf16 with `seq_len<4`; the exact shape Qwen 3.5 linear_attn hits on every KV-aware decode step. Wrapper retries inside `torch.backends.cudnn.flags(enabled=False)`. Logs `conv1d_t4_fallback_patched: N modules` at startup |
+| 7 | `_run_layers` materialises `DynamicCache` for prefill | :white_check_mark: | (Shipped in Phase 6 session) Native `Qwen3_5TextModel.forward` creates `DynamicCache(config=...)` when `use_cache=True, past_key_values=None`; our `_run_layers` now does the same. Prevents "tuple of Nones" cache → garbage single-token decode |
+| 7 | Live validation | :white_check_mark: | Both models coherent through coordinator on Lightning T4×2. See summary below |
+
+**Final TPS summary (Lightning T4×2 via Mac coordinator, SSH-tunnelled WAN):**
+
+| Model | Endpoint | Tokens | Phase 1 (stateless) | Phase 6+7 (KV-aware) | Speedup |
+|---|---|---|---|---|---|
+| Qwen3.5-9B | `/v1/completions` | 16 | 74.8s / 0.21 TPS | 25.5s / **0.63 TPS** | **3.0×** |
+| Qwen3.5-9B | `/v1/completions` | 32 | — | 49.9s / **0.64 TPS** | — |
+| Qwen3.5-9B | `/v1/chat/completions` stream | 24 | empty | 45.3s / **0.53 TPS** | **∞** (was broken) |
+| Gemma4 E4B-it | `/v1/chat/completions` | 20 | 40.0s / 0.50 TPS | 33.3s / **0.60 TPS** | **1.2×** |
+| Gemma4 E4B-it | `/v1/chat/completions` | 40 | — | 56.6s / **0.71 TPS** | — |
+
+### Sharded Inference Fixes — Phase 6 KV-aware Decode (2026-04-12)
+
+| Phase | Task | Status | Notes |
+|-------|------|--------|-------|
+| 6A | KV-aware decode loop in `infer()` (prefill once + decode N) | :white_check_mark: | `coordinator/inference_service.py` — drops O(N²) re-prefill for sharded PyTorch pipelines |
+| 6A | Stateless fallback on `RuntimeError` | :white_check_mark: | First failure switches mode for the rest of the request; visible in `autoregressive_sharded_done mode=...` log |
+| 6B | `_run_layers` materialises `DynamicCache` when `use_cache=True` | :white_check_mark: | `peer/model_shard.py` — fixes the "tuple of Nones" cache that made every Phase 6 decode step a fresh single-token re-prefill (silent garbage logits) |
+| 6C | T4 cuDNN workaround for depthwise `Conv1d` | :white_check_mark: | `_patch_depthwise_conv1d_t4_fallback()` — wraps every depthwise `nn.Conv1d` with a `cudnn.flags(enabled=False)` retry path. cuDNN on T4 has no kernel for `Conv1d(C, C, k=4, groups=C, padding=3)` in bf16 with `seq_len<4`; the exact shape Qwen 3.5 `linear_attn` hits on every decode step. Logs `conv1d_t4_fallback_patched: N depthwise Conv1d modules wrapped` |
+| 6D | Regression tests — `tests/test_autoregressive_sharded.py` | :white_check_mark: | 5 tests: KV prefill→decode call sequence, stateless fallback on KV failure, stateless full-context per step, EOS early-exit, prefill happens exactly once |
+| 6E | Full test suite | :white_check_mark: | **1129 passed, 9 skipped** (up from 1124; +5 new) |
+| 6F | Live validation on Lightning T4×2 | :white_check_mark: | `/v1/completions` 16 tok in **25.5s = 0.63 TPS**, 32 tok in **49.9s = 0.64 TPS**; `/v1/chat/completions` 24 tok in **35.8s = 0.67 TPS**. **~3× faster** than Phase 1 stateless on the same 16-token generation (74.8s → 25.5s). Coherent reasoning output (`"[Reasoning]\n- Step 1: Multiply 17 by"`). Decode latency now constant ~1.35s/token regardless of context length |
+
+### Sharded Inference Fixes — Phase 4 Gemma 4 Adapter (2026-04-12)
+
+| Phase | Task | Status | Notes |
+|-------|------|--------|-------|
+| 4A | `_DecoderArchitecture` extras: `layer_types`, `per_layer_embed/proj/norm`, `hidden_size_per_layer`, `text_model` | :white_check_mark: | Defaults to empty/None so non-Gemma-4 paths are untouched |
+| 4B | `ForwardRequest.prompt_token_ids` proto field (#42) | :white_check_mark: | Repeated int64; `peer/peer_pb2{,_grpc}.py` regenerated |
+| 4C | `_detect_decoder_architecture` populates Gemma 4 extras + sets `family="gemma4"` | :white_check_mark: | Previously set Gemma 4 to `family="llama"` and produced garbage |
+| 4D | `_run_layers_gemma4` branch with layer-type rotary + full/sliding masks + per-layer-input slicing + local `DynamicCache` | :white_check_mark: | `peer/model_shard.py` — 130 lines |
+| 4E | `_forward_impl` threads `prompt_token_ids` through and computes per-layer-input sidecar before `_run_layers` | :white_check_mark: | Stage 0 falls back to `activation` when field is empty for backward compat |
+| 4F | `PyTorchRuntime` / `ModelShard` forward + forward_async signatures carry `prompt_token_ids` | :white_check_mark: | Isolated to `isinstance(runtime, PyTorchRuntime)` so ToyRuntime / MLXRuntime stay untouched |
+| 4G | `chain.run()` auto-derives `prompt_token_ids` from `initial_activation` when it's all integer-valued floats | :white_check_mark: | Phase 1 and Phase 4 compose automatically; no inference_service changes |
+| 4H | Peer server reads `request.prompt_token_ids` + passes to `shard.forward_async` | :white_check_mark: | `peer/server.py` |
+| 4I | Hidden-size probe uses `text_config.hidden_size` for multimodal wrappers | :white_check_mark: | Fixes `invalid_hidden_payload:hidden_size` from 768 default |
+| 4J | Gemma 4 KV-sharing: create `DynamicCache` + pass to every layer | :white_check_mark: | `num_kv_shared_layers=18` — layers 24-41 read from `cache.shared_layers` populated by layers 22-23. Without this, produces garbage tokens (reproduced + fixed via `/tmp/diag_gemma4_sharded.py`) |
+| 4K | Shard-split safety check raises `gemma4_shard_split_breaks_kv_sharing` when a shard has shared layers but no storing layers | :white_check_mark: | Clear error with recovery suggestion |
+| 4L | Regression tests — `tests/test_gemma4_sharded.py` | :white_check_mark: | 10 tests: `_DecoderArchitecture` defaults + Gemma 4 population, proto roundtrip + field-number stability, chain.run auto-derive cases, `_compute_gemma4_per_layer_inputs` safe defaults |
+| 4M | Full test suite | :white_check_mark: | **1124 passed, 9 skipped** (up from 1114; +10 new Gemma 4 tests) |
+| 4N | Live validation on Lightning T4×2 | :white_check_mark: | `openhydra-gemma4-e4b-it` sharded 21/21 across Lightning Studios 1+2 via Mac coordinator. Coherent output: `"Write one sentence about the ocean."` → `"The vast, mysterious ocean covers most of our planet, teeming with incredible life beneath its surface."` (20 tok, 40.0s ≈ 0.50 TPS). Both peers log `multimodal_strip: kept=21 replaced=21` at startup. |
+
+### Sharded Inference Fixes — Phases 1+2+3 (2026-04-12)
+
+See `plans/sharded-inference-fixes.md` for the full plan.
+
+| Phase | Task | Status | Notes |
+|-------|------|--------|-------|
+| 1A | Non-streaming outer decode loop in `infer()` | :white_check_mark: | `coordinator/inference_service.py` — stateless re-prefill per token over sharded PyTorch pipelines; shared `_collect_eos_token_ids` helper also used by streaming path |
+| 1B | `--autoregressive-sharded` kill-switch | :white_check_mark: | Added to both `api_server.py` and `coordinator/node.py`; wires to `EngineConfig.autoregressive_sharded_enabled` (default True) |
+| 1C | Drop `decode_text` `.strip()` | :white_check_mark: | `peer/model_shard.py`; preserves whitespace-only first tokens (Qwen 3.5 thinking preamble) |
+| 2A | Investigate meta-tensor error | :white_check_mark: | Root cause: `self._blocks[idx] = None` only clears local ref — the real `nn.ModuleList` still holds meta-device modules that DynamicCache / `_update_causal_mask` iterate over |
+| 2B | Identity-replace offloaded layers in ModuleList | :white_check_mark: | New helpers `_find_decoder_layer_list` + `_replace_offloaded_layers_with_identity`; called from `PyTorchRuntime.__init__`; `_strip_multimodal_components` refactored to reuse |
+| 2C | Regression test suite | :white_check_mark: | `tests/test_sharded_kv_cache.py` — 8 tests covering meta-tensor elimination, indexing preservation, idempotence, no-op full-model case, bare-model handling, parameter iteration |
+| 3A | SpecPipe stage-worker sentinel fix | :white_check_mark: | `_stage_worker` normalizes error tuples per downstream stage shape; adds `activation is None` sentinel check at top of loop |
+| 3B | SpecPipe regression tests | :white_check_mark: | `tests/test_specpipe.py::TestSpecPipePipelinedErrorHandling` — 2 tests exercising stage 0 failures in 2- and 3-stage pipelines |
+| — | Decode-text whitespace regression test | :white_check_mark: | `tests/test_model_shard.py::test_decode_text_preserves_whitespace_only_token` |
+| — | Full test suite | :white_check_mark: | **1114 passed, 9 skipped** (up from 1103; +11 new tests) |
+| — | Live T4×2 validation | :white_check_mark: | `/v1/completions` + `/v1/chat/completions` both generate coherent multi-token output for Qwen3.5-9B sharded across Lightning Studios 1+2 via the Mac coordinator. 16 tok/79.7s = ~0.20 TPS (WAN + stateless re-prefill). Both peers log `pytorch_layer_identity_swap: 16 offloaded layers replaced with nn.Identity` at startup. |
+
+### Qwen 3.5 9B Sharded T4×2 (2026-04-11)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Qwen3.5-9B downloaded to both studios | :white_check_mark: | 19 GB each at `/teamspace/studios/this_studio/openhydra/models/Qwen3.5-9B` |
+| Native-dtype loader probe | :white_check_mark: | `peer/model_shard.py` — reads `config.torch_dtype` / `config.text_config.torch_dtype`; Qwen 3.5 forces bf16 because `linear_attn` state-space buffers cannot be down-cast |
+| `_detect_layer_prefix` / `_build_selective_device_map` kept simple | :white_check_mark: | `AutoModelForCausalLM` picks `Qwen3_5ForCausalLM` (text-only, `model.layers.N`); the multimodal checkpoint keys are auto-remapped |
+| Sharded peers loaded | :white_check_mark: | gpu1 layers 0-15, gpu2 layers 16-31; **10.6 GB VRAM per T4**, ~23 s load each |
+| Sharded forward pipeline runs end-to-end | :white_check_mark: | Via `ops/bench/qwen9b_sharded_bench.py` — direct gRPC to both peers, no coordinator |
+| Coherent output verified | :white_check_mark: | Qwen thinking-chain output ("Thinking Process:\n\n1.  **Analyze the Request:** ...") on math-reasoning prompts |
+| Direct-bench TPS (no KV cache, O(N²) re-prefill) | :white_check_mark: | "Hi"→4 tok = **0.67 TPS** · "Say hello in five words."→8 tok = **0.32 TPS** · "What is 17 times 23?"→24 tok = **0.44 TPS** |
+| `api_server.py --specpipe` flag | :white_check_mark: | Wires `specpipe_enabled` + `specpipe_max_depth` into `EngineConfig` (was hard-coded off) |
+| Coordinator non-streaming sharded multi-token generation | :no_entry_sign: | **Blocked** by three separate coordinator bugs — documented in `plans/memory.md` ("Coordinator Bugs Uncovered"). Direct-bench works, coordinator path does not. |
+
+### Gemma 4 Loader + T4 Bench (2026-04-11)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Multimodal CPU-first loader path | :white_check_mark: | `_strip_multimodal_components()` in `peer/model_shard.py`: loads full `Gemma4ForConditionalGeneration` into CPU RAM, drops `vision_tower` / `audio_tower` / `embed_vision` / `embed_audio` / `multi_modal_projector`, Identity-replaces out-of-shard text layers, moves surviving decoder + `lm_head` to target device |
+| `_is_multimodal_model_type()` detector | :white_check_mark: | Config-only probe for `gemma4` / `qwen3_5` |
+| Single-T4 direct bench (model.generate) | :white_check_mark: | `ops/bench/gemma4_direct_bench.py` — Studio 1: **10.71 TPS**, Studio 2: **8.88 TPS** (warm, greedy, 95 tokens, fp16, ~14.5 GB VRAM) |
+| Full regression suite after refactor | :white_check_mark: | 1103 passed, 9 skipped |
+| Sharded Gemma 4 through `_run_layers` | :no_entry_sign: | **Blocked** by Gemma 4's layer-type-aware rotary + per-layer-input multiplication. Needs (1) `family="gemma4"` branch in `_run_layers`, (2) per-layer-input sidecar in the activation pipeline payload, (3) full + sliding causal masks. See `plans/memory.md` "Known Limitation" section. Single-peer / direct-generate works. |
 
 ### Autonomous Rebalancing (2026-04-10)
 

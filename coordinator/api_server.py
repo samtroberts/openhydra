@@ -1822,6 +1822,18 @@ def main() -> None:
     parser.add_argument("--moe-geo-prompt-hints-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pytorch-generation-model-id", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--pytorch-speculative-draft-model-id", default="sshleifer/tiny-gpt2")
+    parser.add_argument("--specpipe", action="store_true", default=False,
+                        help="Enable SpecPipe scheduler for sharded pipelines — required for multi-token "
+                             "non-streaming generation across remote peers")
+    parser.add_argument("--specpipe-max-depth", type=int, default=4)
+    parser.add_argument(
+        "--autoregressive-sharded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the outer autoregressive decode loop for non-streaming sharded PyTorch "
+             "pipelines (default: True). Set --no-autoregressive-sharded to restore the legacy "
+             "single-chain-call behavior while debugging.",
+    )
     parser.add_argument("--tls-enable", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--tls-root-cert-path", default=None)
     parser.add_argument("--tls-client-cert-path", default=None)
@@ -1944,6 +1956,9 @@ def main() -> None:
         moe_geo_prompt_hints_enabled=args.moe_geo_prompt_hints_enabled,
         pytorch_generation_model_id=str(args.pytorch_generation_model_id),
         pytorch_speculative_draft_model_id=str(args.pytorch_speculative_draft_model_id),
+        specpipe_enabled=bool(args.specpipe),
+        specpipe_max_depth=max(1, int(args.specpipe_max_depth)),
+        autoregressive_sharded_enabled=bool(args.autoregressive_sharded),
     )
     serve(args.host, args.port, config, api_key=api_key, rate_limiter=rate_limiter)
 
