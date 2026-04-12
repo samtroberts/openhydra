@@ -4,16 +4,19 @@
 #
 # Runs Qwen3.5-2B (24 layers) sharded across two MacBooks.
 # Each Mac loads 12 layers on its Metal GPU (MPS) via PyTorch.
-# Peers discover each other through the global DHT — no IPs needed.
+# Peers discover each other via libp2p (mDNS on LAN, Kademlia DHT cross-ISP).
+#
+# Prerequisites:
+#   pip install openhydra-network   (or: cd network && maturin build --release && pip install target/wheels/*.whl)
 #
 # Usage:
 #   Mac A:  ./ops/demo_2mac_sharded.sh mac-a
 #   Mac B:  ./ops/demo_2mac_sharded.sh mac-b
 #
-# Wait ~60s for DHT announcements, then chat:
+# Wait ~60s for model loading + DHT announcements, then chat from Mac A:
 #   curl -s http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'Content-Type: application/json' \
-#     -d '{"model":"openhydra-qwen3.5-2b","messages":[{"role":"user","content":"Hello!"}],"max_tokens":32}'
+#     -d '{"model":"openhydra-qwen3.5-2b","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":32}'
 # ─────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
@@ -52,13 +55,21 @@ else
 fi
 
 echo "================================================================"
-echo "  OpenHydra 2-Mac Sharded Demo"
+echo "  OpenHydra 2-Mac Sharded Demo (libp2p)"
 echo "  Model:  $HF_MODEL ($TOTAL_LAYERS layers)"
 echo "  Role:   $ROLE (shard $SHARD_INDEX, layers $LAYER_START-$((LAYER_END - 1)))"
-echo "  DHT:    auto-discovery (STUN detects reachable IP)"
+echo "  P2P:    mDNS (LAN) + Kademlia DHT (cross-ISP)"
 echo "================================================================"
 echo ""
-echo "Starting peer..."
+
+# Check openhydra_network is installed.
+if ! python3 -c "import openhydra_network" 2>/dev/null; then
+    echo "ERROR: openhydra_network not installed."
+    echo "Run: cd network && maturin build --release && pip install target/wheels/*.whl"
+    exit 1
+fi
+
+echo "Starting peer with libp2p P2P networking..."
 echo ""
 
 python3 -m coordinator.node \
@@ -73,4 +84,5 @@ python3 -m coordinator.node \
     --grpc-port "$GRPC_PORT" \
     --api-port "$API_PORT" \
     --api-host 0.0.0.0 \
+    --p2p-enabled \
     --log-level INFO
