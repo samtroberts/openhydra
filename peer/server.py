@@ -1843,6 +1843,21 @@ def serve(
         announce_thread: threading.Thread | None = None
         if resolved_dht_urls or _hivemind_adapter is not None:
             effective_host = advertise_host or ("127.0.0.1" if host in {"0.0.0.0", "::"} else host)
+            # When behind NAT, use the STUN-detected external IP so other
+            # peers across the internet can reach us. For full_cone NAT
+            # (most home routers + some mobile hotspots), the NAT preserves
+            # port mappings and forwards inbound TCP to our gRPC port.
+            if (
+                _nat_profile is not None
+                and _nat_profile.external_ip
+                and _nat_profile.nat_type != "open"
+                and not advertise_host  # don't override explicit --advertise-host
+            ):
+                effective_host = _nat_profile.external_ip
+                logging.info(
+                    "peer %s using STUN external IP as advertise_host: %s (nat_type=%s)",
+                    peer_id, effective_host, _nat_profile.nat_type,
+                )
             announce_thread = threading.Thread(
                 target=_announce_loop,
                 kwargs={
