@@ -99,8 +99,10 @@ class DiscoveryService:
         _dht_lookup_successes: int = 0,
         _dht_lookup_failures: int = 0,
         engine: Any = None,
+        p2p_node: Any = None,
     ) -> None:
         self._engine = engine
+        self._p2p_node = p2p_node
         self.config = config
         self.health = health
         self.auto_scaler = auto_scaler
@@ -390,6 +392,29 @@ class DiscoveryService:
             if dht_errors and not peers:
                 latest = dht_errors[-1]
                 raise RuntimeError(f"dht_lookup_failed: {latest}") from latest
+
+        # Rust Kademlia DHT discover (libp2p path).
+        if self._p2p_node is not None:
+            for model_id in model_filter:
+                try:
+                    libp2p_peers = self._p2p_node.discover(model_id=model_id)
+                    for p in (libp2p_peers or []):
+                        peers.append(PeerEndpoint(
+                            peer_id=str(p.get("peer_id", "")),
+                            host=str(p.get("host", "")),
+                            port=int(p.get("port", 0)),
+                            model_id=str(p.get("model_id", model_id)),
+                            layer_start=int(p.get("layer_start", 0)),
+                            layer_end=int(p.get("layer_end", 0)),
+                            total_layers=int(p.get("total_layers", 0)),
+                            nat_type=str(p.get("nat_type", "unknown")),
+                            requires_relay=bool(p.get("requires_relay", False)),
+                            relay_address=str(p.get("relay_address", "")),
+                            runtime_backend=str(p.get("runtime_backend", "")),
+                            runtime_model_id=str(p.get("runtime_model_id", "")),
+                        ))
+                except Exception as p2p_exc:
+                    logger.debug("p2p_discover_error for %s: %s", model_id, p2p_exc)
 
         peers = self._dedupe_peer_entries(peers)
         if not peers:
