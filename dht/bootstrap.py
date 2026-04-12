@@ -252,6 +252,12 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             "expert_admission_approved": True,
             "expert_admission_reason": "approved",
             "updated_unix_ms": int(payload.get("updated_unix_ms", 0)),
+            # Layer sharding fields — required for auto-discovery of
+            # sharded pipelines. Without these, coordinators can't
+            # assemble multi-peer pipelines from DHT-discovered peers.
+            "layer_start": int(payload.get("layer_start", 0)),
+            "layer_end": int(payload.get("layer_end", 0)),
+            "total_layers": int(payload.get("total_layers", 0)),
         }
 
     @staticmethod
