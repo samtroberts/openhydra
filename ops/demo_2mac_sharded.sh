@@ -55,8 +55,7 @@ if [[ "$ROLE" == "mac-a" ]]; then
         --peer-id mac-a-peer \
         --model-id "$MODEL_ID" \
         --runtime-model-id "$HF_MODEL" \
-        --runtime-backend pytorch_mps \
-        --runtime-target mps \
+        --runtime-backend pytorch_auto \
         --layer-start 0 \
         --layer-end "$LAYERS_PER_SHARD" \
         --shard-index 0 \
@@ -76,8 +75,7 @@ elif [[ "$ROLE" == "mac-b" ]]; then
         --peer-id mac-b-peer \
         --model-id "$MODEL_ID" \
         --runtime-model-id "$HF_MODEL" \
-        --runtime-backend pytorch_mps \
-        --runtime-target mps \
+        --runtime-backend pytorch_auto \
         --layer-start "$LAYERS_PER_SHARD" \
         --layer-end "$TOTAL_LAYERS" \
         --shard-index 1 \
