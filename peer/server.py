@@ -94,6 +94,56 @@ def _exponential_backoff_delay(
     return min(float(cap_seconds), float(base_seconds) * (2.0 ** clamped))
 
 
+def _derive_relay_addresses(
+    dht_urls: list[str],
+    relay_port: int = 50052,
+) -> list[str]:
+    """Derive relay gRPC addresses from DHT bootstrap HTTP URLs.
+
+    The relay service runs on the same hosts as the DHT bootstrap but on
+    a different port. This helper extracts hostnames from URLs like
+    ``http://bootstrap-us.openhydra.co:8468`` and returns
+    ``["bootstrap-us.openhydra.co:50052", ...]``.
+    """
+    from urllib.parse import urlparse
+    addrs: list[str] = []
+    for url in dht_urls:
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname
+            if host:
+                addrs.append(f"{host}:{relay_port}")
+        except Exception:
+            continue
+    return addrs
+
+
+def _relay_heartbeat_loop(
+    *,
+    stop_event: threading.Event,
+    relay_channel: Any,
+    peer_id: str,
+    interval_s: float = 120.0,
+) -> None:
+    """Send periodic heartbeats to the relay to keep registration alive.
+
+    The RelayServer expires registrations after 300s without activity.
+    This thread sends a Ping every 120s — well within the timeout.
+    """
+    from peer import peer_pb2, peer_pb2_grpc
+    stub = peer_pb2_grpc.PeerStub(relay_channel)
+    while not stop_event.is_set():
+        try:
+            stub.Ping(
+                peer_pb2.PingRequest(sent_unix_ms=int(time.time() * 1000)),
+                timeout=10.0,
+                metadata=[("x-openhydra-peer-id", peer_id)],
+            )
+        except Exception as exc:
+            logging.warning("relay_heartbeat_failed: peer=%s err=%s", peer_id, exc)
+        stop_event.wait(interval_s)
+
+
 def _resolve_quantization_mode(quantization: str, quantization_mode: str | None) -> str:
     legacy = str(quantization_mode or "").strip().lower()
     if legacy in {"fp32", "int8", "int4"}:
@@ -1381,6 +1431,7 @@ def serve(
     rebalance_interval: int = 6,
     rebalance_min_improvement: float = 1.15,
     rebalance_cooldown_s: float = 300.0,
+    relay_address: str = "",
 ) -> None:
     resolved_dht_urls: list[str] = []
     seen_dht_urls: set[str] = set()
@@ -1695,6 +1746,100 @@ def serve(
             except Exception as exc:
                 logging.warning("hivemind_dht: init failed: %s — HTTP-only mode", exc)
 
+        # ── Phase C: NAT traversal ─────────────────────────────────
+        # Probe our NAT type via STUN, and if we're behind restrictive
+        # NAT (symmetric, restricted, or unknown), connect outbound to
+        # a relay server so coordinators can reach us. The relay address
+        # is derived from the DHT bootstrap URLs (same hosts, port 50052).
+        _relay_channel = None
+        _relay_heartbeat_thread: threading.Thread | None = None
+        try:
+            from coordinator.stun_client import probe_nat
+            # Allow forcing a NAT type for testing (e.g. OPENHYDRA_FORCE_NAT=symmetric)
+            import os as _os
+            _force_nat = _os.environ.get("OPENHYDRA_FORCE_NAT", "").strip().lower()
+            if _force_nat:
+                from coordinator.stun_client import NatProfile
+                _nat_profile = NatProfile(
+                    reachable=_force_nat == "open",
+                    nat_type=_force_nat,
+                    requires_relay=_force_nat not in ("open", "full_cone"),
+                )
+                logging.info("peer %s nat_forced: type=%s requires_relay=%s",
+                             peer_id, _nat_profile.nat_type, _nat_profile.requires_relay)
+            else:
+                _nat_profile = probe_nat()
+                logging.info(
+                    "peer %s nat_probe: type=%s requires_relay=%s external=%s:%d",
+                    peer_id, _nat_profile.nat_type, _nat_profile.requires_relay,
+                    _nat_profile.external_ip, _nat_profile.external_port,
+                )
+            service._nat_type = _nat_profile.nat_type
+            service._requires_relay = _nat_profile.requires_relay
+
+            if _nat_profile.requires_relay:
+                from coordinator.relay import connect_to_relay
+                from openhydra_defaults import DEFAULT_RELAY_PORT
+
+                # Explicit --relay-address overrides auto-derivation.
+                _relay_addrs: list[str] = []
+                _explicit_relay = str(relay_address or "").strip()
+                if _explicit_relay:
+                    _relay_addrs = [_explicit_relay]
+                else:
+                    _relay_addrs = _derive_relay_addresses(
+                        resolved_dht_urls, relay_port=DEFAULT_RELAY_PORT,
+                    )
+
+                for _raddr in _relay_addrs:
+                    try:
+                        _relay_channel, _relay_peer_id = connect_to_relay(
+                            relay_address=_raddr,
+                            peer_id=peer_id,
+                            grpc_port=port,
+                            model_id=model_id,
+                        )
+                        service._relay_peer_id = _relay_peer_id
+                        service._relay_address = _raddr
+                        logging.info(
+                            "peer %s relay_connected: relay=%s relay_peer=%s",
+                            peer_id, _raddr, _relay_peer_id,
+                        )
+                        break
+                    except Exception as _rexc:
+                        logging.warning(
+                            "peer %s relay_connect_failed: %s err=%s",
+                            peer_id, _raddr, _rexc,
+                        )
+
+                if not getattr(service, '_relay_address', ''):
+                    logging.error(
+                        "peer %s requires relay but all relay candidates failed — "
+                        "this peer will be unreachable by remote coordinators",
+                        peer_id,
+                    )
+                else:
+                    # Start heartbeat thread to keep relay registration alive
+                    # (RelayServer expires registrations after 300s without heartbeat).
+                    _relay_heartbeat_thread = threading.Thread(
+                        target=_relay_heartbeat_loop,
+                        kwargs={
+                            "stop_event": stop_event,
+                            "relay_channel": _relay_channel,
+                            "peer_id": peer_id,
+                            "interval_s": 120.0,
+                        },
+                        daemon=True,
+                    )
+                    _relay_heartbeat_thread.start()
+        except Exception as _nat_exc:
+            logging.warning(
+                "peer %s nat_probe_failed: %s — assuming open (no relay)",
+                peer_id, _nat_exc,
+            )
+            service._nat_type = "unknown"
+            service._requires_relay = False
+
         announce_thread: threading.Thread | None = None
         if resolved_dht_urls or _hivemind_adapter is not None:
             effective_host = advertise_host or ("127.0.0.1" if host in {"0.0.0.0", "::"} else host)
@@ -1763,6 +1908,13 @@ def serve(
             if _hivemind_adapter is not None:
                 try:
                     _hivemind_adapter.shutdown()
+                except Exception:
+                    pass
+            if _relay_heartbeat_thread is not None:
+                _relay_heartbeat_thread.join(timeout=2.0)
+            if _relay_channel is not None:
+                try:
+                    _relay_channel.close()
                 except Exception:
                     pass
             shutdown_event = server.stop(grace=2)
@@ -2071,6 +2223,9 @@ def main() -> None:
     )
 
     parser.add_argument("--runtime-target", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument("--relay-address", default="",
+                        help="Explicit relay address (host:port) for NAT traversal. "
+                             "If not set, auto-derived from DHT bootstrap URLs when NAT probe requires relay.")
     parser.add_argument("--quantization", choices=["none", "8bit", "4bit"], default="none")
     parser.add_argument(
         "--quantization-mode",
@@ -2192,6 +2347,7 @@ def main() -> None:
         p2p_cache_dir=args.p2p_cache_dir or None,
         enable_local_fast_path=bool(args.enable_local_fast_path),
         hivemind_initial_peers=list(args.hivemind_initial_peers) if args.hivemind_initial_peers else None,
+        relay_address=str(getattr(args, "relay_address", "") or ""),
     )
 
 

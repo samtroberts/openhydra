@@ -258,6 +258,13 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             "layer_start": int(payload.get("layer_start", 0)),
             "layer_end": int(payload.get("layer_end", 0)),
             "total_layers": int(payload.get("total_layers", 0)),
+            # NAT traversal fields — required for auto-relay of peers
+            # behind NAT. Without these, coordinators can't route through
+            # relays to reach NATted peers.
+            "nat_type": str(payload.get("nat_type", "unknown")),
+            "requires_relay": bool(payload.get("requires_relay", False)),
+            "relay_peer_id": str(payload.get("relay_peer_id", "")),
+            "relay_address": str(payload.get("relay_address", "")),
         }
 
     @staticmethod
