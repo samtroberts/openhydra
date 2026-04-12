@@ -2276,30 +2276,15 @@ class PyTorchRuntime:
         # sharded ``_run_layers`` can drive the same state machine.
         if use_cache and shared_cache is None:
             try:
-                # Qwen3.5 has hybrid Mamba+Attention layers that require
-                # Qwen3_5DynamicCache (has `has_previous_state` for the
-                # Mamba-style linear attention). Generic DynamicCache
-                # crashes with AttributeError on those layers.
-                # Note: config.layer_types is only set after model loading,
-                # so we must use self._model.config (not AutoConfig).
+                from transformers.cache_utils import DynamicCache
                 _cfg = getattr(self._model, "config", None)
-                _cache_cls = None
-                if _cfg is not None and hasattr(_cfg, "layer_types"):
-                    try:
-                        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
-                        _cache_cls = Qwen3_5DynamicCache
-                    except ImportError:
-                        pass
-                if _cache_cls is None:
-                    from transformers.cache_utils import DynamicCache
-                    _cache_cls = DynamicCache
                 if _cfg is not None:
                     try:
-                        shared_cache = _cache_cls(config=_cfg)
+                        shared_cache = DynamicCache(config=_cfg)
                     except TypeError:
-                        shared_cache = _cache_cls()
+                        shared_cache = DynamicCache()
                 else:
-                    shared_cache = _cache_cls()
+                    shared_cache = DynamicCache()
             except Exception as _cache_exc:
                 logging.debug(
                     "run_layers_dynamic_cache_init_failed: %s — falling back to cache-less forward",
