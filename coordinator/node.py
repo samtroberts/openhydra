@@ -325,7 +325,14 @@ def main() -> None:
         if _explicit_layer_indices:
             _local_peer[0]["layer_start"] = int(_explicit_layer_indices[0])
             _local_peer[0]["layer_end"] = int(_explicit_layer_indices[-1]) + 1
-            _local_peer[0]["total_layers"] = int(args.layer_end) if args.layer_end else 0
+            # total_layers must be the FULL model depth (e.g. 24 for
+            # Qwen3.5-2B), NOT this shard's layer_end. Otherwise the
+            # coordinator thinks a 12-layer shard covers a "12-layer model"
+            # and uses full_model mode instead of assembling a sharded
+            # pipeline. Compute from total_shards × shard_size.
+            _shard_size = len(_explicit_layer_indices)
+            _total_layers = int(_shard_size * max(1, int(args.total_shards)))
+            _local_peer[0]["total_layers"] = _total_layers
             _local_peer[0]["runtime_model_id"] = str(_runtime_model_id)
         _tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="openhydra_peers_",
