@@ -1458,6 +1458,8 @@ class InferenceService:
                     )
 
                 _prefill_done = False
+                _kv_consecutive_failures = 0
+                _KV_MAX_RETRIES = 3  # retry KV-aware path up to 3 times before permanent fallback
                 for _ar_step in range(_ar_target_tokens):
                     try:
                         if _ar_kv_mode == "kv_aware":
@@ -1468,30 +1470,51 @@ class InferenceService:
                                 # We have at least one generated token if we're here
                                 # past step 0; feed the last one into the decode path.
                                 _step_result = _step_decode(_ar_generated[-1])
+                            _kv_consecutive_failures = 0  # reset on success
                         else:
                             _step_result = _step_stateless(_ar_context_ids + _ar_generated)
                     except RuntimeError as _kv_exc:
                         if _ar_kv_mode == "kv_aware":
-                            # First failure flips us into stateless mode and
-                            # retries this token. All subsequent tokens stay
-                            # in stateless mode for the remainder of the
-                            # request (avoids oscillation). We log once at
-                            # warning level so the degradation is visible.
-                            logger.warning(
-                                "autoregressive_sharded_kv_fallback: step=%d err=%s — switching to stateless re-prefill",
-                                _ar_step, str(_kv_exc)[:200],
-                            )
-                            _ar_kv_mode = "stateless"
-                            try:
-                                _step_result = _step_stateless(
-                                    _ar_context_ids + _ar_generated
+                            _kv_consecutive_failures += 1
+                            _is_transient = "deadline_exceeded" in str(_kv_exc).lower() or "deadline exceeded" in str(_kv_exc).lower()
+                            if _is_transient and _kv_consecutive_failures < _KV_MAX_RETRIES:
+                                # Transient timeout — retry KV-aware on the next
+                                # step. The KV cache is still valid on the peer;
+                                # only fall back to stateless if the cache is
+                                # actually lost (kv_cache_miss) or we hit max retries.
+                                logger.warning(
+                                    "autoregressive_sharded_kv_transient: step=%d attempt=%d err=%s — retrying kv_aware",
+                                    _ar_step, _kv_consecutive_failures, str(_kv_exc)[:120],
                                 )
-                            except Exception as _fallback_exc:
-                                logger.error(
-                                    "autoregressive_sharded_stateless_fallback_failed: %s",
-                                    _fallback_exc,
+                                # Re-prefill to recover: the peer's KV cache may
+                                # be stale after a timeout, so do a fresh prefill
+                                # with the full context built so far, then resume
+                                # KV-aware decode from the next step.
+                                try:
+                                    _step_result = _step_stateless(
+                                        _ar_context_ids + _ar_generated
+                                    )
+                                    _prefill_done = False  # force re-prefill on next KV step
+                                except Exception:
+                                    _ar_kv_mode = "stateless"
+                                    raise
+                            else:
+                                # Permanent failure (kv_cache_miss or too many retries).
+                                logger.warning(
+                                    "autoregressive_sharded_kv_fallback: step=%d err=%s — switching to stateless",
+                                    _ar_step, str(_kv_exc)[:200],
                                 )
-                                raise
+                                _ar_kv_mode = "stateless"
+                                try:
+                                    _step_result = _step_stateless(
+                                        _ar_context_ids + _ar_generated
+                                    )
+                                except Exception as _fallback_exc:
+                                    logger.error(
+                                        "autoregressive_sharded_stateless_fallback_failed: %s",
+                                        _fallback_exc,
+                                    )
+                                    raise
                         else:
                             raise
 
