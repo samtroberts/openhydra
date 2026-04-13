@@ -169,12 +169,30 @@ class InferenceChain:
             compression_latent_dim = len(latent)
 
         # INT8 activation compression (P0-B): quantize before wire transfer.
-        # Disabled when binary packing is available — INT8 corrupts the
-        # [seq_len, hidden_size] header embedded in the payload. Binary
-        # packing provides the serialization speedup without precision loss.
+        # The activation payload has a [seq_len, hidden_size] header prefix
+        # (2 floats) followed by the hidden state data. We preserve the
+        # header exactly (as raw float32 bytes) and only INT8-quantize the
+        # data values. This avoids header corruption from absmax scaling.
         _quantized_activation = b""
         _quantized_scales: list[float] = []
         _activation_quantization = ""
+        if (
+            self.activation_quantization_enabled
+            and stage_index > 0
+            and wire_activation
+            and len(wire_activation) > 2
+            and not self.advanced_encryption_enabled
+        ):
+            import struct as _struct
+            from peer.activation_codec import quantize_int8
+            _header = wire_activation[:2]
+            _payload = wire_activation[2:]
+            _quantized_payload, _quantized_scales = quantize_int8(_payload)
+            # Pack: 2 header floats (8 bytes, exact) + quantized payload bytes
+            _header_bytes = _struct.pack('<2f', *_header)
+            _quantized_activation = _header_bytes + _quantized_payload
+            _activation_quantization = "int8"
+            plain_activation = []
 
         if self.advanced_encryption_enabled and wire_activation:
             peer_pubkey_hex = str(getattr(peer, "public_key_hex", "") or "")
@@ -379,15 +397,19 @@ class InferenceChain:
             _t_serial_ms + _t_grpc_ms + _t_deser_ms,
         )
 
-        # INT8 dequantization on response
+        # INT8 dequantization on response (header-preserving format)
         resp_activation = list(response.activation)
         resp_quant = str(getattr(response, "activation_quantization", "") or "")
         if resp_quant == "int8" and getattr(response, "quantized_activation", b""):
+            import struct as _struct_resp
             from peer.activation_codec import dequantize_int8
-            resp_activation = dequantize_int8(
-                bytes(response.quantized_activation),
-                list(response.quantized_scales),
-            )
+            _raw_resp = bytes(response.quantized_activation)
+            if len(_raw_resp) > 8:
+                _resp_header = list(_struct_resp.unpack('<2f', _raw_resp[:8]))
+                _resp_payload = dequantize_int8(_raw_resp[8:], list(response.quantized_scales))
+                resp_activation = _resp_header + _resp_payload
+            else:
+                resp_activation = dequantize_int8(_raw_resp, list(response.quantized_scales))
 
         _resp_hash = bytes(getattr(response, "activation_hash", b"") or b"")
 
