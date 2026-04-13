@@ -547,11 +547,14 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 _quant_mode = str(getattr(request, "activation_quantization", "") or "").strip()
                 _packed = bytes(getattr(request, "activation_packed", b"") or b"")
                 if _quant_mode == "int8" and request.quantized_activation:
+                    import struct as _struct_q
                     from peer.activation_codec import dequantize_int8
-                    activation_in = dequantize_int8(
-                        bytes(request.quantized_activation),
-                        list(request.quantized_scales),
-                    )
+                    _raw = bytes(request.quantized_activation)
+                    # First 8 bytes are the preserved [seq_len, hidden_size]
+                    # header (2 × float32, exact). Rest is INT8 payload.
+                    _header = list(_struct_q.unpack('<2f', _raw[:8]))
+                    _payload = dequantize_int8(_raw[8:], list(request.quantized_scales))
+                    activation_in = _header + _payload
                 elif _packed:
                     import struct as _struct
                     _n = len(_packed) // 4
@@ -782,10 +785,19 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 next_next_addr = str(next_route[0].address)
                 next_next_id = str(next_route[0].peer_id)
 
+            # Binary-pack the activation for faster peer-to-peer transfer.
+            _push_activation = list(response.activation)
+            _push_packed = b""
+            if _push_activation:
+                import struct as _push_struct
+                _push_packed = _push_struct.pack(f'<{len(_push_activation)}f', *_push_activation)
+                _push_activation = []
+
             next_req = peer_pb2.ForwardRequest(
                 request_id=request.request_id,
                 prompt="",  # Only stage 0 gets the prompt
-                activation=list(response.activation),
+                activation=_push_activation,
+                activation_packed=_push_packed,
                 stage_index=request.stage_index + 1,
                 total_stages=request.total_stages,
                 max_tokens=request.max_tokens,

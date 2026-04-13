@@ -404,6 +404,20 @@ def main() -> None:
     if not os.path.exists(_catalog_path):
         _catalog_path = None
 
+    # Auto-detect LAN IP for push mode callback (last peer sends result here).
+    _push_callback_addr = f"127.0.0.1:{args.grpc_port}"
+    try:
+        import socket as _sock
+        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        _s.connect(("8.8.8.8", 80))
+        _lan_ip = _s.getsockname()[0]
+        _s.close()
+        if _lan_ip and not _lan_ip.startswith("127."):
+            _push_callback_addr = f"{_lan_ip}:{args.grpc_port}"
+    except Exception:
+        pass
+    logger.info("push_callback_address=%s", _push_callback_addr)
+
     # Build the coordinator engine config with only the fields we override;
     # EngineConfig is a frozen dataclass and all other fields carry their defaults.
     engine_config = EngineConfig(
@@ -426,8 +440,9 @@ def main() -> None:
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
         autoregressive_sharded_enabled=bool(getattr(args, "autoregressive_sharded", True)),
         chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
-        push_mode_enabled=bool(getattr(args, "push_mode", False)),
-        push_callback_address=str(getattr(args, "push_callback_address", "") or ""),
+        push_mode_enabled=True,  # peer-to-peer forwarding (skip coordinator round-trip)
+        push_callback_address=str(getattr(args, "push_callback_address", "") or "")
+            or _push_callback_addr,
     )
 
     # Start the coordinator HTTP API on the main thread (blocking).
