@@ -706,6 +706,7 @@ class InferenceService:
                 kv_store_activation=kv_store_activation,
                 kv_use_cached_activation=kv_use_cached_activation,
                 callback_address=self.config.push_callback_address,
+                initial_activation=initial_activation,
                 **decode_controls,
             )
         else:
