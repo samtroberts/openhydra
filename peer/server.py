@@ -118,6 +118,47 @@ def _derive_relay_addresses(
     return addrs
 
 
+def _proxy_handler_loop(
+    *,
+    stop_event: threading.Event,
+    p2p_node: Any,
+    service: Any,
+) -> None:
+    """Receive inbound proxy requests from libp2p and forward to local Forward().
+
+    Remote peers send gRPC ForwardRequest bytes through the libp2p
+    request_response protocol. This thread polls for those requests,
+    deserializes the protobuf, calls PeerService.Forward() directly
+    (no gRPC round-trip), serializes the response, and sends it back.
+    """
+    from peer import peer_pb2
+    logging.info("proxy_handler_loop started")
+    while not stop_event.is_set():
+        try:
+            pending = p2p_node.poll_proxy_request(timeout_ms=500)
+            if pending is None:
+                continue
+            req_id, req_bytes = pending
+            try:
+                request = peer_pb2.ForwardRequest()
+                request.ParseFromString(bytes(req_bytes))
+                response = service.Forward(request, context=None)
+                resp_bytes = response.SerializeToString()
+                p2p_node.respond_proxy(request_id=req_id, data=resp_bytes)
+            except Exception as e:
+                logging.warning("proxy_handler_forward_error: req=%s err=%s", req_id, e)
+                err_resp = peer_pb2.ForwardResponse(
+                    error=f"proxy_forward_failed: {e}",
+                    request_id=str(getattr(request, 'request_id', req_id)),
+                )
+                p2p_node.respond_proxy(request_id=req_id, data=err_resp.SerializeToString())
+        except Exception as e:
+            if not stop_event.is_set():
+                logging.warning("proxy_handler_poll_error: %s", e)
+                time.sleep(1.0)
+    logging.info("proxy_handler_loop stopped")
+
+
 def _relay_heartbeat_loop(
     *,
     stop_event: threading.Event,
@@ -1991,6 +2032,21 @@ def serve(
             )
             announce_thread.start()
 
+        # Start libp2p proxy handler thread (receives inbound proxy requests
+        # from remote peers and forwards to local PeerService.Forward()).
+        _proxy_handler_thread: threading.Thread | None = None
+        if p2p_node is not None:
+            _proxy_handler_thread = threading.Thread(
+                target=_proxy_handler_loop,
+                kwargs={
+                    "stop_event": stop_event,
+                    "p2p_node": p2p_node,
+                    "service": service,
+                },
+                daemon=True,
+            )
+            _proxy_handler_thread.start()
+
         restart_delay_s = 0.0
         try:
             while True:
@@ -2020,6 +2076,8 @@ def serve(
                 announce_thread.join(timeout=2.0)
             if seeding_thread is not None:
                 seeding_thread.join(timeout=2.0)
+            if _proxy_handler_thread is not None:
+                _proxy_handler_thread.join(timeout=2.0)
             if _fast_path_server is not None:
                 try:
                     _fast_path_server.stop()
