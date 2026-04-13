@@ -168,20 +168,13 @@ class InferenceChain:
             compression_original_dim = len(activation)
             compression_latent_dim = len(latent)
 
-        # INT8 activation compression (P0-B): quantize before wire transfer
+        # INT8 activation compression (P0-B): quantize before wire transfer.
+        # Disabled when binary packing is available — INT8 corrupts the
+        # [seq_len, hidden_size] header embedded in the payload. Binary
+        # packing provides the serialization speedup without precision loss.
         _quantized_activation = b""
         _quantized_scales: list[float] = []
         _activation_quantization = ""
-        if (
-            self.activation_quantization_enabled
-            and stage_index > 0
-            and wire_activation
-            and not self.advanced_encryption_enabled  # skip if encryption handles bytes
-        ):
-            from peer.activation_codec import quantize_int8
-            _quantized_activation, _quantized_scales = quantize_int8(wire_activation)
-            _activation_quantization = "int8"
-            plain_activation = []  # clear fp32 — use quantized bytes instead
 
         if self.advanced_encryption_enabled and wire_activation:
             peer_pubkey_hex = str(getattr(peer, "public_key_hex", "") or "")
@@ -222,9 +215,16 @@ class InferenceChain:
 
         # Binary-pack float32 activation for faster serialization.
         # struct.pack is a single C call vs Python iterating each float.
+        # Binary packing supersedes INT8 quantization — INT8 corrupts the
+        # [seq_len, hidden_size] header embedded in the activation payload.
         _activation_packed = b""
         if plain_activation and not _quantized_activation:
             import struct as _struct
+            logging.debug(
+                "chain_pack: stage=%d n_floats=%d first2=[%s]",
+                stage_index, len(plain_activation),
+                ",".join(f"{v:.1f}" for v in plain_activation[:2]) if len(plain_activation) >= 2 else "?",
+            )
             _activation_packed = _struct.pack(f'<{len(plain_activation)}f', *plain_activation)
             plain_activation = []  # clear repeated float — use packed bytes
 
