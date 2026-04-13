@@ -591,7 +591,11 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 )
                 kv_cache_hit = bool(self.shard.last_kv_cache_hit)
             else:
-                if kv_use_cached_activation:
+                # MLX sharded path manages KV cache internally (in the
+                # runtime's _kv_cache dict). Pass kv flags through to
+                # shard.forward() instead of intercepting here.
+                _mlx_sharded = (int(request.total_stages) > 1)
+                if kv_use_cached_activation and not _mlx_sharded:
                     cached = self._kv_cache_get(kv_session_id)
                     if not cached:
                         raise RuntimeError("kv_cache_miss")
@@ -602,10 +606,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 # ThreadPoolExecutor scheduling overhead that kills TPS
                 # on memory-constrained 8GB machines.
                 if self.inflight_count() <= 1:
-                    activation = list(self.shard.forward(
-                        request.prompt,
-                        activation_in,
-                        max_tokens,
+                    _fwd_kwargs: dict = dict(
                         stage_index=int(request.stage_index),
                         total_stages=int(request.total_stages),
                         request_id=str(request.request_id),
@@ -614,6 +615,16 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         decode_top_p=decode_top_p,
                         decode_top_k=decode_top_k,
                         decode_seed=(decode_seed if decode_seed > 0 else None),
+                    )
+                    if _mlx_sharded:
+                        _fwd_kwargs["kv_session_id"] = kv_session_id
+                        _fwd_kwargs["kv_store_activation"] = kv_store_activation
+                        _fwd_kwargs["kv_use_cached_activation"] = kv_use_cached_activation
+                    activation = list(self.shard.forward(
+                        request.prompt,
+                        activation_in,
+                        max_tokens,
+                        **_fwd_kwargs,
                     ))
                 else:
                     activation = self.batch_queue.forward(
