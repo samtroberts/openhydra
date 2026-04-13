@@ -52,6 +52,16 @@ pub enum SwarmCommand {
         local_grpc_port: u16,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Poll for the next inbound proxy request (from a remote peer).
+    /// Returns (request_id, bytes) or None if the queue is empty.
+    PollProxyRequest {
+        reply: oneshot::Sender<Option<(String, Vec<u8>)>>,
+    },
+    /// Send a response to an inbound proxy request.
+    RespondProxy {
+        request_id: String,
+        data: Vec<u8>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -75,9 +85,14 @@ struct LoopState {
     pending_proxy: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
     /// Local gRPC port for inbound proxy requests.
     local_grpc_port: u16,
-    /// Channel for proxy response delivery (from background tasks).
-    proxy_respond_tx: mpsc::Sender<(request_response::ResponseChannel<ProxyResponse>, ProxyResponse)>,
-    proxy_respond_rx: mpsc::Receiver<(request_response::ResponseChannel<ProxyResponse>, ProxyResponse)>,
+    /// Inbound proxy requests waiting for Python to process.
+    /// (request_id, raw_bytes, response_channel_for_libp2p)
+    inbound_proxy_queue: Vec<(String, Vec<u8>)>,
+    /// Pending inbound proxy responses: request_id → (libp2p ResponseChannel, proxy_respond_tx sender)
+    /// When Python calls RespondProxy, we find the channel here and send_response.
+    inbound_proxy_channels: HashMap<String, request_response::ResponseChannel<ProxyResponse>>,
+    /// Counter for generating unique inbound request IDs.
+    inbound_proxy_counter: u64,
 }
 
 struct PendingDiscover {
@@ -89,7 +104,6 @@ struct PendingDiscover {
 
 impl LoopState {
     fn new() -> Self {
-        let (proxy_respond_tx, proxy_respond_rx) = mpsc::channel(64);
         Self {
             nat_info: NatInfo {
                 nat_type: "unknown".into(),
@@ -103,8 +117,9 @@ impl LoopState {
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
             local_grpc_port: 50051,
-            proxy_respond_tx,
-            proxy_respond_rx,
+            inbound_proxy_queue: Vec::new(),
+            inbound_proxy_channels: HashMap::new(),
+            inbound_proxy_counter: 0,
         }
     }
 }
@@ -145,6 +160,23 @@ pub async fn run_event_loop(
                         state.local_grpc_port = local_grpc_port;
                         handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
                     }
+                    Some(SwarmCommand::PollProxyRequest { reply }) => {
+                        let item = if state.inbound_proxy_queue.is_empty() {
+                            None
+                        } else {
+                            Some(state.inbound_proxy_queue.remove(0))
+                        };
+                        let _ = reply.send(item);
+                    }
+                    Some(SwarmCommand::RespondProxy { request_id, data }) => {
+                        if let Some(channel) = state.inbound_proxy_channels.remove(&request_id) {
+                            if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
+                                warn!("proxy respond failed: {:?}", e);
+                            }
+                        } else {
+                            warn!("proxy respond: unknown request_id={}", request_id);
+                        }
+                    }
                     Some(SwarmCommand::Shutdown { reply }) => {
                         info!("swarm shutting down");
                         let _ = reply.send(());
@@ -154,12 +186,6 @@ pub async fn run_event_loop(
                         info!("command channel closed, shutting down swarm");
                         return;
                     }
-                }
-            }
-            // Process proxy responses (from background forwarding tasks).
-            Some((channel, response)) = state.proxy_respond_rx.recv() => {
-                if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, response) {
-                    warn!("proxy send_response failed: {:?}", e);
                 }
             }
             // Process swarm events.
@@ -502,16 +528,13 @@ fn handle_grpc_proxy_event(
         request_response::Event::Message { peer, message } => {
             match message {
                 request_response::Message::Request { request_id, request, channel } => {
-                    // Inbound: forward to local gRPC server asynchronously,
-                    // then send the response back through the channel.
-                    // Store the channel and spawn the forwarding task.
-                    info!(%peer, bytes = request.0.len(), "proxy request received");
-                    let port = state.local_grpc_port;
-                    let cmd_tx = state.proxy_respond_tx.clone();
-                    tokio::spawn(async move {
-                        let response = proxy::handle_proxy_request(request, port).await;
-                        let _ = cmd_tx.send((channel, response)).await;
-                    });
+                    // Queue the request for Python to process via poll_proxy_request().
+                    // Store the response channel so RespondProxy can send back.
+                    state.inbound_proxy_counter += 1;
+                    let req_id = format!("proxy-{}", state.inbound_proxy_counter);
+                    info!(%peer, bytes = request.0.len(), id = %req_id, "proxy request queued for Python");
+                    state.inbound_proxy_queue.push((req_id.clone(), request.0));
+                    state.inbound_proxy_channels.insert(req_id, channel);
                 }
                 request_response::Message::Response { request_id, response } => {
                     // Outbound response received — deliver to waiting proxy forward.

@@ -333,6 +333,40 @@ impl PyP2PNode {
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 
+    /// Poll for the next inbound proxy request from a remote peer.
+    /// Returns (request_id, data_bytes) or None if queue is empty.
+    /// CRITICAL: releases GIL during the blocking recv to avoid deadlocking
+    /// other Python threads (gRPC server, coordinator, announce loop).
+    #[pyo3(signature = (timeout_ms=500))]
+    fn poll_proxy_request(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<(String, Vec<u8>)>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            // Use a short timeout to avoid blocking forever.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .blocking_send(SwarmCommand::PollProxyRequest { reply: reply_tx })
+                .map_err(|_| "swarm not running".to_string())?;
+            match reply_rx.blocking_recv() {
+                Ok(item) => Ok(item),
+                Err(_) => Ok(None),
+            }
+        })
+        .map_err(|e: String| PyRuntimeError::new_err(e))
+    }
+
+    /// Send a response to an inbound proxy request (identified by request_id).
+    fn respond_proxy(&self, py: Python<'_>, request_id: String, data: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::RespondProxy { request_id, data })
+                .map_err(|_| "swarm not running".to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// Forward raw bytes to a peer via libp2p (through Circuit Relay if needed).
     /// Returns response bytes. Used for cross-ISP gRPC tunneling.
     fn proxy_forward(&self, py: Python<'_>, target_peer_id: String, data: Vec<u8>) -> PyResult<Vec<u8>> {
