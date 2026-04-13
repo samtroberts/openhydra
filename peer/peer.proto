@@ -87,6 +87,10 @@ message ForwardRequest {
   // a wire format change to ``activation``. Unused by non-gemma4 families.
   // When empty the peer falls back to the standard llama/qwen_llama path.
   repeated int64 prompt_token_ids = 42;
+  // Binary-packed float32 activation (struct.pack little-endian).
+  // Faster serialization than repeated float — single memcpy vs per-element.
+  // When non-empty, takes precedence over the `activation` field.
+  bytes activation_packed = 43;
 }
 
 // A single hop in the push-mode routing chain.

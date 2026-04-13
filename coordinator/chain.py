@@ -220,6 +220,14 @@ class InferenceChain:
         else:
             plain_activation = wire_activation
 
+        # Binary-pack float32 activation for faster serialization.
+        # struct.pack is a single C call vs Python iterating each float.
+        _activation_packed = b""
+        if plain_activation and not _quantized_activation:
+            import struct as _struct
+            _activation_packed = _struct.pack(f'<{len(plain_activation)}f', *plain_activation)
+            plain_activation = []  # clear repeated float — use packed bytes
+
         _t_serial_start = time.perf_counter()
         req = peer_pb2.ForwardRequest(
             request_id=request_id,
@@ -262,6 +270,7 @@ class InferenceChain:
             # per-layer input tensor locally. Unused by non-Gemma-4 families;
             # empty list when the caller didn't supply ids.
             prompt_token_ids=list(int(t) for t in (prompt_token_ids or [])),
+            activation_packed=_activation_packed,
         )
 
         # --- Deadline-aware per-stage timeout ---

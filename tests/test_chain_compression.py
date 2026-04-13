@@ -109,7 +109,18 @@ def test_request_stage_includes_compression_metadata(monkeypatch):
     )
 
     req = captured["request"]
-    assert list(req.activation) == [1.5, 3.5]  # type: ignore[union-attr]
+    # Activation is now binary-packed (activation_packed field) instead of
+    # repeated float. Unpack and verify.
+    import struct
+    _packed = bytes(req.activation_packed)  # type: ignore[union-attr]
+    if _packed:
+        _n = len(_packed) // 4
+        _unpacked = list(struct.unpack(f'<{_n}f', _packed))
+    else:
+        _unpacked = list(req.activation)  # type: ignore[union-attr]
+    assert len(_unpacked) == 2
+    assert abs(_unpacked[0] - 1.5) < 1e-5
+    assert abs(_unpacked[1] - 3.5) < 1e-5
     assert req.compression_codec == "tensor_autoencoder_mean_pool"  # type: ignore[union-attr]
     assert req.compression_original_dim == 4  # type: ignore[union-attr]
     assert req.compression_latent_dim == 2  # type: ignore[union-attr]

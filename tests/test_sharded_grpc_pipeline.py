@@ -32,7 +32,18 @@ from unittest.mock import MagicMock, patch, call
 import grpc
 import pytest
 
+import struct as _struct
+
 from coordinator.chain import InferenceChain
+
+
+def _unpack_activation(req_or_resp):
+    """Extract activation from either packed bytes or repeated float field."""
+    packed = bytes(getattr(req_or_resp, "activation_packed", b"") or b"")
+    if packed:
+        n = len(packed) // 4
+        return list(_struct.unpack(f'<{n}f', packed))
+    return list(req_or_resp.activation)
 from coordinator.layer_coverage import LayerCoverageMap, LayerRange
 from coordinator.path_finder import PeerEndpoint, PeerHealth
 from peer import peer_pb2, peer_pb2_grpc
@@ -79,6 +90,7 @@ class _CapturedForwardRequest:
     shard_layer_start: int
     shard_layer_end: int
     shard_total_layers: int
+    activation_packed: bytes = b""
 
 
 def _make_stub_factory(peer_responses: list[list[float]]) -> tuple[list[_CapturedForwardRequest], Any]:
@@ -104,6 +116,7 @@ def _make_stub_factory(peer_responses: list[list[float]]) -> tuple[list[_Capture
                 shard_layer_start=int(request.shard_layer_start),
                 shard_layer_end=int(request.shard_layer_end),
                 shard_total_layers=int(request.shard_total_layers),
+                activation_packed=bytes(getattr(request, "activation_packed", b"") or b""),
             )
         )
         activation_out = peer_responses[idx] if idx < len(peer_responses) else []
@@ -213,12 +226,12 @@ class TestInferenceChainShardHandoff:
         # Stage 1: must receive exactly what stage 0 returned
         assert captured[1].stage_index == 1
         assert captured[1].prompt == ""      # prompt not re-sent after stage 0
-        assert captured[1].activation == pytest.approx(stage0_output, abs=1e-4)
+        assert _unpack_activation(captured[1]) == pytest.approx(stage0_output, abs=1e-4)
 
         # Stage 2: must receive exactly what stage 1 returned
         assert captured[2].stage_index == 2
         assert captured[2].prompt == ""
-        assert captured[2].activation == pytest.approx(stage1_output, abs=1e-4)
+        assert _unpack_activation(captured[2]) == pytest.approx(stage1_output, abs=1e-4)
 
     def test_single_shard_pipeline(self):
         """A one-shard pipeline: stage_index=0=total_stages-1, is_first AND is_last."""
@@ -641,5 +654,5 @@ class TestLayerCoverageMapInferenceIntegration:
         assert captured[1].shard_layer_start == 11 and captured[1].shard_layer_end == 22
         assert captured[2].shard_layer_start == 22 and captured[2].shard_layer_end == 32
         # Activation handoff verified
-        assert captured[1].activation == pytest.approx(hidden, abs=1e-4)
-        assert captured[2].activation == pytest.approx(hidden, abs=1e-4)
+        assert _unpack_activation(captured[1]) == pytest.approx(hidden, abs=1e-4)
+        assert _unpack_activation(captured[2]) == pytest.approx(hidden, abs=1e-4)
