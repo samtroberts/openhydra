@@ -620,10 +620,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     activation_in = cached
                     kv_cache_hit = True
                 # Fast path: bypass BatchingQueue when inflight count is
-                # low (single-peer / no concurrent requests).  Avoids
-                # ThreadPoolExecutor scheduling overhead that kills TPS
-                # on memory-constrained 8GB machines.
-                if self.inflight_count() <= 1:
+                # low (single-peer / no concurrent requests), OR when the
+                # request is sharded (forward_batch doesn't support sharding).
+                if self.inflight_count() <= 1 or _mlx_sharded:
                     _fwd_kwargs: dict = dict(
                         stage_index=int(request.stage_index),
                         total_stages=int(request.total_stages),
