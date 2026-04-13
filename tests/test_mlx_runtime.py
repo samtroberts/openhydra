@@ -240,11 +240,11 @@ def test_forward_single_stage_returns_token_list():
 
 
 @MLX_MARK
-def test_forward_multi_stage_raises_not_implemented():
-    """forward() with total_stages > 1 must raise NotImplementedError (Phase 3)."""
+def test_forward_multi_stage_non_sharded_raises():
+    """forward(total_stages=2) on a non-sharded runtime must raise RuntimeError."""
     from peer.mlx_runtime import MLXRuntime
     rt = MLXRuntime(_make_minimal_config())
-    with pytest.raises(NotImplementedError, match="Phase 3"):
+    with pytest.raises(RuntimeError, match="not initialized for sharding"):
         rt.forward("hi", activation=[], max_tokens=4, total_stages=2)
 
 
@@ -349,21 +349,34 @@ def test_runtime_profile_is_copy():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @MLX_MARK
-def test_activation_to_hidden_raises():
-    """_activation_to_hidden() must raise NotImplementedError (Phase 3 stub)."""
+def test_activation_to_hidden_roundtrip():
+    """_activation_to_hidden() parses the [seq_len, hidden, v0, ...] format."""
     from peer.mlx_runtime import MLXRuntime
     rt = MLXRuntime(_make_minimal_config())
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        rt._activation_to_hidden([1.0, 2.0, 3.0])
+    # 2 tokens, hidden_size=4
+    payload = [2.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    h = rt._activation_to_hidden(payload)
+    assert h.shape == (1, 2, 4)
+
+    # Invalid payload should raise
+    with pytest.raises(RuntimeError, match="too short"):
+        rt._activation_to_hidden([1.0])
 
 
 @MLX_MARK
-def test_hidden_to_payload_raises():
-    """_hidden_to_payload() must raise NotImplementedError (Phase 3 stub)."""
+def test_hidden_to_payload_roundtrip():
+    """_hidden_to_payload() serializes and _activation_to_hidden() deserializes."""
+    import mlx.core as mx
     from peer.mlx_runtime import MLXRuntime
     rt = MLXRuntime(_make_minimal_config())
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        rt._hidden_to_payload(None)
+    h = mx.ones((1, 3, 4))
+    payload = rt._hidden_to_payload(h)
+    assert payload[0] == 3.0  # seq_len
+    assert payload[1] == 4.0  # hidden_size
+    assert len(payload) == 2 + 3 * 4
+    # Round-trip
+    h2 = rt._activation_to_hidden(payload)
+    assert h2.shape == (1, 3, 4)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

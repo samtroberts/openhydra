@@ -225,6 +225,75 @@ class MLXRuntime:
         _layers = getattr(_inner, "layers", None) or []
         self._total_layers = int(len(_layers))
 
+        # ── Phase 3: Layer sharding for multi-peer gRPC inference ─────────
+        # When total_shards > 1, keep only this shard's layers and extract
+        # the embedding / norm / lm_head components for first/last shards.
+        _total_shards = int(getattr(config, "total_shards", 1))
+        _shard_idx = int(getattr(config, "shard_index", 0))
+        _explicit = tuple(getattr(config, "runtime_layer_indices", ()) or ())
+        self._is_sharded = _total_shards > 1 or bool(_explicit)
+
+        if self._is_sharded:
+            if _explicit:
+                self._shard_layer_indices = _explicit
+            else:
+                from peer.mlx_parallel import assign_layers
+                assignments = assign_layers(self._total_layers, _total_shards)
+                start, end = assignments[_shard_idx]
+                self._shard_layer_indices = tuple(range(start, end))
+
+            # Navigate the model structure:
+            # model.language_model.model = Qwen3_5TextModel (has embed_tokens, layers, norm)
+            # model.language_model = TextModel (has lm_head or tie_word_embeddings)
+            _lm = getattr(self._model, "language_model", self._model)
+            _text_model = getattr(_lm, "model", _lm)
+            _all_layers = list(_text_model.layers)
+
+            self._selected_layers = [_all_layers[i] for i in self._shard_layer_indices]
+            self._is_first_shard = (min(self._shard_layer_indices) == 0)
+            self._is_last_shard = (max(self._shard_layer_indices) == self._total_layers - 1)
+
+            _lm_args = getattr(_lm, "args", None)
+            self._tie_word_embeddings = bool(getattr(_lm_args, "tie_word_embeddings", False))
+            # First shard needs embed_tokens for tokenization → embedding.
+            # Last shard also needs it when tie_word_embeddings=True (used as lm_head).
+            _needs_embed = self._is_first_shard or (self._is_last_shard and self._tie_word_embeddings)
+            self._shard_embed_tokens = _text_model.embed_tokens if _needs_embed else None
+            self._shard_norm = getattr(_text_model, "norm", None) if self._is_last_shard else None
+            self._shard_lm_head = getattr(_lm, "lm_head", None) if (self._is_last_shard and not self._tie_word_embeddings) else None
+            self._shard_hidden_size = int(getattr(_lm_args, "hidden_size", 0))
+
+            # Layer type info for mask creation (Qwen3.5 has linear + full_attention)
+            self._shard_layer_is_linear = [_all_layers[i].is_linear for i in self._shard_layer_indices]
+            # Find first full-attention and first SSM layer in THIS shard for mask creation
+            self._shard_fa_cache_idx = None
+            self._shard_ssm_cache_idx = None
+            for local_idx, global_idx in enumerate(self._shard_layer_indices):
+                if not _all_layers[global_idx].is_linear and self._shard_fa_cache_idx is None:
+                    self._shard_fa_cache_idx = local_idx
+                if _all_layers[global_idx].is_linear and self._shard_ssm_cache_idx is None:
+                    self._shard_ssm_cache_idx = local_idx
+
+            # Free unused layers
+            for i in range(self._total_layers):
+                if i not in set(self._shard_layer_indices):
+                    _all_layers[i] = None
+
+            self._kv_cache_max = int(getattr(config, "runtime_kv_cache_max_entries", 256))
+            logging.info(
+                "mlx_shard_init: layers=%d-%d (%d/%d) is_first=%s is_last=%s hidden=%d tie_embed=%s",
+                min(self._shard_layer_indices), max(self._shard_layer_indices) + 1,
+                len(self._shard_layer_indices), self._total_layers,
+                self._is_first_shard, self._is_last_shard,
+                self._shard_hidden_size, self._tie_word_embeddings,
+            )
+        else:
+            self._shard_layer_indices = ()
+            self._selected_layers = []
+            self._is_first_shard = True
+            self._is_last_shard = True
+            self._kv_cache_max = 256
+
         # ── Phase 4A: Pipeline parallelism ────────────────────────────────
         self._mlx_world_size = int(getattr(config, "mlx_world_size", 1))
         self._mlx_rank = int(getattr(config, "mlx_rank", 0))
@@ -258,8 +327,8 @@ class MLXRuntime:
             "param_count":              self._param_count,
             "estimated_memory_mb":      _est_mem_mb,
             "estimated_tokens_per_sec": 120.0,
-            "layer_start":              0,
-            "layer_end":                self._total_layers,
+            "layer_start":              int(min(self._shard_layer_indices)) if self._is_sharded else 0,
+            "layer_end":                int(max(self._shard_layer_indices) + 1) if self._is_sharded else self._total_layers,
             "total_layers":             self._total_layers,
         }
 
@@ -495,9 +564,21 @@ class MLXRuntime:
             ``_torch_to_mx`` / ``_mx_to_torch`` (zero-copy DLPack).
         """
         if total_stages > 1:
-            raise NotImplementedError(
-                "mlx_runtime: multi-stage layer sharding (total_stages > 1) "
-                "requires Phase 3.  Use --total-shards 1 with --runtime-backend mlx."
+            return self._forward_sharded(
+                prompt=prompt,
+                activation=activation,
+                max_tokens=max_tokens,
+                stage_index=stage_index,
+                total_stages=total_stages,
+                kv_session_id=kv_session_id,
+                kv_store_activation=kv_store_activation,
+                kv_use_cached_activation=kv_use_cached_activation,
+                request_id=request_id,
+                decode_do_sample=decode_do_sample,
+                decode_temperature=decode_temperature,
+                decode_top_p=decode_top_p,
+                decode_top_k=decode_top_k,
+                decode_seed=decode_seed,
             )
 
         # ── Build sampler via make_sampler() ─────────────────────────────────
@@ -614,6 +695,135 @@ class MLXRuntime:
 
     def runtime_profile(self) -> dict[str, Any]:
         return dict(self._runtime_profile)
+
+    # ── Sharded forward pass (Phase 3) ──────────────────────────────────────────
+
+    def _make_shard_cache(self) -> list[Any]:
+        """Create per-layer KV cache for this shard's layers only."""
+        from mlx_lm.models.cache import make_prompt_cache
+        full_cache = make_prompt_cache(self._model)
+        # Pick only the cache entries for our shard's layers.
+        return [full_cache[i] for i in self._shard_layer_indices]
+
+    def _sample_from_logits(
+        self,
+        logits: Any,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+        **_,
+    ) -> list[float]:
+        """Sample a single token from logits [1, seq, vocab] → [token_id]."""
+        import mlx.core as mx
+        last_logits = logits[:, -1, :]
+        if decode_do_sample is False or not decode_temperature:
+            token_id = int(mx.argmax(last_logits, axis=-1).item())
+        else:
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(
+                temp=max(1e-6, float(decode_temperature or 1.0)),
+                top_p=float(decode_top_p or 0.0),
+            )
+            token_arr = sampler(last_logits)
+            mx.eval(token_arr)
+            token_id = int(token_arr.item())
+        return [float(token_id)]
+
+    def _forward_sharded(
+        self,
+        prompt: str,
+        activation: list[float],
+        max_tokens: int,
+        stage_index: int,
+        total_stages: int,
+        kv_session_id: str | None = None,
+        kv_store_activation: bool = False,
+        kv_use_cached_activation: bool = False,
+        request_id: str | None = None,
+        **sampling_kwargs,
+    ) -> list[float]:
+        """Multi-peer sharded forward — runs this shard's layers only.
+
+        First shard: tokenize → embed → layers → serialize hidden
+        Last shard:  deserialize → layers → norm → lm_head → sample
+        Middle:      deserialize → layers → serialize hidden
+        """
+        if not self._is_sharded:
+            raise RuntimeError(
+                "mlx_runtime: not initialized for sharding (total_shards=1). "
+                "Use --total-shards 2 with --runtime-backend mlx."
+            )
+        import mlx.core as mx
+
+        is_first = (stage_index == 0)
+        is_last = (stage_index == total_stages - 1)
+
+        # ── KV cache retrieval ─────────────────────────────────────
+        session_id = str(kv_session_id or "").strip()
+        cached_kv = None
+        if session_id and kv_use_cached_activation:
+            cached_kv = self._kv_cache.get(session_id)
+            if cached_kv is None:
+                raise RuntimeError("kv_cache_miss")
+
+        # ── Input preparation ──────────────────────────────────────
+        if is_first:
+            # Tokenize and embed
+            if activation:
+                token_ids = [max(0, int(round(v))) for v in activation]
+            else:
+                token_ids = self._tokenizer.encode(str(prompt or ""))
+            h = self._shard_embed_tokens(mx.array([token_ids], dtype=mx.uint32))
+        else:
+            # Deserialize hidden state from previous peer
+            if not activation:
+                raise RuntimeError("missing_hidden_payload")
+            h = self._activation_to_hidden(activation)
+
+        self._watchdog.run(mx.eval, h)
+
+        # ── Build masks ────────────────────────────────────────────
+        # Qwen3.5 needs separate masks for full-attention and SSM layers.
+        # Import the mask builders from the model's module.
+        _text_model = getattr(getattr(self._model, "language_model", self._model), "model", self._model)
+        _model_mod = type(_text_model).__module__
+        import importlib
+        _mod = importlib.import_module(_model_mod)
+        _create_fa_mask = getattr(_mod, "create_attention_mask", lambda h, cache=None: None)
+        _create_ssm_mask = getattr(_mod, "create_ssm_mask", lambda h, cache=None: None)
+
+        fa_cache_ref = cached_kv[self._shard_fa_cache_idx] if (cached_kv and self._shard_fa_cache_idx is not None) else None
+        ssm_cache_ref = cached_kv[self._shard_ssm_cache_idx] if (cached_kv and self._shard_ssm_cache_idx is not None) else None
+        fa_mask = _create_fa_mask(h, cache=fa_cache_ref)
+        ssm_mask = _create_ssm_mask(h, cache=ssm_cache_ref)
+
+        # ── Run shard layers ───────────────────────────────────────
+        cache = cached_kv if cached_kv is not None else self._make_shard_cache()
+        for i, layer in enumerate(self._selected_layers):
+            mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
+            h = layer(h, mask=mask, cache=cache[i])
+
+        self._watchdog.run(mx.eval, h)
+
+        # ── Store KV cache ─────────────────────────────────────────
+        if session_id and kv_store_activation:
+            self._kv_cache[session_id] = cache
+            while len(self._kv_cache) > self._kv_cache_max:
+                self._kv_cache.pop(next(iter(self._kv_cache)))
+
+        # ── Output ─────────────────────────────────────────────────
+        if is_last:
+            h = self._shard_norm(h)
+            if self._tie_word_embeddings:
+                logits = self._shard_embed_tokens.as_linear(h)
+            else:
+                logits = self._shard_lm_head(h)
+            self._watchdog.run(mx.eval, logits)
+            return self._sample_from_logits(logits, **sampling_kwargs)
+        else:
+            return self._hidden_to_payload(h)
 
     # ── Batched forward pass ───────────────────────────────────────────────────
 
@@ -758,31 +968,29 @@ class MLXRuntime:
 
         Incoming format (same as PyTorchRuntime):
             [seq_len_f, hidden_size_f, v0, v1, …]
-
-        The float data is converted directly to ``mx.array`` — no PyTorch
-        intermediate is needed here because the payload was already serialised
-        as a plain float list by the previous peer.  If the previous peer sent
-        a PyTorch tensor directly (future optimisation), use ``_torch_to_mx``.
-
-        Raises:
-            NotImplementedError: until Phase 3 is wired.
         """
-        raise NotImplementedError(
-            "mlx_runtime: hidden-state activation exchange requires Phase 3"
-        )
+        import mlx.core as mx
+        if len(activation) < 3:
+            raise RuntimeError("invalid_hidden_payload: too short")
+        seq_len = int(round(activation[0]))
+        hidden_size = int(round(activation[1]))
+        if seq_len <= 0 or hidden_size <= 0:
+            raise RuntimeError(f"invalid_hidden_payload: seq={seq_len} hidden={hidden_size}")
+        payload = activation[2:]
+        expected = seq_len * hidden_size
+        if len(payload) != expected:
+            raise RuntimeError(f"invalid_hidden_payload: expected {expected} values, got {len(payload)}")
+        return mx.array(payload, dtype=mx.float32).reshape(1, seq_len, hidden_size)
 
     def _hidden_to_payload(self, hidden: Any) -> list[float]:
         """Serialise an MLX hidden-state tensor to a gRPC float list.
 
         Output format (same as PyTorchRuntime):
             [seq_len_f, hidden_size_f, v0, v1, …]
-
-        Uses ``_mx_to_torch`` (DLPack) then ``.tolist()`` for the final
-        CPU serialisation, avoiding a redundant ``mx.eval`` → numpy step.
-
-        Raises:
-            NotImplementedError: until Phase 3 is wired.
         """
-        raise NotImplementedError(
-            "mlx_runtime: hidden-state payload serialisation requires Phase 3"
-        )
+        import mlx.core as mx
+        mx.eval(hidden)
+        seq_len = int(hidden.shape[1])
+        hidden_size = int(hidden.shape[2])
+        flat = hidden.reshape(-1).tolist()
+        return [float(seq_len), float(hidden_size)] + flat
