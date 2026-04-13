@@ -678,6 +678,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         _fwd_kwargs["kv_session_id"] = kv_session_id
                         _fwd_kwargs["kv_store_activation"] = kv_store_activation
                         _fwd_kwargs["kv_use_cached_activation"] = kv_use_cached_activation
+                        # Pass raw packed bytes for zero-copy DLPack path.
+                        if _packed:
+                            _fwd_kwargs["packed_bytes"] = _packed
                     activation = list(self.shard.forward(
                         request.prompt,
                         activation_in,

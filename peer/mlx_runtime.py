@@ -548,6 +548,7 @@ class MLXRuntime:
         decode_top_p: float | None = None,
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
+        packed_bytes: bytes | None = None,
     ) -> list[float]:
         """Run inference and return token IDs (or hidden state) as floats.
 
@@ -579,6 +580,7 @@ class MLXRuntime:
                 decode_top_p=decode_top_p,
                 decode_top_k=decode_top_k,
                 decode_seed=decode_seed,
+                packed_bytes=packed_bytes,
             )
 
         # ── Build sampler via make_sampler() ─────────────────────────────────
@@ -742,6 +744,7 @@ class MLXRuntime:
         kv_store_activation: bool = False,
         kv_use_cached_activation: bool = False,
         request_id: str | None = None,
+        packed_bytes: bytes | None = None,
         **sampling_kwargs,
     ) -> list[float]:
         """Multi-peer sharded forward — runs this shard's layers only.
@@ -777,10 +780,11 @@ class MLXRuntime:
                 token_ids = self._tokenizer.encode(str(prompt or ""))
             h = self._shard_embed_tokens(mx.array([token_ids], dtype=mx.uint32))
         else:
-            # Deserialize hidden state from previous peer
-            if not activation:
+            # Deserialize hidden state from previous peer.
+            # Zero-copy DLPack path when packed_bytes are available.
+            if not activation and not packed_bytes:
                 raise RuntimeError("missing_hidden_payload")
-            h = self._activation_to_hidden(activation)
+            h = self._activation_to_hidden(activation, packed_bytes=packed_bytes)
 
         self._watchdog.run(mx.eval, h)
 
@@ -963,13 +967,30 @@ class MLXRuntime:
 
     # ── Phase 3 stubs (hidden-state exchange, DLPack path) ───────────────────
 
-    def _activation_to_hidden(self, activation: list[float]) -> Any:
-        """Deserialise a gRPC float-list into an MLX hidden-state tensor.
+    def _activation_to_hidden(self, activation: list[float], packed_bytes: bytes | None = None) -> Any:
+        """Deserialise activation into an MLX hidden-state tensor.
 
-        Incoming format (same as PyTorchRuntime):
-            [seq_len_f, hidden_size_f, v0, v1, …]
+        When ``packed_bytes`` is provided (from ``activation_packed`` gRPC field),
+        uses the zero-copy DLPack path: Rust decodes → RustTensor → torch.from_dlpack
+        → mx.array (via numpy). No Python list iteration.
+
+        Falls back to the list[float] path when packed_bytes is not available.
         """
         import mlx.core as mx
+
+        # Zero-copy path: packed bytes → DLPack → tensor
+        if packed_bytes is not None and len(packed_bytes) >= 8:
+            try:
+                import openhydra_network
+                rust_tensor = openhydra_network.decode_activation(packed_bytes)
+                # MLX doesn't have from_dlpack — go through PyTorch DLPack bridge.
+                import torch
+                torch_tensor = torch.from_dlpack(rust_tensor)
+                return self._torch_to_mx(torch_tensor.reshape(1, rust_tensor.shape[1], rust_tensor.shape[2]))
+            except Exception as _dlpack_exc:
+                logging.debug("dlpack_fallback: %s — using list path", _dlpack_exc)
+
+        # Fallback: list[float] path
         if len(activation) < 3:
             raise RuntimeError("invalid_hidden_payload: too short")
         seq_len = int(round(activation[0]))
