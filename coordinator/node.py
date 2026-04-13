@@ -440,7 +440,7 @@ def main() -> None:
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
         autoregressive_sharded_enabled=bool(getattr(args, "autoregressive_sharded", True)),
         chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
-        push_mode_enabled=False,  # TODO: debug push mode hang with sharded autoregressive
+        push_mode_enabled=True,  # peer-to-peer forwarding (skip coordinator round-trip)
         push_callback_address=str(getattr(args, "push_callback_address", "") or "")
             or _push_callback_addr,
     )

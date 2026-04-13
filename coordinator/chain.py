@@ -825,6 +825,7 @@ class InferenceChain:
         kv_store_activation: bool = False,
         kv_use_cached_activation: bool = False,
         callback_address: str = "",
+        initial_activation: list[float] | None = None,
         **decode_controls: Any,
     ) -> ChainResult:
         """Execute the pipeline in push mode: peers forward directly to each other.
@@ -875,10 +876,18 @@ class InferenceChain:
         next_addr = f"{self.pipeline[1].host}:{self.pipeline[1].port}" if n > 1 else ""
         next_id = self.pipeline[1].peer_id if n > 1 else ""
 
+        # Binary-pack the initial activation if provided.
+        _push_activation: list[float] = []
+        _push_packed = b""
+        if initial_activation:
+            import struct as _push_struct
+            _push_packed = _push_struct.pack(f'<{len(initial_activation)}f', *initial_activation)
+
         req = peer_pb2.ForwardRequest(
             request_id=rid,
             prompt=prompt,
-            activation=[],
+            activation=_push_activation,
+            activation_packed=_push_packed,
             stage_index=0,
             total_stages=n,
             max_tokens=max_tokens,
@@ -901,32 +910,30 @@ class InferenceChain:
             remaining_route=route_hops[1:],  # Skip first peer (that's where we're sending)
         )
 
-        # Send to first peer (non-blocking from coordinator's perspective
-        # — the peer chain handles the rest)
-        try:
-            first_addr = f"{first_peer.host}:{first_peer.port}"
-            channel = grpc.insecure_channel(
-                first_addr,
-                options=[
-                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                ],
-            )
-            stub = peer_pb2_grpc.PeerStub(channel)
-            stub.Forward(req, timeout=min(self.timeout_s, 60.0))
-            channel.close()
-        except Exception as exc:
-            logger.warning("push_initial_send_failed: %s: %s — falling back to run()", first_addr, exc)
-            from coordinator.push_receiver import cancel_push
-            cancel_push(rid)
-            return self.run(
-                prompt=prompt, max_tokens=max_tokens,
-                request_id=rid, deadline=deadline,
-                kv_session=kv_session_id,
-                kv_store_activation=kv_store_activation,
-                kv_use_cached_activation=kv_use_cached_activation,
-                **decode_controls,
-            )
+        # Send to first peer in a BACKGROUND THREAD to avoid deadlock.
+        # When the coordinator IS the first peer (same process), a blocking
+        # Forward() call would deadlock: the gRPC server can't process the
+        # PushResult callback while Forward() is waiting for the chain.
+        import threading as _push_threading
+
+        def _send_push():
+            try:
+                first_addr = f"{first_peer.host}:{first_peer.port}"
+                channel = grpc.insecure_channel(
+                    first_addr,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                stub = peer_pb2_grpc.PeerStub(channel)
+                stub.Forward(req, timeout=min(self.timeout_s, 60.0))
+                channel.close()
+            except Exception as exc:
+                logger.warning("push_send_failed: %s", exc)
+
+        _push_thread = _push_threading.Thread(target=_send_push, daemon=True)
+        _push_thread.start()
 
         # Wait for the final result from the last peer
         timeout_s = 120.0
