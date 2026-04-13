@@ -324,7 +324,7 @@ class InferenceChain:
                     )
                     _used_stream = True
             except Exception as exc:
-                logger.debug("stream_fallback: peer=%s err=%s", peer.peer_id, exc)
+                logging.debug("stream_fallback: peer=%s err=%s", peer.peer_id, exc)
                 _used_stream = False
 
         if not _used_stream:
@@ -930,7 +930,7 @@ class InferenceChain:
                 stub.Forward(req, timeout=min(self.timeout_s, 60.0))
                 channel.close()
             except Exception as exc:
-                logger.warning("push_send_failed: %s", exc)
+                logging.warning("push_send_failed: %s", exc)
 
         _push_thread = _push_threading.Thread(target=_send_push, daemon=True)
         _push_thread.start()
@@ -942,7 +942,7 @@ class InferenceChain:
         try:
             result_response = await_push(rid, timeout_s=timeout_s)
         except Exception as exc:
-            logger.warning("push_await_failed: %s: %s — falling back to run()", rid, exc)
+            logging.warning("push_await_failed: %s: %s — falling back to run()", rid, exc)
             return self.run(
                 prompt=prompt, max_tokens=max_tokens,
                 request_id=rid, deadline=deadline,
@@ -965,7 +965,7 @@ class InferenceChain:
                 ),
             )
 
-        logger.info(
+        logging.info(
             "push_chain_complete: req=%s stages=%d wall=%.0fms activation_len=%d",
             rid, n, total_ms, len(activation),
         )
