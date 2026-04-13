@@ -3089,6 +3089,7 @@ class ModelShard:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
+        packed_bytes: bytes | None = None,
     ) -> list[float]:
         # Only forward prompt_token_ids to runtimes that accept it. ToyRuntime
         # and MLXRuntime ignore the Gemma 4 sidecar; PyTorchRuntime consumes
@@ -3108,6 +3109,8 @@ class ModelShard:
         }
         if prompt_token_ids is not None and isinstance(self._runtime, PyTorchRuntime):
             _kwargs["prompt_token_ids"] = prompt_token_ids
+        if packed_bytes is not None and hasattr(self._runtime, '_forward_sharded'):
+            _kwargs["packed_bytes"] = packed_bytes
         return list(
             self._runtime.forward(prompt, activation, max_tokens, **_kwargs)
         )
