@@ -651,6 +651,8 @@ class InferenceService:
             stream_pool=getattr(self, "_stream_pool", None),
             session=_session,
         )
+        # Inject P2P node for cross-ISP relay tunneling.
+        chain._p2p_node = getattr(self.discovery_service, '_p2p_node', None)
         run_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,
             "request_id": request_id,

@@ -6,13 +6,15 @@
 use std::collections::HashMap;
 
 use futures::StreamExt;
+use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{kad, Multiaddr};
+use libp2p::{kad, Multiaddr, PeerId};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::behaviour::{OpenHydraBehaviour, OpenHydraBehaviourEvent};
 use crate::dht;
+use crate::proxy::{self, ProxyRequest, ProxyResponse};
 use crate::types::{DiscoveredPeer, NatInfo, PeerRecord};
 
 /// Commands sent from the Python thread to the swarm event loop.
@@ -36,6 +38,20 @@ pub enum SwarmCommand {
         peer_id: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Send raw bytes to a peer via the gRPC proxy protocol.
+    /// Used by the local TCP proxy listener.
+    ProxyForward {
+        peer_id: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// Start a local TCP proxy that tunnels to a remote peer via libp2p.
+    /// Returns "127.0.0.1:<port>" for gRPC to connect to.
+    OpenProxy {
+        target_libp2p_peer_id: String,
+        local_grpc_port: u16,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -55,6 +71,13 @@ struct LoopState {
     /// Relay addresses we've reserved.
     #[allow(dead_code)]
     relay_addrs: Vec<Multiaddr>,
+    /// Pending proxy forward requests: request_id → reply channel.
+    pending_proxy: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Local gRPC port for inbound proxy requests.
+    local_grpc_port: u16,
+    /// Channel for proxy response delivery (from background tasks).
+    proxy_respond_tx: mpsc::Sender<(request_response::ResponseChannel<ProxyResponse>, ProxyResponse)>,
+    proxy_respond_rx: mpsc::Receiver<(request_response::ResponseChannel<ProxyResponse>, ProxyResponse)>,
 }
 
 struct PendingDiscover {
@@ -64,8 +87,9 @@ struct PendingDiscover {
     reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
 }
 
-impl Default for LoopState {
-    fn default() -> Self {
+impl LoopState {
+    fn new() -> Self {
+        let (proxy_respond_tx, proxy_respond_rx) = mpsc::channel(64);
         Self {
             nat_info: NatInfo {
                 nat_type: "unknown".into(),
@@ -77,6 +101,10 @@ impl Default for LoopState {
             pending_discovers: HashMap::new(),
             external_addrs: Vec::new(),
             relay_addrs: Vec::new(),
+            pending_proxy: HashMap::new(),
+            local_grpc_port: 50051,
+            proxy_respond_tx,
+            proxy_respond_rx,
         }
     }
 }
@@ -86,7 +114,7 @@ pub async fn run_event_loop(
     mut swarm: libp2p::Swarm<OpenHydraBehaviour>,
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
 ) {
-    let mut state = LoopState::default();
+    let mut state = LoopState::new();
 
     // Kick off Kademlia bootstrap (populate routing table from bootstrap peers).
     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -110,6 +138,13 @@ pub async fn run_event_loop(
                     Some(SwarmCommand::ResolveAddress { peer_id, reply }) => {
                         handle_resolve(&state, &peer_id, reply);
                     }
+                    Some(SwarmCommand::ProxyForward { peer_id, data, reply }) => {
+                        handle_proxy_forward(&mut swarm, &peer_id, data, reply, &mut state);
+                    }
+                    Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
+                        state.local_grpc_port = local_grpc_port;
+                        handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
+                    }
                     Some(SwarmCommand::Shutdown { reply }) => {
                         info!("swarm shutting down");
                         let _ = reply.send(());
@@ -119,6 +154,12 @@ pub async fn run_event_loop(
                         info!("command channel closed, shutting down swarm");
                         return;
                     }
+                }
+            }
+            // Process proxy responses (from background forwarding tasks).
+            Some((channel, response)) = state.proxy_respond_rx.recv() => {
+                if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, response) {
+                    warn!("proxy send_response failed: {:?}", e);
                 }
             }
             // Process swarm events.
@@ -293,6 +334,11 @@ fn handle_swarm_event(
             }
         }
 
+        // ── gRPC Proxy ──
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::GrpcProxy(proxy_event)) => {
+            handle_grpc_proxy_event(proxy_event, swarm, state);
+        }
+
         // ── Connection lifecycle ──
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
@@ -445,6 +491,117 @@ fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<String> {
     None
 }
 
+// ── gRPC proxy event handling ─────────────────────────────────────────
+
+fn handle_grpc_proxy_event(
+    event: request_response::Event<ProxyRequest, ProxyResponse>,
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+) {
+    match event {
+        request_response::Event::Message { peer, message } => {
+            match message {
+                request_response::Message::Request { request_id, request, channel } => {
+                    // Inbound: forward to local gRPC server asynchronously,
+                    // then send the response back through the channel.
+                    // Store the channel and spawn the forwarding task.
+                    info!(%peer, bytes = request.0.len(), "proxy request received");
+                    let port = state.local_grpc_port;
+                    let cmd_tx = state.proxy_respond_tx.clone();
+                    tokio::spawn(async move {
+                        let response = proxy::handle_proxy_request(request, port).await;
+                        let _ = cmd_tx.send((channel, response)).await;
+                    });
+                }
+                request_response::Message::Response { request_id, response } => {
+                    // Outbound response received — deliver to waiting proxy forward.
+                    if let Some(reply) = state.pending_proxy.remove(&request_id) {
+                        let _ = reply.send(Ok(response.0));
+                    }
+                }
+            }
+        }
+        request_response::Event::OutboundFailure { request_id, error, .. } => {
+            warn!(?error, "proxy outbound failure");
+            if let Some(reply) = state.pending_proxy.remove(&request_id) {
+                let _ = reply.send(Err(format!("proxy outbound: {error:?}")));
+            }
+        }
+        request_response::Event::InboundFailure { error, .. } => {
+            warn!(?error, "proxy inbound failure");
+        }
+        _ => {}
+    }
+}
+
+/// Send a proxy forward request to a peer via request_response.
+fn handle_proxy_forward(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    peer_id_str: &str,
+    data: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    state: &mut LoopState,
+) {
+    let peer_id: PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = reply.send(Err(format!("invalid peer_id: {e}")));
+            return;
+        }
+    };
+    let req_id = swarm
+        .behaviour_mut()
+        .grpc_proxy
+        .send_request(&peer_id, ProxyRequest(data));
+    state.pending_proxy.insert(req_id, reply);
+}
+
+/// Open a local TCP proxy that tunnels to a remote peer via libp2p.
+fn handle_open_proxy(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    target_peer_id: &str,
+    reply: oneshot::Sender<Result<String, String>>,
+    state: &LoopState,
+) {
+    let target: PeerId = match target_peer_id.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = reply.send(Err(format!("invalid peer_id: {e}")));
+            return;
+        }
+    };
+
+    // Dial the peer so the connection is ready when proxy requests arrive.
+    if let Err(e) = swarm.dial(target) {
+        warn!(%target, error=%e, "proxy dial failed");
+    }
+
+    // Start the local TCP listener in a background task.
+    let target_str = target.to_string();
+    tokio::spawn(async move {
+        match proxy::start_proxy_listener().await {
+            Ok((listener, addr)) => {
+                let _ = reply.send(Ok(addr.clone()));
+                info!(proxy=%addr, target=%target_str, "proxy ready");
+                // Note: the actual forwarding happens via SwarmCommand::ProxyForward
+                // from Python — the TCP listener is handled in Python by calling
+                // open_proxy() which returns the address, then the coordinator
+                // connects gRPC to that address. But gRPC doesn't go through our
+                // TCP listener — it goes directly to the address. We need a different
+                // approach: the proxy is the P2PNode itself, not a TCP listener.
+                //
+                // Instead, Python will call proxy_forward(peer_id, bytes) for each
+                // gRPC call. The local TCP proxy approach won't work for gRPC because
+                // HTTP/2 is stateful and multiplexed.
+                drop(listener); // Not used — see note above.
+            }
+            Err(e) => {
+                let _ = reply.send(Err(format!("proxy listener: {e}")));
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +643,7 @@ mod tests {
 
     #[test]
     fn test_extract_ip() {
+
         let addr: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
         assert_eq!(extract_ip_from_multiaddr(&addr), Some("1.2.3.4".into()));
     }

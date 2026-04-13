@@ -333,6 +333,39 @@ impl PyP2PNode {
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 
+    /// Forward raw bytes to a peer via libp2p (through Circuit Relay if needed).
+    /// Returns response bytes. Used for cross-ISP gRPC tunneling.
+    fn proxy_forward(&self, py: Python<'_>, target_peer_id: String, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::ProxyForward {
+                peer_id: target_peer_id,
+                data,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Open a proxy connection to a remote peer. Dials the peer via libp2p
+    /// (through Circuit Relay if needed) and sets the local gRPC port for
+    /// inbound proxy requests.
+    fn open_proxy(&self, py: Python<'_>, target_peer_id: String, local_grpc_port: u16) -> PyResult<String> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::OpenProxy {
+                target_libp2p_peer_id: target_peer_id,
+                local_grpc_port,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// The libp2p PeerId (base58 multihash).
     #[getter]
     fn libp2p_peer_id(&self) -> &str {

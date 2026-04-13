@@ -112,6 +112,9 @@ pub fn build_swarm(
         peer_id,
     )?;
 
+    // gRPC proxy (cross-ISP tunneling through relay).
+    let grpc_proxy = crate::proxy::proxy_behaviour();
+
     let behaviour = OpenHydraBehaviour {
         kademlia,
         relay_client,
@@ -119,6 +122,7 @@ pub fn build_swarm(
         autonat,
         identify,
         mdns,
+        grpc_proxy,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()
