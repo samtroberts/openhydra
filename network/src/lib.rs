@@ -4,8 +4,15 @@
 //! Phase A: standalone Rust crate with Kademlia DHT, identity, and types.
 //! Phase B: full PyO3 bindings (P2PNode class).
 
+pub mod activation;
 pub mod behaviour;
+pub mod dlpack;
 pub mod proxy;
+
+/// Prost-generated types from peer.proto.
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/openhydra.peer.rs"));
+}
 pub mod dht;
 pub mod event_loop;
 pub mod identity;
@@ -26,6 +33,19 @@ mod python {
     fn openhydra_network(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("__version__", "0.1.0")?;
         m.add_class::<crate::node::PyP2PNode>()?;
+        m.add_class::<crate::dlpack::PyRustTensor>()?;
+        m.add_function(wrap_pyfunction!(decode_activation, m)?)?;
         Ok(())
+    }
+
+    /// Decode activation_packed bytes into a zero-copy RustTensor.
+    ///
+    /// Usage:
+    ///     tensor = openhydra_network.decode_activation(packed_bytes)
+    ///     hidden = mx.from_dlpack(tensor)  # zero-copy
+    #[pyfunction]
+    fn decode_activation(packed: Vec<u8>) -> PyResult<crate::dlpack::PyRustTensor> {
+        crate::dlpack::rust_tensor_from_packed(packed)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
     }
 }
