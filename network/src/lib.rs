@@ -5,6 +5,7 @@
 //! Phase B: full PyO3 bindings (P2PNode class).
 
 pub mod behaviour;
+pub mod proxy;
 pub mod dht;
 pub mod event_loop;
 pub mod identity;

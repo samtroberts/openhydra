@@ -328,9 +328,23 @@ class InferenceChain:
                 _used_stream = False
 
         if not _used_stream:
-            with create_channel(peer.address, self.transport_config) as channel:
-                stub = peer_pb2_grpc.PeerStub(channel)
-                response = stub.Forward(req, timeout=effective_timeout)
+            # Cross-ISP relay: if the peer requires relay and we have a
+            # P2P node, tunnel the gRPC request through libp2p instead
+            # of connecting directly (the remote IP is unreachable).
+            _p2p_node = getattr(self, '_p2p_node', None)
+            _peer_libp2p_id = str(getattr(peer, 'libp2p_peer_id', '') or '').strip()
+            if _p2p_node is not None and getattr(peer, 'requires_relay', False) and _peer_libp2p_id:
+                req_bytes = req.SerializeToString()
+                resp_bytes = _p2p_node.proxy_forward(
+                    target_peer_id=_peer_libp2p_id,
+                    data=req_bytes,
+                )
+                response = peer_pb2.ForwardResponse()
+                response.ParseFromString(bytes(resp_bytes))
+            else:
+                with create_channel(peer.address, self.transport_config) as channel:
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    response = stub.Forward(req, timeout=effective_timeout)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         _t_grpc_ms = (time.perf_counter() - _t_grpc_start) * 1000
