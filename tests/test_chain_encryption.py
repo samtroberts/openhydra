@@ -170,7 +170,15 @@ def test_request_stage_sends_plain_activation_when_disabled(monkeypatch):
     req = captured["request"]
 
     assert result.activation == [2.0]
-    assert list(req.activation) == pytest.approx([0.4, 0.5], abs=1e-6)  # type: ignore[union-attr]
+    # Activation is binary-packed when not encrypted/quantized.
+    import struct
+    _packed = bytes(req.activation_packed)  # type: ignore[union-attr]
+    if _packed:
+        _n = len(_packed) // 4
+        _vals = list(struct.unpack(f'<{_n}f', _packed))
+    else:
+        _vals = list(req.activation)  # type: ignore[union-attr]
+    assert _vals == pytest.approx([0.4, 0.5], abs=1e-6)
     assert bytes(req.encrypted_activation) == b""  # type: ignore[union-attr]
 
 

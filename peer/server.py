@@ -543,7 +543,21 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             else:
                 if self.advanced_encryption_enabled and int(request.stage_index) > 0:
                     raise RuntimeError("encrypted_activation_required")
-                activation_in = list(request.activation)
+                # Check for INT8 quantized or binary-packed activation first.
+                _quant_mode = str(getattr(request, "activation_quantization", "") or "").strip()
+                _packed = bytes(getattr(request, "activation_packed", b"") or b"")
+                if _quant_mode == "int8" and request.quantized_activation:
+                    from peer.activation_codec import dequantize_int8
+                    activation_in = dequantize_int8(
+                        bytes(request.quantized_activation),
+                        list(request.quantized_scales),
+                    )
+                elif _packed:
+                    import struct as _struct
+                    _n = len(_packed) // 4
+                    activation_in = list(_struct.unpack(f'<{_n}f', _packed))
+                else:
+                    activation_in = list(request.activation)
 
             compression_codec = str(request.compression_codec or "").strip()
             if compression_codec:
@@ -594,7 +608,8 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 # MLX sharded path manages KV cache internally (in the
                 # runtime's _kv_cache dict). Pass kv flags through to
                 # shard.forward() instead of intercepting here.
-                _mlx_sharded = (int(request.total_stages) > 1)
+                _backend = str(self.runtime_profile.get("backend", "")).lower()
+                _mlx_sharded = (int(request.total_stages) > 1 and _backend == "mlx")
                 if kv_use_cached_activation and not _mlx_sharded:
                     cached = self._kv_cache_get(kv_session_id)
                     if not cached:
