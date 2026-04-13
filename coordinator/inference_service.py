@@ -188,11 +188,20 @@ class InferenceService:
 
     @staticmethod
     def _pipeline_uses_pytorch_runtime(pipeline: list[PeerEndpoint]) -> bool:
-        """Return True if every peer in the pipeline uses a PyTorch backend."""
+        """Return True if every peer uses a real model backend (PyTorch or MLX).
+
+        The autoregressive sharded decode loop is needed for any backend
+        that returns one token per forward call through a sharded pipeline.
+        Both PyTorch and MLX sharded runtimes require this.
+        """
         if not pipeline:
             return False
+        _REAL_BACKENDS = {"pytorch", "mlx"}
         backends = [str(peer.runtime_backend or "").strip().lower() for peer in pipeline]
-        return bool(backends) and all(item.startswith("pytorch") for item in backends)
+        return bool(backends) and all(
+            any(item.startswith(prefix) for prefix in _REAL_BACKENDS)
+            for item in backends
+        )
 
     @staticmethod
     def _collect_eos_token_ids(tokenizer: Any) -> tuple[set[int], set[int]]:
