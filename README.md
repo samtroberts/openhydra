@@ -142,7 +142,7 @@ Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware 
       |  Binary-packed wire     |  INT8 activation compression
       v                          v
   libp2p Bootstrap (Kademlia DHT + Circuit Relay v2)
-      US: 45.79.190.172:4001  |  EU: 172.105.69.49:4001  |  AP: 172.104.164.98:4001
+      3 geo-distributed nodes (US / EU / AP) — auto-connected via --p2p-enabled
 ```
 
 Each node bundles two components in a single process:
@@ -258,13 +258,18 @@ sudo apt-get install build-essential python3-dev libssl-dev
 </details>
 
 <details>
-<summary><strong>"Address already in use: 0.0.0.0:8080"</strong></summary>
+<summary><strong>"Address already in use" (port 8080, 50051, or 4001)</strong></summary>
+
+A previous OpenHydra process is still running. Kill it:
 
 ```bash
-lsof -i :8080          # Find what's using it
-# Use a different port:
-python3 -m coordinator.node --peer-id my-node --api-port 8081
+# Kill all stale OpenHydra processes
+lsof -ti:8080 -ti:50051 -ti:4001 | xargs kill -9
+
+# Then retry your command
 ```
+
+Or use a different port: `--api-port 8081`
 </details>
 
 <details>
