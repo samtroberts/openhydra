@@ -861,6 +861,8 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 final_callback_address=request.final_callback_address,
                 final_callback_request_id=request.final_callback_request_id,
                 remaining_route=next_route,
+                # Gemma 4 needs prompt_token_ids at every stage for per-layer inputs.
+                prompt_token_ids=list(request.prompt_token_ids),
             )
 
             channel = grpc.insecure_channel(
