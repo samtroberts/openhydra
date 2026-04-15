@@ -5,22 +5,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/samtroberts/openhydra/releases"><img src="https://img.shields.io/badge/download-Desktop%20App-00d4b8.svg" alt="Download"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
 </p>
 
 ---
 
-OpenHydra is a peer-to-peer inference network that turns idle hardware into a global AI swarm. Any Mac, NVIDIA GPU, or AMD GPU can join. No central server. No API keys. No $20/month subscription. Just open the app and you're contributing compute.
-
-**The moment you open OpenHydra, you join the base swarm** running Qwen 3.5 0.8B &mdash; just 2 GB of RAM. Everyone gets an instant green light. If your hardware can handle more, the app auto-promotes you to larger models with higher rewards. Zero configuration required.
+OpenHydra is a peer-to-peer inference network that turns idle hardware into a global AI swarm. Any Mac, NVIDIA GPU, or AMD GPU can join. No central server. No API keys. No $20/month subscription. Just start a node and you're contributing compute.
 
 **Why OpenHydra?**
 
-- **One click to join.** Open the app. Your hardware auto-joins the swarm. No terminal, no model selection, no VRAM calculations.
 - **No VRAM ceiling.** A 70B model that needs 140 GB runs across 8 peers, each contributing 18 GB.
 - **No central server.** Every node is both client and server. The network is the computer.
+- **Auto-discovery.** Peers find each other via Kademlia DHT + mDNS. No IPs to configure.
 - **Privacy by default.** Onion routing + AES-256-GCM encryption + differential privacy. No peer sees your full query.
 - **Earn while you idle.** HYDRA tokens and barter credits for every request your node serves.
 
@@ -28,252 +25,164 @@ OpenHydra is a peer-to-peer inference network that turns idle hardware into a gl
 
 ## Quick Start
 
-### Desktop App (recommended)
-
-**[Download for Mac](https://github.com/samtroberts/openhydra/releases)** &nbsp;|&nbsp; **[Download for Windows](https://github.com/samtroberts/openhydra/releases)**
-
-Open the app. It auto-detects your hardware, joins the base swarm (Qwen 3.5 0.8B), and starts earning. If you have heavy hardware, it recommends upgrading to larger models for higher rewards.
-
-### CLI Install (macOS Apple Silicon)
+### Install (macOS Apple Silicon)
 
 ```bash
-# Install build tools (one-time)
+# Prerequisites (one-time)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install python@3.12
 xcode-select --install
 
-# Create virtual environment
-python3 -m venv ~/.openhydra-venv && source ~/.openhydra-venv/bin/activate
+# Clone and install
+git clone https://github.com/samtroberts/openhydra.git
+cd openhydra
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-mlx.txt
 
-# Install with MLX support (Apple Silicon GPU acceleration)
-pip install "openhydra-network[mlx]"
-
-# Start your node
-openhydra-node --peer-id my-node
+# Build the P2P networking module (Rust + PyO3)
+pip install maturin
+cd network && maturin build --release && pip install target/wheels/*.whl && cd ..
 ```
 
-### CLI Install (NVIDIA / Linux)
+### Install (Linux / NVIDIA GPU)
 
 ```bash
-# System dependencies (one-time)
-sudo apt-get install -y build-essential python3-dev python3-venv libssl-dev
-
-# Create virtual environment
-python3 -m venv ~/.openhydra-venv && source ~/.openhydra-venv/bin/activate
-
-# Install PyTorch with CUDA, then OpenHydra
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install openhydra-network
-
-# Start your node
-openhydra-node --peer-id my-node
+git clone https://github.com/samtroberts/openhydra.git
+cd openhydra
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-OpenHydra auto-detects your hardware (Apple Silicon &rarr; MLX, NVIDIA &rarr; CUDA, AMD &rarr; ROCm), joins the global DHT, and starts an OpenAI-compatible API at `http://127.0.0.1:8080`. The default model is Qwen 3.5 0.8B &mdash; lightweight enough for any machine.
+---
 
-**Supported platforms:**
+## Run Sharded Inference on 2 Macs
 
-| Platform | Backend | Notes |
-|----------|---------|-------|
-| 🍎 Apple Silicon (M1&ndash;M4) | MLX (Metal) | Zero-copy unified memory. ~75 tok/s (API), ~98 tok/s (raw). Auto 4-bit quantization. |
-| 🟢 NVIDIA GPU (CUDA) | PyTorch | Any CUDA-capable GPU. NF4 quantization. |
-| 🔴 AMD GPU (ROCm) | PyTorch | ROCm 6.2+. Same PyTorch backend. |
+Qwen 3.5 2B has 24 transformer layers. Split them across two Macs — each loads 12 layers on its Metal GPU. Peers discover each other automatically via the global DHT.
 
-### Chat with your node
+**Mac A (layers 0-11):**
 
 ```bash
-# Chat completion
+python3 -m coordinator.node \
+    --peer-id mac-a-peer \
+    --model-id openhydra-qwen3.5-2b \
+    --runtime-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
+    --runtime-backend mlx \
+    --layer-start 0 --layer-end 12 \
+    --shard-index 0 --total-shards 2 \
+    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --p2p-enabled --log-level INFO
+```
+
+**Mac B (layers 12-23):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id mac-b-peer \
+    --model-id openhydra-qwen3.5-2b \
+    --runtime-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
+    --runtime-backend mlx \
+    --layer-start 12 --layer-end 24 \
+    --shard-index 1 --total-shards 2 \
+    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --p2p-enabled --log-level INFO
+```
+
+Wait for both to show `announced to Kademlia DHT (libp2p)`, then test:
+
+```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "openhydra-qwen3.5-0.8b",
-    "messages": [{"role": "user", "content": "Explain P2P inference in one sentence."}]
+    "model": "openhydra-qwen3.5-2b",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 32
   }' | python3 -m json.tool
-
-# Streaming
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "openhydra-qwen3.5-0.8b",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": true
-  }'
 ```
 
-### Ollama-compatible API
+---
 
-Already using Open WebUI or Continue.dev? OpenHydra speaks Ollama natively:
+## Benchmarks
 
-```bash
-# Ollama-style generate
-curl http://127.0.0.1:8080/api/generate \
-  -d '{"model": "openhydra-qwen3.5-0.8b", "prompt": "Why is the sky blue?"}'
+Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware caching:
 
-# Ollama-style chat
-curl http://127.0.0.1:8080/api/chat \
-  -d '{"model": "openhydra-qwen3.5-0.8b", "messages": [{"role": "user", "content": "Hello"}]}'
-```
+| Model | Hardware | Transport | TPS |
+|-------|----------|-----------|-----|
+| Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9** |
+| Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **10.4** |
+| Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.5** |
 
-### Local development (private DHT, two terminals)
+---
 
-```bash
-# Terminal 1 - DHT bootstrap
-openhydra-dht --host 127.0.0.1 --port 8468
+## Supported Platforms
 
-# Terminal 2 - node
-openhydra-node --peer-id dev-node \
-    --dht-url http://127.0.0.1:8468
-```
-
-### Docker (full stack: node + Prometheus + Grafana)
-
-```bash
-docker compose up
-# API:        http://localhost:8080
-# Prometheus: http://localhost:9090
-# Grafana:    http://localhost:3000  (admin / openhydra)
-```
+| Platform | Backend | Notes |
+|----------|---------|-------|
+| Apple Silicon (M1-M4) | MLX (Metal) | Native Apple Silicon. 8-bit quantized models via mlx-community. |
+| NVIDIA GPU (CUDA) | PyTorch | Any CUDA-capable GPU. NF4 quantization for large models. |
+| AMD GPU (ROCm) | PyTorch | ROCm 6.2+. Same PyTorch backend. |
 
 ---
 
 ## Architecture
 
 ```
-  Client (curl / SDK / Open WebUI / Continue.dev)
-      |  POST /v1/chat/completions  OR  /api/chat (Ollama)
+  Client (curl / SDK / Open WebUI)
+      |  POST /v1/chat/completions
       v
   Coordinator (HTTP :8080)
-      |  Dual-stack DHT lookup (HTTP + Hivemind Kademlia)
+      |  Kademlia DHT + mDNS peer discovery
       |  Pipeline assembly (sharded or full-model)
-      |  Onion route construction + activation encryption
+      |  Push mode: peer-to-peer activation forwarding
       v
   Peer Pipeline (gRPC :50051)
-      peer-A (layers 0-7)  -->  peer-B (layers 8-15)  -->  peer-C (layers 16-31, emits tokens)
-      |                          |                          |
-      |  KV compaction          |  NF4 quantization       |  Speculative decode
-      |  Radix prefix cache     |  Batched inference       |  Token streaming
-      v                          v                          v
-  DHT Bootstrap (HTTP :8468) + Hivemind Signposts (libp2p :38751)
-      EU: 172.105.69.49  |  US: 45.79.190.172  |  AP: 172.104.164.98
+      peer-A (layers 0-11)  -->  peer-B (layers 12-23, emits tokens)
+      |                          |
+      |  KV-aware caching       |  Token sampling
+      |  Binary-packed wire     |  INT8 activation compression
+      v                          v
+  libp2p Bootstrap (Kademlia DHT + Circuit Relay v2)
+      US: 45.79.190.172:4001  |  EU: 172.105.69.49:4001  |  AP: 172.104.164.98:4001
 ```
 
 Each node bundles two components in a single process:
 
-- **Peer** &mdash; a gRPC inference server that loads one model shard (or a full model on capable hardware) and announces itself to the DHT every 60 seconds.
-- **Coordinator** &mdash; an OpenAI-compatible HTTP API that discovers peers, assembles inference pipelines, enforces verification, and manages the token economy.
+- **Peer** — a gRPC inference server that loads one model shard (or a full model) and announces itself to the Kademlia DHT.
+- **Coordinator** — an OpenAI-compatible HTTP API that discovers peers, assembles inference pipelines, and manages verification + token economy.
 
-Because every participant runs their own coordinator, there is no central authority. Accessing the network means running a node &mdash; the same model as BitTorrent.
+### Peer Discovery
 
-### Dual-Stack Peer Discovery
+OpenHydra uses **libp2p** (Rust, via PyO3) for peer discovery and NAT traversal:
 
-OpenHydra runs two DHT protocols simultaneously for maximum resilience:
-
-1. **HTTP DHT** (port 8468) &mdash; lightweight announce/lookup REST API behind nginx. Sub-millisecond lookups. Used for peer discovery today.
-2. **Hivemind Kademlia DHT** (port 38751) &mdash; production libp2p Kademlia network with persistent peer IDs. Three signpost nodes (EU/US/AP) bootstrap the swarm. Peers auto-join via hardcoded multiaddrs.
+- **Kademlia DHT** — decentralized peer discovery via 3 bootstrap nodes (US/EU/AP)
+- **mDNS** — zero-config LAN discovery (peers on the same WiFi find each other instantly)
+- **Circuit Relay v2** — NAT traversal for peers behind firewalls (traffic relayed through bootstrap nodes)
+- **AutoNAT** — automatic NAT type detection
+- **DCUtR** — direct connection upgrade through relay (hole punching)
 
 ### Layer Sharding
 
-A 32-layer model can be split across 4 peers, each running 8 layers. The coordinator's `LayerCoverageMap` detects which layers are available across the swarm and assembles complete pipelines using a greedy O(n*s) algorithm. If a sharded pipeline can't cover all layers, it falls back to a peer running the full model.
+A model's transformer layers are split across N peers. The coordinator's `LayerCoverageMap` detects which layers are available and assembles complete pipelines using a greedy algorithm.
 
 ```bash
-# Run only layers 0-7 of a 32-layer model
-openhydra-node --peer-id shard-0 \
-  --shard-index 0 --total-shards 4 \
-  --runtime-backend pytorch_auto \
-  --runtime-model-id meta-llama/Llama-3.1-8B
+# Example: 4 peers x 8 layers each = 32-layer model
+openhydra-node --peer-id shard-0 --total-shards 4 --shard-index 0 \
+    --runtime-model-id Qwen/Qwen3.5-9B --runtime-backend pytorch_auto --p2p-enabled
 ```
 
----
+### Push Mode
 
-## The AppChain Economy
-
-### Barter Credits (Tier 1)
-
-Every inference request is settled peer-to-peer in barter credits (1,000 tokens served = 1 credit). Credits decay at 5%/day to prevent hoarding. SQLite WAL-mode ledger, zero external dependencies.
-
-### HYDRA Token (Tier 2)
-
-HYDRA is a capped-supply token (69M max) with Burn-and-Mint Equilibrium:
-
-| Mechanism | Purpose |
-|-----------|---------|
-| **Mint on serve** | Peers earn HYDRA for inference work |
-| **Burn on use** | Clients burn HYDRA for priority access |
-| **Stake** | Staked peers get priority routing |
-| **Slash** | Failed audits reduce stake |
-| **State channels** | Off-chain micro-payments (15-min TTL, 8 channels/peer) |
-
-### Three-Tier Verification
-
-1. **Mystery Shopper** (Tier 1) &mdash; probabilistic re-execution (10% default sample rate), output comparison
-2. **Redundant Execution** (Tier 2) &mdash; N-peer majority vote
-3. **Auditor Spot-check** (Tier 3) &mdash; independent Bernoulli sampling when primary matches secondary
-
-Verification outcomes feed into a weighted reputation score (40% verification, 25% uptime, 20% latency consistency, 15% stake factor) that determines routing priority.
+By default, peers forward activations directly to each other (peer-to-peer push) instead of routing through the coordinator. This eliminates one network round-trip per token, improving throughput by ~2x on LAN and ~10x on VPC.
 
 ---
 
-## Security & Privacy
+## Can more than 2 Macs connect?
 
-| Layer | Mechanism |
-|-------|-----------|
-| **Identity** | Ed25519 keys at `~/.openhydra/identity.key` (mode 0600) |
-| **Transport** | X25519 ECDH key agreement + AES-256-GCM per activation |
-| **Routing** | Concentric onion routing &mdash; layered encryption through pipeline stages. Each peer peels one layer and forwards the rest. |
-| **Privacy** | Differential privacy noise injection with verifiable audit tags (HMAC-SHA256) |
-| **Sybil resistance** | Geo-challenge: SHA-256 proof-of-work bound to claimed region |
-| **Systemd hardening** | Non-root user, `ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`, iptables rate limiting |
-
-Encryption overhead is ~0.15ms per activation (~0.02% of total inference latency). We keep it on by default.
-
----
-
-## KV Cache Compaction
-
-OpenHydra implements Q-Tensor KV Compaction via Attention Matching, enabling unbounded effective context length on fixed-memory hardware.
-
-**Four phases, incrementally composable:**
-
-| Phase | What it does | Output |
-|-------|-------------|--------|
-| **Phase 1** | HAK (Highest Attention Keys) or OMP (greedy residual pursuit) token selection | Standard HF DynamicCache |
-| **Phase 2** | Beta bias correction (NNLS) + Cv value refit (least-squares) | CompactedKVCache with per-head beta |
-| **Phase 3** | Per-layer/per-head token budgets from JSON | Non-uniform compression |
-| **Phase 4** | Online mid-trajectory compaction when seq_len > threshold | Unbounded context on fixed memory |
-
-```bash
-openhydra-node --kv-compaction-mode auto \
-  --kv-compaction-ratio 0.5 \
-  --kv-compaction-phase 4
-```
-
-Reference: [arXiv:2602.16284](https://arxiv.org/abs/2602.16284)
-
----
-
-## Model Catalog
-
-Graceful degradation built in &mdash; if the requested model lacks peers, the coordinator serves the nearest smaller model and reports it via `X-OpenHydra-Degradation-Reason`.
-
-| Tier | Model | HuggingFace ID | VRAM | Peers | Quant | Status |
-|------|-------|----------------|------|-------|-------|--------|
-| Frontier | Qwen 3.5 27B | `Qwen/Qwen3.5-27B` | 16 GB × 4 | 4 | int4 | ✅ Available |
-| Advanced | Qwen 3.5 9B | `Qwen/Qwen3.5-9B` | 18 GB × 2 | 2 | int8 | ✅ Available |
-| Standard | Qwen 3.5 4B | `Qwen/Qwen3.5-4B` | 9 GB | 1 | int4 | ✅ Available |
-| Basic | Qwen 3.5 2B | `Qwen/Qwen3.5-2B` | 5 GB | 1 | fp32 | ✅ Available |
-| Basic | Qwen 3.5 0.8B | `Qwen/Qwen3.5-0.8B` | 2 GB | 1 | 4-bit (MLX) / fp32 | ✅ Available |
-
-Full catalog: [`models.catalog.json`](models.catalog.json)
+Yes. There is no hardcoded peer limit. `--total-shards N` accepts any integer. The `LayerCoverageMap` assembles pipelines from any number of shards. The model catalog includes models requiring 4 peers (Qwen 3.5 27B: 4 x 16 GB).
 
 ---
 
 ## REST API
-
-### Public (no auth)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness probe |
-| `GET` | `/readyz` | Readiness probe |
-| `GET` | `/metrics` | Prometheus metrics |
 
 ### OpenAI-compatible
 
@@ -287,40 +196,31 @@ Full catalog: [`models.catalog.json`](models.catalog.json)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/tags` | List models (Ollama format) |
 | `POST` | `/api/generate` | Ollama generate |
 | `POST` | `/api/chat` | Ollama chat |
-| `POST` | `/api/show` | Model details |
-| `GET` | `/api/ps` | Running models |
+| `GET` | `/api/tags` | List models |
 
-### Internal (localhost only)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/internal/mode` | Current mode (local/swarm) |
-| `POST` | `/v1/internal/mode` | Switch mode (`{"mode": "local"\|"swarm"}`) |
-
-### Economy & Network
+### Health & Metrics
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/network/status` | Peer inventory, reputation, economy |
-| `GET` | `/v1/account/balance` | Barter + HYDRA balance |
-| `POST` | `/v1/hydra/stake` | Stake HYDRA |
-| `POST` | `/v1/hydra/channels/open` | Open state channel |
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/metrics` | Prometheus metrics |
 
-### Rate Limiting
+---
 
-Every response includes standard rate-limit headers:
+## Model Catalog
 
-```
-X-RateLimit-Limit: 120
-X-RateLimit-Remaining: 87
-X-RateLimit-Reset: 1741474823
-Retry-After: 30          # only on 429
-```
+| Model | HuggingFace ID | VRAM | Peers | Status |
+|-------|----------------|------|-------|--------|
+| Qwen 3.5 27B | `Qwen/Qwen3.5-27B` | 16 GB x 4 | 4 | Available |
+| Qwen 3.5 9B | `Qwen/Qwen3.5-9B` | 18 GB x 2 | 2 | Available |
+| Qwen 3.5 4B | `Qwen/Qwen3.5-4B` | 9 GB | 1 | Available |
+| Qwen 3.5 2B | `Qwen/Qwen3.5-2B` | 5 GB | 1 | Available |
+| Gemma 4 E4B-it | `google/gemma-4-E4B-it` | 8 GB | 1 | Available |
+| Gemma 4 E2B-it | `google/gemma-4-E2B-it` | 4 GB | 1 | Available |
 
-Default: 120 requests per 60-second sliding window per IP.
+Full catalog: [`models.catalog.json`](models.catalog.json)
 
 ---
 
@@ -330,17 +230,13 @@ Default: 120 requests per 60-second sliding window per IP.
 peer/              Inference engine: gRPC server, model shard, MLX/PyTorch runtimes,
                    KV compaction, request coalescing, P2P model cache, batching
 coordinator/       HTTP API, pipeline routing, chain failover, speculative decode,
-                   auto-scaler, verification, economy, interactive CLI
-dht/               HTTP DHT bootstrap + Hivemind Kademlia signpost daemon
+                   auto-scaler, verification, economy
+network/           Rust libp2p networking layer (Kademlia, Circuit Relay, mDNS, PyO3)
+dht/               HTTP DHT bootstrap server
 economy/           Barter credits + HYDRA token + state channels (SQLite & Postgres)
-verification/      Mystery Shopper, redundant execution, auditor spot-checks, reputation
-compression/       LZ4 codec + learned tensor autoencoder
-grounding/         DuckDuckGo RAG with local cache fallback
-sdk/               Python and TypeScript SDK clients
-desktop/           Tauri v2 desktop app (Rust + React + Tailwind), Local/Swarm toggle
-ops/               Terraform, Docker Compose, Prometheus/Grafana, TLS, deploy scripts
-scripts/           SLO chaos test, KV benchmark, head-budget optimizer, canary rollout
-tests/             1045+ tests (unit + integration + API emulation + mode switch)
+verification/      Mystery Shopper, redundant execution, auditor spot-checks
+ops/               Terraform, Docker Compose, Prometheus/Grafana, deploy scripts
+tests/             1100+ tests (unit + integration + API emulation)
 ```
 
 ---
@@ -350,7 +246,7 @@ tests/             1045+ tests (unit + integration + API emulation + mode switch
 <details>
 <summary><strong>"error: command 'gcc' failed"</strong> during pip install</summary>
 
-grpcio and cryptography require a C compiler. Install build tools first:
+grpcio and cryptography require a C compiler:
 
 ```bash
 # macOS
@@ -362,129 +258,45 @@ sudo apt-get install build-essential python3-dev libssl-dev
 </details>
 
 <details>
-<summary><strong>"ModuleNotFoundError: No module named 'torch'"</strong></summary>
-
-PyTorch is not bundled because different platforms need different builds. Install it explicitly:
-
-```bash
-# Apple Silicon (use MLX instead — faster)
-pip install "openhydra-network[mlx]"
-
-# NVIDIA CUDA 12.4
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-
-# CPU only (slow but works everywhere)
-pip install torch
-```
-</details>
-
-<details>
 <summary><strong>"Address already in use: 0.0.0.0:8080"</strong></summary>
-
-Another process is using port 8080. Use a different port:
 
 ```bash
 lsof -i :8080          # Find what's using it
-openhydra-node --peer-id my-node --api-port 8081
-```
-</details>
-
-<details>
-<summary><strong>macOS: "OpenHydra.app is damaged and can't be opened"</strong></summary>
-
-macOS Gatekeeper blocks unsigned apps. Fix:
-
-```bash
-# Option 1: Right-click > Open (one-time bypass)
-# Option 2: Remove quarantine attribute
-xattr -cr /Applications/OpenHydra.app
-```
-</details>
-
-<details>
-<summary><strong>Slow inference (&lt; 1 tok/s on Apple Silicon)</strong></summary>
-
-MLX is not installed, so OpenHydra fell back to PyTorch CPU (100x slower):
-
-```bash
-pip install "openhydra-network[mlx]"
-# Restart the node — expected: ~252 tok/s (vs ~1.3 tok/s on CPU)
+# Use a different port:
+python3 -m coordinator.node --peer-id my-node --api-port 8081
 ```
 </details>
 
 <details>
 <summary><strong>"No viable model found" / 503</strong></summary>
 
-The coordinator can't find peers. Ensure DHT connectivity:
-
-```bash
-openhydra-node --peer-id my-node --dht-url https://bootstrap-eu.openhydra.co
-```
+The coordinator can't find peers. Ensure `--p2p-enabled` is set and both peers show `announced to Kademlia DHT`.
 </details>
+
+---
+
+## Security & Privacy
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Identity** | Ed25519 keys at `~/.openhydra/identity.key` (mode 0600) |
+| **Transport** | X25519 ECDH + AES-256-GCM per activation |
+| **Routing** | Onion routing — layered encryption through pipeline stages |
+| **Privacy** | Differential privacy noise injection with verifiable audit tags |
+| **NAT Traversal** | libp2p Circuit Relay v2 + DCUtR hole punching |
 
 ---
 
 ## License
 
-OpenHydra uses a **dual open-core license**:
-
-The entire OpenHydra stack is licensed under [Apache 2.0](LICENSE) — maximum adoption, use in proprietary products, patent grant included.
-
-We believe open infrastructure wins. The BitTorrent of AI should be free for everyone.
+Licensed under [Apache 2.0](LICENSE). The BitTorrent of AI should be free for everyone.
 
 ---
 
-## Contributing
+## Acknowledgements
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and commit conventions.
-
-Good first issues: [`good first issue`](../../issues?q=label%3A%22good+first+issue%22)
-
----
-
-## Security
-
-See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy.
-
-**Do not open public issues for security vulnerabilities.** Email `sam@openhydra.co` or use [GitHub Security Advisories](../../security/advisories/new).
-
----
-
-## Acknowledgements & Prior Art
-
-OpenHydra stands on the shoulders of remarkable projects and research:
-
-- **[Petals](https://github.com/bigscience-workshop/petals)** (BigScience) &mdash; proved that pipeline-parallel LLM inference over the public internet is viable. Their work on collaborative serving of BLOOM-176B demonstrated that volunteer hardware can collectively run frontier models. OpenHydra's layer sharding pipeline is philosophically descended from Petals.
-- **[Exo](https://github.com/exo-explore/exo)** &mdash; demonstrated MLX tensor parallelism for local network clusters and pioneered shard-aware model downloads. Their focus on Apple Silicon performance informed our MLX runtime design.
-- **[Apple MLX](https://github.com/ml-explore/mlx)** &mdash; the MLX framework and its unified memory architecture make zero-copy inference on Apple Silicon practical. Our MLX runtime achieves ~252 tok/s thanks to their work.
-- **[Hivemind](https://github.com/learning-at-home/hivemind)** &mdash; production-grade decentralised training and DHT infrastructure. OpenHydra's Kademlia signpost layer uses hivemind's libp2p DHT implementation.
-- **Kademlia DHT** (Maymounkov & Mazieres, 2002) &mdash; the distributed hash table protocol that underpins peer discovery in BitTorrent, IPFS, and now OpenHydra.
-- **KV Cache Compaction** ([arXiv:2602.16284](https://arxiv.org/abs/2602.16284)) &mdash; the attention matching framework that inspired our Q-Tensor compaction pipeline.
-- **Speculative Decoding** (Leviathan et al., 2023; Chen et al., 2023) &mdash; the draft-then-verify paradigm that OpenHydra extends to distributed multi-peer pipelines.
-
----
-
-## Roadmap
-
-| Status | Milestone |
-|--------|-----------|
-| Done | Core inference, DHT, TLS, three-tier verification, barter credits, HYDRA token |
-| Done | Ed25519 identity, PostgreSQL economy, Terraform IaC, Grafana dashboards |
-| Done | KV cache compaction (4 phases + Option A query capture) |
-| Done | MLX backend, NF4 quantization, request coalescing, P2P model cache |
-| Done | Layer sharding, auto-scaler, Hivemind Kademlia DHT, Ollama API |
-| Done | Open-core licensing, rate-limit headers, CI, documentation |
-| Done | v1.1 Hybrid Local/Swarm Mode (75 TPS local, 20 TPS swarm on 8GB M1) |
-| Done | 4-bit auto-quantization, tokenizer caching, verification bypass |
-| Done | Premium Tauri desktop UI with Local/Swarm toggle |
-| Done | v1.2 Swarm Optimization: DSD, SpecPipe, INT8 compression, TOPLOC, Chunked Prefill |
-| Done | 5-node WAN sharded pipeline (Bangalore→Chennai→Mumbai→Singapore×2) |
-| Done | Petals parity: server-to-server push (2.66x TPS), streaming sessions, NAT relay, throughput benchmarking |
-| Done | GPU benchmarks: 18.8 TPS localhost, 0.54 TPS WAN on Lightning.ai T4 |
-| Done | Selective weight loading: 14GB model on 8GB Mac (peak 1.5GB) |
-| Done | Gemma 4 + Qwen 3.5 model families (multimodal, thinking), 21 catalog entries |
-| Done | Autonomous dynamic rebalancing (peers self-optimize layer positions) |
-| Next | On-chain DAO (Solidity state-channel contract on Arbitrum/Base) |
-| Next | SDK v1 (Python + TypeScript, streaming, retry, type-safe) |
-| Next | P2P agentic swarms (agent sessions, tool execution, MCP) |
-| Next | Full documentation site (MkDocs Material + API reference) |
+- **[Petals](https://github.com/bigscience-workshop/petals)** — proved pipeline-parallel LLM inference over the internet is viable
+- **[Exo](https://github.com/exo-explore/exo)** — MLX tensor parallelism for local clusters
+- **[Apple MLX](https://github.com/ml-explore/mlx)** — native Apple Silicon inference
+- **[libp2p](https://libp2p.io/)** — peer-to-peer networking (Kademlia, Circuit Relay, NAT traversal)
+- **KV Cache Compaction** ([arXiv:2602.16284](https://arxiv.org/abs/2602.16284))
