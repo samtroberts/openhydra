@@ -2223,6 +2223,14 @@ class PyTorchRuntime:
             except Exception as exc:
                 logging.debug("gemma4_sliding_mask_fallback: %s", exc)
 
+        # Gemma 4 KV sharing: layers with ``store_full_length_kv=True``
+        # write their K/V into this dict keyed by layer_idx. Later
+        # KV-shared layers read from it via ``kv_shared_layer_index``.
+        # The model's own forward() creates this dict at line ~1615 of
+        # modeling_gemma4.py. Without it: TypeError 'NoneType' does not
+        # support item assignment.
+        _shared_kv_states: dict[int, Any] = {}
+
         output = hidden
         for idx, block in zip(self.layer_indices, self._selected_layers):
             layer_type = (
@@ -2241,11 +2249,8 @@ class PyTorchRuntime:
                 "position_embeddings": position_embeddings.get(layer_type),
                 "attention_mask": causal_mask_mapping.get(layer_type, attention_mask),
                 "position_ids": position_ids,
-                # Pass the local DynamicCache so non-shared layers can
-                # populate ``past_key_values.shared_layers`` for later
-                # KV-shared layers to read. Falls back to the caller's
-                # ``past_key_values`` if they supplied one.
                 "past_key_values": _effective_pkv,
+                "shared_kv_states": _shared_kv_states,
             }
             # Gemma 4 attention always needs ``use_cache=True`` when a
             # cache is present because the KV-sharing branch reads from
