@@ -106,11 +106,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware caching:
 
-| Model | Hardware | Transport | TPS |
-|-------|----------|-----------|-----|
-| Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9** |
-| Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **10.4** |
-| Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.5** |
+| Model | Hardware | Transport | Short prompt | Long prompt |
+|-------|----------|-----------|-------------|------------|
+| Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9 TPS** | **6.9 TPS** |
+| Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.9 TPS** | **8.9 TPS** |
+| Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **5.8 TPS** | **6.8 TPS** |
 
 ---
 
