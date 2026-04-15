@@ -109,8 +109,8 @@ Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware 
 | Model | Hardware | Transport | Short prompt | Long prompt |
 |-------|----------|-----------|-------------|------------|
 | Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9 TPS** | **6.9 TPS** |
-| Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.9 TPS** | **8.9 TPS** |
-| Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **5.8 TPS** | **6.8 TPS** |
+| Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **9.3 TPS** | **9.8 TPS** |
+| Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.2 TPS** | **7.3 TPS** |
 
 ---
 
