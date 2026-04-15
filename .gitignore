@@ -123,6 +123,23 @@ desktop/
 # ── Landing page (moved to samtroberts/openhydra-landing) ────────────────────
 landing/
 
+# ── Internal / non-public files ───────────────────────────────────────────────
+plans/
+landing/
+desktop/
+docs/
+sdk/
+web/
+torrent/
+site/
+licenses/AGPL-3.0.txt
+AGPL-3.0.txt
+OpenHydra_Project_Analysis.docx
+OpenHydra_masterplan.md
+OpenHydra_progress.md
+codex_prompt*.md
+peers*.json
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.orig
 *.bak

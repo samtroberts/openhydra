@@ -1,7 +1,0 @@
-{
-  "name": "openhydra-sdk",
-  "version": "0.1.0",
-  "description": "OpenHydra TypeScript SDK skeleton",
-  "type": "module",
-  "main": "src/index.ts"
-}
