@@ -1,12 +1,17 @@
-# Runtime dependencies (mirrors [project.dependencies] in pyproject.toml)
+# ── Core runtime ─────────────────────────────────────────────────────
+torch>=2.0
 grpcio>=1.62,<2
 grpcio-tools>=1.62,<2
 protobuf>=4.25,<7
-cryptography>=42,<47
-accelerate>=1.13.0
 transformers>=5.5.0
+accelerate>=1.13.0
 requests>=2.28.0
+sentencepiece>=0.2.0
+cryptography>=42,<47
 
-# Development / test dependencies
+# ── Apple Silicon (MLX) — see requirements-mlx.txt ───────────────────
+# pip install -r requirements-mlx.txt
+
+# ── Development / test ───────────────────────────────────────────────
 pytest>=8.0,<9
 pytest-asyncio>=0.23

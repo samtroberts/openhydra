@@ -111,6 +111,18 @@ logs/
 peer/proto/*_pb2*.py
 peer/proto/*_pb2*.pyi
 
+# ── Internal planning / session files ─────────────────────────────────────────
+plans/
+codex_prompt*.md
+peers*.json
+OpenHydra_Project_Analysis.docx
+
+# ── Desktop app (source kept locally, not on GitHub) ─────────────────────────
+desktop/
+
+# ── Landing page (moved to samtroberts/openhydra-landing) ────────────────────
+landing/
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.orig
 *.bak

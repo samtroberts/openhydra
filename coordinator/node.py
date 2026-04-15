@@ -88,11 +88,11 @@ def main() -> None:
 
     # --- Identity / model ---
     parser.add_argument(
-        "--peer-id", required=True,
-        help="Unique identifier for this node (required).",
+        "--peer-id", default=None,
+        help="Unique identifier for this node (default: auto-generated from hostname).",
     )
-    parser.add_argument("--model-id", default="openhydra-qwen3.5-0.8b",
-                        help="Model ID this node serves (default: openhydra-qwen3.5-0.8b).")
+    parser.add_argument("--model-id", default="openhydra-qwen3.5-2b",
+                        help="Model ID this node serves (default: openhydra-qwen3.5-2b).")
     parser.add_argument("--shard-index", type=int, default=0,
                         help="Shard index within the inference pipeline (default: 0).")
     parser.add_argument("--total-shards", type=int, default=1,
@@ -137,7 +137,7 @@ def main() -> None:
     parser.add_argument(
         "--p2p-enabled",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Enable the Rust libp2p networking layer for Kademlia DHT, "
             "Circuit Relay v2, DCUtR hole-punching, AutoNAT, and mDNS. "
@@ -226,6 +226,13 @@ def main() -> None:
         level=args.log_level,
         json_logs=(args.deployment_profile == "prod"),
     )
+
+    # Auto-generate peer-id from hostname if not provided.
+    if not args.peer_id:
+        import socket
+        _hostname = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
+        args.peer_id = f"{_hostname}-peer"
+        logger.info("auto_peer_id: %s", args.peer_id)
 
     # Resolve DHT URLs; fall back to production bootstrap nodes if none given.
     dht_urls: list[str] = _parse_dht_urls(args.dht_url) or list(PRODUCTION_BOOTSTRAP_URLS)

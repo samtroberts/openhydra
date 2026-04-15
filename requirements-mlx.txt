@@ -1,0 +1,5 @@
+# Extra dependencies for Apple Silicon MLX backend.
+# Install AFTER requirements.txt:
+#   pip install -r requirements-mlx.txt
+mlx>=0.31
+mlx-lm>=0.31
