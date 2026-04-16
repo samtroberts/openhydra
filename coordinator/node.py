@@ -395,6 +395,10 @@ def main() -> None:
             _total_layers = int(_shard_size * max(1, int(args.total_shards)))
             _local_peer[0]["total_layers"] = _total_layers
             _local_peer[0]["runtime_model_id"] = str(_runtime_model_id)
+        # Add libp2p peer ID for cross-ISP relay routing in push mode.
+        if _p2p_node is not None:
+            _local_peer[0]["libp2p_peer_id"] = str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+            _local_peer[0]["requires_relay"] = True  # Conservative: assume relay needed
         _tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="openhydra_peers_",
             delete=False,
