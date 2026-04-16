@@ -1465,7 +1465,63 @@ class InferenceService:
                 _prefill_done = False
                 _kv_consecutive_failures = 0
                 _KV_MAX_RETRIES = 3  # retry KV-aware path up to 3 times before permanent fallback
-                for _ar_step in range(_ar_target_tokens):
+
+                # ── Ring topology: continuous push loop ────────────────────
+                # When push mode is enabled and pipeline has relay peers,
+                # use the ring: coordinator kicks off one push, tokens
+                # circulate peer-to-peer, emitted into a queue in real-time.
+                _use_ring = (
+                    self.config.push_mode_enabled
+                    and len(prep.primary_pipeline) >= 2
+                    and self.config.push_callback_address
+                )
+                if _use_ring:
+                    import coordinator.engine as _ring_engine
+                    _RingChain = getattr(_ring_engine, "InferenceChain", InferenceChain)
+                    _ring_chain = _RingChain(
+                        prep.primary_pipeline,
+                        timeout_ms=self.config.timeout_ms,
+                        transport_config=self.transport_config,
+                    )
+                    _ring_chain._p2p_node = getattr(self.discovery_service, '_p2p_node', None)
+
+                    from coordinator.push_receiver import register_ring, unregister_ring
+                    _ring_queue = register_ring(str(request_id))
+
+                    _ring_chain.run_push_ring(
+                        initial_activation=[float(t) for t in _ar_context_ids],
+                        max_tokens=_ar_target_tokens,
+                        ring_eos_ids=list(_ar_eos_ids),
+                        kv_session_id=_ar_kv_session,
+                        callback_address=self.config.push_callback_address,
+                        request_id=request_id,
+                        **decode_controls,
+                    )
+
+                    # Drain tokens from the ring queue in real-time.
+                    import queue as _q_mod
+                    _ring_t0 = time.perf_counter()
+                    for _ring_step in range(_ar_target_tokens):
+                        try:
+                            _ring_token = _ring_queue.get(timeout=30.0)
+                        except _q_mod.Empty:
+                            logger.warning("ring_token_timeout: step=%d", _ring_step)
+                            break
+                        if _ring_token is None:
+                            break  # EOS or ring complete
+                        _ar_generated.append(int(_ring_token))
+
+                    _ar_total_latency_ms = (time.perf_counter() - _ring_t0) * 1000
+                    unregister_ring(str(request_id))
+                    logger.info(
+                        "autoregressive_ring_done: tokens=%d latency_ms=%.1f tps=%.2f",
+                        len(_ar_generated), _ar_total_latency_ms,
+                        len(_ar_generated) / (_ar_total_latency_ms / 1000) if _ar_total_latency_ms > 0 else 0,
+                    )
+
+                # ── Fallback: per-token coordinator-mediated loop ──────────
+                if not _use_ring:
+                  for _ar_step in range(_ar_target_tokens):
                     try:
                         if _ar_kv_mode == "kv_aware":
                             if not _prefill_done:

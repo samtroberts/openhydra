@@ -80,3 +80,46 @@ def cancel_push(request_id: str) -> None:
         future = _PUSH_RESULTS.pop(request_id, None)
     if future is not None and not future.done():
         future.cancel()
+
+
+# ── Ring autoregressive token queue ─────────────────────────────────
+#
+# The ring topology lets tokens circulate peer-to-peer. The last shard
+# (same process as coordinator) drops each sampled token into a
+# thread-safe queue.Queue. The coordinator's HTTP handler thread reads
+# from it with a blocking get(timeout=...) — safe because each request
+# runs in its own thread (ThreadingMixIn).
+
+import queue as _queue_mod
+
+_RING_QUEUES: dict[str, _queue_mod.Queue] = {}
+_RING_LOCK = threading.Lock()
+
+
+def register_ring(request_id: str) -> _queue_mod.Queue:
+    """Register a ring token queue for real-time streaming.
+
+    Returns a thread-safe Queue that yields token IDs (int) or None (sentinel).
+    """
+    q: _queue_mod.Queue = _queue_mod.Queue()
+    with _RING_LOCK:
+        _RING_QUEUES[request_id] = q
+    return q
+
+
+def emit_ring_token(request_id: str, token_id: int | None) -> None:
+    """Emit a token from the gRPC/proxy thread into the ring queue.
+
+    Thread-safe: queue.Queue.put_nowait() is safe from any thread.
+    ``None`` is the sentinel: generation complete (EOS or max tokens).
+    """
+    with _RING_LOCK:
+        q = _RING_QUEUES.get(request_id)
+    if q is not None:
+        q.put_nowait(token_id)
+
+
+def unregister_ring(request_id: str) -> None:
+    """Clean up the ring queue after generation completes."""
+    with _RING_LOCK:
+        _RING_QUEUES.pop(request_id, None)
