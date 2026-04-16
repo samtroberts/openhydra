@@ -411,8 +411,16 @@ class InferenceChain:
             _t_serial_ms + _t_grpc_ms + _t_deser_ms,
         )
 
+        # Prefer activation_packed (binary) over repeated float activation.
+        _resp_packed = bytes(getattr(response, "activation_packed", b"") or b"")
+        if _resp_packed and len(_resp_packed) >= 8:
+            import struct as _struct_unpack
+            _n_floats = len(_resp_packed) // 4
+            resp_activation = list(_struct_unpack.unpack(f'<{_n_floats}f', _resp_packed))
+        else:
+            resp_activation = list(response.activation)
+
         # INT8 dequantization on response (header-preserving format)
-        resp_activation = list(response.activation)
         resp_quant = str(getattr(response, "activation_quantization", "") or "")
         if resp_quant == "int8" and getattr(response, "quantized_activation", b""):
             import struct as _struct_resp
@@ -985,7 +993,14 @@ class InferenceChain:
             )
 
         total_ms = (time.perf_counter() - t_start) * 1000
-        activation = list(result_response.activation) if hasattr(result_response, "activation") else []
+        # Prefer packed bytes from response (push result).
+        _push_packed = bytes(getattr(result_response, "activation_packed", b"") or b"")
+        if _push_packed and len(_push_packed) >= 8:
+            import struct as _push_unpack
+            _n = len(_push_packed) // 4
+            activation = list(_push_unpack.unpack(f'<{_n}f', _push_packed))
+        else:
+            activation = list(result_response.activation) if hasattr(result_response, "activation") else []
         output = ""
         if activation:
             output = ModelShard.decode_text(
