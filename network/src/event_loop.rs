@@ -93,6 +93,9 @@ struct LoopState {
     inbound_proxy_channels: HashMap<String, request_response::ResponseChannel<ProxyResponse>>,
     /// Counter for generating unique inbound request IDs.
     inbound_proxy_counter: u64,
+    /// Proxy forward requests waiting for a relay connection to be established.
+    /// (target_peer_id, data, reply_channel)
+    pending_relay_forwards: Vec<(PeerId, Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>)>,
 }
 
 struct PendingDiscover {
@@ -120,6 +123,7 @@ impl LoopState {
             inbound_proxy_queue: Vec::new(),
             inbound_proxy_channels: HashMap::new(),
             inbound_proxy_counter: 0,
+            pending_relay_forwards: Vec::new(),
         }
     }
 }
@@ -136,30 +140,35 @@ pub async fn run_event_loop(
         warn!("kademlia bootstrap failed (no peers yet?): {e}");
     }
 
-    // Listen on relay addresses through bootstrap nodes so peers behind
-    // NAT can receive inbound connections via Circuit Relay v2.
-    // This establishes a "reservation" with each relay node.
-    //
-    // The relay client transport expects a full address:
-    //   /ip4/X/tcp/Y/p2p/<RELAY_PEER_ID>/p2p-circuit
-    // With relay transport as the first branch of OrTransport, these
-    // addresses are routed to the relay client (not TCP).
-    for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-        if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
-            let listen_addr = relay_multiaddr
-                .with(libp2p::multiaddr::Protocol::P2pCircuit);
-            match swarm.listen_on(listen_addr.clone()) {
-                Ok(_) => {
-                    info!(addr = %listen_addr, "listening via relay (reservation requested)");
-                }
-                Err(e) => {
-                    warn!(addr = %listen_addr, error = %e, "relay listen failed");
+    // Relay reservations are requested after a short delay (see below)
+    // to ensure Kademlia has connected to the bootstrap peers first.
+    // The relay client behaviour sends the reservation request on an
+    // existing connection — without one, it dials via TCP which doesn't
+    // install the relay reservation handler.
+    let mut relay_reservation_pending = true;
+    let relay_reservation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        // Delayed relay reservation: wait for Kademlia to connect to
+        // bootstrap peers, then request relay reservations via listen_on.
+        if relay_reservation_pending && tokio::time::Instant::now() >= relay_reservation_deadline {
+            relay_reservation_pending = false;
+            for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+                if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+                    let listen_addr = relay_multiaddr
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    match swarm.listen_on(listen_addr.clone()) {
+                        Ok(_) => {
+                            info!(addr = %listen_addr, "listening via relay (reservation requested)");
+                        }
+                        Err(e) => {
+                            warn!(addr = %listen_addr, error = %e, "relay listen failed");
+                        }
+                    }
                 }
             }
         }
-    }
 
-    loop {
         tokio::select! {
             // Process commands from Python.
             cmd = cmd_rx.recv() => {
@@ -394,6 +403,21 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             debug!(%peer_id, "connection established");
+            // Send any queued proxy forwards that were waiting for this connection.
+            let mut remaining = Vec::new();
+            for (target, data, reply) in state.pending_relay_forwards.drain(..) {
+                if target == peer_id {
+                    info!(%peer_id, "sending queued proxy forward after relay connection");
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .grpc_proxy
+                        .send_request(&peer_id, ProxyRequest(data));
+                    state.pending_proxy.insert(req_id, reply);
+                } else {
+                    remaining.push((target, data, reply));
+                }
+            }
+            state.pending_relay_forwards = remaining;
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             debug!(%peer_id, "connection closed");
@@ -582,11 +606,8 @@ fn handle_grpc_proxy_event(
 
 /// Send a proxy forward request to a peer via request_response.
 ///
-/// If the target peer requires relay (discovered via Kademlia with
-/// `requires_relay=true`), we first dial the peer through the Circuit
-/// Relay bootstrap node so that the `OrTransport` picks the relay branch.
-/// The `send_request()` call then succeeds because the swarm already has
-/// an active relayed connection to the target.
+/// If the peer isn't directly connected, initiates a relay circuit dial
+/// and queues the request to be sent after the connection is established.
 fn handle_proxy_forward(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     peer_id_str: &str,
@@ -602,40 +623,42 @@ fn handle_proxy_forward(
         }
     };
 
-    // Check if the peer requires relay and dial through bootstrap relays.
-    // Look up peer in known_peers cache (populated from Kademlia discovery).
-    let needs_relay = state
-        .known_peers
-        .values()
-        .any(|r| r.libp2p_peer_id == peer_id_str && r.requires_relay);
-
-    if needs_relay && !swarm.is_connected(&peer_id) {
-        // Dial through each known relay bootstrap node until one works.
-        // The multiaddr format is: /ip4/RELAY/tcp/4001/p2p/RELAY_ID/p2p-circuit/p2p/TARGET
+    if swarm.is_connected(&peer_id) {
+        // Already connected — send immediately.
+        let req_id = swarm
+            .behaviour_mut()
+            .grpc_proxy
+            .send_request(&peer_id, ProxyRequest(data));
+        state.pending_proxy.insert(req_id, reply);
+    } else {
+        // Not connected — dial through relay and queue the request.
+        // It will be sent when ConnectionEstablished fires.
+        info!(%peer_id, "proxy_forward: peer not connected, dialing via relay");
+        let mut dialed = false;
         for relay_str in crate::relay::BOOTSTRAP_RELAYS {
             if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
                 let circuit_addr = relay_multiaddr
                     .with(libp2p::multiaddr::Protocol::P2pCircuit)
                     .with(libp2p::multiaddr::Protocol::P2p(peer_id));
-                info!(
-                    %peer_id, addr = %circuit_addr,
-                    "dialing peer through relay for proxy forward"
-                );
+                info!(%peer_id, addr = %circuit_addr, "dialing peer through relay");
                 match swarm.dial(circuit_addr) {
-                    Ok(_) => break, // Successfully initiated dial
+                    Ok(_) => {
+                        dialed = true;
+                        break;
+                    }
                     Err(e) => {
-                        warn!(%peer_id, error=%e, "relay dial attempt failed, trying next relay");
+                        warn!(%peer_id, error=%e, "relay dial failed, trying next");
                     }
                 }
             }
         }
+        if dialed {
+            // Queue the request to be sent after connection is established.
+            state.pending_relay_forwards.push((peer_id, data, reply));
+        } else {
+            let _ = reply.send(Err("proxy_forward: no relay dial succeeded".into()));
+        }
     }
-
-    let req_id = swarm
-        .behaviour_mut()
-        .grpc_proxy
-        .send_request(&peer_id, ProxyRequest(data));
-    state.pending_proxy.insert(req_id, reply);
 }
 
 /// Open a local TCP proxy that tunnels to a remote peer via libp2p.

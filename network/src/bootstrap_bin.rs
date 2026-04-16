@@ -106,6 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_circuits: 512,
             max_circuits_per_peer: 8,
             reservation_duration: Duration::from_secs(3600),
+            // 10 MB per circuit — activation tensors can be several MB.
+            max_circuit_bytes: 10 * 1024 * 1024,
+            // 10 minutes per circuit — autoregressive decode can take a while.
+            max_circuit_duration: Duration::from_secs(600),
             ..Default::default()
         },
     );
