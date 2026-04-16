@@ -136,6 +136,24 @@ pub async fn run_event_loop(
         warn!("kademlia bootstrap failed (no peers yet?): {e}");
     }
 
+    // Listen on relay addresses through bootstrap nodes so peers behind
+    // NAT can receive inbound connections via Circuit Relay v2.
+    // This establishes a "reservation" with each relay node.
+    for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+        if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+            let listen_addr = relay_multiaddr
+                .with(libp2p::multiaddr::Protocol::P2pCircuit);
+            match swarm.listen_on(listen_addr.clone()) {
+                Ok(_) => {
+                    info!(addr = %listen_addr, "listening via relay (reservation requested)");
+                }
+                Err(e) => {
+                    warn!(addr = %listen_addr, error = %e, "relay listen failed");
+                }
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             // Process commands from Python.
@@ -558,6 +576,12 @@ fn handle_grpc_proxy_event(
 }
 
 /// Send a proxy forward request to a peer via request_response.
+///
+/// If the target peer requires relay (discovered via Kademlia with
+/// `requires_relay=true`), we first dial the peer through the Circuit
+/// Relay bootstrap node so that the `OrTransport` picks the relay branch.
+/// The `send_request()` call then succeeds because the swarm already has
+/// an active relayed connection to the target.
 fn handle_proxy_forward(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     peer_id_str: &str,
@@ -572,6 +596,36 @@ fn handle_proxy_forward(
             return;
         }
     };
+
+    // Check if the peer requires relay and dial through bootstrap relays.
+    // Look up peer in known_peers cache (populated from Kademlia discovery).
+    let needs_relay = state
+        .known_peers
+        .values()
+        .any(|r| r.libp2p_peer_id == peer_id_str && r.requires_relay);
+
+    if needs_relay && !swarm.is_connected(&peer_id) {
+        // Dial through each known relay bootstrap node until one works.
+        // The multiaddr format is: /ip4/RELAY/tcp/4001/p2p/RELAY_ID/p2p-circuit/p2p/TARGET
+        for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+            if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+                let circuit_addr = relay_multiaddr
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                    .with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                info!(
+                    %peer_id, addr = %circuit_addr,
+                    "dialing peer through relay for proxy forward"
+                );
+                match swarm.dial(circuit_addr) {
+                    Ok(_) => break, // Successfully initiated dial
+                    Err(e) => {
+                        warn!(%peer_id, error=%e, "relay dial attempt failed, trying next relay");
+                    }
+                }
+            }
+        }
+    }
+
     let req_id = swarm
         .behaviour_mut()
         .grpc_proxy

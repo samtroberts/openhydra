@@ -31,6 +31,15 @@ mod python {
 
     #[pymodule]
     fn openhydra_network(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        // Initialize tracing subscriber so Rust info!/warn!/debug! macros
+        // produce visible output (controlled by RUST_LOG env var).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_target(false)
+            .try_init();
         m.add("__version__", "0.1.0")?;
         m.add_class::<crate::node::PyP2PNode>()?;
         m.add_class::<crate::dlpack::PyRustTensor>()?;
