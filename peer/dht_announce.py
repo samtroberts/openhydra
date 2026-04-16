@@ -94,6 +94,8 @@ class Announcement:
     requires_relay: bool = False
     relay_peer_id: str = ""        # peer_id of the relay handling this peer
     relay_address: str = ""        # "host:port" of the relay (for routing)
+    # Cross-ISP: libp2p peer ID for proxy forwarding through Circuit Relay.
+    libp2p_peer_id: str = ""
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:

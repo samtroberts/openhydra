@@ -226,6 +226,8 @@ class PeerEndpoint:
     requires_relay: bool = False
     relay_peer_id: str = ""
     relay_address: str = ""
+    # Cross-ISP: libp2p peer ID for proxy-forwarding through Circuit Relay.
+    libp2p_peer_id: str = ""
 
     @property
     def address(self) -> str:
@@ -303,6 +305,7 @@ class PeerEndpoint:
             requires_relay=bool(data.get("requires_relay", False)),
             relay_peer_id=str(data.get("relay_peer_id", "")),
             relay_address=str(data.get("relay_address", "")),
+            libp2p_peer_id=str(data.get("libp2p_peer_id", "")),
         )
 
     def replace(self, **overrides: Any) -> "PeerEndpoint":
@@ -500,11 +503,93 @@ def dedupe_peers(peers: list[PeerEndpoint]) -> list[PeerEndpoint]:
 class PathFinder:
     """Reachability and latency discovery over configurable transport."""
 
-    def __init__(self, timeout_ms: int = 700, transport_config: TransportConfig | None = None):
+    # Strict timeout for proxy pings through libp2p relay (seconds).
+    PROXY_PING_TIMEOUT_S = 2.0
+
+    def __init__(
+        self,
+        timeout_ms: int = 700,
+        transport_config: TransportConfig | None = None,
+        p2p_node: Any | None = None,
+    ):
         self.timeout_s = timeout_ms / 1000.0
         self.transport_config = transport_config or TransportConfig()
+        self._p2p_node = p2p_node
+
+    def _proxy_ping(self, peer: PeerEndpoint) -> PeerHealth | None:
+        """Ping a relay-required peer through libp2p proxy.
+
+        Sends a serialized PingRequest via ``p2p_node.proxy_forward()``.
+        Runs two pings: discards the first (cold start — relay setup,
+        DCUtR hole punch, TLS handshake) and uses the second for the
+        routing table.  Enforces a strict 2s timeout per ping attempt.
+
+        Returns a PeerHealth on success, or None if the proxy ping fails
+        (caller should fall back to trust-based default).
+        """
+        node = self._p2p_node
+        libp2p_id = peer.libp2p_peer_id
+        if node is None or not libp2p_id:
+            return None
+
+        ping_req = peer_pb2.PingRequest(sent_unix_ms=int(time.time() * 1000))
+        req_bytes = ping_req.SerializeToString()
+
+        import threading
+
+        for attempt in range(2):
+            result: list[Any] = [None, None]  # [resp_bytes | None, error | None]
+
+            def _do_proxy():
+                try:
+                    result[0] = node.proxy_forward(
+                        target_peer_id=libp2p_id,
+                        data=req_bytes,
+                    )
+                except Exception as exc:
+                    result[1] = exc
+
+            t0 = time.perf_counter()
+            thread = threading.Thread(target=_do_proxy, daemon=True)
+            thread.start()
+            thread.join(timeout=self.PROXY_PING_TIMEOUT_S)
+
+            if thread.is_alive() or result[1] is not None or result[0] is None:
+                # Timed out or errored — abandon
+                if attempt == 0:
+                    continue  # Try once more (warm-up may have partially connected)
+                return None
+
+            # Attempt 0 = warm-up (discard), attempt 1 = real measurement
+            if attempt == 0:
+                continue
+
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            try:
+                resp = peer_pb2.PingResponse()
+                resp.ParseFromString(bytes(result[0]))
+                return PeerHealth(
+                    peer=peer,
+                    healthy=bool(resp.ok),
+                    latency_ms=latency_ms,
+                    load_pct=float(resp.load_pct),
+                    daemon_mode=resp.daemon_mode,
+                )
+            except Exception:
+                return None
+
+        return None
 
     def ping(self, peer: PeerEndpoint) -> PeerHealth:
+        # For relay-required peers with a libp2p ID, try proxy ping first.
+        if peer.requires_relay and peer.libp2p_peer_id and self._p2p_node is not None:
+            proxy_result = self._proxy_ping(peer)
+            if proxy_result is not None:
+                return proxy_result
+            # Proxy ping failed — fall through to direct ping (will likely
+            # also fail for private IPs, but _scan_network has a trust
+            # fallback for relay peers).
+
         t0 = time.perf_counter()
         try:
             with create_channel(peer.address, self.transport_config) as channel:

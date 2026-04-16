@@ -33,6 +33,7 @@ from coordinator.degradation import DegradationDecision, DegradationPolicy, Mode
 from coordinator.path_finder import (
     PathFinder,
     PeerEndpoint,
+    PeerHealth,
     load_peer_config,
     load_peers_from_dht,
 )
@@ -277,6 +278,9 @@ class DiscoveryService:
                         layer_end=existing.layer_end,
                         total_layers=existing.total_layers,
                     )
+                # Merge libp2p_peer_id: carry forward from whichever has it.
+                if existing.libp2p_peer_id and not new_peer.libp2p_peer_id:
+                    new_peer = new_peer.replace(libp2p_peer_id=existing.libp2p_peer_id)
             deduped[key] = new_peer
         return list(deduped.values())
 
@@ -394,9 +398,16 @@ class DiscoveryService:
                 raise RuntimeError(f"dht_lookup_failed: {latest}") from latest
 
         # Rust Kademlia DHT discover (libp2p path).
-        # Skip if we already have peers from config/HTTP DHT (Kademlia queries
-        # block for up to 10s each and are redundant when peers are known).
-        if self._p2p_node is not None and not peers:
+        # Query Kademlia when we have relay peers missing libp2p_peer_id
+        # (needed for cross-ISP proxy), OR when no peers were found yet.
+        # Only query models that actually need it to avoid blocking.
+        _need_kademlia = not peers  # no peers at all
+        if not _need_kademlia:
+            # Check if any relay peer lacks a libp2p_peer_id
+            _need_kademlia = any(
+                p.requires_relay and not p.libp2p_peer_id for p in peers
+            )
+        if self._p2p_node is not None and _need_kademlia:
             for model_id in model_filter:
                 try:
                     libp2p_peers = self._p2p_node.discover(model_id=model_id)
@@ -414,6 +425,7 @@ class DiscoveryService:
                             relay_address=str(p.get("relay_address", "")),
                             runtime_backend=str(p.get("runtime_backend", "")),
                             runtime_model_id=str(p.get("runtime_model_id", "")),
+                            libp2p_peer_id=str(p.get("libp2p_peer_id", "")),
                         ))
                 except Exception as p2p_exc:
                     logger.debug("p2p_discover_error for %s: %s", model_id, p2p_exc)
@@ -491,12 +503,43 @@ class DiscoveryService:
         finder = PathFinder(
             timeout_ms=min(self.config.timeout_ms, 1200),
             transport_config=self.transport_config,
+            p2p_node=self._p2p_node,
         )
 
         survey = finder.survey(peers)
         self._record_ping_health(survey)
 
-        healthy = [h for h in survey if h.healthy and h.latency_ms <= self.config.max_latency_ms]
+        # Default latency estimate for relay peers that couldn't be pinged
+        # (neither directly nor via libp2p proxy).  High enough to be
+        # deprioritised by Dijkstra routing but low enough to pass the
+        # max_latency_ms gate (which defaults to 600s for sharded decode).
+        _RELAY_DEFAULT_LATENCY_MS = 500.0
+
+        healthy = []
+        for h in survey:
+            if h.healthy and h.latency_ms <= self.config.max_latency_ms:
+                healthy.append(h)
+            elif (
+                not h.healthy
+                and h.peer.requires_relay
+                and h.peer.libp2p_peer_id
+            ):
+                # Trust relay peers that failed direct ping — they are
+                # reachable through the libp2p Circuit Relay proxy.
+                # Assign a default latency so they participate in routing.
+                trusted = PeerHealth(
+                    peer=h.peer,
+                    healthy=True,
+                    latency_ms=_RELAY_DEFAULT_LATENCY_MS,
+                    load_pct=h.load_pct,
+                    daemon_mode=h.daemon_mode,
+                    error=None,
+                )
+                healthy.append(trusted)
+                logger.info(
+                    "relay_peer_trusted: peer=%s libp2p=%s default_latency=%.0fms",
+                    h.peer.peer_id, h.peer.libp2p_peer_id, _RELAY_DEFAULT_LATENCY_MS,
+                )
         available_peer_counts: dict[str, int] = {}
         for item in healthy:
             model_id = self._normalize_peer_model(item.peer)

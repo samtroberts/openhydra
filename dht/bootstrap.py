@@ -265,6 +265,10 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             "requires_relay": bool(payload.get("requires_relay", False)),
             "relay_peer_id": str(payload.get("relay_peer_id", "")),
             "relay_address": str(payload.get("relay_address", "")),
+            # Cross-ISP: libp2p peer ID for proxy forwarding through
+            # Circuit Relay. Required by coordinators to route gRPC
+            # through libp2p when direct connections are impossible.
+            "libp2p_peer_id": str(payload.get("libp2p_peer_id", "")),
         }
 
     @staticmethod

@@ -1239,6 +1239,7 @@ def _announce_loop(
             requires_relay=bool(getattr(service, '_requires_relay', False)),
             relay_peer_id=str(getattr(service, '_relay_peer_id', '')),
             relay_address=str(getattr(service, '_relay_address', '')),
+            libp2p_peer_id=str(getattr(p2p_node, 'libp2p_peer_id', '') if p2p_node is not None else ''),
         )
         try:
             # HTTP DHT announce (legacy path).
