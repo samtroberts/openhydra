@@ -901,21 +901,43 @@ class PyTorchRuntime:
 
             _is_multimodal = _is_multimodal_model_type(self.model_name)
 
-            if _pre_layer_indices and _is_multimodal:
-                # Multimodal checkpoints (Gemma 4) ship with vision/audio
-                # towers embedded in the same safetensors file, and their
-                # text decoder lives at ``model.model.language_model``
-                # rather than ``model.model``. Selective accelerate device_map
-                # chokes on this layout (dozens of aux components, mismatched
-                # prefixes). Strategy: load everything into CPU RAM in the
-                # checkpoint's native dtype, then ``_strip_multimodal_components``
-                # drops the vision/audio towers and out-of-shard layers before
-                # we move the text decoder onto the target device.
+            # Detect if the checkpoint has built-in quantization (FP8, etc.)
+            # that causes dequantization during loading, inflating peak VRAM
+            # beyond what selective device_map can handle on small GPUs.
+            _has_builtin_quant = False
+            try:
+                from transformers import AutoConfig as _QAC
+                _qcfg = _QAC.from_pretrained(
+                    self.model_name, trust_remote_code=False,
+                    local_files_only=_local_only,
+                )
+                _qc = getattr(_qcfg, "quantization_config", None)
+                if isinstance(_qc, dict) and _qc.get("quant_method") in ("fp8", "gptq", "awq"):
+                    _has_builtin_quant = True
+            except Exception:
+                pass
+
+            if _pre_layer_indices and (_is_multimodal or _has_builtin_quant):
+                # Multimodal checkpoints (Gemma 4) and FP8-quantized checkpoints
+                # need the CPU-first load path. Multimodal because the text
+                # decoder lives at ``model.model.language_model`` and selective
+                # device_map chokes on the layout. FP8 because dequantization
+                # to fp16 during loading inflates peak VRAM — 16 layers of a
+                # 27B model at fp16 + embeddings can exceed 15GB T4 VRAM.
+                # Strategy: load everything into CPU RAM, then strip unused
+                # layers before moving the shard onto the target device.
                 load_kwargs["device_map"] = {"": "cpu"}
                 load_kwargs["low_cpu_mem_usage"] = True
                 load_kwargs["torch_dtype"] = _native_dtype
-                self._multimodal_strip_layers = tuple(_pre_layer_indices)
-                self._multimodal_strip_dtype = _native_dtype
+                if _is_multimodal:
+                    self._multimodal_strip_layers = tuple(_pre_layer_indices)
+                    self._multimodal_strip_dtype = _native_dtype
+                else:
+                    # Reuse the MPS strip path but target CUDA/CPU as needed.
+                    # The post-load handler moves layers to the correct device.
+                    self._cpu_first_strip_layers = tuple(_pre_layer_indices)
+                    self._cpu_first_strip_dtype = _native_dtype
+                    self._cpu_first_strip_device = target  # "cuda" or "cpu"
             elif _pre_layer_indices and target == "mps":
                 # MPS sharding: accelerate's ``device_map`` doesn't support
                 # MPS as a target device. Load everything to CPU first, then
@@ -1072,6 +1094,45 @@ class PyTorchRuntime:
                 )
             self._mps_strip_layers = None
 
+        # CPU-first strip for FP8/quantized CUDA shards: load to CPU, swap
+        # unused layers with Identity, then move kept layers to CUDA.
+        _cpu_first_layer_indices = getattr(self, "_cpu_first_strip_layers", None)
+        if _cpu_first_layer_indices:
+            try:
+                _cf_dtype = getattr(self, "_cpu_first_strip_dtype", None) or torch.float16
+                _cf_device = getattr(self, "_cpu_first_strip_device", "cuda")
+                _id_replaced = _replace_offloaded_layers_with_identity(
+                    self._model, tuple(_cpu_first_layer_indices),
+                )
+                _target_dev = f"cuda:0" if _cf_device == "cuda" else _cf_device
+                _decoder_layers = _find_decoder_layer_list(self._model)
+                if _decoder_layers is not None:
+                    for _li in _cpu_first_layer_indices:
+                        if _li < len(_decoder_layers):
+                            _decoder_layers[_li].to(device=_target_dev, dtype=_cf_dtype)
+                _inner = getattr(self._model, "model", self._model)
+                _lm_inner = getattr(_inner, "language_model", None) or _inner
+                for _attr in ("embed_tokens", "norm", "rotary_emb"):
+                    _mod = getattr(_lm_inner, _attr, None)
+                    if _mod is not None and isinstance(_mod, torch.nn.Module):
+                        _mod.to(device=_target_dev, dtype=_cf_dtype)
+                if hasattr(self._model, "lm_head") and self._model.lm_head is not None:
+                    self._model.lm_head.to(device=_target_dev, dtype=_cf_dtype)
+                import gc as _gc2
+                _gc2.collect()
+                if _cf_device == "cuda":
+                    torch.cuda.empty_cache()
+                logging.info(
+                    "cpu_first_shard_strip: model=%s kept=%d identity_replaced=%d device=%s",
+                    self.model_name, len(_cpu_first_layer_indices), _id_replaced, _target_dev,
+                )
+            except Exception as _cf_exc:
+                logging.warning(
+                    "cpu_first_shard_strip_failed: model=%s err=%s",
+                    self.model_name, _cf_exc,
+                )
+            self._cpu_first_strip_layers = None
+
         # Skip .to() when using selective device_map (accelerate manages placement)
         # or when quantized weights are already on device.
         _dm = load_kwargs.get("device_map")
@@ -1082,11 +1143,15 @@ class PyTorchRuntime:
         elif isinstance(_dm, str) and _dm == "auto":
             # device_map="auto" means accelerate placed everything; don't move
             _has_selective_map = True
+        # _cpu_first_strip_layers is set to None after stripping completes.
+        # If it was originally set (not "sentinel"), the strip ran.
+        _cpu_first_stripped = getattr(self, "_cpu_first_strip_layers", "sentinel") is None
         if (
             not quantized_weights_loaded
             and not _has_selective_map
             and not _multimodal_stripped
             and not _mps_stripped
+            and not _cpu_first_stripped
         ):
             self._model.to(self._device)
         self._model.eval()
