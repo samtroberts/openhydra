@@ -890,22 +890,40 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                             prompt_token_ids=list(request.prompt_token_ids),
                         )
                         # Fire-and-forget: ring loop-back in background thread.
-                        # proxy_forward blocks (request-response), but the ring
-                        # doesn't need the response. Background thread prevents
-                        # the Forward() handler from blocking for 10s+ per hop.
+                        # IMPORTANT: Do NOT use _push_to_next_hop here — it rebuilds
+                        # the request with stage_index+1 and wrong shard layers.
+                        # The ring loop-back sends the pre-built _ring_req directly.
                         import threading as _ring_threading
-                        def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr, _rroute=list(_ring_route)):
+                        _ring_first_libp2p = str(request.ring_first_hop_libp2p_id or "")
+                        def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr,
+                                            _libp2p=_ring_first_libp2p):
                             try:
-                                logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s",
-                                            _rreq.request_id, _rreq.ring_tokens_remaining, _raddr)
-                                self._push_to_next_hop(
-                                    request=_rreq,
-                                    response=peer_pb2.ForwardResponse(),
-                                    next_address=_raddr,
-                                    remaining_route=_rroute,
-                                )
-                                logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d",
-                                            _rreq.request_id, _rreq.ring_tokens_remaining)
+                                logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
+                                            _rreq.request_id, _rreq.ring_tokens_remaining,
+                                            _raddr, _libp2p[:20] if _libp2p else "none")
+                                if self._p2p_node is not None and _libp2p:
+                                    self._p2p_node.proxy_forward(
+                                        target_peer_id=_libp2p,
+                                        data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                                    )
+                                    logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_relay",
+                                                _rreq.request_id, _rreq.ring_tokens_remaining)
+                                elif _raddr:
+                                    import grpc as _rl_grpc
+                                    _rl_ch = _rl_grpc.insecure_channel(
+                                        _raddr,
+                                        options=[
+                                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                                        ],
+                                    )
+                                    _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
+                                    _rl_stub.Forward(_rreq, timeout=60.0)
+                                    _rl_ch.close()
+                                    logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_grpc",
+                                                _rreq.request_id, _rreq.ring_tokens_remaining)
+                                else:
+                                    logger.error("RING_LOOPBACK_NO_ROUTE: req=%s", _rreq.request_id)
                             except Exception as _rl_exc:
                                 logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
                                              _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
