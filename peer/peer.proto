@@ -91,6 +91,8 @@ message ForwardRequest {
   // Faster serialization than repeated float — single memcpy vs per-element.
   // When non-empty, takes precedence over the `activation` field.
   bytes activation_packed = 43;
+  // Cross-ISP: coordinator's libp2p peer ID for PushResult relay routing.
+  string final_callback_libp2p_peer_id = 44;
 }
 
 // A single hop in the push-mode routing chain.
@@ -101,6 +103,8 @@ message PeerHop {
   uint32 shard_layer_start = 4;
   uint32 shard_layer_end = 5;
   uint32 shard_total_layers = 6;
+  // Cross-ISP: libp2p peer ID for relay proxy routing at each hop.
+  string libp2p_peer_id = 7;
 }
 
 // Acknowledgement from coordinator after receiving PushResult.
@@ -138,6 +142,9 @@ message ForwardResponse {
   string activation_quantization = 23;
   // TOPLOC: hash of activation for integrity verification (P2-B)
   bytes activation_hash = 24;
+  // Binary-packed float32 activation (zero-copy Rust encode).
+  // When non-empty, takes precedence over the `activation` field.
+  bytes activation_packed = 25;
 }
 
 message PeerStatusRequest {}

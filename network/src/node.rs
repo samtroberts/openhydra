@@ -400,6 +400,19 @@ impl PyP2PNode {
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 
+    /// Check if a peer is currently connected (direct or relayed).
+    fn is_peer_connected(&self, py: Python<'_>, peer_id: String) -> PyResult<bool> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::IsConnected {
+                peer_id,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// The libp2p PeerId (base58 multihash).
     #[getter]
     fn libp2p_peer_id(&self) -> &str {

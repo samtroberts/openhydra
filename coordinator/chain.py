@@ -880,6 +880,7 @@ class InferenceChain:
                 shard_layer_start=int(getattr(peer, "layer_start", 0)),
                 shard_layer_end=int(getattr(peer, "layer_end", 0)),
                 shard_total_layers=int(getattr(peer, "total_layers", 0)),
+                libp2p_peer_id=str(getattr(peer, "libp2p_peer_id", "") or ""),
             ))
 
         # Register the result callback
@@ -921,6 +922,9 @@ class InferenceChain:
             next_hop_peer_id=next_id,
             final_callback_address=callback_address,
             final_callback_request_id=rid,
+            final_callback_libp2p_peer_id=str(
+                getattr(getattr(self, '_p2p_node', None), 'libp2p_peer_id', '') or ''
+            ),
             remaining_route=route_hops[1:],  # Skip first peer (that's where we're sending)
         )
 

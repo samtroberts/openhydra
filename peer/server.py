@@ -769,6 +769,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         response=response,
                         callback_address=callback_addr,
                         callback_request_id=str(getattr(request, "final_callback_request_id", "") or ""),
+                        callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
                     )
                     return peer_pb2.ForwardResponse(
                         request_id=request.request_id,
@@ -872,13 +873,35 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 prompt_token_ids=list(request.prompt_token_ids),
             )
 
-            # Check if the next hop requires relay routing.
+            # Route to next hop: try direct gRPC first, fall back to relay proxy.
             _next_hop_libp2p_id = ""
             if remaining_route:
                 _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
-            if self._p2p_node is not None and _next_hop_libp2p_id:
-                # Route through libp2p Circuit Relay proxy.
-                resp_bytes = self._p2p_node.proxy_forward(
+
+            _sent_direct = False
+            if next_address:
+                try:
+                    channel = grpc.insecure_channel(
+                        next_address,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(next_req, timeout=5.0)  # Short timeout for direct attempt
+                    channel.close()
+                    _sent_direct = True
+                    logger.info(
+                        "push_forwarded_direct: req=%s stage=%d -> %s",
+                        request.request_id, request.stage_index, next_address,
+                    )
+                except Exception:
+                    pass  # Fall through to relay
+
+            if not _sent_direct and self._p2p_node is not None and _next_hop_libp2p_id:
+                # Direct failed or unavailable — route through libp2p relay.
+                self._p2p_node.proxy_forward(
                     target_peer_id=_next_hop_libp2p_id,
                     data=next_req.SerializeToString(),
                 )
@@ -886,19 +909,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     "push_forwarded_via_relay: req=%s stage=%d -> %s (libp2p=%s)",
                     request.request_id, request.stage_index, next_address, _next_hop_libp2p_id[:20],
                 )
-            else:
-                channel = grpc.insecure_channel(
-                    next_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                stub = peer_pb2_grpc.PeerStub(channel)
-                stub.Forward(next_req, timeout=60.0)
-                channel.close()
-                logger.info(
-                    "push_forwarded: req=%s stage=%d -> %s",
+            elif not _sent_direct:
+                logger.warning(
+                    "push_forward_no_route: req=%s stage=%d -> %s (no direct, no relay)",
                     request.request_id, request.stage_index, next_address,
                 )
         except Exception as exc:
@@ -1727,6 +1740,7 @@ def serve(
         mlx_eval_timeout_s=max(1.0, float(mlx_eval_timeout_s)),
         batch_window_ms=float(batch_window_ms),
         max_batch_size=max(1, int(max_batch_size)),
+        p2p_node=p2p_node,
     )
 
     # Autonomous rebalancer (Petals parity)
