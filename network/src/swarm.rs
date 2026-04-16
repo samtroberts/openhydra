@@ -58,10 +58,13 @@ pub fn build_swarm(
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
 
-    // Combine TCP with relay transport: try TCP first, fall back to relay.
+    // Combine relay + TCP transports. Relay is tried FIRST so that
+    // `/p2p-circuit` multiaddrs are handled by the relay client transport.
+    // TCP addresses (without `/p2p-circuit`) fail relay parsing and fall
+    // through to the TCP side.
     let combined_transport = libp2p::core::transport::OrTransport::new(
-        tcp_transport,
         relay_upgraded,
+        tcp_transport,
     )
     .map(|either_output, _| match either_output {
         futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),

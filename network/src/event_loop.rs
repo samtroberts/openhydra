@@ -139,6 +139,11 @@ pub async fn run_event_loop(
     // Listen on relay addresses through bootstrap nodes so peers behind
     // NAT can receive inbound connections via Circuit Relay v2.
     // This establishes a "reservation" with each relay node.
+    //
+    // The relay client transport expects a full address:
+    //   /ip4/X/tcp/Y/p2p/<RELAY_PEER_ID>/p2p-circuit
+    // With relay transport as the first branch of OrTransport, these
+    // addresses are routed to the relay client (not TCP).
     for relay_str in crate::relay::BOOTSTRAP_RELAYS {
         if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
             let listen_addr = relay_multiaddr
