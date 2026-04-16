@@ -62,6 +62,11 @@ pub enum SwarmCommand {
         request_id: String,
         data: Vec<u8>,
     },
+    /// Check if a peer is currently connected.
+    IsConnected {
+        peer_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -192,6 +197,13 @@ pub async fn run_event_loop(
                     }
                     Some(SwarmCommand::ProxyForward { peer_id, data, reply }) => {
                         handle_proxy_forward(&mut swarm, &peer_id, data, reply, &mut state);
+                    }
+                    Some(SwarmCommand::IsConnected { peer_id, reply }) => {
+                        let connected = match peer_id.parse::<PeerId>() {
+                            Ok(pid) => swarm.is_connected(&pid),
+                            Err(_) => false,
+                        };
+                        let _ = reply.send(connected);
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;

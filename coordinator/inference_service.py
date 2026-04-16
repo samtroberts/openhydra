@@ -694,15 +694,11 @@ class InferenceService:
 
         # Use push mode when enabled and pipeline has 2+ stages.
         # Push mode eliminates coordinator-mediated round-trips between stages.
-        # Disable push mode when any peer requires relay — push mode assumes
-        # direct gRPC connectivity between peers, which doesn't exist cross-ISP.
-        # The normal chain path routes each hop through the libp2p proxy.
-        _has_relay_peers = any(getattr(p, 'requires_relay', False) for p in pipeline)
+        # Relay peers use libp2p proxy_forward for push forwarding (WS4).
         if (
             self.config.push_mode_enabled
             and len(pipeline) >= 2
             and self.config.push_callback_address
-            and not _has_relay_peers
         ):
             result = chain.run_push(
                 prompt,
