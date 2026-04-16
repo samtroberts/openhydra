@@ -932,17 +932,31 @@ class InferenceChain:
 
         def _send_push():
             try:
-                first_addr = f"{first_peer.host}:{first_peer.port}"
-                channel = grpc.insecure_channel(
-                    first_addr,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                stub = peer_pb2_grpc.PeerStub(channel)
-                stub.Forward(req, timeout=min(self.timeout_s, 60.0))
-                channel.close()
+                _p2p = getattr(self, '_p2p_node', None)
+                _libp2p_id = str(getattr(first_peer, 'libp2p_peer_id', '') or '').strip()
+                if (
+                    _p2p is not None
+                    and getattr(first_peer, 'requires_relay', False)
+                    and _libp2p_id
+                ):
+                    # Route through libp2p Circuit Relay proxy
+                    resp_bytes = _p2p.proxy_forward(
+                        target_peer_id=_libp2p_id,
+                        data=req.SerializeToString(),
+                    )
+                    logging.info("push_sent_via_relay: peer=%s libp2p=%s", first_peer.peer_id, _libp2p_id[:20])
+                else:
+                    first_addr = f"{first_peer.host}:{first_peer.port}"
+                    channel = grpc.insecure_channel(
+                        first_addr,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(req, timeout=min(self.timeout_s, 60.0))
+                    channel.close()
             except Exception as exc:
                 logging.warning("push_send_failed: %s", exc)
 
