@@ -159,6 +159,36 @@ def _proxy_handler_loop(
                     p2p_node.respond_proxy(request_id=req_id, data=PROXY_METHOD_FIRE_FORGET)
                     _ff_request = peer_pb2.ForwardRequest()
                     _ff_request.ParseFromString(raw[1:])
+
+                    # ── Ring token emission on coordinator node ──
+                    # The ring handler on the last shard emits tokens and adds them
+                    # to ring_generated_ids. When the loop-back arrives here (stage 0,
+                    # ring_mode=True), the coordinator should emit the latest token
+                    # to its local ring queue so the inference_service can drain it.
+                    if (bool(getattr(_ff_request, "ring_mode", False))
+                            and _ff_request.stage_index == 0
+                            and _ff_request.ring_generated_ids):
+                        try:
+                            from coordinator.push_receiver import emit_ring_token
+                            _ring_cb = str(getattr(_ff_request, "final_callback_request_id", "") or "")
+                            _latest_token = int(_ff_request.ring_generated_ids[-1])
+                            emit_ring_token(_ring_cb, _latest_token)
+                            logging.info("ring_token_emitted_on_coordinator: token=%d remaining=%d",
+                                         _latest_token, int(_ff_request.ring_tokens_remaining))
+
+                            # If ring is done (remaining==0 or EOS), emit sentinel.
+                            _ring_eos = set(int(e) for e in _ff_request.ring_eos_ids)
+                            if _ff_request.ring_tokens_remaining <= 0 or _latest_token in _ring_eos:
+                                emit_ring_token(_ring_cb, None)
+                                logging.info("ring_complete_on_coordinator: tokens=%d",
+                                             len(_ff_request.ring_generated_ids))
+                                # Don't process further — ring is done.
+                                p2p_node.respond_proxy(
+                                    request_id=req_id, data=PROXY_METHOD_FIRE_FORGET)
+                                continue
+                        except Exception as _emit_exc:
+                            logging.warning("ring_emit_coordinator_failed: %s", _emit_exc)
+
                     def _ff_process(_req=_ff_request):
                         try:
                             logging.info("ASYNC_THREAD_START: req=%s stage=%d ring=%s",
