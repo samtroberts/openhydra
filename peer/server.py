@@ -864,22 +864,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     emit_ring_token(_ring_cb_id, _ring_token)
                     logger.info("ring_token_emitted: token=%d remaining=%d", _ring_token, _ring_remaining)
 
-                    if _ring_token in _ring_eos or _ring_remaining <= 0:
-                        # Ring complete — send sentinel + PushResult.
-                        emit_ring_token(_ring_cb_id, None)
-                        _final = peer_pb2.ForwardResponse(
-                            request_id=_ring_cb_id,
-                            peer_id=self.peer_id,
-                            activation=[float(t) for t in _ring_generated],
-                            stage_index=request.stage_index,
-                        )
-                        self._push_final_result(
-                            response=_final,
-                            callback_address=callback_addr,
-                            callback_request_id=_ring_cb_id,
-                            callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
-                        )
-                    else:
+                    # Always loop back to coordinator — the coordinator's fire-and-forget
+                    # handler emits tokens + sentinel. Even when remaining==0, the
+                    # coordinator needs the final token delivered via the loop-back.
+                    if True:
                         # Loop back to first peer with the new token.
                         _ring_route = list(request.ring_full_route)
                         _ring_next_addr = str(request.ring_first_hop_address)
