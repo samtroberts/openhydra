@@ -191,6 +191,96 @@ impl PyRustTensor {
     }
 }
 
+// ── DLPack import: Python tensor → packed bytes ─────────────────────
+
+/// Import a tensor via DLPack and encode it to packed activation bytes.
+///
+/// Extracts the `DLManagedTensor*` from a PyCapsule, validates the tensor
+/// is CPU/float32/contiguous, calls `encode_to_packed` for a single memcpy,
+/// and renames the capsule to "used_dltensor" per the DLPack protocol.
+///
+/// # Safety
+/// The capsule must be a valid PyCapsule containing a DLManagedTensor*.
+#[cfg(feature = "pyo3")]
+pub unsafe fn import_dlpack_and_encode(capsule_ptr: *mut pyo3::ffi::PyObject) -> Result<Vec<u8>, String> {
+    // Extract DLManagedTensor from the PyCapsule.
+    static DLTENSOR_NAME: &[u8] = b"dltensor\0";
+    let managed_ptr = pyo3::ffi::PyCapsule_GetPointer(
+        capsule_ptr,
+        DLTENSOR_NAME.as_ptr() as *const std::ffi::c_char,
+    ) as *mut DLManagedTensor;
+    if managed_ptr.is_null() {
+        return Err("DLPack capsule is empty or has wrong name".into());
+    }
+
+    let tensor = &(*managed_ptr).dl_tensor;
+
+    // Validate device: must be CPU (kDLCPU = 1).
+    if tensor.device.device_type != 1 {
+        return Err(format!(
+            "encode_activation requires CPU tensor, got device_type={}",
+            tensor.device.device_type
+        ));
+    }
+
+    // Validate dtype: must be float32 (code=2, bits=32, lanes=1).
+    if tensor.dtype.code != 2 || tensor.dtype.bits != 32 || tensor.dtype.lanes != 1 {
+        return Err(format!(
+            "encode_activation requires float32, got code={} bits={} lanes={}",
+            tensor.dtype.code, tensor.dtype.bits, tensor.dtype.lanes
+        ));
+    }
+
+    // Validate ndim: expect 2D [seq_len, hidden_size] or 3D [1, seq_len, hidden_size].
+    let (seq_len, hidden_size) = match tensor.ndim {
+        2 => {
+            let shape = std::slice::from_raw_parts(tensor.shape, 2);
+            (shape[0] as usize, shape[1] as usize)
+        }
+        3 => {
+            let shape = std::slice::from_raw_parts(tensor.shape, 3);
+            (shape[1] as usize, shape[2] as usize)
+        }
+        _ => {
+            return Err(format!(
+                "encode_activation expects 2D or 3D tensor, got ndim={}",
+                tensor.ndim
+            ));
+        }
+    };
+
+    // Validate contiguous (strides must be NULL or C-contiguous).
+    if !tensor.strides.is_null() {
+        let strides = std::slice::from_raw_parts(tensor.strides, tensor.ndim as usize);
+        // Check C-contiguous: last stride = 1, second-to-last = hidden_size, etc.
+        let expected_last = 1i64;
+        if *strides.last().unwrap_or(&0) != expected_last {
+            return Err("encode_activation requires contiguous tensor (call .contiguous() first)".into());
+        }
+    }
+
+    // Get the data pointer (applying byte_offset if non-zero).
+    let data_ptr = (tensor.data as *const u8).add(tensor.byte_offset as usize) as *const f32;
+
+    // Encode to packed bytes (single memcpy).
+    let packed = crate::activation::encode_to_packed(data_ptr, seq_len, hidden_size);
+
+    // Rename capsule to "used_dltensor" per DLPack protocol.
+    // This prevents double-consumption.
+    static USED_NAME: &[u8] = b"used_dltensor\0";
+    pyo3::ffi::PyCapsule_SetName(
+        capsule_ptr,
+        USED_NAME.as_ptr() as *const std::ffi::c_char,
+    );
+
+    // Call the deleter if present to free the producer's memory.
+    if let Some(deleter) = (*managed_ptr).deleter {
+        deleter(managed_ptr);
+    }
+
+    Ok(packed)
+}
+
 // ── Public constructor (Rust-only, not exposed to Python directly) ───
 
 /// Create a RustTensor from raw activation_packed bytes.
