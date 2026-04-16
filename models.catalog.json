@@ -26,6 +26,31 @@
     "description": "Qwen 3.5 35B-A3B FP8 \u2014 MoE (256 experts, 8 active), 40 layers, FP8 quantized. 4-peer sharding."
   },
   {
+    "model_id": "openhydra-qwen3.5-27b-fp8",
+    "hf_model_id": "Qwen/Qwen3.5-27B-FP8",
+    "draft_model_id": null,
+    "required_peers": 4,
+    "min_vram_gb": 28,
+    "shard_vram_gb": 7.0,
+    "shards_needed": 4,
+    "quality_tier": "frontier",
+    "recommended_quantization": "fp32",
+    "num_layers": 64,
+    "context_length": 262144,
+    "languages": [
+      "en",
+      "multilingual"
+    ],
+    "tags": [
+      "thinking",
+      "reasoning",
+      "large",
+      "fp8",
+      "shardable"
+    ],
+    "description": "Qwen 3.5 27B FP8 \u2014 frontier thinking model, 64 layers, hybrid linear+full attention, FP8 quantized. 4-peer sharding on T4 GPUs."
+  },
+  {
     "model_id": "openhydra-qwen3.5-27b",
     "hf_model_id": "Qwen/Qwen3.5-27B",
     "draft_model_id": "Qwen/Qwen3.5-0.8B",
