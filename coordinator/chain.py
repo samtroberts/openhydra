@@ -973,10 +973,10 @@ class InferenceChain:
                     channel.close()
                     logging.info("push_sent_direct: peer=%s", first_peer.peer_id)
                 elif _p2p is not None and _libp2p_id:
-                    # No direct connection — route via relay instantly.
+                    # Fire-and-forget: ACK instantly, inference runs async.
                     _p2p.proxy_forward(
                         target_peer_id=_libp2p_id,
-                        data=b'\x01' + req.SerializeToString(),  # 0x01 = Forward
+                        data=b'\x03' + req.SerializeToString(),  # 0x03 = fire-and-forget
                     )
                     logging.info("push_sent_via_relay: peer=%s libp2p=%s", first_peer.peer_id, _libp2p_id[:20])
                 else:
