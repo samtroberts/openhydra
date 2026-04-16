@@ -93,6 +93,15 @@ message ForwardRequest {
   bytes activation_packed = 43;
   // Cross-ISP: coordinator's libp2p peer ID for PushResult relay routing.
   string final_callback_libp2p_peer_id = 44;
+  // Ring autoregressive mode: tokens loop peer-to-peer without coordinator.
+  bool ring_mode = 45;                        // Enable ring autoregressive
+  uint32 ring_tokens_remaining = 46;          // Tokens left to generate
+  repeated int64 ring_generated_ids = 47;     // Accumulated token IDs so far
+  repeated int64 ring_eos_ids = 48;           // EOS token IDs (stop on match)
+  string ring_first_hop_address = 49;         // Address of first peer in ring
+  string ring_first_hop_peer_id = 50;         // peer_id of first peer
+  string ring_first_hop_libp2p_id = 51;       // libp2p_peer_id of first peer
+  repeated PeerHop ring_full_route = 52;      // Full route for ring reset
 }
 
 // A single hop in the push-mode routing chain.

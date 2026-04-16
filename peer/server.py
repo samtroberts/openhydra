@@ -123,18 +123,23 @@ def _derive_relay_addresses(
     return addrs
 
 
+# Proxy method prefix bytes for demultiplexing.
+PROXY_METHOD_FORWARD = b'\x01'      # ForwardRequest → call Forward()
+PROXY_METHOD_PUSH_RESULT = b'\x02'  # ForwardResponse → call PushResult()
+
+
 def _proxy_handler_loop(
     *,
     stop_event: threading.Event,
     p2p_node: Any,
     service: Any,
 ) -> None:
-    """Receive inbound proxy requests from libp2p and forward to local Forward().
+    """Receive inbound proxy requests from libp2p and demux to Forward/PushResult.
 
-    Remote peers send gRPC ForwardRequest bytes through the libp2p
-    request_response protocol. This thread polls for those requests,
-    deserializes the protobuf, calls PeerService.Forward() directly
-    (no gRPC round-trip), serializes the response, and sends it back.
+    Messages carry a 1-byte method prefix:
+      0x01 = ForwardRequest  → service.Forward()
+      0x02 = ForwardResponse → service.PushResult()
+    Legacy messages without prefix are treated as ForwardRequest (backward compat).
     """
     from peer import peer_pb2
     logging.info("proxy_handler_loop started")
@@ -143,20 +148,38 @@ def _proxy_handler_loop(
             pending = p2p_node.poll_proxy_request(timeout_ms=500)
             if pending is None:
                 continue
-            req_id, req_bytes = pending
+            req_id, raw_bytes = pending
+            raw = bytes(raw_bytes)
             try:
-                request = peer_pb2.ForwardRequest()
-                request.ParseFromString(bytes(req_bytes))
-                response = service.Forward(request, context=None)
-                resp_bytes = response.SerializeToString()
-                p2p_node.respond_proxy(request_id=req_id, data=resp_bytes)
+                # Demultiplex by method prefix byte.
+                if raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
+                    # PushResult path: ForwardResponse → PushResult RPC.
+                    push_resp = peer_pb2.ForwardResponse()
+                    push_resp.ParseFromString(raw[1:])
+                    ack = service.PushResult(push_resp, context=None)
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_PUSH_RESULT + ack.SerializeToString(),
+                    )
+                else:
+                    # Forward path (0x01 prefix or legacy no-prefix).
+                    payload = raw[1:] if raw and raw[0:1] == PROXY_METHOD_FORWARD else raw
+                    request = peer_pb2.ForwardRequest()
+                    request.ParseFromString(payload)
+                    response = service.Forward(request, context=None)
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_FORWARD + response.SerializeToString(),
+                    )
             except Exception as e:
-                logging.warning("proxy_handler_forward_error: req=%s err=%s", req_id, e)
+                logging.warning("proxy_handler_error: req=%s err=%s", req_id, e)
                 err_resp = peer_pb2.ForwardResponse(
-                    error=f"proxy_forward_failed: {e}",
-                    request_id=str(getattr(request, 'request_id', req_id)),
+                    error=f"proxy_handler_failed: {e}",
                 )
-                p2p_node.respond_proxy(request_id=req_id, data=err_resp.SerializeToString())
+                p2p_node.respond_proxy(
+                    request_id=req_id,
+                    data=PROXY_METHOD_FORWARD + err_resp.SerializeToString(),
+                )
         except Exception as e:
             if not stop_event.is_set():
                 logging.warning("proxy_handler_poll_error: %s", e)
@@ -777,8 +800,84 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         stage_index=request.stage_index,
                         error="",
                     )
+                elif bool(getattr(request, "ring_mode", False)) and not next_addr:
+                    # ── Ring autoregressive: last shard loops back to first ──
+                    _ring_activation = list(response.activation)
+                    _ring_token = int(round(float(_ring_activation[0]))) if _ring_activation else 0
+                    _ring_generated = list(request.ring_generated_ids) + [_ring_token]
+                    _ring_remaining = int(request.ring_tokens_remaining) - 1
+                    _ring_eos = set(int(e) for e in request.ring_eos_ids)
+                    _ring_cb_id = str(getattr(request, "final_callback_request_id", "") or "")
+
+                    # Emit token to coordinator's async queue (same process, zero-cost).
+                    from coordinator.push_receiver import emit_ring_token
+                    emit_ring_token(_ring_cb_id, _ring_token)
+                    logger.info("ring_token_emitted: token=%d remaining=%d", _ring_token, _ring_remaining)
+
+                    if _ring_token in _ring_eos or _ring_remaining <= 0:
+                        # Ring complete — send sentinel + PushResult.
+                        emit_ring_token(_ring_cb_id, None)
+                        _final = peer_pb2.ForwardResponse(
+                            request_id=_ring_cb_id,
+                            peer_id=self.peer_id,
+                            activation=[float(t) for t in _ring_generated],
+                            stage_index=request.stage_index,
+                        )
+                        self._push_final_result(
+                            response=_final,
+                            callback_address=callback_addr,
+                            callback_request_id=_ring_cb_id,
+                            callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                        )
+                    else:
+                        # Loop back to first peer with the new token.
+                        _ring_route = list(request.ring_full_route)
+                        _ring_next_addr = str(request.ring_first_hop_address)
+                        _ring_next_next = _ring_route[1].address if len(_ring_route) > 1 else ""
+                        _ring_next_next_id = _ring_route[1].peer_id if len(_ring_route) > 1 else ""
+                        _ring_req = peer_pb2.ForwardRequest(
+                            request_id=request.request_id,
+                            activation=[float(_ring_token)],
+                            stage_index=0,
+                            total_stages=request.total_stages,
+                            max_tokens=1,
+                            kv_session_id=request.kv_session_id,
+                            kv_store_activation=True,
+                            kv_use_cached_activation=True,
+                            decode_do_sample=request.decode_do_sample,
+                            decode_temperature=request.decode_temperature,
+                            decode_top_p=request.decode_top_p,
+                            decode_top_k=request.decode_top_k,
+                            decode_seed=request.decode_seed,
+                            shard_layer_start=_ring_route[0].shard_layer_start if _ring_route else 0,
+                            shard_layer_end=_ring_route[0].shard_layer_end if _ring_route else 0,
+                            shard_total_layers=_ring_route[0].shard_total_layers if _ring_route else 0,
+                            push_mode=True,
+                            ring_mode=True,
+                            ring_tokens_remaining=_ring_remaining,
+                            ring_generated_ids=_ring_generated,
+                            ring_eos_ids=list(request.ring_eos_ids),
+                            ring_first_hop_address=request.ring_first_hop_address,
+                            ring_first_hop_peer_id=request.ring_first_hop_peer_id,
+                            ring_first_hop_libp2p_id=request.ring_first_hop_libp2p_id,
+                            ring_full_route=_ring_route,
+                            next_hop_address=_ring_next_next,
+                            next_hop_peer_id=_ring_next_next_id,
+                            final_callback_address=callback_addr,
+                            final_callback_request_id=_ring_cb_id,
+                            final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                            remaining_route=_ring_route[1:],
+                            prompt_token_ids=list(request.prompt_token_ids),
+                        )
+                        self._push_to_next_hop(
+                            request=_ring_req,
+                            response=peer_pb2.ForwardResponse(),
+                            next_address=_ring_next_addr,
+                            remaining_route=_ring_route,
+                        )
+
                 elif callback_addr:
-                    # Last peer: send result back to coordinator
+                    # Last peer: send result back to coordinator (non-ring push)
                     self._push_final_result(
                         response=response,
                         callback_address=callback_addr,
@@ -923,7 +1022,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 # No direct connection — route through relay instantly (no delay).
                 self._p2p_node.proxy_forward(
                     target_peer_id=_next_hop_libp2p_id,
-                    data=next_req.SerializeToString(),
+                    data=PROXY_METHOD_FORWARD + next_req.SerializeToString(),
                 )
                 logger.info(
                     "push_forwarded_via_relay: req=%s stage=%d -> %s (libp2p=%s)",
@@ -998,10 +1097,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     response.request_id, callback_address,
                 )
             elif self._p2p_node is not None and _cb_libp2p:
-                # No direct connection — route through relay instantly.
+                # No direct connection — route PushResult through relay.
                 self._p2p_node.proxy_forward(
                     target_peer_id=_cb_libp2p,
-                    data=response.SerializeToString(),
+                    data=PROXY_METHOD_PUSH_RESULT + response.SerializeToString(),
                 )
                 logger.info(
                     "push_result_sent_via_relay: req=%s -> %s (libp2p=%s)",

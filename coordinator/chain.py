@@ -334,13 +334,17 @@ class InferenceChain:
             _p2p_node = getattr(self, '_p2p_node', None)
             _peer_libp2p_id = str(getattr(peer, 'libp2p_peer_id', '') or '').strip()
             if _p2p_node is not None and getattr(peer, 'requires_relay', False) and _peer_libp2p_id:
-                req_bytes = req.SerializeToString()
+                req_bytes = b'\x01' + req.SerializeToString()  # 0x01 = ForwardRequest
                 resp_bytes = _p2p_node.proxy_forward(
                     target_peer_id=_peer_libp2p_id,
                     data=req_bytes,
                 )
+                # Strip method prefix from response.
+                raw_resp = bytes(resp_bytes)
+                if raw_resp and raw_resp[0:1] in (b'\x01', b'\x02'):
+                    raw_resp = raw_resp[1:]
                 response = peer_pb2.ForwardResponse()
-                response.ParseFromString(bytes(resp_bytes))
+                response.ParseFromString(raw_resp)
             else:
                 with create_channel(peer.address, self.transport_config) as channel:
                     stub = peer_pb2_grpc.PeerStub(channel)
@@ -972,7 +976,7 @@ class InferenceChain:
                     # No direct connection — route via relay instantly.
                     _p2p.proxy_forward(
                         target_peer_id=_libp2p_id,
-                        data=req.SerializeToString(),
+                        data=b'\x01' + req.SerializeToString(),  # 0x01 = Forward
                     )
                     logging.info("push_sent_via_relay: peer=%s libp2p=%s", first_peer.peer_id, _libp2p_id[:20])
                 else:
@@ -1043,6 +1047,127 @@ class InferenceChain:
             latency_ms=total_ms,
             activation_hash=bytes(getattr(result_response, "activation_hash", b"")),
         )
+
+
+    def run_push_ring(
+        self,
+        *,
+        initial_activation: list[float],
+        max_tokens: int,
+        ring_eos_ids: list[int],
+        kv_session_id: str = "",
+        callback_address: str = "",
+        request_id: str | None = None,
+        **decode_controls,
+    ) -> None:
+        """Kick off a ring autoregressive push — fire-and-forget.
+
+        Sends the initial ForwardRequest to the first peer with ring_mode=True.
+        Tokens circulate peer-to-peer until max_tokens or EOS. Each token is
+        emitted via emit_ring_token() to the coordinator's asyncio.Queue.
+        """
+        n = len(self.pipeline)
+        rid = request_id or str(__import__("uuid").uuid4())
+
+        route_hops = []
+        for i, peer in enumerate(self.pipeline):
+            route_hops.append(peer_pb2.PeerHop(
+                peer_id=peer.peer_id,
+                address=f"{peer.host}:{peer.port}",
+                stage_index=i,
+                shard_layer_start=int(getattr(peer, "layer_start", 0)),
+                shard_layer_end=int(getattr(peer, "layer_end", 0)),
+                shard_total_layers=int(getattr(peer, "total_layers", 0)),
+                libp2p_peer_id=str(getattr(peer, "libp2p_peer_id", "") or ""),
+            ))
+
+        first_peer = self.pipeline[0]
+        next_addr = f"{self.pipeline[1].host}:{self.pipeline[1].port}" if n > 1 else ""
+        next_id = self.pipeline[1].peer_id if n > 1 else ""
+
+        import struct as _ring_struct
+        _ring_packed = _ring_struct.pack(f'<{len(initial_activation)}f', *initial_activation)
+
+        req = peer_pb2.ForwardRequest(
+            request_id=rid,
+            prompt="",
+            activation=[],
+            activation_packed=_ring_packed,
+            stage_index=0,
+            total_stages=n,
+            max_tokens=1,
+            kv_session_id=kv_session_id,
+            kv_store_activation=True,
+            kv_use_cached_activation=False,  # First step = prefill
+            decode_do_sample=bool(decode_controls.get("decode_do_sample", False)),
+            decode_temperature=float(decode_controls.get("decode_temperature", 0.0) or 0.0),
+            decode_top_p=float(decode_controls.get("decode_top_p", 0.0) or 0.0),
+            decode_top_k=int(decode_controls.get("decode_top_k", 0) or 0),
+            decode_seed=int(decode_controls.get("decode_seed", 0) or 0),
+            shard_layer_start=int(getattr(first_peer, "layer_start", 0)),
+            shard_layer_end=int(getattr(first_peer, "layer_end", 0)),
+            shard_total_layers=int(getattr(first_peer, "total_layers", 0)),
+            push_mode=True,
+            ring_mode=True,
+            ring_tokens_remaining=max_tokens,
+            ring_generated_ids=[],
+            ring_eos_ids=ring_eos_ids,
+            ring_first_hop_address=f"{first_peer.host}:{first_peer.port}",
+            ring_first_hop_peer_id=first_peer.peer_id,
+            ring_first_hop_libp2p_id=str(getattr(first_peer, "libp2p_peer_id", "") or ""),
+            ring_full_route=route_hops,
+            next_hop_address=next_addr,
+            next_hop_peer_id=next_id,
+            final_callback_address=callback_address,
+            final_callback_request_id=rid,
+            final_callback_libp2p_peer_id=str(
+                getattr(getattr(self, '_p2p_node', None), 'libp2p_peer_id', '') or ''
+            ),
+            remaining_route=route_hops[1:],
+        )
+
+        # Fire-and-forget in background thread (same as run_push).
+        import threading as _ring_threading
+
+        def _send_ring():
+            try:
+                _p2p = getattr(self, '_p2p_node', None)
+                _libp2p_id = str(getattr(first_peer, 'libp2p_peer_id', '') or '').strip()
+                _has_direct = False
+                if _p2p is not None and _libp2p_id:
+                    try:
+                        _has_direct = _p2p.is_peer_connected(_libp2p_id)
+                    except Exception:
+                        pass
+                if _has_direct:
+                    first_addr = f"{first_peer.host}:{first_peer.port}"
+                    channel = grpc.insecure_channel(first_addr, options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ])
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(req, timeout=60.0)
+                    channel.close()
+                elif _p2p is not None and _libp2p_id:
+                    _p2p.proxy_forward(target_peer_id=_libp2p_id, data=b'\x01' + req.SerializeToString())
+                else:
+                    first_addr = f"{first_peer.host}:{first_peer.port}"
+                    channel = grpc.insecure_channel(first_addr, options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ])
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(req, timeout=60.0)
+                    channel.close()
+            except Exception as exc:
+                logging.warning("ring_push_send_failed: %s", exc)
+                # Emit sentinel so the coordinator doesn't hang.
+                from coordinator.push_receiver import emit_ring_token
+                emit_ring_token(rid, None)
+
+        _ring_thread = _ring_threading.Thread(target=_send_ring, daemon=True)
+        _ring_thread.start()
+        logging.info("ring_push_started: req=%s tokens=%d stages=%d", rid, max_tokens, n)
 
 
 def _suite_name(level: str) -> str:
