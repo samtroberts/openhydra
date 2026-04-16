@@ -2403,8 +2403,11 @@ class PyTorchRuntime:
                     else:
                         shared_cache = DynamicCache()
                     # Non-Qwen3.5: patch has_previous_state for Mamba compat.
+                    # Must be callable — Qwen3.5 model code calls cache.has_previous_state()
+                    # and cache.has_previous_state(layer_idx).
                     if not hasattr(shared_cache, "has_previous_state"):
-                        shared_cache.has_previous_state = (past_key_values is not None)
+                        _has_state = (past_key_values is not None)
+                        shared_cache.has_previous_state = lambda *_args, **_kw: _has_state
             except Exception as _cache_exc:
                 logging.debug(
                     "run_layers_dynamic_cache_init_failed: %s — falling back to cache-less forward",
@@ -2461,7 +2464,8 @@ class PyTorchRuntime:
                 if hasattr(shared_cache, "has_previous_state") and not isinstance(
                     type(shared_cache).__dict__.get("has_previous_state"), property
                 ):
-                    shared_cache.has_previous_state = True
+                    # Must stay callable — model code calls cache.has_previous_state()
+                    shared_cache.has_previous_state = lambda *_args, **_kw: True
             except (AttributeError, TypeError):
                 pass  # Property or read-only — auto-detects state
             return output, shared_cache
