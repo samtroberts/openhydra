@@ -161,9 +161,16 @@ def _proxy_handler_loop(
                     _ff_request.ParseFromString(raw[1:])
                     def _ff_process(_req=_ff_request):
                         try:
+                            logging.info("ASYNC_THREAD_START: req=%s stage=%d ring=%s",
+                                         _req.request_id, _req.stage_index,
+                                         bool(getattr(_req, "ring_mode", False)))
                             service.Forward(_req, context=None)
+                            logging.info("ASYNC_THREAD_DONE: req=%s stage=%d",
+                                         _req.request_id, _req.stage_index)
                         except Exception as _ff_exc:
-                            logging.warning("fire_forget_forward_error: %s", _ff_exc)
+                            logging.error("ASYNC_THREAD_CRASH: req=%s stage=%d err=%s",
+                                          _req.request_id, _req.stage_index, _ff_exc,
+                                          exc_info=True)
                     threading.Thread(target=_ff_process, daemon=True).start()
                 elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                     # PushResult path: ForwardResponse → PushResult RPC.
@@ -887,13 +894,22 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         # doesn't need the response. Background thread prevents
                         # the Forward() handler from blocking for 10s+ per hop.
                         import threading as _ring_threading
-                        def _ring_loop_back():
-                            self._push_to_next_hop(
-                                request=_ring_req,
-                                response=peer_pb2.ForwardResponse(),
-                                next_address=_ring_next_addr,
-                                remaining_route=_ring_route,
-                            )
+                        def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr, _rroute=list(_ring_route)):
+                            try:
+                                logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s",
+                                            _rreq.request_id, _rreq.ring_tokens_remaining, _raddr)
+                                self._push_to_next_hop(
+                                    request=_rreq,
+                                    response=peer_pb2.ForwardResponse(),
+                                    next_address=_raddr,
+                                    remaining_route=_rroute,
+                                )
+                                logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d",
+                                            _rreq.request_id, _rreq.ring_tokens_remaining)
+                            except Exception as _rl_exc:
+                                logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
+                                             _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
+                                             exc_info=True)
                         _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
 
                 elif callback_addr:
@@ -1057,7 +1073,8 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     request.request_id, request.stage_index,
                 )
         except Exception as exc:
-            logger.warning("push_forward_failed: %s -> %s: %s", self.peer_id, next_address, exc)
+            logger.error("PUSH_FORWARD_CRASH: %s -> %s: %s", self.peer_id, next_address, exc,
+                         exc_info=True)
 
     def _push_final_result(
         self,
