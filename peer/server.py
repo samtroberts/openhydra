@@ -69,8 +69,13 @@ from peer.tls import load_server_credentials
 from peer import peer_pb2
 from peer import peer_pb2_grpc
 from openhydra_secrets import is_insecure_secret_value, load_secret_store
-from torrent.session import SessionBootstrapConfig, TorrentSessionManager
-from torrent.seeder import ArbitrationConfig
+try:
+    from torrent.session import SessionBootstrapConfig, TorrentSessionManager
+    from torrent.seeder import ArbitrationConfig
+except ImportError:
+    SessionBootstrapConfig = None  # type: ignore[assignment,misc]
+    TorrentSessionManager = None  # type: ignore[assignment,misc]
+    ArbitrationConfig = None  # type: ignore[assignment,misc]
 
 GRPC_MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 GRPC_SERVER_OPTIONS: list[tuple[str, int]] = [
