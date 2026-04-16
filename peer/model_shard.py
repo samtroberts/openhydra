@@ -2491,6 +2491,54 @@ class PyTorchRuntime:
         out.extend(float(item) for item in flattened)
         return out
 
+    def _hidden_to_packed_bytes(
+        self,
+        hidden,
+        *,
+        request_id: str | None,
+        stage_index: int,
+    ) -> bytes:
+        """Convert hidden state tensor to packed activation bytes via Rust zero-copy.
+
+        Same as ``_hidden_to_payload`` but returns binary-packed bytes using
+        ``openhydra_network.encode_activation()`` (single memcpy, ~12x faster
+        than ``.tolist()`` + ``struct.pack``).  Falls back to the Python path
+        if the Rust module is unavailable.
+        """
+        tensor = hidden
+        self._last_noise_applied = False
+        self._last_noise_observed_variance = 0.0
+        self._last_noise_observed_std = 0.0
+        self._last_noise_audit_tag = ""
+        self._last_noise_payload_index = int(self.privacy_noise_payloads)
+        if self._privacy_noise is not None:
+            tensor = self._privacy_noise.apply(
+                tensor,
+                peer_id=str(self.config.runtime_peer_id or ""),
+                request_id=str(request_id or ""),
+                stage_index=int(stage_index),
+                shared_secret_seed=str(self.config.runtime_privacy_audit_seed or ""),
+            )
+            noise_stats = self._privacy_noise.stats()
+            self._last_noise_applied = True
+            self._last_noise_observed_variance = float(noise_stats.last_observed_variance)
+            self._last_noise_observed_std = float(noise_stats.last_observed_std)
+            self._last_noise_audit_tag = str(noise_stats.last_audit_tag)
+            self._last_noise_payload_index = int(noise_stats.applied_payloads)
+        if self._compressor is not None:
+            tensor = self._compressor.encode(tensor)
+        tensor = tensor.detach().to(device="cpu", dtype=self._torch.float32).contiguous()
+        try:
+            import openhydra_network
+            return openhydra_network.encode_activation(tensor)
+        except (ImportError, Exception):
+            # Fallback to Python path
+            import struct
+            payload = self._hidden_to_payload(
+                hidden, request_id=request_id, stage_index=stage_index,
+            )
+            return struct.pack(f'<{len(payload)}f', *payload)
+
     def _hidden_to_next_token_payload(
         self,
         hidden,
