@@ -82,6 +82,34 @@ impl ActivationBuffer {
     }
 }
 
+/// Encode a float32 buffer into the packed activation format.
+///
+/// Inverse of `ActivationBuffer::from_packed`. Writes an 8-byte header
+/// (seq_len, hidden_size as little-endian float32) followed by a memcpy
+/// of the raw float data.
+///
+/// # Safety
+/// `data_ptr` must point to `seq_len * hidden_size` contiguous float32s.
+pub unsafe fn encode_to_packed(
+    data_ptr: *const f32,
+    seq_len: usize,
+    hidden_size: usize,
+) -> Vec<u8> {
+    let n_floats = seq_len * hidden_size;
+    let payload_bytes = n_floats * 4;
+    let mut packed = Vec::with_capacity(8 + payload_bytes);
+
+    // Header: seq_len and hidden_size as little-endian float32.
+    packed.extend_from_slice(&(seq_len as f32).to_le_bytes());
+    packed.extend_from_slice(&(hidden_size as f32).to_le_bytes());
+
+    // Payload: single memcpy of the float buffer.
+    let src = std::slice::from_raw_parts(data_ptr as *const u8, payload_bytes);
+    packed.extend_from_slice(src);
+
+    packed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +147,16 @@ mod tests {
     #[test]
     fn test_from_packed_too_short() {
         assert!(ActivationBuffer::from_packed(vec![0, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let payload: [f32; 6] = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5];
+        let packed = unsafe { super::encode_to_packed(payload.as_ptr(), 2, 3) };
+
+        let buf = ActivationBuffer::from_packed(packed).unwrap();
+        assert_eq!(buf.seq_len, 2);
+        assert_eq!(buf.hidden_size, 3);
+        assert_eq!(buf.as_floats(), &payload);
     }
 }

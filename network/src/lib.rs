@@ -44,6 +44,7 @@ mod python {
         m.add_class::<crate::node::PyP2PNode>()?;
         m.add_class::<crate::dlpack::PyRustTensor>()?;
         m.add_function(wrap_pyfunction!(decode_activation, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_activation, m)?)?;
         Ok(())
     }
 
@@ -56,5 +57,34 @@ mod python {
     fn decode_activation(packed: Vec<u8>) -> PyResult<crate::dlpack::PyRustTensor> {
         crate::dlpack::rust_tensor_from_packed(packed)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    }
+
+    /// Encode a tensor into packed activation bytes via DLPack (zero-copy).
+    ///
+    /// Accepts any tensor implementing `__dlpack__()` (PyTorch, MLX via torch bridge).
+    /// Extracts the raw float32 pointer, writes an 8-byte header (seq_len, hidden_size),
+    /// and performs a single memcpy of the float buffer. Returns Python `bytes`.
+    ///
+    /// The tensor must be:
+    ///   - CPU device
+    ///   - float32 dtype
+    ///   - contiguous (call `.contiguous()` first if needed)
+    ///   - 2D [seq_len, hidden_size] or 3D [1, seq_len, hidden_size]
+    ///
+    /// Usage:
+    ///     packed = openhydra_network.encode_activation(hidden_state)
+    ///     # packed is bytes, ready for protobuf activation_packed field
+    #[pyfunction]
+    fn encode_activation(py: Python<'_>, tensor: PyObject) -> PyResult<PyObject> {
+        // Call tensor.__dlpack__() to get the PyCapsule.
+        let capsule = tensor.call_method0(py, "__dlpack__")?;
+        let capsule_ptr = capsule.as_ptr();
+
+        // Import the tensor via DLPack and encode to packed bytes.
+        let packed = unsafe { crate::dlpack::import_dlpack_and_encode(capsule_ptr) }
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+        // Return as Python bytes.
+        Ok(pyo3::types::PyBytes::new(py, &packed).into())
     }
 }
