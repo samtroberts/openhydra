@@ -946,6 +946,26 @@ class InferenceService:
         # assume every peer runs the complete model).
         _sharded_pipeline = self._engine._select_pipeline_sharded(health)
         if _sharded_pipeline is not None:
+            # Inject libp2p_peer_id into pipeline peers missing it.
+            # The local peer's auto-config doesn't carry libp2p_peer_id through
+            # the health check, causing push mode to use direct gRPC instead of
+            # relay. Remote peers get their ID from the DHT; only the local peer
+            # needs patching.
+            _local_p2p = getattr(self.discovery_service, '_p2p_node', None)
+            if _local_p2p is not None:
+                _local_libp2p = str(getattr(_local_p2p, 'libp2p_peer_id', '') or '')
+                _local_oh_id = str(getattr(_local_p2p, 'openhydra_peer_id', '') or '')
+                for _i, _sp in enumerate(_sharded_pipeline):
+                    if not _sp.libp2p_peer_id and _local_libp2p:
+                        # Patch: this peer is missing libp2p_peer_id.
+                        # If it's the local peer (host=127.0.0.1 or matching peer_id),
+                        # inject our own ID. Otherwise leave it empty.
+                        _is_local = _sp.host in ("127.0.0.1", "localhost", "0.0.0.0")
+                        if _is_local:
+                            _sharded_pipeline[_i] = _sp.replace(
+                                libp2p_peer_id=_local_libp2p,
+                                requires_relay=True,
+                            )
             return InferencePreparation(
                 effective_prompt=effective_prompt,
                 snippets=snippets,

@@ -984,9 +984,19 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 next_hop_peer_id=next_next_id,
                 final_callback_address=request.final_callback_address,
                 final_callback_request_id=request.final_callback_request_id,
+                final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
                 remaining_route=next_route,
                 # Gemma 4 needs prompt_token_ids at every stage for per-layer inputs.
                 prompt_token_ids=list(request.prompt_token_ids),
+                # Ring mode fields — must carry forward for the ring to function.
+                ring_mode=bool(getattr(request, "ring_mode", False)),
+                ring_tokens_remaining=int(getattr(request, "ring_tokens_remaining", 0)),
+                ring_generated_ids=list(getattr(request, "ring_generated_ids", [])),
+                ring_eos_ids=list(getattr(request, "ring_eos_ids", [])),
+                ring_first_hop_address=str(getattr(request, "ring_first_hop_address", "") or ""),
+                ring_first_hop_peer_id=str(getattr(request, "ring_first_hop_peer_id", "") or ""),
+                ring_first_hop_libp2p_id=str(getattr(request, "ring_first_hop_libp2p_id", "") or ""),
+                ring_full_route=list(getattr(request, "ring_full_route", [])),
             )
 
             # State-aware routing: ask the Rust bridge if a direct (non-relayed)
@@ -995,30 +1005,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             if remaining_route:
                 _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
 
-            _has_direct = False
             if self._p2p_node is not None and _next_hop_libp2p_id:
-                try:
-                    _has_direct = self._p2p_node.is_peer_connected(_next_hop_libp2p_id)
-                except Exception:
-                    pass
-
-            if _has_direct and next_address:
-                # DCUtR hole punch succeeded — use direct gRPC (fastest path).
-                channel = grpc.insecure_channel(
-                    next_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                stub = peer_pb2_grpc.PeerStub(channel)
-                stub.Forward(next_req, timeout=60.0)
-                channel.close()
-                logger.info(
-                    "push_forwarded_direct: req=%s stage=%d -> %s",
-                    request.request_id, request.stage_index, next_address,
-                )
-            elif self._p2p_node is not None and _next_hop_libp2p_id:
                 # No direct connection — route through relay instantly (no delay).
                 self._p2p_node.proxy_forward(
                     target_peer_id=_next_hop_libp2p_id,

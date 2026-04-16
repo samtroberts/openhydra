@@ -1071,6 +1071,12 @@ class InferenceChain:
 
         route_hops = []
         for i, peer in enumerate(self.pipeline):
+            _hop_libp2p = str(getattr(peer, "libp2p_peer_id", "") or "")
+            logging.info(
+                "ring_route_hop: stage=%d peer=%s libp2p=%s host=%s relay=%s",
+                i, peer.peer_id, _hop_libp2p[:25] or "EMPTY", peer.host,
+                getattr(peer, "requires_relay", "?"),
+            )
             route_hops.append(peer_pb2.PeerHop(
                 peer_id=peer.peer_id,
                 address=f"{peer.host}:{peer.port}",
@@ -1078,7 +1084,7 @@ class InferenceChain:
                 shard_layer_start=int(getattr(peer, "layer_start", 0)),
                 shard_layer_end=int(getattr(peer, "layer_end", 0)),
                 shard_total_layers=int(getattr(peer, "total_layers", 0)),
-                libp2p_peer_id=str(getattr(peer, "libp2p_peer_id", "") or ""),
+                libp2p_peer_id=_hop_libp2p,
             ))
 
         first_peer = self.pipeline[0]
