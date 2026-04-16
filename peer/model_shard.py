@@ -2379,23 +2379,32 @@ class PyTorchRuntime:
         # sharded ``_run_layers`` can drive the same state machine.
         if use_cache and shared_cache is None:
             try:
-                from transformers.cache_utils import DynamicCache
                 _cfg = getattr(self._model, "config", None)
+                # Qwen3.5 hybrid Mamba architecture needs Qwen3_5DynamicCache
+                # which carries conv_states + ssm_states alongside KV cache.
+                # Plain DynamicCache crashes with "has no attribute 'conv_states'".
+                _used_qwen3_5_cache = False
                 if _cfg is not None:
-                    try:
-                        shared_cache = DynamicCache(config=_cfg)
-                    except TypeError:
+                    _model_type = str(getattr(_cfg, "model_type", "")).lower()
+                    if "qwen3_5" in _model_type:
+                        try:
+                            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+                            shared_cache = Qwen3_5DynamicCache(config=_cfg)
+                            _used_qwen3_5_cache = True
+                        except Exception:
+                            pass
+                if not _used_qwen3_5_cache:
+                    from transformers.cache_utils import DynamicCache
+                    if _cfg is not None:
+                        try:
+                            shared_cache = DynamicCache(config=_cfg)
+                        except TypeError:
+                            shared_cache = DynamicCache()
+                    else:
                         shared_cache = DynamicCache()
-                else:
-                    shared_cache = DynamicCache()
-                # Qwen3.5 linear_attn blocks check cache.has_previous_state
-                # (Mamba-style recurrent state). DynamicCache doesn't have
-                # this — patch it so linear_attn treats the first call as
-                # "no prior state" (initializes fresh) and subsequent calls
-                # as "has state" (reads from cache). The attribute is set
-                # to True after the first _run_layers pass completes.
-                if not hasattr(shared_cache, "has_previous_state"):
-                    shared_cache.has_previous_state = (past_key_values is not None)
+                    # Non-Qwen3.5: patch has_previous_state for Mamba compat.
+                    if not hasattr(shared_cache, "has_previous_state"):
+                        shared_cache.has_previous_state = (past_key_values is not None)
             except Exception as _cache_exc:
                 logging.debug(
                     "run_layers_dynamic_cache_init_failed: %s — falling back to cache-less forward",
@@ -2446,8 +2455,15 @@ class PyTorchRuntime:
         if shared_cache is not None:
             # Mark that we now have state — next decode step's linear_attn
             # blocks will read from the cache instead of initializing fresh.
-            if hasattr(shared_cache, "has_previous_state") and not callable(getattr(shared_cache, "has_previous_state", None)):
-                shared_cache.has_previous_state = True
+            # Qwen3_5DynamicCache has has_previous_state as a property (auto-detects
+            # from conv_states) — skip the set for property-based caches.
+            try:
+                if hasattr(shared_cache, "has_previous_state") and not isinstance(
+                    type(shared_cache).__dict__.get("has_previous_state"), property
+                ):
+                    shared_cache.has_previous_state = True
+            except (AttributeError, TypeError):
+                pass  # Property or read-only — auto-detects state
             return output, shared_cache
         return output, tuple(present_key_values)
 
