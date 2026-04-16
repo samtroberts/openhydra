@@ -694,11 +694,15 @@ class InferenceService:
 
         # Use push mode when enabled and pipeline has 2+ stages.
         # Push mode eliminates coordinator-mediated round-trips between stages.
-        # Relay peers use libp2p proxy_forward for push forwarding (WS4).
+        # Disable push for relay peers until persistent relay circuits are
+        # implemented — the direct-first fallback timeout adds latency and
+        # relay circuit churn causes ConnectionClosed errors.
+        _has_relay_peers = any(getattr(p, 'requires_relay', False) for p in pipeline)
         if (
             self.config.push_mode_enabled
             and len(pipeline) >= 2
             and self.config.push_callback_address
+            and not _has_relay_peers
         ):
             result = chain.run_push(
                 prompt,
