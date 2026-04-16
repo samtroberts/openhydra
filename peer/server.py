@@ -124,8 +124,9 @@ def _derive_relay_addresses(
 
 
 # Proxy method prefix bytes for demultiplexing.
-PROXY_METHOD_FORWARD = b'\x01'      # ForwardRequest → call Forward()
+PROXY_METHOD_FORWARD = b'\x01'      # ForwardRequest → call Forward(), block for response
 PROXY_METHOD_PUSH_RESULT = b'\x02'  # ForwardResponse → call PushResult()
+PROXY_METHOD_FIRE_FORGET = b'\x03'  # ForwardRequest → ACK immediately, Forward() in background
 
 
 def _proxy_handler_loop(
@@ -152,7 +153,19 @@ def _proxy_handler_loop(
             raw = bytes(raw_bytes)
             try:
                 # Demultiplex by method prefix byte.
-                if raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
+                if raw and raw[0:1] == PROXY_METHOD_FIRE_FORGET:
+                    # Fire-and-forget: ACK immediately, run Forward() in background.
+                    # Decouples relay circuit lifetime from inference duration.
+                    p2p_node.respond_proxy(request_id=req_id, data=PROXY_METHOD_FIRE_FORGET)
+                    _ff_request = peer_pb2.ForwardRequest()
+                    _ff_request.ParseFromString(raw[1:])
+                    def _ff_process(_req=_ff_request):
+                        try:
+                            service.Forward(_req, context=None)
+                        except Exception as _ff_exc:
+                            logging.warning("fire_forget_forward_error: %s", _ff_exc)
+                    threading.Thread(target=_ff_process, daemon=True).start()
+                elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                     # PushResult path: ForwardResponse → PushResult RPC.
                     push_resp = peer_pb2.ForwardResponse()
                     push_resp.ParseFromString(raw[1:])
@@ -1013,10 +1026,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
 
             if self._p2p_node is not None and _next_hop_libp2p_id:
-                # No direct connection — route through relay instantly (no delay).
+                # Fire-and-forget: ACK instantly, inference runs async on receiver.
                 self._p2p_node.proxy_forward(
                     target_peer_id=_next_hop_libp2p_id,
-                    data=PROXY_METHOD_FORWARD + next_req.SerializeToString(),
+                    data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
                 )
                 logger.info(
                     "push_forwarded_via_relay: req=%s stage=%d -> %s (libp2p=%s)",
