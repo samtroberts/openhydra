@@ -869,12 +869,19 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                             remaining_route=_ring_route[1:],
                             prompt_token_ids=list(request.prompt_token_ids),
                         )
-                        self._push_to_next_hop(
-                            request=_ring_req,
-                            response=peer_pb2.ForwardResponse(),
-                            next_address=_ring_next_addr,
-                            remaining_route=_ring_route,
-                        )
+                        # Fire-and-forget: ring loop-back in background thread.
+                        # proxy_forward blocks (request-response), but the ring
+                        # doesn't need the response. Background thread prevents
+                        # the Forward() handler from blocking for 10s+ per hop.
+                        import threading as _ring_threading
+                        def _ring_loop_back():
+                            self._push_to_next_hop(
+                                request=_ring_req,
+                                response=peer_pb2.ForwardResponse(),
+                                next_address=_ring_next_addr,
+                                remaining_route=_ring_route,
+                            )
+                        _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
 
                 elif callback_addr:
                     # Last peer: send result back to coordinator (non-ring push)
