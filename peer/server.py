@@ -287,8 +287,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         mlx_eval_timeout_s: float = 120.0,
         batch_window_ms: float = 50.0,
         max_batch_size: int = 8,
+        p2p_node: Any | None = None,
     ):
         self.peer_id = peer_id
+        self._p2p_node = p2p_node
         self.model_id = model_id
         self.shard_index = shard_index
         self.total_shards = total_shards
@@ -870,20 +872,35 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 prompt_token_ids=list(request.prompt_token_ids),
             )
 
-            channel = grpc.insecure_channel(
-                next_address,
-                options=[
-                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                ],
-            )
-            stub = peer_pb2_grpc.PeerStub(channel)
-            stub.Forward(next_req, timeout=60.0)
-            channel.close()
-            logger.info(
-                "push_forwarded: req=%s stage=%d -> %s",
-                request.request_id, request.stage_index, next_address,
-            )
+            # Check if the next hop requires relay routing.
+            _next_hop_libp2p_id = ""
+            if remaining_route:
+                _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
+            if self._p2p_node is not None and _next_hop_libp2p_id:
+                # Route through libp2p Circuit Relay proxy.
+                resp_bytes = self._p2p_node.proxy_forward(
+                    target_peer_id=_next_hop_libp2p_id,
+                    data=next_req.SerializeToString(),
+                )
+                logger.info(
+                    "push_forwarded_via_relay: req=%s stage=%d -> %s (libp2p=%s)",
+                    request.request_id, request.stage_index, next_address, _next_hop_libp2p_id[:20],
+                )
+            else:
+                channel = grpc.insecure_channel(
+                    next_address,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                stub = peer_pb2_grpc.PeerStub(channel)
+                stub.Forward(next_req, timeout=60.0)
+                channel.close()
+                logger.info(
+                    "push_forwarded: req=%s stage=%d -> %s",
+                    request.request_id, request.stage_index, next_address,
+                )
         except Exception as exc:
             logger.warning("push_forward_failed: %s -> %s: %s", self.peer_id, next_address, exc)
 
@@ -892,6 +909,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         response: peer_pb2.ForwardResponse,
         callback_address: str,
         callback_request_id: str,
+        callback_libp2p_peer_id: str = "",
     ) -> None:
         """Send final activation back to the coordinator via PushResult RPC."""
         try:
@@ -905,20 +923,32 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     kv_cache_hit=response.kv_cache_hit,
                     activation_hash=response.activation_hash,
                 )
-            channel = grpc.insecure_channel(
-                callback_address,
-                options=[
-                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                ],
-            )
-            stub = peer_pb2_grpc.PeerStub(channel)
-            stub.PushResult(response, timeout=10.0)
-            channel.close()
-            logger.info(
-                "push_result_sent: req=%s -> %s",
-                response.request_id, callback_address,
-            )
+            _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
+            if self._p2p_node is not None and _cb_libp2p:
+                # Route PushResult through libp2p relay proxy.
+                resp_bytes = self._p2p_node.proxy_forward(
+                    target_peer_id=_cb_libp2p,
+                    data=response.SerializeToString(),
+                )
+                logger.info(
+                    "push_result_sent_via_relay: req=%s -> %s (libp2p=%s)",
+                    response.request_id, callback_address, _cb_libp2p[:20],
+                )
+            else:
+                channel = grpc.insecure_channel(
+                    callback_address,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                stub = peer_pb2_grpc.PeerStub(channel)
+                stub.PushResult(response, timeout=10.0)
+                channel.close()
+                logger.info(
+                    "push_result_sent: req=%s -> %s",
+                    response.request_id, callback_address,
+                )
         except Exception as exc:
             logger.warning("push_result_failed: %s: %s", callback_address, exc)
 
@@ -1867,11 +1897,20 @@ def serve(
                 _nat_info = p2p_node.nat_status()
                 service._nat_type = str(_nat_info.get("nat_type", "unknown"))
                 service._requires_relay = service._nat_type != "open"
+                # AutoNAT may report "open" when the peer is reachable through
+                # its relay reservation — the external IP will be the relay's IP,
+                # not the peer's real public IP.  Detect this and force relay.
+                _ext_ip = str(_nat_info.get("external_ip", ""))
+                _relay_ips = {"45.79.190.172", "172.105.69.49", "172.104.164.98"}
+                if _ext_ip in _relay_ips:
+                    service._nat_type = "relay"
+                    service._requires_relay = True
                 logging.info(
-                    "peer %s p2p_nat: type=%s is_public=%s external_ip=%s",
+                    "peer %s p2p_nat: type=%s is_public=%s external_ip=%s requires_relay=%s",
                     peer_id, service._nat_type,
                     _nat_info.get("is_public", False),
-                    _nat_info.get("external_ip", ""),
+                    _ext_ip,
+                    service._requires_relay,
                 )
                 # Circuit Relay v2 is automatic — no manual relay connect needed.
                 # The Rust swarm holds an outbound connection to bootstrap relays
