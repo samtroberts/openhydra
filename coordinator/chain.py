@@ -946,18 +946,37 @@ class InferenceChain:
             try:
                 _p2p = getattr(self, '_p2p_node', None)
                 _libp2p_id = str(getattr(first_peer, 'libp2p_peer_id', '') or '').strip()
-                if (
-                    _p2p is not None
-                    and getattr(first_peer, 'requires_relay', False)
-                    and _libp2p_id
-                ):
-                    # Route through libp2p Circuit Relay proxy
-                    resp_bytes = _p2p.proxy_forward(
+                # State-aware routing: check if direct connection exists.
+                _has_direct = False
+                if _p2p is not None and _libp2p_id:
+                    try:
+                        _has_direct = _p2p.is_peer_connected(_libp2p_id)
+                    except Exception:
+                        pass
+
+                if _has_direct:
+                    # Direct connection (DCUtR succeeded or same LAN) — use gRPC.
+                    first_addr = f"{first_peer.host}:{first_peer.port}"
+                    channel = grpc.insecure_channel(
+                        first_addr,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(req, timeout=min(self.timeout_s, 60.0))
+                    channel.close()
+                    logging.info("push_sent_direct: peer=%s", first_peer.peer_id)
+                elif _p2p is not None and _libp2p_id:
+                    # No direct connection — route via relay instantly.
+                    _p2p.proxy_forward(
                         target_peer_id=_libp2p_id,
                         data=req.SerializeToString(),
                     )
                     logging.info("push_sent_via_relay: peer=%s libp2p=%s", first_peer.peer_id, _libp2p_id[:20])
                 else:
+                    # No P2P — direct gRPC only (LAN/VPC).
                     first_addr = f"{first_peer.host}:{first_peer.port}"
                     channel = grpc.insecure_channel(
                         first_addr,
