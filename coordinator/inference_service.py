@@ -1503,7 +1503,9 @@ class InferenceService:
                     _ring_t0 = time.perf_counter()
                     for _ring_step in range(_ar_target_tokens):
                         try:
-                            _ring_token = _ring_queue.get(timeout=30.0)
+                            # First token takes longer (relay circuit setup).
+                            _ring_timeout = 60.0 if _ring_step == 0 else 30.0
+                            _ring_token = _ring_queue.get(timeout=_ring_timeout)
                         except _q_mod.Empty:
                             logger.warning("ring_token_timeout: step=%d", _ring_step)
                             break

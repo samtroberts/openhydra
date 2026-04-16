@@ -96,9 +96,12 @@ impl Codec for GrpcProxyCodec {
 }
 
 pub fn proxy_behaviour() -> request_response::Behaviour<GrpcProxyCodec> {
+    let mut config = request_response::Config::default();
+    // Increase timeout for model inference — CPU inference can take 10-30s.
+    config.set_request_timeout(std::time::Duration::from_secs(120));
     request_response::Behaviour::new(
         [(PROXY_PROTOCOL, ProtocolSupport::Full)],
-        request_response::Config::default(),
+        config,
     )
 }
 
