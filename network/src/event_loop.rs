@@ -104,6 +104,14 @@ struct LoopState {
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
+    /// Peers with confirmed direct (non-relayed) connections.
+    /// Populated by DCUtR success events and non-relay ConnectionEstablished.
+    /// Python checks this via IsConnected to decide direct gRPC vs relay proxy.
+    direct_peers: std::collections::HashSet<PeerId>,
+    /// Reply channels for local proxy forwards (Ouroboros: target == self).
+    /// When respond_proxy is called with a "proxy-local-*" req_id, the response
+    /// is delivered here instead of through libp2p.
+    local_proxy_replies: HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>,
 }
 
 struct PendingDiscover {
@@ -134,6 +142,8 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
+            direct_peers: std::collections::HashSet::new(),
+            local_proxy_replies: HashMap::new(),
         }
     }
 }
@@ -199,11 +209,13 @@ pub async fn run_event_loop(
                         handle_proxy_forward(&mut swarm, &peer_id, data, reply, &mut state);
                     }
                     Some(SwarmCommand::IsConnected { peer_id, reply }) => {
-                        let connected = match peer_id.parse::<PeerId>() {
-                            Ok(pid) => swarm.is_connected(&pid),
+                        // Returns true ONLY if we have a direct (non-relayed) connection.
+                        // Used by Python push mode to decide direct gRPC vs relay proxy.
+                        let has_direct = match peer_id.parse::<PeerId>() {
+                            Ok(pid) => state.direct_peers.contains(&pid),
                             Err(_) => false,
                         };
-                        let _ = reply.send(connected);
+                        let _ = reply.send(has_direct);
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;
@@ -218,7 +230,10 @@ pub async fn run_event_loop(
                         let _ = reply.send(item);
                     }
                     Some(SwarmCommand::RespondProxy { request_id, data }) => {
-                        if let Some(channel) = state.inbound_proxy_channels.remove(&request_id) {
+                        // Check local proxy replies first (Ouroboros: self-targeted forwards).
+                        if let Some(reply) = state.local_proxy_replies.remove(&request_id) {
+                            let _ = reply.send(Ok(data));
+                        } else if let Some(channel) = state.inbound_proxy_channels.remove(&request_id) {
                             if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
                                 warn!("proxy respond failed: {:?}", e);
                             }
@@ -409,6 +424,7 @@ fn handle_swarm_event(
             match dcutr_event.result {
                 Ok(conn_id) => {
                     state.dcutr_successes += 1;
+                    state.direct_peers.insert(peer);
                     info!(
                         %peer, ?conn_id,
                         successes = state.dcutr_successes,
@@ -437,8 +453,17 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
         }
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-            debug!(%peer_id, "connection established");
+        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            debug!(%peer_id, ?endpoint, "connection established");
+            // Track direct (non-relay) connections for push mode routing.
+            // Relay connections have addresses containing /p2p-circuit/.
+            let addr_str = match &endpoint {
+                libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
+                libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
+            };
+            if !addr_str.contains("p2p-circuit") {
+                state.direct_peers.insert(peer_id);
+            }
             // Send any queued proxy forwards that were waiting for this connection.
             let mut remaining = Vec::new();
             for (target, data, reply) in state.pending_relay_forwards.drain(..) {
@@ -457,6 +482,10 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             debug!(%peer_id, "connection closed");
+            // Remove from direct_peers if no more connections remain.
+            if !swarm.is_connected(&peer_id) {
+                state.direct_peers.remove(&peer_id);
+            }
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
             info!(%address, "external address confirmed");
@@ -658,6 +687,18 @@ fn handle_proxy_forward(
             return;
         }
     };
+
+    // Ouroboros guard: if the target is our own peer ID, route locally.
+    // Queue as inbound proxy request and store the reply channel so
+    // respond_proxy() can deliver the response back to the caller.
+    if peer_id == *swarm.local_peer_id() {
+        info!("proxy_forward: target is self — routing locally");
+        state.inbound_proxy_counter += 1;
+        let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
+        state.inbound_proxy_queue.push((req_id.clone(), data));
+        state.local_proxy_replies.insert(req_id, reply);
+        return;
+    }
 
     if swarm.is_connected(&peer_id) {
         // Already connected — send immediately.
