@@ -24,6 +24,7 @@ impl Default for SwarmOptions {
         Self {
             listen_addrs: vec![
                 "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
+                "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
             ],
             bootstrap_peers: Vec::new(),
             protocol_version: "openhydra/0.1.0".to_string(),
@@ -40,7 +41,10 @@ pub fn build_swarm(
     let keypair = identity.keypair.clone();
 
     // Transport: TCP + Noise + Yamux
-    let tcp_transport = crate::transport::build_transport(&keypair)?;
+    let tcp_transport = crate::transport::build_tcp_transport(&keypair)?;
+
+    // Transport: QUIC (built-in TLS 1.3 + multiplexing, UDP-based)
+    let quic_transport = crate::transport::build_quic_transport(&keypair)?;
 
     // Relay client — returns a (Transport, Behaviour) pair.
     // The Transport MUST be combined with the base transport and kept alive;
@@ -58,13 +62,19 @@ pub fn build_swarm(
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
 
-    // Combine relay + TCP transports. Relay is tried FIRST so that
-    // `/p2p-circuit` multiaddrs are handled by the relay client transport.
-    // TCP addresses (without `/p2p-circuit`) fail relay parsing and fall
-    // through to the TCP side.
+    // 3-way transport composition: relay → QUIC → TCP (fallback order).
+    // Relay first: handles /p2p-circuit multiaddrs.
+    // QUIC second: handles /udp/.../quic-v1 addresses (faster, UDP hole punch).
+    // TCP last: fallback for /tcp/ addresses.
+    let quic_tcp = libp2p::core::transport::OrTransport::new(quic_transport, tcp_transport)
+        .map(|either, _| match either {
+            futures::future::Either::Left((pid, mux)) => (pid, StreamMuxerBox::new(mux)),
+            futures::future::Either::Right((pid, mux)) => (pid, StreamMuxerBox::new(mux)),
+        });
+
     let combined_transport = libp2p::core::transport::OrTransport::new(
         relay_upgraded,
-        tcp_transport,
+        quic_tcp,
     )
     .map(|either_output, _| match either_output {
         futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),

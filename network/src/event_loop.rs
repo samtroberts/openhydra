@@ -96,6 +96,9 @@ struct LoopState {
     /// Proxy forward requests waiting for a relay connection to be established.
     /// (target_peer_id, data, reply_channel)
     pending_relay_forwards: Vec<(PeerId, Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>)>,
+    /// DCUtR hole punch counters.
+    dcutr_successes: u64,
+    dcutr_failures: u64,
 }
 
 struct PendingDiscover {
@@ -124,6 +127,8 @@ impl LoopState {
             inbound_proxy_channels: HashMap::new(),
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
+            dcutr_successes: 0,
+            dcutr_failures: 0,
         }
     }
 }
@@ -328,12 +333,19 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Identify(identify_event)) => {
             if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
                 debug!(%peer_id, protocol = %info.protocol_version, "identify received");
-                // Add observed addresses to Kademlia.
+                // Add the remote peer's listen addresses to Kademlia.
                 for addr in &info.listen_addrs {
                     swarm
                         .behaviour_mut()
                         .kademlia
                         .add_address(&peer_id, addr.clone());
+                }
+                // Critical for DCUtR: register the observed address (our NAT
+                // external mapping) as an external address. Without this, DCUtR
+                // has no candidate addresses for hole punching.
+                if !info.observed_addr.to_string().is_empty() {
+                    debug!(addr = %info.observed_addr, "adding observed addr as external");
+                    swarm.add_external_address(info.observed_addr);
                 }
             }
         }
@@ -384,10 +396,22 @@ fn handle_swarm_event(
             let peer = dcutr_event.remote_peer_id;
             match dcutr_event.result {
                 Ok(conn_id) => {
-                    info!(%peer, ?conn_id, "DCUtR: direct connection established (hole punch success)");
+                    state.dcutr_successes += 1;
+                    info!(
+                        %peer, ?conn_id,
+                        successes = state.dcutr_successes,
+                        failures = state.dcutr_failures,
+                        "DCUtR: direct connection established (hole punch success)"
+                    );
                 }
                 Err(ref e) => {
-                    warn!(%peer, error = %e, "DCUtR: hole punch failed, staying on relay");
+                    state.dcutr_failures += 1;
+                    warn!(
+                        %peer, error = %e,
+                        successes = state.dcutr_successes,
+                        failures = state.dcutr_failures,
+                        "DCUtR: hole punch failed, staying on relay"
+                    );
                 }
             }
         }

@@ -18,20 +18,22 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::swarm::Config as SwarmConfig;
-use libp2p::{autonat, identify, kad, relay, Multiaddr, Swarm};
+use libp2p::{autonat, identify, kad, relay, Multiaddr, Swarm, Transport};
 use tracing::info;
 
 // Re-use crate modules for identity and transport.
 // Note: since this is a [[bin]], we import the library crate.
 use openhydra_network::identity::Identity;
 
-/// Bootstrap-specific behaviour — includes relay::Behaviour (server mode).
+/// Bootstrap-specific behaviour — includes relay::Behaviour (server mode)
+/// and DCUtR for advertising hole-punch support in Identify.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct BootstrapBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     relay_server: relay::Behaviour,
     autonat: autonat::Behaviour,
     identify: identify::Behaviour,
+    dcutr: libp2p::dcutr::Behaviour,
 }
 
 #[tokio::main]
@@ -62,8 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peer_id = identity.libp2p_peer_id;
     let keypair = identity.keypair.clone();
 
-    // Transport: TCP + Noise + Yamux
-    let transport = openhydra_network::transport::build_transport(&keypair)?;
+    // Transport: QUIC + TCP (bootstrap is public, no relay needed)
+    let tcp_transport = openhydra_network::transport::build_tcp_transport(&keypair)?;
+    let quic_transport = openhydra_network::transport::build_quic_transport(&keypair)?;
+    let transport = libp2p::core::transport::OrTransport::new(quic_transport, tcp_transport)
+        .map(|either, _| match either {
+            futures::future::Either::Left((pid, mux)) => (pid, libp2p::core::muxing::StreamMuxerBox::new(mux)),
+            futures::future::Either::Right((pid, mux)) => (pid, libp2p::core::muxing::StreamMuxerBox::new(mux)),
+        })
+        .boxed();
 
     // Kademlia in server mode (bootstrap node).
     let mut kad_config = kad::Config::new(
@@ -129,11 +138,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_push_listen_addr_updates(true),
     );
 
+    // DCUtR — advertises hole-punch support in Identify protocol list.
+    let dcutr = libp2p::dcutr::Behaviour::new(peer_id);
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
         autonat,
         identify,
+        dcutr,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()
