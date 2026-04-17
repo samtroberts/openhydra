@@ -111,6 +111,13 @@ Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware 
 | Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9 TPS** | **6.9 TPS** |
 | Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **9.3 TPS** | **9.8 TPS** |
 | Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.2 TPS** | **7.3 TPS** |
+| Qwen 3.5 2B | MacBook Air M1 (MLX) + T4 GPU (CUDA) | **Cross-ISP via Circuit Relay** | **1.04 TPS** | — |
+
+### Cross-ISP ring topology (2026-04-16)
+
+Sharded inference **across different ISPs** — Mac on home broadband (NAT) and Lightning.ai T4 GPU on AWS — using libp2p Circuit Relay v2 for NAT traversal. 32 tokens generated in 30.8 seconds. Each token cycle: Mac runs layers 0-11 (MLX Metal) → relay → GPU runs layers 12-23 (PyTorch CUDA) → relay → back to Mac. No port forwarding, no VPN, no SSH tunnel.
+
+Uses the **push ring** topology — after the coordinator kicks off the first forward, tokens circulate peer-to-peer (fire-and-forget protocol, 0x03 proxy method) until EOS/max_tokens. Each hop ACKs instantly so the relay circuit is released in ~500 ms rather than held open for the full inference duration.
 
 ---
 
@@ -173,6 +180,10 @@ openhydra-node --peer-id shard-0 --total-shards 4 --shard-index 0 \
 ### Push Mode
 
 By default, peers forward activations directly to each other (peer-to-peer push) instead of routing through the coordinator. This eliminates one network round-trip per token, improving throughput by ~2x on LAN and ~10x on VPC.
+
+### Push Ring (Cross-ISP)
+
+When peers are on different ISPs behind NAT, push-mode activations are routed through libp2p Circuit Relay. The ring topology keeps tokens circulating peer-to-peer after the initial kick-off — no coordinator round-trip per token. The fire-and-forget proxy protocol (`0x03`) releases the relay circuit within ~500 ms of the ACK, so relays never have to hold a circuit open for the full inference duration.
 
 ---
 
