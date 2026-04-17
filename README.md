@@ -30,6 +30,7 @@ OpenHydra is a peer-to-peer inference network that turns idle hardware into a gl
 - **Python 3.11+** (3.12 recommended; 3.13 also works)
 - **Rust toolchain** — the P2P wheel (`openhydra-network`) is not on PyPI yet, so it must be built from source with `maturin`. `maturin` needs `cargo` on `PATH`.
 - **C compiler** — `grpcio` and `cryptography` compile C extensions if no wheel is available for your Python / arch.
+- **Protobuf compiler (`protoc`)** — the Rust `prost-build` step compiles `peer.proto` at wheel-build time. Fresh macOS usually has it via Xcode CLT; on Linux install via `apt install protobuf-compiler`.
 
 The commands below install all of these plus OpenHydra itself.
 
@@ -60,7 +61,8 @@ cd network && maturin build --release && pip install target/wheels/*.whl && cd .
 # One-time system prerequisites
 sudo apt update
 sudo apt install -y python3.12 python3.12-venv python3-pip \
-                    build-essential libssl-dev python3-dev pkg-config
+                    build-essential libssl-dev python3-dev pkg-config \
+                    protobuf-compiler
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 
@@ -157,11 +159,18 @@ Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware 
 | Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9 TPS** | **6.9 TPS** |
 | Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **9.3 TPS** | **9.8 TPS** |
 | Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.2 TPS** | **7.3 TPS** |
-| Qwen 3.5 2B | MacBook Air M1 (MLX) + T4 GPU (CUDA) | **Cross-ISP via Circuit Relay** | **1.04 TPS** | — |
+| Qwen 3.5 2B | MacBook Air M1 (MLX) + T4 GPU (CUDA) | **Cross-ISP via Circuit Relay** | **0.93 TPS (64 tok)** | **1.09 TPS (128 tok)** |
 
-### Cross-ISP ring topology (2026-04-16)
+### Cross-ISP ring topology (2026-04-17)
 
-Sharded inference **across different ISPs** — Mac on home broadband (NAT) and Lightning.ai T4 GPU on AWS — using libp2p Circuit Relay v2 for NAT traversal. 32 tokens generated in 30.8 seconds. Each token cycle: Mac runs layers 0-11 (MLX Metal) → relay → GPU runs layers 12-23 (PyTorch CUDA) → relay → back to Mac. No port forwarding, no VPN, no SSH tunnel.
+Sharded inference **across different ISPs** — Mac on home broadband (NAT) and Lightning.ai T4 GPU on AWS — using libp2p Circuit Relay v2 for NAT traversal. Measured from a **clean install from GitHub** following the Quick Start above:
+
+| Tokens | Latency | TPS | Output |
+|--------|---------|-----|--------|
+| 64 | 68.6 s | 0.93 | Lighthouse-keeper short story |
+| 128 | 118.0 s | 1.09 | Pulp Fiction review with markdown headers |
+
+Each token cycle: Mac runs layers 0-11 (MLX Metal) → relay → GPU runs layers 12-23 (PyTorch CUDA) → relay → back to Mac. No port forwarding, no VPN, no SSH tunnel. TPS trends upward with longer outputs as fixed startup cost amortizes.
 
 Uses the **push ring** topology — after the coordinator kicks off the first forward, tokens circulate peer-to-peer (fire-and-forget protocol, 0x03 proxy method) until EOS/max_tokens. Each hop ACKs instantly so the relay circuit is released in ~500 ms rather than held open for the full inference duration.
 
