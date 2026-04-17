@@ -25,34 +25,80 @@ OpenHydra is a peer-to-peer inference network that turns idle hardware into a gl
 
 ## Quick Start
 
-### Install (macOS Apple Silicon)
+### Prerequisites (all platforms)
+
+- **Python 3.11+** (3.12 recommended; 3.13 also works)
+- **Rust toolchain** — the P2P wheel (`openhydra-network`) is not on PyPI yet, so it must be built from source with `maturin`. `maturin` needs `cargo` on `PATH`.
+- **C compiler** — `grpcio` and `cryptography` compile C extensions if no wheel is available for your Python / arch.
+
+The commands below install all of these plus OpenHydra itself.
+
+### Install — macOS (Apple Silicon, M1/M2/M3/M4)
 
 ```bash
-# Prerequisites (one-time)
+# One-time system prerequisites
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install python@3.12
-xcode-select --install
+brew install python@3.12 rust
+xcode-select --install     # C compiler — no-op if already installed
 
-# Clone and install
+# Clone + Python deps
 git clone https://github.com/samtroberts/openhydra.git
 cd openhydra
 python3.12 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
-pip install -r requirements-mlx.txt
+pip install -r requirements-mlx.txt   # Apple Silicon MLX backend
 
-# Build the P2P networking module (Rust + PyO3)
+# Build + install the P2P networking wheel (Rust + PyO3)
 pip install maturin
 cd network && maturin build --release && pip install target/wheels/*.whl && cd ..
 ```
 
-### Install (Linux / NVIDIA GPU)
+### Install — Linux (Ubuntu 22.04 / Debian 12 / CPU or NVIDIA)
 
 ```bash
+# One-time system prerequisites
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3-pip \
+                    build-essential libssl-dev python3-dev pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# Clone + Python deps
 git clone https://github.com/samtroberts/openhydra.git
 cd openhydra
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
+
+# NVIDIA GPU users: install CUDA-enabled PyTorch wheels (optional but recommended)
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Build + install the P2P networking wheel (Rust + PyO3)
+pip install maturin
+cd network && maturin build --release && pip install target/wheels/*.whl && cd ..
 ```
+
+### Install — Windows (WSL2 recommended)
+
+OpenHydra's P2P stack and MLX/PyTorch runtimes are validated on **WSL2 Ubuntu 22.04**. Native Windows is not yet supported — the Rust `libp2p` build and several Python deps don't have Windows wheels for all arches.
+
+```powershell
+# In PowerShell (run as Administrator)
+wsl --install -d Ubuntu-22.04
+# Reboot if prompted, then open the new "Ubuntu" app and follow the Linux
+# install steps above inside the WSL shell.
+```
+
+Optional desktop app (no Python needed): install the pre-built Tauri bundle from the [releases page](https://github.com/samtroberts/openhydra/releases). The bundled app runs Local Mode only; to join the swarm on Windows natively, use WSL2.
+
+### First run
+
+```bash
+python3 -m coordinator.node --peer-id my-node --p2p-enabled
+```
+
+Your node announces to the global Kademlia DHT. From another terminal (or another machine), query the OpenAI-compatible API at `http://127.0.0.1:8080/v1/chat/completions`.
 
 ---
 
