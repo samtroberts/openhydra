@@ -1,16 +1,24 @@
+# OpenHydra runtime dependencies — must match `pyproject.toml` [project.dependencies].
+# If you add a hard `import X` to any module loaded at startup, add X here AND
+# in pyproject.toml so PyPI installs and source installs stay in sync.
+#
+# Install:
+#   pip install -r requirements.txt
+#   pip install -r requirements-mlx.txt   # Apple Silicon only
+#
 # ── Core runtime ─────────────────────────────────────────────────────
 torch>=2.0
-grpcio>=1.78
-grpcio-tools>=1.78
+grpcio>=1.78,<2
+grpcio-tools>=1.78,<2
 protobuf>=4.25,<7
 transformers>=5.5.0
 accelerate>=1.13.0
-requests>=2.28.0
+requests>=2.28,<3
 sentencepiece>=0.2.0
 cryptography>=42,<47
 
 # ── Apple Silicon (MLX) — see requirements-mlx.txt ───────────────────
-# pip install -r requirements-mlx.txt
+# On M1/M2/M3/M4 Macs, also run: pip install -r requirements-mlx.txt
 
 # ── Development / test ───────────────────────────────────────────────
 pytest>=8.0,<9

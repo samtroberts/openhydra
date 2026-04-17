@@ -1,5 +1,11 @@
-# Extra dependencies for Apple Silicon MLX backend.
+# Apple Silicon MLX backend — required ONLY on M1/M2/M3/M4 Macs for the native
+# Metal inference runtime. Linux and Windows (WSL2) users can skip this file.
+#
 # Install AFTER requirements.txt:
 #   pip install -r requirements-mlx.txt
+#
+# Versions here must match the `[project.optional-dependencies].mlx` list in
+# pyproject.toml. Keep them in sync — the running MLX runtime calls APIs that
+# exist only in 0.31+.
 mlx>=0.31
 mlx-lm>=0.31
