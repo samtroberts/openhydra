@@ -83,7 +83,7 @@
     "shards_needed": 2,
     "quality_tier": "advanced",
     "recommended_quantization": "int8",
-    "num_layers": 48,
+    "num_layers": 32,
     "context_length": 32768,
     "languages": [
       "en",
