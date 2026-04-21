@@ -55,7 +55,7 @@ pip install maturin
 cd network && maturin build --release && pip install target/wheels/*.whl && cd ..
 ```
 
-### Install — Linux (Ubuntu 22.04 / Debian 12 / CPU or NVIDIA)
+### Install — Linux (Ubuntu 22.04+ or Debian 12+, CPU or NVIDIA)
 
 ```bash
 # One-time system prerequisites
@@ -83,11 +83,11 @@ cd network && maturin build --release && pip install target/wheels/*.whl && cd .
 
 ### Install — Windows (WSL2 recommended)
 
-OpenHydra's P2P stack and MLX/PyTorch runtimes are validated on **WSL2 Ubuntu 22.04**. Native Windows is not yet supported — the Rust `libp2p` build and several Python deps don't have Windows wheels for all arches.
+OpenHydra's P2P stack and MLX/PyTorch runtimes are validated on **WSL2 Ubuntu 22.04 and 24.04**. Native Windows is not yet supported — the Rust `libp2p` build and several Python deps don't have Windows wheels for all arches.
 
 ```powershell
 # In PowerShell (run as Administrator)
-wsl --install -d Ubuntu-22.04
+wsl --install -d Ubuntu
 # Reboot if prompted, then open the new "Ubuntu" app and follow the Linux
 # install steps above inside the WSL shell.
 ```
@@ -147,6 +147,44 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
     "max_tokens": 32
   }' | python3 -m json.tool
 ```
+
+---
+
+## Run Sharded Inference on 2 Cloud GPUs (same VPC)
+
+On cloud providers where peers can reach each other over a private subnet (AWS VPC, GCP VPC, DigitalOcean VPC), point each peer at its internal IP with `--advertise-host` and give the second peer an explicit `--p2p-bootstrap` multiaddr for the first. This forces direct libp2p routing over the internal subnet and avoids tunneling through the public Circuit Relay — direct P2P is **30–75% faster** than relay (see the Benchmarks section).
+
+**Peer 1 (coordinator + shard 0):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id gpu1-peer \
+    --runtime-model-id Qwen/Qwen3.5-2B \
+    --shard-index 0 --total-shards 2 \
+    --layer-start 0 --layer-end 12 \
+    --p2p-enabled --push-mode \
+    --advertise-host 10.0.0.1 \
+    --api-host 0.0.0.0
+```
+
+Capture peer 1's libp2p peer id from its startup log (line `p2p_node_started libp2p_peer_id=12D3Koo...`).
+
+**Peer 2 (shard 1):**
+
+```bash
+GPU1_LIBP2P_ID=12D3KooW...   # from peer 1's log
+
+python3 -m coordinator.node \
+    --peer-id gpu2-peer \
+    --runtime-model-id Qwen/Qwen3.5-2B \
+    --shard-index 1 --total-shards 2 \
+    --layer-start 12 --layer-end 24 \
+    --p2p-enabled --push-mode \
+    --advertise-host 10.0.0.2 \
+    --p2p-bootstrap /ip4/10.0.0.1/tcp/4001/p2p/$GPU1_LIBP2P_ID
+```
+
+Replace `10.0.0.1` / `10.0.0.2` with your own internal IPs. For genuinely public reachable peers (home LAN with port-forwarding, dedicated servers with public IPs), the same pattern works with public IPs. If peers can't reach each other directly, omit these flags and libp2p will fall back to Circuit Relay automatically.
 
 ---
 
