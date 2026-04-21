@@ -152,18 +152,35 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ## Benchmarks
 
-Measured on real hardware with push mode (peer-to-peer forwarding) and KV-aware caching:
+Measured on real hardware from a clean `git clone` + Quick Start install. Push ring topology, KV-aware caching, deterministic seed (`seed=42`, `temperature=0.7`) — outputs are reproducible.
 
-| Model | Hardware | Transport | Short prompt | Long prompt |
-|-------|----------|-----------|-------------|------------|
-| Qwen 3.5 2B | 2 x MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | **6.9 TPS** | **6.9 TPS** |
-| Qwen 3.5 2B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **9.3 TPS** | **9.8 TPS** |
-| Qwen 3.5 9B | 2 x NVIDIA T4 GPU (CUDA) | P2P auto-discovered | **7.2 TPS** | **7.3 TPS** |
-| Qwen 3.5 2B | MacBook Air M1 (MLX) + T4 GPU (CUDA) | **Cross-ISP via Circuit Relay** | **0.93 TPS (64 tok)** | **1.09 TPS (128 tok)** |
+### Headline numbers
+
+| Model | Hardware | Transport | 64 tok | 128 tok | 256 tok |
+|-------|----------|-----------|--------|---------|---------|
+| Qwen 3.5 2B | 2 × MacBook Air M1 8GB (MLX 8-bit) | LAN push mode | — | 6.9 TPS | — |
+| Qwen 3.5 2B | 2 × NVIDIA T4 (CUDA) | **Direct P2P** (same VPC) | **9.64** | **9.57** | **9.70** |
+| Qwen 3.5 9B | 2 × NVIDIA T4 (CUDA) | **Direct P2P** (same VPC) | **6.94** | **6.93** | **6.94** |
+| Qwen 3.5 2B | MacBook Air M1 (MLX) ↔ T4 (CUDA) | **Cross-ISP via Circuit Relay** | 0.93 | 1.09 | — |
+
+### Direct P2P vs Circuit Relay (2 × T4 Lightning.ai, 2026-04-20)
+
+When peers can reach each other directly (same VPC / LAN / reachable public IP), the ring uses a direct libp2p connection. When peers are behind NAT (or public reachability is blocked), traffic tunnels through a Linode Circuit Relay bootstrap node. Running the exact same prompts with the same seed, routing is the only variable:
+
+| Model | Tokens | Direct P2P | Circuit Relay | Relay overhead |
+|-------|--------|-----------|---------------|----------------|
+| Qwen 3.5 2B | 64 | 9.64 TPS | 5.54 TPS | +74% |
+| Qwen 3.5 2B | 128 | 9.57 TPS | 6.48 TPS | +48% |
+| Qwen 3.5 2B | 256 | 9.70 TPS | 6.58 TPS | +47% |
+| Qwen 3.5 9B | 64 | 6.94 TPS | 4.88 TPS | +42% |
+| Qwen 3.5 9B | 128 | 6.93 TPS | 5.07 TPS | +37% |
+| Qwen 3.5 9B | 256 | 6.94 TPS | 5.35 TPS | +30% |
+
+Direct TPS is essentially flat across token counts — per-token ring cycle cost is consistent. Relay TPS scales upward with token count as the higher per-token overhead amortizes over more tokens. Relay is not catastrophic — the gap is 30–74%, not orders of magnitude.
 
 ### Cross-ISP ring topology (2026-04-17)
 
-Sharded inference **across different ISPs** — Mac on home broadband (NAT) and Lightning.ai T4 GPU on AWS — using libp2p Circuit Relay v2 for NAT traversal. Measured from a **clean install from GitHub** following the Quick Start above:
+Genuine cross-ISP sharding — Mac on home broadband (NAT) and Lightning.ai T4 GPU on AWS — forces Circuit Relay because neither end is directly reachable:
 
 | Tokens | Latency | TPS | Output |
 |--------|---------|-----|--------|
@@ -173,6 +190,19 @@ Sharded inference **across different ISPs** — Mac on home broadband (NAT) and 
 Each token cycle: Mac runs layers 0-11 (MLX Metal) → relay → GPU runs layers 12-23 (PyTorch CUDA) → relay → back to Mac. No port forwarding, no VPN, no SSH tunnel. TPS trends upward with longer outputs as fixed startup cost amortizes.
 
 Uses the **push ring** topology — after the coordinator kicks off the first forward, tokens circulate peer-to-peer (fire-and-forget protocol, 0x03 proxy method) until EOS/max_tokens. Each hop ACKs instantly so the relay circuit is released in ~500 ms rather than held open for the full inference duration.
+
+### Time to announce
+
+From process launch to `announced to Kademlia DHT (libp2p)` on a clean install:
+
+| Node | Model | HF cache | Time to announce | Dominant cost |
+|------|-------|----------|------------------|---------------|
+| MacBook Air M1 | Qwen 3.5 2B | warm | **~10–13 s** | MLX model load (~6 s) |
+| NVIDIA T4 | Qwen 3.5 2B | warm | **~10–14 s** | PyTorch CUDA init + shard select |
+| NVIDIA T4 | Qwen 3.5 2B | cold | ~71 s | 4.3 GB HF download |
+| NVIDIA T4 | Qwen 3.5 9B | warm | **~31 s** | 10 GB weights load into VRAM |
+
+The libp2p layer itself (3 relay reservations accepted across US/EU/AP bootstraps) completes in under **1 second** every run. First-request latency is model-load time, not P2P overhead.
 
 ---
 
