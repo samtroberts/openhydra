@@ -1433,6 +1433,9 @@ def _announce_loop(
     local_fast_path_port: int = 0,
     hivemind_adapter: Any = None,
     p2p_node: object | None = None,
+    # Phase 3 zero-config: capacity snapshot attached to every announcement.
+    capacity_json: str = "",
+    capacity_schema_version: int = 0,
 ) -> None:
     announce_interval = max(1.0, float(announce_interval_sec))
     announced_once = False
@@ -1503,6 +1506,12 @@ def _announce_loop(
             relay_peer_id=str(getattr(service, '_relay_peer_id', '')),
             relay_address=str(getattr(service, '_relay_address', '')),
             libp2p_peer_id=str(getattr(p2p_node, 'libp2p_peer_id', '') if p2p_node is not None else ''),
+            # Phase 3 zero-config: capacity snapshot for swarm negotiation.
+            # Static for this boot — caller passes the JSON serialisation of
+            # the CapacityReport built at bootstrap.  Empty string (default)
+            # means "no capacity info available" and is ignored by readers.
+            capacity_json=str(capacity_json or ""),
+            capacity_schema_version=int(capacity_schema_version or 0),
         )
         try:
             # HTTP DHT announce (legacy path).
@@ -1803,6 +1812,14 @@ def serve(
     rebalance_cooldown_s: float = 300.0,
     relay_address: str = "",
     p2p_node: object | None = None,
+    # Phase 3 zero-config bootstrap: capacity snapshot emitted alongside
+    # every DHT announcement.  ``capacity_json`` is a JSON-string payload
+    # produced by :func:`peer.capacity.build_capacity_report` then
+    # ``json.dumps(report.to_dict())``.  Empty string = no capacity info
+    # attached (backward-compatible with Phase 1/2 callers that don't
+    # know about the CapacityEngine yet).
+    capacity_json: str = "",
+    capacity_schema_version: int = 0,
 ) -> None:
     resolved_dht_urls: list[str] = []
     seen_dht_urls: set[str] = set()
@@ -2311,6 +2328,10 @@ def serve(
                     "local_fast_path_port": _fast_path_port,
                     "hivemind_adapter": _hivemind_adapter,
                     "p2p_node": p2p_node,
+                    # Phase 3 zero-config: pass capacity snapshot through to
+                    # every Announcement emitted by the loop.
+                    "capacity_json": str(capacity_json or ""),
+                    "capacity_schema_version": int(capacity_schema_version or 0),
                 },
                 daemon=True,
             )
