@@ -1436,6 +1436,10 @@ def _announce_loop(
     # Phase 3 zero-config: capacity snapshot attached to every announcement.
     capacity_json: str = "",
     capacity_schema_version: int = 0,
+    # Phase 4 zero-config: live snapshot written by NegotiationLoop.  When
+    # provided, each iteration reads fresh capacity_json + assignment from
+    # this object, superseding the static kwargs above.
+    capacity_snapshot_ref: Any = None,
 ) -> None:
     announce_interval = max(1.0, float(announce_interval_sec))
     announced_once = False
@@ -1456,9 +1460,41 @@ def _announce_loop(
         runtime_profile = dict(service.runtime_profile or {})
         _cstats = service.compaction_stats()
 
+        # ── Phase 4: read fresh capacity + assignment from the live
+        # NegotiationLoop snapshot if one is wired in.  Falls back to
+        # the static kwargs (Phase 3 path) when no snapshot is present.
+        _effective_capacity_json = capacity_json
+        _effective_capacity_schema_version = capacity_schema_version
+        _effective_layer_start = int(runtime_profile.get("layer_start", 0))
+        _effective_layer_end = int(runtime_profile.get("layer_end", 0))
+        _effective_total_layers = int(runtime_profile.get("total_layers", 0))
+        _effective_model_id = service.model_id
+        if capacity_snapshot_ref is not None:
+            try:
+                _snap_json, _snap_ver, _snap_assignment, _ = (
+                    capacity_snapshot_ref.snapshot()
+                )
+                if _snap_json:
+                    _effective_capacity_json = _snap_json
+                    _effective_capacity_schema_version = int(_snap_ver or 0)
+                if _snap_assignment is not None:
+                    # Live assignment overrides the static runtime_profile
+                    # layer range so the announce tells neighbours where
+                    # we'd *like* to be — even before the next reshard lands.
+                    _effective_layer_start = int(_snap_assignment.layer_start)
+                    _effective_layer_end = int(_snap_assignment.layer_end)
+                    _effective_total_layers = int(_snap_assignment.total_layers)
+                    _effective_model_id = str(_snap_assignment.model_id or service.model_id)
+            except Exception as _snap_err:
+                logging.debug(
+                    "announce_loop_snapshot_read_failed: %s — "
+                    "falling back to static capacity_json",
+                    _snap_err,
+                )
+
         announcement = Announcement(
             peer_id=service.peer_id,
-            model_id=service.model_id,
+            model_id=str(_effective_model_id),
             host=advertise_host,
             port=port,
             operator_id=operator_id,
@@ -1495,9 +1531,9 @@ def _announce_loop(
             next_hop_rtts_json=service.get_next_hop_rtts_json(),
             compact_tokens_saved_total=int(_cstats.get("compact_tokens_saved", 0)),
             compact_latency_total_ms=round(float(_cstats.get("compact_latency_s", 0.0)) * 1000, 1),
-            layer_start=int(runtime_profile.get("layer_start", 0)),
-            layer_end=int(runtime_profile.get("layer_end", 0)),
-            total_layers=int(runtime_profile.get("total_layers", 0)),
+            layer_start=_effective_layer_start,
+            layer_end=_effective_layer_end,
+            total_layers=_effective_total_layers,
             seeder_http_port=int(seeder_http_port),
             cached_model_ids=tuple(p2p_cache.announce_cached_models() if p2p_cache is not None else []),
             local_fast_path_port=int(local_fast_path_port),
@@ -1506,12 +1542,13 @@ def _announce_loop(
             relay_peer_id=str(getattr(service, '_relay_peer_id', '')),
             relay_address=str(getattr(service, '_relay_address', '')),
             libp2p_peer_id=str(getattr(p2p_node, 'libp2p_peer_id', '') if p2p_node is not None else ''),
-            # Phase 3 zero-config: capacity snapshot for swarm negotiation.
-            # Static for this boot — caller passes the JSON serialisation of
-            # the CapacityReport built at bootstrap.  Empty string (default)
-            # means "no capacity info available" and is ignored by readers.
-            capacity_json=str(capacity_json or ""),
-            capacity_schema_version=int(capacity_schema_version or 0),
+            # Phase 3/4 zero-config: capacity snapshot for swarm negotiation.
+            # When a live NegotiationLoop is wired in via capacity_snapshot_ref
+            # these values reflect the latest tick; otherwise they are the
+            # static boot-time values passed as kwargs.  Empty string means
+            # "no capacity info available" and is ignored by readers.
+            capacity_json=str(_effective_capacity_json or ""),
+            capacity_schema_version=int(_effective_capacity_schema_version or 0),
         )
         try:
             # HTTP DHT announce (legacy path).
@@ -1820,6 +1857,17 @@ def serve(
     # know about the CapacityEngine yet).
     capacity_json: str = "",
     capacity_schema_version: int = 0,
+    # Phase 4 zero-config: continuous re-negotiation.
+    # When ``capacity_snapshot_ref`` is provided, the announce loop reads
+    # the latest capacity_json + current assignment from this live
+    # :class:`peer.negotiation_loop.LoopSnapshot` object — overriding
+    # ``capacity_json`` / ``capacity_schema_version`` above.  When
+    # ``negotiation_loop_factory`` is also provided, serve() invokes it
+    # with ``is_busy_fn=lambda: service.inflight_count() > 0`` and starts
+    # the returned loop alongside the announce loop.  Either can be None
+    # for backward-compat (Phase 1–3 callers).
+    capacity_snapshot_ref: Any = None,
+    negotiation_loop_factory: Any = None,
 ) -> None:
     resolved_dht_urls: list[str] = []
     seen_dht_urls: set[str] = set()
@@ -2332,10 +2380,38 @@ def serve(
                     # every Announcement emitted by the loop.
                     "capacity_json": str(capacity_json or ""),
                     "capacity_schema_version": int(capacity_schema_version or 0),
+                    # Phase 4 zero-config: live snapshot written by the
+                    # NegotiationLoop overrides the static kwargs per tick.
+                    "capacity_snapshot_ref": capacity_snapshot_ref,
                 },
                 daemon=True,
             )
             announce_thread.start()
+
+        # ── Phase 4: continuous re-negotiation thread ──────────────────
+        # Start a NegotiationLoop if the caller supplied a factory.  The
+        # loop writes fresh capacity_json + current_assignment into
+        # ``capacity_snapshot_ref`` every ``interval_s`` seconds; the
+        # announce loop above picks those up on its next heartbeat.
+        # ``is_busy_fn`` is wired to the live PeerService so we never
+        # re-negotiate while a Forward() request is in flight.
+        _negotiation_loop_obj = None
+        if negotiation_loop_factory is not None:
+            try:
+                _negotiation_loop_obj = negotiation_loop_factory(
+                    lambda: service.inflight_count() > 0,
+                )
+                if _negotiation_loop_obj is not None and hasattr(
+                    _negotiation_loop_obj, "start"
+                ):
+                    _negotiation_loop_obj.start()
+            except Exception as _neg_err:
+                logging.warning(
+                    "negotiation_loop_start_failed: %s — "
+                    "falling back to one-shot Phase 3 assignment",
+                    _neg_err,
+                )
+                _negotiation_loop_obj = None
 
         # Start libp2p proxy handler thread (receives inbound proxy requests
         # from remote peers and forwards to local PeerService.Forward()).
