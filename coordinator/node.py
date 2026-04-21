@@ -245,6 +245,18 @@ def main() -> None:
     parser.add_argument("--rebalance-cooldown", type=int, default=300,
                         help="Seconds to wait after rebalance before checking again (default 300).")
 
+    # --- Phase 4: Continuous re-negotiation ---
+    parser.add_argument(
+        "--negotiation-interval-s",
+        type=float, default=60.0,
+        help=(
+            "Continuous-re-negotiation tick cadence in seconds (default 60). "
+            "Every tick the NegotiationLoop refreshes the CapacityReport and "
+            "consults SwarmNegotiator; if the peer is idle and a better shard "
+            "assignment is available, it re-claims.  Floor: 5s."
+        ),
+    )
+
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
                         help="Bearer token for the HTTP API. Also read from OPENHYDRA_API_KEY.")
@@ -645,6 +657,132 @@ def main() -> None:
     except Exception as _phase3_err:
         logger.warning("phase3_negotiate_failed: %s", _phase3_err)
 
+    # ── Phase 4 zero-config bootstrap: build a LoopSnapshot + negotiation
+    # loop factory.  The factory is invoked inside peer_server.serve()
+    # once the live PeerService is available (so ``is_busy_fn`` can call
+    # ``service.inflight_count() > 0``).  If anything here fails, we
+    # degrade to Phase 3 one-shot behaviour gracefully. ────────────────
+    _capacity_snapshot_ref = None
+    _negotiation_loop_factory_fn = None
+    try:
+        from peer.negotiation_loop import (
+            DEFAULT_NEGOTIATION_INTERVAL_S as _P4_INTERVAL,
+            LoopSnapshot as _P4_LoopSnapshot,
+            NegotiationLoop as _P4_NegotiationLoop,
+        )
+
+        _capacity_snapshot_ref = _P4_LoopSnapshot.build(
+            capacity_json=_capacity_json_str,
+            capacity_schema_version=_capacity_schema_version,
+            current_assignment=_negotiator_assignment,
+        )
+
+        # Closure: rebuild the CapacityReport with fresh HardwareProfile.
+        # Keeps static metadata (peer_id, ports, persona, upstream)
+        # captured at boot — they don't drift.
+        def _p4_build_report():
+            # Local imports to keep boot-time module graph lean.
+            from peer.capacity import (
+                UpstreamConfig as _P4_UC,
+                build_capacity_report as _P4_build,
+            )
+            from peer.hardware import detect_hardware_profile as _P4_hw
+            _p4_upstream = None
+            if _node_persona == "atomic_worker":
+                _p4_upstream = _P4_UC(
+                    kind=_upstream_kind,
+                    url=_upstream_url,
+                    hosted_model_ids=tuple(_hosted_model_ids),
+                )
+            return _P4_build(
+                hardware=_P4_hw(),
+                catalog=_phase3_catalog,
+                peer_id=str(args.peer_id or ""),
+                libp2p_peer_id=(
+                    str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+                    if _p2p_node is not None else ""
+                ),
+                ports={
+                    "api": int(args.api_port),
+                    "grpc": int(args.grpc_port),
+                    "libp2p": int(_resolved.p2p_port),
+                },
+                advertise_host=str(args.advertise_host or ""),
+                runtime_backend=str(args.runtime_backend or ""),
+                node_persona=_node_persona,
+                upstream=_p4_upstream,
+            )
+
+        # Closure: make a fresh SwarmNegotiator bound to a fresh report.
+        def _p4_make_negotiator(report):
+            from peer.swarm_negotiator import (
+                PeerClaim as _P4_PeerClaim,
+                SwarmNegotiator as _P4_Negotiator,
+            )
+
+            def _scan(mid: str) -> list:
+                claims: list = []
+                if _p2p_node is None:
+                    return claims
+                try:
+                    discovered = _p2p_node.discover(mid) or []
+                except Exception:
+                    return claims
+                for rec in discovered:
+                    try:
+                        if not isinstance(rec, dict):
+                            continue
+                        claims.append(_P4_PeerClaim(
+                            libp2p_peer_id=str(rec.get("libp2p_peer_id") or ""),
+                            model_id=str(rec.get("model_id") or mid),
+                            layer_start=int(rec.get("layer_start", 0) or 0),
+                            layer_end=int(rec.get("layer_end", 0) or 0),
+                            total_layers=int(rec.get("total_layers", 0) or 0),
+                            available_vram_mb=int(rec.get("available_vram_mb", 0) or 0),
+                        ))
+                    except (TypeError, ValueError):
+                        continue
+                return claims
+
+            return _P4_Negotiator(
+                capacity_report=report,
+                libp2p_peer_id=(
+                    str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+                    if _p2p_node is not None else ""
+                ),
+                dht_scan=_scan,
+                preferred_model_order=(args.model_id,) if args.model_id else (),
+            )
+
+        _p4_interval = float(
+            getattr(args, "negotiation_interval_s", _P4_INTERVAL) or _P4_INTERVAL
+        )
+
+        # Factory: peer_server.serve() calls this once with ``is_busy_fn``.
+        def _negotiation_loop_factory_impl(is_busy_fn):
+            return _P4_NegotiationLoop(
+                build_capacity_report_fn=_p4_build_report,
+                make_negotiator_fn=_p4_make_negotiator,
+                snapshot=_capacity_snapshot_ref,
+                initial_assignment=_negotiator_assignment,
+                is_busy_fn=is_busy_fn,
+                interval_s=_p4_interval,
+            )
+
+        _negotiation_loop_factory_fn = _negotiation_loop_factory_impl
+        logger.info(
+            "phase4_negotiation_loop_configured: interval=%.1fs",
+            _p4_interval,
+        )
+    except Exception as _phase4_err:
+        logger.warning(
+            "phase4_negotiation_loop_setup_failed: %s — "
+            "falling back to Phase 3 one-shot negotiation",
+            _phase4_err,
+        )
+        _capacity_snapshot_ref = None
+        _negotiation_loop_factory_fn = None
+
     # Start the peer gRPC server in a background daemon thread.
     # daemon=True ensures it is reaped automatically when the main thread exits
     # (the coordinator's SIGTERM handler on the main thread handles clean shutdown).
@@ -675,6 +813,13 @@ def main() -> None:
             # per-model capacity without a follow-up probe.
             "capacity_json": _capacity_json_str,
             "capacity_schema_version": _capacity_schema_version,
+            # Phase 4 zero-config: continuous re-negotiation plumbing.
+            # ``capacity_snapshot_ref`` is updated every tick by the
+            # NegotiationLoop; the announce loop reads from it on each
+            # heartbeat so fresh capacity + assignment propagate without
+            # any additional RPCs.
+            "capacity_snapshot_ref": _capacity_snapshot_ref,
+            "negotiation_loop_factory": _negotiation_loop_factory_fn,
             # All other peer params use peer/server.py defaults.
         },
         name="openhydra-peer",
