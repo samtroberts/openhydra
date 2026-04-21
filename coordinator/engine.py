@@ -461,6 +461,9 @@ class CoordinatorEngine:
                 shard_vram_gb=max(0.0, float(entry.get("shard_vram_gb", 0))),
                 shards_needed=max(1, int(entry.get("shards_needed", required))),
                 quality_tier=str(entry.get("quality_tier", "standard")),
+                # Phase 1 zero-config: plumb num_layers through so CapacityEngine
+                # can divide shard_vram_gb across layers.
+                num_layers=max(0, int(entry.get("num_layers", 0))),
             ))
         if not catalogue:
             raise RuntimeError("invalid_model_catalog: no valid entries")
