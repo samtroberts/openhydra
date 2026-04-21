@@ -332,12 +332,56 @@ def main() -> None:
             )
             raise SystemExit(2)
 
-    # Auto-generate peer-id from hostname if not provided.
-    if not args.peer_id:
-        import socket
-        _hostname = socket.gethostname().lower().replace(" ", "-").replace(".", "-")
-        args.peer_id = f"{_hostname}-peer"
-        logger.info("auto_peer_id: %s", args.peer_id)
+    # ── Phase 2 ConfigResolver: headless bootstrap ───────────────────────
+    # Resolve peer-id + ports in one shot.  Manual CLI flags take precedence:
+    #   * ``--peer-id foo`` → used verbatim
+    #   * ``--peer-id`` omitted → persistent peer-id from
+    #     ``.openhydra/peers.local.json`` if present, else derived from the
+    #     Ed25519 pubkey at ``.openhydra/bootstrap_identity.json``.
+    #   * Ports: if the CLI value equals the documented default we probe and
+    #     auto-increment on collision; a non-default CLI value is taken
+    #     literally (the user meant that port).
+    from peer.bootstrap_config import (
+        DEFAULT_BOOTSTRAP_IDENTITY_PATH,
+        DEFAULT_PEERS_LOCAL_PATH,
+        PeersLocalConfig,
+        resolve_bootstrap,
+    )
+
+    # First libp2p listen port — extract from --p2p-listen if present,
+    # else default to 4001 (matches coordinator/node.py default).
+    _p2p_default_port = 4001
+    _p2p_listen_from_cli = args.p2p_listen or []
+    if _p2p_listen_from_cli:
+        _first = str(_p2p_listen_from_cli[0])
+        # Extract /tcp/<port> from the multiaddr; fall back to default on parse errors.
+        import re as _re
+        _m = _re.search(r"/tcp/(\d+)", _first)
+        _p2p_default_port = int(_m.group(1)) if _m else 4001
+
+    _resolved = resolve_bootstrap(
+        cli_peer_id=args.peer_id,
+        cli_api_port=int(args.api_port),
+        cli_grpc_port=int(args.grpc_port),
+        cli_p2p_port=int(_p2p_default_port),
+        identity_path=DEFAULT_BOOTSTRAP_IDENTITY_PATH,
+        peers_local_path=DEFAULT_PEERS_LOCAL_PATH,
+    )
+    args.peer_id = _resolved.peer_id
+    args.api_port = _resolved.api_port
+    args.grpc_port = _resolved.grpc_port
+    # If the libp2p listen port changed due to auto-retry, rewrite any
+    # ``--p2p-listen`` multiaddrs that still reference the original default.
+    # Multi-multiaddr cases (repeated --p2p-listen flags) are left intact —
+    # the user clearly wanted specific addresses.
+    if _resolved.p2p_port != _p2p_default_port and len(_p2p_listen_from_cli) <= 1:
+        args.p2p_listen = [f"/ip4/0.0.0.0/tcp/{_resolved.p2p_port}"]
+    logger.info(
+        "bootstrap_resolved: peer_id=%s source=%s api=%d grpc=%d libp2p=%d migrated=%s",
+        _resolved.peer_id, _resolved.peer_id_source,
+        _resolved.api_port, _resolved.grpc_port, _resolved.p2p_port,
+        _resolved.ports_migrated,
+    )
 
     # Resolve DHT URLs; fall back to production bootstrap nodes if none given.
     dht_urls: list[str] = _parse_dht_urls(args.dht_url) or list(PRODUCTION_BOOTSTRAP_URLS)
@@ -513,6 +557,29 @@ def main() -> None:
         peers_config_path = _tmp.name
         logger.info("auto_peers_config: %s (local peer %s on :%d)",
                      peers_config_path, args.peer_id, args.grpc_port)
+
+    # ── Phase 2: persist peers.local.json so next boot reuses the same
+    # peer-id, advertise host, and ports without any CLI flags ────────────
+    try:
+        _persisted = PeersLocalConfig(
+            peer_id=str(args.peer_id),
+            libp2p_peer_id=(
+                str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+                if _p2p_node is not None else ""
+            ),
+            advertise_host=str(args.advertise_host or ""),
+            ports={
+                "api": int(args.api_port),
+                "grpc": int(args.grpc_port),
+                "libp2p": int(_resolved.p2p_port),
+            },
+        )
+        _persisted.save(_resolved.peers_local_path)
+        logger.info("peers_local_saved: %s", _resolved.peers_local_path)
+    except Exception as _persist_err:
+        # Non-fatal — persistence is a convenience, not a correctness
+        # requirement.  Log and continue.
+        logger.warning("peers_local_save_failed: %s", _persist_err)
 
     # Resolve model catalog path — look for models.catalog.json in cwd,
     # then fall back to None (uses engine defaults).
