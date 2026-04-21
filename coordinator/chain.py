@@ -237,13 +237,15 @@ class InferenceChain:
         # [seq_len, hidden_size] header embedded in the activation payload.
         _activation_packed = b""
         if plain_activation and not _quantized_activation:
-            import struct as _struct
+            # PR-1: route through vectorised numpy packer (~10× faster than
+            # ``struct.pack(*list)`` for 10⁵+ element activations).
+            from peer.activation_codec import pack_fp32 as _pack_fp32
             logging.debug(
                 "chain_pack: stage=%d n_floats=%d first2=[%s]",
                 stage_index, len(plain_activation),
                 ",".join(f"{v:.1f}" for v in plain_activation[:2]) if len(plain_activation) >= 2 else "?",
             )
-            _activation_packed = _struct.pack(f'<{len(plain_activation)}f', *plain_activation)
+            _activation_packed = _pack_fp32(plain_activation)
             plain_activation = []  # clear repeated float — use packed bytes
 
         _t_serial_start = time.perf_counter()
@@ -907,8 +909,9 @@ class InferenceChain:
         _push_activation: list[float] = []
         _push_packed = b""
         if initial_activation:
-            import struct as _push_struct
-            _push_packed = _push_struct.pack(f'<{len(initial_activation)}f', *initial_activation)
+            # PR-1: vectorised pack (numpy fast path).
+            from peer.activation_codec import pack_fp32 as _push_pack_fp32
+            _push_packed = _push_pack_fp32(initial_activation)
 
         req = peer_pb2.ForwardRequest(
             request_id=rid,

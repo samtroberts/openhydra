@@ -677,9 +677,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     _payload = dequantize_int8(_raw[8:], list(request.quantized_scales))
                     activation_in = _header + _payload
                 elif _packed:
-                    import struct as _struct
-                    _n = len(_packed) // 4
-                    activation_in = list(_struct.unpack(f'<{_n}f', _packed))
+                    # PR-1: vectorised unpack via numpy. unpack_fp32 falls
+                    # back to struct.unpack when numpy is unavailable.
+                    from peer.activation_codec import unpack_fp32 as _unpack_fp32
+                    activation_in = _unpack_fp32(_packed)
                 else:
                     activation_in = list(request.activation)
 
@@ -800,8 +801,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             _activation_for_proto = activation
             if activation and len(activation) > 10:
                 try:
-                    import struct as _struct
-                    _activation_packed_resp = _struct.pack(f'<{len(activation)}f', *activation)
+                    # PR-1: vectorised pack (numpy). Falls back to struct.pack
+                    # inside pack_fp32 when numpy is absent.
+                    from peer.activation_codec import pack_fp32 as _pack_fp32
+                    _activation_packed_resp = _pack_fp32(activation)
                     _activation_for_proto = []  # Clear repeated field when packed is set
                 except Exception:
                     pass
