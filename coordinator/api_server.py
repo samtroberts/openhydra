@@ -882,6 +882,9 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             from peer.capacity import (
                 DEFAULT_RESERVED_SYSTEM_MB,
                 DEFAULT_TARGET_CONTEXT,
+                NODE_PERSONA_ATOMIC_WORKER,
+                NODE_PERSONA_NATIVE_SHARD,
+                UpstreamConfig,
                 build_capacity_report,
             )
             from peer.hardware import detect_hardware_profile
@@ -909,6 +912,26 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
 
             meta = self.__class__._node_meta or {}
             hardware = detect_hardware_profile()
+
+            # Phase 1.5: reify the optional upstream dict into UpstreamConfig
+            # so build_capacity_report can validate it.  Missing / empty /
+            # non-dict values collapse to None (native_shard path).
+            _node_persona = str(
+                meta.get("node_persona") or NODE_PERSONA_NATIVE_SHARD
+            )
+            _upstream_meta = meta.get("upstream")
+            _upstream = None
+            if _node_persona == NODE_PERSONA_ATOMIC_WORKER and isinstance(
+                _upstream_meta, dict
+            ):
+                _upstream = UpstreamConfig(
+                    kind=str(_upstream_meta.get("kind") or ""),
+                    url=str(_upstream_meta.get("url") or ""),
+                    hosted_model_ids=tuple(
+                        str(m) for m in (_upstream_meta.get("hosted_model_ids") or ())
+                    ),
+                )
+
             report = build_capacity_report(
                 hardware=hardware,
                 catalog=list(getattr(engine, "model_catalog", []) or []),
@@ -923,6 +946,8 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 target_context=target_context,
                 reserved_system_mb=reserved_system_mb,
                 throughput_summary=dict(meta.get("throughput_summary") or {}),
+                node_persona=_node_persona,
+                upstream=_upstream,
             )
             self._send_json(report.to_dict(), headers=headers)
         except Exception as exc:

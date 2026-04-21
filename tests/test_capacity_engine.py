@@ -22,14 +22,21 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from coordinator.degradation import ModelAvailability
 from peer.capacity import (
     CAPACITY_SCHEMA_VERSION,
     DEFAULT_RESERVED_SYSTEM_MB,
     DEFAULT_TARGET_CONTEXT,
+    NODE_PERSONA_ATOMIC_WORKER,
+    NODE_PERSONA_NATIVE_SHARD,
+    REASON_MODEL_NOT_HOSTED,
     STATUS_CAPABLE,
     STATUS_INCAPABLE,
     STATUS_SHARDABLE,
+    UPSTREAM_KIND_OLLAMA,
+    UpstreamConfig,
     build_capacity_report,
     calculate_model_capacity,
 )
@@ -367,3 +374,203 @@ def test_catalog_loader_populates_num_layers_from_json(tmp_path) -> None:
     cap = calculate_model_capacity(_cuda_t4(), entry)
     assert cap.num_layers_total == 24
     assert cap.status == STATUS_CAPABLE
+
+
+# ─── Phase 1.5: node_persona / atomic_worker tests ───────────────────────────
+
+
+def _upstream_ollama_hosting(*model_ids: str) -> UpstreamConfig:
+    """Factory: an Ollama upstream declaring the given catalog model_ids."""
+    return UpstreamConfig(
+        kind=UPSTREAM_KIND_OLLAMA,
+        url="http://localhost:11434",
+        hosted_model_ids=tuple(model_ids),
+    )
+
+
+def test_schema_version_is_2() -> None:
+    """Schema bumped from 1 → 2 in Phase 1.5."""
+    assert CAPACITY_SCHEMA_VERSION == 2
+
+
+def test_native_shard_is_default_persona() -> None:
+    """Calling build_capacity_report with no persona arg yields native_shard
+    at the report level and on every entry."""
+    report = build_capacity_report(hardware=_cuda_t4(), catalog=_catalog())
+    d = report.to_dict()
+    assert d["node_persona"] == NODE_PERSONA_NATIVE_SHARD
+    assert d["upstream"] is None
+    assert all(c["persona"] == NODE_PERSONA_NATIVE_SHARD for c in d["capacity"])
+
+
+def test_atomic_worker_capable_for_hosted_model() -> None:
+    """An atomic_worker hosting the 2B model reports it as capable with
+    max_layers == num_layers_total and None per-layer math fields."""
+    upstream = _upstream_ollama_hosting("openhydra-qwen3.5-2b")
+    report = build_capacity_report(
+        hardware=_cuda_t4(),
+        catalog=_catalog(),
+        node_persona=NODE_PERSONA_ATOMIC_WORKER,
+        upstream=upstream,
+    )
+    cap_by_id = {c.model_id: c for c in report.capacity}
+    cap = cap_by_id["openhydra-qwen3.5-2b"]
+    assert cap.status == STATUS_CAPABLE
+    assert cap.max_layers_hostable == cap.num_layers_total == 24
+    assert cap.per_layer_weights_mb is None
+    assert cap.kv_cache_per_token_kb is None
+    assert cap.activation_overhead_mb is None
+    assert cap.persona == NODE_PERSONA_ATOMIC_WORKER
+    assert cap.can_host_full is True
+    assert cap.can_shard is False
+
+
+def test_atomic_worker_incapable_for_non_hosted_model() -> None:
+    """Models absent from hosted_model_ids are marked incapable with the
+    documented reason string."""
+    upstream = _upstream_ollama_hosting("openhydra-qwen3.5-2b")
+    report = build_capacity_report(
+        hardware=_cuda_t4(),
+        catalog=_catalog(),
+        node_persona=NODE_PERSONA_ATOMIC_WORKER,
+        upstream=upstream,
+    )
+    cap_by_id = {c.model_id: c for c in report.capacity}
+    cap = cap_by_id["openhydra-qwen3.5-9b"]
+    assert cap.status == STATUS_INCAPABLE
+    assert cap.reason == REASON_MODEL_NOT_HOSTED
+    assert cap.max_layers_hostable == 0
+    assert cap.per_layer_weights_mb is None
+    assert cap.persona == NODE_PERSONA_ATOMIC_WORKER
+
+
+def test_atomic_worker_without_upstream_raises() -> None:
+    """Keeps API callers honest — atomic_worker must provide an UpstreamConfig."""
+    with pytest.raises(ValueError, match="requires an UpstreamConfig"):
+        build_capacity_report(
+            hardware=_cuda_t4(),
+            catalog=_catalog(),
+            node_persona=NODE_PERSONA_ATOMIC_WORKER,
+            upstream=None,
+        )
+
+
+def test_native_shard_with_upstream_raises() -> None:
+    """Conversely, native_shard must NOT carry an upstream."""
+    upstream = _upstream_ollama_hosting("openhydra-qwen3.5-2b")
+    with pytest.raises(ValueError, match="cannot have an upstream"):
+        build_capacity_report(
+            hardware=_cuda_t4(),
+            catalog=_catalog(),
+            node_persona=NODE_PERSONA_NATIVE_SHARD,
+            upstream=upstream,
+        )
+
+
+def test_unknown_persona_raises() -> None:
+    with pytest.raises(ValueError, match="unknown node_persona"):
+        build_capacity_report(
+            hardware=_cuda_t4(),
+            catalog=_catalog(),
+            node_persona="potato_worker",
+        )
+
+
+def test_atomic_worker_can_shard_is_always_false() -> None:
+    """Every atomic_worker capacity entry must have can_shard=False,
+    regardless of whether the model is hosted."""
+    upstream = _upstream_ollama_hosting("openhydra-qwen3.5-2b")
+    report = build_capacity_report(
+        hardware=_cuda_t4(),
+        catalog=_catalog(),
+        node_persona=NODE_PERSONA_ATOMIC_WORKER,
+        upstream=upstream,
+    )
+    assert all(c.can_shard is False for c in report.capacity)
+
+
+def test_atomic_worker_report_upstream_block_shape() -> None:
+    """The ``upstream`` block serialises as the documented dict shape."""
+    upstream = UpstreamConfig(
+        kind=UPSTREAM_KIND_OLLAMA,
+        url="http://localhost:11434",
+        hosted_model_ids=("openhydra-qwen3.5-2b", "openhydra-qwen3.5-9b"),
+    )
+    report = build_capacity_report(
+        hardware=_cuda_t4(),
+        catalog=_catalog(),
+        node_persona=NODE_PERSONA_ATOMIC_WORKER,
+        upstream=upstream,
+    )
+    d = report.to_dict()
+    assert d["upstream"] == {
+        "kind": "ollama",
+        "url": "http://localhost:11434",
+        "hosted_model_ids": ["openhydra-qwen3.5-2b", "openhydra-qwen3.5-9b"],
+    }
+
+
+def test_atomic_worker_report_json_round_trip() -> None:
+    """to_dict() output round-trips cleanly through json with no custom encoder."""
+    upstream = _upstream_ollama_hosting("openhydra-qwen3.5-2b")
+    report = build_capacity_report(
+        hardware=_cuda_t4(),
+        catalog=_catalog(),
+        node_persona=NODE_PERSONA_ATOMIC_WORKER,
+        upstream=upstream,
+    )
+    payload = json.dumps(report.to_dict())
+    parsed = json.loads(payload)
+    assert parsed["schema_version"] == CAPACITY_SCHEMA_VERSION
+    assert parsed["node_persona"] == NODE_PERSONA_ATOMIC_WORKER
+    # None per-layer fields must round-trip as JSON null, not missing keys.
+    first = parsed["capacity"][0]
+    assert first["per_layer_weights_mb"] is None
+    assert first["kv_cache_per_token_kb"] is None
+    assert first["activation_overhead_mb"] is None
+
+
+def test_atomic_worker_per_layer_fields_are_none_not_zero() -> None:
+    """Explicit sentinel test — None is the documented "does not apply"
+    value.  If someone refactors to 0.0 they must be forced to update this."""
+    upstream = _upstream_ollama_hosting("openhydra-qwen3.5-2b")
+    report = build_capacity_report(
+        hardware=_cuda_t4(),
+        catalog=_catalog(),
+        node_persona=NODE_PERSONA_ATOMIC_WORKER,
+        upstream=upstream,
+    )
+    for c in report.capacity:
+        assert c.per_layer_weights_mb is None, c.model_id
+        assert c.kv_cache_per_token_kb is None, c.model_id
+        assert c.activation_overhead_mb is None, c.model_id
+
+
+def test_native_shard_per_layer_fields_are_floats() -> None:
+    """Regression guard: native_shard entries keep numeric per-layer costs
+    even with the new nullable type — Phase 1 consumers must not break."""
+    report = build_capacity_report(hardware=_cuda_t4(), catalog=_catalog())
+    for c in report.capacity:
+        assert isinstance(c.per_layer_weights_mb, float), c.model_id
+        assert isinstance(c.kv_cache_per_token_kb, float), c.model_id
+        assert isinstance(c.activation_overhead_mb, float), c.model_id
+
+
+def test_native_shard_numeric_snapshot_unchanged() -> None:
+    """Lock Phase 1 baseline: on a T4, Qwen 2B is capable with 106-108 MB
+    per layer and Qwen 9B is shardable with ~576 MB per layer + kv 4.5 KB/tok.
+    If these numbers drift, something in the memory model changed and we
+    should be deliberate about it."""
+    report = build_capacity_report(hardware=_cuda_t4(), catalog=_catalog())
+    cap_by_id = {c.model_id: c for c in report.capacity}
+
+    q2b = cap_by_id["openhydra-qwen3.5-2b"]
+    assert q2b.status == STATUS_CAPABLE
+    assert 105.0 <= q2b.per_layer_weights_mb <= 108.0
+    assert abs(q2b.kv_cache_per_token_kb - 1.25) < 0.05
+
+    q9b = cap_by_id["openhydra-qwen3.5-9b"]
+    assert q9b.status == STATUS_SHARDABLE
+    assert 575.0 <= q9b.per_layer_weights_mb <= 577.0
+    assert abs(q9b.kv_cache_per_token_kb - 4.5) < 0.05
+    assert 15 <= q9b.max_layers_hostable <= 19  # small drift tolerance
