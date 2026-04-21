@@ -125,6 +125,49 @@ def main() -> None:
             "Default: auto-detected by the peer."
         ),
     )
+
+    # --- Node persona (Phase 1.5 zero-config bootstrap) ---
+    # A node is either a ``native_shard`` (tensor-passing libp2p peer — the
+    # default) or an ``atomic_worker`` (wrapper around a third-party runtime
+    # like Ollama/Exo that accepts full text prompts).  Atomic workers never
+    # shard — they serve layer 0→N as one atomic unit.
+    parser.add_argument(
+        "--node-persona",
+        choices=["native_shard", "atomic_worker"],
+        default="native_shard",
+        help=(
+            "Node role. ``native_shard`` (default) is a tensor-passing libp2p peer. "
+            "``atomic_worker`` is a wrapper around an external runtime (Ollama, Exo, "
+            "llama.cpp, OpenAI-compatible) that handles full text prompts. "
+            "Atomic workers require --upstream-kind / --upstream-url / --hosted-model-ids."
+        ),
+    )
+    parser.add_argument(
+        "--upstream-kind",
+        choices=["", "ollama", "exo", "openai_compat", "llama_cpp"],
+        default="",
+        help=(
+            "External runtime kind wrapped by this node. "
+            "Only meaningful when --node-persona=atomic_worker."
+        ),
+    )
+    parser.add_argument(
+        "--upstream-url",
+        default="",
+        help=(
+            "Base URL of the external runtime (e.g. http://localhost:11434 for Ollama). "
+            "Only meaningful when --node-persona=atomic_worker."
+        ),
+    )
+    parser.add_argument(
+        "--hosted-model-ids",
+        default="",
+        help=(
+            "Comma-separated OpenHydra model_ids served by this atomic_worker's "
+            "upstream runtime (e.g. openhydra-qwen3.5-2b,openhydra-qwen3.5-9b). "
+            "Declared at boot — no automatic probing of the upstream in Phase 1.5."
+        ),
+    )
     parser.add_argument(
         "--dht-url", action="append", default=None, metavar="URL",
         help=(
@@ -226,6 +269,68 @@ def main() -> None:
         level=args.log_level,
         json_logs=(args.deployment_profile == "prod"),
     )
+
+    # ── Phase 1.5: node persona CLI validation ─────────────────────────────
+    # atomic_worker requires upstream config and cannot shard.
+    # native_shard forbids upstream config and --hosted-model-ids.
+    _node_persona = str(getattr(args, "node_persona", "native_shard") or "native_shard")
+    _upstream_kind = str(getattr(args, "upstream_kind", "") or "")
+    _upstream_url = str(getattr(args, "upstream_url", "") or "")
+    _hosted_model_ids_raw = str(getattr(args, "hosted_model_ids", "") or "")
+    _hosted_model_ids: list[str] = [
+        m.strip() for m in _hosted_model_ids_raw.split(",") if m.strip()
+    ]
+
+    if _node_persona == "atomic_worker":
+        _missing: list[str] = []
+        if not _upstream_kind:
+            _missing.append("--upstream-kind")
+        if not _upstream_url:
+            _missing.append("--upstream-url")
+        if not _hosted_model_ids:
+            _missing.append("--hosted-model-ids")
+        if _missing:
+            logger.error(
+                "atomic_worker_cli_validation_failed: --node-persona=atomic_worker "
+                "requires %s",
+                ", ".join(_missing),
+            )
+            raise SystemExit(2)
+        # Atomic workers cannot shard — they always serve layer 0→N as an
+        # opaque text API.  Refuse any shard-related flag that would imply
+        # partial coverage.
+        _shard_violations: list[str] = []
+        if int(getattr(args, "layer_start", 0) or 0) != 0:
+            _shard_violations.append("--layer-start")
+        if int(getattr(args, "layer_end", 0) or 0) != 0:
+            _shard_violations.append("--layer-end")
+        if int(getattr(args, "shard_index", 0) or 0) != 0:
+            _shard_violations.append("--shard-index")
+        if int(getattr(args, "total_shards", 1) or 1) > 1:
+            _shard_violations.append("--total-shards>1")
+        if _shard_violations:
+            logger.error(
+                "atomic_worker_cli_validation_failed: atomic workers cannot shard — "
+                "remove %s (they always serve the entire model)",
+                ", ".join(_shard_violations),
+            )
+            raise SystemExit(2)
+    else:
+        # native_shard default — reject upstream-only flags.
+        _forbidden: list[str] = []
+        if _upstream_kind:
+            _forbidden.append("--upstream-kind")
+        if _upstream_url:
+            _forbidden.append("--upstream-url")
+        if _hosted_model_ids:
+            _forbidden.append("--hosted-model-ids")
+        if _forbidden:
+            logger.error(
+                "native_shard_cli_validation_failed: --node-persona=native_shard (default) "
+                "does not accept %s — pass --node-persona=atomic_worker to use them",
+                ", ".join(_forbidden),
+            )
+            raise SystemExit(2)
 
     # Auto-generate peer-id from hostname if not provided.
     if not args.peer_id:
@@ -473,6 +578,18 @@ def main() -> None:
         },
         "advertise_host": str(args.advertise_host or ""),
         "runtime_backend": str(args.runtime_backend or ""),
+        # Phase 1.5: hybrid persona metadata for /v1/internal/capacity.
+        # ``upstream`` is a dict (not an UpstreamConfig yet) to keep node.py
+        # free of the peer.capacity import — the API handler reifies it.
+        "node_persona": _node_persona,
+        "upstream": (
+            {
+                "kind": _upstream_kind,
+                "url": _upstream_url,
+                "hosted_model_ids": list(_hosted_model_ids),
+            }
+            if _node_persona == "atomic_worker" else None
+        ),
     }
 
     # Start the coordinator HTTP API on the main thread (blocking).

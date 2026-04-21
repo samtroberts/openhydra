@@ -104,6 +104,17 @@ class Announcement:
     #   parse it lazily — old peers that never populate this remain compatible.
     capacity_schema_version: int = 0
     capacity_json: str = ""
+    # Zero-config bootstrap Phase 1.5: hybrid node persona.
+    # node_persona: "native_shard" (default) — tensor-passing libp2p peer;
+    #               "atomic_worker" — wrapper around a third-party runtime
+    #               (Ollama, Exo, llama.cpp, OpenAI-compatible) that accepts
+    #               full text prompts and returns full text completions.
+    # upstream_kind / upstream_url: populated only for atomic_worker nodes.
+    # Old coordinators that predate schema v2 simply ignore these three
+    # fields — the distinction is additive.
+    node_persona: str = "native_shard"
+    upstream_kind: str = ""
+    upstream_url: str = ""
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:
