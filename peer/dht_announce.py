@@ -96,6 +96,14 @@ class Announcement:
     relay_address: str = ""        # "host:port" of the relay (for routing)
     # Cross-ISP: libp2p peer ID for proxy forwarding through Circuit Relay.
     libp2p_peer_id: str = ""
+    # Zero-config bootstrap Phase 1: capacity engine payload.
+    # capacity_schema_version: bumps when the JSON shape changes (see
+    #   peer.capacity.CAPACITY_SCHEMA_VERSION).  0 = no capacity report attached.
+    # capacity_json: stringified CapacityReport produced by
+    #   peer.capacity.build_capacity_report(...).to_dict().  Coordinators can
+    #   parse it lazily — old peers that never populate this remain compatible.
+    capacity_schema_version: int = 0
+    capacity_json: str = ""
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:

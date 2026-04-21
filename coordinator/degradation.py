@@ -32,6 +32,10 @@ class ModelAvailability:
     shard_vram_gb: float = 0.0    # VRAM per shard in GB (0 = not sharded / unknown)
     shards_needed: int = 1        # peers required for a full pipeline
     quality_tier: str = "standard"  # "basic" | "standard" | "advanced" | "frontier"
+    # Zero-config bootstrap Phase 1: transformer layer count.  Sourced from
+    # the ``num_layers`` catalog field (mirrors HuggingFace ``num_hidden_layers``).
+    # 0 = unknown; CapacityEngine treats unknown models as incapable.
+    num_layers: int = 0
 
 
 @dataclass(frozen=True)

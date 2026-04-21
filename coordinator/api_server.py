@@ -332,6 +332,12 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
     _mode_switching: bool = False          # 503 drain gate during mode transition
     _mode_switch_lock = threading.Lock()   # Serialize concurrent mode switches
     _metrics_lock = threading.Lock()
+    # Zero-config bootstrap Phase 1: node-identity metadata supplied by
+    # coordinator.node at serve() time.  Used by the /v1/internal/capacity
+    # endpoint to emit the full CapacityReport payload without re-deriving
+    # peer_id / libp2p_peer_id / ports / advertise_host from scratch.
+    # ``None`` when the coordinator is running standalone (no co-located peer).
+    _node_meta: dict[str, Any] | None = None
     _http_requests_total: int = 0
     _http_request_errors_total: int = 0
     _http_request_latency_seconds_sum: float = 0.0
@@ -853,6 +859,80 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             "switching": bool(self.__class__._mode_switching),
         })
 
+    def _handle_capacity_report(
+        self,
+        *,
+        rid_headers: dict[str, str] | None = None,
+    ) -> None:
+        """Handle GET /v1/internal/capacity — zero-config capacity JSON.
+
+        Emits a :class:`peer.capacity.CapacityReport` for this node.  The
+        hardware profile is recomputed on every request so the caller sees
+        live VRAM/RAM figures, not boot-time snapshots.  Model catalogue
+        comes from the engine; peer / libp2p / port / advertise_host
+        metadata comes from ``OpenHydraHandler._node_meta`` (populated by
+        :func:`serve` at startup).
+
+        Query params (all optional, all integers):
+            target_context      — override DEFAULT_TARGET_CONTEXT (default 8192)
+            reserved_system_mb  — override OS/driver headroom (default 1024)
+        """
+        headers = dict(rid_headers or {})
+        try:
+            from peer.capacity import (
+                DEFAULT_RESERVED_SYSTEM_MB,
+                DEFAULT_TARGET_CONTEXT,
+                build_capacity_report,
+            )
+            from peer.hardware import detect_hardware_profile
+
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                target_context = int(qs.get("target_context", [str(DEFAULT_TARGET_CONTEXT)])[0])
+            except (TypeError, ValueError):
+                target_context = DEFAULT_TARGET_CONTEXT
+            try:
+                reserved_system_mb = int(
+                    qs.get("reserved_system_mb", [str(DEFAULT_RESERVED_SYSTEM_MB)])[0]
+                )
+            except (TypeError, ValueError):
+                reserved_system_mb = DEFAULT_RESERVED_SYSTEM_MB
+
+            engine = self.__class__.engine
+            if engine is None:
+                self._send_json(
+                    {"error": "engine_not_initialized"},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    headers=headers,
+                )
+                return
+
+            meta = self.__class__._node_meta or {}
+            hardware = detect_hardware_profile()
+            report = build_capacity_report(
+                hardware=hardware,
+                catalog=list(getattr(engine, "model_catalog", []) or []),
+                peer_id=str(meta.get("peer_id") or ""),
+                libp2p_peer_id=str(meta.get("libp2p_peer_id") or ""),
+                ports=dict(meta.get("ports") or {}),
+                advertise_host=str(meta.get("advertise_host") or ""),
+                requires_relay=bool(meta.get("requires_relay") or False),
+                relay_circuits=list(meta.get("relay_circuits") or []),
+                runtime_backend=str(meta.get("runtime_backend") or ""),
+                accelerator_detail=str(meta.get("accelerator_detail") or ""),
+                target_context=target_context,
+                reserved_system_mb=reserved_system_mb,
+                throughput_summary=dict(meta.get("throughput_summary") or {}),
+            )
+            self._send_json(report.to_dict(), headers=headers)
+        except Exception as exc:
+            logger.exception("capacity_report_failed: %s", exc)
+            self._send_json(
+                {"error": "capacity_report_failed", "detail": str(exc)},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                headers=headers,
+            )
+
     @classmethod
     def _record_http_request_metrics(
         cls,
@@ -1031,6 +1111,13 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             # Internal mode status endpoint.
             if parsed.path == "/v1/internal/mode":
                 self._handle_mode_status()
+                return
+
+            # Zero-config bootstrap Phase 1: capacity report for this node.
+            # Always recomputes HardwareProfile on request so users see
+            # live VRAM/RAM numbers rather than boot-time snapshots.
+            if parsed.path == "/v1/internal/capacity":
+                self._handle_capacity_report(rid_headers=rid_headers)
                 return
 
             self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND, headers=rid_headers)
@@ -1660,6 +1747,7 @@ def serve(
     api_key: str | None = None,
     rate_limiter: _RateLimiter | None = None,
     p2p_node: object | None = None,
+    node_meta: dict[str, Any] | None = None,
 ) -> None:
     OpenHydraHandler.engine = CoordinatorEngine(config)
     # Inject the Rust P2P node into the discovery service (if available).
@@ -1669,6 +1757,15 @@ def serve(
             _dsvc._p2p_node = p2p_node
     OpenHydraHandler._api_key = api_key or None
     OpenHydraHandler._rate_limiter = rate_limiter
+    # Zero-config bootstrap Phase 1: node metadata for /v1/internal/capacity.
+    # If callers don't supply node_meta explicitly, synthesize minimal info
+    # from the p2p_node (if present).  Capacity reports without peer_id will
+    # still be meaningful for the user; they just won't carry identity.
+    if node_meta is None and p2p_node is not None:
+        node_meta = {
+            "libp2p_peer_id": str(getattr(p2p_node, "libp2p_peer_id", "") or ""),
+        }
+    OpenHydraHandler._node_meta = node_meta
     if api_key:
         logger.info("API key authentication enabled")
     else:

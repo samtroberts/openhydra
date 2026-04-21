@@ -456,6 +456,25 @@ def main() -> None:
             or _push_callback_addr,
     )
 
+    # Zero-config bootstrap Phase 1: forward identity + network metadata to
+    # the HTTP API so the /v1/internal/capacity endpoint can emit a complete
+    # CapacityReport without re-deriving any of this. All fields default to
+    # empty strings / zeros if the underlying value isn't available yet.
+    _node_meta: dict[str, Any] = {
+        "peer_id": str(args.peer_id or ""),
+        "libp2p_peer_id": (
+            str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+            if _p2p_node is not None else ""
+        ),
+        "ports": {
+            "api": int(args.api_port),
+            "grpc": int(args.grpc_port),
+            "libp2p": 4001,
+        },
+        "advertise_host": str(args.advertise_host or ""),
+        "runtime_backend": str(args.runtime_backend or ""),
+    }
+
     # Start the coordinator HTTP API on the main thread (blocking).
     # Signal handling (SIGTERM, SIGINT) is already wired inside coordinator_serve.
     coordinator_serve(
@@ -464,6 +483,7 @@ def main() -> None:
         config=engine_config,
         api_key=api_key,
         p2p_node=_p2p_node,
+        node_meta=_node_meta,
     )
 
 
