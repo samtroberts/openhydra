@@ -479,6 +479,172 @@ def main() -> None:
         except Exception as _p2p_err:
             logger.warning("p2p_node_start_failed: %s", _p2p_err)
 
+    # ── Phase 3 zero-config bootstrap: SwarmNegotiator + capacity snapshot ──
+    # Build the CapacityReport NOW (before peer announce) so we can:
+    #   1. Self-assign a shard via SwarmNegotiator when the user didn't
+    #      pass explicit --layer-start / --layer-end / --shard-index.
+    #   2. Serialise it as capacity_json and hand it to the announce loop.
+    # Any failure here is non-fatal — we fall back to whatever the user
+    # passed on the CLI (manual shard flags always win anyway).
+    _capacity_json_str: str = ""
+    _capacity_schema_version: int = 0
+    _negotiator_assignment = None
+    try:
+        import json as _negotiator_json
+        from coordinator.engine import EngineConfig as _EC
+        from coordinator.degradation import ModelAvailability as _MA
+        from peer.capacity import (
+            CAPACITY_SCHEMA_VERSION as _CSV,
+            NODE_PERSONA_ATOMIC_WORKER as _NP_ATOMIC,
+            NODE_PERSONA_NATIVE_SHARD as _NP_NATIVE,
+            UpstreamConfig as _UC,
+            build_capacity_report as _build_report,
+        )
+        from peer.hardware import detect_hardware_profile as _detect_hw
+        from peer.swarm_negotiator import (
+            PeerClaim as _PeerClaim,
+            SwarmNegotiator as _Negotiator,
+        )
+
+        # Load the catalogue independently of the CoordinatorEngine —
+        # the engine itself spins up only later inside coordinator_serve.
+        _phase3_catalog_path: str | None = "models.catalog.json"
+        if not os.path.exists(_phase3_catalog_path or ""):
+            _phase3_catalog_path = None
+        _phase3_catalog: list = []
+        if _phase3_catalog_path:
+            try:
+                _phase3_raw = _negotiator_json.loads(
+                    open(_phase3_catalog_path).read()
+                )
+                _seen: set[str] = set()
+                for _entry in _phase3_raw:
+                    _mid = str(_entry.get("model_id", "")).strip()
+                    if not _mid or _mid in _seen:
+                        continue
+                    _seen.add(_mid)
+                    _phase3_catalog.append(_MA(
+                        model_id=_mid,
+                        required_peers=int(_entry.get("required_peers", 1)),
+                        hf_model_id=str(_entry.get("hf_model_id", "")),
+                        min_vram_gb=max(0, int(_entry.get("min_vram_gb", 0))),
+                        recommended_quantization=str(_entry.get("recommended_quantization", "fp32")),
+                        context_length=max(0, int(_entry.get("context_length", 4096))),
+                        shard_vram_gb=max(0.0, float(_entry.get("shard_vram_gb", 0))),
+                        shards_needed=max(1, int(_entry.get("shards_needed", 1))),
+                        quality_tier=str(_entry.get("quality_tier", "standard")),
+                        num_layers=max(0, int(_entry.get("num_layers", 0))),
+                    ))
+            except Exception as _cat_err:
+                logger.warning("phase3_catalog_load_failed: %s", _cat_err)
+                _phase3_catalog = []
+
+        _hw = _detect_hw()
+        _upstream_cfg = None
+        if _node_persona == "atomic_worker":
+            _upstream_cfg = _UC(
+                kind=_upstream_kind,
+                url=_upstream_url,
+                hosted_model_ids=tuple(_hosted_model_ids),
+            )
+        _report = _build_report(
+            hardware=_hw,
+            catalog=_phase3_catalog,
+            peer_id=str(args.peer_id or ""),
+            libp2p_peer_id=(
+                str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+                if _p2p_node is not None else ""
+            ),
+            ports={
+                "api": int(args.api_port),
+                "grpc": int(args.grpc_port),
+                "libp2p": int(_resolved.p2p_port),
+            },
+            advertise_host=str(args.advertise_host or ""),
+            runtime_backend=str(args.runtime_backend or ""),
+            node_persona=_node_persona,
+            upstream=_upstream_cfg,
+        )
+        _capacity_json_str = _negotiator_json.dumps(_report.to_dict())
+        _capacity_schema_version = _CSV
+
+        # Skip negotiation if the user passed an explicit shard range —
+        # manual CLI intent always wins (Phase 2 design principle).
+        _manual_shard = (
+            bool(_explicit_layer_indices)
+            or int(getattr(args, "total_shards", 1) or 1) > 1
+            or int(getattr(args, "shard_index", 0) or 0) != 0
+        )
+        if _manual_shard:
+            logger.info(
+                "swarm_negotiate_skipped: manual shard flags present "
+                "(--layer-start/--layer-end/--shard-index/--total-shards)"
+            )
+        else:
+            # Build a DHT scan function.  When we have a live p2p_node,
+            # query Kademlia; otherwise return empty (first-boot-on-empty-swarm).
+            def _scan_dht_for_model(mid: str) -> list:
+                claims: list = []
+                if _p2p_node is None:
+                    return claims
+                try:
+                    discovered = _p2p_node.discover(mid) or []
+                except Exception as _disc_err:
+                    logger.debug(
+                        "phase3_discover_failed: model=%s err=%s", mid, _disc_err,
+                    )
+                    return claims
+                for rec in discovered:
+                    try:
+                        if not isinstance(rec, dict):
+                            continue
+                        claims.append(_PeerClaim(
+                            libp2p_peer_id=str(rec.get("libp2p_peer_id") or ""),
+                            model_id=str(rec.get("model_id") or mid),
+                            layer_start=int(rec.get("layer_start", 0) or 0),
+                            layer_end=int(rec.get("layer_end", 0) or 0),
+                            total_layers=int(rec.get("total_layers", 0) or 0),
+                            available_vram_mb=int(rec.get("available_vram_mb", 0) or 0),
+                        ))
+                    except (TypeError, ValueError):
+                        continue
+                return claims
+
+            _negotiator = _Negotiator(
+                capacity_report=_report,
+                libp2p_peer_id=(
+                    str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+                    if _p2p_node is not None else ""
+                ),
+                dht_scan=_scan_dht_for_model,
+                preferred_model_order=(args.model_id,) if args.model_id else (),
+            )
+            _negotiator_assignment = _negotiator.negotiate()
+            if _negotiator_assignment is not None:
+                # Override the shard args so the peer thread picks up the
+                # negotiated range instead of the CLI defaults (shard_index=0,
+                # total_shards=1, empty layer_start/layer_end).
+                args.model_id = _negotiator_assignment.model_id
+                args.layer_start = int(_negotiator_assignment.layer_start)
+                args.layer_end = int(_negotiator_assignment.layer_end)
+                _explicit_layer_indices = tuple(
+                    range(args.layer_start, args.layer_end)
+                )
+                logger.info(
+                    "swarm_negotiate_result: model=%s layers=[%d, %d) total=%d source=%s",
+                    _negotiator_assignment.model_id,
+                    _negotiator_assignment.layer_start,
+                    _negotiator_assignment.layer_end,
+                    _negotiator_assignment.total_layers,
+                    _negotiator_assignment.source,
+                )
+            else:
+                logger.info(
+                    "swarm_negotiate_no_assignment: falling back to CLI defaults"
+                )
+    except Exception as _phase3_err:
+        logger.warning("phase3_negotiate_failed: %s", _phase3_err)
+
     # Start the peer gRPC server in a background daemon thread.
     # daemon=True ensures it is reaped automatically when the main thread exits
     # (the coordinator's SIGTERM handler on the main thread handles clean shutdown).
@@ -504,6 +670,11 @@ def main() -> None:
             "rebalance_min_improvement": float(getattr(args, "rebalance_min_improvement", 1.15)),
             "rebalance_cooldown_s": float(getattr(args, "rebalance_cooldown", 300)),
             "p2p_node": _p2p_node,
+            # Phase 3 zero-config: capacity snapshot attached to every
+            # DHT announcement so the rest of the swarm sees this node's
+            # per-model capacity without a follow-up probe.
+            "capacity_json": _capacity_json_str,
+            "capacity_schema_version": _capacity_schema_version,
             # All other peer params use peer/server.py defaults.
         },
         name="openhydra-peer",
