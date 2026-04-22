@@ -781,25 +781,78 @@ def main() -> None:
             )
 
             def _scan(mid: str) -> list:
+                """Combined DHT scan for the negotiator.
+
+                The libp2p Kademlia discover has a key-schema mismatch
+                between ``handle_announce`` (which writes at
+                ``/openhydra/model/<mid>/<peer_id>``) and
+                ``handle_discover`` (which reads at ``/openhydra/model/
+                <mid>``). Until that's fixed in Rust, we fall back to
+                the HTTP DHT on port 8468 — the same source the chain's
+                PathFinder uses to build live pipelines — which is
+                known to work reliably in production. On an empty
+                Kademlia result we merge the HTTP DHT peer list so the
+                SwarmNegotiator's conflict_split heuristic can still
+                see the other peers.
+                """
                 claims: list = []
-                if _p2p_node is None:
-                    return claims
-                try:
-                    discovered = _p2p_node.discover(mid) or []
-                except Exception:
-                    return claims
-                for rec in discovered:
+                # Kademlia path (primary — will find peers once the key
+                # schema is repaired on the Rust side).
+                if _p2p_node is not None:
                     try:
-                        if not isinstance(rec, dict):
+                        discovered = _p2p_node.discover(mid) or []
+                    except Exception:
+                        discovered = []
+                    for rec in discovered:
+                        try:
+                            if not isinstance(rec, dict):
+                                continue
+                            claims.append(_P4_PeerClaim(
+                                libp2p_peer_id=str(rec.get("libp2p_peer_id") or ""),
+                                model_id=str(rec.get("model_id") or mid),
+                                layer_start=int(rec.get("layer_start", 0) or 0),
+                                layer_end=int(rec.get("layer_end", 0) or 0),
+                                total_layers=int(rec.get("total_layers", 0) or 0),
+                                available_vram_mb=int(rec.get("available_vram_mb", 0) or 0),
+                            ))
+                        except (TypeError, ValueError):
+                            continue
+                # HTTP DHT fallback — always runs so a failing Kademlia
+                # doesn't silently block the negotiator.
+                try:
+                    from coordinator.path_finder import load_peers_from_dht as _lpf
+                    http_peers = _lpf(
+                        dht_urls=list(dht_urls or ()),
+                        model_id=str(mid or ""),
+                        timeout_s=2.0,
+                    ) or []
+                except Exception:
+                    http_peers = []
+                seen_libp2p = {c.libp2p_peer_id for c in claims if c.libp2p_peer_id}
+                for peer in http_peers:
+                    try:
+                        pid = str(getattr(peer, "libp2p_peer_id", "") or "")
+                        # Skip self + already-known peers.
+                        if not pid:
+                            continue
+                        if pid in seen_libp2p:
+                            continue
+                        total = int(getattr(peer, "total_layers", 0) or 0)
+                        start = int(getattr(peer, "layer_start", 0) or 0)
+                        end = int(getattr(peer, "layer_end", 0) or 0)
+                        # Skip records that don't advertise a layer range
+                        # at all — they predate the sharding schema.
+                        if total <= 0 or end <= start:
                             continue
                         claims.append(_P4_PeerClaim(
-                            libp2p_peer_id=str(rec.get("libp2p_peer_id") or ""),
-                            model_id=str(rec.get("model_id") or mid),
-                            layer_start=int(rec.get("layer_start", 0) or 0),
-                            layer_end=int(rec.get("layer_end", 0) or 0),
-                            total_layers=int(rec.get("total_layers", 0) or 0),
-                            available_vram_mb=int(rec.get("available_vram_mb", 0) or 0),
+                            libp2p_peer_id=pid,
+                            model_id=str(getattr(peer, "model_id", "") or mid),
+                            layer_start=start,
+                            layer_end=end,
+                            total_layers=total,
+                            available_vram_mb=0,  # HTTP DHT doesn't track VRAM yet
                         ))
+                        seen_libp2p.add(pid)
                     except (TypeError, ValueError):
                         continue
                 return claims
