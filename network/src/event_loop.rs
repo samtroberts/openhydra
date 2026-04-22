@@ -72,6 +72,23 @@ pub enum SwarmCommand {
     GetDcutrStats {
         reply: oneshot::Sender<(u64, u64, u64)>,
     },
+    /// Publish a raw bytes payload on the Gossipsub topic
+    /// ``openhydra/swarm/v1/events`` (PR-3 / B1). The Python
+    /// ``GossipClient`` is responsible for the JSON codec and
+    /// event-type semantics.
+    PublishEvent {
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Drain the oldest queued inbound gossip message, if any (PR-3 / B1).
+    /// Returns ``None`` when the queue is empty. The returned tuple is
+    /// ``(sender_libp2p_peer_id, payload_bytes)`` — callers that need the
+    /// sender identity for the ``PEER_DEAD`` 2-observer quorum can read
+    /// it directly off the gossip hop rather than trusting an embedded
+    /// claim inside the JSON.
+    PollEvent {
+        reply: oneshot::Sender<Option<(String, Vec<u8>)>>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -117,7 +134,19 @@ struct LoopState {
     /// When respond_proxy is called with a "proxy-local-*" req_id, the response
     /// is delivered here instead of through libp2p.
     local_proxy_replies: HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// PR-3 (B1): inbound gossip messages awaiting Python poll. Each entry
+    /// is ``(sender_libp2p_peer_id, payload_bytes)``. Bounded ring — the
+    /// Rust side drops the oldest when the queue exceeds
+    /// ``GOSSIP_INBOUND_QUEUE_MAX`` to prevent unbounded memory growth
+    /// when Python is slow to poll.
+    gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
 }
+
+/// PR-3: upper bound on pending inbound gossip messages.
+/// The swarm-wide event rate is tiny (one ``PEER_DEAD`` per real failure,
+/// plus the occasional ``REQUEST_HOLE_PUNCH``) so a soft cap of 256 is
+/// roughly an hour of breathing room before oldest-drop kicks in.
+const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 
 struct PendingDiscover {
     #[allow(dead_code)]
@@ -149,6 +178,7 @@ impl LoopState {
             dcutr_failures: 0,
             direct_peers: std::collections::HashSet::new(),
             local_proxy_replies: HashMap::new(),
+            gossip_inbound_queue: std::collections::VecDeque::new(),
         }
     }
 }
@@ -229,6 +259,25 @@ pub async fn run_event_loop(
                             state.direct_peers.len() as u64,
                         );
                         let _ = reply.send(snapshot);
+                    }
+                    Some(SwarmCommand::PublishEvent { payload, reply }) => {
+                        // PR-3: publish raw bytes on the Gossipsub topic.
+                        // The Python side has already JSON-encoded the
+                        // message and decided on event_type semantics.
+                        let topic = libp2p::gossipsub::IdentTopic::new(
+                            crate::swarm::GOSSIPSUB_TOPIC,
+                        );
+                        let res = swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(topic, payload)
+                            .map(|_| ())
+                            .map_err(|e| format!("gossipsub publish: {e}"));
+                        let _ = reply.send(res);
+                    }
+                    Some(SwarmCommand::PollEvent { reply }) => {
+                        let item = state.gossip_inbound_queue.pop_front();
+                        let _ = reply.send(item);
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;
@@ -460,6 +509,28 @@ fn handle_swarm_event(
         // ── gRPC Proxy ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::GrpcProxy(proxy_event)) => {
             handle_grpc_proxy_event(proxy_event, swarm, state);
+        }
+
+        // ── Gossipsub (PR-3 / B1) ──
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Gossipsub(gossip_event)) => {
+            if let libp2p::gossipsub::Event::Message {
+                propagation_source,
+                message,
+                ..
+            } = gossip_event
+            {
+                // Queue the payload for Python to poll. ``propagation_source``
+                // is the immediate gossip hop (NOT necessarily the original
+                // author) — we surface it so Python can build a 2-observer
+                // quorum from distinct hop sources when needed.
+                if state.gossip_inbound_queue.len() >= GOSSIP_INBOUND_QUEUE_MAX {
+                    state.gossip_inbound_queue.pop_front();
+                    warn!("gossipsub_queue_overflow: dropped oldest message");
+                }
+                state
+                    .gossip_inbound_queue
+                    .push_back((propagation_source.to_string(), message.data));
+            }
         }
 
         // ── Connection lifecycle ──

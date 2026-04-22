@@ -353,6 +353,47 @@ impl PyP2PNode {
         Ok(dict.into_py_any(py)?)
     }
 
+    /// Publish a raw bytes payload on the Gossipsub topic
+    /// ``openhydra/swarm/v1/events`` (PR-3 / B1).
+    ///
+    /// The Python caller (``peer/gossip_client.py``) is responsible for the
+    /// JSON codec — this method is intentionally format-agnostic so future
+    /// event types can evolve without a wheel rebuild.
+    ///
+    /// Returns ``None`` on success; raises ``PyRuntimeError`` if publishing
+    /// fails (no subscribed peers yet, payload too large, signing error).
+    /// A common benign failure is ``InsufficientPeers`` right after boot,
+    /// before the mesh has formed — callers should treat it as retryable.
+    fn publish_event(&self, py: Python<'_>, payload: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::PublishEvent {
+                payload,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Drain the oldest queued inbound gossip message (PR-3 / B1).
+    ///
+    /// Returns a tuple ``(sender_libp2p_peer_id, payload_bytes)`` or
+    /// ``None`` when the queue is empty. The sender id is the immediate
+    /// propagation hop — callers that need the original author must
+    /// extract it from the JSON payload itself.
+    fn poll_event(&self, py: Python<'_>) -> PyResult<Option<(String, Vec<u8>)>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        let result = py
+            .allow_threads(move || {
+                send_and_wait(&cmd_tx, |reply| SwarmCommand::PollEvent { reply })
+            })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(result)
+    }
+
     /// Resolve a reachable address for a peer (direct host:port or relay multiaddr).
     fn resolve_address(&self, py: Python<'_>, peer_id: String) -> PyResult<String> {
         let inner = self.require_started()?;

@@ -205,11 +205,19 @@ class NegotiationLoop:
         self._clock = clock_fn
 
         self._stop_event = threading.Event()
+        # PR-3 (B1): wake_event forces an immediate re-tick without waiting
+        # for ``interval_s``. Used by the gossip client on ``PEER_DEAD`` —
+        # when a peer in our routing table just died, we want sub-second
+        # re-negotiation, not a 60 s wait. Setting ``_wake_event`` during
+        # ``self._stop_event.wait(interval_s)`` causes the wait to return
+        # immediately; the loop clears the flag and runs a fresh tick.
+        self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         # Monotonic counters — handy for introspection + tests.
         self._tick_count = 0
         self._skip_count = 0
         self._assignment_change_count = 0
+        self._wake_count = 0
 
     # ── public lifecycle ───────────────────────────────────────────────
 
@@ -237,6 +245,18 @@ class NegotiationLoop:
         )
         return thread
 
+    def wake(self) -> None:
+        """Force the next tick to happen immediately, without waiting for
+        the ``interval_s`` timer to expire (PR-3 / B1).
+
+        Thread-safe and idempotent: calling ``wake()`` multiple times
+        before a single tick has run coalesces into one immediate tick.
+        Safe to call from any thread, including from a gossip subscriber
+        callback on the :class:`peer.gossip_client.GossipClient` poll
+        thread.
+        """
+        self._wake_event.set()
+
     def stop(self, join_timeout_s: float = 5.0) -> None:
         """Signal the loop to exit and wait for it to finish one in-flight tick."""
         self._stop_event.set()
@@ -253,6 +273,13 @@ class NegotiationLoop:
     @property
     def tick_count(self) -> int:
         return int(self._tick_count)
+
+    @property
+    def wake_count(self) -> int:
+        """How many times :meth:`wake` fired and shortened a tick interval
+        (PR-3 observability — handy for verifying gossip-driven reactivity
+        in integration tests)."""
+        return int(self._wake_count)
 
     @property
     def skip_count(self) -> int:
@@ -406,7 +433,7 @@ class NegotiationLoop:
 
     def _run(self) -> None:
         """Thread entry-point.  Sleeps ``interval_s`` between ticks; wakes
-        early on :meth:`stop`."""
+        early on :meth:`stop` or :meth:`wake`."""
         # Run an immediate first tick so the announce loop sees a fresh
         # snapshot within a few seconds of boot, instead of waiting a
         # full interval.
@@ -415,10 +442,26 @@ class NegotiationLoop:
                 self.tick_once()
             except Exception as exc:  # pragma: no cover — defensive
                 logger.exception("negotiation_tick_unhandled: %s", exc)
-            # Event.wait() returns True if the event was set (stop requested),
-            # False on timeout.  Either way we loop back and recheck.
-            if self._stop_event.wait(self._interval_s):
-                break
+            # Wait for either:
+            #  (a) the interval elapses  — normal cadence
+            #  (b) _stop_event is set    — clean shutdown
+            #  (c) _wake_event is set    — external wake (PR-3 gossip-driven).
+            # Poll both events without racing by combining them into a
+            # small-granularity wait.
+            waited = 0.0
+            step = min(0.25, self._interval_s)
+            while waited < self._interval_s:
+                if self._stop_event.wait(step):
+                    return
+                if self._wake_event.is_set():
+                    self._wake_event.clear()
+                    self._wake_count += 1
+                    logger.info(
+                        "negotiation_wake: forcing immediate re-tick "
+                        "(waited_s=%.2f)", waited
+                    )
+                    break
+                waited += step
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
