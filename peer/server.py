@@ -538,28 +538,18 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 pass
             # B3 follow-up: the ``shard_layer_mismatch`` validator on the
             # Forward handler reads ``runtime_profile['layer_start']`` /
-            # ``runtime_profile['layer_end']``. Those were baked in at
-            # boot from the CLI config and don't reflect the live shard
-            # after a reload. Refresh them from the new shard so the
-            # validator accepts the coordinator's ``shard_layer_start``
-            # / ``shard_layer_end`` values on the very next Forward call.
+            # ``runtime_profile['layer_end']``. The assignment's actual
+            # layer range is the single source of truth — any derived
+            # values from ``new_shard.runtime_profile()`` tend to encode
+            # ``shard_index`` / ``shard_index+1`` rather than the real
+            # contiguous layer range, which then causes the validator
+            # to reject the coordinator's (correct) request.
             try:
-                self.runtime_profile = dict(new_shard.runtime_profile())
+                self.runtime_profile["layer_start"] = int(assignment.layer_start)
+                self.runtime_profile["layer_end"] = int(assignment.layer_end)
+                self.runtime_profile["total_layers"] = int(assignment.total_layers)
             except Exception:
-                # Fall back to mutating the existing dict in place so
-                # at least the layer range matches reality.
-                try:
-                    self.runtime_profile["layer_start"] = int(
-                        assignment.layer_start
-                    )
-                    self.runtime_profile["layer_end"] = int(
-                        assignment.layer_end
-                    )
-                    self.runtime_profile["total_layers"] = int(
-                        assignment.total_layers
-                    )
-                except Exception:
-                    pass
+                pass
 
     def resource_budget(self) -> ResourceBudget:
         with self._lock:
