@@ -422,6 +422,10 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
     # hole-punch counters. ``None`` when p2p is disabled; the endpoint
     # then omits the block cleanly rather than erroring.
     _p2p_node: Any | None = None
+    # PR-3 B1: gossip client handle, so /v1/internal/capacity can surface
+    # gossip counters (published / received / dispatched / errors) under
+    # ``network.gossip`` alongside the DCUtR block.
+    _gossip_client: Any | None = None
     _http_requests_total: int = 0
     _http_request_errors_total: int = 0
     _http_request_latency_seconds_sum: float = 0.0
@@ -1040,6 +1044,19 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
             # payload remains valid.
             _payload = report.to_dict()
             _payload["network"] = _collect_network_block(self.__class__._p2p_node)
+            # PR-3 B1: gossip counters alongside DCUtR.
+            _gc = self.__class__._gossip_client
+            if _gc is not None and hasattr(_gc, "stats"):
+                try:
+                    _payload["network"]["gossip"] = {"available": True, **_gc.stats()}
+                except Exception as exc:  # pragma: no cover — defensive
+                    _payload["network"]["gossip"] = {
+                        "available": False,
+                        "reason": "stats_error",
+                        "error": str(exc)[:200],
+                    }
+            else:
+                _payload["network"]["gossip"] = {"available": False, "reason": "disabled"}
             self._send_json(_payload, headers=headers)
         except Exception as exc:
             logger.exception("capacity_report_failed: %s", exc)
@@ -1894,6 +1911,7 @@ def serve(
     # PR-2: expose the P2P node handle to the HTTP capacity endpoint so it
     # can surface DCUtR hole-punch counters under ``network.dcutr``.
     OpenHydraHandler._p2p_node = p2p_node
+    OpenHydraHandler._gossip_client = gossip_client
     if api_key:
         logger.info("API key authentication enabled")
     else:

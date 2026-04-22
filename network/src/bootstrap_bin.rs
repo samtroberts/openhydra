@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::swarm::Config as SwarmConfig;
-use libp2p::{autonat, identify, kad, relay, Multiaddr, Swarm, Transport};
+use libp2p::{autonat, gossipsub, identify, kad, relay, Multiaddr, Swarm, Transport};
 use tracing::info;
 
 // Re-use crate modules for identity and transport.
@@ -34,6 +34,17 @@ struct BootstrapBehaviour {
     autonat: autonat::Behaviour,
     identify: identify::Behaviour,
     dcutr: libp2p::dcutr::Behaviour,
+    /// Gossipsub (B1 rendezvous support).
+    ///
+    /// Bootstrap nodes subscribe to the same ``openhydra/swarm/v1/events``
+    /// topic as peers so they can **forward** ``REQUEST_HOLE_PUNCH`` /
+    /// ``PEER_DEAD`` messages between peers that don't have a direct
+    /// libp2p connection to each other — the common case for two
+    /// NATted peers whose only shared connection point is a Linode
+    /// relay. Without this, peer A's publish never reaches peer B
+    /// because neither is connected to anyone who'll forward the
+    /// topic message.
+    gossipsub: gossipsub::Behaviour,
 }
 
 #[tokio::main]
@@ -159,12 +170,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DCUtR — advertises hole-punch support in Identify protocol list.
     let dcutr = libp2p::dcutr::Behaviour::new(peer_id);
 
+    // Gossipsub forwarder — bootstraps subscribe to the swarm-wide topic so
+    // peers that can only reach each other through a bootstrap still see
+    // each other's events. The message-authenticity signing guarantees the
+    // bootstrap can't forge events; it just propagates signed messages.
+    let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(Duration::from_secs(1))
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .max_transmit_size(64 * 1024)
+        .build()
+        .map_err(|e| format!("gossipsub config: {e}"))?;
+    let mut gossipsub = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+        gossipsub_config,
+    )
+    .map_err(|e| format!("gossipsub behaviour: {e}"))?;
+    let gossip_topic =
+        gossipsub::IdentTopic::new(openhydra_network::swarm::GOSSIPSUB_TOPIC);
+    gossipsub
+        .subscribe(&gossip_topic)
+        .map_err(|e| format!("gossipsub subscribe: {e:?}"))?;
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
         autonat,
         identify,
         dcutr,
+        gossipsub,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()

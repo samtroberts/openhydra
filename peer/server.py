@@ -1081,6 +1081,50 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
 
             if self._p2p_node is not None and _next_hop_libp2p_id:
+                # B1 rendezvous: we're about to route through a circuit
+                # relay. Before we do, publish REQUEST_HOLE_PUNCH so the
+                # remote peer dials us back within the ~100 ms gossip
+                # propagation window — the narrow NAT-binding overlap
+                # DCUtR needs to punch through symmetric NAT. Inline
+                # 5 s per-(me,target) debounce: the ``proxy_forward``
+                # path fires ~once per token so we guard the publish.
+                try:
+                    _my_libp2p = str(getattr(self._p2p_node, "libp2p_peer_id", "") or "")
+                    if _my_libp2p and _my_libp2p != _next_hop_libp2p_id:
+                        import time as _t
+                        now_mono = _t.monotonic()
+                        _last = getattr(self, "_b1_last_pub", None) or {}
+                        key = (_my_libp2p, _next_hop_libp2p_id)
+                        if now_mono - _last.get(key, 0.0) >= 5.0:
+                            import json as _json
+                            _env = {
+                                "type": "REQUEST_HOLE_PUNCH",
+                                "data": {
+                                    "from_peer_id": _my_libp2p,
+                                    "to_peer_id": _next_hop_libp2p_id,
+                                },
+                                "observed_by": _my_libp2p,
+                                "unix_ms": int(_t.time() * 1000),
+                            }
+                            try:
+                                self._p2p_node.publish_event(
+                                    _json.dumps(_env, separators=(",", ":"))
+                                    .encode("utf-8")
+                                )
+                                _last[key] = now_mono
+                                self._b1_last_pub = _last
+                                logger.info(
+                                    "b1_rendezvous_published_push: target=%s",
+                                    _next_hop_libp2p_id[:14],
+                                )
+                            except Exception as _pub_exc:
+                                logger.debug(
+                                    "b1_rendezvous_publish_push_failed: %s",
+                                    _pub_exc,
+                                )
+                except Exception:  # pragma: no cover — never derail the push
+                    pass
+
                 # Fire-and-forget: ACK instantly, inference runs async on receiver.
                 self._p2p_node.proxy_forward(
                     target_peer_id=_next_hop_libp2p_id,
