@@ -465,6 +465,24 @@ fn handle_swarm_event(
         // ── Connection lifecycle ──
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
+            // A3 DCUtR fix: register non-loopback, non-wildcard, non-circuit
+            // listen addresses as external address candidates *before* the
+            // relay reservations come in (relay reservations fire 5s after
+            // startup — see relay_reservation_deadline at the top of the
+            // event loop). This gives DCUtR a pool of real direct addresses
+            // to offer during hole-punch negotiation instead of only the
+            // ``/p2p-circuit/`` multiaddrs that Identify would otherwise
+            // observe once the peer is relay-bound.
+            //
+            // Safety: AutoNAT will probe each candidate; truly unreachable
+            // LAN addresses get falsified and only contribute to the
+            // DCUtR candidate set for same-LAN peers (where they *are* the
+            // right answer). Reachable public addresses get confirmed via
+            // ``ExternalAddrConfirmed`` and light up the DCUtR hot path.
+            if is_direct_listen_candidate(&address) {
+                debug!(%address, "registering direct listen addr as external");
+                swarm.add_external_address(address.clone());
+            }
         }
         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
             debug!(%peer_id, ?endpoint, "connection established");
@@ -502,12 +520,27 @@ fn handle_swarm_event(
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
             info!(%address, "external address confirmed");
-            state.external_addrs.push(address);
-            // Update NAT status — if we have a confirmed external addr, we're public.
-            state.nat_info.is_public = true;
-            state.nat_info.nat_type = "open".into();
-            if let Some(ip) = extract_ip_from_multiaddr(&state.external_addrs.last().unwrap()) {
-                state.nat_info.external_ip = ip;
+            let is_circuit = address.to_string().contains("/p2p-circuit");
+            state.external_addrs.push(address.clone());
+            // A3 DCUtR fix: only flip the peer to ``is_public`` when the
+            // confirmed address is a *direct* multiaddr. A ``/p2p-circuit/``
+            // confirmation means "a relay forwarded traffic for us" — not
+            // "we are publicly reachable". Previously any confirmation
+            // (including circuit) marked the peer public, which suppressed
+            // AutoNAT's Private verdict and kept DCUtR dormant.
+            if !is_circuit {
+                state.nat_info.is_public = true;
+                state.nat_info.nat_type = "open".into();
+                if let Some(ip) = extract_ip_from_multiaddr(&address) {
+                    state.nat_info.external_ip = ip;
+                }
+            } else {
+                // Record the relay path for observability but leave NAT
+                // status untouched so AutoNAT probes continue to drive the
+                // public/private classification.
+                debug!(
+                    "circuit external address recorded but not marking public"
+                );
             }
         }
         _ => {}
@@ -628,6 +661,39 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
         runtime_model_id: r.runtime_model_id.clone(),
         reachable_address,
     }
+}
+
+/// A3 DCUtR fix: decide whether a newly-bound listen address is a sensible
+/// DCUtR external candidate.
+///
+/// Returns ``false`` for:
+/// * ``/p2p-circuit/`` multiaddrs (relay-originated, useless for hole punching)
+/// * loopback IPs (``127.0.0.0/8``, ``::1``)
+/// * unspecified / wildcard IPs (``0.0.0.0``, ``::``)
+///
+/// Everything else — LAN / ULA / public — is returned as a candidate.
+/// AutoNAT then probes the candidates; unreachable ones get falsified and
+/// only contribute within the LAN scope where they're valid.
+fn is_direct_listen_candidate(addr: &Multiaddr) -> bool {
+    if addr.to_string().contains("/p2p-circuit") {
+        return false;
+    }
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                if ip.is_loopback() || ip.is_unspecified() {
+                    return false;
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                if ip.is_loopback() || ip.is_unspecified() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Extract an IP string from a multiaddr like `/ip4/1.2.3.4/tcp/4001`.
