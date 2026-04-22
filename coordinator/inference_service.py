@@ -1220,6 +1220,31 @@ class InferenceService:
                           kv_use_cached_activation=False,
                           decode_temperature=None, decode_do_sample=None,
                           decode_top_p=None, decode_top_k=None, **kw):
+                # B1 rendezvous: if the stage peer is relay-bound, publish
+                # a ``REQUEST_HOLE_PUNCH`` so the target dials us back and
+                # DCUtR can try a simultaneous-dial hole-punch. The
+                # per-pair 5 s debounce inside GossipClient means calling
+                # this once per token step is safe — only the first
+                # attempt in each 5 s window actually goes to the wire.
+                _gossip = getattr(_chain, "_gossip_client", None)
+                _self_libp2p = getattr(_chain, "_self_libp2p_peer_id", "")
+                if _gossip is not None and _self_libp2p:
+                    try:
+                        from coordinator.path_finder import maybe_request_hole_punch as _maybe_rhp
+                        if _maybe_rhp(
+                            _gossip,
+                            self_libp2p_peer_id=str(_self_libp2p),
+                            peer=peer,
+                        ):
+                            logger.info(
+                                "b1_rendezvous_published_autoreg: target=%s stage=%d",
+                                str(getattr(peer, "libp2p_peer_id", "") or "")[:14],
+                                int(stage_index),
+                            )
+                    except Exception:  # pragma: no cover — never derail
+                        logger.debug(
+                            "b1_rendezvous_publish_autoreg_failed", exc_info=True
+                        )
                 result = _chain._request_stage(
                     peer=peer, request_id=request_id, prompt=prompt,
                     activation=activation, stage_index=stage_index,
