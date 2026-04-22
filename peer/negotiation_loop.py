@@ -193,6 +193,12 @@ class NegotiationLoop:
         is_busy_fn: Callable[[], bool] | None = None,
         # Tick cadence in seconds.  Clamped to MIN_NEGOTIATION_INTERVAL_S.
         interval_s: float = DEFAULT_NEGOTIATION_INTERVAL_S,
+        # B3: optional callback invoked when the tick observes a
+        # changed assignment. Signature: ``fn(new_assignment) -> None``.
+        # Production wiring calls ``ReshardExecutor.propose(new)``.
+        # When left as ``None`` the loop retains its pre-B3 behaviour
+        # (log ``reshard_pending``, update snapshot, nothing else).
+        reshard_executor_fn: Callable[[Any], Any] | None = None,
         # Used by tests to bypass the real ``time.monotonic`` clock.
         clock_fn: Callable[[], float] = time.monotonic,
     ):
@@ -202,6 +208,7 @@ class NegotiationLoop:
         self._current_assignment: ShardAssignment | None = initial_assignment
         self._is_busy = is_busy_fn or (lambda: False)
         self._interval_s = max(MIN_NEGOTIATION_INTERVAL_S, float(interval_s))
+        self._reshard_executor_fn = reshard_executor_fn
         self._clock = clock_fn
 
         self._stop_event = threading.Event()
@@ -404,12 +411,24 @@ class NegotiationLoop:
         changed = _assignment_changed(self._current_assignment, new_assignment)
         if changed:
             logger.info(
-                "negotiation_reshard_pending: old=%s new=%s "
-                "(re-announce will reflect the new range; actual model "
-                "reshard is out of scope for Phase 4)",
+                "negotiation_reshard_pending: old=%s new=%s",
                 _assignment_repr(self._current_assignment),
                 _assignment_repr(new_assignment),
             )
+            # B3 hookup — if a ReshardExecutor is wired, fire the FSM
+            # synchronously. The executor is responsible for draining,
+            # tearing down, reloading, and re-announcing. On failure
+            # it logs and stays degraded (stay-degraded policy). We
+            # still advance ``self._current_assignment`` so the next
+            # tick's change detection doesn't re-fire the same proposal
+            # every interval.
+            if self._reshard_executor_fn is not None:
+                try:
+                    self._reshard_executor_fn(new_assignment)
+                except Exception as exc:  # noqa: BLE001 — never derail
+                    logger.exception(
+                        "negotiation_reshard_executor_error: %s", exc
+                    )
             self._current_assignment = new_assignment
             self._assignment_change_count += 1
 

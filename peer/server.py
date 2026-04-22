@@ -446,6 +446,97 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         with self._lock:
             self._resource_budget = budget
 
+    # ── B3 ReshardExecutor hooks ──────────────────────────────────────
+    #
+    # Both methods are synchronous and intentionally minimal. The
+    # executor is responsible for ordering (drain before unload, etc.);
+    # these methods just do the work.
+
+    def teardown_shard(self) -> None:
+        """Drop the current ``self.shard`` and free its memory.
+
+        PyTorch path: ``del shard`` then ``torch.cuda.empty_cache()`` if
+        CUDA is available.
+        MLX path: ``mx.metal.clear_cache()`` if MLX is present.
+
+        The ``self.shard`` attribute is set to ``None`` on exit; the
+        caller must invoke :meth:`reload_shard` before accepting any
+        new ``Forward`` requests.
+        """
+        with self._lock:
+            old = self.shard
+            self.shard = None  # type: ignore[assignment]
+        # Drop the Python reference *outside* the lock so GC can proceed
+        # without blocking other calls.
+        del old
+        try:
+            import torch  # noqa: F401
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            import mlx.core as mx  # noqa: F401
+            mx.metal.clear_cache()
+        except Exception:
+            pass
+        # Also drop any lingering KV-cache session data so the new shard
+        # starts fresh (session ids keyed on the old shard shape would
+        # otherwise poison the first inference).
+        with self._lock:
+            if hasattr(self, "_kv_cache"):
+                try:
+                    self._kv_cache.clear()
+                except Exception:
+                    pass
+
+    def reload_shard(self, assignment: Any) -> None:
+        """Rebuild ``self.shard`` with a new layer-range ``assignment``.
+
+        ``assignment`` must expose ``model_id``, ``layer_start``,
+        ``layer_end``, ``total_layers`` — the
+        :class:`peer.swarm_negotiator.ShardAssignment` shape.
+
+        Raises any exception from :class:`ModelShard` construction so
+        :class:`peer.reshard_executor.ReshardExecutor` can catch it and
+        transition to ``LOADING_FAILED`` (stay-degraded policy).
+        """
+        # Compose a new ToyShardConfig that mirrors the one used at
+        # ``__init__`` time but with the new layer indices.
+        new_layer_indices = tuple(
+            range(int(assignment.layer_start), int(assignment.layer_end))
+        )
+        total_layers = int(assignment.total_layers)
+        # Derive shard_index / total_shards from the layer range so
+        # peers with mixed shard sizes still self-describe correctly.
+        slice_size = max(1, int(assignment.layer_end - assignment.layer_start))
+        total_shards = max(1, total_layers // slice_size)
+        shard_index = int(assignment.layer_start) // slice_size
+
+        new_shard = ModelShard(
+            ToyShardConfig(
+                model_id=str(assignment.model_id or getattr(self, "model_id", "")),
+                shard_index=shard_index,
+                total_shards=total_shards,
+                runtime_backend=str(
+                    getattr(getattr(self, "shard", None), "runtime_backend", "")
+                    or getattr(self, "runtime_backend", "")
+                    or ""
+                ),
+                runtime_layer_indices=new_layer_indices,
+                runtime_peer_id=str(self.peer_id),
+            )
+        )
+        with self._lock:
+            self.shard = new_shard
+            # Also update the service's advertised shard metadata so the
+            # announce loop picks up the new layer range on the next tick.
+            try:
+                self.shard_index = shard_index
+                self.total_shards = total_shards
+            except Exception:
+                pass
+
     def resource_budget(self) -> ResourceBudget:
         with self._lock:
             return ResourceBudget(
@@ -2445,9 +2536,21 @@ def serve(
         _negotiation_loop_obj = None
         if negotiation_loop_factory is not None:
             try:
-                _negotiation_loop_obj = negotiation_loop_factory(
-                    lambda: service.inflight_count() > 0,
-                )
+                # Factory signature: legacy single-arg ``(is_busy_fn)``
+                # or B3 two-arg ``(is_busy_fn, service)``. Detect
+                # arity rather than break existing callers.
+                import inspect as _insp
+                try:
+                    _sig_arity = len(
+                        _insp.signature(negotiation_loop_factory).parameters
+                    )
+                except (TypeError, ValueError):
+                    _sig_arity = 1
+                _is_busy = lambda: service.inflight_count() > 0
+                if _sig_arity >= 2:
+                    _negotiation_loop_obj = negotiation_loop_factory(_is_busy, service)
+                else:
+                    _negotiation_loop_obj = negotiation_loop_factory(_is_busy)
                 if _negotiation_loop_obj is not None and hasattr(
                     _negotiation_loop_obj, "start"
                 ):

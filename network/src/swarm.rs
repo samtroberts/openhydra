@@ -159,13 +159,28 @@ pub fn build_swarm(
     // PR-3 (B1) — Gossipsub over a single topic, signed with our Ed25519
     // identity so recipients can verify the message came from a real swarm
     // member rather than a spoofed peer.
+    // Small-swarm reliability tuning (B1 follow-up). With only a handful
+    // of peers + 3 bootstraps, the default gossipsub mesh targets
+    // (D_lo=4, D_hi=12) aren't reachable, so messages get dropped before
+    // they cross the mesh. ``flood_publish(true)`` instructs libp2p to
+    // send a published message to *every* known peer of the topic, not
+    // just the D-sized mesh slice — trading bandwidth for reliability.
+    // At v1 message volumes (control-plane events, not activations) this
+    // is cheap.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        // 64 KiB caps PEER_DEAD / REQUEST_HOLE_PUNCH at the JSON layer —
-        // far more than we need for the simple control-plane messages
-        // while leaving headroom for future v1.x fields.
         .max_transmit_size(64 * 1024)
+        .flood_publish(true)
+        // Ensure small meshes still exist; libp2p defaults assume large
+        // swarms. The invariant the validator enforces is
+        // ``mesh_outbound_min <= mesh_n_low <= mesh_n <= mesh_n_high``
+        // — so we must lower ``mesh_outbound_min`` too (default is 2)
+        // otherwise a 2-peer topology fails config validation.
+        .mesh_outbound_min(1)
+        .mesh_n_low(1)
+        .mesh_n(3)
+        .mesh_n_high(6)
         .build()
         .map_err(|e| format!("gossipsub config: {e}"))?;
     let mut gossipsub = gossipsub::Behaviour::new(
