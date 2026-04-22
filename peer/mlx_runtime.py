@@ -190,9 +190,47 @@ class MLXRuntime:
             self.model_name, _req_mode,
         )
         _t0 = time.perf_counter()
-        self._model, self._tokenizer = mlx_load(self.model_name)
+        self._model, _mlx_bundled_tokenizer = mlx_load(self.model_name)
+        self._tokenizer = _mlx_bundled_tokenizer
         _load_s = time.perf_counter() - _t0
         logging.info("mlx_runtime: loaded in %.1f s", _load_s)
+
+        # ── Tokenizer alignment for heterogeneous MLX ↔ PyTorch rings ──
+        # The mlx-community checkpoints ship with a re-packaged tokenizer
+        # whose vocab/special-token indices may differ from the canonical
+        # HuggingFace repo. When an MLX peer ships `prompt_token_ids` to
+        # a PyTorch peer that loaded weights from the HF repo, those IDs
+        # hit `nn.Embedding(num_embeddings=HF_vocab)` — a vocab mismatch
+        # surfaces as `IndexError: index out of range in self`. Force the
+        # HF tokenizer so both backends encode/decode against the same
+        # vocabulary.
+        _hf_model_id = str(getattr(config, "runtime_hf_model_id", "") or "").strip()
+        _force_hf_tok = bool(getattr(config, "runtime_mlx_force_hf_tokenizer", True))
+        self._hf_model_id = _hf_model_id or self.model_name
+        if _force_hf_tok and _hf_model_id and _hf_model_id != self.model_name:
+            try:
+                from transformers import AutoTokenizer
+                _trust = "qwen" in _hf_model_id.lower()
+                try:
+                    _hf_tok = AutoTokenizer.from_pretrained(
+                        _hf_model_id, trust_remote_code=_trust, local_files_only=True,
+                    )
+                except OSError:
+                    _hf_tok = AutoTokenizer.from_pretrained(
+                        _hf_model_id, trust_remote_code=_trust,
+                    )
+                self._tokenizer = _hf_tok
+                logging.info(
+                    "mlx_runtime: tokenizer overridden mlx=%s -> hf=%s (vocab=%d)",
+                    self.model_name, _hf_model_id,
+                    int(getattr(_hf_tok, "vocab_size", 0) or 0),
+                )
+            except Exception as _tok_err:
+                logging.warning(
+                    "mlx_runtime: hf_tokenizer_override_failed hf=%s err=%s — "
+                    "falling back to mlx-bundled tokenizer",
+                    _hf_model_id, _tok_err,
+                )
 
         # Force Metal allocation of all parameters now, not lazily on first use.
         self._watchdog.run(mx.eval, self._model.parameters())
@@ -317,10 +355,24 @@ class MLXRuntime:
         _bits_pp = self.quantization_bits if self.quantization_bits > 0 else 16
         _est_mem_mb = int(self._param_count * (_bits_pp / 8) / (1024 * 1024))
 
+        # Advertise the HF model id as ``runtime_model_id`` when we
+        # overrode the tokenizer — downstream peers / coordinator resolve
+        # their tokenizer from this field (see
+        # ``TokenizationService._resolve_pipeline_runtime_model_id``), and
+        # we need them to land on the canonical HF vocab, not on the
+        # mlx-community repo.
+        _advertised_model_id = (
+            self._hf_model_id
+            if (_force_hf_tok and _hf_model_id and _hf_model_id != self.model_name)
+            else self.model_name
+        )
         self._runtime_profile: dict[str, Any] = {
             "backend":                  "mlx",
             "target":                   "metal",
-            "runtime_model_id":         self.model_name,
+            "runtime_model_id":         _advertised_model_id,
+            "runtime_mlx_model_id":     self.model_name,
+            "runtime_hf_model_id":      self._hf_model_id,
+            "tokenizer_vocab_size":     int(getattr(self._tokenizer, "vocab_size", 0) or 0),
             "quantization_mode":        self.quantization_mode,
             "quantization_bits":        self.quantization_bits,
             "gpu_available":            True,
@@ -331,6 +383,13 @@ class MLXRuntime:
             "layer_end":                int(max(self._shard_layer_indices) + 1) if self._is_sharded else self._total_layers,
             "total_layers":             self._total_layers,
         }
+
+        # Vocab-size guard — surfaces misaligned tokenizers (catches
+        # future regressions where the HF repo advances ahead of an
+        # mlx-community fork, or a downstream caller passes the wrong
+        # hf_model_id).
+        if bool(getattr(config, "runtime_tokenizer_vocab_guard", True)):
+            self._assert_tokenizer_matches_embedding()
 
         # ── KV prefix cache (RadixKVCache) ───────────────────────────────────
         self._radix_cache = None
@@ -697,6 +756,36 @@ class MLXRuntime:
 
     def runtime_profile(self) -> dict[str, Any]:
         return dict(self._runtime_profile)
+
+    def _assert_tokenizer_matches_embedding(self) -> None:
+        """Abort startup if tokenizer vocab disagrees with embed_tokens size.
+
+        A mismatch means any ``prompt_token_ids`` this peer produces will
+        land on an out-of-range index at a downstream PyTorch (or HF-aligned
+        MLX) peer's embedding. Fail fast here rather than poisoning a ring.
+        """
+        tok_vocab = int(getattr(self._tokenizer, "vocab_size", 0) or 0)
+        # Locate the embedding module — same unwrap as the sharded path.
+        _lm = getattr(self._model, "language_model", self._model)
+        _text_model = getattr(_lm, "model", _lm)
+        _embed = getattr(_text_model, "embed_tokens", None)
+        if _embed is None or tok_vocab <= 0:
+            return  # Nothing to compare against — skip silently.
+        # MLX QuantizedEmbedding / Embedding both expose .weight [V, D].
+        try:
+            _embed_vocab = int(_embed.weight.shape[0])
+        except Exception:
+            return
+        # Tolerate tokenizer.vocab_size < embed_vocab (model pads to a
+        # power-of-two vocab). Only reject strict overshoot.
+        if tok_vocab > _embed_vocab:
+            raise RuntimeError(
+                "tokenizer_vocab_mismatch: "
+                f"tokenizer.vocab_size={tok_vocab} > embed_tokens={_embed_vocab} "
+                f"(hf_model_id={self._hf_model_id!r}, mlx_model_id={self.model_name!r}). "
+                "Refusing to serve — fix --hf-model-id or disable "
+                "--tokenizer-vocab-guard to override."
+            )
 
     # ── Sharded forward pass (Phase 3) ──────────────────────────────────────────
 

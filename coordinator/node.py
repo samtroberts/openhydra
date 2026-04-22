@@ -103,6 +103,27 @@ def main() -> None:
                         help="One past the last transformer layer (exclusive). Use with --layer-start.")
     parser.add_argument("--runtime-model-id", default=None,
                         help="HuggingFace model ID or local path for the runtime (overrides --model-id for weight loading).")
+    parser.add_argument("--hf-model-id", default=None,
+                        help=(
+                            "Canonical HuggingFace model id used for the tokenizer across every "
+                            "backend. When unset, resolved from models.catalog.json for the given "
+                            "--model-id. Forces MLX peers onto the HF tokenizer so heterogeneous "
+                            "MLX ↔ PyTorch rings share one vocab."
+                        ))
+    parser.add_argument("--mlx-force-hf-tokenizer",
+                        dest="mlx_force_hf_tokenizer",
+                        action="store_true", default=True,
+                        help="Force MLX runtime to use the canonical HF tokenizer (default: on).")
+    parser.add_argument("--no-mlx-force-hf-tokenizer",
+                        dest="mlx_force_hf_tokenizer", action="store_false",
+                        help="Revert MLX runtime to the bundled mlx-community tokenizer.")
+    parser.add_argument("--tokenizer-vocab-guard",
+                        dest="tokenizer_vocab_guard",
+                        action="store_true", default=True,
+                        help="Fail startup if tokenizer vocab > embed_tokens size (default: on).")
+    parser.add_argument("--no-tokenizer-vocab-guard",
+                        dest="tokenizer_vocab_guard", action="store_false",
+                        help="Disable the tokenizer/embedding vocab-size guard.")
 
     # --- Network ---
     parser.add_argument("--grpc-port", type=int, default=50051,
@@ -472,6 +493,30 @@ def main() -> None:
     if args.runtime_backend == "mlx" and _runtime_model_id in _MLX_4BIT_MAP:
         _runtime_model_id = _MLX_4BIT_MAP[_runtime_model_id]
         logger.info("mlx_4bit_upgrade: %s -> %s", args.model_id, _runtime_model_id)
+
+    # Resolve the canonical HF model id for the tokenizer — the authority
+    # MLX ↔ PyTorch peers use to agree on a shared vocab. See
+    # ``peer.model_catalog.resolve_hf_model_id`` for resolution order.
+    _hf_model_id = str(getattr(args, "hf_model_id", "") or "").strip()
+    if not _hf_model_id:
+        from peer.model_catalog import resolve_hf_model_id as _resolve_hf
+        _hf_model_id = _resolve_hf(
+            args.model_id,
+            catalog_path=getattr(args, "model_catalog_path", None) or "models.catalog.json",
+            runtime_model_id=_runtime_model_id,
+        )
+    if _hf_model_id:
+        logger.info(
+            "hf_tokenizer_id: model=%s hf_model_id=%s (force=%s, guard=%s)",
+            args.model_id, _hf_model_id,
+            bool(getattr(args, "mlx_force_hf_tokenizer", True)),
+            bool(getattr(args, "tokenizer_vocab_guard", True)),
+        )
+    else:
+        logger.warning(
+            "hf_model_id_unresolved: model=%s — MLX runtime will fall back to bundled tokenizer",
+            args.model_id,
+        )
 
     # Compute explicit layer indices from --layer-start/--layer-end
     _explicit_layer_indices: tuple[int, ...] = ()
@@ -948,6 +993,9 @@ def main() -> None:
             "peer_id": args.peer_id,
             "model_id": args.model_id,
             "runtime_model_id": _runtime_model_id,
+            "hf_model_id": _hf_model_id,
+            "mlx_force_hf_tokenizer": bool(getattr(args, "mlx_force_hf_tokenizer", True)),
+            "tokenizer_vocab_guard": bool(getattr(args, "tokenizer_vocab_guard", True)),
             "shard_index": args.shard_index,
             "total_shards": args.total_shards,
             "expert_layer_indices": list(_explicit_layer_indices),
