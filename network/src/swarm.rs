@@ -4,9 +4,17 @@ use std::time::Duration;
 
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::swarm::Config as SwarmConfig;
-use libp2p::{autonat, dcutr, identify, kad, mdns, relay, Multiaddr, PeerId, Swarm, Transport};
+use libp2p::{
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay, Multiaddr, PeerId, Swarm, Transport,
+};
 
 use crate::behaviour::OpenHydraBehaviour;
+
+/// PR-3: the single topic that carries all swarm-wide events. Keeping one
+/// topic for v1 intentionally bounds the blast radius — future versions can
+/// add per-model topics once the coordinator has logic to subscribe /
+/// unsubscribe as models come and go.
+pub const GOSSIPSUB_TOPIC: &str = "openhydra/swarm/v1/events";
 use crate::identity::Identity;
 
 /// Configuration for creating a new OpenHydra swarm.
@@ -148,6 +156,32 @@ pub fn build_swarm(
     // gRPC proxy (cross-ISP tunneling through relay).
     let grpc_proxy = crate::proxy::proxy_behaviour();
 
+    // PR-3 (B1) — Gossipsub over a single topic, signed with our Ed25519
+    // identity so recipients can verify the message came from a real swarm
+    // member rather than a spoofed peer.
+    let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(Duration::from_secs(1))
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        // 64 KiB caps PEER_DEAD / REQUEST_HOLE_PUNCH at the JSON layer —
+        // far more than we need for the simple control-plane messages
+        // while leaving headroom for future v1.x fields.
+        .max_transmit_size(64 * 1024)
+        .build()
+        .map_err(|e| format!("gossipsub config: {e}"))?;
+    let mut gossipsub = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+        gossipsub_config,
+    )
+    .map_err(|e| format!("gossipsub behaviour: {e}"))?;
+
+    // Subscribe immediately so we start participating in the mesh as soon
+    // as we have connected peers. Subscription is idempotent; publishing
+    // works whether or not we're subscribed to the topic.
+    let topic = gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC);
+    gossipsub
+        .subscribe(&topic)
+        .map_err(|e| format!("gossipsub subscribe: {e:?}"))?;
+
     let behaviour = OpenHydraBehaviour {
         kademlia,
         relay_client,
@@ -156,6 +190,7 @@ pub fn build_swarm(
         identify,
         mdns,
         grpc_proxy,
+        gossipsub,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()

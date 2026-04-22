@@ -5,7 +5,7 @@
 
 use libp2p::request_response;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{autonat, dcutr, identify, kad, mdns, relay};
+use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, relay};
 
 use crate::proxy::GrpcProxyCodec;
 
@@ -26,4 +26,12 @@ pub struct OpenHydraBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     /// gRPC proxy — tunnels gRPC through libp2p for cross-ISP inference.
     pub grpc_proxy: request_response::Behaviour<GrpcProxyCodec>,
+    /// Gossipsub (PR-3 / B1) — swarm-wide event bus on a single topic,
+    /// ``openhydra/swarm/v1/events``. Used for:
+    /// * ``PEER_DEAD`` — broadcast when a peer observes another peer's
+    ///   gRPC socket drop mid-generation. Drives sub-2 s failover.
+    /// * ``REQUEST_HOLE_PUNCH`` — pairs with A3's DCUtR fix: a peer asks
+    ///   a specific counterpart to dial back *now*, giving both sides a
+    ///   coordinated simultaneous-dial window even behind symmetric NAT.
+    pub gossipsub: gossipsub::Behaviour,
 }

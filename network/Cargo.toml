@@ -27,6 +27,7 @@ libp2p = { version = "0.54", features = [
     "ed25519",
     "macros",
     "request-response",
+    "gossipsub",
 ] }
 
 # Async runtime

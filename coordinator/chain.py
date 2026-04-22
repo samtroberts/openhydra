@@ -82,6 +82,7 @@ class InferenceChain:
         activation_quantization_enabled: bool = False,
         stream_pool: Any | None = None,
         session: Any | None = None,
+        peer_dead_callback: Any | None = None,
     ):
         if not pipeline:
             raise ValueError("pipeline must contain at least one peer")
@@ -93,6 +94,14 @@ class InferenceChain:
         self.advanced_encryption_enabled = bool(advanced_encryption_enabled)
         self.advanced_encryption_seed = str(advanced_encryption_seed)
         self.advanced_encryption_level = str(advanced_encryption_level)
+        # PR-3 (B1+B2): fast-fail hook. When set, the chain calls
+        # ``peer_dead_callback(libp2p_peer_id, reason)`` synchronously from
+        # the gRPC error handler so the coordinator can publish a
+        # ``PEER_DEAD`` gossip event and wake the NegotiationLoop before
+        # re-routing. Callback failures are swallowed — the retry loop
+        # must never be derailed by a side-channel failure. ``None``
+        # disables the hook (default, backwards-compat).
+        self._peer_dead_callback = peer_dead_callback
         self._last_stage_kv_cache_hit = False
         self._autoencoder: TensorAutoencoder | None = None
         if self.tensor_autoencoder_enabled:
@@ -760,6 +769,37 @@ class InferenceChain:
                 except (grpc.RpcError, RuntimeError) as exc:
                     failed_peer_id = candidate.peer_id
                     errors.append(f"{candidate.peer_id}: {exc}")
+                    # PR-3 (B2) fast-fail: on an UNAVAILABLE / DEADLINE_EXCEEDED
+                    # RpcError we publish a ``PEER_DEAD`` gossip event (via
+                    # the coordinator-supplied callback) so the swarm can
+                    # drop this peer from its routing tables *before* the
+                    # next 60 s DHT tick. The local failover retry keeps
+                    # running regardless — gossip is a complementary
+                    # broadcast, not a replacement for the immediate
+                    # single-request re-route.
+                    _rpc_code_name = ""
+                    if isinstance(exc, grpc.RpcError):
+                        try:
+                            _rpc_code_name = exc.code().name  # type: ignore[attr-defined]
+                        except Exception:  # pragma: no cover — defensive
+                            _rpc_code_name = ""
+                    _is_dead_signal = _rpc_code_name in {
+                        "UNAVAILABLE", "DEADLINE_EXCEEDED", "UNKNOWN"
+                    }
+                    if self._peer_dead_callback is not None and _is_dead_signal:
+                        _target_libp2p = str(
+                            getattr(candidate, "libp2p_peer_id", "") or ""
+                        )
+                        if _target_libp2p:
+                            try:
+                                self._peer_dead_callback(
+                                    _target_libp2p,
+                                    _rpc_code_name or "rpc_error",
+                                )
+                            except Exception:  # pragma: no cover — never derail
+                                logging.debug(
+                                    "peer_dead_callback_failed", exc_info=True
+                                )
             else:
                 detail = "; ".join(errors)
                 raise RuntimeError(f"stage {stage_index} failed after retries: {detail}")
