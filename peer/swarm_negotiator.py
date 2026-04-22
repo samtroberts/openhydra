@@ -471,6 +471,37 @@ class SwarmNegotiator:
             gaps = compute_gaps(claims, total_layers)
 
             if not gaps:
+                # Stability: if I'm already in the claim set for a
+                # fully-covered model, keep my current range rather
+                # than rolling to another model. Without this, each
+                # negotiation tick after a successful split would move
+                # the peer to the next ranked candidate (since this
+                # model looks "full" from outside), thrashing the
+                # ReshardExecutor through model after model.
+                my_claim = next(
+                    (
+                        c for c in claims
+                        if c.libp2p_peer_id == self.libp2p_peer_id
+                        and int(c.total_layers) == total_layers
+                        and int(c.layer_end) > int(c.layer_start)
+                    ),
+                    None,
+                )
+                if my_claim is not None:
+                    logger.debug(
+                        "swarm_negotiate_stable: model=%s keeping my "
+                        "current shard [%d, %d)",
+                        entry.model_id,
+                        int(my_claim.layer_start),
+                        int(my_claim.layer_end),
+                    )
+                    return ShardAssignment(
+                        model_id=entry.model_id,
+                        layer_start=int(my_claim.layer_start),
+                        layer_end=int(my_claim.layer_end),
+                        total_layers=total_layers,
+                        source=SOURCE_PICK_BEST_FIT,
+                    )
                 logger.debug(
                     "swarm_negotiate_fully_covered: model=%s — skipping",
                     entry.model_id,
