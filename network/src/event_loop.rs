@@ -67,6 +67,11 @@ pub enum SwarmCommand {
         peer_id: String,
         reply: oneshot::Sender<bool>,
     },
+    /// Snapshot of DCUtR hole-punch counters (PR-2).
+    /// Returns `(successes, failures, direct_peers_count)`.
+    GetDcutrStats {
+        reply: oneshot::Sender<(u64, u64, u64)>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -216,6 +221,14 @@ pub async fn run_event_loop(
                             Err(_) => false,
                         };
                         let _ = reply.send(has_direct);
+                    }
+                    Some(SwarmCommand::GetDcutrStats { reply }) => {
+                        let snapshot = (
+                            state.dcutr_successes,
+                            state.dcutr_failures,
+                            state.direct_peers.len() as u64,
+                        );
+                        let _ = reply.send(snapshot);
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;

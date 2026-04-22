@@ -310,6 +310,85 @@ def _resolve_runtime_profile_settings(parser: argparse.ArgumentParser, args: arg
     }
 
 
+def _collect_network_block(p2p_node: Any | None) -> dict[str, Any]:
+    """Build the ``network`` block for ``/v1/internal/capacity`` (PR-2).
+
+    Currently emits a single nested key ``dcutr`` carrying libp2p
+    Direct-Connection-Upgrade-through-Relay counters pulled from the Rust
+    event loop. Shape::
+
+        {
+          "dcutr": {
+            "available": true,
+            "successes": 3,
+            "failures": 1,
+            "direct_peers_count": 2
+          }
+        }
+
+    Failure modes are all mapped to ``available=False`` with an ``error``
+    string rather than raising — the rest of the capacity report must
+    remain valid even when the P2P layer is disabled or mis-wired:
+
+    * ``p2p_node is None`` → ``reason="p2p_disabled"``.
+    * Node object exists but ``get_dcutr_stats`` is absent (older wheel) →
+      ``reason="binding_missing"``.
+    * Call raises (node not yet started, event loop shut down, …) →
+      ``reason="runtime_error"`` plus a truncated ``error`` message.
+    """
+    if p2p_node is None:
+        return {
+            "dcutr": {
+                "available": False,
+                "reason": "p2p_disabled",
+                "successes": 0,
+                "failures": 0,
+                "direct_peers_count": 0,
+            }
+        }
+
+    get_stats = getattr(p2p_node, "get_dcutr_stats", None)
+    if not callable(get_stats):
+        return {
+            "dcutr": {
+                "available": False,
+                "reason": "binding_missing",
+                "successes": 0,
+                "failures": 0,
+                "direct_peers_count": 0,
+            }
+        }
+
+    try:
+        stats = get_stats() or {}
+    except Exception as exc:  # pragma: no cover — defensive
+        return {
+            "dcutr": {
+                "available": False,
+                "reason": "runtime_error",
+                "error": str(exc)[:200],
+                "successes": 0,
+                "failures": 0,
+                "direct_peers_count": 0,
+            }
+        }
+
+    def _as_int(key: str) -> int:
+        try:
+            return int(stats.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "dcutr": {
+            "available": True,
+            "successes": _as_int("successes"),
+            "failures": _as_int("failures"),
+            "direct_peers_count": _as_int("direct_peers_count"),
+        }
+    }
+
+
 def _safe_free_memory() -> None:
     """Free Python objects and MLX Metal buffer pool.
 
@@ -338,6 +417,11 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
     # peer_id / libp2p_peer_id / ports / advertise_host from scratch.
     # ``None`` when the coordinator is running standalone (no co-located peer).
     _node_meta: dict[str, Any] | None = None
+    # PR-2 (DCUtR Verification): live handle to the Rust P2P node, used by
+    # /v1/internal/capacity to emit a ``network.dcutr`` block with
+    # hole-punch counters. ``None`` when p2p is disabled; the endpoint
+    # then omits the block cleanly rather than erroring.
+    _p2p_node: Any | None = None
     _http_requests_total: int = 0
     _http_request_errors_total: int = 0
     _http_request_latency_seconds_sum: float = 0.0
@@ -949,7 +1033,14 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 node_persona=_node_persona,
                 upstream=_upstream,
             )
-            self._send_json(report.to_dict(), headers=headers)
+            # PR-2: augment with a live DCUtR stats block when a P2P node
+            # is available. Non-fatal: any failure (stats call raised,
+            # node not started, method missing) degrades gracefully to an
+            # ``available=False`` marker so the rest of the capacity
+            # payload remains valid.
+            _payload = report.to_dict()
+            _payload["network"] = _collect_network_block(self.__class__._p2p_node)
+            self._send_json(_payload, headers=headers)
         except Exception as exc:
             logger.exception("capacity_report_failed: %s", exc)
             self._send_json(
@@ -1791,6 +1882,9 @@ def serve(
             "libp2p_peer_id": str(getattr(p2p_node, "libp2p_peer_id", "") or ""),
         }
     OpenHydraHandler._node_meta = node_meta
+    # PR-2: expose the P2P node handle to the HTTP capacity endpoint so it
+    # can surface DCUtR hole-punch counters under ``network.dcutr``.
+    OpenHydraHandler._p2p_node = p2p_node
     if api_key:
         logger.info("API key authentication enabled")
     else:
