@@ -172,6 +172,19 @@ class ToyShardConfig:
     # Default raised from 30s to 120s to support 8 GB machines under memory pressure.
     runtime_mlx_eval_timeout_s: float = 120.0
 
+    # ── Tokenizer alignment (heterogeneous MLX ↔ PyTorch rings) ───────────
+    # Canonical HuggingFace model id (e.g. "Qwen/Qwen3.5-2B") used to load
+    # the *tokenizer* across every backend. When set and
+    # ``runtime_mlx_force_hf_tokenizer`` is True, MLXRuntime discards the
+    # tokenizer bundled with the mlx-community checkpoint and loads the HF
+    # tokenizer instead, guaranteeing that token IDs encoded on an MLX peer
+    # are valid indices into a PyTorch peer's HF embedding table downstream.
+    runtime_hf_model_id: str = ""
+    runtime_mlx_force_hf_tokenizer: bool = True
+    # Startup guard: refuse to advertise if tokenizer.vocab_size does not
+    # match the loaded embedding table's num_embeddings.
+    runtime_tokenizer_vocab_guard: bool = True
+
 
 @dataclass(frozen=True)
 class RuntimeProfile:
