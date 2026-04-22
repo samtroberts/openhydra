@@ -394,6 +394,31 @@ impl PyP2PNode {
         Ok(result)
     }
 
+    /// Issue an active dial to a libp2p peer id (PR-3 / B1 rendezvous).
+    ///
+    /// Intended to be called from a ``REQUEST_HOLE_PUNCH`` gossip
+    /// subscriber when the inbound event targets this node: the remote
+    /// peer has just asked us to simultaneously dial them, so we do.
+    /// Both sides dialling at the same time under a coordinated ~100 ms
+    /// gossip-delivery window is what gives DCUtR a real chance of
+    /// hole-punching through symmetric NAT.
+    ///
+    /// Fire-and-forget in the sense that success / failure of the dial
+    /// itself is not returned here — it's surfaced asynchronously via
+    /// ``ConnectionEstablished`` / ``DialFailure`` events that already
+    /// drive the direct-peers set and the DCUtR counters. Returns
+    /// ``None`` once the dial has been enqueued; raises
+    /// ``PyRuntimeError`` only on validation failure (bad peer id).
+    fn dial_peer(&self, py: Python<'_>, peer_id: String) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::DialPeer { peer_id, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// Resolve a reachable address for a peer (direct host:port or relay multiaddr).
     fn resolve_address(&self, py: Python<'_>, peer_id: String) -> PyResult<String> {
         let inner = self.require_started()?;

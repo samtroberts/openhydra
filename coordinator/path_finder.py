@@ -626,3 +626,93 @@ class PathFinder:
         if max_latency_ms is not None:
             filtered = [h for h in filtered if h.latency_ms <= max_latency_ms]
         return sorted(filtered, key=lambda x: x.latency_ms)
+
+
+# ─── B1 rendezvous helpers ───────────────────────────────────────────────────
+
+def is_relay_bound(peer: PeerEndpoint) -> bool:
+    """Return ``True`` when routing to *peer* would currently traverse a
+    libp2p circuit relay rather than a direct connection.
+
+    Signals checked, in order:
+
+    * ``peer.requires_relay`` from the peer's DHT announcement — the
+      peer self-declared it's behind a NAT it couldn't open.
+    * ``peer.relay_address`` non-empty — even when ``requires_relay``
+      isn't set (older announcements), a populated relay address is
+      itself a strong signal.
+    * ``peer.address`` contains ``/p2p-circuit`` — final fallback for
+      hand-assembled endpoints.
+
+    A ``True`` return is the trigger for :func:`request_hole_punch`.
+    """
+    if bool(getattr(peer, "requires_relay", False)):
+        return True
+    if str(getattr(peer, "relay_address", "") or "").strip():
+        return True
+    try:
+        return "/p2p-circuit" in str(peer.address)
+    except Exception:
+        return False
+
+
+def request_hole_punch(
+    gossip: Any,
+    *,
+    self_libp2p_peer_id: str,
+    peer: PeerEndpoint,
+) -> bool:
+    """Publish a ``REQUEST_HOLE_PUNCH`` event asking ``peer`` to
+    simultaneously dial us.
+
+    This is the **active** side of the B1 rendezvous: we ask the target
+    to open a dial slot toward our libp2p peer id at the same moment we
+    open one toward theirs — giving libp2p's DCUtR behaviour a real
+    chance of hole-punching through symmetric NAT. The inbound side is
+    handled by :func:`peer.gossip_client.attach_hole_punch_responder`,
+    which calls :meth:`openhydra_network.P2PNode.dial_peer` when a
+    matching ``REQUEST_HOLE_PUNCH`` arrives.
+
+    Returns ``False`` (and logs at debug) when:
+
+    * ``gossip`` is ``None`` — peer isn't on the gossip mesh yet.
+    * ``peer`` has no ``libp2p_peer_id`` — a pre-libp2p legacy peer, no
+      point asking.
+    * ``self_libp2p_peer_id`` is empty — our identity isn't known yet.
+    * Gossip publish fails (e.g. ``InsufficientPeers`` right after boot).
+    * The per-pair 5 s debounce suppressed this call.
+    """
+    if gossip is None:
+        return False
+    remote = str(getattr(peer, "libp2p_peer_id", "") or "").strip()
+    self_id = str(self_libp2p_peer_id or "").strip()
+    if not remote or not self_id:
+        return False
+    if self_id == remote:
+        # Self-loop guard: never ask ourselves to dial ourselves.
+        return False
+    from peer.gossip_client import publish_request_hole_punch
+    return publish_request_hole_punch(
+        gossip, from_peer_id=self_id, to_peer_id=remote
+    )
+
+
+def maybe_request_hole_punch(
+    gossip: Any,
+    *,
+    self_libp2p_peer_id: str,
+    peer: PeerEndpoint,
+) -> bool:
+    """Convenience wrapper: publish ``REQUEST_HOLE_PUNCH`` **iff** the
+    route to *peer* is currently relay-bound.
+
+    The single call you'd normally make from the coordinator / chain
+    before routing through a candidate peer. Safe to call every
+    request — the gossip client's per-pair 5 s debounce absorbs the
+    cost of repeated probes.
+    """
+    if not is_relay_bound(peer):
+        return False
+    return request_hole_punch(
+        gossip, self_libp2p_peer_id=self_libp2p_peer_id, peer=peer
+    )

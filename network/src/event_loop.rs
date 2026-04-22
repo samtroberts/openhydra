@@ -80,6 +80,19 @@ pub enum SwarmCommand {
         payload: Vec<u8>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Issue an active ``Dial`` to the given libp2p peer id (B1 rendezvous).
+    /// The dial is fire-and-forget at this layer — success / failure is
+    /// surfaced via the usual ``ConnectionEstablished`` / ``DialFailure``
+    /// swarm events that already drive our direct-peers set and DCUtR
+    /// counters.
+    ///
+    /// Returns ``Ok(())`` when the dial was successfully enqueued and
+    /// ``Err`` with a short reason when the peer id was malformed or the
+    /// dial slot couldn't be acquired.
+    DialPeer {
+        peer_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Drain the oldest queued inbound gossip message, if any (PR-3 / B1).
     /// Returns ``None`` when the queue is empty. The returned tuple is
     /// ``(sender_libp2p_peer_id, payload_bytes)`` — callers that need the
@@ -278,6 +291,29 @@ pub async fn run_event_loop(
                     Some(SwarmCommand::PollEvent { reply }) => {
                         let item = state.gossip_inbound_queue.pop_front();
                         let _ = reply.send(item);
+                    }
+                    Some(SwarmCommand::DialPeer { peer_id, reply }) => {
+                        // B1 rendezvous: enqueue an active dial to the
+                        // peer id carried on a REQUEST_HOLE_PUNCH gossip
+                        // event. Because libp2p already knows the peer's
+                        // candidate addresses (via Kademlia / Identify
+                        // / direct registration), we don't need to pass
+                        // multiaddrs — just the PeerId. The resulting
+                        // simultaneous dial from *both* sides is what
+                        // forces DCUtR hole-punch against symmetric NAT.
+                        let res = match peer_id.parse::<PeerId>() {
+                            Ok(pid) => {
+                                match swarm.dial(pid) {
+                                    Ok(()) => {
+                                        info!(%pid, "b1_hole_punch_dial_issued");
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(format!("dial error: {e}")),
+                                }
+                            }
+                            Err(e) => Err(format!("invalid peer_id: {e}")),
+                        };
+                        let _ = reply.send(res);
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;

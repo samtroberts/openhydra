@@ -142,18 +142,28 @@ class GossipClient:
         self_libp2p_peer_id: str,
         poll_interval_s: float = 0.1,
         peer_dead_debounce_s: float = 1.0,
+        hole_punch_debounce_s: float = 5.0,
         clock_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         self._p2p_node = p2p_node
         self._self_id = str(self_libp2p_peer_id or "")
         self._poll_interval_s = max(0.01, float(poll_interval_s))
         self._peer_dead_debounce_s = max(0.0, float(peer_dead_debounce_s))
+        # B1 rendezvous: a second, longer debounce keyed by ``(from, to)``
+        # peer-id pair. REQUEST_HOLE_PUNCH is a stronger signal than
+        # PEER_DEAD — we actively ask a remote peer to dial us — so we
+        # rate-limit it harder. 5 s matches typical NAT binding TTLs;
+        # any faster and we'd waste dial capacity on a peer whose prior
+        # punch attempt is still resolving.
+        self._hole_punch_debounce_s = max(0.0, float(hole_punch_debounce_s))
         self._clock_fn = clock_fn
         self._subscribers: dict[str, list[Subscriber]] = defaultdict(list)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # per-peer debounce map keyed by libp2p_peer_id → last-publish mono.
         self._peer_dead_last: dict[str, float] = {}
+        # per-(from, to) pair debounce for REQUEST_HOLE_PUNCH.
+        self._hole_punch_last: dict[tuple[str, str], float] = {}
         self._lock = threading.Lock()
         # counters (observable via :meth:`stats` for tests + /v1/internal)
         self._published = 0
@@ -211,6 +221,23 @@ class GossipClient:
 
         # PEER_DEAD debounce: skip if we just published one for the same
         # target within the debounce window.
+        # REQUEST_HOLE_PUNCH: per-(from, to) pair debounce.
+        if (
+            event_type_clean == EVENT_REQUEST_HOLE_PUNCH
+            and self._hole_punch_debounce_s > 0
+        ):
+            pair = (
+                str(payload_data.get("from_peer_id") or ""),
+                str(payload_data.get("to_peer_id") or ""),
+            )
+            if pair[0] and pair[1]:
+                with self._lock:
+                    now_mono = self._clock_fn()
+                    last = self._hole_punch_last.get(pair)
+                    if last is not None and now_mono - last < self._hole_punch_debounce_s:
+                        return False
+                    self._hole_punch_last[pair] = now_mono
+
         if event_type_clean == EVENT_PEER_DEAD and self._peer_dead_debounce_s > 0:
             target = str(payload_data.get("libp2p_peer_id") or "")
             if target:
@@ -380,6 +407,57 @@ def publish_peer_dead(
         EVENT_PEER_DEAD,
         {"libp2p_peer_id": str(libp2p_peer_id), "reason": str(reason)},
     )
+
+
+def attach_hole_punch_responder(
+    client: "GossipClient",
+    *,
+    p2p_node: Any,
+    self_libp2p_peer_id: str,
+) -> Callable[["GossipMessage"], None]:
+    """Wire the passive side of the B1 rendezvous.
+
+    Subscribes to ``REQUEST_HOLE_PUNCH`` on ``client``; when an event
+    arrives with ``to_peer_id == self_libp2p_peer_id`` **and** a
+    non-self ``from_peer_id``, calls
+    :meth:`p2p_node.dial_peer(from_peer_id)` to issue the simultaneous
+    dial that lets DCUtR punch through symmetric NAT.
+
+    Returns the subscriber callable so callers can ``client.off(...)``
+    it during shutdown. Idempotent: registering twice produces two
+    subscribers, but :meth:`GossipClient.off` only removes one at a
+    time — so teardown matches setup.
+
+    Exceptions from ``dial_peer`` are logged at debug and **not**
+    re-raised — the gossip dispatcher continues running.
+    """
+    self_id = str(self_libp2p_peer_id or "").strip()
+
+    def _respond(msg: GossipMessage) -> None:
+        if msg.type != EVENT_REQUEST_HOLE_PUNCH:
+            return
+        to_peer = str(msg.data.get("to_peer_id") or "").strip()
+        from_peer = str(msg.data.get("from_peer_id") or "").strip()
+        if not self_id or not to_peer or to_peer != self_id:
+            return
+        if not from_peer or from_peer == self_id:
+            return
+        try:
+            p2p_node.dial_peer(from_peer)
+            logger.info(
+                "b1_hole_punch_responder: dialed %s in response to "
+                "REQUEST_HOLE_PUNCH (observed_by=%s)",
+                from_peer,
+                msg.observed_by,
+            )
+        except Exception as exc:  # noqa: BLE001 — dispatcher must not die
+            logger.debug(
+                "b1_hole_punch_dial_failed: target=%s err=%s",
+                from_peer, exc,
+            )
+
+    client.on(EVENT_REQUEST_HOLE_PUNCH, _respond)
+    return _respond
 
 
 def publish_request_hole_punch(
