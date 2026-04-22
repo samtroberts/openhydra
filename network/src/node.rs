@@ -322,6 +322,37 @@ impl PyP2PNode {
         Ok(result.into_py_any(py)?)
     }
 
+    /// Snapshot of DCUtR hole-punch counters (PR-2 — DCUtR Verification).
+    ///
+    /// Returns a dict with:
+    ///
+    /// * ``successes`` (int) — cumulative DCUtR hole-punch successes since
+    ///   node start.
+    /// * ``failures``  (int) — cumulative DCUtR hole-punch failures. A peer
+    ///   that fails DCUtR stays on the relay path.
+    /// * ``direct_peers_count`` (int) — number of peers currently in the
+    ///   direct-connection set (updated by DCUtR success events and
+    ///   non-relay ConnectionEstablished events).
+    ///
+    /// Surfaces on the HTTP capacity endpoint as ``network.dcutr``; drives
+    /// the A3 field-audit benchmark (cross-ISP direct-vs-relay ratio).
+    fn get_dcutr_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        let snapshot = py
+            .allow_threads(move || {
+                send_and_wait(&cmd_tx, |reply| SwarmCommand::GetDcutrStats { reply })
+            })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        let (successes, failures, direct_peers_count) = snapshot;
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("successes", successes)?;
+        dict.set_item("failures", failures)?;
+        dict.set_item("direct_peers_count", direct_peers_count)?;
+        Ok(dict.into_py_any(py)?)
+    }
+
     /// Resolve a reachable address for a peer (direct host:port or relay multiaddr).
     fn resolve_address(&self, py: Python<'_>, peer_id: String) -> PyResult<String> {
         let inner = self.require_started()?;
