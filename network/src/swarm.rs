@@ -103,12 +103,32 @@ pub fn build_swarm(
     let dcutr = dcutr::Behaviour::new(peer_id);
 
     // AutoNAT (NAT type detection).
+    //
+    // A3 DCUtR fix: tune the client config so probes fire eagerly enough
+    // that the peer reaches a confident Private/Public verdict *before*
+    // the first DCUtR hole-punch attempt. Previously ``refresh_interval``
+    // was 60 s and ``use_connected`` defaulted to ``true`` but a few
+    // fields mattered:
+    //
+    // * ``use_connected = true`` — reuse already-established bootstrap
+    //   connections for probes instead of dialing fresh TCP sockets
+    //   (cheaper, and more reliable against aggressive NATs).
+    // * ``only_global_ips = false`` — allow AutoNAT to probe LAN / ULA
+    //   candidates as well as globally-routable ones. We register a
+    //   bunch of LAN candidates in the ``NewListenAddr`` handler (the
+    //   direct-listen fix above), and we want AutoNAT to falsify them
+    //   quickly rather than silently ignore them.
+    // * ``confidence_max = 3`` — match libp2p's default; three agreeing
+    //   probes needed before the verdict latches (stability vs. speed).
     let autonat = autonat::Behaviour::new(
         peer_id,
         autonat::Config {
             boot_delay: Duration::from_secs(5),
             refresh_interval: Duration::from_secs(60),
             retry_interval: Duration::from_secs(30),
+            use_connected: true,
+            only_global_ips: false,
+            confidence_max: 3,
             ..Default::default()
         },
     );

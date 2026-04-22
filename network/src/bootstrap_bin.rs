@@ -123,11 +123,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    // AutoNAT server — responds to NAT probes from peers.
+    // AutoNAT reporter — responds to NAT probes from peers.
+    //
+    // A3 DCUtR fix: configure this node to act as an authoritative
+    // reporter for every peer that probes it, including peers whose
+    // candidate external addrs fall in LAN / ULA space (``only_global_ips
+    // = false``). Without this, a peer behind NAT that registered its LAN
+    // IP as an external candidate (PR A3 event_loop.rs change) would
+    // never get a Falsified verdict — the bootstrap would silently skip
+    // the probe, leaving AutoNAT in ``Unknown`` forever and DCUtR
+    // dormant.
+    //
+    // Throttle limits are relaxed above the libp2p defaults so a steady
+    // swarm of a few dozen peers probing at the same time doesn't get
+    // rate-limited out. Each probe is cheap (a single TCP dial) so the
+    // bootstrap can comfortably serve ~500 req/min.
     let autonat = autonat::Behaviour::new(
         peer_id,
         autonat::Config {
             boot_delay: Duration::from_secs(1),
+            only_global_ips: false,
+            throttle_clients_global_max: 128,
+            throttle_clients_peer_max: 8,
+            throttle_clients_period: Duration::from_secs(1),
             ..Default::default()
         },
     );
