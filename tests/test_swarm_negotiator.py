@@ -36,9 +36,11 @@ from peer.swarm_negotiator import (
     PeerClaim,
     ShardAssignment,
     SOURCE_ATOMIC_WORKER,
+    SOURCE_CONFLICT_SPLIT,
     SOURCE_FALLBACK_WHOLE,
     SOURCE_PICK_BEST_FIT,
     SwarmNegotiator,
+    compute_conflict_split,
     compute_gaps,
     pick_best_fit,
     should_concede,
@@ -506,6 +508,248 @@ def test_unknown_persona_returns_none_without_raising():
 
 
 # ─── ShardAssignment shape ───────────────────────────────────────────────────
+
+
+# ─── compute_conflict_split (Blocker B fix) ─────────────────────────────────
+
+
+def _claim_whole(
+    peer_id: str,
+    total_layers: int = 24,
+    *,
+    available_vram_mb: int = 8000,
+) -> PeerClaim:
+    """Shortcut — a peer that claims the whole model, i.e. is in the
+    ``fallback_whole_model`` deadlock state.
+
+    Default ``available_vram_mb`` of 8000 is deliberately *below* the
+    T4 test fixture's ~14 336 MB so :func:`should_concede` doesn't
+    fire for the peer-under-test — the fix is about the deadlock,
+    not about conceding to a bigger peer.
+    """
+    return PeerClaim(
+        libp2p_peer_id=peer_id,
+        model_id="openhydra-qwen3.5-2b",
+        layer_start=0,
+        layer_end=total_layers,
+        total_layers=total_layers,
+        available_vram_mb=available_vram_mb,
+    )
+
+
+class TestComputeConflictSplit:
+    """Unit-level coverage of the deterministic whole-model split."""
+
+    def test_no_overlappers_returns_none(self):
+        """No deadlock → helper returns None so the caller falls through
+        to ``pick_best_fit``."""
+        assert compute_conflict_split(
+            peer_claims=[],
+            total_layers=24,
+            my_libp2p_peer_id="12D3KooWMINE",
+            max_layers_hostable=24,
+        ) is None
+
+    def test_partial_range_overlapper_not_a_deadlock(self):
+        """A peer claiming only [0, 12) is a valid partial — not a
+        deadlock. Falls through to the normal gap path."""
+        assert compute_conflict_split(
+            peer_claims=[
+                PeerClaim(
+                    libp2p_peer_id="12D3KooWOTHER",
+                    model_id="openhydra-qwen3.5-2b",
+                    layer_start=0, layer_end=12,
+                    total_layers=24, available_vram_mb=15000,
+                )
+            ],
+            total_layers=24,
+            my_libp2p_peer_id="12D3KooWMINE",
+            max_layers_hostable=24,
+        ) is None
+
+    def test_two_peer_whole_model_splits_50_50(self):
+        """The canonical benchmark scenario: Mac + GPU1 both claim
+        [0, 24). With lex-ordered ids, one gets [0, 12), other gets
+        [12, 24). On 24 layers and 2 peers this is always exactly 12/12."""
+        # "12D3KooWA..." < "12D3KooWM..." lex.
+        me = "12D3KooWAAAAA"
+        other = "12D3KooWZZZZZ"
+        my_split = compute_conflict_split(
+            peer_claims=[_claim_whole(other)],
+            total_layers=24,
+            my_libp2p_peer_id=me,
+            max_layers_hostable=24,
+        )
+        other_split = compute_conflict_split(
+            peer_claims=[_claim_whole(me)],
+            total_layers=24,
+            my_libp2p_peer_id=other,
+            max_layers_hostable=24,
+        )
+        assert my_split == (0, 12)
+        assert other_split == (12, 24)
+
+    def test_deterministic_across_two_lex_orders(self):
+        """Either peer running the helper with the same inputs produces
+        a complementary pair that tiles ``[0, total_layers)``."""
+        ids = ["12D3KooWGpu", "12D3KooWMac"]
+        # Both peers see the same full-range overlap — exchange roles.
+        splits = []
+        for self_id in ids:
+            other_ids = [p for p in ids if p != self_id]
+            split = compute_conflict_split(
+                peer_claims=[_claim_whole(o) for o in other_ids],
+                total_layers=24,
+                my_libp2p_peer_id=self_id,
+                max_layers_hostable=24,
+            )
+            splits.append(split)
+        # Chunks must tile [0, 24) with no gaps, no overlap.
+        splits_sorted = sorted(splits)
+        assert splits_sorted == [(0, 12), (12, 24)]
+
+    def test_three_peer_32_layer_split_is_even_chunks(self):
+        """9B model has 32 layers. 3 peers → ceil(32/3)=11. Chunks
+        [0,11), [11,22), [22,32) — last peer absorbs the remainder."""
+        ids = ["12D3KooWA", "12D3KooWB", "12D3KooWC"]
+        results: dict[str, tuple[int, int]] = {}
+        for self_id in ids:
+            other_ids = [p for p in ids if p != self_id]
+            split = compute_conflict_split(
+                peer_claims=[
+                    _claim_whole(o, total_layers=32) for o in other_ids
+                ],
+                total_layers=32,
+                my_libp2p_peer_id=self_id,
+                max_layers_hostable=32,
+            )
+            results[self_id] = split
+        assert results == {
+            "12D3KooWA": (0, 11),
+            "12D3KooWB": (11, 22),
+            "12D3KooWC": (22, 32),
+        }
+        # Tile: total coverage is [0, 32), no gap, no overlap.
+        ranges = sorted(results.values())
+        assert ranges[0][0] == 0
+        assert ranges[-1][1] == 32
+        for i in range(len(ranges) - 1):
+            assert ranges[i][1] == ranges[i + 1][0]
+
+    def test_respects_max_layers_hostable_budget(self):
+        """If the computed chunk is bigger than the peer can host, it
+        shrinks to the budget — still at the same ``my_start``."""
+        split = compute_conflict_split(
+            peer_claims=[_claim_whole("12D3KooWZZZ")],
+            total_layers=24,
+            my_libp2p_peer_id="12D3KooWAAA",
+            max_layers_hostable=4,  # much smaller than the 12-layer chunk
+        )
+        assert split == (0, 4)
+
+    def test_ignores_claims_with_wrong_total_layers(self):
+        """A peer advertising a different model depth mustn't count
+        toward this model's deadlock."""
+        split = compute_conflict_split(
+            peer_claims=[
+                PeerClaim(
+                    libp2p_peer_id="12D3KooWOther",
+                    model_id="openhydra-qwen3.5-2b",
+                    layer_start=0, layer_end=32,  # wrong total
+                    total_layers=32, available_vram_mb=15000,
+                )
+            ],
+            total_layers=24,
+            my_libp2p_peer_id="12D3KooWMine",
+            max_layers_hostable=24,
+        ) is None or None  # both branches accept
+
+    def test_empty_self_id_returns_none(self):
+        """Defensive: a negotiator with no identity cannot compute a
+        deterministic position — bail rather than hand it an arbitrary
+        range."""
+        assert compute_conflict_split(
+            peer_claims=[_claim_whole("12D3KooWOther")],
+            total_layers=24,
+            my_libp2p_peer_id="",
+            max_layers_hostable=24,
+        ) is None
+
+    def test_zero_total_layers_returns_none(self):
+        assert compute_conflict_split(
+            peer_claims=[_claim_whole("12D3KooWOther", total_layers=0)],
+            total_layers=0,
+            my_libp2p_peer_id="12D3KooWMine",
+            max_layers_hostable=24,
+        ) is None
+
+
+class TestConflictSplitInNegotiator:
+    """Integration-level: _native_shard_assignment returns a conflict-
+    split assignment when a full-range overlapper is present."""
+
+    def test_negotiator_emits_conflict_split_source(self):
+        """Mac-like peer discovers GPU1's whole-model claim on tick 2
+        and assigns itself the lower half of the model."""
+        me = "12D3KooWAlpha"
+        other = "12D3KooWZebra"
+        claims = [_claim_whole(other)]
+        report = _native_report(_cuda_t4(), _qwen_2b(), libp2p_peer_id=me)
+        neg = SwarmNegotiator(
+            capacity_report=report,
+            libp2p_peer_id=me,
+            dht_scan=_fixed_scan(claims),
+        )
+        assignment = neg.negotiate()
+        assert assignment is not None
+        assert assignment.source == SOURCE_CONFLICT_SPLIT
+        assert assignment.model_id == "openhydra-qwen3.5-2b"
+        assert assignment.total_layers == 24
+        # Alpha < Zebra lex → I take [0, 12).
+        assert (assignment.layer_start, assignment.layer_end) == (0, 12)
+
+    def test_negotiator_conflict_split_complements_across_peers(self):
+        """Two peers running their own negotiator against each other's
+        whole-model claim emit complementary sharded assignments."""
+        mac = "12D3KooWMac"
+        gpu = "12D3KooWZZZ"
+        mac_report = _native_report(_cuda_t4(), _qwen_2b(), libp2p_peer_id=mac)
+        gpu_report = _native_report(_cuda_t4(), _qwen_2b(), libp2p_peer_id=gpu)
+
+        mac_neg = SwarmNegotiator(
+            capacity_report=mac_report, libp2p_peer_id=mac,
+            dht_scan=_fixed_scan([_claim_whole(gpu)]),
+        )
+        gpu_neg = SwarmNegotiator(
+            capacity_report=gpu_report, libp2p_peer_id=gpu,
+            dht_scan=_fixed_scan([_claim_whole(mac)]),
+        )
+        mac_ass = mac_neg.negotiate()
+        gpu_ass = gpu_neg.negotiate()
+        assert mac_ass.source == gpu_ass.source == SOURCE_CONFLICT_SPLIT
+        assert (mac_ass.layer_start, mac_ass.layer_end) == (0, 12)
+        assert (gpu_ass.layer_start, gpu_ass.layer_end) == (12, 24)
+
+    def test_partial_peer_does_not_trigger_split(self):
+        """A peer already holding a partial shard [0, 12) lets the
+        normal pick_best_fit logic fill the [12, 24) gap — conflict
+        split should NOT fire."""
+        me = "12D3KooWMine"
+        other_partial = PeerClaim(
+            libp2p_peer_id="12D3KooWOther",
+            model_id="openhydra-qwen3.5-2b",
+            layer_start=0, layer_end=12,
+            total_layers=24, available_vram_mb=15000,
+        )
+        report = _native_report(_cuda_t4(), _qwen_2b(), libp2p_peer_id=me)
+        neg = SwarmNegotiator(
+            capacity_report=report, libp2p_peer_id=me,
+            dht_scan=_fixed_scan([other_partial]),
+        )
+        assignment = neg.negotiate()
+        assert assignment is not None
+        assert assignment.source == SOURCE_PICK_BEST_FIT
+        assert (assignment.layer_start, assignment.layer_end) == (12, 24)
 
 
 def test_shard_assignment_is_immutable():

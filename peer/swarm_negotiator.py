@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 SOURCE_ATOMIC_WORKER = "atomic_worker"          # layer 0→N from hosted_model_ids
 SOURCE_PICK_BEST_FIT = "pick_best_fit"          # filled a coverage gap
 SOURCE_FALLBACK_WHOLE = "fallback_whole_model"  # no gaps found, serve 0..num_layers
+SOURCE_CONFLICT_SPLIT = "conflict_split"  # two+ peers both claim whole — force split
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,91 @@ def pick_best_fit(
     # Nothing fits whole.  Take the biggest slice we can of the widest gap.
     widest_s, widest_e = max(gaps, key=lambda r: r[1] - r[0])
     return (widest_s, widest_s + int(max_layers_hostable))
+
+
+def compute_conflict_split(
+    *,
+    peer_claims: list[PeerClaim],
+    total_layers: int,
+    my_libp2p_peer_id: str,
+    max_layers_hostable: int,
+) -> tuple[int, int] | None:
+    """Deterministically carve ``[0, total_layers)`` into contiguous
+    chunks when the swarm has deadlocked on every peer claiming the
+    whole model.
+
+    The ``fallback_whole_model`` deadlock looks like this: peers A and B
+    both boot, neither sees the other, each self-assigns [0, N), and
+    each re-announces [0, N). On the next negotiation tick A scans the
+    DHT and sees B's [0, N) claim; B sees A's. Because each claim
+    already covers the whole range, :func:`compute_gaps` returns ``[]``
+    (fully covered) → ``_native_shard_assignment`` skips the model →
+    no reshard ever fires → ring stays single-peer-served forever.
+
+    The fix: when the scan surfaces one or more other peers who also
+    claim ``[0, total_layers)``, treat the swarm as ``k+1`` peers (me +
+    the k overlappers), sort the combined libp2p_peer_ids
+    lexicographically, and assign myself the chunk at my position.
+
+    This uses the **same lex-order tie-break** already used by
+    :func:`should_concede`, so the two heuristics agree on who wins
+    which range without a second round-trip.
+
+    Returns ``None`` if no deadlock is detected (no full-range peer
+    claims), if our ``max_layers_hostable`` can't hold even one chunk,
+    or if inputs are degenerate. The caller should fall through to the
+    existing ``pick_best_fit`` path on ``None``.
+
+    Determinism
+    -----------
+    * Every peer with the same inputs computes the same (my_start,
+      my_end). No RPCs, no randomness.
+    * Ties on peer_id are impossible (libp2p PeerIds are cryptographic
+      hashes).
+    * On an N-layer model with k+1 peers, chunks are size
+      ``ceil(N / (k+1))``; any remainder is absorbed by the last peer.
+      E.g. 24 layers, 2 peers → 12 + 12. 24 layers, 3 peers → 8 + 8 + 8.
+      24 layers, 5 peers → 5 + 5 + 5 + 5 + 4.
+    """
+    if total_layers <= 0 or max_layers_hostable <= 0:
+        return None
+    my_id = str(my_libp2p_peer_id or "").strip()
+    if not my_id:
+        return None
+
+    # Detect "whole model" overlappers — every peer whose claim covers
+    # the entire [0, total_layers) range for this model.
+    full_range_ids: set[str] = set()
+    for c in peer_claims:
+        if int(c.total_layers) != int(total_layers):
+            continue
+        if int(c.layer_start) <= 0 and int(c.layer_end) >= int(total_layers):
+            pid = str(c.libp2p_peer_id or "").strip()
+            if pid and pid != my_id:
+                full_range_ids.add(pid)
+
+    if not full_range_ids:
+        return None  # no deadlock — let pick_best_fit handle it normally
+
+    # Build the ordered participant list: me + every full-range peer.
+    participants = sorted({my_id, *full_range_ids})
+    n = len(participants)
+    my_position = participants.index(my_id)
+
+    # Ceiling division — the last participant absorbs any remainder.
+    chunk_size = (int(total_layers) + n - 1) // n
+    my_start = my_position * chunk_size
+    my_end = min(int(total_layers), my_start + chunk_size)
+
+    if my_end <= my_start:
+        return None  # degenerate — position beyond layer count
+
+    # Respect the local peer's hostable-layer budget. If the
+    # computed chunk is bigger than we can hold, shrink the end.
+    if (my_end - my_start) > int(max_layers_hostable):
+        my_end = my_start + int(max_layers_hostable)
+
+    return (my_start, my_end)
 
 
 def should_concede(
@@ -329,6 +415,59 @@ class SwarmNegotiator:
         for entry in candidates:
             claims = self._safe_scan(entry.model_id)
             total_layers = int(entry.num_layers_total)
+
+            # Deadlock-breaker: if one or more other peers are already
+            # claiming the whole ``[0, total_layers)`` range (because
+            # they, like us, fell back to ``fallback_whole_model`` on
+            # their first tick), force a deterministic split so every
+            # peer advances to a distinct contiguous chunk on this
+            # tick. Must run *before* ``compute_gaps`` — otherwise
+            # overlapping full-range claims hide the gap.
+            split_candidate = compute_conflict_split(
+                peer_claims=claims,
+                total_layers=total_layers,
+                my_libp2p_peer_id=self.libp2p_peer_id,
+                max_layers_hostable=int(entry.max_layers_hostable),
+            )
+            if split_candidate is not None:
+                # Before committing to the split, run the concede check
+                # on the proposed range. If a higher-priority peer
+                # (more VRAM, or lex-smaller id on a tie) already
+                # overlaps our slice, let them serve the model alone
+                # — don't force an unnecessary split. Fall through to
+                # the next candidate model in the ranked list.
+                my_start, my_end = split_candidate
+                if should_concede(
+                    (my_start, my_end),
+                    peer_claims=claims,
+                    model_id=entry.model_id,
+                    total_layers=total_layers,
+                    my_vram_mb=my_vram_mb,
+                    my_libp2p_peer_id=self.libp2p_peer_id,
+                ):
+                    logger.info(
+                        "swarm_negotiate_conflict_split_conceded: model=%s — "
+                        "higher-priority peer already covers overlapping range",
+                        entry.model_id,
+                    )
+                    continue
+                logger.info(
+                    "swarm_negotiate_conflict_split: model=%s layers=[%d, %d) "
+                    "total=%d (breaking whole-model deadlock with %d peer(s))",
+                    entry.model_id, my_start, my_end, total_layers,
+                    sum(1 for c in claims
+                        if int(c.total_layers) == total_layers
+                        and int(c.layer_start) <= 0
+                        and int(c.layer_end) >= total_layers),
+                )
+                return ShardAssignment(
+                    model_id=entry.model_id,
+                    layer_start=my_start,
+                    layer_end=my_end,
+                    total_layers=total_layers,
+                    source=SOURCE_CONFLICT_SPLIT,
+                )
+
             gaps = compute_gaps(claims, total_layers)
 
             if not gaps:

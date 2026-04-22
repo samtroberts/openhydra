@@ -436,9 +436,43 @@ def attach_hole_punch_responder(
     def _respond(msg: GossipMessage) -> None:
         if msg.type != EVENT_REQUEST_HOLE_PUNCH:
             return
+        # Extract addressing fields with explicit string coercion. Both
+        # ends must use identical base58 libp2p peer ids — any trimming,
+        # casing, or byte-order drift would silently kill the rendezvous
+        # (that's exactly what happened in the first live run — 52/52
+        # messages arrived but the responder silently returned on every
+        # one of them). We log at INFO on any mismatch so the failure
+        # mode surfaces in the log, not as a mystery.
         to_peer = str(msg.data.get("to_peer_id") or "").strip()
         from_peer = str(msg.data.get("from_peer_id") or "").strip()
-        if not self_id or not to_peer or to_peer != self_id:
+        # Fallback: if the envelope's ``from_peer_id`` is missing (a
+        # producer using an older envelope shape), fall back to the
+        # gossip propagation hop — that's typically the original
+        # publisher in a small mesh with flood_publish enabled.
+        if not from_peer:
+            from_peer = str(msg.propagation_source or "").strip()
+
+        if not self_id:
+            logger.warning(
+                "b1_hole_punch_responder_unconfigured: got REQUEST_HOLE_PUNCH "
+                "but responder has empty self_libp2p_peer_id — subscriber "
+                "was wired up before the P2P node finished starting?",
+            )
+            return
+
+        # A key instrumentation point: if we get here but ``to_peer``
+        # isn't addressing us, log a short snippet of both ids so the
+        # mismatch is visible. (Full ids are 52 chars; 14-char prefix
+        # is unique enough for debugging without spamming 52×52 chars.)
+        if not to_peer or to_peer != self_id:
+            if to_peer:
+                # Only log the first few — with flood_publish an
+                # unaddressed message arrives at every node in the
+                # mesh, so this is normal if many peers use the topic.
+                logger.debug(
+                    "b1_hole_punch_not_for_us: to=%s self=%s from=%s",
+                    to_peer[:14], self_id[:14], from_peer[:14],
+                )
             return
         if not from_peer or from_peer == self_id:
             return
@@ -451,8 +485,9 @@ def attach_hole_punch_responder(
                 msg.observed_by,
             )
         except Exception as exc:  # noqa: BLE001 — dispatcher must not die
-            logger.debug(
-                "b1_hole_punch_dial_failed: target=%s err=%s",
+            logger.info(
+                "b1_hole_punch_dial_failed: target=%s err=%s — will retry "
+                "on next publish (5 s debounce window)",
                 from_peer, exc,
             )
 

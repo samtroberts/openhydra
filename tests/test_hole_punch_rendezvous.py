@@ -376,6 +376,38 @@ class TestHolePunchResponder:
         client.tick_once()
         assert node._dials == ["12D3KooWReq2"]
 
+    def test_from_peer_falls_back_to_propagation_source(self):
+        """If the envelope is missing ``from_peer_id`` (older producer
+        or the peer/server.py raw-publish path without the field), the
+        responder falls back to the gossip propagation hop — which
+        with flood_publish enabled is typically the original sender
+        in a small mesh."""
+        node = FakeP2PNode()
+        client = self._client_with_responder(node, self_id="12D3KooWSelf")
+        # Enqueue a REQUEST_HOLE_PUNCH with only ``to_peer_id``.
+        env = {
+            "type": EVENT_REQUEST_HOLE_PUNCH,
+            "data": {"to_peer_id": "12D3KooWSelf"},  # no from_peer_id
+            "observed_by": "12D3KooWRemote",
+            "unix_ms": 0,
+        }
+        node.enqueue_from("12D3KooWRemote", json.dumps(env).encode("utf-8"))
+        client.tick_once()
+        assert node._dials == ["12D3KooWRemote"]
+
+    def test_empty_self_id_logs_and_skips(self):
+        """If the responder was wired before the P2P node finished
+        starting (self_libp2p_peer_id empty), it must NOT crash — log
+        and skip."""
+        node = FakeP2PNode()
+        client = self._client_with_responder(node, self_id="")  # empty
+        self._enqueue_hole_punch(
+            node, from_peer="12D3KooWReq", to_peer="12D3KooWSomeone"
+        )
+        # Must not raise.
+        client.tick_once()
+        assert node._dials == []
+
     def test_wrong_event_type_ignored(self):
         node = FakeP2PNode()
         client = self._client_with_responder(node, self_id="12D3KooWSelf")
