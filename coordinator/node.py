@@ -256,6 +256,30 @@ def main() -> None:
             "assignment is available, it re-claims.  Floor: 5s."
         ),
     )
+    # --- Track B / B3: ReshardExecutor feature flag (default OFF) ---
+    parser.add_argument(
+        "--reshard-executor-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When the NegotiationLoop observes a changed shard assignment, "
+            "run the B3 drain→unload→reload FSM to *actually* apply it to "
+            "the running PeerService. Default OFF — failures leave the peer "
+            "in a degraded LOADING_FAILED state (stay-degraded policy; no "
+            "execv). Flip on once you're ready to bake the reload path "
+            "against CUDA / MPS / Metal memory-leak surfaces."
+        ),
+    )
+    parser.add_argument(
+        "--reshard-drain-timeout-s",
+        type=float, default=120.0,
+        help=(
+            "Max wall-clock the B3 FSM waits for in-flight requests to "
+            "complete before proceeding with UNLOADING. Default 120s "
+            "matches the master plan's 'do not penalise users for a "
+            "network reshard event' policy."
+        ),
+    )
 
     # --- Auth ---
     parser.add_argument("--api-key", default=None,
@@ -794,8 +818,48 @@ def main() -> None:
             getattr(args, "negotiation_interval_s", _P4_INTERVAL) or _P4_INTERVAL
         )
 
-        # Factory: peer_server.serve() calls this once with ``is_busy_fn``.
-        def _negotiation_loop_factory_impl(is_busy_fn):
+        # Factory: peer_server.serve() calls this once with ``(is_busy_fn,
+        # service)``. The ``service`` arg gates the B3 ReshardExecutor;
+        # when the ``--reshard-executor-enabled`` flag is set and a
+        # ``service`` reference is available, the loop's tick hands
+        # changed assignments to the executor which runs the drain →
+        # unload → reload FSM. Feature-flagged off by default; on
+        # failure the executor stays degraded (stay-degraded policy).
+        _b3_enabled = bool(getattr(args, "reshard_executor_enabled", False))
+        _b3_drain_timeout = float(
+            getattr(args, "reshard_drain_timeout_s", 120.0) or 120.0
+        )
+
+        def _negotiation_loop_factory_impl(is_busy_fn, service=None):
+            _reshard_fn = None
+            if _b3_enabled and service is not None:
+                try:
+                    from peer.reshard_executor import ReshardExecutor as _ReExec
+                    # Gossip publish hook so RESHARD_ANNOUNCE goes out on
+                    # successful reload. ``_gossip_client`` was set up
+                    # back in the P2P bootstrap block above.
+                    _pub_fn = None
+                    if _gossip_client is not None:
+                        _pub_fn = lambda evt_type, data: bool(
+                            _gossip_client.publish(evt_type, data)
+                        )
+                    _executor = _ReExec(
+                        service=service,
+                        drain_timeout_s=_b3_drain_timeout,
+                        gossip_publish_fn=_pub_fn,
+                    )
+                    _executor.set_initial_assignment(_negotiator_assignment)
+                    _reshard_fn = _executor.propose
+                    logger.info(
+                        "reshard_executor_enabled: drain_timeout=%.1fs gossip=%s",
+                        _b3_drain_timeout,
+                        "on" if _pub_fn is not None else "off",
+                    )
+                except Exception as _re_err:
+                    logger.warning(
+                        "reshard_executor_wire_failed: %s — falling back "
+                        "to Phase-4 log-only behaviour", _re_err,
+                    )
             return _P4_NegotiationLoop(
                 build_capacity_report_fn=_p4_build_report,
                 make_negotiator_fn=_p4_make_negotiator,
@@ -803,6 +867,7 @@ def main() -> None:
                 initial_assignment=_negotiator_assignment,
                 is_busy_fn=is_busy_fn,
                 interval_s=_p4_interval,
+                reshard_executor_fn=_reshard_fn,
             )
 
         _negotiation_loop_factory_fn = _negotiation_loop_factory_impl

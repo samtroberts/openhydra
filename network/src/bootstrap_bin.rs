@@ -174,10 +174,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // peers that can only reach each other through a bootstrap still see
     // each other's events. The message-authenticity signing guarantees the
     // bootstrap can't forge events; it just propagates signed messages.
+    // Small-swarm tuning identical to the peer side — critical so the
+    // bootstrap forwards every published message to every topic peer,
+    // not just the D-sized mesh slice.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .max_transmit_size(64 * 1024)
+        .flood_publish(true)
+        .mesh_outbound_min(1)
+        .mesh_n_low(1)
+        .mesh_n(3)
+        .mesh_n_high(6)
         .build()
         .map_err(|e| format!("gossipsub config: {e}"))?;
     let mut gossipsub = gossipsub::Behaviour::new(
