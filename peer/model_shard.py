@@ -2004,7 +2004,41 @@ class PyTorchRuntime:
         hidden = self._embed_from_input_ids(input_ids, position_ids)
         return hidden
 
-    def _activation_to_hidden(self, activation: list[float]):
+    def _activation_to_hidden(
+        self,
+        activation: list[float],
+        packed_bytes: bytes | None = None,
+    ):
+        # Zero-copy path: ``activation_packed`` bytes from the previous
+        # stage. Matches the MLX runtime's symmetric decoder so an MLX
+        # peer can ship straight into a PyTorch peer (and vice versa).
+        # Wire format: ``openhydra_network.encode_activation`` output —
+        # header-less fp32 buffer prefixed by a ``[seq_len, hidden_size]``
+        # RustTensor shape.
+        if packed_bytes is not None and len(packed_bytes) >= 8:
+            try:
+                import openhydra_network
+                rust_tensor = openhydra_network.decode_activation(packed_bytes)
+                decoded = self._torch.from_dlpack(rust_tensor)
+                # RustTensor shape is [1, seq_len, hidden_size].
+                seq_len = int(rust_tensor.shape[1])
+                hidden_size = int(rust_tensor.shape[2])
+                if hidden_size != int(self._hidden_size):
+                    raise RuntimeError(
+                        f"invalid_hidden_payload:hidden_size "
+                        f"(wire={hidden_size}, expected={self._hidden_size})"
+                    )
+                hidden = decoded.reshape(1, seq_len, hidden_size).to(self._device)
+                if self._dtype != self._torch.float32:
+                    hidden = hidden.to(dtype=self._dtype)
+                return hidden
+            except Exception as _dlpack_exc:
+                # Rust wheel missing or malformed bytes — fall through to
+                # the legacy list-float path so the peer stays useful on
+                # minimal installs.
+                logging.debug(
+                    "pytorch_packed_fallback: %s — using list path", _dlpack_exc,
+                )
         values = [float(item) for item in activation]
         if len(values) < 3:
             raise RuntimeError("invalid_hidden_payload:too_short")
@@ -2664,6 +2698,7 @@ class PyTorchRuntime:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
+        packed_bytes: bytes | None = None,
     ) -> list[float]:
         self.last_forward_thread_id = threading.get_ident()
         self.last_kv_cache_hit = False
@@ -2863,9 +2898,11 @@ class PyTorchRuntime:
                     position_ids = self._build_position_ids(seq_len=seq_len, past_len=past_len)
                     hidden = self._embed_from_input_ids(input_ids, position_ids)
                 else:
-                    if not activation:
+                    if not activation and not packed_bytes:
                         raise RuntimeError("missing_hidden_payload")
-                    hidden = self._activation_to_hidden(activation)
+                    hidden = self._activation_to_hidden(
+                        activation, packed_bytes=packed_bytes,
+                    )
                     seq_len = int(hidden.shape[1])
                     past_len = self._past_sequence_length(cached_past)
                     position_ids = self._build_position_ids(seq_len=seq_len, past_len=past_len)
@@ -2943,6 +2980,7 @@ class PyTorchRuntime:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
+        packed_bytes: bytes | None = None,
     ) -> list[float]:
         return self._forward_impl(
             prompt,
@@ -2960,7 +2998,16 @@ class PyTorchRuntime:
             decode_top_k=decode_top_k,
             decode_seed=decode_seed,
             prompt_token_ids=prompt_token_ids,
+            packed_bytes=packed_bytes,
         )
+
+    # Symmetric with ``MLXRuntime._forward_sharded``. The dispatcher in
+    # ``ModelShard.forward`` gates ``packed_bytes`` pass-through on
+    # ``hasattr(self._runtime, "_forward_sharded")`` — without this
+    # alias, a PyTorch peer at stage 1+ never receives the MLX peer's
+    # zero-copy packed bytes, forcing the slow list[float] path even
+    # when both sides could DLPack-decode.
+    _forward_sharded = _forward_impl
 
     async def forward_async(
         self,
@@ -2979,11 +3026,12 @@ class PyTorchRuntime:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
+        packed_bytes: bytes | None = None,
     ) -> list[float]:
         loop = asyncio.get_running_loop()
         # ``run_in_executor`` doesn't take **kwargs — pass positional args only
-        # and let ``_forward_impl`` receive ``prompt_token_ids`` via its own
-        # parameter at the tail of the signature.
+        # and let ``_forward_impl`` receive ``prompt_token_ids`` / ``packed_bytes``
+        # via its own parameters at the tail of the signature.
         return await loop.run_in_executor(
             self._executor,
             self._forward_impl,
@@ -3002,6 +3050,7 @@ class PyTorchRuntime:
             decode_top_k,
             decode_seed,
             prompt_token_ids,
+            packed_bytes,
         )
 
     def forward_batch(self, items: list[Any]) -> list[list[float]]:

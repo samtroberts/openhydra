@@ -412,6 +412,24 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 runtime_peer_id=str(peer_id),
             )
         )
+        # Persist boot-time ToyShardConfig inputs so ``reload_shard`` can
+        # rebuild a configured-identical shard with just the layer range
+        # rotated. Without this, every reshard silently resets the runtime
+        # to ``toy_auto`` (because ``runtime_backend or "toy_auto"`` in the
+        # ModelShard dispatcher kicks in on the empty fallback), swapping
+        # the production PyTorch/MLX backend for tinyllama-15M — the bug
+        # that surfaced as ``IndexError: index out of range in self`` on
+        # GPU1 stage 0 during the April 22 cross-ISP benchmark.
+        self._boot_runtime_backend = str(runtime_backend)
+        self._boot_runtime_target = str(runtime_target)
+        self._boot_quantization_mode = str(quantization_mode)
+        self._boot_runtime_model_id = str(runtime_model_id)
+        self._boot_hf_model_id = str(hf_model_id or "")
+        self._boot_mlx_force_hf_tokenizer = bool(mlx_force_hf_tokenizer)
+        self._boot_tokenizer_vocab_guard = bool(tokenizer_vocab_guard)
+        self._boot_kv_cache_max_entries = max(1, int(kv_cache_max_entries))
+        self._boot_warmup_on_start = bool(warmup_on_start)
+        self._boot_mlx_eval_timeout_s = max(1.0, float(mlx_eval_timeout_s))
         self.runtime_profile = dict(self.shard.runtime_profile())
         self.batch_queue = BatchingQueue(
             self.shard,
@@ -524,10 +542,28 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 model_id=str(assignment.model_id or getattr(self, "model_id", "")),
                 shard_index=shard_index,
                 total_shards=total_shards,
-                runtime_backend=str(
-                    getattr(getattr(self, "shard", None), "runtime_backend", "")
-                    or getattr(self, "runtime_backend", "")
-                    or ""
+                # Preserve the original runtime wiring — without this the
+                # ModelShard dispatcher falls back to ``toy_auto`` (tinyllama-15M)
+                # on every reshard, silently swapping out the production
+                # PyTorch / MLX runtime. See the ``_boot_*`` fields on
+                # ``PeerService.__init__``.
+                runtime_backend=str(getattr(self, "_boot_runtime_backend", "") or ""),
+                runtime_target=str(getattr(self, "_boot_runtime_target", "auto") or "auto"),
+                quantization_mode=str(getattr(self, "_boot_quantization_mode", "fp32") or "fp32"),
+                runtime_model_id=str(getattr(self, "_boot_runtime_model_id", "") or ""),
+                runtime_hf_model_id=str(getattr(self, "_boot_hf_model_id", "") or ""),
+                runtime_mlx_force_hf_tokenizer=bool(
+                    getattr(self, "_boot_mlx_force_hf_tokenizer", True)
+                ),
+                runtime_tokenizer_vocab_guard=bool(
+                    getattr(self, "_boot_tokenizer_vocab_guard", True)
+                ),
+                runtime_kv_cache_max_entries=int(
+                    getattr(self, "_boot_kv_cache_max_entries", 1024)
+                ),
+                runtime_warmup_on_start=bool(getattr(self, "_boot_warmup_on_start", False)),
+                runtime_mlx_eval_timeout_s=float(
+                    getattr(self, "_boot_mlx_eval_timeout_s", 120.0)
                 ),
                 runtime_layer_indices=new_layer_indices,
                 runtime_peer_id=str(self.peer_id),
