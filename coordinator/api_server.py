@@ -1864,6 +1864,7 @@ def serve(
     rate_limiter: _RateLimiter | None = None,
     p2p_node: object | None = None,
     node_meta: dict[str, Any] | None = None,
+    gossip_client: Any | None = None,
 ) -> None:
     OpenHydraHandler.engine = CoordinatorEngine(config)
     # Inject the Rust P2P node into the discovery service (if available).
@@ -1871,6 +1872,14 @@ def serve(
         _dsvc = getattr(OpenHydraHandler.engine, "_discovery_svc", None)
         if _dsvc is not None:
             _dsvc._p2p_node = p2p_node
+            # B1 rendezvous: stash the gossip client on the discovery
+            # service so the inference_service layer can pass it into
+            # every InferenceChain it builds (next commit over in
+            # coordinator/inference_service.py picks it up).
+            _dsvc._gossip_client = gossip_client
+            _dsvc._self_libp2p_peer_id = (
+                str(getattr(p2p_node, "libp2p_peer_id", "") or "")
+            )
     OpenHydraHandler._api_key = api_key or None
     OpenHydraHandler._rate_limiter = rate_limiter
     # Zero-config bootstrap Phase 1: node metadata for /v1/internal/capacity.

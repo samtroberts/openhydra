@@ -653,6 +653,26 @@ class InferenceService:
         )
         # Inject P2P node for cross-ISP relay tunneling.
         chain._p2p_node = getattr(self.discovery_service, '_p2p_node', None)
+        # B1 rendezvous: inject gossip client + our own libp2p peer id so
+        # the chain's stage loop can publish ``REQUEST_HOLE_PUNCH`` for
+        # each relay-bound candidate before the first ``Forward`` RPC.
+        chain._gossip_client = getattr(self.discovery_service, '_gossip_client', None)
+        chain._self_libp2p_peer_id = str(
+            getattr(self.discovery_service, '_self_libp2p_peer_id', "") or ""
+        )
+        # B2 fast-fail: wire ``peer_dead_callback`` so UNAVAILABLE /
+        # DEADLINE_EXCEEDED RpcErrors from a stage peer broadcast
+        # ``PEER_DEAD`` gossip. A subscriber elsewhere in the swarm can
+        # then wake its NegotiationLoop and re-route sub-2 s.
+        _cb_gossip = chain._gossip_client
+        if _cb_gossip is not None:
+            def _peer_dead_cb(libp2p_peer_id: str, reason: str) -> None:
+                try:
+                    from peer.gossip_client import publish_peer_dead as _pd
+                    _pd(_cb_gossip, libp2p_peer_id=libp2p_peer_id, reason=reason)
+                except Exception:  # pragma: no cover — never derail
+                    pass
+            chain._peer_dead_callback = _peer_dead_cb
         run_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,
             "request_id": request_id,
@@ -1186,6 +1206,12 @@ class InferenceService:
                 timeout_ms=self.config.timeout_ms,
                 transport_config=self.transport_config,
                 activation_quantization_enabled=self.config.activation_quantization_enabled,
+            )
+            # B1 rendezvous injection (same pattern as the main chain path).
+            _chain._p2p_node = getattr(self.discovery_service, '_p2p_node', None)
+            _chain._gossip_client = getattr(self.discovery_service, '_gossip_client', None)
+            _chain._self_libp2p_peer_id = str(
+                getattr(self.discovery_service, '_self_libp2p_peer_id', "") or ""
             )
 
             def _stage_fn(peer, activation, prompt="", stage_index=0,
@@ -1859,6 +1885,12 @@ class InferenceService:
                     timeout_ms=self.config.timeout_ms,
                     transport_config=self.transport_config,
                     activation_quantization_enabled=self.config.activation_quantization_enabled,
+                )
+                # B1 rendezvous injection (verification path).
+                verify_chain._p2p_node = getattr(self.discovery_service, '_p2p_node', None)
+                verify_chain._gossip_client = getattr(self.discovery_service, '_gossip_client', None)
+                verify_chain._self_libp2p_peer_id = str(
+                    getattr(self.discovery_service, '_self_libp2p_peer_id', "") or ""
                 )
 
                 # Extract initial token IDs from primary activation

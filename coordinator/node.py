@@ -491,6 +491,42 @@ def main() -> None:
         except Exception as _p2p_err:
             logger.warning("p2p_node_start_failed: %s", _p2p_err)
 
+    # ── B1 rendezvous: gossipsub client + hole-punch responder ──
+    # Opt-in, non-fatal: if P2P is disabled or gossipsub publish fails
+    # (InsufficientPeers right after boot), we continue without.
+    # The responder side listens for inbound ``REQUEST_HOLE_PUNCH``
+    # events targeting this node and issues an active ``dial_peer``
+    # toward the requester, giving DCUtR a simultaneous-dial window
+    # to punch through symmetric NAT.
+    _gossip_client = None
+    if _p2p_node is not None:
+        try:
+            from peer.gossip_client import (
+                GossipClient as _GossipClient,
+                attach_hole_punch_responder as _attach_hp,
+            )
+            _self_libp2p_id = str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+            _gossip_client = _GossipClient(
+                p2p_node=_p2p_node,
+                self_libp2p_peer_id=_self_libp2p_id,
+                poll_interval_s=0.1,
+                peer_dead_debounce_s=1.0,
+                hole_punch_debounce_s=5.0,
+            )
+            _attach_hp(
+                _gossip_client,
+                p2p_node=_p2p_node,
+                self_libp2p_peer_id=_self_libp2p_id,
+            )
+            _gossip_client.start(thread_name="openhydra-gossip")
+            logger.info(
+                "gossip_client_started libp2p_peer_id=%s topic=openhydra/swarm/v1/events",
+                _self_libp2p_id,
+            )
+        except Exception as _gossip_err:
+            logger.warning("gossip_client_start_failed: %s", _gossip_err)
+            _gossip_client = None
+
     # ── Phase 3 zero-config bootstrap: SwarmNegotiator + capacity snapshot ──
     # Build the CapacityReport NOW (before peer announce) so we can:
     #   1. Self-assign a shard via SwarmNegotiator when the user didn't
@@ -984,6 +1020,7 @@ def main() -> None:
         api_key=api_key,
         p2p_node=_p2p_node,
         node_meta=_node_meta,
+        gossip_client=_gossip_client,
     )
 
 

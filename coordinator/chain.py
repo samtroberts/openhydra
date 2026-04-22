@@ -649,6 +649,26 @@ class InferenceChain:
 
             for attempt, candidate in enumerate(candidates, start=1):
                 try:
+                    # B1 rendezvous: if the candidate is relay-bound, ask it
+                    # (via gossipsub) to simultaneously dial us. The
+                    # gossip client's per-pair 5 s debounce means it's
+                    # safe to call this unconditionally on every attempt —
+                    # duplicate publishes collapse transparently.
+                    _gossip = getattr(self, "_gossip_client", None)
+                    _self_libp2p = getattr(self, "_self_libp2p_peer_id", "")
+                    if _gossip is not None and _self_libp2p:
+                        try:
+                            from coordinator.path_finder import maybe_request_hole_punch as _maybe_rhp
+                            _maybe_rhp(
+                                _gossip,
+                                self_libp2p_peer_id=str(_self_libp2p),
+                                peer=candidate,
+                            )
+                        except Exception:  # pragma: no cover — never derail
+                            logging.debug(
+                                "b1_rendezvous_publish_failed",
+                                exc_info=True,
+                            )
                     stage_input = list(activation)
                     candidate_backend = str(getattr(candidate, "runtime_backend", "")).strip().lower()
                     compressed_transfer = (
