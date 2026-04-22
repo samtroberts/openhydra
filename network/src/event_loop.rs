@@ -301,9 +301,23 @@ pub async fn run_event_loop(
                         // multiaddrs — just the PeerId. The resulting
                         // simultaneous dial from *both* sides is what
                         // forces DCUtR hole-punch against symmetric NAT.
+                        // libp2p's default ``DialOpts`` uses
+                        // ``PeerCondition::Disconnected`` which *rejects* a
+                        // new dial when the peer is already connected via
+                        // relay — precisely the state we're in when a
+                        // REQUEST_HOLE_PUNCH gossip event fires. Force
+                        // ``PeerCondition::Always`` so the dial is enqueued
+                        // anyway. The libp2p transport stack will attempt
+                        // an upgrade through DCUtR once the simultaneous
+                        // connect from both sides lands, promoting the
+                        // relayed connection into a direct one.
+                        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
                         let res = match peer_id.parse::<PeerId>() {
                             Ok(pid) => {
-                                match swarm.dial(pid) {
+                                let opts = DialOpts::peer_id(pid)
+                                    .condition(PeerCondition::Always)
+                                    .build();
+                                match swarm.dial(opts) {
                                     Ok(()) => {
                                         info!(%pid, "b1_hole_punch_dial_issued");
                                         Ok(())
