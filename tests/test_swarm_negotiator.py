@@ -475,8 +475,13 @@ def test_native_shard_skips_incapable_models():
     assert a is None
 
 
-def test_native_shard_self_claim_in_dht_does_not_trigger_concession():
-    """If our own prior announce is still in the DHT, ignore it."""
+def test_native_shard_self_claim_in_dht_is_kept_stable():
+    """Post-stability-fix (B3 follow-up): if our own prior announce
+    is in the DHT, the negotiator returns it as-is — no reshard,
+    no moving to another model. Before this, the negotiator would
+    skip fully-covered models → candidate exhausted → None, which
+    caused thrashing when the NegotiationLoop interpreted None as
+    a change and moved to the next ranked model."""
     my_id = "12D3KooWMINE"
     stale_self = [
         PeerClaim(libp2p_peer_id=my_id, model_id="openhydra-qwen3.5-2b",
@@ -488,12 +493,13 @@ def test_native_shard_self_claim_in_dht_does_not_trigger_concession():
         capacity_report=report, libp2p_peer_id=my_id,
         dht_scan=_fixed_scan(stale_self),
     )
-    # The stale self-claim fully covers 2B. compute_gaps won't exclude it
-    # (it's a valid segment), so the gap is empty → no assignment.
-    # This is expected behaviour: a re-negotiation should not collide
-    # with the still-live prior claim.  The Phase 3 design accepts this
-    # as a no-op on re-run; the peer's next announce refreshes the TTL.
-    assert neg.negotiate() is None
+    assignment = neg.negotiate()
+    assert assignment is not None
+    assert assignment.model_id == "openhydra-qwen3.5-2b"
+    assert (assignment.layer_start, assignment.layer_end) == (0, 24)
+    # This isn't a "change" per the NegotiationLoop — same shape as the
+    # existing current_assignment, so ``_assignment_changed`` returns
+    # False and no reshard fires.
 
 
 def test_unknown_persona_returns_none_without_raising():
