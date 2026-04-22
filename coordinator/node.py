@@ -1139,6 +1139,7 @@ def main() -> None:
         p2p_node=_p2p_node,
         node_meta=_node_meta,
         gossip_client=_gossip_client,
+        capacity_snapshot_ref=_capacity_snapshot_ref,
     )
 
 

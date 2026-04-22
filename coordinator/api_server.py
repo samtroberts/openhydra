@@ -1882,6 +1882,7 @@ def serve(
     p2p_node: object | None = None,
     node_meta: dict[str, Any] | None = None,
     gossip_client: Any | None = None,
+    capacity_snapshot_ref: Any | None = None,
 ) -> None:
     OpenHydraHandler.engine = CoordinatorEngine(config)
     # Inject the Rust P2P node into the discovery service (if available).
@@ -1897,6 +1898,16 @@ def serve(
             _dsvc._self_libp2p_peer_id = (
                 str(getattr(p2p_node, "libp2p_peer_id", "") or "")
             )
+            # B3 follow-up (pipeline ordering fix): give the inference
+            # service a handle to the live ``LoopSnapshot`` so it can
+            # override the *local* peer's stale layer range (baked in
+            # at peers_config generation time) with whatever the
+            # ReshardExecutor most recently loaded into the shard.
+            # Without this override, a peer that just re-sharded to
+            # ``[12, 24)`` still appears as full-model in the
+            # candidate list and the sharded-pipeline selector
+            # collapses to the legacy full-model path.
+            _dsvc._capacity_snapshot_ref = capacity_snapshot_ref
     OpenHydraHandler._api_key = api_key or None
     OpenHydraHandler._rate_limiter = rate_limiter
     # Zero-config bootstrap Phase 1: node metadata for /v1/internal/capacity.
