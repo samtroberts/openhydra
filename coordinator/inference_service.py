@@ -53,6 +53,126 @@ logger = logging.getLogger(__name__)
 from coordinator.engine import InferencePreparation
 
 
+def _override_local_peer_layer_range_from_snapshot(
+    *,
+    health: list,
+    discovery_service: Any,
+) -> list:
+    """Patch the local peer's layer range in ``health`` with the live
+    :class:`~peer.negotiation_loop.LoopSnapshot` current assignment
+    (B3 follow-up — pipeline-ordering fix).
+
+    The local peer's PeerEndpoint is built once at boot from the
+    auto-generated peers config and never refreshed. After a
+    ReshardExecutor cycle the in-memory shard may cover a different
+    layer range (e.g. the conflict-split heuristic moved us from
+    ``[0, 24)`` to ``[12, 24)``). Unless we rewrite the PeerEndpoint
+    the coverage map sees us as a full-model replica, the sharded
+    pipeline selector rejects that arrangement, and the legacy
+    full-model path routes stage 0 to whichever full-replica peer
+    ranks first — often the wrong one for embedding.
+
+    Returns a new ``health`` list with the local entry replaced when
+    an override is available; otherwise returns ``health`` unchanged.
+    Conservative failure mode: any error in resolution logs at debug
+    and falls back to the original list.
+    """
+    snap_ref = getattr(discovery_service, "_capacity_snapshot_ref", None)
+    self_libp2p = str(
+        getattr(discovery_service, "_self_libp2p_peer_id", "") or ""
+    ).strip()
+    if snap_ref is None or not self_libp2p:
+        return health
+    try:
+        _, _, current_assignment, _ = snap_ref.snapshot()
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("live_layer_override_snapshot_failed: %s", exc)
+        return health
+    if current_assignment is None:
+        return health
+    try:
+        layer_start = int(current_assignment.layer_start)
+        layer_end = int(current_assignment.layer_end)
+        total_layers = int(current_assignment.total_layers)
+    except (AttributeError, TypeError, ValueError):
+        return health
+    if layer_end <= layer_start or total_layers <= 0:
+        return health
+
+    patched: list = []
+    replaced = False
+    for h in health:
+        peer = getattr(h, "peer", None)
+        if peer is None:
+            patched.append(h)
+            continue
+        peer_libp2p = str(getattr(peer, "libp2p_peer_id", "") or "").strip()
+        if peer_libp2p != self_libp2p:
+            patched.append(h)
+            continue
+        # Found the local peer — rewrite its layer range with the live
+        # assignment. ``PeerEndpoint.replace`` is immutable-safe.
+        try:
+            new_peer = peer.replace(
+                layer_start=layer_start,
+                layer_end=layer_end,
+                total_layers=total_layers,
+            )
+            new_h = h.__class__(
+                **{
+                    **{k: getattr(h, k) for k in h.__dataclass_fields__},
+                    "peer": new_peer,
+                }
+            ) if hasattr(h, "__dataclass_fields__") else h
+            # Fallback for non-dataclass health entries: mutate peer in place.
+            if new_h is h:
+                try:
+                    object.__setattr__(h, "peer", new_peer)
+                except Exception:
+                    pass
+            patched.append(new_h)
+            replaced = True
+            logger.info(
+                "live_layer_override: local peer %s layer_range=[%d, %d) "
+                "total=%d (was %s-%s)",
+                self_libp2p[:14],
+                layer_start, layer_end, total_layers,
+                getattr(peer, "layer_start", "?"),
+                getattr(peer, "layer_end", "?"),
+            )
+        except Exception as exc:
+            logger.debug("live_layer_override_replace_failed: %s", exc)
+            patched.append(h)
+
+    return patched if replaced else health
+
+
+def _sort_pipeline_by_layer_start(pipeline: list) -> list:
+    """Sort a sharded pipeline by ``layer_start`` so the peer owning
+    ``[0, ...)`` is always stage 0 (B3 follow-up).
+
+    Safe no-op when:
+    * pipeline has fewer than two peers;
+    * every peer has the same ``layer_start`` (full-model replicas —
+      the full-model path owns ordering there).
+
+    Tie-breaks on equal layer_start by ``peer_id`` lexicographically so
+    the sort is deterministic across requests (helps KV cache reuse).
+    """
+    if len(pipeline) < 2:
+        return pipeline
+    starts = {int(getattr(p, "layer_start", 0) or 0) for p in pipeline}
+    if len(starts) < 2:
+        return pipeline  # all equal — not a sharded pipeline
+    return sorted(
+        pipeline,
+        key=lambda p: (
+            int(getattr(p, "layer_start", 0) or 0),
+            str(getattr(p, "peer_id", "") or ""),
+        ),
+    )
+
+
 class InferenceService:
     """Orchestrates inference requests: preparation, execution, streaming, and chat.
 
@@ -964,6 +1084,21 @@ class InferenceService:
         # assembles an ordered shard pipeline and bypasses the full-model peer
         # selection, bandwidth asymmetry, and MoE geo-sharding steps (which all
         # assume every peer runs the complete model).
+        #
+        # B3 follow-up (live-reshard layer-range override): after a
+        # ``ReshardExecutor`` cycle, the local peer's shard in memory may
+        # cover a different layer range than its peers_config entry
+        # (which is frozen at boot). If we don't patch the health list,
+        # the coverage map sees the local peer as a "full model" replica
+        # (layer_end=0 defaults → ``is_sharded=False``) → sharded selection
+        # fails → falls back to full-model routing → stage 0 goes to the
+        # wrong peer → ``index out of range`` on embed_tokens. Override
+        # the local peer's layer range from the live capacity snapshot
+        # so the coverage map sees reality.
+        health = _override_local_peer_layer_range_from_snapshot(
+            health=health,
+            discovery_service=self.discovery_service,
+        )
         _sharded_pipeline = self._engine._select_pipeline_sharded(health)
         if _sharded_pipeline is not None:
             # Inject libp2p_peer_id into pipeline peers missing it.
@@ -986,6 +1121,17 @@ class InferenceService:
                                 libp2p_peer_id=_local_libp2p,
                                 requires_relay=True,
                             )
+            # B3 follow-up: enforce strict layer_start ordering so the
+            # peer owning ``[0, ...)`` is always stage 0 regardless of
+            # discovery order. Without this, a healthy 2-stage ring can
+            # still mis-route the embed step to the wrong peer.
+            _sharded_pipeline = _sort_pipeline_by_layer_start(_sharded_pipeline)
+            logger.info(
+                "sharded_pipeline_ordered: stages=%s",
+                [(p.peer_id, int(getattr(p, "layer_start", 0) or 0),
+                  int(getattr(p, "layer_end", 0) or 0))
+                 for p in _sharded_pipeline],
+            )
             return InferencePreparation(
                 effective_prompt=effective_prompt,
                 snippets=snippets,
