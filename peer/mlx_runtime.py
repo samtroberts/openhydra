@@ -608,6 +608,7 @@ class MLXRuntime:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         packed_bytes: bytes | None = None,
+        return_hidden_state: bool = False,
     ) -> list[float]:
         """Run inference and return token IDs (or hidden state) as floats.
 
@@ -640,6 +641,7 @@ class MLXRuntime:
                 decode_top_k=decode_top_k,
                 decode_seed=decode_seed,
                 packed_bytes=packed_bytes,
+                return_hidden_state=return_hidden_state,
             )
 
         # ── Build sampler via make_sampler() ─────────────────────────────────
@@ -822,6 +824,60 @@ class MLXRuntime:
             token_id = int(token_arr.item())
         return [float(token_id)]
 
+    def apply_final_head(
+        self,
+        hidden_state: Any,
+        *,
+        packed_bytes: bytes | None = None,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+    ) -> int:
+        """Apply ``final_norm`` + ``lm_head`` + sampling on the coordinator.
+
+        Path A (client-terminated pipeline) entry point: called by
+        ``HeadSampler`` when the last peer returns a hidden state via
+        ``ForwardResponse.is_hidden_state=True``.
+
+        Accepts either:
+          * ``hidden_state`` — a list/array shaped like ``_hidden_to_payload``
+            output: ``[seq_len_f, hidden_size_f, v0, v1, ...]``
+          * ``packed_bytes`` — zero-copy ``activation_packed`` bytes from
+            the Rust encoder. Preferred when available.
+
+        Returns a single sampled token id (``int``). Reuses
+        ``_sample_from_logits`` for sampler semantics parity with the
+        on-peer path. Only available when this shard includes the last
+        transformer layer (``_is_last_shard=True``) — otherwise there are
+        no head weights to apply.
+        """
+        if not getattr(self, "_is_last_shard", False):
+            raise RuntimeError(
+                "apply_final_head: this MLX shard does not own the last "
+                "layer; head weights are on a different peer"
+            )
+        import mlx.core as mx
+        # Decode hidden state → MLX tensor [1, seq, hidden].
+        h = self._activation_to_hidden(hidden_state, packed_bytes=packed_bytes)
+        mx.eval(h)
+        h = self._shard_norm(h)
+        if self._tie_word_embeddings:
+            logits = self._shard_embed_tokens.as_linear(h)
+        else:
+            logits = self._shard_lm_head(h)
+        self._watchdog.run(mx.eval, logits)
+        token_payload = self._sample_from_logits(
+            logits,
+            decode_do_sample=decode_do_sample,
+            decode_temperature=decode_temperature,
+            decode_top_p=decode_top_p,
+            decode_top_k=decode_top_k,
+            decode_seed=decode_seed,
+        )
+        return int(round(float(token_payload[0]))) if token_payload else 0
+
     def _forward_sharded(
         self,
         prompt: str,
@@ -834,6 +890,7 @@ class MLXRuntime:
         kv_use_cached_activation: bool = False,
         request_id: str | None = None,
         packed_bytes: bytes | None = None,
+        return_hidden_state: bool = False,
         **sampling_kwargs,
     ) -> list[float]:
         """Multi-peer sharded forward — runs this shard's layers only.
@@ -907,7 +964,11 @@ class MLXRuntime:
                 self._kv_cache.pop(next(iter(self._kv_cache)))
 
         # ── Output ─────────────────────────────────────────────────
-        if is_last:
+        # Client-terminated pipeline (Path A): when ``return_hidden_state``
+        # is set by the request, the last shard skips final_norm + lm_head
+        # + sampling and returns the raw post-last-layer hidden state.
+        # The coordinator applies the head and samples via ``HeadSampler``.
+        if is_last and not return_hidden_state:
             h = self._shard_norm(h)
             if self._tie_word_embeddings:
                 logits = self._shard_embed_tokens.as_linear(h)
@@ -916,6 +977,8 @@ class MLXRuntime:
             self._watchdog.run(mx.eval, logits)
             return self._sample_from_logits(logits, **sampling_kwargs)
         else:
+            # Intermediate shards always return hidden state; last shard
+            # does the same when sample_on_coordinator=True (Path A).
             return self._hidden_to_payload(h)
 
     # ── Batched forward pass ───────────────────────────────────────────────────

@@ -1150,6 +1150,7 @@ class InferenceChain:
         kv_session_id: str = "",
         callback_address: str = "",
         request_id: str | None = None,
+        sample_on_coordinator: bool = False,
         **decode_controls,
     ) -> None:
         """Kick off a ring autoregressive push — fire-and-forget.
@@ -1222,7 +1223,51 @@ class InferenceChain:
                 getattr(getattr(self, '_p2p_node', None), 'libp2p_peer_id', '') or ''
             ),
             remaining_route=route_hops[1:],
+            sample_on_coordinator=bool(sample_on_coordinator),
         )
+
+        # Path A (client-terminated pipeline): register the ring session so
+        # the PushResult handler can sample the returned hidden state and
+        # re-inject the next stage-0 request. Registered before firing to
+        # avoid a race where the last peer's PushResult arrives before the
+        # session is stored (possible on low-latency LAN topologies).
+        if sample_on_coordinator:
+            from coordinator.head_sampler import (
+                RingSession, DecodeConfig, register_ring_session,
+            )
+            register_ring_session(RingSession(
+                request_id=rid,
+                ring_first_hop_address=f"{first_peer.host}:{first_peer.port}",
+                ring_first_hop_peer_id=first_peer.peer_id,
+                ring_first_hop_libp2p_id=str(getattr(first_peer, "libp2p_peer_id", "") or ""),
+                ring_full_route=list(route_hops),
+                next_hop_address=next_addr,
+                next_hop_peer_id=next_id,
+                ring_tokens_remaining=int(max_tokens),
+                ring_eos_ids=set(int(e) for e in ring_eos_ids),
+                ring_generated_ids=[],
+                decode=DecodeConfig(
+                    do_sample=bool(decode_controls.get("decode_do_sample", False)),
+                    temperature=float(decode_controls.get("decode_temperature", 0.0) or 0.0),
+                    top_p=float(decode_controls.get("decode_top_p", 0.0) or 0.0),
+                    top_k=int(decode_controls.get("decode_top_k", 0) or 0),
+                    seed=(
+                        int(decode_controls.get("decode_seed", 0))
+                        if int(decode_controls.get("decode_seed", 0) or 0) > 0
+                        else None
+                    ),
+                ),
+                kv_session_id=kv_session_id,
+                total_stages=n,
+                final_callback_address=callback_address,
+                final_callback_libp2p_peer_id=str(
+                    getattr(getattr(self, '_p2p_node', None), 'libp2p_peer_id', '') or ''
+                ),
+                callback_request_id=rid,
+                stage0_layer_start=int(getattr(first_peer, "layer_start", 0)),
+                stage0_layer_end=int(getattr(first_peer, "layer_end", 0)),
+                stage0_total_layers=int(getattr(first_peer, "total_layers", 0)),
+            ))
 
         # Fire-and-forget in background thread (same as run_push).
         import threading as _ring_threading

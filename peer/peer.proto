@@ -107,6 +107,13 @@ message ForwardRequest {
   // "int8" (force INT8 quantised). When "auto", peers downgrade to fp32 only
   // if one side cannot participate in INT8.
   string preferred_wire_format = 53;
+  // Client-terminated pipeline (Petals parity): when true, the last peer
+  // skips ``final_norm`` + ``lm_head`` + sampling and returns the raw
+  // post-last-layer hidden state to the coordinator. The coordinator then
+  // applies the head, samples, and re-injects the token into stage 0.
+  // Eliminates the per-token ring-loopback hop on co-located deployments.
+  // Flag-gated: default false preserves today's ring-on-peer behaviour.
+  bool sample_on_coordinator = 54;
 }
 
 // A single hop in the push-mode routing chain.
@@ -159,6 +166,13 @@ message ForwardResponse {
   // Binary-packed float32 activation (zero-copy Rust encode).
   // When non-empty, takes precedence over the `activation` field.
   bytes activation_packed = 25;
+  // Client-terminated pipeline (Petals parity): when true, the payload
+  // in ``activation_packed`` / ``activation`` is the raw post-last-layer
+  // hidden state (shape ``[hidden_dim]`` or ``[seq, hidden_dim]``), not a
+  // sampled token. The coordinator applies ``final_norm`` + ``lm_head`` +
+  // sampling and re-injects the resulting token into stage 0. Set by the
+  // last peer when ``ForwardRequest.sample_on_coordinator`` was true.
+  bool is_hidden_state = 26;
 }
 
 message PeerStatusRequest {}

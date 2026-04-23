@@ -131,6 +131,14 @@ class EngineConfig:
     # Petals parity Phase A: server-to-server push mode
     push_mode_enabled: bool = False
     push_callback_address: str = ""  # "host:port" where PushResult arrives
+    # Path A (client-terminated pipeline, Petals parity): when true, the
+    # last peer returns its raw post-last-layer hidden state instead of
+    # sampling; the coordinator's HeadSampler applies final_norm + lm_head
+    # and re-injects the token into stage 0. Eliminates the per-token
+    # ring-loopback hop. Requires a co-located last-shard peer whose
+    # runtime has been registered as the coordinator's head source (see
+    # ``coordinator/head_sampler.py``). Default off for rollback safety.
+    sample_on_coordinator: bool = False
     # Petals parity Phase B: stateful streaming sessions + history replay
     streaming_sessions_enabled: bool = False
     # P1-A: SpecPipe — pipeline-filling speculative decoding
