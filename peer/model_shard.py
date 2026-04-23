@@ -2606,6 +2606,55 @@ class PyTorchRuntime:
             )
             return struct.pack(f'<{len(payload)}f', *payload)
 
+    def apply_final_head(
+        self,
+        hidden_state: Any,
+        *,
+        packed_bytes: bytes | None = None,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+    ) -> int:
+        """Coordinator-side final head + sampler (Path A).
+
+        Symmetric with ``MLXRuntime.apply_final_head``. Accepts either a
+        flat ``[seq_f, hidden_f, v0, ...]`` list from ``_hidden_to_payload``
+        or zero-copy ``packed_bytes`` produced by the Rust encoder, decodes
+        to a PyTorch tensor shaped ``[1, seq, hidden]`` via
+        ``_activation_to_hidden``, applies ``final_norm`` + ``lm_head``,
+        then samples exactly as ``_logits_to_next_token_payload`` does on
+        the peer side.
+
+        Only callable on a PyTorch shard that owns the last layer
+        (``self._lm_head is not None``). Raises ``RuntimeError`` otherwise.
+        """
+        if self._lm_head is None:
+            raise RuntimeError(
+                "apply_final_head: this PyTorch shard does not own the "
+                "last layer; lm_head weights are on a different peer"
+            )
+        hidden = self._activation_to_hidden(
+            hidden_state, packed_bytes=packed_bytes,
+        )
+        normed = self._apply_final_norm(hidden)
+        logits = self._lm_head(normed)
+        tokens = self._logits_to_next_token_payload(
+            logits,
+            token_count=1,
+            decode_do_sample=bool(decode_do_sample),
+            decode_temperature=max(1e-5, float(decode_temperature or 1.0)),
+            decode_top_p=max(0.0, min(1.0, float(decode_top_p or 1.0))),
+            decode_top_k=max(0, int(decode_top_k or 0)),
+            decode_seed=(
+                max(1, int(decode_seed))
+                if (decode_seed is not None and int(decode_seed) > 0)
+                else None
+            ),
+        )
+        return int(round(float(tokens[0]))) if tokens else 0
+
     def _hidden_to_next_token_payload(
         self,
         hidden,
@@ -2699,6 +2748,7 @@ class PyTorchRuntime:
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
         packed_bytes: bytes | None = None,
+        return_hidden_state: bool = False,
     ) -> list[float]:
         self.last_forward_thread_id = threading.get_ident()
         self.last_kv_cache_hit = False
@@ -2936,7 +2986,7 @@ class PyTorchRuntime:
                         next_past is None,
                     )
                     self._kv_cache_set(session_id, next_past)
-                if is_last:
+                if is_last and not return_hidden_state:
                     output_count = 1
                     if cache_requested and activation and int(max_tokens) > 1:
                         output_count = min(int(max_tokens), len(activation))
@@ -2954,12 +3004,17 @@ class PyTorchRuntime:
                         ),
                     )
                 else:
+                    # Path A (client-terminated pipeline): when
+                    # ``return_hidden_state=True`` is set on the last shard,
+                    # fall through to ``_hidden_to_payload`` so the
+                    # coordinator can apply ``final_norm`` + ``lm_head``
+                    # and sample. Non-last shards always take this path.
                     output = self._hidden_to_payload(
                         hidden,
                         request_id=request_id,
                         stage_index=stage,
                     )
-        if is_last:
+        if is_last and not return_hidden_state:
             return [float(max(0, int(round(item)))) for item in output]
         return _apply_quantization(output, self.quantization_bits)
 
@@ -2981,6 +3036,7 @@ class PyTorchRuntime:
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
         packed_bytes: bytes | None = None,
+        return_hidden_state: bool = False,
     ) -> list[float]:
         return self._forward_impl(
             prompt,
@@ -2999,6 +3055,7 @@ class PyTorchRuntime:
             decode_seed=decode_seed,
             prompt_token_ids=prompt_token_ids,
             packed_bytes=packed_bytes,
+            return_hidden_state=return_hidden_state,
         )
 
     # Symmetric with ``MLXRuntime._forward_sharded``. The dispatcher in
@@ -3027,6 +3084,7 @@ class PyTorchRuntime:
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
         packed_bytes: bytes | None = None,
+        return_hidden_state: bool = False,
     ) -> list[float]:
         loop = asyncio.get_running_loop()
         # ``run_in_executor`` doesn't take **kwargs — pass positional args only
@@ -3051,6 +3109,7 @@ class PyTorchRuntime:
             decode_seed,
             prompt_token_ids,
             packed_bytes,
+            return_hidden_state,
         )
 
     def forward_batch(self, items: list[Any]) -> list[list[float]]:
@@ -3290,6 +3349,7 @@ class ModelShard:
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
         packed_bytes: bytes | None = None,
+        return_hidden_state: bool = False,
     ) -> list[float]:
         # Only forward prompt_token_ids to runtimes that accept it. ToyRuntime
         # and MLXRuntime ignore the Gemma 4 sidecar; PyTorchRuntime consumes
@@ -3311,6 +3371,18 @@ class ModelShard:
             _kwargs["prompt_token_ids"] = prompt_token_ids
         if packed_bytes is not None and hasattr(self._runtime, '_forward_sharded'):
             _kwargs["packed_bytes"] = packed_bytes
+        # Path A (client-terminated pipeline): thread the flag through only
+        # to runtimes that understand it. Older runtimes (ToyRuntime) would
+        # raise TypeError on unknown kwargs — gate by attribute check.
+        if return_hidden_state and isinstance(
+            self._runtime, (PyTorchRuntime,)
+        ):
+            _kwargs["return_hidden_state"] = True
+        elif return_hidden_state and hasattr(self._runtime, "_forward_sharded"):
+            # MLXRuntime accepts it via _forward_sharded; forward() also
+            # threads it through (see mlx_runtime.py). ToyRuntime is
+            # excluded because it would reject the kwarg.
+            _kwargs["return_hidden_state"] = True
         return list(
             self._runtime.forward(prompt, activation, max_tokens, **_kwargs)
         )
@@ -3332,6 +3404,7 @@ class ModelShard:
         decode_top_k: int | None = None,
         decode_seed: int | None = None,
         prompt_token_ids: list[int] | tuple[int, ...] | None = None,
+        return_hidden_state: bool = False,
     ) -> list[float]:
         async_forward = getattr(self._runtime, "forward_async", None)
         _kwargs: dict[str, Any] = {
@@ -3349,6 +3422,8 @@ class ModelShard:
         }
         if prompt_token_ids is not None and isinstance(self._runtime, PyTorchRuntime):
             _kwargs["prompt_token_ids"] = prompt_token_ids
+        if return_hidden_state and isinstance(self._runtime, PyTorchRuntime):
+            _kwargs["return_hidden_state"] = True
         if callable(async_forward):
             return list(
                 await async_forward(prompt, activation, max_tokens, **_kwargs)

@@ -1712,6 +1712,9 @@ class InferenceService:
                         kv_session_id=_ar_kv_session,
                         callback_address=self.config.push_callback_address,
                         request_id=request_id,
+                        sample_on_coordinator=bool(
+                            getattr(self.config, "sample_on_coordinator", False)
+                        ),
                         **decode_controls,
                     )
 

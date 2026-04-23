@@ -431,6 +431,12 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         self._boot_warmup_on_start = bool(warmup_on_start)
         self._boot_mlx_eval_timeout_s = max(1.0, float(mlx_eval_timeout_s))
         self.runtime_profile = dict(self.shard.runtime_profile())
+        # Path A (client-terminated pipeline): register this peer's runtime
+        # with the coordinator-side HeadSampler when the shard owns the
+        # last transformer layer. Idempotent — safe to re-register on
+        # reshard. When coordinator and peer share a process (the common
+        # setup), the HeadSampler borrows weights in place with no copy.
+        self._maybe_register_head_source()
         self.batch_queue = BatchingQueue(
             self.shard,
             batch_window_ms=float(batch_window_ms),
@@ -461,6 +467,47 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         self.onion_layers_peeled = 0
         self.last_onion_next_peer_id: str | None = None
         self.onion_next_peer_history: list[str] = []
+
+    # ── Path A: coordinator-side HeadSampler registration ────────────
+    def _maybe_register_head_source(self) -> None:
+        """Register this peer's runtime as the coordinator's head source
+        when the shard owns the last transformer layer.
+
+        Safe to call multiple times (idempotent — last caller wins).
+        No-op when the shard is not the last one in the pipeline; the
+        coordinator falls back to today's sample-on-peer path in that case.
+        """
+        try:
+            shard = self.shard
+            if shard is None:
+                return
+            runtime = getattr(shard, "_runtime", None)
+            if runtime is None:
+                return
+            # Heuristic: accept any runtime that exposes apply_final_head
+            # and reports it owns the last layer. Both MLXRuntime and
+            # PyTorchRuntime gained apply_final_head in Phase 2.
+            if not hasattr(runtime, "apply_final_head"):
+                return
+            # MLX sets _is_last_shard on the runtime. PyTorch sets _lm_head
+            # on the _DecoderArchitecture handle — but apply_final_head
+            # itself raises RuntimeError if the shard doesn't own the head,
+            # so we can register optimistically and let the sampler-time
+            # check guard misuse. Still, prefer an up-front check when
+            # the signal is available to avoid misleading registration.
+            if hasattr(runtime, "_is_last_shard"):
+                if not bool(getattr(runtime, "_is_last_shard", False)):
+                    return
+            else:
+                # PyTorch runtime: check the DecoderArchitecture's lm_head.
+                arch = getattr(runtime, "_model", None)
+                if arch is not None and hasattr(arch, "_lm_head"):
+                    if getattr(arch, "_lm_head", None) is None:
+                        return
+            from coordinator.head_sampler import register_head_source
+            register_head_source(peer_id=str(self.peer_id), runtime=runtime)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("head_sampler_register_skipped: %s", exc)
 
     def inflight_count(self) -> int:
         with self._lock:
@@ -592,6 +639,15 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 self.runtime_profile["total_layers"] = int(assignment.total_layers)
             except Exception:
                 pass
+            # Path A: refresh the coordinator-side HeadSampler after reshard.
+            # The new shard may or may not own the last layer — either way,
+            # the register-or-skip heuristic handles both cases.
+            try:
+                from coordinator.head_sampler import unregister_head_source
+                unregister_head_source(str(self.peer_id))
+            except Exception:
+                pass
+            self._maybe_register_head_source()
 
     def resource_budget(self) -> ResourceBudget:
         with self._lock:
@@ -854,6 +910,18 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             if len(request.prompt_token_ids) > 0:
                 _prompt_token_ids = [int(t) for t in request.prompt_token_ids]
 
+            # ── Client-terminated pipeline (Path A, flag-gated) ────────────
+            # When ``sample_on_coordinator=True`` AND this peer is the last
+            # stage, skip final_norm + lm_head + sampling and return the
+            # hidden state. Coordinator's HeadSampler applies the head.
+            # Flag ignored on non-last stages (they always return hidden).
+            _sample_on_coord = bool(getattr(request, "sample_on_coordinator", False))
+            _is_last_stage = (
+                int(request.total_stages) > 0
+                and int(request.stage_index) == int(request.total_stages) - 1
+            )
+            _return_hidden = bool(_sample_on_coord and _is_last_stage)
+
             if self.shard.uses_pytorch_runtime:
                 # Offload PyTorch matrix compute to a worker thread to protect async control planes.
                 activation = asyncio.run(
@@ -873,6 +941,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         decode_top_k=decode_top_k,
                         decode_seed=(decode_seed if decode_seed > 0 else None),
                         prompt_token_ids=_prompt_token_ids,
+                        return_hidden_state=_return_hidden,
                     )
                 )
                 kv_cache_hit = bool(self.shard.last_kv_cache_hit)
@@ -909,6 +978,8 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         # Pass raw packed bytes for zero-copy DLPack path.
                         if _packed:
                             _fwd_kwargs["packed_bytes"] = _packed
+                    if _return_hidden:
+                        _fwd_kwargs["return_hidden_state"] = True
                     activation = list(self.shard.forward(
                         request.prompt,
                         activation_in,
@@ -978,6 +1049,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 dp_noise_audit_tag=str(self.shard.privacy_noise_last_audit_tag),
                 compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
                 activation_hash=_act_hash,
+                is_hidden_state=_return_hidden,
             )
 
             # ── Push mode: forward to next peer or return to coordinator ──
@@ -1001,7 +1073,38 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         error="",
                     )
                 elif bool(getattr(request, "ring_mode", False)) and not next_addr:
-                    # ── Ring autoregressive: last shard loops back to first ──
+                    # ── Path A: coordinator-terminated ring ───────────────
+                    # When sample_on_coordinator=True, the last peer has
+                    # already returned a hidden state in ``response`` (with
+                    # ``is_hidden_state=True``). Skip the peer-side
+                    # loop-back entirely — ship the hidden state to the
+                    # coordinator via PushResult and let its HeadSampler
+                    # do the sampling + stage-0 re-injection. This removes
+                    # the last-peer→first-peer hop that motivated Path A.
+                    if bool(getattr(request, "sample_on_coordinator", False)):
+                        _cb_addr = str(getattr(request, "final_callback_address", "") or "").strip()
+                        _cb_libp2p = str(getattr(request, "final_callback_libp2p_peer_id", "") or "").strip()
+                        if _cb_addr or _cb_libp2p:
+                            self._push_final_result(
+                                response=response,
+                                callback_address=_cb_addr,
+                                callback_request_id=str(
+                                    getattr(request, "final_callback_request_id", "") or ""
+                                ),
+                                callback_libp2p_peer_id=_cb_libp2p,
+                            )
+                            return peer_pb2.ForwardResponse(
+                                request_id=request.request_id,
+                                peer_id=self.peer_id,
+                                stage_index=request.stage_index,
+                                error="",
+                            )
+                        logger.warning(
+                            "sample_on_coordinator_set_but_no_callback: "
+                            "req=%s — falling back to legacy ring loopback",
+                            request.request_id,
+                        )
+                    # ── Ring autoregressive (legacy): last shard loops back ──
                     _ring_activation = list(response.activation)
                     _ring_token = int(round(float(_ring_activation[0]))) if _ring_activation else 0
                     _ring_generated = list(request.ring_generated_ids) + [_ring_token]
@@ -1316,10 +1419,16 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         """Send final activation back to the coordinator via PushResult RPC."""
         try:
             if callback_request_id:
+                # Preserve ``activation_packed`` and ``is_hidden_state`` —
+                # required for Path A (client-terminated pipeline), where
+                # the last peer returns a packed hidden state and the
+                # coordinator's PushResult handler routes based on the flag.
                 response = peer_pb2.ForwardResponse(
                     request_id=callback_request_id,
                     peer_id=response.peer_id,
                     activation=list(response.activation),
+                    activation_packed=bytes(getattr(response, "activation_packed", b"") or b""),
+                    is_hidden_state=bool(getattr(response, "is_hidden_state", False)),
                     stage_index=response.stage_index,
                     error=response.error,
                     kv_cache_hit=response.kv_cache_hit,
@@ -1379,14 +1488,257 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         except Exception as exc:
             logger.warning("push_result_failed: %s: %s", callback_address, exc)
 
+    # ── Path A: coordinator-side sample-and-reinject ─────────────────
+    def _handle_hidden_state_push_result(
+        self,
+        response: peer_pb2.ForwardResponse,
+    ) -> peer_pb2.PushAck | None:
+        """Sample a hidden state returned by the last peer, emit the
+        token to the ring queue, and re-inject the next stage-0 request.
+
+        Returns a ``PushAck`` on success or a terminal error. Returns
+        ``None`` when no HeadSampler or RingSession is registered, so
+        the caller falls through to the legacy push-receiver future.
+        """
+        from coordinator.head_sampler import (
+            get_head_sampler, get_ring_session, unregister_ring_session,
+        )
+        from coordinator.push_receiver import emit_ring_token
+
+        sampler = get_head_sampler()
+        if sampler is None:
+            logger.error(
+                "push_result_hidden_state_no_sampler: req=%s — "
+                "last peer set is_hidden_state=True but no co-located "
+                "HeadSampler is registered on the coordinator",
+                response.request_id,
+            )
+            return peer_pb2.PushAck(
+                request_id=response.request_id,
+                ok=False,
+                error="no_head_sampler_registered",
+            )
+
+        session = get_ring_session(str(response.request_id))
+        if session is None:
+            logger.error(
+                "push_result_hidden_state_no_session: req=%s — "
+                "HeadSampler present but RingSession missing (state was "
+                "not registered at ring-launch time)",
+                response.request_id,
+            )
+            return peer_pb2.PushAck(
+                request_id=response.request_id,
+                ok=False,
+                error="no_ring_session_registered",
+            )
+
+        # ── Decode hidden-state payload ─────────────────────────────
+        # Prefer zero-copy packed bytes; fall back to repeated-float.
+        _packed = bytes(getattr(response, "activation_packed", b"") or b"")
+        _activation_list: list[float] | None = None
+        if not _packed:
+            _activation_list = list(response.activation)
+            if not _activation_list:
+                logger.error(
+                    "push_result_hidden_state_empty_payload: req=%s",
+                    response.request_id,
+                )
+                return peer_pb2.PushAck(
+                    request_id=response.request_id, ok=False,
+                    error="empty_hidden_state",
+                )
+
+        # ── Apply final head + sample ────────────────────────────────
+        try:
+            token_id = int(sampler.sample(
+                _activation_list if _activation_list is not None else [],
+                session.decode,
+                packed_bytes=_packed if _packed else None,
+            ))
+        except Exception as exc:
+            import traceback as _tb
+            logger.error(
+                "push_result_sample_failed: req=%s err=%s\n%s",
+                response.request_id, exc, _tb.format_exc(),
+            )
+            emit_ring_token(session.callback_request_id, None)
+            unregister_ring_session(response.request_id)
+            return peer_pb2.PushAck(
+                request_id=response.request_id, ok=False,
+                error=f"sample_failed:{exc}",
+            )
+
+        # ── Emit to ring queue + accounting ──────────────────────────
+        session.ring_generated_ids.append(token_id)
+        session.ring_tokens_remaining = max(0, session.ring_tokens_remaining - 1)
+        emit_ring_token(session.callback_request_id, token_id)
+        logger.info(
+            "coordinator_ring_sampled: req=%s token=%d remaining=%d eos_hit=%s",
+            response.request_id, token_id, session.ring_tokens_remaining,
+            (token_id in session.ring_eos_ids),
+        )
+
+        # ── Termination check ────────────────────────────────────────
+        _is_eos = token_id in session.ring_eos_ids
+        if session.ring_tokens_remaining <= 0 or _is_eos:
+            emit_ring_token(session.callback_request_id, None)
+            unregister_ring_session(response.request_id)
+            return peer_pb2.PushAck(
+                request_id=response.request_id, ok=True, error="",
+            )
+
+        # ── Re-inject into stage 0 ───────────────────────────────────
+        try:
+            self._coordinator_reinject_ring_step(session, token_id)
+        except Exception as exc:
+            import traceback as _tb
+            logger.error(
+                "push_result_reinject_failed: req=%s err=%s\n%s",
+                response.request_id, exc, _tb.format_exc(),
+            )
+            emit_ring_token(session.callback_request_id, None)
+            unregister_ring_session(response.request_id)
+            return peer_pb2.PushAck(
+                request_id=response.request_id, ok=False,
+                error=f"reinject_failed:{exc}",
+            )
+
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=True, error="",
+        )
+
+    def _coordinator_reinject_ring_step(
+        self,
+        session: "RingSession",  # type: ignore[name-defined]
+        token_id: int,
+    ) -> None:
+        """Build and fire a new ForwardRequest for the next ring cycle.
+
+        Fire-and-forget — mirrors the existing peer-side ring-loopback
+        but runs on the coordinator. The request carries a single-token
+        activation (``[float(token_id)]``) and enters at stage 0. The
+        ``sample_on_coordinator`` flag is preserved so the next cycle
+        also terminates on the coordinator.
+        """
+        route = list(session.ring_full_route)
+        _next_next = route[1].address if len(route) > 1 else ""
+        _next_next_id = route[1].peer_id if len(route) > 1 else ""
+        req = peer_pb2.ForwardRequest(
+            request_id=session.request_id,
+            activation=[float(token_id)],
+            stage_index=0,
+            total_stages=int(session.total_stages),
+            max_tokens=1,
+            kv_session_id=session.kv_session_id,
+            kv_store_activation=True,
+            kv_use_cached_activation=True,
+            decode_do_sample=session.decode.do_sample,
+            decode_temperature=float(session.decode.temperature or 0.0),
+            decode_top_p=float(session.decode.top_p or 0.0),
+            decode_top_k=int(session.decode.top_k or 0),
+            decode_seed=int(session.decode.seed or 0),
+            shard_layer_start=int(session.stage0_layer_start),
+            shard_layer_end=int(session.stage0_layer_end),
+            shard_total_layers=int(session.stage0_total_layers),
+            push_mode=True,
+            ring_mode=True,
+            sample_on_coordinator=True,
+            ring_tokens_remaining=int(session.ring_tokens_remaining),
+            ring_generated_ids=list(session.ring_generated_ids),
+            ring_eos_ids=list(session.ring_eos_ids),
+            ring_first_hop_address=session.ring_first_hop_address,
+            ring_first_hop_peer_id=session.ring_first_hop_peer_id,
+            ring_first_hop_libp2p_id=session.ring_first_hop_libp2p_id,
+            ring_full_route=route,
+            next_hop_address=_next_next,
+            next_hop_peer_id=_next_next_id,
+            final_callback_address=session.final_callback_address,
+            final_callback_request_id=session.callback_request_id,
+            final_callback_libp2p_peer_id=session.final_callback_libp2p_peer_id,
+            remaining_route=route[1:],
+        )
+
+        _first_addr = session.ring_first_hop_address
+        _first_libp2p = session.ring_first_hop_libp2p_id
+
+        def _fire(_rreq=req, _addr=_first_addr, _libp2p=_first_libp2p):
+            try:
+                logger.info(
+                    "COORD_REINJECT_START: req=%s remaining=%d -> %s (libp2p=%s)",
+                    _rreq.request_id, _rreq.ring_tokens_remaining,
+                    _addr, _libp2p[:20] if _libp2p else "none",
+                )
+                if self._p2p_node is not None and _libp2p:
+                    self._p2p_node.proxy_forward(
+                        target_peer_id=_libp2p,
+                        data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                    )
+                    logger.info(
+                        "COORD_REINJECT_DONE: req=%s via_relay",
+                        _rreq.request_id,
+                    )
+                elif _addr:
+                    _ch = grpc.insecure_channel(
+                        _addr,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    _stub = peer_pb2_grpc.PeerStub(_ch)
+                    _stub.Forward(_rreq, timeout=60.0)
+                    _ch.close()
+                    logger.info(
+                        "COORD_REINJECT_DONE: req=%s via_grpc",
+                        _rreq.request_id,
+                    )
+                else:
+                    logger.error(
+                        "COORD_REINJECT_NO_ROUTE: req=%s", _rreq.request_id,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "COORD_REINJECT_CRASH: req=%s err=%s",
+                    _rreq.request_id, exc, exc_info=True,
+                )
+
+        threading.Thread(target=_fire, daemon=True).start()
+
     def PushResult(self, request: peer_pb2.ForwardResponse, context: grpc.ServicerContext) -> peer_pb2.PushAck:
         """Receive final result from last peer in push chain.
 
         This handler is primarily used when this node is the coordinator.
         The push_receiver module registers a callback for the request_id.
         """
-        logger.info("push_result_received: req=%s from=%s", request.request_id, request.peer_id)
-        # Dispatch to the push receiver if registered
+        _is_hidden = bool(getattr(request, "is_hidden_state", False))
+        logger.info(
+            "push_result_received: req=%s from=%s is_hidden_state=%s",
+            request.request_id, request.peer_id, _is_hidden,
+        )
+        # Client-terminated pipeline (Path A, flag-gated): when the last
+        # peer returns a hidden state instead of a sampled token, route to
+        # the coordinator-side HeadSampler. Phase 1 only performs the
+        # dispatch — the actual sample-and-reinject loop lands in Phase 3.
+        # Until then, calls that arrive here with is_hidden_state=True will
+        # surface NotImplementedError from HeadSampler.sample(), which is
+        # the intended fail-loud behaviour while the flag is default-off.
+        if _is_hidden:
+            try:
+                _ack = self._handle_hidden_state_push_result(request)
+                if _ack is not None:
+                    return _ack
+            except Exception as exc:  # pragma: no cover — defensive
+                import traceback as _tb
+                logger.error(
+                    "push_result_hidden_state_crash: req=%s err=%s\n%s",
+                    request.request_id, exc, _tb.format_exc(),
+                )
+                # Fall through to the legacy push-receiver future below so
+                # any awaiting caller sees a terminal response.
+        # Dispatch to the push receiver if registered (existing behaviour —
+        # covers both (a) is_hidden_state=False (today's token payload) and
+        # (b) the Phase-1 hidden-state stub path above).
         try:
             from coordinator.push_receiver import _PUSH_RESULTS
             future = _PUSH_RESULTS.pop(str(request.request_id), None)

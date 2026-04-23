@@ -257,6 +257,19 @@ def main() -> None:
                         help="Enable server-to-server push mode (Petals parity Phase A).")
     parser.add_argument("--push-callback-address", default="",
                         help="Host:port where PushResult RPC arrives (usually this node's gRPC address).")
+    parser.add_argument(
+        "--sample-on-coordinator",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Client-terminated pipeline (Path A): last peer returns a hidden "
+            "state; coordinator applies final_norm + lm_head + sampling and "
+            "re-injects the token into stage 0. Eliminates the per-token "
+            "ring-loopback hop. Requires the coordinator to be co-located "
+            "with the last-shard peer (the common --p2p-enabled setup). "
+            "Default off — reversible; opt in per run."
+        ),
+    )
     parser.add_argument("--rebalance-enabled", action="store_true", default=False,
                         help="Enable autonomous dynamic rebalancing (peers decide their own layers).")
     parser.add_argument("--rebalance-interval", type=int, default=6,
@@ -1144,6 +1157,7 @@ def main() -> None:
         push_mode_enabled=True,  # peer-to-peer forwarding (skip coordinator round-trip)
         push_callback_address=str(getattr(args, "push_callback_address", "") or "")
             or _push_callback_addr,
+        sample_on_coordinator=bool(getattr(args, "sample_on_coordinator", False)),
     )
 
     # Zero-config bootstrap Phase 1: forward identity + network metadata to
