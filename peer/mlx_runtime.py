@@ -293,12 +293,41 @@ class MLXRuntime:
 
             _lm_args = getattr(_lm, "args", None)
             self._tie_word_embeddings = bool(getattr(_lm_args, "tie_word_embeddings", False))
+            # Path A Phase 5: ``load_full_head`` forces ``_shard_norm`` and
+            # ``_shard_lm_head`` (or the tied-embed) to be loaded on every
+            # shard so the coordinator can call ``apply_final_head`` against
+            # a non-terminal peer (e.g. Mac stage 0 co-located with the
+            # coordinator, GPU stage 1 doing the actual transformer work).
+            self._load_full_head = bool(
+                getattr(config, "runtime_load_full_head", False)
+            )
+            _head_anywhere = self._is_last_shard or self._load_full_head
             # First shard needs embed_tokens for tokenization → embedding.
             # Last shard also needs it when tie_word_embeddings=True (used as lm_head).
-            _needs_embed = self._is_first_shard or (self._is_last_shard and self._tie_word_embeddings)
+            # With load_full_head, every shard needs embed_tokens if tied.
+            _needs_embed = (
+                self._is_first_shard
+                or (_head_anywhere and self._tie_word_embeddings)
+            )
             self._shard_embed_tokens = _text_model.embed_tokens if _needs_embed else None
-            self._shard_norm = getattr(_text_model, "norm", None) if self._is_last_shard else None
-            self._shard_lm_head = getattr(_lm, "lm_head", None) if (self._is_last_shard and not self._tie_word_embeddings) else None
+            self._shard_norm = getattr(_text_model, "norm", None) if _head_anywhere else None
+            self._shard_lm_head = (
+                getattr(_lm, "lm_head", None)
+                if (_head_anywhere and not self._tie_word_embeddings)
+                else None
+            )
+            # Advertise whether this runtime can execute apply_final_head.
+            # Used by server.py::_maybe_register_head_source to decide if
+            # the coordinator may borrow from this peer — independent of
+            # _is_last_shard so the Phase-5 Mac-stage-0 case works.
+            self._has_final_head = bool(
+                self._shard_norm is not None
+                and (
+                    self._tie_word_embeddings
+                    and self._shard_embed_tokens is not None
+                    or self._shard_lm_head is not None
+                )
+            )
             self._shard_hidden_size = int(getattr(_lm_args, "hidden_size", 0))
 
             # Layer type info for mask creation (Qwen3.5 has linear + full_attention)
@@ -853,10 +882,17 @@ class MLXRuntime:
         transformer layer (``_is_last_shard=True``) — otherwise there are
         no head weights to apply.
         """
-        if not getattr(self, "_is_last_shard", False):
+        # Gate: any shard that has been loaded with full head weights
+        # (either because it is the last shard OR because
+        # ``runtime_load_full_head=True``) can apply the head. The
+        # concrete attribute set is computed at init — defensive re-check
+        # here so a misconfigured runtime fails loudly.
+        if not getattr(self, "_has_final_head", False):
             raise RuntimeError(
-                "apply_final_head: this MLX shard does not own the last "
-                "layer; head weights are on a different peer"
+                "apply_final_head: this MLX shard has no head weights "
+                "loaded (not the last shard and runtime_load_full_head "
+                "is False). Re-launch the peer with "
+                "--sample-on-coordinator to opt in."
             )
         import mlx.core as mx
         # Decode hidden state → MLX tensor [1, seq, hidden].

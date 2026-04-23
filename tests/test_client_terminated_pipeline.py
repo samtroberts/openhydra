@@ -247,3 +247,65 @@ def test_run_push_ring_accepts_sample_on_coordinator_kwarg():
     sig = inspect.signature(InferenceChain.run_push_ring)
     assert "sample_on_coordinator" in sig.parameters
     assert sig.parameters["sample_on_coordinator"].default is False
+
+
+# ── Phase 5: load_full_head on non-terminal shards ──────────────────────
+
+def test_toy_shard_config_has_load_full_head():
+    from peer.model_shard import ToyShardConfig
+
+    default = ToyShardConfig()
+    assert default.runtime_load_full_head is False
+
+    enabled = ToyShardConfig(runtime_load_full_head=True)
+    assert enabled.runtime_load_full_head is True
+
+
+def test_peer_service_and_serve_accept_load_full_head():
+    from peer.server import PeerService, serve
+
+    for fn in (PeerService.__init__, serve):
+        params = inspect.signature(fn).parameters
+        assert "load_full_head" in params, (
+            f"{fn.__qualname__} missing load_full_head kwarg"
+        )
+        assert params["load_full_head"].default is False
+
+
+def test_engine_config_has_sample_on_coordinator():
+    from coordinator.engine import EngineConfig
+
+    assert EngineConfig().sample_on_coordinator is False
+    assert EngineConfig(sample_on_coordinator=True).sample_on_coordinator is True
+
+
+def test_register_head_source_accepts_has_final_head_attribute():
+    """Phase 5 relaxes the registration gate: a runtime advertising
+    ``_has_final_head=True`` is accepted regardless of ``_is_last_shard``.
+
+    This is what lets the Mac-stage-0 peer register itself as the
+    coordinator's head source when launched with
+    ``--sample-on-coordinator``: it loads the full head (so
+    ``_has_final_head=True``) but is not the last shard.
+    """
+    from coordinator.head_sampler import (
+        HeadSampler, DecodeConfig, clear_head_source,
+    )
+
+    clear_head_source()
+
+    class _FirstShardWithHead:
+        """Simulates MLX stage 0 after load_full_head=True — advertises
+        head weights are loaded even though is_last_shard=False."""
+        _is_last_shard = False
+        _has_final_head = True
+
+        def apply_final_head(self, hidden_state, **kwargs):
+            return 7
+
+    # HeadSampler itself is oblivious to _is_last_shard / _has_final_head
+    # (those are the peer-side registration gate). It just calls
+    # apply_final_head. That's the right separation of concerns.
+    sampler = HeadSampler(runtime=_FirstShardWithHead(), peer_id="p0")
+    assert sampler.sample([1.0, 2.0], DecodeConfig()) == 7
+    clear_head_source()

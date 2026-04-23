@@ -127,6 +127,14 @@ class ToyShardConfig:
     runtime_layer_indices: tuple[int, ...] = ()
     runtime_max_context_tokens: int = 64
     runtime_kv_cache_max_entries: int = 256
+    # Path A Phase 5: force loading of ``final_norm`` + ``lm_head`` (or the
+    # tied-embed linear) on EVERY shard, not just the last. Enables a
+    # non-last-shard peer to serve as the coordinator's head source when
+    # ``--sample-on-coordinator`` is set and the coordinator is co-located
+    # with a non-terminal stage (e.g. Mac-coordinator on stage 0, GPU on
+    # the last stage). Default off — preserves today's memory footprint
+    # on peers that don't need head weights.
+    runtime_load_full_head: bool = False
     runtime_tensor_autoencoder_enabled: bool = False
     runtime_tensor_autoencoder_latent_dim: int = 1024
     runtime_privacy_noise_variance: float = 0.0

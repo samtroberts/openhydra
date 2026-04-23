@@ -364,6 +364,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         batch_window_ms: float = 50.0,
         max_batch_size: int = 8,
         p2p_node: Any | None = None,
+        load_full_head: bool = False,
     ):
         self.peer_id = peer_id
         self._p2p_node = p2p_node
@@ -410,6 +411,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 runtime_privacy_noise_variance=max(0.0, float(privacy_noise_variance)),
                 runtime_privacy_audit_seed=str(advanced_encryption_seed),
                 runtime_peer_id=str(peer_id),
+                runtime_load_full_head=bool(load_full_head),
             )
         )
         # Persist boot-time ToyShardConfig inputs so ``reload_shard`` can
@@ -430,6 +432,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         self._boot_kv_cache_max_entries = max(1, int(kv_cache_max_entries))
         self._boot_warmup_on_start = bool(warmup_on_start)
         self._boot_mlx_eval_timeout_s = max(1.0, float(mlx_eval_timeout_s))
+        self._boot_load_full_head = bool(load_full_head)
         self.runtime_profile = dict(self.shard.runtime_profile())
         # Path A (client-terminated pipeline): register this peer's runtime
         # with the coordinator-side HeadSampler when the shard owns the
@@ -489,13 +492,19 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             # PyTorchRuntime gained apply_final_head in Phase 2.
             if not hasattr(runtime, "apply_final_head"):
                 return
-            # MLX sets _is_last_shard on the runtime. PyTorch sets _lm_head
-            # on the _DecoderArchitecture handle — but apply_final_head
-            # itself raises RuntimeError if the shard doesn't own the head,
-            # so we can register optimistically and let the sampler-time
-            # check guard misuse. Still, prefer an up-front check when
-            # the signal is available to avoid misleading registration.
-            if hasattr(runtime, "_is_last_shard"):
+            # Phase 5: prefer ``_has_final_head`` — a runtime-level
+            # advertisement that the head weights (norm + lm_head / tied
+            # embed) are actually loaded on this shard. This is True for
+            # (a) last-shard peers (today's behaviour) AND (b) any peer
+            # launched with ``runtime_load_full_head=True`` (Path A
+            # Phase 5 — lets the Mac-stage-0 coordinator borrow head
+            # weights from its co-located first-shard peer).
+            if hasattr(runtime, "_has_final_head"):
+                if not bool(getattr(runtime, "_has_final_head", False)):
+                    return
+            elif hasattr(runtime, "_is_last_shard"):
+                # Runtimes without the new attribute fall back to the
+                # pre-Phase-5 gate.
                 if not bool(getattr(runtime, "_is_last_shard", False)):
                     return
             else:
@@ -614,6 +623,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 ),
                 runtime_layer_indices=new_layer_indices,
                 runtime_peer_id=str(self.peer_id),
+                runtime_load_full_head=bool(
+                    getattr(self, "_boot_load_full_head", False)
+                ),
             )
         )
         with self._lock:
@@ -2387,6 +2399,7 @@ def serve(
     mlx_eval_timeout_s: float = 120.0,
     batch_window_ms: float = 50.0,
     max_batch_size: int = 8,
+    load_full_head: bool = False,
     p2p_enable: bool = False,
     seeder_port: int = 0,
     p2p_cache_dir: str | None = None,
@@ -2577,6 +2590,7 @@ def serve(
         mlx_eval_timeout_s=max(1.0, float(mlx_eval_timeout_s)),
         batch_window_ms=float(batch_window_ms),
         max_batch_size=max(1, int(max_batch_size)),
+        load_full_head=bool(load_full_head),
         p2p_node=p2p_node,
     )
 
@@ -3470,6 +3484,7 @@ def main() -> None:
         mlx_eval_timeout_s=float(args.mlx_eval_timeout),
         batch_window_ms=float(args.batch_window_ms),
         max_batch_size=max(1, int(args.max_batch_size)),
+        load_full_head=bool(getattr(args, "sample_on_coordinator", False)),
         p2p_enable=bool(args.p2p_enable),
         seeder_port=max(0, int(args.seeder_port)),
         p2p_cache_dir=args.p2p_cache_dir or None,
