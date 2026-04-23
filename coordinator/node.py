@@ -1035,6 +1035,14 @@ def main() -> None:
             # any additional RPCs.
             "capacity_snapshot_ref": _capacity_snapshot_ref,
             "negotiation_loop_factory": _negotiation_loop_factory_fn,
+            # Path A Phase 5: tell the local peer to load final_norm +
+            # lm_head on every shard (not just the last) so the
+            # coordinator — co-located in this same process — can borrow
+            # the head weights via HeadSampler even when the local peer
+            # is stage 0 rather than the terminal stage. Gated on the
+            # ``--sample-on-coordinator`` opt-in so default deployments
+            # see no extra memory usage.
+            "load_full_head": bool(getattr(args, "sample_on_coordinator", False)),
             # All other peer params use peer/server.py defaults.
         },
         name="openhydra-peer",
