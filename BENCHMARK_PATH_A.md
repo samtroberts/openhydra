@@ -315,3 +315,93 @@ All Phase 1-5 code paths verified under a local-only MLX launch on the Mac:
 - `HeadSampler.sample()` threads all five decode params to the borrowed
   runtime's `apply_final_head`
 - 17/17 Path A unit tests pass, 1385/1385 full suite green
+
+## 2026-04-24 session results — True Petals topology attempt
+
+### What shipped this session
+
+- **`ee924ef`** — Disable Qwen3.5 `<think>` by default + fix negotiator
+  oscillation (+4 tests)
+- **`c8a9742`** — Path A Phase 6: standalone head loader for pure coordinator
+  (+10 tests)
+- **`faa9777`** — LAN-first routing: GPU1 → GPU2 direct gRPC on shared /16
+  instead of libp2p relay via Linode US (+32 tests)
+- **`e7fcedf`** — Propagate `sample_on_coordinator` through
+  `_push_to_next_hop` so last peer takes Path A instead of legacy ring
+- **`50eeea0`** — Concurrent pre-dial of all ring peers with
+  discover-then-dial pattern
+
+Full suite: **1431 passed, 9 skipped**. Zero regressions.
+
+### What was verified live
+
+With Mac-pure-coord + GPU1-stage0 + GPU2-stage1 on same Lightning VPC:
+
+1. ✅ `standalone_head_ready: model=mlx-community/Qwen3.5-2B-MLX-8bit
+   hidden=2048 vocab=248320 tie=True` — Mac loads head-only module,
+   24 layers pruned.
+2. ✅ `head_sampler_registered: peer=coordinator-standalone-head
+   runtime=StandaloneHead` — HeadSampler registry binds correctly.
+3. ✅ `sharded_pipeline_ordered: stages=[('gpu1-stage0', 0, 12),
+   ('gpu2-stage1', 12, 24)]` — pipeline builder respects explicit
+   `--peers-config`.
+4. ✅ `push_forwarded_via_lan: -> 10.192.11.74:50052 (LAN-first;
+   bypassing libp2p_id=...)` — **GPU1 → GPU2 now uses LAN gRPC directly**.
+   No Linode-relay round-trip between two VPC-local peers.
+5. ✅ `lan_routing_local_prefixes: ['10.192.0.0/16']` on GPU1 & GPU2,
+   `['127.0.0.0/16', '192.168.1.0/24']` on Mac — classifier correctly
+   distinguishes intra-VPC from cross-internet hops.
+6. ✅ GPU2 receives + executes stage-1 forward end-to-end.
+7. ✅ `sample_on_coordinator=True` propagates all the way to GPU2
+   (after the `e7fcedf` fix) — GPU2 enters
+   `_handle_hidden_state_push_result` instead of the legacy ring
+   loopback.
+
+### Remaining blocker (not Path A code)
+
+GPU2's `PushResult` back to Mac fails with
+`proxy outbound: DialFailure` → `dial error: no addresses for peer`.
+
+Root cause: Mac's Rust libp2p Kademlia routing table knows GPU2's
+`libp2p_peer_id` (it's cached from the HTTP DHT via `discovery_service`)
+but has **no multiaddrs** associated with that peer_id. Without
+multiaddrs, `Swarm::dial` cannot construct a relay path. `discover()`
+returns peer records to the Python caller but does NOT populate the
+Swarm's per-peer address book on the Rust side. Similarly, the
+GPU2→Mac direction fails because GPU2 has never dialed Mac (no inbound
+connection from Mac to establish a cached entry).
+
+This is a `P2PNode` Rust-side API gap, not a Path A bug. Closing it
+requires adding `P2PNode.add_address(peer_id, multiaddr)` to the Rust
+bridge so the Python side can explicitly populate the address book
+with multiaddrs derived from the relay reservations (which Mac DOES
+publish successfully to all 3 Linode relays on startup).
+
+### Shape of the Rust fix (next session)
+
+In `network/src/` (Rust bridge):
+
+```rust
+#[pymethods]
+impl P2PNode {
+    fn add_address(&self, peer_id: &str, multiaddr: &str) -> PyResult<()> {
+        // Send SwarmCommand::AddAddress { peer_id, multiaddr } over
+        // self._cmd_tx; event_loop forwards to Swarm::add_peer_address
+        // which populates the per-peer multiaddr book that dial_peer
+        // consults before attempting a Swarm::dial.
+    }
+}
+```
+
+Then in `coordinator/chain.py::run_push_ring`, after discover() returns
+peer records, iterate the records for multiaddrs and call
+`p2p_node.add_address(libp2p_id, multiaddr)` for each. Subsequent
+`dial_peer` calls will find the multiaddrs and complete the dial.
+
+### Honest TPS status
+
+Still the 2026-04-23 baseline: **~1.0 TPS legacy cross-ISP ring** (Run A
+from yesterday's Mac-stage-0 + GPU1-stage-1 topology). No Path A
+number yet because the Mac↔GPU2 libp2p Kademlia address-book gap
+prevents PushResult delivery. Everything else on the Path A path is
+verified working in isolation.
