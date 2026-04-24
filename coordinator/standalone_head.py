@@ -330,20 +330,26 @@ class StandaloneHead:
 
         with torch.inference_mode():
             normed = self._shard_norm(h)
-            if self._tie_word_embeddings:
-                # Tied embeddings: logits = normed @ embed_tokens.weight.T
-                # HF nn.Embedding doesn't expose an as_linear; use the
-                # underlying weight matrix directly.
+            # Prefer the model's own ``lm_head`` module whenever it
+            # exists — for tied-embedding HF models the lm_head is a
+            # Linear whose ``weight`` is already tied to
+            # ``embed_tokens.weight`` by the model's constructor. Using
+            # the module keeps any wrapper logic intact (dtype casts,
+            # optional bias, activation, etc.) and matches exactly
+            # what the model's own ``forward`` would compute. The raw
+            # ``matmul(normed, embed.weight.T)`` path is a fallback
+            # only when the model truly lacks an lm_head module.
+            if self._shard_lm_head is not None:
+                logits = self._shard_lm_head(normed)
+            elif self._tie_word_embeddings:
                 weight = self._shard_embed_tokens.weight
                 if weight.dtype != normed.dtype:
                     weight = weight.to(dtype=normed.dtype)
                 logits = torch.matmul(normed, weight.t())
             else:
-                if self._shard_lm_head is None:
-                    raise RuntimeError(
-                        "standalone_head: untied model but no lm_head loaded"
-                    )
-                logits = self._shard_lm_head(normed)
+                raise RuntimeError(
+                    "standalone_head: untied model but no lm_head loaded"
+                )
 
         # Sample: mirror PyTorchRuntime._logits_to_next_token_payload logic.
         return self._pytorch_sample(
@@ -674,7 +680,13 @@ def _load_pytorch_standalone_head(
         hf_model_id=str(hf_model_id),
         norm_module=norm_module,
         embed_tokens_module=embed_tokens_module,
-        lm_head_module=(None if tie else lm_head_module),
+        # Keep the lm_head module regardless of tie — for tied models
+        # HF already ties ``lm_head.weight == embed_tokens.weight``, so
+        # calling ``self._shard_lm_head(normed)`` is the most faithful
+        # reproduction of the model's own forward. Dropping it forced
+        # a manual ``matmul(normed, embed.weight.T)`` that gave wrong
+        # logits on Qwen3.5-2B in the 2026-04-24 all-LAN benchmark.
+        lm_head_module=lm_head_module,
         tie_word_embeddings=tie,
         hidden_size=hidden_size,
         vocab_size=vocab_size,
