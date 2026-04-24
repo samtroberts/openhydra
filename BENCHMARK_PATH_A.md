@@ -405,3 +405,84 @@ from yesterday's Mac-stage-0 + GPU1-stage-1 topology). No Path A
 number yet because the Mac↔GPU2 libp2p Kademlia address-book gap
 prevents PushResult delivery. Everything else on the Path A path is
 verified working in isolation.
+
+## 2026-04-24 session 2 — True Petals topology WORKING
+
+### What shipped
+
+| Commit | Change |
+|---|---|
+| `8227b78` | `P2PNode.add_address` Rust API + auto-populate Kademlia on every FoundRecord event. Wheel rebuilt on Mac + GPU1 + GPU2. |
+| `008e6ae` | Drop the `is_peer_connected`-gated direct-gRPC branch from `_push_final_result` — conflated libp2p-connected with gRPC-reachable. |
+| `2b1ffa8` | New `_coordinator_proxy_handler_loop` that runs when `--no-local-peer` is set. Drains inbound `PROXY_METHOD_PUSH_RESULT` and dispatches to a shared `_coordinator_handle_push_result` free function (Phase 3 logic extracted so it doesn't need a `PeerService` instance). |
+
+### First True Petals benchmark result
+
+**Topology:**
+- Mac (home Wi-Fi, public-NAT'd, no transformer layers, `StandaloneHead`
+  loaded from `mlx-community/Qwen3.5-2B-MLX-8bit`)
+- GPU1 (Lightning VPC `10.192.11.221`, stage 0, layers `[0, 12)`, PyTorch T4)
+- GPU2 (Lightning VPC `10.192.15.173`, stage 1, layers `[12, 24)`, PyTorch T4)
+
+**Request:** "Write a three-sentence haiku-style poem about a mountain
+at dawn." max_tokens=32, temperature=0.0, seed=42.
+
+**Output:** *"Silent peak rises from the mist, Golden light spills over
+snow-capped ridges, Morning breath begins to rise."* — 17 user-visible
+tokens, 27 raw ring tokens, 28 424 ms.
+
+```
+autoregressive_ring_done: tokens=27 latency_ms=28424.8 tps=0.95
+```
+
+**TPS comparison:**
+
+| Topology | TPS | Notes |
+|---|---|---|
+| 2026-04-23 Run A (Mac-MLX stage-0 + GPU1 stage-1) legacy ring | **0.97** | 2-peer co-located-coord baseline |
+| 2026-04-24 Run B (Mac pure-coord + GPU1 + GPU2) True Petals + Path A | **0.95** | 3-node, cross-VPC, Mac has no layers |
+
+### Why the TPS is flat (this is actually useful signal)
+
+Path A's claimed "~2× TPS" assumed the final-peer → first-peer loopback
+was a *real saved wire hop*. In our actual cross-VPC topology Mac↔GPU
+traffic goes through the Linode relay regardless of topology (Mac is
+on home Wi-Fi, GPUs are in Lightning VPC). The relay-hop cost dominates
+the per-token budget. Moving `lm_head` off GPU2 and onto Mac saves
+~5 ms of T4 compute per token — invisible against ~1 s relay RTT.
+
+The "2×" figure lives in a different topology we haven't tested yet:
+**coordinator + all peers on the same LAN.** There the wire cost is
+LAN-bound (~0.5 ms) and compute dominates, so removing a whole compute
+cycle (the ring loopback going through peer 0 → peer 1 → peer N again)
+matters. Requires a 3rd Lightning studio or all-local setup to measure.
+
+### What this session proved end-to-end
+
+1. ✅ `P2PNode.add_address` Rust API lets Python populate Kademlia's
+   routing table explicitly. Closes the "no addresses for peer" gap
+   that yesterday's session flagged as a Rust-side blocker.
+2. ✅ Auto-population on every `discover()` FoundRecord → no Python
+   glue needed in steady state.
+3. ✅ Mac pure coordinator mode (`--no-local-peer --sample-on-coordinator`)
+   loads `StandaloneHead`, registers with `HeadSampler`, spawns the
+   coord-only proxy handler, and sucessfully completes full ring
+   generation cycles against 2 remote GPU peers.
+4. ✅ Path A flow verified end-to-end across 27 tokens:
+   `coord_push_result_received` → `coord_ring_sampled` →
+   `coord_reinject_done` — one complete ring cycle per ~1 second.
+5. ✅ LAN-first routing GPU1 → GPU2 confirmed in logs:
+   `push_forwarded_via_lan -> 10.192.15.173:50052 (LAN-first; bypassing libp2p_id=...)`.
+
+### Next steps for actual TPS gain
+
+- **All-LAN benchmark** — 3 Lightning studios, one as coordinator.
+  That's where Path A was designed to win. ~2× expected.
+- **Speculative decoding** — amortises one ring cycle over 2-4 tokens.
+  The SpecPipe scaffolding is already in the codebase (`specpipe_enabled`).
+  ~2-3× effective TPS, topology-agnostic.
+- **INT8 wire format default** — Petals parity; codec already written
+  in `peer/activation_codec.py`, just not defaulted.
+- **Async network kernels / pipeline overlap** — the "big unlock" from
+  the original plan. MLX lazy-eval + CUDA streams + pinned buffers.
+  ~1.5-2× TPS, additive to everything else.
