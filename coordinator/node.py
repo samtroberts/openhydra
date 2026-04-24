@@ -1065,6 +1065,28 @@ def main() -> None:
             )
             raise
         peer_thread = None  # No local peer thread in pure-coordinator mode.
+        # Start the coord-only proxy handler so inbound libp2p proxy
+        # requests (specifically PROXY_METHOD_PUSH_RESULT from the
+        # last peer in a Path A ring) get drained. Without this the
+        # Rust request_response handler times out on every inbound
+        # request because nothing calls p2p_node.poll_proxy_request.
+        if _p2p_node is not None:
+            from peer.server import _coordinator_proxy_handler_loop
+            _coord_proxy_stop = threading.Event()
+            _coord_proxy_thread = threading.Thread(
+                target=_coordinator_proxy_handler_loop,
+                kwargs={
+                    "stop_event": _coord_proxy_stop,
+                    "p2p_node": _p2p_node,
+                },
+                name="openhydra-coord-proxy",
+                daemon=True,
+            )
+            _coord_proxy_thread.start()
+            logger.info(
+                "coordinator_proxy_handler_started: handles "
+                "PROXY_METHOD_PUSH_RESULT for pure-coordinator Path A"
+            )
     else:
         # Start the peer gRPC server in a background daemon thread.
         # daemon=True ensures it is reaped automatically when the main thread exits

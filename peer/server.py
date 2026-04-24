@@ -237,6 +237,281 @@ def _proxy_handler_loop(
     logging.info("proxy_handler_loop stopped")
 
 
+def _coordinator_proxy_handler_loop(
+    *,
+    stop_event: threading.Event,
+    p2p_node: Any,
+) -> None:
+    """Minimal proxy handler for pure-coordinator mode (``--no-local-peer``).
+
+    Runs when the coordinator has no local peer (and therefore no
+    PeerService) but DOES need to receive inbound libp2p proxy requests
+    — specifically ``PROXY_METHOD_PUSH_RESULT`` messages delivering
+    hidden states from the last peer in a Path A ring.
+
+    Dispatches:
+      * ``PROXY_METHOD_PUSH_RESULT`` → sample on coordinator
+        (HeadSampler + RingSession + emit_ring_token + re-inject).
+      * Any other method byte → ACK with an error response so the
+        sender's proxy_forward unblocks and surfaces the mismatch in
+        its own log.
+
+    This is the coord-only analog of ``_proxy_handler_loop``. Without
+    it, libp2p ``request_response`` times out on the inbound side
+    because nothing in the Python process calls
+    ``p2p_node.poll_proxy_request`` and the corresponding
+    ``respond_proxy``. Observed as
+    ``proxy inbound failure error=Timeout`` on Mac and
+    ``push_result_failed: proxy outbound: Timeout`` on the remote peer.
+    """
+    from peer import peer_pb2
+    from coordinator.head_sampler import (
+        get_head_sampler, get_ring_session, unregister_ring_session,
+    )
+    from coordinator.push_receiver import emit_ring_token
+
+    logging.info("coordinator_proxy_handler_loop started")
+    while not stop_event.is_set():
+        try:
+            pending = p2p_node.poll_proxy_request(timeout_ms=500)
+            if pending is None:
+                continue
+            req_id, raw_bytes = pending
+            raw = bytes(raw_bytes)
+            try:
+                if raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
+                    push_resp = peer_pb2.ForwardResponse()
+                    push_resp.ParseFromString(raw[1:])
+                    # Process inline (mirrors PeerService.PushResult logic
+                    # for the is_hidden_state branch). Respond with a
+                    # minimal PushAck so the sender's RPC unblocks.
+                    ack = _coordinator_handle_push_result(
+                        response=push_resp,
+                        p2p_node=p2p_node,
+                    )
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_PUSH_RESULT + ack.SerializeToString(),
+                    )
+                else:
+                    # Unknown method in pure-coord mode — the coordinator
+                    # doesn't serve Forward() (no peer). Reply with a
+                    # small error and move on.
+                    err = peer_pb2.PushAck(
+                        request_id="",
+                        ok=False,
+                        error="pure_coordinator_unsupported_proxy_method",
+                    )
+                    logging.warning(
+                        "coord_proxy_unsupported_method: byte=%s req=%s",
+                        raw[0:1].hex() if raw else "empty", req_id,
+                    )
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
+                    )
+            except Exception as exc:  # pragma: no cover — defensive
+                import traceback as _tb
+                logging.warning(
+                    "coord_proxy_dispatch_failed: req=%s err=%s\n%s",
+                    req_id, exc, _tb.format_exc(),
+                )
+                try:
+                    err = peer_pb2.PushAck(
+                        request_id="", ok=False, error=f"dispatch_failed: {exc}",
+                    )
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            if not stop_event.is_set():
+                logging.warning("coord_proxy_poll_error: %s", exc)
+                time.sleep(1.0)
+    logging.info("coordinator_proxy_handler_loop stopped")
+
+
+def _coordinator_handle_push_result(
+    *,
+    response: Any,
+    p2p_node: Any,
+) -> Any:
+    """Shared PushResult handler — used by both
+    :class:`PeerService.PushResult` and the pure-coordinator proxy
+    handler loop. Kept as a free function so the coord-only path
+    doesn't need a PeerService instance.
+
+    Returns a ``PushAck`` reflecting whether the sample + re-inject
+    succeeded.
+    """
+    from peer import peer_pb2
+    from coordinator.head_sampler import (
+        get_head_sampler, get_ring_session, unregister_ring_session,
+    )
+    from coordinator.push_receiver import emit_ring_token
+
+    _is_hidden = bool(getattr(response, "is_hidden_state", False))
+    logging.info(
+        "coord_push_result_received: req=%s is_hidden_state=%s from=%s",
+        response.request_id, _is_hidden, response.peer_id,
+    )
+    if not _is_hidden:
+        # Pure-coord mode only handles hidden-state responses. A
+        # non-hidden PushResult in this mode is unexpected — ACK and
+        # move on.
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=True, error="",
+        )
+
+    sampler = get_head_sampler()
+    if sampler is None:
+        logging.error(
+            "coord_push_result_no_sampler: req=%s", response.request_id,
+        )
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=False,
+            error="no_head_sampler_registered",
+        )
+
+    session = get_ring_session(str(response.request_id))
+    if session is None:
+        logging.error(
+            "coord_push_result_no_session: req=%s", response.request_id,
+        )
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=False,
+            error="no_ring_session_registered",
+        )
+
+    _packed = bytes(getattr(response, "activation_packed", b"") or b"")
+    _activation_list: list[float] | None = None
+    if not _packed:
+        _activation_list = list(response.activation)
+        if not _activation_list:
+            return peer_pb2.PushAck(
+                request_id=response.request_id, ok=False,
+                error="empty_hidden_state",
+            )
+
+    try:
+        token_id = int(sampler.sample(
+            _activation_list if _activation_list is not None else [],
+            session.decode,
+            packed_bytes=_packed if _packed else None,
+        ))
+    except Exception as exc:
+        import traceback as _tb
+        logging.error(
+            "coord_push_result_sample_failed: req=%s err=%s\n%s",
+            response.request_id, exc, _tb.format_exc(),
+        )
+        emit_ring_token(session.callback_request_id, None)
+        unregister_ring_session(response.request_id)
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=False,
+            error=f"sample_failed:{exc}",
+        )
+
+    session.ring_generated_ids.append(token_id)
+    session.ring_tokens_remaining = max(0, session.ring_tokens_remaining - 1)
+    emit_ring_token(session.callback_request_id, token_id)
+    logging.info(
+        "coord_ring_sampled: req=%s token=%d remaining=%d",
+        response.request_id, token_id, session.ring_tokens_remaining,
+    )
+
+    _is_eos = token_id in session.ring_eos_ids
+    if session.ring_tokens_remaining <= 0 or _is_eos:
+        emit_ring_token(session.callback_request_id, None)
+        unregister_ring_session(response.request_id)
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=True, error="",
+        )
+
+    # Re-inject: build a new stage-0 ForwardRequest with the sampled
+    # token as activation. Fire-and-forget via libp2p to the first hop.
+    try:
+        route = list(session.ring_full_route)
+        _next_next = route[1].address if len(route) > 1 else ""
+        _next_next_id = route[1].peer_id if len(route) > 1 else ""
+        req = peer_pb2.ForwardRequest(
+            request_id=session.request_id,
+            activation=[float(token_id)],
+            stage_index=0,
+            total_stages=int(session.total_stages),
+            max_tokens=1,
+            kv_session_id=session.kv_session_id,
+            kv_store_activation=True,
+            kv_use_cached_activation=True,
+            decode_do_sample=session.decode.do_sample,
+            decode_temperature=float(session.decode.temperature or 0.0),
+            decode_top_p=float(session.decode.top_p or 0.0),
+            decode_top_k=int(session.decode.top_k or 0),
+            decode_seed=int(session.decode.seed or 0),
+            shard_layer_start=int(session.stage0_layer_start),
+            shard_layer_end=int(session.stage0_layer_end),
+            shard_total_layers=int(session.stage0_total_layers),
+            push_mode=True,
+            ring_mode=True,
+            sample_on_coordinator=True,
+            ring_tokens_remaining=int(session.ring_tokens_remaining),
+            ring_generated_ids=list(session.ring_generated_ids),
+            ring_eos_ids=list(session.ring_eos_ids),
+            ring_first_hop_address=session.ring_first_hop_address,
+            ring_first_hop_peer_id=session.ring_first_hop_peer_id,
+            ring_first_hop_libp2p_id=session.ring_first_hop_libp2p_id,
+            ring_full_route=route,
+            next_hop_address=_next_next,
+            next_hop_peer_id=_next_next_id,
+            final_callback_address=session.final_callback_address,
+            final_callback_request_id=session.callback_request_id,
+            final_callback_libp2p_peer_id=session.final_callback_libp2p_peer_id,
+            remaining_route=route[1:],
+        )
+        _first_libp2p = session.ring_first_hop_libp2p_id
+
+        def _fire(_rreq=req, _libp2p=_first_libp2p):
+            try:
+                if p2p_node is not None and _libp2p:
+                    p2p_node.proxy_forward(
+                        target_peer_id=_libp2p,
+                        data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                    )
+                    logging.info(
+                        "coord_reinject_done: req=%s via_relay",
+                        _rreq.request_id,
+                    )
+                else:
+                    logging.error(
+                        "coord_reinject_no_route: req=%s", _rreq.request_id,
+                    )
+            except Exception as exc:
+                logging.error(
+                    "coord_reinject_crash: req=%s err=%s",
+                    _rreq.request_id, exc, exc_info=True,
+                )
+
+        threading.Thread(target=_fire, daemon=True).start()
+    except Exception as exc:
+        import traceback as _tb
+        logging.error(
+            "coord_push_result_reinject_failed: req=%s err=%s\n%s",
+            response.request_id, exc, _tb.format_exc(),
+        )
+        emit_ring_token(session.callback_request_id, None)
+        unregister_ring_session(response.request_id)
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=False,
+            error=f"reinject_failed:{exc}",
+        )
+
+    return peer_pb2.PushAck(
+        request_id=response.request_id, ok=True, error="",
+    )
+
+
 def _relay_heartbeat_loop(
     *,
     stop_event: threading.Event,
