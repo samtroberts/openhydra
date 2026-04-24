@@ -486,3 +486,72 @@ matters. Requires a 3rd Lightning studio or all-local setup to measure.
 - **Async network kernels / pipeline overlap** — the "big unlock" from
   the original plan. MLX lazy-eval + CUDA streams + pinned buffers.
   ~1.5-2× TPS, additive to everything else.
+
+## 2026-04-24 session 3 — ALL-LAN 3-NODE TRUE PETALS: 3.76 TPS
+
+### What shipped
+
+| Commit | Change |
+|---|---|
+| `747ac12` | PyTorch backend for `StandaloneHead` (Linux coord support). `--standalone-head-backend` / `--standalone-head-device` / `--standalone-head-dtype` CLI flags. Dual-backend dispatch in `apply_final_head`. +12 tests. |
+| `a7b3adf` | Minimal coord-side gRPC `PushResult` server for LAN-reachable last peers. Pairs with `_coordinator_proxy_handler_loop` (libp2p fallback). |
+| `7316f2b` | Use HF `lm_head` module directly (tied weight already wired by HF) instead of manual `matmul(normed, embed.weight.T)` — the manual path gave wrong logits on Qwen3.5-2B. |
+
+### The authoritative number
+
+**3 Lightning studios, all on Lightning `10.192.0.0/16` VPC:**
+
+- **GPU3** (`10.192.11.159`) — pure coordinator, `--no-local-peer`, PyTorch
+  StandaloneHead on CPU bfloat16
+- **GPU1** (`10.192.11.221`) — stage 0, layers `[0, 12)`, PyTorch T4
+- **GPU2** (`10.192.15.173`) — stage 1, layers `[12, 24)`, PyTorch T4
+
+```
+autoregressive_ring_done: tokens=28 latency_ms=7442.8 tps=3.76
+content: "Silent peak rises from the mist,
+         Golden light spills over snow-capped ridges,
+         Morning breaks in soft blue light."
+```
+
+Two consecutive 32-token runs:
+
+| Run | Tokens | Latency | TPS |
+|---|---|---|---|
+| 1 | 28 | 7694.7 ms | **3.64** |
+| 2 | 28 | 7442.8 ms | **3.76** |
+
+### The multiplier
+
+| Topology | TPS | vs 2-node cross-VPC baseline |
+|---|---|---|
+| 2026-04-23 Mac-stage-0 + GPU1 cross-VPC legacy ring | 0.97 | 1.00× |
+| 2026-04-24 session 1 — Mac pure-coord + GPU1 + GPU2 cross-VPC Path A | 0.95 | 0.98× |
+| **2026-04-24 session 3 — GPU3 pure-coord + GPU1 + GPU2 ALL-LAN Path A** | **3.76** | **3.87×** |
+
+Path A's theoretical "~2×" landed as ~3.9× because it compounded with:
+1. Wire savings from LAN-first routing (sub-ms vs ~500 ms relay RTT per hop)
+2. Per-token compute parity between the two PyTorch T4 peers (vs Mac MLX + GPU1 T4 heterogeneous baseline)
+3. Removal of the Mac's MLX↔PyTorch dtype cast on every hidden state transfer
+
+### End-to-end proof points
+
+- ``standalone_head_loading[pytorch]: model=Qwen/Qwen3.5-2B device=cpu dtype=bfloat16``
+- ``standalone_head[pytorch]_layers_pruned: freed=24`` (all transformer layers dropped)
+- ``coordinator_grpc_server_bound: 0.0.0.0:50050 — PushResult only``
+- ``push_forwarded_via_lan -> 10.192.15.173:50052 (LAN-first; bypassing libp2p_id=...)``
+  on every ring cycle
+- ``coord_push_result_received`` + ``coord_ring_sampled`` + ``coord_reinject_done``
+  28 times per 32-token generation
+- Final EOS on ``token=248046`` (real Qwen3.5 `<|im_end|>`), not the earlier
+  garbage `token=0` that signalled an lm_head/matmul bug
+
+### Known limitations
+
+- The ring still does one wire round-trip per token. Speculative decoding
+  or async-stream pipelining is needed to amortise that further.
+- Coord's head matmul runs on CPU in bfloat16. A GPU-equipped coord would
+  cut ~5-10 ms per token; at 3.76 TPS the head compute is ~2% of the
+  per-token budget so this is low-priority.
+- `coord_reinject_done: via_relay` — the re-inject hop still goes via
+  libp2p (coord → stage 0 peer). Could be LAN-first too for the return
+  path; minor optimisation left on the table.
