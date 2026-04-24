@@ -512,6 +512,85 @@ def _coordinator_handle_push_result(
     )
 
 
+class _CoordinatorOnlyPushResultServicer(peer_pb2_grpc.PeerServicer):
+    """Minimal gRPC servicer for pure-coordinator mode.
+
+    Implements ONLY the ``PushResult`` RPC — the coord has no shard so
+    ``Forward`` / ``Ping`` / etc. are not applicable. Every other method
+    returns ``UNIMPLEMENTED``. ``PushResult`` dispatches to the shared
+    ``_coordinator_handle_push_result`` helper.
+    """
+
+    def PushResult(
+        self,
+        request: Any,
+        context: Any,
+    ) -> Any:
+        # Use the p2p_node attached to the servicer (set at server
+        # start) for the reinject fire-and-forget path.
+        return _coordinator_handle_push_result(
+            response=request,
+            p2p_node=getattr(self, "_p2p_node", None),
+        )
+
+    def Forward(self, request, context):  # pragma: no cover
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("pure-coordinator: Forward not served (no shard)")
+        return peer_pb2.ForwardResponse(
+            error="pure_coordinator_forward_unimplemented",
+        )
+
+    def Ping(self, request, context):  # pragma: no cover
+        from peer import peer_pb2 as _pp
+        return _pp.PingResponse(
+            peer_id="coordinator-standalone-head", ok=True, load_pct=0.0,
+            daemon_mode="coordinator", geo_nonce_signature="",
+        )
+
+    def GetPeerStatus(self, request, context):  # pragma: no cover
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("pure-coordinator: not a peer")
+        return peer_pb2.PeerStatusResponse(peer_id="coordinator-standalone-head")
+
+
+def start_coordinator_grpc_server(
+    *,
+    host: str = "0.0.0.0",
+    port: int = 50050,
+    p2p_node: Any = None,
+) -> Any:
+    """Start a minimal gRPC server for pure-coordinator Path A.
+
+    Binds ``host:port`` and serves ONLY the ``PushResult`` RPC (via
+    :class:`_CoordinatorOnlyPushResultServicer`). Used when
+    ``--no-local-peer`` is set: the peer thread is skipped but
+    LAN-reachable last peers still need a gRPC target for
+    ``final_callback_address`` direct pushes.
+
+    Returns the ``grpc.Server`` instance so the caller can stop it on
+    SIGTERM.
+    """
+    from concurrent import futures
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=16),
+        options=[
+            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+        ],
+    )
+    servicer = _CoordinatorOnlyPushResultServicer()
+    servicer._p2p_node = p2p_node  # stash for reinject fire-and-forget
+    peer_pb2_grpc.add_PeerServicer_to_server(servicer, server)
+    _addr = f"{host}:{port}"
+    server.add_insecure_port(_addr)
+    server.start()
+    logging.info(
+        "coordinator_grpc_server_bound: %s — PushResult only",
+        _addr,
+    )
+    return server
+
+
 def _relay_heartbeat_loop(
     *,
     stop_event: threading.Event,

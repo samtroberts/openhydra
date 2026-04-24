@@ -1130,6 +1130,29 @@ def main() -> None:
                 "coordinator_proxy_handler_started: handles "
                 "PROXY_METHOD_PUSH_RESULT for pure-coordinator Path A"
             )
+        # Start a minimal gRPC server on args.grpc_port that accepts ONLY
+        # PushResult. LAN-reachable last peers (e.g. GPU2 in the all-LAN
+        # True Petals topology) will hit this directly via the
+        # ``final_callback_address`` field — sub-millisecond path, no
+        # libp2p-proxy or relay hop. Non-LAN peers still fall through to
+        # the libp2p path handled by ``_coordinator_proxy_handler_loop``.
+        try:
+            from peer.server import start_coordinator_grpc_server
+            _coord_grpc_server = start_coordinator_grpc_server(
+                host="0.0.0.0",
+                port=int(args.grpc_port),
+                p2p_node=_p2p_node,
+            )
+            logger.info(
+                "coordinator_grpc_server_started: :%d — handles LAN-reachable "
+                "PushResult calls for pure-coordinator Path A",
+                int(args.grpc_port),
+            )
+        except Exception as exc:
+            logger.warning(
+                "coordinator_grpc_server_failed: %s — LAN-direct PushResult "
+                "will fall back to libp2p (slower but still works)", exc,
+            )
     else:
         # Start the peer gRPC server in a background daemon thread.
         # daemon=True ensures it is reaped automatically when the main thread exits
@@ -1281,33 +1304,24 @@ def main() -> None:
         _catalog_path = None
 
     # Auto-detect LAN IP for push mode callback (last peer sends result here).
-    # In PURE-COORDINATOR mode (``--no-local-peer``) the coord has NO gRPC
-    # server on ``args.grpc_port`` — that port is only bound by the peer
-    # thread, which is skipped. Advertising it anyway would make the last
-    # peer's ``_push_final_result`` pick the direct-gRPC branch (especially
-    # with LAN-first routing enabled when coord + peer share a /16),
-    # causing ``_InactiveRpcError`` against a closed port. Force the
-    # callback_address empty so the last peer falls through to the
-    # libp2p-proxy path, which ``_coordinator_proxy_handler_loop`` handles.
-    if bool(getattr(args, "no_local_peer", False)):
-        _push_callback_addr = ""
-        logger.info(
-            "push_callback_address=<empty> (pure-coordinator mode — "
-            "PushResult routes via libp2p to coordinator_proxy_handler_loop)"
-        )
-    else:
-        _push_callback_addr = f"127.0.0.1:{args.grpc_port}"
-        try:
-            import socket as _sock
-            _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-            _s.connect(("8.8.8.8", 80))
-            _lan_ip = _s.getsockname()[0]
-            _s.close()
-            if _lan_ip and not _lan_ip.startswith("127."):
-                _push_callback_addr = f"{_lan_ip}:{args.grpc_port}"
-        except Exception:
-            pass
-        logger.info("push_callback_address=%s", _push_callback_addr)
+    # In PURE-COORDINATOR mode (``--no-local-peer``) the peer thread is
+    # skipped, but we still need a gRPC listener on ``args.grpc_port`` so
+    # LAN-reachable last peers can POST ``PushResult`` directly without
+    # paying the libp2p-relay tax. The minimal coord-side gRPC server is
+    # started below — here we just compute the address that will be
+    # advertised in every ForwardRequest's ``final_callback_address``.
+    _push_callback_addr = f"127.0.0.1:{args.grpc_port}"
+    try:
+        import socket as _sock
+        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        _s.connect(("8.8.8.8", 80))
+        _lan_ip = _s.getsockname()[0]
+        _s.close()
+        if _lan_ip and not _lan_ip.startswith("127."):
+            _push_callback_addr = f"{_lan_ip}:{args.grpc_port}"
+    except Exception:
+        pass
+    logger.info("push_callback_address=%s", _push_callback_addr)
 
     # Build the coordinator engine config with only the fields we override;
     # EngineConfig is a frozen dataclass and all other fields carry their defaults.
