@@ -93,6 +93,29 @@ pub enum SwarmCommand {
         peer_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Explicitly populate Kademlia's routing table with ``(peer_id, multiaddr)``.
+    ///
+    /// Bridges a known gap in the libp2p Kademlia behaviour: ``discover()``
+    /// returns ``DiscoveredPeer`` records with ``relay_address`` strings
+    /// to the Python caller, but does NOT automatically add those addresses
+    /// to the Swarm's per-peer address book. Without this, ``dial_peer``
+    /// fails with "no addresses for peer" even when Kademlia has just
+    /// returned a valid multiaddr for that same peer_id.
+    ///
+    /// This command lets Python explicitly call
+    /// ``swarm.behaviour_mut().kademlia.add_address(&pid, ma)`` after each
+    /// ``discover()`` call — closing the gap that blocked the 2026-04-24
+    /// True Petals cross-VPC benchmark (Mac coordinator dialing GPU2
+    /// through a Linode relay).
+    ///
+    /// Returns ``Ok(())`` on successful enqueue. Reports a short error
+    /// on peer_id or multiaddr parse failure so the Python side can log
+    /// it and continue with the remaining peers.
+    AddAddress {
+        peer_id: String,
+        multiaddr: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Drain the oldest queued inbound gossip message, if any (PR-3 / B1).
     /// Returns ``None`` when the queue is empty. The returned tuple is
     /// ``(sender_libp2p_peer_id, payload_bytes)`` — callers that need the
@@ -329,6 +352,25 @@ pub async fn run_event_loop(
                         };
                         let _ = reply.send(res);
                     }
+                    Some(SwarmCommand::AddAddress { peer_id, multiaddr, reply }) => {
+                        // Feed the ``(peer_id, multiaddr)`` pair into Kademlia's
+                        // routing table so a subsequent ``DialPeer`` /
+                        // ``ProxyForward`` can find a dialable address for this
+                        // peer. The libp2p Swarm consults Kademlia during
+                        // dial-address resolution, so this one API call closes
+                        // the "no addresses for peer" dial failure surfaced in
+                        // the 2026-04-24 cross-VPC benchmark.
+                        let res = match (peer_id.parse::<PeerId>(), multiaddr.parse::<Multiaddr>()) {
+                            (Ok(pid), Ok(ma)) => {
+                                let update = swarm.behaviour_mut().kademlia.add_address(&pid, ma.clone());
+                                info!(%pid, %ma, ?update, "add_address_applied");
+                                Ok(())
+                            }
+                            (Err(e), _) => Err(format!("invalid peer_id: {e}")),
+                            (_, Err(e)) => Err(format!("invalid multiaddr: {e}")),
+                        };
+                        let _ = reply.send(res);
+                    }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;
                         handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
@@ -460,7 +502,7 @@ fn handle_swarm_event(
     match event {
         // ── Kademlia ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Kademlia(kad_event)) => {
-            handle_kad_event(kad_event, state);
+            handle_kad_event(kad_event, swarm, state);
         }
 
         // ── AutoNAT ──
@@ -669,7 +711,11 @@ fn handle_swarm_event(
 }
 
 /// Handle Kademlia events.
-fn handle_kad_event(event: kad::Event, state: &mut LoopState) {
+fn handle_kad_event(
+    event: kad::Event,
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+) {
     match event {
         kad::Event::OutboundQueryProgressed {
             id,
@@ -682,6 +728,49 @@ fn handle_kad_event(event: kad::Event, state: &mut LoopState) {
                     if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         match dht::decode_record(&record.value) {
                             Ok(peer_record) => {
+                                // Auto-populate Kademlia's routing table with
+                                // the peer's advertised relay_address so a
+                                // subsequent ``dial_peer`` / ``proxy_forward``
+                                // can find a dialable multiaddr. Without this,
+                                // ``discover()`` returns records to Python
+                                // but the Swarm's address book stays empty
+                                // (surfaced as "no addresses for peer" in the
+                                // 2026-04-24 cross-VPC benchmark).
+                                //
+                                // The relay_address may be empty (peer is
+                                // publicly reachable and didn't advertise a
+                                // circuit), in which case we skip — the
+                                // direct host:port dial will be attempted by
+                                // the gRPC layer instead.
+                                if !peer_record.relay_address.is_empty()
+                                    && !peer_record.libp2p_peer_id.is_empty()
+                                {
+                                    match (
+                                        peer_record.libp2p_peer_id.parse::<PeerId>(),
+                                        peer_record.relay_address.parse::<Multiaddr>(),
+                                    ) {
+                                        (Ok(pid), Ok(ma)) => {
+                                            let update = swarm
+                                                .behaviour_mut()
+                                                .kademlia
+                                                .add_address(&pid, ma.clone());
+                                            debug!(
+                                                %pid, %ma, ?update,
+                                                "discover_auto_added_address"
+                                            );
+                                        }
+                                        (Err(e), _) => {
+                                            warn!(
+                                                "discover: invalid libp2p_peer_id in record: {e}"
+                                            );
+                                        }
+                                        (_, Err(e)) => {
+                                            warn!(
+                                                "discover: invalid relay_address in record: {e}"
+                                            );
+                                        }
+                                    }
+                                }
                                 // Cache the peer.
                                 state
                                     .known_peers
