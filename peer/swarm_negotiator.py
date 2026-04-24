@@ -416,6 +416,67 @@ class SwarmNegotiator:
             claims = self._safe_scan(entry.model_id)
             total_layers = int(entry.num_layers_total)
 
+            # ── Stability gate (anti-oscillation) ────────────────────────
+            # Before computing gaps, look for our OWN claim in the DHT
+            # scan. If we already have a valid non-empty range for this
+            # model AND no higher-priority peer overlaps it, keep it.
+            #
+            # Without this, the negotiator computes gaps from "all claims
+            # including self" — so a peer that previously claimed [0,12)
+            # sees its own claim, identifies [12,24) as a "gap", and
+            # re-assigns to fill it. Next tick, sees its own [12,24),
+            # identifies [0,12) as the gap, flips back. The 60 s
+            # flip-flop observed in the 2026-04-23 cross-ISP benchmark.
+            #
+            # This branch fires BEFORE compute_conflict_split because the
+            # split logic targets the "everyone claims [0, N)" deadlock —
+            # if I already have a valid sub-range claim, I'm not in that
+            # deadlock and shouldn't be moved.
+            my_existing_claim = next(
+                (
+                    c for c in claims
+                    if c.libp2p_peer_id == self.libp2p_peer_id
+                    and int(c.total_layers) == total_layers
+                    and int(c.layer_end) > int(c.layer_start)
+                ),
+                None,
+            )
+            if my_existing_claim is not None:
+                _my_range = (
+                    int(my_existing_claim.layer_start),
+                    int(my_existing_claim.layer_end),
+                )
+                # Only abandon my current claim if a higher-priority peer
+                # is already overlapping it. ``should_concede`` applies the
+                # same VRAM + lex-id tiebreak used elsewhere, so the
+                # decision matches what a fresh negotiation would reach
+                # — but only when there's a genuine reason to move.
+                if not should_concede(
+                    _my_range,
+                    peer_claims=claims,
+                    model_id=entry.model_id,
+                    total_layers=total_layers,
+                    my_vram_mb=my_vram_mb,
+                    my_libp2p_peer_id=self.libp2p_peer_id,
+                ):
+                    logger.debug(
+                        "swarm_negotiate_stable: model=%s keeping my "
+                        "current shard [%d, %d) (anti-oscillation)",
+                        entry.model_id, _my_range[0], _my_range[1],
+                    )
+                    return ShardAssignment(
+                        model_id=entry.model_id,
+                        layer_start=_my_range[0],
+                        layer_end=_my_range[1],
+                        total_layers=total_layers,
+                        source=SOURCE_PICK_BEST_FIT,
+                    )
+                logger.info(
+                    "swarm_negotiate_concede_existing: model=%s my=[%d, %d) "
+                    "— higher-priority peer overlaps, re-negotiating",
+                    entry.model_id, _my_range[0], _my_range[1],
+                )
+
             # Deadlock-breaker: if one or more other peers are already
             # claiming the whole ``[0, total_layers)`` range (because
             # they, like us, fell back to ``fallback_whole_model`` on

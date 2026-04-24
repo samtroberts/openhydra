@@ -502,6 +502,77 @@ def test_native_shard_self_claim_in_dht_is_kept_stable():
     # False and no reshard fires.
 
 
+def test_native_shard_partial_self_claim_does_not_oscillate():
+    """2026-04-24 fix: a peer that previously claimed a partial range
+    (e.g. ``[0, 12)`` of a 24-layer model) must KEEP that range on the
+    next negotiation tick — even though ``compute_gaps`` would identify
+    ``[12, 24)`` as a "gap" and ``pick_best_fit`` would propose to fill it.
+
+    Without the stability gate, the negotiator computes gaps from claims
+    that include self, sees a "gap" that's actually the complement of
+    its own range, fills it, and on the following tick sees its own NEW
+    range as the obstacle — flipping back and forth every 60 s.
+    Observed in the 2026-04-23 cross-ISP benchmark log.
+
+    With the gate, the negotiator looks for its own claim first, finds
+    ``[0, 12)``, runs ``should_concede`` (no overlapping higher-priority
+    peer), and returns ``[0, 12)`` unchanged.
+    """
+    my_id = "12D3KooWMINE"
+    # Self previously claimed [0, 12) — half of a 24-layer model.
+    my_partial_claim = [
+        PeerClaim(libp2p_peer_id=my_id, model_id="openhydra-qwen3.5-2b",
+                  layer_start=0, layer_end=12, total_layers=24,
+                  available_vram_mb=14000),
+    ]
+    report = _native_report(_cuda_t4(), _qwen_2b(), libp2p_peer_id=my_id)
+    neg = SwarmNegotiator(
+        capacity_report=report, libp2p_peer_id=my_id,
+        dht_scan=_fixed_scan(my_partial_claim),
+    )
+    # First negotiation: keeps [0, 12).
+    a1 = neg.negotiate()
+    assert a1 is not None
+    assert (a1.layer_start, a1.layer_end) == (0, 12), (
+        f"expected stable [0, 12), got [{a1.layer_start}, {a1.layer_end}) — "
+        "the oscillation regression has returned"
+    )
+    # Simulate a second tick where my claim is unchanged in the DHT.
+    a2 = neg.negotiate()
+    assert (a2.layer_start, a2.layer_end) == (0, 12)
+
+
+def test_native_shard_partial_self_claim_concedes_to_bigger_peer():
+    """The stability gate must NOT lock us in when a higher-priority
+    peer (more VRAM) already overlaps our range. In that case we
+    should re-negotiate exactly as a fresh peer would."""
+    my_id = "12D3KooWMINE"
+    # Self has [0, 12); a bigger peer (24 GB) ALSO claims [0, 12).
+    overlapping_bigger_peer = PeerClaim(
+        libp2p_peer_id="12D3KooWBIGGER",
+        model_id="openhydra-qwen3.5-2b",
+        layer_start=0, layer_end=12, total_layers=24,
+        available_vram_mb=24000,
+    )
+    my_partial_claim = PeerClaim(
+        libp2p_peer_id=my_id, model_id="openhydra-qwen3.5-2b",
+        layer_start=0, layer_end=12, total_layers=24,
+        available_vram_mb=14000,
+    )
+    claims = [my_partial_claim, overlapping_bigger_peer]
+    report = _native_report(_cuda_t4(), _qwen_2b(), libp2p_peer_id=my_id)
+    neg = SwarmNegotiator(
+        capacity_report=report, libp2p_peer_id=my_id,
+        dht_scan=_fixed_scan(claims),
+    )
+    a = neg.negotiate()
+    # Stability gate sees the conflict, falls through to the normal
+    # pick_best_fit path. With BIGGER claiming [0,12), gap is [12,24)
+    # → we get assigned [12, 24).
+    assert a is not None
+    assert (a.layer_start, a.layer_end) == (12, 24)
+
+
 def test_unknown_persona_returns_none_without_raising():
     """Malformed report with an unknown persona — negotiator stays silent."""
     # Build a normal report then mutate (ugly, but CapacityReport is frozen).

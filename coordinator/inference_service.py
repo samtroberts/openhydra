@@ -466,15 +466,31 @@ class InferenceService:
         if not templated_messages:
             return fallback
 
+        # Per-config chat-template kwargs (e.g. ``enable_thinking=False`` for
+        # Qwen3.5). Tokenisers that don't accept the extra kwargs raise
+        # TypeError; we retry without them. The double-fallback covers
+        # both ``add_generation_prompt`` and the extra-kwargs case.
+        _ct_kwargs = dict(getattr(self.config, "chat_template_default_kwargs", {}) or {})
         try:
             templated = apply_chat_template(
                 templated_messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                **_ct_kwargs,
             )
         except TypeError:
+            # Retry without the extra kwargs — tokeniser doesn't accept them.
             try:
-                templated = apply_chat_template(templated_messages, tokenize=False)
+                templated = apply_chat_template(
+                    templated_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except TypeError:
+                try:
+                    templated = apply_chat_template(templated_messages, tokenize=False)
+                except Exception:
+                    return fallback
             except Exception:
                 return fallback
         except Exception:
