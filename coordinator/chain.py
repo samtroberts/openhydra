@@ -1280,24 +1280,54 @@ class InferenceChain:
         # send path will still attempt its own connection.
         _p2p_pre = getattr(self, '_p2p_node', None)
         if _p2p_pre is not None and sample_on_coordinator:
+            # Fire each dial in its own short-lived daemon thread so the
+            # main ring fire-and-forget below isn't blocked. ``dial_peer``
+            # in the Rust bridge is a libp2p ``Swarm::dial`` that can
+            # take 30s+ on a cold relay path — sequencing them serially
+            # would burn the user's 120 s timeout before the first
+            # ForwardRequest even leaves Mac.
+            import threading as _predial_threading
             for _peer in self.pipeline:
                 _peer_libp2p = str(getattr(_peer, 'libp2p_peer_id', '') or '').strip()
                 if not _peer_libp2p:
                     continue
-                try:
-                    _p2p_pre.dial_peer(_peer_libp2p)
-                    logging.info(
-                        "ring_predial: peer=%s libp2p=%s",
-                        _peer.peer_id, _peer_libp2p[:20],
-                    )
-                except Exception as _dial_exc:
-                    # Non-fatal — peer might already be connected, or the
-                    # dial is async and Rust returned immediately. The
-                    # actual ForwardRequest send below will retry.
-                    logging.debug(
-                        "ring_predial_failed: peer=%s err=%s",
-                        _peer.peer_id, _dial_exc,
-                    )
+                _peer_id_for_log = str(_peer.peer_id)
+
+                def _dial(
+                    _pid=_peer_libp2p,
+                    _name=_peer_id_for_log,
+                    _mid=str(getattr(_peer, "model_id", "") or ""),
+                ):
+                    # dial_peer fails with "no addresses for peer" when
+                    # Rust's Kademlia hasn't resolved the libp2p_id yet
+                    # — only the id is cached (from the HTTP DHT via
+                    # discovery_service), not the multiaddrs. Trigger a
+                    # Kademlia FIND_PEER by calling discover() on the
+                    # model id FIRST; that walks the k-buckets toward the
+                    # target and returns address records. THEN dial_peer
+                    # can find multiaddrs in the routing table.
+                    try:
+                        if _mid:
+                            try:
+                                _p2p_pre.discover(_mid)
+                            except Exception as _disc_exc:
+                                logging.debug(
+                                    "ring_predial_discover_failed: peer=%s "
+                                    "model=%s err=%s",
+                                    _name, _mid, _disc_exc,
+                                )
+                        _p2p_pre.dial_peer(_pid)
+                        logging.info(
+                            "ring_predial: peer=%s libp2p=%s",
+                            _name, _pid[:20],
+                        )
+                    except Exception as _dial_exc:
+                        logging.warning(
+                            "ring_predial_failed: peer=%s err=%s",
+                            _name, _dial_exc,
+                        )
+
+                _predial_threading.Thread(target=_dial, daemon=True).start()
 
         # Fire-and-forget in background thread (same as run_push).
         import threading as _ring_threading
