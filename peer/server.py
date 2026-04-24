@@ -1184,7 +1184,31 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                                 logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
                                             _rreq.request_id, _rreq.ring_tokens_remaining,
                                             _raddr, _libp2p[:20] if _libp2p else "none")
-                                if self._p2p_node is not None and _libp2p:
+                                # LAN-first: if we can reach the first
+                                # peer directly via gRPC on a shared /16,
+                                # bypass the libp2p relay path.
+                                from peer.lan_routing import (
+                                    is_reachable_lan as _ir, parse_host_from_address as _ph,
+                                )
+                                _lh = _ph(_raddr)
+                                _lan_ok = bool(_lh) and _ir(_lh)
+                                if _lan_ok and _raddr:
+                                    import grpc as _rl_grpc
+                                    _rl_ch = _rl_grpc.insecure_channel(
+                                        _raddr,
+                                        options=[
+                                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                                        ],
+                                    )
+                                    try:
+                                        _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
+                                        _rl_stub.Forward(_rreq, timeout=60.0)
+                                    finally:
+                                        _rl_ch.close()
+                                    logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_lan",
+                                                _rreq.request_id, _rreq.ring_tokens_remaining)
+                                elif self._p2p_node is not None and _libp2p:
                                     self._p2p_node.proxy_forward(
                                         target_peer_id=_libp2p,
                                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
@@ -1342,7 +1366,35 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             if remaining_route:
                 _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
 
-            if self._p2p_node is not None and _next_hop_libp2p_id:
+            # ── LAN-first routing (2026-04-24) ─────────────────────────
+            # When ``next_address`` is a private IP that we can reach via
+            # a local interface in the same /16, prefer direct gRPC
+            # unconditionally — even when libp2p is available. This
+            # collapses cross-VPC libp2p relay hops (which break under
+            # symmetric NAT, even with DCUtR) into single-RTT LAN gRPC.
+            from peer.lan_routing import is_reachable_lan, parse_host_from_address
+            _next_host = parse_host_from_address(next_address)
+            _lan_reachable = bool(_next_host) and is_reachable_lan(_next_host)
+            if _lan_reachable and next_address:
+                logger.info(
+                    "push_forwarded_via_lan: req=%s stage=%d -> %s "
+                    "(LAN-first; bypassing libp2p_id=%s)",
+                    request.request_id, request.stage_index, next_address,
+                    _next_hop_libp2p_id[:20] if _next_hop_libp2p_id else "none",
+                )
+                channel = grpc.insecure_channel(
+                    next_address,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                try:
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(next_req, timeout=60.0)
+                finally:
+                    channel.close()
+            elif self._p2p_node is not None and _next_hop_libp2p_id:
                 # B1 rendezvous: we're about to route through a circuit
                 # relay. Before we do, publish REQUEST_HOLE_PUNCH so the
                 # remote peer dials us back within the ~100 ms gossip
@@ -1447,6 +1499,15 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     activation_hash=response.activation_hash,
                 )
             _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
+            # LAN-first: if the callback address is a private IP we can
+            # reach via a local interface (same /16), bypass libp2p
+            # entirely. Caller is the coordinator's PushResult endpoint;
+            # when coord and last-peer share a VPC subnet this saves a
+            # transcontinental relay round-trip.
+            from peer.lan_routing import is_reachable_lan, parse_host_from_address
+            _cb_host = parse_host_from_address(callback_address)
+            _cb_lan_reachable = bool(_cb_host) and is_reachable_lan(_cb_host)
+
             # State-aware routing for PushResult callback.
             _has_direct_cb = False
             if self._p2p_node is not None and _cb_libp2p:
@@ -1455,7 +1516,26 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 except Exception:
                     pass
 
-            if _has_direct_cb and callback_address:
+            if _cb_lan_reachable and callback_address:
+                # LAN-direct gRPC to coordinator — fastest path.
+                channel = grpc.insecure_channel(
+                    callback_address,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                try:
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.PushResult(response, timeout=10.0)
+                finally:
+                    channel.close()
+                logger.info(
+                    "push_result_sent_via_lan: req=%s -> %s "
+                    "(LAN-first; bypassing libp2p)",
+                    response.request_id, callback_address,
+                )
+            elif _has_direct_cb and callback_address:
                 # Direct connection to coordinator — send PushResult via gRPC.
                 channel = grpc.insecure_channel(
                     callback_address,
@@ -1681,7 +1761,34 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     _rreq.request_id, _rreq.ring_tokens_remaining,
                     _addr, _libp2p[:20] if _libp2p else "none",
                 )
-                if self._p2p_node is not None and _libp2p:
+                # LAN-first: when the coordinator and stage-0 peer share
+                # a /16, skip libp2p entirely. Most likely irrelevant for
+                # the pure-coordinator case (Mac coord ↔ remote VPC peer)
+                # but matches the routing rule applied symmetrically on
+                # other hops.
+                from peer.lan_routing import (
+                    is_reachable_lan as _ir, parse_host_from_address as _ph,
+                )
+                _lh = _ph(_addr)
+                _lan_ok = bool(_lh) and _ir(_lh)
+                if _lan_ok and _addr:
+                    _ch = grpc.insecure_channel(
+                        _addr,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    try:
+                        _stub = peer_pb2_grpc.PeerStub(_ch)
+                        _stub.Forward(_rreq, timeout=60.0)
+                    finally:
+                        _ch.close()
+                    logger.info(
+                        "COORD_REINJECT_DONE: req=%s via_lan",
+                        _rreq.request_id,
+                    )
+                elif self._p2p_node is not None and _libp2p:
                     self._p2p_node.proxy_forward(
                         target_peer_id=_libp2p,
                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
