@@ -1514,13 +1514,16 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             _cb_host = parse_host_from_address(callback_address)
             _cb_lan_reachable = bool(_cb_host) and is_reachable_lan(_cb_host)
 
-            # State-aware routing for PushResult callback.
-            _has_direct_cb = False
-            if self._p2p_node is not None and _cb_libp2p:
-                try:
-                    _has_direct_cb = self._p2p_node.is_peer_connected(_cb_libp2p)
-                except Exception:
-                    pass
+            # Note: previous versions branched on
+            # ``_p2p_node.is_peer_connected(_cb_libp2p)`` before picking
+            # between direct gRPC and libp2p. That heuristic is wrong
+            # for PushResult — libp2p-connected says nothing about
+            # whether ``callback_address`` is network-reachable from
+            # here. We now rely purely on (a) LAN reachability for
+            # direct gRPC, (b) libp2p presence for relay, (c) last-
+            # resort direct gRPC. The ``is_peer_connected`` probe is
+            # still useful for the outbound Push-to-next-peer path
+            # (different call site); dropped only here.
 
             if _cb_lan_reachable and callback_address:
                 # LAN-direct gRPC to coordinator — fastest path.
@@ -1539,22 +1542,6 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 logger.info(
                     "push_result_sent_via_lan: req=%s -> %s "
                     "(LAN-first; bypassing libp2p)",
-                    response.request_id, callback_address,
-                )
-            elif _has_direct_cb and callback_address:
-                # Direct connection to coordinator — send PushResult via gRPC.
-                channel = grpc.insecure_channel(
-                    callback_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                stub = peer_pb2_grpc.PeerStub(channel)
-                stub.PushResult(response, timeout=10.0)
-                channel.close()
-                logger.info(
-                    "push_result_sent_direct: req=%s -> %s",
                     response.request_id, callback_address,
                 )
             elif self._p2p_node is not None and _cb_libp2p:
