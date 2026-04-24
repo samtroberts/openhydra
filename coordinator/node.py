@@ -1281,18 +1281,33 @@ def main() -> None:
         _catalog_path = None
 
     # Auto-detect LAN IP for push mode callback (last peer sends result here).
-    _push_callback_addr = f"127.0.0.1:{args.grpc_port}"
-    try:
-        import socket as _sock
-        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-        _s.connect(("8.8.8.8", 80))
-        _lan_ip = _s.getsockname()[0]
-        _s.close()
-        if _lan_ip and not _lan_ip.startswith("127."):
-            _push_callback_addr = f"{_lan_ip}:{args.grpc_port}"
-    except Exception:
-        pass
-    logger.info("push_callback_address=%s", _push_callback_addr)
+    # In PURE-COORDINATOR mode (``--no-local-peer``) the coord has NO gRPC
+    # server on ``args.grpc_port`` — that port is only bound by the peer
+    # thread, which is skipped. Advertising it anyway would make the last
+    # peer's ``_push_final_result`` pick the direct-gRPC branch (especially
+    # with LAN-first routing enabled when coord + peer share a /16),
+    # causing ``_InactiveRpcError`` against a closed port. Force the
+    # callback_address empty so the last peer falls through to the
+    # libp2p-proxy path, which ``_coordinator_proxy_handler_loop`` handles.
+    if bool(getattr(args, "no_local_peer", False)):
+        _push_callback_addr = ""
+        logger.info(
+            "push_callback_address=<empty> (pure-coordinator mode — "
+            "PushResult routes via libp2p to coordinator_proxy_handler_loop)"
+        )
+    else:
+        _push_callback_addr = f"127.0.0.1:{args.grpc_port}"
+        try:
+            import socket as _sock
+            _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+            _s.connect(("8.8.8.8", 80))
+            _lan_ip = _s.getsockname()[0]
+            _s.close()
+            if _lan_ip and not _lan_ip.startswith("127."):
+                _push_callback_addr = f"{_lan_ip}:{args.grpc_port}"
+        except Exception:
+            pass
+        logger.info("push_callback_address=%s", _push_callback_addr)
 
     # Build the coordinator engine config with only the fields we override;
     # EngineConfig is a frozen dataclass and all other fields carry their defaults.
