@@ -31,6 +31,8 @@ OpenHydra is a peer-to-peer inference network that turns idle hardware into a gl
 - **Rust toolchain** — the P2P wheel (`openhydra-network`) is not on PyPI yet, so it must be built from source with `maturin`. `maturin` needs `cargo` on `PATH`.
 - **C compiler** — `grpcio` and `cryptography` compile C extensions if no wheel is available for your Python / arch.
 - **Protobuf compiler (`protoc`)** — the Rust `prost-build` step compiles `peer.proto` at wheel-build time. Fresh macOS usually has it via Xcode CLT; on Linux install via `apt install protobuf-compiler`.
+- **`numpy<2`** — some Linux managed-Python environments (e.g. Lightning AI, Modal) ship numpy 2.x but with scipy/pandas/scikit-learn wheels pinned against numpy 1.x, causing `ImportError: numpy.core.multiarray failed to import` cascades inside `transformers`. We pin to `numpy<2` in `requirements.txt`; if you ever manually upgrade inside a studio, pin it back. See Troubleshooting.
+- **No `torchvision`** — OpenHydra does not use it. Some PyTorch distributions (especially on Linux CUDA studios) pre-install `torchvision` bundled to an older torch, which then fails to register C++ ops at import time (`operator torchvision::nms does not exist`) and takes `transformers` down with it. Uninstall it if present: `pip uninstall -y torchvision`.
 
 The commands below install all of these plus OpenHydra itself.
 
@@ -188,6 +190,58 @@ Replace `10.0.0.1` / `10.0.0.2` with your own internal IPs. For genuinely public
 
 ---
 
+## Run 3-Node True Petals (pure-coordinator topology)
+
+OpenHydra now supports the **true Petals client-terminated topology**: a dedicated coordinator node holds only the lm_head + embedding weights, while remote peers run the transformer layers. The coordinator samples tokens locally and re-injects them into the ring — no single peer needs to own the full model.
+
+This is the best-performing topology when all three nodes share a LAN (VPC, home network, datacenter rack) — on three Lightning AI studios in the same `10.192.0.0/16` subnet, the ring hit **3.76 TPS on Qwen 3.5 2B**, vs 0.97 TPS on the 2-node cross-ISP legacy ring (a 3.87× gain).
+
+**Coordinator node (no transformer layers, PyTorch backend on CPU):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id coord-pure \
+    --p2p-enabled --push-mode \
+    --no-local-peer --sample-on-coordinator \
+    --standalone-head-backend pytorch \
+    --standalone-head-device cpu \
+    --standalone-head-dtype bfloat16 \
+    --runtime-model-id Qwen/Qwen3.5-2B \
+    --hf-model-id Qwen/Qwen3.5-2B \
+    --total-shards 2 \
+    --grpc-port 50050 --api-port 7050 \
+    --peers-config /path/to/peers.json
+```
+
+On Apple Silicon, use `--standalone-head-backend mlx` with an MLX-quantised model id (e.g. `mlx-community/Qwen3.5-2B-MLX-8bit`) instead. The backend dispatches automatically when `--standalone-head-backend auto` (default).
+
+**Peer 1 and Peer 2** (stage 0 + stage 1, one per peer): use the two-GPU launch commands above, each with its `--layer-start` / `--layer-end` slice.
+
+**`peers.json`** example for the coordinator (mirror each peer's libp2p_peer_id and LAN host):
+
+```json
+[
+  {"peer_id": "gpu1", "host": "10.192.11.221", "port": 50051,
+   "layer_start": 0, "layer_end": 12, "total_layers": 24,
+   "libp2p_peer_id": "12D3KooW...", "requires_relay": false},
+  {"peer_id": "gpu2", "host": "10.192.15.173", "port": 50052,
+   "layer_start": 12, "layer_end": 24, "total_layers": 24,
+   "libp2p_peer_id": "12D3KooW...", "requires_relay": false}
+]
+```
+
+**Required guardrails** (enforced by argparse):
+
+- `--no-local-peer` requires `--sample-on-coordinator` (otherwise the coord has no work to do).
+- `--no-local-peer` requires `--runtime-model-id` with an HF repo id (slash-bearing: `Qwen/Qwen3.5-2B`, `mlx-community/Qwen3.5-2B-MLX-8bit`).
+- The backend's host must have the matching runtime deps (MLX on Apple Silicon; torch + transformers on Linux).
+
+**LAN-first routing** — when peers share a `/16` subnet, OpenHydra automatically prefers direct gRPC over libp2p relay hops, even when a libp2p peer_id is advertised. This is what makes the 3-node LAN benchmark ~4× faster than the 2-node cross-ISP ring. See `peer/lan_routing.py`.
+
+**Qwen3.5 `<think>` preamble** — disabled by default. The HF chat template's `enable_thinking=False` is now wired into `EngineConfig.chat_template_default_kwargs`, saving ~40% of the user-visible token budget on Qwen3.5. Override via `EngineConfig(chat_template_default_kwargs={"enable_thinking": True})` if you want chain-of-thought.
+
+---
+
 ## Benchmarks
 
 Measured on real hardware from a clean `git clone` + Quick Start install. Push ring topology, KV-aware caching, deterministic seed (`seed=42`, `temperature=0.7`) — outputs are reproducible.
@@ -200,6 +254,19 @@ Measured on real hardware from a clean `git clone` + Quick Start install. Push r
 | Qwen 3.5 2B | 2 × NVIDIA T4 (CUDA) | **Direct P2P** (same VPC) | **9.64** | **9.57** | **9.70** |
 | Qwen 3.5 9B | 2 × NVIDIA T4 (CUDA) | **Direct P2P** (same VPC) | **6.94** | **6.93** | **6.94** |
 | Qwen 3.5 2B | MacBook Air M1 (MLX) ↔ T4 (CUDA) | **Cross-ISP via Circuit Relay** | 0.93 | 1.09 | — |
+| Qwen 3.5 2B | **3-node True Petals** (CPU coord + 2 × T4, same VPC, Path A) | Direct LAN | — | **3.76** (`32 tok`) | — |
+
+### 3-Node True Petals (Path A, 2026-04-24)
+
+Three Lightning AI studios on the same `10.192.0.0/16` VPC, one as a pure coordinator (no transformer layers, just lm_head + embeddings on CPU bfloat16), two as stage 0 / stage 1 peers (PyTorch T4). The coordinator samples every token locally and re-injects into the ring — no peer ever sees the full model. Output text is a correctly-formed haiku ("Silent peak rises from the mist…"), EOS hit on the real `<|im_end|>` token.
+
+| Topology | TPS | vs 2-node cross-ISP baseline |
+|---|---|---|
+| 2-node cross-ISP (Mac-MLX stage-0 + T4 stage-1), legacy ring | 0.97 | 1.00× |
+| 2-node cross-ISP (Mac pure-coord + 2 × T4), Path A | 0.95 | 0.98× |
+| **3-node all-LAN (CPU pure-coord + 2 × T4)**, Path A | **3.76** | **3.87×** |
+
+Path A's theoretical 2× compounded with LAN-first wire savings + homogeneous PyTorch compute (no MLX↔PyTorch dtype casts) for the 3.87× headline. See `BENCHMARK_PATH_A.md` for the full log.
 
 ### Direct P2P vs Circuit Relay (2 × T4 Lightning.ai, 2026-04-20)
 
@@ -410,6 +477,47 @@ Or use a different port: `--api-port 8081`
 <summary><strong>"No viable model found" / 503</strong></summary>
 
 The coordinator can't find peers. Ensure `--p2p-enabled` is set and both peers show `announced to Kademlia DHT`.
+</details>
+
+<details>
+<summary><strong>"numpy.core.multiarray failed to import" or "numpy.dtype size changed"</strong></summary>
+
+Managed-Python envs (Lightning AI, Modal, some Docker images) often ship numpy 2.x but with scipy / pandas / scikit-learn wheels pinned against numpy 1.x. The transitive import chain through `transformers.generation.candidate_generator → sklearn → scipy.sparse` then fails at import time.
+
+Fix:
+
+```bash
+pip install "numpy<2" --force-reinstall
+```
+
+This is also why we pin `numpy<2` in `requirements.txt`. Don't upgrade inside a studio without verifying the rest of the stack supports it.
+</details>
+
+<details>
+<summary><strong>"operator torchvision::nms does not exist" / "Could not import module 'Qwen3_5ForCausalLM'"</strong></summary>
+
+Some PyTorch distributions (especially Lightning AI's default CUDA studios) pre-install `torchvision` built against an older torch. When torch is upgraded without torchvision being re-built, torchvision's C++ ops fail to register — and since `transformers.generation.candidate_generator` imports `torchvision` transitively, every HF model import fails with a misleading `ModuleNotFoundError: Could not import module 'Qwen3_5ForCausalLM'`.
+
+OpenHydra does not use torchvision. Uninstall it:
+
+```bash
+pip uninstall -y torchvision
+```
+
+Verify:
+
+```bash
+python3 -c "from transformers.models.qwen3_5 import Qwen3_5ForCausalLM; print('OK')"
+```
+</details>
+
+<details>
+<summary><strong>Standalone head: "apply_final_head: this shard does not own the last layer"</strong></summary>
+
+Only applies to `--sample-on-coordinator` mode. The coordinator didn't successfully register a `HeadSampler` source. Two common causes:
+
+1. `--no-local-peer` set without `--runtime-model-id Qwen/... ` (or `mlx-community/...-MLX-...`) — the HeadSampler has no model to load. Argparse enforces this guardrail at startup; double-check the error message.
+2. `--standalone-head-backend pytorch` on a host without `torch + transformers`, or `mlx` on non-Apple Silicon. Use `--standalone-head-backend auto` to let the loader pick.
 </details>
 
 ---
