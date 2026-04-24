@@ -48,6 +48,68 @@ def test_messages_to_model_prompt_uses_chat_template_when_available(tmp_path, mo
     assert prompt == "TEMPLATE::user::hello hydra"
 
 
+def test_messages_to_model_prompt_passes_enable_thinking_false_by_default(tmp_path, monkeypatch):
+    """2026-04-24 free-win fix: ``EngineConfig.chat_template_default_kwargs``
+    defaults to ``{"enable_thinking": False}`` and is forwarded to
+    ``apply_chat_template``. On Qwen3.5 this drops the ``<think>...</think>``
+    preamble (~30-40% of the user-visible token budget).
+    """
+    engine = _engine(tmp_path)
+
+    received: dict = {}
+
+    class _ThinkingAwareTokenizer:
+        # Accepts the kwarg — like Qwen3.5's tokenizer.
+        def apply_chat_template(
+            self, messages, tokenize=False,
+            add_generation_prompt=True, enable_thinking=True,
+        ):
+            received["enable_thinking"] = enable_thinking
+            return f"PROMPT(think={enable_thinking})::{messages[0]['content']}"
+
+    monkeypatch.setattr(
+        engine, "_load_generation_tokenizer",
+        lambda model_id: _ThinkingAwareTokenizer(),
+    )
+    prompt = engine._messages_to_model_prompt(
+        [{"role": "user", "content": "haiku"}],
+        model_id="Qwen/Qwen3.5-2B",
+    )
+    assert received.get("enable_thinking") is False
+    assert prompt == "PROMPT(think=False)::haiku"
+
+
+def test_messages_to_model_prompt_falls_back_when_kwarg_unsupported(tmp_path, monkeypatch):
+    """A tokenizer that doesn't accept ``enable_thinking`` (older HF
+    transformers, or non-Qwen models) raises ``TypeError`` — the
+    retry path strips the extra kwargs and re-applies the template.
+    """
+    engine = _engine(tmp_path)
+    call_log: list[dict] = []
+
+    class _StrictTokenizer:
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True,
+        ):
+            call_log.append({"add_generation_prompt": add_generation_prompt})
+            return f"BASIC::{messages[0]['content']}"
+
+    monkeypatch.setattr(
+        engine, "_load_generation_tokenizer",
+        lambda model_id: _StrictTokenizer(),
+    )
+    prompt = engine._messages_to_model_prompt(
+        [{"role": "user", "content": "haiku"}],
+        model_id="some/other-model",
+    )
+    # Two attempts: one with enable_thinking (TypeError), one without.
+    # Final assertion: the strict tokeniser was called once successfully
+    # and the prompt is the basic template.
+    assert len(call_log) == 1
+    assert call_log[0]["add_generation_prompt"] is True
+    assert prompt == "BASIC::haiku"
+
+
 def test_infer_chat_stream_normalizes_openai_decode_aliases(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     seen: dict[str, object] = {}
