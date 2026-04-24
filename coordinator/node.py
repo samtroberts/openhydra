@@ -277,10 +277,41 @@ def main() -> None:
         help=(
             "Phase 6 (true Petals topology): run as a PURE coordinator "
             "with no local peer thread. Requires --sample-on-coordinator "
-            "AND --runtime-model-id (the MLX model id used to load the "
+            "AND --runtime-model-id (the model id used to load the "
             "coordinator's standalone head weights). Use when the "
             "coordinator should orchestrate + sample but run no transformer "
-            "layers — e.g. a Mac coordinator driving GPU peers in the swarm."
+            "layers — e.g. a Mac coordinator driving GPU peers in the swarm, "
+            "or a cheap Linux coordinator sitting alongside GPU peers in a VPC."
+        ),
+    )
+    parser.add_argument(
+        "--standalone-head-backend",
+        choices=("auto", "mlx", "pytorch"),
+        default="auto",
+        help=(
+            "Backend for the pure-coordinator standalone head. "
+            "'auto' (default) prefers MLX when importable (Apple Silicon), "
+            "otherwise PyTorch. 'mlx' / 'pytorch' force a specific backend. "
+            "Linux coordinators typically want 'pytorch'."
+        ),
+    )
+    parser.add_argument(
+        "--standalone-head-device",
+        default="cpu",
+        help=(
+            "PyTorch backend only — device to place the head weights on. "
+            "Default 'cpu' (sensible for a Linux coordinator without a GPU). "
+            "Use 'cuda' / 'cuda:0' / 'mps' to place on accelerator if available."
+        ),
+    )
+    parser.add_argument(
+        "--standalone-head-dtype",
+        choices=("float32", "bfloat16", "float16"),
+        default="float32",
+        help=(
+            "PyTorch backend only — weight dtype for the standalone head. "
+            "Default 'float32' (safest for CPU). 'bfloat16' halves memory "
+            "and is typically fine for matmul accuracy on modern CPUs."
         ),
     )
     parser.add_argument("--rebalance-enabled", action="store_true", default=False,
@@ -1026,15 +1057,17 @@ def main() -> None:
                 "ring loops back among themselves and the HTTP client never "
                 "receives tokens."
             )
-        # Guardrail #2: standalone head needs an MLX HF repo id (e.g.
-        # ``mlx-community/Qwen3.5-2B-MLX-8bit``). The catalog's logical
-        # ids (e.g. ``openhydra-qwen3.5-2b``) won't load directly via
-        # ``mlx_lm.load`` — require an explicit HF-style id.
+        # Guardrail #2: standalone head needs an HF repo id (MLX or
+        # PyTorch), not one of the catalog's logical names like
+        # ``openhydra-qwen3.5-2b`` which neither mlx_lm.load nor
+        # transformers.AutoModel can resolve. Any string without a
+        # ``user/repo`` slash is rejected.
         _rmi = str(_runtime_model_id or "").strip()
         if not _rmi or "/" not in _rmi:
             parser.error(
                 "--no-local-peer requires --runtime-model-id with an "
-                "HF repo id like ``mlx-community/Qwen3.5-2B-MLX-8bit``. "
+                "HF repo id like ``Qwen/Qwen3.5-2B`` (PyTorch backend) or "
+                "``mlx-community/Qwen3.5-2B-MLX-8bit`` (MLX backend). "
                 f"Got {_rmi!r}, which is not a valid HF repo id "
                 "(missing the ``user/repo`` slash)."
             )
@@ -1045,13 +1078,23 @@ def main() -> None:
         try:
             from coordinator.standalone_head import load_standalone_head
             from coordinator.head_sampler import register_head_source
-            _standalone_head = load_standalone_head(str(_runtime_model_id))
+            _sh_backend = str(getattr(args, "standalone_head_backend", "auto") or "auto")
+            _sh_device = str(getattr(args, "standalone_head_device", "cpu") or "cpu")
+            _sh_dtype = str(getattr(args, "standalone_head_dtype", "float32") or "float32")
+            _standalone_head = load_standalone_head(
+                str(_runtime_model_id),
+                backend=_sh_backend,
+                pytorch_device=_sh_device,
+                pytorch_dtype=_sh_dtype,
+            )
             register_head_source(
                 peer_id="coordinator-standalone-head",
                 runtime=_standalone_head,
             )
             logger.info(
-                "standalone_head_registered: hf_model_id=%s vocab=%d hidden=%d tie=%s",
+                "standalone_head_registered: backend=%s hf_model_id=%s "
+                "vocab=%d hidden=%d tie=%s",
+                _standalone_head.backend,
                 _standalone_head.hf_model_id,
                 _standalone_head.vocab_size,
                 _standalone_head.hidden_size,
