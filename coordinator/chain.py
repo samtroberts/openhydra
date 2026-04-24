@@ -1269,6 +1269,36 @@ class InferenceChain:
                 stage0_total_layers=int(getattr(first_peer, "total_layers", 0)),
             ))
 
+        # ── Pre-dial all peers to warm bidirectional libp2p connections ──
+        # When sample_on_coordinator=True, the LAST peer must send a
+        # PushResult back to the coordinator. If Mac never dialed the
+        # last peer outbound, the last peer has no entry for Mac in its
+        # routing table → ``proxy_forward`` raises DialFailure.
+        # Pre-dialing here establishes Mac↔every-peer libp2p in advance.
+        # Cheap when libp2p is already connected (no-op) and short-circuits
+        # quickly when not. Skip silently on any failure — the existing
+        # send path will still attempt its own connection.
+        _p2p_pre = getattr(self, '_p2p_node', None)
+        if _p2p_pre is not None and sample_on_coordinator:
+            for _peer in self.pipeline:
+                _peer_libp2p = str(getattr(_peer, 'libp2p_peer_id', '') or '').strip()
+                if not _peer_libp2p:
+                    continue
+                try:
+                    _p2p_pre.dial_peer(_peer_libp2p)
+                    logging.info(
+                        "ring_predial: peer=%s libp2p=%s",
+                        _peer.peer_id, _peer_libp2p[:20],
+                    )
+                except Exception as _dial_exc:
+                    # Non-fatal — peer might already be connected, or the
+                    # dial is async and Rust returned immediately. The
+                    # actual ForwardRequest send below will retry.
+                    logging.debug(
+                        "ring_predial_failed: peer=%s err=%s",
+                        _peer.peer_id, _dial_exc,
+                    )
+
         # Fire-and-forget in background thread (same as run_push).
         import threading as _ring_threading
 
