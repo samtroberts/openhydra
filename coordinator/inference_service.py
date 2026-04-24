@@ -1606,13 +1606,25 @@ class InferenceService:
 
             if _ar_tokenizer is not None:
                 _ar_eos_ids, _ar_special_ids = self._collect_eos_token_ids(_ar_tokenizer)
+                _ep_preview = str(prep.effective_prompt or "")
+                logger.info(
+                    "autoregressive_sharded_prompt_debug: runtime_model=%s "
+                    "tokenizer=%s effective_prompt_len=%d head=%r eos_ids=%s",
+                    _runtime_model,
+                    getattr(_ar_tokenizer, "name_or_path", "<unknown>"),
+                    len(_ep_preview), _ep_preview[:120],
+                    sorted(_ar_eos_ids)[:5] if _ar_eos_ids else "<empty>",
+                )
                 try:
                     _ar_context_ids = [
                         int(t) for t in _ar_tokenizer.encode(
                             prep.effective_prompt, add_special_tokens=True,
                         )
                     ]
-                except Exception:
+                except Exception as _enc_exc:
+                    logger.warning(
+                        "autoregressive_sharded_encode_failed: %s", _enc_exc,
+                    )
                     _ar_context_ids = []
                 if not _ar_context_ids:
                     _ar_context_ids = [
