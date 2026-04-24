@@ -1358,6 +1358,12 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 ring_first_hop_peer_id=str(getattr(request, "ring_first_hop_peer_id", "") or ""),
                 ring_first_hop_libp2p_id=str(getattr(request, "ring_first_hop_libp2p_id", "") or ""),
                 ring_full_route=list(getattr(request, "ring_full_route", [])),
+                # Path A: carry sample_on_coordinator forward so the LAST
+                # peer skips final_norm + lm_head + sampling and routes
+                # the hidden state to the coordinator. Without this the
+                # legacy ring-loopback path fires on the last peer and
+                # the Path A code never runs.
+                sample_on_coordinator=bool(getattr(request, "sample_on_coordinator", False)),
             )
 
             # State-aware routing: ask the Rust bridge if a direct (non-relayed)
