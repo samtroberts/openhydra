@@ -121,7 +121,7 @@ python3 -m coordinator.node \
     --layer-start 0 --layer-end 12 \
     --shard-index 0 --total-shards 2 \
     --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
-    --p2p-enabled --log-level INFO
+    --p2p-enabled --push-mode --log-level INFO
 ```
 
 **Mac B (layers 12-23):**
@@ -135,8 +135,10 @@ python3 -m coordinator.node \
     --layer-start 12 --layer-end 24 \
     --shard-index 1 --total-shards 2 \
     --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
-    --p2p-enabled --log-level INFO
+    --p2p-enabled --push-mode --log-level INFO
 ```
+
+`--push-mode` enables server-to-server forwarding (peer-to-peer, skipping the coordinator round-trip). On LAN this is 2× faster than the default coordinator-round-trip mode; on cross-ISP it is essential. Every example in this README uses it.
 
 Wait for both to show `announced to Kademlia DHT (libp2p)`, then test:
 
@@ -187,6 +189,60 @@ python3 -m coordinator.node \
 ```
 
 Replace `10.0.0.1` / `10.0.0.2` with your own internal IPs. For genuinely public reachable peers (home LAN with port-forwarding, dedicated servers with public IPs), the same pattern works with public IPs. If peers can't reach each other directly, omit these flags and libp2p will fall back to Circuit Relay automatically.
+
+---
+
+## Run Sharded Inference — Cross-ISP Mac + GPU (heterogeneous)
+
+Split Qwen 3.5 2B across a Mac (MLX, Apple Silicon) at home and a cloud GPU (PyTorch / CUDA) anywhere on the public internet. No VPN, no port forwarding, no WireGuard. libp2p Circuit Relay handles the NAT traversal via the three Linode bootstrap nodes.
+
+**Mac (stage 0, layers 0-11, MLX on Metal):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id mac-peer \
+    --model-id openhydra-qwen3.5-2b \
+    --runtime-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
+    --runtime-backend mlx \
+    --layer-start 0 --layer-end 12 \
+    --shard-index 0 --total-shards 2 \
+    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --p2p-enabled --push-mode --log-level INFO
+```
+
+**Cloud GPU (stage 1, layers 12-23, PyTorch on CUDA):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id gpu-peer \
+    --model-id openhydra-qwen3.5-2b \
+    --runtime-model-id Qwen/Qwen3.5-2B \
+    --runtime-backend pytorch \
+    --layer-start 12 --layer-end 24 \
+    --shard-index 1 --total-shards 2 \
+    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --p2p-enabled --push-mode --log-level INFO
+```
+
+No `--advertise-host` / `--p2p-bootstrap` on either side — the peers can't reach each other directly (different ISPs), so libp2p falls back to Circuit Relay via the Linode bootstraps automatically. DCUtR will try to hole-punch a direct connection; if the NAT pair is symmetric it stays on the relay.
+
+**Tokenizer alignment is automatic.** The Mac's MLX runtime detects that `mlx-community/Qwen3.5-2B-MLX-8bit` derives from `Qwen/Qwen3.5-2B` and transparently overrides the MLX tokenizer with the HF tokenizer so integer token ids match across the MLX↔PyTorch boundary (log line: `mlx_runtime: tokenizer overridden mlx=... -> hf=Qwen/Qwen3.5-2B (vocab=248044)`). No flags needed.
+
+Wait for both to log `announced to Kademlia DHT (libp2p)`, then test from the Mac:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "openhydra-qwen3.5-2b",
+    "messages": [{"role":"user","content":"Write a three-sentence haiku-style poem about a mountain at dawn."}],
+    "max_tokens": 64,
+    "temperature": 0.0,
+    "seed": 42
+  }' | python3 -m json.tool
+```
+
+Expected output (greedy / seed=42): a short haiku about a mountain, terminated on EOS. Benchmark (verified 2026-04-24): **`tps=0.93`** on 20 ring tokens via Circuit Relay. Relay RTT dominates — for the 3.76 TPS all-LAN topology, see "Run 3-Node True Petals" below.
 
 ---
 
