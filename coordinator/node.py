@@ -270,6 +270,19 @@ def main() -> None:
             "Default off — reversible; opt in per run."
         ),
     )
+    parser.add_argument(
+        "--no-local-peer",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase 6 (true Petals topology): run as a PURE coordinator "
+            "with no local peer thread. Requires --sample-on-coordinator "
+            "AND --runtime-model-id (the MLX model id used to load the "
+            "coordinator's standalone head weights). Use when the "
+            "coordinator should orchestrate + sample but run no transformer "
+            "layers — e.g. a Mac coordinator driving GPU peers in the swarm."
+        ),
+    )
     parser.add_argument("--rebalance-enabled", action="store_true", default=False,
                         help="Enable autonomous dynamic rebalancing (peers decide their own layers).")
     parser.add_argument("--rebalance-interval", type=int, default=6,
@@ -995,69 +1008,145 @@ def main() -> None:
         _capacity_snapshot_ref = None
         _negotiation_loop_factory_fn = None
 
-    # Start the peer gRPC server in a background daemon thread.
-    # daemon=True ensures it is reaped automatically when the main thread exits
-    # (the coordinator's SIGTERM handler on the main thread handles clean shutdown).
-    peer_thread = threading.Thread(
-        target=peer_server.serve,
-        kwargs={
-            "host": "0.0.0.0",
-            "port": args.grpc_port,
-            "peer_id": args.peer_id,
-            "model_id": args.model_id,
-            "runtime_model_id": _runtime_model_id,
-            "hf_model_id": _hf_model_id,
-            "mlx_force_hf_tokenizer": bool(getattr(args, "mlx_force_hf_tokenizer", True)),
-            "tokenizer_vocab_guard": bool(getattr(args, "tokenizer_vocab_guard", True)),
-            "shard_index": args.shard_index,
-            "total_shards": args.total_shards,
-            "expert_layer_indices": list(_explicit_layer_indices),
-            "dht_urls": dht_urls,
-            "daemon_mode": args.daemon_mode,
-            "runtime_backend": args.runtime_backend,
-            "advertise_host": args.advertise_host,
-            "identity_path": args.identity_path,
-            "mlx_eval_timeout_s": args.mlx_eval_timeout,
-            "rebalance_enabled": bool(getattr(args, "rebalance_enabled", False)),
-            "rebalance_interval": int(getattr(args, "rebalance_interval", 6)),
-            "rebalance_min_improvement": float(getattr(args, "rebalance_min_improvement", 1.15)),
-            "rebalance_cooldown_s": float(getattr(args, "rebalance_cooldown", 300)),
-            "p2p_node": _p2p_node,
-            # Phase 3 zero-config: capacity snapshot attached to every
-            # DHT announcement so the rest of the swarm sees this node's
-            # per-model capacity without a follow-up probe.
-            "capacity_json": _capacity_json_str,
-            "capacity_schema_version": _capacity_schema_version,
-            # Phase 4 zero-config: continuous re-negotiation plumbing.
-            # ``capacity_snapshot_ref`` is updated every tick by the
-            # NegotiationLoop; the announce loop reads from it on each
-            # heartbeat so fresh capacity + assignment propagate without
-            # any additional RPCs.
-            "capacity_snapshot_ref": _capacity_snapshot_ref,
-            "negotiation_loop_factory": _negotiation_loop_factory_fn,
-            # Path A Phase 5: tell the local peer to load final_norm +
-            # lm_head on every shard (not just the last) so the
-            # coordinator — co-located in this same process — can borrow
-            # the head weights via HeadSampler even when the local peer
-            # is stage 0 rather than the terminal stage. Gated on the
-            # ``--sample-on-coordinator`` opt-in so default deployments
-            # see no extra memory usage.
-            "load_full_head": bool(getattr(args, "sample_on_coordinator", False)),
-            # All other peer params use peer/server.py defaults.
-        },
-        name="openhydra-peer",
-        daemon=True,
-    )
-    peer_thread.start()
-    logger.info(
-        "peer_thread_started grpc_port=%d; waiting 1s for gRPC bind", args.grpc_port,
-    )
-    time.sleep(1.0)
+    # ── Phase 6: pure-coordinator mode (no local peer thread) ───────────
+    # When ``--no-local-peer`` is set, skip the peer thread entirely and
+    # construct a StandaloneHead so the coordinator can still sample
+    # via Path A. Used for the true Petals topology: client / coordinator
+    # on a laptop, transformer layers on remote GPU peers.
+    _no_local_peer = bool(getattr(args, "no_local_peer", False))
+    _sample_on_coord = bool(getattr(args, "sample_on_coordinator", False))
+    if _no_local_peer:
+        # Guardrail #1: --no-local-peer is meaningless without --sample-on-coordinator
+        # (the coordinator would have no work to do — peers would orchestrate
+        # themselves but no one would emit tokens to the HTTP queue).
+        if not _sample_on_coord:
+            parser.error(
+                "--no-local-peer requires --sample-on-coordinator. Without "
+                "Path A enabled, the coordinator has no work to do — peer "
+                "ring loops back among themselves and the HTTP client never "
+                "receives tokens."
+            )
+        # Guardrail #2: standalone head needs an MLX HF repo id (e.g.
+        # ``mlx-community/Qwen3.5-2B-MLX-8bit``). The catalog's logical
+        # ids (e.g. ``openhydra-qwen3.5-2b``) won't load directly via
+        # ``mlx_lm.load`` — require an explicit HF-style id.
+        _rmi = str(_runtime_model_id or "").strip()
+        if not _rmi or "/" not in _rmi:
+            parser.error(
+                "--no-local-peer requires --runtime-model-id with an "
+                "HF repo id like ``mlx-community/Qwen3.5-2B-MLX-8bit``. "
+                f"Got {_rmi!r}, which is not a valid HF repo id "
+                "(missing the ``user/repo`` slash)."
+            )
+        logger.info(
+            "pure_coordinator_mode: --no-local-peer set → skipping peer "
+            "thread; loading standalone head from %s", _runtime_model_id,
+        )
+        try:
+            from coordinator.standalone_head import load_standalone_head
+            from coordinator.head_sampler import register_head_source
+            _standalone_head = load_standalone_head(str(_runtime_model_id))
+            register_head_source(
+                peer_id="coordinator-standalone-head",
+                runtime=_standalone_head,
+            )
+            logger.info(
+                "standalone_head_registered: hf_model_id=%s vocab=%d hidden=%d tie=%s",
+                _standalone_head.hf_model_id,
+                _standalone_head.vocab_size,
+                _standalone_head.hidden_size,
+                _standalone_head.tie_word_embeddings,
+            )
+        except Exception as exc:
+            logger.error(
+                "standalone_head_load_failed: %s — pure-coordinator mode "
+                "cannot serve requests",
+                exc,
+            )
+            raise
+        peer_thread = None  # No local peer thread in pure-coordinator mode.
+    else:
+        # Start the peer gRPC server in a background daemon thread.
+        # daemon=True ensures it is reaped automatically when the main thread exits
+        # (the coordinator's SIGTERM handler on the main thread handles clean shutdown).
+        peer_thread = threading.Thread(
+            target=peer_server.serve,
+            kwargs={
+                "host": "0.0.0.0",
+                "port": args.grpc_port,
+                "peer_id": args.peer_id,
+                "model_id": args.model_id,
+                "runtime_model_id": _runtime_model_id,
+                "hf_model_id": _hf_model_id,
+                "mlx_force_hf_tokenizer": bool(getattr(args, "mlx_force_hf_tokenizer", True)),
+                "tokenizer_vocab_guard": bool(getattr(args, "tokenizer_vocab_guard", True)),
+                "shard_index": args.shard_index,
+                "total_shards": args.total_shards,
+                "expert_layer_indices": list(_explicit_layer_indices),
+                "dht_urls": dht_urls,
+                "daemon_mode": args.daemon_mode,
+                "runtime_backend": args.runtime_backend,
+                "advertise_host": args.advertise_host,
+                "identity_path": args.identity_path,
+                "mlx_eval_timeout_s": args.mlx_eval_timeout,
+                "rebalance_enabled": bool(getattr(args, "rebalance_enabled", False)),
+                "rebalance_interval": int(getattr(args, "rebalance_interval", 6)),
+                "rebalance_min_improvement": float(getattr(args, "rebalance_min_improvement", 1.15)),
+                "rebalance_cooldown_s": float(getattr(args, "rebalance_cooldown", 300)),
+                "p2p_node": _p2p_node,
+                # Phase 3 zero-config: capacity snapshot attached to every
+                # DHT announcement so the rest of the swarm sees this node's
+                # per-model capacity without a follow-up probe.
+                "capacity_json": _capacity_json_str,
+                "capacity_schema_version": _capacity_schema_version,
+                # Phase 4 zero-config: continuous re-negotiation plumbing.
+                # ``capacity_snapshot_ref`` is updated every tick by the
+                # NegotiationLoop; the announce loop reads from it on each
+                # heartbeat so fresh capacity + assignment propagate without
+                # any additional RPCs.
+                "capacity_snapshot_ref": _capacity_snapshot_ref,
+                "negotiation_loop_factory": _negotiation_loop_factory_fn,
+                # Path A Phase 5: tell the local peer to load final_norm +
+                # lm_head on every shard (not just the last) so the
+                # coordinator — co-located in this same process — can borrow
+                # the head weights via HeadSampler even when the local peer
+                # is stage 0 rather than the terminal stage. Gated on the
+                # ``--sample-on-coordinator`` opt-in so default deployments
+                # see no extra memory usage.
+                "load_full_head": bool(getattr(args, "sample_on_coordinator", False)),
+                # All other peer params use peer/server.py defaults.
+            },
+            name="openhydra-peer",
+            daemon=True,
+        )
+        peer_thread.start()
+        logger.info(
+            "peer_thread_started grpc_port=%d; waiting 1s for gRPC bind", args.grpc_port,
+        )
+        time.sleep(1.0)
 
     # Auto-generate a local peers config so the coordinator can always find
     # its co-located peer — no --peers-config needed for single-node usage.
+    # In pure-coordinator mode there's NO local peer to register; the
+    # coordinator relies entirely on remote peers discovered via the DHT.
+    # An empty peers config triggers the existing DHT-discovery path in
+    # the chain builder.
     peers_config_path = args.peers_config
-    if not peers_config_path:
+    if not peers_config_path and _no_local_peer:
+        # Write an empty list so downstream code that opens peers_config
+        # finds a parseable file. Discovery happens entirely via DHT.
+        _tmp_empty = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="openhydra_peers_pure_",
+            delete=False,
+        )
+        json.dump([], _tmp_empty)
+        _tmp_empty.close()
+        peers_config_path = _tmp_empty.name
+        logger.info(
+            "auto_peers_config_pure_coordinator: %s (empty — DHT discovery only)",
+            peers_config_path,
+        )
+    elif not peers_config_path:
         _local_peer = [{
             "peer_id": args.peer_id,
             "host": "127.0.0.1",
