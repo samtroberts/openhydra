@@ -419,6 +419,42 @@ impl PyP2PNode {
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 
+    /// Explicitly populate Kademlia's routing table with a known
+    /// ``(peer_id, multiaddr)`` pair so the next ``dial_peer`` /
+    /// ``proxy_forward`` can find a route.
+    ///
+    /// The ``discover()`` Kademlia walk returns ``DiscoveredPeer`` records
+    /// with ``relay_address`` strings up to Python, but the Swarm's
+    /// per-peer address book is only auto-populated for peers that have
+    /// already been dialed. For peers we learn about second-hand
+    /// (e.g. via ``--peers-config`` or via a relay record pushed through
+    /// the HTTP DHT), Python must feed the addresses back into Kademlia
+    /// explicitly.
+    ///
+    /// Args:
+    ///     peer_id: the libp2p peer id as a base-58 string.
+    ///     multiaddr: a full multiaddr string, e.g.
+    ///         ``"/ip4/45.79.190.172/tcp/4001/p2p/12D3KooW.../p2p-circuit/p2p/12D3KooW..."``
+    ///         for a relayed address, or ``"/ip4/10.192.11.74/tcp/4001"``
+    ///         for a LAN-direct address.
+    ///
+    /// Raises ``PyRuntimeError`` on parse failure. Returns ``None`` on
+    /// success — Kademlia's ``add_address`` is internally idempotent so
+    /// repeat calls are harmless.
+    fn add_address(&self, py: Python<'_>, peer_id: String, multiaddr: String) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::AddAddress {
+                peer_id,
+                multiaddr,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// Resolve a reachable address for a peer (direct host:port or relay multiaddr).
     fn resolve_address(&self, py: Python<'_>, peer_id: String) -> PyResult<String> {
         let inner = self.require_started()?;
