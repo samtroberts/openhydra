@@ -991,7 +991,16 @@ class MLXRuntime:
             mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
             h = layer(h, mask=mask, cache=cache[i])
 
-        self._watchdog.run(mx.eval, h)
+        # Phase 2a: drop the post-shard ``mx.eval(h)`` fence. MLX's
+        # lazy graph can carry the full shard's work through to the
+        # serialise boundary (``_hidden_to_payload`` / ``_hidden_to_packed_bytes``,
+        # both of which already call ``mx.eval`` internally). Eliminating
+        # this intermediate fence lets the layer compute pipeline freely
+        # with the next-token transmit on the upstream gRPC handler
+        # thread — the core of the async-pipeline win on MLX peers.
+        # Last-shard sample path (below) still calls ``mx.eval(logits)``
+        # via the watchdog because we materialise logits before
+        # ``_sample_from_logits``; that fence stays.
 
         # ── Store KV cache ─────────────────────────────────────────
         if session_id and kv_store_activation:
