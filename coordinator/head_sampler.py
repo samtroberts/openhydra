@@ -198,6 +198,62 @@ def clear_head_source() -> None:
 # carries in ``final_callback_request_id`` via the PushResult envelope.
 
 
+# ── Phase 2a: per-slot state ────────────────────────────────────────────
+
+
+# Slot lifecycle states. The compound transition (state mutation +
+# in-flight count check + next-slot reservation) MUST run under
+# ``RingSession.lock`` — see the docstring on ``RingSession.lock``.
+SLOT_STATE_DISPATCHED = "dispatched"        # coord fired, peer-0 not yet started
+SLOT_STATE_IN_FLIGHT_P0 = "in_flight_p0"     # peer-0 computing
+SLOT_STATE_IN_FLIGHT_P1 = "in_flight_p1"     # peer-1 computing
+SLOT_STATE_AWAITING_SAMPLE = "awaiting_sample"  # PushResult arrived, sampler running
+SLOT_STATE_SAMPLED = "sampled"               # token id assigned, slot finalised
+SLOT_STATE_COMMITTED = "committed"           # reserved for Phase 2b speculation
+SLOT_STATE_ABORTED = "aborted"               # reserved for Phase 2b rollback
+
+# Set of "in-flight" states for the depth-throttle check inside
+# _coordinator_handle_push_result. A slot counts toward the in-flight
+# budget while it's anywhere in the pipeline before final sampling.
+SLOT_STATES_IN_FLIGHT = frozenset({
+    SLOT_STATE_DISPATCHED,
+    SLOT_STATE_IN_FLIGHT_P0,
+    SLOT_STATE_IN_FLIGHT_P1,
+    SLOT_STATE_AWAITING_SAMPLE,
+})
+
+# Set of "finalised" states — the early-return idempotency check uses
+# this to drop late-arriving duplicate PushResults silently.
+SLOT_STATES_FINAL = frozenset({
+    SLOT_STATE_SAMPLED,
+    SLOT_STATE_COMMITTED,
+    SLOT_STATE_ABORTED,
+})
+
+
+@dataclass
+class SlotState:
+    """One per-token slot in a pipelined ring.
+
+    Created when the coord fires a ForwardRequest with ``slot_id=N``;
+    transitions through ``dispatched → in_flight_p0 → in_flight_p1 →
+    awaiting_sample → sampled`` as the request progresses through the
+    ring and the PushResult comes back. ``committed`` and ``aborted``
+    are reserved for Phase 2b's draft-and-verify path.
+
+    All field mutations MUST run under the parent ``RingSession.lock``.
+    """
+
+    slot_id: int
+    state: str = SLOT_STATE_DISPATCHED
+    dispatched_at_ms: float = 0.0
+    last_update_ms: float = 0.0
+    token_id: Optional[int] = None        # set after sampling
+    # Reserved for Phase 2b — the draft token stage-0 predicted before
+    # peer-1 returned its hidden state. ``None`` in Phase 2a.
+    draft_token_id: Optional[int] = None
+
+
 @dataclass
 class RingSession:
     """Per-request ring state owned by the coordinator (Path A).
@@ -233,6 +289,40 @@ class RingSession:
     stage0_layer_start: int = 0
     stage0_layer_end: int = 0
     stage0_total_layers: int = 0
+    # ── Phase 2a: pipelined ring state ─────────────────────────────
+    # ``pipeline_depth`` of 1 (default) preserves today's serial ring
+    # exactly — the slots dict stays empty, the lock is uncontended,
+    # every code site short-circuits to the legacy path. 2+ enables
+    # multiple in-flight tokens; the coord-side worker pool calls
+    # ``_coordinator_handle_push_result`` from N concurrent threads
+    # which hold ``lock`` for the compound state-transition + reinject-
+    # decision op (see plan section 6).
+    pipeline_depth: int = 1
+    slots: dict[int, SlotState] = field(default_factory=dict)
+    next_slot_id: int = 0
+    # Per-session mutex protecting the COMPOUND ops on slots /
+    # next_slot_id / ring_tokens_remaining / ring_generated_ids.
+    # Granularity rationale: per-session, not per-slot (the in-flight
+    # count iterates over all slots, so per-slot locks cannot make the
+    # read-decide-write atomic) and not global (would over-serialise
+    # independent requests on different request_ids).
+    #
+    # Lock-ordering discipline (deadlock prevention):
+    #     NEVER acquire ``_RING_SESSION_LOCK`` while holding
+    #     ``session.lock``. The reverse is fine — see the helpers
+    #     below which always release ``_RING_SESSION_LOCK`` before
+    #     returning the session object to a caller that may then
+    #     acquire ``session.lock``.
+    #
+    # ``threading.Lock`` is not pickle-safe but ``RingSession`` is
+    # process-local (lives in the in-memory ``_RING_SESSIONS`` dict),
+    # so this is fine. ``compare=False`` keeps it out of dataclass
+    # equality / repr — locks aren't comparable.
+    lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        compare=False,
+        repr=False,
+    )
 
 
 _RING_SESSIONS: dict[str, RingSession] = {}
