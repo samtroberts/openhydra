@@ -241,6 +241,7 @@ def _coordinator_proxy_handler_loop(
     *,
     stop_event: threading.Event,
     p2p_node: Any,
+    pipeline_depth: int = 1,
 ) -> None:
     """Minimal proxy handler for pure-coordinator mode (``--no-local-peer``).
 
@@ -256,6 +257,21 @@ def _coordinator_proxy_handler_loop(
         sender's proxy_forward unblocks and surfaces the mismatch in
         its own log.
 
+    Concurrency (Phase 2a):
+        Under ``pipeline_depth >= 2``, each inbound PushResult is
+        dispatched to a worker in ``ThreadPoolExecutor(max_workers=
+        max(2, pipeline_depth))`` instead of being processed in-line.
+        That way two concurrent PushResults for different slots of
+        the same ring don't queue serially behind each other's
+        ~10 ms head-sample step. The workers themselves serialise
+        the per-ring compound state-transition op via
+        ``RingSession.lock`` (see ``_coordinator_handle_push_result``).
+
+        Under ``pipeline_depth == 1`` (default) the worker pool is
+        skipped entirely and dispatch happens in-line on the polling
+        thread — byte-identical to the pre-Phase-2a single-threaded
+        loop.
+
     This is the coord-only analog of ``_proxy_handler_loop``. Without
     it, libp2p ``request_response`` times out on the inbound side
     because nothing in the Python process calls
@@ -265,71 +281,124 @@ def _coordinator_proxy_handler_loop(
     ``push_result_failed: proxy outbound: Timeout`` on the remote peer.
     """
     from peer import peer_pb2
-    from coordinator.head_sampler import (
-        get_head_sampler, get_ring_session, unregister_ring_session,
-    )
-    from coordinator.push_receiver import emit_ring_token
 
-    logging.info("coordinator_proxy_handler_loop started")
-    while not stop_event.is_set():
+    # Worker pool (Phase 2a) — only spawned when pipeline_depth >= 2.
+    # ``max(2, pipeline_depth)`` because under depth=2 two PushResults
+    # can be in flight; the +1 of headroom doesn't hurt and keeps the
+    # pool small (each worker handles a ~10 ms sample + ~30 ms libp2p
+    # fire so 2-4 workers covers any realistic depth).
+    _worker_pool: Any = None
+    if int(pipeline_depth) >= 2:
+        _worker_pool = futures.ThreadPoolExecutor(
+            max_workers=max(2, int(pipeline_depth)),
+            thread_name_prefix="oh-coord-pushresult",
+        )
+        logging.info(
+            "coordinator_proxy_handler_loop started: pipeline_depth=%d "
+            "worker_pool=%d", pipeline_depth, max(2, int(pipeline_depth)),
+        )
+    else:
+        logging.info(
+            "coordinator_proxy_handler_loop started: serial mode "
+            "(pipeline_depth=1)"
+        )
+
+    def _dispatch_push_result(req_id: str, raw: bytes) -> None:
+        """Handle one PROXY_METHOD_PUSH_RESULT message.
+
+        Runs either in-line (depth=1) or on a worker (depth>=2). The
+        worker version is what gives us the read-decide-write race
+        ``RingSession.lock`` was designed to prevent.
+        """
         try:
-            pending = p2p_node.poll_proxy_request(timeout_ms=500)
-            if pending is None:
-                continue
-            req_id, raw_bytes = pending
-            raw = bytes(raw_bytes)
+            push_resp = peer_pb2.ForwardResponse()
+            push_resp.ParseFromString(raw[1:])
+            ack = _coordinator_handle_push_result(
+                response=push_resp,
+                p2p_node=p2p_node,
+            )
+            p2p_node.respond_proxy(
+                request_id=req_id,
+                data=PROXY_METHOD_PUSH_RESULT + ack.SerializeToString(),
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            import traceback as _tb
+            logging.warning(
+                "coord_proxy_worker_failed: req=%s err=%s\n%s",
+                req_id, exc, _tb.format_exc(),
+            )
             try:
-                if raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
-                    push_resp = peer_pb2.ForwardResponse()
-                    push_resp.ParseFromString(raw[1:])
-                    # Process inline (mirrors PeerService.PushResult logic
-                    # for the is_hidden_state branch). Respond with a
-                    # minimal PushAck so the sender's RPC unblocks.
-                    ack = _coordinator_handle_push_result(
-                        response=push_resp,
-                        p2p_node=p2p_node,
-                    )
-                    p2p_node.respond_proxy(
-                        request_id=req_id,
-                        data=PROXY_METHOD_PUSH_RESULT + ack.SerializeToString(),
-                    )
-                else:
-                    # Unknown method in pure-coord mode — the coordinator
-                    # doesn't serve Forward() (no peer). Reply with a
-                    # small error and move on.
-                    err = peer_pb2.PushAck(
-                        request_id="",
-                        ok=False,
-                        error="pure_coordinator_unsupported_proxy_method",
-                    )
-                    logging.warning(
-                        "coord_proxy_unsupported_method: byte=%s req=%s",
-                        raw[0:1].hex() if raw else "empty", req_id,
-                    )
-                    p2p_node.respond_proxy(
-                        request_id=req_id,
-                        data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
-                    )
-            except Exception as exc:  # pragma: no cover — defensive
-                import traceback as _tb
-                logging.warning(
-                    "coord_proxy_dispatch_failed: req=%s err=%s\n%s",
-                    req_id, exc, _tb.format_exc(),
+                err = peer_pb2.PushAck(
+                    request_id="", ok=False, error=f"dispatch_failed: {exc}",
                 )
+                p2p_node.respond_proxy(
+                    request_id=req_id,
+                    data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
+                )
+            except Exception:
+                pass
+
+    try:
+        while not stop_event.is_set():
+            try:
+                pending = p2p_node.poll_proxy_request(timeout_ms=500)
+                if pending is None:
+                    continue
+                req_id, raw_bytes = pending
+                raw = bytes(raw_bytes)
                 try:
-                    err = peer_pb2.PushAck(
-                        request_id="", ok=False, error=f"dispatch_failed: {exc}",
+                    if raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
+                        # Pipelined dispatch: hand off to a worker so the
+                        # poll loop can drain the next message immediately.
+                        # Serial dispatch: process in-line, byte-identical
+                        # to pre-Phase-2a behaviour.
+                        if _worker_pool is not None:
+                            _worker_pool.submit(_dispatch_push_result, req_id, raw)
+                        else:
+                            _dispatch_push_result(req_id, raw)
+                    else:
+                        # Unknown method in pure-coord mode — the coordinator
+                        # doesn't serve Forward() (no peer). Reply with a
+                        # small error and move on.
+                        err = peer_pb2.PushAck(
+                            request_id="",
+                            ok=False,
+                            error="pure_coordinator_unsupported_proxy_method",
+                        )
+                        logging.warning(
+                            "coord_proxy_unsupported_method: byte=%s req=%s",
+                            raw[0:1].hex() if raw else "empty", req_id,
+                        )
+                        p2p_node.respond_proxy(
+                            request_id=req_id,
+                            data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
+                        )
+                except Exception as exc:  # pragma: no cover — defensive
+                    import traceback as _tb
+                    logging.warning(
+                        "coord_proxy_dispatch_failed: req=%s err=%s\n%s",
+                        req_id, exc, _tb.format_exc(),
                     )
-                    p2p_node.respond_proxy(
-                        request_id=req_id,
-                        data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
-                    )
-                except Exception:
-                    pass
-        except Exception as exc:
-            if not stop_event.is_set():
-                logging.warning("coord_proxy_poll_error: %s", exc)
-                time.sleep(1.0)
+                    try:
+                        err = peer_pb2.PushAck(
+                            request_id="", ok=False, error=f"dispatch_failed: {exc}",
+                        )
+                        p2p_node.respond_proxy(
+                            request_id=req_id,
+                            data=PROXY_METHOD_PUSH_RESULT + err.SerializeToString(),
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                if not stop_event.is_set():
+                    logging.warning("coord_proxy_poll_error: %s", exc)
+                    time.sleep(1.0)
+    finally:
+        if _worker_pool is not None:
+            try:
+                _worker_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
     logging.info("coordinator_proxy_handler_loop stopped")
 
 
@@ -345,17 +414,42 @@ def _coordinator_handle_push_result(
 
     Returns a ``PushAck`` reflecting whether the sample + re-inject
     succeeded.
+
+    Concurrency model (Phase 2a):
+        Called from N concurrent worker threads under
+        ``pipeline_depth >= 2`` (the coord-side proxy handler pool
+        dispatches each inbound PushResult to a fresh worker so two
+        slots can be sampled in parallel).
+
+        The compound op
+            (state transition + token append + remaining decrement +
+             EOS check + in-flight count + next_slot_id reservation)
+        runs under ``session.lock`` to keep it atomic. The fire-and-
+        forget re-inject (a slow ~20-50 ms libp2p proxy_forward) and
+        the ``emit_ring_token`` queue write happen AFTER lock release
+        so they never serialise concurrent threads on different slots
+        of the same ring. Idempotent on duplicate PushResults — late
+        arrivals for already-sampled slots short-circuit silently.
+
+        Under ``pipeline_depth == 1`` (default) the lock is acquired
+        but uncontended (~10 ns); the slots dict stays empty (legacy
+        path tracks no per-slot state); behaviour is byte-identical
+        to the pre-Phase-2a serial ring.
     """
     from peer import peer_pb2
     from coordinator.head_sampler import (
         get_head_sampler, get_ring_session, unregister_ring_session,
+        SlotState,
+        SLOT_STATE_AWAITING_SAMPLE, SLOT_STATE_SAMPLED,
+        SLOT_STATES_FINAL, SLOT_STATES_IN_FLIGHT,
     )
     from coordinator.push_receiver import emit_ring_token
 
     _is_hidden = bool(getattr(response, "is_hidden_state", False))
+    _slot_id = int(getattr(response, "slot_id", 0) or 0)
     logging.info(
-        "coord_push_result_received: req=%s is_hidden_state=%s from=%s",
-        response.request_id, _is_hidden, response.peer_id,
+        "coord_push_result_received: req=%s slot=%d is_hidden_state=%s from=%s",
+        response.request_id, _slot_id, _is_hidden, response.peer_id,
     )
     if not _is_hidden:
         # Pure-coord mode only handles hidden-state responses. A
@@ -385,6 +479,22 @@ def _coordinator_handle_push_result(
             error="no_ring_session_registered",
         )
 
+    # ── Pipelined-mode idempotency check (no-op when pipeline_depth == 1) ──
+    # Late-arriving / duplicate PushResults for an already-sampled slot
+    # are dropped silently. Done OUTSIDE the network/sampler work so a
+    # duplicate doesn't waste a head-matmul cycle.
+    if session.pipeline_depth >= 2 and _slot_id in session.slots:
+        with session.lock:
+            _existing = session.slots.get(_slot_id)
+            if _existing is not None and _existing.state in SLOT_STATES_FINAL:
+                logging.info(
+                    "coord_push_result_duplicate_dropped: req=%s slot=%d state=%s",
+                    response.request_id, _slot_id, _existing.state,
+                )
+                return peer_pb2.PushAck(
+                    request_id=response.request_id, ok=True, error="",
+                )
+
     _packed = bytes(getattr(response, "activation_packed", b"") or b"")
     _activation_list: list[float] | None = None
     if not _packed:
@@ -395,6 +505,12 @@ def _coordinator_handle_push_result(
                 error="empty_hidden_state",
             )
 
+    # ── Sampler runs OUTSIDE session.lock ───────────────────────────
+    # Sampling on coord CPU is ~10 ms (norm + lm_head + softmax + arg-
+    # max). Holding ``session.lock`` here would serialise all worker
+    # threads sampling for the SAME session, defeating the point of
+    # the worker pool. The sampler is read-only on session state
+    # (``session.decode`` is immutable after registration).
     try:
         token_id = int(sampler.sample(
             _activation_list if _activation_list is not None else [],
@@ -404,8 +520,8 @@ def _coordinator_handle_push_result(
     except Exception as exc:
         import traceback as _tb
         logging.error(
-            "coord_push_result_sample_failed: req=%s err=%s\n%s",
-            response.request_id, exc, _tb.format_exc(),
+            "coord_push_result_sample_failed: req=%s slot=%d err=%s\n%s",
+            response.request_id, _slot_id, exc, _tb.format_exc(),
         )
         emit_ring_token(session.callback_request_id, None)
         unregister_ring_session(response.request_id)
@@ -414,65 +530,190 @@ def _coordinator_handle_push_result(
             error=f"sample_failed:{exc}",
         )
 
-    session.ring_generated_ids.append(token_id)
-    session.ring_tokens_remaining = max(0, session.ring_tokens_remaining - 1)
+    # ── ATOMIC: state mutation + termination check + reinject reservation ──
+    # Decide-then-act: under the lock we (a) record the sampled token,
+    # (b) check termination, (c) compute in-flight count, (d) reserve
+    # the next slot_id if we're going to fire. Network ops + queue
+    # writes happen AFTER releasing the lock, taking only the small
+    # ``reinject_args`` snapshot the closure needs.
+    _now_ms = time.monotonic() * 1000.0
+
+    with session.lock:
+        # Slot bookkeeping (skipped when pipeline_depth == 1 to keep
+        # the legacy path byte-identical).
+        if session.pipeline_depth >= 2:
+            slot = session.slots.get(_slot_id)
+            if slot is None:
+                # PushResult arrived for an unknown slot — could happen if
+                # the initial fire never registered (race during first
+                # send) or if the proto field defaulted to 0 on a peer
+                # that didn't propagate it. Fall back to creating an
+                # implicit slot rather than crashing; logged for diagnosis.
+                slot = SlotState(
+                    slot_id=_slot_id,
+                    state=SLOT_STATE_AWAITING_SAMPLE,
+                    dispatched_at_ms=_now_ms,
+                    last_update_ms=_now_ms,
+                )
+                session.slots[_slot_id] = slot
+                logging.warning(
+                    "coord_push_result_implicit_slot: req=%s slot=%d "
+                    "(no prior dispatch record — backfilled)",
+                    response.request_id, _slot_id,
+                )
+            elif slot.state in SLOT_STATES_FINAL:
+                # Race: another worker finalised this slot between the
+                # idempotency check above and lock acquisition. Drop.
+                logging.info(
+                    "coord_push_result_duplicate_inside_lock: req=%s slot=%d "
+                    "state=%s", response.request_id, _slot_id, slot.state,
+                )
+                return peer_pb2.PushAck(
+                    request_id=response.request_id, ok=True, error="",
+                )
+            slot.state = SLOT_STATE_SAMPLED
+            slot.token_id = token_id
+            slot.last_update_ms = _now_ms
+
+        session.ring_generated_ids.append(token_id)
+        session.ring_tokens_remaining = max(0, session.ring_tokens_remaining - 1)
+
+        # Termination INSIDE the lock so two threads can't both decide
+        # "remaining > 0, fire next" when remaining == 1.
+        _is_eos = token_id in session.ring_eos_ids
+        is_done = (session.ring_tokens_remaining <= 0) or _is_eos
+
+        # In-flight count INSIDE the lock — sees the just-recorded
+        # state transition above so this slot isn't double-counted as
+        # in-flight.
+        if session.pipeline_depth >= 2:
+            in_flight = sum(
+                1 for s in session.slots.values()
+                if s.state in SLOT_STATES_IN_FLIGHT
+            )
+            fire_next = (not is_done) and (in_flight < session.pipeline_depth)
+        else:
+            # Serial mode — fire iff not done.
+            fire_next = not is_done
+            in_flight = 0  # for logging only
+
+        # Reserve next slot_id INSIDE the lock so no two threads claim
+        # the same id. The reinject ITSELF fires after lock release.
+        next_slot_id_reserved: Optional[int] = None
+        if fire_next and session.pipeline_depth >= 2:
+            next_slot_id_reserved = session.next_slot_id
+            session.next_slot_id += 1
+            session.slots[next_slot_id_reserved] = SlotState(
+                slot_id=next_slot_id_reserved,
+                state="dispatched",  # SLOT_STATE_DISPATCHED
+                dispatched_at_ms=_now_ms,
+                last_update_ms=_now_ms,
+            )
+
+        # Snapshot the few fields the reinject closure needs so the
+        # closure can run after lock release. The fields are immutable
+        # after RingSession construction (route, callback ids, decode
+        # config) OR are intentionally captured-by-value here
+        # (ring_tokens_remaining, ring_generated_ids).
+        if fire_next:
+            reinject_snapshot = {
+                "request_id": session.request_id,
+                "token_id": token_id,
+                "next_slot_id": next_slot_id_reserved if next_slot_id_reserved is not None else 0,
+                "pipeline_depth": session.pipeline_depth,
+                "total_stages": int(session.total_stages),
+                "kv_session_id": session.kv_session_id,
+                "decode": session.decode,
+                "ring_tokens_remaining": int(session.ring_tokens_remaining),
+                "ring_generated_ids": list(session.ring_generated_ids),
+                "ring_eos_ids": list(session.ring_eos_ids),
+                "ring_first_hop_address": session.ring_first_hop_address,
+                "ring_first_hop_peer_id": session.ring_first_hop_peer_id,
+                "ring_first_hop_libp2p_id": session.ring_first_hop_libp2p_id,
+                "ring_full_route": list(session.ring_full_route),
+                "final_callback_address": session.final_callback_address,
+                "callback_request_id": session.callback_request_id,
+                "final_callback_libp2p_peer_id": session.final_callback_libp2p_peer_id,
+                "stage0_layer_start": int(session.stage0_layer_start),
+                "stage0_layer_end": int(session.stage0_layer_end),
+                "stage0_total_layers": int(session.stage0_total_layers),
+            }
+        else:
+            reinject_snapshot = None
+    # ── lock released ──────────────────────────────────────────────
+
+    # Network ops + queue writes happen WITHOUT the lock. emit_ring_token
+    # is thread-safe (queue.Queue) and is_done check above already
+    # serialised termination so two threads can't both emit a sentinel.
     emit_ring_token(session.callback_request_id, token_id)
     logging.info(
-        "coord_ring_sampled: req=%s token=%d remaining=%d",
-        response.request_id, token_id, session.ring_tokens_remaining,
+        "coord_ring_sampled: req=%s slot=%d token=%d remaining=%d in_flight=%d",
+        response.request_id, _slot_id, token_id,
+        session.ring_tokens_remaining, in_flight,
     )
 
-    _is_eos = token_id in session.ring_eos_ids
-    if session.ring_tokens_remaining <= 0 or _is_eos:
+    if is_done:
         emit_ring_token(session.callback_request_id, None)
         unregister_ring_session(response.request_id)
         return peer_pb2.PushAck(
             request_id=response.request_id, ok=True, error="",
         )
 
-    # Re-inject: build a new stage-0 ForwardRequest with the sampled
-    # token as activation. Fire-and-forget via libp2p to the first hop.
+    if reinject_snapshot is None:
+        # Pipeline depth saturated — another in-flight slot will close
+        # the loop. Do not fire here.
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=True, error="",
+        )
+
+    # ── Re-inject: build + fire-and-forget the next stage-0 request ──
     try:
-        route = list(session.ring_full_route)
+        snap = reinject_snapshot
+        route = snap["ring_full_route"]
         _next_next = route[1].address if len(route) > 1 else ""
         _next_next_id = route[1].peer_id if len(route) > 1 else ""
         req = peer_pb2.ForwardRequest(
-            request_id=session.request_id,
-            activation=[float(token_id)],
+            request_id=snap["request_id"],
+            activation=[float(snap["token_id"])],
             stage_index=0,
-            total_stages=int(session.total_stages),
+            total_stages=snap["total_stages"],
             max_tokens=1,
-            kv_session_id=session.kv_session_id,
+            kv_session_id=snap["kv_session_id"],
             kv_store_activation=True,
             kv_use_cached_activation=True,
-            decode_do_sample=session.decode.do_sample,
-            decode_temperature=float(session.decode.temperature or 0.0),
-            decode_top_p=float(session.decode.top_p or 0.0),
-            decode_top_k=int(session.decode.top_k or 0),
-            decode_seed=int(session.decode.seed or 0),
-            shard_layer_start=int(session.stage0_layer_start),
-            shard_layer_end=int(session.stage0_layer_end),
-            shard_total_layers=int(session.stage0_total_layers),
+            decode_do_sample=snap["decode"].do_sample,
+            decode_temperature=float(snap["decode"].temperature or 0.0),
+            decode_top_p=float(snap["decode"].top_p or 0.0),
+            decode_top_k=int(snap["decode"].top_k or 0),
+            decode_seed=int(snap["decode"].seed or 0),
+            shard_layer_start=snap["stage0_layer_start"],
+            shard_layer_end=snap["stage0_layer_end"],
+            shard_total_layers=snap["stage0_total_layers"],
             push_mode=True,
             ring_mode=True,
             sample_on_coordinator=True,
-            ring_tokens_remaining=int(session.ring_tokens_remaining),
-            ring_generated_ids=list(session.ring_generated_ids),
-            ring_eos_ids=list(session.ring_eos_ids),
-            ring_first_hop_address=session.ring_first_hop_address,
-            ring_first_hop_peer_id=session.ring_first_hop_peer_id,
-            ring_first_hop_libp2p_id=session.ring_first_hop_libp2p_id,
+            ring_tokens_remaining=snap["ring_tokens_remaining"],
+            ring_generated_ids=snap["ring_generated_ids"],
+            ring_eos_ids=snap["ring_eos_ids"],
+            ring_first_hop_address=snap["ring_first_hop_address"],
+            ring_first_hop_peer_id=snap["ring_first_hop_peer_id"],
+            ring_first_hop_libp2p_id=snap["ring_first_hop_libp2p_id"],
             ring_full_route=route,
             next_hop_address=_next_next,
             next_hop_peer_id=_next_next_id,
-            final_callback_address=session.final_callback_address,
-            final_callback_request_id=session.callback_request_id,
-            final_callback_libp2p_peer_id=session.final_callback_libp2p_peer_id,
+            final_callback_address=snap["final_callback_address"],
+            final_callback_request_id=snap["callback_request_id"],
+            final_callback_libp2p_peer_id=snap["final_callback_libp2p_peer_id"],
             remaining_route=route[1:],
+            slot_id=snap["next_slot_id"],
+            pipeline_depth=snap["pipeline_depth"],
         )
-        _first_libp2p = session.ring_first_hop_libp2p_id
+        _first_libp2p = snap["ring_first_hop_libp2p_id"]
+        _req_id_log = snap["request_id"]
+        _slot_id_log = snap["next_slot_id"]
 
-        def _fire(_rreq=req, _libp2p=_first_libp2p):
+        def _fire(_rreq=req, _libp2p=_first_libp2p,
+                  _rid=_req_id_log, _sid=_slot_id_log):
             try:
                 if p2p_node is not None and _libp2p:
                     p2p_node.proxy_forward(
@@ -480,17 +721,17 @@ def _coordinator_handle_push_result(
                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                     )
                     logging.info(
-                        "coord_reinject_done: req=%s via_relay",
-                        _rreq.request_id,
+                        "coord_reinject_done: req=%s slot=%d via_relay",
+                        _rid, _sid,
                     )
                 else:
                     logging.error(
-                        "coord_reinject_no_route: req=%s", _rreq.request_id,
+                        "coord_reinject_no_route: req=%s slot=%d", _rid, _sid,
                     )
             except Exception as exc:
                 logging.error(
-                    "coord_reinject_crash: req=%s err=%s",
-                    _rreq.request_id, exc, exc_info=True,
+                    "coord_reinject_crash: req=%s slot=%d err=%s",
+                    _rid, _sid, exc, exc_info=True,
                 )
 
         threading.Thread(target=_fire, daemon=True).start()
