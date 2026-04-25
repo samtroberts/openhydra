@@ -1151,6 +1151,7 @@ class InferenceChain:
         callback_address: str = "",
         request_id: str | None = None,
         sample_on_coordinator: bool = False,
+        pipeline_depth: int = 1,
         **decode_controls,
     ) -> None:
         """Kick off a ring autoregressive push — fire-and-forget.
@@ -1224,6 +1225,8 @@ class InferenceChain:
             ),
             remaining_route=route_hops[1:],
             sample_on_coordinator=bool(sample_on_coordinator),
+            slot_id=0,
+            pipeline_depth=max(1, int(pipeline_depth)),
         )
 
         # Path A (client-terminated pipeline): register the ring session so
@@ -1232,10 +1235,14 @@ class InferenceChain:
         # avoid a race where the last peer's PushResult arrives before the
         # session is stored (possible on low-latency LAN topologies).
         if sample_on_coordinator:
+            import time as _ring_time
             from coordinator.head_sampler import (
-                RingSession, DecodeConfig, register_ring_session,
+                RingSession, SlotState, DecodeConfig, register_ring_session,
+                SLOT_STATE_DISPATCHED,
             )
-            register_ring_session(RingSession(
+            _depth = max(1, int(pipeline_depth))
+            _now_ms = _ring_time.monotonic() * 1000.0
+            _session = RingSession(
                 request_id=rid,
                 ring_first_hop_address=f"{first_peer.host}:{first_peer.port}",
                 ring_first_hop_peer_id=first_peer.peer_id,
@@ -1267,7 +1274,21 @@ class InferenceChain:
                 stage0_layer_start=int(getattr(first_peer, "layer_start", 0)),
                 stage0_layer_end=int(getattr(first_peer, "layer_end", 0)),
                 stage0_total_layers=int(getattr(first_peer, "total_layers", 0)),
-            ))
+                pipeline_depth=_depth,
+            )
+            # Phase 2a: when pipeline_depth >= 2, seed slot 0 + bump
+            # next_slot_id to 1 so the first PushResult lookup finds
+            # the dispatched record. With depth=1 the slots dict stays
+            # empty (legacy fast path).
+            if _depth >= 2:
+                _session.slots[0] = SlotState(
+                    slot_id=0,
+                    state=SLOT_STATE_DISPATCHED,
+                    dispatched_at_ms=_now_ms,
+                    last_update_ms=_now_ms,
+                )
+                _session.next_slot_id = 1
+            register_ring_session(_session)
 
         # ── Pre-dial all peers to warm bidirectional libp2p connections ──
         # When sample_on_coordinator=True, the LAST peer must send a

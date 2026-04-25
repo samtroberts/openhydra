@@ -285,6 +285,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--pipeline-depth",
+        type=int,
+        default=1,
+        help=(
+            "Phase 2a (async pipeline scaffolding): number of in-flight ring "
+            "tokens. Default 1 = today's serial ring (compute, transmit, "
+            "sample, re-inject all in lockstep). 2+ activates the coord-side "
+            "PushResult worker pool, per-slot RingSession state tracking, "
+            "and (in upcoming peer-side commits) async compute/transmit "
+            "overlap. Recommended upper bound: 2 * (number of pipeline "
+            "stages). Reversible — depth=1 short-circuits every new code "
+            "path to the legacy serial behaviour."
+        ),
+    )
+    parser.add_argument(
         "--standalone-head-backend",
         choices=("auto", "mlx", "pytorch"),
         default="auto",
@@ -1116,11 +1131,13 @@ def main() -> None:
         if _p2p_node is not None:
             from peer.server import _coordinator_proxy_handler_loop
             _coord_proxy_stop = threading.Event()
+            _coord_pipeline_depth = int(getattr(args, "pipeline_depth", 1) or 1)
             _coord_proxy_thread = threading.Thread(
                 target=_coordinator_proxy_handler_loop,
                 kwargs={
                     "stop_event": _coord_proxy_stop,
                     "p2p_node": _p2p_node,
+                    "pipeline_depth": _coord_pipeline_depth,
                 },
                 name="openhydra-coord-proxy",
                 daemon=True,
@@ -1128,7 +1145,8 @@ def main() -> None:
             _coord_proxy_thread.start()
             logger.info(
                 "coordinator_proxy_handler_started: handles "
-                "PROXY_METHOD_PUSH_RESULT for pure-coordinator Path A"
+                "PROXY_METHOD_PUSH_RESULT for pure-coordinator Path A "
+                "(pipeline_depth=%d)", _coord_pipeline_depth,
             )
         # Start a minimal gRPC server on args.grpc_port that accepts ONLY
         # PushResult. LAN-reachable last peers (e.g. GPU2 in the all-LAN
@@ -1349,6 +1367,7 @@ def main() -> None:
         push_callback_address=str(getattr(args, "push_callback_address", "") or "")
             or _push_callback_addr,
         sample_on_coordinator=bool(getattr(args, "sample_on_coordinator", False)),
+        pipeline_depth=max(1, int(getattr(args, "pipeline_depth", 1) or 1)),
     )
 
     # Zero-config bootstrap Phase 1: forward identity + network metadata to
