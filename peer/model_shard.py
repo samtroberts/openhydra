@@ -174,6 +174,17 @@ class ToyShardConfig:
     # expected and acceptable.  Has no effect on ToyRuntime.
     runtime_warmup_on_start: bool = False
 
+    # ── Phase 2a: async pipeline depth ──────────────────────────────────────
+    # Number of concurrent forward executions the runtime executor accepts.
+    # Default 1 = today's serial behavior (one forward at a time per peer).
+    # 2+ enables the coord-side pipeline_depth >= 2 path: multiple ring
+    # tokens may be in-flight on the same peer simultaneously, with their
+    # forward passes parallelised across executor workers. Sized via
+    # ``coordinator/node.py --pipeline-depth`` (threaded through
+    # ``peer.serve()`` into ``ToyShardConfig``). The executor's
+    # ``max_workers`` is set to ``max(1, runtime_pipeline_depth)``.
+    runtime_pipeline_depth: int = 1
+
     # MLX watchdog: maximum seconds for any single MLX computation (mx.eval,
     # stream_generate loop, forward_batch decode loop).  If exceeded, the
     # computation is treated as a GPU hang and a TimeoutError is raised.
@@ -744,7 +755,15 @@ class PyTorchRuntime:
         else:
             self._trust_remote_code = bool(requested_trust_remote_code)
         self.max_context_tokens = max(8, int(config.runtime_max_context_tokens))
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"pytorch-shard-{int(config.shard_index)}")
+        # Phase 2a: pipeline depth controls executor concurrency. depth=1
+        # preserves today's strict serial single-worker behavior;
+        # depth>=2 lets concurrent ForwardRequests (different slot_ids on
+        # the same ring) execute their forward passes in parallel.
+        _pt_workers = max(1, int(getattr(config, "runtime_pipeline_depth", 1) or 1))
+        self._executor = ThreadPoolExecutor(
+            max_workers=_pt_workers,
+            thread_name_prefix=f"pytorch-shard-{int(config.shard_index)}",
+        )
         self._kv_cache_max_entries = max(1, int(config.runtime_kv_cache_max_entries))
         self._kv_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._last_noise_applied = False
