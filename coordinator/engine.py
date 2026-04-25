@@ -139,6 +139,15 @@ class EngineConfig:
     # runtime has been registered as the coordinator's head source (see
     # ``coordinator/head_sampler.py``). Default off for rollback safety.
     sample_on_coordinator: bool = False
+    # Phase 2a (async pipeline scaffolding): number of in-flight ring
+    # tokens. Default 1 = today's serial behaviour. 2+ enables the
+    # coord-side PushResult worker pool, per-slot RingSession state
+    # tracking, and (in upcoming commits 5-7) async compute/transmit
+    # overlap on peers. The coord threads this hint to peers via
+    # ``ForwardRequest.pipeline_depth`` so they size their compute
+    # executor accordingly. Recommended upper bound: 2 * number of
+    # pipeline stages.
+    pipeline_depth: int = 1
     # Petals parity Phase B: stateful streaming sessions + history replay
     streaming_sessions_enabled: bool = False
     # P1-A: SpecPipe — pipeline-filling speculative decoding

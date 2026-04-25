@@ -1743,6 +1743,9 @@ class InferenceService:
                         sample_on_coordinator=bool(
                             getattr(self.config, "sample_on_coordinator", False)
                         ),
+                        pipeline_depth=max(
+                            1, int(getattr(self.config, "pipeline_depth", 1) or 1),
+                        ),
                         **decode_controls,
                     )
 
