@@ -960,6 +960,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         max_batch_size: int = 8,
         p2p_node: Any | None = None,
         load_full_head: bool = False,
+        pipeline_depth: int = 1,
     ):
         self.peer_id = peer_id
         self._p2p_node = p2p_node
@@ -1007,6 +1008,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 runtime_privacy_audit_seed=str(advanced_encryption_seed),
                 runtime_peer_id=str(peer_id),
                 runtime_load_full_head=bool(load_full_head),
+                runtime_pipeline_depth=max(1, int(pipeline_depth or 1)),
             )
         )
         # Persist boot-time ToyShardConfig inputs so ``reload_shard`` can
@@ -1028,6 +1030,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         self._boot_warmup_on_start = bool(warmup_on_start)
         self._boot_mlx_eval_timeout_s = max(1.0, float(mlx_eval_timeout_s))
         self._boot_load_full_head = bool(load_full_head)
+        # Phase 2a: persist pipeline_depth so reload_shard preserves the
+        # async-pipeline executor sizing across resharding events.
+        self._boot_pipeline_depth = max(1, int(pipeline_depth or 1))
         self.runtime_profile = dict(self.shard.runtime_profile())
         # Path A (client-terminated pipeline): register this peer's runtime
         # with the coordinator-side HeadSampler when the shard owns the
@@ -1220,6 +1225,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 runtime_peer_id=str(self.peer_id),
                 runtime_load_full_head=bool(
                     getattr(self, "_boot_load_full_head", False)
+                ),
+                runtime_pipeline_depth=max(
+                    1, int(getattr(self, "_boot_pipeline_depth", 1) or 1)
                 ),
             )
         )
@@ -3095,6 +3103,7 @@ def serve(
     batch_window_ms: float = 50.0,
     max_batch_size: int = 8,
     load_full_head: bool = False,
+    pipeline_depth: int = 1,
     p2p_enable: bool = False,
     seeder_port: int = 0,
     p2p_cache_dir: str | None = None,
@@ -3286,6 +3295,7 @@ def serve(
         batch_window_ms=float(batch_window_ms),
         max_batch_size=max(1, int(max_batch_size)),
         load_full_head=bool(load_full_head),
+        pipeline_depth=max(1, int(pipeline_depth or 1)),
         p2p_node=p2p_node,
     )
 

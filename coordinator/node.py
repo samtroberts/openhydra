@@ -1220,6 +1220,11 @@ def main() -> None:
                 # ``--sample-on-coordinator`` opt-in so default deployments
                 # see no extra memory usage.
                 "load_full_head": bool(getattr(args, "sample_on_coordinator", False)),
+                # Phase 2a: thread --pipeline-depth into the peer so its
+                # PyTorch ThreadPoolExecutor / ToyShardConfig knows how
+                # many concurrent forward passes to admit. Default 1
+                # preserves serial behavior.
+                "pipeline_depth": max(1, int(getattr(args, "pipeline_depth", 1) or 1)),
                 # All other peer params use peer/server.py defaults.
             },
             name="openhydra-peer",
