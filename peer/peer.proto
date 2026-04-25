@@ -114,6 +114,17 @@ message ForwardRequest {
   // Eliminates the per-token ring-loopback hop on co-located deployments.
   // Flag-gated: default false preserves today's ring-on-peer behaviour.
   bool sample_on_coordinator = 54;
+  // Phase 2a (async pipeline scaffolding): per-ring slot identifier so
+  // the coordinator can reconcile out-of-order ``PushResult`` arrivals
+  // when multiple tokens are in flight. Slot 0 is the initial ring fire;
+  // every coord-side re-inject increments. Default 0 with
+  // ``pipeline_depth=1`` is byte-identical to today's serial behaviour.
+  uint32 slot_id = 55;
+  // Hint to peers: how many slots may be in flight concurrently. Used by
+  // the receiving peer to size its compute executor / decide whether to
+  // overlap network send with the next forward. Coord sets this from
+  // ``EngineConfig.pipeline_depth``. Default 1 = serial.
+  uint32 pipeline_depth = 56;
 }
 
 // A single hop in the push-mode routing chain.
@@ -173,6 +184,11 @@ message ForwardResponse {
   // sampling and re-injects the resulting token into stage 0. Set by the
   // last peer when ``ForwardRequest.sample_on_coordinator`` was true.
   bool is_hidden_state = 26;
+  // Phase 2a: echo of ``ForwardRequest.slot_id``. The last peer copies
+  // it onto the PushResult so the coordinator's worker pool can match
+  // an out-of-order arrival back to the correct ``RingSession.slots[id]``
+  // entry under ``session.lock``. Default 0 = serial path.
+  uint32 slot_id = 27;
 }
 
 message PeerStatusRequest {}
