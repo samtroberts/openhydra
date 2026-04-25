@@ -1707,6 +1707,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                                     getattr(request, "final_callback_request_id", "") or ""
                                 ),
                                 callback_libp2p_peer_id=_cb_libp2p,
+                                pipeline_depth=int(
+                                    getattr(request, "pipeline_depth", 1) or 1
+                                ),
+                                slot_id=int(getattr(request, "slot_id", 0) or 0),
                             )
                             return peer_pb2.ForwardResponse(
                                 request_id=request.request_id,
@@ -1847,6 +1851,8 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         callback_address=callback_addr,
                         callback_request_id=str(getattr(request, "final_callback_request_id", "") or ""),
                         callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                        pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
+                        slot_id=int(getattr(request, "slot_id", 0) or 0),
                     )
                     return peer_pb2.ForwardResponse(
                         request_id=request.request_id,
@@ -1967,6 +1973,12 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 # legacy ring-loopback path fires on the last peer and
                 # the Path A code never runs.
                 sample_on_coordinator=bool(getattr(request, "sample_on_coordinator", False)),
+                # Phase 2a: forward per-ring slot_id verbatim through every
+                # hop. The terminal peer echoes it on PushResult so the
+                # coord can match the response back to its in-flight
+                # SlotState (out-of-order safe under pipeline_depth >= 2).
+                slot_id=int(getattr(request, "slot_id", 0) or 0),
+                pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
             )
 
             # State-aware routing: ask the Rust bridge if a direct (non-relayed)
@@ -1991,18 +2003,34 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     request.request_id, request.stage_index, next_address,
                     _next_hop_libp2p_id[:20] if _next_hop_libp2p_id else "none",
                 )
-                channel = grpc.insecure_channel(
-                    next_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                try:
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(next_req, timeout=60.0)
-                finally:
-                    channel.close()
+                # Phase 2a: with pipeline_depth >= 2 the gRPC handler
+                # thread cannot afford to block on the next-hop send —
+                # the caller is about to start computing the NEXT slot's
+                # forward pass and we don't want that pass serialised
+                # behind a 20-50 ms direct-LAN dial. Fire-and-forget
+                # via a daemon thread; correctness is preserved because
+                # the receiving peer's Forward handler is idempotent
+                # under retry and no caller depends on the response
+                # body (Path A push mode).
+                _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
+                if _depth_ff >= 2:
+                    self._dispatch_direct_grpc_async(
+                        next_address, next_req, label="lan",
+                        request_id=str(request.request_id),
+                    )
+                else:
+                    channel = grpc.insecure_channel(
+                        next_address,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    try:
+                        stub = peer_pb2_grpc.PeerStub(channel)
+                        stub.Forward(next_req, timeout=60.0)
+                    finally:
+                        channel.close()
             elif self._p2p_node is not None and _next_hop_libp2p_id:
                 # B1 rendezvous: we're about to route through a circuit
                 # relay. Before we do, publish REQUEST_HOLE_PUNCH so the
@@ -2059,16 +2087,23 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 )
             elif next_address:
                 # No P2P node — direct gRPC only (LAN/VPC path).
-                channel = grpc.insecure_channel(
-                    next_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                stub = peer_pb2_grpc.PeerStub(channel)
-                stub.Forward(next_req, timeout=60.0)
-                channel.close()
+                _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
+                if _depth_ff >= 2:
+                    self._dispatch_direct_grpc_async(
+                        next_address, next_req, label="direct",
+                        request_id=str(request.request_id),
+                    )
+                else:
+                    channel = grpc.insecure_channel(
+                        next_address,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(next_req, timeout=60.0)
+                    channel.close()
                 logger.info(
                     "push_forwarded: req=%s stage=%d -> %s",
                     request.request_id, request.stage_index, next_address,
@@ -2088,8 +2123,18 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         callback_address: str,
         callback_request_id: str,
         callback_libp2p_peer_id: str = "",
+        pipeline_depth: int = 1,
+        slot_id: int = 0,
     ) -> None:
-        """Send final activation back to the coordinator via PushResult RPC."""
+        """Send final activation back to the coordinator via PushResult RPC.
+
+        Phase 2a: when ``pipeline_depth >= 2``, both direct-gRPC paths
+        (LAN-first and last-resort) are dispatched on a daemon thread so
+        the gRPC handler returns immediately and the peer can begin
+        computing the next slot's forward without waiting for the
+        coord-bound send to complete. Libp2p relay is already
+        fire-and-forget via ``PROXY_METHOD_PUSH_RESULT``.
+        """
         try:
             if callback_request_id:
                 # Preserve ``activation_packed`` and ``is_hidden_state`` —
@@ -2106,6 +2151,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     error=response.error,
                     kv_cache_hit=response.kv_cache_hit,
                     activation_hash=response.activation_hash,
+                    # Phase 2a: echo slot_id back so the coord-side
+                    # _coordinator_handle_push_result can match this
+                    # response to its in-flight SlotState (pipeline_depth>=2).
+                    slot_id=int(slot_id or 0),
                 )
             _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
             # LAN-first: if the callback address is a private IP we can
@@ -2128,20 +2177,26 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             # still useful for the outbound Push-to-next-peer path
             # (different call site); dropped only here.
 
+            _depth_ff = max(1, int(pipeline_depth or 1))
             if _cb_lan_reachable and callback_address:
                 # LAN-direct gRPC to coordinator — fastest path.
-                channel = grpc.insecure_channel(
-                    callback_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                try:
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.PushResult(response, timeout=10.0)
-                finally:
-                    channel.close()
+                if _depth_ff >= 2:
+                    self._dispatch_push_result_async(
+                        callback_address, response, label="lan",
+                    )
+                else:
+                    channel = grpc.insecure_channel(
+                        callback_address,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    try:
+                        stub = peer_pb2_grpc.PeerStub(channel)
+                        stub.PushResult(response, timeout=10.0)
+                    finally:
+                        channel.close()
                 logger.info(
                     "push_result_sent_via_lan: req=%s -> %s "
                     "(LAN-first; bypassing libp2p)",
@@ -2159,22 +2214,111 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 )
             else:
                 # No P2P node — direct gRPC only.
-                channel = grpc.insecure_channel(
-                    callback_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                stub = peer_pb2_grpc.PeerStub(channel)
-                stub.PushResult(response, timeout=10.0)
-                channel.close()
+                if _depth_ff >= 2:
+                    self._dispatch_push_result_async(
+                        callback_address, response, label="direct",
+                    )
+                else:
+                    channel = grpc.insecure_channel(
+                        callback_address,
+                        options=[
+                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                        ],
+                    )
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.PushResult(response, timeout=10.0)
+                    channel.close()
                 logger.info(
                     "push_result_sent: req=%s -> %s",
                     response.request_id, callback_address,
                 )
         except Exception as exc:
             logger.warning("push_result_failed: %s: %s", callback_address, exc)
+
+    # ── Phase 2a: fire-and-forget direct-gRPC dispatch helpers ───────
+    def _dispatch_direct_grpc_async(
+        self,
+        next_address: str,
+        next_req: peer_pb2.ForwardRequest,
+        *,
+        label: str,
+        request_id: str,
+    ) -> None:
+        """Send a ForwardRequest on a daemon thread and return instantly.
+
+        Used by ``_push_to_next_hop`` under ``pipeline_depth >= 2`` so
+        the gRPC handler thread isn't blocked by the next-hop send. The
+        receiving peer's Forward handler is idempotent under retry and
+        Path A push mode doesn't depend on the response body.
+        """
+        import threading as _ff_threading
+
+        def _send():
+            try:
+                ch = grpc.insecure_channel(
+                    next_address,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                try:
+                    stub = peer_pb2_grpc.PeerStub(ch)
+                    stub.Forward(next_req, timeout=60.0)
+                finally:
+                    ch.close()
+            except Exception as exc:
+                logger.warning(
+                    "push_forward_async_failed: req=%s label=%s -> %s: %s",
+                    request_id, label, next_address, exc,
+                )
+
+        _ff_threading.Thread(
+            target=_send, daemon=True,
+            name=f"oh-push-fwd-{label}",
+        ).start()
+
+    def _dispatch_push_result_async(
+        self,
+        callback_address: str,
+        response: peer_pb2.ForwardResponse,
+        *,
+        label: str,
+    ) -> None:
+        """Send a PushResult on a daemon thread and return instantly.
+
+        Used by ``_push_final_result`` under ``pipeline_depth >= 2`` so
+        the last peer's gRPC handler isn't blocked by the coord-bound
+        send — frees it to start computing the next slot's forward
+        immediately.
+        """
+        import threading as _ff_threading
+
+        def _send():
+            try:
+                ch = grpc.insecure_channel(
+                    callback_address,
+                    options=[
+                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ],
+                )
+                try:
+                    stub = peer_pb2_grpc.PeerStub(ch)
+                    stub.PushResult(response, timeout=10.0)
+                finally:
+                    ch.close()
+            except Exception as exc:
+                logger.warning(
+                    "push_result_async_failed: req=%s label=%s -> %s: %s",
+                    response.request_id, label, callback_address, exc,
+                )
+
+        _ff_threading.Thread(
+            target=_send, daemon=True,
+            name=f"oh-push-result-{label}",
+        ).start()
 
     # ── Path A: coordinator-side sample-and-reinject ─────────────────
     def _handle_hidden_state_push_result(
