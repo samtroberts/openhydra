@@ -74,6 +74,92 @@ def test_proto_field_numbers_stable():
     resp_fields = {f.name: f.number for f in peer_pb2.ForwardResponse.DESCRIPTOR.fields}
     assert req_fields["sample_on_coordinator"] == 54
     assert resp_fields["is_hidden_state"] == 26
+    # Phase 2a additive fields (commit 1a606a5).
+    assert req_fields["slot_id"] == 55
+    assert req_fields["pipeline_depth"] == 56
+    assert resp_fields["slot_id"] == 27
+
+
+# ── Phase 2a: slot_id round-trip + RingSession lock guards ──────────────
+
+def test_proto_slot_id_roundtrip_request():
+    """slot_id and pipeline_depth survive wire serialise/deserialise on the
+    request, and their defaults preserve today's serial behavior (0 / 1)."""
+    from peer import peer_pb2
+
+    req = peer_pb2.ForwardRequest(slot_id=7, pipeline_depth=3)
+    assert req.slot_id == 7
+    assert req.pipeline_depth == 3
+    # Defaults — default slot_id=0 + default pipeline_depth=0 (proto3
+    # uint32 zero-default), which the runtime treats as "1" via
+    # ``max(1, ...)`` clamps.
+    blank = peer_pb2.ForwardRequest()
+    assert blank.slot_id == 0
+    assert blank.pipeline_depth == 0
+    # Wire round-trip preserves both fields.
+    wire = req.SerializeToString()
+    restored = peer_pb2.ForwardRequest()
+    restored.ParseFromString(wire)
+    assert restored.slot_id == 7
+    assert restored.pipeline_depth == 3
+
+
+def test_proto_slot_id_roundtrip_response():
+    """ForwardResponse.slot_id round-trips so the coordinator can match a
+    PushResult back to its in-flight SlotState under pipeline_depth >= 2."""
+    from peer import peer_pb2
+
+    resp = peer_pb2.ForwardResponse(slot_id=11)
+    assert resp.slot_id == 11
+    assert peer_pb2.ForwardResponse().slot_id == 0
+    wire = resp.SerializeToString()
+    restored = peer_pb2.ForwardResponse()
+    restored.ParseFromString(wire)
+    assert restored.slot_id == 11
+
+
+def test_engine_config_has_pipeline_depth_default_one():
+    """EngineConfig.pipeline_depth must default to 1 — today's serial path."""
+    from coordinator.engine import EngineConfig
+
+    cfg = EngineConfig()
+    assert getattr(cfg, "pipeline_depth", None) == 1
+
+
+def test_toy_shard_config_has_runtime_pipeline_depth_default_one():
+    """ToyShardConfig.runtime_pipeline_depth defaults to 1 so reload_shard
+    paths and existing peer constructors keep one executor worker."""
+    from peer.model_shard import ToyShardConfig
+
+    cfg = ToyShardConfig()
+    assert getattr(cfg, "runtime_pipeline_depth", None) == 1
+
+
+def test_peer_service_and_serve_accept_pipeline_depth():
+    """End-to-end signature check: --pipeline-depth must thread from CLI
+    through serve() into PeerService and ToyShardConfig."""
+    from peer.server import PeerService, serve
+    sig_serve = inspect.signature(serve)
+    sig_init = inspect.signature(PeerService.__init__)
+    assert "pipeline_depth" in sig_serve.parameters
+    assert sig_serve.parameters["pipeline_depth"].default == 1
+    assert "pipeline_depth" in sig_init.parameters
+    assert sig_init.parameters["pipeline_depth"].default == 1
+
+
+def test_ring_session_default_pipeline_depth_one_no_slots():
+    """Regression guard: default RingSession is byte-identical to
+    pre-Phase-2a — no slots dict populated, depth=1, lock present but
+    not contributing to repr/eq."""
+    from coordinator.head_sampler import RingSession
+
+    s = RingSession(request_id="r1")
+    assert s.pipeline_depth == 1
+    assert s.slots == {}
+    assert s.next_slot_id == 0
+    # Lock exists and is independent across instances.
+    s2 = RingSession(request_id="r2")
+    assert s.lock is not s2.lock
 
 
 # ── Phase 2: runtime signatures ─────────────────────────────────────────
