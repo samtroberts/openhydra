@@ -148,6 +148,40 @@ class EngineConfig:
     # executor accordingly. Recommended upper bound: 2 * number of
     # pipeline stages.
     pipeline_depth: int = 1
+    # ── Phase 2b (DFlash block-diffusion speculative decoding) ──────────
+    # Where the draft model runs.
+    #   "off"     — no speculation; single-token autoregressive (Phase 2a
+    #               and earlier behaviour). Default.
+    #   "local"   — Topology A: coordinator hosts the draft. Coord drafts
+    #               16 candidate tokens, packs them into ForwardRequest,
+    #               ring verifies in one pass.
+    #   "stage-0" — Topology B: stage-0 peer hosts the draft. Coord sends
+    #               only the prefix; stage-0 drafts locally and feeds
+    #               straight into its own layer shard. Coord broadcasts
+    #               a VerifyResult swarm event so stage-0 can start the
+    #               next block immediately.
+    draft_location: str = "off"
+    # HuggingFace path or local dir of the DFlash draft model. Required
+    # when draft_location != "off". Bypasses the dflash auto-registry —
+    # required for 4-bit MLX targets (mlx-community/Qwen3.5-4B-MLX-4bit
+    # is not in the published registry). Phase 2b launch default is
+    # ``z-lab/Qwen3.5-4B-DFlash``; see ARCHITECTURE_ROADMAP_v1.md
+    # "Pinned models" section.
+    draft_model_path: str = ""
+    # Tokens drafted per block. DFlash default 16. Configurable so
+    # Phase 3's auto-negotiator (and operators with low-acceptance
+    # workloads) can shrink the block to reduce wasted verify work.
+    # Hard cap 32 — beyond that the dflash-mlx Metal kernel layouts
+    # need a recompile path we don't ship in 2b.
+    draft_block_size: int = 16
+    # Manual layer-range override for asymmetric sharding tests
+    # (Phase 2b §7). Format: "START-END" (inclusive-exclusive,
+    # e.g. "0-12"). Empty string = derive from coord's announced
+    # assignment (today's behaviour). When ANY peer sets this, ALL
+    # peers must, AND the union must cover [0, total_layers) exactly
+    # once — coord refuses to start otherwise rather than silently
+    # producing wrong output.
+    manual_layers: str = ""
     # Petals parity Phase B: stateful streaming sessions + history replay
     streaming_sessions_enabled: bool = False
     # P1-A: SpecPipe — pipeline-filling speculative decoding
