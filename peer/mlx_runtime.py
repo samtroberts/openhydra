@@ -914,6 +914,49 @@ class MLXRuntime:
         )
         return int(round(float(token_payload[0]))) if token_payload else 0
 
+    def apply_final_head_block(
+        self,
+        hidden_states_block: Any,
+        *,
+        packed_bytes: bytes | None = None,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+    ) -> list[int]:
+        """Phase 2b — DFlash block-verify entry point.
+
+        Apply ``final_norm`` + ``lm_head`` to a block of N hidden states
+        and return N argmax token ids. Called by
+        ``HeadSampler.verify_block`` after the verify ring trip.
+
+        Lossless: returns the greedy argmax per position regardless of
+        decode parameters. Phase 2b only fully supports temp=0; the
+        decode_* kwargs are accepted for API symmetry with
+        ``apply_final_head`` but are currently ignored.
+        """
+        if not getattr(self, "_has_final_head", False):
+            raise RuntimeError(
+                "apply_final_head_block: this MLX shard has no head "
+                "weights loaded; relaunch with --sample-on-coordinator"
+            )
+        import mlx.core as mx
+        h = self._activation_to_hidden(
+            hidden_states_block, packed_bytes=packed_bytes,
+        )
+        mx.eval(h)
+        h = self._shard_norm(h)
+        if self._tie_word_embeddings:
+            logits = self._shard_embed_tokens.as_linear(h)
+        else:
+            logits = self._shard_lm_head(h)
+        self._watchdog.run(mx.eval, logits)
+        argmax_ids = mx.argmax(logits, axis=-1)
+        argmax_arr = argmax_ids[0] if argmax_ids.ndim == 2 else argmax_ids
+        mx.eval(argmax_arr)
+        return [int(t) for t in argmax_arr.tolist()]
+
     def _forward_sharded(
         self,
         prompt: str,

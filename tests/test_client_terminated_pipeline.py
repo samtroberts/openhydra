@@ -279,6 +279,31 @@ def test_apply_final_head_present_on_runtimes():
     assert callable(getattr(PyTorchRuntime, "apply_final_head", None))
 
 
+def test_apply_final_head_block_present_on_runtimes():
+    """Phase 2b §6 — both runtimes must expose
+    ``apply_final_head_block`` so HeadSampler.verify_block can route
+    cleanly. Signature-only check; the body needs a real loaded
+    model to exercise (lives in the live-bench coverage)."""
+    import inspect
+    from peer.mlx_runtime import MLXRuntime
+    from peer.model_shard import PyTorchRuntime
+
+    for cls in (MLXRuntime, PyTorchRuntime):
+        method = getattr(cls, "apply_final_head_block", None)
+        assert callable(method), (
+            f"{cls.__name__} missing apply_final_head_block"
+        )
+        sig = inspect.signature(method)
+        for kw in (
+            "packed_bytes", "decode_do_sample", "decode_temperature",
+            "decode_top_p", "decode_top_k", "decode_seed",
+        ):
+            assert kw in sig.parameters, (
+                f"{cls.__name__}.apply_final_head_block missing "
+                f"kwarg {kw!r}"
+            )
+
+
 # ── Phase 3: coordinator sample + ring-session registry ─────────────────
 
 def test_head_sampler_registry_roundtrip():
