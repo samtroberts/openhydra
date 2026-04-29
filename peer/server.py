@@ -447,14 +447,55 @@ def _coordinator_handle_push_result(
 
     _is_hidden = bool(getattr(response, "is_hidden_state", False))
     _slot_id = int(getattr(response, "slot_id", 0) or 0)
+    _block_size = int(getattr(response, "block_size", 0) or 0)
+    _block_index = int(getattr(response, "block_index", 0) or 0)
     logging.info(
-        "coord_push_result_received: req=%s slot=%d is_hidden_state=%s from=%s",
-        response.request_id, _slot_id, _is_hidden, response.peer_id,
+        "coord_push_result_received: req=%s slot=%d is_hidden_state=%s "
+        "block_size=%d block_index=%d from=%s",
+        response.request_id, _slot_id, _is_hidden,
+        _block_size, _block_index, response.peer_id,
     )
     if not _is_hidden:
         # Pure-coord mode only handles hidden-state responses. A
         # non-hidden PushResult in this mode is unexpected — ACK and
         # move on.
+        return peer_pb2.PushAck(
+            request_id=response.request_id, ok=True, error="",
+        )
+
+    # ── Phase 2b live-bench Binding #2: block-verify routing ────────
+    # When block_size > 0, the response is the multi-position hidden
+    # state block from a DFlash verify pass. Route the activation_packed
+    # bytes to the per-(request_id, block_index) queue the multi-peer
+    # transport is waiting on. Short-circuit the per-token sampler —
+    # block-verify outcomes are sampled by HeadSampler.verify_block on
+    # the transport-receiving thread, not here.
+    if _block_size > 0:
+        from coordinator.push_receiver import emit_dflash_block_response
+        _packed = bytes(getattr(response, "activation_packed", b"") or b"")
+        if not _packed:
+            logging.error(
+                "coord_block_verify_empty_payload: req=%s block=%d",
+                response.request_id, _block_index,
+            )
+            return peer_pb2.PushAck(
+                request_id=response.request_id, ok=False,
+                error="block_verify_empty_payload",
+            )
+        delivered = emit_dflash_block_response(
+            request_id=str(response.request_id),
+            block_index=_block_index,
+            activation_packed=_packed,
+            block_size=_block_size,
+        )
+        if not delivered:
+            # No transport waiting — late arrival or stray response.
+            # Drop silently; the transport's timeout already fired.
+            logging.warning(
+                "coord_block_verify_no_queue: req=%s block=%d "
+                "(late arrival or transport timed out)",
+                response.request_id, _block_index,
+            )
         return peer_pb2.PushAck(
             request_id=response.request_id, ok=True, error="",
         )
@@ -1542,6 +1583,31 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             logger.info("forward_dispatch: peer=%s stage=%d/%d backend=%s",
                        self.peer_id, int(request.stage_index), int(request.total_stages),
                        "pytorch" if self.shard.uses_pytorch_runtime else "batch_queue")
+
+            # ── Phase 2b live-bench Binding #2: block-verify dispatch ────
+            # When the request arrives with ``draft_block=True``, route
+            # to the block-verify forward path instead of the per-token
+            # decode loop. Hidden states for the B+1 verify positions
+            # (prefix_len-1 .. prefix_len+B-1) get returned to the coord
+            # via the existing PushResult path with block_size > 0.
+            if bool(getattr(request, "draft_block", False)):
+                _bv_response = self._handle_block_verify_request(request)
+                # The handler returned a fully-formed response; wire it
+                # back through the existing push-mode return path so the
+                # coord-side queue routing kicks in.
+                if bool(getattr(request, "push_mode", False)):
+                    callback_addr = str(getattr(request, "final_callback_address", "") or "").strip()
+                    if callback_addr:
+                        self._push_final_result(
+                            response=_bv_response,
+                            callback_address=callback_addr,
+                            callback_request_id=str(getattr(request, "final_callback_request_id", "") or ""),
+                            callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                            pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
+                            slot_id=int(getattr(request, "slot_id", 0) or 0),
+                        )
+                return _bv_response
+
             # Phase 4 (Gemma 4 sharded adapter): read the ``prompt_token_ids``
             # sidecar. Every stage needs these to recompute the per-layer
             # input tensor locally — without them, Gemma 4 layer forward
@@ -1691,6 +1757,17 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
                 activation_hash=_act_hash,
                 is_hidden_state=_return_hidden,
+                # Phase 2b live-bench Binding #2: echo block-verify
+                # metadata on the response so the coord's PushResult
+                # handler routes it to the right per-(req_id, block_idx)
+                # queue. Default 0 = single-token response (Phase 2a
+                # path); set when this Forward processed a draft block.
+                block_size=(
+                    (len(list(getattr(request, "prompt_token_ids", []) or [])) + 1)
+                    if bool(getattr(request, "draft_block", False))
+                    else 0
+                ),
+                block_index=int(getattr(request, "block_index", 0) or 0),
             )
 
             # ── Push mode: forward to next peer or return to coordinator ──
@@ -1925,6 +2002,184 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 self._inflight = max(0, self._inflight - 1)
 
     # ── Push mode: server-to-server forwarding (Petals parity) ─────────────
+
+    def _handle_block_verify_request(
+        self,
+        request: peer_pb2.ForwardRequest,
+    ) -> peer_pb2.ForwardResponse:
+        """Phase 2b live-bench Binding #2 — peer-side block-verify dispatch.
+
+        When the coord fires a ForwardRequest with ``draft_block=True``,
+        the request carries:
+
+          * ``prompt_token_ids`` — the B-token draft block.
+          * ``activation_packed`` — the ``[prefix_len_floats, ...]``
+            payload encoding the prefix tokens (initial_activation in
+            chain.py::run_push_ring is the prefix token-id list, packed
+            as floats).
+          * ``draft_block`` = True
+          * ``block_index`` — the coord-assigned per-session counter.
+          * ``kv_rollback_to`` — applied per Phase 2b §5 before this
+            forward (already handled at the top of Forward).
+
+        On a single-peer / full-model deployment (this peer owns the
+        full target), the handler runs ``forward_block_for_verify``
+        directly and packages the [B+1, hidden] hidden states into a
+        ForwardResponse with ``is_hidden_state=True`` and
+        ``block_size=B+1``.
+
+        On a multi-peer SHARDED deployment, the handler currently
+        emits a structured error response (block-verify-sharded).
+        Sharded block-verify across a layer-sliced ring requires each
+        peer to run its slice over B+1 positions in parallel and
+        forward the hidden states down the chain — a follow-up that
+        reuses the existing prefill multi-position code path.
+        """
+        block_drafts = list(request.prompt_token_ids or [])
+        block_index = int(getattr(request, "block_index", 0) or 0)
+        block_size_response = len(block_drafts) + 1   # B+1 verify positions
+
+        # Decode the prefix from activation_packed (chain.py packed
+        # initial_activation = list[float] of token IDs as floats).
+        prefix_token_ids: list[int] = []
+        try:
+            packed = bytes(getattr(request, "activation_packed", b"") or b"")
+            if packed:
+                import struct
+                n = len(packed) // 4
+                if n > 0:
+                    floats = list(struct.unpack(f"<{n}f", packed))
+                    prefix_token_ids = [int(round(f)) for f in floats]
+            elif list(getattr(request, "activation", []) or []):
+                prefix_token_ids = [
+                    int(round(f)) for f in list(request.activation)
+                ]
+        except Exception as exc:
+            logger.error(
+                "block_verify_decode_prefix_failed: req=%s err=%s",
+                request.request_id, exc, exc_info=True,
+            )
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                error=f"block_verify_decode_prefix_failed: {exc}",
+                is_hidden_state=False,
+                block_size=0,
+                block_index=block_index,
+            )
+
+        # Try forward_block_for_verify on the local runtime. This is
+        # the in-process / full-model path. Sharded peers don't expose
+        # the full-model entry point — the head-only PyTorchRuntime in
+        # a true 3-shard ring would lack the embedding + early layers.
+        runtime = getattr(self.shard, "_runtime", None)
+        fwd_block = getattr(runtime, "forward_block_for_verify", None)
+        if not callable(fwd_block):
+            logger.warning(
+                "block_verify_runtime_unsupported: peer=%s runtime=%s "
+                "does not expose forward_block_for_verify; sharded "
+                "block-verify is the next deliverable",
+                self.peer_id,
+                type(runtime).__name__ if runtime is not None else "None",
+            )
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                error="block_verify_runtime_unsupported",
+                is_hidden_state=False,
+                block_size=0,
+                block_index=block_index,
+            )
+
+        if not prefix_token_ids:
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                error="block_verify_empty_prefix",
+                is_hidden_state=False,
+                block_size=0,
+                block_index=block_index,
+            )
+
+        if not block_drafts:
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                error="block_verify_empty_drafts",
+                is_hidden_state=False,
+                block_size=0,
+                block_index=block_index,
+            )
+
+        # Run the full-model verify forward and pack the result.
+        try:
+            hidden_block = fwd_block(prefix_token_ids, block_drafts)
+        except Exception as exc:
+            logger.error(
+                "block_verify_forward_failed: req=%s block=%d err=%s",
+                request.request_id, block_index, exc, exc_info=True,
+            )
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                error=f"block_verify_forward_failed: {exc}",
+                is_hidden_state=False,
+                block_size=0,
+                block_index=block_index,
+            )
+
+        # Pack the hidden state block to wire bytes. Reuse the
+        # runtime's existing serialiser when available; fall back to
+        # a generic float-pack.
+        packer = getattr(runtime, "_hidden_to_packed_bytes", None)
+        try:
+            if callable(packer):
+                packed_bytes = bytes(packer(hidden_block))
+            else:
+                # Generic fallback: flatten + struct.pack as fp32.
+                import struct
+                if hasattr(hidden_block, "detach"):
+                    flat = hidden_block.detach().to("cpu").float().contiguous().view(-1).tolist()
+                else:
+                    # MLX path: convert to numpy then flatten.
+                    import numpy as _np
+                    flat = list(_np.asarray(hidden_block).astype("float32").reshape(-1))
+                packed_bytes = struct.pack(f"<{len(flat)}f", *flat)
+        except Exception as exc:
+            logger.error(
+                "block_verify_pack_failed: req=%s block=%d err=%s",
+                request.request_id, block_index, exc, exc_info=True,
+            )
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                error=f"block_verify_pack_failed: {exc}",
+                is_hidden_state=False,
+                block_size=0,
+                block_index=block_index,
+            )
+
+        logger.info(
+            "block_verify_done: peer=%s req=%s block=%d "
+            "prefix=%d drafts=%d packed_bytes=%d",
+            self.peer_id, request.request_id, block_index,
+            len(prefix_token_ids), len(block_drafts), len(packed_bytes),
+        )
+        return peer_pb2.ForwardResponse(
+            request_id=request.request_id,
+            peer_id=self.peer_id,
+            stage_index=request.stage_index,
+            activation_packed=packed_bytes,
+            is_hidden_state=True,
+            block_size=block_size_response,
+            block_index=block_index,
+        )
 
     def _push_to_next_hop(
         self,
@@ -2181,6 +2436,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     # _coordinator_handle_push_result can match this
                     # response to its in-flight SlotState (pipeline_depth>=2).
                     slot_id=int(slot_id or 0),
+                    # Phase 2b live-bench Binding #2: preserve block-verify
+                    # routing fields if the inbound response carried them.
+                    block_size=int(getattr(response, "block_size", 0) or 0),
+                    block_index=int(getattr(response, "block_index", 0) or 0),
                 )
             _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
             # LAN-first: if the callback address is a private IP we can

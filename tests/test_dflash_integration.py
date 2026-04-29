@@ -245,15 +245,27 @@ def test_inprocess_transport_requires_callable():
 # ── MultiPeerRingVerifyTransport stub ─────────────────────────────────
 
 
-def test_multipeer_stub_raises_with_actionable_error():
-    from coordinator.dflash_integration import (
-        DFlashIntegrationError, MultiPeerRingVerifyTransport,
-    )
-    transport = MultiPeerRingVerifyTransport()
-    with pytest.raises(DFlashIntegrationError) as exc:
-        transport.verify()
-    assert exc.value.code == "multipeer_unsupported"
-    assert "InProcessRingVerifyTransport" in str(exc.value)
+def test_multipeer_constructor_requires_chain_and_request_id():
+    """Constructor guards: chain must be non-None; request_id
+    non-empty. With Binding #2 the actual verify path is now
+    implemented and tested in test_multipeer_block_verify.py."""
+    from coordinator.dflash_integration import MultiPeerRingVerifyTransport
+
+    with pytest.raises(ValueError, match="chain"):
+        MultiPeerRingVerifyTransport(
+            chain=None, request_id="x",
+            kv_session_id="", callback_address="",
+        )
+
+    class _DummyChain:
+        def run_push_ring(self, **kwargs):
+            pass
+
+    with pytest.raises(ValueError, match="request_id"):
+        MultiPeerRingVerifyTransport(
+            chain=_DummyChain(), request_id="",
+            kv_session_id="", callback_address="",
+        )
 
 
 # ── run_dflash_generation end-to-end ──────────────────────────────────
