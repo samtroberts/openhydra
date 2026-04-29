@@ -449,6 +449,20 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Phase 2b: validate --layers at parse time so a malformed value
+    # ("twelve-twenty", "5-3") fails BEFORE any peer state is built.
+    # The full union-coverage check runs later in
+    # validate_manual_sharding() once peers have announced; this is
+    # just the per-string parse.
+    if getattr(args, "layers", ""):
+        from coordinator.manual_sharding import (
+            ManualShardingError, parse_layers_arg,
+        )
+        try:
+            parse_layers_arg(args.layers)
+        except ManualShardingError as exc:
+            parser.error(f"--layers: {exc}")
+
     # Logging must be configured before any other module emits records.
     configure_logging(
         level=args.log_level,
