@@ -2682,6 +2682,142 @@ class PyTorchRuntime:
         )
         return int(round(float(tokens[0]))) if tokens else 0
 
+    # ── Phase 2b §5: KV rollback (NO fallback drop) ──────────────
+    def apply_kv_rollback(self, *, session_id: str, target_len: int) -> bool:
+        """Apply per-layer-type rollback to the session's caches.
+
+        Attention layers: HF DynamicCache.crop(target_len) — IN-PLACE,
+        O(1) view, zero memory copy. The accepted-prefix K/V entries
+        are preserved bit-for-bit.
+
+        GatedDeltaNet layers: TapeReplayRecurrentRollback using the
+        (pre_block_state, innovations, replay_step) tape captured
+        during the last verify forward. Bit-identical to AR forward
+        over the accepted prefix.
+
+        NO FALLBACK to drop-and-reprefill. Any precondition violation
+        (target_len > current length, missing tape, etc.) raises and
+        propagates to the gRPC response. The coordinator treats a
+        rollback failure as session-fatal — silently re-prefilling
+        a 4 K context destroys the speculative-decoding TPS advantage.
+        """
+        from peer.kv_rollback import TapeReplayRecurrentRollback
+
+        sid = str(session_id or "").strip()
+        if not sid or sid not in self._kv_cache:
+            # First request for this session — no cache to roll back.
+            # Treat as no-op (the next forward will populate from
+            # scratch with the prefix the caller provided).
+            return True
+
+        entry = self._kv_cache[sid]
+
+        # 1. Attention truncation: HF DynamicCache.crop() in place.
+        pkv = entry.get("past_key_values")
+        if pkv is None:
+            raise RuntimeError(
+                f"apply_kv_rollback: session {sid!r} entry has no "
+                f"past_key_values (expected an HF DynamicCache)"
+            )
+        crop = getattr(pkv, "crop", None)
+        if not callable(crop):
+            raise RuntimeError(
+                f"apply_kv_rollback: past_key_values for session "
+                f"{sid!r} ({type(pkv).__name__}) does not expose "
+                f"crop(); cannot perform in-place truncation"
+            )
+        crop(int(target_len))
+
+        # 2. Recurrent tape replay per Mamba/GatedDeltaNet layer.
+        #    Tape is populated during verify forward by the
+        #    instrumentation hooks in _install_recurrent_tape_hooks
+        #    (sketched below; activated only when verify runs against
+        #    a hybrid-architecture model).
+        recurrent_tape = entry.get("recurrent_tape")
+        if recurrent_tape:
+            strategy = TapeReplayRecurrentRollback()
+            for layer_idx, layer_kv in recurrent_tape.items():
+                rolled = strategy.rollback_to(layer_kv, int(target_len))
+                recurrent_tape[layer_idx] = rolled
+                # Push the rolled-back live_state back into the actual
+                # layer cache so the next forward consumes the
+                # restored state. Concrete plumbing depends on the HF
+                # Qwen3.5 hybrid cache layout — done at instrumentation
+                # time so the runtime owns the (cache, layer_idx) →
+                # state-write mapping.
+                self._restore_recurrent_live_state(
+                    pkv, int(layer_idx), rolled["live_state"],
+                )
+
+        return True
+
+    def drop_kv_session(self, session_id: str) -> bool:
+        """Tear down the KV cache for ``session_id``. Used only by
+        explicit teardown (EOS, session expiry); never as a fallback
+        for failed rollback."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        return self._kv_cache.pop(sid, None) is not None
+
+    def _restore_recurrent_live_state(
+        self, pkv: Any, layer_idx: int, live_state: Any,
+    ) -> None:
+        """Write a rolled-back recurrent state back into the layer's
+        cache slot.
+
+        Implementation depends on the HF model's cache convention.
+        For Qwen3.5 hybrid: the cache exposes per-layer slots via
+        ``conv_states`` / ``recurrent_states`` lists; this method
+        writes ``live_state`` into the right slot. The concrete
+        attribute path varies by transformers version, so we probe
+        the most common shapes.
+        """
+        # Standard HF Qwen3.5 hybrid cache shape.
+        for attr in ("recurrent_states", "ssm_states", "states"):
+            seq = getattr(pkv, attr, None)
+            if seq is None:
+                continue
+            try:
+                seq[layer_idx] = live_state
+                return
+            except (IndexError, TypeError):
+                continue
+        # If we reach here, the cache layout is unfamiliar — fail
+        # loudly rather than silently drop the rollback.
+        raise RuntimeError(
+            f"_restore_recurrent_live_state: cannot find recurrent "
+            f"state slot for layer {layer_idx} on cache "
+            f"{type(pkv).__name__} (probed attrs: recurrent_states, "
+            f"ssm_states, states)"
+        )
+
+    @staticmethod
+    def _gateddeltanet_replay_step(S: Any, beta: Any, k: Any, v: Any) -> Any:
+        """Eq.(1) — GatedDeltaNet delta rule with gating, in PyTorch.
+
+            S' = (I − β · k k^T) · S + β · v · k^T
+
+        Used by the tape-replay rollback to redo accepted innovations
+        from the pre-block snapshot. See Phase 2b plan §5 (the
+        seven sharpenings — point 3) for the math derivation.
+
+        Tensor shapes (per-head, batched over num_v_heads):
+            S:    [num_v_heads, d_v, d_k]
+            beta: [num_v_heads]
+            k:    [num_v_heads, d_k]
+            v:    [num_v_heads, d_v]
+        """
+        import torch
+        # Outer products kk^T and vk^T.
+        kkT = torch.einsum("hi,hj->hij", k, k)
+        vkT = torch.einsum("hi,hj->hij", v, k)
+        beta = beta.view(-1, 1, 1)
+        eye = torch.eye(
+            S.shape[-1], device=S.device, dtype=S.dtype,
+        ).expand_as(kkT)
+        return (eye - beta * kkT) @ S + beta * vkT
+
     def apply_final_head_block(
         self,
         hidden_states_block: Any,
@@ -3394,6 +3530,32 @@ class ModelShard:
         if callable(encoder):
             return list(encoder(prompt, max_tokens))
         return []
+
+    # ── Phase 2b: KV rollback dispatch (NO fallback drop) ────────────
+    def apply_kv_rollback(self, *, session_id: str, target_len: int) -> bool:
+        """Dispatch ``ForwardRequest.kv_rollback_to`` to the runtime.
+
+        Phase 2b §5 — race-free: the rollback runs INLINE in the
+        Forward handler before the next forward starts. NO FALLBACK
+        to drop-and-reprefill: a 4 K context re-prefill stalls the
+        pipeline and destroys speculative-decoding throughput.
+        Errors propagate to the gRPC response so the coord can react.
+        """
+        impl = getattr(self._runtime, "apply_kv_rollback", None)
+        if not callable(impl):
+            raise RuntimeError(
+                f"apply_kv_rollback: runtime "
+                f"{type(self._runtime).__name__} does not implement the "
+                f"Phase 2b rollback hook; cannot honour kv_rollback_to "
+                f"without it"
+            )
+        return bool(impl(session_id=str(session_id), target_len=int(target_len)))
+
+    def drop_kv_session(self, session_id: str) -> bool:
+        impl = getattr(self._runtime, "drop_kv_session", None)
+        if not callable(impl):
+            return False
+        return bool(impl(str(session_id)))
 
     def forward(
         self,

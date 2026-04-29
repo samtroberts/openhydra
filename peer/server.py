@@ -1364,6 +1364,32 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             kv_store_activation = bool(getattr(request, "kv_store_activation", False) and kv_session_id)
             kv_use_cached_activation = bool(getattr(request, "kv_use_cached_activation", False) and kv_session_id)
 
+            # ── Phase 2b §5: inline KV rollback ─────────────────────
+            # Honour ``request.kv_rollback_to`` BEFORE the forward.
+            # Race-free: applied inline against the same Forward call
+            # that carries the request, so a separate SwarmCommand
+            # cannot race the next ForwardRequest. NO FALLBACK to
+            # drop-and-reprefill — a 4 K context re-prefill destroys
+            # the speculative-decoding TPS advantage. Any error here
+            # is session-fatal and propagates to the gRPC response.
+            _kv_rollback_to = int(getattr(request, "kv_rollback_to", 0) or 0)
+            if _kv_rollback_to > 0 and kv_session_id:
+                _apply_kv_rb = getattr(self.shard, "apply_kv_rollback", None)
+                if not callable(_apply_kv_rb):
+                    raise RuntimeError(
+                        "apply_kv_rollback unavailable on this shard — "
+                        "cannot honour kv_rollback_to without it. Phase "
+                        "2b requires runtime upgrade."
+                    )
+                _apply_kv_rb(
+                    session_id=kv_session_id,
+                    target_len=_kv_rollback_to,
+                )
+                logger.info(
+                    "kv_rollback_applied: req=%s session=%s target_len=%d",
+                    request.request_id, kv_session_id, _kv_rollback_to,
+                )
+
             # DSD: batch verification of draft tokens (P0-A)
             verify_batch = int(getattr(request, "verify_batch_size", 0) or 0)
             if verify_batch > 0 and request.draft_token_ids:
