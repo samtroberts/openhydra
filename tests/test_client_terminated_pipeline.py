@@ -183,6 +183,26 @@ def test_engine_config_has_pipeline_depth_default_one():
     assert getattr(cfg, "pipeline_depth", None) == 1
 
 
+def test_engine_config_has_phase_2b_inert_defaults():
+    """Phase 2b adds draft_location/draft_model_path/draft_block_size/
+    manual_layers. Default values must keep Phase 2b code paths inert
+    so that running without --draft-location produces byte-identical
+    Phase 2a behaviour."""
+    from coordinator.engine import EngineConfig
+
+    cfg = EngineConfig()
+    # draft_location='off' → no speculation; all DFlash code paths
+    # short-circuit.
+    assert getattr(cfg, "draft_location", None) == "off"
+    # No draft model loaded by default.
+    assert getattr(cfg, "draft_model_path", None) == ""
+    # Block size only consulted when draft_location != 'off'; 16 matches
+    # DFlash's published default.
+    assert getattr(cfg, "draft_block_size", None) == 16
+    # Empty manual_layers = derive from DHT announcement (today's path).
+    assert getattr(cfg, "manual_layers", None) == ""
+
+
 def test_toy_shard_config_has_runtime_pipeline_depth_default_one():
     """ToyShardConfig.runtime_pipeline_depth defaults to 1 so reload_shard
     paths and existing peer constructors keep one executor worker."""

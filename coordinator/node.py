@@ -299,6 +299,62 @@ def main() -> None:
             "path to the legacy serial behaviour."
         ),
     )
+    # ── Phase 2b (DFlash block-diffusion speculative decoding) ──────────
+    parser.add_argument(
+        "--draft-location",
+        choices=("off", "local", "stage-0"),
+        default="off",
+        help=(
+            "Where the DFlash drafter runs. 'off' (default) disables "
+            "speculation entirely — single-token autoregressive (Phase 2a "
+            "and earlier behaviour). 'local' = Topology A: coordinator "
+            "hosts the draft, packs 16-token block into ForwardRequest, "
+            "ring verifies in one pass. 'stage-0' = Topology B: stage-0 "
+            "peer hosts the draft and feeds straight into its layer "
+            "shard; coord broadcasts a VerifyResult swarm event after "
+            "verify so stage-0 can start the next block. See "
+            "ARCHITECTURE_ROADMAP_v1.md and the Phase 2b plan for "
+            "topology selection guidance."
+        ),
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        default="",
+        help=(
+            "HuggingFace path or local directory of the DFlash draft "
+            "model. Required when --draft-location is 'local' or "
+            "'stage-0'. Bypasses the dflash auto-registry — required "
+            "for 4-bit MLX targets like mlx-community/Qwen3.5-4B-MLX-4bit. "
+            "Phase 2b launch default: z-lab/Qwen3.5-4B-DFlash."
+        ),
+    )
+    parser.add_argument(
+        "--draft-block-size",
+        type=int,
+        default=16,
+        help=(
+            "Tokens drafted per block. DFlash default 16. Lower for "
+            "low-acceptance workloads (less wasted verify); higher for "
+            "high-acceptance workloads up to a hard cap of 32. Phase 3 "
+            "auto-negotiator can tune this per session."
+        ),
+    )
+    parser.add_argument(
+        "--layers",
+        type=str,
+        default="",
+        help=(
+            "Phase 2b manual layer-range override for asymmetric "
+            "sharding tests. Format: 'START-END' (inclusive-exclusive, "
+            "e.g. '0-12' for layers 0..11). Default empty = derive "
+            "from coord's DHT-announced assignment. CRITICAL: when ANY "
+            "peer in the swarm uses this flag, ALL peers must, and the "
+            "union must cover [0, total_layers) exactly once. Coord "
+            "validates this invariant on first announce and refuses to "
+            "start otherwise."
+        ),
+    )
     parser.add_argument(
         "--standalone-head-backend",
         choices=("auto", "mlx", "pytorch"),
@@ -1373,6 +1429,14 @@ def main() -> None:
             or _push_callback_addr,
         sample_on_coordinator=bool(getattr(args, "sample_on_coordinator", False)),
         pipeline_depth=max(1, int(getattr(args, "pipeline_depth", 1) or 1)),
+        # Phase 2b: drafting topology + draft spec + block size + manual
+        # sharding. All inert defaults preserve Phase 2a behaviour
+        # byte-for-byte; only --draft-location != "off" activates any
+        # speculative-decoding code path.
+        draft_location=str(getattr(args, "draft_location", "off") or "off"),
+        draft_model_path=str(getattr(args, "draft_model", "") or ""),
+        draft_block_size=max(1, min(32, int(getattr(args, "draft_block_size", 16) or 16))),
+        manual_layers=str(getattr(args, "layers", "") or ""),
     )
 
     # Zero-config bootstrap Phase 1: forward identity + network metadata to
