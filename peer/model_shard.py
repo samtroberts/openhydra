@@ -2836,6 +2836,14 @@ class PyTorchRuntime:
         return N argmax token ids. Lossless: returns greedy argmax
         regardless of decode parameters. Phase 2b only fully supports
         temp=0.
+
+        Accepts either:
+          * The flat-list / packed-bytes payload (gRPC wire form).
+          * A torch.Tensor of shape ``[1, seq, hidden]`` or
+            ``[seq, hidden]`` directly (in-process binding —
+            ``forward_block_for_verify`` returns this shape so the
+            in-process transport can avoid round-tripping through
+            the wire encoder/decoder).
         """
         if self._lm_head is None:
             raise RuntimeError(
@@ -2844,9 +2852,16 @@ class PyTorchRuntime:
                 "different peer"
             )
         import torch as _torch
-        hidden = self._activation_to_hidden(
-            hidden_states_block, packed_bytes=packed_bytes,
-        )
+        # Phase 2b live-bench Item 3: bypass _activation_to_hidden when
+        # the caller already has a tensor (in-process binding).
+        if isinstance(hidden_states_block, _torch.Tensor):
+            hidden = hidden_states_block
+            if hidden.dim() == 2:
+                hidden = hidden.unsqueeze(0)   # → [1, seq, hidden]
+        else:
+            hidden = self._activation_to_hidden(
+                hidden_states_block, packed_bytes=packed_bytes,
+            )
         normed = self._apply_final_norm(hidden)
         logits = self._lm_head(normed)
         with _torch.no_grad():
@@ -2854,6 +2869,152 @@ class PyTorchRuntime:
             if argmax.dim() == 2:
                 argmax = argmax[0]
             return [int(t.item()) for t in argmax]
+
+    def forward_block_for_verify(
+        self,
+        prefix_token_ids: list[int],
+        draft_token_ids: list[int],
+    ) -> Any:
+        """Phase 2b live-bench Item 3 (Binding #1) — in-process
+        block-verify forward (PyTorch).
+
+        Runs the target model over ``[prefix..., drafts]`` and returns
+        pre-norm hidden states for the ``len(drafts) + 1`` verify
+        positions — exactly the shape ``apply_final_head_block``
+        expects.
+
+        Verify positions are the last ``len(drafts) + 1`` positions
+        of the input sequence:
+
+            [prefix_len - 1, prefix_len, ..., prefix_len + B - 1]
+
+        At input position ``i``, the model's hidden state predicts
+        position ``i + 1``. So:
+
+            * H[prefix_len - 1] predicts position prefix_len → check
+              vs ``draft[0]``.
+            * H[prefix_len + i - 1] for ``i ∈ [0, B)`` predicts
+              ``draft[i]``.
+            * H[prefix_len + B - 1] predicts the bonus token (one
+              past the last draft).
+
+        Bit-identical to autoregressive greedy decoding under
+        ``temperature=0`` because we run the same model with the
+        same inputs and read the same hidden states.
+
+        Pre-norm extraction: HF transformers' final norm is
+        ``model.model.norm``. We register a forward-pre-hook on it
+        that captures the input (= pre-norm last-layer output),
+        run the model, and read the captured tensor. Avoids
+        depending on ``output_hidden_states=True``'s exact tuple
+        layout (which can flip pre-/post-norm across transformers
+        versions).
+
+        Args:
+            prefix_token_ids: The committed token sequence so far.
+            draft_token_ids: The drafter's candidate block (length B).
+
+        Returns:
+            ``torch.Tensor`` of shape ``[1, B+1, hidden_size]`` —
+            ready to feed into ``apply_final_head_block``.
+
+        Raises:
+            RuntimeError: If this shard doesn't own the full model
+                (lm_head missing or model.model.norm absent).
+            ValueError: If prefix or drafts is empty.
+        """
+        import torch as _torch
+
+        if self._lm_head is None:
+            raise RuntimeError(
+                "forward_block_for_verify: this PyTorch shard does "
+                "not own the last layer; in-process block-verify "
+                "requires a full-model peer"
+            )
+
+        prefix = list(prefix_token_ids or [])
+        drafts = list(draft_token_ids or [])
+        if not prefix:
+            raise ValueError(
+                "forward_block_for_verify: prefix_token_ids must be "
+                "non-empty (need at least the last prompt token to "
+                "verify draft_0)"
+            )
+        if not drafts:
+            raise ValueError(
+                "forward_block_for_verify: draft_token_ids must be "
+                "non-empty"
+            )
+
+        # Resolve the final-norm module via the canonical HF path.
+        # ``self._model.model.norm`` for LlamaForCausalLM-style;
+        # falls back to ``self._final_norm`` if the runtime tracked it
+        # at decoder-architecture detection time.
+        norm_module = None
+        for path in ("model.model.norm", "model.norm"):
+            try:
+                obj = self._model
+                for attr in path.split("."):
+                    obj = getattr(obj, attr)
+                norm_module = obj
+                break
+            except AttributeError:
+                continue
+        if norm_module is None:
+            norm_module = getattr(self, "_final_norm", None)
+        if norm_module is None:
+            raise RuntimeError(
+                "forward_block_for_verify: cannot locate the model's "
+                "final norm module; expected at "
+                "model.model.norm / model.norm or as "
+                "self._final_norm"
+            )
+
+        full_input = prefix + drafts
+        input_ids = _torch.tensor(
+            [full_input], dtype=_torch.long, device=self._device,
+        )
+
+        captured: list[_torch.Tensor] = []
+
+        def _pre_norm_hook(_module, args):
+            # First positional arg to RMSNorm.forward is the hidden tensor.
+            if args:
+                # Detach + clone so we don't tie autograd or share
+                # storage with the model's transient buffers.
+                captured.append(args[0].detach().clone())
+            return None
+
+        handle = norm_module.register_forward_pre_hook(_pre_norm_hook)
+        try:
+            with _torch.no_grad():
+                # Bypass the lm_head by calling the inner model
+                # (HF: ``self._model.model(...)``). If the runtime is
+                # configured for a different attribute layout, fall
+                # back to the full forward and rely on the hook to
+                # still fire (the norm runs the same way).
+                inner = getattr(self._model, "model", None)
+                if callable(inner):
+                    inner(input_ids, use_cache=False)
+                else:
+                    self._model(input_ids, use_cache=False)
+        finally:
+            handle.remove()
+
+        if not captured:
+            raise RuntimeError(
+                "forward_block_for_verify: pre-norm hook never fired; "
+                "the model's final norm module did not run during "
+                "forward — verify this is a complete LM model"
+            )
+
+        pre_norm = captured[-1]   # [1, prefix_len + B, hidden]
+        # Verify positions: [prefix_len - 1, ..., prefix_len + B - 1].
+        verify_start = len(prefix) - 1
+        verify_end = verify_start + len(drafts) + 1   # B+1 positions
+        verify_block = pre_norm[:, verify_start:verify_end, :].contiguous()
+        # Returned as [1, B+1, hidden] — apply_final_head_block accepts this.
+        return verify_block
 
     def _hidden_to_next_token_payload(
         self,

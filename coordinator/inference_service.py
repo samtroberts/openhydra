@@ -1795,26 +1795,33 @@ class InferenceService:
                                     )
                                 else:
                                     # In-process transport: target forward
-                                    # runs locally (single peer = this
-                                    # process). The runtime's
-                                    # ``apply_final_head_block`` is
-                                    # already in place from Commit 7.
-                                    def _local_target(prefix, drafts):
-                                        # The real target forward over
-                                        # (prefix + drafts) is the runtime
-                                        # path; the in-process integration
-                                        # exercises this stub for
-                                        # synchronous tests. Production
-                                        # runs route through the libp2p
-                                        # ring (follow-up).
-                                        raise DFlashIntegrationError(
-                                            "transport_required",
-                                            "in-process target callable "
-                                            "not yet bound; --draft-location "
-                                            "currently requires the multi-"
-                                            "peer ring follow-up to fire "
-                                            "real generation requests",
+                                    # runs locally on the registered
+                                    # HeadSampler's runtime, which owns
+                                    # the full model in single-peer
+                                    # deployments.
+                                    _hs_runtime = getattr(
+                                        _head_sampler, "runtime", None,
+                                    )
+                                    _fwd_block = getattr(
+                                        _hs_runtime, "forward_block_for_verify", None,
+                                    ) if _hs_runtime is not None else None
+                                    if not callable(_fwd_block):
+                                        logger.warning(
+                                            "dflash_inprocess_unavailable: "
+                                            "head sampler's runtime "
+                                            "(%s) does not expose "
+                                            "forward_block_for_verify; "
+                                            "Phase 2b live-bench Item 1 "
+                                            "binding not active. Falling "
+                                            "through to per-token ring path.",
+                                            type(_hs_runtime).__name__
+                                            if _hs_runtime is not None
+                                            else "None",
                                         )
+                                        _dflash_session = None  # disable
+
+                                    def _local_target(prefix, drafts):
+                                        return _fwd_block(prefix, drafts)
                                     try:
                                         _dflash_transport = InProcessRingVerifyTransport(
                                             run_target_block=_local_target,

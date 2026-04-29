@@ -1023,13 +1023,11 @@ class MLXRuntime:
         """Phase 2b — DFlash block-verify entry point.
 
         Apply ``final_norm`` + ``lm_head`` to a block of N hidden states
-        and return N argmax token ids. Called by
-        ``HeadSampler.verify_block`` after the verify ring trip.
+        and return N argmax token ids. Lossless under temp=0.
 
-        Lossless: returns the greedy argmax per position regardless of
-        decode parameters. Phase 2b only fully supports temp=0; the
-        decode_* kwargs are accepted for API symmetry with
-        ``apply_final_head`` but are currently ignored.
+        Accepts the gRPC wire form (flat list / packed bytes) OR an
+        ``mx.array`` directly (in-process binding —
+        ``forward_block_for_verify`` returns this shape).
         """
         if not getattr(self, "_has_final_head", False):
             raise RuntimeError(
@@ -1037,9 +1035,16 @@ class MLXRuntime:
                 "weights loaded; relaunch with --sample-on-coordinator"
             )
         import mlx.core as mx
-        h = self._activation_to_hidden(
-            hidden_states_block, packed_bytes=packed_bytes,
-        )
+        # Phase 2b live-bench Item 3: bypass the wire decoder when
+        # the caller already has an mx.array.
+        if isinstance(hidden_states_block, mx.array):
+            h = hidden_states_block
+            if h.ndim == 2:
+                h = h[None, :, :]   # → [1, seq, hidden]
+        else:
+            h = self._activation_to_hidden(
+                hidden_states_block, packed_bytes=packed_bytes,
+            )
         mx.eval(h)
         h = self._shard_norm(h)
         if self._tie_word_embeddings:
@@ -1051,6 +1056,125 @@ class MLXRuntime:
         argmax_arr = argmax_ids[0] if argmax_ids.ndim == 2 else argmax_ids
         mx.eval(argmax_arr)
         return [int(t) for t in argmax_arr.tolist()]
+
+    def forward_block_for_verify(
+        self,
+        prefix_token_ids: list[int],
+        draft_token_ids: list[int],
+    ) -> Any:
+        """Phase 2b live-bench Item 3 (Binding #1) — in-process
+        block-verify forward (MLX).
+
+        Symmetric with ``PyTorchRuntime.forward_block_for_verify``.
+        Runs the target model over ``[prefix..., drafts]`` and
+        returns pre-norm hidden states for the ``len(drafts) + 1``
+        verify positions as an ``mx.array`` of shape
+        ``[1, B+1, hidden]`` — feeds straight into
+        ``apply_final_head_block``.
+
+        MLX models built via ``mlx_lm.load`` do not expose a stock
+        ``output_hidden_states`` API. We use the same forward-pre-hook
+        idea as PyTorch but applied in MLX land: temporarily wrap the
+        final norm's ``__call__`` to capture its input, run the
+        model's inner forward, and restore.
+
+        Bit-identical to autoregressive greedy decoding under
+        temperature=0 — the model runs over the same inputs with the
+        same weights.
+        """
+        if not getattr(self, "_has_final_head", False):
+            raise RuntimeError(
+                "forward_block_for_verify: this MLX shard has no "
+                "head weights loaded; relaunch with "
+                "--sample-on-coordinator"
+            )
+        import mlx.core as mx
+
+        prefix = list(prefix_token_ids or [])
+        drafts = list(draft_token_ids or [])
+        if not prefix:
+            raise ValueError(
+                "forward_block_for_verify: prefix_token_ids must be "
+                "non-empty"
+            )
+        if not drafts:
+            raise ValueError(
+                "forward_block_for_verify: draft_token_ids must be "
+                "non-empty"
+            )
+
+        full_input = prefix + drafts
+        input_ids = mx.array([full_input])
+
+        # Resolve the inner forward (skips the lm_head). For Qwen3.5
+        # MLX models the inner model is ``self._model.model`` or
+        # ``self._model.language_model.model`` depending on the
+        # config. Probe both.
+        inner = None
+        for path in ("model", "language_model.model"):
+            try:
+                obj = self._model
+                for attr in path.split("."):
+                    obj = getattr(obj, attr)
+                if callable(obj):
+                    inner = obj
+                    break
+            except AttributeError:
+                continue
+        if inner is None:
+            # Fall back to the full model; the final norm runs anyway.
+            inner = self._model
+
+        # Resolve the final norm. Phase 2a stored it as ``_shard_norm``.
+        norm_module = getattr(self, "_shard_norm", None)
+        if norm_module is None:
+            raise RuntimeError(
+                "forward_block_for_verify: self._shard_norm is None; "
+                "the runtime did not initialise the final norm "
+                "reference"
+            )
+
+        # Capture the norm's input via a __call__ wrapper. MLX modules
+        # don't have register_forward_pre_hook so we monkey-patch
+        # __call__ for the duration of this forward.
+        captured: list = []
+        original_call = norm_module.__call__
+
+        def _capturing_call(x, *args, **kwargs):
+            # Eager-eval the input so the captured array is a stable
+            # snapshot — Phase 2a's lazy-graph deferral could otherwise
+            # let downstream ops mutate ``x``'s underlying storage.
+            mx.eval(x)
+            captured.append(x)
+            return original_call(x, *args, **kwargs)
+
+        # Bind via type — assigning to the instance's __call__ doesn't
+        # always intercept on MLX nn.Modules. Use the bound-method
+        # replacement pattern.
+        norm_module.__call__ = _capturing_call    # type: ignore[assignment]
+        try:
+            inner(input_ids)
+        finally:
+            # Restore the original.
+            try:
+                del norm_module.__call__
+            except AttributeError:
+                norm_module.__call__ = original_call    # type: ignore[assignment]
+
+        if not captured:
+            raise RuntimeError(
+                "forward_block_for_verify: norm-capture wrapper "
+                "never fired; the model's final norm did not run "
+                "during forward"
+            )
+
+        pre_norm = captured[-1]    # shape [1, prefix_len + B, hidden]
+        mx.eval(pre_norm)
+        verify_start = len(prefix) - 1
+        verify_end = verify_start + len(drafts) + 1
+        verify_block = pre_norm[:, verify_start:verify_end, :]
+        mx.eval(verify_block)
+        return verify_block
 
     def _forward_sharded(
         self,
