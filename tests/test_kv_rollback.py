@@ -135,51 +135,99 @@ def test_truncate_attention_invalid_axis_raises():
         )
 
 
-# ── TapeReplayRecurrentRollback ─────────────────────────────────────────
-
-def test_tape_replay_returns_pre_state_at_target():
-    """The accepted-prefix pre-state at index target_len is the
-    state we want after rollback."""
-    pre_states = [f"pre-{i}" for i in range(17)]   # 16 drafts + bonus
-    tape = [f"innov-{i}" for i in range(16)]
-    kv = {"state": "post-final", "tape": tape, "pre_states": pre_states}
-
-    out = TapeReplayRecurrentRollback().rollback_to(kv, target_len=4)
-    assert out["state"] == "pre-4"           # the snapshot we want
-    assert out["tape"] == tape[:4]           # tape truncated
-    assert out["pre_states"] == pre_states[:5]   # +1 to allow next step
+# ── TapeReplayRecurrentRollback (Strategy B: snapshot-once + replay) ────
 
 
-def test_tape_replay_to_zero_returns_pre_prefix_state():
-    """target_len=0 = no drafts accepted = recurrent state at the
-    prefix-end position (before drafting started)."""
-    pre_states = ["pre-prefix"] + [f"pre-{i}" for i in range(16)]
+def _scalar_replay_step(S, beta, k, v):
+    """Test-only replay step that works on plain scalars/lists.
+
+    For unit tests we model S as a single float and (β, k, v) as
+    floats; eq. (1) collapses to ``S' = (1 - β·k·k)·S + β·v·k``.
+    The dispatcher uses this as the ``replay_step`` callable so we
+    can validate the math without standing up a tensor library.
+    """
+    return (1.0 - float(beta) * float(k) * float(k)) * float(S) + float(beta) * float(v) * float(k)
+
+
+def _make_tape(pre_state, innovations, block_start_pos=0, replay=_scalar_replay_step):
+    return {
+        "live_state": pre_state,
+        "pre_block_state": pre_state,
+        "innovations": list(innovations),
+        "block_start_pos": int(block_start_pos),
+        "replay_step": replay,
+    }
+
+
+def test_tape_replay_zero_accepted_returns_pre_state():
+    """target_len == block_start_pos = 0 drafts accepted → restore
+    the pre-block snapshot exactly."""
+    innovations = [(0.5, 1.0, 2.0), (0.3, 0.5, 1.5)]
     out = TapeReplayRecurrentRollback().rollback_to(
-        {"state": "post-all", "tape": ["t0"] * 16, "pre_states": pre_states},
-        target_len=0,
+        _make_tape(pre_state=10.0, innovations=innovations, block_start_pos=100),
+        target_len=100,
     )
-    assert out["state"] == "pre-prefix"
-    assert out["tape"] == []
+    assert out["live_state"] == 10.0
 
 
-def test_tape_replay_full_acceptance_keeps_state():
-    """When all 16 drafts are accepted, target_len equals the tape
-    length — the rollback is effectively a no-op (just keep current
-    state)."""
-    pre_states = [f"pre-{i}" for i in range(16)]   # 16 entries
-    tape = [f"innov-{i}" for i in range(16)]
-    kv = {"state": "post-final", "tape": tape, "pre_states": pre_states}
+def test_tape_replay_full_acceptance_replays_all_innovations():
+    """All B drafts accepted → replay all B innovations from S_pre."""
+    innovations = [(0.5, 1.0, 2.0), (0.3, 0.5, 1.5)]
+    out = TapeReplayRecurrentRollback().rollback_to(
+        _make_tape(pre_state=10.0, innovations=innovations, block_start_pos=100),
+        target_len=102,   # 100 + 2 drafts accepted
+    )
+    # Manual replay:
+    #  S_0 = 10.0
+    #  S_1 = (1 - 0.5*1*1)*10.0 + 0.5*2*1     = 5.0 + 1.0 = 6.0
+    #  S_2 = (1 - 0.3*0.5*0.5)*6.0 + 0.3*1.5*0.5 = (1 - 0.075)*6.0 + 0.225
+    #      = 0.925*6.0 + 0.225 = 5.55 + 0.225 = 5.775
+    assert abs(out["live_state"] - 5.775) < 1e-9
 
-    # target_len == len(pre_states) means "accept everything in tape"
-    out = TapeReplayRecurrentRollback().rollback_to(kv, target_len=16)
-    assert out["state"] == "post-final"
+
+def test_tape_replay_partial_acceptance_replays_only_accepted():
+    """Mid-block divergence: replay first K innovations, drop rest."""
+    innovations = [(0.5, 1.0, 2.0), (0.3, 0.5, 1.5), (0.9, 0.1, 9.9)]
+    out = TapeReplayRecurrentRollback().rollback_to(
+        _make_tape(pre_state=10.0, innovations=innovations, block_start_pos=100),
+        target_len=101,   # 1 draft accepted, last 2 rolled back
+    )
+    # S_1 = (1 - 0.5*1*1)*10.0 + 0.5*2*1 = 5.0 + 1.0 = 6.0
+    assert abs(out["live_state"] - 6.0) < 1e-9
 
 
-def test_tape_replay_target_len_beyond_tape_raises():
-    pre_states = [f"pre-{i}" for i in range(8)]
-    kv = {"state": "x", "tape": ["t"] * 8, "pre_states": pre_states}
-    with pytest.raises(RollbackError, match="exceeds tape length"):
-        TapeReplayRecurrentRollback().rollback_to(kv, target_len=12)
+def test_tape_replay_preserves_tape_for_further_rollback():
+    """The pre_block_state and innovations stay in the returned KV
+    dict so a subsequent rollback (e.g. tree speculation in Phase 2c)
+    can replay from the same baseline."""
+    innovations = [(0.5, 1.0, 2.0), (0.3, 0.5, 1.5)]
+    kv = _make_tape(pre_state=10.0, innovations=innovations, block_start_pos=100)
+    out = TapeReplayRecurrentRollback().rollback_to(kv, target_len=101)
+    assert out["pre_block_state"] == 10.0
+    assert out["innovations"] == innovations
+    assert out["block_start_pos"] == 100
+
+
+def test_tape_replay_target_predates_block_start_raises():
+    """target_len < block_start_pos = the rollback wants a state
+    from BEFORE this block was even entered. Caller bug; fail loud."""
+    innovations = [(0.5, 1.0, 2.0)]
+    with pytest.raises(RollbackError, match="predates block_start_pos"):
+        TapeReplayRecurrentRollback().rollback_to(
+            _make_tape(pre_state=10.0, innovations=innovations, block_start_pos=100),
+            target_len=99,
+        )
+
+
+def test_tape_replay_target_beyond_block_raises():
+    """target_len > block_start + len(innovations) = nothing in the
+    tape. Caller bug; fail loud."""
+    innovations = [(0.5, 1.0, 2.0)]
+    with pytest.raises(RollbackError, match="tape only has"):
+        TapeReplayRecurrentRollback().rollback_to(
+            _make_tape(pre_state=10.0, innovations=innovations, block_start_pos=100),
+            target_len=110,
+        )
 
 
 def test_tape_replay_requires_dict_kv():
@@ -189,11 +237,133 @@ def test_tape_replay_requires_dict_kv():
         )
 
 
-def test_tape_replay_requires_pre_states_list():
-    with pytest.raises(RollbackError, match="pre_states"):
-        TapeReplayRecurrentRollback().rollback_to(
-            {"state": "x", "tape": []}, target_len=0,
+def test_tape_replay_requires_all_required_keys():
+    """Each required field must be present; caller bug otherwise."""
+    full = _make_tape(pre_state=1.0, innovations=[(0.5, 1.0, 2.0)],
+                      block_start_pos=0)
+    for missing in ("pre_block_state", "innovations", "block_start_pos", "replay_step"):
+        partial = {k: v for k, v in full.items() if k != missing}
+        with pytest.raises(RollbackError, match=missing):
+            TapeReplayRecurrentRollback().rollback_to(partial, target_len=0)
+
+
+def test_tape_replay_rejects_non_callable_replay_step():
+    kv = _make_tape(pre_state=1.0, innovations=[(0.5, 1.0, 2.0)],
+                    block_start_pos=0, replay="not callable")
+    with pytest.raises(RollbackError, match="callable"):
+        TapeReplayRecurrentRollback().rollback_to(kv, target_len=0)
+
+
+# ── Byte-equivalence: replay == autoregressive forward ─────────────────
+
+
+def test_hybrid_rollback_byte_equivalence_attention():
+    """Attention in-place truncation must produce a state byte-identical
+    to a hypothetical AR forward over the accepted prefix only.
+
+    Because attention K/V is purely concatenative (eq. trivial: K_t is
+    just [k_0, ..., k_{t-1}] stacked), truncation IS the same operation
+    as AR forward over the prefix — both produce a [K, ..., :] slice of
+    the same elements. We verify by constructing K, V from per-position
+    keys/values and asserting the truncated tensor equals the
+    AR-built tensor.
+    """
+    # AR forward emits k, v per position.
+    per_pos_keys = [np.full((4, 8), float(i), dtype=np.float32) for i in range(16)]
+    per_pos_vals = [np.full((4, 8), float(i + 100), dtype=np.float32) for i in range(16)]
+
+    # Verify-time cache after full block: stack all 16 positions.
+    K_verify = np.stack(per_pos_keys, axis=1)   # [4, 16, 8]
+    V_verify = np.stack(per_pos_vals, axis=1)
+    cache_verify = {"keys": K_verify, "values": V_verify}
+
+    # AR forward over accepted prefix (K=5).
+    K_ar = np.stack(per_pos_keys[:5], axis=1)
+    V_ar = np.stack(per_pos_vals[:5], axis=1)
+
+    # Truncate verify-time cache to K=5.
+    cache_rolled = TruncateAttentionRollback(seq_axis=1).rollback_to(
+        cache_verify, target_len=5,
+    )
+
+    # Bit-identical.
+    np.testing.assert_array_equal(cache_rolled["keys"], K_ar)
+    np.testing.assert_array_equal(cache_rolled["values"], V_ar)
+
+
+def test_hybrid_rollback_byte_equivalence_recurrent():
+    """Tape-replay must produce a state bit-identical to autoregressive
+    forward over the accepted prefix.
+
+    Construction: pick a synthetic (S_pre, innovations) tape; compute
+    AR-baseline S_K by running the replay_step for K steps from S_pre;
+    compute rollback S_K via TapeReplayRecurrentRollback.rollback_to;
+    assert they match exactly.
+
+    This is the headline lossless guarantee for the recurrent path.
+    """
+    S_pre = 7.0
+    innovations = [
+        (0.5, 1.0, 2.0),
+        (0.3, 0.5, 1.5),
+        (0.7, 0.2, 4.0),
+        (0.1, 0.9, 0.5),
+        (0.4, 0.3, 3.3),
+    ]
+    block_start = 200
+
+    # AR baseline: walk replay_step K times manually.
+    def ar_baseline(K: int) -> float:
+        S = S_pre
+        for i in range(K):
+            beta, k, v = innovations[i]
+            S = _scalar_replay_step(S, beta, k, v)
+        return S
+
+    # Rollback via the strategy.
+    def rolled(K: int) -> float:
+        kv = _make_tape(pre_state=S_pre, innovations=innovations,
+                        block_start_pos=block_start)
+        out = TapeReplayRecurrentRollback().rollback_to(
+            kv, target_len=block_start + K,
         )
+        return out["live_state"]
+
+    # Every accepted-prefix length must match the AR baseline exactly.
+    for K in range(0, len(innovations) + 1):
+        ar_S = ar_baseline(K)
+        rolled_S = rolled(K)
+        assert ar_S == rolled_S, (
+            f"byte-equivalence broken at K={K}: ar={ar_S} rolled={rolled_S}"
+        )
+
+
+def test_hybrid_rollback_byte_equivalence_repeated_rollbacks():
+    """Repeated rollbacks within the same block (Phase 2c tree
+    speculation reuses this entry) must each produce the AR-equivalent
+    state because pre_block_state and innovations are preserved
+    untouched across calls.
+    """
+    S_pre = 7.0
+    innovations = [(0.5, 1.0, 2.0), (0.3, 0.5, 1.5), (0.7, 0.2, 4.0)]
+    kv = _make_tape(pre_state=S_pre, innovations=innovations, block_start_pos=0)
+
+    out_3 = TapeReplayRecurrentRollback().rollback_to(kv, target_len=3)
+    out_2 = TapeReplayRecurrentRollback().rollback_to(out_3, target_len=2)
+    out_1 = TapeReplayRecurrentRollback().rollback_to(out_2, target_len=1)
+    out_0 = TapeReplayRecurrentRollback().rollback_to(out_1, target_len=0)
+
+    # Each step must equal the corresponding AR-baseline.
+    S = S_pre
+    expected = [S]
+    for beta, k, v in innovations:
+        S = _scalar_replay_step(S, beta, k, v)
+        expected.append(S)
+
+    assert out_0["live_state"] == expected[0]
+    assert out_1["live_state"] == expected[1]
+    assert out_2["live_state"] == expected[2]
+    assert out_3["live_state"] == expected[3]
 
 
 # ── rollback_session_kv dispatcher ──────────────────────────────────────
@@ -201,36 +371,38 @@ def test_tape_replay_requires_pre_states_list():
 def test_dispatcher_routes_per_layer_type():
     """Hybrid Qwen3.5-style shard: layers 0,2 attention; layer 1
     GatedDeltaNet. Each gets its own strategy."""
-    plan = SessionRollbackPlan(session_id="s1")
-    plan.add(0, KVKind.ATTENTION, TruncateAttentionRollback())
-    plan.add(1, KVKind.RECURRENT, TapeReplayRecurrentRollback())
-    plan.add(2, KVKind.ATTENTION, TruncateAttentionRollback())
-
     K_attn = np.arange(16 * 8).reshape(16, 8).astype(np.float32)
-    # 17 entries (16 drafts + 1 bonus position) = same indexing as
-    # the standalone tape-replay test: pre[i] is the snapshot before
-    # step i, so pre[target_len] is the rollback target.
-    pre = [f"pre-{i}" for i in range(17)]
-    layer_kv = {
-        0: {"keys": K_attn, "values": K_attn},
-        1: {"state": "post", "tape": ["t"] * 16, "pre_states": pre},
-        2: {"keys": K_attn, "values": K_attn},
-    }
+    pre_state = 7.0
+    innovations = [(0.5, 1.0, 2.0)] * 16   # 16 drafts
 
-    # Use seq_axis=0 since our attention K is 2D in this test.
+    # Build the dispatch plan with the appropriate seq_axis for our
+    # 2-D attention test tensor.
+    plan = SessionRollbackPlan(session_id="s1")
     plan.entries = [
         LayerRollbackEntry(0, KVKind.ATTENTION, TruncateAttentionRollback(seq_axis=0)),
         LayerRollbackEntry(1, KVKind.RECURRENT, TapeReplayRecurrentRollback()),
         LayerRollbackEntry(2, KVKind.ATTENTION, TruncateAttentionRollback(seq_axis=0)),
     ]
 
+    layer_kv = {
+        0: {"keys": K_attn, "values": K_attn},
+        1: _make_tape(
+            pre_state=pre_state, innovations=innovations,
+            block_start_pos=0,
+        ),
+        2: {"keys": K_attn, "values": K_attn},
+    }
+
     out = rollback_session_kv(plan, layer_kv, target_len=4)
-    # Attention layers truncated.
+    # Attention layers truncated to 4 entries.
     assert out[0]["keys"].shape == (4, 8)
     assert out[2]["keys"].shape == (4, 8)
-    # Recurrent layer rolled back via tape replay.
-    assert out[1]["state"] == "pre-4"
-    assert out[1]["tape"] == ["t"] * 4
+    # Recurrent layer rolled back via tape replay (4 innovations).
+    expected_S = pre_state
+    for i in range(4):
+        beta, k, v = innovations[i]
+        expected_S = _scalar_replay_step(expected_S, beta, k, v)
+    assert out[1]["live_state"] == expected_S
 
 
 def test_dispatcher_skips_layers_not_yet_warmed_up():

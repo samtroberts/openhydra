@@ -190,33 +190,52 @@ class TruncateAttentionRollback(RollbackStrategy):
 
 
 class TapeReplayRecurrentRollback(RollbackStrategy):
-    """Replay accepted innovations from a recorded tape.
+    """Strategy B — snapshot-once + innovation tape replay.
 
     Phase 2b's port of dflash-mlx's ``RecurrentRollbackCache`` pattern,
-    backend-neutral.
+    backend-neutral. Mathematically exact: replay produces a
+    bit-identical state to autoregressive forward over the accepted
+    prefix, because we re-apply the *same* (β, k, v) triples that ran
+    during verify.
+
+    The recurrent update equation (GatedDeltaNet delta rule with
+    gating, eq. 1 in the Phase 2b plan):
+
+        S_t = (I − β_t · k_t k_tᵀ) · S_{t−1} + β_t · v_t k_tᵀ
+
+    is rank-1 in S (factor (I − β k kᵀ) is generally non-invertible)
+    so S cannot be sliced. We snapshot S ONCE at block start, record
+    the (β, k, v) tape during verify, and on rollback restore the
+    snapshot and replay the accepted innovations.
 
     Expected ``kv_state`` shape:
-        ``{"state": <recurrent state>,
-           "tape": [innovation_0, innovation_1, ...],
-           "pre_states": [pre_state_0, pre_state_1, ...]}``
+        {
+          "live_state":      <tensor>,    # current recurrent state
+          "pre_block_state": <tensor>,    # S_pre — clone, taken at block start
+          "innovations":     [(β_i, k_i, v_i), ...],  # B entries, one per draft
+          "block_start_pos": int,         # absolute seq pos at block start
+          "replay_step":     callable,    # f(S, β, k, v) → S' (eq. 1)
+        }
 
-    where each ``innovation_i`` is the per-step delta the layer
-    applied at step ``i`` (after seeing the prefix + drafts[0..i-1]),
-    and ``pre_states[i]`` is a snapshot of the recurrent state BEFORE
-    step ``i`` ran. ``pre_states[0]`` therefore equals the state at
-    the prefix end, before any drafts; ``pre_states[target_len]``
-    is the state we want to roll back TO.
+    Why snapshot-once not snapshot-per-step:
+        * Snapshot-per-step needs (B+1) clones × |S| memory.
+        * Snapshot-once + replay needs 1 × |S| + B × (β, k, v).
+        * For Qwen3.5-4B with d_v=128, d_k=64, num_v_heads=32:
+          |S| ≈ 0.5 MB; (β, k, v) ≈ 24 KB per step → ~5 MB total
+          per session per shard, vs 68 MB for snapshot-per-step.
 
-    The runtime's verify forward is responsible for populating
-    ``tape`` and ``pre_states``. Commit 7 (the block-decode path)
-    adds the ``record_innovation`` hook that does this.
+    Cost per rollback: K applications of replay_step where K =
+    accepted drafts (≤ 16). Each is a rank-1 update, sub-millisecond
+    on Metal/CUDA.
 
-    Cost per layer: O(1) — we just read the right pre-state. The
-    "replay" name is a holdover from dflash-mlx where the kernel
-    actually re-runs the accepted innovations through a fused step;
-    here we precomputed the pre-states so the rollback is a lookup,
-    not a re-scan. Both are correct; the lookup is simpler.
+    No fallback. Any precondition violation raises RollbackError so
+    the caller treats it as session-fatal rather than silently
+    corrupting state.
     """
+
+    _REQUIRED_KEYS = (
+        "pre_block_state", "innovations", "block_start_pos", "replay_step",
+    )
 
     def rollback_to(self, kv_state: Any, target_len: int) -> Any:
         if target_len < 0:
@@ -226,31 +245,68 @@ class TapeReplayRecurrentRollback(RollbackStrategy):
         if not isinstance(kv_state, dict):
             raise RollbackError(
                 "TapeReplayRecurrentRollback requires dict-shaped KV "
-                f"with 'state', 'tape', 'pre_states'; got "
+                f"with {list(self._REQUIRED_KEYS)}; got "
                 f"{type(kv_state).__name__}"
             )
-        pre_states = kv_state.get("pre_states")
-        if not isinstance(pre_states, list):
+        for key in self._REQUIRED_KEYS:
+            if key not in kv_state:
+                raise RollbackError(
+                    f"TapeReplayRecurrentRollback requires "
+                    f"kv_state[{key!r}] to be present"
+                )
+
+        block_start = int(kv_state["block_start_pos"])
+        innovations = kv_state["innovations"]
+        replay = kv_state["replay_step"]
+        accepted = target_len - block_start
+        if accepted < 0:
             raise RollbackError(
-                "TapeReplayRecurrentRollback requires kv_state['pre_states'] "
-                "to be a list of per-step pre-state snapshots"
+                f"target_len={target_len} predates block_start_pos="
+                f"{block_start}; rollback target lies before this "
+                f"block was even entered"
             )
-        if target_len > len(pre_states):
+        if accepted > len(innovations):
             raise RollbackError(
-                f"target_len={target_len} exceeds tape length "
-                f"{len(pre_states)} — verify pass didn't record enough "
+                f"target_len={target_len} maps to accepted="
+                f"{accepted} drafts; tape only has {len(innovations)} "
                 f"innovations"
             )
-        # Reconstruct: the rollback'd state is the pre-state at
-        # position target_len, with the tape truncated to match.
-        new_state = pre_states[target_len] if target_len < len(pre_states) else kv_state["state"]
-        new_tape = list(kv_state.get("tape", []))[:target_len]
-        new_pre_states = list(pre_states)[:target_len + 1]
-        return {
-            "state": new_state,
-            "tape": new_tape,
-            "pre_states": new_pre_states,
-        }
+        if not callable(replay):
+            raise RollbackError(
+                "kv_state['replay_step'] must be a callable "
+                "(S, β, k, v) → S applying eq.(1)"
+            )
+
+        # Restore S_pre then replay accepted innovations.
+        # Clone protects callers that may roll back further within the
+        # same block (Phase 2c tree speculation reuses this entry).
+        S = _clone_tensor(kv_state["pre_block_state"])
+        for i in range(accepted):
+            beta_i, k_i, v_i = innovations[i]
+            S = replay(S, beta_i, k_i, v_i)
+
+        # Returned dict preserves pre_block_state + innovations
+        # untouched so further rollbacks within the same block stay
+        # correct. Only ``live_state`` advances.
+        new_kv = dict(kv_state)
+        new_kv["live_state"] = S
+        return new_kv
+
+
+def _clone_tensor(t: Any) -> Any:
+    """Backend-neutral clone.
+
+    PyTorch:  ``t.clone()``
+    NumPy:    ``t.copy()``
+    MLX:      ``mx.array(t)`` via type ctor; mlx.array also supports .copy()
+    Lists:    deepcopy fallback for tests.
+    """
+    if hasattr(t, "clone"):
+        return t.clone()
+    if hasattr(t, "copy"):
+        return t.copy()
+    import copy as _copy
+    return _copy.deepcopy(t)
 
 
 # ── Per-session dispatcher ──────────────────────────────────────────────

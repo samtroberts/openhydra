@@ -914,6 +914,101 @@ class MLXRuntime:
         )
         return int(round(float(token_payload[0]))) if token_payload else 0
 
+    # ── Phase 2b §5: KV rollback (NO fallback drop) ──────────────
+    def apply_kv_rollback(self, *, session_id: str, target_len: int) -> bool:
+        """Apply per-layer-type rollback to the session's caches.
+
+        Symmetric with PyTorchRuntime.apply_kv_rollback. Attention
+        layers get a lazy slice along the sequence axis (zero copy
+        in MLX); recurrent layers get tape-replay from the snapshot
+        + innovations captured during verify forward.
+
+        NO FALLBACK to drop-and-reprefill.
+        """
+        from peer.kv_rollback import TapeReplayRecurrentRollback
+
+        sid = str(session_id or "").strip()
+        if not sid or sid not in self._kv_cache:
+            return True
+
+        entry = self._kv_cache[sid]
+
+        # 1. Attention truncation: lazy slice along the seq axis.
+        attention_layers = entry.get("attention_layers") or {}
+        for layer_idx, layer_cache in attention_layers.items():
+            keys = getattr(layer_cache, "keys", None)
+            values = getattr(layer_cache, "values", None)
+            if keys is None or values is None:
+                raise RuntimeError(
+                    f"apply_kv_rollback: MLX attention cache for layer "
+                    f"{layer_idx} session {sid!r} has no keys/values"
+                )
+            # MLX cache convention: [batch, num_heads, seq, head_dim].
+            layer_cache.keys = keys[:, :, : int(target_len), :]
+            layer_cache.values = values[:, :, : int(target_len), :]
+
+        # 2. Recurrent tape replay.
+        recurrent_tape = entry.get("recurrent_tape")
+        if recurrent_tape:
+            strategy = TapeReplayRecurrentRollback()
+            mamba_layers = entry.get("mamba_layers") or {}
+            for layer_idx, layer_kv in recurrent_tape.items():
+                rolled = strategy.rollback_to(layer_kv, int(target_len))
+                recurrent_tape[layer_idx] = rolled
+                # Push the rolled-back state back into the layer's
+                # MLX cache slot.
+                mamba_cache = mamba_layers.get(layer_idx)
+                if mamba_cache is None:
+                    raise RuntimeError(
+                        f"apply_kv_rollback: MLX recurrent cache for "
+                        f"layer {layer_idx} session {sid!r} has no slot "
+                        f"to receive rolled-back state"
+                    )
+                # Concrete attribute name varies; try canonical first.
+                if hasattr(mamba_cache, "state"):
+                    mamba_cache.state = rolled["live_state"]
+                elif hasattr(mamba_cache, "recurrent_state"):
+                    mamba_cache.recurrent_state = rolled["live_state"]
+                else:
+                    raise RuntimeError(
+                        f"apply_kv_rollback: MLX recurrent cache slot "
+                        f"for layer {layer_idx} ({type(mamba_cache).__name__}) "
+                        f"has no .state / .recurrent_state attribute"
+                    )
+
+        return True
+
+    def drop_kv_session(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        return self._kv_cache.pop(sid, None) is not None
+
+    @staticmethod
+    def _gateddeltanet_replay_step(S: Any, beta: Any, k: Any, v: Any) -> Any:
+        """Eq.(1) — GatedDeltaNet delta rule with gating, in MLX.
+
+            S' = (I − β · k k^T) · S + β · v · k^T
+
+        See PyTorchRuntime._gateddeltanet_replay_step for the
+        mathematical derivation; this is the same algebra in MLX ops.
+
+        Tensor shapes (per-head, batched over num_v_heads):
+            S:    [num_v_heads, d_v, d_k]
+            beta: [num_v_heads]
+            k:    [num_v_heads, d_k]
+            v:    [num_v_heads, d_v]
+        """
+        import mlx.core as mx
+        kkT = mx.einsum("hi,hj->hij", k, k)
+        vkT = mx.einsum("hi,hj->hij", v, k)
+        beta = beta.reshape(-1, 1, 1)
+        eye = mx.broadcast_to(
+            mx.eye(S.shape[-1], dtype=S.dtype),
+            kkT.shape,
+        )
+        return (eye - beta * kkT) @ S + beta * vkT
+
     def apply_final_head_block(
         self,
         hidden_states_block: Any,
