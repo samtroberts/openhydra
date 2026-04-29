@@ -125,6 +125,25 @@ message ForwardRequest {
   // overlap network send with the next forward. Coord sets this from
   // ``EngineConfig.pipeline_depth``. Default 1 = serial.
   uint32 pipeline_depth = 56;
+  // Reserved: tag 57 for a future ``verify_temperature`` override
+  // (per-block temperature for speculative verify) so we don't burn
+  // it on something we haven't designed yet.
+  reserved 57;
+  // ── Phase 2b (DFlash block-diffusion speculative decoding) ──────────
+  // Truncate the per-session KV cache to this absolute sequence position
+  // BEFORE running this forward. Default 0 = no rollback (today's
+  // append-only KV behaviour). Applied INLINE on the receiving peer so
+  // a separate SwarmCommand cannot race the next ForwardRequest. Used
+  // by the coordinator after ``verify_block`` to drop unaccepted draft
+  // entries from peer KV caches before issuing the next block. Strategy
+  // dispatched per-layer-type on the peer (truncate for attention,
+  // tape-replay for GatedDeltaNet/Mamba); see ``peer/kv_rollback.py``.
+  uint32 kv_rollback_to = 58;
+  // True when ``prompt_token_ids`` carries a draft block (length ==
+  // EngineConfig.draft_block_size, default 16) that the peer should
+  // run as a single 16-position parallel forward over its layer shard.
+  // False (default) preserves today's single-position decode path.
+  bool draft_block = 59;
 }
 
 // A single hop in the push-mode routing chain.

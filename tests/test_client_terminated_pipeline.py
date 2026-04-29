@@ -78,6 +78,63 @@ def test_proto_field_numbers_stable():
     assert req_fields["slot_id"] == 55
     assert req_fields["pipeline_depth"] == 56
     assert resp_fields["slot_id"] == 27
+    # Phase 2b additive fields (commit kv_rollback_to + draft_block).
+    # Tag 57 is reserved on ForwardRequest for a future
+    # verify_temperature override; do not reuse without an ADR.
+    assert req_fields["kv_rollback_to"] == 58
+    assert req_fields["draft_block"] == 59
+
+
+# ── Phase 2b: kv_rollback_to + draft_block round-trip ───────────────────
+
+def test_proto_kv_rollback_to_roundtrip():
+    """``kv_rollback_to`` survives wire serialise/deserialise and
+    defaults to 0 (no rollback — today's append-only KV behaviour)."""
+    from peer import peer_pb2
+
+    req = peer_pb2.ForwardRequest(kv_rollback_to=128)
+    assert req.kv_rollback_to == 128
+    assert peer_pb2.ForwardRequest().kv_rollback_to == 0
+    wire = req.SerializeToString()
+    restored = peer_pb2.ForwardRequest()
+    restored.ParseFromString(wire)
+    assert restored.kv_rollback_to == 128
+
+
+def test_proto_draft_block_roundtrip():
+    """``draft_block`` survives wire serialise/deserialise and defaults
+    to False (today's single-position decode path)."""
+    from peer import peer_pb2
+
+    req = peer_pb2.ForwardRequest(draft_block=True)
+    assert req.draft_block is True
+    assert peer_pb2.ForwardRequest().draft_block is False
+    wire = req.SerializeToString()
+    restored = peer_pb2.ForwardRequest()
+    restored.ParseFromString(wire)
+    assert restored.draft_block is True
+
+
+def test_proto_phase_2b_defaults_preserve_phase_2a_behaviour():
+    """A ForwardRequest constructed with only Phase 2a fields set must
+    have Phase 2b fields at their inert defaults so a Phase 2a peer
+    talking to a Phase 2b peer (or vice-versa) sees byte-identical
+    serial behaviour."""
+    from peer import peer_pb2
+
+    req = peer_pb2.ForwardRequest(
+        request_id="r1",
+        slot_id=0,
+        pipeline_depth=1,
+    )
+    assert req.kv_rollback_to == 0       # no rollback
+    assert req.draft_block is False      # single-position decode
+    # Round-trip through wire to confirm.
+    wire = req.SerializeToString()
+    restored = peer_pb2.ForwardRequest()
+    restored.ParseFromString(wire)
+    assert restored.kv_rollback_to == 0
+    assert restored.draft_block is False
 
 
 # ── Phase 2a: slot_id round-trip + RingSession lock guards ──────────────
