@@ -123,3 +123,99 @@ def unregister_ring(request_id: str) -> None:
     """Clean up the ring queue after generation completes."""
     with _RING_LOCK:
         _RING_QUEUES.pop(request_id, None)
+
+
+# ── Phase 2b live-bench Binding #2: block-verify response queues ────────
+#
+# Separate from the per-token ring queues above. Each block-verify
+# round trip registers a queue keyed on (request_id, block_index),
+# the multi-peer transport waits on it, and the coord PushResult
+# handler routes ``is_hidden_state=True`` + ``block_size > 0``
+# responses here. Block-verify responses are payloads, not tokens —
+# the queue carries either bytes (the activation_packed wire form)
+# or an exception sentinel for transport-side errors.
+
+_DFLASH_BLOCK_QUEUES: dict[tuple[str, int], _queue_mod.Queue] = {}
+_DFLASH_BLOCK_LOCK = threading.Lock()
+
+
+def register_dflash_block(
+    request_id: str, block_index: int,
+) -> _queue_mod.Queue:
+    """Register a queue for a single block-verify round trip.
+
+    The queue receives EXACTLY ONE message: either a tuple
+    ``("ok", activation_packed_bytes, block_size)`` on success,
+    or ``("err", exception_message)`` on transport failure. The
+    transport's verify() blocks on a single get(); whichever side
+    of the tuple arrives, it returns / raises accordingly.
+
+    Idempotent: a second register on the same (req, idx) replaces
+    the queue. Useful when retrying after timeout — the new wait
+    starts from a fresh queue.
+    """
+    q: _queue_mod.Queue = _queue_mod.Queue()
+    key = (str(request_id), int(block_index))
+    with _DFLASH_BLOCK_LOCK:
+        _DFLASH_BLOCK_QUEUES[key] = q
+    return q
+
+
+def emit_dflash_block_response(
+    request_id: str,
+    block_index: int,
+    activation_packed: bytes,
+    block_size: int,
+) -> bool:
+    """Deliver a block-verify response to the waiting transport.
+
+    Returns ``True`` if a queue was registered for the (req, idx);
+    ``False`` if no transport is waiting (late arrival after a
+    timeout, or a stray response). Late responses are dropped
+    silently rather than queued indefinitely.
+    """
+    key = (str(request_id), int(block_index))
+    with _DFLASH_BLOCK_LOCK:
+        q = _DFLASH_BLOCK_QUEUES.get(key)
+    if q is None:
+        return False
+    q.put_nowait(("ok", bytes(activation_packed or b""), int(block_size)))
+    return True
+
+
+def emit_dflash_block_error(
+    request_id: str,
+    block_index: int,
+    error: str,
+) -> bool:
+    """Surface a transport failure to the waiting transport. Same
+    return semantics as ``emit_dflash_block_response``."""
+    key = (str(request_id), int(block_index))
+    with _DFLASH_BLOCK_LOCK:
+        q = _DFLASH_BLOCK_QUEUES.get(key)
+    if q is None:
+        return False
+    q.put_nowait(("err", str(error or "unknown")))
+    return True
+
+
+def unregister_dflash_block(
+    request_id: str, block_index: int,
+) -> None:
+    """Drop the queue registration. Idempotent. Always called by
+    the transport in a finally clause so a thrown exception during
+    verify() doesn't leak queue state across blocks."""
+    key = (str(request_id), int(block_index))
+    with _DFLASH_BLOCK_LOCK:
+        _DFLASH_BLOCK_QUEUES.pop(key, None)
+
+
+def unregister_dflash_session(request_id: str) -> int:
+    """Drop ALL queues for ``request_id`` regardless of block_index.
+    Called at end-of-generation cleanup. Returns the count of
+    queues dropped."""
+    with _DFLASH_BLOCK_LOCK:
+        keys = [k for k in _DFLASH_BLOCK_QUEUES if k[0] == str(request_id)]
+        for k in keys:
+            _DFLASH_BLOCK_QUEUES.pop(k, None)
+    return len(keys)

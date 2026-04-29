@@ -144,6 +144,13 @@ message ForwardRequest {
   // run as a single 16-position parallel forward over its layer shard.
   // False (default) preserves today's single-position decode path.
   bool draft_block = 59;
+  // Phase 2b live-bench Binding #2: monotonic per-session block
+  // counter assigned by the coord. Echoed back on the corresponding
+  // ForwardResponse.block_index so the coord can match an inbound
+  // response to the right pending verify queue under
+  // ``pipeline_depth >= 2`` where multiple blocks may be in flight.
+  // Default 0 = first block / single-block-in-flight (today's path).
+  uint32 block_index = 60;
 }
 
 // A single hop in the push-mode routing chain.
@@ -208,6 +215,21 @@ message ForwardResponse {
   // an out-of-order arrival back to the correct ``RingSession.slots[id]``
   // entry under ``session.lock``. Default 0 = serial path.
   uint32 slot_id = 27;
+  // Phase 2b live-bench Binding #2: when the originating
+  // ForwardRequest had ``draft_block=True``, the last peer echoes
+  // the block size on the response (= len(draft_token_ids) + 1, the
+  // B+1 verify positions including the bonus). Default 0 = single-
+  // token response (today's path). Coord routes
+  // ``is_hidden_state=True`` responses with ``block_size > 0`` to the
+  // block-verify queue keyed on (request_id, block_index); single-
+  // token responses continue through the existing per-token
+  // PushResult handler unchanged.
+  uint32 block_size = 28;
+  // Coord-assigned monotonic block index. Echoed verbatim from the
+  // originating ForwardRequest so the coord can match the response
+  // to the right pending block-verify queue when multiple verifies
+  // are in flight.
+  uint32 block_index = 29;
 }
 
 message PeerStatusRequest {}

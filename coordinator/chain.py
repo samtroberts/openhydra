@@ -1152,6 +1152,17 @@ class InferenceChain:
         request_id: str | None = None,
         sample_on_coordinator: bool = False,
         pipeline_depth: int = 1,
+        # Phase 2b live-bench Binding #2 — block-verify firing path.
+        # When ``draft_block=True``, ``draft_token_ids`` carries the
+        # B-token candidate block and ``block_index`` is the coord-
+        # assigned monotonic counter the response will echo back so
+        # the multi-peer transport can route it to the right queue.
+        # ``kv_rollback_to`` honours peer-side per-layer-type
+        # rollback before the verify forward starts (Phase 2b §5).
+        draft_block: bool = False,
+        draft_token_ids: list[int] | None = None,
+        block_index: int = 0,
+        kv_rollback_to: int = 0,
         **decode_controls,
     ) -> None:
         """Kick off a ring autoregressive push — fire-and-forget.
@@ -1227,6 +1238,13 @@ class InferenceChain:
             sample_on_coordinator=bool(sample_on_coordinator),
             slot_id=0,
             pipeline_depth=max(1, int(pipeline_depth)),
+            # Phase 2b live-bench Binding #2 — block-verify fields. All
+            # default-zero / False so the request is byte-identical to
+            # the existing per-token path when DFlash is off.
+            draft_block=bool(draft_block),
+            block_index=int(block_index or 0),
+            kv_rollback_to=int(kv_rollback_to or 0),
+            prompt_token_ids=list(draft_token_ids or []),
         )
 
         # Path A (client-terminated pipeline): register the ring session so

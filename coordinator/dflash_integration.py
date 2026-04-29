@@ -210,6 +210,18 @@ def setup_dflash_session(
     )
 
     def _verifier(hidden_states_block, draft_token_ids):
+        # Multi-peer transport hands back {"packed_bytes": ...,
+        # "block_size": ...}; in-process transport returns a tensor
+        # directly. Both shapes are accepted by HeadSampler.verify_block
+        # via the apply_final_head_block dispatch.
+        if isinstance(hidden_states_block, dict) and "packed_bytes" in hidden_states_block:
+            packed = hidden_states_block["packed_bytes"]
+            return head_sampler.verify_block(
+                hidden_states_block=None,
+                draft_token_ids=list(draft_token_ids),
+                decode=decode_cfg,
+                packed_bytes=packed,
+            )
         return head_sampler.verify_block(
             hidden_states_block=hidden_states_block,
             draft_token_ids=list(draft_token_ids),
@@ -323,33 +335,175 @@ class InProcessRingVerifyTransport:
 
 
 class MultiPeerRingVerifyTransport:
-    """Ring-based verify transport (multi-peer libp2p).
+    """Phase 2b live-bench Binding #2 — ring-based verify transport
+    over the existing libp2p / push-mode chain.
 
-    Stub. Full implementation requires:
-      1. A coord-side block-verify response queue keyed by
-         (request_id, block_index).
-      2. PushResult handler in peer/server.py distinguishing
-         block-verify hidden-state responses from single-token ones.
-      3. ForwardRequest path that fires the draft block as
-         ``prompt_token_ids`` with ``draft_block=True``.
+    Owns the per-block round-trip:
 
-    Lands in a follow-up. Today the constructor is callable so
-    deployments can wire the type, but ``verify()`` raises with
-    an actionable error.
+        1. Increment ``block_index``; register a one-shot response
+           queue keyed on ``(request_id, block_index)``.
+        2. Build a ``ForwardRequest`` carrying:
+             * ``prompt_token_ids`` = drafts (length B)
+             * ``draft_block`` = True
+             * ``block_index`` = the just-incremented counter
+             * ``kv_rollback_to`` = caller-supplied (per Phase 2b §5)
+             * ``sample_on_coordinator`` = True
+           Fire it through the existing ``InferenceChain.run_push_ring``
+           machinery so peers see Phase 2b's draft_block path.
+        3. Block on the queue. Receive
+           ``("ok", activation_packed, block_size)`` from the coord-
+           side PushResult handler — bytes ready for
+           ``apply_final_head_block(packed_bytes=...)``.
+        4. Unregister the queue regardless of outcome.
+
+    Errors propagate as ``DFlashIntegrationError`` so the driver's
+    structured-warning fall-through behaviour stays intact.
+
+    Args:
+        chain: An ``InferenceChain`` instance configured for the
+            push-ring topology (the same object the existing
+            per-token ring uses).
+        request_id: The session-level request id.
+        kv_session_id: The KV cache key shared with the existing
+            ring path.
+        callback_address: The coord's PushResult callback host:port.
+        ring_eos_ids: Forwarded for ring termination logic; currently
+            unused by block-verify because we only emit one
+            response per block, but kept on the request for parity.
+        sample_on_coordinator: Always True for Phase 2b — the coord
+            owns lm_head + verify_block.
+        block_timeout_s: Per-block wait deadline. Default 60 s
+            covers cross-ISP relay round-trips on a 16-token block.
     """
 
-    def __init__(self, **kwargs: Any):
-        self._kwargs = dict(kwargs)
+    def __init__(
+        self,
+        *,
+        chain: Any,
+        request_id: str,
+        kv_session_id: str,
+        callback_address: str,
+        ring_eos_ids: Any = (),
+        sample_on_coordinator: bool = True,
+        block_timeout_s: float = 60.0,
+        decode_kwargs: Optional[dict] = None,
+    ):
+        if chain is None:
+            raise ValueError(
+                "MultiPeerRingVerifyTransport: chain is required"
+            )
+        if not request_id:
+            raise ValueError(
+                "MultiPeerRingVerifyTransport: request_id is required"
+            )
+        self._chain = chain
+        self._request_id = str(request_id)
+        self._kv_session_id = str(kv_session_id or "")
+        self._callback_address = str(callback_address or "")
+        self._ring_eos_ids = list(ring_eos_ids or [])
+        self._sample_on_coordinator = bool(sample_on_coordinator)
+        self._block_timeout_s = max(1.0, float(block_timeout_s))
+        self._decode_kwargs = dict(decode_kwargs or {})
+        self._next_block_index = 0
+        self._lock = __import__("threading").Lock()
 
-    def verify(self, **_kwargs: Any) -> Any:
-        raise DFlashIntegrationError(
-            "multipeer_unsupported",
-            "MultiPeerRingVerifyTransport.verify: the libp2p ring "
-            "transport for block-verify is not yet implemented. Use "
-            "InProcessRingVerifyTransport for single-process DFlash "
-            "or set --draft-location=off until the multi-peer ring "
-            "follow-up lands.",
+    def _allocate_block_index(self) -> int:
+        with self._lock:
+            idx = self._next_block_index
+            self._next_block_index += 1
+            return idx
+
+    def verify(
+        self,
+        *,
+        prefix_token_ids: list[int],
+        draft_token_ids: list[int],
+        kv_rollback_to: int,
+        request_id: str,
+        kv_session_id: str,
+    ) -> Any:
+        from coordinator.push_receiver import (
+            emit_dflash_block_error,
+            register_dflash_block,
+            unregister_dflash_block,
         )
+
+        block_index = self._allocate_block_index()
+        block_size_request = len(draft_token_ids) + 1   # B+1 verify positions
+        queue = register_dflash_block(self._request_id, block_index)
+
+        try:
+            # Fire the block-verify ForwardRequest through the chain.
+            # The chain's run_push_ring honours draft_block + block_index
+            # + kv_rollback_to and threads them through the multi-peer
+            # ring; the last peer returns hidden states via PushResult,
+            # which the coord-side handler routes to our queue (registered
+            # above) by calling emit_dflash_block_response.
+            self._chain.run_push_ring(
+                initial_activation=[float(t) for t in prefix_token_ids],
+                max_tokens=1,    # ignored for block-verify; required by API
+                ring_eos_ids=self._ring_eos_ids,
+                kv_session_id=self._kv_session_id,
+                callback_address=self._callback_address,
+                request_id=self._request_id,
+                sample_on_coordinator=self._sample_on_coordinator,
+                draft_block=True,
+                draft_token_ids=list(draft_token_ids),
+                block_index=block_index,
+                kv_rollback_to=int(kv_rollback_to),
+                **self._decode_kwargs,
+            )
+
+            try:
+                outcome = queue.get(timeout=self._block_timeout_s)
+            except Exception as exc:
+                raise DFlashIntegrationError(
+                    "multipeer_unsupported",
+                    f"MultiPeerRingVerifyTransport.verify: timeout "
+                    f"({self._block_timeout_s:.1f}s) waiting for "
+                    f"block_index={block_index} response on "
+                    f"request_id={self._request_id!r}: {exc}",
+                ) from exc
+
+            kind = outcome[0] if isinstance(outcome, tuple) else "err"
+            if kind != "ok":
+                msg = outcome[1] if (
+                    isinstance(outcome, tuple) and len(outcome) >= 2
+                ) else "unknown error"
+                raise DFlashIntegrationError(
+                    "multipeer_unsupported",
+                    f"MultiPeerRingVerifyTransport.verify: block "
+                    f"{block_index} returned error: {msg}",
+                )
+
+            # outcome = ("ok", activation_packed_bytes, returned_block_size)
+            packed = outcome[1]
+            if not packed:
+                raise DFlashIntegrationError(
+                    "multipeer_unsupported",
+                    f"MultiPeerRingVerifyTransport.verify: block "
+                    f"{block_index} returned empty activation_packed",
+                )
+            # Hand the packed bytes back to the driver — it passes
+            # them to HeadSampler.verify_block which routes through
+            # apply_final_head_block(packed_bytes=...).
+            logger.debug(
+                "dflash_multipeer_verify_done: req=%s block=%d "
+                "drafts=%d packed_bytes=%d",
+                self._request_id, block_index, len(draft_token_ids),
+                len(packed),
+            )
+            return {"packed_bytes": packed, "block_size": int(outcome[2])}
+        except DFlashIntegrationError:
+            raise
+        except Exception as exc:
+            raise DFlashIntegrationError(
+                "multipeer_unsupported",
+                f"MultiPeerRingVerifyTransport.verify: unexpected "
+                f"error during block {block_index}: {exc}",
+            ) from exc
+        finally:
+            unregister_dflash_block(self._request_id, block_index)
 
 
 # ── Driver harness ────────────────────────────────────────────────────

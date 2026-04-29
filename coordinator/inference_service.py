@@ -1783,17 +1783,82 @@ class InferenceService:
                                 # runtime can serve the target end-to-end
                                 # (typical of single-Mac demos).
                                 if len(prep.primary_pipeline) >= 2:
-                                    logger.warning(
-                                        "dflash_multipeer_unsupported: "
-                                        "--draft-location=%s with %d peers "
-                                        "in pipeline; multi-peer libp2p "
-                                        "ring transport is not yet "
-                                        "implemented. Falling through to "
-                                        "per-token ring path.",
-                                        getattr(self.config, "draft_location", ""),
-                                        len(prep.primary_pipeline),
+                                    # Phase 2b live-bench Binding #2:
+                                    # multi-peer ring transport. Builds a
+                                    # ForwardRequest with draft_block=True,
+                                    # fires it through the chain, waits on
+                                    # the coord-side block-verify queue.
+                                    from coordinator.dflash_integration import (
+                                        MultiPeerRingVerifyTransport,
                                     )
+                                    from coordinator.push_receiver import (
+                                        unregister_dflash_session,
+                                    )
+                                    import coordinator.engine as _mp_engine
+                                    _MPChain = getattr(
+                                        _mp_engine, "InferenceChain", InferenceChain,
+                                    )
+                                    _mp_chain = _MPChain(
+                                        prep.primary_pipeline,
+                                        timeout_ms=self.config.timeout_ms,
+                                        transport_config=self.transport_config,
+                                    )
+                                    _mp_chain._p2p_node = getattr(
+                                        self.discovery_service, "_p2p_node", None,
+                                    )
+                                    try:
+                                        _dflash_transport = MultiPeerRingVerifyTransport(
+                                            chain=_mp_chain,
+                                            request_id=str(request_id),
+                                            kv_session_id=str(_ar_kv_session or ""),
+                                            callback_address=self.config.push_callback_address,
+                                            ring_eos_ids=list(_ar_eos_ids or []),
+                                            sample_on_coordinator=True,
+                                            decode_kwargs=decode_controls,
+                                        )
+                                        _dflash_result = run_dflash_generation(
+                                            session=_dflash_session,
+                                            transport=_dflash_transport,
+                                            prompt_token_ids=list(_ar_context_ids),
+                                            max_tokens=_ar_target_tokens,
+                                            stop_token_ids=frozenset(_ar_eos_ids or []),
+                                            request_id=str(request_id),
+                                            kv_session_id=str(_ar_kv_session or ""),
+                                        )
+                                        _ar_generated.extend(_dflash_result["tokens"])
+                                        _ar_total_latency_ms = _dflash_result["total_ms"]
+                                        _dflash_active = True
+                                        logger.info(
+                                            "dflash_multipeer_done: req=%s "
+                                            "tokens=%d blocks=%d "
+                                            "acceptance=%.3f tps=%.2f",
+                                            request_id,
+                                            _dflash_result["tokens_emitted"],
+                                            _dflash_result["blocks"],
+                                            _dflash_result["acceptance_rate"],
+                                            (_dflash_result["tokens_emitted"]
+                                             / max(0.001, _dflash_result["total_ms"] / 1000.0)),
+                                        )
+                                    except DFlashIntegrationError as exc:
+                                        logger.warning(
+                                            "dflash_multipeer_failed: "
+                                            "code=%s err=%s — falling "
+                                            "through to per-token ring",
+                                            exc.code, exc,
+                                        )
+                                    except Exception as exc:
+                                        logger.error(
+                                            "dflash_multipeer_unexpected: "
+                                            "err=%s — falling through",
+                                            exc, exc_info=True,
+                                        )
+                                    finally:
+                                        unregister_dflash_session(str(request_id))
                                 else:
+                                    # Single-peer: in-process transport.
+                                    # Target forward runs locally on the
+                                    # registered HeadSampler's runtime, which
+                                    # owns the full model.
                                     # In-process transport: target forward
                                     # runs locally on the registered
                                     # HeadSampler's runtime, which owns
