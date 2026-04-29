@@ -64,6 +64,7 @@ __all__ = [
     "SwarmEvent",
     "SwarmEventBus",
     "InMemorySwarmEventBus",
+    "LibP2PSwarmEventBus",
     "encode_event",
     "decode_event",
     "EventDecodeError",
@@ -451,3 +452,170 @@ class InMemorySwarmEventBus(SwarmEventBus):
                     self._subs.pop(event_type, None)
 
         return _unsubscribe
+
+
+# ── libp2p adapter ──────────────────────────────────────────────────────
+
+
+class LibP2PSwarmEventBus(SwarmEventBus):
+    """Production adapter — rides the existing ``GossipClient``
+    libp2p pub/sub channel.
+
+    The codebase already runs one ``GossipClient`` per peer (see
+    ``peer/gossip_client.py``) for PEER_DEAD / REQUEST_HOLE_PUNCH
+    coordination. Phase 2b's swarm events join the same channel
+    rather than spinning up a parallel poll loop. Type-string
+    prefixes (``verify_result``, ``register_draft_model``,
+    ``promote_drafter``) don't collide with the existing types.
+
+    The GossipClient envelope wraps our payload's ``data`` dict;
+    we put the schema version inside ``data`` so versioned
+    upgrades stay backwards-compat with peers running the older
+    GossipClient.
+
+    Args:
+        gossip_client: A started GossipClient instance.
+        local_peer_id: This peer's libp2p id. Used for outgoing
+            ``from_peer`` field on published events.
+    """
+
+    def __init__(self, gossip_client: Any, *, local_peer_id: str):
+        if gossip_client is None:
+            raise ValueError("LibP2PSwarmEventBus: gossip_client is required")
+        if not local_peer_id:
+            raise ValueError("LibP2PSwarmEventBus: local_peer_id is required")
+        self._gc = gossip_client
+        self._local = str(local_peer_id)
+        # Track active subscriptions so close() can cleanly detach.
+        self._handlers: dict[str, list[tuple[Callable, Callable]]] = {}
+        self._lock = threading.Lock()
+
+    # ── Publish ────────────────────────────────────────────────────
+
+    def publish(self, payload: Any, *, from_peer: str = "") -> None:
+        """Encode + publish via the wrapped GossipClient.
+
+        The ``from_peer`` argument is honoured if provided (for
+        operator-driven publishes that want to attribute to a
+        different peer); otherwise we stamp ``self._local``.
+
+        We use our envelope encoder to populate the GossipClient's
+        ``data`` field — that puts the schema version + validated
+        payload inside the gossip data dict so receivers running
+        the same Phase 2b version decode the wire bytes through
+        ``decode_event``.
+        """
+        if isinstance(payload, VerifyResult):
+            type_str = EVENT_TYPE_VERIFY_RESULT
+        elif isinstance(payload, RegisterDraftModel):
+            type_str = EVENT_TYPE_REGISTER_DRAFT_MODEL
+        elif isinstance(payload, PromoteDrafter):
+            type_str = EVENT_TYPE_PROMOTE_DRAFTER
+        else:
+            raise TypeError(
+                f"LibP2PSwarmEventBus.publish: unsupported payload "
+                f"{type(payload).__name__}"
+            )
+
+        payload.validate()
+
+        # GossipClient.publish takes (event_type, data_dict). We embed
+        # the schema version + dataclass fields. Receivers reconstruct
+        # the typed payload via decode_event on the dict.
+        from dataclasses import asdict
+        data = {"v": SCHEMA_VERSION, **asdict(payload)}
+
+        from_peer_id = str(from_peer or self._local)
+        ok = self._gc.publish(type_str, data)
+        if not ok:
+            logger.debug(
+                "libp2p_swarm_event_publish_rejected: type=%s from_peer=%s",
+                type_str, from_peer_id,
+            )
+
+    # ── Subscribe ─────────────────────────────────────────────────
+
+    def subscribe(
+        self,
+        event_type: str,
+        handler: Callable[[SwarmEvent], None],
+    ) -> Callable[[], None]:
+        if event_type not in _KNOWN_EVENT_TYPES:
+            raise ValueError(
+                f"subscribe: unknown event_type {event_type!r}"
+            )
+
+        # Wrap the SwarmEvent handler in a GossipMessage handler that
+        # decodes the gossip-data dict back into our typed event.
+        def _gossip_callback(msg: Any) -> None:
+            # GossipMessage: {type, data, observed_by, unix_ms, propagation_source}
+            try:
+                # Reconstruct the SwarmEvent envelope shape that
+                # decode_event expects, then route through the
+                # validator. Schema version is inside data['v'].
+                data = dict(msg.data)
+                schema_v = int(data.pop("v", SCHEMA_VERSION))
+                envelope = {
+                    "type": str(msg.type),
+                    "v": schema_v,
+                    "data": data,
+                    "from_peer": str(msg.observed_by or ""),
+                    "unix_ms": int(msg.unix_ms or 0),
+                }
+                event = decode_event(envelope)
+            except EventDecodeError as exc:
+                logger.warning(
+                    "libp2p_swarm_event_decode_failed: type=%s "
+                    "reason=%s err=%s",
+                    msg.type, exc.reason, exc,
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "libp2p_swarm_event_unexpected_error: type=%s err=%s",
+                    msg.type, exc,
+                )
+                return
+
+            try:
+                handler(event)
+            except Exception:
+                logger.exception(
+                    "libp2p_swarm_event_handler_failed: type=%s",
+                    event.type,
+                )
+
+        # Register on GossipClient.
+        self._gc.on(event_type, _gossip_callback)
+
+        with self._lock:
+            self._handlers.setdefault(event_type, []).append(
+                (handler, _gossip_callback),
+            )
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                lst = self._handlers.get(event_type)
+                if lst is None:
+                    return
+                # Find and remove (handler, _gossip_callback) pair.
+                for i, (h, cb) in enumerate(lst):
+                    if h is handler:
+                        self._gc.off(event_type, cb)
+                        lst.pop(i)
+                        break
+                if not lst:
+                    self._handlers.pop(event_type, None)
+
+        return _unsubscribe
+
+    def close(self) -> None:
+        """Detach every subscription. Idempotent."""
+        with self._lock:
+            for event_type, lst in list(self._handlers.items()):
+                for _h, cb in lst:
+                    try:
+                        self._gc.off(event_type, cb)
+                    except Exception:  # pragma: no cover
+                        pass
+            self._handlers.clear()
