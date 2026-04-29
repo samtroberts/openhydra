@@ -125,6 +125,160 @@ class HeadSampler:
                 decode_seed=decode.seed,
             ))
 
+    def verify_block(
+        self,
+        hidden_states_block: Any,
+        draft_token_ids: list[int],
+        decode: DecodeConfig,
+        *,
+        packed_bytes: bytes | None = None,
+    ) -> tuple[int, int]:
+        """Phase 2b — DFlash block-verify.
+
+        Given the target's hidden states for ``len(draft_token_ids) + 1``
+        positions (the +1 is the next-token position past the last
+        draft, used to sample the bonus token) and the corresponding
+        draft tokens, return ``(accepted_len, bonus_token)``:
+
+        * ``accepted_len`` — the longest prefix where the target's
+          greedy argmax matches the draft. Range [0, len(drafts)].
+        * ``bonus_token`` — sampled from the target's logits at
+          position ``accepted_len``. Always emitted, even on full
+          rejection (then it's the target's argmax at position 0).
+
+        The total tokens emitted per verify pass is therefore always
+        ``accepted_len + 1`` — that's the per-block speedup factor
+        (1 if the draft is fully wrong, up to ``block_size + 1`` when
+        every draft matches).
+
+        Lossless guarantee: under ``decode.temperature == 0`` every
+        emitted token is the target's greedy argmax — byte-identical
+        to non-speculative greedy decoding. Under ``temperature > 0``
+        we accept while greedy-equivalent and sample the bonus from
+        the target's distribution at position ``accepted_len``; output
+        is sampling-equivalent to single-token decoding within the
+        same temperature schedule.
+
+        Args:
+            hidden_states_block: Backend-tensor of shape
+                ``[len(draft_token_ids) + 1, hidden_size]``. Caller
+                guarantees fp16/fp32 contiguous layout the runtime
+                expects — the runtime's
+                ``apply_final_head_block(hidden_states_block) ->
+                List[int]`` returns one argmax per position. Wired in
+                Commit 9 (the Topology A driver loop).
+            draft_token_ids: The candidate tokens the drafter emitted.
+                Length == ``EngineConfig.draft_block_size``, default 16.
+            decode: Decode config. Phase 2b only fully supports
+                ``temperature == 0`` (lossless); ``temperature > 0``
+                accepts on greedy-equivalence and samples the bonus
+                from the target's distribution.
+            packed_bytes: Optional pre-serialised hidden states, same
+                contract as ``sample()`` — caller provides this for
+                MLX runtimes that already produced the packed wire
+                form during ring assembly.
+
+        Returns:
+            ``(accepted_len, bonus_token)`` — both ints, both safe to
+            wire back to the swarm via VerifyResult / kv_rollback_to.
+
+        Raises:
+            RuntimeError: If the borrowed runtime lacks
+            ``apply_final_head_block`` (runtime predates Phase 2b).
+            ValueError: If ``draft_token_ids`` is empty.
+        """
+        if not draft_token_ids:
+            raise ValueError("verify_block requires non-empty draft_token_ids")
+
+        apply_block = getattr(self._runtime, "apply_final_head_block", None)
+        if not callable(apply_block):
+            raise RuntimeError(
+                "head_sampler: borrowed runtime lacks apply_final_head_block; "
+                "this runtime predates Phase 2b. Update the peer to a build "
+                "that ships the block-decode path (Phase 2b Commit 7)."
+            )
+
+        with self._lock:
+            argmax_per_position: list[int] = list(apply_block(
+                hidden_states_block,
+                packed_bytes=packed_bytes,
+                decode_do_sample=decode.do_sample,
+                decode_temperature=decode.temperature,
+                decode_top_p=decode.top_p,
+                decode_top_k=decode.top_k,
+                decode_seed=decode.seed,
+            ))
+
+        accepted_len, bonus_token = select_accepted_prefix(
+            argmax_per_position=argmax_per_position,
+            draft_token_ids=list(draft_token_ids),
+        )
+        return int(accepted_len), int(bonus_token)
+
+
+# ── Phase 2b pure algorithm — testable without a runtime ────────────────
+
+
+def select_accepted_prefix(
+    *,
+    argmax_per_position: list[int],
+    draft_token_ids: list[int],
+) -> tuple[int, int]:
+    """Compute (accepted_len, bonus_token) from argmax + draft sequences.
+
+    Pure integer arithmetic — no tensors, no runtime dispatch. Lives
+    here so ``HeadSampler.verify_block`` is just a thin orchestrator
+    around it, AND so the algorithm gets unit-tested without pulling
+    any backend.
+
+    Contract:
+        * ``argmax_per_position`` must have length ``len(draft_token_ids) + 1``.
+          Index ``i`` for ``i < len(drafts)`` is the target's prediction
+          for what should appear at position ``i`` — i.e., the value
+          ``draft_token_ids[i]`` is being checked against. Index
+          ``len(drafts)`` is the bonus-token position.
+        * Returns ``accepted_len`` in ``[0, len(drafts)]`` — exclusive
+          upper bound matches the "longest matching prefix length"
+          convention.
+        * Returns ``bonus_token`` = ``argmax_per_position[accepted_len]``.
+          Total emitted = ``accepted_len + 1`` tokens.
+
+    Lossless under temp=0: every emitted token is exactly what the
+    target model's greedy argmax would have produced step-by-step
+    in single-token decoding. The block-verify path is mathematically
+    equivalent to autoregressive greedy decoding when each draft
+    matches the argmax.
+
+    Examples:
+        Full acceptance (all 16 drafts match) — returns
+        ``(16, argmax[16])``, emitting 17 tokens.
+
+        First-position rejection — returns ``(0, argmax[0])``,
+        emitting just 1 token (the target's argmax at pos 0). Note
+        the rejected drafts are NOT emitted; the caller must roll
+        back peer KV state by exactly ``len(drafts) - accepted_len``
+        positions before the next forward.
+    """
+    n_drafts = len(draft_token_ids)
+    if n_drafts <= 0:
+        raise ValueError("draft_token_ids must be non-empty")
+    if len(argmax_per_position) != n_drafts + 1:
+        raise ValueError(
+            f"argmax_per_position must have length {n_drafts + 1} "
+            f"(== len(drafts)+1 for the bonus position); "
+            f"got {len(argmax_per_position)}"
+        )
+
+    # Walk the draft, accept while the target agrees position-by-position.
+    accepted_len = 0
+    while accepted_len < n_drafts and (
+        int(argmax_per_position[accepted_len]) == int(draft_token_ids[accepted_len])
+    ):
+        accepted_len += 1
+
+    bonus_token = int(argmax_per_position[accepted_len])
+    return accepted_len, bonus_token
+
 
 # ── Process-local registry ──────────────────────────────────────────────
 #
