@@ -99,7 +99,9 @@
   {
     "model_id": "openhydra-qwen3.5-4b",
     "hf_model_id": "Qwen/Qwen3.5-4B",
+    "mlx_model_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
     "draft_model_id": "Qwen/Qwen3.5-0.8B",
+    "dflash_draft_model_id": "z-lab/Qwen3.5-4B-DFlash",
     "required_peers": 1,
     "min_vram_gb": 9,
     "shard_vram_gb": 9.0,
@@ -339,7 +341,9 @@
   {
     "model_id": "openhydra-qwen3.5-4b",
     "hf_model_id": "Qwen/Qwen3.5-4B",
+    "mlx_model_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
     "draft_model_id": "Qwen/Qwen3.5-0.8B",
+    "dflash_draft_model_id": "z-lab/Qwen3.5-4B-DFlash",
     "required_peers": 1,
     "min_vram_gb": 8,
     "shard_vram_gb": 3.0,
