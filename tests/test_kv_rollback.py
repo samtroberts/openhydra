@@ -138,14 +138,21 @@ def test_truncate_attention_invalid_axis_raises():
 # ── TapeReplayRecurrentRollback (Strategy B: snapshot-once + replay) ────
 
 
-def _scalar_replay_step(S, beta, k, v):
-    """Test-only replay step that works on plain scalars/lists.
+def _scalar_replay_step(S, innovation):
+    """Test-only replay step that works on plain scalars/tuples.
 
-    For unit tests we model S as a single float and (β, k, v) as
-    floats; eq. (1) collapses to ``S' = (1 - β·k·k)·S + β·v·k``.
-    The dispatcher uses this as the ``replay_step`` callable so we
-    can validate the math without standing up a tensor library.
+    For unit tests we model S as a single float and innovation as
+    a (β, k, v) tuple; eq. (1) collapses to
+    ``S' = (1 - β·k·k)·S + β·v·k``. The dispatcher uses this as
+    the ``replay_step`` callable so we can validate the math
+    without standing up a tensor library.
+
+    Variadic: the rollback strategy passes one innovation through
+    per step. Different layer architectures plug in different
+    innovation shapes; here we use the (β, k, v) tuple to model
+    vanilla DeltaNet.
     """
+    beta, k, v = innovation
     return (1.0 - float(beta) * float(k) * float(k)) * float(S) + float(beta) * float(v) * float(k)
 
 
@@ -317,7 +324,7 @@ def test_hybrid_rollback_byte_equivalence_recurrent():
         S = S_pre
         for i in range(K):
             beta, k, v = innovations[i]
-            S = _scalar_replay_step(S, beta, k, v)
+            S = _scalar_replay_step(S, (beta, k, v))
         return S
 
     # Rollback via the strategy.
@@ -357,7 +364,7 @@ def test_hybrid_rollback_byte_equivalence_repeated_rollbacks():
     S = S_pre
     expected = [S]
     for beta, k, v in innovations:
-        S = _scalar_replay_step(S, beta, k, v)
+        S = _scalar_replay_step(S, (beta, k, v))
         expected.append(S)
 
     assert out_0["live_state"] == expected[0]
@@ -401,7 +408,7 @@ def test_dispatcher_routes_per_layer_type():
     expected_S = pre_state
     for i in range(4):
         beta, k, v = innovations[i]
-        expected_S = _scalar_replay_step(expected_S, beta, k, v)
+        expected_S = _scalar_replay_step(expected_S, (beta, k, v))
     assert out[1]["live_state"] == expected_S
 
 

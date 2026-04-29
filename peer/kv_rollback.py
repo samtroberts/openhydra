@@ -210,12 +210,33 @@ class TapeReplayRecurrentRollback(RollbackStrategy):
 
     Expected ``kv_state`` shape:
         {
-          "live_state":      <tensor>,    # current recurrent state
-          "pre_block_state": <tensor>,    # S_pre — clone, taken at block start
-          "innovations":     [(β_i, k_i, v_i), ...],  # B entries, one per draft
-          "block_start_pos": int,         # absolute seq pos at block start
-          "replay_step":     callable,    # f(S, β, k, v) → S' (eq. 1)
+          "live_state":      <state>,            # current recurrent state
+          "pre_block_state": <state>,            # snapshot at block start
+          "innovations":     [innov_0, ...],     # B entries; each is whatever
+                                                 # the layer's replay_step
+                                                 # needs to redo one step
+                                                 # (e.g. (β, k, v) tuple for
+                                                 # vanilla DeltaNet,
+                                                 # hidden_states slice for
+                                                 # Qwen3Next where the layer
+                                                 # recomputes its own
+                                                 # projections).
+          "block_start_pos": int,                # absolute seq pos at block start
+          "replay_step":     callable,           # f(S, innovation) → S'
         }
+
+    The replay_step signature is intentionally variadic in the second
+    argument so different recurrent layer architectures can plug in
+    their own innovation shapes. For vanilla DeltaNet the innovation
+    is ``(β_i, k_i, v_i)`` and ``replay_step`` applies eq.(1):
+
+        S' = (I − β · k k^T) · S + β · v · k^T
+
+    For Qwen3Next the innovation is the per-step ``hidden_states``
+    slice and ``replay_step`` re-invokes the layer's own forward
+    over that slice — the layer recomputes (q, k, v, β, a) from
+    the same input, producing a bit-identical state because the
+    inputs and weights are identical to the verify pass.
 
     Why snapshot-once not snapshot-per-step:
         * Snapshot-per-step needs (B+1) clones × |S| memory.
@@ -282,8 +303,7 @@ class TapeReplayRecurrentRollback(RollbackStrategy):
         # same block (Phase 2c tree speculation reuses this entry).
         S = _clone_tensor(kv_state["pre_block_state"])
         for i in range(accepted):
-            beta_i, k_i, v_i = innovations[i]
-            S = replay(S, beta_i, k_i, v_i)
+            S = replay(S, innovations[i])
 
         # Returned dict preserves pre_block_state + innovations
         # untouched so further rollbacks within the same block stay
