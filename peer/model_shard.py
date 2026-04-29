@@ -2682,6 +2682,43 @@ class PyTorchRuntime:
         )
         return int(round(float(tokens[0]))) if tokens else 0
 
+    def apply_final_head_block(
+        self,
+        hidden_states_block: Any,
+        *,
+        packed_bytes: bytes | None = None,
+        decode_do_sample: bool | None = None,
+        decode_temperature: float | None = None,
+        decode_top_p: float | None = None,
+        decode_top_k: int | None = None,
+        decode_seed: int | None = None,
+    ) -> list[int]:
+        """Phase 2b — DFlash block-verify entry point (PyTorch).
+
+        Symmetric with ``MLXRuntime.apply_final_head_block``. Apply
+        ``final_norm`` + ``lm_head`` to a block of N hidden states and
+        return N argmax token ids. Lossless: returns greedy argmax
+        regardless of decode parameters. Phase 2b only fully supports
+        temp=0.
+        """
+        if self._lm_head is None:
+            raise RuntimeError(
+                "apply_final_head_block: this PyTorch shard does not "
+                "own the last layer; lm_head weights are on a "
+                "different peer"
+            )
+        import torch as _torch
+        hidden = self._activation_to_hidden(
+            hidden_states_block, packed_bytes=packed_bytes,
+        )
+        normed = self._apply_final_norm(hidden)
+        logits = self._lm_head(normed)
+        with _torch.no_grad():
+            argmax = _torch.argmax(logits, dim=-1)
+            if argmax.dim() == 2:
+                argmax = argmax[0]
+            return [int(t.item()) for t in argmax]
+
     def _hidden_to_next_token_payload(
         self,
         hidden,
