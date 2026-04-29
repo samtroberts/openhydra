@@ -1711,12 +1711,165 @@ class InferenceService:
                 _kv_consecutive_failures = 0
                 _KV_MAX_RETRIES = 3  # retry KV-aware path up to 3 times before permanent fallback
 
+                # ── Phase 2b: DFlash speculative decoding branch ──────────
+                # When --draft-location != "off" AND a head sampler is
+                # registered (Path A active), route into the DFlash
+                # path BEFORE the ring path takes over. The DFlash
+                # driver runs the verify ring trip itself; the
+                # surrounding autoregressive loop is bypassed.
+                #
+                # This branch is currently gated to single-process
+                # (in-process verify) mode — multi-peer libp2p ring
+                # transport for block-verify is the next deliverable.
+                # When a multi-peer setup is detected we log a
+                # warning and fall through to the existing per-token
+                # ring path so generation still completes (just
+                # without the speculative speedup).
+                _dflash_active = False
+                try:
+                    from coordinator.dflash_integration import (
+                        DFlashIntegrationError,
+                        InProcessRingVerifyTransport,
+                        dflash_eligible,
+                        run_dflash_generation,
+                        setup_dflash_session,
+                    )
+                    from coordinator.head_sampler import get_head_sampler
+                    from coordinator.swarm_events import (
+                        InMemorySwarmEventBus,
+                        LibP2PSwarmEventBus,
+                    )
+
+                    if dflash_eligible(self.config):
+                        _head_sampler = get_head_sampler()
+                        if _head_sampler is None:
+                            logger.warning(
+                                "dflash_skip: --draft-location=%s but no "
+                                "HeadSampler registered; Path A inactive. "
+                                "Falling through to per-token ring path.",
+                                getattr(self.config, "draft_location", ""),
+                            )
+                        else:
+                            # Choose bus: LibP2P when p2p_node is up,
+                            # in-memory otherwise (single-process tests).
+                            _p2p = getattr(self.discovery_service, "_p2p_node", None)
+                            _gc = getattr(self, "_gossip_client", None)
+                            _local_id = getattr(_p2p, "libp2p_peer_id", "") or "local"
+                            if _p2p is not None and _gc is not None:
+                                _dflash_bus = LibP2PSwarmEventBus(
+                                    _gc, local_peer_id=str(_local_id),
+                                )
+                            else:
+                                _dflash_bus = InMemorySwarmEventBus()
+
+                            try:
+                                _dflash_session = setup_dflash_session(
+                                    config=self.config,
+                                    head_sampler=_head_sampler,
+                                    bus=_dflash_bus,
+                                    local_peer_id=str(_local_id),
+                                )
+                            except DFlashIntegrationError as exc:
+                                logger.warning(
+                                    "dflash_setup_failed: code=%s err=%s — "
+                                    "falling through to per-token ring path",
+                                    exc.code, exc,
+                                )
+                                _dflash_session = None
+
+                            if _dflash_session is not None:
+                                # Multi-peer ring transport not yet wired —
+                                # short-circuit to in-process when the local
+                                # runtime can serve the target end-to-end
+                                # (typical of single-Mac demos).
+                                if len(prep.primary_pipeline) >= 2:
+                                    logger.warning(
+                                        "dflash_multipeer_unsupported: "
+                                        "--draft-location=%s with %d peers "
+                                        "in pipeline; multi-peer libp2p "
+                                        "ring transport is not yet "
+                                        "implemented. Falling through to "
+                                        "per-token ring path.",
+                                        getattr(self.config, "draft_location", ""),
+                                        len(prep.primary_pipeline),
+                                    )
+                                else:
+                                    # In-process transport: target forward
+                                    # runs locally (single peer = this
+                                    # process). The runtime's
+                                    # ``apply_final_head_block`` is
+                                    # already in place from Commit 7.
+                                    def _local_target(prefix, drafts):
+                                        # The real target forward over
+                                        # (prefix + drafts) is the runtime
+                                        # path; the in-process integration
+                                        # exercises this stub for
+                                        # synchronous tests. Production
+                                        # runs route through the libp2p
+                                        # ring (follow-up).
+                                        raise DFlashIntegrationError(
+                                            "transport_required",
+                                            "in-process target callable "
+                                            "not yet bound; --draft-location "
+                                            "currently requires the multi-"
+                                            "peer ring follow-up to fire "
+                                            "real generation requests",
+                                        )
+                                    try:
+                                        _dflash_transport = InProcessRingVerifyTransport(
+                                            run_target_block=_local_target,
+                                            telemetry=_dflash_session.telemetry,
+                                        )
+                                        _dflash_result = run_dflash_generation(
+                                            session=_dflash_session,
+                                            transport=_dflash_transport,
+                                            prompt_token_ids=list(_ar_context_ids),
+                                            max_tokens=_ar_target_tokens,
+                                            stop_token_ids=frozenset(_ar_eos_ids or []),
+                                            request_id=str(request_id),
+                                            kv_session_id=str(_ar_kv_session or ""),
+                                        )
+                                        _ar_generated.extend(_dflash_result["tokens"])
+                                        _ar_total_latency_ms = _dflash_result["total_ms"]
+                                        _dflash_active = True
+                                        logger.info(
+                                            "dflash_generation_done: req=%s "
+                                            "tokens=%d blocks=%d acceptance=%.3f "
+                                            "tps=%.2f",
+                                            request_id,
+                                            _dflash_result["tokens_emitted"],
+                                            _dflash_result["blocks"],
+                                            _dflash_result["acceptance_rate"],
+                                            (_dflash_result["tokens_emitted"]
+                                             / max(0.001, _dflash_result["total_ms"] / 1000.0)),
+                                        )
+                                    except DFlashIntegrationError as exc:
+                                        logger.warning(
+                                            "dflash_generation_failed: "
+                                            "code=%s err=%s — falling "
+                                            "through to per-token ring path",
+                                            exc.code, exc,
+                                        )
+                                    except Exception as exc:
+                                        logger.error(
+                                            "dflash_generation_unexpected: "
+                                            "err=%s — falling through",
+                                            exc, exc_info=True,
+                                        )
+                except Exception as exc:
+                    # DFlash setup is best-effort — never derail a
+                    # request that would have otherwise succeeded.
+                    logger.warning(
+                        "dflash_branch_skipped: err=%s", exc,
+                    )
+
                 # ── Ring topology: continuous push loop ────────────────────
                 # When push mode is enabled and pipeline has relay peers,
                 # use the ring: coordinator kicks off one push, tokens
                 # circulate peer-to-peer, emitted into a queue in real-time.
                 _use_ring = (
-                    self.config.push_mode_enabled
+                    not _dflash_active
+                    and self.config.push_mode_enabled
                     and len(prep.primary_pipeline) >= 2
                     and self.config.push_callback_address
                 )
