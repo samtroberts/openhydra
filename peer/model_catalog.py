@@ -26,7 +26,11 @@ import json
 import logging
 from pathlib import Path
 
-__all__ = ["resolve_hf_model_id"]
+__all__ = [
+    "resolve_hf_model_id",
+    "resolve_mlx_model_id",
+    "resolve_dflash_draft_model_id",
+]
 
 
 def resolve_hf_model_id(
@@ -84,3 +88,72 @@ def resolve_hf_model_id(
 
     # 4. Unresolved.
     return ""
+
+
+def _read_catalog_entry(
+    model_id: str,
+    *,
+    catalog_path: str | Path | None = None,
+) -> dict | None:
+    """Return the catalog entry dict for ``model_id`` or ``None``."""
+    mid = str(model_id or "").strip()
+    if not mid:
+        return None
+    cp = Path(catalog_path) if catalog_path is not None else Path("models.catalog.json")
+    try:
+        if cp.exists():
+            raw = json.loads(cp.read_text())
+            if isinstance(raw, list):
+                for entry in raw:
+                    if isinstance(entry, dict) and str(entry.get("model_id", "")).strip() == mid:
+                        return entry
+    except Exception as exc:  # pragma: no cover — logged, non-fatal
+        logging.warning("catalog_lookup_failed: path=%s id=%s err=%s", cp, mid, exc)
+    return None
+
+
+def resolve_mlx_model_id(
+    model_id: str,
+    *,
+    catalog_path: str | Path | None = None,
+) -> str:
+    """Return the canonical MLX-community model id for a target model.
+
+    Phase 2b: peers running MLX should load the ``mlx-community/*``
+    fork specified by the catalog's ``mlx_model_id`` field rather than
+    the canonical HF ``hf_model_id`` (which is unquantised fp16). This
+    keeps Mac peers within unified-memory budget on 4B+ targets and
+    matches the Phase 2b launch matrix in ARCHITECTURE_ROADMAP_v1.md.
+
+    Returns the empty string when the catalog has no MLX-specific id.
+    Callers must fall back to ``hf_model_id`` (or the operator's
+    explicit ``--runtime-model-id``) when this returns empty.
+    """
+    entry = _read_catalog_entry(model_id, catalog_path=catalog_path)
+    if entry is None:
+        return ""
+    return str(entry.get("mlx_model_id", "") or "").strip()
+
+
+def resolve_dflash_draft_model_id(
+    model_id: str,
+    *,
+    catalog_path: str | Path | None = None,
+) -> str:
+    """Return the DFlash draft model id paired with a target model.
+
+    Distinct from ``draft_model_id`` (the legacy SpecPipe draft, used
+    by ``coordinator/specpipe_scheduler.py``). DFlash drafts are
+    block-diffusion models specifically trained against a target —
+    e.g. ``z-lab/Qwen3.5-4B-DFlash`` for ``Qwen/Qwen3.5-4B``. The
+    legacy and DFlash drafts coexist in the catalog so existing
+    SpecPipe deployments keep working while Phase 2b ships.
+
+    Returns the empty string when the catalog has no DFlash draft for
+    this target. Callers should treat that as "DFlash unsupported for
+    this model; pass --draft-model explicitly or use --draft-location off."
+    """
+    entry = _read_catalog_entry(model_id, catalog_path=catalog_path)
+    if entry is None:
+        return ""
+    return str(entry.get("dflash_draft_model_id", "") or "").strip()
