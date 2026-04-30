@@ -1592,20 +1592,49 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             # via the existing PushResult path with block_size > 0.
             if bool(getattr(request, "draft_block", False)):
                 _bv_response = self._handle_block_verify_request(request)
-                # The handler returned a fully-formed response; wire it
-                # back through the existing push-mode return path so the
-                # coord-side queue routing kicks in.
+                # The handler returns a fully-formed response. Routing
+                # depends on the response's role:
+                #
+                #  * is_hidden_state=True (terminal stage / single-peer):
+                #    push to coord via _push_final_result so the dflash
+                #    queue picks it up.
+                #  * is_hidden_state=False (intermediate): push to next
+                #    hop so the next shard in the ring runs its layer
+                #    slice on top of these hidden states.
+                #
+                # Errors (response.error non-empty) ride either path —
+                # the receiver is expected to handle the error code in
+                # the response body.
                 if bool(getattr(request, "push_mode", False)):
-                    callback_addr = str(getattr(request, "final_callback_address", "") or "").strip()
-                    if callback_addr:
-                        self._push_final_result(
-                            response=_bv_response,
-                            callback_address=callback_addr,
-                            callback_request_id=str(getattr(request, "final_callback_request_id", "") or ""),
-                            callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
-                            pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
-                            slot_id=int(getattr(request, "slot_id", 0) or 0),
-                        )
+                    if bool(getattr(_bv_response, "is_hidden_state", False)):
+                        # Terminal — return to coord.
+                        callback_addr = str(getattr(request, "final_callback_address", "") or "").strip()
+                        if callback_addr:
+                            self._push_final_result(
+                                response=_bv_response,
+                                callback_address=callback_addr,
+                                callback_request_id=str(getattr(request, "final_callback_request_id", "") or ""),
+                                callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                                pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
+                                slot_id=int(getattr(request, "slot_id", 0) or 0),
+                            )
+                    else:
+                        # Intermediate — push to next hop. Reuse the
+                        # existing per-token push machinery; it copies
+                        # remaining_route, draft_block, block_index,
+                        # prompt_token_ids, etc. through to the next
+                        # ForwardRequest. Final-callback fields stay
+                        # unchanged so the LAST peer eventually returns
+                        # to the same coord callback.
+                        next_addr = str(getattr(request, "next_hop_address", "") or "").strip()
+                        if next_addr:
+                            remaining = list(getattr(request, "remaining_route", []))
+                            self._push_to_next_hop(
+                                request=request,
+                                response=_bv_response,
+                                next_address=next_addr,
+                                remaining_route=remaining,
+                            )
                 return _bv_response
 
             # Phase 4 (Gemma 4 sharded adapter): read the ``prompt_token_ids``
@@ -2039,47 +2068,178 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         block_index = int(getattr(request, "block_index", 0) or 0)
         block_size_response = len(block_drafts) + 1   # B+1 verify positions
 
-        # Decode the prefix from activation_packed (chain.py packed
-        # initial_activation = list[float] of token IDs as floats).
-        prefix_token_ids: list[int] = []
-        try:
-            packed = bytes(getattr(request, "activation_packed", b"") or b"")
-            if packed:
-                import struct
-                n = len(packed) // 4
-                if n > 0:
-                    floats = list(struct.unpack(f"<{n}f", packed))
-                    prefix_token_ids = [int(round(f)) for f in floats]
-            elif list(getattr(request, "activation", []) or []):
-                prefix_token_ids = [
-                    int(round(f)) for f in list(request.activation)
-                ]
-        except Exception as exc:
-            logger.error(
-                "block_verify_decode_prefix_failed: req=%s err=%s",
-                request.request_id, exc, exc_info=True,
-            )
+        stage_index = int(getattr(request, "stage_index", 0) or 0)
+        total_stages = int(getattr(request, "total_stages", 1) or 1)
+        is_first_stage = (stage_index == 0)
+        is_last_stage = (stage_index == total_stages - 1)
+
+        if not block_drafts:
             return peer_pb2.ForwardResponse(
                 request_id=request.request_id,
                 peer_id=self.peer_id,
                 stage_index=request.stage_index,
-                error=f"block_verify_decode_prefix_failed: {exc}",
+                error="block_verify_empty_drafts",
                 is_hidden_state=False,
                 block_size=0,
                 block_index=block_index,
             )
 
-        # Try forward_block_for_verify on the local runtime. This is
-        # the in-process / full-model path. Sharded peers don't expose
-        # the full-model entry point — the head-only PyTorchRuntime in
-        # a true 3-shard ring would lack the embedding + early layers.
         runtime = getattr(self.shard, "_runtime", None)
-        fwd_block = getattr(runtime, "forward_block_for_verify", None)
-        if not callable(fwd_block):
+        # ── Phase 2b live-bench Binding #3 — sharded block-verify ────
+        # Layer-sliced peers route through forward_block_layer_slice
+        # which runs THIS peer's layer slice over the multi-position
+        # input. Stage 0 embeds [prefix + drafts]; intermediate / last
+        # stages take incoming hidden states from the previous shard.
+        # The terminal stage slices the last B+1 positions before
+        # returning so only the verify positions ride the libp2p relay
+        # back to coord.
+        #
+        # Single-peer / full-model deployments (total_stages == 1) keep
+        # the simpler forward_block_for_verify path which was
+        # exhaustively unit-tested in Binding #1.
+        fwd_block_full = getattr(runtime, "forward_block_for_verify", None)
+        fwd_block_slice = getattr(runtime, "forward_block_layer_slice", None)
+
+        if total_stages <= 1 and callable(fwd_block_full):
+            # Single-peer fast path — preserves the Binding #1 contract.
+            prefix_token_ids: list[int] = []
+            try:
+                packed = bytes(getattr(request, "activation_packed", b"") or b"")
+                if packed:
+                    import struct
+                    n = len(packed) // 4
+                    if n > 0:
+                        floats = list(struct.unpack(f"<{n}f", packed))
+                        prefix_token_ids = [int(round(f)) for f in floats]
+                elif list(getattr(request, "activation", []) or []):
+                    prefix_token_ids = [
+                        int(round(f)) for f in list(request.activation)
+                    ]
+            except Exception as exc:
+                logger.error(
+                    "block_verify_decode_prefix_failed: req=%s err=%s",
+                    request.request_id, exc, exc_info=True,
+                )
+                return peer_pb2.ForwardResponse(
+                    request_id=request.request_id,
+                    peer_id=self.peer_id,
+                    stage_index=request.stage_index,
+                    error=f"block_verify_decode_prefix_failed: {exc}",
+                    is_hidden_state=False,
+                    block_size=0,
+                    block_index=block_index,
+                )
+            if not prefix_token_ids:
+                return peer_pb2.ForwardResponse(
+                    request_id=request.request_id,
+                    peer_id=self.peer_id,
+                    stage_index=request.stage_index,
+                    error="block_verify_empty_prefix",
+                    is_hidden_state=False,
+                    block_size=0,
+                    block_index=block_index,
+                )
+            try:
+                hidden_block = fwd_block_full(prefix_token_ids, block_drafts)
+            except Exception as exc:
+                logger.error(
+                    "block_verify_forward_failed: req=%s block=%d err=%s",
+                    request.request_id, block_index, exc, exc_info=True,
+                )
+                return peer_pb2.ForwardResponse(
+                    request_id=request.request_id,
+                    peer_id=self.peer_id,
+                    stage_index=request.stage_index,
+                    error=f"block_verify_forward_failed: {exc}",
+                    is_hidden_state=False,
+                    block_size=0,
+                    block_index=block_index,
+                )
+            # Single-peer always behaves as last_stage from the coord's
+            # perspective: it returns the verify-position hidden states.
+            is_last_stage = True
+            forward_output = hidden_block
+        elif callable(fwd_block_slice):
+            # Sharded path — Binding #3.
+            try:
+                if is_first_stage:
+                    # Decode prefix from activation_packed (token IDs as fp32).
+                    prefix_token_ids = []
+                    packed = bytes(getattr(request, "activation_packed", b"") or b"")
+                    if packed:
+                        import struct
+                        n = len(packed) // 4
+                        if n > 0:
+                            floats = list(struct.unpack(f"<{n}f", packed))
+                            prefix_token_ids = [int(round(f)) for f in floats]
+                    elif list(getattr(request, "activation", []) or []):
+                        prefix_token_ids = [
+                            int(round(f)) for f in list(request.activation)
+                        ]
+                    if not prefix_token_ids:
+                        return peer_pb2.ForwardResponse(
+                            request_id=request.request_id,
+                            peer_id=self.peer_id,
+                            stage_index=request.stage_index,
+                            error="block_verify_empty_prefix",
+                            is_hidden_state=False,
+                            block_size=0,
+                            block_index=block_index,
+                        )
+                    forward_output = fwd_block_slice(
+                        is_first_stage=True,
+                        is_last_stage=is_last_stage,
+                        prefix_token_ids=prefix_token_ids,
+                        draft_token_ids=block_drafts,
+                    )
+                else:
+                    # Intermediate or last stage: incoming activation
+                    # is the previous shard's pre-norm hidden state
+                    # block as activation_packed bytes.
+                    incoming_packed = bytes(
+                        getattr(request, "activation_packed", b"") or b""
+                    )
+                    if not incoming_packed:
+                        return peer_pb2.ForwardResponse(
+                            request_id=request.request_id,
+                            peer_id=self.peer_id,
+                            stage_index=request.stage_index,
+                            error="block_verify_empty_incoming_hidden",
+                            is_hidden_state=False,
+                            block_size=0,
+                            block_index=block_index,
+                        )
+                    # Decode hidden states via runtime helper.
+                    incoming_hidden = runtime._activation_to_hidden(
+                        None, packed_bytes=incoming_packed,
+                    )
+                    forward_output = fwd_block_slice(
+                        is_first_stage=False,
+                        is_last_stage=is_last_stage,
+                        draft_token_ids=block_drafts,
+                        incoming_hidden=incoming_hidden,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "block_verify_sharded_forward_failed: req=%s "
+                    "stage=%d/%d block=%d err=%s",
+                    request.request_id, stage_index, total_stages,
+                    block_index, exc, exc_info=True,
+                )
+                return peer_pb2.ForwardResponse(
+                    request_id=request.request_id,
+                    peer_id=self.peer_id,
+                    stage_index=request.stage_index,
+                    error=f"block_verify_sharded_forward_failed: {exc}",
+                    is_hidden_state=False,
+                    block_size=0,
+                    block_index=block_index,
+                )
+        else:
             logger.warning(
                 "block_verify_runtime_unsupported: peer=%s runtime=%s "
-                "does not expose forward_block_for_verify; sharded "
-                "block-verify is the next deliverable",
+                "lacks forward_block_for_verify and "
+                "forward_block_layer_slice",
                 self.peer_id,
                 type(runtime).__name__ if runtime is not None else "None",
             )
@@ -2093,45 +2253,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 block_index=block_index,
             )
 
-        if not prefix_token_ids:
-            return peer_pb2.ForwardResponse(
-                request_id=request.request_id,
-                peer_id=self.peer_id,
-                stage_index=request.stage_index,
-                error="block_verify_empty_prefix",
-                is_hidden_state=False,
-                block_size=0,
-                block_index=block_index,
-            )
-
-        if not block_drafts:
-            return peer_pb2.ForwardResponse(
-                request_id=request.request_id,
-                peer_id=self.peer_id,
-                stage_index=request.stage_index,
-                error="block_verify_empty_drafts",
-                is_hidden_state=False,
-                block_size=0,
-                block_index=block_index,
-            )
-
-        # Run the full-model verify forward and pack the result.
-        try:
-            hidden_block = fwd_block(prefix_token_ids, block_drafts)
-        except Exception as exc:
-            logger.error(
-                "block_verify_forward_failed: req=%s block=%d err=%s",
-                request.request_id, block_index, exc, exc_info=True,
-            )
-            return peer_pb2.ForwardResponse(
-                request_id=request.request_id,
-                peer_id=self.peer_id,
-                stage_index=request.stage_index,
-                error=f"block_verify_forward_failed: {exc}",
-                is_hidden_state=False,
-                block_size=0,
-                block_index=block_index,
-            )
+        hidden_block = forward_output
 
         # Pack the hidden state block to wire bytes. Reuse the
         # runtime's existing serialiser when available; fall back to
@@ -2165,19 +2287,48 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 block_index=block_index,
             )
 
+        # Phase 2b live-bench Binding #3 — response shape depends on
+        # this peer's role in the ring:
+        #
+        #  * Last stage (or single-peer): is_hidden_state=True,
+        #    block_size=B+1 so the coord-side PushResult handler routes
+        #    to the dflash queue.
+        #  * Intermediate stage: is_hidden_state=False, block_size=0 so
+        #    _push_to_next_hop forwards the rebuilt request (with our
+        #    activation_packed = our shard's hidden output) to the next
+        #    peer rather than to coord.
+        if is_last_stage:
+            logger.info(
+                "block_verify_done_terminal: peer=%s req=%s stage=%d/%d "
+                "block=%d drafts=%d packed_bytes=%d",
+                self.peer_id, request.request_id,
+                stage_index, total_stages, block_index,
+                len(block_drafts), len(packed_bytes),
+            )
+            return peer_pb2.ForwardResponse(
+                request_id=request.request_id,
+                peer_id=self.peer_id,
+                stage_index=request.stage_index,
+                activation_packed=packed_bytes,
+                is_hidden_state=True,
+                block_size=block_size_response,
+                block_index=block_index,
+            )
+
         logger.info(
-            "block_verify_done: peer=%s req=%s block=%d "
-            "prefix=%d drafts=%d packed_bytes=%d",
-            self.peer_id, request.request_id, block_index,
-            len(prefix_token_ids), len(block_drafts), len(packed_bytes),
+            "block_verify_done_intermediate: peer=%s req=%s stage=%d/%d "
+            "block=%d drafts=%d packed_bytes=%d (forwarding to stage %d)",
+            self.peer_id, request.request_id,
+            stage_index, total_stages, block_index,
+            len(block_drafts), len(packed_bytes), stage_index + 1,
         )
         return peer_pb2.ForwardResponse(
             request_id=request.request_id,
             peer_id=self.peer_id,
             stage_index=request.stage_index,
             activation_packed=packed_bytes,
-            is_hidden_state=True,
-            block_size=block_size_response,
+            is_hidden_state=False,
+            block_size=0,
             block_index=block_index,
         )
 
@@ -2260,6 +2411,14 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 # SlotState (out-of-order safe under pipeline_depth >= 2).
                 slot_id=int(getattr(request, "slot_id", 0) or 0),
                 pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
+                # Phase 2b live-bench Binding #3: propagate block-verify
+                # routing fields verbatim. Each shard runs its slice
+                # over the SAME drafts / kv_rollback_to / block_index;
+                # only ``activation_packed`` mutates as hidden states
+                # cascade down the ring.
+                draft_block=bool(getattr(request, "draft_block", False)),
+                block_index=int(getattr(request, "block_index", 0) or 0),
+                kv_rollback_to=int(getattr(request, "kv_rollback_to", 0) or 0),
             )
 
             # State-aware routing: ask the Rust bridge if a direct (non-relayed)

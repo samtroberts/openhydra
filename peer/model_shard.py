@@ -3016,6 +3016,140 @@ class PyTorchRuntime:
         # Returned as [1, B+1, hidden] — apply_final_head_block accepts this.
         return verify_block
 
+    def forward_block_layer_slice(
+        self,
+        *,
+        is_first_stage: bool,
+        is_last_stage: bool,
+        prefix_token_ids: list[int] | None = None,
+        draft_token_ids: list[int] | None = None,
+        incoming_hidden: Any = None,
+    ) -> Any:
+        """Phase 2b live-bench Binding #3 — sharded block-verify forward.
+
+        Runs THIS peer's layer slice (``self._selected_layers``) over
+        ``[prefix..., drafts]`` for block-verify across a layer-sliced
+        ring. Mirrors the multi-position prefill path (which already
+        works across shards) but with two structural changes:
+
+        1. The verify forward does NOT use the per-session KV cache —
+           each block-verify is a from-scratch prefill over (prefix +
+           drafts). KV-aware sharded block-verify is a Phase 4
+           follow-up; for the cross-ISP benchmark the full re-prefill
+           per block is still fast enough to demonstrate the 3.2×
+           DFlash speedup because the alternative (per-token ring
+           round trip × 16 tokens) was much slower.
+
+        2. The terminal peer (``is_last_stage=True``) slices the last
+           ``len(drafts) + 1`` positions before returning so the
+           coord side only routes the actual verify positions back —
+           saving ~``prefix_len * hidden_size * 4`` bytes per round
+           on the libp2p relay. The pre-norm shape contract for
+           ``apply_final_head_block`` is preserved (last shard returns
+           pre-norm hidden states; coord applies final_norm +
+           lm_head).
+
+        Args:
+            is_first_stage: True iff this is stage 0 — embeds the
+                token IDs internally.
+            is_last_stage: True iff this is the terminal stage —
+                slices last B+1 positions before returning.
+            prefix_token_ids: Required when ``is_first_stage=True``;
+                ignored otherwise.
+            draft_token_ids: Required everywhere — either embedded
+                here (first stage) or used to compute the verify
+                slice end (last stage).
+            incoming_hidden: A ``[1, seq, hidden]`` tensor produced
+                by the previous stage's
+                ``forward_block_layer_slice``. Required when
+                ``is_first_stage=False``.
+
+        Returns:
+            ``[1, seq, hidden]`` torch.Tensor for intermediate
+            stages, ``[1, B+1, hidden]`` for the terminal stage.
+            ``apply_final_head_block`` accepts both shapes.
+
+        Raises:
+            ValueError: On missing required inputs for the stage.
+            RuntimeError: When the runtime can't reach the embedder
+                (first stage with no full-model embedding) or when
+                ``_run_layers`` itself fails.
+        """
+        import torch as _torch
+
+        drafts = list(draft_token_ids or [])
+        if not drafts:
+            raise ValueError(
+                "forward_block_layer_slice: draft_token_ids must be "
+                "non-empty"
+            )
+
+        if is_first_stage:
+            prefix = list(prefix_token_ids or [])
+            if not prefix:
+                raise ValueError(
+                    "forward_block_layer_slice: prefix_token_ids "
+                    "must be non-empty on the first stage"
+                )
+            embed = getattr(self, "_embed_tokens", None)
+            if embed is None:
+                raise RuntimeError(
+                    "forward_block_layer_slice: first-stage peer has "
+                    "no embed_tokens reference; the runtime did not "
+                    "load the embedder. Sharded deployments must put "
+                    "the embedder on stage 0."
+                )
+            full_input = prefix + drafts
+            input_ids = _torch.tensor(
+                [full_input], dtype=_torch.long, device=self._device,
+            )
+            with _torch.no_grad():
+                hidden = embed(input_ids)
+        else:
+            if incoming_hidden is None:
+                raise ValueError(
+                    "forward_block_layer_slice: incoming_hidden is "
+                    "required on intermediate / last stages"
+                )
+            if isinstance(incoming_hidden, _torch.Tensor):
+                hidden = incoming_hidden
+                if hidden.dim() == 2:
+                    hidden = hidden.unsqueeze(0)
+                hidden = hidden.to(device=self._device, dtype=self._dtype)
+            else:
+                # Allow flat-list / packed-bytes wire form for callers
+                # that haven't decoded yet.
+                hidden = self._activation_to_hidden(incoming_hidden)
+
+        # Build position_ids covering the absolute sequence positions
+        # [0, 1, ..., seq_len - 1]. The rotary embedding inside
+        # ``_run_layers`` needs these for correct attention; without
+        # them position 0 token gets the same rotation as position 99
+        # and the output is silently wrong.
+        seq_len = int(hidden.shape[1])
+        position_ids = _torch.arange(
+            seq_len, dtype=_torch.long, device=self._device,
+        ).unsqueeze(0)
+
+        with _torch.no_grad():
+            output, _ = self._run_layers(
+                hidden,
+                past_key_values=None,
+                use_cache=False,
+                position_ids=position_ids,
+                attention_mask=None,
+                cache_position=position_ids[0],
+            )
+
+        if is_last_stage:
+            # Slice last B+1 positions for the terminal stage. The
+            # coord applies final_norm + lm_head via
+            # apply_final_head_block on the returned tensor.
+            tail = len(drafts) + 1
+            output = output[:, -tail:, :].contiguous()
+
+        return output
+
     def _hidden_to_next_token_payload(
         self,
         hidden,
