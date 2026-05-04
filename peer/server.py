@@ -2008,12 +2008,20 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                                     logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_lan",
                                                 _rreq.request_id, _rreq.ring_tokens_remaining)
                                 elif self._p2p_node is not None and _libp2p:
+                                    _rl_direct = False
+                                    try:
+                                        _rl_direct = self._p2p_node.is_peer_connected(_libp2p)
+                                    except Exception:
+                                        pass
                                     self._p2p_node.proxy_forward(
                                         target_peer_id=_libp2p,
                                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                                     )
-                                    logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_relay",
-                                                _rreq.request_id, _rreq.ring_tokens_remaining)
+                                    logger.info(
+                                        "RING_LOOPBACK_DONE: req=%s remaining=%d via_%s",
+                                        _rreq.request_id, _rreq.ring_tokens_remaining,
+                                        "direct_quic" if _rl_direct else "relay",
+                                    )
                                 elif _raddr:
                                     _rl_ch = self._get_grpc_channel(_raddr)
                                     _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
@@ -2556,14 +2564,24 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         request.request_id, request.stage_index, next_address,
                     )
                 elif self._p2p_node is not None and _next_hop_libp2p_id:
-                    # IPv6 direct failed or cached-fail — use relay
+                    # IPv6 gRPC failed — route via libp2p (direct QUIC
+                    # if DCUtR succeeded, otherwise relay).
                     self._p2p_node.proxy_forward(
                         target_peer_id=_next_hop_libp2p_id,
                         data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
                     )
+                    _v6_fb_direct = False
+                    try:
+                        _v6_fb_direct = self._p2p_node.is_peer_connected(
+                            _next_hop_libp2p_id
+                        )
+                    except Exception:
+                        pass
+                    _v6_fb_label = "direct_quic" if _v6_fb_direct else "relay"
                     logger.info(
-                        "push_forwarded_via_relay: req=%s stage=%d -> %s "
+                        "push_forwarded_via_%s: req=%s stage=%d -> %s "
                         "(ipv6_fallback; libp2p=%s)",
+                        _v6_fb_label,
                         request.request_id, request.stage_index,
                         next_address, _next_hop_libp2p_id[:20],
                     )
@@ -2585,58 +2603,76 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     stub = peer_pb2_grpc.PeerStub(channel)
                     stub.Forward(next_req, timeout=60.0)
             elif self._p2p_node is not None and _next_hop_libp2p_id:
-                # B1 rendezvous: we're about to route through a circuit
-                # relay. Before we do, publish REQUEST_HOLE_PUNCH so the
-                # remote peer dials us back within the ~100 ms gossip
-                # propagation window — the narrow NAT-binding overlap
-                # DCUtR needs to punch through symmetric NAT. Inline
-                # 5 s per-(me,target) debounce: the ``proxy_forward``
-                # path fires ~once per token so we guard the publish.
+                # ── Option C: prefer direct QUIC when DCUtR succeeded ──
+                # is_peer_connected checks the direct_peers HashSet,
+                # which is populated by DCUtR success and non-relay
+                # ConnectionEstablished events.  If True, proxy_forward
+                # routes over the direct QUIC stream automatically —
+                # no relay, no hole-punch gossip needed.
+                _is_direct_peer = False
                 try:
-                    _my_libp2p = str(getattr(self._p2p_node, "libp2p_peer_id", "") or "")
-                    if _my_libp2p and _my_libp2p != _next_hop_libp2p_id:
-                        import time as _t
-                        now_mono = _t.monotonic()
-                        _last = getattr(self, "_b1_last_pub", None) or {}
-                        key = (_my_libp2p, _next_hop_libp2p_id)
-                        if now_mono - _last.get(key, 0.0) >= 5.0:
-                            import json as _json
-                            _env = {
-                                "type": "REQUEST_HOLE_PUNCH",
-                                "data": {
-                                    "from_peer_id": _my_libp2p,
-                                    "to_peer_id": _next_hop_libp2p_id,
-                                },
-                                "observed_by": _my_libp2p,
-                                "unix_ms": int(_t.time() * 1000),
-                            }
-                            try:
-                                self._p2p_node.publish_event(
-                                    _json.dumps(_env, separators=(",", ":"))
-                                    .encode("utf-8")
-                                )
-                                _last[key] = now_mono
-                                self._b1_last_pub = _last
-                                logger.info(
-                                    "b1_rendezvous_published_push: target=%s",
-                                    _next_hop_libp2p_id[:14],
-                                )
-                            except Exception as _pub_exc:
-                                logger.debug(
-                                    "b1_rendezvous_publish_push_failed: %s",
-                                    _pub_exc,
-                                )
-                except Exception:  # pragma: no cover — never derail the push
+                    _is_direct_peer = self._p2p_node.is_peer_connected(
+                        _next_hop_libp2p_id
+                    )
+                except Exception:
                     pass
 
-                # Fire-and-forget: ACK instantly, inference runs async on receiver.
+                if not _is_direct_peer:
+                    # B1 rendezvous: we're about to route through a circuit
+                    # relay. Publish REQUEST_HOLE_PUNCH so the remote peer
+                    # dials us back within the ~100 ms gossip propagation
+                    # window — the narrow NAT-binding overlap DCUtR needs
+                    # to punch through symmetric NAT.  5 s debounce.
+                    try:
+                        _my_libp2p = str(getattr(self._p2p_node, "libp2p_peer_id", "") or "")
+                        if _my_libp2p and _my_libp2p != _next_hop_libp2p_id:
+                            import time as _t
+                            now_mono = _t.monotonic()
+                            _last = getattr(self, "_b1_last_pub", None) or {}
+                            key = (_my_libp2p, _next_hop_libp2p_id)
+                            if now_mono - _last.get(key, 0.0) >= 5.0:
+                                import json as _json
+                                _env = {
+                                    "type": "REQUEST_HOLE_PUNCH",
+                                    "data": {
+                                        "from_peer_id": _my_libp2p,
+                                        "to_peer_id": _next_hop_libp2p_id,
+                                    },
+                                    "observed_by": _my_libp2p,
+                                    "unix_ms": int(_t.time() * 1000),
+                                }
+                                try:
+                                    self._p2p_node.publish_event(
+                                        _json.dumps(_env, separators=(",", ":"))
+                                        .encode("utf-8")
+                                    )
+                                    _last[key] = now_mono
+                                    self._b1_last_pub = _last
+                                    logger.info(
+                                        "b1_rendezvous_published_push: target=%s",
+                                        _next_hop_libp2p_id[:14],
+                                    )
+                                except Exception as _pub_exc:
+                                    logger.debug(
+                                        "b1_rendezvous_publish_push_failed: %s",
+                                        _pub_exc,
+                                    )
+                    except Exception:  # pragma: no cover — never derail the push
+                        pass
+
+                # Fire-and-forget: ACK instantly, inference runs async
+                # on receiver.  libp2p routes via direct QUIC when the
+                # peer is in direct_peers, otherwise through relay.
                 self._p2p_node.proxy_forward(
                     target_peer_id=_next_hop_libp2p_id,
                     data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
                 )
+                _route_label = "direct_quic" if _is_direct_peer else "relay"
                 logger.info(
-                    "push_forwarded_via_relay: req=%s stage=%d -> %s (libp2p=%s)",
-                    request.request_id, request.stage_index, next_address, _next_hop_libp2p_id[:20],
+                    "push_forwarded_via_%s: req=%s stage=%d -> %s (libp2p=%s)",
+                    _route_label,
+                    request.request_id, request.stage_index,
+                    next_address, _next_hop_libp2p_id[:20],
                 )
             elif next_address:
                 # No P2P node — direct gRPC only (LAN/VPC path).
@@ -2774,13 +2810,22 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         response.request_id, callback_address,
                     )
                 elif self._p2p_node is not None and _cb_libp2p:
+                    # IPv6 gRPC failed — route via libp2p (direct QUIC
+                    # if DCUtR succeeded, otherwise relay).
                     self._p2p_node.proxy_forward(
                         target_peer_id=_cb_libp2p,
                         data=PROXY_METHOD_PUSH_RESULT + response.SerializeToString(),
                     )
+                    _v6r_direct = False
+                    try:
+                        _v6r_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
+                    except Exception:
+                        pass
+                    _v6r_label = "direct_quic" if _v6r_direct else "relay"
                     logger.info(
-                        "push_result_sent_via_relay: req=%s -> %s "
+                        "push_result_sent_via_%s: req=%s -> %s "
                         "(ipv6_fallback; libp2p=%s)",
+                        _v6r_label,
                         response.request_id, callback_address, _cb_libp2p[:20],
                     )
             elif _cb_lan_reachable and callback_address:
@@ -2799,13 +2844,21 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     response.request_id, callback_address,
                 )
             elif self._p2p_node is not None and _cb_libp2p:
-                # No direct connection — route PushResult through relay.
+                # Route via libp2p — direct QUIC if DCUtR succeeded,
+                # otherwise through circuit relay.
+                _pr_is_direct = False
+                try:
+                    _pr_is_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
+                except Exception:
+                    pass
                 self._p2p_node.proxy_forward(
                     target_peer_id=_cb_libp2p,
                     data=PROXY_METHOD_PUSH_RESULT + response.SerializeToString(),
                 )
+                _pr_label = "direct_quic" if _pr_is_direct else "relay"
                 logger.info(
-                    "push_result_sent_via_relay: req=%s -> %s (libp2p=%s)",
+                    "push_result_sent_via_%s: req=%s -> %s (libp2p=%s)",
+                    _pr_label,
                     response.request_id, callback_address, _cb_libp2p[:20],
                 )
             else:
@@ -3137,13 +3190,19 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         _rreq.request_id,
                     )
                 elif self._p2p_node is not None and _libp2p:
+                    _cr_direct = False
+                    try:
+                        _cr_direct = self._p2p_node.is_peer_connected(_libp2p)
+                    except Exception:
+                        pass
                     self._p2p_node.proxy_forward(
                         target_peer_id=_libp2p,
                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                     )
+                    _cr_label = "direct_quic" if _cr_direct else "relay"
                     logger.info(
-                        "COORD_REINJECT_DONE: req=%s via_relay",
-                        _rreq.request_id,
+                        "COORD_REINJECT_DONE: req=%s via_%s",
+                        _rreq.request_id, _cr_label,
                     )
                 elif _addr:
                     _ch = self._get_grpc_channel(_addr)
