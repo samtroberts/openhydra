@@ -184,7 +184,47 @@ def setup_dflash_session(
     from coordinator.failover import DraftModelRegistry, FailoverManager
     from coordinator.swarm_events import RegisterDraftModel
 
-    backend = "mlx"   # default; CUDA peers override at construction time
+    # Auto-detect backend.
+    #
+    # Priority:
+    #   1. MLX (Apple Silicon with dflash-mlx installed)
+    #   2. PyTorch DFlash (CUDA with z-lab/dflash installed)
+    #   3. Autoregressive (any causal LM as draft — standard spec decode)
+    #   4. Mock (infra testing, ~0% acceptance)
+    #
+    # Autoregressive is the fallback for CUDA deployments where the
+    # DFlash package isn't installed but a standard small model (e.g.
+    # Qwen3.5-0.8B) is set as --draft-model.
+    backend = "mlx"
+    try:
+        from dflash_mlx.runtime import generate_dflash_once as _gdo  # noqa: F401
+    except Exception:
+        try:
+            import dflash as _dflash_pt  # noqa: F401
+            backend = "pytorch"
+        except Exception:
+            # No DFlash package available. If a draft model path is
+            # set, use autoregressive (standard speculative decoding
+            # with a small causal LM). Otherwise fall back to mock.
+            draft_path_check = str(
+                getattr(config, "draft_model_path", "") or ""
+            ).strip()
+            if draft_path_check:
+                backend = "autoregressive"
+                logger.info(
+                    "dflash_backend_autoregressive: no DFlash package "
+                    "found, using standard speculative decoding with "
+                    "draft_model=%s", draft_path_check,
+                )
+            else:
+                backend = "mock"
+                logger.warning(
+                    "dflash_backend_fallback: neither dflash-mlx nor "
+                    "dflash importable and no draft model path set — "
+                    "using mock drafter. Block-verify pipeline is "
+                    "exercised end-to-end but acceptance rate will be "
+                    "~0%%."
+                )
     target_path = str(
         getattr(config, "default_target_model", "")
         or getattr(config, "default_model", "Qwen/Qwen3.5-4B")

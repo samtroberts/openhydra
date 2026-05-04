@@ -102,15 +102,15 @@ class DFlashConfig:
     target_model_path: str = _DEFAULT_TARGET_CUDA
     draft_model_path: str = _DEFAULT_DRAFT
     block_size: int = 16
-    backend: str = "mlx"           # "mlx" | "pytorch" | "mock"
+    backend: str = "mlx"           # "mlx" | "pytorch" | "mock" | "autoregressive"
     sliding_window_size: Optional[int] = None
     device: str = ""
 
     def __post_init__(self) -> None:
-        if self.backend not in {"mlx", "pytorch", "mock"}:
+        if self.backend not in {"mlx", "pytorch", "mock", "autoregressive"}:
             raise ValueError(
-                f"DFlashConfig.backend must be 'mlx', 'pytorch', or "
-                f"'mock'; got {self.backend!r}"
+                f"DFlashConfig.backend must be 'mlx', 'pytorch', 'mock', "
+                f"or 'autoregressive'; got {self.backend!r}"
             )
         if self.block_size < 1 or self.block_size > 32:
             raise ValueError(
@@ -345,6 +345,119 @@ class _MLXDFlashDrafter(DFlashDrafter):
         return emitted
 
 
+class _AutoRegressiveDrafter(DFlashDrafter):
+    """Standard speculative decoding drafter using a small causal LM.
+
+    Loads any HuggingFace ``AutoModelForCausalLM``-compatible model
+    (e.g. ``Qwen/Qwen3.5-0.8B``) and generates draft tokens via
+    greedy autoregressive decoding. The draft tokens are then
+    verified by the full target model through the ring.
+
+    This is the "classic" speculative decoding approach (Leviathan
+    et al. 2022) — no block-diffusion, no target hidden states
+    needed. The draft model only needs the prefix token IDs.
+
+    Advantages over DFlash for distributed sharding:
+      * Draft model is self-contained — no target hidden state
+        extraction from specific layers across peers.
+      * Works with any same-family small model as drafter.
+      * Acceptance rate depends on distribution match between
+        small and large model (typically 60-85% for same-family).
+    """
+
+    _INSTALL_HINT = "pip install transformers accelerate"
+
+    def ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise DFlashNotAvailableError(
+                backend="autoregressive",
+                install_hint=self._INSTALL_HINT,
+            ) from exc
+
+        device = self._cfg.device or "auto"
+        # Detect dtype: fp16 for CUDA (T4 etc.), bf16 for Ampere+
+        import torch
+        if device == "auto" or "cuda" in device:
+            # T4 = sm_75, no native bf16. Ampere (sm_80+) has bf16.
+            if torch.cuda.is_available():
+                cap = torch.cuda.get_device_capability()
+                dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+            else:
+                dtype = torch.float32
+        else:
+            dtype = torch.float32
+
+        logger.info(
+            "autoregressive_drafter_loading: model=%s device=%s dtype=%s",
+            self._cfg.draft_model_path, device, dtype,
+        )
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self._cfg.draft_model_path,
+            dtype=dtype,
+            device_map=device if device != "auto" else "auto",
+            trust_remote_code=True,
+        ).eval()
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self._cfg.draft_model_path,
+            trust_remote_code=True,
+        )
+        self._device = next(self._model.parameters()).device
+        self._dtype = dtype
+        self._loaded = True
+        logger.info(
+            "autoregressive_drafter_loaded: model=%s device=%s "
+            "params=%.1fM block_size=%d",
+            self._cfg.draft_model_path, self._device,
+            sum(p.numel() for p in self._model.parameters()) / 1e6,
+            self._cfg.block_size,
+        )
+
+    def draft(self, prefix_token_ids: list[int]) -> list[int]:
+        self.ensure_loaded()
+        import torch
+
+        input_ids = torch.tensor(
+            [list(prefix_token_ids)],
+            dtype=torch.long,
+            device=self._device,
+        )
+        with torch.inference_mode():
+            output = self._model.generate(
+                input_ids,
+                max_new_tokens=self._cfg.block_size,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
+        # Extract only the NEW tokens (after the prefix).
+        new_tokens = output[0, input_ids.shape[1]:].tolist()
+
+        # Pad to block_size if the model hit EOS early.
+        if len(new_tokens) < self._cfg.block_size:
+            pad = new_tokens[-1] if new_tokens else 0
+            new_tokens += [pad] * (self._cfg.block_size - len(new_tokens))
+
+        return new_tokens[: self._cfg.block_size]
+
+    def memory_mb(self) -> int:
+        if not self._loaded:
+            return 0
+        try:
+            import torch
+            total = sum(
+                p.numel() * p.element_size()
+                for p in self._model.parameters()
+            )
+            return int(total / (1024 * 1024))
+        except Exception:
+            return 0
+
+
 def load_dflash_drafter(cfg: DFlashConfig) -> DFlashDrafter:
     """Factory: instantiate the right drafter subclass for ``cfg.backend``.
 
@@ -355,6 +468,8 @@ def load_dflash_drafter(cfg: DFlashConfig) -> DFlashDrafter:
     """
     if cfg.backend == "mock":
         return MockDFlashDrafter(cfg)
+    if cfg.backend == "autoregressive":
+        return _AutoRegressiveDrafter(cfg)
     if cfg.backend == "pytorch":
         return _PyTorchDFlashDrafter(cfg)
     if cfg.backend == "mlx":
