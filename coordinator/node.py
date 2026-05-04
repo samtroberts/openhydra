@@ -680,7 +680,10 @@ def main() -> None:
     if getattr(args, "p2p_enabled", False):
         try:
             from openhydra_network import P2PNode
-            _p2p_listen = getattr(args, "p2p_listen", None) or ["/ip4/0.0.0.0/tcp/4001"]
+            _p2p_listen = getattr(args, "p2p_listen", None) or [
+                "/ip4/0.0.0.0/tcp/4001",
+                "/ip6/::/tcp/4001",
+            ]
             _p2p_bootstrap = getattr(args, "p2p_bootstrap", None) or list(PRODUCTION_LIBP2P_BOOTSTRAP_PEERS)
             _p2p_node = P2PNode(
                 identity_key_path=args.identity_path,

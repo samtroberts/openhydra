@@ -52,7 +52,10 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             identity_path: dirs_default_identity(),
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/4001".into()],
+            listen_addrs: vec![
+                "/ip4/0.0.0.0/tcp/4001".into(),
+                "/ip6/::/tcp/4001".into(),
+            ],
             bootstrap_peers: Vec::new(),
         }
     }
@@ -209,7 +212,10 @@ impl PyP2PNode {
                 .map(PathBuf::from)
                 .unwrap_or_else(dirs_default_identity),
             listen_addrs: listen_addrs
-                .unwrap_or_else(|| vec!["/ip4/0.0.0.0/tcp/4001".into()]),
+                .unwrap_or_else(|| vec![
+                    "/ip4/0.0.0.0/tcp/4001".into(),
+                    "/ip6/::/tcp/4001".into(),
+                ]),
             bootstrap_peers: bootstrap_peers.unwrap_or_default(),
         };
 
