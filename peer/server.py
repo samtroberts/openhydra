@@ -2625,48 +2625,21 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 except Exception:
                     pass
 
-                if not _is_direct_peer:
-                    # B1 rendezvous: we're about to route through a circuit
-                    # relay. Publish REQUEST_HOLE_PUNCH so the remote peer
-                    # dials us back within the ~100 ms gossip propagation
-                    # window — the narrow NAT-binding overlap DCUtR needs
-                    # to punch through symmetric NAT.  5 s debounce.
-                    try:
-                        _my_libp2p = str(getattr(self._p2p_node, "libp2p_peer_id", "") or "")
-                        if _my_libp2p and _my_libp2p != _next_hop_libp2p_id:
-                            import time as _t
-                            now_mono = _t.monotonic()
-                            _last = getattr(self, "_b1_last_pub", None) or {}
-                            key = (_my_libp2p, _next_hop_libp2p_id)
-                            if now_mono - _last.get(key, 0.0) >= 5.0:
-                                import json as _json
-                                _env = {
-                                    "type": "REQUEST_HOLE_PUNCH",
-                                    "data": {
-                                        "from_peer_id": _my_libp2p,
-                                        "to_peer_id": _next_hop_libp2p_id,
-                                    },
-                                    "observed_by": _my_libp2p,
-                                    "unix_ms": int(_t.time() * 1000),
-                                }
-                                try:
-                                    self._p2p_node.publish_event(
-                                        _json.dumps(_env, separators=(",", ":"))
-                                        .encode("utf-8")
-                                    )
-                                    _last[key] = now_mono
-                                    self._b1_last_pub = _last
-                                    logger.info(
-                                        "b1_rendezvous_published_push: target=%s",
-                                        _next_hop_libp2p_id[:14],
-                                    )
-                                except Exception as _pub_exc:
-                                    logger.debug(
-                                        "b1_rendezvous_publish_push_failed: %s",
-                                        _pub_exc,
-                                    )
-                    except Exception:  # pragma: no cover — never derail the push
-                        pass
+                # NOTE: B1 gossip (REQUEST_HOLE_PUNCH) was previously
+                # published here on every relay-bound token with a 5 s
+                # debounce.  This caused a fatal regression: the gossip
+                # triggered a DialPeer(PeerCondition::Always) on the
+                # remote peer, which created a NEW relay circuit.  Relay
+                # v2 enforces max_circuits_per_peer=1, so the relay
+                # dropped the EXISTING circuit to make room.  DCUtR
+                # then failed (symmetric NAT), the new circuit also
+                # died, and proxy_forward had to re-dial (2-4 s).
+                # Result: Mac↔T4 1.07 TPS → Mac↔Mac 0.047 TPS.
+                #
+                # B1 gossip now fires ONCE at discovery time (in the
+                # discovery service) rather than on the inference hot
+                # path.  Hole-punch attempts belong at connection
+                # establishment, not per-token.
 
                 # Fire-and-forget: ACK instantly, inference runs async
                 # on receiver.  libp2p routes via direct QUIC when the
