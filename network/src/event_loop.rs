@@ -45,6 +45,15 @@ pub enum SwarmCommand {
         data: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
     },
+    /// Fire-and-forget variant of ProxyForward — sends raw bytes to a peer
+    /// via libp2p but does NOT block for an ACK/response. The sender
+    /// returns immediately after enqueuing; the response (if any) is
+    /// silently discarded when it arrives. Used by cross-ISP push mode
+    /// to eliminate the ~200ms synchronous ACK wait per token.
+    ProxyForwardNoWait {
+        peer_id: String,
+        data: Vec<u8>,
+    },
     /// Start a local TCP proxy that tunnels to a remote peer via libp2p.
     /// Returns "127.0.0.1:<port>" for gRPC to connect to.
     OpenProxy {
@@ -284,6 +293,9 @@ pub async fn run_event_loop(
                     }
                     Some(SwarmCommand::ProxyForward { peer_id, data, reply }) => {
                         handle_proxy_forward(&mut swarm, &peer_id, data, reply, &mut state);
+                    }
+                    Some(SwarmCommand::ProxyForwardNoWait { peer_id, data }) => {
+                        handle_proxy_forward_no_wait(&mut swarm, &peer_id, data, &mut state);
                     }
                     Some(SwarmCommand::IsConnected { peer_id, reply }) => {
                         // Returns true ONLY if we have a direct (non-relayed) connection.
@@ -1060,6 +1072,86 @@ fn handle_proxy_forward(
             state.pending_relay_forwards.push((peer_id, data, reply));
         } else {
             let _ = reply.send(Err("proxy_forward: no relay dial succeeded".into()));
+        }
+    }
+}
+
+/// Fire-and-forget variant of handle_proxy_forward.
+///
+/// Sends data to a peer via request_response but does NOT store a reply
+/// channel in `pending_proxy`. When the response arrives, the
+/// `pending_proxy.remove()` call in the response handler returns `None`
+/// and the response is silently discarded — exactly the desired behaviour
+/// for fire-and-forget cross-ISP push mode.
+///
+/// For Ouroboros (self-targeted) forwards: queues in `inbound_proxy_queue`
+/// without a `local_proxy_replies` entry. The respond_proxy for the
+/// "proxy-local-*" request will hit the `warn!("unknown request_id")`
+/// branch — harmless; the Python caller doesn't expect a response.
+///
+/// For not-yet-connected peers: creates a dummy oneshot pair and pushes
+/// into `pending_relay_forwards`. When the connection establishes and
+/// the actual send happens, the reply goes to the dummy receiver which
+/// has already been dropped — silently discarded.
+fn handle_proxy_forward_no_wait(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    peer_id_str: &str,
+    data: Vec<u8>,
+    state: &mut LoopState,
+) {
+    let peer_id: PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("proxy_forward_no_wait: invalid peer_id: {e}");
+            return;
+        }
+    };
+
+    // Ouroboros guard: self-targeted forward — queue locally, no reply channel.
+    if peer_id == *swarm.local_peer_id() {
+        debug!("proxy_forward_no_wait: target is self — routing locally (no reply)");
+        state.inbound_proxy_counter += 1;
+        let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
+        state.inbound_proxy_queue.push((req_id, data));
+        // No local_proxy_replies entry — respond_proxy will warn and discard.
+        return;
+    }
+
+    if swarm.is_connected(&peer_id) {
+        // Already connected — send immediately, don't track reply.
+        let _req_id = swarm
+            .behaviour_mut()
+            .grpc_proxy
+            .send_request(&peer_id, ProxyRequest(data));
+        // Deliberately NOT inserting into pending_proxy.
+        // Response will be silently discarded when it arrives.
+    } else {
+        // Not connected — dial through relay and queue with a dummy reply channel.
+        info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing via relay");
+        let mut dialed = false;
+        for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+            if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+                let circuit_addr = relay_multiaddr
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                    .with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                match swarm.dial(circuit_addr) {
+                    Ok(_) => {
+                        dialed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(%peer_id, error=%e, "no_wait relay dial failed, trying next");
+                    }
+                }
+            }
+        }
+        if dialed {
+            // Dummy oneshot — the receiver is dropped immediately so the
+            // response will be silently discarded when it arrives.
+            let (dummy_tx, _dummy_rx) = oneshot::channel();
+            state.pending_relay_forwards.push((peer_id, data, dummy_tx));
+        } else {
+            warn!(%peer_id, "proxy_forward_no_wait: no relay dial succeeded — data dropped");
         }
     }
 }

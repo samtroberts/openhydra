@@ -135,6 +135,7 @@ def _derive_relay_addresses(
 PROXY_METHOD_FORWARD = b'\x01'      # ForwardRequest → call Forward(), block for response
 PROXY_METHOD_PUSH_RESULT = b'\x02'  # ForwardResponse → call PushResult()
 PROXY_METHOD_FIRE_FORGET = b'\x03'  # ForwardRequest → ACK immediately, Forward() in background
+PROXY_METHOD_FIRE_FORGET_RESULT = b'\x04'  # ForwardResponse → ACK immediately, PushResult() in background
 
 
 def _proxy_handler_loop(
@@ -185,6 +186,25 @@ def _proxy_handler_loop(
                                           _req.request_id, _req.stage_index, _ff_exc,
                                           exc_info=True)
                     threading.Thread(target=_ff_process, daemon=True).start()
+                elif raw and raw[0:1] == PROXY_METHOD_FIRE_FORGET_RESULT:
+                    # Fire-and-forget PushResult: ACK immediately,
+                    # dispatch PushResult in a background thread.
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_FIRE_FORGET_RESULT,
+                    )
+                    _ff_resp = peer_pb2.ForwardResponse()
+                    _ff_resp.ParseFromString(raw[1:])
+
+                    def _ff_push_result(_resp=_ff_resp):
+                        try:
+                            service.PushResult(_resp, context=None)
+                        except Exception as _exc:
+                            logging.error(
+                                "FF_PUSH_RESULT_CRASH: req=%s err=%s",
+                                _resp.request_id, _exc, exc_info=True,
+                            )
+                    threading.Thread(target=_ff_push_result, daemon=True).start()
                 elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                     # PushResult path: ForwardResponse → PushResult RPC.
                     push_resp = peer_pb2.ForwardResponse()
@@ -330,7 +350,25 @@ def _coordinator_proxy_handler_loop(
                 req_id, raw_bytes = pending
                 raw = bytes(raw_bytes)
                 try:
-                    if raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
+                    if raw and raw[0:1] == PROXY_METHOD_FIRE_FORGET_RESULT:
+                        # Fire-and-forget PushResult: ACK immediately,
+                        # dispatch in background. Sent by peers using
+                        # proxy_forward_no_wait to eliminate ACK blocking.
+                        p2p_node.respond_proxy(
+                            request_id=req_id,
+                            data=PROXY_METHOD_FIRE_FORGET_RESULT,
+                        )
+                        # Re-pack with 0x02 prefix so _dispatch_push_result
+                        # can ParseFromString at raw[1:] identically.
+                        _repacked = PROXY_METHOD_PUSH_RESULT + raw[1:]
+                        _synth_id = f"ff-{req_id}"
+                        if _worker_pool is not None:
+                            _worker_pool.submit(
+                                _dispatch_push_result, _synth_id, _repacked,
+                            )
+                        else:
+                            _dispatch_push_result(_synth_id, _repacked)
+                    elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                         # Pipelined dispatch: hand off to a worker so the
                         # poll loop can drain the next message immediately.
                         # Serial dispatch: process in-line, byte-identical
@@ -740,12 +778,13 @@ def _coordinator_handle_push_result(
                   _rid=_req_id_log, _sid=_slot_id_log):
             try:
                 if p2p_node is not None and _libp2p:
-                    p2p_node.proxy_forward(
+                    # Phase 1: fire-and-forget — no ACK wait.
+                    p2p_node.proxy_forward_no_wait(
                         target_peer_id=_libp2p,
                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                     )
                     logging.info(
-                        "coord_reinject_done: req=%s slot=%d via_relay",
+                        "coord_reinject_done: req=%s slot=%d via_relay (no_wait)",
                         _rid, _sid,
                     )
                 else:
@@ -2021,12 +2060,13 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                                         _rl_direct = self._p2p_node.is_peer_connected(_libp2p)
                                     except Exception:
                                         pass
-                                    self._p2p_node.proxy_forward(
+                                    # Phase 1: fire-and-forget — no ACK wait.
+                                    self._p2p_node.proxy_forward_no_wait(
                                         target_peer_id=_libp2p,
                                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                                     )
                                     logger.info(
-                                        "RING_LOOPBACK_DONE: req=%s remaining=%d via_%s",
+                                        "RING_LOOPBACK_DONE: req=%s remaining=%d via_%s (no_wait)",
                                         _rreq.request_id, _rreq.ring_tokens_remaining,
                                         "direct_quic" if _rl_direct else "relay",
                                     )
@@ -2574,7 +2614,8 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 elif self._p2p_node is not None and _next_hop_libp2p_id:
                     # IPv6 gRPC failed — route via libp2p (direct QUIC
                     # if DCUtR succeeded, otherwise relay).
-                    self._p2p_node.proxy_forward(
+                    # Phase 1: fire-and-forget — no ACK wait.
+                    self._p2p_node.proxy_forward_no_wait(
                         target_peer_id=_next_hop_libp2p_id,
                         data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
                     )
@@ -2588,7 +2629,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     _v6_fb_label = "direct_quic" if _v6_fb_direct else "relay"
                     logger.info(
                         "push_forwarded_via_%s: req=%s stage=%d -> %s "
-                        "(ipv6_fallback; libp2p=%s)",
+                        "(ipv6_fallback; libp2p=%s; no_wait)",
                         _v6_fb_label,
                         request.request_id, request.stage_index,
                         next_address, _next_hop_libp2p_id[:20],
@@ -2641,16 +2682,17 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 # path.  Hole-punch attempts belong at connection
                 # establishment, not per-token.
 
-                # Fire-and-forget: ACK instantly, inference runs async
-                # on receiver.  libp2p routes via direct QUIC when the
-                # peer is in direct_peers, otherwise through relay.
-                self._p2p_node.proxy_forward(
+                # Fire-and-forget: no ACK wait. libp2p routes via direct
+                # QUIC when the peer is in direct_peers, otherwise relay.
+                # Phase 1: proxy_forward_no_wait eliminates ~200ms
+                # synchronous ACK blocking per token.
+                self._p2p_node.proxy_forward_no_wait(
                     target_peer_id=_next_hop_libp2p_id,
                     data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
                 )
                 _route_label = "direct_quic" if _is_direct_peer else "relay"
                 logger.info(
-                    "push_forwarded_via_%s: req=%s stage=%d -> %s (libp2p=%s)",
+                    "push_forwarded_via_%s: req=%s stage=%d -> %s (libp2p=%s; no_wait)",
                     _route_label,
                     request.request_id, request.stage_index,
                     next_address, _next_hop_libp2p_id[:20],
@@ -2793,9 +2835,10 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 elif self._p2p_node is not None and _cb_libp2p:
                     # IPv6 gRPC failed — route via libp2p (direct QUIC
                     # if DCUtR succeeded, otherwise relay).
-                    self._p2p_node.proxy_forward(
+                    # Phase 1: fire-and-forget — no ACK wait.
+                    self._p2p_node.proxy_forward_no_wait(
                         target_peer_id=_cb_libp2p,
-                        data=PROXY_METHOD_PUSH_RESULT + response.SerializeToString(),
+                        data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
                     )
                     _v6r_direct = False
                     try:
@@ -2805,7 +2848,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     _v6r_label = "direct_quic" if _v6r_direct else "relay"
                     logger.info(
                         "push_result_sent_via_%s: req=%s -> %s "
-                        "(ipv6_fallback; libp2p=%s)",
+                        "(ipv6_fallback; libp2p=%s; no_wait)",
                         _v6r_label,
                         response.request_id, callback_address, _cb_libp2p[:20],
                     )
@@ -2827,18 +2870,19 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             elif self._p2p_node is not None and _cb_libp2p:
                 # Route via libp2p — direct QUIC if DCUtR succeeded,
                 # otherwise through circuit relay.
+                # Phase 1: fire-and-forget — no ACK wait.
                 _pr_is_direct = False
                 try:
                     _pr_is_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
                 except Exception:
                     pass
-                self._p2p_node.proxy_forward(
+                self._p2p_node.proxy_forward_no_wait(
                     target_peer_id=_cb_libp2p,
-                    data=PROXY_METHOD_PUSH_RESULT + response.SerializeToString(),
+                    data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
                 )
                 _pr_label = "direct_quic" if _pr_is_direct else "relay"
                 logger.info(
-                    "push_result_sent_via_%s: req=%s -> %s (libp2p=%s)",
+                    "push_result_sent_via_%s: req=%s -> %s (libp2p=%s; no_wait)",
                     _pr_label,
                     response.request_id, callback_address, _cb_libp2p[:20],
                 )
@@ -3176,13 +3220,14 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         _cr_direct = self._p2p_node.is_peer_connected(_libp2p)
                     except Exception:
                         pass
-                    self._p2p_node.proxy_forward(
+                    # Phase 1: fire-and-forget — no ACK wait.
+                    self._p2p_node.proxy_forward_no_wait(
                         target_peer_id=_libp2p,
                         data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                     )
                     _cr_label = "direct_quic" if _cr_direct else "relay"
                     logger.info(
-                        "COORD_REINJECT_DONE: req=%s via_%s",
+                        "COORD_REINJECT_DONE: req=%s via_%s (no_wait)",
                         _rreq.request_id, _cr_label,
                     )
                 elif _addr:
