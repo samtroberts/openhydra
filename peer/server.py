@@ -3992,6 +3992,15 @@ def serve(
                     logging.info("peer %s TLS enabled (mTLS=%s)", peer_id, tls_require_client_auth)
                 else:
                     bound_port = int(candidate.add_insecure_port(bind_addr))
+                    # Also listen on IPv6 so cross-ISP peers with public
+                    # v6 addresses can connect directly (bypasses relay).
+                    if host in ("0.0.0.0", ""):
+                        _v6_addr = f"[::]:{port}"
+                        try:
+                            candidate.add_insecure_port(_v6_addr)
+                            logging.info("peer %s also listening on %s (IPv6)", peer_id, _v6_addr)
+                        except Exception as _v6_err:
+                            logging.debug("peer %s IPv6 bind skipped: %s", peer_id, _v6_err)
                 if bound_port <= 0:
                     raise RuntimeError(f"bind_failed:{bind_addr}")
                 candidate.start()
