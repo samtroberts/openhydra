@@ -4269,7 +4269,7 @@ def serve(
         # ``is_busy_fn`` is wired to the live PeerService so we never
         # re-negotiate while a Forward() request is in flight.
         _negotiation_loop_obj = None
-        if negotiation_loop_factory is not None:
+        if negotiation_loop_factory is not None and not manual_shard:
             try:
                 # Factory signature: legacy single-arg ``(is_busy_fn)``
                 # or B3 two-arg ``(is_busy_fn, service)``. Detect
