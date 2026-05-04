@@ -160,14 +160,18 @@ def _proxy_handler_loop(
                     _ff_request = peer_pb2.ForwardRequest()
                     _ff_request.ParseFromString(raw[1:])
 
-                    # ── Ring token emission on coordinator node ──
-                    # The ring handler on the last shard emits tokens and adds them
-                    # to ring_generated_ids. When the loop-back arrives here (stage 0,
-                    # ring_mode=True), the coordinator should emit the latest token
-                    # to its local ring queue so the inference_service can drain it.
+                    # ── Ring token emission on coordinator node (legacy path only) ──
+                    # When sample_on_coordinator=False, the last shard samples the
+                    # token, appends it to ring_generated_ids, and loops back here.
+                    # This block picks up the latest token for the coordinator's
+                    # ring queue.
+                    # When sample_on_coordinator=True, the token was ALREADY emitted
+                    # by _handle_hidden_state_push_result (via the PushResult handler)
+                    # before the re-injection arrived here — skip to avoid double-emit.
                     if (bool(getattr(_ff_request, "ring_mode", False))
                             and _ff_request.stage_index == 0
-                            and _ff_request.ring_generated_ids):
+                            and _ff_request.ring_generated_ids
+                            and not bool(getattr(_ff_request, "sample_on_coordinator", False))):
                         try:
                             from coordinator.push_receiver import emit_ring_token
                             _ring_cb = str(getattr(_ff_request, "final_callback_request_id", "") or "")
