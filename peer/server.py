@@ -160,38 +160,9 @@ def _proxy_handler_loop(
                     _ff_request = peer_pb2.ForwardRequest()
                     _ff_request.ParseFromString(raw[1:])
 
-                    # ── Ring token emission on coordinator node (legacy path only) ──
-                    # When sample_on_coordinator=False, the last shard samples the
-                    # token, appends it to ring_generated_ids, and loops back here.
-                    # This block picks up the latest token for the coordinator's
-                    # ring queue.
-                    # When sample_on_coordinator=True, the token was ALREADY emitted
-                    # by _handle_hidden_state_push_result (via the PushResult handler)
-                    # before the re-injection arrived here — skip to avoid double-emit.
-                    if (bool(getattr(_ff_request, "ring_mode", False))
-                            and _ff_request.stage_index == 0
-                            and _ff_request.ring_generated_ids
-                            and not bool(getattr(_ff_request, "sample_on_coordinator", False))):
-                        try:
-                            from coordinator.push_receiver import emit_ring_token
-                            _ring_cb = str(getattr(_ff_request, "final_callback_request_id", "") or "")
-                            _latest_token = int(_ff_request.ring_generated_ids[-1])
-                            emit_ring_token(_ring_cb, _latest_token)
-                            logging.info("ring_token_emitted_on_coordinator: token=%d remaining=%d",
-                                         _latest_token, int(_ff_request.ring_tokens_remaining))
-
-                            # If ring is done (remaining==0 or EOS), emit sentinel.
-                            _ring_eos = set(int(e) for e in _ff_request.ring_eos_ids)
-                            if _ff_request.ring_tokens_remaining <= 0 or _latest_token in _ring_eos:
-                                emit_ring_token(_ring_cb, None)
-                                logging.info("ring_complete_on_coordinator: tokens=%d",
-                                             len(_ff_request.ring_generated_ids))
-                                # Don't process further — ring is done.
-                                p2p_node.respond_proxy(
-                                    request_id=req_id, data=PROXY_METHOD_FIRE_FORGET)
-                                continue
-                        except Exception as _emit_exc:
-                            logging.warning("ring_emit_coordinator_failed: %s", _emit_exc)
+                    # Ring token emission is handled inside Forward()
+                    # (transport-agnostic). No emit here to avoid double-emit
+                    # when the proxy path calls Forward() in _ff_process below.
 
                     def _ff_process(_req=_ff_request):
                         try:
@@ -1399,6 +1370,42 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             self._inflight += 1
 
         try:
+            # ── Ring loop-back token emission (transport-agnostic) ────
+            # When a ring loop-back arrives at stage 0 with tokens in
+            # ring_generated_ids, emit the latest token to the coord's
+            # ring queue. Works for BOTH direct gRPC (LAN) and proxy
+            # (relay) paths. emit_ring_token is a no-op if no queue is
+            # registered (i.e. on a non-coordinator process).
+            # When sample_on_coordinator=True, the PushResult handler
+            # already emitted the token — skip to avoid double-emit.
+            if (bool(getattr(request, "ring_mode", False))
+                    and request.stage_index == 0
+                    and request.ring_generated_ids
+                    and not bool(getattr(request, "sample_on_coordinator", False))):
+                try:
+                    from coordinator.push_receiver import emit_ring_token
+                    _ring_cb = str(getattr(request, "final_callback_request_id", "") or "")
+                    _latest_tok = int(request.ring_generated_ids[-1])
+                    emit_ring_token(_ring_cb, _latest_tok)
+
+                    _ring_eos = set(int(e) for e in request.ring_eos_ids)
+                    if request.ring_tokens_remaining <= 0 or _latest_tok in _ring_eos:
+                        emit_ring_token(_ring_cb, None)
+                        logger.info(
+                            "ring_complete_in_forward: tokens=%d",
+                            len(request.ring_generated_ids),
+                        )
+                        with self._lock:
+                            self._inflight -= 1
+                        return peer_pb2.ForwardResponse(
+                            request_id=request.request_id,
+                            peer_id=self.peer_id,
+                            stage_index=0,
+                            error="",
+                        )
+                except Exception as _emit_exc:
+                    logger.warning("ring_emit_in_forward_failed: %s", _emit_exc)
+
             max_tokens = int(request.max_tokens or 24)
             decode_do_sample = bool(getattr(request, "decode_do_sample", False))
             decode_temperature = float(getattr(request, "decode_temperature", 0.0) or 0.0)
@@ -1863,11 +1870,12 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     _ring_activation = list(response.activation)
                     _ring_token = int(round(float(_ring_activation[0]))) if _ring_activation else 0
                     _ring_generated = list(request.ring_generated_ids) + [_ring_token]
-                    _ring_remaining = int(request.ring_tokens_remaining) - 1
+                    _ring_remaining = max(0, int(request.ring_tokens_remaining) - 1)
                     _ring_eos = set(int(e) for e in request.ring_eos_ids)
                     _ring_cb_id = str(getattr(request, "final_callback_request_id", "") or "")
 
-                    # Emit token to coordinator's async queue (same process, zero-cost).
+                    # Emit token to coordinator's async queue (no-op if
+                    # this process has no ring queue registered).
                     from coordinator.push_receiver import emit_ring_token
                     emit_ring_token(_ring_cb_id, _ring_token)
                     logger.info("ring_token_emitted: token=%d remaining=%d", _ring_token, _ring_remaining)
