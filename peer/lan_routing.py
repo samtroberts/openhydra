@@ -158,28 +158,100 @@ def local_lan_prefixes() -> set[ipaddress.IPv4Network]:
 
 
 def is_reachable_lan(target_host: str) -> bool:
-    """Return True iff ``target_host`` is a private IP **and** falls in
-    a /16 that any of our local interfaces also covers.
+    """Return True iff ``target_host`` is reachable via direct gRPC
+    without going through a relay.
 
-    This is the predicate the routing layer queries before deciding
-    whether to send a ForwardRequest via direct gRPC instead of via the
-    libp2p relay path. Conservative: returns False on any error,
-    on hostnames (no DNS round-trip), and on public IPs.
+    For IPv4: True when the target is a private IP in the same /16 as
+    one of our local interfaces (VPC / LAN topology).
 
-    The "same /16" rule is empirically a good fit for VPC topologies.
-    For tighter or looser policies, override the prefixes via
-    :func:`set_local_lan_prefixes` (test/operator hook).
+    For IPv6: True when we have a global unicast IPv6 address and the
+    target is also a global unicast IPv6 address. IPv6 is end-to-end
+    routable (no NAT), so direct gRPC is always worth trying. If the
+    remote ISP firewalls inbound, the gRPC connect will fail fast and
+    the caller falls back to relay.
+
+    Conservative: returns False on any error, on hostnames (no DNS
+    round-trip).
     """
-    if not is_private_lan_address(target_host):
+    if not target_host:
         return False
     try:
-        target = ipaddress.IPv4Address(str(target_host).strip())
+        target = ipaddress.ip_address(str(target_host).strip())
     except ValueError:
         return False
-    for prefix in local_lan_prefixes():
-        if target in prefix:
-            return True
+
+    # IPv4: same /16 private range
+    if isinstance(target, ipaddress.IPv4Address):
+        if not is_private_lan_address(target_host):
+            return False
+        for prefix in local_lan_prefixes():
+            if target in prefix:
+                return True
+        return False
+
+    # IPv6: both sides have global unicast → try direct
+    if isinstance(target, ipaddress.IPv6Address):
+        if target.is_loopback or target.is_link_local:
+            return True  # always reachable
+        if target.is_global:
+            # Check if we have any global IPv6 address
+            for addr in _enumerate_local_ipv6_addresses():
+                try:
+                    local_ip = ipaddress.IPv6Address(addr)
+                    if local_ip.is_global:
+                        return True
+                except ValueError:
+                    continue
+        return False
+
     return False
+
+
+# ── IPv6 address enumeration ─────────────────────────────────────────
+
+_LOCAL_IPV6_LOCK = threading.Lock()
+_LOCAL_IPV6_ADDRS: Optional[set[str]] = None
+
+
+def _enumerate_local_ipv6_addresses() -> set[str]:
+    """Best-effort enumeration of this host's IPv6 addresses.
+
+    Memoised — computed once per process.
+    """
+    global _LOCAL_IPV6_ADDRS
+    with _LOCAL_IPV6_LOCK:
+        if _LOCAL_IPV6_ADDRS is not None:
+            return _LOCAL_IPV6_ADDRS
+        addrs: set[str] = set()
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET6):
+                try:
+                    a = info[4][0]
+                    if "%" in a:
+                        a = a.split("%", 1)[0]
+                    ip = ipaddress.IPv6Address(a)
+                    if not ip.is_loopback:
+                        addrs.add(str(ip))
+                except (ValueError, IndexError):
+                    continue
+        except (OSError, socket.gaierror):
+            pass
+        # UDP trick for IPv6 default route
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+                s.settimeout(0.5)
+                s.connect(("2001:4860:4860::8888", 80))  # Google DNS IPv6
+                a = s.getsockname()[0]
+                if "%" in a:
+                    a = a.split("%", 1)[0]
+                addrs.add(a)
+        except (OSError, socket.timeout):
+            pass
+        _LOCAL_IPV6_ADDRS = addrs
+        if addrs:
+            logger.info("lan_routing_local_ipv6: %s", sorted(addrs))
+        return addrs
 
 
 def parse_host_from_address(address: str) -> str:
@@ -217,9 +289,11 @@ def parse_host_from_address(address: str) -> str:
 def _invalidate_cache() -> None:
     """Wipe the memoised local prefixes — for tests that mock
     ``_enumerate_local_ipv4_addresses`` and need a fresh read."""
-    global _LOCAL_PREFIXES_V4
+    global _LOCAL_PREFIXES_V4, _LOCAL_IPV6_ADDRS
     with _LOCAL_PREFIXES_LOCK:
         _LOCAL_PREFIXES_V4 = None
+    with _LOCAL_IPV6_LOCK:
+        _LOCAL_IPV6_ADDRS = None
 
 
 def set_local_lan_prefixes(prefixes: Iterable[str]) -> None:
