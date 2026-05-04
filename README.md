@@ -41,7 +41,7 @@ The commands below install all of these plus OpenHydra itself.
 ```bash
 # One-time system prerequisites
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-brew install python@3.12 rust
+brew install python@3.12 rust protobuf
 xcode-select --install     # C compiler — no-op if already installed
 
 # Clone + Python deps
@@ -54,8 +54,10 @@ pip install -r requirements-mlx.txt   # Apple Silicon MLX backend
 
 # Build + install the P2P networking wheel (Rust + PyO3)
 pip install maturin
-cd network && maturin build --release && pip install target/wheels/*.whl && cd ..
+cd network && maturin develop --release && cd ..
 ```
+
+> **Note:** You must use Python 3.11 or 3.12. Python 3.13 works but 3.14 does not (PyTorch doesn't support it yet). If `python3 --version` shows 3.14, use `python3.12` explicitly. See Troubleshooting.
 
 ### Install — Linux (Ubuntu 22.04+ or Debian 12+, CPU or NVIDIA)
 
@@ -80,7 +82,7 @@ pip install -r requirements.txt
 
 # Build + install the P2P networking wheel (Rust + PyO3)
 pip install maturin
-cd network && maturin build --release && pip install target/wheels/*.whl && cd ..
+cd network && maturin develop --release && cd ..
 ```
 
 ### Install — Windows (WSL2 recommended)
@@ -499,6 +501,84 @@ tests/             1100+ tests (unit + integration + API emulation)
 ---
 
 ## Troubleshooting
+
+<details>
+<summary><strong>Python 3.14: "ModuleNotFoundError: No module named 'compression._common'"</strong></summary>
+
+Python 3.14 restructured the `gzip` stdlib module. PyTorch, transformers, and most ML libraries don't support 3.14 yet. The error cascades through `torch.profiler` → `gzip` → `compression._common` and kills the peer thread at startup.
+
+Fix: use Python 3.11 or 3.12 (recommended):
+
+```bash
+# macOS
+brew install python@3.12
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+</details>
+
+<details>
+<summary><strong>"externally-managed-environment" when running pip install</strong></summary>
+
+Homebrew-installed Python on macOS (3.12+) blocks system-wide pip installs via PEP 668. Use a virtual environment:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+All subsequent `pip install` and `python3` commands will use the venv automatically. Remember to `source .venv/bin/activate` each time you open a new terminal.
+</details>
+
+<details>
+<summary><strong>"zsh: command not found: maturin"</strong></summary>
+
+`maturin` was installed by pip but isn't on your shell's PATH. Use:
+
+```bash
+python3 -m maturin develop --release
+```
+
+Or, if you're in a venv, deactivate and reactivate to refresh PATH:
+
+```bash
+deactivate && source .venv/bin/activate
+maturin develop --release
+```
+</details>
+
+<details>
+<summary><strong>"Could not find `protoc`" during maturin build</strong></summary>
+
+The Rust networking extension compiles `peer.proto` at build time using `protoc` (the Protocol Buffers compiler). Install it:
+
+```bash
+# macOS
+brew install protobuf
+
+# Ubuntu/Debian
+sudo apt install -y protobuf-compiler
+
+# Verify
+protoc --version
+```
+
+Then retry: `cd network && maturin develop --release`
+</details>
+
+<details>
+<summary><strong>"rustc, the rust compiler, is not installed"</strong></summary>
+
+The P2P networking extension is written in Rust. Install the Rust toolchain:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+```
+
+Then retry: `cd network && maturin develop --release`
+</details>
 
 <details>
 <summary><strong>"error: command 'gcc' failed"</strong> during pip install</summary>
