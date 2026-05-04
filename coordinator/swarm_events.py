@@ -194,10 +194,11 @@ class RegisterDraftModel:
                 "data_invalid",
                 f"block_size must be in [1, 32]; got {self.block_size}",
             )
-        if self.backend not in {"mlx", "pytorch"}:
+        if self.backend not in {"mlx", "pytorch", "autoregressive", "mock"}:
             raise EventDecodeError(
                 "data_invalid",
-                f"backend must be 'mlx' or 'pytorch'; got {self.backend!r}",
+                f"backend must be 'mlx', 'pytorch', 'autoregressive', "
+                f"or 'mock'; got {self.backend!r}",
             )
 
 
