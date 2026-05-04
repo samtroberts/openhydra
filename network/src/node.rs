@@ -522,6 +522,24 @@ impl PyP2PNode {
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 
+    /// Fire-and-forget variant of proxy_forward — sends raw bytes to a
+    /// peer via libp2p but returns immediately without waiting for an
+    /// ACK/response. Eliminates the ~200ms synchronous wait per token
+    /// in cross-ISP push mode.
+    fn proxy_forward_no_wait(&self, py: Python<'_>, target_peer_id: String, data: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::ProxyForwardNoWait {
+                    peer_id: target_peer_id,
+                    data,
+                })
+                .map_err(|_| "swarm not running".to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// Open a proxy connection to a remote peer. Dials the peer via libp2p
     /// (through Circuit Relay if needed) and sets the local gRPC port for
     /// inbound proxy requests.
@@ -600,6 +618,6 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert!(config.identity_path.to_string_lossy().contains("identity.key"));
-        assert_eq!(config.listen_addrs.len(), 1);
+        assert_eq!(config.listen_addrs.len(), 2);
     }
 }
