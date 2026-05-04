@@ -55,6 +55,13 @@ impl Default for NodeConfig {
             listen_addrs: vec![
                 "/ip4/0.0.0.0/tcp/4001".into(),
                 "/ip6/::/tcp/4001".into(),
+                // QUIC (UDP) — critical for DCUtR hole punching.
+                // UDP hole punching has ~70-80% success rate vs TCP's
+                // ~5-10% against symmetric NAT. Without these, DCUtR
+                // can only attempt TCP simultaneous-open which fails
+                // against most residential and cloud NATs.
+                "/ip4/0.0.0.0/udp/4001/quic-v1".into(),
+                "/ip6/::/udp/4001/quic-v1".into(),
             ],
             bootstrap_peers: Vec::new(),
         }
@@ -215,6 +222,8 @@ impl PyP2PNode {
                 .unwrap_or_else(|| vec![
                     "/ip4/0.0.0.0/tcp/4001".into(),
                     "/ip6/::/tcp/4001".into(),
+                    "/ip4/0.0.0.0/udp/4001/quic-v1".into(),
+                    "/ip6/::/udp/4001/quic-v1".into(),
                 ]),
             bootstrap_peers: bootstrap_peers.unwrap_or_default(),
         };
@@ -618,6 +627,6 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert!(config.identity_path.to_string_lossy().contains("identity.key"));
-        assert_eq!(config.listen_addrs.len(), 2);
+        assert_eq!(config.listen_addrs.len(), 4); // TCP + QUIC, IPv4 + IPv6
     }
 }
