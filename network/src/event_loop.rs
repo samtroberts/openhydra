@@ -163,9 +163,15 @@ struct LoopState {
     dcutr_successes: u64,
     dcutr_failures: u64,
     /// Peers with confirmed direct (non-relayed) connections.
-    /// Populated by DCUtR success events and non-relay ConnectionEstablished.
-    /// Python checks this via IsConnected to decide direct gRPC vs relay proxy.
-    direct_peers: std::collections::HashSet<PeerId>,
+    /// Maps peer → count of active non-circuit connections.  When a
+    /// non-circuit ConnectionEstablished fires the count increments;
+    /// when ConnectionClosed fires for a non-circuit endpoint the count
+    /// decrements.  `is_direct(peer)` ↔ `count > 0`.  This prevents a
+    /// race where a failed DCUtR attempt briefly opens a direct
+    /// connection, adds the peer, then closes — but the relay
+    /// connection keeps `swarm.is_connected()` true, leaving the peer
+    /// permanently mis-classified as "direct."
+    direct_peers: HashMap<PeerId, u32>,
     /// Reply channels for local proxy forwards (Ouroboros: target == self).
     /// When respond_proxy is called with a "proxy-local-*" req_id, the response
     /// is delivered here instead of through libp2p.
@@ -212,7 +218,7 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
-            direct_peers: std::collections::HashSet::new(),
+            direct_peers: HashMap::new(),
             local_proxy_replies: HashMap::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
         }
@@ -283,7 +289,7 @@ pub async fn run_event_loop(
                         // Returns true ONLY if we have a direct (non-relayed) connection.
                         // Used by Python push mode to decide direct gRPC vs relay proxy.
                         let has_direct = match peer_id.parse::<PeerId>() {
-                            Ok(pid) => state.direct_peers.contains(&pid),
+                            Ok(pid) => state.direct_peers.get(&pid).copied().unwrap_or(0) > 0,
                             Err(_) => false,
                         };
                         let _ = reply.send(has_direct);
@@ -578,7 +584,14 @@ fn handle_swarm_event(
             match dcutr_event.result {
                 Ok(conn_id) => {
                     state.dcutr_successes += 1;
-                    state.direct_peers.insert(peer);
+                    // DCUtR success: mark as direct.  The actual
+                    // ConnectionEstablished for the hole-punched
+                    // connection will also bump the count; using
+                    // max(1, current) here ensures the peer is always
+                    // marked direct after a successful DCUtR even if
+                    // the event ordering varies.
+                    let cnt = state.direct_peers.entry(peer).or_insert(0);
+                    *cnt = (*cnt).max(1);
                     info!(
                         %peer, ?conn_id,
                         successes = state.dcutr_successes,
@@ -625,6 +638,14 @@ fn handle_swarm_event(
             }
         }
 
+        // Ping keepalive — log only failures (success is silent to avoid
+        // flooding logs every 15 s per connection).
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Ping(ping_event)) => {
+            if let Err(ref e) = ping_event.result {
+                debug!(peer = %ping_event.peer, error = %e, "ping failed");
+            }
+        }
+
         // ── Connection lifecycle ──
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
@@ -656,7 +677,8 @@ fn handle_swarm_event(
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
             };
             if !addr_str.contains("p2p-circuit") {
-                state.direct_peers.insert(peer_id);
+                *state.direct_peers.entry(peer_id).or_insert(0) += 1;
+                info!(%peer_id, count = state.direct_peers[&peer_id], "direct_peer_added");
             }
             // Send any queued proxy forwards that were waiting for this connection.
             let mut remaining = Vec::new();
@@ -674,9 +696,24 @@ fn handle_swarm_event(
             }
             state.pending_relay_forwards = remaining;
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
             debug!(%peer_id, "connection closed");
-            // Remove from direct_peers if no more connections remain.
+            // Decrement direct connection count if this was a non-circuit
+            // connection.  Remove the entry when count hits zero.
+            let addr_str = match &endpoint {
+                libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
+                libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
+            };
+            if !addr_str.contains("p2p-circuit") {
+                if let Some(cnt) = state.direct_peers.get_mut(&peer_id) {
+                    *cnt = cnt.saturating_sub(1);
+                    if *cnt == 0 {
+                        state.direct_peers.remove(&peer_id);
+                        info!(%peer_id, "direct_peer_removed (last direct conn closed)");
+                    }
+                }
+            }
+            // Also clean up if the peer is completely disconnected.
             if !swarm.is_connected(&peer_id) {
                 state.direct_peers.remove(&peer_id);
             }

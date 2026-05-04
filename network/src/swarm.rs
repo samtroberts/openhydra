@@ -5,7 +5,8 @@ use std::time::Duration;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay, Multiaddr, PeerId, Swarm, Transport,
+    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, Multiaddr, PeerId, Swarm,
+    Transport,
 };
 
 use crate::behaviour::OpenHydraBehaviour;
@@ -197,6 +198,17 @@ pub fn build_swarm(
         .subscribe(&topic)
         .map_err(|e| format!("gossipsub subscribe: {e:?}"))?;
 
+    // Ping keepalive — 15 s interval keeps relay circuit TCP mappings
+    // alive through aggressive mobile-hotspot NAT. Without this, the
+    // 1-3 s inference silence between tokens causes the hotspot to
+    // evict the NAT mapping, killing the relay circuit. Each re-dial
+    // costs 2-4 s → the dominant factor in the 0.047 TPS cross-ISP
+    // benchmark.
+    let ping = ping::Behaviour::new(
+        ping::Config::new()
+            .with_interval(Duration::from_secs(15)),
+    );
+
     let behaviour = OpenHydraBehaviour {
         kademlia,
         relay_client,
@@ -206,6 +218,7 @@ pub fn build_swarm(
         mdns,
         grpc_proxy,
         gossipsub,
+        ping,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()

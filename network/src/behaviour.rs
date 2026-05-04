@@ -5,7 +5,7 @@
 
 use libp2p::request_response;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, relay};
+use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay};
 
 use crate::proxy::GrpcProxyCodec;
 
@@ -34,4 +34,9 @@ pub struct OpenHydraBehaviour {
     ///   a specific counterpart to dial back *now*, giving both sides a
     ///   coordinated simultaneous-dial window even behind symmetric NAT.
     pub gossipsub: gossipsub::Behaviour,
+    /// Ping keepalive — sends periodic pings on ALL connections (including
+    /// relay circuits) to prevent NAT mapping eviction.  Without this,
+    /// mobile hotspot NAT drops TCP mappings during the 1-3 s inference
+    /// silence, killing the relay circuit between tokens.
+    pub ping: ping::Behaviour,
 }
