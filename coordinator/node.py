@@ -692,6 +692,11 @@ def main() -> None:
             _p2p_listen = getattr(args, "p2p_listen", None) or [
                 "/ip4/0.0.0.0/tcp/4001",
                 "/ip6/::/tcp/4001",
+                # QUIC (UDP) — critical for DCUtR hole punching.
+                # UDP hole punching has ~70-80% success rate vs TCP's
+                # ~5-10% against symmetric NAT.
+                "/ip4/0.0.0.0/udp/4001/quic-v1",
+                "/ip6/::/udp/4001/quic-v1",
             ]
             _p2p_bootstrap = getattr(args, "p2p_bootstrap", None) or list(PRODUCTION_LIBP2P_BOOTSTRAP_PEERS)
             _p2p_node = P2PNode(

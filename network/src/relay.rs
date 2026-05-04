@@ -48,6 +48,21 @@ pub const BOOTSTRAP_RELAYS: &[&str] = &[
     "/ip4/172.104.164.98/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
 ];
 
+/// IP addresses of the production bootstrap relay servers.
+/// Used by the event loop to detect when a ConnectionEstablished endpoint
+/// routes through a relay's IP — such connections should NOT be classified
+/// as "direct" even if the multiaddr doesn't contain `/p2p-circuit/`.
+pub const BOOTSTRAP_RELAY_IPS: &[&str] = &[
+    "45.79.190.172",   // US (Dallas)
+    "172.105.69.49",   // EU (London)
+    "172.104.164.98",  // AP (Singapore)
+];
+
+/// Check if an IP string matches a known bootstrap relay server.
+pub fn is_bootstrap_relay_ip(ip: &str) -> bool {
+    BOOTSTRAP_RELAY_IPS.contains(&ip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

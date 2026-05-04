@@ -62,7 +62,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity_path = parse_flag(&args, "--identity")
         .unwrap_or_else(|| "/opt/openhydra/.libp2p_identity.key".to_string());
     let listen_addrs: Vec<Multiaddr> = parse_flag_multi(&args, "--listen")
-        .unwrap_or_else(|| vec!["/ip4/0.0.0.0/tcp/4001".parse().unwrap()]);
+        .unwrap_or_else(|| vec![
+            "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
+            // QUIC (UDP) — enables UDP-based AutoNAT probing and DCUtR
+            // hole punching. Without this, peers can only attempt TCP
+            // hole punching which has ~5-10% success rate.
+            "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
+        ]);
 
     info!("loading identity from {identity_path}");
     let identity = Identity::load_or_create(&PathBuf::from(&identity_path))?;

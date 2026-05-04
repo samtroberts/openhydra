@@ -683,14 +683,33 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
             debug!(%peer_id, ?endpoint, "connection established");
             // Track direct (non-relay) connections for push mode routing.
-            // Relay connections have addresses containing /p2p-circuit/.
+            //
+            // A connection is "direct" only if:
+            //   1. The endpoint address does NOT contain /p2p-circuit/
+            //   2. The endpoint IP is NOT a known bootstrap relay IP
+            //
+            // Guard #2 fixes a false-positive where relay-upgraded
+            // connections report the relay server's raw IP without the
+            // /p2p-circuit/ suffix, causing peers to be mis-classified
+            // as "direct" when they're actually relay-bound.
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
             };
-            if !addr_str.contains("p2p-circuit") {
+            let has_circuit = addr_str.contains("p2p-circuit");
+            let endpoint_ip = extract_ip_from_multiaddr_str(&addr_str);
+            let is_relay_ip = endpoint_ip
+                .as_ref()
+                .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
+                .unwrap_or(false);
+            if !has_circuit && !is_relay_ip {
                 *state.direct_peers.entry(peer_id).or_insert(0) += 1;
-                info!(%peer_id, count = state.direct_peers[&peer_id], "direct_peer_added");
+                info!(%peer_id, %addr_str, count = state.direct_peers[&peer_id], "direct_peer_added");
+            } else {
+                debug!(
+                    %peer_id, %addr_str, has_circuit, is_relay_ip,
+                    "connection_established (not marking direct)"
+                );
             }
             // Send any queued proxy forwards that were waiting for this connection.
             let mut remaining = Vec::new();
@@ -710,13 +729,19 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
             debug!(%peer_id, "connection closed");
-            // Decrement direct connection count if this was a non-circuit
-            // connection.  Remove the entry when count hits zero.
+            // Decrement direct connection count — mirror the same
+            // classification logic used in ConnectionEstablished.
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
             };
-            if !addr_str.contains("p2p-circuit") {
+            let has_circuit = addr_str.contains("p2p-circuit");
+            let endpoint_ip = extract_ip_from_multiaddr_str(&addr_str);
+            let is_relay_ip = endpoint_ip
+                .as_ref()
+                .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
+                .unwrap_or(false);
+            if !has_circuit && !is_relay_ip {
                 if let Some(cnt) = state.direct_peers.get_mut(&peer_id) {
                     *cnt = cnt.saturating_sub(1);
                     if *cnt == 0 {
@@ -963,6 +988,31 @@ fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<String> {
             libp2p::multiaddr::Protocol::Ip6(ip) => return Some(ip.to_string()),
             _ => {}
         }
+    }
+    None
+}
+
+/// Extract an IP string from a multiaddr string representation.
+/// Parses `/ip4/1.2.3.4/...` or `/ip6/::1/...` without requiring
+/// a full Multiaddr parse (which can fail on partial addresses).
+fn extract_ip_from_multiaddr_str(addr_str: &str) -> Option<String> {
+    for segment in addr_str.split('/') {
+        // The IP follows "/ip4/" or "/ip6/" — grab the next segment.
+        if segment == "ip4" || segment == "ip6" {
+            continue;
+        }
+        // Check if this segment looks like an IPv4 address.
+        if segment.contains('.') && segment.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Some(segment.to_string());
+        }
+        // Check if this looks like an IPv6 address (contains colons).
+        if segment.contains(':') && !segment.contains("p2p") {
+            return Some(segment.to_string());
+        }
+    }
+    // Fallback: try parsing as full multiaddr.
+    if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+        return extract_ip_from_multiaddr(&addr);
     }
     None
 }
@@ -1243,8 +1293,36 @@ mod tests {
 
     #[test]
     fn test_extract_ip() {
-
         let addr: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
         assert_eq!(extract_ip_from_multiaddr(&addr), Some("1.2.3.4".into()));
+    }
+
+    #[test]
+    fn test_extract_ip_from_multiaddr_str() {
+        assert_eq!(
+            extract_ip_from_multiaddr_str("/ip4/45.79.190.172/tcp/4001"),
+            Some("45.79.190.172".into()),
+        );
+        assert_eq!(
+            extract_ip_from_multiaddr_str("/ip4/192.168.1.11/tcp/4001"),
+            Some("192.168.1.11".into()),
+        );
+        assert_eq!(
+            extract_ip_from_multiaddr_str(
+                "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL/p2p-circuit/p2p/12D3KooW9xM53"
+            ),
+            Some("45.79.190.172".into()),
+        );
+    }
+
+    #[test]
+    fn test_relay_ip_detection() {
+        // Bootstrap relay IPs should be detected.
+        assert!(crate::relay::is_bootstrap_relay_ip("45.79.190.172"));
+        assert!(crate::relay::is_bootstrap_relay_ip("172.105.69.49"));
+        assert!(crate::relay::is_bootstrap_relay_ip("172.104.164.98"));
+        // Non-relay IPs should not.
+        assert!(!crate::relay::is_bootstrap_relay_ip("192.168.1.11"));
+        assert!(!crate::relay::is_bootstrap_relay_ip("10.192.11.51"));
     }
 }
