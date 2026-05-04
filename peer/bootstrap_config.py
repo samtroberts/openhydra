@@ -120,6 +120,8 @@ def _try_bind(host: str, port: int) -> bool:
     Non-bind errors (permission denied, bad address) propagate as exceptions
     so they surface during boot rather than silently looping.
     """
+    if port < 0 or port > 65535:
+        return False
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)

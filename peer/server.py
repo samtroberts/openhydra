@@ -1086,6 +1086,41 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         self.onion_layers_peeled = 0
         self.last_onion_next_peer_id: str | None = None
         self.onion_next_peer_history: list[str] = []
+        # ── gRPC channel cache ───────────────────────────────────────
+        # Reuse TCP+HTTP/2 connections instead of create/destroy per
+        # token. Eliminates ~5-8 ms per-hop handshake on WiFi LAN.
+        self._grpc_channels: dict[str, grpc.Channel] = {}
+        self._grpc_channels_lock = threading.Lock()
+
+    def _get_grpc_channel(self, address: str) -> grpc.Channel:
+        """Get or create a cached gRPC channel for ``address``.
+
+        gRPC channels are thread-safe and handle reconnection
+        automatically.  Caching eliminates per-token TCP+HTTP/2
+        handshake cost (~5-8 ms on WiFi LAN), which compounds to
+        ~10-15 ms/token on a 2-hop ring.
+        """
+        with self._grpc_channels_lock:
+            ch = self._grpc_channels.get(address)
+            if ch is not None:
+                return ch
+            ch = grpc.insecure_channel(
+                address,
+                options=[
+                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                    ("grpc.keepalive_time_ms", 30000),
+                    ("grpc.keepalive_timeout_ms", 5000),
+                    ("grpc.keepalive_permit_without_calls", 1),
+                    ("grpc.http2.max_pings_without_data", 0),
+                ],
+            )
+            self._grpc_channels[address] = ch
+            logger.info(
+                "grpc_channel_cached: %s (total=%d)",
+                address, len(self._grpc_channels),
+            )
+            return ch
 
     # ── Path A: coordinator-side HeadSampler registration ────────────
     def _maybe_register_head_source(self) -> None:
@@ -1405,6 +1440,29 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         )
                 except Exception as _emit_exc:
                     logger.warning("ring_emit_in_forward_failed: %s", _emit_exc)
+
+            # ── Guard: reject empty/malformed discovery probes ────────
+            # libp2p proxy probe requests arrive with empty request_id,
+            # stage 0/0, and no prompt or embeddings. Returning early
+            # avoids a noisy ValueError from the MLX runtime.
+            _req_id = str(request.request_id or "").strip()
+            if (
+                not _req_id
+                and int(request.total_stages or 0) == 0
+                and not request.prompt
+                and not list(request.activation)
+            ):
+                logger.debug(
+                    "forward_probe_ignored: empty request (likely discovery probe)"
+                )
+                with self._lock:
+                    self._inflight -= 1
+                return peer_pb2.ForwardResponse(
+                    request_id="",
+                    peer_id=self.peer_id,
+                    stage_index=0,
+                    error="",
+                )
 
             max_tokens = int(request.max_tokens or 24)
             decode_do_sample = bool(getattr(request, "decode_do_sample", False))
@@ -1944,19 +2002,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                                 _lh = _ph(_raddr)
                                 _lan_ok = bool(_lh) and _ir(_lh)
                                 if _lan_ok and _raddr:
-                                    import grpc as _rl_grpc
-                                    _rl_ch = _rl_grpc.insecure_channel(
-                                        _raddr,
-                                        options=[
-                                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                                        ],
-                                    )
-                                    try:
-                                        _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
-                                        _rl_stub.Forward(_rreq, timeout=60.0)
-                                    finally:
-                                        _rl_ch.close()
+                                    _rl_ch = self._get_grpc_channel(_raddr)
+                                    _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
+                                    _rl_stub.Forward(_rreq, timeout=60.0)
                                     logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_lan",
                                                 _rreq.request_id, _rreq.ring_tokens_remaining)
                                 elif self._p2p_node is not None and _libp2p:
@@ -1967,17 +2015,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                                     logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_relay",
                                                 _rreq.request_id, _rreq.ring_tokens_remaining)
                                 elif _raddr:
-                                    import grpc as _rl_grpc
-                                    _rl_ch = _rl_grpc.insecure_channel(
-                                        _raddr,
-                                        options=[
-                                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                                        ],
-                                    )
+                                    _rl_ch = self._get_grpc_channel(_raddr)
                                     _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
                                     _rl_stub.Forward(_rreq, timeout=60.0)
-                                    _rl_ch.close()
                                     logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_grpc",
                                                 _rreq.request_id, _rreq.ring_tokens_remaining)
                                 else:
@@ -2494,22 +2534,13 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                             "push_try_ipv6_direct: req=%s stage=%d -> %s",
                             request.request_id, request.stage_index, next_address,
                         )
-                        channel = grpc.insecure_channel(
-                            next_address,
-                            options=[
-                                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                                ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                            ],
-                        )
-                        try:
-                            stub = peer_pb2_grpc.PeerStub(channel)
-                            stub.Forward(next_req, timeout=3.0)
-                            _ipv6_ok = True
-                            # Success — clear any negative cache entry
-                            _v6_neg_cache.pop(next_address, None)
-                            self._ipv6_neg_cache = _v6_neg_cache
-                        finally:
-                            channel.close()
+                        channel = self._get_grpc_channel(next_address)
+                        stub = peer_pb2_grpc.PeerStub(channel)
+                        stub.Forward(next_req, timeout=3.0)
+                        _ipv6_ok = True
+                        # Success — clear any negative cache entry
+                        _v6_neg_cache.pop(next_address, None)
+                        self._ipv6_neg_cache = _v6_neg_cache
                     except Exception as _v6_exc:
                         logger.info(
                             "push_ipv6_direct_failed: req=%s stage=%d -> %s "
@@ -2550,18 +2581,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         request_id=str(request.request_id),
                     )
                 else:
-                    channel = grpc.insecure_channel(
-                        next_address,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
-                    try:
-                        stub = peer_pb2_grpc.PeerStub(channel)
-                        stub.Forward(next_req, timeout=60.0)
-                    finally:
-                        channel.close()
+                    channel = self._get_grpc_channel(next_address)
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.Forward(next_req, timeout=60.0)
             elif self._p2p_node is not None and _next_hop_libp2p_id:
                 # B1 rendezvous: we're about to route through a circuit
                 # relay. Before we do, publish REQUEST_HOLE_PUNCH so the
@@ -2625,16 +2647,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         request_id=str(request.request_id),
                     )
                 else:
-                    channel = grpc.insecure_channel(
-                        next_address,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
+                    channel = self._get_grpc_channel(next_address)
                     stub = peer_pb2_grpc.PeerStub(channel)
                     stub.Forward(next_req, timeout=60.0)
-                    channel.close()
                 logger.info(
                     "push_forwarded: req=%s stage=%d -> %s",
                     request.request_id, request.stage_index, next_address,
@@ -2739,21 +2754,12 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 _v6_ok = False
                 if not _v6_cached:
                     try:
-                        channel = grpc.insecure_channel(
-                            callback_address,
-                            options=[
-                                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                                ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                            ],
-                        )
-                        try:
-                            stub = peer_pb2_grpc.PeerStub(channel)
-                            stub.PushResult(response, timeout=3.0)
-                            _v6_ok = True
-                            _v6_neg.pop(callback_address, None)
-                            self._ipv6_neg_cache = _v6_neg
-                        finally:
-                            channel.close()
+                        channel = self._get_grpc_channel(callback_address)
+                        stub = peer_pb2_grpc.PeerStub(channel)
+                        stub.PushResult(response, timeout=3.0)
+                        _v6_ok = True
+                        _v6_neg.pop(callback_address, None)
+                        self._ipv6_neg_cache = _v6_neg
                     except Exception as _v6_exc:
                         logger.info(
                             "push_result_ipv6_failed: req=%s -> %s "
@@ -2784,18 +2790,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         callback_address, response, label="lan",
                     )
                 else:
-                    channel = grpc.insecure_channel(
-                        callback_address,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
-                    try:
-                        stub = peer_pb2_grpc.PeerStub(channel)
-                        stub.PushResult(response, timeout=10.0)
-                    finally:
-                        channel.close()
+                    channel = self._get_grpc_channel(callback_address)
+                    stub = peer_pb2_grpc.PeerStub(channel)
+                    stub.PushResult(response, timeout=10.0)
                 logger.info(
                     "push_result_sent_via_lan: req=%s -> %s "
                     "(LAN-first; bypassing libp2p)",
@@ -2818,16 +2815,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         callback_address, response, label="direct",
                     )
                 else:
-                    channel = grpc.insecure_channel(
-                        callback_address,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
+                    channel = self._get_grpc_channel(callback_address)
                     stub = peer_pb2_grpc.PeerStub(channel)
                     stub.PushResult(response, timeout=10.0)
-                    channel.close()
                 logger.info(
                     "push_result_sent: req=%s -> %s",
                     response.request_id, callback_address,
@@ -2855,18 +2845,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
 
         def _send():
             try:
-                ch = grpc.insecure_channel(
-                    next_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                try:
-                    stub = peer_pb2_grpc.PeerStub(ch)
-                    stub.Forward(next_req, timeout=60.0)
-                finally:
-                    ch.close()
+                ch = self._get_grpc_channel(next_address)
+                stub = peer_pb2_grpc.PeerStub(ch)
+                stub.Forward(next_req, timeout=60.0)
             except Exception as exc:
                 logger.warning(
                     "push_forward_async_failed: req=%s label=%s -> %s: %s",
@@ -2896,18 +2877,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
 
         def _send():
             try:
-                ch = grpc.insecure_channel(
-                    callback_address,
-                    options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ],
-                )
-                try:
-                    stub = peer_pb2_grpc.PeerStub(ch)
-                    stub.PushResult(response, timeout=10.0)
-                finally:
-                    ch.close()
+                ch = self._get_grpc_channel(callback_address)
+                stub = peer_pb2_grpc.PeerStub(ch)
+                stub.PushResult(response, timeout=10.0)
             except Exception as exc:
                 logger.warning(
                     "push_result_async_failed: req=%s label=%s -> %s: %s",
@@ -3157,18 +3129,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 _lh = _ph(_addr)
                 _lan_ok = bool(_lh) and _ir(_lh)
                 if _lan_ok and _addr:
-                    _ch = grpc.insecure_channel(
-                        _addr,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
-                    try:
-                        _stub = peer_pb2_grpc.PeerStub(_ch)
-                        _stub.Forward(_rreq, timeout=60.0)
-                    finally:
-                        _ch.close()
+                    _ch = self._get_grpc_channel(_addr)
+                    _stub = peer_pb2_grpc.PeerStub(_ch)
+                    _stub.Forward(_rreq, timeout=60.0)
                     logger.info(
                         "COORD_REINJECT_DONE: req=%s via_lan",
                         _rreq.request_id,
@@ -3183,16 +3146,9 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                         _rreq.request_id,
                     )
                 elif _addr:
-                    _ch = grpc.insecure_channel(
-                        _addr,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
+                    _ch = self._get_grpc_channel(_addr)
                     _stub = peer_pb2_grpc.PeerStub(_ch)
                     _stub.Forward(_rreq, timeout=60.0)
-                    _ch.close()
                     logger.info(
                         "COORD_REINJECT_DONE: req=%s via_grpc",
                         _rreq.request_id,
