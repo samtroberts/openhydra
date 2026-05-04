@@ -3289,6 +3289,10 @@ def _announce_loop(
     # provided, each iteration reads fresh capacity_json + assignment from
     # this object, superseding the static kwargs above.
     capacity_snapshot_ref: Any = None,
+    # Phase 2b: when True, operator specified explicit --layer-start/end
+    # and the negotiator's assignment must NOT override the announced
+    # layer range (the assignment reflects "desired" not "loaded").
+    manual_shard: bool = False,
 ) -> None:
     announce_interval = max(1.0, float(announce_interval_sec))
     announced_once = False
@@ -3326,10 +3330,14 @@ def _announce_loop(
                 if _snap_json:
                     _effective_capacity_json = _snap_json
                     _effective_capacity_schema_version = int(_snap_ver or 0)
-                if _snap_assignment is not None:
+                if _snap_assignment is not None and not manual_shard:
                     # Live assignment overrides the static runtime_profile
                     # layer range so the announce tells neighbours where
                     # we'd *like* to be — even before the next reshard lands.
+                    # Skipped when manual_shard=True because the operator
+                    # explicitly chose a layer range via --layer-start/end
+                    # and the negotiator's "desired" range doesn't reflect
+                    # the actually loaded layers.
                     _effective_layer_start = int(_snap_assignment.layer_start)
                     _effective_layer_end = int(_snap_assignment.layer_end)
                     _effective_total_layers = int(_snap_assignment.total_layers)
@@ -3722,6 +3730,11 @@ def serve(
     # for backward-compat (Phase 1–3 callers).
     capacity_snapshot_ref: Any = None,
     negotiation_loop_factory: Any = None,
+    # Phase 2b: when True, the operator specified an explicit layer range
+    # via --layer-start/--layer-end and the swarm negotiator's assignment
+    # must NOT override the DHT-announced layer range (the negotiator's
+    # "desired" range can differ from the actually loaded layers).
+    manual_shard: bool = False,
 ) -> None:
     resolved_dht_urls: list[str] = []
     seen_dht_urls: set[str] = set()
@@ -4242,6 +4255,7 @@ def serve(
                     # Phase 4 zero-config: live snapshot written by the
                     # NegotiationLoop overrides the static kwargs per tick.
                     "capacity_snapshot_ref": capacity_snapshot_ref,
+                    "manual_shard": manual_shard,
                 },
                 daemon=True,
             )

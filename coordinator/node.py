@@ -1295,6 +1295,9 @@ def main() -> None:
                 # many concurrent forward passes to admit. Default 1
                 # preserves serial behavior.
                 "pipeline_depth": max(1, int(getattr(args, "pipeline_depth", 1) or 1)),
+                # Phase 2b: propagate manual_shard so the announce loop
+                # does NOT let the negotiator override the loaded layer range.
+                "manual_shard": _manual_shard,
                 # All other peer params use peer/server.py defaults.
             },
             name="openhydra-peer",
