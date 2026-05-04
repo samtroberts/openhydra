@@ -65,11 +65,14 @@ class TestModelCatalogJson:
         assert multi, "Expected at least one model with required_peers > 1"
 
     def test_largest_model_has_4_peers(self):
-        """The frontier 27B model requires 4 peers."""
+        """At least one frontier model requires 4 peers."""
         catalog = _load_catalog()
         large = [e for e in catalog if e.get("required_peers", 1) >= 4]
         assert large, "Expected at least one model with required_peers >= 4"
-        assert large[0]["model_id"] == "openhydra-qwen3.5-27b"
+        large_ids = {e["model_id"] for e in large}
+        assert "openhydra-qwen3.5-27b" in large_ids, (
+            f"Expected openhydra-qwen3.5-27b in 4-peer models, got {large_ids}"
+        )
 
     def test_all_models_have_valid_ids(self):
         """All catalog models have openhydra- prefix."""

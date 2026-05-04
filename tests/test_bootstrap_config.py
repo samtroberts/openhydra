@@ -65,7 +65,14 @@ def _free_port_base(reserve_count: int = 3) -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         base = s.getsockname()[1]
-    return base + 1000
+    # Offset to avoid OS ephemeral allocation, but clamp so the test
+    # window (which may span up to base + 25 for bootstrap tests)
+    # stays within the valid port range (0-65535).
+    candidate = base + 1000
+    max_port = 65535 - max(reserve_count, 30)
+    if candidate > max_port:
+        candidate = max(1024, base - 1000)
+    return candidate
 
 
 # ─── 1. derive_persistent_peer_id ────────────────────────────────────────────
@@ -160,7 +167,7 @@ def test_resolve_port_increments_multiple_times() -> None:
 
 
 def test_resolve_port_raises_when_all_probes_fail() -> None:
-    base = _free_port_base()
+    base = _free_port_base(reserve_count=5)
     occupies = [_occupy_port(base + offset) for offset in range(5)]
     try:
         with pytest.raises(PortResolutionError):
