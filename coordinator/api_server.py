@@ -1940,6 +1940,33 @@ def serve(
             "Set --no-hydra-ledger-bridge-mock-mode and wire a real L1 resolver for production."
         )
 
+    # ── Discovery warmup: pre-populate peer table in the background ────
+    # Without this, the first inference request pays a ~5-15 s penalty for
+    # DHT lookups + peer health checks. The warmup fires 3 s after boot
+    # (enough for libp2p relay reservations + Kademlia announce to settle)
+    # and runs one full _discover_for_model pass so the cache is hot by
+    # the time the first user request arrives.
+    def _discovery_warmup() -> None:
+        import time as _time
+        _time.sleep(3.0)
+        _engine = OpenHydraHandler.engine
+        if _engine is None:
+            return
+        _model = str(getattr(_engine.config, "default_model", "") or "")
+        if not _model:
+            return
+        try:
+            _engine._discover_for_model(_model, allow_degradation=True)
+            logger.info("discovery_warmup_done: model=%s", _model)
+        except Exception as _exc:
+            logger.debug("discovery_warmup_failed: %s (non-fatal)", _exc)
+
+    threading.Thread(
+        target=_discovery_warmup,
+        name="openhydra-discovery-warmup",
+        daemon=True,
+    ).start()
+
     server = ThreadingHTTPServer((host, port), OpenHydraHandler)
 
     def _on_sigterm(signum: int, _frame: object) -> None:

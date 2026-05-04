@@ -2261,7 +2261,11 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         packer = getattr(runtime, "_hidden_to_packed_bytes", None)
         try:
             if callable(packer):
-                packed_bytes = bytes(packer(hidden_block))
+                packed_bytes = bytes(packer(
+                    hidden_block,
+                    request_id=request.request_id,
+                    stage_index=stage_index,
+                ))
             else:
                 # Generic fallback: flatten + struct.pack as fp32.
                 import struct
@@ -2775,7 +2779,41 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         Returns a ``PushAck`` on success or a terminal error. Returns
         ``None`` when no HeadSampler or RingSession is registered, so
         the caller falls through to the legacy push-receiver future.
+
+        Phase 2b: block-verify responses (block_size > 0) are routed
+        to the DFlash block queue instead of the per-token sampler.
         """
+        # ── Phase 2b: route block-verify responses to DFlash queue ──
+        _block_size = int(getattr(response, "block_size", 0) or 0)
+        _block_index = int(getattr(response, "block_index", 0) or 0)
+        if _block_size > 0:
+            from coordinator.push_receiver import emit_dflash_block_response
+            _packed = bytes(getattr(response, "activation_packed", b"") or b"")
+            if not _packed:
+                logger.error(
+                    "block_verify_empty_payload_in_push: req=%s block=%d",
+                    response.request_id, _block_index,
+                )
+                return peer_pb2.PushAck(
+                    request_id=response.request_id, ok=False,
+                    error="block_verify_empty_payload",
+                )
+            delivered = emit_dflash_block_response(
+                request_id=str(response.request_id),
+                block_index=_block_index,
+                activation_packed=_packed,
+                block_size=_block_size,
+            )
+            logger.info(
+                "block_verify_routed_to_dflash: req=%s block=%d "
+                "packed_bytes=%d delivered=%s",
+                response.request_id, _block_index,
+                len(_packed), delivered,
+            )
+            return peer_pb2.PushAck(
+                request_id=response.request_id, ok=True, error="",
+            )
+
         from coordinator.head_sampler import (
             get_head_sampler, get_ring_session, unregister_ring_session,
         )
