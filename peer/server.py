@@ -2444,22 +2444,97 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             from peer.lan_routing import is_reachable_lan, parse_host_from_address
             _next_host = parse_host_from_address(next_address)
             _lan_reachable = bool(_next_host) and is_reachable_lan(_next_host)
-            if _lan_reachable and next_address:
+
+            # For IPv6 targets, detect whether this is a true LAN address
+            # (private/link-local) or a global IPv6 that might be firewalled.
+            # Global IPv6 gets a short timeout + relay fallback.
+            import ipaddress as ipaddress
+            _is_ipv6_global = False
+            if _lan_reachable and _next_host:
+                try:
+                    _target_ip = ipaddress.ip_address(_next_host)
+                    _is_ipv6_global = (
+                        isinstance(_target_ip, ipaddress.IPv6Address)
+                        and _target_ip.is_global
+                    )
+                except ValueError:
+                    pass
+
+            if _lan_reachable and next_address and _is_ipv6_global:
+                # ── IPv6 direct attempt with fast fallback to relay ──
+                # Global IPv6 is end-to-end routable in principle, but
+                # the remote ISP may firewall inbound. Try direct gRPC
+                # with a short timeout; on failure, cache the negative
+                # result for 60s so subsequent tokens skip straight to
+                # relay without the 3s penalty.
+                import time as _v6_time
+                _v6_neg_cache = getattr(self, "_ipv6_neg_cache", None) or {}
+                _v6_neg_ttl = 60.0
+                _v6_cached_fail = (
+                    next_address in _v6_neg_cache
+                    and (_v6_time.monotonic() - _v6_neg_cache[next_address]) < _v6_neg_ttl
+                )
+                _ipv6_ok = False
+                if _v6_cached_fail:
+                    logger.debug(
+                        "push_ipv6_skip_cached: req=%s -> %s (neg cache hit)",
+                        request.request_id, next_address,
+                    )
+                else:
+                    try:
+                        logger.info(
+                            "push_try_ipv6_direct: req=%s stage=%d -> %s",
+                            request.request_id, request.stage_index, next_address,
+                        )
+                        channel = grpc.insecure_channel(
+                            next_address,
+                            options=[
+                                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                            ],
+                        )
+                        try:
+                            stub = peer_pb2_grpc.PeerStub(channel)
+                            stub.Forward(next_req, timeout=3.0)
+                            _ipv6_ok = True
+                            # Success — clear any negative cache entry
+                            _v6_neg_cache.pop(next_address, None)
+                            self._ipv6_neg_cache = _v6_neg_cache
+                        finally:
+                            channel.close()
+                    except Exception as _v6_exc:
+                        logger.info(
+                            "push_ipv6_direct_failed: req=%s stage=%d -> %s "
+                            "err=%s — caching failure for %.0fs, using relay",
+                            request.request_id, request.stage_index,
+                            next_address, _v6_exc, _v6_neg_ttl,
+                        )
+                        _v6_neg_cache[next_address] = _v6_time.monotonic()
+                        self._ipv6_neg_cache = _v6_neg_cache
+                if _ipv6_ok:
+                    logger.info(
+                        "push_forwarded_via_ipv6: req=%s stage=%d -> %s",
+                        request.request_id, request.stage_index, next_address,
+                    )
+                elif self._p2p_node is not None and _next_hop_libp2p_id:
+                    # IPv6 direct failed or cached-fail — use relay
+                    self._p2p_node.proxy_forward(
+                        target_peer_id=_next_hop_libp2p_id,
+                        data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
+                    )
+                    logger.info(
+                        "push_forwarded_via_relay: req=%s stage=%d -> %s "
+                        "(ipv6_fallback; libp2p=%s)",
+                        request.request_id, request.stage_index,
+                        next_address, _next_hop_libp2p_id[:20],
+                    )
+            elif _lan_reachable and next_address:
                 logger.info(
                     "push_forwarded_via_lan: req=%s stage=%d -> %s "
                     "(LAN-first; bypassing libp2p_id=%s)",
                     request.request_id, request.stage_index, next_address,
                     _next_hop_libp2p_id[:20] if _next_hop_libp2p_id else "none",
                 )
-                # Phase 2a: with pipeline_depth >= 2 the gRPC handler
-                # thread cannot afford to block on the next-hop send —
-                # the caller is about to start computing the NEXT slot's
-                # forward pass and we don't want that pass serialised
-                # behind a 20-50 ms direct-LAN dial. Fire-and-forget
-                # via a daemon thread; correctness is preserved because
-                # the receiving peer's Forward handler is idempotent
-                # under retry and no caller depends on the response
-                # body (Path A push mode).
                 _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
                 if _depth_ff >= 2:
                     self._dispatch_direct_grpc_async(
@@ -2630,8 +2705,72 @@ class PeerService(peer_pb2_grpc.PeerServicer):
             # (different call site); dropped only here.
 
             _depth_ff = max(1, int(pipeline_depth or 1))
-            if _cb_lan_reachable and callback_address:
-                # LAN-direct gRPC to coordinator — fastest path.
+
+            # Detect global IPv6 — needs try-then-fallback instead of
+            # unconditional direct (ISP may firewall inbound).
+            import ipaddress as ipaddress
+            _cb_ipv6_global = False
+            if _cb_lan_reachable and _cb_host:
+                try:
+                    _cb_ip = ipaddress.ip_address(_cb_host)
+                    _cb_ipv6_global = (
+                        isinstance(_cb_ip, ipaddress.IPv6Address)
+                        and _cb_ip.is_global
+                    )
+                except ValueError:
+                    pass
+
+            if _cb_lan_reachable and callback_address and _cb_ipv6_global:
+                # ── IPv6 direct PushResult with relay fallback ────────
+                import time as _v6_time
+                _v6_neg = getattr(self, "_ipv6_neg_cache", None) or {}
+                _v6_cached = (
+                    callback_address in _v6_neg
+                    and (_v6_time.monotonic() - _v6_neg[callback_address]) < 60.0
+                )
+                _v6_ok = False
+                if not _v6_cached:
+                    try:
+                        channel = grpc.insecure_channel(
+                            callback_address,
+                            options=[
+                                ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+                                ("grpc.max_send_message_length", 100 * 1024 * 1024),
+                            ],
+                        )
+                        try:
+                            stub = peer_pb2_grpc.PeerStub(channel)
+                            stub.PushResult(response, timeout=3.0)
+                            _v6_ok = True
+                            _v6_neg.pop(callback_address, None)
+                            self._ipv6_neg_cache = _v6_neg
+                        finally:
+                            channel.close()
+                    except Exception as _v6_exc:
+                        logger.info(
+                            "push_result_ipv6_failed: req=%s -> %s "
+                            "err=%s — caching, using relay",
+                            response.request_id, callback_address, _v6_exc,
+                        )
+                        _v6_neg[callback_address] = _v6_time.monotonic()
+                        self._ipv6_neg_cache = _v6_neg
+                if _v6_ok:
+                    logger.info(
+                        "push_result_sent_via_ipv6: req=%s -> %s",
+                        response.request_id, callback_address,
+                    )
+                elif self._p2p_node is not None and _cb_libp2p:
+                    self._p2p_node.proxy_forward(
+                        target_peer_id=_cb_libp2p,
+                        data=PROXY_METHOD_PUSH_RESULT + response.SerializeToString(),
+                    )
+                    logger.info(
+                        "push_result_sent_via_relay: req=%s -> %s "
+                        "(ipv6_fallback; libp2p=%s)",
+                        response.request_id, callback_address, _cb_libp2p[:20],
+                    )
+            elif _cb_lan_reachable and callback_address:
+                # LAN-direct gRPC to coordinator — fastest path (IPv4 LAN).
                 if _depth_ff >= 2:
                     self._dispatch_push_result_async(
                         callback_address, response, label="lan",
@@ -2987,11 +3126,23 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     _rreq.request_id, _rreq.ring_tokens_remaining,
                     _addr, _libp2p[:20] if _libp2p else "none",
                 )
+                # ── Self-reinject: stage 0 IS the local peer ──────────
+                # When the coordinator hosts stage 0 (co-located peer),
+                # skip all network paths and call Forward() directly.
+                # Saves a full relay round trip (~200-500 ms cross-ISP).
+                _is_self = (
+                    session.ring_first_hop_peer_id == self.peer_id
+                )
+                if _is_self:
+                    self.Forward(_rreq, context=None)
+                    logger.info(
+                        "COORD_REINJECT_DONE: req=%s via_local (self)",
+                        _rreq.request_id,
+                    )
+                    return
+
                 # LAN-first: when the coordinator and stage-0 peer share
-                # a /16, skip libp2p entirely. Most likely irrelevant for
-                # the pure-coordinator case (Mac coord ↔ remote VPC peer)
-                # but matches the routing rule applied symmetrically on
-                # other hops.
+                # a /16 (or same /64 for IPv6), skip libp2p entirely.
                 from peer.lan_routing import (
                     is_reachable_lan as _ir, parse_host_from_address as _ph,
                 )
