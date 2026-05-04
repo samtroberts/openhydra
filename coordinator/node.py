@@ -46,10 +46,19 @@ Quickstart
 """
 from __future__ import annotations
 
+import os
+
+# ── Suppress cosmetic gRPC C-core fork warnings ─────────────────────
+# gRPC's internal DNS resolver may fork() while threads are active,
+# producing harmless "FD from fork parent still in poll list" INFO
+# messages from ev_poll_posix.cc.  These are not errors — the stale
+# FDs sit unused in the child's poll set.  Suppress before grpc is
+# imported so the C core picks up the setting.
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
 import argparse
 import json
 import logging
-import os
 import tempfile
 import threading
 import time

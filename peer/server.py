@@ -13,6 +13,14 @@
 
 from __future__ import annotations
 
+import os as _os
+
+# ── Suppress cosmetic gRPC C-core fork warnings ─────────────────────
+# gRPC's internal DNS resolver may fork() while threads are active,
+# producing harmless "FD from fork parent still in poll list" INFO
+# messages.  Set before grpc is imported.
+_os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
 import argparse
 import asyncio
 from concurrent import futures
