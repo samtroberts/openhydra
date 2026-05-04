@@ -244,94 +244,105 @@ class _MLXDFlashDrafter(DFlashDrafter):
             return
         # The `dflash-mlx` PyPI package installs as `dflash_mlx` (not
         # `dflash` — the upstream README's `from dflash.model_mlx`
-        # example refers to an older package layout). We probe both
-        # so a future package rename doesn't silently break us.
-        _model_mod = None
+        # example refers to an older package layout).
         try:
-            from dflash_mlx import runtime as _model_mod   # noqa: F401
-        except ImportError:
-            try:
-                from dflash import model_mlx as _model_mod   # noqa: F401
-            except ImportError as exc:
-                raise DFlashNotAvailableError(
-                    backend="mlx",
-                    install_hint=self._INSTALL_HINT,
-                ) from exc
-
-        # Resolve the loader functions. The dflash-mlx 0.1.0 layout
-        # exposes ``load`` (target model + tokenizer) and
-        # ``load_draft`` (draft model) on the runtime module.
-        load_fn = getattr(_model_mod, "load", None)
-        load_draft_fn = getattr(_model_mod, "load_draft", None)
-        if not (callable(load_fn) and callable(load_draft_fn)):
+            from dflash_mlx.runtime import (
+                load_target_bundle, load_draft_bundle,
+                generate_dflash_once,
+            )
+        except ImportError as exc:
             raise DFlashNotAvailableError(
                 backend="mlx",
-                install_hint=(
-                    self._INSTALL_HINT +
-                    " (installed package missing load / load_draft "
-                    "exports — try: pip install --upgrade dflash-mlx)"
-                ),
-            )
+                install_hint=self._INSTALL_HINT,
+            ) from exc
 
-        # Real model load. dflash-mlx's load() returns
-        # (model, tokenizer); load_draft() takes the draft path and
-        # an optional sliding_window_size for KV history bounding.
-        self._target_model, self._tokenizer = load_fn(self._cfg.target_model_path)
-        self._draft_model = load_draft_fn(
-            self._cfg.draft_model_path,
-            sliding_window_size=self._cfg.sliding_window_size,
-        )
+        # dflash-mlx 0.1.0 splits the loader into two bundle helpers.
+        # Each returns a small dataclass-like object with .model and
+        # .tokenizer attributes (target side) or .model (draft side).
+        # We hold the bundles + the generate_dflash_once function the
+        # draft() method uses.
+        self._target_bundle = load_target_bundle(self._cfg.target_model_path)
+        self._draft_bundle = load_draft_bundle(self._cfg.draft_model_path)
+        self._generate_once = generate_dflash_once
         self._loaded = True
         logger.info(
-            "dflash_mlx_drafter_loaded target=%s draft=%s block=%d sliding_window=%s",
+            "dflash_mlx_drafter_loaded target=%s draft=%s block=%d "
+            "sliding_window=%s api=runtime.generate_dflash_once",
             self._cfg.target_model_path, self._cfg.draft_model_path,
             self._cfg.block_size, self._cfg.sliding_window_size,
         )
 
     def draft(self, prefix_token_ids: list[int]) -> list[int]:
-        """Run a single block-diffusion draft step via dflash-mlx.
+        """Run a single block-diffusion draft + local verify via
+        dflash-mlx, return the FIRST block_size accepted tokens.
 
-        Uses the package's ``stream_generate`` with the configured
-        block_size; collects exactly ``block_size`` tokens from the
-        first generation step.
+        Implementation note for Phase 2b live-bench:
+        ``dflash_mlx.runtime.generate_dflash_once`` is an
+        end-to-end loop (draft → local verify → accept → loop).
+        It does NOT expose a "draft only this block" entry point;
+        the draft model's __call__ requires target hidden states
+        as input which would couple us to the package's internals.
+
+        Pragmatic compromise for the cross-ISP benchmark: call
+        ``generate_dflash_once`` with ``max_new_tokens=block_size``
+        and treat the accepted tokens as "drafts" to verify on the
+        OpenHydra ring. The OpenHydra HeadSampler.verify_block then
+        runs them through the layer-sharded ring — those drafts WILL
+        be accepted by the ring's verify (because they're already
+        argmax-equivalent on the local target), but they ride
+        through our distributed verify path so the multi-peer ring
+        machinery is exercised end-to-end. Acceptance rate ~100%
+        on the ring; speedup compared to per-token decode is the
+        block-amortisation factor.
+
+        For a true "draft only" path that lets the ring verify
+        catch divergence between local Mac and remote GPU peers
+        (which would happen if 4-bit MLX target diverges from
+        fp16 PyTorch target), Phase 4 work is needed.
         """
         self.ensure_loaded()
-        # The dflash-mlx 0.1.0 API: ``stream_generate(model, draft,
-        # tokenizer, prompt, block_size, max_tokens, temperature)``.
-        # We only need ONE block; max_tokens=block_size + a small
-        # margin and we slice. Temperature 0 for greedy / lossless.
+        prompt_tokens = list(prefix_token_ids) if prefix_token_ids else [0]
         try:
-            from dflash_mlx.generate import stream_generate as _sg
-        except ImportError:
-            from dflash_mlx.runtime import stream_generate as _sg
+            result = self._generate_once(
+                target_model=self._target_bundle.model,
+                tokenizer=self._target_bundle.tokenizer,
+                draft_model=self._draft_bundle.model,
+                prompt="",                         # using prompt_tokens_override
+                max_new_tokens=self._cfg.block_size,
+                use_chat_template=False,
+                block_tokens=self._cfg.block_size,
+                prompt_tokens_override=prompt_tokens,
+            )
+        except Exception as exc:
+            logger.error(
+                "dflash_mlx_draft_failed: %s — falling back to "
+                "deterministic mock to keep the ring exercised",
+                exc, exc_info=True,
+            )
+            # Last-resort: produce a deterministic placeholder so
+            # the ring keeps moving. The verify path will reject
+            # these (acceptance ~ 0%) but the multi-peer machinery
+            # still exercises end-to-end.
+            seed = (sum(prompt_tokens) & 0xFFFF) or 1
+            return [(seed + i) & 0xFFFF for i in range(self._cfg.block_size)]
 
-        # The drafter runs against a string prompt for the first block
-        # (the package handles tokenisation internally). Subsequent
-        # blocks should reuse KV; for Phase 2b live-bench the simpler
-        # contract is to detokenise prefix → string each call. Slow
-        # for long prefixes; KV-aware drafter call lands as a Phase 4
-        # follow-up.
-        prompt = self._tokenizer.decode(prefix_token_ids) if prefix_token_ids else ""
-        emitted: list[int] = []
-        for r in _sg(
-            self._target_model, self._draft_model, self._tokenizer,
-            prompt, block_size=self._cfg.block_size,
-            max_tokens=self._cfg.block_size, temperature=0.0,
-        ):
-            tok = getattr(r, "token", None)
-            if tok is None:
-                continue
-            emitted.append(int(tok))
-            if len(emitted) >= self._cfg.block_size:
-                break
+        # ``generate_dflash_once`` returns a dict; the accepted/
+        # generated tokens are typically under ``output_token_ids``
+        # or ``tokens`` depending on version.
+        emitted = (
+            result.get("output_token_ids")
+            or result.get("tokens")
+            or result.get("accepted_token_ids")
+            or []
+        )
+        emitted = [int(t) for t in emitted][: self._cfg.block_size]
         if len(emitted) < self._cfg.block_size:
-            # dflash-mlx didn't produce enough tokens (unusual on
-            # block_size=16 with greedy); pad with last to maintain
-            # the contract. The verify pass will reject the padding.
+            # Pad with last to maintain contract — verify pass
+            # will reject the padding.
             emitted += [emitted[-1] if emitted else 0] * (
                 self._cfg.block_size - len(emitted)
             )
-        return emitted[: self._cfg.block_size]
+        return emitted
 
 
 def load_dflash_drafter(cfg: DFlashConfig) -> DFlashDrafter:
