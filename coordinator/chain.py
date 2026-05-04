@@ -649,32 +649,8 @@ class InferenceChain:
 
             for attempt, candidate in enumerate(candidates, start=1):
                 try:
-                    # B1 rendezvous: if the candidate is relay-bound, ask it
-                    # (via gossipsub) to simultaneously dial us. The
-                    # gossip client's per-pair 5 s debounce means it's
-                    # safe to call this unconditionally on every attempt —
-                    # duplicate publishes collapse transparently.
-                    _gossip = getattr(self, "_gossip_client", None)
-                    _self_libp2p = getattr(self, "_self_libp2p_peer_id", "")
-                    if _gossip is not None and _self_libp2p:
-                        try:
-                            from coordinator.path_finder import maybe_request_hole_punch as _maybe_rhp
-                            _published = _maybe_rhp(
-                                _gossip,
-                                self_libp2p_peer_id=str(_self_libp2p),
-                                peer=candidate,
-                            )
-                            if _published:
-                                logging.info(
-                                    "b1_rendezvous_published: target=%s stage=%d",
-                                    str(getattr(candidate, "libp2p_peer_id", "") or "")[:14],
-                                    stage_index,
-                                )
-                        except Exception:  # pragma: no cover — never derail
-                            logging.debug(
-                                "b1_rendezvous_publish_failed",
-                                exc_info=True,
-                            )
+                    # NOTE: B1 gossip (REQUEST_HOLE_PUNCH) removed from
+                    # inference hot path — see peer/server.py comment.
                     stage_input = list(activation)
                     candidate_backend = str(getattr(candidate, "runtime_backend", "")).strip().lower()
                     compressed_transfer = (
@@ -950,28 +926,8 @@ class InferenceChain:
                 **decode_controls,
             )
 
-        # B1 rendezvous (push mode): ask every relay-bound peer on the
-        # route to simultaneously dial us *before* we send the first
-        # activation. The per-pair 5 s debounce inside GossipClient
-        # prevents re-publish storms across many auto-regressive tokens.
-        _gossip = getattr(self, "_gossip_client", None)
-        _self_libp2p = getattr(self, "_self_libp2p_peer_id", "")
-        if _gossip is not None and _self_libp2p:
-            try:
-                from coordinator.path_finder import maybe_request_hole_punch as _maybe_rhp
-                for _cand in self.pipeline:
-                    _pub = _maybe_rhp(
-                        _gossip,
-                        self_libp2p_peer_id=str(_self_libp2p),
-                        peer=_cand,
-                    )
-                    if _pub:
-                        logging.info(
-                            "b1_rendezvous_published_push: target=%s",
-                            str(getattr(_cand, "libp2p_peer_id", "") or "")[:14],
-                        )
-            except Exception:  # pragma: no cover — never derail
-                logging.debug("b1_rendezvous_publish_push_failed", exc_info=True)
+        # NOTE: B1 gossip (REQUEST_HOLE_PUNCH) removed from inference
+        # hot path — see peer/server.py comment.
 
         # Build the route for remaining hops
         route_hops = []
