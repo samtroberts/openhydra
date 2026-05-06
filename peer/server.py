@@ -2077,13 +2077,25 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     # Emit token to coordinator's async queue (no-op if
                     # this process has no ring queue registered).
                     from coordinator.push_receiver import emit_ring_token
+                    _is_ring_eos = _ring_token in _ring_eos
                     emit_ring_token(_ring_cb_id, _ring_token)
-                    logger.info("ring_token_emitted: token=%d remaining=%d", _ring_token, _ring_remaining)
+                    logger.info("ring_token_emitted: token=%d remaining=%d eos=%s", _ring_token, _ring_remaining, _is_ring_eos)
 
-                    # Always loop back to coordinator — the coordinator's fire-and-forget
-                    # handler emits tokens + sentinel. Even when remaining==0, the
-                    # coordinator needs the final token delivered via the loop-back.
-                    if True:
+                    # ── EOS early-exit: stop ring BEFORE looping back ────
+                    # Without this check, the ring wastes full round trips
+                    # (forward pass + network RTT per peer) generating past
+                    # the EOS token or past the max_tokens budget. For a
+                    # 366-token response with max_tokens=512, that's 146
+                    # wasted iterations × ~50 ms each ≈ 7-10 s of latency.
+                    if _ring_remaining <= 0 or _is_ring_eos:
+                        emit_ring_token(_ring_cb_id, None)  # sentinel
+                        logger.info(
+                            "ring_eos_early_exit: token=%d remaining=%d "
+                            "eos=%s generated=%d",
+                            _ring_token, _ring_remaining, _is_ring_eos,
+                            len(_ring_generated),
+                        )
+                    elif _ring_remaining > 0 and not _is_ring_eos:
                         # Loop back to first peer with the new token.
                         _ring_route = list(request.ring_full_route)
                         _ring_next_addr = str(request.ring_first_hop_address)

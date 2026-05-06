@@ -328,15 +328,21 @@ class InferenceService:
         """Extract (eos_token_ids, all_special_ids) from a HuggingFace tokenizer.
 
         Returns two sets of non-negative ints. ``eos_token_ids`` covers single
-        ``eos_token_id`` plus list-valued eos specifications. ``special_ids``
-        is the tokenizer's ``all_special_ids`` used to filter out BOS/PAD/etc.
-        during decode. Both paths (non-streaming ``infer()`` outer loop and
-        streaming ``infer_chat_stream``) use this helper so they stay in sync.
+        ``eos_token_id`` plus list-valued eos specifications AND any
+        additional EOS IDs from the model's ``generation_config``.
+        ``special_ids`` is the tokenizer's ``all_special_ids`` used to
+        filter out BOS/PAD/etc. during decode.
+
+        For Qwen3.5 chat models, ``tokenizer.eos_token_id`` is typically
+        151645 (``<|im_end|>``). ``generation_config`` may carry a list
+        like ``[151643, 151645]``.  We take the union so the ring's EOS
+        check never misses the actual end-of-turn token.
         """
         eos_ids: set[int] = set()
         special_ids: set[int] = set()
         if tokenizer is None:
             return eos_ids, special_ids
+        # 1. tokenizer.eos_token_id (int or list)
         eos_raw = getattr(tokenizer, "eos_token_id", None)
         if isinstance(eos_raw, int):
             eos_ids = {int(eos_raw)}
@@ -345,6 +351,22 @@ class InferenceService:
                 eos_ids = {int(item) for item in list(eos_raw)}
             except TypeError:
                 eos_ids = set()
+        # 2. generation_config.eos_token_id (may be a list with extra IDs)
+        _gen_cfg = getattr(tokenizer, "generation_config", None)
+        if _gen_cfg is None:
+            # Some tokenizers don't carry generation_config; try the model
+            # attribute that AutoTokenizer.from_pretrained stashes.
+            _gen_cfg = getattr(tokenizer, "_generation_config", None)
+        if _gen_cfg is not None:
+            _gc_eos = getattr(_gen_cfg, "eos_token_id", None)
+            if isinstance(_gc_eos, int):
+                eos_ids.add(int(_gc_eos))
+            elif _gc_eos is not None:
+                try:
+                    for _item in list(_gc_eos):
+                        eos_ids.add(int(_item))
+                except (TypeError, ValueError):
+                    pass
         eos_ids = {item for item in eos_ids if item >= 0}
         special_raw = getattr(tokenizer, "all_special_ids", None)
         if special_raw is not None:
