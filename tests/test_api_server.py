@@ -513,6 +513,8 @@ def test_post_completions_returns_engine_response():
             return {
                 "response": "hello",
                 "request_id": "r1",
+                "completion_tokens": 5,
+                "prompt_tokens": 3,
                 "model": {"served": "openhydra-test", "requested": "openhydra-test", "reason": "none", "detail": ""},
             }
 
@@ -543,6 +545,8 @@ def test_post_chat_completions_returns_engine_response():
             return {
                 "response": "hi there",
                 "request_id": "r2",
+                "completion_tokens": 8,
+                "prompt_tokens": 3,
                 "model": {"served": "openhydra-test", "requested": "openhydra-test", "reason": "none", "detail": ""},
             }
 
@@ -573,7 +577,7 @@ def test_post_invalid_json_body_returns_422_or_400():
     class _NullEngine:
         config = SimpleNamespace(default_model="openhydra-test")
         def infer(self, **kwargs):
-            return {"response": "ok", "request_id": "x", "model": {}}
+            return {"response": "ok", "request_id": "x", "completion_tokens": 1, "prompt_tokens": 1, "model": {}}
 
     prev_key = OpenHydraHandler._api_key
     prev_rl = OpenHydraHandler._rate_limiter

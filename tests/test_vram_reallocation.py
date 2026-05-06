@@ -63,6 +63,7 @@ class _MockSwarmEngine:
 
     def infer_chat(self, **kw):
         return {"request_id": "s-1", "response": "Swarm",
+                "completion_tokens": 5, "prompt_tokens": 3,
                 "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"}}
 
 

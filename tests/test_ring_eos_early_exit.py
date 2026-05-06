@@ -190,3 +190,66 @@ class TestLastPeerEosCheck:
         _is_ring_eos = token in eos_set
         should_stop = remaining <= 0 or _is_ring_eos
         assert should_stop == expect_stop
+
+
+# ── completion_tokens accuracy tests ──────────────────────────────────────
+
+
+class TestCompletionTokenCount:
+    """Verify completion_tokens strict enforcement — no word-count fallback.
+
+    The API now uses ``_strict_token_counts`` / ``_usage_from_payload``
+    which raise ``KeyError`` when ``completion_tokens`` is missing or
+    zero, rather than silently falling back to ``len(text.split())``.
+    """
+
+    def test_strict_token_counts_valid(self):
+        """_strict_token_counts returns (pt, ct) when both are present."""
+        from coordinator.api_server import _strict_token_counts
+        payload = {
+            "response": "Hello world this is a test response",
+            "completion_tokens": 42,
+            "prompt_tokens": 10,
+        }
+        pt, ct = _strict_token_counts(payload)
+        assert ct == 42, "Should use actual token count from activation"
+        assert pt == 10
+
+    def test_strict_token_counts_missing_raises(self):
+        """_strict_token_counts raises KeyError when completion_tokens absent."""
+        from coordinator.api_server import _strict_token_counts
+        payload = {
+            "response": "Hello world this is a test response",
+        }
+        with pytest.raises(KeyError, match="completion_tokens missing"):
+            _strict_token_counts(payload)
+
+    def test_strict_token_counts_zero_raises(self):
+        """_strict_token_counts raises KeyError when completion_tokens is 0."""
+        from coordinator.api_server import _strict_token_counts
+        payload = {
+            "response": "One two three",
+            "completion_tokens": 0,
+        }
+        with pytest.raises(KeyError, match="completion_tokens missing"):
+            _strict_token_counts(payload)
+
+    def test_usage_from_payload_builds_dict(self):
+        """_usage_from_payload builds correct usage dict."""
+        from coordinator.api_server import _usage_from_payload
+        payload = {
+            "response": "Hello world",
+            "completion_tokens": 50,
+            "prompt_tokens": 20,
+        }
+        usage = _usage_from_payload(payload)
+        assert usage["completion_tokens"] == 50
+        assert usage["prompt_tokens"] == 20
+        assert usage["total_tokens"] == 70
+
+    def test_usage_from_payload_missing_raises(self):
+        """_usage_from_payload raises KeyError when completion_tokens absent."""
+        from coordinator.api_server import _usage_from_payload
+        payload = {"response": "Hello world"}
+        with pytest.raises(KeyError, match="completion_tokens missing"):
+            _usage_from_payload(payload)

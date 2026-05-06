@@ -2392,11 +2392,18 @@ class InferenceService:
             cap_fraction=self.config.operator_cap_fraction,
         )
 
+        # Actual token count — ``primary.activation`` carries one float per
+        # generated token ID. Use this for ``completion_tokens`` in the API
+        # response instead of the old ``len(text.split())`` word count.
+        _completion_token_count = len(primary.activation) if primary.activation else 0
+
         return {
             "request_id": primary.request_id,
             "response": response_text,
             "primary_response": primary.text,
             "latency_ms": round(primary.latency_ms, 2),
+            "completion_tokens": _completion_token_count,
+            "prompt_tokens": prompt_tokens_est,
             "pipeline": [asdict(trace) for trace in primary.traces],
             "verification": asdict(verification),
             "verification_feedback": verification_feedback,

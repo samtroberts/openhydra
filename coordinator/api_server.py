@@ -35,6 +35,40 @@ from openhydra_secrets import is_insecure_secret_value, load_secret_store
 
 logger = logging.getLogger(__name__)
 
+
+def _strict_token_counts(payload: dict[str, Any]) -> tuple[int, int]:
+    """Extract (prompt_tokens, completion_tokens) from an inference payload.
+
+    Strictly uses ``payload["completion_tokens"]`` (set from
+    ``len(primary.activation)`` in ``InferenceService.infer()``).
+    Raises ``KeyError`` if the field is missing — callers must never
+    silently fall back to word count.
+    """
+    ct = int(payload.get("completion_tokens") or 0)
+    if ct <= 0:
+        raise KeyError(
+            "completion_tokens missing or zero in inference payload — "
+            "the engine must set this from len(primary.activation)"
+        )
+    pt = int(payload.get("prompt_tokens") or 0)
+    return pt, ct
+
+
+def _usage_from_payload(payload: dict[str, Any]) -> dict[str, int]:
+    """Build an OpenAI ``usage`` dict from an inference payload.
+
+    Fails fast if ``completion_tokens`` is missing or zero — no word-count
+    fallback.  All API response builders call this instead of inlining
+    ``len(payload["response"].split())``.
+    """
+    pt, ct = _strict_token_counts(payload)
+    return {
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "total_tokens": pt + ct,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Request validation limits
 # ---------------------------------------------------------------------------
@@ -605,11 +639,7 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                         "message": {"role": "assistant", "content": payload["response"]},
                         "finish_reason": "stop",
                     }],
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": len(payload["response"].split()),
-                        "total_tokens": len(payload["response"].split()),
-                    },
+                    "usage": _usage_from_payload(payload),
                     "openhydra": payload,
                 })
 
@@ -1455,8 +1485,8 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                     "done": True,
                     "total_duration": 0,
                     "load_duration": 0,
-                    "prompt_eval_count": 0,
-                    "eval_count": len(payload["response"].split()),
+                    "prompt_eval_count": _strict_token_counts(payload)[0],
+                    "eval_count": _strict_token_counts(payload)[1],
                     "eval_duration": 0,
                 },
                 headers=rid_headers,
@@ -1513,8 +1543,8 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                     "done": True,
                     "total_duration": 0,
                     "load_duration": 0,
-                    "prompt_eval_count": 0,
-                    "eval_count": len(payload["response"].split()),
+                    "prompt_eval_count": _strict_token_counts(payload)[0],
+                    "eval_count": _strict_token_counts(payload)[1],
                     "eval_duration": 0,
                 },
                 headers=rid_headers,
@@ -1659,11 +1689,7 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                                 "finish_reason": "stop",
                             }
                         ],
-                        "usage": {
-                            "prompt_tokens": 0,
-                            "completion_tokens": len(payload["response"].split()),
-                            "total_tokens": len(payload["response"].split()),
-                        },
+                        "usage": _usage_from_payload(payload),
                         "openhydra": payload,
                     },
                     headers=headers,
@@ -1701,11 +1727,7 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                                 "finish_reason": "stop",
                             }
                         ],
-                        "usage": {
-                            "prompt_tokens": 0,
-                            "completion_tokens": len(payload["response"].split()),
-                            "total_tokens": len(payload["response"].split()),
-                        },
+                        "usage": _usage_from_payload(payload),
                         "openhydra": payload,
                     },
                     headers=headers,

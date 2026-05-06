@@ -134,6 +134,8 @@ class _MockSwarmEngine:
         return {
             "request_id": "swarm-req-1",
             "response": "Swarm response",
+            "completion_tokens": 12,
+            "prompt_tokens": 5,
             "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
         }
 
@@ -142,6 +144,8 @@ class _MockSwarmEngine:
         return {
             "request_id": "swarm-req-1",
             "response": "Swarm streaming",
+            "completion_tokens": 8,
+            "prompt_tokens": 5,
             "stream": iter(["Swarm", " streaming"]),
             "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
         }
@@ -151,6 +155,8 @@ class _MockSwarmEngine:
         return {
             "request_id": "swarm-req-1",
             "response": "Swarm text",
+            "completion_tokens": 10,
+            "prompt_tokens": 5,
             "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
         }
 
@@ -159,6 +165,8 @@ class _MockSwarmEngine:
         return {
             "request_id": "swarm-req-1",
             "response": "Swarm text",
+            "completion_tokens": 10,
+            "prompt_tokens": 5,
             "stream": iter(["Swarm", " text"]),
             "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
         }

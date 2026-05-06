@@ -201,8 +201,8 @@ class LocalInferenceEngine:
                     finish_reason = "stop"
                     break
 
-        # Determine finish reason
-        completion_token_count = self._count_completion_tokens(text, max_tokens)
+        # Determine finish reason — use activation length, not word count.
+        completion_token_count = len(activation)
         if finish_reason != "stop" and completion_token_count < max_tokens:
             finish_reason = "stop"
 
@@ -355,7 +355,8 @@ class LocalInferenceEngine:
                 return text.strip(), len(filtered)
             return "", 0
 
-        # Slow fallback: ToyRuntime (no real tokenizer)
+        # Slow fallback: ToyRuntime (no real tokenizer).
+        # Token count = len(activation), not word count.
         _runtime_model = getattr(
             getattr(self.shard, "config", None), "runtime_model_id", None
         )
@@ -363,7 +364,7 @@ class LocalInferenceEngine:
             activation, max_tokens=max_tokens,
             tokenizer_model_id=_runtime_model or None,
         )
-        return text, self._count_completion_tokens(text, max_tokens)
+        return text, len(activation)
 
     def _count_prompt_tokens(self, prompt: str) -> int:
         """Count prompt tokens using the real tokenizer when available."""
@@ -374,16 +375,8 @@ class LocalInferenceEngine:
                 pass
         return len(prompt.split())
 
-    @staticmethod
-    def _count_completion_tokens(text: str, max_tokens: int) -> int:
-        """Count completion tokens from decoded text.
-
-        For ToyRuntime: count words (matches decode_text's word-join).
-        For real runtimes: will use actual token IDs in Phase 2.
-        """
-        if not text:
-            return 0
-        return min(len(text.split()), max_tokens)
+    # _count_completion_tokens removed — all paths now use
+    # len(activation) for the actual token count.
 
     def _build_response(
         self,

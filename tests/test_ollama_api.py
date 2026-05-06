@@ -52,6 +52,8 @@ def _make_engine(infer_resp=None, infer_chat_resp=None, stream_chunks=None):
             return infer_resp or {
                 "request_id": "req-123",
                 "response": "Hello world",
+                "completion_tokens": 10,
+                "prompt_tokens": 5,
                 "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
             }
 
@@ -60,6 +62,8 @@ def _make_engine(infer_resp=None, infer_chat_resp=None, stream_chunks=None):
             return infer_chat_resp or {
                 "request_id": "req-456",
                 "response": "Hi there",
+                "completion_tokens": 8,
+                "prompt_tokens": 5,
                 "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
             }
 
@@ -67,6 +71,8 @@ def _make_engine(infer_resp=None, infer_chat_resp=None, stream_chunks=None):
             self._last_infer_kwargs = kwargs
             return {
                 "request_id": "req-789",
+                "completion_tokens": 10,
+                "prompt_tokens": 5,
                 "stream": iter(stream_chunks or ["Hello", " world"]),
                 "model": {"served": "openhydra-toy-345m"},
             }
@@ -75,6 +81,8 @@ def _make_engine(infer_resp=None, infer_chat_resp=None, stream_chunks=None):
             self._last_chat_kwargs = kwargs
             return {
                 "request_id": "req-012",
+                "completion_tokens": 8,
+                "prompt_tokens": 5,
                 "stream": iter(stream_chunks or ["Hi", " there"]),
                 "model": {"served": "openhydra-toy-345m"},
             }
