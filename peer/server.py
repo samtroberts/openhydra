@@ -2081,115 +2081,121 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     emit_ring_token(_ring_cb_id, _ring_token)
                     logger.info("ring_token_emitted: token=%d remaining=%d eos=%s", _ring_token, _ring_remaining, _is_ring_eos)
 
-                    # ── EOS early-exit: stop ring BEFORE looping back ────
-                    # Without this check, the ring wastes full round trips
-                    # (forward pass + network RTT per peer) generating past
-                    # the EOS token or past the max_tokens budget. For a
-                    # 366-token response with max_tokens=512, that's 146
-                    # wasted iterations × ~50 ms each ≈ 7-10 s of latency.
+                    # ── EOS early-exit ────────────────────────────────────
+                    # When EOS is detected or max tokens exhausted, skip
+                    # the expensive forward-pass loop but STILL send one
+                    # final loop-back to stage-0 with remaining=0.
+                    # Stage-0 (co-located with coordinator) emits the
+                    # sentinel to the ring queue. Without this loop-back
+                    # the coordinator's drain loop never receives the
+                    # None sentinel and waits the full 120 s timeout.
                     if _ring_remaining <= 0 or _is_ring_eos:
-                        emit_ring_token(_ring_cb_id, None)  # sentinel
+                        _ring_remaining = 0  # ensure 0 for sentinel path
                         logger.info(
                             "ring_eos_early_exit: token=%d remaining=%d "
                             "eos=%s generated=%d",
                             _ring_token, _ring_remaining, _is_ring_eos,
                             len(_ring_generated),
                         )
-                    elif _ring_remaining > 0 and not _is_ring_eos:
-                        # Loop back to first peer with the new token.
-                        _ring_route = list(request.ring_full_route)
-                        _ring_next_addr = str(request.ring_first_hop_address)
-                        _ring_next_next = _ring_route[1].address if len(_ring_route) > 1 else ""
-                        _ring_next_next_id = _ring_route[1].peer_id if len(_ring_route) > 1 else ""
-                        _ring_req = peer_pb2.ForwardRequest(
-                            request_id=request.request_id,
-                            activation=[float(_ring_token)],
-                            stage_index=0,
-                            total_stages=request.total_stages,
-                            max_tokens=1,
-                            kv_session_id=request.kv_session_id,
-                            kv_store_activation=True,
-                            kv_use_cached_activation=True,
-                            decode_do_sample=request.decode_do_sample,
-                            decode_temperature=request.decode_temperature,
-                            decode_top_p=request.decode_top_p,
-                            decode_top_k=request.decode_top_k,
-                            decode_seed=request.decode_seed,
-                            shard_layer_start=_ring_route[0].shard_layer_start if _ring_route else 0,
-                            shard_layer_end=_ring_route[0].shard_layer_end if _ring_route else 0,
-                            shard_total_layers=_ring_route[0].shard_total_layers if _ring_route else 0,
-                            push_mode=True,
-                            ring_mode=True,
-                            ring_tokens_remaining=_ring_remaining,
-                            ring_generated_ids=_ring_generated,
-                            ring_eos_ids=list(request.ring_eos_ids),
-                            ring_first_hop_address=request.ring_first_hop_address,
-                            ring_first_hop_peer_id=request.ring_first_hop_peer_id,
-                            ring_first_hop_libp2p_id=request.ring_first_hop_libp2p_id,
-                            ring_full_route=_ring_route,
-                            next_hop_address=_ring_next_next,
-                            next_hop_peer_id=_ring_next_next_id,
-                            final_callback_address=callback_addr,
-                            final_callback_request_id=_ring_cb_id,
-                            final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
-                            remaining_route=_ring_route[1:],
-                            prompt_token_ids=list(request.prompt_token_ids),
-                        )
-                        # Fire-and-forget: ring loop-back in background thread.
-                        # IMPORTANT: Do NOT use _push_to_next_hop here — it rebuilds
-                        # the request with stage_index+1 and wrong shard layers.
-                        # The ring loop-back sends the pre-built _ring_req directly.
-                        import threading as _ring_threading
-                        _ring_first_libp2p = str(request.ring_first_hop_libp2p_id or "")
-                        def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr,
-                                            _libp2p=_ring_first_libp2p):
-                            try:
-                                logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
-                                            _rreq.request_id, _rreq.ring_tokens_remaining,
-                                            _raddr, _libp2p[:20] if _libp2p else "none")
-                                # LAN-first: if we can reach the first
-                                # peer directly via gRPC on a shared /16,
-                                # bypass the libp2p relay path.
-                                from peer.lan_routing import (
-                                    is_reachable_lan as _ir, parse_host_from_address as _ph,
-                                )
-                                _lh = _ph(_raddr)
-                                _lan_ok = bool(_lh) and _ir(_lh)
-                                if _lan_ok and _raddr:
-                                    _rl_ch = self._get_grpc_channel(_raddr)
-                                    _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
-                                    _rl_stub.Forward(_rreq, timeout=60.0)
-                                    logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_lan",
-                                                _rreq.request_id, _rreq.ring_tokens_remaining)
-                                elif self._p2p_node is not None and _libp2p:
-                                    _rl_direct = False
-                                    try:
-                                        _rl_direct = self._p2p_node.is_peer_connected(_libp2p)
-                                    except Exception:
-                                        pass
-                                    # Phase 1: fire-and-forget — no ACK wait.
-                                    self._p2p_node.proxy_forward_no_wait(
-                                        target_peer_id=_libp2p,
-                                        data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
-                                    )
-                                    logger.info(
-                                        "RING_LOOPBACK_DONE: req=%s remaining=%d via_%s (no_wait)",
+
+                    # Always loop back to stage-0: for normal tokens this
+                    # continues the ring; for EOS (remaining=0) stage-0
+                    # emits the token + sentinel and returns early without
+                    # running the forward pass (see ring_complete_in_forward
+                    # at stage_index==0 above).
+                    _ring_route = list(request.ring_full_route)
+                    _ring_next_addr = str(request.ring_first_hop_address)
+                    _ring_next_next = _ring_route[1].address if len(_ring_route) > 1 else ""
+                    _ring_next_next_id = _ring_route[1].peer_id if len(_ring_route) > 1 else ""
+                    _ring_req = peer_pb2.ForwardRequest(
+                        request_id=request.request_id,
+                        activation=[float(_ring_token)],
+                        stage_index=0,
+                        total_stages=request.total_stages,
+                        max_tokens=1,
+                        kv_session_id=request.kv_session_id,
+                        kv_store_activation=True,
+                        kv_use_cached_activation=True,
+                        decode_do_sample=request.decode_do_sample,
+                        decode_temperature=request.decode_temperature,
+                        decode_top_p=request.decode_top_p,
+                        decode_top_k=request.decode_top_k,
+                        decode_seed=request.decode_seed,
+                        shard_layer_start=_ring_route[0].shard_layer_start if _ring_route else 0,
+                        shard_layer_end=_ring_route[0].shard_layer_end if _ring_route else 0,
+                        shard_total_layers=_ring_route[0].shard_total_layers if _ring_route else 0,
+                        push_mode=True,
+                        ring_mode=True,
+                        ring_tokens_remaining=_ring_remaining,
+                        ring_generated_ids=_ring_generated,
+                        ring_eos_ids=list(request.ring_eos_ids),
+                        ring_first_hop_address=request.ring_first_hop_address,
+                        ring_first_hop_peer_id=request.ring_first_hop_peer_id,
+                        ring_first_hop_libp2p_id=request.ring_first_hop_libp2p_id,
+                        ring_full_route=_ring_route,
+                        next_hop_address=_ring_next_next,
+                        next_hop_peer_id=_ring_next_next_id,
+                        final_callback_address=callback_addr,
+                        final_callback_request_id=_ring_cb_id,
+                        final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                        remaining_route=_ring_route[1:],
+                        prompt_token_ids=list(request.prompt_token_ids),
+                    )
+                    # Fire-and-forget: ring loop-back in background thread.
+                    # IMPORTANT: Do NOT use _push_to_next_hop here — it rebuilds
+                    # the request with stage_index+1 and wrong shard layers.
+                    # The ring loop-back sends the pre-built _ring_req directly.
+                    import threading as _ring_threading
+                    _ring_first_libp2p = str(request.ring_first_hop_libp2p_id or "")
+                    def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr,
+                                        _libp2p=_ring_first_libp2p):
+                        try:
+                            logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
                                         _rreq.request_id, _rreq.ring_tokens_remaining,
-                                        "direct_quic" if _rl_direct else "relay",
-                                    )
-                                elif _raddr:
-                                    _rl_ch = self._get_grpc_channel(_raddr)
-                                    _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
-                                    _rl_stub.Forward(_rreq, timeout=60.0)
-                                    logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_grpc",
-                                                _rreq.request_id, _rreq.ring_tokens_remaining)
-                                else:
-                                    logger.error("RING_LOOPBACK_NO_ROUTE: req=%s", _rreq.request_id)
-                            except Exception as _rl_exc:
-                                logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
-                                             _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
-                                             exc_info=True)
-                        _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
+                                        _raddr, _libp2p[:20] if _libp2p else "none")
+                            # LAN-first: if we can reach the first
+                            # peer directly via gRPC on a shared /16,
+                            # bypass the libp2p relay path.
+                            from peer.lan_routing import (
+                                is_reachable_lan as _ir, parse_host_from_address as _ph,
+                            )
+                            _lh = _ph(_raddr)
+                            _lan_ok = bool(_lh) and _ir(_lh)
+                            if _lan_ok and _raddr:
+                                _rl_ch = self._get_grpc_channel(_raddr)
+                                _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
+                                _rl_stub.Forward(_rreq, timeout=60.0)
+                                logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_lan",
+                                            _rreq.request_id, _rreq.ring_tokens_remaining)
+                            elif self._p2p_node is not None and _libp2p:
+                                _rl_direct = False
+                                try:
+                                    _rl_direct = self._p2p_node.is_peer_connected(_libp2p)
+                                except Exception:
+                                    pass
+                                # Phase 1: fire-and-forget — no ACK wait.
+                                self._p2p_node.proxy_forward_no_wait(
+                                    target_peer_id=_libp2p,
+                                    data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                                )
+                                logger.info(
+                                    "RING_LOOPBACK_DONE: req=%s remaining=%d via_%s (no_wait)",
+                                    _rreq.request_id, _rreq.ring_tokens_remaining,
+                                    "direct_quic" if _rl_direct else "relay",
+                                )
+                            elif _raddr:
+                                _rl_ch = self._get_grpc_channel(_raddr)
+                                _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
+                                _rl_stub.Forward(_rreq, timeout=60.0)
+                                logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_grpc",
+                                            _rreq.request_id, _rreq.ring_tokens_remaining)
+                            else:
+                                logger.error("RING_LOOPBACK_NO_ROUTE: req=%s", _rreq.request_id)
+                        except Exception as _rl_exc:
+                            logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
+                                         _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
+                                         exc_info=True)
+                    _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
 
                 elif callback_addr:
                     # Last peer: send result back to coordinator (non-ring push)
