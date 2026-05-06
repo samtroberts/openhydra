@@ -618,7 +618,19 @@ class PathFinder:
             )
 
     def survey(self, peers: list[PeerEndpoint]) -> list[PeerHealth]:
-        return [self.ping(peer) for peer in peers]
+        if not peers:
+            return []
+        if len(peers) == 1:
+            return [self.ping(peers[0])]
+        # Ping all peers concurrently — each ping blocks up to timeout_s
+        # (1.2 s), so sequential pinging of N peers costs N × 1.2 s.
+        # Parallel pinging costs max(latencies) ≈ 1.2 s regardless of N.
+        with ThreadPoolExecutor(max_workers=min(len(peers), 16)) as pool:
+            futures = {pool.submit(self.ping, peer): peer for peer in peers}
+            results: list[PeerHealth] = []
+            for future in as_completed(futures):
+                results.append(future.result())
+        return results
 
     def discover(self, peers: list[PeerEndpoint], max_latency_ms: float | None = None) -> list[PeerHealth]:
         health = self.survey(peers)

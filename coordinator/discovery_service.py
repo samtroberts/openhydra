@@ -24,6 +24,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,11 @@ class DiscoveryService:
         self._dht_lookup_successes = _dht_lookup_successes
         self._dht_lookup_failures = _dht_lookup_failures
         self._last_scored_peers: list[ScoredPeer] = []
+        # Survey cache: avoid re-pinging peers on every request when the
+        # pipeline is already known.  TTL keeps things fresh without the
+        # 8+ second sequential-ping overhead on every API call.
+        self._survey_cache: tuple[float, list, dict] | None = None  # (ts, healthy, counts)
+        self._survey_cache_ttl_s: float = 30.0  # seconds — long enough to survive between requests
         self._last_verification_qos: dict[str, Any] = {
             "enabled": False,
             "min_events": 0,
@@ -356,42 +362,63 @@ class DiscoveryService:
         dht_sources = self._configured_dht_urls()
         if dht_sources:
             dht_errors: list[Exception] = []
-            for model_id in model_filter:
-                with self._metrics_lock:
-                    self._dht_lookup_attempts += 1
+            _dht_timeout = self.config.dht_lookup_timeout_s
+            _dht_region = self.config.dht_preferred_region
+            _dht_limit = self.config.dht_lookup_limit if self.config.dht_lookup_limit > 0 else None
+            _dht_sloppy = max(0, int(self.config.dht_lookup_sloppy_factor))
+            _dht_replicas = max(0, int(self.config.dht_lookup_dsht_replicas))
+            _single_source = len(dht_sources) == 1
+
+            def _lookup_model(model_id: str) -> tuple[str, list, Exception | None]:
+                """DHT lookup for a single model; returns (model_id, peers, error)."""
                 try:
-                    if len(dht_sources) == 1:
-                        dht_peers = _load_peers_from_dht(
+                    if _single_source:
+                        result = _load_peers_from_dht(
                             dht_sources[0],
                             model_id=model_id,
-                            timeout_s=self.config.dht_lookup_timeout_s,
-                            preferred_region=self.config.dht_preferred_region,
-                            limit=(self.config.dht_lookup_limit if self.config.dht_lookup_limit > 0 else None),
-                            sloppy_factor=max(0, int(self.config.dht_lookup_sloppy_factor)),
-                            dsht_replicas=max(0, int(self.config.dht_lookup_dsht_replicas)),
+                            timeout_s=_dht_timeout,
+                            preferred_region=_dht_region,
+                            limit=_dht_limit,
+                            sloppy_factor=_dht_sloppy,
+                            dsht_replicas=_dht_replicas,
                         )
                     else:
-                        dht_peers = _load_peers_from_dht(
+                        result = _load_peers_from_dht(
                             model_id=model_id,
-                            timeout_s=self.config.dht_lookup_timeout_s,
-                            preferred_region=self.config.dht_preferred_region,
-                            limit=(self.config.dht_lookup_limit if self.config.dht_lookup_limit > 0 else None),
-                            sloppy_factor=max(0, int(self.config.dht_lookup_sloppy_factor)),
-                            dsht_replicas=max(0, int(self.config.dht_lookup_dsht_replicas)),
+                            timeout_s=_dht_timeout,
+                            preferred_region=_dht_region,
+                            limit=_dht_limit,
+                            sloppy_factor=_dht_sloppy,
+                            dsht_replicas=_dht_replicas,
                             dht_urls=dht_sources,
                         )
-                    if dht_peers:
-                        peers.extend(dht_peers)
-                        self._cache_dht_peers(model_id=model_id, peers=dht_peers)
+                    return (model_id, result or [], None)
+                except Exception as exc:
+                    return (model_id, [], exc)
+
+            # Parallelize DHT lookups across all models — each lookup
+            # blocks on HTTP (3s timeout), so sequential 16-model lookup
+            # costs 16 × 3s worst case.  Parallel: max(latencies) ≈ 3s.
+            model_list = list(model_filter)
+            with ThreadPoolExecutor(max_workers=min(len(model_list), 16)) as pool:
+                futures = [pool.submit(_lookup_model, mid) for mid in model_list]
+                for future in as_completed(futures):
+                    mid, dht_peers, exc = future.result()
+                    with self._metrics_lock:
+                        self._dht_lookup_attempts += 1
+                    if exc is not None:
+                        dht_errors.append(exc)
+                        peers.extend(self._cached_dht_peers(model_id=mid))
+                        with self._metrics_lock:
+                            self._dht_lookup_failures += 1
                     else:
-                        peers.extend(self._cached_dht_peers(model_id=model_id))
-                    with self._metrics_lock:
-                        self._dht_lookup_successes += 1
-                except Exception as exc:  # pragma: no cover
-                    dht_errors.append(exc)
-                    peers.extend(self._cached_dht_peers(model_id=model_id))
-                    with self._metrics_lock:
-                        self._dht_lookup_failures += 1
+                        if dht_peers:
+                            peers.extend(dht_peers)
+                            self._cache_dht_peers(model_id=mid, peers=dht_peers)
+                        else:
+                            peers.extend(self._cached_dht_peers(model_id=mid))
+                        with self._metrics_lock:
+                            self._dht_lookup_successes += 1
 
             if dht_errors and not peers:
                 latest = dht_errors[-1]
@@ -493,13 +520,27 @@ class DiscoveryService:
     def _scan_network(self, model_ids: list[str] | None = None):
         """Load peers, ping-survey them, and return healthy peers with counts.
 
+        Uses a short TTL cache to avoid re-pinging on every request when
+        the peer set is stable.  The cache is keyed on the model_ids
+        filter and expires after ``_survey_cache_ttl_s`` seconds (default 5).
+
         Args:
             model_ids: Optional model ID filter for peer loading.
 
         Returns:
             Tuple of (healthy_items, available_peer_counts_by_model).
         """
+        import time as _time
+        _cache = self._survey_cache
+        if _cache is not None:
+            _ts, _cached_healthy, _cached_counts = _cache
+            if (_time.monotonic() - _ts) < self._survey_cache_ttl_s:
+                logger.info("PROFILE scan_network_cache_hit age=%.1fs", _time.monotonic() - _ts)
+                return _cached_healthy, _cached_counts
+
+        _t0_dht = _time.perf_counter()
         peers = self._load_candidate_peers(model_ids=model_ids)
+        _t1_dht = _time.perf_counter()
         finder = PathFinder(
             timeout_ms=min(self.config.timeout_ms, 1200),
             transport_config=self.transport_config,
@@ -507,6 +548,13 @@ class DiscoveryService:
         )
 
         survey = finder.survey(peers)
+        _t2_survey = _time.perf_counter()
+        logger.info(
+            "PROFILE scan_network: dht_load=%.0fms survey=%.0fms peers=%d",
+            (_t1_dht - _t0_dht) * 1000,
+            (_t2_survey - _t1_dht) * 1000,
+            len(peers),
+        )
         self._record_ping_health(survey)
 
         # Default latency estimate for relay peers that couldn't be pinged
@@ -545,6 +593,7 @@ class DiscoveryService:
             model_id = self._normalize_peer_model(item.peer)
             available_peer_counts[model_id] = available_peer_counts.get(model_id, 0) + 1
 
+        self._survey_cache = (_time.monotonic(), healthy, available_peer_counts)
         return healthy, available_peer_counts
 
     def _record_ping_health(self, survey) -> None:
