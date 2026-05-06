@@ -248,6 +248,78 @@ Expected output (greedy / seed=42): a short haiku about a mountain, terminated o
 
 ---
 
+## Run Sharded Inference on 4 Cloud GPUs (Qwen3.5-9B)
+
+Qwen 3.5 9B has 32 transformer layers. Split them across 4 GPUs (8 layers each) on the same VPC. One GPU acts as both coordinator and peer; the other three are peer-only nodes. Uses static peer discovery via `peers.local.json` for deterministic routing.
+
+**GPU1 (coordinator + peer, layers 0-8):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id gpu1-coord \
+    --model-id openhydra-qwen3.5-9b \
+    --runtime-model-id Qwen/Qwen3.5-9B \
+    --hf-model-id Qwen/Qwen3.5-9B \
+    --layer-start 0 --layer-end 8 --total-shards 4 \
+    --grpc-port 50051 --runtime-backend pytorch \
+    --autoregressive-sharded --pipeline-depth 1 \
+    --draft-location off \
+    --dht-url http://127.0.0.1:1 \
+    --api-port 8080 --api-host 0.0.0.0 \
+    --peers-config peers.local.json
+```
+
+**GPU2 (layers 8-16), GPU3 (layers 16-24), GPU4 (layers 24-32):**
+
+```bash
+python3 -m coordinator.node \
+    --peer-id gpu2-peer \
+    --model openhydra-qwen3.5-9b \
+    --runtime-model-id Qwen/Qwen3.5-9B \
+    --hf-model-id Qwen/Qwen3.5-9B \
+    --layer-start 8 --layer-end 16 \
+    --dht-url http://127.0.0.1:1
+```
+
+Repeat for GPU3 (`--layer-start 16 --layer-end 24`) and GPU4 (`--layer-start 24 --layer-end 32`), each with a unique `--peer-id`.
+
+**`peers.local.json`** on GPU1:
+
+```json
+[
+  {"peer_id":"gpu1-coord","host":"127.0.0.1","port":50051,"model_id":"openhydra-qwen3.5-9b",
+   "layer_start":0,"layer_end":8,"total_layers":32,"runtime_backend":"pytorch",
+   "runtime_model_id":"Qwen/Qwen3.5-9B","operator_id":"local"},
+  {"peer_id":"gpu2-peer","host":"10.0.0.2","port":50051,"model_id":"openhydra-qwen3.5-9b",
+   "layer_start":8,"layer_end":16,"total_layers":32,"runtime_backend":"pytorch",
+   "runtime_model_id":"Qwen/Qwen3.5-9B"},
+  {"peer_id":"gpu3-peer","host":"10.0.0.3","port":50051,"model_id":"openhydra-qwen3.5-9b",
+   "layer_start":16,"layer_end":24,"total_layers":32,"runtime_backend":"pytorch",
+   "runtime_model_id":"Qwen/Qwen3.5-9B"},
+  {"peer_id":"gpu4-peer","host":"10.0.0.4","port":50051,"model_id":"openhydra-qwen3.5-9b",
+   "layer_start":24,"layer_end":32,"total_layers":32,"runtime_backend":"pytorch",
+   "runtime_model_id":"Qwen/Qwen3.5-9B"}
+]
+```
+
+Replace `10.0.0.2-4` with your actual LAN IPs. The `runtime_backend` and `runtime_model_id` fields are **required** for all peers — without them, the autoregressive sharded loop is silently skipped and you get garbage single-token output.
+
+Wait for all 4 GPUs to load models (~20-30s on T4), then query from GPU1:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "openhydra-qwen3.5-9b",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 32
+  }' | python3 -m json.tool
+```
+
+Verified benchmark: **~7.0 TPS sustained** on 4× Lightning AI T4 GPUs with Qwen3.5-9B. See the Benchmarks section for full results.
+
+---
+
 ## Run 3-Node True Petals (pure-coordinator topology)
 
 OpenHydra now supports the **true Petals client-terminated topology**: a dedicated coordinator node holds only the lm_head + embedding weights, while remote peers run the transformer layers. The coordinator samples tokens locally and re-injects them into the ring — no single peer needs to own the full model.
@@ -313,6 +385,7 @@ Measured on real hardware from a clean `git clone` + Quick Start install. Push r
 | Qwen 3.5 9B | 2 × NVIDIA T4 (CUDA) | **Direct P2P** (same VPC) | **6.94** | **6.93** | **6.94** |
 | Qwen 3.5 2B | MacBook Air M1 (MLX) ↔ T4 (CUDA) | **Cross-ISP via Circuit Relay** | 0.93 | 1.09 | — |
 | Qwen 3.5 2B | **3-node True Petals** (CPU coord + 2 × T4, same VPC, Path A) | Direct LAN | — | **3.76** (`32 tok`) | — |
+| Qwen 3.5 9B | **4 × NVIDIA T4** (CUDA, sharded 32 layers) | Static peers (same VPC) | **6.78** | **6.92** | **7.03** |
 
 ### 3-Node True Petals (Path A, 2026-04-24)
 
@@ -325,6 +398,20 @@ Three Lightning AI studios on the same `10.192.0.0/16` VPC, one as a pure coordi
 | **3-node all-LAN (CPU pure-coord + 2 × T4)**, Path A | **3.76** | **3.87×** |
 
 Path A's theoretical 2× compounded with LAN-first wire savings + homogeneous PyTorch compute (no MLX↔PyTorch dtype casts) for the 3.87× headline. See `BENCHMARK_PATH_A.md` for the full log.
+
+### 4-GPU Sharded Qwen3.5-9B (4 × T4 Lightning.ai, 2026-05-06)
+
+Four Lightning AI studios, each with 1× NVIDIA T4 (15 GB VRAM), sharding Qwen3.5-9B's 32 transformer layers (8 layers per GPU). Coordinator-mediated mode (no push), KV-aware caching, `temperature=0.0`.
+
+| Prompt | Tokens | Latency | TPS |
+|--------|--------|---------|-----|
+| 50-word letter | 80 | 11.8s | 6.77 |
+| P2P 3 sentences | 117 | 16.9s | 6.92 |
+| P2P 10 sentences | 234 | 33.3s | 7.03 |
+| Pulp Fiction review | 512 | 73.1s | 7.01 |
+| History of computing | 1024 | 144.6s | 7.08 |
+
+**Sustained average: ~7.0 TPS.** Comparable to the 2-GPU baseline (7.1-7.3 TPS) because the bottleneck is the sequential coordinator-mediated gRPC round-trip per token per stage — 4 stages × ~35ms ≈ 140ms per token. Pipeline depth (tested at 1, 2, and 4) has no measurable effect in this mode; it is designed for the push/ring path where multiple tokens can be in-flight simultaneously.
 
 ### Direct P2P vs Circuit Relay (2 × T4 Lightning.ai, 2026-04-20)
 
@@ -495,7 +582,7 @@ dht/               HTTP DHT bootstrap server
 economy/           Barter credits + HYDRA token + state channels (SQLite & Postgres)
 verification/      Mystery Shopper, redundant execution, auditor spot-checks
 ops/               Terraform, Docker Compose, Prometheus/Grafana, deploy scripts
-tests/             1100+ tests (unit + integration + API emulation)
+tests/             1794 tests (unit + integration + API emulation)
 ```
 
 ---

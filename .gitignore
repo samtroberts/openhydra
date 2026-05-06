@@ -140,6 +140,24 @@ OpenHydra_progress.md
 codex_prompt*.md
 peers*.json
 
+# ── Economy module (not public) ──────────────────────────────────────────────
+economy/
+
+# ── Benchmark data / logs ────────────────────────────────────────────────────
+GPU bench/
+gpu_logs_4gpu_benchmark/
+
+# ── Internal planning docs ───────────────────────────────────────────────────
+LANDING_LIVE_EDITS.md
+LANDING_UPDATE_PLAN.md
+PATH_A_PHASE_2_PLANS.md
+BENCHMARK_PATH_A.md
+ARCHITECTURE_ROADMAP_v1.md
+
+# ── Personal / session files ─────────────────────────────────────────────────
+chat context/
+router/
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.orig
 *.bak
