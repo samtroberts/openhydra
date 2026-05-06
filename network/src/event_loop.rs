@@ -134,6 +134,41 @@ pub enum SwarmCommand {
     PollEvent {
         reply: oneshot::Sender<Option<(String, Vec<u8>)>>,
     },
+    /// Phase 2: Open a TCP-to-libp2p tunnel to a remote peer.
+    ///
+    /// Binds a local TCP listener on `127.0.0.1:0`. For each inbound TCP
+    /// connection, opens a libp2p substream to the target peer using the
+    /// `/openhydra/tunnel/1.0.0` protocol and bidirectionally copies bytes.
+    ///
+    /// Returns the local TCP address (e.g. `"127.0.0.1:52431"`) that
+    /// Python's gRPC client should connect to instead of using the relay
+    /// proxy. If a tunnel to this peer already exists, returns the
+    /// existing address without creating a new one.
+    OpenTunnel {
+        peer_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Phase 2: Close an active tunnel to a remote peer.
+    CloseTunnel {
+        peer_id: String,
+    },
+    /// Phase 2: Poll for DCUtR success events.
+    ///
+    /// Returns the libp2p peer_id (base58) of a peer that just completed
+    /// a successful DCUtR hole punch, or `None` if the queue is empty.
+    /// Python uses this to trigger `open_tunnel()` for newly direct peers.
+    PollDcutrEvent {
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Phase 2: Poll for tunnel close events.
+    ///
+    /// Returns the libp2p peer_id (base58) of a peer whose tunnel was
+    /// torn down (connection lost), or `None` if the queue is empty.
+    /// Python uses this to remove the peer from `_tunnel_channels` and
+    /// fall back to relay routing.
+    PollTunnelCloseEvent {
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -191,6 +226,18 @@ struct LoopState {
     /// ``GOSSIP_INBOUND_QUEUE_MAX`` to prevent unbounded memory growth
     /// when Python is slow to poll.
     gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
+    /// Phase 2: DCUtR success events awaiting Python poll.
+    /// Each entry is the libp2p peer_id (base58) of a peer that just
+    /// completed a successful DCUtR hole punch.
+    dcutr_event_queue: std::collections::VecDeque<String>,
+    /// Phase 2: Tunnel close events awaiting Python poll.
+    /// Each entry is the libp2p peer_id (base58) of a peer whose tunnel
+    /// was torn down due to connection loss.
+    tunnel_close_queue: std::collections::VecDeque<String>,
+    /// Phase 2: Active tunnels, keyed by remote PeerId.
+    active_tunnels: HashMap<PeerId, crate::tunnel::TunnelState>,
+    /// Phase 2: libp2p-stream control handle for opening tunnel substreams.
+    stream_control: Option<libp2p_stream::Control>,
 }
 
 /// PR-3: upper bound on pending inbound gossip messages.
@@ -230,6 +277,10 @@ impl LoopState {
             direct_peers: HashMap::new(),
             local_proxy_replies: HashMap::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
+            dcutr_event_queue: std::collections::VecDeque::new(),
+            tunnel_close_queue: std::collections::VecDeque::new(),
+            active_tunnels: HashMap::new(),
+            stream_control: None,
         }
     }
 }
@@ -240,6 +291,26 @@ pub async fn run_event_loop(
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
 ) {
     let mut state = LoopState::new();
+
+    // Phase 2: obtain libp2p-stream control handle and spawn the tunnel
+    // responder. The responder accepts inbound `/openhydra/tunnel/1.0.0`
+    // streams from any peer and connects them to the local gRPC server.
+    {
+        let mut stream_control = swarm.behaviour().tunnel.new_control();
+        match stream_control.accept(crate::tunnel::TUNNEL_PROTOCOL) {
+            Ok(incoming) => {
+                crate::tunnel::spawn_tunnel_responder(
+                    incoming,
+                    crate::tunnel::DEFAULT_GRPC_PORT,
+                );
+                info!("tunnel_responder: accepting inbound streams on {:?}", crate::tunnel::TUNNEL_PROTOCOL);
+            }
+            Err(e) => {
+                warn!("tunnel_responder: accept failed (protocol already registered?): {e}");
+            }
+        }
+        state.stream_control = Some(stream_control);
+    }
 
     // Kick off Kademlia bootstrap (populate routing table from bootstrap peers).
     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -388,6 +459,20 @@ pub async fn run_event_loop(
                             (_, Err(e)) => Err(format!("invalid multiaddr: {e}")),
                         };
                         let _ = reply.send(res);
+                    }
+                    Some(SwarmCommand::OpenTunnel { peer_id, reply }) => {
+                        handle_open_tunnel(&peer_id, reply, &mut state);
+                    }
+                    Some(SwarmCommand::CloseTunnel { peer_id }) => {
+                        handle_close_tunnel(&peer_id, &mut state);
+                    }
+                    Some(SwarmCommand::PollDcutrEvent { reply }) => {
+                        let item = state.dcutr_event_queue.pop_front();
+                        let _ = reply.send(item);
+                    }
+                    Some(SwarmCommand::PollTunnelCloseEvent { reply }) => {
+                        let item = state.tunnel_close_queue.pop_front();
+                        let _ = reply.send(item);
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;
@@ -610,6 +695,8 @@ fn handle_swarm_event(
                         failures = state.dcutr_failures,
                         "DCUtR: direct connection established (hole punch success)"
                     );
+                    // Phase 2: queue event for Python to poll and open a tunnel.
+                    state.dcutr_event_queue.push_back(peer.to_string());
                 }
                 Err(ref e) => {
                     state.dcutr_failures += 1;
@@ -649,6 +736,11 @@ fn handle_swarm_event(
                     .push_back((propagation_source.to_string(), message.data));
             }
         }
+
+        // Phase 2: Tunnel stream behaviour — events are `()` (no-op).
+        // All tunnel I/O is handled through the Control handle, not
+        // through behaviour events.
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Tunnel(())) => {}
 
         // Ping keepalive — log only failures (success is silent to avoid
         // flooding logs every 15 s per connection).
@@ -753,6 +845,12 @@ fn handle_swarm_event(
             // Also clean up if the peer is completely disconnected.
             if !swarm.is_connected(&peer_id) {
                 state.direct_peers.remove(&peer_id);
+                // Phase 2: tear down any active tunnel to this peer.
+                if let Some(tunnel) = state.active_tunnels.remove(&peer_id) {
+                    let _ = tunnel.cancel_tx.send(true);
+                    info!(%peer_id, addr = %tunnel.local_addr, "tunnel_torn_down (peer disconnected)");
+                    state.tunnel_close_queue.push_back(peer_id.to_string());
+                }
             }
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -1203,6 +1301,118 @@ fn handle_proxy_forward_no_wait(
         } else {
             warn!(%peer_id, "proxy_forward_no_wait: no relay dial succeeded — data dropped");
         }
+    }
+}
+
+// ── Phase 2: Tunnel commands ──────────────────────────────────────────
+
+/// Open a TCP-to-libp2p tunnel to a remote peer.
+///
+/// If a tunnel already exists, returns the existing address.
+/// Otherwise, binds a TCP listener, spawns the initiator task, stores
+/// the state, and replies with the local address.
+fn handle_open_tunnel(
+    peer_id_str: &str,
+    reply: oneshot::Sender<Result<String, String>>,
+    state: &mut LoopState,
+) {
+    let target: PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = reply.send(Err(format!("invalid peer_id: {e}")));
+            return;
+        }
+    };
+
+    // Return existing tunnel if one is already open.
+    if let Some(ts) = state.active_tunnels.get(&target) {
+        info!(%target, addr = %ts.local_addr, "tunnel already exists, reusing");
+        let _ = reply.send(Ok(ts.local_addr.clone()));
+        return;
+    }
+
+    let control = match &state.stream_control {
+        Some(c) => c.clone(),
+        None => {
+            let _ = reply.send(Err("stream control not initialized".into()));
+            return;
+        }
+    };
+
+    // Spawn a task that binds the listener and starts the tunnel.
+    // The reply is sent from inside the task once the listener is bound.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // We need to send the tunnel state back to the event loop. Use a
+    // oneshot channel for this.
+    let (state_tx, state_rx) = oneshot::channel::<(String, tokio::task::JoinHandle<()>)>();
+
+    let target_clone = target;
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => {
+                let port = listener.local_addr().unwrap().port();
+                let addr = format!("127.0.0.1:{port}");
+                let _ = reply.send(Ok(addr.clone()));
+                // Notify the event loop of the handle.
+                let handle = tokio::spawn(crate::tunnel::run_tunnel_initiator(
+                    listener,
+                    control,
+                    target_clone,
+                    cancel_rx,
+                ));
+                let _ = state_tx.send((addr, handle));
+            }
+            Err(e) => {
+                let _ = reply.send(Err(format!("tunnel bind: {e}")));
+            }
+        }
+    });
+
+    // We can't await state_rx here (sync context), but we need to store
+    // the state. Use a background task to receive and store via command.
+    // Alternative: store with a placeholder and update later.
+    //
+    // Actually, since the TCP bind is nearly instant, we can use a simpler
+    // pattern: spawn_blocking to create the listener synchronously.
+    //
+    // But the cleanest approach for our architecture: store the cancel_tx
+    // immediately with a placeholder address. The spawned task will send
+    // the reply to Python. If the bind fails, the cancel_tx is harmless.
+    //
+    // For cleanup purposes, having the cancel_tx is what matters — the
+    // address is only used by Python (returned via the reply channel).
+    let placeholder_handle = tokio::spawn(async move {
+        // Wait for the real handle to arrive, then await it.
+        if let Ok((_addr, handle)) = state_rx.await {
+            let _ = handle.await;
+        }
+    });
+
+    state.active_tunnels.insert(target, crate::tunnel::TunnelState {
+        local_addr: format!("pending-{target}"),
+        cancel_tx,
+        _handle: placeholder_handle,
+    });
+}
+
+/// Close an active tunnel to a remote peer.
+fn handle_close_tunnel(
+    peer_id_str: &str,
+    state: &mut LoopState,
+) {
+    let target: PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("close_tunnel: invalid peer_id: {e}");
+            return;
+        }
+    };
+
+    if let Some(tunnel) = state.active_tunnels.remove(&target) {
+        let _ = tunnel.cancel_tx.send(true);
+        info!(%target, addr = %tunnel.local_addr, "tunnel_closed_by_request");
+    } else {
+        debug!(%target, "close_tunnel: no active tunnel");
     }
 }
 

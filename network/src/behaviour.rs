@@ -39,4 +39,9 @@ pub struct OpenHydraBehaviour {
     /// mobile hotspot NAT drops TCP mappings during the 1-3 s inference
     /// silence, killing the relay circuit between tokens.
     pub ping: ping::Behaviour,
+    /// Phase 2 tunnel — raw bidirectional streams over `/openhydra/tunnel/1.0.0`.
+    /// When DCUtR hole-punches a direct connection, `open_tunnel()` binds a
+    /// local TCP port and for each inbound TCP connection opens a libp2p
+    /// substream, bypassing the request_response proxy for gRPC traffic.
+    pub tunnel: libp2p_stream::Behaviour,
 }

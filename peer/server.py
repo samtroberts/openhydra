@@ -1138,6 +1138,21 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         # token. Eliminates ~5-8 ms per-hop handshake on WiFi LAN.
         self._grpc_channels: dict[str, grpc.Channel] = {}
         self._grpc_channels_lock = threading.Lock()
+        # ── Phase 2: TCP-to-libp2p tunnel state ─────────────────────
+        # Maps libp2p_peer_id → "127.0.0.1:<port>" for peers with an
+        # active DCUtR tunnel. Populated by _tunnel_monitor_loop when
+        # poll_dcutr_event() fires; cleared when poll_tunnel_close_event()
+        # fires or the tunnel is explicitly closed.
+        self._tunnel_channels: dict[str, str] = {}
+        self._tunnel_channels_lock = threading.Lock()
+        # Start the tunnel monitor background thread if P2P is active.
+        if self._p2p_node is not None:
+            self._tunnel_monitor_thread = threading.Thread(
+                target=self._tunnel_monitor_loop,
+                daemon=True,
+                name="tunnel-monitor",
+            )
+            self._tunnel_monitor_thread.start()
 
     def _get_grpc_channel(self, address: str) -> grpc.Channel:
         """Get or create a cached gRPC channel for ``address``.
@@ -1168,6 +1183,86 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 address, len(self._grpc_channels),
             )
             return ch
+
+    # ── Phase 2: Tunnel monitor ──────────────────────────────────────
+    def _tunnel_monitor_loop(self) -> None:
+        """Background thread that polls for DCUtR success and tunnel close
+        events from the Rust P2P layer.
+
+        When DCUtR succeeds for a peer, opens a tunnel and caches the
+        local address. When a tunnel closes (connection lost), removes
+        the cached address so routing falls back to relay.
+        """
+        import time
+        logger.info("tunnel_monitor_started")
+        while True:
+            try:
+                p2p = self._p2p_node
+                if p2p is None:
+                    break
+
+                # Poll DCUtR success events — open tunnels for new direct peers.
+                while True:
+                    try:
+                        peer_id = p2p.poll_dcutr_event()
+                    except Exception:
+                        break
+                    if peer_id is None:
+                        break
+                    # Check if we already have a tunnel for this peer.
+                    with self._tunnel_channels_lock:
+                        if peer_id in self._tunnel_channels:
+                            logger.debug(
+                                "tunnel_monitor: already have tunnel for %s",
+                                peer_id[:20],
+                            )
+                            continue
+                    try:
+                        tunnel_addr = p2p.open_tunnel(peer_id)
+                        with self._tunnel_channels_lock:
+                            self._tunnel_channels[peer_id] = tunnel_addr
+                        logger.info(
+                            "tunnel_opened: peer=%s addr=%s",
+                            peer_id[:20], tunnel_addr,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "tunnel_open_failed: peer=%s err=%s",
+                            peer_id[:20], exc,
+                        )
+
+                # Poll tunnel close events — remove cached addresses.
+                while True:
+                    try:
+                        peer_id = p2p.poll_tunnel_close_event()
+                    except Exception:
+                        break
+                    if peer_id is None:
+                        break
+                    with self._tunnel_channels_lock:
+                        removed = self._tunnel_channels.pop(peer_id, None)
+                    if removed:
+                        logger.info(
+                            "tunnel_closed: peer=%s addr=%s",
+                            peer_id[:20], removed,
+                        )
+                    else:
+                        logger.debug(
+                            "tunnel_close_event for unknown peer=%s",
+                            peer_id[:20],
+                        )
+            except Exception as exc:
+                logger.warning("tunnel_monitor_error: %s", exc)
+
+            time.sleep(0.5)  # 500ms poll interval
+
+    def _get_tunnel_addr(self, libp2p_peer_id: str) -> str | None:
+        """Return the local tunnel address for ``libp2p_peer_id``, or
+        ``None`` if no tunnel exists."""
+        if not libp2p_peer_id:
+            return None
+        with self._tunnel_channels_lock:
+            return self._tunnel_channels.get(libp2p_peer_id)
 
     # ── Path A: coordinator-side HeadSampler registration ────────────
     def _maybe_register_head_source(self) -> None:
@@ -2652,51 +2747,53 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     stub = peer_pb2_grpc.PeerStub(channel)
                     stub.Forward(next_req, timeout=60.0)
             elif self._p2p_node is not None and _next_hop_libp2p_id:
-                # ── Option C: prefer direct QUIC when DCUtR succeeded ──
-                # is_peer_connected checks the direct_peers HashSet,
-                # which is populated by DCUtR success and non-relay
-                # ConnectionEstablished events.  If True, proxy_forward
-                # routes over the direct QUIC stream automatically —
-                # no relay, no hole-punch gossip needed.
-                _is_direct_peer = False
-                try:
-                    _is_direct_peer = self._p2p_node.is_peer_connected(
-                        _next_hop_libp2p_id
+                # ── Phase 2: Check for TCP-to-libp2p tunnel first ──
+                # If DCUtR succeeded and a tunnel is active, route gRPC
+                # directly through the tunnel (127.0.0.1:<port>) —
+                # bypasses both the relay proxy and the request_response
+                # layer, cutting per-hop latency from ~200-600ms to
+                # ~5-30ms.
+                _tunnel_addr = self._get_tunnel_addr(_next_hop_libp2p_id)
+                if _tunnel_addr:
+                    _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
+                    if _depth_ff >= 2:
+                        self._dispatch_direct_grpc_async(
+                            _tunnel_addr, next_req, label="tunnel",
+                            request_id=str(request.request_id),
+                        )
+                    else:
+                        channel = self._get_grpc_channel(_tunnel_addr)
+                        stub = peer_pb2_grpc.PeerStub(channel)
+                        stub.Forward(next_req, timeout=60.0)
+                    logger.info(
+                        "push_forwarded_via_tunnel: req=%s stage=%d -> %s "
+                        "(tunnel=%s; libp2p=%s)",
+                        request.request_id, request.stage_index,
+                        next_address, _tunnel_addr, _next_hop_libp2p_id[:20],
                     )
-                except Exception:
-                    pass
+                else:
+                    # ── Option C: libp2p relay/direct QUIC fallback ──
+                    _is_direct_peer = False
+                    try:
+                        _is_direct_peer = self._p2p_node.is_peer_connected(
+                            _next_hop_libp2p_id
+                        )
+                    except Exception:
+                        pass
 
-                # NOTE: B1 gossip (REQUEST_HOLE_PUNCH) was previously
-                # published here on every relay-bound token with a 5 s
-                # debounce.  This caused a fatal regression: the gossip
-                # triggered a DialPeer(PeerCondition::Always) on the
-                # remote peer, which created a NEW relay circuit.  Relay
-                # v2 enforces max_circuits_per_peer=1, so the relay
-                # dropped the EXISTING circuit to make room.  DCUtR
-                # then failed (symmetric NAT), the new circuit also
-                # died, and proxy_forward had to re-dial (2-4 s).
-                # Result: Mac↔T4 1.07 TPS → Mac↔Mac 0.047 TPS.
-                #
-                # B1 gossip now fires ONCE at discovery time (in the
-                # discovery service) rather than on the inference hot
-                # path.  Hole-punch attempts belong at connection
-                # establishment, not per-token.
-
-                # Fire-and-forget: no ACK wait. libp2p routes via direct
-                # QUIC when the peer is in direct_peers, otherwise relay.
-                # Phase 1: proxy_forward_no_wait eliminates ~200ms
-                # synchronous ACK blocking per token.
-                self._p2p_node.proxy_forward_no_wait(
-                    target_peer_id=_next_hop_libp2p_id,
-                    data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
-                )
-                _route_label = "direct_quic" if _is_direct_peer else "relay"
-                logger.info(
-                    "push_forwarded_via_%s: req=%s stage=%d -> %s (libp2p=%s; no_wait)",
-                    _route_label,
-                    request.request_id, request.stage_index,
-                    next_address, _next_hop_libp2p_id[:20],
-                )
+                    # Fire-and-forget: no ACK wait. libp2p routes via direct
+                    # QUIC when the peer is in direct_peers, otherwise relay.
+                    self._p2p_node.proxy_forward_no_wait(
+                        target_peer_id=_next_hop_libp2p_id,
+                        data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
+                    )
+                    _route_label = "direct_quic" if _is_direct_peer else "relay"
+                    logger.info(
+                        "push_forwarded_via_%s: req=%s stage=%d -> %s (libp2p=%s; no_wait)",
+                        _route_label,
+                        request.request_id, request.stage_index,
+                        next_address, _next_hop_libp2p_id[:20],
+                    )
             elif next_address:
                 # No P2P node — direct gRPC only (LAN/VPC path).
                 _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
@@ -2868,24 +2965,42 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     response.request_id, callback_address,
                 )
             elif self._p2p_node is not None and _cb_libp2p:
-                # Route via libp2p — direct QUIC if DCUtR succeeded,
-                # otherwise through circuit relay.
-                # Phase 1: fire-and-forget — no ACK wait.
-                _pr_is_direct = False
-                try:
-                    _pr_is_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
-                except Exception:
-                    pass
-                self._p2p_node.proxy_forward_no_wait(
-                    target_peer_id=_cb_libp2p,
-                    data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
-                )
-                _pr_label = "direct_quic" if _pr_is_direct else "relay"
-                logger.info(
-                    "push_result_sent_via_%s: req=%s -> %s (libp2p=%s; no_wait)",
-                    _pr_label,
-                    response.request_id, callback_address, _cb_libp2p[:20],
-                )
+                # ── Phase 2: Check for TCP-to-libp2p tunnel first ──
+                _tunnel_addr = self._get_tunnel_addr(_cb_libp2p)
+                if _tunnel_addr:
+                    if _depth_ff >= 2:
+                        self._dispatch_push_result_async(
+                            _tunnel_addr, response, label="tunnel",
+                        )
+                    else:
+                        channel = self._get_grpc_channel(_tunnel_addr)
+                        stub = peer_pb2_grpc.PeerStub(channel)
+                        stub.PushResult(response, timeout=10.0)
+                    logger.info(
+                        "push_result_sent_via_tunnel: req=%s -> %s "
+                        "(tunnel=%s; libp2p=%s)",
+                        response.request_id, callback_address,
+                        _tunnel_addr, _cb_libp2p[:20],
+                    )
+                else:
+                    # Route via libp2p — direct QUIC if DCUtR succeeded,
+                    # otherwise through circuit relay.
+                    # Phase 1: fire-and-forget — no ACK wait.
+                    _pr_is_direct = False
+                    try:
+                        _pr_is_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
+                    except Exception:
+                        pass
+                    self._p2p_node.proxy_forward_no_wait(
+                        target_peer_id=_cb_libp2p,
+                        data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
+                    )
+                    _pr_label = "direct_quic" if _pr_is_direct else "relay"
+                    logger.info(
+                        "push_result_sent_via_%s: req=%s -> %s (libp2p=%s; no_wait)",
+                        _pr_label,
+                        response.request_id, callback_address, _cb_libp2p[:20],
+                    )
             else:
                 # No P2P node — direct gRPC only.
                 if _depth_ff >= 2:

@@ -209,6 +209,11 @@ pub fn build_swarm(
             .with_interval(Duration::from_secs(15)),
     );
 
+    // Phase 2: libp2p-stream behaviour for raw tunnel substreams.
+    // The Control handle is obtained after swarm construction via
+    // `swarm.behaviour().tunnel.new_control()`.
+    let tunnel = libp2p_stream::Behaviour::new();
+
     let behaviour = OpenHydraBehaviour {
         kademlia,
         relay_client,
@@ -219,6 +224,7 @@ pub fn build_swarm(
         grpc_proxy,
         gossipsub,
         ping,
+        tunnel,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()

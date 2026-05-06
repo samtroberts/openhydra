@@ -566,6 +566,81 @@ impl PyP2PNode {
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 
+    /// Phase 2: Open a TCP-to-libp2p tunnel to a remote peer.
+    ///
+    /// Binds a local TCP listener and returns the address (e.g.
+    /// ``"127.0.0.1:52431"``). Python's gRPC client connects to this
+    /// address instead of using the relay proxy. Each TCP connection
+    /// spawns a libp2p substream to the remote peer using the
+    /// ``/openhydra/tunnel/1.0.0`` protocol.
+    ///
+    /// If a tunnel already exists for this peer, returns the existing
+    /// address without creating a new one.
+    ///
+    /// Args:
+    ///     peer_id: the libp2p peer_id (base58) of the remote peer.
+    ///
+    /// Returns:
+    ///     str: local TCP address, e.g. ``"127.0.0.1:52431"``
+    fn open_tunnel(&self, py: Python<'_>, peer_id: String) -> PyResult<String> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::OpenTunnel {
+                peer_id,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Phase 2: Close an active tunnel to a remote peer.
+    ///
+    /// Cancels the local TCP listener and any in-flight stream copies.
+    /// Python should remove the peer from ``_tunnel_channels`` after
+    /// calling this.
+    fn close_tunnel(&self, py: Python<'_>, peer_id: String) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::CloseTunnel { peer_id })
+                .map_err(|_| "swarm not running".to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Phase 2: Poll for DCUtR success events.
+    ///
+    /// Returns the libp2p peer_id (base58) of a peer that just completed
+    /// a successful DCUtR hole punch, or ``None`` if the queue is empty.
+    /// Python uses this to trigger ``open_tunnel()`` for newly direct
+    /// peers.
+    fn poll_dcutr_event(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::PollDcutrEvent { reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Phase 2: Poll for tunnel close events.
+    ///
+    /// Returns the libp2p peer_id (base58) of a peer whose tunnel was
+    /// torn down (connection lost), or ``None`` if the queue is empty.
+    /// Python uses this to remove the peer from ``_tunnel_channels`` and
+    /// fall back to relay routing.
+    fn poll_tunnel_close_event(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::PollTunnelCloseEvent { reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
     /// Check if a peer is currently connected (direct or relayed).
     fn is_peer_connected(&self, py: Python<'_>, peer_id: String) -> PyResult<bool> {
         let inner = self.require_started()?;

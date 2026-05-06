@@ -22,6 +22,7 @@ pub mod node;
 pub mod relay;
 pub mod swarm;
 pub mod transport;
+pub mod tunnel;
 pub mod types;
 
 /// Python module entry point.
