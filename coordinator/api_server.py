@@ -41,15 +41,16 @@ def _strict_token_counts(payload: dict[str, Any]) -> tuple[int, int]:
 
     Strictly uses ``payload["completion_tokens"]`` (set from
     ``len(primary.activation)`` in ``InferenceService.infer()``).
-    Raises ``KeyError`` if the field is missing — callers must never
-    silently fall back to word count.
+    Raises ``KeyError`` if the key is entirely absent — callers must
+    never silently fall back to word count.  A value of 0 is allowed
+    (e.g. ring timeout producing zero tokens).
     """
-    ct = int(payload.get("completion_tokens") or 0)
-    if ct <= 0:
+    if "completion_tokens" not in payload:
         raise KeyError(
-            "completion_tokens missing or zero in inference payload — "
+            "completion_tokens missing in inference payload — "
             "the engine must set this from len(primary.activation)"
         )
+    ct = int(payload["completion_tokens"])
     pt = int(payload.get("prompt_tokens") or 0)
     return pt, ct
 

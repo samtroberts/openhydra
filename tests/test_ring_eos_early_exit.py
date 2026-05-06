@@ -224,15 +224,15 @@ class TestCompletionTokenCount:
         with pytest.raises(KeyError, match="completion_tokens missing"):
             _strict_token_counts(payload)
 
-    def test_strict_token_counts_zero_raises(self):
-        """_strict_token_counts raises KeyError when completion_tokens is 0."""
+    def test_strict_token_counts_zero_allowed(self):
+        """_strict_token_counts allows 0 (e.g. ring timeout with no tokens)."""
         from coordinator.api_server import _strict_token_counts
         payload = {
-            "response": "One two three",
+            "response": "",
             "completion_tokens": 0,
         }
-        with pytest.raises(KeyError, match="completion_tokens missing"):
-            _strict_token_counts(payload)
+        pt, ct = _strict_token_counts(payload)
+        assert ct == 0, "Zero completion_tokens should be allowed (timeout case)"
 
     def test_usage_from_payload_builds_dict(self):
         """_usage_from_payload builds correct usage dict."""
