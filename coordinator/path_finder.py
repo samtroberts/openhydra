@@ -533,7 +533,7 @@ class PathFinder:
             return None
 
         ping_req = peer_pb2.PingRequest(sent_unix_ms=int(time.time() * 1000))
-        req_bytes = ping_req.SerializeToString()
+        req_bytes = b'\x05' + ping_req.SerializeToString()
 
         import threading
 
@@ -566,8 +566,11 @@ class PathFinder:
 
             latency_ms = (time.perf_counter() - t0) * 1000.0
             try:
+                raw_resp = bytes(result[0])
+                if raw_resp and raw_resp[0:1] == b'\x05':
+                    raw_resp = raw_resp[1:]
                 resp = peer_pb2.PingResponse()
-                resp.ParseFromString(bytes(result[0]))
+                resp.ParseFromString(raw_resp)
                 return PeerHealth(
                     peer=peer,
                     healthy=bool(resp.ok),
