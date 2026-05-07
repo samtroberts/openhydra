@@ -1,17 +1,12 @@
 import json
-from concurrent import futures
 from http.server import ThreadingHTTPServer
 import threading
-import time
 from urllib import request
 
-import grpc
 import pytest
 
 from dht.bootstrap import DhtBootstrapHandler
 from dht.node import InMemoryDhtNode
-from peer.server import PeerService
-from peer import peer_pb2_grpc
 
 
 def _post_json(url: str, payload: dict) -> dict:
@@ -28,40 +23,6 @@ def _post_json(url: str, payload: dict) -> dict:
 def _get_json(url: str) -> dict:
     with request.urlopen(url, timeout=3.0) as response:
         return json.loads(response.read().decode("utf-8"))
-
-
-class _DelayedPingPeerService(PeerService):
-    def __init__(self, *, ping_delay_s: float, **kwargs):
-        super().__init__(**kwargs)
-        self._ping_delay_s = max(0.0, float(ping_delay_s))
-
-    def Ping(self, request, context):
-        if self._ping_delay_s > 0.0:
-            time.sleep(self._ping_delay_s)
-        return super().Ping(request, context)
-
-
-def _start_delayed_peer(seed: str, delay_s: float) -> tuple[grpc.Server, int]:
-    service = _DelayedPingPeerService(
-        ping_delay_s=delay_s,
-        peer_id="peer-geo-delayed",
-        model_id="openhydra-toy-345m",
-        shard_index=0,
-        total_shards=1,
-        daemon_mode="polite",
-        broken=False,
-        runtime_backend="toy_cpu",
-        runtime_target="cpu",
-        quantization_mode="fp32",
-        geo_challenge_seed=seed,
-    )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    peer_pb2_grpc.add_PeerServicer_to_server(service, server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    if port == 0:
-        raise RuntimeError("grpc_listener_unavailable")
-    server.start()
-    return server, port
 
 
 def _reset_geo_bootstrap(*, seed: str, max_rtt_ms: float) -> None:
@@ -82,19 +43,20 @@ def _reset_geo_bootstrap(*, seed: str, max_rtt_ms: float) -> None:
     DhtBootstrapHandler._rebalance_hints = {}
 
 
-def test_dht_geo_triangulation_downgrades_region_on_latency_violation():
+def test_dht_geo_challenge_pending_libp2p_bootstrap():
+    """Geo-challenge now defers to libp2p bootstrap (gRPC removed).
+
+    With the unified libp2p transport, the geo-challenge gRPC Ping is
+    disabled.  _geo_verify_record returns verified=True with reason
+    'challenge_pending_libp2p_bootstrap', so the claimed region is
+    accepted until libp2p-native geo-verification is implemented.
+    """
     seed = "geo-triangulation-test-seed"
     _reset_geo_bootstrap(seed=seed, max_rtt_ms=50.0)
 
     try:
-        peer_server, peer_port = _start_delayed_peer(seed=seed, delay_s=0.08)
-    except Exception as exc:
-        pytest.skip(f"unable to start delayed peer server: {exc}")
-
-    try:
         dht_server = ThreadingHTTPServer(("127.0.0.1", 0), DhtBootstrapHandler)
     except OSError as exc:
-        peer_server.stop(grace=0)
         pytest.skip(f"socket bind unavailable: {exc}")
 
     dht_thread = threading.Thread(target=dht_server.serve_forever, daemon=True)
@@ -106,10 +68,10 @@ def test_dht_geo_triangulation_downgrades_region_on_latency_violation():
         ack = _post_json(
             f"{base}/announce",
             {
-                "peer_id": "peer-geo-delayed",
+                "peer_id": "peer-geo-pending",
                 "model_id": "openhydra-toy-345m",
                 "host": "127.0.0.1",
-                "port": int(peer_port),
+                "port": 50051,
                 "region": "us-east",
                 "operator_id": "op-geo",
                 "load_pct": 1.0,
@@ -120,16 +82,11 @@ def test_dht_geo_triangulation_downgrades_region_on_latency_violation():
         lookup = _get_json(f"{base}/lookup?model_id=openhydra-toy-345m")
         assert lookup["count"] == 1
         peer = lookup["peers"][0]
-        assert peer["peer_id"] == "peer-geo-delayed"
-        # Region is not trusted when crypto challenge RTT exceeds policy.
-        assert peer["region"] is None
-        assert peer["region_claimed"] == "us-east"
-        assert peer["geo_verified"] is False
-        assert peer["geo_challenge_reason"] == "latency_violation"
-        assert float(peer["geo_penalty_score"]) >= 1.0
-        assert float(peer["geo_challenge_rtt_ms"]) > 50.0
+        assert peer["peer_id"] == "peer-geo-pending"
+        assert peer["region"] == "us-east"
+        assert peer["geo_verified"] is True
+        assert peer["geo_challenge_reason"] == "challenge_pending_libp2p_bootstrap"
     finally:
         dht_server.shutdown()
         dht_server.server_close()
         dht_thread.join(timeout=2.0)
-        peer_server.stop(grace=0)

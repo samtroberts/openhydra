@@ -51,10 +51,16 @@ DEFAULT_RELAY_PORT: int = 50052
 # Passing even one --p2p-bootstrap flag replaces the entire default list.
 
 PRODUCTION_LIBP2P_BOOTSTRAP_PEERS: tuple[str, ...] = (
-    # US (Dallas)
+    # US (Dallas) — IPv4 (keep for legacy nodes)
     "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
-    # EU (London)
+    # EU (London) — IPv4 (keep for legacy nodes)
     "/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT",
-    # AP (Singapore)
+    # AP (Singapore) — IPv4 (keep for legacy nodes)
     "/ip4/172.104.164.98/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
+    # US (Dallas) — IPv6
+    "/ip6/2600:3c03::2000:68ff:fe81:55b0/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
+    # EU (London) — IPv6
+    "/ip6/2a01:7e01::2000:84ff:fec5:4520/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT",
+    # AP (Singapore) — IPv6
+    "/ip6/2400:8901::2000:86ff:fe58:6d39/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
 )

@@ -1235,29 +1235,12 @@ def main() -> None:
                 "PROXY_METHOD_PUSH_RESULT for pure-coordinator Path A "
                 "(pipeline_depth=%d)", _coord_pipeline_depth,
             )
-        # Start a minimal gRPC server on args.grpc_port that accepts ONLY
-        # PushResult. LAN-reachable last peers (e.g. GPU2 in the all-LAN
-        # True Petals topology) will hit this directly via the
-        # ``final_callback_address`` field — sub-millisecond path, no
-        # libp2p-proxy or relay hop. Non-LAN peers still fall through to
-        # the libp2p path handled by ``_coordinator_proxy_handler_loop``.
-        try:
-            from peer.server import start_coordinator_grpc_server
-            _coord_grpc_server = start_coordinator_grpc_server(
-                host="0.0.0.0",
-                port=int(args.grpc_port),
-                p2p_node=_p2p_node,
-            )
-            logger.info(
-                "coordinator_grpc_server_started: :%d — handles LAN-reachable "
-                "PushResult calls for pure-coordinator Path A",
-                int(args.grpc_port),
-            )
-        except Exception as exc:
-            logger.warning(
-                "coordinator_grpc_server_failed: %s — LAN-direct PushResult "
-                "will fall back to libp2p (slower but still works)", exc,
-            )
+        # PushResult delivery uses libp2p _coordinator_proxy_handler_loop
+        # (gRPC server removed — unified transport).
+        logger.info(
+            "coordinator: PushResult via libp2p proxy handler (pipeline_depth=%d)",
+            _coord_pipeline_depth,
+        )
     else:
         # Start the peer gRPC server in a background daemon thread.
         # daemon=True ensures it is reaped automatically when the main thread exits
@@ -1348,9 +1331,23 @@ def main() -> None:
             peers_config_path,
         )
     elif not peers_config_path:
+        # Detect routable LAN IP so remote peers can reach us (ring
+        # loopback, PushResult callbacks). Falls back to 127.0.0.1
+        # only when detection fails (single-machine setups).
+        _auto_host = "127.0.0.1"
+        try:
+            import socket as _auto_sock
+            _s = _auto_sock.socket(_auto_sock.AF_INET, _auto_sock.SOCK_DGRAM)
+            _s.connect(("8.8.8.8", 80))
+            _detected = _s.getsockname()[0]
+            _s.close()
+            if _detected and not _detected.startswith("127."):
+                _auto_host = _detected
+        except Exception:
+            pass
         _local_peer = [{
             "peer_id": args.peer_id,
-            "host": "127.0.0.1",
+            "host": _auto_host,
             "port": args.grpc_port,
             "model_id": args.model_id,
             "operator_id": "local",
@@ -1458,7 +1455,7 @@ def main() -> None:
         specpipe_enabled=bool(getattr(args, "specpipe", False)),
         autoregressive_sharded_enabled=bool(getattr(args, "autoregressive_sharded", True)),
         chunked_prefill_enabled=bool(getattr(args, "chunked_prefill", False)),
-        push_mode_enabled=True,  # peer-to-peer forwarding (skip coordinator round-trip)
+        push_mode_enabled=bool(getattr(args, "push_mode", False)),
         push_callback_address=str(getattr(args, "push_callback_address", "") or "")
             or _push_callback_addr,
         sample_on_coordinator=bool(getattr(args, "sample_on_coordinator", False)),

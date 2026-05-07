@@ -28,9 +28,8 @@ import requests as _http_requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from coordinator.transport import TransportConfig, create_channel
+from coordinator.transport import TransportConfig
 from peer import peer_pb2
-from peer import peer_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +237,8 @@ class PeerEndpoint:
         """
         if self.requires_relay and self.relay_address:
             return self.relay_address
-        return f"{self.host}:{self.port}"
+        from coordinator.net_utils import format_address
+        return format_address(self.host, self.port)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PeerEndpoint":
@@ -581,41 +581,19 @@ class PathFinder:
         return None
 
     def ping(self, peer: PeerEndpoint) -> PeerHealth:
-        # For relay-required peers with a libp2p ID, try proxy ping first.
-        if peer.requires_relay and peer.libp2p_peer_id and self._p2p_node is not None:
+        if peer.libp2p_peer_id and self._p2p_node is not None:
             proxy_result = self._proxy_ping(peer)
             if proxy_result is not None:
                 return proxy_result
-            # Proxy ping failed — fall through to direct ping (will likely
-            # also fail for private IPs, but _scan_network has a trust
-            # fallback for relay peers).
 
-        t0 = time.perf_counter()
-        try:
-            with create_channel(peer.address, self.transport_config) as channel:
-                stub = peer_pb2_grpc.PeerStub(channel)
-                response = stub.Ping(
-                    peer_pb2.PingRequest(sent_unix_ms=int(time.time() * 1000)),
-                    timeout=self.timeout_s,
-                )
-            latency_ms = (time.perf_counter() - t0) * 1000.0
-            return PeerHealth(
-                peer=peer,
-                healthy=bool(response.ok),
-                latency_ms=latency_ms,
-                load_pct=float(response.load_pct),
-                daemon_mode=response.daemon_mode,
-            )
-        except grpc.RpcError as exc:
-            latency_ms = (time.perf_counter() - t0) * 1000.0
-            return PeerHealth(
-                peer=peer,
-                healthy=False,
-                latency_ms=latency_ms,
-                load_pct=100.0,
-                daemon_mode="unknown",
-                error=f"{exc.code().name}: {exc.details() or 'unreachable'}",
-            )
+        return PeerHealth(
+            peer=peer,
+            healthy=False,
+            latency_ms=0.0,
+            load_pct=100.0,
+            daemon_mode="unknown",
+            error="no_libp2p_route",
+        )
 
     def survey(self, peers: list[PeerEndpoint]) -> list[PeerHealth]:
         return [self.ping(peer) for peer in peers]

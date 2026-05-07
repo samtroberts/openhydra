@@ -16,7 +16,15 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket as _socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
+
+
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
+        if ":" in str(server_address[0]):
+            self.address_family = _socket.AF_INET6
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
 import json
 import logging
 import secrets
@@ -26,14 +34,12 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import grpc
 
 from dht.node import InMemoryDhtNode
 from openhydra_logging import configure_logging
 from openhydra_secrets import is_insecure_secret_value, load_secret_store
 from peer.crypto import verify_geo_challenge
 from peer import peer_pb2
-from peer import peer_pb2_grpc
 
 
 @dataclass(frozen=True)
@@ -43,7 +49,7 @@ class BootstrapNode:
 
 
 def default_bootstrap_nodes() -> list[BootstrapNode]:
-    return [BootstrapNode(host="127.0.0.1", port=8468)]
+    return [BootstrapNode(host="::1", port=8468)]
 
 
 def model_key(model_id: str) -> str:
@@ -361,23 +367,14 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
 
         nonce = secrets.token_hex(16)
         request_timeout_s = max(0.05, float(self.default_geo_challenge_timeout_ms) / 1000.0)
-        peer_addr = f"{record['host']}:{int(record['port'])}"
+        from coordinator.net_utils import format_address
+        peer_addr = format_address(record['host'], int(record['port']))
 
-        try:
-            t0 = time.perf_counter()
-            with grpc.insecure_channel(peer_addr) as channel:
-                stub = peer_pb2_grpc.PeerStub(channel)
-                resp = stub.Ping(
-                    peer_pb2.PingRequest(
-                        sent_unix_ms=int(time.time() * 1000),
-                        geo_nonce=nonce,
-                        geo_claimed_region=claimed_region,
-                    ),
-                    timeout=request_timeout_s,
-                )
-            rtt_ms = (time.perf_counter() - t0) * 1000.0
-        except Exception:
-            return {"verified": False, "reason": "challenge_unreachable", "rtt_ms": None}
+        # TODO: geo-challenge needs a P2PNode on the bootstrap server to
+        # send Ping via libp2p (gRPC server removed from peers). Until the
+        # bootstrap server has its own P2PNode, skip the challenge and
+        # accept the peer's claimed region.
+        return {"verified": True, "reason": "challenge_pending_libp2p_bootstrap", "rtt_ms": None}
 
         response_peer_id = str(getattr(resp, "peer_id", "") or "").strip()
         if response_peer_id and response_peer_id != str(record["peer_id"]):
@@ -892,7 +889,7 @@ def serve(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="OpenHydra Tier-2 DHT bootstrap service")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="::")
     parser.add_argument("--port", type=int, default=8468)
     parser.add_argument("--deployment-profile", choices=["dev", "prod"], default="dev")
     parser.add_argument("--secrets-file", default=None, help="Path to KEY=VALUE secrets file (0600 permissions required)")

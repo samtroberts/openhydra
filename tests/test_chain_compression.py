@@ -5,9 +5,31 @@ from peer import peer_pb2
 
 def _pipeline() -> list[PeerEndpoint]:
     return [
-        PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001),
-        PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=5002),
+        PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, libp2p_peer_id="12D3KooW_a"),
+        PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=5002, libp2p_peer_id="12D3KooW_b"),
     ]
+
+
+class _MockP2PNode:
+    """Mock P2P node that deserializes ForwardRequest, calls handler, returns serialized response."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.libp2p_peer_id = "12D3KooW_coord"
+
+    def proxy_forward(self, target_peer_id, data):
+        raw = bytes(data)
+        prefix = raw[0:1]
+        req = peer_pb2.ForwardRequest()
+        req.ParseFromString(raw[1:])
+        resp = self._handler(req)
+        return prefix + resp.SerializeToString()
+
+    def proxy_forward_no_wait(self, target_peer_id, data):
+        pass
+
+    def is_peer_connected(self, peer_id):
+        return True
 
 
 def test_chain_autoencoder_compresses_transfer_hop(monkeypatch):
@@ -60,37 +82,19 @@ def test_chain_without_autoencoder_skips_compression(monkeypatch):
     assert result.compression["hops_compressed"] == 0
 
 
-class _DummyChannel:
-    def __enter__(self):
-        return object()
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
 def test_request_stage_includes_compression_metadata(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            captured["request"] = req
-            return peer_pb2.ForwardResponse(
-                request_id=req.request_id,
-                peer_id="peer-b",
-                activation=[2.0, 2.0, 2.0, 2.0],
-                stage_index=req.stage_index,
-                error="",
-                compression_latent_dim=2,
-            )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+    def _handler(req):
+        captured["request"] = req
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-b",
+            activation=[2.0, 2.0, 2.0, 2.0],
+            stage_index=req.stage_index,
+            error="",
+            compression_latent_dim=2,
+        )
 
     chain = InferenceChain(
         _pipeline(),
@@ -98,6 +102,7 @@ def test_request_stage_includes_compression_metadata(monkeypatch):
         tensor_autoencoder_enabled=True,
         tensor_autoencoder_latent_dim=2,
     )
+    chain._p2p_node = _MockP2PNode(_handler)
     chain._request_stage(
         peer=_pipeline()[1],
         request_id="r1",
@@ -109,48 +114,37 @@ def test_request_stage_includes_compression_metadata(monkeypatch):
     )
 
     req = captured["request"]
-    # Activation is now binary-packed (activation_packed field) instead of
-    # repeated float. Unpack and verify.
     import struct
-    _packed = bytes(req.activation_packed)  # type: ignore[union-attr]
+    _packed = bytes(req.activation_packed)
     if _packed:
         _n = len(_packed) // 4
         _unpacked = list(struct.unpack(f'<{_n}f', _packed))
     else:
-        _unpacked = list(req.activation)  # type: ignore[union-attr]
+        _unpacked = list(req.activation)
     assert len(_unpacked) == 2
     assert abs(_unpacked[0] - 1.5) < 1e-5
     assert abs(_unpacked[1] - 3.5) < 1e-5
-    assert req.compression_codec == "tensor_autoencoder_mean_pool"  # type: ignore[union-attr]
-    assert req.compression_original_dim == 4  # type: ignore[union-attr]
-    assert req.compression_latent_dim == 2  # type: ignore[union-attr]
+    assert req.compression_codec == "tensor_autoencoder_mean_pool"
+    assert req.compression_original_dim == 4
+    assert req.compression_latent_dim == 2
 
 
 def test_request_stage_includes_kv_cache_hints(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            captured["request"] = req
-            return peer_pb2.ForwardResponse(
-                request_id=req.request_id,
-                peer_id="peer-a",
-                activation=[3.0, 4.0],
-                stage_index=req.stage_index,
-                error="",
-                kv_cache_hit=True,
-            )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+    def _handler(req):
+        captured["request"] = req
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-a",
+            activation=[3.0, 4.0],
+            stage_index=req.stage_index,
+            error="",
+            kv_cache_hit=True,
+        )
 
     chain = InferenceChain(_pipeline(), timeout_ms=1000, tensor_autoencoder_enabled=False)
+    chain._p2p_node = _MockP2PNode(_handler)
     result = chain._request_stage(
         peer=_pipeline()[0],
         request_id="kv-r1",
@@ -166,9 +160,9 @@ def test_request_stage_includes_kv_cache_hints(monkeypatch):
 
     req = captured["request"]
     assert result.activation == [3.0, 4.0]
-    assert req.kv_session_id == "session-1"  # type: ignore[union-attr]
-    assert req.kv_store_activation is True  # type: ignore[union-attr]
-    assert req.kv_use_cached_activation is True  # type: ignore[union-attr]
+    assert req.kv_session_id == "session-1"
+    assert req.kv_store_activation is True
+    assert req.kv_use_cached_activation is True
     assert chain._last_stage_kv_cache_hit is True
 
 

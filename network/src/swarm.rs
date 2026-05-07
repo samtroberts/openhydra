@@ -34,6 +34,8 @@ impl Default for SwarmOptions {
             listen_addrs: vec![
                 "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
                 "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
+                "/ip6/::/tcp/4001".parse().unwrap(),
+                "/ip6/::/udp/4001/quic-v1".parse().unwrap(),
             ],
             bootstrap_peers: Vec::new(),
             protocol_version: "openhydra/0.1.0".to_string(),

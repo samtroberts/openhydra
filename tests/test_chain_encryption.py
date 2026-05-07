@@ -6,40 +6,42 @@ from peer.crypto import ActivationEnvelope, build_onion_route_envelope, build_pr
 from peer import peer_pb2
 
 
-class _DummyChannel:
-    def __enter__(self):
-        return object()
+class _MockP2PNode:
+    def __init__(self, handler):
+        self._handler = handler
+        self.libp2p_peer_id = "12D3KooW_coord"
 
-    def __exit__(self, exc_type, exc, tb):
-        return False
+    def proxy_forward(self, target_peer_id, data):
+        raw = bytes(data)
+        prefix = raw[0:1]
+        req = peer_pb2.ForwardRequest()
+        req.ParseFromString(raw[1:])
+        resp = self._handler(req)
+        return prefix + resp.SerializeToString()
+
+    def proxy_forward_no_wait(self, target_peer_id, data):
+        pass
+
+    def is_peer_connected(self, peer_id):
+        return True
 
 
 def _peer() -> PeerEndpoint:
-    return PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001)
+    return PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, libp2p_peer_id="12D3KooW_a")
 
 
-def test_request_stage_sends_encrypted_activation(monkeypatch):
+def test_request_stage_sends_encrypted_activation():
     captured: dict[str, object] = {}
 
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            captured["request"] = req
-            return peer_pb2.ForwardResponse(
-                request_id=req.request_id,
-                peer_id="peer-a",
-                activation=[1.0],
-                stage_index=req.stage_index,
-                error="",
-            )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+    def handler(req):
+        captured["request"] = req
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-a",
+            activation=[1.0],
+            stage_index=req.stage_index,
+            error="",
+        )
 
     chain = InferenceChain(
         [_peer()],
@@ -48,6 +50,7 @@ def test_request_stage_sends_encrypted_activation(monkeypatch):
         advanced_encryption_seed="enc-seed",
         advanced_encryption_level="enhanced",
     )
+    chain._p2p_node = _MockP2PNode(handler)
 
     result = chain._request_stage(
         peer=_peer(),
@@ -71,22 +74,15 @@ def test_request_stage_sends_encrypted_activation(monkeypatch):
 def test_request_stage_prefers_pubkey_encryption_when_available(monkeypatch):
     captured: dict[str, object] = {"used_pubkey": False}
 
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            captured["request"] = req
-            return peer_pb2.ForwardResponse(
-                request_id=req.request_id,
-                peer_id="peer-a",
-                activation=[1.0],
-                stage_index=req.stage_index,
-                error="",
-            )
+    def handler(req):
+        captured["request"] = req
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-a",
+            activation=[1.0],
+            stage_index=req.stage_index,
+            error="",
+        )
 
     def fake_build_activation_envelope_with_pubkey(*args, **kwargs):
         captured["used_pubkey"] = True
@@ -101,12 +97,10 @@ def test_request_stage_prefers_pubkey_encryption_when_available(monkeypatch):
     def fail_seed_path(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise AssertionError("seed path should not be used when peer public key is available")
 
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
     monkeypatch.setattr("coordinator.chain.build_activation_envelope_with_pubkey", fake_build_activation_envelope_with_pubkey)
     monkeypatch.setattr("coordinator.chain.build_activation_envelope", fail_seed_path)
 
-    peer = PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, public_key_hex="aa" * 32)
+    peer = PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, public_key_hex="aa" * 32, libp2p_peer_id="12D3KooW_a")
     chain = InferenceChain(
         [peer],
         timeout_ms=1000,
@@ -114,6 +108,7 @@ def test_request_stage_prefers_pubkey_encryption_when_available(monkeypatch):
         advanced_encryption_seed="enc-seed",
         advanced_encryption_level="standard",
     )
+    chain._p2p_node = _MockP2PNode(handler)
     chain._request_stage(
         peer=peer,
         request_id="r-pub",
@@ -129,34 +124,25 @@ def test_request_stage_prefers_pubkey_encryption_when_available(monkeypatch):
     assert bytes(req.encrypted_activation) == b"cipher"  # type: ignore[union-attr]
 
 
-def test_request_stage_sends_plain_activation_when_disabled(monkeypatch):
+def test_request_stage_sends_plain_activation_when_disabled():
     captured: dict[str, object] = {}
 
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            captured["request"] = req
-            return peer_pb2.ForwardResponse(
-                request_id=req.request_id,
-                peer_id="peer-a",
-                activation=[2.0],
-                stage_index=req.stage_index,
-                error="",
-            )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+    def handler(req):
+        captured["request"] = req
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-a",
+            activation=[2.0],
+            stage_index=req.stage_index,
+            error="",
+        )
 
     chain = InferenceChain(
         [_peer()],
         timeout_ms=1000,
         advanced_encryption_enabled=False,
     )
+    chain._p2p_node = _MockP2PNode(handler)
 
     result = chain._request_stage(
         peer=_peer(),
@@ -182,34 +168,24 @@ def test_request_stage_sends_plain_activation_when_disabled(monkeypatch):
     assert bytes(req.encrypted_activation) == b""  # type: ignore[union-attr]
 
 
-def test_request_stage_sends_onion_route_and_tracks_remaining_layers(monkeypatch):
+def test_request_stage_sends_onion_route_and_tracks_remaining_layers():
     captured: dict[str, object] = {}
 
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            captured["request"] = req
-            return peer_pb2.ForwardResponse(
-                request_id=req.request_id,
-                peer_id="peer-a",
-                activation=[1.0],
-                stage_index=req.stage_index,
-                error="",
-                onion_route_ciphertext=b"next-layer",
-                onion_route_nonces=[b"n1"],
-                onion_route_ephemeral_public_keys=[b"k1"],
-                onion_route_suite="suite-route",
-                onion_route_layers=2,
-                onion_next_peer_id="peer-b",
-            )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+    def handler(req):
+        captured["request"] = req
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-a",
+            activation=[1.0],
+            stage_index=req.stage_index,
+            error="",
+            onion_route_ciphertext=b"next-layer",
+            onion_route_nonces=[b"n1"],
+            onion_route_ephemeral_public_keys=[b"k1"],
+            onion_route_suite="suite-route",
+            onion_route_layers=2,
+            onion_next_peer_id="peer-b",
+        )
 
     chain = InferenceChain(
         [_peer()],
@@ -218,6 +194,7 @@ def test_request_stage_sends_onion_route_and_tracks_remaining_layers(monkeypatch
         advanced_encryption_seed="enc-seed",
         advanced_encryption_level="enhanced",
     )
+    chain._p2p_node = _MockP2PNode(handler)
     onion = build_onion_route_envelope(
         ["peer-a", "peer-b", "peer-c"],
         request_id="r3",
@@ -250,59 +227,49 @@ def test_request_stage_sends_onion_route_and_tracks_remaining_layers(monkeypatch
     assert chain._last_onion_next_peer_id == "peer-b"
 
 
-def test_maximum_privacy_mode_verifies_dp_audit_tags(monkeypatch):
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            if int(req.stage_index) == 0:
-                configured = 1e-6
-                observed = 1.02e-6
-                observed_std = observed ** 0.5
-                payload_index = 11
-                tag = build_privacy_audit_tag(
-                    peer_id="peer-a",
-                    request_id=req.request_id,
-                    stage_index=0,
-                    payload_index=payload_index,
-                    configured_variance=configured,
-                    observed_variance=observed,
-                    observed_std=observed_std,
-                    shared_secret_seed="enc-seed",
-                )
-                return peer_pb2.ForwardResponse(
-                    request_id=req.request_id,
-                    peer_id="peer-a",
-                    activation=[0.25, 0.33],
-                    stage_index=req.stage_index,
-                    error="",
-                    onion_next_peer_id="peer-b",
-                    dp_noise_applied=True,
-                    dp_noise_configured_variance=configured,
-                    dp_noise_observed_variance=observed,
-                    dp_noise_observed_std=observed_std,
-                    dp_noise_payload_index=payload_index,
-                    dp_noise_audit_tag=tag,
-                )
+def test_maximum_privacy_mode_verifies_dp_audit_tags():
+    def handler(req):
+        if int(req.stage_index) == 0:
+            configured = 1e-6
+            observed = 1.02e-6
+            observed_std = observed ** 0.5
+            payload_index = 11
+            tag = build_privacy_audit_tag(
+                peer_id="peer-a",
+                request_id=req.request_id,
+                stage_index=0,
+                payload_index=payload_index,
+                configured_variance=configured,
+                observed_variance=observed,
+                observed_std=observed_std,
+                shared_secret_seed="enc-seed",
+            )
             return peer_pb2.ForwardResponse(
                 request_id=req.request_id,
-                peer_id="peer-b",
-                activation=[0.8],
+                peer_id="peer-a",
+                activation=[0.25, 0.33],
                 stage_index=req.stage_index,
                 error="",
-                onion_next_peer_id="",
+                onion_next_peer_id="peer-b",
+                dp_noise_applied=True,
+                dp_noise_configured_variance=configured,
+                dp_noise_observed_variance=observed,
+                dp_noise_observed_std=observed_std,
+                dp_noise_payload_index=payload_index,
+                dp_noise_audit_tag=tag,
             )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-b",
+            activation=[0.8],
+            stage_index=req.stage_index,
+            error="",
+            onion_next_peer_id="",
+        )
 
     pipeline = [
-        PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, privacy_noise_variance=1e-6),
-        PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=5002),
+        PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, privacy_noise_variance=1e-6, libp2p_peer_id="12D3KooW_a"),
+        PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=5002, libp2p_peer_id="12D3KooW_b"),
     ]
     chain = InferenceChain(
         pipeline,
@@ -311,51 +278,42 @@ def test_maximum_privacy_mode_verifies_dp_audit_tags(monkeypatch):
         advanced_encryption_seed="enc-seed",
         advanced_encryption_level="maximum",
     )
+    chain._p2p_node = _MockP2PNode(handler)
 
     result = chain.run("hello", max_tokens=1, request_id="rid-privacy-ok")
     assert result.encryption["privacy_audit_required"] is True
     assert result.encryption["privacy_audit_verified"] is True
 
 
-def test_maximum_privacy_mode_rejects_missing_dp_audit(monkeypatch):
-    def fake_create_channel(_address, _transport_config):
-        return _DummyChannel()
-
-    class _Stub:
-        def __init__(self, _channel):
-            pass
-
-        def Forward(self, req, timeout):
-            if int(req.stage_index) == 0:
-                return peer_pb2.ForwardResponse(
-                    request_id=req.request_id,
-                    peer_id="peer-a",
-                    activation=[0.25, 0.33],
-                    stage_index=req.stage_index,
-                    error="",
-                    onion_next_peer_id="peer-b",
-                    dp_noise_applied=False,
-                    dp_noise_configured_variance=0.0,
-                    dp_noise_observed_variance=0.0,
-                    dp_noise_observed_std=0.0,
-                    dp_noise_payload_index=0,
-                    dp_noise_audit_tag="",
-                )
+def test_maximum_privacy_mode_rejects_missing_dp_audit():
+    def handler(req):
+        if int(req.stage_index) == 0:
             return peer_pb2.ForwardResponse(
                 request_id=req.request_id,
-                peer_id="peer-b",
-                activation=[0.8],
+                peer_id="peer-a",
+                activation=[0.25, 0.33],
                 stage_index=req.stage_index,
                 error="",
-                onion_next_peer_id="",
+                onion_next_peer_id="peer-b",
+                dp_noise_applied=False,
+                dp_noise_configured_variance=0.0,
+                dp_noise_observed_variance=0.0,
+                dp_noise_observed_std=0.0,
+                dp_noise_payload_index=0,
+                dp_noise_audit_tag="",
             )
-
-    monkeypatch.setattr("coordinator.chain.create_channel", fake_create_channel)
-    monkeypatch.setattr("coordinator.chain.peer_pb2_grpc.PeerStub", _Stub)
+        return peer_pb2.ForwardResponse(
+            request_id=req.request_id,
+            peer_id="peer-b",
+            activation=[0.8],
+            stage_index=req.stage_index,
+            error="",
+            onion_next_peer_id="",
+        )
 
     pipeline = [
-        PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, privacy_noise_variance=1e-6),
-        PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=5002),
+        PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=5001, privacy_noise_variance=1e-6, libp2p_peer_id="12D3KooW_a"),
+        PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=5002, libp2p_peer_id="12D3KooW_b"),
     ]
     chain = InferenceChain(
         pipeline,
@@ -364,6 +322,7 @@ def test_maximum_privacy_mode_rejects_missing_dp_audit(monkeypatch):
         advanced_encryption_seed="enc-seed",
         advanced_encryption_level="maximum",
     )
+    chain._p2p_node = _MockP2PNode(handler)
 
     with pytest.raises(RuntimeError, match="privacy_audit_failed"):
         chain.run("hello", max_tokens=1, request_id="rid-privacy-fail")

@@ -40,12 +40,18 @@ pub fn relay_reservation_addr(
 
 /// Known bootstrap relay servers (production Linode nodes).
 pub const BOOTSTRAP_RELAYS: &[&str] = &[
-    // US (Dallas)
+    // US (Dallas) — IPv4 (keep for legacy nodes)
     "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
-    // EU (London)
+    // EU (London) — IPv4 (keep for legacy nodes)
     "/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT",
-    // AP (Singapore)
+    // AP (Singapore) — IPv4 (keep for legacy nodes)
     "/ip4/172.104.164.98/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
+    // US (Dallas) — IPv6
+    "/ip6/2600:3c03::2000:68ff:fe81:55b0/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
+    // EU (London) — IPv6
+    "/ip6/2a01:7e01::2000:84ff:fec5:4520/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT",
+    // AP (Singapore) — IPv6
+    "/ip6/2400:8901::2000:86ff:fe58:6d39/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
 ];
 
 /// IP addresses of the production bootstrap relay servers.
@@ -53,9 +59,12 @@ pub const BOOTSTRAP_RELAYS: &[&str] = &[
 /// routes through a relay's IP — such connections should NOT be classified
 /// as "direct" even if the multiaddr doesn't contain `/p2p-circuit/`.
 pub const BOOTSTRAP_RELAY_IPS: &[&str] = &[
-    "45.79.190.172",   // US (Dallas)
-    "172.105.69.49",   // EU (London)
-    "172.104.164.98",  // AP (Singapore)
+    "45.79.190.172",   // US (Dallas) IPv4
+    "172.105.69.49",   // EU (London) IPv4
+    "172.104.164.98",  // AP (Singapore) IPv4
+    "2600:3c03::2000:68ff:fe81:55b0",   // US (Dallas) IPv6
+    "2a01:7e01::2000:84ff:fec5:4520",   // EU (London) IPv6
+    "2400:8901::2000:86ff:fe58:6d39",   // AP (Singapore) IPv6
 ];
 
 /// Check if an IP string matches a known bootstrap relay server.

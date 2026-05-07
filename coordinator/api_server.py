@@ -2003,7 +2003,7 @@ def main() -> None:
         return out
 
     parser = argparse.ArgumentParser(description="OpenHydra OpenAI-compatible API server")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="::")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--deployment-profile", choices=["dev", "prod"], default="dev")
     parser.add_argument("--secrets-file", default=None, help="Path to KEY=VALUE secrets file (0600 permissions required)")
