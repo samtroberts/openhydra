@@ -337,7 +337,16 @@ After removing the gRPC server and routing all tensor traffic through the native
 | P2P 10 sentences | 226 | 24.3 s | **9.3** | 9.0 |
 | Pulp Fiction review | 512 | 53.7 s | **9.5** | 9.8 |
 
-GPU2 discovery latency: 1.0–1.5 ms (direct QUIC via mDNS on same VPC). The libp2p transport adds negligible overhead vs. the previous gRPC path while eliminating the need for a separate gRPC server, separate port management, and manual address formatting.
+**Qwen 3.5 9B** on the same hardware:
+
+| Prompt | Tokens | Latency | TPS (libp2p) | TPS (gRPC baseline) |
+|--------|--------|---------|-------------|---------------------|
+| 50-word letter | 72 | 11.3 s | **6.4** | 7.2 |
+| P2P 3 sentences | 80 | 12.3 s | **6.5** | 7.1 |
+| P2P 10 sentences | 208 | 31.1 s | **6.7** | 7.3 |
+| Pulp Fiction review | 512 | 75.8 s | **6.8** | 7.3 |
+
+GPU2 discovery latency: 1.0–1.5 ms (direct QUIC on same VPC). The libp2p transport adds negligible overhead vs. the previous gRPC path while eliminating the need for a separate gRPC server, separate port management, and manual address formatting. The 9B model shows a slightly larger gap (7–11% vs 4%) due to larger activation tensors amplifying per-hop serialization overhead.
 
 ### Direct P2P vs Circuit Relay (2 × T4 Lightning.ai, 2026-04-20)
 
