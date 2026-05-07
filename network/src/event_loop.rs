@@ -3,7 +3,8 @@
 //! Receives commands from the Python thread via mpsc and drives the
 //! libp2p swarm. Results are sent back via oneshot channels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 
 use futures::StreamExt;
 use libp2p::request_response;
@@ -60,11 +61,6 @@ pub enum SwarmCommand {
         target_libp2p_peer_id: String,
         local_grpc_port: u16,
         reply: oneshot::Sender<Result<String, String>>,
-    },
-    /// Poll for the next inbound proxy request (from a remote peer).
-    /// Returns (request_id, bytes) or None if the queue is empty.
-    PollProxyRequest {
-        reply: oneshot::Sender<Option<(String, Vec<u8>)>>,
     },
     /// Send a response to an inbound proxy request.
     RespondProxy {
@@ -140,6 +136,38 @@ pub enum SwarmCommand {
     },
 }
 
+/// Thread-safe queue for inbound proxy requests, shared between the
+/// event loop (producer) and Python poll_proxy_request (consumer).
+/// Bypasses the command channel to avoid event-loop round-trip latency.
+pub struct SharedProxyQueue {
+    queue: Mutex<VecDeque<(String, Vec<u8>)>>,
+    condvar: Condvar,
+}
+
+impl SharedProxyQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    pub fn push(&self, item: (String, Vec<u8>)) {
+        let mut q = self.queue.lock().unwrap();
+        q.push_back(item);
+        self.condvar.notify_one();
+    }
+
+    pub fn pop(&self, timeout: std::time::Duration) -> Option<(String, Vec<u8>)> {
+        let mut q = self.queue.lock().unwrap();
+        if let Some(item) = q.pop_front() {
+            return Some(item);
+        }
+        let (mut q, _) = self.condvar.wait_timeout(q, timeout).unwrap();
+        q.pop_front()
+    }
+}
+
 /// State tracked by the event loop.
 struct LoopState {
     /// Cached NAT info from AutoNAT probes.
@@ -157,9 +185,6 @@ struct LoopState {
     pending_proxy: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
     /// Local gRPC port for inbound proxy requests.
     local_grpc_port: u16,
-    /// Inbound proxy requests waiting for Python to process.
-    /// (request_id, raw_bytes, response_channel_for_libp2p)
-    inbound_proxy_queue: Vec<(String, Vec<u8>)>,
     /// Pending inbound proxy responses: request_id → (libp2p ResponseChannel, proxy_respond_tx sender)
     /// When Python calls RespondProxy, we find the channel here and send_response.
     inbound_proxy_channels: HashMap<String, request_response::ResponseChannel<ProxyResponse>>,
@@ -221,7 +246,6 @@ impl LoopState {
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
             local_grpc_port: 50051,
-            inbound_proxy_queue: Vec::new(),
             inbound_proxy_channels: HashMap::new(),
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
@@ -238,6 +262,7 @@ impl LoopState {
 pub async fn run_event_loop(
     mut swarm: libp2p::Swarm<OpenHydraBehaviour>,
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
+    proxy_queue: Arc<SharedProxyQueue>,
 ) {
     let mut state = LoopState::new();
 
@@ -292,10 +317,10 @@ pub async fn run_event_loop(
                         handle_resolve(&state, &peer_id, reply);
                     }
                     Some(SwarmCommand::ProxyForward { peer_id, data, reply }) => {
-                        handle_proxy_forward(&mut swarm, &peer_id, data, reply, &mut state);
+                        handle_proxy_forward(&mut swarm, &peer_id, data, reply, &mut state, &proxy_queue);
                     }
                     Some(SwarmCommand::ProxyForwardNoWait { peer_id, data }) => {
-                        handle_proxy_forward_no_wait(&mut swarm, &peer_id, data, &mut state);
+                        handle_proxy_forward_no_wait(&mut swarm, &peer_id, data, &mut state, &proxy_queue);
                     }
                     Some(SwarmCommand::IsConnected { peer_id, reply }) => {
                         // Returns true ONLY if we have a direct (non-relayed) connection.
@@ -393,14 +418,6 @@ pub async fn run_event_loop(
                         state.local_grpc_port = local_grpc_port;
                         handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
                     }
-                    Some(SwarmCommand::PollProxyRequest { reply }) => {
-                        let item = if state.inbound_proxy_queue.is_empty() {
-                            None
-                        } else {
-                            Some(state.inbound_proxy_queue.remove(0))
-                        };
-                        let _ = reply.send(item);
-                    }
                     Some(SwarmCommand::RespondProxy { request_id, data }) => {
                         // Check local proxy replies first (Ouroboros: self-targeted forwards).
                         if let Some(reply) = state.local_proxy_replies.remove(&request_id) {
@@ -426,7 +443,7 @@ pub async fn run_event_loop(
             }
             // Process swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut state);
+                handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
             }
         }
     }
@@ -516,6 +533,7 @@ fn handle_swarm_event(
     event: SwarmEvent<OpenHydraBehaviourEvent>,
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
+    proxy_queue: &SharedProxyQueue,
 ) {
     match event {
         // ── Kademlia ──
@@ -625,7 +643,7 @@ fn handle_swarm_event(
 
         // ── gRPC Proxy ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::GrpcProxy(proxy_event)) => {
-            handle_grpc_proxy_event(proxy_event, swarm, state);
+            handle_grpc_proxy_event(proxy_event, swarm, state, proxy_queue);
         }
 
         // ── Gossipsub (PR-3 / B1) ──
@@ -1023,6 +1041,7 @@ fn handle_grpc_proxy_event(
     event: request_response::Event<ProxyRequest, ProxyResponse>,
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
+    proxy_queue: &SharedProxyQueue,
 ) {
     match event {
         request_response::Event::Message { peer, message } => {
@@ -1033,7 +1052,7 @@ fn handle_grpc_proxy_event(
                     state.inbound_proxy_counter += 1;
                     let req_id = format!("proxy-{}", state.inbound_proxy_counter);
                     info!(%peer, bytes = request.0.len(), id = %req_id, "proxy request queued for Python");
-                    state.inbound_proxy_queue.push((req_id.clone(), request.0));
+                    proxy_queue.push((req_id.clone(), request.0));
                     state.inbound_proxy_channels.insert(req_id, channel);
                 }
                 request_response::Message::Response { request_id, response } => {
@@ -1067,6 +1086,7 @@ fn handle_proxy_forward(
     data: Vec<u8>,
     reply: oneshot::Sender<Result<Vec<u8>, String>>,
     state: &mut LoopState,
+    proxy_queue: &SharedProxyQueue,
 ) {
     let peer_id: PeerId = match peer_id_str.parse() {
         Ok(p) => p,
@@ -1083,7 +1103,7 @@ fn handle_proxy_forward(
         info!("proxy_forward: target is self — routing locally");
         state.inbound_proxy_counter += 1;
         let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
-        state.inbound_proxy_queue.push((req_id.clone(), data));
+        proxy_queue.push((req_id.clone(), data));
         state.local_proxy_replies.insert(req_id, reply);
         return;
     }
@@ -1134,7 +1154,7 @@ fn handle_proxy_forward(
 /// and the response is silently discarded — exactly the desired behaviour
 /// for fire-and-forget cross-ISP push mode.
 ///
-/// For Ouroboros (self-targeted) forwards: queues in `inbound_proxy_queue`
+/// For Ouroboros (self-targeted) forwards: queues in `proxy_queue`
 /// without a `local_proxy_replies` entry. The respond_proxy for the
 /// "proxy-local-*" request will hit the `warn!("unknown request_id")`
 /// branch — harmless; the Python caller doesn't expect a response.
@@ -1148,6 +1168,7 @@ fn handle_proxy_forward_no_wait(
     peer_id_str: &str,
     data: Vec<u8>,
     state: &mut LoopState,
+    proxy_queue: &SharedProxyQueue,
 ) {
     let peer_id: PeerId = match peer_id_str.parse() {
         Ok(p) => p,
@@ -1162,7 +1183,7 @@ fn handle_proxy_forward_no_wait(
         debug!("proxy_forward_no_wait: target is self — routing locally (no reply)");
         state.inbound_proxy_counter += 1;
         let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
-        state.inbound_proxy_queue.push((req_id, data));
+        proxy_queue.push((req_id, data));
         // No local_proxy_replies entry — respond_proxy will warn and discard.
         return;
     }

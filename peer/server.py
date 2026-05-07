@@ -2397,9 +2397,11 @@ class PeerService:
             if not _next_hop_libp2p_id or self._p2p_node is None:
                 raise RuntimeError(f"no_libp2p_id_for_next_hop: {next_address}")
 
+            _payload = bytearray(PROXY_METHOD_FIRE_FORGET)
+            _payload.extend(next_req.SerializeToString())
             self._p2p_node.proxy_forward_no_wait(
                 target_peer_id=_next_hop_libp2p_id,
-                data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
+                data=bytes(_payload),
             )
             logger.info(
                 "push_forwarded: req=%s stage=%d -> %s (libp2p=%s)",
@@ -2457,9 +2459,11 @@ class PeerService:
             if not _cb_libp2p or self._p2p_node is None:
                 raise RuntimeError(f"no_libp2p_id_for_callback: {callback_address}")
 
+            _payload = bytearray(PROXY_METHOD_FIRE_FORGET_RESULT)
+            _payload.extend(response.SerializeToString())
             self._p2p_node.proxy_forward_no_wait(
                 target_peer_id=_cb_libp2p,
-                data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
+                data=bytes(_payload),
             )
             logger.info(
                 "push_result_sent: req=%s -> %s (libp2p=%s)",
