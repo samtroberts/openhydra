@@ -1230,7 +1230,13 @@ class MLXRuntime:
                 raise RuntimeError("missing_hidden_payload")
             h = self._activation_to_hidden(activation, packed_bytes=packed_bytes)
 
-        self._watchdog.run(mx.eval, h)
+        # Eval on the current thread — NOT through the watchdog executor.
+        # The watchdog runs mx.eval on a dedicated thread, but MLX Metal
+        # streams are thread-local.  When _forward_sharded is called from
+        # a fire-and-forget proxy handler thread, `h` lives on that
+        # thread's stream; sending it to the watchdog thread triggers
+        # "There is no Stream(gpu, N) in current thread".
+        mx.eval(h)
 
         # ── Build masks ────────────────────────────────────────────
         # Qwen3.5 needs separate masks for full-attention and SSM layers.
@@ -1281,7 +1287,7 @@ class MLXRuntime:
                 logits = self._shard_embed_tokens.as_linear(h)
             else:
                 logits = self._shard_lm_head(h)
-            self._watchdog.run(mx.eval, logits)
+            mx.eval(logits)
             return self._sample_from_logits(logits, **sampling_kwargs)
         else:
             # Intermediate shards always return hidden state; last shard
