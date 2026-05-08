@@ -1261,8 +1261,7 @@ class MLXRuntime:
         # Each _forward_sharded call creates ~200+ MLX array objects.
         # Python's gen-0 GC threshold (700) triggers every ~3 calls,
         # releasing MLX Metal buffers mid-eval and stalling the GPU
-        # for ~1s. Disable the cyclic collector during the critical
-        # section and run a manual gen-0 sweep afterward.
+        # for ~1s. Disable the cyclic collector around mx.eval calls.
         _gc_was_enabled = gc.isenabled()
         gc.disable()
 
@@ -1306,7 +1305,6 @@ class MLXRuntime:
         finally:
             if _gc_was_enabled:
                 gc.enable()
-            gc.collect(0)
 
     # ── Batched forward pass ───────────────────────────────────────────────────
 
