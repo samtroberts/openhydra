@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -234,6 +235,23 @@ class MLXRuntime:
 
         # Force Metal allocation of all parameters now, not lazily on first use.
         self._watchdog.run(mx.eval, self._model.parameters())
+
+        # Pin MLX Metal buffers so macOS doesn't reclaim them under memory
+        # pressure.  On 16 GB Macs the compressor can stall Metal heap
+        # commits for ~1s every few tokens.  set_wired_limit keeps model
+        # weights resident; set_cache_limit caps the reuse pool.
+        try:
+            _ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+            _wired = int(min(_ram_gb * 0.5, 8) * 1024 ** 3)
+            _cache = int(2 * 1024 ** 3)
+            mx.set_wired_limit(_wired)
+            mx.set_cache_limit(_cache)
+            logging.info(
+                "mlx_metal_limits: wired=%.1f GB  cache=%.1f GB  system_ram=%.0f GB",
+                _wired / 1e9, _cache / 1e9, _ram_gb,
+            )
+        except (AttributeError, OSError):
+            pass
 
         # Apply runtime quantization if requested and the checkpoint is not
         # already quantized (pre-quantized MLX models, e.g. from mlx-community,
@@ -1197,6 +1215,10 @@ class MLXRuntime:
         Last shard:  deserialize → layers → norm → lm_head → sample
         Middle:      deserialize → layers → serialize hidden
         """
+        # Release unused Metal buffers to prevent cache pool growth that
+        # triggers OS memory compaction stalls (~1s spikes every few tokens).
+        self._mx.clear_cache()
+
         if not self._is_sharded:
             raise RuntimeError(
                 "mlx_runtime: not initialized for sharding (total_shards=1). "
