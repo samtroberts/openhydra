@@ -54,7 +54,7 @@ python3 -m coordinator.node \
   --peer-id mac2 \
   --model-id openhydra-qwen3.5-2b \
   --runtime-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
-  --hf-model-id Qwen/Qwen3.5-2B \
+  --hf-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
   --layer-start 12 --layer-end 24 \
   --shard-index 1 --total-shards 2
 ```
