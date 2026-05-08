@@ -1215,10 +1215,6 @@ class MLXRuntime:
         Last shard:  deserialize → layers → norm → lm_head → sample
         Middle:      deserialize → layers → serialize hidden
         """
-        # Release unused Metal buffers to prevent cache pool growth that
-        # triggers OS memory compaction stalls (~1s spikes every few tokens).
-        self._mx.clear_cache()
-
         if not self._is_sharded:
             raise RuntimeError(
                 "mlx_runtime: not initialized for sharding (total_shards=1). "
