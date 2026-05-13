@@ -216,11 +216,6 @@ struct LoopState {
     /// ``GOSSIP_INBOUND_QUEUE_MAX`` to prevent unbounded memory growth
     /// when Python is slow to poll.
     gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
-    /// Peers connected via relay that need a DCUtR hole-punch attempt.
-    /// After a relay circuit is established, the peer is queued here
-    /// with a scheduled retry time. The event loop forces a re-dial
-    /// to trigger DCUtR upgrade from relay to direct.
-    dcutr_retry_queue: Vec<(PeerId, tokio::time::Instant)>,
 }
 
 /// PR-3: upper bound on pending inbound gossip messages.
@@ -259,7 +254,6 @@ impl LoopState {
             direct_peers: HashMap::new(),
             local_proxy_replies: HashMap::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
-            dcutr_retry_queue: Vec::new(),
         }
     }
 }
@@ -286,28 +280,6 @@ pub async fn run_event_loop(
     let relay_reservation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
-        // DCUtR retry: force-dial relay-connected peers to trigger hole punch.
-        let now = tokio::time::Instant::now();
-        state.dcutr_retry_queue.retain(|(peer_id, retry_at)| {
-            if now >= *retry_at {
-                if state.direct_peers.get(peer_id).copied().unwrap_or(0) > 0 {
-                    info!(%peer_id, "dcutr_retry: peer already direct, skipping");
-                    return false;
-                }
-                use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
-                let opts = DialOpts::peer_id(*peer_id)
-                    .condition(PeerCondition::Always)
-                    .build();
-                match swarm.dial(opts) {
-                    Ok(()) => info!(%peer_id, "dcutr_retry: forced dial to trigger hole punch"),
-                    Err(e) => warn!(%peer_id, %e, "dcutr_retry: dial failed"),
-                }
-                false // remove from queue after attempt
-            } else {
-                true // keep — not yet time
-            }
-        });
-
         // Delayed relay reservation: wait for Kademlia to connect to
         // bootstrap peers, then request relay reservations via listen_on.
         if relay_reservation_pending && tokio::time::Instant::now() >= relay_reservation_deadline {
@@ -762,17 +734,6 @@ fn handle_swarm_event(
                     %peer_id, %addr_str, has_circuit, is_relay_ip, has_transport_ip,
                     "connection_established (not marking direct)"
                 );
-                // Schedule a DCUtR hole-punch retry for non-bootstrap
-                // relay-connected peers (skip bootstrap relay servers).
-                let peer_id_str = peer_id.to_string();
-                let is_bootstrap = crate::relay::BOOTSTRAP_RELAYS
-                    .iter()
-                    .any(|r| r.ends_with(&peer_id_str));
-                if !is_bootstrap && !state.dcutr_retry_queue.iter().any(|(p, _)| *p == peer_id) {
-                    let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                    info!(%peer_id, "scheduling DCUtR retry in 5s (relay-only connection)");
-                    state.dcutr_retry_queue.push((peer_id, retry_at));
-                }
             }
             // Send any queued proxy forwards that were waiting for this connection.
             let mut remaining = Vec::new();
