@@ -720,18 +720,12 @@ fn handle_swarm_event(
                 .as_ref()
                 .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
                 .unwrap_or(false);
-            // A bare `/p2p/PEER_ID` address (no IP/transport) is NOT a
-            // direct connection — it's an internal reference or a relay
-            // whose address was stripped.  Require a real IP to classify
-            // as direct; otherwise DCUtR never triggers because the
-            // system believes it already has a direct path.
-            let has_transport_ip = endpoint_ip.is_some();
-            if !has_circuit && !is_relay_ip && has_transport_ip {
+            if !has_circuit && !is_relay_ip {
                 *state.direct_peers.entry(peer_id).or_insert(0) += 1;
                 info!(%peer_id, %addr_str, count = state.direct_peers[&peer_id], "direct_peer_added");
             } else {
                 debug!(
-                    %peer_id, %addr_str, has_circuit, is_relay_ip, has_transport_ip,
+                    %peer_id, %addr_str, has_circuit, is_relay_ip,
                     "connection_established (not marking direct)"
                 );
             }
