@@ -698,7 +698,8 @@ def main() -> None:
                 "/ip4/0.0.0.0/udp/4001/quic-v1",
                 "/ip6/::/udp/4001/quic-v1",
             ]
-            _p2p_bootstrap = getattr(args, "p2p_bootstrap", None) or list(PRODUCTION_LIBP2P_BOOTSTRAP_PEERS)
+            _p2p_bootstrap_extra = getattr(args, "p2p_bootstrap", None) or []
+            _p2p_bootstrap = list(PRODUCTION_LIBP2P_BOOTSTRAP_PEERS) + _p2p_bootstrap_extra
             _p2p_node = P2PNode(
                 identity_key_path=args.identity_path,
                 listen_addrs=_p2p_listen,

@@ -263,12 +263,25 @@ pub async fn run_event_loop(
     mut swarm: libp2p::Swarm<OpenHydraBehaviour>,
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
+    bootstrap_peers: Vec<(PeerId, Multiaddr)>,
 ) {
     let mut state = LoopState::new();
 
     // Kick off Kademlia bootstrap (populate routing table from bootstrap peers).
     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
         warn!("kademlia bootstrap failed (no peers yet?): {e}");
+    }
+
+    // Explicitly dial every bootstrap peer to force a direct connection.
+    // kademlia.add_address() only populates the routing table — it does
+    // NOT guarantee a connection.  Without an explicit dial the swarm
+    // may never establish a direct QUIC link and will fall back to relay.
+    for (peer_id, addr) in &bootstrap_peers {
+        let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
+        info!(%peer_id, %dial_addr, "bootstrap_dial: explicitly dialing bootstrap peer");
+        if let Err(e) = swarm.dial(dial_addr.clone()) {
+            warn!(%peer_id, %dial_addr, %e, "bootstrap_dial: failed");
+        }
     }
 
     // Relay reservations are requested after a short delay (see below)
@@ -720,12 +733,13 @@ fn handle_swarm_event(
                 .as_ref()
                 .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
                 .unwrap_or(false);
-            if !has_circuit && !is_relay_ip {
+            let has_transport_ip = endpoint_ip.is_some();
+            if !has_circuit && !is_relay_ip && has_transport_ip {
                 *state.direct_peers.entry(peer_id).or_insert(0) += 1;
                 info!(%peer_id, %addr_str, count = state.direct_peers[&peer_id], "direct_peer_added");
             } else {
                 debug!(
-                    %peer_id, %addr_str, has_circuit, is_relay_ip,
+                    %peer_id, %addr_str, has_circuit, is_relay_ip, has_transport_ip,
                     "connection_established (not marking direct)"
                 );
             }

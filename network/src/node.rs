@@ -123,6 +123,7 @@ pub fn start_node(
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
+                let bootstrap_peers_for_dial = bootstrap_peers.clone();
                 let opts = SwarmOptions {
                     listen_addrs,
                     bootstrap_peers,
@@ -132,7 +133,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok(swarm) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
