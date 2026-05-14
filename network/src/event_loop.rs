@@ -292,7 +292,43 @@ pub async fn run_event_loop(
     let mut relay_reservation_pending = true;
     let relay_reservation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
+    // Bootstrap peer retry: periodically re-dial user-supplied bootstrap
+    // peers (non-relay) that haven't established a direct connection.
+    // This enables simultaneous-open hole-punching: both peers keep
+    // dialing each other until both outbound packets cross in-flight
+    // and punch through both NATs.  Only user-supplied peers (those
+    // whose address is NOT a known relay IP) are retried.
+    let non_relay_bootstrap: Vec<(PeerId, Multiaddr)> = bootstrap_peers
+        .iter()
+        .filter(|(_, addr)| {
+            let addr_str = addr.to_string();
+            let ip = extract_ip_from_multiaddr_str(&addr_str);
+            let is_relay = ip
+                .as_ref()
+                .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
+                .unwrap_or(false);
+            !is_relay
+        })
+        .cloned()
+        .collect();
+    let mut bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+
     loop {
+        // Retry dialing non-relay bootstrap peers every 15s until connected.
+        if !non_relay_bootstrap.is_empty() && tokio::time::Instant::now() >= bootstrap_retry_deadline {
+            bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            for (peer_id, addr) in &non_relay_bootstrap {
+                let already_direct = state.direct_peers.get(peer_id).copied().unwrap_or(0) > 0;
+                if already_direct {
+                    continue;
+                }
+                let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
+                info!(%peer_id, %dial_addr, "bootstrap_retry: re-dialing (not yet direct)");
+                if let Err(e) = swarm.dial(dial_addr.clone()) {
+                    warn!(%peer_id, %e, "bootstrap_retry: dial failed");
+                }
+            }
+        }
         // Delayed relay reservation: wait for Kademlia to connect to
         // bootstrap peers, then request relay reservations via listen_on.
         if relay_reservation_pending && tokio::time::Instant::now() >= relay_reservation_deadline {
