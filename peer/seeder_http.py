@@ -249,6 +249,12 @@ class _ThreadingHTTPServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     cache_root: Path  # set by ModelSeedServer before start()
 
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
+        import socket
+        if ":" in str(server_address[0]):
+            self.address_family = socket.AF_INET6
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
 
 class ModelSeedServer:
     """
@@ -268,7 +274,7 @@ class ModelSeedServer:
         self,
         cache_root: str | Path,
         port: int = 0,
-        bind_address: str = "0.0.0.0",
+        bind_address: str = "::",
     ) -> None:
         self._cache_root = Path(cache_root)
         self._port = port

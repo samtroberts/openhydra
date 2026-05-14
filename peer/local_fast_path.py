@@ -130,7 +130,7 @@ class FastPathServer:
     def __init__(
         self,
         handler: Callable[[list[float]], list[float]],
-        bind_host: str = "0.0.0.0",
+        bind_host: str = "::",
         port: int = 0,
     ) -> None:
         self._handler = handler

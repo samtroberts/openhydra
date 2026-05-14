@@ -22,7 +22,7 @@ import grpc
 
 from compression.autoencoder import CompressionProfile, TensorAutoencoder
 from coordinator.path_finder import PeerEndpoint
-from coordinator.transport import TransportConfig, create_channel
+from coordinator.transport import TransportConfig
 from peer.crypto import (
     build_activation_envelope,
     build_activation_envelope_with_pubkey,
@@ -32,7 +32,6 @@ from peer.crypto import (
     verify_privacy_audit_tag,
 )
 from peer import peer_pb2
-from peer import peer_pb2_grpc
 from peer.model_shard import ModelShard
 
 
@@ -344,22 +343,21 @@ class InferenceChain:
             # of connecting directly (the remote IP is unreachable).
             _p2p_node = getattr(self, '_p2p_node', None)
             _peer_libp2p_id = str(getattr(peer, 'libp2p_peer_id', '') or '').strip()
-            if _p2p_node is not None and getattr(peer, 'requires_relay', False) and _peer_libp2p_id:
-                req_bytes = b'\x01' + req.SerializeToString()  # 0x01 = ForwardRequest
-                resp_bytes = _p2p_node.proxy_forward(
-                    target_peer_id=_peer_libp2p_id,
-                    data=req_bytes,
+            if _p2p_node is None or not _peer_libp2p_id:
+                raise RuntimeError(
+                    f"no libp2p route to peer {peer.peer_id} "
+                    f"(p2p_node={_p2p_node is not None}, libp2p_id={_peer_libp2p_id!r})"
                 )
-                # Strip method prefix from response.
-                raw_resp = bytes(resp_bytes)
-                if raw_resp and raw_resp[0:1] in (b'\x01', b'\x02'):
-                    raw_resp = raw_resp[1:]
-                response = peer_pb2.ForwardResponse()
-                response.ParseFromString(raw_resp)
-            else:
-                with create_channel(peer.address, self.transport_config) as channel:
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    response = stub.Forward(req, timeout=effective_timeout)
+            req_bytes = b'\x01' + req.SerializeToString()
+            resp_bytes = _p2p_node.proxy_forward(
+                target_peer_id=_peer_libp2p_id,
+                data=req_bytes,
+            )
+            raw_resp = bytes(resp_bytes)
+            if raw_resp and raw_resp[0:1] in (b'\x01', b'\x02'):
+                raw_resp = raw_resp[1:]
+            response = peer_pb2.ForwardResponse()
+            response.ParseFromString(raw_resp)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         _t_grpc_ms = (time.perf_counter() - _t_grpc_start) * 1000
@@ -503,9 +501,22 @@ class InferenceChain:
             verify_batch_size=k,
         )
 
-        with create_channel(peer.address, self.transport_config) as channel:
-            stub = peer_pb2_grpc.PeerStub(channel)
-            response = stub.Forward(req, timeout=effective_timeout)
+        _p2p_node = getattr(self, '_p2p_node', None)
+        _peer_libp2p_id = str(getattr(peer, 'libp2p_peer_id', '') or '').strip()
+        if _p2p_node is None or not _peer_libp2p_id:
+            raise RuntimeError(
+                f"no libp2p route to peer {peer.peer_id} for verify"
+            )
+        req_bytes = b'\x01' + req.SerializeToString()
+        resp_bytes = _p2p_node.proxy_forward(
+            target_peer_id=_peer_libp2p_id,
+            data=req_bytes,
+        )
+        raw_resp = bytes(resp_bytes)
+        if raw_resp and raw_resp[0:1] in (b'\x01', b'\x02'):
+            raw_resp = raw_resp[1:]
+        response = peer_pb2.ForwardResponse()
+        response.ParseFromString(raw_resp)
 
         if response.error:
             raise RuntimeError(f"verify failed: {response.error}")
@@ -998,48 +1009,15 @@ class InferenceChain:
             try:
                 _p2p = getattr(self, '_p2p_node', None)
                 _libp2p_id = str(getattr(first_peer, 'libp2p_peer_id', '') or '').strip()
-                # State-aware routing: check if direct connection exists.
-                _has_direct = False
-                if _p2p is not None and _libp2p_id:
-                    try:
-                        _has_direct = _p2p.is_peer_connected(_libp2p_id)
-                    except Exception:
-                        pass
-
-                if _has_direct:
-                    # Direct connection (DCUtR succeeded or same LAN) — use gRPC.
-                    first_addr = f"{first_peer.host}:{first_peer.port}"
-                    channel = grpc.insecure_channel(
-                        first_addr,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
+                if _p2p is None or not _libp2p_id:
+                    raise RuntimeError(
+                        f"no libp2p route to first peer {first_peer.peer_id}"
                     )
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(req, timeout=min(self.timeout_s, 60.0))
-                    channel.close()
-                    logging.info("push_sent_direct: peer=%s", first_peer.peer_id)
-                elif _p2p is not None and _libp2p_id:
-                    # Fire-and-forget: ACK instantly, inference runs async.
-                    _p2p.proxy_forward(
-                        target_peer_id=_libp2p_id,
-                        data=b'\x03' + req.SerializeToString(),  # 0x03 = fire-and-forget
-                    )
-                    logging.info("push_sent_via_relay: peer=%s libp2p=%s", first_peer.peer_id, _libp2p_id[:20])
-                else:
-                    # No P2P — direct gRPC only (LAN/VPC).
-                    first_addr = f"{first_peer.host}:{first_peer.port}"
-                    channel = grpc.insecure_channel(
-                        first_addr,
-                        options=[
-                            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                        ],
-                    )
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(req, timeout=min(self.timeout_s, 60.0))
-                    channel.close()
+                _p2p.proxy_forward_no_wait(
+                    target_peer_id=_libp2p_id,
+                    data=b'\x03' + req.SerializeToString(),
+                )
+                logging.info("push_sent: peer=%s libp2p=%s", first_peer.peer_id, _libp2p_id[:20])
             except Exception as exc:
                 logging.warning("push_send_failed: %s", exc)
 
@@ -1152,6 +1130,16 @@ class InferenceChain:
         next_addr = f"{self.pipeline[1].host}:{self.pipeline[1].port}" if n > 1 else ""
         next_id = self.pipeline[1].peer_id if n > 1 else ""
 
+        # Ring loopback address: must be routable from remote peers.
+        # If the pipeline has 127.0.0.1 (auto-config or peers.local.json),
+        # substitute the callback_address host which is the detected LAN IP.
+        _ring_hop_host = first_peer.host
+        if _ring_hop_host in ("127.0.0.1", "localhost", "0.0.0.0") and callback_address:
+            from peer.lan_routing import parse_host_from_address
+            _cb_host = parse_host_from_address(callback_address)
+            if _cb_host and not _cb_host.startswith("127."):
+                _ring_hop_host = _cb_host
+
         import struct as _ring_struct
         _ring_packed = _ring_struct.pack(f'<{len(initial_activation)}f', *initial_activation)
 
@@ -1179,7 +1167,7 @@ class InferenceChain:
             ring_tokens_remaining=max_tokens,
             ring_generated_ids=[],
             ring_eos_ids=ring_eos_ids,
-            ring_first_hop_address=f"{first_peer.host}:{first_peer.port}",
+            ring_first_hop_address=f"{_ring_hop_host}:{first_peer.port}",
             ring_first_hop_peer_id=first_peer.peer_id,
             ring_first_hop_libp2p_id=str(getattr(first_peer, "libp2p_peer_id", "") or ""),
             ring_full_route=route_hops,
@@ -1331,35 +1319,16 @@ class InferenceChain:
             try:
                 _p2p = getattr(self, '_p2p_node', None)
                 _libp2p_id = str(getattr(first_peer, 'libp2p_peer_id', '') or '').strip()
-                _has_direct = False
-                if _p2p is not None and _libp2p_id:
-                    try:
-                        _has_direct = _p2p.is_peer_connected(_libp2p_id)
-                    except Exception:
-                        pass
-                if _has_direct:
-                    first_addr = f"{first_peer.host}:{first_peer.port}"
-                    channel = grpc.insecure_channel(first_addr, options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ])
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(req, timeout=60.0)
-                    channel.close()
-                elif _p2p is not None and _libp2p_id:
-                    _p2p.proxy_forward(target_peer_id=_libp2p_id, data=b'\x01' + req.SerializeToString())
-                else:
-                    first_addr = f"{first_peer.host}:{first_peer.port}"
-                    channel = grpc.insecure_channel(first_addr, options=[
-                        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                        ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ])
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(req, timeout=60.0)
-                    channel.close()
+                if _p2p is None or not _libp2p_id:
+                    raise RuntimeError(
+                        f"no libp2p route to first ring peer {first_peer.peer_id}"
+                    )
+                _p2p.proxy_forward_no_wait(
+                    target_peer_id=_libp2p_id,
+                    data=b'\x03' + req.SerializeToString(),
+                )
             except Exception as exc:
                 logging.warning("ring_push_send_failed: %s", exc)
-                # Emit sentinel so the coordinator doesn't hang.
                 from coordinator.push_receiver import emit_ring_token
                 emit_ring_token(rid, None)
 

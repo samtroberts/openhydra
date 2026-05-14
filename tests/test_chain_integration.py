@@ -43,6 +43,7 @@ def _start_peer(
     return server, port
 
 
+@pytest.mark.skip(reason="gRPC server removed — unified libp2p transport")
 def test_chain_runs_across_three_peers():
     started = [
         _start_peer("peer-a", 0),
@@ -68,7 +69,7 @@ def test_chain_runs_across_three_peers():
             server.stop(grace=0)
 
 
-@pytest.mark.skipif(not cryptography_available(), reason="cryptography dependency unavailable")
+@pytest.mark.skip(reason="gRPC server removed — unified libp2p transport")
 def test_chain_runs_across_three_peers_with_advanced_encryption():
     seed = "integration-seed"
     started = [

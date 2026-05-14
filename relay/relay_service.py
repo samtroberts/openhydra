@@ -175,7 +175,7 @@ class RelayServicer(peer_pb2_grpc.PeerServicer):
         )
 
 
-def serve(host: str = "0.0.0.0", port: int = 50052, peer_id: str = "relay"):
+def serve(host: str = "::", port: int = 50052, peer_id: str = "relay"):
     """Start the relay gRPC service."""
     relay = RelayServer(max_registrations=1024, heartbeat_timeout_s=300.0)
     servicer = RelayServicer(relay, relay_peer_id=peer_id)
@@ -188,7 +188,8 @@ def serve(host: str = "0.0.0.0", port: int = 50052, peer_id: str = "relay"):
         ],
     )
     peer_pb2_grpc.add_PeerServicer_to_server(servicer, server)
-    server.add_insecure_port(f"{host}:{port}")
+    from coordinator.net_utils import format_address
+    server.add_insecure_port(format_address(host, port))
     server.start()
     logger.info("relay_service_started: %s:%d peer_id=%s", host, port, peer_id)
 
@@ -201,7 +202,7 @@ def serve(host: str = "0.0.0.0", port: int = 50052, peer_id: str = "relay"):
 
 def main():
     parser = argparse.ArgumentParser(description="OpenHydra gRPC relay for NAT traversal")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="::")
     parser.add_argument("--port", type=int, default=50052)
     parser.add_argument("--peer-id", default="relay")
     args = parser.parse_args()

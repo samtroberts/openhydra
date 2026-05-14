@@ -75,7 +75,6 @@ from peer.hardware import detect_hardware_profile
 from peer.model_shard import ModelShard, ToyShardConfig
 from peer.tls import load_server_credentials
 from peer import peer_pb2
-from peer import peer_pb2_grpc
 from openhydra_secrets import is_insecure_secret_value, load_secret_store
 try:
     from torrent.session import SessionBootstrapConfig, TorrentSessionManager
@@ -136,6 +135,8 @@ PROXY_METHOD_FORWARD = b'\x01'      # ForwardRequest → call Forward(), block f
 PROXY_METHOD_PUSH_RESULT = b'\x02'  # ForwardResponse → call PushResult()
 PROXY_METHOD_FIRE_FORGET = b'\x03'  # ForwardRequest → ACK immediately, Forward() in background
 PROXY_METHOD_FIRE_FORGET_RESULT = b'\x04'  # ForwardResponse → ACK immediately, PushResult() in background
+PROXY_METHOD_PING = b'\x05'                # PingRequest → call Ping(), block for response
+PROXY_METHOD_GET_STATUS = b'\x06'          # PeerStatusRequest → call GetPeerStatus(), block for response
 
 
 def _proxy_handler_loop(
@@ -213,6 +214,22 @@ def _proxy_handler_loop(
                     p2p_node.respond_proxy(
                         request_id=req_id,
                         data=PROXY_METHOD_PUSH_RESULT + ack.SerializeToString(),
+                    )
+                elif raw and raw[0:1] == PROXY_METHOD_PING:
+                    ping_req = peer_pb2.PingRequest()
+                    ping_req.ParseFromString(raw[1:])
+                    ping_resp = service.Ping(ping_req, context=None)
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_PING + ping_resp.SerializeToString(),
+                    )
+                elif raw and raw[0:1] == PROXY_METHOD_GET_STATUS:
+                    status_req = peer_pb2.PeerStatusRequest()
+                    status_req.ParseFromString(raw[1:])
+                    status_resp = service.GetPeerStatus(status_req, context=None)
+                    p2p_node.respond_proxy(
+                        request_id=req_id,
+                        data=PROXY_METHOD_GET_STATUS + status_resp.SerializeToString(),
                     )
                 else:
                     # Forward path (0x01 prefix or legacy no-prefix).
@@ -816,109 +833,8 @@ def _coordinator_handle_push_result(
     )
 
 
-class _CoordinatorOnlyPushResultServicer(peer_pb2_grpc.PeerServicer):
-    """Minimal gRPC servicer for pure-coordinator mode.
-
-    Implements ONLY the ``PushResult`` RPC — the coord has no shard so
-    ``Forward`` / ``Ping`` / etc. are not applicable. Every other method
-    returns ``UNIMPLEMENTED``. ``PushResult`` dispatches to the shared
-    ``_coordinator_handle_push_result`` helper.
-    """
-
-    def PushResult(
-        self,
-        request: Any,
-        context: Any,
-    ) -> Any:
-        # Use the p2p_node attached to the servicer (set at server
-        # start) for the reinject fire-and-forget path.
-        return _coordinator_handle_push_result(
-            response=request,
-            p2p_node=getattr(self, "_p2p_node", None),
-        )
-
-    def Forward(self, request, context):  # pragma: no cover
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("pure-coordinator: Forward not served (no shard)")
-        return peer_pb2.ForwardResponse(
-            error="pure_coordinator_forward_unimplemented",
-        )
-
-    def Ping(self, request, context):  # pragma: no cover
-        from peer import peer_pb2 as _pp
-        return _pp.PingResponse(
-            peer_id="coordinator-standalone-head", ok=True, load_pct=0.0,
-            daemon_mode="coordinator", geo_nonce_signature="",
-        )
-
-    def GetPeerStatus(self, request, context):  # pragma: no cover
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("pure-coordinator: not a peer")
-        return peer_pb2.PeerStatusResponse(peer_id="coordinator-standalone-head")
 
 
-def start_coordinator_grpc_server(
-    *,
-    host: str = "0.0.0.0",
-    port: int = 50050,
-    p2p_node: Any = None,
-) -> Any:
-    """Start a minimal gRPC server for pure-coordinator Path A.
-
-    Binds ``host:port`` and serves ONLY the ``PushResult`` RPC (via
-    :class:`_CoordinatorOnlyPushResultServicer`). Used when
-    ``--no-local-peer`` is set: the peer thread is skipped but
-    LAN-reachable last peers still need a gRPC target for
-    ``final_callback_address`` direct pushes.
-
-    Returns the ``grpc.Server`` instance so the caller can stop it on
-    SIGTERM.
-    """
-    from concurrent import futures
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=16),
-        options=[
-            ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-            ("grpc.max_send_message_length", 100 * 1024 * 1024),
-        ],
-    )
-    servicer = _CoordinatorOnlyPushResultServicer()
-    servicer._p2p_node = p2p_node  # stash for reinject fire-and-forget
-    peer_pb2_grpc.add_PeerServicer_to_server(servicer, server)
-    _addr = f"{host}:{port}"
-    server.add_insecure_port(_addr)
-    server.start()
-    logging.info(
-        "coordinator_grpc_server_bound: %s — PushResult only",
-        _addr,
-    )
-    return server
-
-
-def _relay_heartbeat_loop(
-    *,
-    stop_event: threading.Event,
-    relay_channel: Any,
-    peer_id: str,
-    interval_s: float = 120.0,
-) -> None:
-    """Send periodic heartbeats to the relay to keep registration alive.
-
-    The RelayServer expires registrations after 300s without activity.
-    This thread sends a Ping every 120s — well within the timeout.
-    """
-    from peer import peer_pb2, peer_pb2_grpc
-    stub = peer_pb2_grpc.PeerStub(relay_channel)
-    while not stop_event.is_set():
-        try:
-            stub.Ping(
-                peer_pb2.PingRequest(sent_unix_ms=int(time.time() * 1000)),
-                timeout=10.0,
-                metadata=[("x-openhydra-peer-id", peer_id)],
-            )
-        except Exception as exc:
-            logging.warning("relay_heartbeat_failed: peer=%s err=%s", peer_id, exc)
-        stop_event.wait(interval_s)
 
 
 def _resolve_quantization_mode(quantization: str, quantization_mode: str | None) -> str:
@@ -976,7 +892,7 @@ def _resolve_deployment_security_settings(parser: argparse.ArgumentParser, args:
     }
 
 
-class PeerService(peer_pb2_grpc.PeerServicer):
+class PeerService:
     def __init__(
         self,
         peer_id: str,
@@ -1135,134 +1051,7 @@ class PeerService(peer_pb2_grpc.PeerServicer):
         self.onion_next_peer_history: list[str] = []
         # ── gRPC channel cache ───────────────────────────────────────
         # Reuse TCP+HTTP/2 connections instead of create/destroy per
-        # token. Eliminates ~5-8 ms per-hop handshake on WiFi LAN.
-        self._grpc_channels: dict[str, grpc.Channel] = {}
-        self._grpc_channels_lock = threading.Lock()
-        # ── Phase 2: TCP-to-libp2p tunnel state ─────────────────────
-        # Maps libp2p_peer_id → "127.0.0.1:<port>" for peers with an
-        # active DCUtR tunnel. Populated by _tunnel_monitor_loop when
-        # poll_dcutr_event() fires; cleared when poll_tunnel_close_event()
-        # fires or the tunnel is explicitly closed.
-        self._tunnel_channels: dict[str, str] = {}
-        self._tunnel_channels_lock = threading.Lock()
-        # Start the tunnel monitor background thread if P2P is active.
-        if self._p2p_node is not None:
-            self._tunnel_monitor_thread = threading.Thread(
-                target=self._tunnel_monitor_loop,
-                daemon=True,
-                name="tunnel-monitor",
-            )
-            self._tunnel_monitor_thread.start()
-
-    def _get_grpc_channel(self, address: str) -> grpc.Channel:
-        """Get or create a cached gRPC channel for ``address``.
-
-        gRPC channels are thread-safe and handle reconnection
-        automatically.  Caching eliminates per-token TCP+HTTP/2
-        handshake cost (~5-8 ms on WiFi LAN), which compounds to
-        ~10-15 ms/token on a 2-hop ring.
-        """
-        with self._grpc_channels_lock:
-            ch = self._grpc_channels.get(address)
-            if ch is not None:
-                return ch
-            ch = grpc.insecure_channel(
-                address,
-                options=[
-                    ("grpc.max_receive_message_length", 100 * 1024 * 1024),
-                    ("grpc.max_send_message_length", 100 * 1024 * 1024),
-                    ("grpc.keepalive_time_ms", 30000),
-                    ("grpc.keepalive_timeout_ms", 5000),
-                    ("grpc.keepalive_permit_without_calls", 1),
-                    ("grpc.http2.max_pings_without_data", 0),
-                ],
-            )
-            self._grpc_channels[address] = ch
-            logger.info(
-                "grpc_channel_cached: %s (total=%d)",
-                address, len(self._grpc_channels),
-            )
-            return ch
-
-    # ── Phase 2: Tunnel monitor ──────────────────────────────────────
-    def _tunnel_monitor_loop(self) -> None:
-        """Background thread that polls for DCUtR success and tunnel close
-        events from the Rust P2P layer.
-
-        When DCUtR succeeds for a peer, opens a tunnel and caches the
-        local address. When a tunnel closes (connection lost), removes
-        the cached address so routing falls back to relay.
-        """
-        import time
-        logger.info("tunnel_monitor_started")
-        while True:
-            try:
-                p2p = self._p2p_node
-                if p2p is None:
-                    break
-
-                # Poll DCUtR success events — open tunnels for new direct peers.
-                while True:
-                    try:
-                        peer_id = p2p.poll_dcutr_event()
-                    except Exception:
-                        break
-                    if peer_id is None:
-                        break
-                    # Check if we already have a tunnel for this peer.
-                    with self._tunnel_channels_lock:
-                        if peer_id in self._tunnel_channels:
-                            logger.debug(
-                                "tunnel_monitor: already have tunnel for %s",
-                                peer_id[:20],
-                            )
-                            continue
-                    try:
-                        tunnel_addr = p2p.open_tunnel(peer_id)
-                        with self._tunnel_channels_lock:
-                            self._tunnel_channels[peer_id] = tunnel_addr
-                        logger.info(
-                            "tunnel_opened: peer=%s addr=%s",
-                            peer_id[:20], tunnel_addr,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "tunnel_open_failed: peer=%s err=%s",
-                            peer_id[:20], exc,
-                        )
-
-                # Poll tunnel close events — remove cached addresses.
-                while True:
-                    try:
-                        peer_id = p2p.poll_tunnel_close_event()
-                    except Exception:
-                        break
-                    if peer_id is None:
-                        break
-                    with self._tunnel_channels_lock:
-                        removed = self._tunnel_channels.pop(peer_id, None)
-                    if removed:
-                        logger.info(
-                            "tunnel_closed: peer=%s addr=%s",
-                            peer_id[:20], removed,
-                        )
-                    else:
-                        logger.debug(
-                            "tunnel_close_event for unknown peer=%s",
-                            peer_id[:20],
-                        )
-            except Exception as exc:
-                logger.warning("tunnel_monitor_error: %s", exc)
-
-            time.sleep(0.5)  # 500ms poll interval
-
-    def _get_tunnel_addr(self, libp2p_peer_id: str) -> str | None:
-        """Return the local tunnel address for ``libp2p_peer_id``, or
-        ``None`` if no tunnel exists."""
-        if not libp2p_peer_id:
-            return None
-        with self._tunnel_channels_lock:
-            return self._tunnel_channels.get(libp2p_peer_id)
+        # (gRPC channel cache removed — unified libp2p transport)
 
     # ── Path A: coordinator-side HeadSampler registration ────────────
     def _maybe_register_head_source(self) -> None:
@@ -2077,125 +1866,82 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     # Emit token to coordinator's async queue (no-op if
                     # this process has no ring queue registered).
                     from coordinator.push_receiver import emit_ring_token
-                    _is_ring_eos = _ring_token in _ring_eos
                     emit_ring_token(_ring_cb_id, _ring_token)
-                    logger.info("ring_token_emitted: token=%d remaining=%d eos=%s", _ring_token, _ring_remaining, _is_ring_eos)
+                    logger.info("ring_token_emitted: token=%d remaining=%d", _ring_token, _ring_remaining)
 
-                    # ── EOS early-exit ────────────────────────────────────
-                    # When EOS is detected or max tokens exhausted, skip
-                    # the expensive forward-pass loop but STILL send one
-                    # final loop-back to stage-0 with remaining=0.
-                    # Stage-0 (co-located with coordinator) emits the
-                    # sentinel to the ring queue. Without this loop-back
-                    # the coordinator's drain loop never receives the
-                    # None sentinel and waits the full 120 s timeout.
-                    if _ring_remaining <= 0 or _is_ring_eos:
-                        _ring_remaining = 0  # ensure 0 for sentinel path
-                        logger.info(
-                            "ring_eos_early_exit: token=%d remaining=%d "
-                            "eos=%s generated=%d",
-                            _ring_token, _ring_remaining, _is_ring_eos,
-                            len(_ring_generated),
+                    # Always loop back to coordinator — the coordinator's fire-and-forget
+                    # handler emits tokens + sentinel. Even when remaining==0, the
+                    # coordinator needs the final token delivered via the loop-back.
+                    if True:
+                        # Loop back to first peer with the new token.
+                        _ring_route = list(request.ring_full_route)
+                        _ring_next_addr = str(request.ring_first_hop_address)
+                        _ring_next_next = _ring_route[1].address if len(_ring_route) > 1 else ""
+                        _ring_next_next_id = _ring_route[1].peer_id if len(_ring_route) > 1 else ""
+                        _ring_req = peer_pb2.ForwardRequest(
+                            request_id=request.request_id,
+                            activation=[float(_ring_token)],
+                            stage_index=0,
+                            total_stages=request.total_stages,
+                            max_tokens=1,
+                            kv_session_id=request.kv_session_id,
+                            kv_store_activation=True,
+                            kv_use_cached_activation=True,
+                            decode_do_sample=request.decode_do_sample,
+                            decode_temperature=request.decode_temperature,
+                            decode_top_p=request.decode_top_p,
+                            decode_top_k=request.decode_top_k,
+                            decode_seed=request.decode_seed,
+                            shard_layer_start=_ring_route[0].shard_layer_start if _ring_route else 0,
+                            shard_layer_end=_ring_route[0].shard_layer_end if _ring_route else 0,
+                            shard_total_layers=_ring_route[0].shard_total_layers if _ring_route else 0,
+                            push_mode=True,
+                            ring_mode=True,
+                            ring_tokens_remaining=_ring_remaining,
+                            ring_generated_ids=_ring_generated,
+                            ring_eos_ids=list(request.ring_eos_ids),
+                            ring_first_hop_address=request.ring_first_hop_address,
+                            ring_first_hop_peer_id=request.ring_first_hop_peer_id,
+                            ring_first_hop_libp2p_id=request.ring_first_hop_libp2p_id,
+                            ring_full_route=_ring_route,
+                            next_hop_address=_ring_next_next,
+                            next_hop_peer_id=_ring_next_next_id,
+                            final_callback_address=callback_addr,
+                            final_callback_request_id=_ring_cb_id,
+                            final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                            remaining_route=_ring_route[1:],
+                            prompt_token_ids=list(request.prompt_token_ids),
                         )
-
-                    # Always loop back to stage-0: for normal tokens this
-                    # continues the ring; for EOS (remaining=0) stage-0
-                    # emits the token + sentinel and returns early without
-                    # running the forward pass (see ring_complete_in_forward
-                    # at stage_index==0 above).
-                    _ring_route = list(request.ring_full_route)
-                    _ring_next_addr = str(request.ring_first_hop_address)
-                    _ring_next_next = _ring_route[1].address if len(_ring_route) > 1 else ""
-                    _ring_next_next_id = _ring_route[1].peer_id if len(_ring_route) > 1 else ""
-                    _ring_req = peer_pb2.ForwardRequest(
-                        request_id=request.request_id,
-                        activation=[float(_ring_token)],
-                        stage_index=0,
-                        total_stages=request.total_stages,
-                        max_tokens=1,
-                        kv_session_id=request.kv_session_id,
-                        kv_store_activation=True,
-                        kv_use_cached_activation=True,
-                        decode_do_sample=request.decode_do_sample,
-                        decode_temperature=request.decode_temperature,
-                        decode_top_p=request.decode_top_p,
-                        decode_top_k=request.decode_top_k,
-                        decode_seed=request.decode_seed,
-                        shard_layer_start=_ring_route[0].shard_layer_start if _ring_route else 0,
-                        shard_layer_end=_ring_route[0].shard_layer_end if _ring_route else 0,
-                        shard_total_layers=_ring_route[0].shard_total_layers if _ring_route else 0,
-                        push_mode=True,
-                        ring_mode=True,
-                        ring_tokens_remaining=_ring_remaining,
-                        ring_generated_ids=_ring_generated,
-                        ring_eos_ids=list(request.ring_eos_ids),
-                        ring_first_hop_address=request.ring_first_hop_address,
-                        ring_first_hop_peer_id=request.ring_first_hop_peer_id,
-                        ring_first_hop_libp2p_id=request.ring_first_hop_libp2p_id,
-                        ring_full_route=_ring_route,
-                        next_hop_address=_ring_next_next,
-                        next_hop_peer_id=_ring_next_next_id,
-                        final_callback_address=callback_addr,
-                        final_callback_request_id=_ring_cb_id,
-                        final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
-                        remaining_route=_ring_route[1:],
-                        prompt_token_ids=list(request.prompt_token_ids),
-                    )
-                    # Fire-and-forget: ring loop-back in background thread.
-                    # IMPORTANT: Do NOT use _push_to_next_hop here — it rebuilds
-                    # the request with stage_index+1 and wrong shard layers.
-                    # The ring loop-back sends the pre-built _ring_req directly.
-                    import threading as _ring_threading
-                    _ring_first_libp2p = str(request.ring_first_hop_libp2p_id or "")
-                    def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr,
-                                        _libp2p=_ring_first_libp2p):
-                        try:
-                            logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
-                                        _rreq.request_id, _rreq.ring_tokens_remaining,
-                                        _raddr, _libp2p[:20] if _libp2p else "none")
-                            # LAN-first: if we can reach the first
-                            # peer directly via gRPC on a shared /16,
-                            # bypass the libp2p relay path.
-                            from peer.lan_routing import (
-                                is_reachable_lan as _ir, parse_host_from_address as _ph,
-                            )
-                            _lh = _ph(_raddr)
-                            _lan_ok = bool(_lh) and _ir(_lh)
-                            if _lan_ok and _raddr:
-                                _rl_ch = self._get_grpc_channel(_raddr)
-                                _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
-                                _rl_stub.Forward(_rreq, timeout=60.0)
-                                logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_lan",
-                                            _rreq.request_id, _rreq.ring_tokens_remaining)
-                            elif self._p2p_node is not None and _libp2p:
-                                _rl_direct = False
-                                try:
-                                    _rl_direct = self._p2p_node.is_peer_connected(_libp2p)
-                                except Exception:
-                                    pass
-                                # Phase 1: fire-and-forget — no ACK wait.
+                        # Fire-and-forget: ring loop-back in background thread.
+                        # IMPORTANT: Do NOT use _push_to_next_hop here — it rebuilds
+                        # the request with stage_index+1 and wrong shard layers.
+                        # The ring loop-back sends the pre-built _ring_req directly.
+                        import threading as _ring_threading
+                        _ring_first_libp2p = str(request.ring_first_hop_libp2p_id or "")
+                        def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr,
+                                            _libp2p=_ring_first_libp2p):
+                            try:
+                                logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
+                                            _rreq.request_id, _rreq.ring_tokens_remaining,
+                                            _raddr, _libp2p[:20] if _libp2p else "none")
+                                # LAN-first: if we can reach the first
+                                # peer directly via gRPC on a shared /16,
+                                if self._p2p_node is None or not _libp2p:
+                                    raise RuntimeError(f"no_libp2p_for_ring_loopback: {_raddr}")
                                 self._p2p_node.proxy_forward_no_wait(
                                     target_peer_id=_libp2p,
                                     data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                                 )
                                 logger.info(
-                                    "RING_LOOPBACK_DONE: req=%s remaining=%d via_%s (no_wait)",
+                                    "RING_LOOPBACK_DONE: req=%s remaining=%d (libp2p=%s)",
                                     _rreq.request_id, _rreq.ring_tokens_remaining,
-                                    "direct_quic" if _rl_direct else "relay",
+                                    _libp2p[:20],
                                 )
-                            elif _raddr:
-                                _rl_ch = self._get_grpc_channel(_raddr)
-                                _rl_stub = peer_pb2_grpc.PeerStub(_rl_ch)
-                                _rl_stub.Forward(_rreq, timeout=60.0)
-                                logger.info("RING_LOOPBACK_DONE: req=%s remaining=%d via_grpc",
-                                            _rreq.request_id, _rreq.ring_tokens_remaining)
-                            else:
-                                logger.error("RING_LOOPBACK_NO_ROUTE: req=%s", _rreq.request_id)
-                        except Exception as _rl_exc:
-                            logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
-                                         _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
-                                         exc_info=True)
-                    _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
+                            except Exception as _rl_exc:
+                                logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
+                                             _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
+                                             exc_info=True)
+                        _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
 
                 elif callback_addr:
                     # Last peer: send result back to coordinator (non-ring push)
@@ -2566,8 +2312,6 @@ class PeerService(peer_pb2_grpc.PeerServicer):
     ) -> None:
         """Forward activation to the next peer in the push chain."""
         try:
-            from coordinator.transport import create_channel
-
             # Build next request: carry the activation + remaining route
             next_route = remaining_route[1:] if len(remaining_route) > 1 else []
             next_next_addr = ""
@@ -2646,193 +2390,24 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                 kv_rollback_to=int(getattr(request, "kv_rollback_to", 0) or 0),
             )
 
-            # State-aware routing: ask the Rust bridge if a direct (non-relayed)
-            # connection exists. Zero blocking — instant check.
             _next_hop_libp2p_id = ""
             if remaining_route:
                 _next_hop_libp2p_id = str(getattr(remaining_route[0], 'libp2p_peer_id', '') or '').strip()
 
-            # ── LAN-first routing (2026-04-24) ─────────────────────────
-            # When ``next_address`` is a private IP that we can reach via
-            # a local interface in the same /16, prefer direct gRPC
-            # unconditionally — even when libp2p is available. This
-            # collapses cross-VPC libp2p relay hops (which break under
-            # symmetric NAT, even with DCUtR) into single-RTT LAN gRPC.
-            from peer.lan_routing import is_reachable_lan, parse_host_from_address
-            _next_host = parse_host_from_address(next_address)
-            _lan_reachable = bool(_next_host) and is_reachable_lan(_next_host)
+            if not _next_hop_libp2p_id or self._p2p_node is None:
+                raise RuntimeError(f"no_libp2p_id_for_next_hop: {next_address}")
 
-            # For IPv6 targets, detect whether this is a true LAN address
-            # (private/link-local) or a global IPv6 that might be firewalled.
-            # Global IPv6 gets a short timeout + relay fallback.
-            import ipaddress as ipaddress
-            _is_ipv6_global = False
-            if _lan_reachable and _next_host:
-                try:
-                    _target_ip = ipaddress.ip_address(_next_host)
-                    _is_ipv6_global = (
-                        isinstance(_target_ip, ipaddress.IPv6Address)
-                        and _target_ip.is_global
-                    )
-                except ValueError:
-                    pass
-
-            if _lan_reachable and next_address and _is_ipv6_global:
-                # ── IPv6 direct attempt with fast fallback to relay ──
-                # Global IPv6 is end-to-end routable in principle, but
-                # the remote ISP may firewall inbound. Try direct gRPC
-                # with a short timeout; on failure, cache the negative
-                # result for 60s so subsequent tokens skip straight to
-                # relay without the 3s penalty.
-                import time as _v6_time
-                _v6_neg_cache = getattr(self, "_ipv6_neg_cache", None) or {}
-                _v6_neg_ttl = 60.0
-                _v6_cached_fail = (
-                    next_address in _v6_neg_cache
-                    and (_v6_time.monotonic() - _v6_neg_cache[next_address]) < _v6_neg_ttl
-                )
-                _ipv6_ok = False
-                if _v6_cached_fail:
-                    logger.debug(
-                        "push_ipv6_skip_cached: req=%s -> %s (neg cache hit)",
-                        request.request_id, next_address,
-                    )
-                else:
-                    try:
-                        logger.info(
-                            "push_try_ipv6_direct: req=%s stage=%d -> %s",
-                            request.request_id, request.stage_index, next_address,
-                        )
-                        channel = self._get_grpc_channel(next_address)
-                        stub = peer_pb2_grpc.PeerStub(channel)
-                        stub.Forward(next_req, timeout=3.0)
-                        _ipv6_ok = True
-                        # Success — clear any negative cache entry
-                        _v6_neg_cache.pop(next_address, None)
-                        self._ipv6_neg_cache = _v6_neg_cache
-                    except Exception as _v6_exc:
-                        logger.info(
-                            "push_ipv6_direct_failed: req=%s stage=%d -> %s "
-                            "err=%s — caching failure for %.0fs, using relay",
-                            request.request_id, request.stage_index,
-                            next_address, _v6_exc, _v6_neg_ttl,
-                        )
-                        _v6_neg_cache[next_address] = _v6_time.monotonic()
-                        self._ipv6_neg_cache = _v6_neg_cache
-                if _ipv6_ok:
-                    logger.info(
-                        "push_forwarded_via_ipv6: req=%s stage=%d -> %s",
-                        request.request_id, request.stage_index, next_address,
-                    )
-                elif self._p2p_node is not None and _next_hop_libp2p_id:
-                    # IPv6 gRPC failed — route via libp2p (direct QUIC
-                    # if DCUtR succeeded, otherwise relay).
-                    # Phase 1: fire-and-forget — no ACK wait.
-                    self._p2p_node.proxy_forward_no_wait(
-                        target_peer_id=_next_hop_libp2p_id,
-                        data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
-                    )
-                    _v6_fb_direct = False
-                    try:
-                        _v6_fb_direct = self._p2p_node.is_peer_connected(
-                            _next_hop_libp2p_id
-                        )
-                    except Exception:
-                        pass
-                    _v6_fb_label = "direct_quic" if _v6_fb_direct else "relay"
-                    logger.info(
-                        "push_forwarded_via_%s: req=%s stage=%d -> %s "
-                        "(ipv6_fallback; libp2p=%s; no_wait)",
-                        _v6_fb_label,
-                        request.request_id, request.stage_index,
-                        next_address, _next_hop_libp2p_id[:20],
-                    )
-            elif _lan_reachable and next_address:
-                logger.info(
-                    "push_forwarded_via_lan: req=%s stage=%d -> %s "
-                    "(LAN-first; bypassing libp2p_id=%s)",
-                    request.request_id, request.stage_index, next_address,
-                    _next_hop_libp2p_id[:20] if _next_hop_libp2p_id else "none",
-                )
-                _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
-                if _depth_ff >= 2:
-                    self._dispatch_direct_grpc_async(
-                        next_address, next_req, label="lan",
-                        request_id=str(request.request_id),
-                    )
-                else:
-                    channel = self._get_grpc_channel(next_address)
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(next_req, timeout=60.0)
-            elif self._p2p_node is not None and _next_hop_libp2p_id:
-                # ── Phase 2: Check for TCP-to-libp2p tunnel first ──
-                # If DCUtR succeeded and a tunnel is active, route gRPC
-                # directly through the tunnel (127.0.0.1:<port>) —
-                # bypasses both the relay proxy and the request_response
-                # layer, cutting per-hop latency from ~200-600ms to
-                # ~5-30ms.
-                _tunnel_addr = self._get_tunnel_addr(_next_hop_libp2p_id)
-                if _tunnel_addr:
-                    _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
-                    if _depth_ff >= 2:
-                        self._dispatch_direct_grpc_async(
-                            _tunnel_addr, next_req, label="tunnel",
-                            request_id=str(request.request_id),
-                        )
-                    else:
-                        channel = self._get_grpc_channel(_tunnel_addr)
-                        stub = peer_pb2_grpc.PeerStub(channel)
-                        stub.Forward(next_req, timeout=60.0)
-                    logger.info(
-                        "push_forwarded_via_tunnel: req=%s stage=%d -> %s "
-                        "(tunnel=%s; libp2p=%s)",
-                        request.request_id, request.stage_index,
-                        next_address, _tunnel_addr, _next_hop_libp2p_id[:20],
-                    )
-                else:
-                    # ── Option C: libp2p relay/direct QUIC fallback ──
-                    _is_direct_peer = False
-                    try:
-                        _is_direct_peer = self._p2p_node.is_peer_connected(
-                            _next_hop_libp2p_id
-                        )
-                    except Exception:
-                        pass
-
-                    # Fire-and-forget: no ACK wait. libp2p routes via direct
-                    # QUIC when the peer is in direct_peers, otherwise relay.
-                    self._p2p_node.proxy_forward_no_wait(
-                        target_peer_id=_next_hop_libp2p_id,
-                        data=PROXY_METHOD_FIRE_FORGET + next_req.SerializeToString(),
-                    )
-                    _route_label = "direct_quic" if _is_direct_peer else "relay"
-                    logger.info(
-                        "push_forwarded_via_%s: req=%s stage=%d -> %s (libp2p=%s; no_wait)",
-                        _route_label,
-                        request.request_id, request.stage_index,
-                        next_address, _next_hop_libp2p_id[:20],
-                    )
-            elif next_address:
-                # No P2P node — direct gRPC only (LAN/VPC path).
-                _depth_ff = max(1, int(getattr(request, "pipeline_depth", 1) or 1))
-                if _depth_ff >= 2:
-                    self._dispatch_direct_grpc_async(
-                        next_address, next_req, label="direct",
-                        request_id=str(request.request_id),
-                    )
-                else:
-                    channel = self._get_grpc_channel(next_address)
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.Forward(next_req, timeout=60.0)
-                logger.info(
-                    "push_forwarded: req=%s stage=%d -> %s",
-                    request.request_id, request.stage_index, next_address,
-                )
-            else:
-                logger.warning(
-                    "push_forward_no_route: req=%s stage=%d (no direct, no relay, no address)",
-                    request.request_id, request.stage_index,
-                )
+            _payload = bytearray(PROXY_METHOD_FIRE_FORGET)
+            _payload.extend(next_req.SerializeToString())
+            self._p2p_node.proxy_forward_no_wait(
+                target_peer_id=_next_hop_libp2p_id,
+                data=bytes(_payload),
+            )
+            logger.info(
+                "push_forwarded: req=%s stage=%d -> %s (libp2p=%s)",
+                request.request_id, request.stage_index,
+                next_address, _next_hop_libp2p_id[:20],
+            )
         except Exception as exc:
             logger.error("PUSH_FORWARD_CRASH: %s -> %s: %s", self.peer_id, next_address, exc,
                          exc_info=True)
@@ -2881,227 +2456,23 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     block_index=int(getattr(response, "block_index", 0) or 0),
                 )
             _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
-            # LAN-first: if the callback address is a private IP we can
-            # reach via a local interface (same /16), bypass libp2p
-            # entirely. Caller is the coordinator's PushResult endpoint;
-            # when coord and last-peer share a VPC subnet this saves a
-            # transcontinental relay round-trip.
-            from peer.lan_routing import is_reachable_lan, parse_host_from_address
-            _cb_host = parse_host_from_address(callback_address)
-            _cb_lan_reachable = bool(_cb_host) and is_reachable_lan(_cb_host)
+            if not _cb_libp2p or self._p2p_node is None:
+                raise RuntimeError(f"no_libp2p_id_for_callback: {callback_address}")
 
-            # Note: previous versions branched on
-            # ``_p2p_node.is_peer_connected(_cb_libp2p)`` before picking
-            # between direct gRPC and libp2p. That heuristic is wrong
-            # for PushResult — libp2p-connected says nothing about
-            # whether ``callback_address`` is network-reachable from
-            # here. We now rely purely on (a) LAN reachability for
-            # direct gRPC, (b) libp2p presence for relay, (c) last-
-            # resort direct gRPC. The ``is_peer_connected`` probe is
-            # still useful for the outbound Push-to-next-peer path
-            # (different call site); dropped only here.
-
-            _depth_ff = max(1, int(pipeline_depth or 1))
-
-            # Detect global IPv6 — needs try-then-fallback instead of
-            # unconditional direct (ISP may firewall inbound).
-            import ipaddress as ipaddress
-            _cb_ipv6_global = False
-            if _cb_lan_reachable and _cb_host:
-                try:
-                    _cb_ip = ipaddress.ip_address(_cb_host)
-                    _cb_ipv6_global = (
-                        isinstance(_cb_ip, ipaddress.IPv6Address)
-                        and _cb_ip.is_global
-                    )
-                except ValueError:
-                    pass
-
-            if _cb_lan_reachable and callback_address and _cb_ipv6_global:
-                # ── IPv6 direct PushResult with relay fallback ────────
-                import time as _v6_time
-                _v6_neg = getattr(self, "_ipv6_neg_cache", None) or {}
-                _v6_cached = (
-                    callback_address in _v6_neg
-                    and (_v6_time.monotonic() - _v6_neg[callback_address]) < 60.0
-                )
-                _v6_ok = False
-                if not _v6_cached:
-                    try:
-                        channel = self._get_grpc_channel(callback_address)
-                        stub = peer_pb2_grpc.PeerStub(channel)
-                        stub.PushResult(response, timeout=3.0)
-                        _v6_ok = True
-                        _v6_neg.pop(callback_address, None)
-                        self._ipv6_neg_cache = _v6_neg
-                    except Exception as _v6_exc:
-                        logger.info(
-                            "push_result_ipv6_failed: req=%s -> %s "
-                            "err=%s — caching, using relay",
-                            response.request_id, callback_address, _v6_exc,
-                        )
-                        _v6_neg[callback_address] = _v6_time.monotonic()
-                        self._ipv6_neg_cache = _v6_neg
-                if _v6_ok:
-                    logger.info(
-                        "push_result_sent_via_ipv6: req=%s -> %s",
-                        response.request_id, callback_address,
-                    )
-                elif self._p2p_node is not None and _cb_libp2p:
-                    # IPv6 gRPC failed — route via libp2p (direct QUIC
-                    # if DCUtR succeeded, otherwise relay).
-                    # Phase 1: fire-and-forget — no ACK wait.
-                    self._p2p_node.proxy_forward_no_wait(
-                        target_peer_id=_cb_libp2p,
-                        data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
-                    )
-                    _v6r_direct = False
-                    try:
-                        _v6r_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
-                    except Exception:
-                        pass
-                    _v6r_label = "direct_quic" if _v6r_direct else "relay"
-                    logger.info(
-                        "push_result_sent_via_%s: req=%s -> %s "
-                        "(ipv6_fallback; libp2p=%s; no_wait)",
-                        _v6r_label,
-                        response.request_id, callback_address, _cb_libp2p[:20],
-                    )
-            elif _cb_lan_reachable and callback_address:
-                # LAN-direct gRPC to coordinator — fastest path (IPv4 LAN).
-                if _depth_ff >= 2:
-                    self._dispatch_push_result_async(
-                        callback_address, response, label="lan",
-                    )
-                else:
-                    channel = self._get_grpc_channel(callback_address)
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.PushResult(response, timeout=10.0)
-                logger.info(
-                    "push_result_sent_via_lan: req=%s -> %s "
-                    "(LAN-first; bypassing libp2p)",
-                    response.request_id, callback_address,
-                )
-            elif self._p2p_node is not None and _cb_libp2p:
-                # ── Phase 2: Check for TCP-to-libp2p tunnel first ──
-                _tunnel_addr = self._get_tunnel_addr(_cb_libp2p)
-                if _tunnel_addr:
-                    if _depth_ff >= 2:
-                        self._dispatch_push_result_async(
-                            _tunnel_addr, response, label="tunnel",
-                        )
-                    else:
-                        channel = self._get_grpc_channel(_tunnel_addr)
-                        stub = peer_pb2_grpc.PeerStub(channel)
-                        stub.PushResult(response, timeout=10.0)
-                    logger.info(
-                        "push_result_sent_via_tunnel: req=%s -> %s "
-                        "(tunnel=%s; libp2p=%s)",
-                        response.request_id, callback_address,
-                        _tunnel_addr, _cb_libp2p[:20],
-                    )
-                else:
-                    # Route via libp2p — direct QUIC if DCUtR succeeded,
-                    # otherwise through circuit relay.
-                    # Phase 1: fire-and-forget — no ACK wait.
-                    _pr_is_direct = False
-                    try:
-                        _pr_is_direct = self._p2p_node.is_peer_connected(_cb_libp2p)
-                    except Exception:
-                        pass
-                    self._p2p_node.proxy_forward_no_wait(
-                        target_peer_id=_cb_libp2p,
-                        data=PROXY_METHOD_FIRE_FORGET_RESULT + response.SerializeToString(),
-                    )
-                    _pr_label = "direct_quic" if _pr_is_direct else "relay"
-                    logger.info(
-                        "push_result_sent_via_%s: req=%s -> %s (libp2p=%s; no_wait)",
-                        _pr_label,
-                        response.request_id, callback_address, _cb_libp2p[:20],
-                    )
-            else:
-                # No P2P node — direct gRPC only.
-                if _depth_ff >= 2:
-                    self._dispatch_push_result_async(
-                        callback_address, response, label="direct",
-                    )
-                else:
-                    channel = self._get_grpc_channel(callback_address)
-                    stub = peer_pb2_grpc.PeerStub(channel)
-                    stub.PushResult(response, timeout=10.0)
-                logger.info(
-                    "push_result_sent: req=%s -> %s",
-                    response.request_id, callback_address,
-                )
+            _payload = bytearray(PROXY_METHOD_FIRE_FORGET_RESULT)
+            _payload.extend(response.SerializeToString())
+            self._p2p_node.proxy_forward_no_wait(
+                target_peer_id=_cb_libp2p,
+                data=bytes(_payload),
+            )
+            logger.info(
+                "push_result_sent: req=%s -> %s (libp2p=%s)",
+                response.request_id, callback_address, _cb_libp2p[:20],
+            )
         except Exception as exc:
             logger.warning("push_result_failed: %s: %s", callback_address, exc)
 
     # ── Phase 2a: fire-and-forget direct-gRPC dispatch helpers ───────
-    def _dispatch_direct_grpc_async(
-        self,
-        next_address: str,
-        next_req: peer_pb2.ForwardRequest,
-        *,
-        label: str,
-        request_id: str,
-    ) -> None:
-        """Send a ForwardRequest on a daemon thread and return instantly.
-
-        Used by ``_push_to_next_hop`` under ``pipeline_depth >= 2`` so
-        the gRPC handler thread isn't blocked by the next-hop send. The
-        receiving peer's Forward handler is idempotent under retry and
-        Path A push mode doesn't depend on the response body.
-        """
-        import threading as _ff_threading
-
-        def _send():
-            try:
-                ch = self._get_grpc_channel(next_address)
-                stub = peer_pb2_grpc.PeerStub(ch)
-                stub.Forward(next_req, timeout=60.0)
-            except Exception as exc:
-                logger.warning(
-                    "push_forward_async_failed: req=%s label=%s -> %s: %s",
-                    request_id, label, next_address, exc,
-                )
-
-        _ff_threading.Thread(
-            target=_send, daemon=True,
-            name=f"oh-push-fwd-{label}",
-        ).start()
-
-    def _dispatch_push_result_async(
-        self,
-        callback_address: str,
-        response: peer_pb2.ForwardResponse,
-        *,
-        label: str,
-    ) -> None:
-        """Send a PushResult on a daemon thread and return instantly.
-
-        Used by ``_push_final_result`` under ``pipeline_depth >= 2`` so
-        the last peer's gRPC handler isn't blocked by the coord-bound
-        send — frees it to start computing the next slot's forward
-        immediately.
-        """
-        import threading as _ff_threading
-
-        def _send():
-            try:
-                ch = self._get_grpc_channel(callback_address)
-                stub = peer_pb2_grpc.PeerStub(ch)
-                stub.PushResult(response, timeout=10.0)
-            except Exception as exc:
-                logger.warning(
-                    "push_result_async_failed: req=%s label=%s -> %s: %s",
-                    response.request_id, label, callback_address, exc,
-                )
-
-        _ff_threading.Thread(
-            target=_send, daemon=True,
-            name=f"oh-push-result-{label}",
-        ).start()
-
     # ── Path A: coordinator-side sample-and-reinject ─────────────────
     def _handle_hidden_state_push_result(
         self,
@@ -3332,49 +2703,16 @@ class PeerService(peer_pb2_grpc.PeerServicer):
                     )
                     return
 
-                # LAN-first: when the coordinator and stage-0 peer share
-                # a /16 (or same /64 for IPv6), skip libp2p entirely.
-                from peer.lan_routing import (
-                    is_reachable_lan as _ir, parse_host_from_address as _ph,
+                if self._p2p_node is None or not _libp2p:
+                    raise RuntimeError(f"no_libp2p_for_coord_reinject: {_addr}")
+                self._p2p_node.proxy_forward_no_wait(
+                    target_peer_id=_libp2p,
+                    data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
                 )
-                _lh = _ph(_addr)
-                _lan_ok = bool(_lh) and _ir(_lh)
-                if _lan_ok and _addr:
-                    _ch = self._get_grpc_channel(_addr)
-                    _stub = peer_pb2_grpc.PeerStub(_ch)
-                    _stub.Forward(_rreq, timeout=60.0)
-                    logger.info(
-                        "COORD_REINJECT_DONE: req=%s via_lan",
-                        _rreq.request_id,
-                    )
-                elif self._p2p_node is not None and _libp2p:
-                    _cr_direct = False
-                    try:
-                        _cr_direct = self._p2p_node.is_peer_connected(_libp2p)
-                    except Exception:
-                        pass
-                    # Phase 1: fire-and-forget — no ACK wait.
-                    self._p2p_node.proxy_forward_no_wait(
-                        target_peer_id=_libp2p,
-                        data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
-                    )
-                    _cr_label = "direct_quic" if _cr_direct else "relay"
-                    logger.info(
-                        "COORD_REINJECT_DONE: req=%s via_%s (no_wait)",
-                        _rreq.request_id, _cr_label,
-                    )
-                elif _addr:
-                    _ch = self._get_grpc_channel(_addr)
-                    _stub = peer_pb2_grpc.PeerStub(_ch)
-                    _stub.Forward(_rreq, timeout=60.0)
-                    logger.info(
-                        "COORD_REINJECT_DONE: req=%s via_grpc",
-                        _rreq.request_id,
-                    )
-                else:
-                    logger.error(
-                        "COORD_REINJECT_NO_ROUTE: req=%s", _rreq.request_id,
-                    )
+                logger.info(
+                    "COORD_REINJECT_DONE: req=%s (libp2p=%s)",
+                    _rreq.request_id, _libp2p[:20],
+                )
             except Exception as exc:
                 logger.error(
                     "COORD_REINJECT_CRASH: req=%s err=%s",
@@ -4306,63 +3644,16 @@ def serve(
         )
         logging.info("peer %s seeded genesis artifact at %s", peer_id, session_manager.genesis_result.artifact_path)
 
-    bind_addr = f"{host}:{port}"
-    bind_attempt = 0
-    lifecycle_restart_attempt = 0
+    if p2p_node is None:
+        raise RuntimeError(
+            "p2p_node is required — gRPC server has been removed. "
+            "Use --p2p-enabled=True (the default) to start a P2PNode."
+        )
+
+    logging.info("peer %s transport: libp2p (gRPC server removed)", peer_id)
+
     shutdown_requested = False
     while not shutdown_requested:
-        server = None
-        while not shutdown_requested:
-            candidate = grpc.server(futures.ThreadPoolExecutor(max_workers=16), options=GRPC_SERVER_OPTIONS)
-            peer_pb2_grpc.add_PeerServicer_to_server(service, candidate)
-            try:
-                if tls_enable:
-                    if not tls_cert_path or not tls_key_path:
-                        raise ValueError("tls-cert-path and tls-key-path are required when tls is enabled")
-                    credentials = load_server_credentials(
-                        cert_path=tls_cert_path,
-                        key_path=tls_key_path,
-                        client_ca_path=tls_client_ca_path,
-                        require_client_auth=tls_require_client_auth,
-                    )
-                    bound_port = int(candidate.add_secure_port(bind_addr, credentials))
-                    logging.info("peer %s TLS enabled (mTLS=%s)", peer_id, tls_require_client_auth)
-                else:
-                    bound_port = int(candidate.add_insecure_port(bind_addr))
-                    # Also listen on IPv6 so cross-ISP peers with public
-                    # v6 addresses can connect directly (bypasses relay).
-                    if host in ("0.0.0.0", ""):
-                        _v6_addr = f"[::]:{port}"
-                        try:
-                            candidate.add_insecure_port(_v6_addr)
-                            logging.info("peer %s also listening on %s (IPv6)", peer_id, _v6_addr)
-                        except Exception as _v6_err:
-                            logging.debug("peer %s IPv6 bind skipped: %s", peer_id, _v6_err)
-                if bound_port <= 0:
-                    raise RuntimeError(f"bind_failed:{bind_addr}")
-                candidate.start()
-                bind_attempt = 0
-                server = candidate
-                logging.info("peer %s listening on %s", peer_id, bind_addr)
-                break
-            except KeyboardInterrupt:
-                candidate.stop(grace=0)
-                shutdown_requested = True
-                break
-            except Exception as exc:
-                bind_attempt += 1
-                delay_s = _exponential_backoff_delay(bind_attempt - 1, base_seconds=1.0, cap_seconds=60.0)
-                logging.warning(
-                    "peer %s failed to bind/start (%s); retrying in %.1fs",
-                    peer_id,
-                    exc,
-                    delay_s,
-                )
-                candidate.stop(grace=0)
-                time.sleep(delay_s)
-
-        if shutdown_requested or server is None:
-            break
 
         stop_event = threading.Event()
         daemon_thread = threading.Thread(
@@ -4477,90 +3768,7 @@ def serve(
                 )
                 service._nat_type = "unknown"
                 service._requires_relay = True
-        else:
-            # Legacy path — STUN probe + Python relay.
-            try:
-                from coordinator.stun_client import probe_nat
-                import os as _os
-                _force_nat = _os.environ.get("OPENHYDRA_FORCE_NAT", "").strip().lower()
-                if _force_nat:
-                    from coordinator.stun_client import NatProfile
-                    _nat_profile = NatProfile(
-                        reachable=_force_nat == "open",
-                        nat_type=_force_nat,
-                        requires_relay=_force_nat not in ("open", "full_cone"),
-                    )
-                    logging.info("peer %s nat_forced: type=%s requires_relay=%s",
-                                 peer_id, _nat_profile.nat_type, _nat_profile.requires_relay)
-                else:
-                    _nat_profile = probe_nat()
-                    logging.info(
-                        "peer %s nat_probe: type=%s requires_relay=%s external=%s:%d",
-                        peer_id, _nat_profile.nat_type, _nat_profile.requires_relay,
-                        _nat_profile.external_ip, _nat_profile.external_port,
-                    )
-                service._nat_type = _nat_profile.nat_type
-                service._requires_relay = _nat_profile.requires_relay
-
-                if _nat_profile.requires_relay:
-                    from coordinator.relay import connect_to_relay
-                    from openhydra_defaults import DEFAULT_RELAY_PORT
-
-                    _relay_addrs: list[str] = []
-                    _explicit_relay = str(relay_address or "").strip()
-                    if _explicit_relay:
-                        _relay_addrs = [_explicit_relay]
-                    else:
-                        _relay_addrs = _derive_relay_addresses(
-                            resolved_dht_urls, relay_port=DEFAULT_RELAY_PORT,
-                        )
-
-                    for _raddr in _relay_addrs:
-                        try:
-                            _relay_channel, _relay_peer_id = connect_to_relay(
-                                relay_address=_raddr,
-                                peer_id=peer_id,
-                                grpc_port=port,
-                                model_id=model_id,
-                            )
-                            service._relay_peer_id = _relay_peer_id
-                            service._relay_address = _raddr
-                            logging.info(
-                                "peer %s relay_connected: relay=%s relay_peer=%s",
-                                peer_id, _raddr, _relay_peer_id,
-                            )
-                            break
-                        except Exception as _rexc:
-                            logging.warning(
-                                "peer %s relay_connect_failed: %s err=%s",
-                                peer_id, _raddr, _rexc,
-                            )
-
-                    if not getattr(service, '_relay_address', ''):
-                        logging.error(
-                            "peer %s requires relay but all relay candidates failed — "
-                            "this peer will be unreachable by remote coordinators",
-                            peer_id,
-                        )
-                    else:
-                        _relay_heartbeat_thread = threading.Thread(
-                            target=_relay_heartbeat_loop,
-                            kwargs={
-                                "stop_event": stop_event,
-                                "relay_channel": _relay_channel,
-                                "peer_id": peer_id,
-                                "interval_s": 120.0,
-                            },
-                            daemon=True,
-                        )
-                        _relay_heartbeat_thread.start()
-            except Exception as _nat_exc:
-                logging.warning(
-                    "peer %s nat_probe_failed: %s — assuming open (no relay)",
-                    peer_id, _nat_exc,
-                )
-                service._nat_type = "unknown"
-                service._requires_relay = False
+        # Legacy STUN+relay path removed — libp2p Circuit Relay v2 handles NAT.
 
         announce_thread: threading.Thread | None = None
         if resolved_dht_urls or _hivemind_adapter is not None or p2p_node is not None:
@@ -4697,28 +3905,10 @@ def serve(
             )
             _proxy_handler_thread.start()
 
-        restart_delay_s = 0.0
         try:
-            while True:
-                timed_out = bool(server.wait_for_termination(timeout=1.0))
-                if timed_out:
-                    continue
-                raise RuntimeError("grpc_server_terminated")
+            stop_event.wait()
         except KeyboardInterrupt:
             shutdown_requested = True
-        except Exception as exc:
-            lifecycle_restart_attempt += 1
-            restart_delay_s = _exponential_backoff_delay(
-                lifecycle_restart_attempt - 1,
-                base_seconds=1.0,
-                cap_seconds=120.0,
-            )
-            logging.warning(
-                "peer %s runtime interruption (%s); restarting in %.1fs",
-                peer_id,
-                exc,
-                restart_delay_s,
-            )
         finally:
             stop_event.set()
             daemon_thread.join(timeout=2.0)
@@ -4750,17 +3940,9 @@ def serve(
                     _relay_channel.close()
                 except Exception:
                     pass
-            shutdown_event = server.stop(grace=2)
-            try:
-                shutdown_event.wait(timeout=3.0)
-            except Exception:
-                pass
 
         if shutdown_requested:
             break
-
-        if restart_delay_s > 0.0:
-            time.sleep(restart_delay_s)
 
 
 def main() -> None:
@@ -4804,7 +3986,7 @@ def main() -> None:
         return out
 
     parser = argparse.ArgumentParser(description="OpenHydra Tier 1/2 peer server")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="::")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--deployment-profile", choices=["dev", "prod"], default="dev")
     parser.add_argument("--secrets-file", default=None, help="Path to KEY=VALUE secrets file (0600 permissions required)")

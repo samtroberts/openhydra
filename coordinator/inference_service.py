@@ -1148,17 +1148,26 @@ class InferenceService:
             if _local_p2p is not None:
                 _local_libp2p = str(getattr(_local_p2p, 'libp2p_peer_id', '') or '')
                 _local_oh_id = str(getattr(_local_p2p, 'openhydra_peer_id', '') or '')
+                # Detect LAN IP for patching local peer's host address.
+                # ring_first_hop_address uses the pipeline's host — if it
+                # stays 127.0.0.1 the ring loopback from the last peer
+                # connects to that peer's OWN gRPC, not the coordinator's.
+                _push_cb = str(getattr(self.config, 'push_callback_address', '') or '')
+                _local_lan_ip = ""
+                if _push_cb:
+                    from peer.lan_routing import parse_host_from_address
+                    _local_lan_ip = parse_host_from_address(_push_cb)
+                    if _local_lan_ip.startswith('127.'):
+                        _local_lan_ip = ""
+
                 for _i, _sp in enumerate(_sharded_pipeline):
-                    if not _sp.libp2p_peer_id and _local_libp2p:
-                        # Patch: this peer is missing libp2p_peer_id.
-                        # If it's the local peer (host=127.0.0.1 or matching peer_id),
-                        # inject our own ID. Otherwise leave it empty.
-                        _is_local = _sp.host in ("127.0.0.1", "localhost", "0.0.0.0")
-                        if _is_local:
-                            _sharded_pipeline[_i] = _sp.replace(
-                                libp2p_peer_id=_local_libp2p,
-                                requires_relay=True,
-                            )
+                    _is_local = _sp.host in ("127.0.0.1", "localhost", "0.0.0.0")
+                    if _is_local:
+                        _sharded_pipeline[_i] = _sp.replace(
+                            host=_local_lan_ip if _local_lan_ip else _sp.host,
+                            libp2p_peer_id=_local_libp2p if (not _sp.libp2p_peer_id and _local_libp2p) else _sp.libp2p_peer_id,
+                            requires_relay=True if (not _sp.libp2p_peer_id and _local_libp2p) else _sp.requires_relay,
+                        )
             # B3 follow-up: enforce strict layer_start ordering so the
             # peer owning ``[0, ...)`` is always stage 0 regardless of
             # discovery order. Without this, a healthy 2-stage ring can

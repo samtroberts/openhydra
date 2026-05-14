@@ -275,9 +275,11 @@ class TestBatchingQueueUnit:
         assert captured_items[0].request_id == "special-id-123"
 
 
-# ── Group 2: gRPC Integration Tests ───────────────────────────────────────────
+# ── Group 2: gRPC Integration Tests (disabled — gRPC server removed) ──────────
+import pytest
 
 
+@pytest.mark.skip(reason="gRPC server removed — unified libp2p transport")
 class TestBatchingQueueGRPC:
     """Integration tests with a real gRPC toy peer and BatchingQueue."""
 

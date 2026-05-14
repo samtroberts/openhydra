@@ -122,7 +122,7 @@ python3 -m coordinator.node \
     --runtime-backend mlx \
     --layer-start 0 --layer-end 12 \
     --shard-index 0 --total-shards 2 \
-    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --api-port 8080 --api-host 0.0.0.0 \
     --p2p-enabled --push-mode --log-level INFO
 ```
 
@@ -136,7 +136,7 @@ python3 -m coordinator.node \
     --runtime-backend mlx \
     --layer-start 12 --layer-end 24 \
     --shard-index 1 --total-shards 2 \
-    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --api-port 8080 --api-host 0.0.0.0 \
     --p2p-enabled --push-mode --log-level INFO
 ```
 
@@ -208,7 +208,7 @@ python3 -m coordinator.node \
     --runtime-backend mlx \
     --layer-start 0 --layer-end 12 \
     --shard-index 0 --total-shards 2 \
-    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --api-port 8080 --api-host 0.0.0.0 \
     --p2p-enabled --push-mode --log-level INFO
 ```
 
@@ -222,7 +222,7 @@ python3 -m coordinator.node \
     --runtime-backend pytorch \
     --layer-start 12 --layer-end 24 \
     --shard-index 1 --total-shards 2 \
-    --grpc-port 50051 --api-port 8080 --api-host 0.0.0.0 \
+    --api-port 8080 --api-host 0.0.0.0 \
     --p2p-enabled --push-mode --log-level INFO
 ```
 
@@ -339,7 +339,7 @@ python3 -m coordinator.node \
     --runtime-model-id Qwen/Qwen3.5-2B \
     --hf-model-id Qwen/Qwen3.5-2B \
     --total-shards 2 \
-    --grpc-port 50050 --api-port 7050 \
+    --api-port 7050 \
     --peers-config /path/to/peers.json
 ```
 
@@ -351,10 +351,10 @@ On Apple Silicon, use `--standalone-head-backend mlx` with an MLX-quantised mode
 
 ```json
 [
-  {"peer_id": "gpu1", "host": "10.192.11.221", "port": 50051,
+  {"peer_id": "gpu1", "host": "10.192.11.221",
    "layer_start": 0, "layer_end": 12, "total_layers": 24,
    "libp2p_peer_id": "12D3KooW...", "requires_relay": false},
-  {"peer_id": "gpu2", "host": "10.192.15.173", "port": 50052,
+  {"peer_id": "gpu2", "host": "10.192.15.173",
    "layer_start": 12, "layer_end": 24, "total_layers": 24,
    "libp2p_peer_id": "12D3KooW...", "requires_relay": false}
 ]
@@ -366,7 +366,7 @@ On Apple Silicon, use `--standalone-head-backend mlx` with an MLX-quantised mode
 - `--no-local-peer` requires `--runtime-model-id` with an HF repo id (slash-bearing: `Qwen/Qwen3.5-2B`, `mlx-community/Qwen3.5-2B-MLX-8bit`).
 - The backend's host must have the matching runtime deps (MLX on Apple Silicon; torch + transformers on Linux).
 
-**LAN-first routing** — when peers share a `/16` subnet, OpenHydra automatically prefers direct gRPC over libp2p relay hops, even when a libp2p peer_id is advertised. This is what makes the 3-node LAN benchmark ~4× faster than the 2-node cross-ISP ring. See `peer/lan_routing.py`.
+**LAN-first routing** — when peers share a LAN subnet, libp2p mDNS discovers them automatically and establishes direct QUIC connections (no relay, no DCUtR needed). This is what makes the 3-node LAN benchmark ~4× faster than the 2-node cross-ISP ring.
 
 **Qwen3.5 `<think>` preamble** — disabled by default. The HF chat template's `enable_thinking=False` is now wired into `EngineConfig.chat_template_default_kwargs`, saving ~40% of the user-visible token budget on Qwen3.5. Override via `EngineConfig(chat_template_default_kwargs={"enable_thinking": True})` if you want chain-of-thought.
 
@@ -411,7 +411,49 @@ Four Lightning AI studios, each with 1× NVIDIA T4 (15 GB VRAM), sharding Qwen3.
 | Pulp Fiction review | 512 | 73.1s | 7.01 |
 | History of computing | 1024 | 144.6s | 7.08 |
 
-**Sustained average: ~7.0 TPS.** Comparable to the 2-GPU baseline (7.1-7.3 TPS) because the bottleneck is the sequential coordinator-mediated gRPC round-trip per token per stage — 4 stages × ~35ms ≈ 140ms per token. Pipeline depth (tested at 1, 2, and 4) has no measurable effect in this mode; it is designed for the push/ring path where multiple tokens can be in-flight simultaneously.
+**Sustained average: ~7.0 TPS.** Comparable to the 2-GPU baseline (7.1-7.3 TPS) because the bottleneck is the sequential coordinator-mediated round-trip per token per stage — 4 stages × ~35ms ≈ 140ms per token.
+
+### Unified libp2p Transport (2 × T4 Lightning.ai, 2026-05-07)
+
+After removing the gRPC server and routing all tensor traffic through the native libp2p request/response protocol (`/openhydra/tensor/1.0.0`), performance is within 4% of the gRPC baseline on direct connections:
+
+| Prompt | Tokens | Latency | TPS (libp2p) | TPS (gRPC baseline) |
+|--------|--------|---------|-------------|---------------------|
+| 50-word letter | 56 | 6.3 s | **8.9** | 9.3 |
+| P2P 3 sentences | 81 | 9.1 s | **8.9** | 9.3 |
+| P2P 10 sentences | 226 | 24.3 s | **9.3** | 9.0 |
+| Pulp Fiction review | 512 | 53.7 s | **9.5** | 9.8 |
+
+**Qwen 3.5 9B** on the same hardware:
+
+| Prompt | Tokens | Latency | TPS (libp2p) | TPS (gRPC baseline) |
+|--------|--------|---------|-------------|---------------------|
+| 50-word letter | 72 | 11.3 s | **6.4** | 7.2 |
+| P2P 3 sentences | 80 | 12.3 s | **6.5** | 7.1 |
+| P2P 10 sentences | 208 | 31.1 s | **6.7** | 7.3 |
+| Pulp Fiction review | 512 | 75.8 s | **6.8** | 7.3 |
+
+GPU2 discovery latency: 1.0–1.5 ms (direct QUIC on same VPC).
+
+**After SharedProxyQueue optimization** (condvar-based shared queue bypassing the event loop, VecDeque O(1) pop, bytearray pre-allocation):
+
+| Prompt | Tokens | Latency | TPS (optimized) | TPS (pre-opt libp2p) | TPS (gRPC baseline) |
+|--------|--------|---------|-----------------|---------------------|---------------------|
+| 50-word letter | 80 | 6.4 s | **12.6** | 8.9 | 9.3 |
+| P2P 3 sentences | 120 | 9.5 s | **12.6** | 8.9 | 9.3 |
+| P2P 10 sentences | 350 | 27.5 s | **12.7** | 9.3 | 9.0 |
+| Pulp Fiction review | 600 | 45.9 s | **13.1** | 9.5 | 9.8 |
+
+**Qwen 3.5 9B** (optimized):
+
+| Prompt | Tokens | Latency | TPS (optimized) | TPS (pre-opt libp2p) | TPS (gRPC baseline) |
+|--------|--------|---------|-----------------|---------------------|---------------------|
+| 50-word letter | 68 | 7.9 s | **8.6** | 6.4 | 7.2 |
+| P2P 3 sentences | 93 | 10.6 s | **8.7** | 6.5 | 7.1 |
+| P2P 10 sentences | 350 | 39.0 s | **9.0** | 6.7 | 7.3 |
+| Pulp Fiction review | 600 | 61.6 s | **9.7** | 6.8 | 7.3 |
+
+Per-token latency dropped ~29% for both models. The main driver is the SharedProxyQueue: `poll_proxy_request()` now pops directly from a shared `Arc<Mutex<VecDeque>>` with condvar notification instead of round-tripping through the tokio event loop command channel.
 
 ### Direct P2P vs Circuit Relay (2 × T4 Lightning.ai, 2026-04-20)
 
@@ -477,19 +519,19 @@ The libp2p layer itself (3 relay reservations accepted across US/EU/AP bootstrap
       |  Pipeline assembly (sharded or full-model)
       |  Push mode: peer-to-peer activation forwarding
       v
-  Peer Pipeline (gRPC :50051)
+  Peer Pipeline (libp2p QUIC + TCP)
       peer-A (layers 0-11)  -->  peer-B (layers 12-23, emits tokens)
       |                          |
       |  KV-aware caching       |  Token sampling
       |  Binary-packed wire     |  INT8 activation compression
       v                          v
   libp2p Bootstrap (Kademlia DHT + Circuit Relay v2)
-      3 geo-distributed nodes (US / EU / AP) — auto-connected via --p2p-enabled
+      3 geo-distributed nodes (US / EU / AP, dual-stack IPv4+IPv6)
 ```
 
 Each node bundles two components in a single process:
 
-- **Peer** — a gRPC inference server that loads one model shard (or a full model) and announces itself to the Kademlia DHT.
+- **Peer** — a libp2p inference service that loads one model shard (or a full model) and announces itself to the Kademlia DHT. All tensor traffic (forward requests, push results, pings) flows over the native libp2p request/response protocol (`/openhydra/tensor/1.0.0`) via QUIC or TCP.
 - **Coordinator** — an OpenAI-compatible HTTP API that discovers peers, assembles inference pipelines, and manages verification + token economy.
 
 ### Peer Discovery
@@ -573,7 +615,7 @@ Full catalog: [`models.catalog.json`](models.catalog.json)
 ## Project Structure
 
 ```
-peer/              Inference engine: gRPC server, model shard, MLX/PyTorch runtimes,
+peer/              Inference engine: libp2p service, model shard, MLX/PyTorch runtimes,
                    KV compaction, request coalescing, P2P model cache, batching
 coordinator/       HTTP API, pipeline routing, chain failover, speculative decode,
                    auto-scaler, verification, economy
@@ -655,6 +697,22 @@ Then retry: `cd network && maturin develop --release`
 </details>
 
 <details>
+<summary><strong>"Couldn't find a virtualenv or conda environment" during maturin develop</strong></summary>
+
+On managed-Python environments (Lightning AI studios, Modal, bare-metal servers using system Python), `maturin develop` requires a virtualenv. If you can't create one, use `maturin build` instead:
+
+```bash
+cd network
+pip install maturin
+maturin build --release
+pip install --force-reinstall target/wheels/openhydra_network-*.whl
+cd ..
+```
+
+On PEP 668 systems, add `--break-system-packages` to the `pip install` commands.
+</details>
+
+<details>
 <summary><strong>"rustc, the rust compiler, is not installed"</strong></summary>
 
 The P2P networking extension is written in Rust. Install the Rust toolchain:
@@ -682,18 +740,18 @@ sudo apt-get install build-essential python3-dev libssl-dev
 </details>
 
 <details>
-<summary><strong>"Address already in use" (port 8080, 50051, or 4001)</strong></summary>
+<summary><strong>"Address already in use" (port 8080 or 4001)</strong></summary>
 
 A previous OpenHydra process is still running. Kill it:
 
 ```bash
 # Kill all stale OpenHydra processes
-lsof -ti:8080 -ti:50051 -ti:4001 | xargs kill -9
+lsof -ti:8080 -ti:4001 | xargs kill -9
 
 # Then retry your command
 ```
 
-Or use a different port: `--api-port 8081`
+Or use a different API port: `--api-port 8081`
 </details>
 
 <details>

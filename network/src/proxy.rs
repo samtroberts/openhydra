@@ -9,7 +9,7 @@ use libp2p::StreamProtocol;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-pub const PROXY_PROTOCOL: StreamProtocol = StreamProtocol::new("/openhydra/grpc-proxy/1.0.0");
+pub const PROXY_PROTOCOL: StreamProtocol = StreamProtocol::new("/openhydra/tensor/1.0.0");
 const MAX_MSG_SIZE: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone)]

@@ -144,7 +144,8 @@ class StreamPool:
             import grpc as _grpc
             from peer import peer_pb2_grpc
 
-            channel = _grpc.insecure_channel(f"{host}:{port}")
+            from coordinator.net_utils import format_address
+            channel = _grpc.insecure_channel(format_address(host, port))
             stub = peer_pb2_grpc.PeerStub(channel)
 
             # Create a thread-safe request queue for the bidirectional stream.

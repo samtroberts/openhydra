@@ -1,8 +1,8 @@
-"""Integration tests for the sharded gRPC inference pipeline (Phase 3).
+"""Integration tests for the sharded libp2p inference pipeline (Phase 3).
 
 Three test groups:
 
-1. ``TestInferenceChainShardHandoff`` — Unit tests with a mock gRPC stub.
+1. ``TestInferenceChainShardHandoff`` — Unit tests with a mock P2P node.
    Verifies:
    * ``shard_layer_start/end/total_layers`` are set in every ``ForwardRequest``.
    * The activation (hidden-state tensor) returned by peer N is passed as
@@ -12,24 +12,16 @@ Three test groups:
    ``CoordinatorEngine._select_pipeline_sharded()``.
    Verifies edge cases: empty fleet, no shards, incomplete coverage, happy path.
 
-3. ``TestShardedPipelineEndToEnd`` — Real gRPC servers (toy backend), 3 peers
-   each covering one "layer" of a 3-layer toy model.
-   Verifies:
-   * ``InferenceChain`` produces a 3-stage trace.
-   * Each stage hit the right peer.
-   * ``shard_layer_start/end`` validation passes on every peer.
-   * The final result text is non-empty.
+3. ``TestLayerCoverageMapInferenceIntegration`` — Verify that
+   LayerCoverageMap.best_pipeline correctly produces PeerEndpoints that
+   InferenceChain can use to route a request via proxy_forward.
 """
 from __future__ import annotations
 
 import threading
-from concurrent import futures
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import MagicMock, patch, call
 
-import grpc
 import pytest
 
 import struct as _struct
@@ -46,11 +38,19 @@ def _unpack_activation(req_or_resp):
     return list(req_or_resp.activation)
 from coordinator.layer_coverage import LayerCoverageMap, LayerRange
 from coordinator.path_finder import PeerEndpoint, PeerHealth
-from peer import peer_pb2, peer_pb2_grpc
-from peer.server import PeerService
+from peer import peer_pb2
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+_LIBP2P_COUNTER = 0
+
+
+def _next_libp2p_id() -> str:
+    """Generate a unique fake libp2p peer ID."""
+    global _LIBP2P_COUNTER
+    _LIBP2P_COUNTER += 1
+    return f"12D3KooW_peer{_LIBP2P_COUNTER:04d}"
 
 
 def _peer(
@@ -60,6 +60,7 @@ def _peer(
     total_layers: int,
     host: str = "127.0.0.1",
     port: int = 9000,
+    libp2p_peer_id: str = "",
 ) -> PeerEndpoint:
     return PeerEndpoint(
         peer_id=peer_id,
@@ -68,6 +69,7 @@ def _peer(
         layer_start=layer_start,
         layer_end=layer_end,
         total_layers=total_layers,
+        libp2p_peer_id=libp2p_peer_id or _next_libp2p_id(),
     )
 
 
@@ -75,12 +77,12 @@ def _health(peer: PeerEndpoint) -> PeerHealth:
     return PeerHealth(peer=peer, healthy=True, latency_ms=5.0, load_pct=0.1, daemon_mode="polite")
 
 
-# ── Stub infrastructure ───────────────────────────────────────────────────────
+# ── Mock P2P node infrastructure ────────────────────────────────────────────
 
 
 @dataclass
 class _CapturedForwardRequest:
-    """One captured gRPC ForwardRequest from a mock stub."""
+    """One captured ForwardRequest from a mock P2P proxy_forward call."""
     peer_id: str
     request_id: str
     stage_index: int
@@ -93,16 +95,40 @@ class _CapturedForwardRequest:
     activation_packed: bytes = b""
 
 
-def _make_stub_factory(peer_responses: list[list[float]]) -> tuple[list[_CapturedForwardRequest], Any]:
-    """Return (captured_requests, stub_class_mock) that replays ``peer_responses``.
+class _MockP2PNode:
+    """Mock libp2p P2P node that intercepts proxy_forward calls."""
 
-    ``peer_responses[i]`` is the list[float] that stub call #i returns as
-    ``ForwardResponse.activation``.
+    def __init__(self, handler):
+        self._handler = handler
+        self.libp2p_peer_id = "12D3KooW_coord"
+
+    def proxy_forward(self, target_peer_id, data):
+        raw = bytes(data)
+        prefix = raw[0:1]
+        req = peer_pb2.ForwardRequest()
+        req.ParseFromString(raw[1:])
+        resp = self._handler(req)
+        return prefix + resp.SerializeToString()
+
+    def proxy_forward_no_wait(self, target_peer_id, data):
+        pass
+
+    def is_peer_connected(self, peer_id):
+        return True
+
+
+def _make_mock_p2p_node(
+    peer_responses: list[list[float]],
+) -> tuple[list[_CapturedForwardRequest], _MockP2PNode]:
+    """Return (captured_requests, mock_p2p_node) that replays ``peer_responses``.
+
+    ``peer_responses[i]`` is the list[float] that proxy_forward call #i returns
+    as ``ForwardResponse.activation``.
     """
     captured: list[_CapturedForwardRequest] = []
     call_count = [0]
 
-    def _fake_forward(request, timeout=None):
+    def _handler(request):
         idx = call_count[0]
         call_count[0] += 1
         captured.append(
@@ -128,23 +154,23 @@ def _make_stub_factory(peer_responses: list[list[float]]) -> tuple[list[_Capture
             error="",
         )
 
-    stub_instance = MagicMock()
-    stub_instance.Forward.side_effect = _fake_forward
-
-    stub_class = MagicMock(return_value=stub_instance)
-    return captured, stub_class
+    mock_node = _MockP2PNode(_handler)
+    return captured, mock_node
 
 
-@contextmanager
-def _mock_grpc(stub_class_mock):
-    """Patch grpc channel creation and PeerStub with ``stub_class_mock``."""
-    fake_channel = MagicMock()
-    fake_channel.__enter__ = lambda s: fake_channel
-    fake_channel.__exit__ = MagicMock(return_value=False)
+def _make_chain_with_mock_p2p(
+    pipeline: list[PeerEndpoint],
+    peer_responses: list[list[float]],
+    timeout_ms: int = 500,
+) -> tuple[InferenceChain, list[_CapturedForwardRequest]]:
+    """Build an InferenceChain with a _MockP2PNode attached.
 
-    with patch("coordinator.chain.create_channel", return_value=fake_channel):
-        with patch("coordinator.chain.peer_pb2_grpc.PeerStub", stub_class_mock):
-            yield
+    Returns (chain, captured_requests).
+    """
+    captured, mock_node = _make_mock_p2p_node(peer_responses)
+    chain = InferenceChain(pipeline, timeout_ms=timeout_ms)
+    chain._p2p_node = mock_node
+    return chain, captured
 
 
 # ── Group 1: Handoff unit tests ───────────────────────────────────────────────
@@ -168,14 +194,13 @@ class TestInferenceChainShardHandoff:
         hidden_b = [2.0, 64.0] + [0.7] * 128
         tokens_c = [42.0, 17.0, 3.0]            # token IDs (final stage)
 
-        captured, stub_cls = _make_stub_factory([hidden_a, hidden_b, tokens_c])
         pipeline = self._build_pipeline()
+        chain, captured = _make_chain_with_mock_p2p(
+            pipeline, [hidden_a, hidden_b, tokens_c],
+        )
+        chain.run("test prompt", max_tokens=3)
 
-        with _mock_grpc(stub_cls):
-            chain = InferenceChain(pipeline, timeout_ms=500)
-            chain.run("test prompt", max_tokens=3)
-
-        assert len(captured) == 3, "Expected exactly 3 gRPC calls"
+        assert len(captured) == 3, "Expected exactly 3 proxy_forward calls"
 
         # Stage 0 — shard-a [0, 10)
         req0 = captured[0]
@@ -210,12 +235,11 @@ class TestInferenceChainShardHandoff:
         # Stage 2 returns token IDs
         stage2_output = [7.0, 42.0]
 
-        captured, stub_cls = _make_stub_factory([stage0_output, stage1_output, stage2_output])
         pipeline = self._build_pipeline()
-
-        with _mock_grpc(stub_cls):
-            chain = InferenceChain(pipeline, timeout_ms=500)
-            chain.run("handoff test", max_tokens=2)
+        chain, captured = _make_chain_with_mock_p2p(
+            pipeline, [stage0_output, stage1_output, stage2_output],
+        )
+        chain.run("handoff test", max_tokens=2)
 
         assert len(captured) == 3
 
@@ -236,12 +260,9 @@ class TestInferenceChainShardHandoff:
     def test_single_shard_pipeline(self):
         """A one-shard pipeline: stage_index=0=total_stages-1, is_first AND is_last."""
         tokens = [3.0, 7.0, 11.0]
-        captured, stub_cls = _make_stub_factory([tokens])
         pipeline = [_peer("solo", 0, 32, 32, port=9001)]
-
-        with _mock_grpc(stub_cls):
-            chain = InferenceChain(pipeline, timeout_ms=500)
-            chain.run("solo shard", max_tokens=3)
+        chain, captured = _make_chain_with_mock_p2p(pipeline, [tokens])
+        chain.run("solo shard", max_tokens=3)
 
         assert len(captured) == 1
         req = captured[0]
@@ -254,13 +275,13 @@ class TestInferenceChainShardHandoff:
     def test_shard_fields_zero_for_full_model_peer(self):
         """Full-model peers (layer_end=0) send zero shard fields."""
         tokens = [5.0]
-        captured, stub_cls = _make_stub_factory([tokens])
         # PeerEndpoint with no layer range (full-model replica)
-        pipeline = [PeerEndpoint(peer_id="full", host="127.0.0.1", port=9001)]
-
-        with _mock_grpc(stub_cls):
-            chain = InferenceChain(pipeline, timeout_ms=500)
-            chain.run("full model test", max_tokens=1)
+        pipeline = [PeerEndpoint(
+            peer_id="full", host="127.0.0.1", port=9001,
+            libp2p_peer_id=_next_libp2p_id(),
+        )]
+        chain, captured = _make_chain_with_mock_p2p(pipeline, [tokens])
+        chain.run("full model test", max_tokens=1)
 
         assert len(captured) == 1
         req = captured[0]
@@ -273,16 +294,13 @@ class TestInferenceChainShardHandoff:
         hidden = [1.0, 2.0] + [0.1] * 4
         tokens = [10.0]
         responses = [hidden, hidden, hidden, tokens]
-        captured, stub_cls = _make_stub_factory(responses)
 
         pipeline = [
             _peer(f"shard-{i}", i * 8, (i + 1) * 8, 32, port=9000 + i)
             for i in range(4)
         ]
-
-        with _mock_grpc(stub_cls):
-            chain = InferenceChain(pipeline, timeout_ms=500)
-            chain.run("four shards", max_tokens=1)
+        chain, captured = _make_chain_with_mock_p2p(pipeline, responses)
+        chain.run("four shards", max_tokens=1)
 
         assert len(captured) == 4
         for i, req in enumerate(captured):
@@ -424,160 +442,7 @@ class TestSelectPipelineSharded:
         assert peer_ids == ["shard-a", "shard-b"]
 
 
-# ── Group 3: End-to-end with real gRPC toy peers ──────────────────────────────
-
-
-def _start_toy_peer(
-    peer_id: str,
-    shard_index: int,
-    total_shards: int = 3,
-) -> tuple[grpc.Server, int]:
-    """Start a real gRPC toy-backend PeerService.  Returns (server, port)."""
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
-    peer_pb2_grpc.add_PeerServicer_to_server(
-        PeerService(
-            peer_id=peer_id,
-            model_id="openhydra-toy-345m",
-            shard_index=shard_index,
-            total_shards=total_shards,
-            daemon_mode="polite",
-            broken=False,
-        ),
-        server,
-    )
-    try:
-        port = server.add_insecure_port("127.0.0.1:0")
-    except RuntimeError as exc:
-        pytest.skip(f"gRPC listener unavailable: {exc}")
-    if port == 0:
-        pytest.skip("gRPC listener unavailable")
-    server.start()
-    return server, port
-
-
-class TestShardedPipelineEndToEnd:
-    """Real gRPC servers; verifies that activations flow peer→peer correctly."""
-
-    def test_three_shard_inference_produces_three_traces(self):
-        """3 toy shards (shard_index 0/1/2) each handle one stage.
-
-        We configure PeerEndpoint with total_layers=3, layer_start=i, layer_end=i+1
-        so the coordinator's LayerCoverageMap sees complete [0,3) coverage and the
-        per-peer shard_layer validation in server.py passes.
-        """
-        started = [
-            _start_toy_peer("peer-a", shard_index=0),
-            _start_toy_peer("peer-b", shard_index=1),
-            _start_toy_peer("peer-c", shard_index=2),
-        ]
-        servers = [srv for srv, _ in started]
-        ports = [port for _, port in started]
-        try:
-            pipeline = [
-                PeerEndpoint(
-                    peer_id="peer-a",
-                    host="127.0.0.1",
-                    port=ports[0],
-                    layer_start=0,
-                    layer_end=1,
-                    total_layers=3,
-                ),
-                PeerEndpoint(
-                    peer_id="peer-b",
-                    host="127.0.0.1",
-                    port=ports[1],
-                    layer_start=1,
-                    layer_end=2,
-                    total_layers=3,
-                ),
-                PeerEndpoint(
-                    peer_id="peer-c",
-                    host="127.0.0.1",
-                    port=ports[2],
-                    layer_start=2,
-                    layer_end=3,
-                    total_layers=3,
-                ),
-            ]
-            chain = InferenceChain(pipeline, timeout_ms=3000)
-            result = chain.run("sharded end-to-end test", max_tokens=8)
-
-            # ── Assertions ────────────────────────────────────────────────────
-            # 3 traces = 3 pipeline stages executed
-            assert len(result.traces) == 3, (
-                f"Expected 3 traces but got {len(result.traces)}: {result.traces}"
-            )
-            # Each trace hit the right peer in order
-            assert result.traces[0].peer_id == "peer-a"
-            assert result.traces[1].peer_id == "peer-b"
-            assert result.traces[2].peer_id == "peer-c"
-
-            # Stage indices must be sequential
-            assert [t.stage_index for t in result.traces] == [0, 1, 2]
-
-            # Final result must be non-empty text
-            assert isinstance(result.text, str)
-            assert len(result.text) > 0, "Final text output must not be empty"
-
-            # Total latency must be sum of per-stage latencies (within 10% rounding)
-            total_stage_ms = sum(t.latency_ms for t in result.traces)
-            assert result.latency_ms <= total_stage_ms * 1.2, (
-                f"Chain latency ({result.latency_ms:.1f}ms) exceeds sum of stages "
-                f"({total_stage_ms:.1f}ms) by >20%"
-            )
-        finally:
-            for srv in servers:
-                srv.stop(grace=0)
-
-    def test_shard_layer_validation_passes_for_matching_config(self):
-        """PeerService validates shard_layer_start/end against its own RuntimeProfile.
-
-        When the coordinator sends the correct layer range, the peer must NOT
-        raise a shard_layer_mismatch error.
-        """
-        server, port = _start_toy_peer("peer-z", shard_index=0, total_shards=1)
-        try:
-            # shard_index=0, total_shards=1 → layer_start=0, layer_end=1
-            pipeline = [
-                PeerEndpoint(
-                    peer_id="peer-z",
-                    host="127.0.0.1",
-                    port=port,
-                    layer_start=0,
-                    layer_end=1,
-                    total_layers=1,
-                )
-            ]
-            chain = InferenceChain(pipeline, timeout_ms=3000)
-            result = chain.run("shard validation test", max_tokens=4)
-            # If we get here, no mismatch error was raised
-            assert len(result.traces) == 1
-        finally:
-            server.stop(grace=0)
-
-    def test_shard_layer_mismatch_returns_error(self):
-        """If the coordinator sends wrong shard_layer_end, the peer rejects the request."""
-        server, port = _start_toy_peer("peer-x", shard_index=0, total_shards=1)
-        try:
-            # Intentionally wrong: coordinator claims layer_end=99, but peer has layer_end=1
-            pipeline = [
-                PeerEndpoint(
-                    peer_id="peer-x",
-                    host="127.0.0.1",
-                    port=port,
-                    layer_start=0,
-                    layer_end=99,   # mismatch — peer has layer_end=1
-                    total_layers=100,
-                )
-            ]
-            chain = InferenceChain(pipeline, timeout_ms=3000)
-            with pytest.raises(RuntimeError, match="shard_layer_mismatch"):
-                chain.run("mismatch test", max_tokens=4)
-        finally:
-            server.stop(grace=0)
-
-
-# ── Group 4: LayerCoverageMap → InferencePreparation integration ──────────────
+# ── Group 3: LayerCoverageMap → InferencePreparation integration ──────────────
 
 
 class TestLayerCoverageMapInferenceIntegration:
@@ -642,11 +507,10 @@ class TestLayerCoverageMapInferenceIntegration:
 
         hidden = [2.0, 11.0] + [0.3] * 22   # seq=2, hidden=11
         tokens = [1.0, 2.0, 3.0]
-        captured, stub_cls = _make_stub_factory([hidden, hidden, tokens])
-
-        with _mock_grpc(stub_cls):
-            chain = InferenceChain(endpoint_pipeline, timeout_ms=500)
-            result = chain.run("layer range handoff", max_tokens=3)
+        chain, captured = _make_chain_with_mock_p2p(
+            endpoint_pipeline, [hidden, hidden, tokens],
+        )
+        result = chain.run("layer range handoff", max_tokens=3)
 
         assert len(captured) == 3
         # Shard fields match the LayerRange for each stage

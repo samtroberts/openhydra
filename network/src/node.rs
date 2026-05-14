@@ -12,6 +12,7 @@
 //! receiver for the result, with the GIL released during the wait.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::mpsc;
@@ -27,7 +28,7 @@ use pyo3::exceptions::PyRuntimeError;
 #[cfg(feature = "pyo3")]
 use pyo3::IntoPyObjectExt;
 
-use crate::event_loop::{self, SwarmCommand};
+use crate::event_loop::{self, SharedProxyQueue, SwarmCommand};
 use crate::identity::Identity;
 use crate::swarm::{self, SwarmOptions};
 #[cfg(feature = "pyo3")]
@@ -37,6 +38,7 @@ use crate::types::PeerRecord;
 #[cfg(feature = "pyo3")]
 struct NodeInner {
     cmd_tx: mpsc::Sender<SwarmCommand>,
+    proxy_queue: Arc<SharedProxyQueue>,
     /// Handle to the background thread running tokio + swarm.
     _thread: std::thread::JoinHandle<()>,
 }
@@ -79,7 +81,7 @@ fn dirs_default_identity() -> PathBuf {
 /// a Shutdown command is received or the sender is dropped.
 pub fn start_node(
     config: &NodeConfig,
-) -> Result<(mpsc::Sender<SwarmCommand>, std::thread::JoinHandle<()>), String> {
+) -> Result<(mpsc::Sender<SwarmCommand>, Arc<SharedProxyQueue>, std::thread::JoinHandle<()>), String> {
     // Load or generate identity.
     let identity = Identity::load_or_create(&config.identity_path)
         .map_err(|e| format!("identity: {e}"))?;
@@ -103,6 +105,10 @@ pub fn start_node(
     // Create the command channel.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(256);
 
+    // Shared proxy queue: event loop pushes, Python poll_proxy_request pops.
+    let proxy_queue = Arc::new(SharedProxyQueue::new());
+    let proxy_queue_clone = Arc::clone(&proxy_queue);
+
     // Use a oneshot to communicate any startup error from the background thread.
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -117,6 +123,7 @@ pub fn start_node(
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
+                let bootstrap_peers_for_dial = bootstrap_peers.clone();
                 let opts = SwarmOptions {
                     listen_addrs,
                     bootstrap_peers,
@@ -126,7 +133,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok(swarm) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -143,7 +150,7 @@ pub fn start_node(
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, thread))
+    Ok((cmd_tx, proxy_queue, thread))
 }
 
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.
@@ -252,10 +259,11 @@ impl PyP2PNode {
             bootstrap_peers: self.config.bootstrap_peers.clone(),
         };
         let result = py.allow_threads(|| start_node(&config));
-        let (cmd_tx, thread) = result
+        let (cmd_tx, proxy_queue, thread) = result
             .map_err(|e| PyRuntimeError::new_err(format!("start failed: {e}")))?;
         self.inner = Some(NodeInner {
             cmd_tx,
+            proxy_queue,
             _thread: thread,
         });
         Ok(())
@@ -488,19 +496,9 @@ impl PyP2PNode {
     #[pyo3(signature = (timeout_ms=500))]
     fn poll_proxy_request(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<(String, Vec<u8>)>> {
         let inner = self.require_started()?;
-        let cmd_tx = inner.cmd_tx.clone();
-        py.allow_threads(move || {
-            // Use a short timeout to avoid blocking forever.
-            let (reply_tx, reply_rx) = oneshot::channel();
-            cmd_tx
-                .blocking_send(SwarmCommand::PollProxyRequest { reply: reply_tx })
-                .map_err(|_| "swarm not running".to_string())?;
-            match reply_rx.blocking_recv() {
-                Ok(item) => Ok(item),
-                Err(_) => Ok(None),
-            }
-        })
-        .map_err(|e: String| PyRuntimeError::new_err(e))
+        let queue = Arc::clone(&inner.proxy_queue);
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        Ok(py.allow_threads(move || queue.pop(timeout)))
     }
 
     /// Send a response to an inbound proxy request (identified by request_id).

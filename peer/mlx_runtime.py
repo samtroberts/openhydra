@@ -37,7 +37,9 @@ Phase 3 scope (multi-peer, layer sharding):
 from __future__ import annotations
 
 import copy
+import gc
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -234,6 +236,23 @@ class MLXRuntime:
 
         # Force Metal allocation of all parameters now, not lazily on first use.
         self._watchdog.run(mx.eval, self._model.parameters())
+
+        # Pin MLX Metal buffers so macOS doesn't reclaim them under memory
+        # pressure.  On 16 GB Macs the compressor can stall Metal heap
+        # commits for ~1s every few tokens.  set_wired_limit keeps model
+        # weights resident; set_cache_limit caps the reuse pool.
+        try:
+            _ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+            _wired = int(min(_ram_gb * 0.5, 8) * 1024 ** 3)
+            _cache = int(2 * 1024 ** 3)
+            mx.set_wired_limit(_wired)
+            mx.set_cache_limit(_cache)
+            logging.info(
+                "mlx_metal_limits: wired=%.1f GB  cache=%.1f GB  system_ram=%.0f GB",
+                _wired / 1e9, _cache / 1e9, _ram_gb,
+            )
+        except (AttributeError, OSError):
+            pass
 
         # Apply runtime quantization if requested and the checkpoint is not
         # already quantized (pre-quantized MLX models, e.g. from mlx-community,
@@ -1230,63 +1249,62 @@ class MLXRuntime:
                 raise RuntimeError("missing_hidden_payload")
             h = self._activation_to_hidden(activation, packed_bytes=packed_bytes)
 
-        self._watchdog.run(mx.eval, h)
+        # Eval on the current thread — NOT through the watchdog executor.
+        # The watchdog runs mx.eval on a dedicated thread, but MLX Metal
+        # streams are thread-local.  When _forward_sharded is called from
+        # a fire-and-forget proxy handler thread, `h` lives on that
+        # thread's stream; sending it to the watchdog thread triggers
+        # "There is no Stream(gpu, N) in current thread".
+        mx.eval(h)
 
-        # ── Build masks ────────────────────────────────────────────
-        # Qwen3.5 needs separate masks for full-attention and SSM layers.
-        # Import the mask builders from the model's module.
-        _text_model = getattr(getattr(self._model, "language_model", self._model), "model", self._model)
-        _model_mod = type(_text_model).__module__
-        import importlib
-        _mod = importlib.import_module(_model_mod)
-        _create_fa_mask = getattr(_mod, "create_attention_mask", lambda h, cache=None: None)
-        _create_ssm_mask = getattr(_mod, "create_ssm_mask", lambda h, cache=None: None)
+        # ── Suppress Python cyclic GC during Metal evaluation ─────
+        # Each _forward_sharded call creates ~200+ MLX array objects.
+        # Python's gen-0 GC threshold (700) triggers every ~3 calls,
+        # releasing MLX Metal buffers mid-eval and stalling the GPU
+        # for ~1s. Disable the cyclic collector around mx.eval calls.
+        _gc_was_enabled = gc.isenabled()
+        gc.disable()
 
-        fa_cache_ref = cached_kv[self._shard_fa_cache_idx] if (cached_kv and self._shard_fa_cache_idx is not None) else None
-        ssm_cache_ref = cached_kv[self._shard_ssm_cache_idx] if (cached_kv and self._shard_ssm_cache_idx is not None) else None
-        fa_mask = _create_fa_mask(h, cache=fa_cache_ref)
-        ssm_mask = _create_ssm_mask(h, cache=ssm_cache_ref)
+        try:
+            # ── Build masks ────────────────────────────────────────────
+            _text_model = getattr(getattr(self._model, "language_model", self._model), "model", self._model)
+            _model_mod = type(_text_model).__module__
+            import importlib
+            _mod = importlib.import_module(_model_mod)
+            _create_fa_mask = getattr(_mod, "create_attention_mask", lambda h, cache=None: None)
+            _create_ssm_mask = getattr(_mod, "create_ssm_mask", lambda h, cache=None: None)
 
-        # ── Run shard layers ───────────────────────────────────────
-        cache = cached_kv if cached_kv is not None else self._make_shard_cache()
-        for i, layer in enumerate(self._selected_layers):
-            mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
-            h = layer(h, mask=mask, cache=cache[i])
+            fa_cache_ref = cached_kv[self._shard_fa_cache_idx] if (cached_kv and self._shard_fa_cache_idx is not None) else None
+            ssm_cache_ref = cached_kv[self._shard_ssm_cache_idx] if (cached_kv and self._shard_ssm_cache_idx is not None) else None
+            fa_mask = _create_fa_mask(h, cache=fa_cache_ref)
+            ssm_mask = _create_ssm_mask(h, cache=ssm_cache_ref)
 
-        # Phase 2a: drop the post-shard ``mx.eval(h)`` fence. MLX's
-        # lazy graph can carry the full shard's work through to the
-        # serialise boundary (``_hidden_to_payload`` / ``_hidden_to_packed_bytes``,
-        # both of which already call ``mx.eval`` internally). Eliminating
-        # this intermediate fence lets the layer compute pipeline freely
-        # with the next-token transmit on the upstream gRPC handler
-        # thread — the core of the async-pipeline win on MLX peers.
-        # Last-shard sample path (below) still calls ``mx.eval(logits)``
-        # via the watchdog because we materialise logits before
-        # ``_sample_from_logits``; that fence stays.
+            # ── Run shard layers ───────────────────────────────────────
+            cache = cached_kv if cached_kv is not None else self._make_shard_cache()
+            for i, layer in enumerate(self._selected_layers):
+                mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
+                h = layer(h, mask=mask, cache=cache[i])
 
-        # ── Store KV cache ─────────────────────────────────────────
-        if session_id and kv_store_activation:
-            self._kv_cache[session_id] = cache
-            while len(self._kv_cache) > self._kv_cache_max:
-                self._kv_cache.pop(next(iter(self._kv_cache)))
+            # ── Store KV cache ─────────────────────────────────────────
+            if session_id and kv_store_activation:
+                self._kv_cache[session_id] = cache
+                while len(self._kv_cache) > self._kv_cache_max:
+                    self._kv_cache.pop(next(iter(self._kv_cache)))
 
-        # ── Output ─────────────────────────────────────────────────
-        # Client-terminated pipeline (Path A): when ``return_hidden_state``
-        # is set by the request, the last shard skips final_norm + lm_head
-        # + sampling and returns the raw post-last-layer hidden state.
-        # The coordinator applies the head and samples via ``HeadSampler``.
-        if is_last and not return_hidden_state:
-            h = self._shard_norm(h)
-            if self._tie_word_embeddings:
-                logits = self._shard_embed_tokens.as_linear(h)
+            # ── Output ─────────────────────────────────────────────────
+            if is_last and not return_hidden_state:
+                h = self._shard_norm(h)
+                if self._tie_word_embeddings:
+                    logits = self._shard_embed_tokens.as_linear(h)
+                else:
+                    logits = self._shard_lm_head(h)
+                mx.eval(logits)
+                return self._sample_from_logits(logits, **sampling_kwargs)
             else:
-                logits = self._shard_lm_head(h)
-            self._watchdog.run(mx.eval, logits)
-            return self._sample_from_logits(logits, **sampling_kwargs)
-        else:
-            # Intermediate shards always return hidden state; last shard
-            # does the same when sample_on_coordinator=True (Path A).
-            return self._hidden_to_payload(h)
+                return self._hidden_to_payload(h)
+        finally:
+            if _gc_was_enabled:
+                gc.enable()
 
     # ── Batched forward pass ───────────────────────────────────────────────────
 

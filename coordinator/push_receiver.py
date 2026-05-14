@@ -84,11 +84,11 @@ def cancel_push(request_id: str) -> None:
 
 # ── Ring autoregressive token queue ─────────────────────────────────
 #
-# The ring topology lets tokens circulate peer-to-peer. The last shard
-# (same process as coordinator) drops each sampled token into a
-# thread-safe queue.Queue. The coordinator's HTTP handler thread reads
-# from it with a blocking get(timeout=...) — safe because each request
-# runs in its own thread (ThreadingMixIn).
+# The ring topology lets tokens circulate peer-to-peer. When the ring
+# loops back to stage 0 (coordinator process), the Forward handler
+# emits each sampled token into a thread-safe queue.Queue. The
+# coordinator's inference thread reads from it with a blocking
+# get(timeout=...) — safe because each request runs in its own thread.
 
 import queue as _queue_mod
 
