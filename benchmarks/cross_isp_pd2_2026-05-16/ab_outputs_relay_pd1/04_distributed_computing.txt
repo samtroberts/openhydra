@@ -1,0 +1,7 @@
+**Distributed Computing: The Architecture of the Modern World**
+
+Distributed computing is the practice of processing data and executing algorithms across a network of computers, rather than relying on a single centralized server. While the term has gained prominence in the context of the internet, the concept is far older, dating back to the early days of the ARPANET in the 1960s. Today, it is the backbone of the modern digital economy, powering everything from cloud services and mobile applications to the vast data centers of artificial intelligence.
+
+The fundamental principle of distributed computing is **decentralization**. Instead of a single point of failure or a massive, monolithic system, the workload is divided among a group of loosely coupled computers. Each node operates independently, communicating with others via a network protocol (such as TCP/IP or HTTP). This architecture offers several critical advantages: **scalability**, **fault tolerance**, and **resource efficiency**. Because the system is spread out, adding more power or processing capacity is as simple as buying additional hardware; the system continues to function even if individual components fail, a property known as fault tolerance. Furthermore, the workload is dynamically balanced, ensuring that no single machine becomes a bottleneck while others sit idle.
+
+Historically, the term "distributed

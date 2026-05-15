@@ -16,7 +16,55 @@ use tracing::{debug, info, warn};
 use crate::behaviour::{OpenHydraBehaviour, OpenHydraBehaviourEvent};
 use crate::dht;
 use crate::proxy::{self, ProxyRequest, ProxyResponse};
+use crate::tensor_stream::{self, TensorStreamManager};
 use crate::types::{DiscoveredPeer, NatInfo, PeerRecord};
+
+// ── Fix 2: Transport classification ────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportType {
+    QuicDirect,
+    TcpDirect,
+    TcpRelay,
+}
+
+fn classify_transport(addr_str: &str) -> TransportType {
+    if addr_str.contains("p2p-circuit") {
+        return TransportType::TcpRelay;
+    }
+    if addr_str.contains("/quic") || addr_str.contains("/quic-v1") {
+        return TransportType::QuicDirect;
+    }
+    TransportType::TcpDirect
+}
+
+#[derive(Debug, Default)]
+struct PeerConnectionInfo {
+    quic_direct: u32,
+    tcp_direct: u32,
+    tcp_relay: u32,
+}
+
+impl PeerConnectionInfo {
+    fn has_direct(&self) -> bool {
+        self.quic_direct > 0 || self.tcp_direct > 0
+    }
+
+    fn direct_count(&self) -> u32 {
+        self.quic_direct + self.tcp_direct
+    }
+}
+
+/// Snapshot returned by GetConnectionInfo command (Fix 4).
+pub struct ConnectionInfoSnapshot {
+    pub has_quic: bool,
+    pub has_tcp_direct: bool,
+    pub has_relay: bool,
+    pub preferred_transport: String,
+}
+
+/// Debounce interval for TriggerRepunch (Fix 4).
+const REPUNCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Commands sent from the Python thread to the swarm event loop.
 pub enum SwarmCommand {
@@ -130,6 +178,37 @@ pub enum SwarmCommand {
     PollEvent {
         reply: oneshot::Sender<Option<(String, Vec<u8>)>>,
     },
+    /// Phase 2: Open a TCP-to-libp2p tunnel to a remote peer.
+    OpenTunnel {
+        peer_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Phase 2: Close an active tunnel to a remote peer.
+    CloseTunnel {
+        peer_id: String,
+    },
+    /// Phase 2: Poll for DCUtR success events.
+    PollDcutrEvent {
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Phase 2: Poll for tunnel close events.
+    PollTunnelCloseEvent {
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Dial a raw multiaddr (for manual hole-punch testing).
+    DialAddress {
+        multiaddr: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Get detailed connection info for a peer (Fix 4).
+    GetConnectionInfo {
+        peer_id: String,
+        reply: oneshot::Sender<Option<ConnectionInfoSnapshot>>,
+    },
+    /// Trigger a QUIC re-punch for a degraded peer (Fix 4).
+    TriggerRepunch {
+        peer_id: PeerId,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -196,20 +275,22 @@ struct LoopState {
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
-    /// Peers with confirmed direct (non-relayed) connections.
-    /// Maps peer → count of active non-circuit connections.  When a
-    /// non-circuit ConnectionEstablished fires the count increments;
-    /// when ConnectionClosed fires for a non-circuit endpoint the count
-    /// decrements.  `is_direct(peer)` ↔ `count > 0`.  This prevents a
-    /// race where a failed DCUtR attempt briefly opens a direct
-    /// connection, adds the peer, then closes — but the relay
-    /// connection keeps `swarm.is_connected()` true, leaving the peer
-    /// permanently mis-classified as "direct."
-    direct_peers: HashMap<PeerId, u32>,
+    /// Fix 2: per-peer transport-type-aware connection tracking.
+    peer_connections: HashMap<PeerId, PeerConnectionInfo>,
     /// Reply channels for local proxy forwards (Ouroboros: target == self).
-    /// When respond_proxy is called with a "proxy-local-*" req_id, the response
-    /// is delivered here instead of through libp2p.
     local_proxy_replies: HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Fix 4: debounce tracking for TriggerRepunch.
+    last_repunch: HashMap<PeerId, std::time::Instant>,
+    /// Fix 4: cached QUIC IPv6 addresses per peer (learned from Identify).
+    peer_quic_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Fix 1: tensor stream manager reference.
+    tensor_mgr: Option<Arc<TensorStreamManager>>,
+    /// Fix 1: inbound stream response handles for RespondProxy.
+    inbound_stream_responses: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<libp2p::Stream>>>>>,
+    /// Phase 2: DCUtR success event queue (peer_ids as strings).
+    dcutr_event_queue: VecDeque<String>,
+    /// Phase 2: tunnel close event queue.
+    tunnel_close_queue: VecDeque<String>,
     /// PR-3 (B1): inbound gossip messages awaiting Python poll. Each entry
     /// is ``(sender_libp2p_peer_id, payload_bytes)``. Bounded ring — the
     /// Rust side drops the oldest when the queue exceeds
@@ -251,8 +332,14 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
-            direct_peers: HashMap::new(),
+            peer_connections: HashMap::new(),
             local_proxy_replies: HashMap::new(),
+            last_repunch: HashMap::new(),
+            peer_quic_addrs: HashMap::new(),
+            tensor_mgr: None,
+            inbound_stream_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dcutr_event_queue: VecDeque::new(),
+            tunnel_close_queue: VecDeque::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
         }
     }
@@ -264,8 +351,24 @@ pub async fn run_event_loop(
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    mut stream_control: libp2p_stream::Control,
 ) {
     let mut state = LoopState::new();
+
+    // Fix 1: set up persistent tensor streams.
+    let (repunch_tx, mut repunch_rx) = mpsc::unbounded_channel::<PeerId>();
+    let tensor_control = stream_control.clone();
+    let tensor_mgr = Arc::new(TensorStreamManager::new(tensor_control, repunch_tx));
+    state.tensor_mgr = Some(Arc::clone(&tensor_mgr));
+
+    // Accept inbound tensor streams.
+    let tensor_incoming = stream_control.accept(tensor_stream::TENSOR_STREAM_PROTOCOL)
+        .expect("tensor stream protocol already registered");
+    tensor_stream::spawn_inbound_acceptor(
+        tensor_incoming,
+        Arc::clone(&proxy_queue),
+        Arc::clone(&state.inbound_stream_responses),
+    );
 
     // Kick off Kademlia bootstrap (populate routing table from bootstrap peers).
     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -318,7 +421,8 @@ pub async fn run_event_loop(
         if !non_relay_bootstrap.is_empty() && tokio::time::Instant::now() >= bootstrap_retry_deadline {
             bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
             for (peer_id, addr) in &non_relay_bootstrap {
-                let already_direct = state.direct_peers.get(peer_id).copied().unwrap_or(0) > 0;
+                let already_direct = state.peer_connections.get(peer_id)
+                    .map_or(false, |info| info.has_direct());
                 if already_direct {
                     continue;
                 }
@@ -372,19 +476,21 @@ pub async fn run_event_loop(
                         handle_proxy_forward_no_wait(&mut swarm, &peer_id, data, &mut state, &proxy_queue);
                     }
                     Some(SwarmCommand::IsConnected { peer_id, reply }) => {
-                        // Returns true ONLY if we have a direct (non-relayed) connection.
-                        // Used by Python push mode to decide direct gRPC vs relay proxy.
                         let has_direct = match peer_id.parse::<PeerId>() {
-                            Ok(pid) => state.direct_peers.get(&pid).copied().unwrap_or(0) > 0,
+                            Ok(pid) => state.peer_connections.get(&pid)
+                                .map_or(false, |info| info.has_direct()),
                             Err(_) => false,
                         };
                         let _ = reply.send(has_direct);
                     }
                     Some(SwarmCommand::GetDcutrStats { reply }) => {
+                        let direct_count = state.peer_connections.values()
+                            .filter(|info| info.has_direct())
+                            .count() as u64;
                         let snapshot = (
                             state.dcutr_successes,
                             state.dcutr_failures,
-                            state.direct_peers.len() as u64,
+                            direct_count,
                         );
                         let _ = reply.send(snapshot);
                     }
@@ -468,9 +574,18 @@ pub async fn run_event_loop(
                         handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
                     }
                     Some(SwarmCommand::RespondProxy { request_id, data }) => {
-                        // Check local proxy replies first (Ouroboros: self-targeted forwards).
                         if let Some(reply) = state.local_proxy_replies.remove(&request_id) {
                             let _ = reply.send(Ok(data));
+                        } else if request_id.starts_with("ts-") {
+                            // Fix 1: tensor-stream inbound response.
+                            let streams = Arc::clone(&state.inbound_stream_responses);
+                            tokio::spawn(async move {
+                                if let Err(e) = tensor_stream::write_response(
+                                    &streams, &request_id, &data,
+                                ).await {
+                                    warn!(%request_id, %e, "tensor_stream_respond_failed");
+                                }
+                            });
                         } else if let Some(channel) = state.inbound_proxy_channels.remove(&request_id) {
                             if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
                                 warn!("proxy respond failed: {:?}", e);
@@ -478,6 +593,67 @@ pub async fn run_event_loop(
                         } else {
                             warn!("proxy respond: unknown request_id={}", request_id);
                         }
+                    }
+                    Some(SwarmCommand::OpenTunnel { peer_id, reply }) => {
+                        handle_open_tunnel(&peer_id, reply, &mut state);
+                    }
+                    Some(SwarmCommand::CloseTunnel { peer_id }) => {
+                        handle_close_tunnel(&peer_id, &mut state);
+                    }
+                    Some(SwarmCommand::PollDcutrEvent { reply }) => {
+                        let item = state.dcutr_event_queue.pop_front();
+                        let _ = reply.send(item);
+                    }
+                    Some(SwarmCommand::PollTunnelCloseEvent { reply }) => {
+                        let item = state.tunnel_close_queue.pop_front();
+                        let _ = reply.send(item);
+                    }
+                    Some(SwarmCommand::DialAddress { multiaddr, reply }) => {
+                        use libp2p::swarm::dial_opts::DialOpts;
+                        let res = match multiaddr.parse::<Multiaddr>() {
+                            Ok(ma) => {
+                                let opts = DialOpts::unknown_peer_id()
+                                    .address(ma.clone())
+                                    .build();
+                                match swarm.dial(opts) {
+                                    Ok(()) => {
+                                        info!(%ma, "manual_dial_address_issued");
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(format!("dial error: {e}")),
+                                }
+                            }
+                            Err(e) => Err(format!("invalid multiaddr: {e}")),
+                        };
+                        let _ = reply.send(res);
+                    }
+                    Some(SwarmCommand::GetConnectionInfo { peer_id, reply }) => {
+                        let snapshot = match peer_id.parse::<PeerId>() {
+                            Ok(pid) => {
+                                state.peer_connections.get(&pid).map(|info| {
+                                    let preferred = if info.quic_direct > 0 {
+                                        "quic_direct".to_string()
+                                    } else if info.tcp_direct > 0 {
+                                        "tcp_direct".to_string()
+                                    } else if info.tcp_relay > 0 {
+                                        "tcp_relay".to_string()
+                                    } else {
+                                        "none".to_string()
+                                    };
+                                    ConnectionInfoSnapshot {
+                                        has_quic: info.quic_direct > 0,
+                                        has_tcp_direct: info.tcp_direct > 0,
+                                        has_relay: info.tcp_relay > 0,
+                                        preferred_transport: preferred,
+                                    }
+                                })
+                            }
+                            Err(_) => None,
+                        };
+                        let _ = reply.send(snapshot);
+                    }
+                    Some(SwarmCommand::TriggerRepunch { peer_id }) => {
+                        handle_trigger_repunch(&mut swarm, peer_id, &mut state);
                     }
                     Some(SwarmCommand::Shutdown { reply }) => {
                         info!("swarm shutting down");
@@ -489,6 +665,10 @@ pub async fn run_event_loop(
                         return;
                     }
                 }
+            }
+            // Fix 4: process re-punch requests from TensorStreamManager.
+            Some(peer_id) = repunch_rx.recv() => {
+                handle_trigger_repunch(&mut swarm, peer_id, &mut state);
             }
             // Process swarm events.
             event = swarm.select_next_some() => {
@@ -599,19 +779,43 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Identify(identify_event)) => {
             if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
                 debug!(%peer_id, protocol = %info.protocol_version, "identify received");
-                // Add the remote peer's listen addresses to Kademlia.
                 for addr in &info.listen_addrs {
                     swarm
                         .behaviour_mut()
                         .kademlia
                         .add_address(&peer_id, addr.clone());
                 }
-                // Critical for DCUtR: register the observed address (our NAT
-                // external mapping) as an external address. Without this, DCUtR
-                // has no candidate addresses for hole punching.
                 if !info.observed_addr.to_string().is_empty() {
                     debug!(addr = %info.observed_addr, "adding observed addr as external");
                     swarm.add_external_address(info.observed_addr);
+                }
+
+                // Fix 2/4: cache QUIC IPv6 addresses and auto-dial for hole-punch.
+                let quic_v6_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
+                    .filter(|a| {
+                        let s = a.to_string();
+                        s.contains("/quic") && s.contains("/ip6/") && !s.contains("p2p-circuit")
+                    })
+                    .cloned()
+                    .collect();
+
+                if !quic_v6_addrs.is_empty() {
+                    state.peer_quic_addrs.insert(peer_id, quic_v6_addrs.clone());
+
+                    // Auto QUIC hole-punch: if we don't have a QUIC-direct connection
+                    // to this peer, dial their QUIC IPv6 addresses.
+                    let has_quic = state.peer_connections.get(&peer_id)
+                        .map_or(false, |info| info.quic_direct > 0);
+                    if !has_quic {
+                        for addr in &quic_v6_addrs {
+                            use libp2p::swarm::dial_opts::DialOpts;
+                            let ma = addr.clone();
+                            match swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build()) {
+                                Ok(()) => info!(%peer_id, %ma, "auto_quic_holepunch_dial"),
+                                Err(e) => debug!(%peer_id, %ma, %e, "auto_quic_holepunch_dial_failed"),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -663,14 +867,9 @@ fn handle_swarm_event(
             match dcutr_event.result {
                 Ok(conn_id) => {
                     state.dcutr_successes += 1;
-                    // DCUtR success: mark as direct.  The actual
-                    // ConnectionEstablished for the hole-punched
-                    // connection will also bump the count; using
-                    // max(1, current) here ensures the peer is always
-                    // marked direct after a successful DCUtR even if
-                    // the event ordering varies.
-                    let cnt = state.direct_peers.entry(peer).or_insert(0);
-                    *cnt = (*cnt).max(1);
+                    let info = state.peer_connections.entry(peer).or_default();
+                    info.tcp_direct = info.tcp_direct.max(1);
+                    state.dcutr_event_queue.push_back(peer.to_string());
                     info!(
                         %peer, ?conn_id,
                         successes = state.dcutr_successes,
@@ -747,38 +946,61 @@ fn handle_swarm_event(
                 swarm.add_external_address(address.clone());
             }
         }
-        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-            debug!(%peer_id, ?endpoint, "connection established");
-            // Track direct (non-relay) connections for push mode routing.
-            //
-            // A connection is "direct" only if:
-            //   1. The endpoint address does NOT contain /p2p-circuit/
-            //   2. The endpoint IP is NOT a known bootstrap relay IP
-            //
-            // Guard #2 fixes a false-positive where relay-upgraded
-            // connections report the relay server's raw IP without the
-            // /p2p-circuit/ suffix, causing peers to be mis-classified
-            // as "direct" when they're actually relay-bound.
+        SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
             };
-            let has_circuit = addr_str.contains("p2p-circuit");
+            let transport = classify_transport(&addr_str);
             let endpoint_ip = extract_ip_from_multiaddr_str(&addr_str);
             let is_relay_ip = endpoint_ip
                 .as_ref()
                 .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
                 .unwrap_or(false);
-            let has_transport_ip = endpoint_ip.is_some();
-            if !has_circuit && !is_relay_ip && has_transport_ip {
-                *state.direct_peers.entry(peer_id).or_insert(0) += 1;
-                info!(%peer_id, %addr_str, count = state.direct_peers[&peer_id], "direct_peer_added");
+
+            // Reclassify: if the IP is a bootstrap relay but no /p2p-circuit/,
+            // treat as relay (fixes false direct classification).
+            let transport = if is_relay_ip && transport != TransportType::TcpRelay {
+                TransportType::TcpRelay
             } else {
-                debug!(
-                    %peer_id, %addr_str, has_circuit, is_relay_ip, has_transport_ip,
-                    "connection_established (not marking direct)"
-                );
+                transport
+            };
+
+            let info = state.peer_connections.entry(peer_id).or_default();
+
+            // Fix 2: QUIC dedup — if we already have a QUIC-direct connection,
+            // close the new one to prevent 16+ parallel connections.
+            // Must increment BEFORE closing: ConnectionClosed will decrement,
+            // so the original connection's count stays >= 1.
+            if transport == TransportType::QuicDirect && info.quic_direct >= 1 {
+                info.quic_direct += 1;
+                debug!(%peer_id, %addr_str, quic=info.quic_direct, "quic_dedup: closing duplicate QUIC connection");
+                let _ = swarm.close_connection(connection_id);
+            } else {
+                match transport {
+                    TransportType::QuicDirect => {
+                        info.quic_direct += 1;
+                        info!(%peer_id, %addr_str, quic=info.quic_direct, "quic_direct_connected");
+                        // Fix 4: proactively warm tensor stream on first QUIC connection.
+                        if info.quic_direct == 1 {
+                            if let Some(ref mgr) = state.tensor_mgr {
+                                let mgr = Arc::clone(mgr);
+                                let pid = peer_id;
+                                tokio::spawn(async move { mgr.warm_stream(&pid).await });
+                            }
+                        }
+                    }
+                    TransportType::TcpDirect => {
+                        info.tcp_direct += 1;
+                        info!(%peer_id, %addr_str, tcp=info.tcp_direct, "tcp_direct_connected");
+                    }
+                    TransportType::TcpRelay => {
+                        info.tcp_relay += 1;
+                        debug!(%peer_id, %addr_str, relay=info.tcp_relay, "tcp_relay_connected");
+                    }
+                }
             }
+
             // Send any queued proxy forwards that were waiting for this connection.
             let mut remaining = Vec::new();
             for (target, data, reply) in state.pending_relay_forwards.drain(..) {
@@ -796,31 +1018,41 @@ fn handle_swarm_event(
             state.pending_relay_forwards = remaining;
         }
         SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
-            debug!(%peer_id, "connection closed");
-            // Decrement direct connection count — mirror the same
-            // classification logic used in ConnectionEstablished.
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
             };
-            let has_circuit = addr_str.contains("p2p-circuit");
+            let transport = classify_transport(&addr_str);
             let endpoint_ip = extract_ip_from_multiaddr_str(&addr_str);
             let is_relay_ip = endpoint_ip
                 .as_ref()
                 .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
                 .unwrap_or(false);
-            if !has_circuit && !is_relay_ip {
-                if let Some(cnt) = state.direct_peers.get_mut(&peer_id) {
-                    *cnt = cnt.saturating_sub(1);
-                    if *cnt == 0 {
-                        state.direct_peers.remove(&peer_id);
-                        info!(%peer_id, "direct_peer_removed (last direct conn closed)");
-                    }
+            let transport = if is_relay_ip && transport != TransportType::TcpRelay {
+                TransportType::TcpRelay
+            } else {
+                transport
+            };
+
+            if let Some(info) = state.peer_connections.get_mut(&peer_id) {
+                match transport {
+                    TransportType::QuicDirect => info.quic_direct = info.quic_direct.saturating_sub(1),
+                    TransportType::TcpDirect => info.tcp_direct = info.tcp_direct.saturating_sub(1),
+                    TransportType::TcpRelay => info.tcp_relay = info.tcp_relay.saturating_sub(1),
+                }
+                if info.quic_direct == 0 && info.tcp_direct == 0 && info.tcp_relay == 0 {
+                    state.peer_connections.remove(&peer_id);
+                    debug!(%peer_id, "peer_fully_disconnected");
                 }
             }
-            // Also clean up if the peer is completely disconnected.
+            // Clean up tensor stream cache if fully disconnected.
             if !swarm.is_connected(&peer_id) {
-                state.direct_peers.remove(&peer_id);
+                state.peer_connections.remove(&peer_id);
+                if let Some(ref mgr) = state.tensor_mgr {
+                    let mgr = Arc::clone(mgr);
+                    let pid = peer_id;
+                    tokio::spawn(async move { mgr.remove_peer(&pid).await });
+                }
             }
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -847,6 +1079,12 @@ fn handle_swarm_event(
                     "circuit external address recorded but not marking public"
                 );
             }
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            warn!(?peer_id, %error, "outgoing_connection_error");
+        }
+        SwarmEvent::IncomingConnectionError { error, .. } => {
+            warn!(%error, "incoming_connection_error");
         }
         _ => {}
     }
@@ -1146,9 +1384,6 @@ fn handle_proxy_forward(
         }
     };
 
-    // Ouroboros guard: if the target is our own peer ID, route locally.
-    // Queue as inbound proxy request and store the reply channel so
-    // respond_proxy() can deliver the response back to the caller.
     if peer_id == *swarm.local_peer_id() {
         info!("proxy_forward: target is self — routing locally");
         state.inbound_proxy_counter += 1;
@@ -1158,16 +1393,16 @@ fn handle_proxy_forward(
         return;
     }
 
+    // Blocking proxy_forward always uses request-response: it's proven
+    // reliable over both direct and relay connections. Tensor stream is
+    // only used in the fire-and-forget path (proxy_forward_no_wait / push mode).
     if swarm.is_connected(&peer_id) {
-        // Already connected — send immediately.
         let req_id = swarm
             .behaviour_mut()
             .grpc_proxy
             .send_request(&peer_id, ProxyRequest(data));
         state.pending_proxy.insert(req_id, reply);
     } else {
-        // Not connected — dial through relay and queue the request.
-        // It will be sent when ConnectionEstablished fires.
         info!(%peer_id, "proxy_forward: peer not connected, dialing via relay");
         let mut dialed = false;
         for relay_str in crate::relay::BOOTSTRAP_RELAYS {
@@ -1188,7 +1423,6 @@ fn handle_proxy_forward(
             }
         }
         if dialed {
-            // Queue the request to be sent after connection is established.
             state.pending_relay_forwards.push((peer_id, data, reply));
         } else {
             let _ = reply.send(Err("proxy_forward: no relay dial succeeded".into()));
@@ -1228,26 +1462,35 @@ fn handle_proxy_forward_no_wait(
         }
     };
 
-    // Ouroboros guard: self-targeted forward — queue locally, no reply channel.
     if peer_id == *swarm.local_peer_id() {
         debug!("proxy_forward_no_wait: target is self — routing locally (no reply)");
         state.inbound_proxy_counter += 1;
         let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
         proxy_queue.push((req_id, data));
-        // No local_proxy_replies entry — respond_proxy will warn and discard.
         return;
     }
 
+    // Fix 1: prefer tensor stream (fire-and-forget) for connected peers.
+    if let Some(ref mgr) = state.tensor_mgr {
+        if swarm.is_connected(&peer_id) {
+            let mgr = Arc::clone(mgr);
+            let pid = peer_id;
+            tokio::spawn(async move {
+                if let Err(e) = mgr.send_tensor(&pid, &data).await {
+                    warn!(%pid, %e, "tensor_stream_no_wait_failed");
+                }
+            });
+            return;
+        }
+    }
+
+    // Fallback: request-response.
     if swarm.is_connected(&peer_id) {
-        // Already connected — send immediately, don't track reply.
         let _req_id = swarm
             .behaviour_mut()
             .grpc_proxy
             .send_request(&peer_id, ProxyRequest(data));
-        // Deliberately NOT inserting into pending_proxy.
-        // Response will be silently discarded when it arrives.
     } else {
-        // Not connected — dial through relay and queue with a dummy reply channel.
         info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing via relay");
         let mut dialed = false;
         for relay_str in crate::relay::BOOTSTRAP_RELAYS {
@@ -1267,8 +1510,6 @@ fn handle_proxy_forward_no_wait(
             }
         }
         if dialed {
-            // Dummy oneshot — the receiver is dropped immediately so the
-            // response will be silently discarded when it arrives.
             let (dummy_tx, _dummy_rx) = oneshot::channel();
             state.pending_relay_forwards.push((peer_id, data, dummy_tx));
         } else {
@@ -1321,6 +1562,58 @@ fn handle_open_proxy(
             }
         }
     });
+}
+
+// ── Fix 4: TriggerRepunch with debounce ────────────────────────────────
+
+fn handle_trigger_repunch(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    peer_id: PeerId,
+    state: &mut LoopState,
+) {
+    if let Some(last) = state.last_repunch.get(&peer_id) {
+        if last.elapsed() < REPUNCH_DEBOUNCE {
+            debug!(%peer_id, "repunch_debounced: skipping (last was {}s ago)",
+                last.elapsed().as_secs());
+            return;
+        }
+    }
+    state.last_repunch.insert(peer_id, std::time::Instant::now());
+
+    let addrs = match state.peer_quic_addrs.get(&peer_id) {
+        Some(addrs) if !addrs.is_empty() => addrs.clone(),
+        _ => {
+            debug!(%peer_id, "repunch: no QUIC IPv6 addresses cached for peer");
+            return;
+        }
+    };
+
+    info!(%peer_id, count = addrs.len(), "repunch: re-dialing QUIC IPv6 addresses");
+    for addr in addrs {
+        use libp2p::swarm::dial_opts::DialOpts;
+        let ma = addr.clone();
+        match swarm.dial(DialOpts::unknown_peer_id().address(addr).build()) {
+            Ok(()) => info!(%ma, "repunch_dial_issued"),
+            Err(e) => debug!(%ma, %e, "repunch_dial_failed"),
+        }
+    }
+}
+
+// ── Phase 2: Tunnel stubs ─────────────────────────────────────────────
+
+fn handle_open_tunnel(
+    _peer_id: &str,
+    reply: oneshot::Sender<Result<String, String>>,
+    _state: &mut LoopState,
+) {
+    let _ = reply.send(Err("tunnel not yet implemented — use proxy_forward".into()));
+}
+
+fn handle_close_tunnel(
+    _peer_id: &str,
+    _state: &mut LoopState,
+) {
+    debug!("close_tunnel: not yet implemented");
 }
 
 #[cfg(test)]
@@ -1388,12 +1681,68 @@ mod tests {
 
     #[test]
     fn test_relay_ip_detection() {
-        // Bootstrap relay IPs should be detected.
         assert!(crate::relay::is_bootstrap_relay_ip("45.79.190.172"));
         assert!(crate::relay::is_bootstrap_relay_ip("172.105.69.49"));
         assert!(crate::relay::is_bootstrap_relay_ip("172.104.164.98"));
-        // Non-relay IPs should not.
         assert!(!crate::relay::is_bootstrap_relay_ip("192.168.1.11"));
         assert!(!crate::relay::is_bootstrap_relay_ip("10.192.11.51"));
+    }
+
+    // ── Fix 2 tests ──
+
+    #[test]
+    fn test_classify_transport_quic_direct() {
+        assert_eq!(
+            classify_transport("/ip6/2409:40f4:1e:b425::/udp/4001/quic-v1"),
+            TransportType::QuicDirect,
+        );
+    }
+
+    #[test]
+    fn test_classify_transport_quic_v4() {
+        assert_eq!(
+            classify_transport("/ip4/192.168.1.10/udp/4001/quic-v1"),
+            TransportType::QuicDirect,
+        );
+    }
+
+    #[test]
+    fn test_classify_transport_tcp_direct() {
+        assert_eq!(
+            classify_transport("/ip4/192.168.1.10/tcp/4001"),
+            TransportType::TcpDirect,
+        );
+    }
+
+    #[test]
+    fn test_classify_transport_tcp_relay_circuit() {
+        assert_eq!(
+            classify_transport("/ip4/45.79.190.172/tcp/4001/p2p/12D3KooW.../p2p-circuit/p2p/12D3KooW..."),
+            TransportType::TcpRelay,
+        );
+    }
+
+    #[test]
+    fn test_classify_transport_relay_ip_without_circuit() {
+        // Without /p2p-circuit/ in the string, even relay IP classifies as TcpDirect.
+        // The reclassification in ConnectionEstablished handles this case.
+        assert_eq!(
+            classify_transport("/ip4/45.79.190.172/tcp/4001"),
+            TransportType::TcpDirect,
+        );
+    }
+
+    #[test]
+    fn test_peer_connection_info() {
+        let mut info = PeerConnectionInfo::default();
+        assert!(!info.has_direct());
+        info.quic_direct = 1;
+        assert!(info.has_direct());
+        info.quic_direct = 0;
+        info.tcp_direct = 1;
+        assert!(info.has_direct());
+        info.tcp_direct = 0;
+        info.tcp_relay = 1;
+        assert!(!info.has_direct());
     }
 }

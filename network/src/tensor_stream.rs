@@ -1,0 +1,461 @@
+//! Persistent tensor streams over libp2p-stream (Fix 1).
+//!
+//! Replaces the per-token `request_response::send_request()` pattern with
+//! long-lived bidirectional streams. One stream is cached per peer and
+//! reused across all tokens, eliminating the multistream-select negotiation
+//! overhead that dominated QUIC cross-ISP latency (~360ms per token at
+//! 180ms RTT).
+//!
+//! Wire format: 4-byte big-endian length prefix + payload (same framing
+//! as `GrpcProxyCodec` in proxy.rs).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::prelude::*;
+use libp2p::{PeerId, Stream, StreamProtocol};
+use libp2p_stream::Control;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info, warn};
+
+use crate::event_loop::SharedProxyQueue;
+
+/// The libp2p stream protocol for persistent tensor transfer.
+pub const TENSOR_STREAM_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/openhydra/tensor-stream/1.0.0");
+
+/// Maximum message size (same as GrpcProxyCodec).
+const MAX_MSG_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
+/// Hard ceiling timeout for stalled writes (Fix 4).
+/// OS socket errors (BrokenPipe, ConnectionReset) catch most failures
+/// instantly. This timeout is only for connections that stall without
+/// erroring. Set aggressively to avoid pipeline hangs.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Read timeout for request-response mode. If the remote peer doesn't
+/// send a response within this window, the cached stream is discarded
+/// and the error is propagated. Set higher than WRITE_TIMEOUT since
+/// the remote needs time to process the request.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cooldown between QUIC re-probe attempts after Degraded state (Fix 4).
+const DEGRADED_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+// ── Fix 4: transport preference ─────────────────────────────────────────
+
+/// Per-peer transport preference state.
+#[derive(Debug, Clone)]
+enum PreferredTransport {
+    /// QUIC-direct is available and working.
+    QuicDirect,
+    /// Degraded: QUIC failed, using fallback. After cooldown, retry QUIC.
+    Degraded { since: Instant },
+}
+
+/// Manager for persistent outbound tensor streams.
+///
+/// Fix 1: caches one outbound `Stream` per peer, reused across tokens.
+/// Fix 4: transport-aware routing with QUIC → TCP-direct → TCP-relay
+/// fallback and debounced re-punch on QUIC failure.
+pub struct TensorStreamManager {
+    control: Mutex<Control>,
+    /// Cached outbound streams, one per peer.
+    outbound: Mutex<HashMap<PeerId, Stream>>,
+    /// Fix 4: per-peer transport preference.
+    preferences: Mutex<HashMap<PeerId, PreferredTransport>>,
+    /// Fix 4: channel to send TriggerRepunch commands back to the event loop.
+    repunch_tx: mpsc::UnboundedSender<PeerId>,
+}
+
+impl TensorStreamManager {
+    pub fn new(control: Control, repunch_tx: mpsc::UnboundedSender<PeerId>) -> Self {
+        Self {
+            control: Mutex::new(control),
+            outbound: Mutex::new(HashMap::new()),
+            preferences: Mutex::new(HashMap::new()),
+            repunch_tx,
+        }
+    }
+
+    /// Send tensor data to a peer (fire-and-forget, no response expected).
+    ///
+    /// Fix 4 routing: QUIC-direct → TCP-direct → TCP-relay.
+    /// On QUIC failure: marks Degraded, triggers debounced re-punch.
+    /// After 30s cooldown, optimistically retries QUIC.
+    pub async fn send_tensor(
+        &self,
+        peer: &PeerId,
+        data: &[u8],
+    ) -> Result<(), TensorStreamError> {
+        // Check if we should retry QUIC after degradation cooldown.
+        self.maybe_reprobe_quic(peer).await;
+
+        // Try the primary path (cached stream).
+        let result = self.try_send_with_timeout(peer, data).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(TensorStreamError::NoCachedStream) => {
+                // No cached stream — open a new one.
+            }
+            Err(e) => {
+                // Write failed — mark degraded if QUIC, remove stale stream.
+                debug!(%peer, %e, "tensor_stream: cached stream failed, reopening");
+                self.handle_send_failure(peer).await;
+            }
+        }
+
+        // Open a new stream and send.
+        match self.open_and_cache_stream(peer).await {
+            Ok(()) => self.try_send_with_timeout(peer, data).await,
+            Err(e) => {
+                warn!(%peer, %e, "tensor_stream: open_stream failed");
+                Err(e)
+            }
+        }
+    }
+
+    /// Send tensor data and read a response (request-response mode).
+    pub async fn send_tensor_with_reply(
+        &self,
+        peer: &PeerId,
+        data: &[u8],
+    ) -> Result<Vec<u8>, TensorStreamError> {
+        self.maybe_reprobe_quic(peer).await;
+
+        let result = self.try_send_recv_on_cached(peer, data).await;
+        match result {
+            Ok(resp) => return Ok(resp),
+            Err(TensorStreamError::NoCachedStream) => {}
+            Err(e) => {
+                debug!(%peer, %e, "tensor_stream: cached stream failed (rr), reopening");
+                self.handle_send_failure(peer).await;
+            }
+        }
+
+        match self.open_and_cache_stream(peer).await {
+            Ok(()) => self.try_send_recv_on_cached(peer, data).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Pre-open a tensor stream to a peer (Fix 4: proactive warming).
+    ///
+    /// Called from ConnectionEstablished when a QUIC-direct connection
+    /// is established. The first token doesn't pay `open_stream()` latency.
+    pub async fn warm_stream(&self, peer: &PeerId) {
+        // Only warm if we don't already have a cached stream.
+        if self.outbound.lock().await.contains_key(peer) {
+            return;
+        }
+        match self.open_and_cache_stream(peer).await {
+            Ok(()) => {
+                info!(%peer, "tensor_stream: warmed stream proactively");
+                // Mark QUIC as preferred.
+                self.preferences
+                    .lock()
+                    .await
+                    .insert(*peer, PreferredTransport::QuicDirect);
+            }
+            Err(e) => {
+                debug!(%peer, %e, "tensor_stream: warm_stream failed (non-fatal)");
+            }
+        }
+    }
+
+    /// Remove cached stream for a peer (call on ConnectionClosed).
+    pub async fn remove_peer(&self, peer: &PeerId) {
+        if self.outbound.lock().await.remove(peer).is_some() {
+            debug!(%peer, "tensor_stream: removed cached stream (peer disconnected)");
+        }
+        self.preferences.lock().await.remove(peer);
+    }
+
+    /// Get the current transport preference for a peer (for observability).
+    pub async fn get_preference(&self, peer: &PeerId) -> String {
+        match self.preferences.lock().await.get(peer) {
+            Some(PreferredTransport::QuicDirect) => "quic_direct".to_string(),
+            Some(PreferredTransport::Degraded { since }) => {
+                format!("degraded_{}s", since.elapsed().as_secs())
+            }
+            None => "unknown".to_string(),
+        }
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────────
+
+    async fn open_stream(&self, peer: &PeerId) -> Result<Stream, TensorStreamError> {
+        let mut control = self.control.lock().await;
+        match control.open_stream(*peer, TENSOR_STREAM_PROTOCOL).await {
+            Ok(stream) => {
+                debug!(%peer, "tensor_stream: opened new stream");
+                Ok(stream)
+            }
+            Err(e) => Err(TensorStreamError::OpenFailed(format!("{e}"))),
+        }
+    }
+
+    async fn open_and_cache_stream(&self, peer: &PeerId) -> Result<(), TensorStreamError> {
+        let stream = self.open_stream(peer).await?;
+        self.outbound.lock().await.insert(*peer, stream);
+        Ok(())
+    }
+
+    /// Try to send on the cached stream with a 250ms timeout ceiling.
+    async fn try_send_with_timeout(
+        &self,
+        peer: &PeerId,
+        data: &[u8],
+    ) -> Result<(), TensorStreamError> {
+        let mut stream = {
+            let mut map = self.outbound.lock().await;
+            map.remove(peer).ok_or(TensorStreamError::NoCachedStream)?
+        };
+        let result = match tokio::time::timeout(WRITE_TIMEOUT, write_framed(&mut stream, data)).await {
+            Ok(result) => result,
+            Err(_) => Err(TensorStreamError::Write("write timed out (250ms)".into())),
+        };
+        if result.is_ok() {
+            self.outbound.lock().await.insert(*peer, stream);
+        }
+        result
+    }
+
+    /// Try to send + receive on the cached stream.
+    ///
+    /// Takes the stream out of the cache during the operation to avoid
+    /// holding the Mutex across the read (which can block for seconds
+    /// while the remote processes the request). Re-inserts on success.
+    async fn try_send_recv_on_cached(
+        &self,
+        peer: &PeerId,
+        data: &[u8],
+    ) -> Result<Vec<u8>, TensorStreamError> {
+        let mut stream = {
+            let mut map = self.outbound.lock().await;
+            map.remove(peer).ok_or(TensorStreamError::NoCachedStream)?
+        };
+
+        match tokio::time::timeout(WRITE_TIMEOUT, write_framed(&mut stream, data)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(TensorStreamError::Write("write timed out (250ms)".into())),
+        }
+
+        let result = match tokio::time::timeout(READ_TIMEOUT, read_framed(&mut stream)).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(TensorStreamError::Read("read timed out (30s)".into())),
+        };
+
+        if result.is_ok() {
+            self.outbound.lock().await.insert(*peer, stream);
+        }
+        result
+    }
+
+    /// Handle a send failure: remove the dead stream and trigger re-punch
+    /// if the peer was using QUIC.
+    async fn handle_send_failure(&self, peer: &PeerId) {
+        self.outbound.lock().await.remove(peer);
+
+        let mut prefs = self.preferences.lock().await;
+        if let Some(PreferredTransport::QuicDirect) = prefs.get(peer) {
+            info!(%peer, "tensor_stream: QUIC failed, marking degraded, triggering re-punch");
+            prefs.insert(*peer, PreferredTransport::Degraded { since: Instant::now() });
+            // Fire-and-forget re-punch request (debounced in event loop).
+            let _ = self.repunch_tx.send(*peer);
+        }
+    }
+
+    /// If peer is in Degraded state and cooldown has elapsed, clear the
+    /// preference so the next send attempt tries QUIC again.
+    async fn maybe_reprobe_quic(&self, peer: &PeerId) {
+        let mut prefs = self.preferences.lock().await;
+        if let Some(PreferredTransport::Degraded { since }) = prefs.get(peer) {
+            if since.elapsed() > DEGRADED_REPROBE_INTERVAL {
+                info!(%peer, "tensor_stream: degraded cooldown elapsed, will retry QUIC");
+                prefs.remove(peer);
+            }
+        }
+    }
+}
+
+/// Spawn the inbound tensor stream acceptor.
+///
+/// Accepts incoming streams on `/openhydra/tensor-stream/1.0.0` and for
+/// each one spawns a reader loop that pushes messages to the shared
+/// proxy queue (same queue that `poll_proxy_request` drains from Python).
+///
+/// Returns a HashMap for storing response stream handles, and a JoinHandle.
+pub fn spawn_inbound_acceptor(
+    mut incoming: libp2p_stream::IncomingStreams,
+    proxy_queue: Arc<SharedProxyQueue>,
+    inbound_streams: Arc<Mutex<HashMap<String, Arc<Mutex<Stream>>>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        info!("tensor_stream_acceptor: accepting inbound streams");
+        while let Some((peer_id, stream)) = incoming.next().await {
+            info!(%peer_id, "tensor_stream_acceptor: inbound stream accepted");
+            let pq = Arc::clone(&proxy_queue);
+            let streams = Arc::clone(&inbound_streams);
+            tokio::spawn(handle_inbound_stream(peer_id, stream, pq, streams));
+        }
+        info!("tensor_stream_acceptor: stopped");
+    })
+}
+
+/// Handle one inbound tensor stream: read framed messages in a loop,
+/// push each to the proxy queue.
+async fn handle_inbound_stream(
+    peer_id: PeerId,
+    stream: Stream,
+    proxy_queue: Arc<SharedProxyQueue>,
+    inbound_streams: Arc<Mutex<HashMap<String, Arc<Mutex<Stream>>>>>,
+) {
+    let stream = Arc::new(Mutex::new(stream));
+    loop {
+        let data = {
+            let mut s = stream.lock().await;
+            match read_framed(&mut *s).await {
+                Ok(data) => data,
+                Err(e) => {
+                    debug!(%peer_id, %e, "tensor_stream_inbound: read error, closing");
+                    break;
+                }
+            }
+        };
+
+        // Generate a unique request ID for this inbound message.
+        // The Python side will call respond_proxy(req_id, response_data)
+        // which will write the response back on this stream.
+        let req_id = format!("ts-{}-{}", peer_id, uuid_short());
+
+        // Store the stream handle so RespondProxy can write back.
+        inbound_streams
+            .lock()
+            .await
+            .insert(req_id.clone(), Arc::clone(&stream));
+
+        proxy_queue.push((req_id, data));
+    }
+}
+
+/// Write a length-prefixed frame to a stream.
+async fn write_framed(
+    stream: &mut Stream,
+    data: &[u8],
+) -> Result<(), TensorStreamError> {
+    use futures::AsyncWriteExt;
+    let len = data.len() as u32;
+    let len_bytes = len.to_be_bytes();
+    stream
+        .write_all(&len_bytes)
+        .await
+        .map_err(|e| TensorStreamError::Write(e.to_string()))?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(|e| TensorStreamError::Write(e.to_string()))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| TensorStreamError::Write(e.to_string()))?;
+    Ok(())
+}
+
+/// Read a length-prefixed frame from a stream.
+async fn read_framed(stream: &mut Stream) -> Result<Vec<u8>, TensorStreamError> {
+    use futures::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| TensorStreamError::Read(e.to_string()))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MSG_SIZE {
+        return Err(TensorStreamError::Read(format!(
+            "message too large: {len} > {MAX_MSG_SIZE}"
+        )));
+    }
+    let mut data = vec![0u8; len];
+    stream
+        .read_exact(&mut data)
+        .await
+        .map_err(|e| TensorStreamError::Read(e.to_string()))?;
+    Ok(data)
+}
+
+/// Generate a short random ID for inbound request tracking.
+fn uuid_short() -> String {
+    use rand::Rng;
+    let n: u64 = rand::thread_rng().gen();
+    format!("{:016x}", n)
+}
+
+/// Write a response on an inbound tensor stream (called from RespondProxy).
+pub async fn write_response(
+    inbound_streams: &Mutex<HashMap<String, Arc<Mutex<Stream>>>>,
+    req_id: &str,
+    data: &[u8],
+) -> Result<(), TensorStreamError> {
+    let stream = {
+        let mut map = inbound_streams.lock().await;
+        match map.remove(req_id) {
+            Some(s) => s,
+            None => return Err(TensorStreamError::UnknownReqId(req_id.to_string())),
+        }
+    };
+    let mut s = stream.lock().await;
+    write_framed(&mut *s, data).await
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TensorStreamError {
+    #[error("no cached stream for peer")]
+    NoCachedStream,
+    #[error("open_stream failed: {0}")]
+    OpenFailed(String),
+    #[error("write error: {0}")]
+    Write(String),
+    #[error("read error: {0}")]
+    Read(String),
+    #[error("unknown request_id: {0}")]
+    UnknownReqId(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_name() {
+        assert_eq!(
+            TENSOR_STREAM_PROTOCOL.as_ref(),
+            "/openhydra/tensor-stream/1.0.0"
+        );
+    }
+
+    #[test]
+    fn test_uuid_short_length() {
+        let id = uuid_short();
+        assert_eq!(id.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_framed_roundtrip() {
+        // Test the framing codec using in-memory pipe.
+        let (mut a, mut b) = futures::io::AsyncReadExt::split(futures::io::Cursor::new(vec![]));
+        // We can't easily test with a real pipe, but we can test the byte format.
+        let data = b"hello tensor world";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(data);
+        assert_eq!(buf.len(), 4 + data.len());
+        // Verify the length prefix decodes correctly.
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        assert_eq!(len, data.len());
+        assert_eq!(&buf[4..], data);
+    }
+}

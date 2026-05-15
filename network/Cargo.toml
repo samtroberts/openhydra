@@ -57,6 +57,9 @@ futures = "0.3"
 async-trait = "0.1"
 bytemuck = { version = "1", features = ["derive"] }
 prost = "0.13"
+libp2p-stream = "0.2.0-alpha"
+thiserror = "1"
+quinn = { version = "0.11", default-features = false }
 
 [features]
 default = ["pyo3"]
@@ -71,6 +74,10 @@ tempfile = "3"
 strip = true
 opt-level = "s"
 lto = true
+
+
+[patch.crates-io]
+libp2p-quic = { path = "patched-deps/libp2p-quic" }
 
 [[bin]]
 name = "openhydra-bootstrap"

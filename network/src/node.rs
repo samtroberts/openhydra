@@ -131,9 +131,9 @@ pub fn start_node(
                 };
 
                 match swarm::build_swarm(&identity, opts) {
-                    Ok(swarm) => {
+                    Ok((swarm, stream_control)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -574,6 +574,93 @@ impl PyP2PNode {
                 reply,
             })
         })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Get detailed connection info for a peer (Fix 4 observability).
+    ///
+    /// Returns a dict with has_quic, has_tcp_direct, has_relay,
+    /// preferred_transport, or None if the peer is unknown.
+    fn get_connection_info(&self, py: Python<'_>, peer_id: String) -> PyResult<Option<PyObject>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        let snapshot = py
+            .allow_threads(move || {
+                send_and_wait(&cmd_tx, |reply| SwarmCommand::GetConnectionInfo {
+                    peer_id,
+                    reply,
+                })
+            })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        match snapshot {
+            Some(info) => {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("has_quic", info.has_quic)?;
+                dict.set_item("has_tcp_direct", info.has_tcp_direct)?;
+                dict.set_item("has_relay", info.has_relay)?;
+                dict.set_item("preferred_transport", info.preferred_transport)?;
+                Ok(Some(dict.into_py_any(py)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Open a TCP-to-libp2p tunnel to a remote peer.
+    fn open_tunnel(&self, py: Python<'_>, peer_id: String) -> PyResult<String> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::OpenTunnel { peer_id, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Close an active tunnel to a remote peer.
+    fn close_tunnel(&self, py: Python<'_>, peer_id: String) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::CloseTunnel { peer_id })
+                .map_err(|_| "swarm not running".to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Poll for DCUtR success events.
+    fn poll_dcutr_event(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        let result = py
+            .allow_threads(move || {
+                send_and_wait(&cmd_tx, |reply| SwarmCommand::PollDcutrEvent { reply })
+            })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(result)
+    }
+
+    /// Poll for tunnel close events.
+    fn poll_tunnel_close_event(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        let result = py
+            .allow_threads(move || {
+                send_and_wait(&cmd_tx, |reply| SwarmCommand::PollTunnelCloseEvent { reply })
+            })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(result)
+    }
+
+    /// Dial a raw multiaddr (for manual hole-punch testing).
+    fn dial_address(&self, py: Python<'_>, multiaddr: String) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::DialAddress { multiaddr, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
         .map_err(|e| PyRuntimeError::new_err(e))
     }
 

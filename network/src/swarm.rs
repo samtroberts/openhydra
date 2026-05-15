@@ -47,7 +47,7 @@ impl Default for SwarmOptions {
 pub fn build_swarm(
     identity: &Identity,
     opts: SwarmOptions,
-) -> Result<Swarm<OpenHydraBehaviour>, Box<dyn std::error::Error>> {
+) -> Result<(Swarm<OpenHydraBehaviour>, libp2p_stream::Control), Box<dyn std::error::Error>> {
     let peer_id = identity.libp2p_peer_id;
     let keypair = identity.keypair.clone();
 
@@ -211,6 +211,10 @@ pub fn build_swarm(
             .with_interval(Duration::from_secs(15)),
     );
 
+    // libp2p-stream behaviour for persistent tensor streams (Fix 1).
+    let stream = libp2p_stream::Behaviour::new();
+    let stream_control = stream.new_control();
+
     let behaviour = OpenHydraBehaviour {
         kademlia,
         relay_client,
@@ -221,6 +225,7 @@ pub fn build_swarm(
         grpc_proxy,
         gossipsub,
         ping,
+        stream,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()
@@ -233,5 +238,5 @@ pub fn build_swarm(
         swarm.listen_on(addr.clone())?;
     }
 
-    Ok(swarm)
+    Ok((swarm, stream_control))
 }

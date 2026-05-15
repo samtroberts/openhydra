@@ -153,6 +153,28 @@ def _proxy_handler_loop(
     Legacy messages without prefix are treated as ForwardRequest (backward compat).
     """
     from peer import peer_pb2
+    import queue as _queue
+    _fwd_q: _queue.Queue = _queue.Queue()
+
+    def _fwd_worker():
+        """Single thread that processes all Forward() calls sequentially.
+
+        MLX Metal streams are thread-local; spawning a new thread per
+        request loses the stream context on the second call, causing
+        "There is no Stream(gpu, N) in current thread".
+        """
+        while not stop_event.is_set():
+            try:
+                fn = _fwd_q.get(timeout=1.0)
+            except _queue.Empty:
+                continue
+            try:
+                fn()
+            except Exception as _exc:
+                logging.error("fwd_worker_crash: %s", _exc, exc_info=True)
+
+    _fwd_thread = threading.Thread(target=_fwd_worker, daemon=True)
+    _fwd_thread.start()
     logging.info("proxy_handler_loop started")
     while not stop_event.is_set():
         try:
@@ -186,7 +208,7 @@ def _proxy_handler_loop(
                             logging.error("ASYNC_THREAD_CRASH: req=%s stage=%d err=%s",
                                           _req.request_id, _req.stage_index, _ff_exc,
                                           exc_info=True)
-                    threading.Thread(target=_ff_process, daemon=True).start()
+                    _fwd_q.put(_ff_process)
                 elif raw and raw[0:1] == PROXY_METHOD_FIRE_FORGET_RESULT:
                     # Fire-and-forget PushResult: ACK immediately,
                     # dispatch PushResult in a background thread.
@@ -1716,12 +1738,16 @@ class PeerService:
                             _fwd_kwargs["packed_bytes"] = _packed
                     if _return_hidden:
                         _fwd_kwargs["return_hidden_state"] = True
+                    _t0 = time.perf_counter()
                     activation = list(self.shard.forward(
                         request.prompt,
                         activation_in,
                         max_tokens,
                         **_fwd_kwargs,
                     ))
+                    _fwd_ms = (time.perf_counter() - _t0) * 1000
+                    logger.info("shard_forward_ms: peer=%s stage=%d ms=%.1f",
+                                self.peer_id, int(request.stage_index), _fwd_ms)
                 else:
                     activation = self.batch_queue.forward(
                         request.prompt,

@@ -1,0 +1,15 @@
+**From Cables to Clouds: A Brief History of the Internet**
+
+The story of the internet is as much a story of human ingenuity as it is of technological evolution. It began as a collection of disparate networks, grew into a global infrastructure, and now serves as the backbone of modern civilization, connecting ideas, commerce, and culture in ways previously thought impossible.
+
+**The Origins: ARPANET and the Breakthrough**
+The genesis of the internet dates back to January 1, 1969, with the launch of the **ARPANET** (Advanced Research Projects Agency Network). Created as a military project to link remote computers, it was the first time computers were successfully connected via packet switching, a technique where data is broken into small units and routed through a network as needed. While initially thought to be a temporary solution, as demand grew, the network expanded, introducing the concept of remote access, which is a foundational element of modern remote work and collaboration.
+
+**The Golden Age of TCP/IP**
+In 1983, as the US Department of Defense prepared to decommission ARPANET, a group of scientists, led by Vern Paxson, discovered that the network could be made as robust as telephone networks, as long as they all agreed to follow a standard set of rules called **TCP/IP** (Transmission Control Protocol/Internet Protocol). This standardization was the "glue" that allowed different networks to communicate with each other, effectively creating the first global network, as defined by CERN physicist John Cocke as "the network of networks."
+
+**The Rise of the Web**
+While the internet as a network existed, it was the development of the **World Wide Web** in 1989 by Tim Berners-Lee, a British physicist, that transformed it into what we know as the "internet as you know it." Berners-Lee, working as a researcher at CERN, created a system of hyperlinks, a browser, and a server, making information accessible to the average person rather than just to academics and government officials. The launch of the first web browser, **Mosaic**, in 1993, democratized access, sparking a cultural revolution as people began surfing, sharing, and creating content online.
+
+**The Digital Divide and Expansion**
+By the 1990s, the internet had moved from a niche research tool to a dominant force in global commerce, as evidenced by the launch of **Yahoo!**, the

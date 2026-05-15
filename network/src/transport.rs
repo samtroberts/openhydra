@@ -1,5 +1,7 @@
 //! Transport stack builder — TCP + QUIC + Noise + Yamux.
 
+use std::sync::Arc;
+
 use libp2p::{identity, noise, tcp, yamux, Transport};
 
 /// Build the TCP transport: TCP + Noise + Yamux.
@@ -24,9 +26,12 @@ pub fn build_quic_transport(
     keypair: &identity::Keypair,
 ) -> std::io::Result<libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>>
 {
-    let quic_transport = libp2p::quic::tokio::Transport::new(
-        libp2p::quic::Config::new(keypair),
-    )
+    let quic_config = libp2p::quic::Config::new(keypair)
+        .initial_mtu(1452)
+        .congestion_controller_factory(Arc::new(
+            quinn::congestion::BbrConfig::default(),
+        ));
+    let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
     .map(|(peer_id, muxer), _| (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
     .boxed();
 

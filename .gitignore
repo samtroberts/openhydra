@@ -140,6 +140,11 @@ OpenHydra_progress.md
 codex_prompt*.md
 peers*.json
 
+# ── Sensitive scripts (WiFi passwords, LAN IPs, SSH key paths) ────────────────
+scripts/switch_wifi.sh
+scripts/ssh_mac2.sh
+scripts/ab_pipeline_depth.sh
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.orig
 *.bak
