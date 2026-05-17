@@ -414,22 +414,48 @@ pub async fn run_event_loop(
         })
         .cloned()
         .collect();
-    let mut bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    // Align bootstrap retries to wall-clock multiples of 15s so that two
+    // nodes started at different times fire outbound SYNs simultaneously,
+    // enabling TCP simultaneous-open / QUIC hole-punch.
+    fn next_wall_clock_15s() -> tokio::time::Instant {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let next_boundary = ((now_unix / 15) + 1) * 15;
+        let wait_secs = next_boundary - now_unix;
+        tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs)
+    }
+    let mut bootstrap_retry_deadline = next_wall_clock_15s();
 
     loop {
-        // Retry dialing non-relay bootstrap peers every 15s until connected.
+        // Retry dialing non-relay bootstrap peers at wall-clock 15s boundaries.
         if !non_relay_bootstrap.is_empty() && tokio::time::Instant::now() >= bootstrap_retry_deadline {
-            bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            bootstrap_retry_deadline = next_wall_clock_15s();
             for (peer_id, addr) in &non_relay_bootstrap {
                 let already_direct = state.peer_connections.get(peer_id)
                     .map_or(false, |info| info.has_direct());
                 if already_direct {
                     continue;
                 }
+                // TCP dial
                 let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
                 info!(%peer_id, %dial_addr, "bootstrap_retry: re-dialing (not yet direct)");
                 if let Err(e) = swarm.dial(dial_addr.clone()) {
                     warn!(%peer_id, %e, "bootstrap_retry: dial failed");
+                }
+                // Also fire QUIC dials to cached IPv6 addresses on the same
+                // wall-clock boundary for simultaneous hole-punch.
+                if let Some(quic_addrs) = state.peer_quic_addrs.get(peer_id) {
+                    for qaddr in quic_addrs {
+                        use libp2p::swarm::dial_opts::DialOpts;
+                        let ma = qaddr.clone();
+                        match swarm.dial(DialOpts::unknown_peer_id().address(qaddr.clone()).build()) {
+                            Ok(()) => info!(%peer_id, %ma, "bootstrap_retry: quic_holepunch_dial"),
+                            Err(e) => debug!(%peer_id, %ma, %e, "bootstrap_retry: quic_dial_failed"),
+                        }
+                    }
                 }
             }
         }
