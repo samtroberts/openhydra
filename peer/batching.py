@@ -107,7 +107,7 @@ class BatchingQueue:
         """
         item = _BatchItem(
             prompt=prompt,
-            activation=list(activation),
+            activation=activation if hasattr(activation, "shape") else list(activation),
             max_tokens=max_tokens,
             stage_index=stage_index,
             total_stages=total_stages,
@@ -137,7 +137,8 @@ class BatchingQueue:
                 flush_thread.start()
 
         # Block until the batch fires and our future is resolved.
-        return list(item.future.result())
+        result = item.future.result()
+        return result if hasattr(result, "shape") else list(result)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -167,7 +168,7 @@ class BatchingQueue:
             results = self._dispatch(batch)
             for item, result in zip(batch, results):
                 if not item.future.done():
-                    item.future.set_result(list(result))
+                    item.future.set_result(result if hasattr(result, "shape") else list(result))
         except Exception as exc:
             logger.error("batching_queue_flush_error: %s", exc, exc_info=True)
             for item in batch:
@@ -183,7 +184,7 @@ class BatchingQueue:
         """
         fb = getattr(self._shard, "forward_batch", None)
         if callable(fb):
-            return [list(r) for r in fb(batch)]
+            return [r if hasattr(r, "shape") else list(r) for r in fb(batch)]
 
         # Graceful fallback: sequential per-item forward() for legacy runtimes.
         logger.warning(
@@ -206,5 +207,5 @@ class BatchingQueue:
                 decode_top_k=item.decode_top_k,
                 decode_seed=item.decode_seed,
             )
-            results.append(list(result))
+            results.append(result if hasattr(result, "shape") else list(result))
         return results

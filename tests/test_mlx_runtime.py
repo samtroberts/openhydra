@@ -380,6 +380,138 @@ def test_hidden_to_payload_roundtrip():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Group G2 — P0/P1/P3 optimization regression tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@MLX_MARK
+def test_hidden_to_packed_bytes_roundtrip():
+    """P0: _hidden_to_packed_bytes() produces bytes that decode back to the
+    same tensor shape and values as the original hidden state."""
+    import mlx.core as mx
+    import numpy as np
+    from peer.mlx_runtime import MLXRuntime
+    rt = MLXRuntime(_make_minimal_config())
+    h = mx.random.normal((1, 3, rt._runtime_profile["total_layers"]))
+    mx.eval(h)
+    packed = rt._hidden_to_packed_bytes(h)
+    assert isinstance(packed, bytes)
+    assert len(packed) > 0
+
+    # Decode via the same path the receiver uses: unpack_fp32 or
+    # openhydra_network.decode_activation.
+    from peer.activation_codec import unpack_fp32
+    floats = unpack_fp32(packed)
+    # The packed format includes a [seq_len, hidden_size] header.
+    seq_len = int(floats[0])
+    hidden_size = int(floats[1])
+    assert seq_len == 3
+    arr = np.array(floats[2:], dtype=np.float32).reshape(1, seq_len, hidden_size)
+    orig = np.asarray(h)
+    np.testing.assert_allclose(arr, orig, atol=1e-6)
+
+
+@MLX_MARK
+def test_hidden_to_packed_bytes_matches_payload():
+    """P0: packed bytes path and float-list payload path produce
+    numerically identical activations — they must be interchangeable
+    on the wire."""
+    import mlx.core as mx
+    import numpy as np
+    from peer.mlx_runtime import MLXRuntime
+    rt = MLXRuntime(_make_minimal_config())
+    h = mx.random.normal((1, 2, 4))
+    mx.eval(h)
+
+    payload = rt._hidden_to_payload(h)
+    packed = rt._hidden_to_packed_bytes(h)
+
+    from peer.activation_codec import unpack_fp32
+    packed_floats = unpack_fp32(packed)
+    # Both should have [seq_len, hidden_size, v0, v1, ...] shape.
+    assert len(payload) == len(packed_floats)
+    np.testing.assert_allclose(payload, packed_floats, atol=1e-6)
+
+
+@MLX_MARK
+def test_forward_sharded_intermediate_returns_mlx_tensor():
+    """P0: _forward_sharded on a non-last shard must return a raw MLX
+    tensor (not a list[float]). This is the core P0 optimization —
+    the caller (server.py) packs to bytes via _hidden_to_packed_bytes
+    instead of the slow _hidden_to_payload round-trip."""
+    import mlx.core as mx
+    from peer.mlx_runtime import MLXRuntime
+    cfg = _make_minimal_config(
+        total_shards=2,
+        shard_index=0,  # first shard = not last
+    )
+    rt = MLXRuntime(cfg)
+    if not rt._is_sharded:
+        pytest.skip("model too small to shard")
+
+    # Forward a token through the first shard (stage 0 of 2 = not last).
+    result = rt._forward_sharded(
+        prompt="test",
+        activation=None,
+        max_tokens=1,
+        stage_index=0,
+        total_stages=2,
+    )
+    # Must be a raw MLX array, not a Python list.
+    assert hasattr(result, "shape"), (
+        f"P0: intermediate shard should return raw MLX tensor, got {type(result)}"
+    )
+    assert result.dtype in (mx.float32, mx.float16, mx.bfloat16)
+    assert len(result.shape) == 3  # (batch, seq, hidden)
+
+
+@MLX_MARK
+def test_gc_threshold_raised_on_init():
+    """P3: MLXRuntime.__init__ must raise the gen-0 GC threshold to 2100
+    to prevent cyclic GC from firing mid-Metal-eval every ~3 calls."""
+    import gc
+    from peer.mlx_runtime import MLXRuntime
+    _orig = gc.get_threshold()
+    try:
+        MLXRuntime(_make_minimal_config())
+        t0, t1, t2 = gc.get_threshold()
+        assert t0 == 2100, f"gen-0 threshold should be 2100, got {t0}"
+        assert t1 == 10, f"gen-1 threshold should be 10, got {t1}"
+        assert t2 == 10, f"gen-2 threshold should be 10, got {t2}"
+    finally:
+        gc.set_threshold(*_orig)
+
+
+@MLX_MARK
+def test_forward_sharded_no_gc_toggle():
+    """P3: _forward_sharded must NOT toggle gc.disable/gc.enable per call.
+    The raised threshold (P3) replaces the old per-call GC suppression.
+    Verify GC stays enabled throughout a forward call."""
+    import gc
+    from peer.mlx_runtime import MLXRuntime
+    cfg = _make_minimal_config(
+        total_shards=2,
+        shard_index=0,
+    )
+    rt = MLXRuntime(cfg)
+    if not rt._is_sharded:
+        pytest.skip("model too small to shard")
+
+    gc.enable()
+    assert gc.isenabled()
+    rt._forward_sharded(
+        prompt="test",
+        activation=None,
+        max_tokens=1,
+        stage_index=0,
+        total_stages=2,
+    )
+    # GC must still be enabled after the call — the old code would
+    # leave it disabled on exception or if _gc_was_enabled was False.
+    assert gc.isenabled(), "GC should remain enabled after _forward_sharded"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Group H — ModelShard integration
 # ═══════════════════════════════════════════════════════════════════════════════
 

@@ -317,6 +317,7 @@
   {
     "model_id": "openhydra-qwen3.5-0.8b",
     "hf_model_id": "Qwen/Qwen3.5-0.8B",
+    "mlx_model_id": "mlx-community/Qwen3.5-0.8B-MLX-8bit",
     "draft_model_id": null,
     "required_peers": 1,
     "min_vram_gb": 2,

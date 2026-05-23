@@ -105,7 +105,7 @@ def test_forward_request_prompt_token_ids_field_number_stable():
     assert field.number == 42
     # Protobuf int64 enum value is 3 on the runtime side.
     assert field.type == field.TYPE_INT64
-    assert field.label == field.LABEL_REPEATED
+    assert field.is_repeated
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -1,30 +1,18 @@
 """Tests for Phase 4 Request Coalescing — BatchingQueue.
 
-Two test groups:
-
-1. ``TestBatchingQueueUnit`` — pure unit tests using mock shards.
-   Verifies coalescing semantics, max-batch flush, overflow, fallback,
-   and exception propagation.
-
-2. ``TestBatchingQueueGRPC`` — integration tests with a real gRPC toy peer.
-   Verifies that 4 concurrent Forward() calls are coalesced into a single
-   forward_batch() call, each client receives the correct response, and a
-   single request is unaffected by the coalescing machinery.
+Unit tests using mock shards — verifies coalescing semantics, max-batch
+flush, overflow, fallback, and exception propagation.
 """
 
 from __future__ import annotations
 
 import threading
-from concurrent import futures
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import grpc
 import pytest
 
-from peer import peer_pb2, peer_pb2_grpc
 from peer.batching import BatchingQueue, _BatchItem
-from peer.server import PeerService
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -42,32 +30,6 @@ def _make_mock_shard(return_fn=None):
         shard.forward_batch = MagicMock(side_effect=return_fn)
     return shard
 
-
-def _start_toy_peer_with_coalescing(
-    batch_window_ms: float = 100.0,
-    max_batch_size: int = 8,
-) -> tuple[grpc.Server, int, PeerService]:
-    """Start a real gRPC toy-backend PeerService with batching enabled."""
-    service = PeerService(
-        peer_id="coalesce-test",
-        model_id="openhydra-toy-345m",
-        shard_index=0,
-        total_shards=1,
-        daemon_mode="polite",
-        broken=False,
-        batch_window_ms=batch_window_ms,
-        max_batch_size=max_batch_size,
-    )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-    peer_pb2_grpc.add_PeerServicer_to_server(service, server)
-    try:
-        port = server.add_insecure_port("127.0.0.1:0")
-    except RuntimeError as exc:
-        pytest.skip(f"gRPC listener unavailable: {exc}")
-    if port == 0:
-        pytest.skip("gRPC listener unavailable")
-    server.start()
-    return server, port, service
 
 
 # ── Group 1: Unit Tests ────────────────────────────────────────────────────────
@@ -273,162 +235,3 @@ class TestBatchingQueueUnit:
 
         assert len(captured_items) == 1
         assert captured_items[0].request_id == "special-id-123"
-
-
-# ── Group 2: gRPC Integration Tests (disabled — gRPC server removed) ──────────
-import pytest
-
-
-@pytest.mark.skip(reason="gRPC server removed — unified libp2p transport")
-class TestBatchingQueueGRPC:
-    """Integration tests with a real gRPC toy peer and BatchingQueue."""
-
-    def test_four_concurrent_grpc_requests_coalesced(self):
-        """4 concurrent gRPC Forward() calls → forward_batch called once with batch_size=4."""
-        server, port, service = _start_toy_peer_with_coalescing(
-            batch_window_ms=300.0,
-            max_batch_size=8,
-        )
-        try:
-            call_batches: list[int] = []
-            original_fb = service.shard.forward_batch
-
-            def spy_fb(items: list[Any]) -> list[list[float]]:
-                call_batches.append(len(items))
-                return original_fb(items)
-
-            # Patch forward_batch on the shard instance so the BatchingQueue picks it up.
-            service.shard.forward_batch = spy_fb
-
-            channel = grpc.insecure_channel(f"127.0.0.1:{port}")
-            stub = peer_pb2_grpc.PeerStub(channel)
-
-            barrier = threading.Barrier(4)
-            responses: list[Any] = []
-            errors: list[Exception] = []
-            lock = threading.Lock()
-
-            def client(i: int) -> None:
-                barrier.wait()  # Ensure all 4 fire simultaneously
-                try:
-                    resp = stub.Forward(
-                        peer_pb2.ForwardRequest(
-                            request_id=f"req_{i}",
-                            prompt="hello",
-                            activation=[],
-                            max_tokens=1,
-                            stage_index=0,
-                            total_stages=1,
-                        ),
-                        timeout=10,
-                    )
-                    with lock:
-                        responses.append(resp)
-                except Exception as exc:
-                    with lock:
-                        errors.append(exc)
-
-            threads = [threading.Thread(target=client, args=(i,)) for i in range(4)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=10.0)
-
-            channel.close()
-
-            assert not errors, f"Client errors: {errors}"
-            assert len(responses) == 4
-            # All 4 items must have been dispatched. With the inflight_count
-            # fast path, some requests may bypass BatchingQueue and call
-            # shard.forward() directly, so call_batches may not sum to 4.
-            # The key assertion is that all 4 responses were received.
-
-        finally:
-            server.stop(grace=0)
-
-    def test_each_client_receives_correct_response(self):
-        """Each client's ForwardResponse carries the matching request_id."""
-        server, port, service = _start_toy_peer_with_coalescing(
-            batch_window_ms=200.0,
-            max_batch_size=8,
-        )
-        try:
-            channel = grpc.insecure_channel(f"127.0.0.1:{port}")
-            stub = peer_pb2_grpc.PeerStub(channel)
-
-            barrier = threading.Barrier(4)
-            responses_by_id: dict[str, Any] = {}
-            errors: list[Exception] = []
-            lock = threading.Lock()
-
-            def client(i: int) -> None:
-                barrier.wait()
-                try:
-                    resp = stub.Forward(
-                        peer_pb2.ForwardRequest(
-                            request_id=f"req_{i}",
-                            prompt="hello",
-                            activation=[],
-                            max_tokens=1,
-                            stage_index=0,
-                            total_stages=1,
-                        ),
-                        timeout=10,
-                    )
-                    with lock:
-                        responses_by_id[f"req_{i}"] = resp
-                except Exception as exc:
-                    with lock:
-                        errors.append(exc)
-
-            threads = [threading.Thread(target=client, args=(i,)) for i in range(4)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=10.0)
-
-            channel.close()
-
-            assert not errors, f"Client errors: {errors}"
-            # Every client must receive a response with the correct request_id.
-            for i in range(4):
-                key = f"req_{i}"
-                assert key in responses_by_id, f"Missing response for {key}"
-                resp = responses_by_id[key]
-                assert resp.request_id == key, (
-                    f"Expected request_id={key!r}, got {resp.request_id!r}"
-                )
-                assert resp.error == ""
-
-        finally:
-            server.stop(grace=0)
-
-    def test_single_request_unaffected_by_coalescing(self):
-        """A single request still works correctly — no starvation by coalescing logic."""
-        server, port, service = _start_toy_peer_with_coalescing(
-            batch_window_ms=200.0,
-            max_batch_size=8,
-        )
-        try:
-            channel = grpc.insecure_channel(f"127.0.0.1:{port}")
-            stub = peer_pb2_grpc.PeerStub(channel)
-
-            resp = stub.Forward(
-                peer_pb2.ForwardRequest(
-                    request_id="solo-req",
-                    prompt="hello world",
-                    activation=[],
-                    max_tokens=1,
-                    stage_index=0,
-                    total_stages=1,
-                ),
-                timeout=10,
-            )
-            channel.close()
-
-            assert resp.error == ""
-            assert resp.request_id == "solo-req"
-            assert len(resp.activation) > 0
-
-        finally:
-            server.stop(grace=0)

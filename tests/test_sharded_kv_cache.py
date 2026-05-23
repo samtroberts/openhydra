@@ -32,6 +32,25 @@ from peer.model_shard import (
 )
 
 
+def _is_passthrough(module: nn.Module) -> bool:
+    """Return True if *module* is a parameterless pass-through replacement.
+
+    ``_replace_offloaded_layers_with_identity`` replaced ``nn.Identity`` with
+    ``_ShardPassthrough`` — a local class that accepts ``*args, **kwargs``
+    (unlike ``nn.Identity`` which rejects keyword arguments that VLM layers
+    pass).  Since the class is local we can't ``isinstance``-check it; instead
+    we verify the *behavioural* contract:
+
+    1. Zero learnable parameters (no meta-device tensors to trip the dispatcher).
+    2. ``forward(tensor, extra_kwarg=...)`` returns the input unchanged.
+    """
+    if sum(1 for _ in module.parameters()) != 0:
+        return False
+    probe = torch.zeros(2)
+    out = module(probe, dummy_kwarg=True)
+    return out is probe
+
+
 class _FakeDecoderLayer(nn.Module):
     """Stand-in for a Qwen/LLaMA decoder layer with the exact attributes
     OpenHydra's forward path touches."""
@@ -136,9 +155,12 @@ def test_identity_swap_removes_meta_tensors_from_module_list():
     # Kept layers still work as real decoder layers.
     for idx in range(4):
         assert isinstance(m.model.layers[idx], _FakeDecoderLayer)
-    # Dropped layers are now Identity modules (parameterless).
+    # Dropped layers are now parameterless pass-through modules.
     for idx in range(4, 8):
-        assert isinstance(m.model.layers[idx], nn.Identity)
+        assert _is_passthrough(m.model.layers[idx]), (
+            f"layers[{idx}] should be a parameterless pass-through, "
+            f"got {type(m.model.layers[idx]).__name__}"
+        )
 
 
 def test_identity_swap_preserves_indexing():
@@ -152,11 +174,11 @@ def test_identity_swap_preserves_indexing():
 
     assert isinstance(m.model.layers[0], _FakeDecoderLayer)
     assert m.model.layers[0].layer_idx == 0
-    assert isinstance(m.model.layers[1], nn.Identity)
+    assert _is_passthrough(m.model.layers[1])
     assert isinstance(m.model.layers[2], _FakeDecoderLayer)
     assert m.model.layers[2].layer_idx == 2
-    assert isinstance(m.model.layers[3], nn.Identity)
-    assert isinstance(m.model.layers[4], nn.Identity)
+    assert _is_passthrough(m.model.layers[3])
+    assert _is_passthrough(m.model.layers[4])
     assert isinstance(m.model.layers[5], _FakeDecoderLayer)
     assert m.model.layers[5].layer_idx == 5
 

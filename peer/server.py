@@ -156,22 +156,95 @@ def _proxy_handler_loop(
     import queue as _queue
     _fwd_q: _queue.Queue = _queue.Queue()
 
+    # ── GPU keep-alive config ─────────────────────────────────────────
+    # Read from the shard's ToyShardConfig. Only active on MLX backends.
+    _shard_config = getattr(getattr(service, "shard", None), "config", None)
+    _gpu_keepalive = (
+        bool(getattr(_shard_config, "runtime_mlx_gpu_keepalive_enabled", False))
+        and str(getattr(service, "runtime_profile", {}).get("backend", "")).lower() == "mlx"
+    )
+    _keepalive_interval_s = (
+        max(0.001, float(getattr(_shard_config, "runtime_mlx_gpu_keepalive_interval_ms", 5.0))) / 1000.0
+        if _gpu_keepalive else 1.0
+    )
+    _KEEPALIVE_IDLE_THRESHOLD_S = 0.100  # auto-disable after 100ms of no Forward()
+    _KEEPALIVE_GIL_SWITCH_S = 0.0005   # 500μs GIL switch interval during active inference
+    if _gpu_keepalive:
+        logging.info(
+            "gpu_keepalive: enabled interval=%.1fms idle_threshold=%.0fms",
+            _keepalive_interval_s * 1000, _KEEPALIVE_IDLE_THRESHOLD_S * 1000,
+        )
+
     def _fwd_worker():
         """Single thread that processes all Forward() calls sequentially.
 
         MLX Metal streams are thread-local; spawning a new thread per
         request loses the stream context on the second call, causing
         "There is no Stream(gpu, N) in current thread".
+
+        GPU keep-alive: during active inference, uses a non-blocking
+        queue poll with busy-wait to keep the thread scheduled and the
+        Metal GPU power state warm. ``queue.get(timeout=...)`` internally
+        calls ``time.sleep()`` which deschedules the thread and lets the
+        M1 GPU power-gate (~6ms wake penalty). Busy-waiting prevents
+        this. Auto-disables after 100ms of no Forward() activity to
+        avoid wasting CPU when genuinely idle.
+
+        GIL tuning: during active inference, ``sys.setswitchinterval``
+        is lowered from the default 5ms to 500μs so that the
+        proxy_handler_loop thread can put work on the queue within
+        500μs instead of waiting up to 5ms for the GIL. Reverted to
+        default when inference goes idle.
         """
+        import sys as _sys
+        _last_forward_t: float = 0.0
+        _default_switch = _sys.getswitchinterval()
+        _keepalive_active = False
+
         while not stop_event.is_set():
+            # ── Active inference: busy-poll to keep GPU warm ──────────
+            if _gpu_keepalive and _last_forward_t > 0:
+                _since = time.perf_counter() - _last_forward_t
+                if _since < _KEEPALIVE_IDLE_THRESHOLD_S:
+                    if not _keepalive_active:
+                        _sys.setswitchinterval(_KEEPALIVE_GIL_SWITCH_S)
+                        _keepalive_active = True
+                    # Non-blocking poll: keeps thread scheduled, GPU stays
+                    # in active power state. Spin for up to keepalive_interval
+                    # then loop back to check queue again.
+                    _spin_end = time.perf_counter() + _keepalive_interval_s
+                    fn = None
+                    while time.perf_counter() < _spin_end:
+                        try:
+                            fn = _fwd_q.get_nowait()
+                            break
+                        except _queue.Empty:
+                            pass
+                    if fn is None:
+                        continue
+                    try:
+                        fn()
+                    except Exception as _exc:
+                        logging.error("fwd_worker_crash: %s", _exc, exc_info=True)
+                    _last_forward_t = time.perf_counter()
+                    continue
+                else:
+                    # Inference went idle — restore default GIL interval
+                    if _keepalive_active:
+                        _sys.setswitchinterval(_default_switch)
+                        _keepalive_active = False
+
+            # ── Idle: block with 1s timeout to save CPU ───────────────
             try:
                 fn = _fwd_q.get(timeout=1.0)
             except _queue.Empty:
                 continue
+
             try:
                 fn()
             except Exception as _exc:
                 logging.error("fwd_worker_crash: %s", _exc, exc_info=True)
+            _last_forward_t = time.perf_counter()
 
     _fwd_thread = threading.Thread(target=_fwd_worker, daemon=True)
     _fwd_thread.start()
@@ -957,6 +1030,8 @@ class PeerService:
         kv_radix_cache_min_prefix_len: int = 16,
         warmup_on_start: bool = False,
         mlx_eval_timeout_s: float = 120.0,
+        mlx_gpu_keepalive_enabled: bool = True,
+        mlx_gpu_keepalive_interval_ms: float = 5.0,
         batch_window_ms: float = 50.0,
         max_batch_size: int = 8,
         p2p_node: Any | None = None,
@@ -1003,6 +1078,8 @@ class PeerService:
                 runtime_kv_radix_cache_min_prefix_len=max(1, int(kv_radix_cache_min_prefix_len)),
                 runtime_warmup_on_start=bool(warmup_on_start),
                 runtime_mlx_eval_timeout_s=max(1.0, float(mlx_eval_timeout_s)),
+                runtime_mlx_gpu_keepalive_enabled=bool(mlx_gpu_keepalive_enabled),
+                runtime_mlx_gpu_keepalive_interval_ms=max(1.0, float(mlx_gpu_keepalive_interval_ms)),
                 runtime_tensor_autoencoder_enabled=bool(tensor_autoencoder_enabled),
                 runtime_tensor_autoencoder_latent_dim=max(1, int(tensor_autoencoder_latent_dim)),
                 runtime_privacy_noise_variance=max(0.0, float(privacy_noise_variance)),
@@ -1030,6 +1107,8 @@ class PeerService:
         self._boot_kv_cache_max_entries = max(1, int(kv_cache_max_entries))
         self._boot_warmup_on_start = bool(warmup_on_start)
         self._boot_mlx_eval_timeout_s = max(1.0, float(mlx_eval_timeout_s))
+        self._boot_mlx_gpu_keepalive_enabled = bool(mlx_gpu_keepalive_enabled)
+        self._boot_mlx_gpu_keepalive_interval_ms = float(mlx_gpu_keepalive_interval_ms)
         self._boot_load_full_head = bool(load_full_head)
         # Phase 2a: persist pipeline_depth so reload_shard preserves the
         # async-pipeline executor sizing across resharding events.
@@ -1224,6 +1303,12 @@ class PeerService:
                 runtime_warmup_on_start=bool(getattr(self, "_boot_warmup_on_start", False)),
                 runtime_mlx_eval_timeout_s=float(
                     getattr(self, "_boot_mlx_eval_timeout_s", 120.0)
+                ),
+                runtime_mlx_gpu_keepalive_enabled=bool(
+                    getattr(self, "_boot_mlx_gpu_keepalive_enabled", True)
+                ),
+                runtime_mlx_gpu_keepalive_interval_ms=float(
+                    getattr(self, "_boot_mlx_gpu_keepalive_interval_ms", 5.0)
                 ),
                 runtime_layer_indices=new_layer_indices,
                 runtime_peer_id=str(self.peer_id),
@@ -1739,12 +1824,20 @@ class PeerService:
                     if _return_hidden:
                         _fwd_kwargs["return_hidden_state"] = True
                     _t0 = time.perf_counter()
-                    activation = list(self.shard.forward(
+                    _fwd_result = self.shard.forward(
                         request.prompt,
                         activation_in,
                         max_tokens,
                         **_fwd_kwargs,
-                    ))
+                    )
+                    # P0: MLX _forward_sharded now returns a raw MLX tensor
+                    # for intermediate shards instead of a float list.
+                    # Keep it as-is; packing to bytes happens below.
+                    # For non-MLX or last-shard (token IDs), coerce to list.
+                    if hasattr(_fwd_result, "shape"):
+                        activation = _fwd_result  # raw tensor — pack below
+                    else:
+                        activation = list(_fwd_result)
                     _fwd_ms = (time.perf_counter() - _t0) * 1000
                     logger.info("shard_forward_ms: peer=%s stage=%d ms=%.1f",
                                 self.peer_id, int(request.stage_index), _fwd_ms)
@@ -1763,14 +1856,26 @@ class PeerService:
                         decode_seed=(decode_seed if decode_seed > 0 else None),
                     )
                 if kv_store_activation:
-                    self._kv_cache_set(kv_session_id, activation)
+                    # KV cache stores list[float]; materialise raw tensor if needed.
+                    _kv_act = (
+                        self.shard._hidden_to_payload(activation)
+                        if hasattr(activation, "shape")
+                        else activation
+                    )
+                    self._kv_cache_set(kv_session_id, _kv_act)
             self.last_inference_thread_id = self.shard.last_forward_thread_id
 
             # TOPLOC: compute activation hash for integrity verification (P2-B)
             _act_hash = b""
             try:
                 from verification.toploc import activation_hash
-                _act_hash = activation_hash(activation)
+                # activation_hash expects list[float]; materialise raw tensor.
+                _hash_act = (
+                    self.shard._hidden_to_payload(activation)
+                    if hasattr(activation, "shape")
+                    else activation
+                )
+                _act_hash = activation_hash(_hash_act)
             except Exception:
                 pass
 
@@ -1779,7 +1884,17 @@ class PeerService:
             # token IDs which are short and don't benefit from packing.
             _activation_packed_resp = b""
             _activation_for_proto = activation
-            if activation and len(activation) > 10:
+            if hasattr(activation, "shape"):
+                # P0: Raw MLX tensor from _forward_sharded — use the
+                # zero-copy _hidden_to_packed_bytes path directly (~0.3ms),
+                # bypassing the 22ms _hidden_to_payload round-trip entirely.
+                try:
+                    _activation_packed_resp = self.shard._hidden_to_packed_bytes(activation)
+                    _activation_for_proto = []
+                except Exception:
+                    # Fallback: materialise to float list for the legacy path.
+                    _activation_for_proto = self.shard._hidden_to_payload(activation)
+            elif activation and len(activation) > 10:
                 try:
                     # PR-1: vectorised pack (numpy). Falls back to struct.pack
                     # inside pack_fp32 when numpy is absent.
@@ -3435,6 +3550,8 @@ def serve(
     kv_radix_cache_min_prefix_len: int = 16,
     warmup_on_start: bool = False,
     mlx_eval_timeout_s: float = 120.0,
+    mlx_gpu_keepalive_enabled: bool = True,
+    mlx_gpu_keepalive_interval_ms: float = 5.0,
     batch_window_ms: float = 50.0,
     max_batch_size: int = 8,
     load_full_head: bool = False,
@@ -3632,6 +3749,8 @@ def serve(
         kv_radix_cache_min_prefix_len=max(1, int(kv_radix_cache_min_prefix_len)),
         warmup_on_start=bool(warmup_on_start),
         mlx_eval_timeout_s=max(1.0, float(mlx_eval_timeout_s)),
+        mlx_gpu_keepalive_enabled=bool(mlx_gpu_keepalive_enabled),
+        mlx_gpu_keepalive_interval_ms=float(mlx_gpu_keepalive_interval_ms),
         batch_window_ms=float(batch_window_ms),
         max_batch_size=max(1, int(max_batch_size)),
         load_full_head=bool(load_full_head),

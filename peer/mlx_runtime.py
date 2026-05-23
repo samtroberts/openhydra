@@ -55,6 +55,74 @@ __all__ = ["MLXRuntime"]
 _T = TypeVar("_T")
 
 
+# ── P6 proxy caches for mx.compile ──────────────────────────────────────────
+# Drop-in replacements for KVCache / ArraysCache that use compile-safe
+# operations.  Layers call the same interface (.offset, .update_and_fetch,
+# __getitem__/__setitem__, .advance) — the proxy implementations produce
+# MLX-traced ops instead of Python-int mutations and in-place slice writes
+# that force GPU synchronisation.
+
+class _ProxyKVCache:
+    """Compile-safe drop-in for KVCache.
+
+    Uses ``mx.where`` with a one-hot write mask to keep the pre-allocated
+    buffer shape constant across decode steps (no recompilation).
+    Stores offset as ``mx.array`` so RoPE traces correctly.
+    """
+
+    def __init__(self, keys_buf: Any, values_buf: Any, offset_arr: Any) -> None:
+        self.keys = keys_buf          # pre-allocated buffer, shape (B, H, L_buf, D)
+        self.values = values_buf
+        self._offset = offset_arr     # mx.array scalar
+
+    @property
+    def offset(self) -> Any:
+        return self._offset           # mx.array, not Python int
+
+    def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
+        import mlx.core as mx
+        L_buf = self.keys.shape[2]    # baked constant (e.g. 256)
+        pos_idx = mx.arange(L_buf)    # baked constant array
+        write_mask = (pos_idx == self._offset).reshape(1, 1, L_buf, 1)
+        self.keys = mx.where(
+            write_mask,
+            mx.broadcast_to(keys, self.keys.shape),
+            self.keys,
+        )
+        self.values = mx.where(
+            write_mask,
+            mx.broadcast_to(values, self.values.shape),
+            self.values,
+        )
+        self._offset = self._offset + keys.shape[2]  # +1 for decode
+        return self.keys, self.values
+
+
+class _ProxyArraysCache:
+    """Compile-safe drop-in for ArraysCache.
+
+    Standard single-sequence decode: ``lengths`` and ``left_padding`` are
+    ``None``, so ``advance()`` and ``make_mask()`` are no-ops.
+    """
+
+    def __init__(self, *arrays: Any) -> None:
+        self._arrays = list(arrays)
+        self.lengths = None
+        self.left_padding = None
+
+    def __getitem__(self, idx: int) -> Any:
+        return self._arrays[idx]
+
+    def __setitem__(self, idx: int, value: Any) -> None:
+        self._arrays[idx] = value
+
+    def advance(self, N: int) -> None:
+        pass  # no-op for standard single-sequence decode
+
+    def make_mask(self, N: int) -> None:
+        return None
+
+
 class _MlxWatchdog:
     """Timeout wrapper for MLX Metal GPU operations.
 
@@ -350,14 +418,15 @@ class MLXRuntime:
             self._shard_hidden_size = int(getattr(_lm_args, "hidden_size", 0))
 
             # Layer type info for mask creation (Qwen3.5 has linear + full_attention)
-            self._shard_layer_is_linear = [_all_layers[i].is_linear for i in self._shard_layer_indices]
+            # Standard transformers (Qwen2.5, etc.) don't have is_linear — default to False (all full-attention)
+            self._shard_layer_is_linear = [getattr(_all_layers[i], 'is_linear', False) for i in self._shard_layer_indices]
             # Find first full-attention and first SSM layer in THIS shard for mask creation
             self._shard_fa_cache_idx = None
             self._shard_ssm_cache_idx = None
             for local_idx, global_idx in enumerate(self._shard_layer_indices):
-                if not _all_layers[global_idx].is_linear and self._shard_fa_cache_idx is None:
+                if not getattr(_all_layers[global_idx], 'is_linear', False) and self._shard_fa_cache_idx is None:
                     self._shard_fa_cache_idx = local_idx
-                if _all_layers[global_idx].is_linear and self._shard_ssm_cache_idx is None:
+                if getattr(_all_layers[global_idx], 'is_linear', False) and self._shard_ssm_cache_idx is None:
                     self._shard_ssm_cache_idx = local_idx
 
             # Free unused layers
@@ -470,6 +539,27 @@ class MLXRuntime:
             except ImportError as exc:
                 logging.warning("mlx_runtime: RadixKVCache import failed: %s", exc)
                 self._radix_cache = None
+
+        # ── P3: Raise Python's cyclic-GC generation-0 threshold ────────
+        # Each _forward_sharded call creates ~200+ MLX array objects.  The
+        # default gen-0 threshold (700) fires every ~3 calls, releasing
+        # Metal buffers mid-eval and stalling the GPU for ~1ms.  Raising
+        # the threshold to 2100 (3× default) lets gen-0 collections happen
+        # roughly every ~10 calls instead, batching the overhead.
+        gc.set_threshold(2100, 10, 10)
+
+        # ── P6: mx.compile for the shard layer loop ──────────────────
+        # Xcode Metal System Trace showed 14 separate command buffer
+        # submissions per token — one per layer.  mx.compile traces the
+        # Python layer loop and fuses it into 1-2 Metal submissions,
+        # eliminating ~10-15ms/token of dispatch + forced-eval overhead.
+        #
+        # Compiled lazily on first decode call.  Proxy caches provide a
+        # compile-safe interface (slot-based KV writes, mx.array offsets)
+        # while layers remain model-agnostic black boxes.  Recompiles
+        # when the KV buffer expands (every KVCache.step=256 tokens).
+        self._compiled_shard_fn = None
+        self._compiled_cache_size_key: tuple[int, ...] | None = None
 
         # Phase W: warmup.
         if bool(getattr(config, "runtime_warmup_on_start", False)):
@@ -845,6 +935,149 @@ class MLXRuntime:
         full_cache = make_prompt_cache(self._model)
         # Pick only the cache entries for our shard's layers.
         return [full_cache[i] for i in self._shard_layer_indices]
+
+    # ── P6 compiled-shard helpers ─────────────────────────────────────────────
+
+    def _build_compiled_shard_fn(self) -> Any:
+        """Build an ``mx.compile``-d version of the shard layer loop.
+
+        Layers are called as black boxes — no model-specific code is inlined.
+        Proxy cache classes provide a compile-safe interface while the layers
+        call ``cache.update_and_fetch()``, ``cache.offset``, ``cache[0]`` etc.
+        as normal.
+        """
+        import mlx.core as mx
+
+        layers = self._selected_layers
+        is_linear = self._shard_layer_is_linear
+
+        def _run_layers(h: Any, *cache_flat: Any) -> tuple[Any, ...]:
+            # ── Reconstruct proxy caches from flat arrays ──
+            proxies: list[_ProxyKVCache | _ProxyArraysCache] = []
+            idx = 0
+            for i in range(len(layers)):
+                if is_linear[i]:
+                    proxies.append(_ProxyArraysCache(cache_flat[idx], cache_flat[idx + 1]))
+                    idx += 2
+                else:
+                    proxies.append(_ProxyKVCache(cache_flat[idx], cache_flat[idx + 1], cache_flat[idx + 2]))
+                    idx += 3
+
+            # ── Run layers (model-agnostic — layers are black boxes) ──
+            for i, layer in enumerate(layers):
+                if is_linear[i]:
+                    h = layer(h, mask=None, cache=proxies[i])
+                else:
+                    # Validity mask so SDPA ignores unfilled KV buffer slots.
+                    # Positions 0..offset are valid (offset is written by
+                    # update_and_fetch during this layer call).
+                    proxy = proxies[i]
+                    assert isinstance(proxy, _ProxyKVCache)
+                    L_buf = proxy.keys.shape[2]
+                    pos_idx = mx.arange(L_buf)
+                    kv_mask = (pos_idx <= proxy._offset).reshape(1, 1, 1, L_buf)
+                    h = layer(h, mask=kv_mask, cache=proxy)
+
+            # ── Extract updated arrays from proxies ──
+            results: list[Any] = [h]
+            for i in range(len(layers)):
+                p = proxies[i]
+                if is_linear[i]:
+                    assert isinstance(p, _ProxyArraysCache)
+                    results.extend([p[0], p[1]])
+                else:
+                    assert isinstance(p, _ProxyKVCache)
+                    results.extend([p.keys, p.values, p._offset])
+            return tuple(results)
+
+        return mx.compile(_run_layers)
+
+    def _extract_flat_cache(self, cache: list[Any]) -> list[Any]:
+        """Extract raw ``mx.array`` values from cache objects for compiled input."""
+        import mlx.core as mx
+
+        flat: list[Any] = []
+        for i in range(len(self._selected_layers)):
+            c = cache[i]
+            if self._shard_layer_is_linear[i]:
+                # ArraysCache: [conv_state, ssm_state]
+                flat.append(c[0] if c[0] is not None else mx.zeros((1,)))
+                flat.append(c[1] if c[1] is not None else mx.zeros((1,)))
+            else:
+                # KVCache: [keys_buffer, values_buffer, offset]
+                flat.append(c.keys)
+                flat.append(c.values)
+                # Reuse mx.array offset from prior compiled call if available
+                # (avoids int→array conversion on the hot path).
+                flat.append(
+                    c._p6_offset_arr
+                    if hasattr(c, "_p6_offset_arr")
+                    else mx.array(c.offset)
+                )
+        return flat
+
+    def _writeback_flat_cache(self, cache: list[Any], flat: tuple[Any, ...] | list[Any]) -> None:
+        """Write compiled function outputs back to cache objects.
+
+        The KV offset is kept as an ``mx.array`` (``_p6_offset_arr``) to
+        avoid a CPU-GPU sync on every token.  ``c.offset`` (Python int) is
+        only updated lazily when needed by the eager fallback path.
+        """
+        idx = 0
+        for i in range(len(self._selected_layers)):
+            c = cache[i]
+            if self._shard_layer_is_linear[i]:
+                c[0] = flat[idx]
+                c[1] = flat[idx + 1]
+                idx += 2
+            else:
+                c.keys = flat[idx]
+                c.values = flat[idx + 1]
+                # Keep offset as mx.array — no .item() sync.
+                c._p6_offset_arr = flat[idx + 2]
+                idx += 3
+
+    def _sync_compiled_offsets(self, cache: list[Any]) -> None:
+        """Materialise ``_p6_offset_arr`` → ``c.offset`` (Python int).
+
+        Called on eager fallback or before KV cache storage to ensure
+        the ``KVCache.offset`` attribute is correct.
+        """
+        for i in range(len(self._selected_layers)):
+            c = cache[i]
+            if not self._shard_layer_is_linear[i] and hasattr(c, "_p6_offset_arr"):
+                c.offset = int(c._p6_offset_arr.item())
+                del c._p6_offset_arr
+
+    def _kv_buffer_size_key(self, cache: list[Any]) -> tuple[int, ...]:
+        """Return KV buffer sizes — changes when ``KVCache`` pre-allocation expands."""
+        sizes: list[int] = []
+        for i in range(len(self._selected_layers)):
+            if not self._shard_layer_is_linear[i]:
+                c = cache[i]
+                sizes.append(c.keys.shape[2] if c.keys is not None else 0)
+        return tuple(sizes)
+
+    def _kv_would_overflow(self, cache: list[Any]) -> bool:
+        """Return ``True`` if any attention cache offset would exceed its buffer.
+
+        The compiled path uses ``mx.where`` slot writes into a fixed-size
+        buffer — writes beyond the buffer boundary are silently dropped.
+        When overflow is imminent the caller must fall back to eager mode
+        so the real ``KVCache.update_and_fetch`` can resize the buffer.
+
+        Uses ``c.offset`` (Python int), which is always current at the
+        start of each ``_forward_sharded`` call because
+        ``_sync_compiled_offsets`` runs before KV cache storage.  No
+        ``mx.array.item()`` → no CPU-GPU sync on the hot path.
+        """
+        for i in range(len(self._selected_layers)):
+            if not self._shard_layer_is_linear[i]:
+                c = cache[i]
+                if c.keys is not None:
+                    if c.offset + 1 > c.keys.shape[2]:
+                        return True
+        return False
 
     def _sample_from_logits(
         self,
@@ -1249,62 +1482,127 @@ class MLXRuntime:
                 raise RuntimeError("missing_hidden_payload")
             h = self._activation_to_hidden(activation, packed_bytes=packed_bytes)
 
-        # Eval on the current thread — NOT through the watchdog executor.
-        # The watchdog runs mx.eval on a dedicated thread, but MLX Metal
-        # streams are thread-local.  When _forward_sharded is called from
-        # a fire-and-forget proxy handler thread, `h` lives on that
-        # thread's stream; sending it to the watchdog thread triggers
-        # "There is no Stream(gpu, N) in current thread".
-        mx.eval(h)
+        # P1: Removed intermediate mx.eval(h) — the deserialized hidden
+        # state feeds directly into the layer loop which will evaluate it
+        # lazily on the Metal stream.  Skipping the forced GPU sync here
+        # saves one round-trip (~1-2ms) per token.
 
-        # ── Suppress Python cyclic GC during Metal evaluation ─────
-        # Each _forward_sharded call creates ~200+ MLX array objects.
-        # Python's gen-0 GC threshold (700) triggers every ~3 calls,
-        # releasing MLX Metal buffers mid-eval and stalling the GPU
-        # for ~1s. Disable the cyclic collector around mx.eval calls.
-        _gc_was_enabled = gc.isenabled()
-        gc.disable()
+        # ── Build masks ────────────────────────────────────────────
+        _text_model = getattr(getattr(self._model, "language_model", self._model), "model", self._model)
+        _model_mod = type(_text_model).__module__
+        import importlib
+        _mod = importlib.import_module(_model_mod)
+        _create_fa_mask = getattr(_mod, "create_attention_mask", lambda h, cache=None: None)
+        _create_ssm_mask = getattr(_mod, "create_ssm_mask", lambda h, cache=None: None)
 
-        try:
-            # ── Build masks ────────────────────────────────────────────
-            _text_model = getattr(getattr(self._model, "language_model", self._model), "model", self._model)
-            _model_mod = type(_text_model).__module__
-            import importlib
-            _mod = importlib.import_module(_model_mod)
-            _create_fa_mask = getattr(_mod, "create_attention_mask", lambda h, cache=None: None)
-            _create_ssm_mask = getattr(_mod, "create_ssm_mask", lambda h, cache=None: None)
+        fa_cache_ref = cached_kv[self._shard_fa_cache_idx] if (cached_kv and self._shard_fa_cache_idx is not None) else None
+        ssm_cache_ref = cached_kv[self._shard_ssm_cache_idx] if (cached_kv and self._shard_ssm_cache_idx is not None) else None
+        fa_mask = _create_fa_mask(h, cache=fa_cache_ref)
+        ssm_mask = _create_ssm_mask(h, cache=ssm_cache_ref)
 
-            fa_cache_ref = cached_kv[self._shard_fa_cache_idx] if (cached_kv and self._shard_fa_cache_idx is not None) else None
-            ssm_cache_ref = cached_kv[self._shard_ssm_cache_idx] if (cached_kv and self._shard_ssm_cache_idx is not None) else None
-            fa_mask = _create_fa_mask(h, cache=fa_cache_ref)
-            ssm_mask = _create_ssm_mask(h, cache=ssm_cache_ref)
+        # ── Run shard layers ───────────────────────────────────────
+        cache = cached_kv if cached_kv is not None else self._make_shard_cache()
 
-            # ── Run shard layers ───────────────────────────────────────
-            cache = cached_kv if cached_kv is not None else self._make_shard_cache()
+        # P6: compiled path for decode (L=1, no special masks).
+        # Proxy caches replace in-place KV mutations with lazy mx.where
+        # ops, eliminating forced GPU syncs and fusing 14 Metal command
+        # buffer submissions into 1-2.
+        _is_decode = h.shape[1] == 1
+        _use_compiled = (
+            _is_decode
+            and fa_mask is None
+            and ssm_mask is None
+            and self._is_sharded
+        )
+
+        if _use_compiled:
+            # Guard: if the next write would overflow the KV buffer, fall
+            # back to eager so KVCache.update_and_fetch resizes the buffer.
+            # The compiled path's mx.where writes into a fixed-size buffer —
+            # writes beyond the boundary are silently dropped.
+            if self._kv_would_overflow(cache):
+                _use_compiled = False
+                logging.debug("mx_compile: KV buffer full, eager fallback for resize")
+                # Sync offsets before eager runs
+                self._sync_compiled_offsets(cache)
+                # Invalidate so we recompile after the resize
+                self._compiled_shard_fn = None
+
+        if _use_compiled:
+            # Recompile when KV buffer pre-allocation expands (every 256 tokens).
+            _size_key = self._kv_buffer_size_key(cache)
+            if (
+                self._compiled_shard_fn is not None
+                and _size_key != self._compiled_cache_size_key
+            ):
+                logging.debug("mx_compile: KV buffer resized, recompiling")
+                self._compiled_shard_fn = None
+
+            if self._compiled_shard_fn is None:
+                try:
+                    self._compiled_shard_fn = self._build_compiled_shard_fn()
+                    self._compiled_cache_size_key = _size_key
+                    logging.info(
+                        "mx_compile: shard layer loop compiled (%d layers, slot-based KV)",
+                        len(self._selected_layers),
+                    )
+                except Exception as _e:
+                    logging.info("mx_compile: compile failed — %s (using eager mode)", _e)
+
+            if self._compiled_shard_fn is not None:
+                try:
+                    _cache_flat = self._extract_flat_cache(cache)
+                    _results = self._compiled_shard_fn(h, *_cache_flat)
+                    h = _results[0]
+                    self._writeback_flat_cache(cache, _results[1:])
+                except Exception as _e:
+                    logging.warning(
+                        "mx_compile: runtime error — eager fallback: %s",
+                        _e,
+                        exc_info=True,
+                    )
+                    self._compiled_shard_fn = None
+                    # Materialise any pending mx.array offsets before eager
+                    # fallback — layers expect c.offset to be a Python int.
+                    self._sync_compiled_offsets(cache)
+                    for i, layer in enumerate(self._selected_layers):
+                        mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
+                        h = layer(h, mask=mask, cache=cache[i])
+            else:
+                for i, layer in enumerate(self._selected_layers):
+                    mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
+                    h = layer(h, mask=mask, cache=cache[i])
+        else:
+            # Prefill (L>1) or masked: always eager.
             for i, layer in enumerate(self._selected_layers):
                 mask = ssm_mask if self._shard_layer_is_linear[i] else fa_mask
                 h = layer(h, mask=mask, cache=cache[i])
 
-            # ── Store KV cache ─────────────────────────────────────────
-            if session_id and kv_store_activation:
-                self._kv_cache[session_id] = cache
-                while len(self._kv_cache) > self._kv_cache_max:
-                    self._kv_cache.pop(next(iter(self._kv_cache)))
+        # ── Store KV cache ─────────────────────────────────────────
+        if session_id and kv_store_activation:
+            # Materialise any pending mx.array offsets so that cached
+            # KVCache objects have a valid Python-int ``offset`` for the
+            # next call (prefill masks, buffer-resize detection, etc.).
+            self._sync_compiled_offsets(cache)
+            self._kv_cache[session_id] = cache
+            while len(self._kv_cache) > self._kv_cache_max:
+                self._kv_cache.pop(next(iter(self._kv_cache)))
 
-            # ── Output ─────────────────────────────────────────────────
-            if is_last and not return_hidden_state:
-                h = self._shard_norm(h)
-                if self._tie_word_embeddings:
-                    logits = self._shard_embed_tokens.as_linear(h)
-                else:
-                    logits = self._shard_lm_head(h)
-                mx.eval(logits)
-                return self._sample_from_logits(logits, **sampling_kwargs)
+        # ── Output ─────────────────────────────────────────────────
+        if is_last and not return_hidden_state:
+            h = self._shard_norm(h)
+            if self._tie_word_embeddings:
+                logits = self._shard_embed_tokens.as_linear(h)
             else:
-                return self._hidden_to_payload(h)
-        finally:
-            if _gc_was_enabled:
-                gc.enable()
+                logits = self._shard_lm_head(h)
+            mx.eval(logits)
+            return self._sample_from_logits(logits, **sampling_kwargs)
+        else:
+            # P0: Return raw MLX tensor — caller (server.py) will pack
+            # to bytes via _hidden_to_packed_bytes, skipping the 22ms
+            # _hidden_to_payload (mx.eval → numpy → .tolist()) round-trip.
+            mx.eval(h)
+            return h
 
     # ── Batched forward pass ───────────────────────────────────────────────────
 

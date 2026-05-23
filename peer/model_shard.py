@@ -191,6 +191,14 @@ class ToyShardConfig:
     # Default raised from 30s to 120s to support 8 GB machines under memory pressure.
     runtime_mlx_eval_timeout_s: float = 120.0
 
+    # ── Metal GPU keep-alive ─────────────────────────────────────────────
+    # On Apple Silicon, the Metal GPU power-gates after ~5ms idle, adding
+    # ~6ms wake-up penalty in distributed inference's ~30ms inter-step gap.
+    # When enabled, _fwd_worker pokes the GPU with mx.eval(mx.zeros((1,)))
+    # during idle gaps to keep the power state warm. MLX backend only.
+    runtime_mlx_gpu_keepalive_enabled: bool = True
+    runtime_mlx_gpu_keepalive_interval_ms: float = 5.0
+
     # ── Tokenizer alignment (heterogeneous MLX ↔ PyTorch rings) ───────────
     # Canonical HuggingFace model id (e.g. "Qwen/Qwen3.5-2B") used to load
     # the *tokenizer* across every backend. When set and
@@ -359,7 +367,8 @@ def _replace_offloaded_layers_with_identity(
     kept_layer_indices: tuple[int, ...],
 ) -> int:
     """Replace every decoder layer whose index is **not** in
-    ``kept_layer_indices`` with ``nn.Identity()`` in the model's ``ModuleList``.
+    ``kept_layer_indices`` with a ``_ShardPassthrough()`` in the model's
+    ``ModuleList``.
 
     Why this exists
     ---------------
@@ -376,23 +385,37 @@ def _replace_offloaded_layers_with_identity(
     ``_update_causal_mask`` internals iterate all 32 layer slots,
     eventually dispatching an op on a meta tensor → crash.
 
-    Replacing the out-of-shard entries with ``nn.Identity()`` is safe:
+    Replacing the out-of-shard entries with ``_ShardPassthrough()`` is safe:
 
     - Indexing (``layers[layer_idx]``) stays valid; the block's
       ``layer_idx`` attribute (set at model construction) still matches
       its position in the list.
-    - ``nn.Identity(*args, **kwargs)`` returns its first positional
-      argument unchanged, so any ``block(hidden, ...)`` call on a
-      replaced slot is a pass-through (not used by OpenHydra's
-      ``_run_layers``, which only iterates ``self._selected_layers``,
-      but harmless if anything else touches it).
-    - Identity modules have zero parameters and live on no device, so
+    - ``_ShardPassthrough(hidden, *args, **kwargs)`` returns the first
+      positional argument unchanged, so any ``block(hidden, ...)`` call
+      on a replaced slot is a pass-through — including VLM layers that
+      pass ``position_embeddings`` and ``attention_mask`` as kwargs.
+      (Not used by OpenHydra's ``_run_layers``, which only iterates
+      ``self._selected_layers``, but harmless if anything else touches it).
+    - Passthrough modules have zero parameters and live on no device, so
       iteration through ``model.modules()`` / ``model.parameters()``
       no longer yields meta tensors.
 
     Returns the number of layers that were replaced.
     """
     from torch import nn
+
+    class _ShardPassthrough(nn.Module):
+        """Drop-in for ``nn.Identity`` that accepts arbitrary kwargs.
+
+        VLM layers (e.g. Qwen3.5-0.8B ``Qwen3_5ForConditionalGeneration``)
+        pass ``position_embeddings``, ``attention_mask``, etc. as keyword
+        arguments.  ``nn.Identity.forward(self, input: Tensor)`` only
+        accepts a single positional arg and raises ``TypeError`` on any
+        kwarg.  This class returns the first positional argument and
+        ignores everything else — zero parameters, no device.
+        """
+        def forward(self, input, *args, **kwargs):
+            return input
 
     layers = _find_decoder_layer_list(model)
     if layers is None:
@@ -404,12 +427,12 @@ def _replace_offloaded_layers_with_identity(
         if i in kept:
             continue
         existing = layers[i]
-        # Don't replace if it's already an Identity (idempotent) or if
+        # Don't replace if it's already a passthrough (idempotent) or if
         # it's None (already cleared by legacy ``self._blocks[idx] = None``
         # cleanup — the ModuleList still holds the original reference).
-        if isinstance(existing, nn.Identity):
+        if isinstance(existing, nn.Identity) or type(existing).__name__ == '_ShardPassthrough':
             continue
-        layers[i] = nn.Identity()
+        layers[i] = _ShardPassthrough()
         replaced += 1
 
     if replaced > 0:
@@ -1276,8 +1299,10 @@ class PyTorchRuntime:
             # ``parameters()`` iteration — then dispatches an aten op on a
             # meta tensor and crashes with
             # ``GET was unable to find an engine to execute this computation``.
-            # Replace every out-of-shard slot with ``nn.Identity()`` so the
-            # ModuleList no longer contains meta tensors.
+            # Replace every out-of-shard slot with ``_ShardPassthrough()``
+            # so the ModuleList no longer contains meta tensors.
+            # _ShardPassthrough accepts *args/**kwargs (unlike nn.Identity)
+            # so VLM layers that pass position_embeddings etc. don't crash.
             if not _multimodal_stripped:
                 try:
                     _id_replaced = _replace_offloaded_layers_with_identity(
@@ -1285,7 +1310,7 @@ class PyTorchRuntime:
                     )
                     if _id_replaced > 0:
                         logging.info(
-                            "pytorch_layer_identity_swap: %d offloaded layers replaced with nn.Identity",
+                            "pytorch_layer_identity_swap: %d offloaded layers replaced with _ShardPassthrough",
                             _id_replaced,
                         )
                 except Exception as _id_exc:
@@ -1477,6 +1502,44 @@ class PyTorchRuntime:
             except Exception as exc:
                 logging.warning("kv_radix_cache_init_failed: %s — radix cache disabled", exc)
                 self._radix_cache = None
+
+        # ── P4: torch.compile with reduce-overhead mode ─────────────────────
+        # CUDA GPUs spend significant time in cudaLaunchKernel and
+        # at::TensorIteratorBase::build (py-spy profiling showed ~15% of
+        # forward time). torch.compile with mode="reduce-overhead" uses
+        # CUDA Graphs to replay captured kernel sequences, eliminating
+        # per-op dispatch overhead.  fullgraph=False is required because
+        # KV-cache grows dynamically across decode steps.
+        # Guard: only on CUDA, only when torch.compile is available
+        # (PyTorch 2.0+), and silently fall back on any error.
+        self._torch_compiled = False
+        _dev_type = getattr(self._device, "type", str(self._device))
+        # Guard: skip torch.compile when layers are offloaded (disk/CPU) —
+        # CUDA Graphs cannot capture cross-device kernels, and the mixed
+        # device_map causes NaN in attention on low-VRAM GPUs.
+        _has_offload = any(
+            str(v) in ("cpu", "disk")
+            for v in getattr(self._model, "hf_device_map", {}).values()
+        )
+        if _dev_type == "cuda" and not _has_offload:
+            try:
+                _compile_fn = getattr(self._torch, "compile", None)
+                if callable(_compile_fn):
+                    self._model = _compile_fn(
+                        self._model,
+                        mode="reduce-overhead",
+                        fullgraph=False,
+                    )
+                    self._torch_compiled = True
+                    logging.info(
+                        "torch_compile: enabled mode=reduce-overhead device=%s",
+                        self._device,
+                    )
+            except Exception as _compile_exc:
+                logging.info(
+                    "torch_compile: skipped — %s (falling back to eager mode)",
+                    _compile_exc,
+                )
 
         # ── Model warmup (Phase W) ────────────────────────────────────────────
         if bool(getattr(config, "runtime_warmup_on_start", False)):
@@ -2489,6 +2552,14 @@ class PyTorchRuntime:
                 )
                 shared_cache = None
 
+        # P2: Hoist rotary embeddings out of the layer loop. The (cos, sin)
+        # tuple depends only on position_ids, not on the per-layer hidden
+        # state, so computing it once and reusing across all layers avoids
+        # N redundant GPU kernel launches (9ms for 12 layers on GTX 1050).
+        _position_embeddings = None
+        if self._decoder_family in {"llama", "qwen_llama"} and self._rotary_emb is not None and position_ids is not None:
+            _position_embeddings = self._rotary_emb(output, position_ids)
+
         for idx, block in enumerate(self._selected_layers):
             layer_past = None
             if shared_cache is not None:
@@ -2509,11 +2580,8 @@ class PyTorchRuntime:
                 block_kwargs["cache_position"] = cache_position
             if position_ids is not None:
                 block_kwargs["position_ids"] = position_ids
-            if self._decoder_family in {"llama", "qwen_llama"} and self._rotary_emb is not None and position_ids is not None:
-                # Compute rotary position embeddings (cos, sin) for each layer.
-                # This is REQUIRED for correct output — without it, transformer
-                # blocks receive position_embeddings=None and produce garbage.
-                block_kwargs["position_embeddings"] = self._rotary_emb(output, position_ids)
+            if _position_embeddings is not None:
+                block_kwargs["position_embeddings"] = _position_embeddings
 
             block_out = block(output, **block_kwargs)
             if isinstance(block_out, tuple):
@@ -3300,7 +3368,22 @@ class PyTorchRuntime:
                     _gemma4_ids,
                 )
 
-        with self._torch.no_grad():
+        # P5: FP16 autocast — CUDA GPUs (Pascal SM 6.1+, Turing SM 7.5+)
+        # have 2x+ throughput for FP16 ops. T4 Tensor Cores give ~65 TFLOPS
+        # FP16 vs ~8.1 TFLOPS FP32 (8x). The model loads in FP16 but
+        # intermediate ops may upcast to FP32 without autocast.
+        # Use float16 (not bfloat16) — Pascal doesn't support bf16.
+        # When enabled=False (non-CUDA), this is a no-op.
+        _amp_enabled = (
+            getattr(self._device, "type", str(self._device)) == "cuda"
+            and not any(
+                str(v) in ("cpu", "disk")
+                for v in getattr(self._model, "hf_device_map", {}).values()
+            )
+        )
+        with self._torch.no_grad(), self._torch.amp.autocast(
+            device_type="cuda", dtype=self._torch.float16, enabled=_amp_enabled,
+        ):
             full_model_stage = bool(
                 is_first
                 and is_last
@@ -3803,6 +3886,14 @@ class ModelShard:
     def runtime_profile(self) -> dict[str, Any]:
         return dict(self._runtime.runtime_profile())
 
+    def _hidden_to_payload(self, hidden: Any) -> list[float]:
+        """Delegate to the underlying runtime's serialisation method."""
+        return self._runtime._hidden_to_payload(hidden)
+
+    def _hidden_to_packed_bytes(self, hidden: Any) -> bytes:
+        """Delegate to the underlying runtime's zero-copy packing."""
+        return self._runtime._hidden_to_packed_bytes(hidden)
+
     def reshard(self, new_layer_start: int, new_layer_end: int, total_layers: int) -> bool:
         """Reshard the underlying runtime to cover [new_layer_start, new_layer_end).
 
@@ -3904,9 +3995,8 @@ class ModelShard:
             # threads it through (see mlx_runtime.py). ToyRuntime is
             # excluded because it would reject the kwarg.
             _kwargs["return_hidden_state"] = True
-        return list(
-            self._runtime.forward(prompt, activation, max_tokens, **_kwargs)
-        )
+        result = self._runtime.forward(prompt, activation, max_tokens, **_kwargs)
+        return result if hasattr(result, "shape") else list(result)
 
     async def forward_async(
         self,

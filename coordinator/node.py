@@ -250,6 +250,11 @@ def main() -> None:
     parser.add_argument("--mlx-eval-timeout", type=float, default=120.0,
                         help="Maximum seconds for a single MLX computation before the watchdog "
                              "kills it (default: 120). Increase on memory-constrained machines.")
+    parser.add_argument("--mlx-gpu-keepalive", action=argparse.BooleanOptionalAction, default=True,
+                        help="Metal GPU keep-alive during distributed inference idle gaps (default: on). "
+                             "Prevents ~6ms GPU wake-up penalty on Apple Silicon. MLX only.")
+    parser.add_argument("--mlx-gpu-keepalive-interval-ms", type=float, default=5.0,
+                        help="Interval (ms) between GPU keep-alive pokes (default: 5.0).")
     parser.add_argument("--specpipe", action="store_true", default=False,
                         help="Enable SpecPipe pipeline-filling speculation (P1-A).")
     parser.add_argument(
@@ -1266,6 +1271,8 @@ def main() -> None:
                 "advertise_host": args.advertise_host,
                 "identity_path": args.identity_path,
                 "mlx_eval_timeout_s": args.mlx_eval_timeout,
+                "mlx_gpu_keepalive_enabled": bool(getattr(args, "mlx_gpu_keepalive", True)),
+                "mlx_gpu_keepalive_interval_ms": float(getattr(args, "mlx_gpu_keepalive_interval_ms", 5.0)),
                 "rebalance_enabled": bool(getattr(args, "rebalance_enabled", False)),
                 "rebalance_interval": int(getattr(args, "rebalance_interval", 6)),
                 "rebalance_min_improvement": float(getattr(args, "rebalance_min_improvement", 1.15)),

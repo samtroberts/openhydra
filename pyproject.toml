@@ -92,3 +92,9 @@ ignore = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 addopts = "-q"
+filterwarnings = [
+    # CPython 3.11 emits these for C-extension types that lack __module__;
+    # triggered during pytest plugin import, not by our code.  Fixed in 3.12+.
+    "ignore:builtin type Swig:DeprecationWarning",
+    "ignore:builtin type swig:DeprecationWarning",
+]
