@@ -8,8 +8,11 @@ use crate::types::PeerRecord;
 const MODEL_KEY_PREFIX: &str = "/openhydra/model/";
 
 /// Build a Kademlia record key for a peer's model announcement.
-pub fn peer_record_key(model_id: &str, peer_id: &str) -> kad::RecordKey {
-    kad::RecordKey::new(&format!("{MODEL_KEY_PREFIX}{model_id}/{peer_id}"))
+///
+/// Uses the libp2p PeerId (base58) in the key, NOT the OpenHydra peer_id,
+/// so that records can be looked up by provider PeerId after `get_providers`.
+pub fn peer_record_key(model_id: &str, libp2p_peer_id: &str) -> kad::RecordKey {
+    kad::RecordKey::new(&format!("{MODEL_KEY_PREFIX}{model_id}/{libp2p_peer_id}"))
 }
 
 /// Build a Kademlia record key for querying all peers of a model.
@@ -39,21 +42,62 @@ pub fn parse_model_id_from_key(key: &[u8]) -> Option<String> {
     Some(stripped[..slash_pos].to_string())
 }
 
+/// Compute canonical bytes for signing a PeerRecord.
+///
+/// Matches the Python canonical format:
+/// `json.dumps({"host": host, "model_id": model_id, "peer_id": peer_id, "port": port}, sort_keys=True)`
+/// Keys are already alphabetical, so the JSON is deterministic.
+pub fn canonical_bytes(record: &PeerRecord) -> Vec<u8> {
+    format!(
+        r#"{{"host": "{}", "model_id": "{}", "peer_id": "{}", "port": {}}}"#,
+        record.host, record.model_id, record.peer_id, record.port,
+    )
+    .into_bytes()
+}
+
+/// Sign a PeerRecord with the given keypair and populate its `signature`
+/// and `public_key` fields.  Returns the mutated record (Task 6.2).
+pub fn sign_peer_record(
+    record: &PeerRecord,
+    keypair: &libp2p::identity::Keypair,
+) -> Result<PeerRecord, String> {
+    let canonical = canonical_bytes(record);
+    let sig_bytes = keypair
+        .sign(&canonical)
+        .map_err(|e| format!("sign failed: {e}"))?;
+    let ed25519_pk = keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|e| format!("not ed25519: {e}"))?;
+    let mut signed = record.clone();
+    signed.signature = base64_urlsafe_encode(&sig_bytes);
+    signed.public_key = hex::encode(ed25519_pk.to_bytes());
+    signed.libp2p_peer_id =
+        libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+    Ok(signed)
+}
+
+/// URL-safe base64 encoding (matches Python's `base64.urlsafe_b64encode`).
+fn base64_urlsafe_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE.encode(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_key_format() {
-        let key = peer_record_key("openhydra-qwen3.5-2b", "mac-a");
+        let key = peer_record_key("openhydra-qwen3.5-2b", "12D3KooWEL5wELabcdef");
         let raw = key.as_ref();
         let s = std::str::from_utf8(raw).unwrap();
-        assert_eq!(s, "/openhydra/model/openhydra-qwen3.5-2b/mac-a");
+        assert_eq!(s, "/openhydra/model/openhydra-qwen3.5-2b/12D3KooWEL5wELabcdef");
     }
 
     #[test]
     fn test_parse_model_id() {
-        let key = b"/openhydra/model/openhydra-qwen3.5-2b/mac-a";
+        let key = b"/openhydra/model/openhydra-qwen3.5-2b/12D3KooWEL5wELabcdef";
         assert_eq!(
             parse_model_id_from_key(key),
             Some("openhydra-qwen3.5-2b".to_string())

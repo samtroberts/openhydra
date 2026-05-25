@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::swarm::Config as SwarmConfig;
-use libp2p::{autonat, gossipsub, identify, kad, relay, Multiaddr, Swarm, Transport};
-use tracing::info;
+use libp2p::{autonat, gossipsub, identify, kad, ping, relay, Multiaddr, Swarm, Transport};
+use tracing::{debug, info, warn};
 
 // Re-use crate modules for identity and transport.
 // Note: since this is a [[bin]], we import the library crate.
@@ -45,6 +45,9 @@ struct BootstrapBehaviour {
     /// because neither is connected to anyone who'll forward the
     /// topic message.
     gossipsub: gossipsub::Behaviour,
+    /// Phase 5.6: Ping detects stale connections — without it, dead
+    /// connections persist for the full idle_connection_timeout (600s).
+    ping: ping::Behaviour,
 }
 
 #[tokio::main]
@@ -68,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // hole punching. Without this, peers can only attempt TCP
             // hole punching which has ~5-10% success rate.
             "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
+            // IPv6 dual-stack — required for cross-ISP direct connections
+            // where IPv6 may be the only routable path (e.g. Jio CGNAT).
+            "/ip6/::/tcp/4001".parse().unwrap(),
+            "/ip6/::/udp/4001/quic-v1".parse().unwrap(),
         ]);
 
     info!("loading identity from {identity_path}");
@@ -96,12 +103,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         libp2p::StreamProtocol::new("/openhydra/kad/1.0.0"),
     );
     kad_config.set_query_timeout(Duration::from_secs(30));
-    kad_config.set_record_ttl(Some(Duration::from_secs(600)));
+    // Phase 7.5: Reduced from 600s to 300s to match peer nodes. The old
+    // 600s TTL doubled the ghost window compared to peers.
+    kad_config.set_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(600)));
     kad_config.set_publication_interval(Some(Duration::from_secs(240)));
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
+    // Bootstrap nodes MUST be in server mode to accept GET_RECORD/PUT_RECORD
+    // queries from peers. Without this, they may stay in client mode and
+    // silently refuse DHT operations.
+    kademlia.set_mode(Some(kad::Mode::Server));
 
     // Add other bootstrap peers to the routing table.
     let bootstrap_peers: Vec<Multiaddr> = parse_flag_multi(&args, "--peer")
@@ -134,8 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reservation_duration: Duration::from_secs(3600),
             // 10 MB per circuit — activation tensors can be several MB.
             max_circuit_bytes: 10 * 1024 * 1024,
-            // 10 minutes per circuit — autoregressive decode can take a while.
-            max_circuit_duration: Duration::from_secs(600),
+            // Phase 5.5: 30 minutes per circuit — a 2048-token generation at
+            // 3 TPS takes ~683s, exceeding the previous 600s limit.
+            max_circuit_duration: Duration::from_secs(1800),
             ..Default::default()
         },
     );
@@ -205,6 +219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subscribe(&gossip_topic)
         .map_err(|e| format!("gossipsub subscribe: {e:?}"))?;
 
+    // Phase 5.6: Ping with 15s interval detects stale connections faster
+    // than the idle_connection_timeout alone.
+    let ping = ping::Behaviour::new(
+        ping::Config::new().with_interval(Duration::from_secs(15)),
+    );
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
@@ -212,10 +232,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identify,
         dcutr,
         gossipsub,
+        ping,
     };
 
+    // Phase 5.6: Reduced from 600s to 300s to match peer nodes and
+    // reclaim dead connections faster.
     let swarm_config = SwarmConfig::with_tokio_executor()
-        .with_idle_connection_timeout(Duration::from_secs(600));
+        .with_idle_connection_timeout(Duration::from_secs(300));
 
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
 
@@ -226,41 +249,226 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("bootstrap node running — press Ctrl+C to stop");
 
-    // Event loop.
+    // Event loop — Phase 4.4: graceful shutdown via signal handling.
     loop {
-        match swarm.select_next_some().await {
-            libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-                info!(%address, "new listen address");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGTERM/SIGINT, shutting down gracefully");
+                break;
             }
-            libp2p::swarm::SwarmEvent::Behaviour(event) => {
+            event = swarm.select_next_some() => {
                 match event {
-                    BootstrapBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
-                        peer, ..
-                    }) => {
-                        info!(%peer, "kademlia routing table updated");
+                    libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
+                        info!(%address, "new listen address");
                     }
-                    BootstrapBehaviourEvent::RelayServer(
-                        relay::Event::ReservationReqAccepted { src_peer_id, .. },
-                    ) => {
-                        info!(%src_peer_id, "relay reservation accepted");
+                    libp2p::swarm::SwarmEvent::Behaviour(event) => {
+                        match event {
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
+                                peer, ..
+                            }) => {
+                                info!(%peer, "kademlia routing table updated");
+                            }
+                            BootstrapBehaviourEvent::RelayServer(
+                                relay::Event::ReservationReqAccepted { src_peer_id, .. },
+                            ) => {
+                                info!(%src_peer_id, "relay reservation accepted");
+                            }
+                            BootstrapBehaviourEvent::RelayServer(
+                                relay::Event::CircuitClosed { src_peer_id, dst_peer_id, error },
+                            ) => {
+                                info!(%src_peer_id, %dst_peer_id, ?error, "relay circuit closed");
+                            }
+                            // Task 7.1: Relay server — circuit/reservation lifecycle
+                            BootstrapBehaviourEvent::RelayServer(
+                                relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id },
+                            ) => {
+                                info!(%src_peer_id, %dst_peer_id, "relay circuit request accepted");
+                            }
+                            BootstrapBehaviourEvent::RelayServer(
+                                relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id },
+                            ) => {
+                                warn!(%src_peer_id, %dst_peer_id, "relay circuit request denied (capacity limit)");
+                            }
+                            BootstrapBehaviourEvent::RelayServer(
+                                relay::Event::ReservationReqDenied { src_peer_id },
+                            ) => {
+                                warn!(%src_peer_id, "relay reservation request denied");
+                            }
+                            BootstrapBehaviourEvent::RelayServer(
+                                relay::Event::ReservationTimedOut { src_peer_id },
+                            ) => {
+                                info!(%src_peer_id, "relay reservation timed out");
+                            }
+                            #[allow(deprecated)]
+                            BootstrapBehaviourEvent::RelayServer(other) => {
+                                debug!(?other, "relay server event");
+                            }
+
+                            // Task 7.1: Kademlia — routing & query diagnostics
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::UnroutablePeer { peer }) => {
+                                warn!(%peer, "kademlia: unroutable peer (no known listen address)");
+                            }
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                                result, step, ..
+                            }) => {
+                                debug!(?result, last = step.last, "kademlia: outbound query progressed");
+                            }
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::RoutablePeer { peer, address }) => {
+                                debug!(%peer, %address, "kademlia: routable peer");
+                            }
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::PendingRoutablePeer { peer, address }) => {
+                                debug!(%peer, %address, "kademlia: pending routable peer");
+                            }
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::InboundRequest { request }) => {
+                                debug!(?request, "kademlia: inbound request");
+                            }
+                            BootstrapBehaviourEvent::Kademlia(kad::Event::ModeChanged { new_mode }) => {
+                                info!(?new_mode, "kademlia: mode changed");
+                            }
+
+                            // Task 7.1: AutoNAT — NAT status monitoring
+                            BootstrapBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new }) => {
+                                info!(?old, ?new, "autonat: NAT status changed");
+                            }
+                            BootstrapBehaviourEvent::Autonat(other) => {
+                                debug!(?other, "autonat event");
+                            }
+
+                            // Task 7.1: Gossipsub — message forwarding & topic membership
+                            BootstrapBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                                propagation_source, message_id, message,
+                            }) => {
+                                debug!(
+                                    %propagation_source,
+                                    %message_id,
+                                    topic = %message.topic,
+                                    len = message.data.len(),
+                                    "gossipsub: message received/forwarded"
+                                );
+                            }
+                            BootstrapBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+                                peer_id, topic,
+                            }) => {
+                                info!(%peer_id, %topic, "gossipsub: peer subscribed");
+                            }
+                            BootstrapBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed {
+                                peer_id, topic,
+                            }) => {
+                                info!(%peer_id, %topic, "gossipsub: peer unsubscribed");
+                            }
+                            BootstrapBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported {
+                                peer_id,
+                            }) => {
+                                debug!(%peer_id, "gossipsub: protocol not supported by peer");
+                            }
+
+                            // Task 7.1: Identify — peer metadata exchange
+                            BootstrapBehaviourEvent::Identify(identify::Event::Received {
+                                peer_id, info, ..
+                            }) => {
+                                debug!(
+                                    %peer_id,
+                                    protocol_version = %info.protocol_version,
+                                    agent_version = %info.agent_version,
+                                    listen_addrs = info.listen_addrs.len(),
+                                    "identify: received peer info"
+                                );
+                            }
+                            BootstrapBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. }) => {
+                                debug!(%peer_id, "identify: sent local info");
+                            }
+                            BootstrapBehaviourEvent::Identify(identify::Event::Pushed { peer_id, .. }) => {
+                                debug!(%peer_id, "identify: pushed local info");
+                            }
+                            BootstrapBehaviourEvent::Identify(identify::Event::Error {
+                                peer_id, error, ..
+                            }) => {
+                                warn!(%peer_id, %error, "identify: error");
+                            }
+
+                            // Task 7.1: DCUtR — hole-punch results
+                            BootstrapBehaviourEvent::Dcutr(dcutr_event) => {
+                                match &dcutr_event.result {
+                                    Ok(connection_id) => {
+                                        info!(
+                                            peer_id = %dcutr_event.remote_peer_id,
+                                            %connection_id,
+                                            "dcutr: direct connection upgrade succeeded"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            peer_id = %dcutr_event.remote_peer_id,
+                                            %error,
+                                            "dcutr: direct connection upgrade failed"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Task 7.1: Ping — connection health
+                            BootstrapBehaviourEvent::Ping(ping::Event { peer, result, .. }) => {
+                                match result {
+                                    Ok(rtt) => {
+                                        debug!(%peer, ?rtt, "ping: success");
+                                    }
+                                    Err(error) => {
+                                        warn!(%peer, %error, "ping: failure");
+                                    }
+                                }
+                            }
+                        }
                     }
-                    BootstrapBehaviourEvent::RelayServer(
-                        relay::Event::CircuitClosed { src_peer_id, dst_peer_id, .. },
-                    ) => {
-                        info!(%src_peer_id, %dst_peer_id, "relay circuit closed");
+                    libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id: p, .. } => {
+                        info!(%p, "connection established");
                     }
-                    _ => {}
+                    libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id: p, cause, .. } => {
+                        info!(%p, ?cause, "connection closed");
+                    }
+                    // Task 7.1: Swarm-level events — no more catch-all
+                    libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        warn!(?peer_id, %error, "outgoing connection error");
+                    }
+                    libp2p::swarm::SwarmEvent::IncomingConnectionError { error, local_addr, send_back_addr, .. } => {
+                        warn!(%error, %local_addr, %send_back_addr, "incoming connection error");
+                    }
+                    libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
+                        info!(%address, "external address confirmed");
+                    }
+                    libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
+                        info!(%address, "external address expired");
+                    }
+                    libp2p::swarm::SwarmEvent::NewExternalAddrCandidate { address } => {
+                        debug!(%address, "new external address candidate");
+                    }
+                    libp2p::swarm::SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
+                        debug!(%peer_id, %address, "discovered new address of peer");
+                    }
+                    libp2p::swarm::SwarmEvent::ExpiredListenAddr { address, .. } => {
+                        info!(%address, "listen address expired");
+                    }
+                    libp2p::swarm::SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                        warn!(?addresses, ?reason, "listener closed");
+                    }
+                    libp2p::swarm::SwarmEvent::ListenerError { error, .. } => {
+                        warn!(%error, "listener error");
+                    }
+                    libp2p::swarm::SwarmEvent::Dialing { peer_id, .. } => {
+                        debug!(?peer_id, "dialing peer");
+                    }
+                    libp2p::swarm::SwarmEvent::IncomingConnection { local_addr, send_back_addr, .. } => {
+                        debug!(%local_addr, %send_back_addr, "incoming connection");
+                    }
+                    // #[non_exhaustive] requires a catch-all for future SwarmEvent variants.
+                    other => {
+                        debug!(?other, "unhandled swarm event");
+                    }
                 }
             }
-            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id: p, .. } => {
-                info!(%p, "connection established");
-            }
-            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id: p, .. } => {
-                info!(%p, "connection closed");
-            }
-            _ => {}
         }
     }
+
+    Ok(())
 }
 
 // Minimal CLI flag parsing (no clap dependency to keep binary small).

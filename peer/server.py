@@ -197,18 +197,28 @@ def _proxy_handler_loop(
         default when inference goes idle.
         """
         import sys as _sys
+        import gc as _gc
         _last_forward_t: float = 0.0
+        _prev_forward_t: float = 0.0  # Task 8.5: for RTT estimation
+        _observed_gap_ema: float = 0.0  # Task 8.5: EMA of inter-Forward gap
         _default_switch = _sys.getswitchinterval()
         _keepalive_active = False
+        _gc_disabled = False
 
         while not stop_event.is_set():
             # ── Active inference: busy-poll to keep GPU warm ──────────
             if _gpu_keepalive and _last_forward_t > 0:
                 _since = time.perf_counter() - _last_forward_t
-                if _since < _KEEPALIVE_IDLE_THRESHOLD_S:
+                # Task 8.5: adaptive threshold = max(100ms, 3× observed gap EMA)
+                _effective_threshold = max(_KEEPALIVE_IDLE_THRESHOLD_S, 3.0 * _observed_gap_ema)
+                if _since < _effective_threshold:
                     if not _keepalive_active:
                         _sys.setswitchinterval(_KEEPALIVE_GIL_SWITCH_S)
                         _keepalive_active = True
+                        # Task 8.3: disable GC during active inference
+                        if not _gc_disabled:
+                            _gc.disable()
+                            _gc_disabled = True
                     # Non-blocking poll: keeps thread scheduled, GPU stays
                     # in active power state. Spin for up to keepalive_interval
                     # then loop back to check queue again.
@@ -226,13 +236,26 @@ def _proxy_handler_loop(
                         fn()
                     except Exception as _exc:
                         logging.error("fwd_worker_crash: %s", _exc, exc_info=True)
-                    _last_forward_t = time.perf_counter()
+                    # Task 8.5: Track inter-Forward gap for adaptive threshold
+                    _now = time.perf_counter()
+                    if _last_forward_t > 0:
+                        _gap = _now - _last_forward_t
+                        if _gap < 2.0:  # ignore gaps > 2s (session boundaries)
+                            _alpha = 0.3
+                            _observed_gap_ema = _alpha * _gap + (1 - _alpha) * _observed_gap_ema
+                    _prev_forward_t = _last_forward_t
+                    _last_forward_t = _now
                     continue
                 else:
                     # Inference went idle — restore default GIL interval
                     if _keepalive_active:
                         _sys.setswitchinterval(_default_switch)
                         _keepalive_active = False
+                        # Task 8.3: re-enable GC when idle
+                        if _gc_disabled:
+                            _gc.enable()
+                            _gc.collect()
+                            _gc_disabled = False
 
             # ── Idle: block with 1s timeout to save CPU ───────────────
             try:
@@ -244,7 +267,15 @@ def _proxy_handler_loop(
                 fn()
             except Exception as _exc:
                 logging.error("fwd_worker_crash: %s", _exc, exc_info=True)
-            _last_forward_t = time.perf_counter()
+            # Task 8.5: Track inter-Forward gap for adaptive threshold
+            _now = time.perf_counter()
+            if _last_forward_t > 0:
+                _gap = _now - _last_forward_t
+                if _gap < 2.0:  # ignore gaps > 2s (session boundaries)
+                    _alpha = 0.3
+                    _observed_gap_ema = _alpha * _gap + (1 - _alpha) * _observed_gap_ema
+            _prev_forward_t = _last_forward_t
+            _last_forward_t = _now
 
     _fwd_thread = threading.Thread(target=_fwd_worker, daemon=True)
     _fwd_thread.start()
@@ -2461,15 +2492,15 @@ class PeerService:
                 next_next_addr = str(next_route[0].address)
                 next_next_id = str(next_route[0].peer_id)
 
-            # Use activation_packed from response if available (zero-copy path).
-            # Falls back to re-packing the repeated float field.
+            # Task 8.1: Use activation_packed from response (zero-copy path).
+            # Falls back to array-based packing if packed bytes not available.
             _push_packed = bytes(getattr(response, 'activation_packed', b'') or b'')
             _push_activation: list[float] = []
             if not _push_packed:
                 _push_activation = list(response.activation)
                 if _push_activation:
-                    import struct as _push_struct
-                    _push_packed = _push_struct.pack(f'<{len(_push_activation)}f', *_push_activation)
+                    import array as _push_array
+                    _push_packed = _push_array.array('f', _push_activation).tobytes()
                     _push_activation = []
 
             next_req = peer_pb2.ForwardRequest(
@@ -3104,8 +3135,26 @@ def _probe_available_vram_mb() -> int:
     return 0
 
 
-def _sign_announce_safe(private_key: object, peer_id: str, host: str, port: int, model_id: str) -> str:
-    """Sign an announce payload; returns empty string on any error."""
+def _sign_announce_safe(private_key: object, peer_id: str, host: str, port: int, model_id: str, *, p2p_node: object = None) -> str:
+    """Sign an announce payload; returns empty string on any error.
+
+    Task 6.0: When a Rust P2PNode is available, use its Ed25519 keypair
+    for signing (single identity authority). Falls back to Python
+    ``peer.identity`` when P2PNode is not available.
+    """
+    import json as _json, base64 as _b64
+    try:
+        # Prefer Rust P2PNode signing (Task 6.0)
+        if p2p_node is not None and hasattr(p2p_node, "sign_record"):
+            message = _json.dumps(
+                {"host": host, "model_id": model_id, "peer_id": peer_id, "port": port},
+                sort_keys=True,
+            ).encode()
+            sig_bytes = p2p_node.sign_record(message)
+            return _b64.urlsafe_b64encode(sig_bytes).decode()
+    except Exception:
+        pass
+    # Fallback: Python identity
     try:
         from peer.identity import sign_announce as _sign_announce
         return _sign_announce(private_key, peer_id, host, port, model_id)  # type: ignore[arg-type]
@@ -3136,6 +3185,8 @@ def _announce_loop(
     local_fast_path_port: int = 0,
     hivemind_adapter: Any = None,
     p2p_node: object | None = None,
+    # Task 3.1: dual-stack IPv6 address for announcements.
+    effective_host_ipv6: str = "",
     # Phase 3 zero-config: capacity snapshot attached to every announcement.
     capacity_json: str = "",
     capacity_schema_version: int = 0,
@@ -3152,6 +3203,12 @@ def _announce_loop(
     announced_once = False
     consecutive_failures = 0
     outage_window_s = 0.0
+    # Phase 2.3: track last-announced layer range to detect changes.
+    _prev_layer_start: int = -1
+    _prev_layer_end: int = -1
+    _fire_immediate_announce: bool = False
+    # Phase 2.4: monotonically increasing epoch, bumped on each layer change.
+    _rebalance_epoch: int = 0
     while not stop_event.is_set():
         seeding_snapshot: dict[str, Any] = (
             session_manager.snapshot() if session_manager is not None else {
@@ -3203,6 +3260,23 @@ def _announce_loop(
                     _snap_err,
                 )
 
+        # Phase 2.3: detect layer change → expedited re-announce.
+        if _prev_layer_start >= 0 and _prev_layer_end >= 0:
+            if (
+                _effective_layer_start != _prev_layer_start
+                or _effective_layer_end != _prev_layer_end
+            ):
+                _fire_immediate_announce = True
+                _rebalance_epoch += 1
+                logging.info(
+                    "layer_change_detected: [%d,%d) -> [%d,%d) epoch=%d, immediate re-announce",
+                    _prev_layer_start, _prev_layer_end,
+                    _effective_layer_start, _effective_layer_end,
+                    _rebalance_epoch,
+                )
+        _prev_layer_start = _effective_layer_start
+        _prev_layer_end = _effective_layer_end
+
         announcement = Announcement(
             peer_id=service.peer_id,
             model_id=str(_effective_model_id),
@@ -3236,7 +3310,7 @@ def _announce_loop(
             expert_router=bool(service.expert_router),
             peer_public_key=str(peer_public_key or ""),
             public_key=str(announce_public_key_hex or ""),
-            signature=(_sign_announce_safe(announce_private_key, service.peer_id, advertise_host, port, service.model_id) if announce_private_key is not None else ""),
+            signature=(_sign_announce_safe(announce_private_key, service.peer_id, advertise_host, port, service.model_id, p2p_node=p2p_node) if announce_private_key is not None else ""),
             available_vram_mb=_probe_available_vram_mb(),
             available_kv_slots=max(0, service.kv_cache_max_entries - len(getattr(service, '_kv_cache', {}))),
             next_hop_rtts_json=service.get_next_hop_rtts_json(),
@@ -3252,6 +3326,7 @@ def _announce_loop(
             requires_relay=bool(getattr(service, '_requires_relay', False)),
             relay_peer_id=str(getattr(service, '_relay_peer_id', '')),
             relay_address=str(getattr(service, '_relay_address', '')),
+            host_ipv6=effective_host_ipv6,
             libp2p_peer_id=str(getattr(p2p_node, 'libp2p_peer_id', '') if p2p_node is not None else ''),
             # Phase 3/4 zero-config: capacity snapshot for swarm negotiation.
             # When a live NegotiationLoop is wired in via capacity_snapshot_ref
@@ -3260,6 +3335,7 @@ def _announce_loop(
             # "no capacity info available" and is ignored by readers.
             capacity_json=str(_effective_capacity_json or ""),
             capacity_schema_version=int(_effective_capacity_schema_version or 0),
+            rebalance_epoch=_rebalance_epoch,
         )
         try:
             # HTTP DHT announce (legacy path).
@@ -3314,7 +3390,12 @@ def _announce_loop(
             announced_once = True
             consecutive_failures = 0
             outage_window_s = 0.0
-            delay_s = announce_interval
+            # Phase 2.3: skip the 60s wait when a layer change was detected.
+            if _fire_immediate_announce:
+                _fire_immediate_announce = False
+                delay_s = 0.5  # brief pause to avoid tight-loop on rapid changes
+            else:
+                delay_s = announce_interval
 
             # Poll for layer rebalance directives.
             try:
@@ -3615,6 +3696,12 @@ def serve(
         peer_id = _identity["peer_id"]
     _announce_private_key = _identity["private_key"]
     _announce_public_key_hex = _identity["public_key_hex"]
+    # Task 6.0: prefer Rust P2PNode's Ed25519 public key when available
+    if p2p_node is not None and hasattr(p2p_node, "public_key_hex"):
+        try:
+            _announce_public_key_hex = p2p_node.public_key_hex()
+        except Exception:
+            pass  # fall back to Python identity
 
     hardware_profile = detect_hardware_profile()
     logging.info("peer %s hardware profile: %s", peer_id, hardware_profile.to_dict())
@@ -3918,6 +4005,7 @@ def serve(
         announce_thread: threading.Thread | None = None
         if resolved_dht_urls or _hivemind_adapter is not None or p2p_node is not None:
             effective_host = advertise_host or ("127.0.0.1" if host in {"0.0.0.0", "::"} else host)
+            effective_host_ipv6 = ""
             # Auto-detect LAN IP when binding to 0.0.0.0 and no explicit advertise_host.
             # Without this, the peer announces 127.0.0.1 which is unreachable from other machines.
             if not advertise_host and effective_host == "127.0.0.1":
@@ -3932,6 +4020,22 @@ def serve(
                         logging.info(
                             "peer %s auto-detected LAN IP as advertise_host: %s",
                             peer_id, effective_host,
+                        )
+                except Exception:
+                    pass
+            # Task 3.1: Also detect IPv6 LAN address for dual-stack announce.
+            if not advertise_host:
+                try:
+                    import socket as _sock6
+                    _s6 = _sock6.socket(_sock6.AF_INET6, _sock6.SOCK_DGRAM)
+                    _s6.connect(("2001:4860:4860::8888", 80))
+                    _lan_ipv6 = _s6.getsockname()[0]
+                    _s6.close()
+                    if _lan_ipv6 and _lan_ipv6 != "::1" and not _lan_ipv6.startswith("fe80:"):
+                        effective_host_ipv6 = _lan_ipv6
+                        logging.info(
+                            "peer %s auto-detected IPv6 LAN address: %s",
+                            peer_id, effective_host_ipv6,
                         )
                 except Exception:
                     pass
@@ -3987,6 +4091,8 @@ def serve(
                     "p2p_node": p2p_node,
                     # Phase 3 zero-config: pass capacity snapshot through to
                     # every Announcement emitted by the loop.
+                    # Task 3.1: dual-stack IPv6 address for announcements.
+                    "effective_host_ipv6": effective_host_ipv6,
                     "capacity_json": str(capacity_json or ""),
                     "capacity_schema_version": int(capacity_schema_version or 0),
                     # Phase 4 zero-config: live snapshot written by the
@@ -4414,7 +4520,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--identity-path",
-        default=".openhydra/identity.key",
+        default=_os.path.expanduser("~/.openhydra/identity.key"),
         help="Path to Ed25519 identity keypair file (created on first run, mode 0600).",
     )
 

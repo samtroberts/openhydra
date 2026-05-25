@@ -1,3 +1,10 @@
+# DEPRECATED: This Terraform config targets DigitalOcean but production
+# bootstrap nodes run on Linode. Provisioning and deploy are handled by
+# ops/bootstrap/deploy_libp2p.sh and ops/bootstrap/setup_nanode.sh.
+#
+# TODO: Either migrate to the linode/linode Terraform provider or remove
+# this file entirely once ops/bootstrap/ scripts are the sole source of truth.
+
 provider "digitalocean" {
   token = var.do_token
 }
@@ -33,6 +40,19 @@ resource "digitalocean_firewall" "bootstrap" {
   inbound_rule {
     protocol         = "tcp"
     port_range       = tostring(var.dht_port)
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # libp2p: Kademlia DHT, Circuit Relay v2, direct connections
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "4001"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  inbound_rule {
+    protocol         = "udp"
+    port_range       = "4001"
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 

@@ -109,11 +109,20 @@ impl Identity {
 
     /// Load from path if it exists, otherwise generate and save.
     pub fn load_or_create(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        if path.exists() {
-            Self::load(path)
+        let existed = path.exists();
+        let identity = if existed {
+            Self::load(path)?
         } else {
-            Self::generate(path)
-        }
+            Self::generate(path)?
+        };
+        tracing::info!(
+            path = %path.display(),
+            peer_id = %identity.libp2p_peer_id,
+            openhydra_id = %identity.openhydra_peer_id,
+            created = !existed,
+            "identity loaded"
+        );
+        Ok(identity)
     }
 }
 

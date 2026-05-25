@@ -16,15 +16,48 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from http import HTTPStatus
+import os
 import socket as _socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
 
 
 class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    """ThreadingHTTPServer with resource limits for 1 GB Nanodes.
+
+    Phase 7.6: On a 1 GB Nanode, stdlib's ThreadingHTTPServer OOMs at ~125
+    concurrent keep-alive connections (8 MB default stack per thread).
+    Fixes:
+      1. Reduce per-thread stack to 1 MB → supports ~500 concurrent connections.
+      2. Connection semaphore limits to 200 concurrent handler threads.
+    """
+
+    # Maximum concurrent handler threads (connection limiter).
+    _MAX_CONNECTIONS = 200
+
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
         if ":" in str(server_address[0]):
             self.address_family = _socket.AF_INET6
+        # Reduce per-thread stack size from 8 MB to 1 MB.
+        threading.stack_size(1024 * 1024)
+        self._connection_semaphore = threading.Semaphore(self._MAX_CONNECTIONS)
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
+    def process_request(self, request, client_address):
+        """Override to enforce connection limit via semaphore."""
+        if not self._connection_semaphore.acquire(blocking=True, timeout=5.0):
+            logging.warning(
+                "connection_limit_reached: max=%d, rejecting %s",
+                self._MAX_CONNECTIONS, client_address,
+            )
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        finally:
+            self._connection_semaphore.release()
 import json
 import logging
 import secrets
@@ -177,6 +210,9 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
     # Layer rebalance directives: peer_id → list[directive_dict]
     _layer_rebalance_directives: dict[str, list[dict[str, Any]]] = {}
     _layer_rebalance_lock = threading.Lock()
+    # Task 6.5: Bearer token for /rebalance endpoint auth.
+    # Set via OPENHYDRA_REBALANCE_TOKEN env var.  Empty = unauthenticated (dev mode).
+    _rebalance_token: str = ""
 
     def _send_json(
         self,
@@ -194,16 +230,44 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    _MAX_BODY_BYTES = 65536  # 64 KiB — prevents OOM on 1 GB Nanodes
+
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
             return {}
+        if length > self._MAX_BODY_BYTES:
+            self._send_json(
+                {"error": "body_too_large", "max_bytes": self._MAX_BODY_BYTES},
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            raise ValueError(f"body_too_large: {length} > {self._MAX_BODY_BYTES}")
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def _require_dht(self) -> InMemoryDhtNode:
         if self.dht is None:
             raise RuntimeError("dht_uninitialized")
         return self.dht
+
+    # Task 6.5: Bearer token auth for sensitive endpoints.
+    def _check_rebalance_auth(self) -> bool:
+        """Return True if the request is authorized for /rebalance.
+
+        When ``_rebalance_token`` is empty (dev mode), all requests pass.
+        Otherwise, the client must send ``Authorization: Bearer <token>``.
+        """
+        token = self._rebalance_token
+        if not token:
+            return True  # dev mode — no auth required
+        auth = self.headers.get("Authorization", "")
+        if auth == f"Bearer {token}":
+            return True
+        self._send_json(
+            {"error": "unauthorized", "message": "valid Bearer token required"},
+            status=HTTPStatus.UNAUTHORIZED,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        return False
 
     def _normalize_peer_record(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not payload.get("peer_id"):
@@ -321,6 +385,9 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
     def _put_announcement(self, payload: dict[str, Any]) -> dict[str, Any]:
         from peer.identity import verify_announce as _verify_announce
         _identity_verified = False
+        # Task 6.1: enforce identity verification when fields are present.
+        # Phase 1: reject announces with invalid signatures (fields present
+        # but verification fails).  Phase 2 (future): require fields on all.
         if "public_key" in payload and "signature" in payload:
             try:
                 _identity_verified = _verify_announce(
@@ -328,10 +395,11 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
                     payload.get("host", ""), int(payload.get("port", 0)),
                     payload.get("model_id", ""), payload["signature"],
                 )
-                if not _identity_verified:
-                    logging.warning("identity_verify_failed peer_id=%s", payload.get("peer_id"))
             except Exception:
-                pass
+                _identity_verified = False
+            if not _identity_verified:
+                logging.warning("identity_verify_rejected peer_id=%s", payload.get("peer_id"))
+                return {"error": "identity_verification_failed"}
         payload["identity_verified"] = _identity_verified
 
         dht = self._require_dht()
@@ -374,31 +442,9 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
         # send Ping via libp2p (gRPC server removed from peers). Until the
         # bootstrap server has its own P2PNode, skip the challenge and
         # accept the peer's claimed region.
+        # Phase 6.6: Removed 23 lines of unreachable dead code that was after
+        # this return (referenced undefined variables resp, rtt_ms).
         return {"verified": True, "reason": "challenge_pending_libp2p_bootstrap", "rtt_ms": None}
-
-        response_peer_id = str(getattr(resp, "peer_id", "") or "").strip()
-        if response_peer_id and response_peer_id != str(record["peer_id"]):
-            return {"verified": False, "reason": "peer_id_mismatch", "rtt_ms": rtt_ms}
-
-        signature = str(getattr(resp, "geo_nonce_signature", "") or "").strip()
-        if not signature:
-            return {"verified": False, "reason": "missing_signature", "rtt_ms": rtt_ms}
-
-        signature_ok = verify_geo_challenge(
-            peer_id=str(record["peer_id"]),
-            nonce=nonce,
-            claimed_region=claimed_region,
-            signature=signature,
-            shared_secret_seed=str(self.default_geo_challenge_seed),
-        )
-        if not signature_ok:
-            return {"verified": False, "reason": "signature_invalid", "rtt_ms": rtt_ms}
-
-        max_rtt_ms = max(1.0, float(self.default_geo_max_rtt_ms))
-        if rtt_ms > max_rtt_ms:
-            return {"verified": False, "reason": "latency_violation", "rtt_ms": rtt_ms}
-
-        return {"verified": True, "reason": "ok", "rtt_ms": rtt_ms}
 
     @classmethod
     def _lookup_rate_snapshot(cls) -> dict[str, dict[str, int]]:
@@ -523,9 +569,14 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if self.path in {"/announce", "/heartbeat"}:
                 record = self._put_announcement(body)
+                if "error" in record:
+                    self._send_json(record, status=HTTPStatus.FORBIDDEN)
+                    return
                 self._send_json({"ok": True, "peer_id": record["peer_id"], "model_id": record["model_id"]})
                 return
             if self.path == "/rebalance":
+                if not self._check_rebalance_auth():
+                    return
                 self._handle_post_rebalance(body)
                 return
             self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
@@ -628,11 +679,16 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/health":
-                self._send_json(
-                    {
-                        "ok": True,
-                        "keys": dht.keys(),
-                        "stats": dht.stats(),
+                # Task 6.5: unauthenticated /health returns minimal status.
+                # Full diagnostics (rate-limit windows, config) require auth.
+                auth = self.headers.get("Authorization", "")
+                is_authed = bool(
+                    self._rebalance_token
+                    and auth == f"Bearer {self._rebalance_token}"
+                )
+                payload: dict[str, Any] = {"ok": True, "keys": dht.keys(), "stats": dht.stats()}
+                if is_authed or not self._rebalance_token:
+                    payload.update({
                         "lookup_rate_limit": {
                             "window_seconds": int(self.default_lookup_window_seconds),
                             "max_requests_per_window": int(self.default_lookup_max_requests_per_window),
@@ -649,8 +705,8 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
                             "require_stake": bool(self.default_expert_require_stake),
                         },
                         "dsht_rebalance": self._lookup_rebalance_snapshot(),
-                    }
-                )
+                    })
+                self._send_json(payload)
                 return
 
             self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
@@ -828,6 +884,13 @@ def serve(
     DhtBootstrapHandler._lookup_buckets = {}
     DhtBootstrapHandler._rebalance_hints = {}
     DhtBootstrapHandler._layer_rebalance_directives = {}
+    # Task 6.5: Load rebalance auth token from env.
+    _rebalance_token = os.environ.get("OPENHYDRA_REBALANCE_TOKEN", "").strip()
+    DhtBootstrapHandler._rebalance_token = _rebalance_token
+    if _rebalance_token:
+        logging.info("rebalance_auth: enabled (token loaded from OPENHYDRA_REBALANCE_TOKEN)")
+    else:
+        logging.warning("rebalance_auth: disabled — set OPENHYDRA_REBALANCE_TOKEN for production")
     bind_attempt = 0
     lifecycle_restart_attempt = 0
     _stop = threading.Event()

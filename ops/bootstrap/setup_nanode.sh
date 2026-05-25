@@ -71,6 +71,8 @@ fi
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
+ufw allow 4001/tcp comment 'libp2p TCP'
+ufw allow 4001/udp comment 'libp2p QUIC'
 ufw --force enable
 
 # --- TLS certificate ---

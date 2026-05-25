@@ -140,7 +140,17 @@ info "SSH (22): ALLOW all"
 iptables -A OPENHYDRA -p tcp --dport 8080 -j ACCEPT
 info "Port 8080 (coordinator API): ALLOW all (Cloudflare fronted)"
 
-# ── 2d. Port 8468 — DHT bootstrap HTTP ───────────────────────────────────────
+# ── 2d. Port 4001 — libp2p (Kademlia DHT + Circuit Relay + QUIC) ─────────────
+# TCP: Kademlia, relay circuits, direct TCP connections.
+# UDP: QUIC transport, AutoNAT probing, DCUtR hole-punching.
+iptables -A OPENHYDRA -p tcp --dport 4001 -j ACCEPT
+iptables -A OPENHYDRA -p udp --dport 4001 -j ACCEPT
+info "Port 4001 (libp2p): ALLOW TCP + UDP"
+
+# ── 2e. Port 8468 — DHT bootstrap HTTP ──────────────────────────────────────
+# NOTE: After binding the Python DHT to loopback (Phase 0.3), port 8468 is
+# only reachable via nginx reverse proxy on 443. These iptables rules are
+# kept as defence-in-depth but will not match direct external traffic.
 # Allow established DHT connections (already matched by 2a above).
 # For NEW connections: hashlimit to 20/minute per source IP, burst of 5.
 # Excess new connections are silently dropped.
@@ -154,7 +164,7 @@ iptables -A OPENHYDRA -p tcp --dport 8468 -m state --state NEW \
 iptables -A OPENHYDRA -p tcp --dport 8468 -m state --state NEW -j DROP
 info "Port 8468 (DHT): NEW conns hashlimit 20/min per IP (burst 5), excess dropped"
 
-# ── 2e. Port 50051 — Peer gRPC ───────────────────────────────────────────────
+# ── 2f. Port 50051 — Peer gRPC ───────────────────────────────────────────────
 # Limit concurrent connections per source IP to 5.
 # Legitimate peers make very few long-lived connections; this blocks
 # connection-exhaustion attacks while not affecting real peers.
@@ -164,17 +174,17 @@ iptables -A OPENHYDRA -p tcp --dport 50051 \
 iptables -A OPENHYDRA -p tcp --dport 50051 -j ACCEPT
 info "Port 50051 (gRPC): connlimit ≤5 per IP; excess RST"
 
-# ── 2f. ICMP rate limiting ────────────────────────────────────────────────────
+# ── 2g. ICMP rate limiting ────────────────────────────────────────────────────
 iptables -A OPENHYDRA -p icmp \
   -m limit --limit 5/second --limit-burst 10 \
   -j ACCEPT
 iptables -A OPENHYDRA -p icmp -j DROP
 info "ICMP: rate-limited to 5/s (burst 10), excess dropped"
 
-# ── 2g. Loopback — always allow ──────────────────────────────────────────────
+# ── 2h. Loopback — always allow ──────────────────────────────────────────────
 iptables -A OPENHYDRA -i lo -j ACCEPT
 
-# ── 2h. Jump INPUT → OPENHYDRA ───────────────────────────────────────────────
+# ── 2i. Jump INPUT → OPENHYDRA ───────────────────────────────────────────────
 iptables -I INPUT 1 -j OPENHYDRA
 info "OPENHYDRA chain inserted at INPUT position 1"
 

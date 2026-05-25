@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
 use futures::StreamExt;
+use libp2p::kad::store::RecordStore;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{kad, Multiaddr, PeerId};
@@ -40,18 +41,19 @@ fn classify_transport(addr_str: &str) -> TransportType {
 
 #[derive(Debug, Default)]
 struct PeerConnectionInfo {
-    quic_direct: u32,
+    quic_direct_v4: u32,
+    quic_direct_v6: u32,
     tcp_direct: u32,
     tcp_relay: u32,
 }
 
 impl PeerConnectionInfo {
     fn has_direct(&self) -> bool {
-        self.quic_direct > 0 || self.tcp_direct > 0
+        self.quic_direct_v4 > 0 || self.quic_direct_v6 > 0 || self.tcp_direct > 0
     }
 
     fn direct_count(&self) -> u32 {
-        self.quic_direct + self.tcp_direct
+        self.quic_direct_v4 + self.quic_direct_v6 + self.tcp_direct
     }
 }
 
@@ -318,6 +320,8 @@ impl LoopState {
             nat_info: NatInfo {
                 nat_type: "unknown".into(),
                 external_ip: String::new(),
+                external_ipv4: String::new(),
+                external_ipv6: String::new(),
                 external_port: 0,
                 is_public: false,
             },
@@ -352,6 +356,7 @@ pub async fn run_event_loop(
     proxy_queue: Arc<SharedProxyQueue>,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
     mut stream_control: libp2p_stream::Control,
+    keypair: libp2p::identity::Keypair,
 ) {
     let mut state = LoopState::new();
 
@@ -415,22 +420,51 @@ pub async fn run_event_loop(
         .cloned()
         .collect();
     let mut bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    // Phase 7.2: Cap bootstrap retries at 20 to prevent infinite loops.
+    let mut bootstrap_retry_count: u32 = 0;
+    const MAX_BOOTSTRAP_RETRIES: u32 = 20;
+
+    // Phase 1.4: Periodic known_peers reaper — safety net that catches
+    // ghosts missed by individual eviction paths (1.1, 1.2, 1.3, 1.6, 1.7).
+    let mut reaper_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    reaper_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        // Retry dialing non-relay bootstrap peers every 15s until connected.
-        if !non_relay_bootstrap.is_empty() && tokio::time::Instant::now() >= bootstrap_retry_deadline {
+        // Retry dialing non-relay bootstrap peers every 15s until connected or retry cap hit.
+        if !non_relay_bootstrap.is_empty()
+            && bootstrap_retry_count < MAX_BOOTSTRAP_RETRIES
+            && tokio::time::Instant::now() >= bootstrap_retry_deadline
+        {
+            bootstrap_retry_count += 1;
             bootstrap_retry_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut all_connected = true;
             for (peer_id, addr) in &non_relay_bootstrap {
                 let already_direct = state.peer_connections.get(peer_id)
                     .map_or(false, |info| info.has_direct());
                 if already_direct {
                     continue;
                 }
+                all_connected = false;
                 let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
-                info!(%peer_id, %dial_addr, "bootstrap_retry: re-dialing (not yet direct)");
+                info!(
+                    %peer_id, %dial_addr,
+                    attempt = bootstrap_retry_count,
+                    max = MAX_BOOTSTRAP_RETRIES,
+                    "bootstrap_retry: re-dialing (not yet direct)"
+                );
                 if let Err(e) = swarm.dial(dial_addr.clone()) {
                     warn!(%peer_id, %e, "bootstrap_retry: dial failed");
                 }
+            }
+            // Reset counter when all bootstrap peers are connected.
+            if all_connected {
+                bootstrap_retry_count = 0;
+            }
+            if bootstrap_retry_count >= MAX_BOOTSTRAP_RETRIES {
+                warn!(
+                    "bootstrap_retries_exhausted: gave up after {} attempts, some bootstrap peers unreachable",
+                    MAX_BOOTSTRAP_RETRIES
+                );
             }
         }
         // Delayed relay reservation: wait for Kademlia to connect to
@@ -458,7 +492,7 @@ pub async fn run_event_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SwarmCommand::Announce { record, reply }) => {
-                        handle_announce(&mut swarm, &record, reply);
+                        handle_announce(&mut swarm, &record, reply, &mut state, &keypair);
                     }
                     Some(SwarmCommand::Discover { model_id, reply }) => {
                         handle_discover(&mut swarm, &model_id, reply, &mut state);
@@ -631,7 +665,8 @@ pub async fn run_event_loop(
                         let snapshot = match peer_id.parse::<PeerId>() {
                             Ok(pid) => {
                                 state.peer_connections.get(&pid).map(|info| {
-                                    let preferred = if info.quic_direct > 0 {
+                                    let has_quic = info.quic_direct_v4 > 0 || info.quic_direct_v6 > 0;
+                                    let preferred = if has_quic {
                                         "quic_direct".to_string()
                                     } else if info.tcp_direct > 0 {
                                         "tcp_direct".to_string()
@@ -641,7 +676,7 @@ pub async fn run_event_loop(
                                         "none".to_string()
                                     };
                                     ConnectionInfoSnapshot {
-                                        has_quic: info.quic_direct > 0,
+                                        has_quic,
                                         has_tcp_direct: info.tcp_direct > 0,
                                         has_relay: info.tcp_relay > 0,
                                         preferred_transport: preferred,
@@ -655,8 +690,37 @@ pub async fn run_event_loop(
                     Some(SwarmCommand::TriggerRepunch { peer_id }) => {
                         handle_trigger_repunch(&mut swarm, peer_id, &mut state);
                     }
+                    // Phase 4.1: Graceful shutdown — publish PEER_DEPARTED
+                    // gossip and remove self from Kademlia before exiting.
                     Some(SwarmCommand::Shutdown { reply }) => {
-                        info!("swarm shutting down");
+                        info!("swarm shutting down — cleaning up DHT records");
+
+                        // 1. Publish self-departure gossip so other peers
+                        // can immediately evict us (Phase 4.2 receiver side).
+                        let departure_payload = format!(
+                            r#"{{"type":"PEER_DEPARTED","libp2p_peer_id":"{}","timestamp":{}}}"#,
+                            swarm.local_peer_id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        );
+                        let topic = libp2p::gossipsub::IdentTopic::new(
+                            crate::swarm::GOSSIPSUB_TOPIC,
+                        );
+                        match swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(topic, departure_payload.into_bytes())
+                        {
+                            Ok(_) => info!("published PEER_DEPARTED gossip"),
+                            Err(e) => warn!(%e, "failed to publish PEER_DEPARTED"),
+                        }
+
+                        // 2. Remove self from Kademlia routing table.
+                        let local_peer_id = *swarm.local_peer_id();
+                        swarm.behaviour_mut().kademlia.remove_peer(&local_peer_id);
+
                         let _ = reply.send(());
                         return;
                     }
@@ -670,6 +734,25 @@ pub async fn run_event_loop(
             Some(peer_id) = repunch_rx.recv() => {
                 handle_trigger_repunch(&mut swarm, peer_id, &mut state);
             }
+            // Phase 1.4: Periodic known_peers reaper — removes entries whose
+            // libp2p_peer_id is no longer connected. Safety net for ghosts
+            // that slip through individual eviction paths.
+            _ = reaper_interval.tick() => {
+                let before = state.known_peers.len();
+                state.known_peers.retain(|_openhydra_id, record| {
+                    if record.libp2p_peer_id.is_empty() {
+                        return true; // keep records without libp2p binding
+                    }
+                    match record.libp2p_peer_id.parse::<PeerId>() {
+                        Ok(pid) => swarm.is_connected(&pid),
+                        Err(_) => false, // unparseable peer_id = stale
+                    }
+                });
+                let removed = before - state.known_peers.len();
+                if removed > 0 {
+                    info!(removed, remaining = state.known_peers.len(), "known_peers reaper sweep");
+                }
+            }
             // Process swarm events.
             event = swarm.select_next_some() => {
                 handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
@@ -678,20 +761,33 @@ pub async fn run_event_loop(
     }
 }
 
-/// Handle an announce command: PUT the peer record into Kademlia.
+/// Handle an announce command: sign the peer record, PUT it into Kademlia,
+/// and register as a provider for the model (Tasks 2.1, 6.2).
 fn handle_announce(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     record: &PeerRecord,
     reply: oneshot::Sender<Result<(), String>>,
+    state: &mut LoopState,
+    keypair: &libp2p::identity::Keypair,
 ) {
-    let key = dht::peer_record_key(&record.model_id, &record.peer_id);
-    match dht::encode_record(record) {
+    // Task 6.2: sign the record with our Ed25519 keypair.
+    let signed_record = match dht::sign_peer_record(record, keypair) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("announce sign failed: {e}");
+            // Fall back to unsigned record.
+            record.clone()
+        }
+    };
+    let local_libp2p_id = swarm.local_peer_id().to_base58();
+    let key = dht::peer_record_key(&signed_record.model_id, &local_libp2p_id);
+    match dht::encode_record(&signed_record) {
         Ok(value) => {
             let kad_record = kad::Record {
                 key,
                 value,
-                publisher: None,
-                expires: None,
+                publisher: Some(*swarm.local_peer_id()),
+                expires: Some(std::time::Instant::now() + std::time::Duration::from_secs(300)),
             };
             match swarm
                 .behaviour_mut()
@@ -699,10 +795,17 @@ fn handle_announce(
                 .put_record(kad_record, kad::Quorum::One)
             {
                 Ok(_) => {
+                    // Register as provider for this model (Option C: provider API)
+                    let model_key = dht::model_provider_key(&signed_record.model_id);
+                    if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(model_key) {
+                        warn!(model_id = %signed_record.model_id, "start_providing failed: {e:?}");
+                    }
+                    // Cache locally for fast resolve + discover cache hits
+                    state.known_peers.insert(signed_record.peer_id.clone(), signed_record.clone());
                     info!(
-                        model_id = %record.model_id,
-                        peer_id = %record.peer_id,
-                        "announced to kademlia"
+                        model_id = %signed_record.model_id,
+                        peer_id = %signed_record.peer_id,
+                        "announced to kademlia (provider + record)"
                     );
                     let _ = reply.send(Ok(()));
                 }
@@ -717,16 +820,16 @@ fn handle_announce(
     }
 }
 
-/// Handle a discover command: GET records from Kademlia matching the model_id.
+/// Handle a discover command: find providers for the model via Kademlia
+/// provider API (Task 2.1: Option C).
 fn handle_discover(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     model_id: &str,
     reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
     state: &mut LoopState,
 ) {
-    // Use Kademlia get_record with the model provider key.
     let key = dht::model_provider_key(model_id);
-    let query_id = swarm.behaviour_mut().kademlia.get_record(key);
+    let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
     state.pending_discovers.insert(
         query_id,
         PendingDiscover {
@@ -805,7 +908,7 @@ fn handle_swarm_event(
                     // Auto QUIC hole-punch: if we don't have a QUIC-direct connection
                     // to this peer, dial their QUIC IPv6 addresses.
                     let has_quic = state.peer_connections.get(&peer_id)
-                        .map_or(false, |info| info.quic_direct > 0);
+                        .map_or(false, |info| info.quic_direct_v4 > 0 || info.quic_direct_v6 > 0);
                     if !has_quic {
                         for addr in &quic_v6_addrs {
                             use libp2p::swarm::dial_opts::DialOpts;
@@ -832,9 +935,19 @@ fn handle_swarm_event(
                             .add_address(&peer_id, addr);
                     }
                 }
+                // Phase 1.7: mDNS expiry — evict peers that are no longer
+                // reachable on LAN.
                 libp2p::mdns::Event::Expired(peers) => {
                     for (peer_id, _) in peers {
-                        debug!(%peer_id, "mDNS peer expired");
+                        info!(%peer_id, "mDNS peer expired");
+                        if !swarm.is_connected(&peer_id) {
+                            swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                            let libp2p_id_str = peer_id.to_string();
+                            state.known_peers.retain(|_, record| {
+                                record.libp2p_peer_id != libp2p_id_str
+                            });
+                            debug!(%peer_id, "evicted expired mDNS peer");
+                        }
                     }
                 }
             }
@@ -902,6 +1015,23 @@ fn handle_swarm_event(
                 ..
             } = gossip_event
             {
+                // Phase 4.2: Fast-path eviction for PEER_DEPARTED messages.
+                // Parse and evict before queuing for Python to minimize the
+                // ghost peer window on clean shutdown.
+                if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                    if parsed.get("type").and_then(|v| v.as_str()) == Some("PEER_DEPARTED") {
+                        if let Some(departed_id_str) = parsed.get("libp2p_peer_id").and_then(|v| v.as_str()) {
+                            if let Ok(departed_pid) = departed_id_str.parse::<PeerId>() {
+                                swarm.behaviour_mut().kademlia.remove_peer(&departed_pid);
+                                info!(%departed_pid, "evicted departed peer via PEER_DEPARTED gossip");
+                            }
+                            state.known_peers.retain(|_, record| {
+                                record.libp2p_peer_id != departed_id_str
+                            });
+                        }
+                    }
+                }
+
                 // Queue the payload for Python to poll. ``propagation_source``
                 // is the immediate gossip hop (NOT necessarily the original
                 // author) — we surface it so Python can build a 2-observer
@@ -916,11 +1046,20 @@ fn handle_swarm_event(
             }
         }
 
-        // Ping keepalive — log only failures (success is silent to avoid
-        // flooding logs every 15 s per connection).
+        // Ping keepalive — log failures and evict unreachable peers
+        // (Phase 1.6). Success is silent to avoid flooding logs.
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Ping(ping_event)) => {
             if let Err(ref e) = ping_event.result {
-                debug!(peer = %ping_event.peer, error = %e, "ping failed");
+                let peer = ping_event.peer;
+                warn!(%peer, error = %e, "ping failed");
+                if !swarm.is_connected(&peer) {
+                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                    let libp2p_id_str = peer.to_string();
+                    state.known_peers.retain(|_, record| {
+                        record.libp2p_peer_id != libp2p_id_str
+                    });
+                    info!(%peer, "evicted peer after ping failure");
+                }
             }
         }
 
@@ -968,28 +1107,44 @@ fn handle_swarm_event(
 
             let info = state.peer_connections.entry(peer_id).or_default();
 
-            // Fix 2: QUIC dedup — if we already have a QUIC-direct connection,
-            // close the new one to prevent 16+ parallel connections.
+            // Fix 2: AF-aware QUIC dedup — if we already have a QUIC-direct
+            // connection on the *same* address family, close the new one to
+            // prevent 16+ parallel connections.
             // Must increment BEFORE closing: ConnectionClosed will decrement,
             // so the original connection's count stays >= 1.
-            if transport == TransportType::QuicDirect && info.quic_direct >= 1 {
-                info.quic_direct += 1;
-                debug!(%peer_id, %addr_str, quic=info.quic_direct, "quic_dedup: closing duplicate QUIC connection");
-                let _ = swarm.close_connection(connection_id);
-            } else {
-                match transport {
-                    TransportType::QuicDirect => {
-                        info.quic_direct += 1;
-                        info!(%peer_id, %addr_str, quic=info.quic_direct, "quic_direct_connected");
-                        // Fix 4: proactively warm tensor stream on first QUIC connection.
-                        if info.quic_direct == 1 {
-                            if let Some(ref mgr) = state.tensor_mgr {
-                                let mgr = Arc::clone(mgr);
-                                let pid = peer_id;
-                                tokio::spawn(async move { mgr.warm_stream(&pid).await });
-                            }
+            let is_ipv6 = endpoint_ip.as_ref().map_or(false, |ip| ip.contains(':'));
+            if transport == TransportType::QuicDirect {
+                let same_af_count = if is_ipv6 { info.quic_direct_v6 } else { info.quic_direct_v4 };
+                if same_af_count >= 1 {
+                    if is_ipv6 {
+                        info.quic_direct_v6 += 1;
+                    } else {
+                        info.quic_direct_v4 += 1;
+                    }
+                    debug!(%peer_id, %addr_str, v4=info.quic_direct_v4, v6=info.quic_direct_v6,
+                        "quic_dedup: closing duplicate QUIC connection (same AF)");
+                    let _ = swarm.close_connection(connection_id);
+                } else {
+                    if is_ipv6 {
+                        info.quic_direct_v6 += 1;
+                        info!(%peer_id, %addr_str, v6=info.quic_direct_v6, "quic_direct_v6_connected");
+                    } else {
+                        info.quic_direct_v4 += 1;
+                        info!(%peer_id, %addr_str, v4=info.quic_direct_v4, "quic_direct_v4_connected");
+                    }
+                    // Fix 4: proactively warm tensor stream on first QUIC connection of *either* AF.
+                    let total_quic = info.quic_direct_v4 + info.quic_direct_v6;
+                    if total_quic == 1 {
+                        if let Some(ref mgr) = state.tensor_mgr {
+                            let mgr = Arc::clone(mgr);
+                            let pid = peer_id;
+                            tokio::spawn(async move { mgr.warm_stream(&pid).await });
                         }
                     }
+                }
+            } else {
+                match transport {
+                    TransportType::QuicDirect => unreachable!(), // handled above
                     TransportType::TcpDirect => {
                         info.tcp_direct += 1;
                         info!(%peer_id, %addr_str, tcp=info.tcp_direct, "tcp_direct_connected");
@@ -1036,18 +1191,43 @@ fn handle_swarm_event(
 
             if let Some(info) = state.peer_connections.get_mut(&peer_id) {
                 match transport {
-                    TransportType::QuicDirect => info.quic_direct = info.quic_direct.saturating_sub(1),
+                    TransportType::QuicDirect => {
+                        let is_ipv6 = endpoint_ip.as_ref().map_or(false, |ip| ip.contains(':'));
+                        if is_ipv6 {
+                            info.quic_direct_v6 = info.quic_direct_v6.saturating_sub(1);
+                        } else {
+                            info.quic_direct_v4 = info.quic_direct_v4.saturating_sub(1);
+                        }
+                    }
                     TransportType::TcpDirect => info.tcp_direct = info.tcp_direct.saturating_sub(1),
                     TransportType::TcpRelay => info.tcp_relay = info.tcp_relay.saturating_sub(1),
                 }
-                if info.quic_direct == 0 && info.tcp_direct == 0 && info.tcp_relay == 0 {
+                if info.quic_direct_v4 == 0 && info.quic_direct_v6 == 0 && info.tcp_direct == 0 && info.tcp_relay == 0 {
                     state.peer_connections.remove(&peer_id);
                     debug!(%peer_id, "peer_fully_disconnected");
                 }
             }
-            // Clean up tensor stream cache if fully disconnected.
+            // Clean up when fully disconnected: evict from Kademlia routing
+            // table, known_peers cache, and tensor stream cache.
+            // This is the PRIMARY ghost peer elimination path (Phase 1.1).
             if !swarm.is_connected(&peer_id) {
                 state.peer_connections.remove(&peer_id);
+
+                // Ghost-peer purge: Kademlia routing table
+                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                debug!(%peer_id, "evicted from kademlia routing table");
+
+                // Ghost-peer purge: known_peers cache
+                let libp2p_id_str = peer_id.to_string();
+                let before = state.known_peers.len();
+                state.known_peers.retain(|_openhydra_id, record| {
+                    record.libp2p_peer_id != libp2p_id_str
+                });
+                if state.known_peers.len() < before {
+                    info!(%peer_id, "evicted from known_peers cache on disconnect");
+                }
+
+                // Tensor stream cleanup
                 if let Some(ref mgr) = state.tensor_mgr {
                     let mgr = Arc::clone(mgr);
                     let pid = peer_id;
@@ -1069,7 +1249,13 @@ fn handle_swarm_event(
                 state.nat_info.is_public = true;
                 state.nat_info.nat_type = "open".into();
                 if let Some(ip) = extract_ip_from_multiaddr(&address) {
-                    state.nat_info.external_ip = ip;
+                    state.nat_info.external_ip = ip.clone();
+                    // Classify by address family.
+                    if ip.contains(':') {
+                        state.nat_info.external_ipv6 = ip;
+                    } else {
+                        state.nat_info.external_ipv4 = ip;
+                    }
                 }
             } else {
                 // Record the relay path for observability but leave NAT
@@ -1080,8 +1266,20 @@ fn handle_swarm_event(
                 );
             }
         }
+        // Phase 1.3: Failed dials are a strong signal of unreachability.
+        // Evict from Kademlia + known_peers if not otherwise connected.
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             warn!(?peer_id, %error, "outgoing_connection_error");
+            if let Some(ref pid) = peer_id {
+                if !swarm.is_connected(pid) {
+                    swarm.behaviour_mut().kademlia.remove_peer(pid);
+                    let libp2p_id_str = pid.to_string();
+                    state.known_peers.retain(|_, record| {
+                        record.libp2p_peer_id != libp2p_id_str
+                    });
+                    info!(%pid, "evicted unreachable peer after dial failure");
+                }
+            }
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming_connection_error");
@@ -1097,6 +1295,78 @@ fn handle_kad_event(
     state: &mut LoopState,
 ) {
     match event {
+        // Task 2.1: Provider-based discovery (Option C)
+        kad::Event::OutboundQueryProgressed {
+            id,
+            result: kad::QueryResult::GetProviders(result),
+            ..
+        } => {
+            match result {
+                Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => {
+                    if let Some(pending) = state.pending_discovers.get_mut(&id) {
+                        for provider_pid in providers {
+                            let pid_str = provider_pid.to_base58();
+                            // 1. Check known_peers cache (lookup by libp2p_peer_id field)
+                            let cached = state.known_peers.values()
+                                .find(|r| r.libp2p_peer_id == pid_str)
+                                .cloned();
+                            if let Some(record) = cached {
+                                // Deduplicate: don't add if already in results
+                                if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
+                                    pending.records.push(record);
+                                }
+                                continue;
+                            }
+                            // 2. Check local Kademlia store (populated by put_record replication)
+                            let per_peer_key = dht::peer_record_key(&pending.model_id, &pid_str);
+                            let stored_value = swarm.behaviour_mut().kademlia.store_mut()
+                                .get(&per_peer_key)
+                                .map(|cow| cow.into_owned());
+                            if let Some(kad_record) = stored_value {
+                                if let Ok(record) = dht::decode_record(&kad_record.value) {
+                                    if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
+                                        state.known_peers.insert(record.peer_id.clone(), record.clone());
+                                        pending.records.push(record);
+                                    }
+                                }
+                            } else {
+                                debug!(%provider_pid, "provider found but no data in cache or local store");
+                            }
+                        }
+                    }
+                }
+                Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
+                    if let Some(pending) = state.pending_discovers.remove(&id) {
+                        let peers = pending
+                            .records
+                            .into_iter()
+                            .map(|r| record_to_discovered(&r))
+                            .collect();
+                        let _ = pending.reply.send(Ok(peers));
+                    }
+                }
+                Err(e) => {
+                    if let Some(pending) = state.pending_discovers.remove(&id) {
+                        let _ = pending.reply.send(Err(format!("kademlia get_providers: {e:?}")));
+                    }
+                }
+            }
+        }
+        // Task 2.1: Log start_providing results
+        kad::Event::OutboundQueryProgressed {
+            result: kad::QueryResult::StartProviding(result),
+            ..
+        } => {
+            match result {
+                Ok(kad::AddProviderOk { key }) => {
+                    debug!(?key, "start_providing succeeded");
+                }
+                Err(e) => {
+                    warn!("start_providing failed: {e:?}");
+                }
+            }
+        }
+        // Backward compat: keep GetRecord handler for records stored before Task 2.1
         kad::Event::OutboundQueryProgressed {
             id,
             result: kad::QueryResult::GetRecord(result),
@@ -1197,7 +1467,19 @@ fn handle_kad_event(
         kad::Event::RoutingUpdated { peer, .. } => {
             debug!(%peer, "kademlia routing updated");
         }
-        _ => {}
+        // Phase 1.2: UnroutablePeer is the strongest signal that a peer
+        // should be evicted — Kademlia itself declares it unreachable.
+        kad::Event::UnroutablePeer { peer } => {
+            warn!(%peer, "kademlia reports peer unroutable, evicting");
+            swarm.behaviour_mut().kademlia.remove_peer(&peer);
+            let libp2p_id_str = peer.to_string();
+            state.known_peers.retain(|_, record| {
+                record.libp2p_peer_id != libp2p_id_str
+            });
+        }
+        _ => {
+            debug!(?event, "unhandled kademlia event");
+        }
     }
 }
 
@@ -1211,7 +1493,13 @@ fn handle_autonat_event(event: libp2p::autonat::Event, state: &mut LoopState) {
                     state.nat_info.nat_type = "open".into();
                     state.nat_info.is_public = true;
                     if let Some(ip) = extract_ip_from_multiaddr(&addr) {
-                        state.nat_info.external_ip = ip;
+                        state.nat_info.external_ip = ip.clone();
+                        // Classify by address family.
+                        if ip.contains(':') {
+                            state.nat_info.external_ipv6 = ip;
+                        } else {
+                            state.nat_info.external_ipv4 = ip;
+                        }
                     }
                 }
                 libp2p::autonat::NatStatus::Private => {
@@ -1230,15 +1518,22 @@ fn handle_autonat_event(event: libp2p::autonat::Event, state: &mut LoopState) {
 
 /// Convert a PeerRecord into a DiscoveredPeer.
 fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
+    // Prefer IPv4 host, fall back to IPv6 if empty.
+    let effective_host = if r.host.is_empty() && !r.host_ipv6.is_empty() {
+        r.host_ipv6.clone()
+    } else {
+        r.host.clone()
+    };
     let reachable_address = if r.requires_relay && !r.relay_address.is_empty() {
         r.relay_address.clone()
     } else {
-        format!("{}:{}", r.host, r.port)
+        format!("{}:{}", effective_host, r.port)
     };
     DiscoveredPeer {
         peer_id: r.peer_id.clone(),
         libp2p_peer_id: r.libp2p_peer_id.clone(),
-        host: r.host.clone(),
+        host: effective_host,
+        host_ipv6: r.host_ipv6.clone(),
         port: r.port,
         model_id: r.model_id.clone(),
         layer_start: r.layer_start,
@@ -1736,9 +2031,12 @@ mod tests {
     fn test_peer_connection_info() {
         let mut info = PeerConnectionInfo::default();
         assert!(!info.has_direct());
-        info.quic_direct = 1;
+        info.quic_direct_v4 = 1;
         assert!(info.has_direct());
-        info.quic_direct = 0;
+        info.quic_direct_v4 = 0;
+        info.quic_direct_v6 = 1;
+        assert!(info.has_direct());
+        info.quic_direct_v6 = 0;
         info.tcp_direct = 1;
         assert!(info.has_direct());
         info.tcp_direct = 0;

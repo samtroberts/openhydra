@@ -458,6 +458,42 @@ class DiscoveryService:
                 "peers": snapshot,
             }
 
+    def invalidate_peer(self, *, peer_id: str) -> None:
+        """Phase 2.2: Evict all cache entries containing the given peer_id.
+
+        Called when a PEER_DEAD or PEER_DEPARTED gossip message arrives,
+        so the coordinator stops routing to a dead peer within ~1s instead
+        of waiting for the 120s cache TTL to expire.
+
+        Args:
+            peer_id: The OpenHydra peer_id OR libp2p_peer_id of the dead peer.
+        """
+        if not peer_id:
+            return
+        target = str(peer_id).strip()
+        evicted = 0
+        with self._dht_peer_cache_lock:
+            for model_id in list(self._dht_peer_cache.keys()):
+                item = self._dht_peer_cache.get(model_id)
+                if not item:
+                    continue
+                peers = item.get("peers", [])
+                filtered = [
+                    p for p in peers
+                    if not (
+                        getattr(p, "peer_id", "") == target
+                        or getattr(p, "libp2p_peer_id", "") == target
+                    )
+                ]
+                if len(filtered) < len(peers):
+                    evicted += len(peers) - len(filtered)
+                    item["peers"] = filtered
+        if evicted:
+            logging.info(
+                "cache_invalidated: peer_id=%s evicted=%d entries",
+                target, evicted,
+            )
+
     def _cached_dht_peers(self, *, model_id: str) -> list[PeerEndpoint]:
         """Retrieve cached DHT peers for a model, returning empty on miss/expiry.
 

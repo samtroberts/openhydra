@@ -80,12 +80,22 @@ pub struct PeerRecord {
     #[serde(default)]
     pub relay_address: String,
 
+    /// IPv6 address for dual-stack peers (serde default empty).
+    #[serde(default)]
+    pub host_ipv6: String,
+
     // Identity keys
     #[serde(default)]
     pub peer_public_key: String,
     /// libp2p PeerId (base58 multihash) — new field for Rust networking.
     #[serde(default)]
     pub libp2p_peer_id: String,
+    /// Ed25519 public key hex (from Rust P2PNode identity, Task 6.2).
+    #[serde(default)]
+    pub public_key: String,
+    /// Ed25519 signature hex over canonical record bytes (Task 6.2).
+    #[serde(default)]
+    pub signature: String,
 
     // Timestamp
     #[serde(default)]
@@ -106,7 +116,12 @@ fn default_nat_type() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatInfo {
     pub nat_type: String,
+    /// First confirmed external address (backward compat).
     pub external_ip: String,
+    /// Confirmed external IPv4 address (empty until classified).
+    pub external_ipv4: String,
+    /// Confirmed external IPv6 address (empty until classified).
+    pub external_ipv6: String,
     pub external_port: u16,
     pub is_public: bool,
 }
@@ -117,6 +132,7 @@ pub struct DiscoveredPeer {
     pub peer_id: String,
     pub libp2p_peer_id: String,
     pub host: String,
+    pub host_ipv6: String,
     pub port: u16,
     pub model_id: String,
     pub layer_start: u32,
@@ -223,8 +239,11 @@ impl Default for PeerRecord {
             nat_type: "unknown".into(),
             requires_relay: false,
             relay_address: String::new(),
+            host_ipv6: String::new(),
             peer_public_key: String::new(),
             libp2p_peer_id: String::new(),
+            public_key: String::new(),
+            signature: String::new(),
             updated_unix_ms: 0,
         }
     }

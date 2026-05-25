@@ -67,6 +67,8 @@ pub struct TensorStreamManager {
     preferences: Mutex<HashMap<PeerId, PreferredTransport>>,
     /// Fix 4: channel to send TriggerRepunch commands back to the event loop.
     repunch_tx: mpsc::UnboundedSender<PeerId>,
+    /// Phase 5.4: per-peer RTT estimates for adaptive write timeout.
+    peer_rtt: Mutex<HashMap<PeerId, Duration>>,
 }
 
 impl TensorStreamManager {
@@ -76,6 +78,25 @@ impl TensorStreamManager {
             outbound: Mutex::new(HashMap::new()),
             preferences: Mutex::new(HashMap::new()),
             repunch_tx,
+            peer_rtt: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Phase 5.4: Update the RTT estimate for a peer (called from event loop
+    /// on ping success or observed round-trip times).
+    pub async fn update_rtt(&self, peer: &PeerId, rtt: Duration) {
+        self.peer_rtt.lock().await.insert(*peer, rtt);
+    }
+
+    /// Phase 5.4: Compute write timeout for a peer, adaptive to observed RTT.
+    /// Defaults to WRITE_TIMEOUT (250ms) if no RTT estimate available.
+    async fn write_timeout_for(&self, peer: &PeerId) -> Duration {
+        match self.peer_rtt.lock().await.get(peer) {
+            Some(rtt) => {
+                let adaptive = Duration::from_millis((rtt.as_millis() as u64 * 3).max(250));
+                adaptive.min(Duration::from_secs(5)) // cap at 5s
+            }
+            None => WRITE_TIMEOUT,
         }
     }
 
@@ -185,8 +206,13 @@ impl TensorStreamManager {
 
     // ── Internal helpers ────────────────────────────────────────────────
 
+    // Phase 5.3: Clone the Control handle and release the lock immediately.
+    // Without this, the control mutex is held while waiting for the remote
+    // peer to accept the stream — one slow peer blocks all other peers'
+    // stream opens.
     async fn open_stream(&self, peer: &PeerId) -> Result<Stream, TensorStreamError> {
-        let mut control = self.control.lock().await;
+        let mut control = self.control.lock().await.clone();
+        // Lock released — other peers can open streams concurrently.
         match control.open_stream(*peer, TENSOR_STREAM_PROTOCOL).await {
             Ok(stream) => {
                 debug!(%peer, "tensor_stream: opened new stream");
@@ -196,13 +222,28 @@ impl TensorStreamManager {
         }
     }
 
+    // Phase 5.1: Check-before-open prevents stream leaks when two concurrent
+    // send_tensor() calls both hit NoCachedStream and race to open.
     async fn open_and_cache_stream(&self, peer: &PeerId) -> Result<(), TensorStreamError> {
+        // If another task already opened a stream while we were waiting, reuse it.
+        if self.outbound.lock().await.contains_key(peer) {
+            return Ok(());
+        }
         let stream = self.open_stream(peer).await?;
-        self.outbound.lock().await.insert(*peer, stream);
+        // Double-check: another task may have won the race.
+        let mut map = self.outbound.lock().await;
+        if map.contains_key(peer) {
+            // Another task opened a stream while we were opening ours.
+            // Drop our stream (it will be properly closed by Drop).
+            debug!(%peer, "tensor_stream: race detected, discarding duplicate stream");
+            return Ok(());
+        }
+        map.insert(*peer, stream);
         Ok(())
     }
 
-    /// Try to send on the cached stream with a 250ms timeout ceiling.
+    /// Try to send on the cached stream with an adaptive timeout ceiling.
+    /// Phase 5.4: timeout adapts to observed RTT (min 250ms, default 250ms).
     async fn try_send_with_timeout(
         &self,
         peer: &PeerId,
@@ -212,9 +253,12 @@ impl TensorStreamManager {
             let mut map = self.outbound.lock().await;
             map.remove(peer).ok_or(TensorStreamError::NoCachedStream)?
         };
-        let result = match tokio::time::timeout(WRITE_TIMEOUT, write_framed(&mut stream, data)).await {
+        let timeout = self.write_timeout_for(peer).await;
+        let result = match tokio::time::timeout(timeout, write_framed(&mut stream, data)).await {
             Ok(result) => result,
-            Err(_) => Err(TensorStreamError::Write("write timed out (250ms)".into())),
+            Err(_) => Err(TensorStreamError::Write(
+                format!("write timed out ({}ms)", timeout.as_millis()),
+            )),
         };
         if result.is_ok() {
             self.outbound.lock().await.insert(*peer, stream);
@@ -237,10 +281,13 @@ impl TensorStreamManager {
             map.remove(peer).ok_or(TensorStreamError::NoCachedStream)?
         };
 
-        match tokio::time::timeout(WRITE_TIMEOUT, write_framed(&mut stream, data)).await {
+        let timeout = self.write_timeout_for(peer).await;
+        match tokio::time::timeout(timeout, write_framed(&mut stream, data)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(TensorStreamError::Write("write timed out (250ms)".into())),
+            Err(_) => return Err(TensorStreamError::Write(
+                format!("write timed out ({}ms)", timeout.as_millis()),
+            )),
         }
 
         let result = match tokio::time::timeout(READ_TIMEOUT, read_framed(&mut stream)).await {
@@ -257,10 +304,15 @@ impl TensorStreamManager {
 
     /// Handle a send failure: remove the dead stream and trigger re-punch
     /// if the peer was using QUIC.
+    ///
+    /// Phase 5.2: Hold both locks in consistent order (outbound first, then
+    /// preferences) to prevent TOCTOU between releasing outbound and acquiring
+    /// preferences — a concurrent sender could open a new QUIC stream in
+    /// the gap, defeating the degradation intent.
     async fn handle_send_failure(&self, peer: &PeerId) {
-        self.outbound.lock().await.remove(peer);
-
+        let mut outbound = self.outbound.lock().await;
         let mut prefs = self.preferences.lock().await;
+        outbound.remove(peer);
         if let Some(PreferredTransport::QuicDirect) = prefs.get(peer) {
             info!(%peer, "tensor_stream: QUIC failed, marking degraded, triggering re-punch");
             prefs.insert(*peer, PreferredTransport::Degraded { since: Instant::now() });

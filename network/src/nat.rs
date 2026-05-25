@@ -38,9 +38,19 @@ pub fn build_nat_info(
     external_port: u16,
 ) -> NatInfo {
     let is_public = nat_type == "open";
+    // Classify by address family.
+    let (external_ipv4, external_ipv6) = if external_ip.contains(':') {
+        (String::new(), external_ip.clone())
+    } else if !external_ip.is_empty() {
+        (external_ip.clone(), String::new())
+    } else {
+        (String::new(), String::new())
+    };
     NatInfo {
         nat_type: nat_type.to_string(),
         external_ip,
+        external_ipv4,
+        external_ipv6,
         external_port,
         is_public,
     }

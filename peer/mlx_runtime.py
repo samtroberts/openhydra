@@ -265,6 +265,18 @@ class MLXRuntime:
         _load_s = time.perf_counter() - _t0
         logging.info("mlx_runtime: loaded in %.1f s", _load_s)
 
+        # Task 8.1a: detect Apple Silicon unified memory for zero-copy
+        # activation packing (skip PyTorch intermediate on arm64 macOS).
+        import platform as _platform
+        import sys as _sys
+        self._apple_silicon_unified = (
+            _sys.platform == "darwin"
+            and _platform.machine() == "arm64"
+            and bool(getattr(config, "runtime_mlx_local_zerocopy", True))
+        )
+        if self._apple_silicon_unified:
+            logging.info("mlx_runtime: Apple Silicon unified memory detected — zero-copy activation path enabled")
+
         # ── Tokenizer alignment for heterogeneous MLX ↔ PyTorch rings ──
         # The mlx-community checkpoints ship with a re-packaged tokenizer
         # whose vocab/special-token indices may differ from the canonical
@@ -1809,8 +1821,10 @@ class MLXRuntime:
         for MLX runtimes:
 
         1. Evaluate + cast to fp32 (``encode_activation`` contract).
-        2. Route through the PyTorch DLPack bridge → ``openhydra_network.encode_activation``
-           → single memcpy into ``bytes``.
+        2. Route through the Rust ``encode_activation`` via DLPack — on Apple
+           Silicon (Task 8.1a), passes the numpy view directly (skips the
+           PyTorch intermediate and ``.contiguous()`` copy, since MLX arrays
+           on unified memory are already row-major/contiguous).
         3. Falls back to numpy-vectorised ``pack_fp32`` (and then to
            ``struct.pack``) when the Rust wheel is unavailable, preserving
            minimal-install compatibility.
@@ -1837,12 +1851,21 @@ class MLXRuntime:
             from peer.activation_codec import pack_fp32 as _pack_fp32
             return _pack_fp32(payload)
 
-        # Try the Rust zero-copy encoder via the PyTorch DLPack bridge.
+        # Task 8.1a: on Apple Silicon unified memory, pass numpy array
+        # directly to Rust encoder via DLPack — skip PyTorch intermediate.
+        # numpy arrays support __dlpack__() and are already contiguous on
+        # unified memory (no PCIe transfer needed).
         try:
-            import torch  # type: ignore
             import openhydra_network  # type: ignore
-            t = torch.from_numpy(arr).contiguous()
-            return openhydra_network.encode_activation(t)
+            if self._apple_silicon_unified:
+                # Unified memory: numpy→DLPack directly (zero-copy, no
+                # torch.from_numpy + .contiguous() overhead).
+                return openhydra_network.encode_activation(arr)
+            else:
+                # Discrete GPU / non-Apple: torch bridge for DLPack compat.
+                import torch  # type: ignore
+                t = torch.from_numpy(arr).contiguous()
+                return openhydra_network.encode_activation(t)
         except Exception as exc:  # pragma: no cover — exercised in integration
             logging.debug("mlx_packed_fallback: %s — using pack_fp32", exc)
             seq_len = int(hidden.shape[1])

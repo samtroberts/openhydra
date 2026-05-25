@@ -11,7 +11,7 @@ Group=openhydra
 WorkingDirectory=/opt/openhydra
 
 ExecStart=/opt/openhydra/.venv/bin/python -m dht.bootstrap \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 8468 \
     --deployment-profile prod \
     --secrets-file /etc/openhydra/secrets.env \

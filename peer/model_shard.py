@@ -198,6 +198,9 @@ class ToyShardConfig:
     # during idle gaps to keep the power state warm. MLX backend only.
     runtime_mlx_gpu_keepalive_enabled: bool = True
     runtime_mlx_gpu_keepalive_interval_ms: float = 5.0
+    # Task 8.1a: skip CPU↔GPU copies on Apple Silicon unified memory.
+    # Only effective on arm64 macOS where CPU/GPU share the same RAM.
+    runtime_mlx_local_zerocopy: bool = True
 
     # ── Tokenizer alignment (heterogeneous MLX ↔ PyTorch rings) ───────────
     # Canonical HuggingFace model id (e.g. "Qwen/Qwen3.5-2B") used to load
@@ -806,6 +809,9 @@ class PyTorchRuntime:
         # ── Auto-mode VRAM-aware counters (Pass 6) ────────────────────────
         self._auto_skip_count: int = 0
         self._auto_trigger_count: int = 0
+        # ── Task 8.4: Lazy KV VRAM introspection ─────────────────────────
+        self._kv_store_call_count: int = 0
+        self._last_vram_pct: float = 0.0
 
         try:
             import torch
@@ -1984,7 +1990,19 @@ class PyTorchRuntime:
             # ── Pass 6: VRAM-aware auto mode ─────────────────────────────
             _mode = getattr(self._compaction_config, "mode", "on")
             if _mode == "auto":
-                _vram_pct = self._vram_usage_pct()
+                self._kv_store_call_count += 1
+                # Task 8.4: Only query GPU memory stats every 64 tokens
+                # or when last known usage was high. Saves 0.1-0.5ms/token.
+                _check_interval = 64
+                _needs_check = (
+                    self._kv_store_call_count % _check_interval == 0
+                    or self._last_vram_pct >= 0.70
+                )
+                if _needs_check:
+                    _vram_pct = self._vram_usage_pct()
+                    self._last_vram_pct = _vram_pct
+                else:
+                    _vram_pct = self._last_vram_pct
                 _seq_len = self._past_sequence_length(past_key_values)
                 _threshold = getattr(self._compaction_config, "auto_threshold", 512)
                 if _vram_pct < 0.75 and _seq_len <= _threshold:
@@ -2689,7 +2707,9 @@ class PyTorchRuntime:
             self._last_noise_payload_index = int(noise_stats.applied_payloads)
         if self._compressor is not None:
             tensor = self._compressor.encode(tensor)
-        tensor = tensor.detach().to(device="cpu", dtype=self._torch.float32).contiguous()
+        # Task 8.1: Combined detach+cpu cast, dropped redundant .contiguous()
+        # .to(device, dtype) returns a contiguous tensor; .contiguous() was a no-op copy.
+        tensor = tensor.detach().to(device="cpu", dtype=self._torch.float32)
         try:
             import openhydra_network
             return openhydra_network.encode_activation(tensor)

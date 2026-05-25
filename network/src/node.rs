@@ -15,11 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use libp2p::{Multiaddr, PeerId};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::info;
-
-#[cfg(feature = "pyo3")]
-use tokio::sync::oneshot;
 
 #[cfg(feature = "pyo3")]
 use pyo3::prelude::*;
@@ -130,10 +127,11 @@ pub fn start_node(
                     protocol_version: "openhydra/0.1.0".into(),
                 };
 
+                let keypair_for_loop = identity.keypair.clone();
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, stream_control)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -203,6 +201,24 @@ pub struct PyP2PNode {
     /// Cached identity info (set after start).
     libp2p_peer_id: String,
     openhydra_peer_id: String,
+    /// Ed25519 keypair for signing (retained for 6.0 identity methods).
+    keypair: libp2p::identity::Keypair,
+}
+
+// Phase 4.3: Drop implementation for crash safety.
+// If Python doesn't call stop() (SIGKILL, crash, GC), attempt a graceful
+// shutdown so PEER_DEPARTED gossip is published and DHT records are cleaned.
+#[cfg(feature = "pyo3")]
+impl Drop for PyP2PNode {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let (tx, rx) = oneshot::channel();
+            if inner.cmd_tx.blocking_send(SwarmCommand::Shutdown { reply: tx }).is_ok() {
+                // Wait briefly for the shutdown to complete; don't block forever.
+                let _ = rx.blocking_recv();
+            }
+        }
+    }
 }
 
 #[cfg(feature = "pyo3")]
@@ -244,6 +260,7 @@ impl PyP2PNode {
             config,
             libp2p_peer_id: identity.libp2p_peer_id.to_string(),
             openhydra_peer_id: identity.openhydra_peer_id.clone(),
+            keypair: identity.keypair,
         })
     }
 
@@ -674,6 +691,38 @@ impl PyP2PNode {
     #[getter]
     fn openhydra_peer_id(&self) -> &str {
         &self.openhydra_peer_id
+    }
+
+    // ── Task 6.0: Identity methods ──
+
+    /// Return the libp2p PeerId as a base58 string.
+    /// Alias for the libp2p_peer_id property — named for clarity in identity code.
+    fn peer_id_base58(&self) -> &str {
+        &self.libp2p_peer_id
+    }
+
+    /// Sign arbitrary data with the node's Ed25519 keypair.
+    /// Returns the raw 64-byte Ed25519 signature.
+    fn sign_record(&self, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        self.keypair
+            .sign(&data)
+            .map_err(|e| PyRuntimeError::new_err(format!("sign failed: {e}")))
+    }
+
+    /// Export the raw 32-byte Ed25519 public key.
+    fn public_key_bytes(&self) -> PyResult<Vec<u8>> {
+        let ed25519_pk = self
+            .keypair
+            .public()
+            .try_into_ed25519()
+            .map_err(|e| PyRuntimeError::new_err(format!("not ed25519: {e}")))?;
+        Ok(ed25519_pk.to_bytes().to_vec())
+    }
+
+    /// Export the hex-encoded 32-byte Ed25519 public key.
+    fn public_key_hex(&self) -> PyResult<String> {
+        let bytes = self.public_key_bytes()?;
+        Ok(hex::encode(bytes))
     }
 }
 

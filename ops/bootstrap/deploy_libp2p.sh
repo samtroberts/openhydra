@@ -23,6 +23,17 @@ SERVERS=(
     "root@172.104.164.98"  # AP (Singapore)
 )
 
+# Bootstrap peer multiaddrs (each server connects to the other two).
+EU_PEER="/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT"
+US_PEER="/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb"
+AP_PEER="/ip4/172.104.164.98/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo"
+
+# Map server IP → the OTHER two peers (for --peer flags).
+declare -A PEER_FLAGS
+PEER_FLAGS["172.105.69.49"]="--peer ${US_PEER} --peer ${AP_PEER}"   # EU connects to US + AP
+PEER_FLAGS["45.79.190.172"]="--peer ${EU_PEER} --peer ${AP_PEER}"   # US connects to EU + AP
+PEER_FLAGS["172.104.164.98"]="--peer ${EU_PEER} --peer ${US_PEER}"  # AP connects to EU + US
+
 if [[ ! -f "$BINARY" ]]; then
     echo "ERROR: Binary not found at $BINARY"
     echo ""
@@ -58,14 +69,40 @@ for server in "${SERVERS[@]}"; do
         if [ ! -f /opt/openhydra/.libp2p_identity.key ]; then
             /opt/openhydra/bin/openhydra-bootstrap \
                 --identity /opt/openhydra/.libp2p_identity.key \
-                --listen /ip4/0.0.0.0/tcp/0 &
+                --listen /ip4/127.0.0.1/tcp/0 &
             BGPID=\$!
-            sleep 2
+            # Poll for key file instead of sleep (fixes race condition).
+            for i in \$(seq 1 20); do
+                [ -f /opt/openhydra/.libp2p_identity.key ] && break
+                sleep 0.5
+            done
             kill \$BGPID 2>/dev/null || true
             echo 'Generated new libp2p identity key'
         else
             echo 'Identity key already exists'
         fi
+    "
+
+    # Extract this server's IP to look up peer flags.
+    SERVER_IP="\${server#root@}"
+
+    # Generate systemd drop-in override with --peer flags for the other two
+    # bootstraps + full dual-stack listen addresses (IPv4+IPv6, TCP+QUIC).
+    PEERS="${PEER_FLAGS[$SERVER_IP]:-}"
+    ssh "$server" "
+        mkdir -p /etc/systemd/system/openhydra-libp2p.service.d
+        cat > /etc/systemd/system/openhydra-libp2p.service.d/peers.conf <<DROPIN
+[Service]
+ExecStart=
+ExecStart=/opt/openhydra/bin/openhydra-bootstrap \\\\
+    --identity /opt/openhydra/.libp2p_identity.key \\\\
+    --listen /ip4/0.0.0.0/tcp/4001 \\\\
+    --listen /ip4/0.0.0.0/udp/4001/quic-v1 \\\\
+    --listen /ip6/::/tcp/4001 \\\\
+    --listen /ip6/::/udp/4001/quic-v1 \\\\
+    ${PEERS}
+DROPIN
+        echo 'Drop-in override written with peer flags + dual-stack listen'
     "
 
     # Enable and (re)start the service.

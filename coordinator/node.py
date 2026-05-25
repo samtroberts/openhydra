@@ -457,7 +457,7 @@ def main() -> None:
                         help="Path to peers.local.json for static peer discovery (optional).")
     parser.add_argument(
         "--identity-path",
-        default=".openhydra/identity.key",
+        default=os.path.expanduser("~/.openhydra/identity.key"),
         help="Path to Ed25519 identity keypair file (created on first run, mode 0600).",
     )
 

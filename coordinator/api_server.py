@@ -1898,6 +1898,18 @@ def serve(
             _dsvc._self_libp2p_peer_id = (
                 str(getattr(p2p_node, "libp2p_peer_id", "") or "")
             )
+            # Phase 2.2: Wire PEER_DEAD/PEER_DEPARTED gossip to cache
+            # invalidation so the coordinator stops routing to dead peers
+            # within ~1s instead of waiting for the 120s cache TTL.
+            if gossip_client is not None and hasattr(_dsvc, "invalidate_peer"):
+                def _on_peer_dead(msg: Any, dsvc=_dsvc) -> None:
+                    _libp2p_id = ""
+                    if hasattr(msg, "data") and isinstance(msg.data, dict):
+                        _libp2p_id = str(msg.data.get("libp2p_peer_id", ""))
+                    if _libp2p_id:
+                        dsvc.invalidate_peer(peer_id=_libp2p_id)
+                gossip_client.on("PEER_DEAD", _on_peer_dead)
+                gossip_client.on("PEER_DEPARTED", _on_peer_dead)
             # B3 follow-up (pipeline ordering fix): give the inference
             # service a handle to the live ``LoopSnapshot`` so it can
             # override the *local* peer's stale layer range (baked in

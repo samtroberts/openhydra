@@ -461,15 +461,53 @@ def load_peers_from_dht(
     if not merged_payload and not sources:
         return []
 
-    best_by_peer: dict[str, dict] = {}
+    # Task 6.3: verify Ed25519 signature on peer records before consuming.
+    # Records without signatures are accepted (backward compat), but
+    # records with an invalid signature are dropped.
+    verified_payload: list[dict] = []
     for item in merged_payload:
+        _pub_key = str(item.get("public_key", "") or "")
+        _sig = str(item.get("signature", "") or "")
+        if _pub_key and _sig:
+            try:
+                from peer.identity import verify_announce as _verify_announce
+                if not _verify_announce(
+                    _pub_key,
+                    str(item.get("peer_id", "")),
+                    str(item.get("host", "")),
+                    int(item.get("port", 0)),
+                    str(item.get("model_id", "")),
+                    _sig,
+                ):
+                    logger.warning(
+                        "signature_verify_rejected peer_id=%s host=%s",
+                        item.get("peer_id"), item.get("host"),
+                    )
+                    continue
+            except Exception:
+                logger.warning(
+                    "signature_verify_error peer_id=%s", item.get("peer_id"),
+                )
+                continue
+        verified_payload.append(item)
+
+    best_by_peer: dict[str, dict] = {}
+    for item in verified_payload:
         peer_id = str(item.get("peer_id", "")).strip()
         if not peer_id:
             continue
         current = best_by_peer.get(peer_id)
         current_ts = int((current or {}).get("updated_unix_ms", 0) or 0)
         incoming_ts = int(item.get("updated_unix_ms", 0) or 0)
-        if current is None or incoming_ts >= current_ts:
+        # Phase 2.4: prefer the record with the highest rebalance_epoch.
+        # If epochs are equal, fall back to timestamp comparison.
+        current_epoch = int((current or {}).get("rebalance_epoch", 0) or 0)
+        incoming_epoch = int(item.get("rebalance_epoch", 0) or 0)
+        if current is None:
+            best_by_peer[peer_id] = dict(item)
+        elif incoming_epoch > current_epoch:
+            best_by_peer[peer_id] = dict(item)
+        elif incoming_epoch == current_epoch and incoming_ts >= current_ts:
             best_by_peer[peer_id] = dict(item)
 
     peers_payload = sorted(

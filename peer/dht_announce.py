@@ -94,6 +94,8 @@ class Announcement:
     requires_relay: bool = False
     relay_peer_id: str = ""        # peer_id of the relay handling this peer
     relay_address: str = ""        # "host:port" of the relay (for routing)
+    # Task 3.4: IPv6 address for dual-stack peers.
+    host_ipv6: str = ""
     # Cross-ISP: libp2p peer ID for proxy forwarding through Circuit Relay.
     libp2p_peer_id: str = ""
     # Zero-config bootstrap Phase 1: capacity engine payload.
@@ -115,6 +117,11 @@ class Announcement:
     node_persona: str = "native_shard"
     upstream_kind: str = ""
     upstream_url: str = ""
+    # Phase 2.4: monotonically increasing epoch, bumped on each layer change.
+    # Coordinators reject records with epoch < the known epoch for that peer,
+    # preventing stale layer-range announcements from overriding fresh ones
+    # during rebalance races.
+    rebalance_epoch: int = 0
 
 
 def announce_local(announcement: Announcement, registry_file: str = ".openhydra_registry.json") -> None:
