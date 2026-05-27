@@ -21,6 +21,28 @@ import json as _json
 from typing import Any
 
 
+class _DictHop:
+    """Attribute-access wrapper for a PeerHop dict decoded from JSON bytes.
+
+    Provides ``.address``, ``.peer_id``, ``.libp2p_peer_id``,
+    ``.shard_layer_start``, ``.shard_layer_end``, ``.shard_total_layers``
+    exactly like a ``peer_pb2.PeerHop`` protobuf message.
+    """
+    __slots__ = ("_d",)
+
+    def __init__(self, d: dict):
+        self._d = d
+
+    def __getattr__(self, name: str):
+        try:
+            return self._d[name]
+        except KeyError:
+            return 0 if name.startswith("shard_") else ""
+
+    def __repr__(self) -> str:
+        return f"_DictHop({self._d!r})"
+
+
 class OHV2Request:
     """Drop-in replacement for peer_pb2.ForwardRequest using OHV2 decoded dict.
 
@@ -203,7 +225,24 @@ class OHV2Request:
 
     @property
     def ring_full_route(self) -> list:
-        return list(self._d.get("ring_full_route", []))
+        """Decode ring_full_route from opaque bytes to PeerHop-like dicts.
+
+        Same encoding as remaining_route: JSON-serialized list of
+        ``{address, peer_id, libp2p_peer_id, shard_layer_start, ...}``
+        packed into ``Vec<u8>``.
+        """
+        raw = self._d.get("ring_full_route", [])
+        if isinstance(raw, bytes):
+            try:
+                return [_DictHop(h) for h in _json.loads(raw)]
+            except Exception:
+                return []
+        if isinstance(raw, list) and raw and isinstance(raw[0], int):
+            try:
+                return [_DictHop(h) for h in _json.loads(bytes(raw))]
+            except Exception:
+                return []
+        return list(raw)
 
     # ── Callback routing ─────────────────────────────────────────────
     @property
@@ -224,18 +263,18 @@ class OHV2Request:
 
         In OHV2, remaining_route is serialized as opaque bytes (JSON of
         [{address, peer_id, libp2p_peer_id, shard_layer_start, ...}]).
-        Decode on access.
+        Decode on access and wrap in _DictHop for attribute access.
         """
         raw = self._d.get("remaining_route", [])
         if isinstance(raw, bytes):
             try:
-                return _json.loads(raw)
+                return [_DictHop(h) for h in _json.loads(raw)]
             except Exception:
                 return []
         if isinstance(raw, list) and raw and isinstance(raw[0], int):
             # Raw byte array from CBOR — decode as JSON bytes
             try:
-                return _json.loads(bytes(raw))
+                return [_DictHop(h) for h in _json.loads(bytes(raw))]
             except Exception:
                 return []
         return list(raw)

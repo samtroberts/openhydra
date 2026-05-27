@@ -953,56 +953,69 @@ def _coordinator_handle_push_result(
     try:
         snap = reinject_snapshot
         route = snap["ring_full_route"]
-        _next_next = route[1].address if len(route) > 1 else ""
-        _next_next_id = route[1].peer_id if len(route) > 1 else ""
-        req = peer_pb2.ForwardRequest(
-            request_id=snap["request_id"],
-            activation=[float(snap["token_id"])],
-            stage_index=0,
-            total_stages=snap["total_stages"],
-            max_tokens=1,
-            kv_session_id=snap["kv_session_id"],
-            kv_store_activation=True,
-            kv_use_cached_activation=True,
-            decode_do_sample=snap["decode"].do_sample,
-            decode_temperature=float(snap["decode"].temperature or 0.0),
-            decode_top_p=float(snap["decode"].top_p or 0.0),
-            decode_top_k=int(snap["decode"].top_k or 0),
-            decode_seed=int(snap["decode"].seed or 0),
-            shard_layer_start=snap["stage0_layer_start"],
-            shard_layer_end=snap["stage0_layer_end"],
-            shard_total_layers=snap["stage0_total_layers"],
-            push_mode=True,
-            ring_mode=True,
-            sample_on_coordinator=True,
-            ring_tokens_remaining=snap["ring_tokens_remaining"],
-            ring_generated_ids=snap["ring_generated_ids"],
-            ring_eos_ids=snap["ring_eos_ids"],
-            ring_first_hop_address=snap["ring_first_hop_address"],
-            ring_first_hop_peer_id=snap["ring_first_hop_peer_id"],
-            ring_first_hop_libp2p_id=snap["ring_first_hop_libp2p_id"],
-            ring_full_route=route,
-            next_hop_address=_next_next,
-            next_hop_peer_id=_next_next_id,
-            final_callback_address=snap["final_callback_address"],
-            final_callback_request_id=snap["callback_request_id"],
-            final_callback_libp2p_peer_id=snap["final_callback_libp2p_peer_id"],
-            remaining_route=route[1:],
-            slot_id=snap["next_slot_id"],
-            pipeline_depth=snap["pipeline_depth"],
-        )
+        # Route entries are plain dicts — use dict access.
+        _next_next = route[1]["address"] if len(route) > 1 else ""
+        _next_next_id = route[1]["peer_id"] if len(route) > 1 else ""
+
+        # Pack single-token activation as float32.
+        import struct as _reinj_struct
+        _reinj_packed = _reinj_struct.pack('<f', float(snap["token_id"]))
+
+        # OHV2 header dict — replaces peer_pb2.ForwardRequest.
+        _reinj_header = {
+            "request_id": snap["request_id"],
+            "stage_index": 0,
+            "total_stages": snap["total_stages"],
+            "max_tokens": 1,
+            "push_mode": True,
+            "ring_mode": True,
+            "sample_on_coordinator": True,
+            "kv_session_id": snap["kv_session_id"],
+            "kv_store_activation": True,
+            "kv_use_cached_activation": True,
+            "decode_do_sample": snap["decode"].do_sample,
+            "decode_temperature": float(snap["decode"].temperature or 0.0),
+            "decode_top_p": float(snap["decode"].top_p or 0.0),
+            "decode_top_k": int(snap["decode"].top_k or 0),
+            "decode_seed": int(snap["decode"].seed or 0),
+            "shard_layer_start": snap["stage0_layer_start"],
+            "shard_layer_end": snap["stage0_layer_end"],
+            "shard_total_layers": snap["stage0_total_layers"],
+            "ring_tokens_remaining": snap["ring_tokens_remaining"],
+            "ring_generated_ids": snap["ring_generated_ids"],
+            "ring_eos_ids": snap["ring_eos_ids"],
+            "ring_first_hop_address": snap["ring_first_hop_address"],
+            "ring_first_hop_peer_id": snap["ring_first_hop_peer_id"],
+            "ring_first_hop_libp2p_id": snap["ring_first_hop_libp2p_id"],
+            "ring_full_route": PeerService._serialize_route_to_bytes(route),
+            "next_hop_address": _next_next,
+            "next_hop_peer_id": _next_next_id,
+            "final_callback_address": snap["final_callback_address"],
+            "final_callback_request_id": snap["callback_request_id"],
+            "final_callback_libp2p_peer_id": snap["final_callback_libp2p_peer_id"],
+            "remaining_route": PeerService._serialize_route_to_bytes(route[1:]),
+            "slot_id": snap["next_slot_id"],
+            "pipeline_depth": snap["pipeline_depth"],
+            "activation_dtype": 0,
+            "activation_shape": [],
+        }
+
         _first_libp2p = snap["ring_first_hop_libp2p_id"]
         _req_id_log = snap["request_id"]
         _slot_id_log = snap["next_slot_id"]
 
-        def _fire(_rreq=req, _libp2p=_first_libp2p,
+        def _fire(_hdr=_reinj_header, _act=_reinj_packed,
+                  _libp2p=_first_libp2p,
                   _rid=_req_id_log, _sid=_slot_id_log):
             try:
                 if p2p_node is not None and _libp2p:
                     # Phase 1: fire-and-forget — no ACK wait.
+                    _wire = p2p_node.encode_forward_msg(
+                        _hdr, _act, msg_type=0,
+                    )
                     p2p_node.proxy_forward_no_wait(
                         target_peer_id=_libp2p,
-                        data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                        data=PROXY_METHOD_FIRE_FORGET + bytes(_wire),
                     )
                     logging.info(
                         "coord_reinject_done: req=%s slot=%d via_relay (no_wait)",
@@ -2124,72 +2137,108 @@ class PeerService:
                     # coordinator needs the final token delivered via the loop-back.
                     if True:
                         # Loop back to first peer with the new token.
-                        _ring_route = list(request.ring_full_route)
-                        _ring_next_addr = str(request.ring_first_hop_address)
-                        _ring_next_next = _ring_route[1].address if len(_ring_route) > 1 else ""
-                        _ring_next_next_id = _ring_route[1].peer_id if len(_ring_route) > 1 else ""
-                        _ring_req = peer_pb2.ForwardRequest(
-                            request_id=request.request_id,
-                            activation=[float(_ring_token)],
-                            stage_index=0,
-                            total_stages=request.total_stages,
-                            max_tokens=1,
-                            kv_session_id=request.kv_session_id,
-                            kv_store_activation=True,
-                            kv_use_cached_activation=True,
-                            decode_do_sample=request.decode_do_sample,
-                            decode_temperature=request.decode_temperature,
-                            decode_top_p=request.decode_top_p,
-                            decode_top_k=request.decode_top_k,
-                            decode_seed=request.decode_seed,
-                            shard_layer_start=_ring_route[0].shard_layer_start if _ring_route else 0,
-                            shard_layer_end=_ring_route[0].shard_layer_end if _ring_route else 0,
-                            shard_total_layers=_ring_route[0].shard_total_layers if _ring_route else 0,
-                            push_mode=True,
-                            ring_mode=True,
-                            ring_tokens_remaining=_ring_remaining,
-                            ring_generated_ids=_ring_generated,
-                            ring_eos_ids=list(request.ring_eos_ids),
-                            ring_first_hop_address=request.ring_first_hop_address,
-                            ring_first_hop_peer_id=request.ring_first_hop_peer_id,
-                            ring_first_hop_libp2p_id=request.ring_first_hop_libp2p_id,
-                            ring_full_route=_ring_route,
-                            next_hop_address=_ring_next_next,
-                            next_hop_peer_id=_ring_next_next_id,
-                            final_callback_address=callback_addr,
-                            final_callback_request_id=_ring_cb_id,
-                            final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
-                            remaining_route=_ring_route[1:],
-                            prompt_token_ids=list(request.prompt_token_ids),
+                        _ring_route_raw = list(request.ring_full_route)
+                        # Serialize route for OHV2 Vec<u8> fields.  Route
+                        # entries may be _DictHop (OHV2) or PeerHop (protobuf).
+                        _ring_route_bytes = self._serialize_route_to_bytes(_ring_route_raw)
+                        _ring_remaining_bytes = self._serialize_route_to_bytes(
+                            _ring_route_raw[1:],
                         )
+                        _ring_next_addr = str(request.ring_first_hop_address)
+                        # Extract next-next hop address/id via attribute
+                        # access (works for both _DictHop and PeerHop).
+                        _ring_next_next = (
+                            str(getattr(_ring_route_raw[1], "address", "") or "")
+                            if len(_ring_route_raw) > 1 else ""
+                        )
+                        _ring_next_next_id = (
+                            str(getattr(_ring_route_raw[1], "peer_id", "") or "")
+                            if len(_ring_route_raw) > 1 else ""
+                        )
+                        # Shard fields from first hop.
+                        _rl0_start = (
+                            int(getattr(_ring_route_raw[0], "shard_layer_start", 0) or 0)
+                            if _ring_route_raw else 0
+                        )
+                        _rl0_end = (
+                            int(getattr(_ring_route_raw[0], "shard_layer_end", 0) or 0)
+                            if _ring_route_raw else 0
+                        )
+                        _rl0_total = (
+                            int(getattr(_ring_route_raw[0], "shard_total_layers", 0) or 0)
+                            if _ring_route_raw else 0
+                        )
+
+                        # Pack single-token activation as float32.
+                        import struct as _rl_struct
+                        _rl_packed = _rl_struct.pack('<f', float(_ring_token))
+
+                        # OHV2 header dict — replaces peer_pb2.ForwardRequest.
+                        _rl_header = {
+                            "request_id": request.request_id,
+                            "stage_index": 0,
+                            "total_stages": int(request.total_stages),
+                            "max_tokens": 1,
+                            "push_mode": True,
+                            "ring_mode": True,
+                            "kv_session_id": str(request.kv_session_id),
+                            "kv_store_activation": True,
+                            "kv_use_cached_activation": True,
+                            "decode_do_sample": bool(request.decode_do_sample),
+                            "decode_temperature": float(request.decode_temperature),
+                            "decode_top_p": float(request.decode_top_p),
+                            "decode_top_k": int(request.decode_top_k),
+                            "decode_seed": int(request.decode_seed),
+                            "shard_layer_start": _rl0_start,
+                            "shard_layer_end": _rl0_end,
+                            "shard_total_layers": _rl0_total,
+                            "ring_tokens_remaining": _ring_remaining,
+                            "ring_generated_ids": _ring_generated,
+                            "ring_eos_ids": list(int(e) for e in request.ring_eos_ids),
+                            "ring_first_hop_address": str(request.ring_first_hop_address),
+                            "ring_first_hop_peer_id": str(request.ring_first_hop_peer_id),
+                            "ring_first_hop_libp2p_id": str(request.ring_first_hop_libp2p_id),
+                            "ring_full_route": _ring_route_bytes,
+                            "next_hop_address": _ring_next_next,
+                            "next_hop_peer_id": _ring_next_next_id,
+                            "final_callback_address": callback_addr,
+                            "final_callback_request_id": _ring_cb_id,
+                            "final_callback_libp2p_peer_id": str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                            "remaining_route": _ring_remaining_bytes,
+                            "prompt_token_ids": list(request.prompt_token_ids),
+                            "activation_dtype": 0,
+                            "activation_shape": [],
+                        }
                         # Fire-and-forget: ring loop-back in background thread.
                         # IMPORTANT: Do NOT use _push_to_next_hop here — it rebuilds
                         # the request with stage_index+1 and wrong shard layers.
-                        # The ring loop-back sends the pre-built _ring_req directly.
+                        # The ring loop-back sends the pre-built OHV2 header directly.
                         import threading as _ring_threading
                         _ring_first_libp2p = str(request.ring_first_hop_libp2p_id or "")
-                        def _ring_loop_back(_rreq=_ring_req, _raddr=_ring_next_addr,
+                        def _ring_loop_back(_hdr=_rl_header, _act=_rl_packed,
+                                            _raddr=_ring_next_addr,
                                             _libp2p=_ring_first_libp2p):
                             try:
                                 logger.info("RING_LOOPBACK_START: req=%s remaining=%d -> %s (libp2p=%s)",
-                                            _rreq.request_id, _rreq.ring_tokens_remaining,
+                                            _hdr["request_id"], _hdr["ring_tokens_remaining"],
                                             _raddr, _libp2p[:20] if _libp2p else "none")
-                                # LAN-first: if we can reach the first
-                                # peer directly via gRPC on a shared /16,
                                 if self._p2p_node is None or not _libp2p:
                                     raise RuntimeError(f"no_libp2p_for_ring_loopback: {_raddr}")
+                                _wire = self._p2p_node.encode_forward_msg(
+                                    _hdr, _act, msg_type=0,
+                                )
                                 self._p2p_node.proxy_forward_no_wait(
                                     target_peer_id=_libp2p,
-                                    data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                                    data=PROXY_METHOD_FIRE_FORGET + bytes(_wire),
                                 )
                                 logger.info(
                                     "RING_LOOPBACK_DONE: req=%s remaining=%d (libp2p=%s)",
-                                    _rreq.request_id, _rreq.ring_tokens_remaining,
+                                    _hdr["request_id"], _hdr["ring_tokens_remaining"],
                                     _libp2p[:20],
                                 )
                             except Exception as _rl_exc:
                                 logger.error("RING_LOOPBACK_CRASH: req=%s remaining=%d err=%s",
-                                             _rreq.request_id, _rreq.ring_tokens_remaining, _rl_exc,
+                                             _hdr["request_id"], _hdr["ring_tokens_remaining"], _rl_exc,
                                              exc_info=True)
                         _ring_threading.Thread(target=_ring_loop_back, daemon=True).start()
 
@@ -2553,6 +2602,40 @@ class PeerService:
             block_index=block_index,
         )
 
+    @staticmethod
+    def _serialize_route_to_bytes(route_list) -> list[int]:
+        """Serialize a list of PeerHop (protobuf or dict) to JSON-encoded byte values.
+
+        The IpcForwardHeader fields ``ring_full_route`` and ``remaining_route``
+        are ``Vec<u8>`` in Rust — an opaque byte blob.  When the inbound
+        request is protobuf, the route entries are PeerHop message objects;
+        when OHV2, they're already raw bytes (list of ints).  This helper
+        normalises both cases.
+        """
+        if not route_list:
+            return []
+        # Already byte-valued ints from OHV2 decode?
+        if route_list and isinstance(route_list[0], int):
+            return list(route_list)
+        import json as _jr
+        serialised = []
+        for hop in route_list:
+            # Support both dicts and attribute-access objects (protobuf
+            # PeerHop, _DictHop).
+            if isinstance(hop, dict):
+                _get = hop.get
+            else:
+                _get = lambda k, d=None: getattr(hop, k, d)  # noqa: E731
+            serialised.append({
+                "address": str(_get("address", "") or ""),
+                "peer_id": str(_get("peer_id", "") or ""),
+                "libp2p_peer_id": str(_get("libp2p_peer_id", "") or ""),
+                "shard_layer_start": int(_get("shard_layer_start", 0) or 0),
+                "shard_layer_end": int(_get("shard_layer_end", 0) or 0),
+                "shard_total_layers": int(_get("shard_total_layers", 0) or 0),
+            })
+        return list(_jr.dumps(serialised).encode())
+
     def _push_to_next_hop(
         self,
         request,
@@ -2613,7 +2696,7 @@ class PeerService:
                     "ring_first_hop_address": str(getattr(request, "ring_first_hop_address", "") or ""),
                     "ring_first_hop_peer_id": str(getattr(request, "ring_first_hop_peer_id", "") or ""),
                     "ring_first_hop_libp2p_id": str(getattr(request, "ring_first_hop_libp2p_id", "") or ""),
-                    "ring_full_route": list(getattr(request, "ring_full_route", [])),
+                    "ring_full_route": self._serialize_route_to_bytes(list(getattr(request, "ring_full_route", []))),
                     "sample_on_coordinator": bool(getattr(request, "sample_on_coordinator", False)),
                     "slot_id": int(getattr(request, "slot_id", 0) or 0),
                     "pipeline_depth": int(getattr(request, "pipeline_depth", 1) or 1),
@@ -2896,51 +2979,60 @@ class PeerService:
         also terminates on the coordinator.
         """
         route = list(session.ring_full_route)
-        _next_next = route[1].address if len(route) > 1 else ""
-        _next_next_id = route[1].peer_id if len(route) > 1 else ""
-        req = peer_pb2.ForwardRequest(
-            request_id=session.request_id,
-            activation=[float(token_id)],
-            stage_index=0,
-            total_stages=int(session.total_stages),
-            max_tokens=1,
-            kv_session_id=session.kv_session_id,
-            kv_store_activation=True,
-            kv_use_cached_activation=True,
-            decode_do_sample=session.decode.do_sample,
-            decode_temperature=float(session.decode.temperature or 0.0),
-            decode_top_p=float(session.decode.top_p or 0.0),
-            decode_top_k=int(session.decode.top_k or 0),
-            decode_seed=int(session.decode.seed or 0),
-            shard_layer_start=int(session.stage0_layer_start),
-            shard_layer_end=int(session.stage0_layer_end),
-            shard_total_layers=int(session.stage0_total_layers),
-            push_mode=True,
-            ring_mode=True,
-            sample_on_coordinator=True,
-            ring_tokens_remaining=int(session.ring_tokens_remaining),
-            ring_generated_ids=list(session.ring_generated_ids),
-            ring_eos_ids=list(session.ring_eos_ids),
-            ring_first_hop_address=session.ring_first_hop_address,
-            ring_first_hop_peer_id=session.ring_first_hop_peer_id,
-            ring_first_hop_libp2p_id=session.ring_first_hop_libp2p_id,
-            ring_full_route=route,
-            next_hop_address=_next_next,
-            next_hop_peer_id=_next_next_id,
-            final_callback_address=session.final_callback_address,
-            final_callback_request_id=session.callback_request_id,
-            final_callback_libp2p_peer_id=session.final_callback_libp2p_peer_id,
-            remaining_route=route[1:],
-        )
+        # Route entries are plain dicts — use dict access.
+        _next_next = route[1]["address"] if len(route) > 1 else ""
+        _next_next_id = route[1]["peer_id"] if len(route) > 1 else ""
+
+        # Pack single-token activation as float32.
+        import struct as _reinj2_struct
+        _reinj2_packed = _reinj2_struct.pack('<f', float(token_id))
+
+        # OHV2 header dict — replaces peer_pb2.ForwardRequest.
+        _reinj2_header = {
+            "request_id": session.request_id,
+            "stage_index": 0,
+            "total_stages": int(session.total_stages),
+            "max_tokens": 1,
+            "push_mode": True,
+            "ring_mode": True,
+            "sample_on_coordinator": True,
+            "kv_session_id": session.kv_session_id,
+            "kv_store_activation": True,
+            "kv_use_cached_activation": True,
+            "decode_do_sample": session.decode.do_sample,
+            "decode_temperature": float(session.decode.temperature or 0.0),
+            "decode_top_p": float(session.decode.top_p or 0.0),
+            "decode_top_k": int(session.decode.top_k or 0),
+            "decode_seed": int(session.decode.seed or 0),
+            "shard_layer_start": int(session.stage0_layer_start),
+            "shard_layer_end": int(session.stage0_layer_end),
+            "shard_total_layers": int(session.stage0_total_layers),
+            "ring_tokens_remaining": int(session.ring_tokens_remaining),
+            "ring_generated_ids": list(session.ring_generated_ids),
+            "ring_eos_ids": list(session.ring_eos_ids),
+            "ring_first_hop_address": session.ring_first_hop_address,
+            "ring_first_hop_peer_id": session.ring_first_hop_peer_id,
+            "ring_first_hop_libp2p_id": session.ring_first_hop_libp2p_id,
+            "ring_full_route": self._serialize_route_to_bytes(route),
+            "next_hop_address": _next_next,
+            "next_hop_peer_id": _next_next_id,
+            "final_callback_address": session.final_callback_address,
+            "final_callback_request_id": session.callback_request_id,
+            "final_callback_libp2p_peer_id": session.final_callback_libp2p_peer_id,
+            "remaining_route": self._serialize_route_to_bytes(route[1:]),
+            "activation_dtype": 0,
+            "activation_shape": [],
+        }
 
         _first_addr = session.ring_first_hop_address
         _first_libp2p = session.ring_first_hop_libp2p_id
 
-        def _fire(_rreq=req, _addr=_first_addr, _libp2p=_first_libp2p):
+        def _fire(_hdr=_reinj2_header, _act=_reinj2_packed,
+                  _addr=_first_addr, _libp2p=_first_libp2p):
             try:
                 logger.info(
                     "COORD_REINJECT_START: req=%s remaining=%d -> %s (libp2p=%s)",
-                    _rreq.request_id, _rreq.ring_tokens_remaining,
+                    _hdr["request_id"], _hdr["ring_tokens_remaining"],
                     _addr, _libp2p[:20] if _libp2p else "none",
                 )
                 # ── Self-reinject: stage 0 IS the local peer ──────────
@@ -2951,22 +3043,29 @@ class PeerService:
                     session.ring_first_hop_peer_id == self.peer_id
                 )
                 if _is_self:
-                    self.Forward(_rreq, context=None)
+                    # Forward() expects attribute-access request objects —
+                    # wrap OHV2 header dict in an OHV2Request adapter.
+                    from peer.ohv2_adapter import OHV2Request
+                    _ohv2_req = OHV2Request(_hdr, _act)
+                    self.Forward(_ohv2_req, context=None)
                     logger.info(
                         "COORD_REINJECT_DONE: req=%s via_local (self)",
-                        _rreq.request_id,
+                        _hdr["request_id"],
                     )
                     return
 
                 if self._p2p_node is None or not _libp2p:
                     raise RuntimeError(f"no_libp2p_for_coord_reinject: {_addr}")
+                _wire = self._p2p_node.encode_forward_msg(
+                    _hdr, _act, msg_type=0,
+                )
                 self._p2p_node.proxy_forward_no_wait(
                     target_peer_id=_libp2p,
-                    data=PROXY_METHOD_FIRE_FORGET + _rreq.SerializeToString(),
+                    data=PROXY_METHOD_FIRE_FORGET + bytes(_wire),
                 )
                 logger.info(
                     "COORD_REINJECT_DONE: req=%s (libp2p=%s)",
-                    _rreq.request_id, _libp2p[:20],
+                    _hdr["request_id"], _libp2p[:20],
                 )
             except Exception as exc:
                 logger.error(
