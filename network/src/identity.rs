@@ -34,6 +34,20 @@ pub struct Identity {
 impl Identity {
     /// Load an existing identity from the OpenHydra JSON key file.
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        // Warn if the key file has overly permissive permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", mode),
+                    "identity key file has overly permissive permissions (expected 0600)"
+                );
+            }
+        }
+
         let data = std::fs::read_to_string(path)?;
         let file: IdentityFile = serde_json::from_str(&data)?;
 

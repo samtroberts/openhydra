@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# ops/network_limits.sh — OpenHydra Ubuntu node connection-stability hardening
+# ops/network_limits.sh — OpenHydra bootstrap node connection-stability hardening
 #
-# Applies iptables connection limits and sysctl TCP tuning for OpenHydra
-# bootstrap / peer nodes.  Run as root on Ubuntu 22.04+.
+# Applies iptables + ip6tables connection limits and sysctl TCP tuning for
+# OpenHydra bootstrap nodes running the Rust openhydra-bootstrap binary.
 #
 # Ports managed:
 #   22    SSH
-#   8080  Coordinator HTTP API (sits behind Cloudflare; accept all, CF filters L7)
-#   8468  DHT bootstrap HTTP  (public; hashlimit 20 new conns/min per IP)
-#   50051 Peer gRPC           (connlimit ≤5 concurrent per IP)
+#   4001  libp2p (Kademlia DHT + Circuit Relay v2 + QUIC) — TCP + UDP
 #
 # Usage:
 #   sudo bash ops/network_limits.sh          # apply rules
@@ -36,8 +34,14 @@ case "$ACTION" in
     info "Current iptables INPUT chain:"
     iptables -L INPUT -n -v --line-numbers
     echo
-    info "OpenHydra custom chain (if present):"
+    info "OpenHydra IPv4 chain (if present):"
     iptables -L OPENHYDRA -n -v --line-numbers 2>/dev/null || warn "Chain OPENHYDRA not found"
+    echo
+    info "OpenHydra IPv6 chain (if present):"
+    ip6tables -L OPENHYDRA -n -v --line-numbers 2>/dev/null || warn "IPv6 chain OPENHYDRA not found"
+    echo
+    info "IPv6 INPUT default policy:"
+    ip6tables -L INPUT -n | head -1
     echo
     info "Relevant sysctl values:"
     for key in \
@@ -55,9 +59,13 @@ case "$ACTION" in
     ;;
   --flush|-f)
     info "Removing OpenHydra iptables rules..."
-    iptables -D INPUT -j OPENHYDRA 2>/dev/null && info "Removed jump rule" || warn "Jump rule not present"
-    iptables -F OPENHYDRA 2>/dev/null && info "Flushed OPENHYDRA chain" || warn "Chain not present"
-    iptables -X OPENHYDRA 2>/dev/null && info "Deleted OPENHYDRA chain" || true
+    iptables -D INPUT -j OPENHYDRA 2>/dev/null && info "Removed IPv4 jump rule" || warn "IPv4 jump rule not present"
+    iptables -F OPENHYDRA 2>/dev/null && info "Flushed IPv4 OPENHYDRA chain" || warn "IPv4 chain not present"
+    iptables -X OPENHYDRA 2>/dev/null && info "Deleted IPv4 OPENHYDRA chain" || true
+    ip6tables -D INPUT -j OPENHYDRA 2>/dev/null && info "Removed IPv6 jump rule" || warn "IPv6 jump rule not present"
+    ip6tables -F OPENHYDRA 2>/dev/null && info "Flushed IPv6 OPENHYDRA chain" || warn "IPv6 chain not present"
+    ip6tables -X OPENHYDRA 2>/dev/null && info "Deleted IPv6 OPENHYDRA chain" || true
+    ip6tables -P INPUT ACCEPT && info "Reset IPv6 INPUT policy to ACCEPT"
     info "Done. Kernel sysctl values are NOT reverted (persistent via /etc/sysctl.d/)."
     exit 0
     ;;
@@ -102,7 +110,7 @@ net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 
-# Increase listen() backlog for gRPC server under load
+# Increase listen() backlog for libp2p under load
 net.core.somaxconn = 1024
 
 # Allow TIME_WAIT socket reuse for fast port recycling
@@ -113,9 +121,9 @@ sysctl -p "$SYSCTL_CONF" > /dev/null
 info "sysctl values applied and persisted to $SYSCTL_CONF"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 2 — iptables: custom OPENHYDRA chain
+# SECTION 2 — iptables: IPv4 OPENHYDRA chain
 # ─────────────────────────────────────────────────────────────────────────────
-info "Setting up iptables OPENHYDRA chain..."
+info "Setting up IPv4 iptables OPENHYDRA chain..."
 
 # Remove old chain cleanly (idempotent)
 iptables -D INPUT -j OPENHYDRA 2>/dev/null || true
@@ -129,92 +137,97 @@ iptables -N OPENHYDRA
 iptables -A OPENHYDRA -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 # ── 2b. SSH (port 22) — always allow ─────────────────────────────────────────
-# Tip: further restrict with: -s <your-management-ip-cidr>
 iptables -A OPENHYDRA -p tcp --dport 22 -j ACCEPT
 info "SSH (22): ALLOW all"
 
-# ── 2c. Port 8080 — Coordinator API (Cloudflare-fronted) ─────────────────────
-# Accept all; Cloudflare's edge handles L7 DDoS, bot detection, and rate
-# limiting before traffic ever reaches the nanode.  Optionally restrict to
-# Cloudflare IP ranges only (see https://www.cloudflare.com/ips/).
-iptables -A OPENHYDRA -p tcp --dport 8080 -j ACCEPT
-info "Port 8080 (coordinator API): ALLOW all (Cloudflare fronted)"
-
-# ── 2d. Port 4001 — libp2p (Kademlia DHT + Circuit Relay + QUIC) ─────────────
+# ── 2c. Port 4001 — libp2p (Kademlia DHT + Circuit Relay + QUIC) ─────────────
 # TCP: Kademlia, relay circuits, direct TCP connections.
 # UDP: QUIC transport, AutoNAT probing, DCUtR hole-punching.
 iptables -A OPENHYDRA -p tcp --dport 4001 -j ACCEPT
 iptables -A OPENHYDRA -p udp --dport 4001 -j ACCEPT
 info "Port 4001 (libp2p): ALLOW TCP + UDP"
 
-# ── 2e. Port 8468 — DHT bootstrap HTTP ──────────────────────────────────────
-# NOTE: After binding the Python DHT to loopback (Phase 0.3), port 8468 is
-# only reachable via nginx reverse proxy on 443. These iptables rules are
-# kept as defence-in-depth but will not match direct external traffic.
-# Allow established DHT connections (already matched by 2a above).
-# For NEW connections: hashlimit to 20/minute per source IP, burst of 5.
-# Excess new connections are silently dropped.
-iptables -A OPENHYDRA -p tcp --dport 8468 -m state --state NEW \
-  -m hashlimit \
-  --hashlimit-name dht_new_conn \
-  --hashlimit 20/minute \
-  --hashlimit-mode srcip \
-  --hashlimit-burst 5 \
-  -j ACCEPT
-iptables -A OPENHYDRA -p tcp --dport 8468 -m state --state NEW -j DROP
-info "Port 8468 (DHT): NEW conns hashlimit 20/min per IP (burst 5), excess dropped"
-
-# ── 2f. Port 50051 — Peer gRPC ───────────────────────────────────────────────
-# Limit concurrent connections per source IP to 5.
-# Legitimate peers make very few long-lived connections; this blocks
-# connection-exhaustion attacks while not affecting real peers.
-iptables -A OPENHYDRA -p tcp --dport 50051 \
-  -m connlimit --connlimit-above 5 --connlimit-mask 32 \
-  -j REJECT --reject-with tcp-reset
-iptables -A OPENHYDRA -p tcp --dport 50051 -j ACCEPT
-info "Port 50051 (gRPC): connlimit ≤5 per IP; excess RST"
-
-# ── 2g. ICMP rate limiting ────────────────────────────────────────────────────
+# ── 2d. ICMP rate limiting ────────────────────────────────────────────────────
 iptables -A OPENHYDRA -p icmp \
   -m limit --limit 5/second --limit-burst 10 \
   -j ACCEPT
 iptables -A OPENHYDRA -p icmp -j DROP
 info "ICMP: rate-limited to 5/s (burst 10), excess dropped"
 
-# ── 2h. Loopback — always allow ──────────────────────────────────────────────
+# ── 2e. Loopback — always allow ──────────────────────────────────────────────
 iptables -A OPENHYDRA -i lo -j ACCEPT
 
-# ── 2i. Jump INPUT → OPENHYDRA ───────────────────────────────────────────────
+# ── 2f. Jump INPUT → OPENHYDRA ───────────────────────────────────────────────
 iptables -I INPUT 1 -j OPENHYDRA
-info "OPENHYDRA chain inserted at INPUT position 1"
+info "IPv4 OPENHYDRA chain inserted at INPUT position 1"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 3 — Persist rules across reboots
+# SECTION 3 — ip6tables: IPv6 OPENHYDRA chain
+# ─────────────────────────────────────────────────────────────────────────────
+info "Setting up IPv6 ip6tables OPENHYDRA chain..."
+
+# Remove old chain cleanly (idempotent)
+ip6tables -D INPUT -j OPENHYDRA 2>/dev/null || true
+ip6tables -F OPENHYDRA 2>/dev/null || true
+ip6tables -X OPENHYDRA 2>/dev/null || true
+
+ip6tables -N OPENHYDRA
+
+# ── 3a. Always allow established / related traffic ────────────────────────────
+ip6tables -A OPENHYDRA -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# ── 3b. SSH (port 22) ────────────────────────────────────────────────────────
+ip6tables -A OPENHYDRA -p tcp --dport 22 -j ACCEPT
+
+# ── 3c. Port 4001 — libp2p (TCP + UDP) ───────────────────────────────────────
+ip6tables -A OPENHYDRA -p tcp --dport 4001 -j ACCEPT
+ip6tables -A OPENHYDRA -p udp --dport 4001 -j ACCEPT
+
+# ── 3d. ICMPv6 — MUST allow fully (NDP, path MTU discovery) ──────────────────
+# Unlike IPv4 ICMP, ICMPv6 carries Neighbor Discovery Protocol messages.
+# Dropping NDP breaks IPv6 connectivity entirely.
+ip6tables -A OPENHYDRA -p icmpv6 -j ACCEPT
+
+# ── 3e. Loopback ─────────────────────────────────────────────────────────────
+ip6tables -A OPENHYDRA -i lo -j ACCEPT
+
+# ── 3f. Jump INPUT → OPENHYDRA + set default DROP ────────────────────────────
+ip6tables -I INPUT 1 -j OPENHYDRA
+ip6tables -P INPUT DROP
+info "IPv6 OPENHYDRA chain applied, default INPUT policy DROP"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — Persist rules across reboots
 # ─────────────────────────────────────────────────────────────────────────────
 if command -v netfilter-persistent &>/dev/null; then
   netfilter-persistent save
   info "Rules persisted via netfilter-persistent"
 elif command -v iptables-save &>/dev/null; then
   RULES_FILE=/etc/iptables/rules.v4
+  RULES6_FILE=/etc/iptables/rules.v6
   mkdir -p /etc/iptables
   iptables-save > "$RULES_FILE"
-  info "Rules saved to $RULES_FILE"
+  ip6tables-save > "$RULES6_FILE"
+  info "IPv4 rules saved to $RULES_FILE"
+  info "IPv6 rules saved to $RULES6_FILE"
   warn "Install 'iptables-persistent' to auto-restore on reboot: apt install iptables-persistent"
 else
   warn "Cannot auto-persist rules. Run 'iptables-save > /etc/iptables/rules.v4' manually."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 4 — Summary
+# SECTION 5 — Summary
 # ─────────────────────────────────────────────────────────────────────────────
 echo
 info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 info "OpenHydra network limits applied successfully."
 info ""
 info "  Layer 1: Linode Cloud Firewall (configure separately in Cloud Manager)"
-info "  Layer 2: Cloudflare (point 8080/8468 DNS through CF proxy)"
-info "  Layer 3: iptables OPENHYDRA chain — active now ✓"
-info "  Layer 4: Application rate limiter (coordinator/api_server.py) — built-in ✓"
+info "  Layer 2: iptables + ip6tables OPENHYDRA chain — active now ✓"
+info "  Layer 3: libp2p Noise (TCP) + TLS 1.3 (QUIC) encryption ✓"
+info ""
+info "  IPv4: SSH(22) + libp2p TCP+UDP(4001) + ICMP + loopback"
+info "  IPv6: SSH(22) + libp2p TCP+UDP(4001) + ICMPv6 + loopback, default DROP"
 info ""
 info "To verify: sudo bash ops/network_limits.sh --check"
 info "To remove: sudo bash ops/network_limits.sh --flush"

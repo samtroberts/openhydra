@@ -10,20 +10,96 @@ class _MockP2PNode:
     def __init__(self, handler):
         self._handler = handler
         self.libp2p_peer_id = "12D3KooW_coord"
+        from openhydra_network import P2PNode as _RealNode
+        self._real = _RealNode
 
     def proxy_forward(self, target_peer_id, data):
         raw = bytes(data)
         prefix = raw[0:1]
-        req = peer_pb2.ForwardRequest()
-        req.ParseFromString(raw[1:])
-        resp = self._handler(req)
-        return prefix + resp.SerializeToString()
+        payload = raw[1:]
+        if self._real.is_ohv2_msg(payload):
+            from peer.ohv2_adapter import OHV2Request
+            hdr, act, _ = self._real.decode_forward_msg(payload)
+            req = OHV2Request(hdr, act)
+            resp = self._handler(req)
+            import struct as _s
+            resp_hdr = {
+                "request_id": str(getattr(resp, "request_id", "")),
+                "status": 0,
+                "peer_id": str(getattr(resp, "peer_id", "")),
+                "stage_index": int(getattr(resp, "stage_index", 0)),
+            }
+            _err = str(getattr(resp, "error", "") or "")
+            if _err:
+                resp_hdr["status"] = 1
+                resp_hdr["error_message"] = _err
+            if bool(getattr(resp, "kv_cache_hit", False)):
+                resp_hdr["status"] = 2
+            _onp = str(getattr(resp, "onion_next_peer_id", "") or "")
+            if _onp:
+                resp_hdr["onion_next_peer_id"] = _onp
+            _meta = str(getattr(resp, "metadata_json", "") or "")
+            if _meta:
+                resp_hdr["metadata_json"] = _meta
+            # Carry through all response fields used by chain.py.
+            for _str_f in ("dp_noise_audit_tag", "onion_route_suite"):
+                _sv = str(getattr(resp, _str_f, "") or "")
+                if _sv:
+                    resp_hdr[_str_f] = _sv
+            for _bool_f in ("dp_noise_applied",):
+                if bool(getattr(resp, _bool_f, False)):
+                    resp_hdr[_bool_f] = True
+            for _int_f in ("dp_noise_payload_index", "onion_route_layers"):
+                _iv = int(getattr(resp, _int_f, 0) or 0)
+                if _iv:
+                    resp_hdr[_int_f] = _iv
+            for _float_f in ("dp_noise_configured_variance", "dp_noise_observed_variance", "dp_noise_observed_std"):
+                _fv = float(getattr(resp, _float_f, 0.0) or 0.0)
+                if _fv:
+                    resp_hdr[_float_f] = _fv
+            # Bytes fields (onion route pass-through).
+            _orc = bytes(getattr(resp, "onion_route_ciphertext", b"") or b"")
+            if _orc:
+                resp_hdr["onion_route_ciphertext"] = list(_orc)
+            _orn = list(getattr(resp, "onion_route_nonces", []) or [])
+            if _orn:
+                resp_hdr["onion_route_nonces"] = [list(x) for x in _orn]
+            _orek = list(getattr(resp, "onion_route_ephemeral_public_keys", []) or [])
+            if _orek:
+                resp_hdr["onion_route_ephemeral_public_keys"] = [list(x) for x in _orek]
+            _act_list = list(getattr(resp, "activation", []))
+            _packed_out = bytes(getattr(resp, "activation_packed", b"") or b"")
+            if not _packed_out and _act_list:
+                _packed_out = _s.pack(f'<{len(_act_list)}f', *_act_list)
+            return prefix + bytes(self._real.encode_response_msg(resp_hdr, _packed_out))
+        else:
+            req = peer_pb2.ForwardRequest()
+            req.ParseFromString(payload)
+            resp = self._handler(req)
+            return prefix + resp.SerializeToString()
 
     def proxy_forward_no_wait(self, target_peer_id, data):
         pass
 
     def is_peer_connected(self, peer_id):
         return True
+
+    @staticmethod
+    def is_ohv2_msg(data):
+        from openhydra_network import P2PNode as _R
+        return _R.is_ohv2_msg(data)
+
+    def encode_forward_msg(self, header_dict, activation, msg_type=0):
+        return self._real.encode_forward_msg(header_dict, activation, msg_type)
+
+    def encode_response_msg(self, header_dict, activation):
+        return self._real.encode_response_msg(header_dict, activation)
+
+    def decode_forward_msg(self, data):
+        return self._real.decode_forward_msg(data)
+
+    def decode_response_msg(self, data):
+        return self._real.decode_response_msg(data)
 
 
 def _peer() -> PeerEndpoint:

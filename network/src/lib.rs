@@ -5,9 +5,17 @@
 //! Phase B: full PyO3 bindings (P2PNode class).
 
 pub mod activation;
+pub mod batcher;
 pub mod behaviour;
+pub mod dispatcher;
 pub mod dlpack;
+pub mod forward_msg;
+pub mod ipc;
+pub mod ipc_codec;
 pub mod proxy;
+pub mod ring;
+pub mod sampler_bridge;
+pub mod session;
 
 /// Prost-generated types from peer.proto.
 pub mod proto {

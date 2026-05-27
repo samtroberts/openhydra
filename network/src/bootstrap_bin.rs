@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 7.5: Reduced from 600s to 300s to match peer nodes. The old
     // 600s TTL doubled the ghost window compared to peers.
     kad_config.set_record_ttl(Some(Duration::from_secs(300)));
-    kad_config.set_provider_record_ttl(Some(Duration::from_secs(600)));
+    kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_publication_interval(Some(Duration::from_secs(240)));
 
     let store = kad::store::MemoryStore::new(peer_id);
@@ -144,7 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_reservations: 256,
             max_circuits: 512,
             max_circuits_per_peer: 8,
-            reservation_duration: Duration::from_secs(3600),
+            // 15 min — peers re-reserve on reconnect; covers long inference
+            // runs (2048 tokens @ 3 TPS ≈ 683s) with margin.
+            reservation_duration: Duration::from_secs(900),
             // 10 MB per circuit — activation tensors can be several MB.
             max_circuit_bytes: 10 * 1024 * 1024,
             // Phase 5.5: 30 minutes per circuit — a 2048-token generation at
@@ -197,6 +199,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Small-swarm tuning identical to the peer side — critical so the
     // bootstrap forwards every published message to every topic peer,
     // not just the D-sized mesh slice.
+    //
+    // KNOWN LIMITATION: Gossipsub validates message signatures (Strict mode)
+    // but does not validate message payload schemas. Malformed payloads are
+    // forwarded as-is. Add payload validation when the message format stabilizes.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)

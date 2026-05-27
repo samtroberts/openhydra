@@ -110,13 +110,128 @@ pub unsafe fn encode_to_packed(
     packed
 }
 
+// ── CP-1: Standalone activation codec (replaces Python activation_codec.py) ──
+
+/// Pack a slice of f32 values into little-endian bytes.
+///
+/// Bit-for-bit identical to Python's `struct.pack(f'<{n}f', *values)` and
+/// `peer/activation_codec.py::pack_fp32()`.
+pub fn pack_fp32(values: &[f32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+/// Unpack little-endian bytes into f32 values.
+///
+/// Bit-for-bit identical to Python's `struct.unpack(f'<{n}f', data)` and
+/// `peer/activation_codec.py::unpack_fp32()`.
+pub fn unpack_fp32(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// Per-tensor symmetric INT8 quantization (OpenHydra INT8 spec v1.0).
+///
+/// Matches `peer/activation_codec.py::quantize_int8()` bit-for-bit:
+/// - `scale = absmax / 127.0`
+/// - Round-half-to-even (banker's rounding)
+/// - Signed → unsigned via `q_byte = q_signed + 128`
+/// - Empty input → `(b"", 0.0)`
+/// - All-zero input → `(bytes(n), 0.0)`
+///
+/// Returns `(packed_bytes, scale)`.
+pub fn quantize_int8(values: &[f32]) -> (Vec<u8>, f32) {
+    if values.is_empty() {
+        return (Vec::new(), 0.0);
+    }
+
+    // Find absmax, treating NaN/inf as 0.
+    let absmax = values
+        .iter()
+        .map(|v| {
+            let a = v.abs();
+            if a.is_finite() { a } else { 0.0 }
+        })
+        .fold(0.0f32, f32::max);
+
+    if absmax == 0.0 {
+        // Match Python: `bytes(n)` → all-zero bytes, scale=0.0.
+        // Dequant with scale=0 returns all zeros regardless of byte value.
+        return (vec![0u8; values.len()], 0.0);
+    }
+
+    let scale = absmax / 127.0;
+    let inv_scale = 1.0 / scale;
+
+    let packed: Vec<u8> = values
+        .iter()
+        .map(|v| {
+            let v = if v.is_finite() { *v } else { 0.0 };
+            let q = bankers_round(v * inv_scale);
+            let q = q.max(-127.0).min(127.0) as i32;
+            (q + 128) as u8
+        })
+        .collect();
+
+    (packed, scale)
+}
+
+/// Per-tensor symmetric INT8 dequantization.
+///
+/// Matches `peer/activation_codec.py::dequantize_int8()` bit-for-bit.
+pub fn dequantize_int8(data: &[u8], scale: f32) -> Vec<f32> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    if scale == 0.0 {
+        return vec![0.0; data.len()];
+    }
+    data.iter()
+        .map(|&b| ((b as i32) - 128) as f32 * scale)
+        .collect()
+}
+
+/// Banker's rounding (round-half-to-even).
+///
+/// Matches Python's `round()` for integer targets and numpy's `np.round()`.
+/// Critical for bit-for-bit compatibility with the Python INT8 codec.
+#[inline]
+fn bankers_round(v: f32) -> f32 {
+    // The standard Rust f32::round() uses round-half-away-from-zero,
+    // which differs from Python's round-half-to-even. We must match
+    // Python's behaviour for wire compatibility.
+    let rounded = v.round();
+    let diff = (v - rounded).abs();
+    // Check if exactly on the 0.5 boundary.
+    if (diff - 0.0).abs() < f32::EPSILON {
+        // Not on boundary — standard rounding is correct.
+        rounded
+    } else if (v.fract().abs() - 0.5).abs() < f32::EPSILON {
+        // Exactly on 0.5 boundary — round to even.
+        let floor = v.floor();
+        let ceil = v.ceil();
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            ceil
+        }
+    } else {
+        rounded
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── Legacy ActivationBuffer tests ──────────────────────────────────
+
     #[test]
     fn test_from_packed_roundtrip() {
-        // Build a packed activation: header [2.0, 3.0] + 6 payload floats
         let seq_len: f32 = 2.0;
         let hidden_size: f32 = 3.0;
         let payload: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -158,5 +273,174 @@ mod tests {
         assert_eq!(buf.seq_len, 2);
         assert_eq!(buf.hidden_size, 3);
         assert_eq!(buf.as_floats(), &payload);
+    }
+
+    // ── CP-1: pack/unpack FP32 tests ───────────────────────────────────
+
+    #[test]
+    fn test_pack_fp32_roundtrip() {
+        let values = vec![1.0f32, -2.5, 3.14, 0.0, -1e10, f32::MIN_POSITIVE];
+        let packed = pack_fp32(&values);
+        assert_eq!(packed.len(), values.len() * 4);
+        let unpacked = unpack_fp32(&packed);
+        assert_eq!(unpacked.len(), values.len());
+        for (orig, dec) in values.iter().zip(unpacked.iter()) {
+            assert_eq!(orig.to_bits(), dec.to_bits(), "{orig} != {dec}");
+        }
+    }
+
+    #[test]
+    fn test_pack_fp32_empty() {
+        assert!(pack_fp32(&[]).is_empty());
+        assert!(unpack_fp32(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_pack_fp32_single() {
+        let packed = pack_fp32(&[42.0]);
+        assert_eq!(packed.len(), 4);
+        let unpacked = unpack_fp32(&packed);
+        assert_eq!(unpacked, vec![42.0]);
+    }
+
+    #[test]
+    fn test_pack_fp32_large_activation() {
+        // Simulate a 896-dim hidden state.
+        let values: Vec<f32> = (0..896).map(|i| (i as f32) * 0.001).collect();
+        let packed = pack_fp32(&values);
+        let unpacked = unpack_fp32(&packed);
+        assert_eq!(values.len(), unpacked.len());
+        for (i, (o, d)) in values.iter().zip(unpacked.iter()).enumerate() {
+            assert_eq!(
+                o.to_bits(),
+                d.to_bits(),
+                "bit mismatch at index {i}: {o} vs {d}"
+            );
+        }
+    }
+
+    // ── CP-1: INT8 quantization tests ──────────────────────────────────
+
+    #[test]
+    fn test_int8_basic_roundtrip() {
+        let values = vec![0.5f32, -0.3, 1.0, -1.0, 0.0, 0.25];
+        let (packed, scale) = quantize_int8(&values);
+        let restored = dequantize_int8(&packed, scale);
+
+        assert_eq!(restored.len(), values.len());
+        for (orig, rec) in values.iter().zip(restored.iter()) {
+            assert!(
+                (orig - rec).abs() < 0.02,
+                "INT8 roundtrip: {orig} != {rec}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_int8_empty() {
+        let (packed, scale) = quantize_int8(&[]);
+        assert!(packed.is_empty());
+        assert_eq!(scale, 0.0);
+        let restored = dequantize_int8(&packed, scale);
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn test_int8_all_zeros() {
+        let values = vec![0.0f32; 10];
+        let (packed, scale) = quantize_int8(&values);
+        assert_eq!(scale, 0.0);
+        let restored = dequantize_int8(&packed, scale);
+        assert!(restored.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn test_int8_single() {
+        let (packed, scale) = quantize_int8(&[0.7]);
+        let restored = dequantize_int8(&packed, scale);
+        assert_eq!(restored.len(), 1);
+        assert!((restored[0] - 0.7).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_int8_negative_preserved() {
+        let values = vec![-0.9f32, -0.5, -0.1];
+        let (packed, scale) = quantize_int8(&values);
+        let restored = dequantize_int8(&packed, scale);
+        for (orig, rec) in values.iter().zip(restored.iter()) {
+            assert!(*rec < 0.0, "Sign lost: {orig} -> {rec}");
+            assert!((orig - rec).abs() < 0.02);
+        }
+    }
+
+    #[test]
+    fn test_int8_compression_ratio() {
+        let values: Vec<f32> = (0..4096).map(|i| i as f32 / 100.0).collect();
+        let (packed, _scale) = quantize_int8(&values);
+        let original_bytes = values.len() * 4; // FP32
+        let compressed_bytes = packed.len() + 4; // + scale
+        let ratio = original_bytes as f64 / compressed_bytes as f64;
+        assert!(
+            ratio > 3.5,
+            "Expected >3.5x compression, got {ratio:.1}x"
+        );
+    }
+
+    #[test]
+    fn test_int8_byte_packing() {
+        let values = vec![1.0f32, -1.0, 0.5];
+        let (packed, scale) = quantize_int8(&values);
+        assert_eq!(packed.len(), 3); // 1 byte per value
+        assert!(scale > 0.0);
+    }
+
+    #[test]
+    fn test_int8_large_range() {
+        let values = vec![-1000.0f32, 500.0, 0.0, 999.5, -0.001];
+        let (packed, scale) = quantize_int8(&values);
+        let restored = dequantize_int8(&packed, scale);
+        assert_eq!(restored.len(), values.len());
+        for (orig, rec) in values.iter().zip(restored.iter()) {
+            assert!(
+                (orig - rec).abs() < orig.abs() * 0.01 + 0.1,
+                "INT8 large range: {orig} != {rec}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_int8_unsigned_storage_spec() {
+        // Verify the unsigned byte storage format: q_byte = q_signed + 128.
+        // All-zero input → bytes(n) = all zero bytes, scale=0.0 (Python compat).
+        let (packed, scale) = quantize_int8(&[0.0, 0.0, 0.0]);
+        assert!(packed.iter().all(|&b| b == 0));
+        assert_eq!(scale, 0.0);
+
+        // Positive max → q_signed=127 → q_byte=255.
+        let (packed, _) = quantize_int8(&[1.0]);
+        assert_eq!(packed[0], 255);
+
+        // Negative max → q_signed=-127 → q_byte=1.
+        let (packed, _) = quantize_int8(&[-1.0]);
+        assert_eq!(packed[0], 1);
+    }
+
+    // ── Banker's rounding tests ────────────────────────────────────────
+
+    #[test]
+    fn test_bankers_round() {
+        // Standard cases (not on boundary).
+        assert_eq!(bankers_round(2.3), 2.0);
+        assert_eq!(bankers_round(2.7), 3.0);
+        assert_eq!(bankers_round(-2.3), -2.0);
+        assert_eq!(bankers_round(-2.7), -3.0);
+
+        // Boundary cases: round to even.
+        assert_eq!(bankers_round(0.5), 0.0); // 0 is even
+        assert_eq!(bankers_round(1.5), 2.0); // 2 is even
+        assert_eq!(bankers_round(2.5), 2.0); // 2 is even
+        assert_eq!(bankers_round(3.5), 4.0); // 4 is even
+        assert_eq!(bankers_round(-0.5), 0.0);
+        assert_eq!(bankers_round(-1.5), -2.0);
     }
 }

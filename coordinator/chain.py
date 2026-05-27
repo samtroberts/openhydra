@@ -257,53 +257,8 @@ class InferenceChain:
             plain_activation = []  # clear repeated float — use packed bytes
 
         _t_serial_start = time.perf_counter()
-        req = peer_pb2.ForwardRequest(
-            request_id=request_id,
-            prompt=prompt if stage_index == 0 else "",
-            activation=plain_activation,
-            stage_index=stage_index,
-            total_stages=total_stages,
-            max_tokens=max_tokens,
-            encrypted_activation=encrypted_activation,
-            encryption_nonces=encryption_nonces,
-            encryption_ephemeral_public_keys=encryption_ephemeral_public_keys,
-            encryption_suite=encryption_suite,
-            encryption_layers=encryption_layers,
-            compression_codec=compression_codec,
-            compression_original_dim=compression_original_dim,
-            compression_latent_dim=compression_latent_dim,
-            kv_session_id=kv_session,
-            kv_store_activation=kv_store,
-            kv_use_cached_activation=kv_use_cached,
-            onion_route_ciphertext=onion_route_ciphertext,
-            onion_route_nonces=onion_route_nonces,
-            onion_route_ephemeral_public_keys=onion_route_ephemeral_public_keys,
-            onion_route_suite=onion_route_suite,
-            onion_route_layers=onion_route_layers,
-            decode_do_sample=bool(decode_do_sample),
-            decode_temperature=float(decode_temperature or 0.0),
-            decode_top_p=float(decode_top_p or 0.0),
-            decode_top_k=max(0, int(decode_top_k or 0)),
-            decode_seed=int(decode_seed or 0),
-            # Phase 3: pass shard layer range so the peer can validate it matches
-            # its startup configuration and surface the info in its own logs.
-            shard_layer_start=max(0, int(getattr(peer, "layer_start", 0) or 0)),
-            shard_layer_end=max(0, int(getattr(peer, "layer_end", 0) or 0)),
-            shard_total_layers=max(0, int(getattr(peer, "total_layers", 0) or 0)),
-            quantized_activation=_quantized_activation,
-            quantized_scales=_quantized_scales,
-            activation_quantization=_activation_quantization,
-            # Phase 4: Gemma 4 sharded adapter — ship the original prompt
-            # token IDs to every stage so downstream peers can recompute the
-            # per-layer input tensor locally. Unused by non-Gemma-4 families;
-            # empty list when the caller didn't supply ids.
-            prompt_token_ids=list(int(t) for t in (prompt_token_ids or [])),
-            activation_packed=_activation_packed,
-        )
 
         # --- Deadline-aware per-stage timeout ---
-        # Use remaining wall-clock time when a request deadline was propagated;
-        # never exceed the configured per-hop ceiling (self.timeout_s).
         if deadline is not None:
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -315,15 +270,49 @@ class InferenceChain:
         else:
             effective_timeout = self.timeout_s
 
-        _t_serial_ms = (time.perf_counter() - _t_serial_start) * 1000
-        _t_grpc_start = time.perf_counter()
-        t0 = time.perf_counter()
-
         # Phase B: Try persistent streaming connection first (avoids
         # per-request channel creation overhead ~5-15ms per hop).
         _kv_sid = str(kv_session_id or "").strip()
         _used_stream = False
         if self._stream_pool and _kv_sid:
+            # Stream pool path: still uses protobuf (LAN-direct only).
+            req = peer_pb2.ForwardRequest(
+                request_id=request_id,
+                prompt=prompt if stage_index == 0 else "",
+                activation=plain_activation,
+                stage_index=stage_index,
+                total_stages=total_stages,
+                max_tokens=max_tokens,
+                encrypted_activation=encrypted_activation,
+                encryption_nonces=encryption_nonces,
+                encryption_ephemeral_public_keys=encryption_ephemeral_public_keys,
+                encryption_suite=encryption_suite,
+                encryption_layers=encryption_layers,
+                compression_codec=compression_codec,
+                compression_original_dim=compression_original_dim,
+                compression_latent_dim=compression_latent_dim,
+                kv_session_id=kv_session,
+                kv_store_activation=kv_store,
+                kv_use_cached_activation=kv_use_cached,
+                onion_route_ciphertext=onion_route_ciphertext,
+                onion_route_nonces=onion_route_nonces,
+                onion_route_ephemeral_public_keys=onion_route_ephemeral_public_keys,
+                onion_route_suite=onion_route_suite,
+                onion_route_layers=onion_route_layers,
+                decode_do_sample=bool(decode_do_sample),
+                decode_temperature=float(decode_temperature or 0.0),
+                decode_top_p=float(decode_top_p or 0.0),
+                decode_top_k=max(0, int(decode_top_k or 0)),
+                decode_seed=int(decode_seed or 0),
+                shard_layer_start=max(0, int(getattr(peer, "layer_start", 0) or 0)),
+                shard_layer_end=max(0, int(getattr(peer, "layer_end", 0) or 0)),
+                shard_total_layers=max(0, int(getattr(peer, "total_layers", 0) or 0)),
+                quantized_activation=_quantized_activation,
+                quantized_scales=_quantized_scales,
+                activation_quantization=_activation_quantization,
+                prompt_token_ids=list(int(t) for t in (prompt_token_ids or [])),
+                activation_packed=_activation_packed,
+            )
             try:
                 handle = self._stream_pool.get_or_create(
                     peer.peer_id, _kv_sid, peer.host, peer.port,
@@ -337,10 +326,15 @@ class InferenceChain:
                 logging.debug("stream_fallback: peer=%s err=%s", peer.peer_id, exc)
                 _used_stream = False
 
+        _t_serial_ms = (time.perf_counter() - _t_serial_start) * 1000
+        _t_grpc_start = time.perf_counter()
+        t0 = time.perf_counter()
+        req = None  # will be set below if needed for session recording
+
         if not _used_stream:
-            # Cross-ISP relay: if the peer requires relay and we have a
-            # P2P node, tunnel the gRPC request through libp2p instead
-            # of connecting directly (the remote IP is unreachable).
+            # OHV2 binary wire format path: encode header dict + activation
+            # directly in Rust (~7us vs ~1.1ms protobuf). This is the
+            # per-token hot path for cross-ISP relay.
             _p2p_node = getattr(self, '_p2p_node', None)
             _peer_libp2p_id = str(getattr(peer, 'libp2p_peer_id', '') or '').strip()
             if _p2p_node is None or not _peer_libp2p_id:
@@ -348,7 +342,73 @@ class InferenceChain:
                     f"no libp2p route to peer {peer.peer_id} "
                     f"(p2p_node={_p2p_node is not None}, libp2p_id={_peer_libp2p_id!r})"
                 )
-            req_bytes = b'\x01' + req.SerializeToString()
+
+            # Determine activation payload: prefer packed bytes, then
+            # INT8 quantized, then empty.
+            _ohv2_activation = _activation_packed or _quantized_activation or b""
+
+            _ohv2_header = {
+                "request_id": request_id,
+                "stage_index": stage_index,
+                "total_stages": total_stages,
+                "push_mode": False,
+                "shard_layer_start": max(0, int(getattr(peer, "layer_start", 0) or 0)),
+                "shard_layer_end": max(0, int(getattr(peer, "layer_end", 0) or 0)),
+                "shard_total_layers": max(0, int(getattr(peer, "total_layers", 0) or 0)),
+                "kv_session_id": kv_session,
+                "kv_store_activation": kv_store,
+                "kv_use_cached_activation": kv_use_cached,
+                "decode_do_sample": bool(decode_do_sample),
+                "decode_temperature": float(decode_temperature or 0.0),
+                "decode_top_p": float(decode_top_p or 0.0),
+                "decode_top_k": max(0, int(decode_top_k or 0)),
+                "decode_seed": int(decode_seed or 0),
+                "prompt_token_ids": list(int(t) for t in (prompt_token_ids or [])),
+                "activation_dtype": 0,  # Fp32
+                "activation_shape": [],
+            }
+            # Only populate optional fields when non-default to keep
+            # CBOR header compact (serde skip_serializing_if does this
+            # on the Rust side, but we avoid sending empty strings too).
+            if stage_index == 0 and prompt:
+                _ohv2_header["prompt"] = prompt
+            if max_tokens:
+                _ohv2_header["max_tokens"] = int(max_tokens)
+            if _quantized_activation:
+                _ohv2_header["activation_dtype"] = 2  # Int8
+                if _quantized_scales:
+                    _ohv2_header["quantized_scales"] = list(_quantized_scales)
+            if compression_codec:
+                _ohv2_header["compression_codec"] = compression_codec
+            if compression_original_dim:
+                _ohv2_header["compression_original_dim"] = int(compression_original_dim)
+            if compression_latent_dim:
+                _ohv2_header["compression_latent_dim"] = int(compression_latent_dim)
+            if encrypted_activation:
+                _ohv2_header["encrypted_activation"] = list(encrypted_activation)
+            if encryption_suite:
+                _ohv2_header["encryption_suite"] = str(encryption_suite)
+            if encryption_layers:
+                _ohv2_header["encryption_layers"] = int(encryption_layers)
+            if encryption_nonces:
+                _ohv2_header["encryption_nonces"] = list(encryption_nonces)
+            if encryption_ephemeral_public_keys:
+                _ohv2_header["encryption_ephemeral_keys"] = list(encryption_ephemeral_public_keys)
+            if onion_route_ciphertext:
+                _ohv2_header["onion_route_ciphertext"] = list(onion_route_ciphertext)
+            if onion_route_nonces:
+                _ohv2_header["onion_route_nonces"] = list(onion_route_nonces)
+            if onion_route_ephemeral_public_keys:
+                _ohv2_header["onion_route_ephemeral_public_keys"] = list(onion_route_ephemeral_public_keys)
+            if onion_route_suite:
+                _ohv2_header["onion_route_suite"] = str(onion_route_suite)
+            if onion_route_layers:
+                _ohv2_header["onion_route_layers"] = int(onion_route_layers)
+
+            _ohv2_wire = _p2p_node.encode_forward_msg(
+                _ohv2_header, _ohv2_activation, msg_type=0,
+            )
+            req_bytes = b'\x01' + bytes(_ohv2_wire)
             resp_bytes = _p2p_node.proxy_forward(
                 target_peer_id=_peer_libp2p_id,
                 data=req_bytes,
@@ -356,14 +416,20 @@ class InferenceChain:
             raw_resp = bytes(resp_bytes)
             if raw_resp and raw_resp[0:1] in (b'\x01', b'\x02'):
                 raw_resp = raw_resp[1:]
-            response = peer_pb2.ForwardResponse()
-            response.ParseFromString(raw_resp)
+            # Dual-format response detection: OHV2 or protobuf.
+            if _p2p_node.is_ohv2_msg(raw_resp):
+                from peer.ohv2_adapter import OHV2Response
+                _resp_hdr, _resp_act = _p2p_node.decode_response_msg(raw_resp)
+                response = OHV2Response(_resp_hdr, _resp_act)
+            else:
+                response = peer_pb2.ForwardResponse()
+                response.ParseFromString(raw_resp)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         _t_grpc_ms = (time.perf_counter() - _t_grpc_start) * 1000
 
         # Phase B: Record in session history for failover replay
-        if self._session is not None:
+        if self._session is not None and req is not None:
             self._session.record(req, response)
         _t_deser_start = time.perf_counter()
         self._last_stage_kv_cache_hit = bool(getattr(response, "kv_cache_hit", False))
@@ -426,7 +492,7 @@ class InferenceChain:
 
         # Prefer activation_packed (binary) over repeated float activation.
         _resp_packed = bytes(getattr(response, "activation_packed", b"") or b"")
-        if _resp_packed and len(_resp_packed) >= 8:
+        if _resp_packed and len(_resp_packed) >= 4:
             import struct as _struct_unpack
             _n_floats = len(_resp_packed) // 4
             resp_activation = list(_struct_unpack.unpack(f'<{_n_floats}f', _resp_packed))

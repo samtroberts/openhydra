@@ -26,7 +26,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::IntoPyObjectExt;
 
 use crate::event_loop::{self, SharedProxyQueue, SwarmCommand};
+use crate::forward_msg;
 use crate::identity::Identity;
+use crate::ipc_codec::{IpcForwardHeader, IpcResponseHeader, ActivationDtype, IpcStatus};
 use crate::swarm::{self, SwarmOptions};
 #[cfg(feature = "pyo3")]
 use crate::types::PeerRecord;
@@ -189,6 +191,88 @@ fn send_and_wait<T>(
     reply_rx
         .blocking_recv()
         .map_err(|_| "swarm dropped reply channel".to_string())
+}
+
+// ── PyDict ↔ serde_json conversion helpers (OHV2 wire format) ──
+//
+// These convert between PyDict and serde_json::Value for the
+// encode_forward_msg / decode_forward_msg static methods.
+// Using serde_json as the intermediate format reuses all the
+// skip_serializing_if / default annotations on IpcForwardHeader.
+
+#[cfg(feature = "pyo3")]
+fn pydict_to_json_value(dict: &Bound<'_, pyo3::types::PyDict>) -> PyResult<serde_json::Value> {
+    pyany_to_json_value(dict.as_any())
+}
+
+#[cfg(feature = "pyo3")]
+fn pyany_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if obj.is_none() {
+        Ok(serde_json::Value::Null)
+    } else if let Ok(b) = obj.extract::<bool>() {
+        Ok(serde_json::Value::Bool(b))
+    } else if let Ok(i) = obj.extract::<i64>() {
+        Ok(serde_json::json!(i))
+    } else if let Ok(f) = obj.extract::<f64>() {
+        Ok(serde_json::json!(f))
+    } else if let Ok(s) = obj.extract::<String>() {
+        Ok(serde_json::Value::String(s))
+    } else if let Ok(bytes_obj) = obj.extract::<Vec<u8>>() {
+        // Encode bytes as JSON array of u8 values (matches Vec<u8> serde).
+        let arr: Vec<serde_json::Value> = bytes_obj.iter().map(|b| serde_json::json!(*b)).collect();
+        Ok(serde_json::Value::Array(arr))
+    } else if let Ok(list) = obj.downcast::<pyo3::types::PyList>() {
+        let arr: Vec<serde_json::Value> = list
+            .iter()
+            .map(|item| pyany_to_json_value(&item))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(serde_json::Value::Array(arr))
+    } else if let Ok(dict) = obj.downcast::<pyo3::types::PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract()?;
+            map.insert(key, pyany_to_json_value(&v)?);
+        }
+        Ok(serde_json::Value::Object(map))
+    } else {
+        // Fallback: try string extraction.
+        let s: String = obj.str()?.extract()?;
+        Ok(serde_json::Value::String(s))
+    }
+}
+
+#[cfg(feature = "pyo3")]
+fn json_value_to_pyobject(py: Python<'_>, val: &serde_json::Value) -> PyResult<PyObject> {
+    match val {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(b) => Ok(b.into_py_any(py)?),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.into_py_any(py)?)
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.into_py_any(py)?)
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.into_py_any(py)?)
+            } else {
+                Ok(py.None())
+            }
+        }
+        serde_json::Value::String(s) => Ok(s.into_py_any(py)?),
+        serde_json::Value::Array(arr) => {
+            let list = pyo3::types::PyList::empty(py);
+            for item in arr {
+                list.append(json_value_to_pyobject(py, item)?)?;
+            }
+            Ok(list.into_py_any(py)?)
+        }
+        serde_json::Value::Object(map) => {
+            let dict = pyo3::types::PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, json_value_to_pyobject(py, v)?)?;
+            }
+            Ok(dict.into_py_any(py)?)
+        }
+    }
 }
 
 // ── PyO3 class ──
@@ -691,6 +775,115 @@ impl PyP2PNode {
     #[getter]
     fn openhydra_peer_id(&self) -> &str {
         &self.openhydra_peer_id
+    }
+
+    // ── OHV2 wire format: PyO3 bindings for ForwardMsg encode/decode ──
+    //
+    // These static methods expose the Rust CBOR-based wire format to Python,
+    // replacing protobuf serialization on the per-token hot path.
+
+    /// Encode a forward/push message in OHV2 wire format.
+    ///
+    /// Args:
+    ///     header_dict: Python dict with IpcForwardHeader fields (only non-default
+    ///         fields need to be present — serde fills defaults).
+    ///     activation: raw activation bytes (already binary-packed by Python).
+    ///     msg_type: 0=Forward, 1=PushResult, 2=Ping.
+    ///
+    /// Returns:
+    ///     bytes: the OHV2 wire-format message (12-byte preamble + CBOR header + activation).
+    #[staticmethod]
+    fn encode_forward_msg(py: Python<'_>, header_dict: &Bound<'_, pyo3::types::PyDict>, activation: &[u8], msg_type: u16) -> PyResult<PyObject> {
+        // Convert PyDict → serde_json::Value → IpcForwardHeader.
+        // This reuses all skip_serializing_if / default annotations on IpcForwardHeader.
+        let json_val = pydict_to_json_value(header_dict)?;
+        let header: IpcForwardHeader = serde_json::from_value(json_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid header fields: {e}")))?;
+
+        let mt = forward_msg::MsgType::from_u16(msg_type)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        let wire = forward_msg::encode(mt, &header, activation)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        Ok(pyo3::types::PyBytes::new(py, &wire).into())
+    }
+
+    /// Decode an OHV2 wire-format message.
+    ///
+    /// Args:
+    ///     data: raw OHV2 bytes (must start with magic 0x4F485632).
+    ///
+    /// Returns:
+    ///     tuple: (header_dict, activation_bytes, msg_type)
+    ///         header_dict: Python dict with all IpcForwardHeader fields.
+    ///         activation_bytes: raw activation payload (bytes).
+    ///         msg_type: int (0=Forward, 1=PushResult, 2=Ping).
+    #[staticmethod]
+    fn decode_forward_msg(py: Python<'_>, data: &[u8]) -> PyResult<(PyObject, PyObject, u16)> {
+        let decoded = forward_msg::decode(data)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        // Convert IpcForwardHeader → serde_json::Value → PyDict.
+        let json_val = serde_json::to_value(&decoded.header)
+            .map_err(|e| PyRuntimeError::new_err(format!("header to json: {e}")))?;
+        let dict = json_value_to_pyobject(py, &json_val)?;
+
+        let act_bytes = pyo3::types::PyBytes::new(py, decoded.activation);
+
+        Ok((dict, act_bytes.into(), decoded.msg_type as u16))
+    }
+
+    /// Encode an OHV2 response message (PushResult).
+    ///
+    /// Args:
+    ///     header_dict: Python dict with IpcResponseHeader fields.
+    ///     activation: raw activation bytes.
+    ///
+    /// Returns:
+    ///     bytes: OHV2 wire-format response.
+    #[staticmethod]
+    fn encode_response_msg(py: Python<'_>, header_dict: &Bound<'_, pyo3::types::PyDict>, activation: &[u8]) -> PyResult<PyObject> {
+        let json_val = pydict_to_json_value(header_dict)?;
+        let header: IpcResponseHeader = serde_json::from_value(json_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("invalid response header: {e}")))?;
+
+        let wire = forward_msg::encode_response(&header, activation)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        Ok(pyo3::types::PyBytes::new(py, &wire).into())
+    }
+
+    /// Decode an OHV2 response message (PushResult).
+    ///
+    /// Args:
+    ///     data: raw OHV2 bytes (must start with magic 0x4F485632).
+    ///
+    /// Returns:
+    ///     tuple: (header_dict, activation_bytes)
+    ///         header_dict: Python dict with IpcResponseHeader fields.
+    ///         activation_bytes: raw activation payload (bytes).
+    #[staticmethod]
+    fn decode_response_msg(py: Python<'_>, data: &[u8]) -> PyResult<(PyObject, PyObject)> {
+        let (header, activation) = forward_msg::decode_response(data)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        let json_val = serde_json::to_value(&header)
+            .map_err(|e| PyRuntimeError::new_err(format!("response header to json: {e}")))?;
+        let dict = json_value_to_pyobject(py, &json_val)?;
+
+        let act_bytes = pyo3::types::PyBytes::new(py, activation);
+
+        Ok((dict, act_bytes.into()))
+    }
+
+    /// Check if raw bytes start with the OHV2 magic (0x4F485632).
+    ///
+    /// Use this for dual-format detection: if True, decode with
+    /// decode_forward_msg; otherwise fall back to protobuf.
+    #[staticmethod]
+    fn is_ohv2_msg(data: &[u8]) -> bool {
+        forward_msg::is_forward_msg(data)
     }
 
     // ── Task 6.0: Identity methods ──

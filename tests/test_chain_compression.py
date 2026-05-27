@@ -11,25 +11,78 @@ def _pipeline() -> list[PeerEndpoint]:
 
 
 class _MockP2PNode:
-    """Mock P2P node that deserializes ForwardRequest, calls handler, returns serialized response."""
+    """Mock P2P node that deserializes ForwardRequest, calls handler, returns serialized response.
+
+    Supports both legacy protobuf and OHV2 wire formats.
+    """
 
     def __init__(self, handler):
         self._handler = handler
         self.libp2p_peer_id = "12D3KooW_coord"
+        from openhydra_network import P2PNode as _RealNode
+        self._real = _RealNode
 
     def proxy_forward(self, target_peer_id, data):
         raw = bytes(data)
         prefix = raw[0:1]
-        req = peer_pb2.ForwardRequest()
-        req.ParseFromString(raw[1:])
-        resp = self._handler(req)
-        return prefix + resp.SerializeToString()
+        payload = raw[1:]
+        if self._real.is_ohv2_msg(payload):
+            from peer.ohv2_adapter import OHV2Request
+            hdr, act, _ = self._real.decode_forward_msg(payload)
+            req = OHV2Request(hdr, act)
+            resp = self._handler(req)
+            resp_hdr = {
+                "request_id": str(getattr(resp, "request_id", "")),
+                "status": 0,
+                "peer_id": str(getattr(resp, "peer_id", "")),
+                "stage_index": int(getattr(resp, "stage_index", 0)),
+            }
+            _err = str(getattr(resp, "error", "") or "")
+            if _err:
+                resp_hdr["status"] = 1
+                resp_hdr["error_message"] = _err
+            if bool(getattr(resp, "kv_cache_hit", False)):
+                resp_hdr["status"] = 2
+            _onp = str(getattr(resp, "onion_next_peer_id", "") or "")
+            if _onp:
+                resp_hdr["onion_next_peer_id"] = _onp
+            _meta = str(getattr(resp, "metadata_json", "") or "")
+            if _meta:
+                resp_hdr["metadata_json"] = _meta
+            import struct as _s
+            _act_list = list(getattr(resp, "activation", []))
+            _packed_out = bytes(getattr(resp, "activation_packed", b"") or b"")
+            if not _packed_out and _act_list:
+                _packed_out = _s.pack(f'<{len(_act_list)}f', *_act_list)
+            return prefix + bytes(self._real.encode_response_msg(resp_hdr, _packed_out))
+        else:
+            req = peer_pb2.ForwardRequest()
+            req.ParseFromString(payload)
+            resp = self._handler(req)
+            return prefix + resp.SerializeToString()
 
     def proxy_forward_no_wait(self, target_peer_id, data):
         pass
 
     def is_peer_connected(self, peer_id):
         return True
+
+    @staticmethod
+    def is_ohv2_msg(data):
+        from openhydra_network import P2PNode as _R
+        return _R.is_ohv2_msg(data)
+
+    def encode_forward_msg(self, header_dict, activation, msg_type=0):
+        return self._real.encode_forward_msg(header_dict, activation, msg_type)
+
+    def encode_response_msg(self, header_dict, activation):
+        return self._real.encode_response_msg(header_dict, activation)
+
+    def decode_forward_msg(self, data):
+        return self._real.decode_forward_msg(data)
+
+    def decode_response_msg(self, data):
+        return self._real.decode_response_msg(data)
 
 
 def test_chain_autoencoder_compresses_transfer_hop(monkeypatch):

@@ -96,25 +96,78 @@ class _CapturedForwardRequest:
 
 
 class _MockP2PNode:
-    """Mock libp2p P2P node that intercepts proxy_forward calls."""
+    """Mock libp2p P2P node that intercepts proxy_forward calls.
+
+    Supports both legacy protobuf and OHV2 wire formats.
+    """
 
     def __init__(self, handler):
         self._handler = handler
         self.libp2p_peer_id = "12D3KooW_coord"
+        from openhydra_network import P2PNode as _RealNode
+        self._real = _RealNode  # class ref for static methods
 
     def proxy_forward(self, target_peer_id, data):
         raw = bytes(data)
         prefix = raw[0:1]
-        req = peer_pb2.ForwardRequest()
-        req.ParseFromString(raw[1:])
-        resp = self._handler(req)
-        return prefix + resp.SerializeToString()
+        payload = raw[1:]
+        if self._real.is_ohv2_msg(payload):
+            from peer.ohv2_adapter import OHV2Request
+            hdr, act, _ = self._real.decode_forward_msg(payload)
+            req = OHV2Request(hdr, act)
+            resp = self._handler(req)
+            # Encode response as OHV2
+            import struct as _s
+            _resp_hdr = {
+                "request_id": str(getattr(resp, "request_id", "")),
+                "status": 0,
+                "peer_id": str(getattr(resp, "peer_id", "")),
+                "stage_index": int(getattr(resp, "stage_index", 0)),
+            }
+            _err = str(getattr(resp, "error", "") or "")
+            if _err:
+                _resp_hdr["status"] = 1
+                _resp_hdr["error_message"] = _err
+            if bool(getattr(resp, "kv_cache_hit", False)):
+                _resp_hdr["status"] = 2
+            _onp = str(getattr(resp, "onion_next_peer_id", "") or "")
+            if _onp:
+                _resp_hdr["onion_next_peer_id"] = _onp
+            _act_list = list(getattr(resp, "activation", []))
+            _packed_out = bytes(getattr(resp, "activation_packed", b"") or b"")
+            if not _packed_out and _act_list:
+                _packed_out = _s.pack(f'<{len(_act_list)}f', *_act_list)
+            return prefix + bytes(self.encode_response_msg(_resp_hdr, _packed_out))
+        else:
+            req = peer_pb2.ForwardRequest()
+            req.ParseFromString(payload)
+            resp = self._handler(req)
+            return prefix + resp.SerializeToString()
 
     def proxy_forward_no_wait(self, target_peer_id, data):
         pass
 
     def is_peer_connected(self, peer_id):
         return True
+
+    # ── OHV2 static method delegates ──
+
+    @staticmethod
+    def is_ohv2_msg(data):
+        from openhydra_network import P2PNode as _R
+        return _R.is_ohv2_msg(data)
+
+    def encode_forward_msg(self, header_dict, activation, msg_type=0):
+        return self._real.encode_forward_msg(header_dict, activation, msg_type)
+
+    def encode_response_msg(self, header_dict, activation):
+        return self._real.encode_response_msg(header_dict, activation)
+
+    def decode_forward_msg(self, data):
+        return self._real.decode_forward_msg(data)
+
+    def decode_response_msg(self, data):
+        return self._real.decode_response_msg(data)
 
 
 def _make_mock_p2p_node(
@@ -131,6 +184,13 @@ def _make_mock_p2p_node(
     def _handler(request):
         idx = call_count[0]
         call_count[0] += 1
+        # Extract activation from either packed bytes or float list.
+        _packed = bytes(getattr(request, "activation_packed", b"") or b"")
+        if _packed:
+            _n = len(_packed) // 4
+            _act_list = list(_struct.unpack(f'<{_n}f', _packed))
+        else:
+            _act_list = list(request.activation)
         captured.append(
             _CapturedForwardRequest(
                 peer_id=f"stub-peer-{idx}",
@@ -138,21 +198,25 @@ def _make_mock_p2p_node(
                 stage_index=int(request.stage_index),
                 total_stages=int(request.total_stages),
                 prompt=str(request.prompt),
-                activation=list(request.activation),
+                activation=_act_list,
                 shard_layer_start=int(request.shard_layer_start),
                 shard_layer_end=int(request.shard_layer_end),
                 shard_total_layers=int(request.shard_total_layers),
-                activation_packed=bytes(getattr(request, "activation_packed", b"") or b""),
+                activation_packed=_packed,
             )
         )
         activation_out = peer_responses[idx] if idx < len(peer_responses) else []
-        return peer_pb2.ForwardResponse(
+        # Pack activation as bytes for OHV2 compatibility.
+        _packed_out = _struct.pack(f'<{len(activation_out)}f', *activation_out) if activation_out else b""
+        resp = peer_pb2.ForwardResponse(
             request_id=request.request_id,
             peer_id=f"stub-peer-{idx}",
             activation=activation_out,
+            activation_packed=_packed_out,
             stage_index=request.stage_index,
             error="",
         )
+        return resp
 
     mock_node = _MockP2PNode(_handler)
     return captured, mock_node

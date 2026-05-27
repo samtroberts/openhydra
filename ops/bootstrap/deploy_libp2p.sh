@@ -3,7 +3,8 @@
 #
 # Prerequisites:
 #   1. Cross-compile the binary for Linux x86_64:
-#      cd network && cross build --release --target x86_64-unknown-linux-gnu --bin openhydra-bootstrap
+#      cd network && cargo zigbuild --release --target x86_64-unknown-linux-gnu \
+#          --bin openhydra-bootstrap --no-default-features
 #      OR: cargo build --release --bin openhydra-bootstrap  (if building on Linux)
 #
 #   2. Ensure SSH access to root@<linode> for all three servers.
@@ -15,6 +16,7 @@ set -euo pipefail
 
 BINARY="${1:-network/target/x86_64-unknown-linux-gnu/release/openhydra-bootstrap}"
 SERVICE_FILE="ops/bootstrap/libp2p-bootstrap.service"
+FIREWALL_SCRIPT="ops/network_limits.sh"
 
 # Production bootstrap nodes.
 SERVERS=(
@@ -28,22 +30,12 @@ EU_PEER="/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaC
 US_PEER="/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb"
 AP_PEER="/ip4/172.104.164.98/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo"
 
-# Map server IP → the OTHER two peers (for --peer flags).
-declare -A PEER_FLAGS
-PEER_FLAGS["172.105.69.49"]="--peer ${US_PEER} --peer ${AP_PEER}"   # EU connects to US + AP
-PEER_FLAGS["45.79.190.172"]="--peer ${EU_PEER} --peer ${AP_PEER}"   # US connects to EU + AP
-PEER_FLAGS["172.104.164.98"]="--peer ${EU_PEER} --peer ${US_PEER}"  # AP connects to EU + US
-
 if [[ ! -f "$BINARY" ]]; then
     echo "ERROR: Binary not found at $BINARY"
     echo ""
     echo "Build it first:"
-    echo "  # Option A: Cross-compile from macOS (requires 'cross' or 'cargo-zigbuild')"
-    echo "  cargo install cross"
-    echo "  cd network && cross build --release --target x86_64-unknown-linux-gnu --bin openhydra-bootstrap"
-    echo ""
-    echo "  # Option B: Build on a Linux machine"
-    echo "  cd network && cargo build --release --bin openhydra-bootstrap"
+    echo "  cd network && cargo zigbuild --release --target x86_64-unknown-linux-gnu \\"
+    echo "      --bin openhydra-bootstrap --no-default-features"
     exit 1
 fi
 
@@ -54,24 +46,25 @@ echo ""
 for server in "${SERVERS[@]}"; do
     echo "── $server ──"
 
-    # Create dirs.
-    ssh "$server" "mkdir -p /opt/openhydra/bin"
+    # Extract IP for peer flag lookup.
+    SERVER_IP="${server#root@}"
 
-    # Upload binary.
+    # ── Upload binary ───────────────────────────────────────────────
+    ssh "$server" "systemctl stop openhydra-libp2p 2>/dev/null || true"
+    ssh "$server" "mkdir -p /opt/openhydra/bin"
     scp "$BINARY" "$server:/opt/openhydra/bin/openhydra-bootstrap"
     ssh "$server" "chmod +x /opt/openhydra/bin/openhydra-bootstrap"
 
     # Upload systemd service.
     scp "$SERVICE_FILE" "$server:/etc/systemd/system/openhydra-libp2p.service"
 
-    # Generate identity key if it doesn't exist.
+    # ── Generate identity key if it doesn't exist ───────────────────
     ssh "$server" "
         if [ ! -f /opt/openhydra/.libp2p_identity.key ]; then
             /opt/openhydra/bin/openhydra-bootstrap \
                 --identity /opt/openhydra/.libp2p_identity.key \
                 --listen /ip4/127.0.0.1/tcp/0 &
             BGPID=\$!
-            # Poll for key file instead of sleep (fixes race condition).
             for i in \$(seq 1 20); do
                 [ -f /opt/openhydra/.libp2p_identity.key ] && break
                 sleep 0.5
@@ -83,12 +76,67 @@ for server in "${SERVERS[@]}"; do
         fi
     "
 
-    # Extract this server's IP to look up peer flags.
-    SERVER_IP="\${server#root@}"
+    # ── Legacy service cleanup ──────────────────────────────────────
+    echo "  Cleaning up legacy services..."
+    ssh "$server" "
+        for svc in openhydra-bootstrap openhydra-relay openhydra-signpost; do
+            if systemctl is-active --quiet \${svc}.service 2>/dev/null; then
+                systemctl stop \${svc}.service
+                echo \"  Stopped \${svc}\"
+            fi
+            if systemctl is-enabled --quiet \${svc}.service 2>/dev/null; then
+                systemctl disable \${svc}.service
+                echo \"  Disabled \${svc}\"
+            fi
+        done
+        # Stop nginx (only reverse-proxied the legacy Python DHT)
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            systemctl stop nginx && systemctl disable nginx
+            echo '  Stopped and disabled nginx'
+        fi
+        # Kill any gRPC relay running as root
+        # Use relay[.]relay_service so pkill -f doesn't match this shell's own argv
+        pkill -f 'relay[.]relay_service' 2>/dev/null && echo '  Killed relay_service' || true
+        # Kill hivemind p2pd daemon — spawned by signpost but may survive service stop
+        pkill -9 p2pd 2>/dev/null && echo '  Killed p2pd' || true
+    "
 
-    # Generate systemd drop-in override with --peer flags for the other two
-    # bootstraps + full dual-stack listen addresses (IPv4+IPv6, TCP+QUIC).
-    PEERS="${PEER_FLAGS[$SERVER_IP]:-}"
+    # ── Disk cleanup ────────────────────────────────────────────────
+    echo "  Freeing disk space..."
+    ssh "$server" "
+        # Preserve only the Rust binary and identity key.
+        # Remove everything else: Python venv, source dirs, git repo, logs.
+        find /opt/openhydra -mindepth 1 -maxdepth 1 \
+            ! -name 'bin' \
+            ! -name '.libp2p_identity.key' \
+            -exec rm -rf {} + && echo '  Purged legacy files from /opt/openhydra'
+
+        # Remove stray log files anywhere under /opt/openhydra
+        find /opt/openhydra -name '*.log' -delete 2>/dev/null || true
+
+        # Vacuum journal logs to 100 MB
+        journalctl --vacuum-size=100M 2>&1 | tail -1
+
+        # Full APT cleanup (remove orphaned packages + cache)
+        apt-get autoremove -y -qq && apt-get clean -qq && echo '  APT cleaned'
+
+        # Report
+        echo '  Disk after cleanup:' && df -h / | tail -1
+    "
+
+    # ── Systemd drop-in override with peer flags ────────────────────
+    # Determine which peers this server connects to (the other two).
+    if [[ "$SERVER_IP" == "172.105.69.49" ]]; then
+        PEERS="--peer ${US_PEER} --peer ${AP_PEER}"
+    elif [[ "$SERVER_IP" == "45.79.190.172" ]]; then
+        PEERS="--peer ${EU_PEER} --peer ${AP_PEER}"
+    elif [[ "$SERVER_IP" == "172.104.164.98" ]]; then
+        PEERS="--peer ${EU_PEER} --peer ${US_PEER}"
+    else
+        echo "WARNING: Unknown server IP $SERVER_IP, skipping peer flags"
+        PEERS=""
+    fi
+
     ssh "$server" "
         mkdir -p /etc/systemd/system/openhydra-libp2p.service.d
         cat > /etc/systemd/system/openhydra-libp2p.service.d/peers.conf <<DROPIN
@@ -105,7 +153,7 @@ DROPIN
         echo 'Drop-in override written with peer flags + dual-stack listen'
     "
 
-    # Enable and (re)start the service.
+    # ── Enable and (re)start the service ────────────────────────────
     ssh "$server" "
         systemctl daemon-reload
         systemctl enable openhydra-libp2p
@@ -113,6 +161,13 @@ DROPIN
         sleep 1
         systemctl status openhydra-libp2p --no-pager -l | head -20
     "
+
+    # ── Apply firewall rules ────────────────────────────────────────
+    if [[ -f "$FIREWALL_SCRIPT" ]]; then
+        echo "  Applying firewall rules..."
+        scp "$FIREWALL_SCRIPT" "$server:/tmp/network_limits.sh"
+        ssh "$server" "bash /tmp/network_limits.sh && rm /tmp/network_limits.sh"
+    fi
 
     echo ""
 done

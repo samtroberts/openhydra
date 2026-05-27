@@ -313,6 +313,26 @@ def main() -> None:
             "path to the legacy serial behaviour."
         ),
     )
+    # ── CP-0: Rust Control Plane IPC bridge ─────────────────────────────
+    parser.add_argument(
+        "--zmq-worker",
+        action="store_true",
+        default=False,
+        help=(
+            "CP-0: Start the ZMQ IPC worker daemon instead of the internal "
+            "_fwd_worker thread. The worker connects to the Rust IPC bridge "
+            "via a Unix domain socket. Use with --rust-cp to enable the full "
+            "Rust control plane. Fallback: disable with OPENHYDRA_RUST_CP=0."
+        ),
+    )
+    parser.add_argument(
+        "--zmq-socket-path",
+        default="",
+        help=(
+            "Unix domain socket path for the ZMQ IPC bridge. "
+            "Default: /tmp/openhydra-worker-{peer_id}.sock"
+        ),
+    )
     # ── Phase 2b (DFlash block-diffusion speculative decoding) ──────────
     parser.add_argument(
         "--draft-location",
@@ -1306,6 +1326,9 @@ def main() -> None:
                 # Phase 2b: propagate manual_shard so the announce loop
                 # does NOT let the negotiator override the loaded layer range.
                 "manual_shard": _manual_shard,
+                # CP-0: ZMQ IPC worker mode (opt-in via --zmq-worker).
+                "zmq_worker_enabled": bool(getattr(args, "zmq_worker", False)),
+                "zmq_socket_path": str(getattr(args, "zmq_socket_path", "")),
                 # All other peer params use peer/server.py defaults.
             },
             name="openhydra-peer",

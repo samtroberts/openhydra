@@ -279,6 +279,69 @@ def _proxy_handler_loop(
 
     _fwd_thread = threading.Thread(target=_fwd_worker, daemon=True)
     _fwd_thread.start()
+
+    # OHV2 dual-format helpers — imported once, used per message.
+    from peer.ohv2_adapter import OHV2Request as _OHV2Request
+    from peer.ohv2_adapter import OHV2Response as _OHV2Response
+
+    def _decode_forward_request(payload: bytes):
+        """Decode a ForwardRequest from OHV2 or protobuf."""
+        if p2p_node.is_ohv2_msg(payload):
+            _hdr, _act, _ = p2p_node.decode_forward_msg(payload)
+            return _OHV2Request(_hdr, _act)
+        req = peer_pb2.ForwardRequest()
+        req.ParseFromString(payload)
+        return req
+
+    def _decode_forward_response(payload: bytes):
+        """Decode a ForwardResponse from OHV2 or protobuf."""
+        if p2p_node.is_ohv2_msg(payload):
+            _hdr, _act = p2p_node.decode_response_msg(payload)
+            return _OHV2Response(_hdr, _act)
+        resp = peer_pb2.ForwardResponse()
+        resp.ParseFromString(payload)
+        return resp
+
+    def _encode_forward_response(response) -> bytes:
+        """Encode a ForwardResponse to OHV2 wire format."""
+        _resp_hdr = {
+            "request_id": str(getattr(response, "request_id", "") or ""),
+            "status": 0,  # Ok
+            "activation_dtype": 0,  # Fp32
+            "activation_shape": [],
+        }
+        _err = str(getattr(response, "error", "") or "")
+        if _err:
+            _resp_hdr["status"] = 1  # Error
+            _resp_hdr["error_message"] = _err
+        if bool(getattr(response, "kv_cache_hit", False)):
+            _resp_hdr["status"] = 2  # KvCacheHit
+        _meta = str(getattr(response, "metadata_json", "") or "")
+        if _meta:
+            _resp_hdr["metadata_json"] = _meta
+        _peer_id = str(getattr(response, "peer_id", "") or "")
+        if _peer_id:
+            _resp_hdr["peer_id"] = _peer_id
+        _stage = int(getattr(response, "stage_index", 0) or 0)
+        if _stage:
+            _resp_hdr["stage_index"] = _stage
+        if bool(getattr(response, "is_hidden_state", False)):
+            _resp_hdr["is_hidden_state"] = True
+        _slot = int(getattr(response, "slot_id", 0) or 0)
+        if _slot:
+            _resp_hdr["slot_id"] = _slot
+        _block_size = int(getattr(response, "block_size", 0) or 0)
+        if _block_size:
+            _resp_hdr["block_size"] = _block_size
+        _block_idx = int(getattr(response, "block_index", 0) or 0)
+        if _block_idx:
+            _resp_hdr["block_index"] = _block_idx
+        _ahash = str(getattr(response, "activation_hash", "") or "")
+        if _ahash:
+            _resp_hdr["activation_hash"] = _ahash
+        _packed = bytes(getattr(response, "activation_packed", b"") or b"")
+        return bytes(p2p_node.encode_response_msg(_resp_hdr, _packed))
+
     logging.info("proxy_handler_loop started")
     while not stop_event.is_set():
         try:
@@ -293,8 +356,7 @@ def _proxy_handler_loop(
                     # Fire-and-forget: ACK immediately, run Forward() in background.
                     # Decouples relay circuit lifetime from inference duration.
                     p2p_node.respond_proxy(request_id=req_id, data=PROXY_METHOD_FIRE_FORGET)
-                    _ff_request = peer_pb2.ForwardRequest()
-                    _ff_request.ParseFromString(raw[1:])
+                    _ff_request = _decode_forward_request(raw[1:])
 
                     # Ring token emission is handled inside Forward()
                     # (transport-agnostic). No emit here to avoid double-emit
@@ -320,8 +382,7 @@ def _proxy_handler_loop(
                         request_id=req_id,
                         data=PROXY_METHOD_FIRE_FORGET_RESULT,
                     )
-                    _ff_resp = peer_pb2.ForwardResponse()
-                    _ff_resp.ParseFromString(raw[1:])
+                    _ff_resp = _decode_forward_response(raw[1:])
 
                     def _ff_push_result(_resp=_ff_resp):
                         try:
@@ -334,8 +395,7 @@ def _proxy_handler_loop(
                     threading.Thread(target=_ff_push_result, daemon=True).start()
                 elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                     # PushResult path: ForwardResponse → PushResult RPC.
-                    push_resp = peer_pb2.ForwardResponse()
-                    push_resp.ParseFromString(raw[1:])
+                    push_resp = _decode_forward_response(raw[1:])
                     ack = service.PushResult(push_resp, context=None)
                     p2p_node.respond_proxy(
                         request_id=req_id,
@@ -360,13 +420,20 @@ def _proxy_handler_loop(
                 else:
                     # Forward path (0x01 prefix or legacy no-prefix).
                     payload = raw[1:] if raw and raw[0:1] == PROXY_METHOD_FORWARD else raw
-                    request = peer_pb2.ForwardRequest()
-                    request.ParseFromString(payload)
+                    request = _decode_forward_request(payload)
                     response = service.Forward(request, context=None)
-                    p2p_node.respond_proxy(
-                        request_id=req_id,
-                        data=PROXY_METHOD_FORWARD + response.SerializeToString(),
-                    )
+                    # Encode response as OHV2 if we decoded an OHV2 request.
+                    if isinstance(request, _OHV2Request):
+                        _resp_wire = _encode_forward_response(response)
+                        p2p_node.respond_proxy(
+                            request_id=req_id,
+                            data=PROXY_METHOD_FORWARD + _resp_wire,
+                        )
+                    else:
+                        p2p_node.respond_proxy(
+                            request_id=req_id,
+                            data=PROXY_METHOD_FORWARD + response.SerializeToString(),
+                        )
             except Exception as e:
                 logging.warning("proxy_handler_error: req=%s err=%s", req_id, e)
                 err_resp = peer_pb2.ForwardResponse(
@@ -449,6 +516,18 @@ def _coordinator_proxy_handler_loop(
             "(pipeline_depth=1)"
         )
 
+    # OHV2 dual-format helper for coordinator proxy handler.
+    from peer.ohv2_adapter import OHV2Response as _CoordOHV2Response
+
+    def _decode_coord_response(payload: bytes):
+        """Decode a ForwardResponse from OHV2 or protobuf."""
+        if p2p_node.is_ohv2_msg(payload):
+            _hdr, _act = p2p_node.decode_response_msg(payload)
+            return _CoordOHV2Response(_hdr, _act)
+        resp = peer_pb2.ForwardResponse()
+        resp.ParseFromString(payload)
+        return resp
+
     def _dispatch_push_result(req_id: str, raw: bytes) -> None:
         """Handle one PROXY_METHOD_PUSH_RESULT message.
 
@@ -457,8 +536,7 @@ def _coordinator_proxy_handler_loop(
         ``RingSession.lock`` was designed to prevent.
         """
         try:
-            push_resp = peer_pb2.ForwardResponse()
-            push_resp.ParseFromString(raw[1:])
+            push_resp = _decode_coord_response(raw[1:])
             ack = _coordinator_handle_push_result(
                 response=push_resp,
                 p2p_node=p2p_node,
@@ -2477,14 +2555,18 @@ class PeerService:
 
     def _push_to_next_hop(
         self,
-        request: peer_pb2.ForwardRequest,
-        response: peer_pb2.ForwardResponse,
+        request,
+        response,
         next_address: str,
         remaining_route: list,
     ) -> None:
-        """Forward activation to the next peer in the push chain."""
+        """Forward activation to the next peer in the push chain.
+
+        Uses OHV2 binary wire format (~7us) instead of protobuf field-by-field
+        copy + SerializeToString (~1.3ms). When the inbound request is already
+        an OHV2Request, copies its header dict and mutates only changed fields.
+        """
         try:
-            # Build next request: carry the activation + remaining route
             next_route = remaining_route[1:] if len(remaining_route) > 1 else []
             next_next_addr = ""
             next_next_id = ""
@@ -2493,74 +2575,83 @@ class PeerService:
                 next_next_id = str(next_route[0].peer_id)
 
             # Task 8.1: Use activation_packed from response (zero-copy path).
-            # Falls back to array-based packing if packed bytes not available.
             _push_packed = bytes(getattr(response, 'activation_packed', b'') or b'')
-            _push_activation: list[float] = []
             if not _push_packed:
                 _push_activation = list(response.activation)
                 if _push_activation:
                     import array as _push_array
                     _push_packed = _push_array.array('f', _push_activation).tobytes()
-                    _push_activation = []
 
-            next_req = peer_pb2.ForwardRequest(
-                request_id=request.request_id,
-                prompt="",  # Only stage 0 gets the prompt
-                activation=_push_activation,
-                activation_packed=_push_packed,
-                stage_index=request.stage_index + 1,
-                total_stages=request.total_stages,
-                max_tokens=request.max_tokens,
-                kv_session_id=request.kv_session_id,
-                kv_store_activation=request.kv_store_activation,
-                kv_use_cached_activation=request.kv_use_cached_activation,
-                decode_do_sample=request.decode_do_sample,
-                decode_temperature=request.decode_temperature,
-                decode_top_p=request.decode_top_p,
-                decode_top_k=request.decode_top_k,
-                decode_seed=request.decode_seed,
-                shard_layer_start=remaining_route[0].shard_layer_start if remaining_route else 0,
-                shard_layer_end=remaining_route[0].shard_layer_end if remaining_route else 0,
-                shard_total_layers=remaining_route[0].shard_total_layers if remaining_route else 0,
-                push_mode=True,
-                next_hop_address=next_next_addr,
-                next_hop_peer_id=next_next_id,
-                final_callback_address=request.final_callback_address,
-                final_callback_request_id=request.final_callback_request_id,
-                final_callback_libp2p_peer_id=str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
-                remaining_route=next_route,
-                # Gemma 4 needs prompt_token_ids at every stage for per-layer inputs.
-                prompt_token_ids=list(request.prompt_token_ids),
-                # Ring mode fields — must carry forward for the ring to function.
-                ring_mode=bool(getattr(request, "ring_mode", False)),
-                ring_tokens_remaining=int(getattr(request, "ring_tokens_remaining", 0)),
-                ring_generated_ids=list(getattr(request, "ring_generated_ids", [])),
-                ring_eos_ids=list(getattr(request, "ring_eos_ids", [])),
-                ring_first_hop_address=str(getattr(request, "ring_first_hop_address", "") or ""),
-                ring_first_hop_peer_id=str(getattr(request, "ring_first_hop_peer_id", "") or ""),
-                ring_first_hop_libp2p_id=str(getattr(request, "ring_first_hop_libp2p_id", "") or ""),
-                ring_full_route=list(getattr(request, "ring_full_route", [])),
-                # Path A: carry sample_on_coordinator forward so the LAST
-                # peer skips final_norm + lm_head + sampling and routes
-                # the hidden state to the coordinator. Without this the
-                # legacy ring-loopback path fires on the last peer and
-                # the Path A code never runs.
-                sample_on_coordinator=bool(getattr(request, "sample_on_coordinator", False)),
-                # Phase 2a: forward per-ring slot_id verbatim through every
-                # hop. The terminal peer echoes it on PushResult so the
-                # coord can match the response back to its in-flight
-                # SlotState (out-of-order safe under pipeline_depth >= 2).
-                slot_id=int(getattr(request, "slot_id", 0) or 0),
-                pipeline_depth=int(getattr(request, "pipeline_depth", 1) or 1),
-                # Phase 2b live-bench Binding #3: propagate block-verify
-                # routing fields verbatim. Each shard runs its slice
-                # over the SAME drafts / kv_rollback_to / block_index;
-                # only ``activation_packed`` mutates as hidden states
-                # cascade down the ring.
-                draft_block=bool(getattr(request, "draft_block", False)),
-                block_index=int(getattr(request, "block_index", 0) or 0),
-                kv_rollback_to=int(getattr(request, "kv_rollback_to", 0) or 0),
-            )
+            # Build OHV2 header dict — copy from inbound request if OHV2,
+            # otherwise build from scratch.
+            from peer.ohv2_adapter import OHV2Request as _OHV2Request
+            if isinstance(request, _OHV2Request):
+                # Fast path: dict copy + mutate changed fields only.
+                _hdr = dict(request._d)
+            else:
+                # Protobuf fallback: extract fields into dict.
+                _hdr = {
+                    "request_id": str(request.request_id),
+                    "total_stages": int(request.total_stages),
+                    "max_tokens": int(getattr(request, "max_tokens", 0) or 0),
+                    "kv_session_id": str(request.kv_session_id),
+                    "kv_store_activation": bool(request.kv_store_activation),
+                    "kv_use_cached_activation": bool(request.kv_use_cached_activation),
+                    "decode_do_sample": bool(request.decode_do_sample),
+                    "decode_temperature": float(request.decode_temperature),
+                    "decode_top_p": float(request.decode_top_p),
+                    "decode_top_k": int(request.decode_top_k),
+                    "decode_seed": int(request.decode_seed),
+                    "final_callback_address": str(request.final_callback_address),
+                    "final_callback_request_id": str(request.final_callback_request_id),
+                    "final_callback_libp2p_peer_id": str(getattr(request, "final_callback_libp2p_peer_id", "") or ""),
+                    "prompt_token_ids": list(request.prompt_token_ids),
+                    "ring_mode": bool(getattr(request, "ring_mode", False)),
+                    "ring_tokens_remaining": int(getattr(request, "ring_tokens_remaining", 0)),
+                    "ring_generated_ids": list(getattr(request, "ring_generated_ids", [])),
+                    "ring_eos_ids": list(getattr(request, "ring_eos_ids", [])),
+                    "ring_first_hop_address": str(getattr(request, "ring_first_hop_address", "") or ""),
+                    "ring_first_hop_peer_id": str(getattr(request, "ring_first_hop_peer_id", "") or ""),
+                    "ring_first_hop_libp2p_id": str(getattr(request, "ring_first_hop_libp2p_id", "") or ""),
+                    "ring_full_route": list(getattr(request, "ring_full_route", [])),
+                    "sample_on_coordinator": bool(getattr(request, "sample_on_coordinator", False)),
+                    "slot_id": int(getattr(request, "slot_id", 0) or 0),
+                    "pipeline_depth": int(getattr(request, "pipeline_depth", 1) or 1),
+                    "draft_block": bool(getattr(request, "draft_block", False)),
+                    "block_index": int(getattr(request, "block_index", 0) or 0),
+                    "kv_rollback_to": int(getattr(request, "kv_rollback_to", 0) or 0),
+                }
+
+            # Update fields that change per hop.
+            _hdr["stage_index"] = int(request.stage_index) + 1
+            _hdr["push_mode"] = True
+            _hdr["next_hop_address"] = next_next_addr
+            _hdr["next_hop_peer_id"] = next_next_id
+            _hdr["activation_dtype"] = 0  # Fp32 (activation_packed is always fp32)
+            if remaining_route:
+                _hdr["shard_layer_start"] = int(remaining_route[0].shard_layer_start)
+                _hdr["shard_layer_end"] = int(remaining_route[0].shard_layer_end)
+                _hdr["shard_total_layers"] = int(remaining_route[0].shard_total_layers)
+            else:
+                _hdr["shard_layer_start"] = 0
+                _hdr["shard_layer_end"] = 0
+                _hdr["shard_total_layers"] = 0
+            # Serialize remaining_route as JSON bytes for the opaque Vec<u8> field.
+            if next_route:
+                import json as _json_route
+                _route_list = []
+                for hop in next_route:
+                    _route_list.append({
+                        "address": str(hop.address),
+                        "peer_id": str(hop.peer_id),
+                        "libp2p_peer_id": str(getattr(hop, "libp2p_peer_id", "") or ""),
+                        "shard_layer_start": int(getattr(hop, "shard_layer_start", 0) or 0),
+                        "shard_layer_end": int(getattr(hop, "shard_layer_end", 0) or 0),
+                        "shard_total_layers": int(getattr(hop, "shard_total_layers", 0) or 0),
+                    })
+                _hdr["remaining_route"] = list(_json_route.dumps(_route_list).encode())
+            else:
+                _hdr["remaining_route"] = []
 
             _next_hop_libp2p_id = ""
             if remaining_route:
@@ -2569,14 +2660,14 @@ class PeerService:
             if not _next_hop_libp2p_id or self._p2p_node is None:
                 raise RuntimeError(f"no_libp2p_id_for_next_hop: {next_address}")
 
-            _payload = bytearray(PROXY_METHOD_FIRE_FORGET)
-            _payload.extend(next_req.SerializeToString())
+            _ohv2_wire = self._p2p_node.encode_forward_msg(_hdr, _push_packed, msg_type=0)
+            _payload = PROXY_METHOD_FIRE_FORGET + bytes(_ohv2_wire)
             self._p2p_node.proxy_forward_no_wait(
                 target_peer_id=_next_hop_libp2p_id,
-                data=bytes(_payload),
+                data=_payload,
             )
             logger.info(
-                "push_forwarded: req=%s stage=%d -> %s (libp2p=%s)",
+                "push_forwarded: req=%s stage=%d -> %s (libp2p=%s ohv2=True)",
                 request.request_id, request.stage_index,
                 next_address, _next_hop_libp2p_id[:20],
             )
@@ -2586,7 +2677,7 @@ class PeerService:
 
     def _push_final_result(
         self,
-        response: peer_pb2.ForwardResponse,
+        response,
         callback_address: str,
         callback_request_id: str,
         callback_libp2p_peer_id: str = "",
@@ -2595,51 +2686,43 @@ class PeerService:
     ) -> None:
         """Send final activation back to the coordinator via PushResult RPC.
 
-        Phase 2a: when ``pipeline_depth >= 2``, both direct-gRPC paths
-        (LAN-first and last-resort) are dispatched on a daemon thread so
-        the gRPC handler returns immediately and the peer can begin
-        computing the next slot's forward without waiting for the
-        coord-bound send to complete. Libp2p relay is already
-        fire-and-forget via ``PROXY_METHOD_PUSH_RESULT``.
+        Uses OHV2 binary wire format for the libp2p fire-and-forget path.
         """
         try:
-            if callback_request_id:
-                # Preserve ``activation_packed`` and ``is_hidden_state`` —
-                # required for Path A (client-terminated pipeline), where
-                # the last peer returns a packed hidden state and the
-                # coordinator's PushResult handler routes based on the flag.
-                response = peer_pb2.ForwardResponse(
-                    request_id=callback_request_id,
-                    peer_id=response.peer_id,
-                    activation=list(response.activation),
-                    activation_packed=bytes(getattr(response, "activation_packed", b"") or b""),
-                    is_hidden_state=bool(getattr(response, "is_hidden_state", False)),
-                    stage_index=response.stage_index,
-                    error=response.error,
-                    kv_cache_hit=response.kv_cache_hit,
-                    activation_hash=response.activation_hash,
-                    # Phase 2a: echo slot_id back so the coord-side
-                    # _coordinator_handle_push_result can match this
-                    # response to its in-flight SlotState (pipeline_depth>=2).
-                    slot_id=int(slot_id or 0),
-                    # Phase 2b live-bench Binding #2: preserve block-verify
-                    # routing fields if the inbound response carried them.
-                    block_size=int(getattr(response, "block_size", 0) or 0),
-                    block_index=int(getattr(response, "block_index", 0) or 0),
-                )
+            _packed = bytes(getattr(response, "activation_packed", b"") or b"")
+            _resp_hdr = {
+                "request_id": str(callback_request_id or response.request_id),
+                "status": 0,  # Ok
+                "activation_dtype": 0,  # Fp32
+                "activation_shape": [],
+            }
+            _err = str(getattr(response, "error", "") or "")
+            if _err:
+                _resp_hdr["status"] = 1  # Error
+                _resp_hdr["error_message"] = _err
+            if bool(getattr(response, "kv_cache_hit", False)):
+                _resp_hdr["status"] = 2  # KvCacheHit
+            # Carry forward fields needed by coordinator PushResult handler.
+            _resp_hdr["peer_id"] = str(getattr(response, "peer_id", "") or "")
+            _resp_hdr["stage_index"] = int(getattr(response, "stage_index", 0))
+            _resp_hdr["is_hidden_state"] = bool(getattr(response, "is_hidden_state", False))
+            _resp_hdr["slot_id"] = int(slot_id or 0)
+            _resp_hdr["block_size"] = int(getattr(response, "block_size", 0) or 0)
+            _resp_hdr["block_index"] = int(getattr(response, "block_index", 0) or 0)
+
             _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
             if not _cb_libp2p or self._p2p_node is None:
                 raise RuntimeError(f"no_libp2p_id_for_callback: {callback_address}")
 
-            _payload = bytearray(PROXY_METHOD_FIRE_FORGET_RESULT)
-            _payload.extend(response.SerializeToString())
+            _ohv2_wire = self._p2p_node.encode_response_msg(_resp_hdr, _packed)
+            _payload = PROXY_METHOD_FIRE_FORGET_RESULT + bytes(_ohv2_wire)
             self._p2p_node.proxy_forward_no_wait(
                 target_peer_id=_cb_libp2p,
-                data=bytes(_payload),
+                data=_payload,
             )
             logger.info(
-                "push_result_sent: req=%s -> %s (libp2p=%s)",
-                response.request_id, callback_address, _cb_libp2p[:20],
+                "push_result_sent: req=%s -> %s (libp2p=%s ohv2=True)",
+                _resp_hdr["request_id"], callback_address, _cb_libp2p[:20],
             )
         except Exception as exc:
             logger.warning("push_result_failed: %s: %s", callback_address, exc)
@@ -3672,6 +3755,12 @@ def serve(
     # must NOT override the DHT-announced layer range (the negotiator's
     # "desired" range can differ from the actually loaded layers).
     manual_shard: bool = False,
+    # CP-0: ZMQ IPC worker mode — when True, starts zmq_worker.run_worker()
+    # instead of the internal _fwd_worker thread.  The ZMQ worker connects
+    # to the Rust IPC bridge via a Unix domain socket and processes forward
+    # requests over the IPC wire format (CBOR header + raw activation).
+    zmq_worker_enabled: bool = False,
+    zmq_socket_path: str = "",
 ) -> None:
     resolved_dht_urls: list[str] = []
     seen_dht_urls: set[str] = set()
@@ -4141,6 +4230,36 @@ def serve(
                 )
                 _negotiation_loop_obj = None
 
+        # ── CP-0: ZMQ IPC worker (opt-in via --zmq-worker) ────────────
+        # When enabled, starts a ZMQ worker daemon that connects to the
+        # Rust IPC bridge and processes forward requests over Unix domain
+        # sockets.  This replaces the _fwd_worker thread inside
+        # _proxy_handler_loop with a standalone IPC-based worker.
+        _zmq_worker_thread: threading.Thread | None = None
+        if zmq_worker_enabled:
+            _zmq_path = zmq_socket_path or f"/tmp/openhydra-worker-{peer_id}.sock"
+            logging.info("CP-0: starting ZMQ IPC worker on %s", _zmq_path)
+            from peer.zmq_worker import run_worker as _zmq_run_worker
+
+            _shard_config = getattr(service, "shard", None)
+            _shard_config = getattr(_shard_config, "config", None)
+            _gpu_keepalive = (
+                bool(getattr(_shard_config, "runtime_mlx_gpu_keepalive_enabled", False))
+                and runtime_backend.lower() == "mlx"
+            )
+            _zmq_worker_thread = threading.Thread(
+                target=_zmq_run_worker,
+                kwargs={
+                    "socket_path": _zmq_path,
+                    "shard": service.shard,
+                    "stop_event": stop_event,
+                    "gpu_keepalive": _gpu_keepalive,
+                },
+                name="openhydra-zmq-worker",
+                daemon=True,
+            )
+            _zmq_worker_thread.start()
+
         # Start libp2p proxy handler thread (receives inbound proxy requests
         # from remote peers and forwards to local PeerService.Forward()).
         _proxy_handler_thread: threading.Thread | None = None
@@ -4169,6 +4288,8 @@ def serve(
                 seeding_thread.join(timeout=2.0)
             if _proxy_handler_thread is not None:
                 _proxy_handler_thread.join(timeout=2.0)
+            if _zmq_worker_thread is not None:
+                _zmq_worker_thread.join(timeout=2.0)
             if _fast_path_server is not None:
                 try:
                     _fast_path_server.stop()
