@@ -1174,7 +1174,10 @@ class InferenceChain:
             activation=activation,
             traces=[],
             latency_ms=total_ms,
-            activation_hash=bytes(getattr(result_response, "activation_hash", b"")),
+            activation_hash=(
+                _ah if isinstance((_ah := getattr(result_response, "activation_hash", b"")), bytes)
+                else (_ah.encode() if _ah else b"")
+            ),
         )
 
 

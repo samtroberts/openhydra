@@ -424,8 +424,15 @@ class OHV2Response:
         return bool(self._d.get("kv_cache_hit", False))
 
     @property
-    def activation_hash(self) -> str:
-        return self._d.get("activation_hash", "")
+    def activation_hash(self) -> bytes:
+        _v = self._d.get("activation_hash", b"")
+        if isinstance(_v, bytes):
+            return _v
+        if isinstance(_v, str):
+            return _v.encode() if _v else b""
+        if isinstance(_v, list):
+            return bytes(_v)
+        return b""
 
     @property
     def is_hidden_state(self) -> bool:
