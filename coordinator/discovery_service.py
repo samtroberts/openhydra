@@ -264,7 +264,12 @@ class DiscoveryService:
                 e_has_layers = int(existing.total_layers) > 0 and int(existing.layer_end) > 0
                 n_has_layers = int(new_peer.total_layers) > 0 and int(new_peer.layer_end) > 0
                 if e_has_layers and not n_has_layers:
-                    # Existing has layer info, new doesn't — keep existing.
+                    # Existing has layer info, new doesn't — keep existing
+                    # but merge runtime_backend from new if it's more specific.
+                    _e_rb = str(existing.runtime_backend or "").strip().lower()
+                    _n_rb = str(new_peer.runtime_backend or "").strip().lower()
+                    if _n_rb and _n_rb != "toy_cpu" and (_e_rb in ("", "toy_cpu")):
+                        deduped[key] = existing.replace(runtime_backend=new_peer.runtime_backend)
                     continue
                 if n_has_layers and not e_has_layers:
                     # New has layer info, existing doesn't — use new.
@@ -281,6 +286,11 @@ class DiscoveryService:
                 # Merge libp2p_peer_id: carry forward from whichever has it.
                 if existing.libp2p_peer_id and not new_peer.libp2p_peer_id:
                     new_peer = new_peer.replace(libp2p_peer_id=existing.libp2p_peer_id)
+                # Merge runtime_backend: prefer a real backend over toy_cpu.
+                _e_rb = str(existing.runtime_backend or "").strip().lower()
+                _n_rb = str(new_peer.runtime_backend or "").strip().lower()
+                if _e_rb and _e_rb != "toy_cpu" and (_n_rb in ("", "toy_cpu")):
+                    new_peer = new_peer.replace(runtime_backend=existing.runtime_backend)
             deduped[key] = new_peer
         return list(deduped.values())
 
@@ -352,6 +362,14 @@ class DiscoveryService:
                 runtime_id = peer.runtime_model_id or ""
                 if model_id in model_filter or (runtime_id and runtime_id in model_filter):
                     peers.append(peer.replace(model_id=model_id))
+            # Static peers config is authoritative — skip DHT discovery
+            # to avoid pinging ~25 unreachable relay peers (saves ~51s).
+            if peers:
+                logger.info(
+                    "static_peers_loaded: count=%d (skipping DHT discovery)",
+                    len(peers),
+                )
+                return peers
 
         dht_sources = self._configured_dht_urls()
         if dht_sources:

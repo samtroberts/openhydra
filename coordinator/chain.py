@@ -1147,7 +1147,7 @@ class InferenceChain:
         total_ms = (time.perf_counter() - t_start) * 1000
         # Prefer packed bytes from response (push result).
         _push_packed = bytes(getattr(result_response, "activation_packed", b"") or b"")
-        if _push_packed and len(_push_packed) >= 8:
+        if _push_packed and len(_push_packed) >= 4:
             import struct as _push_unpack
             _n = len(_push_packed) // 4
             activation = list(_push_unpack.unpack(f'<{_n}f', _push_packed))

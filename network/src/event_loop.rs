@@ -2738,14 +2738,33 @@ fn handle_ring_event(
             match stage0_peer.parse::<PeerId>() {
                 Ok(pid) => {
                     if swarm.is_connected(&pid) {
-                        let _req_id = swarm
-                            .behaviour_mut()
-                            .grpc_proxy
-                            .send_request(&pid, ProxyRequest(data));
-                        info!(
-                            %session_id, %new_request_id, %pid,
-                            "ring: re-injected embedding to stage 0"
-                        );
+                        // Hot-path: prefer tensor stream (fire-and-forget)
+                        // over request-response (new substream per token).
+                        if let Some(ref mgr) = state.tensor_mgr {
+                            let mgr = Arc::clone(mgr);
+                            let pid_owned = pid;
+                            let _sid = session_id.clone();
+                            let _rid = new_request_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = mgr.send_tensor(&pid_owned, &data).await {
+                                    warn!(%pid_owned, %e, "ring: tensor_stream re-inject failed");
+                                }
+                            });
+                            info!(
+                                %session_id, %new_request_id, %pid,
+                                "ring: re-injected embedding via tensor_stream"
+                            );
+                        } else {
+                            // Fallback to request-response
+                            let _req_id = swarm
+                                .behaviour_mut()
+                                .grpc_proxy
+                                .send_request(&pid, ProxyRequest(data));
+                            info!(
+                                %session_id, %new_request_id, %pid,
+                                "ring: re-injected embedding via request_response (fallback)"
+                            );
+                        }
                     } else {
                         warn!(
                             %session_id, %stage0_peer,

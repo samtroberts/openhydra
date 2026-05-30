@@ -90,6 +90,55 @@ def _gpu_available_hint() -> bool:
     return True
 
 
+# ── Architecture Sniffer ──
+# Detect GPU compute capability once at module level.  The result is
+# used at model-load time (dtype routing) and at SDPA-patch time
+# (Math-backend routing on Turing).  Never call get_device_capability()
+# in the per-token hot path.
+_GPU_PROFILE_CACHE: dict | None = None
+
+
+def get_gpu_profile() -> dict:
+    """Return a cached GPU architecture profile dict."""
+    global _GPU_PROFILE_CACHE
+    if _GPU_PROFILE_CACHE is not None:
+        return _GPU_PROFILE_CACHE
+
+    import torch as _torch
+
+    profile: dict = {
+        "compute_capability": (0, 0),
+        "is_turing_or_older": True,
+        "is_ampere_or_newer": False,
+        "has_native_bf16": False,
+        "recommended_dtype": _torch.float32,
+        "use_sdpa_math_only": False,
+    }
+    if not _torch.cuda.is_available():
+        _GPU_PROFILE_CACHE = profile
+        return profile
+    try:
+        cc = _torch.cuda.get_device_capability()
+        profile["compute_capability"] = cc
+        profile["is_turing_or_older"] = cc[0] < 8
+        profile["is_ampere_or_newer"] = cc[0] >= 8
+        profile["has_native_bf16"] = cc[0] >= 8
+        if cc[0] >= 8:
+            profile["recommended_dtype"] = _torch.bfloat16
+        else:
+            profile["recommended_dtype"] = _torch.float16
+            profile["use_sdpa_math_only"] = True
+        logging.info(
+            "gpu_profile: cc=%d.%d turing_or_older=%s dtype=%s sdpa_math_only=%s",
+            cc[0], cc[1], profile["is_turing_or_older"],
+            profile["recommended_dtype"], profile["use_sdpa_math_only"],
+        )
+    except Exception as e:
+        logging.warning("gpu_profile_failed: %s", e)
+    _GPU_PROFILE_CACHE = profile
+    return profile
+
+
 def _default_trust_remote_code(model_id: str) -> bool:
     normalized = str(model_id or "").strip().lower()
     if not normalized:
@@ -891,10 +940,18 @@ class PyTorchRuntime:
                     from transformers import BitsAndBytesConfig
 
                     if self.quantization_bits == 4:
+                        # Use fp16 compute on pre-Ampere (T4/Pascal lack
+                        # native bf16); bf16 on Ampere+ (A100/H100).
+                        _bnb_compute_dtype = torch.bfloat16
+                        try:
+                            if torch.cuda.get_device_capability()[0] < 8:
+                                _bnb_compute_dtype = torch.float16
+                        except Exception:
+                            pass
                         quantization_config = BitsAndBytesConfig(
                             load_in_4bit=True,
                             bnb_4bit_quant_type="nf4",
-                            bnb_4bit_compute_dtype=torch.bfloat16,
+                            bnb_4bit_compute_dtype=_bnb_compute_dtype,
                             bnb_4bit_use_double_quant=True,
                         )
                     else:
@@ -955,8 +1012,22 @@ class PyTorchRuntime:
             load_kwargs["device_map"] = "auto"
             load_kwargs["torch_dtype"] = _native_dtype
         elif _is_sharded:
-            self._dtype = _native_dtype  # Override fp32 default for memory-constrained shards
-            load_kwargs["torch_dtype"] = _native_dtype
+            # P7: On pre-Ampere CUDA (T4/Turing SM 7.5, Pascal SM 6.x),
+            # bf16 has no hardware support — ops run at fp32 speed and
+            # every matmul implicitly casts bf16→fp16 under autocast.
+            # Load directly as fp16 to eliminate ~60 implicit casts per
+            # shard per token.  Ampere+ (SM 8.0+) keeps native bf16.
+            _shard_dtype = _native_dtype
+            if target == "cuda":
+                _gpu_profile = get_gpu_profile()
+                _shard_dtype = _gpu_profile["recommended_dtype"]
+                logging.info(
+                    "dtype_routing: native=%s shard=%s (cc=%s)",
+                    _native_dtype, _shard_dtype,
+                    _gpu_profile["compute_capability"],
+                )
+            self._dtype = _shard_dtype
+            load_kwargs["torch_dtype"] = _shard_dtype
             # Selective weight loading: compute which layers this shard needs
             # BEFORE loading the model, then map unneeded layers to "disk"
             # device (zero memory). This reduces peak memory from full-model
@@ -1225,6 +1296,35 @@ class PyTorchRuntime:
             self._model.to(self._device)
         self._model.eval()
 
+        # P0 dtype enforcement: Qwen 3.5 transformers code creates some
+        # internal weights (e.g. linear_attn.in_proj_qkv) using the model
+        # config.dtype attribute (bfloat16) rather than the torch_dtype
+        # loading kwarg.  On pre-Ampere CUDA (T4) we load as fp16, but
+        # these bf16 stragglers cause cross-shard matmul failures
+        # (c10::Half != c10::BFloat16) when GPU1 sends fp16 activations
+        # and GPU2 weights are partially bf16.  Force-cast ALL parameters
+        # and buffers to self._dtype after loading.
+        if (
+            _is_sharded
+            and self._dtype is not None
+            and target == "cuda"
+        ):
+            _mismatched = 0
+            for _pname, _param in self._model.named_parameters():
+                if _param.dtype != self._dtype:
+                    _param.data = _param.data.to(self._dtype).contiguous()
+                    _mismatched += 1
+            for _bname, _buf in self._model.named_buffers():
+                if _buf.dtype not in (self._dtype, torch.int64, torch.int32, torch.bool):
+                    _buf.data = _buf.data.to(self._dtype).contiguous()
+                    _mismatched += 1
+            if _mismatched > 0:
+                logging.info(
+                    "dtype_enforcement: cast %d params/buffers from mismatched dtypes to %s",
+                    _mismatched, self._dtype,
+                )
+
+
         # Phase 6 workaround (T4 + bf16 grouped-conv1d + small seq_len):
         # Qwen 3.5's ``linear_attn`` layers contain a depthwise
         # ``nn.Conv1d(C, C, kernel_size=4, groups=C, padding=3)`` module.
@@ -1246,6 +1346,36 @@ class PyTorchRuntime:
             self._patch_depthwise_conv1d_t4_fallback()
         except Exception as _patch_exc:
             logging.debug("conv1d_t4_patch_skipped: %s", _patch_exc)
+
+        # Architecture Sniffer — SDPA Math-backend routing:
+        # On Turing GPUs (SM 7.5), the FlashAttention / MemEfficient C++
+        # SDPA backends crash with fp16 + GQA + seq_len=1 decode:
+        #   "(*bias): last dimension must be contiguous"
+        # This is a C++ kernel bug — making Python tensors contiguous does
+        # NOT fix it.  The Math backend works correctly.  On Ampere+ the
+        # Flash/MemEfficient backends work fine, so we only force Math on
+        # Turing.  The compute-capability check is hoisted to a closure-
+        # captured boolean (_use_math_only) — zero overhead per token.
+        try:
+            import torch.nn.functional as _F
+            from torch.nn.attention import sdpa_kernel as _sdpa_kernel, SDPBackend as _SDPBackend
+            _orig_torch_sdpa = _F.scaled_dot_product_attention
+            _is_turing = get_gpu_profile()["is_turing_or_older"]
+
+            def _routed_sdpa(query, key, value, attn_mask=None, **kwargs):
+                # Only force Math backend for seq_len=1 decode on Turing.
+                # MemEfficient works fine for prefill (seq_len > 1).
+                # No contiguity checks needed — baseline ran 17.45 TPS without them.
+                if _is_turing and query.shape[-2] <= 1:
+                    with _sdpa_kernel(_SDPBackend.MATH):
+                        return _orig_torch_sdpa(query, key, value, attn_mask=attn_mask, **kwargs)
+                return _orig_torch_sdpa(query, key, value, attn_mask=attn_mask, **kwargs)
+
+            _F.scaled_dot_product_attention = _routed_sdpa
+            logging.info("sdpa_architecture_sniffer: turing_decode_math=%s", _is_turing)
+        except Exception as _sdpa_exc:
+            logging.debug("sdpa_architecture_sniffer_skipped: %s", _sdpa_exc)
+
 
         decoder_arch = self._detect_decoder_architecture(self._model)
         self._decoder_family = str(decoder_arch.family)
@@ -1531,9 +1661,16 @@ class PyTorchRuntime:
             try:
                 _compile_fn = getattr(self._torch, "compile", None)
                 if callable(_compile_fn):
+                    # P8: Use mode="default" (Triton codegen) instead of
+                    # "reduce-overhead" (CUDA Graphs). Qwen3.5's dynamic
+                    # KV cache + hybrid Mamba layers cause graph breaks on
+                    # every decode step, so CUDA Graphs never capture —
+                    # "reduce-overhead" adds JIT cost with zero benefit.
+                    # "default" fuses ops via Triton without requiring
+                    # fixed tensor shapes.
                     self._model = _compile_fn(
                         self._model,
-                        mode="reduce-overhead",
+                        mode="default",
                         fullgraph=False,
                     )
                     self._torch_compiled = True
@@ -2452,6 +2589,10 @@ class PyTorchRuntime:
         _shared_kv_states: dict[int, Any] = {}
 
         output = hidden
+        # Cast incoming activation to model weight dtype — cross-shard
+        # transfers may arrive in a different precision.
+        if hasattr(self, '_dtype') and self._dtype is not None and output.dtype != self._dtype:
+            output = output.to(self._dtype)
         for idx, block in zip(self.layer_indices, self._selected_layers):
             layer_type = (
                 self._layer_types[idx] if idx < len(self._layer_types) else "full_attention"

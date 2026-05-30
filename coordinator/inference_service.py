@@ -313,15 +313,31 @@ class InferenceService:
         The autoregressive sharded decode loop is needed for any backend
         that returns one token per forward call through a sharded pipeline.
         Both PyTorch and MLX sharded runtimes require this.
+
+        When a peer's ``runtime_backend`` is the default ``"toy_cpu"`` but it
+        has real sharding metadata (``layer_end > 0``) AND a non-toy
+        ``runtime_model_id``, treat it as a real backend.  This handles the
+        case where the peers-config JSON omits ``runtime_backend`` — the
+        peer is clearly running a real model (it has layers assigned) but
+        was constructed with the dataclass default.
         """
         if not pipeline:
             return False
         _REAL_BACKENDS = {"pytorch", "mlx"}
-        backends = [str(peer.runtime_backend or "").strip().lower() for peer in pipeline]
-        return bool(backends) and all(
-            any(item.startswith(prefix) for prefix in _REAL_BACKENDS)
-            for item in backends
-        )
+
+        def _is_real(peer: PeerEndpoint) -> bool:
+            backend = str(peer.runtime_backend or "").strip().lower()
+            if any(backend.startswith(p) for p in _REAL_BACKENDS):
+                return True
+            # Infer real backend from sharding metadata: a peer with
+            # layer_end > 0 is running a real sharded model, not a toy.
+            if backend in ("", "toy_cpu") and int(getattr(peer, "layer_end", 0) or 0) > 0:
+                _rmid = str(getattr(peer, "runtime_model_id", "") or "").strip()
+                if _rmid and not _rmid.startswith("tinyllama"):
+                    return True
+            return False
+
+        return all(_is_real(p) for p in pipeline)
 
     @staticmethod
     def _collect_eos_token_ids(tokenizer: Any) -> tuple[set[int], set[int]]:

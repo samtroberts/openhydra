@@ -472,6 +472,10 @@ class RingSession:
     # process-local (lives in the in-memory ``_RING_SESSIONS`` dict),
     # so this is fine. ``compare=False`` keeps it out of dataclass
     # equality / repr — locks aren't comparable.
+    # Cached route serialization — computed once on first ring step,
+    # reused on every subsequent token (avoids json.dumps per token).
+    _cached_full_route_bytes: list = field(default_factory=list, repr=False)
+    _cached_remaining_route_bytes: list = field(default_factory=list, repr=False)
     lock: threading.Lock = field(
         default_factory=threading.Lock,
         compare=False,
