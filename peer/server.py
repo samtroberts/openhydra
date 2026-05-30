@@ -155,7 +155,6 @@ def _proxy_handler_loop(
     from peer import peer_pb2
     import queue as _queue
     _fwd_q: _queue.Queue = _queue.Queue()
-    service._fwd_q = _fwd_q  # Expose to PeerService for ring self-reinject
 
     # ── GPU keep-alive config ─────────────────────────────────────────
     # Read from the shard's ToyShardConfig. Only active on MLX backends.
@@ -393,7 +392,7 @@ def _proxy_handler_loop(
                                 "FF_PUSH_RESULT_CRASH: req=%s err=%s",
                                 _resp.request_id, _exc, exc_info=True,
                             )
-                    _fwd_q.put(_ff_push_result)
+                    threading.Thread(target=_ff_push_result, daemon=True).start()
                 elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                     # PushResult path: ForwardResponse → PushResult RPC.
                     push_resp = _decode_forward_response(raw[1:])
@@ -3088,13 +3087,7 @@ class PeerService:
                     _rreq.request_id, exc, exc_info=True,
                 )
 
-        _q = getattr(self, "_fwd_q", None)
-        if _q is not None:
-            _q.put(_fire)
-        else:
-            # Fallback: no _fwd_q (pure-coordinator mode without
-            # _proxy_handler_loop). Spawn thread as before.
-            threading.Thread(target=_fire, daemon=True).start()
+        threading.Thread(target=_fire, daemon=True).start()
 
     def PushResult(self, request: peer_pb2.ForwardResponse, context: grpc.ServicerContext) -> peer_pb2.PushAck:
         """Receive final result from last peer in push chain.
