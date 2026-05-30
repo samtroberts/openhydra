@@ -155,6 +155,7 @@ def _proxy_handler_loop(
     from peer import peer_pb2
     import queue as _queue
     _fwd_q: _queue.Queue = _queue.Queue()
+    service._fwd_q = _fwd_q  # Expose to PeerService for ring self-reinject
 
     # ── GPU keep-alive config ─────────────────────────────────────────
     # Read from the shard's ToyShardConfig. Only active on MLX backends.
@@ -364,11 +365,11 @@ def _proxy_handler_loop(
 
                     def _ff_process(_req=_ff_request):
                         try:
-                            logging.info("ASYNC_THREAD_START: req=%s stage=%d ring=%s",
+                            logging.debug("ASYNC_THREAD_START: req=%s stage=%d ring=%s",
                                          _req.request_id, _req.stage_index,
                                          bool(getattr(_req, "ring_mode", False)))
                             service.Forward(_req, context=None)
-                            logging.info("ASYNC_THREAD_DONE: req=%s stage=%d",
+                            logging.debug("ASYNC_THREAD_DONE: req=%s stage=%d",
                                          _req.request_id, _req.stage_index)
                         except Exception as _ff_exc:
                             logging.error("ASYNC_THREAD_CRASH: req=%s stage=%d err=%s",
@@ -392,7 +393,7 @@ def _proxy_handler_loop(
                                 "FF_PUSH_RESULT_CRASH: req=%s err=%s",
                                 _resp.request_id, _exc, exc_info=True,
                             )
-                    threading.Thread(target=_ff_push_result, daemon=True).start()
+                    _fwd_q.put(_ff_push_result)
                 elif raw and raw[0:1] == PROXY_METHOD_PUSH_RESULT:
                     # PushResult path: ForwardResponse → PushResult RPC.
                     push_resp = _decode_forward_response(raw[1:])
@@ -1681,16 +1682,25 @@ class PeerService:
                 )
 
             kv_cache_hit = False
-            onion_route_ciphertext = b""
-            onion_route_nonces: list[bytes] = []
-            onion_route_ephemeral_public_keys: list[bytes] = []
-            onion_route_suite = ""
-            onion_route_layers = 0
-            onion_next_peer_id = ""
-            with self._lock:
-                self.last_onion_next_peer_id = None
+            _has_onion = bool(getattr(request, "onion_route_ciphertext", b""))
+            if _has_onion:
+                onion_route_ciphertext = b""
+                onion_route_nonces: list[bytes] = []
+                onion_route_ephemeral_public_keys: list[bytes] = []
+                onion_route_suite = ""
+                onion_route_layers = 0
+                onion_next_peer_id = ""
+                with self._lock:
+                    self.last_onion_next_peer_id = None
+            else:
+                onion_route_ciphertext = b""
+                onion_route_nonces = []
+                onion_route_ephemeral_public_keys = []
+                onion_route_suite = ""
+                onion_route_layers = 0
+                onion_next_peer_id = ""
 
-            if request.onion_route_ciphertext:
+            if _has_onion:
                 if self._peer_private_key is not None:
                     onion_layer = peel_onion_route_layer_with_privkey(
                         ciphertext=bytes(request.onion_route_ciphertext),
@@ -1809,7 +1819,7 @@ class PeerService:
                 decoder = TensorAutoencoder(CompressionProfile(latent_dim=max(1, latent_dim)))
                 activation_in = decoder.decode(activation_in, target_dim=original_dim)
 
-            logger.info("forward_dispatch: peer=%s stage=%d/%d backend=%s",
+            logger.debug("forward_dispatch: peer=%s stage=%d/%d backend=%s",
                        self.peer_id, int(request.stage_index), int(request.total_stages),
                        "pytorch" if self.shard.uses_pytorch_runtime else "batch_queue")
 
@@ -1988,16 +1998,16 @@ class PeerService:
             self.last_inference_thread_id = self.shard.last_forward_thread_id
 
             # TOPLOC: compute activation hash for integrity verification (P2-B)
+            # Uses vectorized PyTorch ops when activation is a tensor,
+            # avoiding the slow _hidden_to_payload materialization.
             _act_hash = b""
             try:
-                from verification.toploc import activation_hash
-                # activation_hash expects list[float]; materialise raw tensor.
-                _hash_act = (
-                    self.shard._hidden_to_payload(activation)
-                    if hasattr(activation, "shape")
-                    else activation
-                )
-                _act_hash = activation_hash(_hash_act)
+                if hasattr(activation, "shape"):
+                    from verification.toploc import activation_hash_tensor
+                    _act_hash = activation_hash_tensor(activation)
+                else:
+                    from verification.toploc import activation_hash
+                    _act_hash = activation_hash(activation)
             except Exception:
                 pass
 
@@ -2026,6 +2036,7 @@ class PeerService:
                 except Exception:
                     pass
 
+            _has_dp = self.shard.privacy_noise_variance > 0.0
             response = peer_pb2.ForwardResponse(
                 request_id=request.request_id,
                 peer_id=self.peer_id,
@@ -2040,12 +2051,12 @@ class PeerService:
                 onion_route_suite=onion_route_suite,
                 onion_route_layers=onion_route_layers,
                 onion_next_peer_id=onion_next_peer_id,
-                dp_noise_applied=bool(self.shard.privacy_noise_last_applied),
-                dp_noise_configured_variance=float(self.shard.privacy_noise_variance),
-                dp_noise_observed_variance=float(self.shard.privacy_noise_last_observed_variance),
-                dp_noise_observed_std=float(self.shard.privacy_noise_last_observed_std),
-                dp_noise_payload_index=int(self.shard.privacy_noise_last_payload_index),
-                dp_noise_audit_tag=str(self.shard.privacy_noise_last_audit_tag),
+                dp_noise_applied=bool(self.shard.privacy_noise_last_applied) if _has_dp else False,
+                dp_noise_configured_variance=float(self.shard.privacy_noise_variance) if _has_dp else 0.0,
+                dp_noise_observed_variance=float(self.shard.privacy_noise_last_observed_variance) if _has_dp else 0.0,
+                dp_noise_observed_std=float(self.shard.privacy_noise_last_observed_std) if _has_dp else 0.0,
+                dp_noise_payload_index=int(self.shard.privacy_noise_last_payload_index) if _has_dp else 0,
+                dp_noise_audit_tag=str(self.shard.privacy_noise_last_audit_tag) if _has_dp else "",
                 compression_latent_dim=max(0, int(getattr(request, "compression_latent_dim", 0) or 0)),
                 activation_hash=_act_hash,
                 is_hidden_state=_return_hidden,
@@ -2749,7 +2760,7 @@ class PeerService:
                 target_peer_id=_next_hop_libp2p_id,
                 data=_payload,
             )
-            logger.info(
+            logger.debug(
                 "push_forwarded: req=%s stage=%d -> %s (libp2p=%s ohv2=True)",
                 request.request_id, request.stage_index,
                 next_address, _next_hop_libp2p_id[:20],
@@ -2803,7 +2814,7 @@ class PeerService:
                 target_peer_id=_cb_libp2p,
                 data=_payload,
             )
-            logger.info(
+            logger.debug(
                 "push_result_sent: req=%s -> %s (libp2p=%s ohv2=True)",
                 _resp_hdr["request_id"], callback_address, _cb_libp2p[:20],
             )
@@ -2930,7 +2941,7 @@ class PeerService:
         session.ring_generated_ids.append(token_id)
         session.ring_tokens_remaining = max(0, session.ring_tokens_remaining - 1)
         emit_ring_token(session.callback_request_id, token_id)
-        logger.info(
+        logger.debug(
             "coordinator_ring_sampled: req=%s token=%d remaining=%d eos_hit=%s",
             response.request_id, token_id, session.ring_tokens_remaining,
             (token_id in session.ring_eos_ids),
@@ -2979,6 +2990,10 @@ class PeerService:
         also terminates on the coordinator.
         """
         route = list(session.ring_full_route)
+        # Cache route serialization on first call — route is static per session.
+        if not session._cached_full_route_bytes:
+            session._cached_full_route_bytes = self._serialize_route_to_bytes(route)
+            session._cached_remaining_route_bytes = self._serialize_route_to_bytes(route[1:])
         # Route entries are plain dicts — use dict access.
         _next_next = route[1]["address"] if len(route) > 1 else ""
         _next_next_id = route[1]["peer_id"] if len(route) > 1 else ""
@@ -3013,13 +3028,13 @@ class PeerService:
             "ring_first_hop_address": session.ring_first_hop_address,
             "ring_first_hop_peer_id": session.ring_first_hop_peer_id,
             "ring_first_hop_libp2p_id": session.ring_first_hop_libp2p_id,
-            "ring_full_route": self._serialize_route_to_bytes(route),
+            "ring_full_route": session._cached_full_route_bytes or self._serialize_route_to_bytes(route),
             "next_hop_address": _next_next,
             "next_hop_peer_id": _next_next_id,
             "final_callback_address": session.final_callback_address,
             "final_callback_request_id": session.callback_request_id,
             "final_callback_libp2p_peer_id": session.final_callback_libp2p_peer_id,
-            "remaining_route": self._serialize_route_to_bytes(route[1:]),
+            "remaining_route": session._cached_remaining_route_bytes or self._serialize_route_to_bytes(route[1:]),
             "activation_dtype": 0,
             "activation_shape": [],
         }
@@ -3030,7 +3045,7 @@ class PeerService:
         def _fire(_hdr=_reinj2_header, _act=_reinj2_packed,
                   _addr=_first_addr, _libp2p=_first_libp2p):
             try:
-                logger.info(
+                logger.debug(
                     "COORD_REINJECT_START: req=%s remaining=%d -> %s (libp2p=%s)",
                     _hdr["request_id"], _hdr["ring_tokens_remaining"],
                     _addr, _libp2p[:20] if _libp2p else "none",
@@ -3048,7 +3063,7 @@ class PeerService:
                     from peer.ohv2_adapter import OHV2Request
                     _ohv2_req = OHV2Request(_hdr, _act)
                     self.Forward(_ohv2_req, context=None)
-                    logger.info(
+                    logger.debug(
                         "COORD_REINJECT_DONE: req=%s via_local (self)",
                         _hdr["request_id"],
                     )
@@ -3063,7 +3078,7 @@ class PeerService:
                     target_peer_id=_libp2p,
                     data=PROXY_METHOD_FIRE_FORGET + bytes(_wire),
                 )
-                logger.info(
+                logger.debug(
                     "COORD_REINJECT_DONE: req=%s (libp2p=%s)",
                     _hdr["request_id"], _libp2p[:20],
                 )
@@ -3073,7 +3088,13 @@ class PeerService:
                     _rreq.request_id, exc, exc_info=True,
                 )
 
-        threading.Thread(target=_fire, daemon=True).start()
+        _q = getattr(self, "_fwd_q", None)
+        if _q is not None:
+            _q.put(_fire)
+        else:
+            # Fallback: no _fwd_q (pure-coordinator mode without
+            # _proxy_handler_loop). Spawn thread as before.
+            threading.Thread(target=_fire, daemon=True).start()
 
     def PushResult(self, request: peer_pb2.ForwardResponse, context: grpc.ServicerContext) -> peer_pb2.PushAck:
         """Receive final result from last peer in push chain.
@@ -3082,7 +3103,7 @@ class PeerService:
         The push_receiver module registers a callback for the request_id.
         """
         _is_hidden = bool(getattr(request, "is_hidden_state", False))
-        logger.info(
+        logger.debug(
             "push_result_received: req=%s from=%s is_hidden_state=%s",
             request.request_id, request.peer_id, _is_hidden,
         )

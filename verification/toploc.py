@@ -63,6 +63,39 @@ def activation_hash(activation: list[float]) -> bytes:
     return hashlib.sha256(bytes(packed)).digest()
 
 
+def activation_hash_tensor(tensor) -> bytes:
+    """Vectorized activation hash using PyTorch ops.
+
+    Accepts a raw PyTorch tensor (shape [batch, seq, hidden]) and
+    computes the same hash as activation_hash() but using PyTorch's
+    C++ vectorized ops instead of a Python for-loop over 1920 floats.
+
+    For hidden states (all values in [-1, 1] from layer norm), the
+    fast path produces byte-identical hashes to activation_hash().
+    Falls back to the original loop for mixed token-ID vectors.
+    """
+    try:
+        import torch
+    except ImportError:
+        # No PyTorch — fall back to the scalar loop.
+        if hasattr(tensor, "tolist"):
+            return activation_hash(tensor.tolist())
+        return activation_hash(list(tensor))
+
+    flat = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous().view(-1)
+    large_mask = flat.abs() > 1.5
+
+    if not large_mask.any():
+        # Fast path: all hidden states ≤1.5 — uniform 1-byte quantization.
+        # This is the common case for intermediate activations (layer-normed).
+        buckets = ((flat + 1.0) * 127.5).round().clamp(0, 255).to(torch.uint8)
+        return hashlib.sha256(buckets.numpy().tobytes()).digest()
+
+    # Slow path: mixed token-ID + hidden-state vector (rare for intermediate stages).
+    # Fall back to per-element loop to preserve exact mixed-width hash format.
+    return activation_hash(flat.tolist())
+
+
 def verify_hash(activation: list[float], expected_hash: bytes) -> bool:
     """Verify an activation vector against an expected hash.
 
