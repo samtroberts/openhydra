@@ -591,6 +591,53 @@ impl RingManager {
         self.sessions.contains_key(session_id)
     }
 
+    /// Check if any active session involves the given peer.
+    pub fn peer_has_active_session(&self, peer_id: &str) -> bool {
+        self.sessions
+            .values()
+            .any(|s| s.config.route.iter().any(|hop| hop.peer_id == peer_id))
+    }
+
+    /// Abort all sessions involving the given peer.
+    /// Returns `Vec<(session_id, generated_token_ids)>`.
+    pub fn abort_sessions_for_peer(&mut self, peer_id: &str) -> Vec<(String, Vec<u32>)> {
+        let to_abort: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.config.route.iter().any(|hop| hop.peer_id == peer_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut aborted = Vec::new();
+        for session_id in to_abort {
+            if let Some((_lr, ids)) = self.abort_session(&session_id, peer_id) {
+                aborted.push((session_id, ids));
+            }
+        }
+        aborted
+    }
+
+    /// Returns `(session_id, reason)` pairs for sessions that exceeded
+    /// their hop timeout with no activity.
+    pub fn check_timeouts(&self) -> Vec<(String, String)> {
+        let now = std::time::Instant::now();
+        let mut timed_out = Vec::new();
+        for (session_id, session) in &self.sessions {
+            // Use hop_timeout_ms with a minimum floor of 30 s.
+            let timeout =
+                std::time::Duration::from_millis(session.config.hop_timeout_ms.max(30_000));
+            if now.duration_since(session.last_inject_time) > timeout {
+                timed_out.push((
+                    session_id.clone(),
+                    format!(
+                        "no activity for {:?}",
+                        now.duration_since(session.last_inject_time)
+                    ),
+                ));
+            }
+        }
+        timed_out
+    }
+
     /// Get a reference to a session's config (for building SampleRequest).
     pub fn session_config(&self, session_id: &str) -> Option<&RingConfig> {
         self.sessions.get(session_id).map(|s| &s.config)
@@ -676,6 +723,10 @@ impl RingManager {
     /// The request_id is carried through every hop and returned in the
     /// PushResult from the last peer.
     pub fn register_request(&mut self, request_id: String, session_id: String) {
+        // B3: Refresh activity timestamp for timeout watchdog.
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            s.last_inject_time = std::time::Instant::now();
+        }
         info!(%request_id, %session_id, "ring: registered request");
         self.pending_requests.insert(request_id, session_id);
     }
@@ -818,6 +869,10 @@ impl RingManager {
         session_id: String,
         chunk_index: usize,
     ) {
+        // B3: Refresh activity timestamp for timeout watchdog.
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            s.last_inject_time = std::time::Instant::now();
+        }
         info!(
             %request_id, %session_id, %chunk_index,
             "ring: registered prefill chunk request"
@@ -1768,5 +1823,88 @@ mod tests {
         mgr.remove_session("ring-001");
         assert!(!mgr.is_ring_request("pf-0"));
         assert_eq!(mgr.prefill_request_count(), 0);
+    }
+
+    // ── B3/B4 tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_check_timeouts_no_timeout() {
+        let mut mgr = RingManager::new();
+        let _handle = mgr.start_session(test_config());
+        // Immediately after creation, nothing should be timed out.
+        assert!(mgr.check_timeouts().is_empty());
+    }
+
+    #[test]
+    fn test_check_timeouts_expired() {
+        let mut mgr = RingManager::new();
+        let _handle = mgr.start_session(test_config());
+        // Manually backdate the last_inject_time to 60s ago.
+        mgr.sessions
+            .get_mut("ring-001")
+            .unwrap()
+            .last_inject_time = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let timed_out = mgr.check_timeouts();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].0, "ring-001");
+    }
+
+    #[test]
+    fn test_peer_has_active_session() {
+        let mut mgr = RingManager::new();
+        let _handle = mgr.start_session(test_config());
+        assert!(mgr.peer_has_active_session("peer-A"));
+        assert!(mgr.peer_has_active_session("peer-B"));
+        assert!(!mgr.peer_has_active_session("peer-C"));
+    }
+
+    #[test]
+    fn test_abort_sessions_for_peer() {
+        let mut mgr = RingManager::new();
+        let _h1 = mgr.start_session(test_config());
+        // Second session on different peers.
+        let mut cfg2 = test_config();
+        cfg2.session_id = "ring-002".into();
+        cfg2.request_id = "req-002".into();
+        cfg2.route = vec![
+            RingHop {
+                peer_id: "peer-C".into(),
+                layer_start: 0,
+                layer_end: 16,
+                total_layers: 32,
+            },
+            RingHop {
+                peer_id: "peer-D".into(),
+                layer_start: 16,
+                layer_end: 32,
+                total_layers: 32,
+            },
+        ];
+        let _h2 = mgr.start_session(cfg2);
+
+        assert_eq!(mgr.active_sessions(), 2);
+
+        // Abort sessions involving peer-A — only ring-001 should be aborted.
+        let aborted = mgr.abort_sessions_for_peer("peer-A");
+        assert_eq!(aborted.len(), 1);
+        assert_eq!(aborted[0].0, "ring-001");
+        assert_eq!(mgr.active_sessions(), 1);
+        assert!(mgr.has_session("ring-002"));
+    }
+
+    #[test]
+    fn test_abort_sessions_for_peer_cleans_pending() {
+        let mut mgr = RingManager::new();
+        let _handle = mgr.start_session(test_config());
+        mgr.register_request("req-100".into(), "ring-001".into());
+        mgr.register_request("req-101".into(), "ring-001".into());
+        assert!(mgr.is_ring_request("req-100"));
+        assert!(mgr.is_ring_request("req-101"));
+
+        mgr.abort_sessions_for_peer("peer-B");
+        // Pending requests should be cleaned up.
+        assert!(!mgr.is_ring_request("req-100"));
+        assert!(!mgr.is_ring_request("req-101"));
+        assert_eq!(mgr.active_sessions(), 0);
     }
 }

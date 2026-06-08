@@ -133,7 +133,8 @@ impl Default for BatcherConfig {
     fn default() -> Self {
         Self {
             max_batch_size: 4,
-            max_wait: std::time::Duration::from_millis(5),
+            // C2: Reduced from 5ms to 1ms — caps per-hop queue delay at ~1ms.
+            max_wait: std::time::Duration::from_millis(1),
         }
     }
 }
