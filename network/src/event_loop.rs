@@ -12,7 +12,7 @@ use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{kad, Multiaddr, PeerId};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::batcher::{Batcher, BatchItem, BatchKey, DtypeTag, FlushedBatch};
 use crate::behaviour::{OpenHydraBehaviour, OpenHydraBehaviourEvent};
@@ -409,6 +409,8 @@ struct LoopState {
     /// ``GOSSIP_INBOUND_QUEUE_MAX`` to prevent unbounded memory growth
     /// when Python is slow to poll.
     gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
+    /// B2: Per-peer relay dial retry state: (attempt_count, last_attempt).
+    relay_dial_retries: HashMap<PeerId, (u32, tokio::time::Instant)>,
 }
 
 /// PR-3: upper bound on pending inbound gossip messages.
@@ -467,6 +469,7 @@ impl LoopState {
             batch_pending: HashMap::new(),
             prefill_stage0_acks: HashMap::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
+            relay_dial_retries: HashMap::new(),
         }
     }
 }
@@ -562,8 +565,18 @@ pub async fn run_event_loop(
     reaper_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // CP-4: Batch flush ticker — fires every 5ms to drain time-expired batches.
-    let mut batch_ticker = tokio::time::interval(std::time::Duration::from_millis(5));
+    // C2: Reduced from 5ms to 1ms — caps per-hop queue delay at ~1ms instead of ~5ms.
+    let mut batch_ticker = tokio::time::interval(std::time::Duration::from_millis(1));
     batch_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // B3: Ring session timeout watchdog — checks every 5s for stale sessions.
+    let mut ring_timeout_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    ring_timeout_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // B5: Relay reservation renewal — every 30 minutes (well before the
+    // 1-hour server-side reservation_duration from Workstream D).
+    let mut relay_renewal_ticker = tokio::time::interval(std::time::Duration::from_secs(1800));
+    relay_renewal_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Retry dialing non-relay bootstrap peers every 15s until connected or retry cap hit.
@@ -1015,6 +1028,32 @@ pub async fn run_event_loop(
                     }
                 }
             }
+            // B3: Ring session timeout watchdog.
+            _ = ring_timeout_ticker.tick() => {
+                let timed_out = state.ring_manager.check_timeouts();
+                for (session_id, reason) in timed_out {
+                    warn!(%session_id, %reason, "ring: session timed out, aborting");
+                    state.ring_manager.remove_session(&session_id);
+                }
+            }
+            // B5: Proactive relay reservation renewal.
+            _ = relay_renewal_ticker.tick() => {
+                info!("relay_renewal: proactively re-requesting reservations");
+                for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+                    if let Ok(relay_ma) = relay_str.parse::<Multiaddr>() {
+                        let listen_addr =
+                            relay_ma.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        match swarm.listen_on(listen_addr.clone()) {
+                            Ok(_) => {
+                                debug!(addr = %listen_addr, "relay_renewal: reservation requested");
+                            }
+                            Err(e) => {
+                                warn!(addr = %listen_addr, %e, "relay_renewal: listen_on failed");
+                            }
+                        }
+                    }
+                }
+            }
             // Process swarm events.
             event = swarm.select_next_some() => {
                 handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
@@ -1348,6 +1387,9 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+            // B2: Clear relay dial retry state on successful reconnection.
+            state.relay_dial_retries.remove(&peer_id);
+
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
@@ -1495,6 +1537,13 @@ fn handle_swarm_event(
                     let pid = peer_id;
                     tokio::spawn(async move { mgr.remove_peer(&pid).await });
                 }
+
+                // B4: Abort ring sessions involving this peer.
+                let peer_id_str = peer_id.to_string();
+                let aborted = state.ring_manager.abort_sessions_for_peer(&peer_id_str);
+                for (session_id, _) in &aborted {
+                    warn!(%session_id, %peer_id, "ring: aborted session due to peer disconnect");
+                }
             }
         }
         SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -1528,25 +1577,93 @@ fn handle_swarm_event(
                 );
             }
         }
-        // Phase 1.3: Failed dials are a strong signal of unreachability.
-        // Evict from Kademlia + known_peers if not otherwise connected.
+        // Phase 1.3 + B2: Failed dials with relay-aware retry for active
+        // ring sessions, immediate eviction otherwise.
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             warn!(?peer_id, %error, "outgoing_connection_error");
             if let Some(ref pid) = peer_id {
                 if !swarm.is_connected(pid) {
-                    swarm.behaviour_mut().kademlia.remove_peer(pid);
-                    let libp2p_id_str = pid.to_string();
-                    state.known_peers.retain(|_, record| {
-                        record.libp2p_peer_id != libp2p_id_str
-                    });
-                    info!(%pid, "evicted unreachable peer after dial failure");
+                    let pid_str = pid.to_string();
+                    let has_ring = state.ring_manager.peer_has_active_session(&pid_str);
+
+                    if has_ring {
+                        // B2: Retry via relay with exponential backoff.
+                        let entry = state
+                            .relay_dial_retries
+                            .entry(*pid)
+                            .or_insert((0, tokio::time::Instant::now()));
+                        entry.0 += 1;
+                        entry.1 = tokio::time::Instant::now();
+
+                        if entry.0 <= 5 {
+                            let backoff_ms = 500 * (1u64 << (entry.0 - 1).min(4));
+                            info!(
+                                %pid, attempt = entry.0, backoff_ms,
+                                "relay_reconnect: retrying via relay"
+                            );
+                            for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+                                if let Ok(relay_ma) = relay_str.parse::<Multiaddr>() {
+                                    let circuit_addr = relay_ma
+                                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                                        .with(libp2p::multiaddr::Protocol::P2p(*pid));
+                                    if swarm.dial(circuit_addr).is_ok() {
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!(%pid, "relay_reconnect: max retries (5) exceeded, evicting");
+                            state.relay_dial_retries.remove(pid);
+                            swarm.behaviour_mut().kademlia.remove_peer(pid);
+                            state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
+                            // B4: also abort ring sessions for this peer.
+                            let aborted = state.ring_manager.abort_sessions_for_peer(&pid_str);
+                            for (sid, _) in &aborted {
+                                warn!(%sid, %pid, "ring: aborted session after relay retry exhaustion");
+                            }
+                            info!(%pid, "evicted unreachable peer after relay retries exhausted");
+                        }
+                    } else {
+                        // No active ring session — existing behavior: immediate eviction.
+                        swarm.behaviour_mut().kademlia.remove_peer(pid);
+                        state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
+                        info!(%pid, "evicted unreachable peer after dial failure");
+                    }
                 }
             }
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming_connection_error");
         }
-        _ => {}
+        // B1: Explicit handlers for relay-critical events (previously silent).
+        SwarmEvent::ExpiredListenAddr { address, .. } => {
+            warn!(%address, "listen_addr_expired");
+            if address.to_string().contains("/p2p-circuit") {
+                info!(%address, "relay reservation expired, requesting renewal");
+                match swarm.listen_on(address.clone()) {
+                    Ok(_) => info!(%address, "relay re-reservation requested"),
+                    Err(e) => warn!(%address, %e, "relay re-reservation failed"),
+                }
+            }
+        }
+        SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+            warn!(?addresses, ?reason, "listener_closed");
+            for addr in &addresses {
+                if addr.to_string().contains("/p2p-circuit") {
+                    info!(%addr, "relay listener closed, re-opening");
+                    let _ = swarm.listen_on(addr.clone());
+                }
+            }
+        }
+        SwarmEvent::ListenerError { error, .. } => {
+            warn!(%error, "listener_error");
+        }
+        SwarmEvent::Dialing { peer_id, .. } => {
+            debug!(?peer_id, "dialing");
+        }
+        _ => {
+            trace!("unhandled_swarm_event");
+        }
     }
 }
 
@@ -2275,6 +2392,11 @@ fn handle_proxy_forward(
     // reliable over both direct and relay connections. Tensor stream is
     // only used in the fire-and-forget path (proxy_forward_no_wait / push mode).
     if swarm.is_connected(&peer_id) {
+        // C3: Log transport type at dispatch time.
+        let transport = state.peer_connections.get(&peer_id)
+            .map(|info| if info.has_direct() { "direct" } else { "relay" })
+            .unwrap_or("unknown");
+        debug!(%peer_id, %transport, bytes = data.len(), "proxy_forward");
         let req_id = swarm
             .behaviour_mut()
             .grpc_proxy
@@ -2348,9 +2470,15 @@ fn handle_proxy_forward_no_wait(
         return;
     }
 
+    // C3: Log transport type at dispatch time.
+    let transport = state.peer_connections.get(&peer_id)
+        .map(|info| if info.has_direct() { "direct" } else { "relay" })
+        .unwrap_or("unknown");
+
     // Fix 1: prefer tensor stream (fire-and-forget) for connected peers.
     if let Some(ref mgr) = state.tensor_mgr {
         if swarm.is_connected(&peer_id) {
+            debug!(%peer_id, %transport, bytes = data.len(), "proxy_forward_no_wait via tensor_stream");
             let mgr = Arc::clone(mgr);
             let pid = peer_id;
             tokio::spawn(async move {
@@ -2364,6 +2492,7 @@ fn handle_proxy_forward_no_wait(
 
     // Fallback: request-response.
     if swarm.is_connected(&peer_id) {
+        debug!(%peer_id, %transport, bytes = data.len(), "proxy_forward_no_wait via request_response");
         let _req_id = swarm
             .behaviour_mut()
             .grpc_proxy

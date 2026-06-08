@@ -144,14 +144,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_reservations: 256,
             max_circuits: 512,
             max_circuits_per_peer: 8,
-            // 15 min — peers re-reserve on reconnect; covers long inference
-            // runs (2048 tokens @ 3 TPS ≈ 683s) with margin.
-            reservation_duration: Duration::from_secs(900),
-            // 10 MB per circuit — activation tensors can be several MB.
-            max_circuit_bytes: 10 * 1024 * 1024,
-            // Phase 5.5: 30 minutes per circuit — a 2048-token generation at
-            // 3 TPS takes ~683s, exceeding the previous 600s limit.
-            max_circuit_duration: Duration::from_secs(1800),
+            // 1 hour — defense-in-depth while peer-side renewal (B5) is pending.
+            reservation_duration: Duration::from_secs(3600),
+            // 64 MB per circuit — supports ~4000 tokens at ~16 KB/token (2 hops).
+            max_circuit_bytes: 64 * 1024 * 1024,
+            // 1 hour per circuit — matches reservation_duration.
+            max_circuit_duration: Duration::from_secs(3600),
             ..Default::default()
         },
     );
@@ -255,12 +253,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("bootstrap node running — press Ctrl+C to stop");
 
+    // Relay metrics counters — updated by event handlers, logged by ticker.
+    let mut active_reservations: u64 = 0;
+    let mut active_circuits: u64 = 0;
+    let mut total_circuits: u64 = 0;
+    let mut denied_circuits: u64 = 0;
+
+    let mut metrics_ticker = tokio::time::interval(Duration::from_secs(300));
+    metrics_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Event loop — Phase 4.4: graceful shutdown via signal handling.
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("received SIGTERM/SIGINT, shutting down gracefully");
                 break;
+            }
+            _ = metrics_ticker.tick() => {
+                let peers = swarm.connected_peers().count();
+                info!(
+                    active_reservations,
+                    active_circuits,
+                    total_circuits,
+                    denied_circuits,
+                    connected_peers = peers,
+                    "relay_metrics"
+                );
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -277,23 +295,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             BootstrapBehaviourEvent::RelayServer(
                                 relay::Event::ReservationReqAccepted { src_peer_id, .. },
                             ) => {
-                                info!(%src_peer_id, "relay reservation accepted");
+                                active_reservations += 1;
+                                info!(%src_peer_id, active_reservations, "relay reservation accepted");
                             }
                             BootstrapBehaviourEvent::RelayServer(
                                 relay::Event::CircuitClosed { src_peer_id, dst_peer_id, error },
                             ) => {
-                                info!(%src_peer_id, %dst_peer_id, ?error, "relay circuit closed");
+                                active_circuits = active_circuits.saturating_sub(1);
+                                info!(%src_peer_id, %dst_peer_id, ?error, active_circuits, "relay circuit closed");
                             }
                             // Task 7.1: Relay server — circuit/reservation lifecycle
                             BootstrapBehaviourEvent::RelayServer(
                                 relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id },
                             ) => {
-                                info!(%src_peer_id, %dst_peer_id, "relay circuit request accepted");
+                                active_circuits += 1;
+                                total_circuits += 1;
+                                info!(%src_peer_id, %dst_peer_id, active_circuits, total_circuits, "relay circuit request accepted");
                             }
                             BootstrapBehaviourEvent::RelayServer(
                                 relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id },
                             ) => {
-                                warn!(%src_peer_id, %dst_peer_id, "relay circuit request denied (capacity limit)");
+                                denied_circuits += 1;
+                                warn!(%src_peer_id, %dst_peer_id, denied_circuits, "relay circuit request denied (capacity limit)");
                             }
                             BootstrapBehaviourEvent::RelayServer(
                                 relay::Event::ReservationReqDenied { src_peer_id },
@@ -303,7 +326,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             BootstrapBehaviourEvent::RelayServer(
                                 relay::Event::ReservationTimedOut { src_peer_id },
                             ) => {
-                                info!(%src_peer_id, "relay reservation timed out");
+                                active_reservations = active_reservations.saturating_sub(1);
+                                info!(%src_peer_id, active_reservations, "relay reservation timed out");
                             }
                             #[allow(deprecated)]
                             BootstrapBehaviourEvent::RelayServer(other) => {
