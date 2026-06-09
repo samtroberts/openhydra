@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from typing import Any, Iterator
+
+from .adapter import (
+    SupernodeAdapter,
+    PromptRequest,
+    TokenChunk,
+    ModelInfo,
+    BackendStatus,
+    BackendError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class SupernodeRouter:
+    """Routes OpenAI-format requests to registered SupernodeAdapters.
+
+    MVP: single local adapter (Ollama). Phase 1d adds remote dispatch
+    via libp2p; this class gains multi-adapter selection at that point.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop | None = None):
+        self._adapters: dict[str, SupernodeAdapter] = {}
+        self._loop = loop
+        self._model_cache: dict[str, list[ModelInfo]] = {}
+
+    def register_adapter(self, name: str, adapter: SupernodeAdapter) -> None:
+        self._adapters[name] = adapter
+
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        if self._loop is not None:
+            return self._loop
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            self._loop = asyncio.new_event_loop()
+            return self._loop
+
+    # ------------------------------------------------------------------
+    # Model listing
+    # ------------------------------------------------------------------
+
+    def list_models_openai(self) -> dict[str, Any]:
+        loop = self._get_loop()
+        models = loop.run_until_complete(self._list_all_models())
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": m.model_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "openhydra",
+                    "openhydra": {
+                        "family": m.model_family,
+                        "parameter_count": m.parameter_count,
+                        "quantization": m.quantization,
+                        "context_length": m.context_length,
+                        "supports_streaming": m.supports_streaming,
+                    },
+                }
+                for m in models
+            ],
+        }
+
+    async def _list_all_models(self) -> list[ModelInfo]:
+        all_models: list[ModelInfo] = []
+        for name, adapter in self._adapters.items():
+            try:
+                models = await adapter.list_models()
+                self._model_cache[name] = models
+                all_models.extend(models)
+            except Exception:
+                logger.warning("supernode_list_models_failed adapter=%s", name, exc_info=True)
+        return all_models
+
+    # ------------------------------------------------------------------
+    # Supernode status
+    # ------------------------------------------------------------------
+
+    def list_supernodes(self) -> list[dict[str, Any]]:
+        loop = self._get_loop()
+        return loop.run_until_complete(self._list_supernodes_async())
+
+    async def _list_supernodes_async(self) -> list[dict[str, Any]]:
+        results = []
+        for name, adapter in self._adapters.items():
+            entry: dict[str, Any] = {
+                "name": name,
+                "backend": adapter.backend_type(),
+                "trust_tier": adapter.trust_tier(),
+                "integration_level": adapter.integration_level(),
+                "healthy": False,
+                "status": None,
+                "models": [],
+            }
+            try:
+                entry["healthy"] = await adapter.health_check()
+                if entry["healthy"]:
+                    status = await adapter.get_status()
+                    entry["status"] = {
+                        "current_load": status.current_load,
+                        "active_requests": status.active_requests,
+                        "max_concurrent": status.max_concurrent,
+                        "gpu_memory_free_mb": status.gpu_memory_free_mb,
+                        "models_loaded": status.models_loaded,
+                    }
+                    models = await adapter.list_models()
+                    entry["models"] = [m.model_id for m in models]
+            except Exception:
+                logger.warning("supernode_status_failed adapter=%s", name, exc_info=True)
+            results.append(entry)
+        return results
+
+    # ------------------------------------------------------------------
+    # Inference — chat completions
+    # ------------------------------------------------------------------
+
+    def chat_completion(
+        self,
+        body: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        request_id = request_id or str(uuid.uuid4())
+        req = self._body_to_prompt_request(body, request_id)
+        loop = self._get_loop()
+        return loop.run_until_complete(self._chat_completion_async(req, body))
+
+    def chat_completion_stream(
+        self,
+        body: dict[str, Any],
+        request_id: str | None = None,
+    ) -> Iterator[str]:
+        request_id = request_id or str(uuid.uuid4())
+        req = self._body_to_prompt_request(body, request_id)
+        req.stream = True
+        loop = self._get_loop()
+
+        async def collect():
+            chunks = []
+            async for chunk in self._generate(req):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = loop.run_until_complete(collect())
+        for chunk in chunks:
+            if chunk.token:
+                yield chunk.token
+
+    # ------------------------------------------------------------------
+    # Inference — text completions
+    # ------------------------------------------------------------------
+
+    def text_completion(
+        self,
+        body: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        request_id = request_id or str(uuid.uuid4())
+        req = self._body_to_prompt_request(body, request_id, mode="completion")
+        loop = self._get_loop()
+        return loop.run_until_complete(self._text_completion_async(req, body))
+
+    def text_completion_stream(
+        self,
+        body: dict[str, Any],
+        request_id: str | None = None,
+    ) -> Iterator[str]:
+        request_id = request_id or str(uuid.uuid4())
+        req = self._body_to_prompt_request(body, request_id, mode="completion")
+        req.stream = True
+        loop = self._get_loop()
+
+        async def collect():
+            chunks = []
+            async for chunk in self._generate(req):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = loop.run_until_complete(collect())
+        for chunk in chunks:
+            if chunk.token:
+                yield chunk.token
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    async def _chat_completion_async(
+        self, req: PromptRequest, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        text_parts: list[str] = []
+        token_count = 0
+        finish_reason = "stop"
+
+        async for chunk in self._generate(req):
+            text_parts.append(chunk.token)
+            token_count += 1
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+
+        return {
+            "id": req.request_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model_id,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(text_parts)},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": token_count,
+                "total_tokens": token_count,
+            },
+        }
+
+    async def _text_completion_async(
+        self, req: PromptRequest, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        text_parts: list[str] = []
+        token_count = 0
+        finish_reason = "stop"
+
+        async for chunk in self._generate(req):
+            text_parts.append(chunk.token)
+            token_count += 1
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+
+        return {
+            "id": req.request_id,
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": req.model_id,
+            "choices": [{
+                "index": 0,
+                "text": "".join(text_parts),
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": token_count,
+                "total_tokens": token_count,
+            },
+        }
+
+    async def _generate(self, req: PromptRequest):
+        adapter = self._select_adapter(req.model_id)
+        if adapter is None:
+            raise BackendError(f"No adapter available for model '{req.model_id}'")
+        async for chunk in adapter.generate(req):
+            yield chunk
+
+    def _select_adapter(self, model_id: str) -> SupernodeAdapter | None:
+        if len(self._adapters) == 1:
+            return next(iter(self._adapters.values()))
+        for name, cached_models in self._model_cache.items():
+            if any(m.model_id == model_id for m in cached_models):
+                return self._adapters[name]
+        if self._adapters:
+            return next(iter(self._adapters.values()))
+        return None
+
+    def _body_to_prompt_request(
+        self,
+        body: dict[str, Any],
+        request_id: str,
+        mode: str = "chat",
+    ) -> PromptRequest:
+        stop = body.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+
+        if mode == "chat":
+            return PromptRequest(
+                request_id=request_id,
+                model_id=str(body.get("model", "")),
+                messages=body.get("messages"),
+                max_tokens=int(body.get("max_tokens", 512)),
+                temperature=float(body.get("temperature", 0.7)),
+                top_p=float(body.get("top_p", 0.9)),
+                top_k=int(body.get("top_k", 40)),
+                stop=stop,
+                stream=bool(body.get("stream", False)),
+                response_format=body.get("response_format", {}).get("type", "text")
+                if isinstance(body.get("response_format"), dict)
+                else str(body.get("response_format", "text")),
+            )
+        else:
+            return PromptRequest(
+                request_id=request_id,
+                model_id=str(body.get("model", "")),
+                prompt=str(body.get("prompt", "")),
+                max_tokens=int(body.get("max_tokens", 512)),
+                temperature=float(body.get("temperature", 0.7)),
+                top_p=float(body.get("top_p", 0.9)),
+                top_k=int(body.get("top_k", 40)),
+                stop=stop,
+                stream=bool(body.get("stream", False)),
+                response_format=body.get("response_format", {}).get("type", "text")
+                if isinstance(body.get("response_format"), dict)
+                else str(body.get("response_format", "text")),
+            )

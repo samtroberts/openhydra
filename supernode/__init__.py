@@ -7,6 +7,7 @@ from .adapter import (
     BackendError,
 )
 from .ollama_adapter import OllamaAdapter
+from .router import SupernodeRouter
 
 __all__ = [
     "SupernodeAdapter",
@@ -16,4 +17,5 @@ __all__ = [
     "BackendStatus",
     "BackendError",
     "OllamaAdapter",
+    "SupernodeRouter",
 ]
