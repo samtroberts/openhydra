@@ -90,16 +90,12 @@ class ManifestPublisher:
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self) -> None:
-        self._loop = asyncio.new_event_loop()
         try:
-            self._loop.run_until_complete(self._publish())
+            asyncio.run(self._publish())
             while not self._stop_event.wait(timeout=self._refresh_interval):
-                self._loop.run_until_complete(self._publish())
+                asyncio.run(self._publish())
         except Exception:
             logger.error("manifest_publisher_crash", exc_info=True)
-        finally:
-            self._loop.close()
-            self._loop = None
 
     async def _publish(self) -> None:
         try:
@@ -168,14 +164,5 @@ class ManifestPublisher:
 
     def publish_now(self) -> bool:
         """Force an immediate publish (blocking). Returns True on success."""
-        if self._loop is None:
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(self._publish())
-                return True
-            finally:
-                loop.close()
-        else:
-            future = asyncio.run_coroutine_threadsafe(self._publish(), self._loop)
-            future.result(timeout=10.0)
-            return True
+        asyncio.run(self._publish())
+        return True
