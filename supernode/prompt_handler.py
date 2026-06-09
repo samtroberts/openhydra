@@ -142,7 +142,6 @@ class PromptHandlerLoop:
         cancel_event: threading.Event,
     ) -> None:
         adapter_req = _wire_to_adapter_request(wire)
-        loop = asyncio.new_event_loop()
         try:
             token_count = 0
             t0 = time.monotonic()
@@ -162,7 +161,7 @@ class PromptHandlerLoop:
                         return chunk.finish_reason
                 return "stop"
 
-            finish_reason = loop.run_until_complete(_stream())
+            finish_reason = asyncio.run(_stream())
             elapsed = time.monotonic() - t0
             tps = token_count / elapsed if elapsed > 0 else 0.0
             ttft_ms = int((first_token_time - t0) * 1000) if first_token_time else 0
@@ -192,8 +191,6 @@ class PromptHandlerLoop:
         except Exception as e:
             logger.error("prompt_handler_crash request_id=%s: %s", wire.request_id, e, exc_info=True)
             self._send_error(req_id, str(e), retryable=False)
-        finally:
-            loop.close()
 
     def _send_error(self, req_id: str, error: str, retryable: bool) -> None:
         chunk = WireChunk(
