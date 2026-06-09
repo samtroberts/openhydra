@@ -21,11 +21,11 @@ class OllamaAdapter(SupernodeAdapter):
         self._session: aiohttp.ClientSession | None = None
         self._active_requests: dict[str, bool] = {}
 
+    _REQ_TIMEOUT = aiohttp.ClientTimeout(total=300)
+
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=300)
-            )
+            self._session = aiohttp.ClientSession()
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -34,7 +34,7 @@ class OllamaAdapter(SupernodeAdapter):
 
     async def list_models(self) -> list[ModelInfo]:
         await self._ensure_session()
-        async with self._session.get(f"{self._base_url}/api/tags") as resp:
+        async with self._session.get(f"{self._base_url}/api/tags", timeout=self._REQ_TIMEOUT) as resp:
             if resp.status != 200:
                 raise BackendError(f"Ollama /api/tags returned {resp.status}")
             data = await resp.json()
@@ -89,7 +89,7 @@ class OllamaAdapter(SupernodeAdapter):
             body["format"] = "json"
 
         try:
-            async with self._session.post(url, json=body) as resp:
+            async with self._session.post(url, json=body, timeout=self._REQ_TIMEOUT) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     raise BackendError(f"Ollama error {resp.status}: {error_text}")
@@ -125,7 +125,7 @@ class OllamaAdapter(SupernodeAdapter):
 
     async def get_status(self) -> BackendStatus:
         await self._ensure_session()
-        async with self._session.get(f"{self._base_url}/api/ps") as resp:
+        async with self._session.get(f"{self._base_url}/api/ps", timeout=self._REQ_TIMEOUT) as resp:
             if resp.status != 200:
                 raise BackendError(f"Ollama /api/ps returned {resp.status}")
             data = await resp.json()
