@@ -5,6 +5,7 @@ import time
 
 import pytest
 import pytest_asyncio
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from supernode.adapter import (
     SupernodeAdapter,
@@ -15,6 +16,9 @@ from supernode.adapter import (
     BackendError,
 )
 from supernode.router import SupernodeRouter
+from supernode.manifest import SupernodeManifest, ModelCapability, HardwareInfo
+from supernode.discovery import SupernodeDiscovery
+from supernode.selector import PromptRouter
 
 
 # ---------------------------------------------------------------------------
@@ -341,3 +345,152 @@ class TestAdapterSelection:
         result = r.chat_completion(body)
         assert a2._last_request is not None
         assert a1._last_request is None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for failover tests
+# ---------------------------------------------------------------------------
+
+class MidStreamFailAdapter(SupernodeAdapter):
+    """Yields one token then raises."""
+
+    async def list_models(self):
+        return [ModelInfo("llama3:8b", "llama", 8000, "Q4_0", 8192)]
+
+    async def generate(self, request):
+        yield TokenChunk(token="partial")
+        raise ConnectionError("mid-stream disconnect")
+
+    async def cancel(self, request_id): pass
+    async def get_status(self):
+        return BackendStatus(0.0, 0, 4, 12000, ["llama3:8b"])
+    async def health_check(self): return True
+    async def warmup(self, model_id): return True
+
+
+class PreTokenFailAdapter(SupernodeAdapter):
+    """Raises before yielding any token."""
+
+    async def list_models(self):
+        return [ModelInfo("llama3:8b", "llama", 8000, "Q4_0", 8192)]
+
+    async def generate(self, request):
+        raise ConnectionError("connection refused")
+        yield  # noqa: make it a generator
+
+    async def cancel(self, request_id): pass
+    async def get_status(self):
+        return BackendStatus(0.0, 0, 4, 12000, ["llama3:8b"])
+    async def health_check(self): return True
+    async def warmup(self, model_id): return True
+
+
+def _make_signed_manifest(peer_id, model_ids=None, trust_tier="unverified"):
+    model_ids = model_ids or ["llama3:8b"]
+    key = Ed25519PrivateKey.generate()
+    m = SupernodeManifest(
+        peer_id=peer_id,
+        libp2p_peer_id=f"12D3KooW{peer_id}",
+        backend_type="ollama",
+        version="0.1.0",
+        integration_level=1,
+        trust_tier=trust_tier,
+        models=[
+            ModelCapability(mid, "llama", 8000, "Q4_0", 8192)
+            for mid in model_ids
+        ],
+        max_concurrent=4,
+        max_context_length=8192,
+        hardware=HardwareInfo(),
+        listen_addrs=["/ip4/127.0.0.1/tcp/4001"],
+        nat_status="unknown",
+        region="",
+    )
+    m.sign(key)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Tests: fail-fast failover
+# ---------------------------------------------------------------------------
+
+class TestFailover:
+    @pytest.fixture
+    def loop(self):
+        l = asyncio.new_event_loop()
+        yield l
+        l.close()
+
+    def _build_router(self, loop, adapters_by_peer_id, model_id="llama3:8b"):
+        """Wire up discovery + prompt_router + supernode_router."""
+        discovery = SupernodeDiscovery()
+        prompt_router = PromptRouter(discovery)
+
+        for peer_id, adapter in adapters_by_peer_id.items():
+            manifest = _make_signed_manifest(peer_id, [model_id])
+            discovery.register_manifest(manifest)
+            prompt_router.register_adapter(f"12D3KooW{peer_id}", adapter)
+
+        return SupernodeRouter(loop=loop, prompt_router=prompt_router)
+
+    def test_pre_token_failover_to_next(self, loop):
+        """Pre-first-token failure should retry the next candidate."""
+        r = self._build_router(loop, {
+            "fail": PreTokenFailAdapter(),
+            "good": MockAdapter(tokens=["ok"]),
+        })
+        body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        result = r.chat_completion(body)
+        assert "ok" in result["choices"][0]["message"]["content"]
+
+    def test_mid_stream_terminates_with_error(self, loop):
+        """Mid-stream failure should yield finish_reason='error', no retry."""
+        r = self._build_router(loop, {
+            "bad": MidStreamFailAdapter(),
+            "good": MockAdapter(tokens=["should-not-reach"]),
+        })
+        body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        result = r.chat_completion(body)
+        content = result["choices"][0]["message"]["content"]
+        assert "partial" in content
+        assert result["choices"][0]["finish_reason"] == "error"
+        assert "should-not-reach" not in content
+
+    def test_all_fail_raises(self, loop):
+        """If all candidates fail pre-token, BackendError is raised."""
+        r = self._build_router(loop, {
+            "a": PreTokenFailAdapter(),
+            "b": PreTokenFailAdapter(),
+        })
+        body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        with pytest.raises(BackendError, match="All .* supernodes failed"):
+            r.chat_completion(body)
+
+    def test_no_candidates_raises(self, loop):
+        """No supernodes for the model should raise BackendError."""
+        discovery = SupernodeDiscovery()
+        prompt_router = PromptRouter(discovery)
+        r = SupernodeRouter(loop=loop, prompt_router=prompt_router)
+        body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        with pytest.raises(BackendError, match="No supernode"):
+            r.chat_completion(body)
+
+    def test_stream_failover(self, loop):
+        """Streaming should also failover pre-first-token."""
+        r = self._build_router(loop, {
+            "fail": PreTokenFailAdapter(),
+            "good": MockAdapter(tokens=["stream", "ok"]),
+        })
+        body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        tokens = list(r.chat_completion_stream(body))
+        assert "stream" in tokens
+        assert "ok" in tokens
+
+    def test_stream_mid_failure_yields_no_extra(self, loop):
+        """Mid-stream failure in streaming should stop."""
+        r = self._build_router(loop, {
+            "bad": MidStreamFailAdapter(),
+        })
+        body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        tokens = list(r.chat_completion_stream(body))
+        assert "partial" in tokens
