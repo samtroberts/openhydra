@@ -34,8 +34,8 @@ Let supernodes advertise **static capabilities** to the Kademlia DHT and let any
 - [x] Define `SupernodeManifest` + `ModelCapability` + `HardwareInfo` (Python with CBOR; Rust mirror deferred to deploy).
 - [x] `supernode_record_key(peer_id)` + provider-key normalization.
 - [x] Sign/verify (Ed25519 over canonical CBOR) + freshness check.
-- [ ] Publish loop: startup, on-change, 5-min refresh; `START_PROVIDING` per model.
-- [ ] Graceful shutdown: `STOP_PROVIDING` + tombstone manifest (§7.3).
+- [x] Publish loop: startup, on-change, 5-min refresh; `START_PROVIDING` per model.
+- [x] Graceful shutdown: `STOP_PROVIDING` + tombstone manifest (§7.3).
 - [x] `discover_supernodes(model_id)` in `supernode/discovery.py` + 120s manifest cache.
 - [x] Tests: round-trip encode/sign/verify; discovery returns providers; stale manifest rejected.
 
