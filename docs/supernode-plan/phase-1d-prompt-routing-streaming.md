@@ -34,14 +34,14 @@ Carry prompts and stream tokens **peer-to-peer over libp2p** using new method pr
 - Failover: pre-sort candidates so retry needs no new DHT query; on pre-first-token failure resend to next; decrement failed node's reputation (reputation store stubbed until 3c).
 
 ## 5. Tasks (sub-sub checklist)
-- [ ] Rust: add `0x10–0x14` to `dispatcher.rs`; new `SwarmCommand` variants in `event_loop.rs`.
-- [ ] Rust: `send_prompt_request()` + `poll_prompt_stream()` PyO3 bindings in `node.rs`.
-- [x] CBOR `PromptRequest`/`PromptChunk` encode/decode (Python — `supernode/prompt_protocol.py`; Rust deferred to maturin rebuild).
-- [ ] Python prompt handler in `peer/server.py` with async bridge → adapter `generate()`.
-- [ ] Cancellation path (`0x11`).
+- [x] Rust: add `/openhydra/prompt/1.0.0` protocol, `SwarmCommand::PromptForward` + `RespondPrompt` in `event_loop.rs`, `handle_prompt_router_event` + `handle_prompt_forward`.
+- [x] Rust: `send_prompt_request()` + `poll_prompt_request()` + `respond_prompt()` PyO3 bindings in `node.rs` with GIL-released blocking.
+- [x] CBOR `PromptRequest`/`PromptChunk` encode/decode (Python — `supernode/prompt_protocol.py`).
+- [x] Python prompt handler: `supernode/prompt_handler.py` `PromptHandlerLoop` — polls `poll_prompt_request()`, dispatches to adapter `generate()` in background threads.
+- [x] Cancellation path (`0x11`) — cooperative via `threading.Event` per active request.
 - [x] Router: basic score + `select_supernode()` randomized near-equal (§4.3.1) — `supernode/selector.py`.
 - [x] Fail-fast failover + reputation-decrement hook (stub store) — wired into `SupernodeRouter._generate_with_failover()`.
-- [x] Tests: selection spread (statistical), pre-first-token failover, mid-stream error, CBOR roundtrip — 44 tests across `test_prompt_protocol.py`, `test_selector.py`, `test_supernode_router.py`.
+- [x] Tests: 52 tests — CBOR roundtrip, selection spread (statistical), pre-first-token failover, mid-stream error, prompt handler (inference, cancel, concurrent, error). 28 Rust tests pass.
 
 ## 6. Files
 **Create:** `supernode/router.py`, `supernode/prompt_protocol.py`, `tests/test_prompt_routing.py`, Rust tests in `network/`.
