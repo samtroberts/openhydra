@@ -7,6 +7,7 @@
 pub mod activation;
 pub mod behaviour;
 pub mod dlpack;
+pub mod prompt;
 pub mod proxy;
 
 /// Prost-generated types from peer.proto.

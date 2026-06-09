@@ -39,6 +39,8 @@ use crate::types::PeerRecord;
 struct NodeInner {
     cmd_tx: mpsc::Sender<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
+    /// Phase 1d: separate queue for prompt routing requests.
+    prompt_queue: Arc<SharedProxyQueue>,
     /// Handle to the background thread running tokio + swarm.
     _thread: std::thread::JoinHandle<()>,
 }
@@ -81,7 +83,7 @@ fn dirs_default_identity() -> PathBuf {
 /// a Shutdown command is received or the sender is dropped.
 pub fn start_node(
     config: &NodeConfig,
-) -> Result<(mpsc::Sender<SwarmCommand>, Arc<SharedProxyQueue>, std::thread::JoinHandle<()>), String> {
+) -> Result<(mpsc::Sender<SwarmCommand>, Arc<SharedProxyQueue>, Arc<SharedProxyQueue>, std::thread::JoinHandle<()>), String> {
     // Load or generate identity.
     let identity = Identity::load_or_create(&config.identity_path)
         .map_err(|e| format!("identity: {e}"))?;
@@ -109,6 +111,10 @@ pub fn start_node(
     let proxy_queue = Arc::new(SharedProxyQueue::new());
     let proxy_queue_clone = Arc::clone(&proxy_queue);
 
+    // Phase 1d: separate queue for prompt routing requests.
+    let prompt_queue = Arc::new(SharedProxyQueue::new());
+    let prompt_queue_clone = Arc::clone(&prompt_queue);
+
     // Use a oneshot to communicate any startup error from the background thread.
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -133,7 +139,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok(swarm) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, prompt_queue_clone, bootstrap_peers_for_dial).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -150,7 +156,7 @@ pub fn start_node(
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, proxy_queue, thread))
+    Ok((cmd_tx, proxy_queue, prompt_queue, thread))
 }
 
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.
@@ -259,11 +265,12 @@ impl PyP2PNode {
             bootstrap_peers: self.config.bootstrap_peers.clone(),
         };
         let result = py.allow_threads(|| start_node(&config));
-        let (cmd_tx, proxy_queue, thread) = result
+        let (cmd_tx, proxy_queue, prompt_queue, thread) = result
             .map_err(|e| PyRuntimeError::new_err(format!("start failed: {e}")))?;
         self.inner = Some(NodeInner {
             cmd_tx,
             proxy_queue,
+            prompt_queue,
             _thread: thread,
         });
         Ok(())
@@ -635,6 +642,44 @@ impl PyP2PNode {
         let cmd_tx = inner.cmd_tx.clone();
         py.allow_threads(move || {
             send_and_wait(&cmd_tx, |reply| SwarmCommand::PollTunnelCloseEvent { reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Phase 1d: Send a prompt request to a supernode via the prompt protocol.
+    /// Returns the response bytes (CBOR-encoded PromptChunk).
+    fn send_prompt_request(&self, py: Python<'_>, target_peer_id: String, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::PromptForward {
+                peer_id: target_peer_id,
+                data,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Phase 1d: Poll for the next inbound prompt request from a remote peer.
+    /// Returns (request_id, data_bytes) or None if queue is empty.
+    #[pyo3(signature = (timeout_ms=500))]
+    fn poll_prompt_request(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<(String, Vec<u8>)>> {
+        let inner = self.require_started()?;
+        let queue = Arc::clone(&inner.prompt_queue);
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        Ok(py.allow_threads(move || queue.pop(timeout)))
+    }
+
+    /// Phase 1d: Send a response to an inbound prompt request.
+    fn respond_prompt(&self, py: Python<'_>, request_id: String, data: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::RespondPrompt { request_id, data })
+                .map_err(|_| "swarm not running".to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(e))
     }

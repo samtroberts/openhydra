@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::behaviour::{OpenHydraBehaviour, OpenHydraBehaviourEvent};
 use crate::dht;
+use crate::prompt::{PromptRequest as PromptReq, PromptResponse as PromptResp};
 use crate::proxy::{self, ProxyRequest, ProxyResponse};
 use crate::types::{DiscoveredPeer, NatInfo, PeerRecord};
 
@@ -165,6 +166,18 @@ pub enum SwarmCommand {
     PollTunnelCloseEvent {
         reply: oneshot::Sender<Option<String>>,
     },
+    /// Phase 1d: Forward a prompt request to a supernode via the
+    /// `/openhydra/prompt/1.0.0` protocol. Returns the response bytes.
+    PromptForward {
+        peer_id: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// Phase 1d: Send a response to an inbound prompt request.
+    RespondPrompt {
+        request_id: String,
+        data: Vec<u8>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -259,6 +272,12 @@ struct LoopState {
     /// Each entry is the libp2p peer_id (base58) of a peer whose tunnel
     /// was torn down due to connection loss.
     tunnel_close_queue: std::collections::VecDeque<String>,
+    /// Phase 1d: Pending prompt forward requests: request_id → reply channel.
+    pending_prompt: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Phase 1d: Inbound prompt response channels: request_id → ResponseChannel.
+    inbound_prompt_channels: HashMap<String, request_response::ResponseChannel<PromptResp>>,
+    /// Phase 1d: Counter for generating unique inbound prompt request IDs.
+    inbound_prompt_counter: u64,
     /// Phase 2: Active tunnels, keyed by remote PeerId.
     active_tunnels: HashMap<PeerId, crate::tunnel::TunnelState>,
     /// Phase 2: libp2p-stream control handle for opening tunnel substreams.
@@ -303,6 +322,9 @@ impl LoopState {
             gossip_inbound_queue: std::collections::VecDeque::new(),
             dcutr_event_queue: std::collections::VecDeque::new(),
             tunnel_close_queue: std::collections::VecDeque::new(),
+            pending_prompt: HashMap::new(),
+            inbound_prompt_channels: HashMap::new(),
+            inbound_prompt_counter: 0,
             active_tunnels: HashMap::new(),
             stream_control: None,
         }
@@ -314,6 +336,7 @@ pub async fn run_event_loop(
     mut swarm: libp2p::Swarm<OpenHydraBehaviour>,
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
+    prompt_queue: Arc<SharedProxyQueue>,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
 ) {
     let mut state = LoopState::new();
@@ -564,6 +587,18 @@ pub async fn run_event_loop(
                             warn!("proxy respond: unknown request_id={}", request_id);
                         }
                     }
+                    Some(SwarmCommand::PromptForward { peer_id, data, reply }) => {
+                        handle_prompt_forward(&mut swarm, &peer_id, data, reply, &mut state);
+                    }
+                    Some(SwarmCommand::RespondPrompt { request_id, data }) => {
+                        if let Some(channel) = state.inbound_prompt_channels.remove(&request_id) {
+                            if let Err(e) = swarm.behaviour_mut().prompt_router.send_response(channel, PromptResp(data)) {
+                                warn!("prompt respond failed: {:?}", e);
+                            }
+                        } else {
+                            warn!("prompt respond: unknown request_id={}", request_id);
+                        }
+                    }
                     Some(SwarmCommand::Shutdown { reply }) => {
                         info!("swarm shutting down");
                         let _ = reply.send(());
@@ -577,7 +612,7 @@ pub async fn run_event_loop(
             }
             // Process swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
+                handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue, &prompt_queue);
             }
         }
     }
@@ -668,6 +703,7 @@ fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
     proxy_queue: &SharedProxyQueue,
+    prompt_queue: &SharedProxyQueue,
 ) {
     match event {
         // ── Kademlia ──
@@ -780,6 +816,11 @@ fn handle_swarm_event(
         // ── gRPC Proxy ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::GrpcProxy(proxy_event)) => {
             handle_grpc_proxy_event(proxy_event, swarm, state, proxy_queue);
+        }
+
+        // ── Prompt Router (Phase 1d) ──
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::PromptRouter(prompt_event)) => {
+            handle_prompt_router_event(prompt_event, state, prompt_queue);
         }
 
         // ── Gossipsub (PR-3 / B1) ──
@@ -1531,6 +1572,69 @@ fn handle_open_proxy(
             }
         }
     });
+}
+
+// ── Phase 1d: Prompt routing handlers ──
+
+fn handle_prompt_router_event(
+    event: request_response::Event<PromptReq, PromptResp>,
+    state: &mut LoopState,
+    prompt_queue: &SharedProxyQueue,
+) {
+    match event {
+        request_response::Event::Message { peer, message } => {
+            match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    state.inbound_prompt_counter += 1;
+                    let req_id = format!("prompt-{}", state.inbound_prompt_counter);
+                    info!(%peer, bytes = request.0.len(), id = %req_id, "prompt request queued");
+                    prompt_queue.push((req_id.clone(), request.0));
+                    state.inbound_prompt_channels.insert(req_id, channel);
+                }
+                request_response::Message::Response { request_id, response } => {
+                    if let Some(reply) = state.pending_prompt.remove(&request_id) {
+                        let _ = reply.send(Ok(response.0));
+                    }
+                }
+            }
+        }
+        request_response::Event::OutboundFailure { request_id, error, .. } => {
+            warn!(?error, "prompt outbound failure");
+            if let Some(reply) = state.pending_prompt.remove(&request_id) {
+                let _ = reply.send(Err(format!("prompt outbound: {error:?}")));
+            }
+        }
+        request_response::Event::InboundFailure { error, .. } => {
+            warn!(?error, "prompt inbound failure");
+        }
+        _ => {}
+    }
+}
+
+fn handle_prompt_forward(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    peer_id_str: &str,
+    data: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    state: &mut LoopState,
+) {
+    let peer_id: PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = reply.send(Err(format!("invalid peer_id: {e}")));
+            return;
+        }
+    };
+
+    if swarm.is_connected(&peer_id) {
+        let req_id = swarm
+            .behaviour_mut()
+            .prompt_router
+            .send_request(&peer_id, PromptReq(data));
+        state.pending_prompt.insert(req_id, reply);
+    } else {
+        let _ = reply.send(Err(format!("peer not connected: {peer_id}")));
+    }
 }
 
 #[cfg(test)]

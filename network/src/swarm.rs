@@ -159,6 +159,9 @@ pub fn build_swarm(
     // gRPC proxy (cross-ISP tunneling through relay).
     let grpc_proxy = crate::proxy::proxy_behaviour();
 
+    // Supernode prompt routing (Phase 1d).
+    let prompt_router = crate::prompt::prompt_behaviour();
+
     // PR-3 (B1) — Gossipsub over a single topic, signed with our Ed25519
     // identity so recipients can verify the message came from a real swarm
     // member rather than a spoofed peer.
@@ -224,6 +227,7 @@ pub fn build_swarm(
         identify,
         mdns,
         grpc_proxy,
+        prompt_router,
         gossipsub,
         ping,
         tunnel,

@@ -7,6 +7,7 @@ use libp2p::request_response;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay};
 
+use crate::prompt::PromptCodec;
 use crate::proxy::GrpcProxyCodec;
 
 /// The composed behaviour for an OpenHydra peer node.
@@ -39,6 +40,10 @@ pub struct OpenHydraBehaviour {
     /// mobile hotspot NAT drops TCP mappings during the 1-3 s inference
     /// silence, killing the relay circuit between tokens.
     pub ping: ping::Behaviour,
+    /// Supernode prompt routing — request/response over `/openhydra/prompt/1.0.0`.
+    /// Separate from gRPC proxy so prompt traffic has its own queue and
+    /// doesn't interfere with tensor activation forwarding.
+    pub prompt_router: request_response::Behaviour<PromptCodec>,
     /// Phase 2 tunnel — raw bidirectional streams over `/openhydra/tunnel/1.0.0`.
     /// When DCUtR hole-punches a direct connection, `open_tunnel()` binds a
     /// local TCP port and for each inbound TCP connection opens a libp2p
