@@ -49,13 +49,16 @@ class SupernodeRouter:
         self._local.loop = loop
         return loop
 
+    def _run(self, coro):
+        loop = self._get_loop()
+        return loop.run_until_complete(asyncio.ensure_future(coro, loop=loop))
+
     # ------------------------------------------------------------------
     # Model listing
     # ------------------------------------------------------------------
 
     def list_models_openai(self) -> dict[str, Any]:
-        loop = self._get_loop()
-        models = loop.run_until_complete(self._list_all_models())
+        models = self._run(self._list_all_models())
         return {
             "object": "list",
             "data": [
@@ -92,8 +95,7 @@ class SupernodeRouter:
     # ------------------------------------------------------------------
 
     def list_supernodes(self) -> list[dict[str, Any]]:
-        loop = self._get_loop()
-        return loop.run_until_complete(self._list_supernodes_async())
+        return self._run(self._list_supernodes_async())
 
     async def _list_supernodes_async(self) -> list[dict[str, Any]]:
         results = []
@@ -136,8 +138,7 @@ class SupernodeRouter:
     ) -> dict[str, Any]:
         request_id = request_id or str(uuid.uuid4())
         req = self._body_to_prompt_request(body, request_id)
-        loop = self._get_loop()
-        return loop.run_until_complete(self._chat_completion_async(req, body))
+        return self._run(self._chat_completion_async(req, body))
 
     def chat_completion_stream(
         self,
@@ -147,7 +148,6 @@ class SupernodeRouter:
         request_id = request_id or str(uuid.uuid4())
         req = self._body_to_prompt_request(body, request_id)
         req.stream = True
-        loop = self._get_loop()
 
         async def collect():
             chunks = []
@@ -155,7 +155,7 @@ class SupernodeRouter:
                 chunks.append(chunk)
             return chunks
 
-        chunks = loop.run_until_complete(collect())
+        chunks = self._run(collect())
         for chunk in chunks:
             if chunk.token:
                 yield chunk.token
@@ -171,8 +171,7 @@ class SupernodeRouter:
     ) -> dict[str, Any]:
         request_id = request_id or str(uuid.uuid4())
         req = self._body_to_prompt_request(body, request_id, mode="completion")
-        loop = self._get_loop()
-        return loop.run_until_complete(self._text_completion_async(req, body))
+        return self._run(self._text_completion_async(req, body))
 
     def text_completion_stream(
         self,
@@ -182,7 +181,6 @@ class SupernodeRouter:
         request_id = request_id or str(uuid.uuid4())
         req = self._body_to_prompt_request(body, request_id, mode="completion")
         req.stream = True
-        loop = self._get_loop()
 
         async def collect():
             chunks = []
@@ -190,7 +188,7 @@ class SupernodeRouter:
                 chunks.append(chunk)
             return chunks
 
-        chunks = loop.run_until_complete(collect())
+        chunks = self._run(collect())
         for chunk in chunks:
             if chunk.token:
                 yield chunk.token
