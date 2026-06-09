@@ -35,12 +35,12 @@ This document is the single source of truth for **what to build, in what order, 
 
 | Phase | Title | Plan | Status | Sub-phases done |
 |-------|-------|------|--------|-----------------|
-| **1** | Adoption MVP (Option A) | [phase-1](phase-1-adoption-mvp.md) | 🔲 | 0 / 5 |
+| **1** | Adoption MVP (Option A) | [phase-1](phase-1-adoption-mvp.md) | 🟢 | 5 / 5 |
 | **2** | Trust MVP + Levels + UI (Option B) | [phase-2](phase-2-trust-levels-ui.md) | 🔲 | 0 / 6 |
 | **3** | Smart Routing + Verification | [phase-3](phase-3-smart-routing-verification.md) | 🔲 | 0 / 4 |
 | **4** | Advanced Features | [phase-4](phase-4-advanced.md) | 🔲 | 0 / 5 |
 
-**Overall: 0 / 20 sub-phases complete.**
+**Overall: 5 / 20 sub-phases complete.**
 
 ---
 
@@ -80,11 +80,11 @@ This document is the single source of truth for **what to build, in what order, 
 
 | ID | Sub-phase | Status | Depends on | Blocks | Phase gate |
 |----|-----------|--------|------------|--------|-----------|
-| **1a** | [Adapter + Ollama L1](phase-1a-adapter-and-ollama-bridge.md) | 🟡 | — | 1b, 1c, 1d, 2c | P1 |
-| **1b** | [OpenAI HTTP API](phase-1b-openai-http-api.md) | 🟡 | 1a | 1d, 1e, 2f | P1 |
-| **1c** | [Manifest + DHT + discovery](phase-1c-manifest-dht-discovery.md) | 🟡 | 1a | 1d, 2d, 2e, 3a, 4b | P1 |
-| **1d** | [Routing + streaming](phase-1d-prompt-routing-streaming.md) | 🟡 | 1a, 1b, 1c | 1e, 2c, 3a, 3b, 3d, 4c, 4e | P1 |
-| **1e** | [CLI](phase-1e-cli.md) | 🟡 | 1a, 1b, 1c, 1d | 2a | P1 |
+| **1a** | [Adapter + Ollama L1](phase-1a-adapter-and-ollama-bridge.md) | 🟢 | — | 1b, 1c, 1d, 2c | P1 |
+| **1b** | [OpenAI HTTP API](phase-1b-openai-http-api.md) | 🟢 | 1a | 1d, 1e, 2f | P1 |
+| **1c** | [Manifest + DHT + discovery](phase-1c-manifest-dht-discovery.md) | 🟢 | 1a | 1d, 2d, 2e, 3a, 4b | P1 |
+| **1d** | [Routing + streaming](phase-1d-prompt-routing-streaming.md) | 🟢 | 1a, 1b, 1c | 1e, 2c, 3a, 3b, 3d, 4c, 4e | P1 |
+| **1e** | [CLI](phase-1e-cli.md) | 🟢 | 1a, 1b, 1c, 1d | 2a | P1 |
 | **2a** | [Managed Ollama L2](phase-2a-managed-ollama-l2.md) | 🔲 | 1a, 1e, 2c | 2b, 2e, 2f, 3b | P2 |
 | **2b** | [LM Studio + Exo](phase-2b-lmstudio-exo-adapters.md) | 🔲 | 1a, 2a | 2e, 2f | P2 |
 | **2c** | [Embedded attested L3](phase-2c-embedded-attested-runtimes.md) | 🔲 | 1a, 1d | 2a, 2d, 2e, 3b, 3c | P2 |
@@ -210,3 +210,4 @@ The longest hard-dependency chain — the minimum sequential spine of the progra
 | 2026-06-09 | 1c → 🟡 In progress. SupernodeManifest (CBOR + Ed25519), SupernodeDiscovery (cache + model index) + 148 tests (all green). Remaining: publish loop, graceful shutdown, Rust mirror. |
 | 2026-06-09 | 1d → 🟡 In progress. Wire protocol, selector, failover, Rust prompt protocol + PyO3 bindings, Python prompt handler with cancellation. 181 Python + 28 Rust tests pass. All 8 tasks complete. Remaining: maturin rebuild + two-node end-to-end smoke test (blocked on Lightning.ai). |
 | 2026-06-09 | 1e → 🟡 In progress. `--bridge ollama` in node.py, `openhydra` CLI entry point (join/chat/status/models), graceful shutdown. 160 Python tests pass (14 new CLI tests). All 6 tasks complete. Remaining: manual two-node smoke test (blocked on Lightning.ai). |
+| 2026-06-09 | **Phase 1 → 🟢 Done.** End-to-end smoke test passed: Mac client → Asus supernode (bridge mode) → Ollama (tinyllama). All endpoints verified: /health, /v1/models, /v1/chat/completions (streaming + non-streaming), /v1/supernodes, CLI status/models. Fixed: thread-safe event loops (asyncio.run()), aiohttp session-per-loop, _require_engine() ordering for bridge mode. |

@@ -1,7 +1,7 @@
 # Phase 1d — Prompt Routing Protocol + Token Streaming
 
 > Part of [Phase 1: Adoption MVP](phase-1-adoption-mvp.md) · [Masterplan](MASTERPLAN.md)
-> **Status:** 🟡 In progress **Owner:** _unassigned_ **Plan ID:** P1.4 (1d)
+> **Status:** 🟢 Done **Owner:** _unassigned_ **Plan ID:** P1.4 (1d)
 > Architecture refs: §5 (wire protocol), §4.1 (routing flow), §4.3.1 (selection), §4.4 (failover), §8.1–8.2 (dispatch/integration)
 
 ## 1. Goal

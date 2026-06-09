@@ -1,7 +1,7 @@
 # Phase 1b — OpenAI-Compatible HTTP API
 
 > Part of [Phase 1: Adoption MVP](phase-1-adoption-mvp.md) · [Masterplan](MASTERPLAN.md)
-> **Status:** 🟡 In progress **Owner:** _unassigned_ **Plan ID:** P1.2 (1b)
+> **Status:** 🟢 Done **Owner:** _unassigned_ **Plan ID:** P1.2 (1b)
 > Architecture refs: §8.3 (HTTP API), §5.2 (PromptRequest), §5.3 (PromptChunk)
 
 ## 1. Goal

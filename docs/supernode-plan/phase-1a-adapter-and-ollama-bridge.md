@@ -1,7 +1,7 @@
 # Phase 1a — SupernodeAdapter Interface + Ollama External Adapter (L1)
 
 > Part of [Phase 1: Adoption MVP](phase-1-adoption-mvp.md) · [Masterplan](MASTERPLAN.md)
-> **Status:** 🟡 In progress **Owner:** _unassigned_ **Plan ID:** P1.1 (1a)
+> **Status:** 🟢 Done **Owner:** _unassigned_ **Plan ID:** P1.1 (1a)
 > Architecture refs: §6.1 (abstract base), §6.4–6.5 (Ollama external)
 
 ## 1. Goal

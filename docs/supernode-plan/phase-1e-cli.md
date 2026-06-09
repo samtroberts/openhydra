@@ -1,7 +1,7 @@
 # Phase 1e — CLI (`openhydra join --bridge ollama`, `openhydra chat`)
 
 > Part of [Phase 1: Adoption MVP](phase-1-adoption-mvp.md) · [Masterplan](MASTERPLAN.md)
-> **Status:** 🟡 In progress **Owner:** _unassigned_ **Plan ID:** P1.5 (1e)
+> **Status:** 🟢 Done **Owner:** _unassigned_ **Plan ID:** P1.5 (1e)
 > Architecture refs: §7.1 (join), §13.1 (CLI), §13.3 (join flow)
 
 ## 1. Goal

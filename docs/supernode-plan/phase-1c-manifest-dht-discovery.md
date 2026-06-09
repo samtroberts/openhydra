@@ -1,7 +1,7 @@
 # Phase 1c — SupernodeManifest + DHT Advertisement + Discovery
 
 > Part of [Phase 1: Adoption MVP](phase-1-adoption-mvp.md) · [Masterplan](MASTERPLAN.md)
-> **Status:** 🟡 In progress **Owner:** _unassigned_ **Plan ID:** P1.3 (1c)
+> **Status:** 🟢 Done **Owner:** _unassigned_ **Plan ID:** P1.3 (1c)
 > Architecture refs: §3.1–3.3 (manifest, DHT keys, refresh), §4.1 step 2 (candidate discovery)
 
 ## 1. Goal
