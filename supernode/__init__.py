@@ -27,6 +27,7 @@ from .selector import (
     score_candidate,
     select_supernode,
 )
+from .prompt_handler import PromptHandlerLoop
 
 __all__ = [
     "SupernodeAdapter",
@@ -54,4 +55,5 @@ __all__ = [
     "PromptRouter",
     "score_candidate",
     "select_supernode",
+    "PromptHandlerLoop",
 ]
