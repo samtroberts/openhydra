@@ -217,11 +217,12 @@ class TestStatusCommand:
         assert "healthy" in captured.out
         assert "llama3:8b" in captured.out
 
-    def test_status_unreachable(self):
+    def test_status_unreachable(self, capsys):
         import argparse
         args = argparse.Namespace(api_url="http://127.0.0.1:1")
-        with pytest.raises(SystemExit):
-            cmd_status(args)
+        cmd_status(args)
+        captured = capsys.readouterr()
+        assert "unhealthy" in captured.out
 
 
 # ── Models command ───────────────────────────────────────────────────────
