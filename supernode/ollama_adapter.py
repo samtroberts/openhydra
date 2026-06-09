@@ -24,8 +24,9 @@ class OllamaAdapter(SupernodeAdapter):
     _REQ_TIMEOUT = aiohttp.ClientTimeout(total=300)
 
     async def _ensure_session(self):
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = aiohttp.ClientSession()
 
     async def close(self):
         if self._session and not self._session.closed:
