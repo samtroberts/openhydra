@@ -1590,7 +1590,7 @@ def main() -> None:
             _bridge_prompt_handler.start()
             logger.info("bridge_prompt_handler_started")
 
-        _bridge_router = SupernodeRouter(loop=_bridge_loop)
+        _bridge_router = SupernodeRouter()
         _bridge_router.register_adapter("ollama", _bridge_adapter)
 
         from coordinator.api_server import OpenHydraHandler
