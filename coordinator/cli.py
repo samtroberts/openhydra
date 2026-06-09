@@ -162,30 +162,32 @@ def cmd_status(args: argparse.Namespace) -> None:
     """Show local node status."""
     api_url = args.api_url.rstrip("/")
 
-    health = _api_get(f"{api_url}/health")
-    print(f"Node:    {'healthy' if health.get('status') == 'ok' else 'unhealthy'}")
-
     try:
         models = _api_get(f"{api_url}/v1/models")
         model_list = models.get("data", [])
-        print(f"Models:  {len(model_list)}")
-        for m in model_list:
-            mid = m.get("id", "?")
-            oh = m.get("openhydra", {})
-            quant = oh.get("quantization", "")
-            ctx = oh.get("context_length", "")
-            print(f"  - {mid} ({quant}, ctx={ctx})")
+        healthy = True
     except SystemExit:
-        print("Models:  unavailable")
+        model_list = []
+        healthy = False
+
+    print(f"Node:    {'healthy' if healthy else 'unhealthy'}")
+    print(f"Models:  {len(model_list)}")
+    for m in model_list:
+        mid = m.get("id", "?")
+        oh = m.get("openhydra", {})
+        quant = oh.get("quantization", "")
+        ctx = oh.get("context_length", "")
+        print(f"  - {mid} ({quant}, ctx={ctx})")
 
     try:
         supernodes = _api_get(f"{api_url}/v1/supernodes")
         sn_list = supernodes if isinstance(supernodes, list) else supernodes.get("supernodes", [])
         print(f"Supernodes: {len(sn_list)}")
         for sn in sn_list:
-            pid = sn.get("peer_id", "?")
-            mids = sn.get("model_ids", [])
-            print(f"  - {pid}: {', '.join(mids)}")
+            name = sn.get("name", "?")
+            sn_models = sn.get("models", [])
+            sn_healthy = sn.get("healthy", False)
+            print(f"  - {name}: {', '.join(sn_models)} ({'ok' if sn_healthy else 'down'})")
     except SystemExit:
         pass
 
