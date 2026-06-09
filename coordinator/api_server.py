@@ -396,6 +396,7 @@ def _safe_free_memory() -> None:
 class OpenHydraHandler(BaseHTTPRequestHandler):
     engine: CoordinatorEngine | None = None
     local_engine: Any = None  # LocalInferenceEngine when in local mode
+    supernode_router: Any = None  # SupernodeRouter when supernode mode active
     _api_key: str | None = None           # None → auth disabled
     _rate_limiter: _RateLimiter | None = None
     _mode_switching: bool = False          # 503 drain gate during mode transition
@@ -1197,9 +1198,19 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "rate_limit_exceeded"}, status=HTTPStatus.TOO_MANY_REQUESTS, headers=rid_headers)
                 return
 
+            if parsed.path == "/v1/supernodes" and self.__class__.supernode_router is not None:
+                self._send_json(self.__class__.supernode_router.list_supernodes(), headers=rid_headers)
+                return
+
             engine = self._require_engine()
             if parsed.path == "/v1/models":
-                self._send_json(engine.list_models(), headers=rid_headers)
+                if self.__class__.supernode_router is not None:
+                    self._send_json(
+                        self.__class__.supernode_router.list_models_openai(),
+                        headers=rid_headers,
+                    )
+                else:
+                    self._send_json(engine.list_models(), headers=rid_headers)
                 return
 
             if parsed.path == "/v1/network/status":
@@ -1346,6 +1357,70 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self._last_response_status = int(HTTPStatus.OK)
+
+    # ------------------------------------------------------------------
+    # Supernode routing helpers
+    # ------------------------------------------------------------------
+
+    def _handle_supernode_chat(
+        self, body: dict[str, Any], request_id: str, stream: bool, headers: dict[str, str],
+    ) -> None:
+        router = self.__class__.supernode_router
+        try:
+            if stream:
+                model_id = str(body.get("model", ""))
+                self._send_sse(
+                    request_id=request_id,
+                    model_id=model_id,
+                    chunks=router.chat_completion_stream(body, request_id=request_id),
+                    headers=headers,
+                )
+            else:
+                result = router.chat_completion(body, request_id=request_id)
+                self._send_json(result, headers=headers)
+        except Exception as e:
+            logger.error("supernode_chat_error req_id=%s: %s", request_id, e, exc_info=True)
+            self._send_json(
+                {
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": "supernode_error",
+                    }
+                },
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                headers=headers,
+            )
+
+    def _handle_supernode_completion(
+        self, body: dict[str, Any], request_id: str, stream: bool, headers: dict[str, str],
+    ) -> None:
+        router = self.__class__.supernode_router
+        try:
+            if stream:
+                model_id = str(body.get("model", ""))
+                self._send_sse(
+                    request_id=request_id,
+                    model_id=model_id,
+                    chunks=router.text_completion_stream(body, request_id=request_id),
+                    headers=headers,
+                )
+            else:
+                result = router.text_completion(body, request_id=request_id)
+                self._send_json(result, headers=headers)
+        except Exception as e:
+            logger.error("supernode_completion_error req_id=%s: %s", request_id, e, exc_info=True)
+            self._send_json(
+                {
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error",
+                        "code": "supernode_error",
+                    }
+                },
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                headers=headers,
+            )
 
     # ------------------------------------------------------------------
     # Ollama payload helpers (called from do_GET / do_POST + testable directly)
@@ -1599,6 +1674,11 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                     self._handle_chat_completions(body=body)
                     return
 
+                # Supernode routing: dispatch via registered adapters
+                if self.__class__.supernode_router is not None:
+                    self._handle_supernode_chat(body, request_id, stream, rid_headers)
+                    return
+
                 payload = self._chat_stream_payload(body, request_id) if stream else self._chat_payload(body, request_id)
                 model_meta = payload.get("model", {})
                 served_model = str(model_meta.get("served", requested_model))
@@ -1641,6 +1721,10 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/v1/completions":
+                if self.__class__.supernode_router is not None:
+                    self._handle_supernode_completion(body, request_id, stream, rid_headers)
+                    return
+
                 payload = self._completion_stream_payload(body, request_id) if stream else self._completion_payload(body, request_id)
                 model_meta = payload.get("model", {})
                 served_model = str(model_meta.get("served", requested_model))
