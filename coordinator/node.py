@@ -1596,7 +1596,6 @@ def main() -> None:
         from coordinator.api_server import OpenHydraHandler
         OpenHydraHandler.supernode_router = _bridge_router
         logger.info("bridge_supernode_router_wired")
-        _bridge_loop.close()
 
     # Start the coordinator HTTP API on the main thread (blocking).
     # Signal handling (SIGTERM, SIGINT) is already wired inside coordinator_serve.
@@ -1618,6 +1617,10 @@ def main() -> None:
             _bridge_stop_event.set()
             _bridge_prompt_handler.stop()
         if args.bridge:
+            try:
+                _bridge_loop.close()
+            except Exception:
+                pass
             logger.info("bridge_shutdown_complete")
 
 
