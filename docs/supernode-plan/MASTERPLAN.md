@@ -81,7 +81,7 @@ This document is the single source of truth for **what to build, in what order, 
 | ID | Sub-phase | Status | Depends on | Blocks | Phase gate |
 |----|-----------|--------|------------|--------|-----------|
 | **1a** | [Adapter + Ollama L1](phase-1a-adapter-and-ollama-bridge.md) | 🟡 | — | 1b, 1c, 1d, 2c | P1 |
-| **1b** | [OpenAI HTTP API](phase-1b-openai-http-api.md) | 🔲 | 1a | 1d, 1e, 2f | P1 |
+| **1b** | [OpenAI HTTP API](phase-1b-openai-http-api.md) | 🟡 | 1a | 1d, 1e, 2f | P1 |
 | **1c** | [Manifest + DHT + discovery](phase-1c-manifest-dht-discovery.md) | 🔲 | 1a | 1d, 2d, 2e, 3a, 4b | P1 |
 | **1d** | [Routing + streaming](phase-1d-prompt-routing-streaming.md) | 🔲 | 1a, 1b, 1c | 1e, 2c, 3a, 3b, 3d, 4c, 4e | P1 |
 | **1e** | [CLI](phase-1e-cli.md) | 🔲 | 1a, 1b, 1c, 1d | 2a | P1 |
@@ -206,3 +206,4 @@ The longest hard-dependency chain — the minimum sequential spine of the progra
 |------|--------|
 | 2026-06-09 | Initial plan set created: 4 phase overviews + 20 sub-phase plans + this master. All 🔲 Not started. Derived from SUPERNODE_ROUTING_ARCHITECTURE.md §12 (post-review, Attested-tier + Option-A/B phasing). |
 | 2026-06-09 | 1a → 🟡 In progress. ABC + dataclasses + OllamaAdapter + 53 tests (all green). Branch: `feat/supernode-1a-adapter-ollama`. Remaining: manual smoke test against live Ollama, then flip to 🟢. |
+| 2026-06-09 | 1b → 🟡 In progress. SupernodeRouter + api_server.py integration + /v1/supernodes endpoint + 109 tests (all green). Remaining: manual smoke test with `curl`/`openai` SDK. |
