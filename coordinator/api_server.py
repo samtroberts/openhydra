@@ -1202,15 +1202,16 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 self._send_json(self.__class__.supernode_router.list_supernodes(), headers=rid_headers)
                 return
 
+            if parsed.path == "/v1/models" and self.__class__.supernode_router is not None:
+                self._send_json(
+                    self.__class__.supernode_router.list_models_openai(),
+                    headers=rid_headers,
+                )
+                return
+
             engine = self._require_engine()
             if parsed.path == "/v1/models":
-                if self.__class__.supernode_router is not None:
-                    self._send_json(
-                        self.__class__.supernode_router.list_models_openai(),
-                        headers=rid_headers,
-                    )
-                else:
-                    self._send_json(engine.list_models(), headers=rid_headers)
+                self._send_json(engine.list_models(), headers=rid_headers)
                 return
 
             if parsed.path == "/v1/network/status":
@@ -1656,8 +1657,6 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 return
 
             body = self._read_json()
-            engine = self._require_engine()
-            requested_model = str(body.get("model", engine.config.default_model))
             stream = bool(body.get("stream", False))
 
             # Validate inference params for inference endpoints
@@ -1679,6 +1678,15 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                     self._handle_supernode_chat(body, request_id, stream, rid_headers)
                     return
 
+            if parsed.path == "/v1/completions":
+                if self.__class__.supernode_router is not None:
+                    self._handle_supernode_completion(body, request_id, stream, rid_headers)
+                    return
+
+            engine = self._require_engine()
+            requested_model = str(body.get("model", engine.config.default_model))
+
+            if parsed.path == "/v1/chat/completions":
                 payload = self._chat_stream_payload(body, request_id) if stream else self._chat_payload(body, request_id)
                 model_meta = payload.get("model", {})
                 served_model = str(model_meta.get("served", requested_model))
@@ -1721,10 +1729,6 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/v1/completions":
-                if self.__class__.supernode_router is not None:
-                    self._handle_supernode_completion(body, request_id, stream, rid_headers)
-                    return
-
                 payload = self._completion_stream_payload(body, request_id) if stream else self._completion_payload(body, request_id)
                 model_meta = payload.get("model", {})
                 served_model = str(model_meta.get("served", requested_model))
