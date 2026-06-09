@@ -41,17 +41,8 @@ class SupernodeRouter:
     def register_adapter(self, name: str, adapter: SupernodeAdapter) -> None:
         self._adapters[name] = adapter
 
-    def _get_loop(self) -> asyncio.AbstractEventLoop:
-        loop = getattr(self._local, "loop", None)
-        if loop is not None and not loop.is_closed():
-            return loop
-        loop = asyncio.new_event_loop()
-        self._local.loop = loop
-        return loop
-
     def _run(self, coro):
-        loop = self._get_loop()
-        return loop.run_until_complete(asyncio.ensure_future(coro, loop=loop))
+        return asyncio.run(coro)
 
     # ------------------------------------------------------------------
     # Model listing
