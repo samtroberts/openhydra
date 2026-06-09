@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Iterator
@@ -33,6 +34,7 @@ class SupernodeRouter:
     ):
         self._adapters: dict[str, SupernodeAdapter] = {}
         self._loop = loop
+        self._local = threading.local()
         self._model_cache: dict[str, list[ModelInfo]] = {}
         self._prompt_router = prompt_router
 
@@ -40,13 +42,12 @@ class SupernodeRouter:
         self._adapters[name] = adapter
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
-        if self._loop is not None:
-            return self._loop
-        try:
-            return asyncio.get_event_loop()
-        except RuntimeError:
-            self._loop = asyncio.new_event_loop()
-            return self._loop
+        loop = getattr(self._local, "loop", None)
+        if loop is not None and not loop.is_closed():
+            return loop
+        loop = asyncio.new_event_loop()
+        self._local.loop = loop
+        return loop
 
     # ------------------------------------------------------------------
     # Model listing
