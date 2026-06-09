@@ -11,6 +11,22 @@ from .router import SupernodeRouter
 from .manifest import SupernodeManifest, ModelCapability, HardwareInfo
 from .discovery import SupernodeDiscovery
 from .publisher import ManifestPublisher
+from .prompt_protocol import (
+    WirePromptRequest,
+    PromptChunk,
+    UsageStats,
+    METHOD_PROMPT_REQUEST,
+    METHOD_PROMPT_CANCEL,
+    METHOD_MANIFEST_REQUEST,
+    METHOD_MANIFEST_RESPONSE,
+    METHOD_LOAD_PROBE,
+)
+from .selector import (
+    ScoredCandidate,
+    PromptRouter,
+    score_candidate,
+    select_supernode,
+)
 
 __all__ = [
     "SupernodeAdapter",
@@ -26,4 +42,16 @@ __all__ = [
     "HardwareInfo",
     "SupernodeDiscovery",
     "ManifestPublisher",
+    "WirePromptRequest",
+    "PromptChunk",
+    "UsageStats",
+    "METHOD_PROMPT_REQUEST",
+    "METHOD_PROMPT_CANCEL",
+    "METHOD_MANIFEST_REQUEST",
+    "METHOD_MANIFEST_RESPONSE",
+    "METHOD_LOAD_PROBE",
+    "ScoredCandidate",
+    "PromptRouter",
+    "score_candidate",
+    "select_supernode",
 ]
