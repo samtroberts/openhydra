@@ -14,6 +14,7 @@ from .adapter import (
     BackendStatus,
     BackendError,
 )
+from .selector import PromptRouter, ScoredCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +26,15 @@ class SupernodeRouter:
     via libp2p; this class gains multi-adapter selection at that point.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop | None = None):
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop | None = None,
+        prompt_router: PromptRouter | None = None,
+    ):
         self._adapters: dict[str, SupernodeAdapter] = {}
         self._loop = loop
         self._model_cache: dict[str, list[ModelInfo]] = {}
+        self._prompt_router = prompt_router
 
     def register_adapter(self, name: str, adapter: SupernodeAdapter) -> None:
         self._adapters[name] = adapter
@@ -253,11 +259,56 @@ class SupernodeRouter:
         }
 
     async def _generate(self, req: PromptRequest):
+        if self._prompt_router is not None:
+            async for chunk in self._generate_with_failover(req):
+                yield chunk
+            return
+
         adapter = self._select_adapter(req.model_id)
         if adapter is None:
             raise BackendError(f"No adapter available for model '{req.model_id}'")
         async for chunk in adapter.generate(req):
             yield chunk
+
+    async def _generate_with_failover(self, req: PromptRequest):
+        """Fail-fast failover (§4.4): pre-first-token resend; post-first-token error."""
+        candidates = self._prompt_router.select_with_failover(req.model_id)
+        if not candidates:
+            raise BackendError(f"No supernode available for model '{req.model_id}'")
+
+        for i, candidate in enumerate(candidates):
+            peer_id = candidate.manifest.libp2p_peer_id
+            adapter = self._prompt_router._adapters.get(peer_id)
+            if adapter is None:
+                adapter = self._select_adapter(req.model_id)
+            if adapter is None:
+                continue
+
+            first_token_sent = False
+            try:
+                async for chunk in adapter.generate(req):
+                    first_token_sent = True
+                    yield chunk
+                return
+            except Exception as e:
+                self._prompt_router.record_failure(peer_id)
+                if first_token_sent:
+                    logger.warning(
+                        "supernode_mid_stream_failure peer=%s err=%s",
+                        peer_id, e,
+                    )
+                    yield TokenChunk(token="", finish_reason="error")
+                    return
+                else:
+                    is_last = i == len(candidates) - 1
+                    logger.warning(
+                        "supernode_pre_token_failure peer=%s retrying=%s err=%s",
+                        peer_id, not is_last, e,
+                    )
+                    if is_last:
+                        raise BackendError(
+                            f"All {len(candidates)} supernodes failed for '{req.model_id}'"
+                        ) from e
 
     def _select_adapter(self, model_id: str) -> SupernodeAdapter | None:
         if len(self._adapters) == 1:
