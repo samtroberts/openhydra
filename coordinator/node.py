@@ -456,6 +456,27 @@ def main() -> None:
         help="Path to Ed25519 identity keypair file (created on first run, mode 0600).",
     )
 
+    # --- Phase 1e: Supernode bridge mode ---
+    parser.add_argument(
+        "--bridge",
+        choices=["ollama"],
+        default=None,
+        help=(
+            "Bridge an external runtime as a supernode. "
+            "'ollama' connects to a local Ollama instance. "
+            "Publishes a manifest, handles inbound prompt requests, "
+            "and serves an OpenAI-compatible API."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-url",
+        default=None,
+        help=(
+            "Base URL of the bridged runtime. "
+            "Default: http://localhost:11434 for Ollama."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Phase 2b: validate --layers at parse time so a malformed value
@@ -1502,18 +1523,102 @@ def main() -> None:
         ),
     }
 
+    # ── Phase 1e: supernode bridge mode ──────────────────────────────────
+    # When ``--bridge ollama`` is set, wire the supernode layer:
+    #   1. Create adapter + health check
+    #   2. Build & publish manifest (background thread)
+    #   3. Start prompt handler (background thread — handles inbound libp2p requests)
+    #   4. Wire SupernodeRouter onto the HTTP API handler class
+    _bridge_publisher: Any = None
+    _bridge_prompt_handler: Any = None
+    _bridge_stop_event = threading.Event()
+
+    if args.bridge == "ollama":
+        import asyncio as _bridge_asyncio
+        from supernode.ollama_adapter import OllamaAdapter
+        from supernode.router import SupernodeRouter
+        from supernode.discovery import SupernodeDiscovery
+        from supernode.publisher import ManifestPublisher
+        from supernode.prompt_handler import PromptHandlerLoop
+
+        _bridge_url = str(args.bridge_url or "http://localhost:11434")
+        _bridge_adapter = OllamaAdapter(base_url=_bridge_url)
+
+        _bridge_loop = _bridge_asyncio.new_event_loop()
+        try:
+            _healthy = _bridge_loop.run_until_complete(_bridge_adapter.health_check())
+        except Exception as _hc_err:
+            logger.error("bridge_health_check_failed: %s at %s", _hc_err, _bridge_url)
+            raise SystemExit(1)
+        if not _healthy:
+            logger.error("bridge_health_check_failed: Ollama not reachable at %s", _bridge_url)
+            raise SystemExit(1)
+        logger.info("bridge_health_ok: ollama at %s", _bridge_url)
+
+        _bridge_discovery = SupernodeDiscovery()
+
+        _bridge_privkey_path = str(getattr(args, "identity_path", ".openhydra/identity.key"))
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            _identity = load_or_create_identity_keyfile(_bridge_privkey_path)
+            _bridge_privkey = private_key_from_identity(_identity)
+        except Exception as _key_err:
+            logger.warning("bridge_key_load_failed: %s — generating ephemeral key", _key_err)
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            _bridge_privkey = Ed25519PrivateKey.generate()
+
+        _bridge_libp2p_id = ""
+        if _p2p_node is not None:
+            _bridge_libp2p_id = str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+
+        _bridge_publisher = ManifestPublisher(
+            adapter=_bridge_adapter,
+            discovery=_bridge_discovery,
+            private_key=_bridge_privkey,
+            peer_id=str(args.peer_id or ""),
+            libp2p_peer_id=_bridge_libp2p_id,
+        )
+        _bridge_publisher.start()
+        logger.info("bridge_publisher_started")
+
+        if _p2p_node is not None:
+            _bridge_prompt_handler = PromptHandlerLoop(
+                p2p_node=_p2p_node,
+                adapter=_bridge_adapter,
+                stop_event=_bridge_stop_event,
+            )
+            _bridge_prompt_handler.start()
+            logger.info("bridge_prompt_handler_started")
+
+        _bridge_router = SupernodeRouter(loop=_bridge_loop)
+        _bridge_router.register_adapter("ollama", _bridge_adapter)
+
+        from coordinator.api_server import OpenHydraHandler
+        OpenHydraHandler.supernode_router = _bridge_router
+        logger.info("bridge_supernode_router_wired")
+        _bridge_loop.close()
+
     # Start the coordinator HTTP API on the main thread (blocking).
     # Signal handling (SIGTERM, SIGINT) is already wired inside coordinator_serve.
-    coordinator_serve(
-        host=args.api_host,
-        port=args.api_port,
-        config=engine_config,
-        api_key=api_key,
-        p2p_node=_p2p_node,
-        node_meta=_node_meta,
-        gossip_client=_gossip_client,
-        capacity_snapshot_ref=_capacity_snapshot_ref,
-    )
+    try:
+        coordinator_serve(
+            host=args.api_host,
+            port=args.api_port,
+            config=engine_config,
+            api_key=api_key,
+            p2p_node=_p2p_node,
+            node_meta=_node_meta,
+            gossip_client=_gossip_client,
+            capacity_snapshot_ref=_capacity_snapshot_ref,
+        )
+    finally:
+        if _bridge_publisher is not None:
+            _bridge_publisher.stop()
+        if _bridge_prompt_handler is not None:
+            _bridge_stop_event.set()
+            _bridge_prompt_handler.stop()
+        if args.bridge:
+            logger.info("bridge_shutdown_complete")
 
 
 if __name__ == "__main__":
