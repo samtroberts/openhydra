@@ -15,6 +15,8 @@ from .manifest import (
     ModelCapability,
     HardwareInfo,
     MANIFEST_REFRESH_S,
+    supernode_record_key,
+    model_provider_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class ManifestPublisher:
         region: str = "",
         hardware: HardwareInfo | None = None,
         refresh_interval: float = MANIFEST_REFRESH_S,
+        p2p_node: Any | None = None,
     ):
         self._adapter = adapter
         self._discovery = discovery
@@ -55,6 +58,7 @@ class ManifestPublisher:
         self._region = region
         self._hardware = hardware or HardwareInfo()
         self._refresh_interval = refresh_interval
+        self._p2p_node = p2p_node
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -78,6 +82,7 @@ class ManifestPublisher:
             self._thread.join(timeout=5.0)
             self._thread = None
 
+        self._stop_providing_dht()
         self._discovery.remove_manifest(self._libp2p_peer_id)
         logger.info("manifest_publisher_stopped peer=%s removed_manifest=true", self._peer_id)
 
@@ -159,8 +164,40 @@ class ManifestPublisher:
                 "manifest_published peer=%s models=%d count=%d",
                 self._peer_id, len(capabilities), self._publish_count,
             )
+            self._publish_to_dht(manifest)
         else:
             logger.warning("manifest_publish_register_failed peer=%s", self._peer_id)
+
+    def _publish_to_dht(self, manifest: SupernodeManifest) -> None:
+        if self._p2p_node is None:
+            return
+        try:
+            manifest_key = supernode_record_key(self._libp2p_peer_id)
+            self._p2p_node.put_record_raw(
+                key=manifest_key.encode(), value=manifest.to_cbor(),
+            )
+            for model in manifest.models:
+                key = model_provider_key(model.model_id)
+                self._p2p_node.start_providing(key=key.encode())
+            logger.debug(
+                "dht_published peer=%s models=%d",
+                self._libp2p_peer_id, len(manifest.models),
+            )
+        except Exception:
+            logger.warning("dht_publish_failed", exc_info=True)
+
+    def _stop_providing_dht(self) -> None:
+        if self._p2p_node is None or not self._last_model_ids:
+            return
+        try:
+            for model_id in self._last_model_ids:
+                key = model_provider_key(model_id)
+                self._p2p_node.stop_providing(key=key.encode())
+            logger.info(
+                "dht_stop_providing models=%s", self._last_model_ids,
+            )
+        except Exception:
+            logger.warning("dht_stop_providing_failed", exc_info=True)
 
     def publish_now(self) -> bool:
         """Force an immediate publish (blocking). Returns True on success."""

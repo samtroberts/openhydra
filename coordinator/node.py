@@ -1577,6 +1577,7 @@ def main() -> None:
             private_key=_bridge_privkey,
             peer_id=str(args.peer_id or ""),
             libp2p_peer_id=_bridge_libp2p_id,
+            p2p_node=_p2p_node,
         )
         _bridge_publisher.start()
         logger.info("bridge_publisher_started")

@@ -421,13 +421,16 @@ class TestFailover:
         yield l
         l.close()
 
-    def _build_router(self, loop, adapters_by_peer_id, model_id="llama3:8b"):
+    def _build_router(self, loop, adapters_by_peer_id, model_id="llama3:8b",
+                      trust_tiers=None):
         """Wire up discovery + prompt_router + supernode_router."""
         discovery = SupernodeDiscovery()
         prompt_router = PromptRouter(discovery)
+        trust_tiers = trust_tiers or {}
 
         for peer_id, adapter in adapters_by_peer_id.items():
-            manifest = _make_signed_manifest(peer_id, [model_id])
+            tier = trust_tiers.get(peer_id, "unverified")
+            manifest = _make_signed_manifest(peer_id, [model_id], trust_tier=tier)
             discovery.register_manifest(manifest)
             prompt_router.register_adapter(f"12D3KooW{peer_id}", adapter)
 
@@ -448,7 +451,7 @@ class TestFailover:
         r = self._build_router(loop, {
             "bad": MidStreamFailAdapter(),
             "good": MockAdapter(tokens=["should-not-reach"]),
-        })
+        }, trust_tiers={"bad": "attested", "good": "unverified"})
         body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
         result = r.chat_completion(body)
         content = result["choices"][0]["message"]["content"]

@@ -222,3 +222,66 @@ class TestModelChange:
 
         assert len(discovery.known_models()) == 2
         assert pub.publish_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: DHT integration
+# ---------------------------------------------------------------------------
+
+class MockDHTNode:
+    def __init__(self):
+        self.put_record_calls: list[tuple[bytes, bytes]] = []
+        self.start_providing_calls: list[bytes] = []
+        self.stop_providing_calls: list[bytes] = []
+
+    def put_record_raw(self, key: bytes, value: bytes):
+        self.put_record_calls.append((key, value))
+
+    def start_providing(self, key: bytes):
+        self.start_providing_calls.append(key)
+
+    def stop_providing(self, key: bytes):
+        self.stop_providing_calls.append(key)
+
+
+class TestDHTPublishing:
+    def test_publish_puts_record_and_provides(self, discovery, key):
+        dht_node = MockDHTNode()
+        adapter = StubAdapter()
+        pub = ManifestPublisher(
+            adapter=adapter, discovery=discovery, private_key=key,
+            peer_id="test-peer", libp2p_peer_id="12D3KooWTest",
+            p2p_node=dht_node,
+        )
+        pub.publish_now()
+
+        assert len(dht_node.put_record_calls) == 1
+        rec_key = dht_node.put_record_calls[0][0]
+        assert b"/openhydra/supernode/12D3KooWTest" in rec_key
+
+        assert len(dht_node.start_providing_calls) == 1
+        prov_key = dht_node.start_providing_calls[0]
+        assert b"/openhydra/model/" in prov_key
+
+    def test_stop_calls_stop_providing(self, discovery, key):
+        dht_node = MockDHTNode()
+        adapter = StubAdapter()
+        pub = ManifestPublisher(
+            adapter=adapter, discovery=discovery, private_key=key,
+            peer_id="test-peer", libp2p_peer_id="12D3KooWTest",
+            p2p_node=dht_node,
+        )
+        pub.publish_now()
+        pub.stop()
+
+        assert len(dht_node.stop_providing_calls) == 1
+
+    def test_no_dht_without_node(self, discovery, key):
+        adapter = StubAdapter()
+        pub = ManifestPublisher(
+            adapter=adapter, discovery=discovery, private_key=key,
+            peer_id="test-peer", libp2p_peer_id="12D3KooWTest",
+        )
+        pub.publish_now()
+        pub.stop()
+        # No crash — DHT calls are skipped when p2p_node is None

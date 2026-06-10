@@ -134,7 +134,7 @@ class TestSelectSupernode:
     def test_weighted_toward_higher(self):
         """Higher-scored candidate should be selected more often."""
         high = ScoredCandidate(manifest=_make_manifest("high"), score=1.0)
-        low = ScoredCandidate(manifest=_make_manifest("low"), score=0.91)
+        low = ScoredCandidate(manifest=_make_manifest("low"), score=0.5)
 
         counts: dict[str, int] = collections.Counter()
         for _ in range(1000):

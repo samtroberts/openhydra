@@ -26,6 +26,7 @@ class TokenChunk:
     token: str
     token_id: int | None = None
     finish_reason: str | None = None
+    usage: dict | None = None
 
 
 @dataclass

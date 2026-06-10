@@ -115,7 +115,17 @@ class OllamaAdapter(SupernodeAdapter):
 
                     if done:
                         finish = chunk.get("done_reason", "stop")
-                        yield TokenChunk(token=token_text, finish_reason=finish)
+                        usage = {}
+                        for k in ("eval_count", "eval_duration",
+                                  "prompt_eval_count", "prompt_eval_duration",
+                                  "total_duration"):
+                            if k in chunk:
+                                usage[k] = chunk[k]
+                        yield TokenChunk(
+                            token=token_text,
+                            finish_reason=finish,
+                            usage=usage or None,
+                        )
                     elif token_text:
                         yield TokenChunk(token=token_text)
         finally:
