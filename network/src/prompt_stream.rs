@@ -238,8 +238,9 @@ pub async fn open_prompt_stream(
         }
         // Push empty sentinel to signal end-of-stream.
         chunk_queue.push((sid.clone(), Vec::new()));
-        // Clean up.
-        readers_ref.lock().unwrap().remove(&sid);
+        // Don't remove from readers/cancels here — Python's poll_prompt_chunk
+        // may not have drained the queue yet. Cleanup happens when Python
+        // calls close_prompt_stream.
         cancels_ref.lock().unwrap().remove(&sid);
     });
 
