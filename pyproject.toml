@@ -51,6 +51,12 @@ mlx = [
   "mlx>=0.31",
   "mlx-lm>=0.31",
 ]
+gguf = [
+  "llama-cpp-python>=0.3",
+]
+vllm = [
+  "vllm>=0.6",
+]
 
 [project.scripts]
 openhydra              = "coordinator.client_cli:main"

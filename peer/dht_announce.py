@@ -51,7 +51,6 @@ class Announcement:
     privacy_noise_observed_variance_ema: float = 0.0
     privacy_noise_last_audit_tag: str = ""
     reputation_score: float = 0.0
-    staked_balance: float = 0.0
     expert_tags: tuple[str, ...] = ()
     expert_layer_indices: tuple[int, ...] = ()
     expert_router: bool = False

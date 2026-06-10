@@ -91,20 +91,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--tier", type=int, default=2)
     parser.add_argument("--max-failovers-per-stage", type=int, default=1)
-    parser.add_argument("--ledger-path", default=".openhydra/credits.db")
-    parser.add_argument("--barter-decay-per-day", type=float, default=0.05)
-    parser.add_argument("--hydra-token-ledger-path", default=".openhydra/hydra_tokens.db")
-    parser.add_argument("--hydra-reward-per-1k-tokens", type=float, default=1.0)
-    parser.add_argument("--hydra-slash-per-failed-verification", type=float, default=0.0)
-    parser.add_argument("--hydra-channel-default-ttl-seconds", type=int, default=900)
-    parser.add_argument("--hydra-channel-max-open-per-payer", type=int, default=8)
-    parser.add_argument("--hydra-channel-min-deposit", type=float, default=0.01)
-    parser.add_argument("--hydra-supply-cap", type=float, default=69_000_000.0)
-    parser.add_argument("--hydra-ledger-bridge-mock-mode", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--hydra-stake-priority-boost", type=float, default=12.0)
-    parser.add_argument("--hydra-no-stake-penalty-events", type=int, default=8)
-    parser.add_argument("--hydra-governance-daily-mint-rate", type=float, default=250_000.0)
-    parser.add_argument("--hydra-governance-min-slash-penalty", type=float, default=0.1)
     parser.add_argument("--health-store-path", default=".openhydra/health.json")
     parser.add_argument("--required-replicas", type=int, default=3)
     parser.add_argument("--allow-dynamic-model-ids", action=argparse.BooleanOptionalAction, default=True)
@@ -190,20 +176,6 @@ def main() -> None:
             verification_qos_min_success_rate=max(0.0, min(1.0, args.verification_qos_min_success_rate)),
             seed=args.seed,
             max_failovers_per_stage=max(0, args.max_failovers_per_stage),
-            ledger_path=args.ledger_path,
-            barter_decay_per_day=max(0.0, args.barter_decay_per_day),
-            hydra_token_ledger_path=args.hydra_token_ledger_path,
-            hydra_reward_per_1k_tokens=max(0.0, args.hydra_reward_per_1k_tokens),
-            hydra_slash_per_failed_verification=max(0.0, args.hydra_slash_per_failed_verification),
-            hydra_channel_default_ttl_seconds=max(1, args.hydra_channel_default_ttl_seconds),
-            hydra_channel_max_open_per_payer=max(1, args.hydra_channel_max_open_per_payer),
-            hydra_channel_min_deposit=max(0.0, args.hydra_channel_min_deposit),
-            hydra_supply_cap=max(0.0, float(args.hydra_supply_cap)),
-            hydra_ledger_bridge_mock_mode=bool(args.hydra_ledger_bridge_mock_mode),
-            hydra_stake_priority_boost=max(0.0, float(args.hydra_stake_priority_boost)),
-            hydra_no_stake_penalty_events=max(1, int(args.hydra_no_stake_penalty_events)),
-            hydra_governance_daily_mint_rate=max(0.0, float(args.hydra_governance_daily_mint_rate)),
-            hydra_governance_min_slash_penalty=max(0.0, float(args.hydra_governance_min_slash_penalty)),
             health_store_path=args.health_store_path,
             required_replicas=max(1, args.required_replicas),
             allow_dynamic_model_ids=bool(args.allow_dynamic_model_ids),

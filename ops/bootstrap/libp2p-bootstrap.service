@@ -14,7 +14,10 @@ WorkingDirectory=/opt/openhydra
 # other two bootstrap peers. The deploy script writes a drop-in override.
 ExecStart=/opt/openhydra/bin/openhydra-bootstrap \
     --identity /opt/openhydra/.libp2p_identity.key \
-    --listen /ip4/0.0.0.0/tcp/4001
+    --listen /ip4/0.0.0.0/tcp/4001 \
+    --listen /ip4/0.0.0.0/udp/4001/quic-v1 \
+    --listen /ip6/::/tcp/4001 \
+    --listen /ip6/::/udp/4001/quic-v1
 
 # Log level via RUST_LOG env var (default: info)
 Environment=RUST_LOG=info

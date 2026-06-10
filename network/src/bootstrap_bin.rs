@@ -19,6 +19,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::{autonat, gossipsub, identify, kad, relay, Multiaddr, Swarm, Transport};
+use libp2p_connection_limits as connection_limits;
 use tracing::info;
 
 // Re-use crate modules for identity and transport.
@@ -45,6 +46,7 @@ struct BootstrapBehaviour {
     /// because neither is connected to anyone who'll forward the
     /// topic message.
     gossipsub: gossipsub::Behaviour,
+    connection_limits: connection_limits::Behaviour,
 }
 
 #[tokio::main]
@@ -99,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kad_config.set_record_ttl(Some(Duration::from_secs(600)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(600)));
     kad_config.set_publication_interval(Some(Duration::from_secs(240)));
+    kad_config.set_max_packet_size(64 * 1024);
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
@@ -130,10 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay::Config {
             max_reservations: 256,
             max_circuits: 512,
-            max_circuits_per_peer: 8,
+            max_circuits_per_peer: 4,
             reservation_duration: Duration::from_secs(3600),
-            // 10 MB per circuit — activation tensors can be several MB.
-            max_circuit_bytes: 10 * 1024 * 1024,
+            // 5 MB per circuit — activation tensors for small models are 1-3 MB.
+            max_circuit_bytes: 5 * 1024 * 1024,
             // 10 minutes per circuit — autoregressive decode can take a while.
             max_circuit_duration: Duration::from_secs(600),
             ..Default::default()
@@ -205,6 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subscribe(&gossip_topic)
         .map_err(|e| format!("gossipsub subscribe: {e:?}"))?;
 
+    let limits = connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(1024))
+        .with_max_established_per_peer(Some(4))
+        .with_max_pending_incoming(Some(128))
+        .with_max_pending_outgoing(Some(64));
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
@@ -212,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         identify,
         dcutr,
         gossipsub,
+        connection_limits: connection_limits::Behaviour::new(limits),
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()

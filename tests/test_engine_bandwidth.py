@@ -9,9 +9,7 @@ def _engine(tmp_path):
     return CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             prefill_token_threshold=5,

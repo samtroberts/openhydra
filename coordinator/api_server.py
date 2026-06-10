@@ -307,17 +307,8 @@ def _resolve_runtime_profile_settings(parser: argparse.ArgumentParser, args: arg
     except RuntimeError as exc:
         parser.error(str(exc))
 
-    mock_mode_arg = getattr(args, "hydra_ledger_bridge_mock_mode", None)
-    if mock_mode_arg is None:
-        hydra_ledger_bridge_mock_mode = (profile != "prod")
-    else:
-        hydra_ledger_bridge_mock_mode = bool(mock_mode_arg)
-
     advanced_encryption_seed = str(getattr(args, "advanced_encryption_seed", "") or "").strip()
     if profile == "prod":
-        if hydra_ledger_bridge_mock_mode:
-            parser.error("prod profile forbids mock ledger mode; use --no-hydra-ledger-bridge-mock-mode")
-
         if not bool(getattr(args, "tls_enable", False)):
             parser.error("prod profile requires --tls-enable")
         if not getattr(args, "tls_root_cert_path", None):
@@ -341,7 +332,6 @@ def _resolve_runtime_profile_settings(parser: argparse.ArgumentParser, args: arg
 
     return {
         "deployment_profile": profile,
-        "hydra_ledger_bridge_mock_mode": hydra_ledger_bridge_mock_mode,
         "advanced_encryption_seed": advanced_encryption_seed or str(getattr(args, "advanced_encryption_seed")),
     }
 
@@ -1260,26 +1250,6 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.network_status(), headers=rid_headers)
                 return
 
-            if parsed.path == "/v1/account/balance":
-                qs = parse_qs(parsed.query)
-                client_id = qs.get("client_id", ["anonymous"])[0]
-                self._send_json(engine.account_balance(client_id=client_id), headers=rid_headers)
-                return
-
-            if parsed.path == "/v1/hydra/status":
-                self._send_json(engine.hydra_status(), headers=rid_headers)
-                return
-
-            if parsed.path == "/v1/hydra/account":
-                qs = parse_qs(parsed.query)
-                client_id = qs.get("client_id", ["anonymous"])[0]
-                self._send_json(engine.hydra_account(client_id=client_id), headers=rid_headers)
-                return
-
-            if parsed.path == "/v1/hydra/governance/params":
-                self._send_json(engine.hydra_governance_params(), headers=rid_headers)
-                return
-
             # Ollama-compatible endpoint: list models in Ollama /api/tags format.
             if parsed.path == "/api/tags":
                 self._tags_ollama(rid_headers=rid_headers)
@@ -1824,104 +1794,6 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if parsed.path == "/v1/hydra/transfer":
-                self._send_json(
-                    engine.hydra_transfer(
-                        from_client_id=str(body.get("from_client_id", "anonymous")),
-                        to_client_id=str(body.get("to_client_id", "")),
-                        amount=float(body.get("amount", 0.0)),
-                    ),
-                    headers=rid_headers,
-                )
-                return
-
-            if parsed.path == "/v1/hydra/stake":
-                self._send_json(
-                    engine.hydra_stake(
-                        client_id=str(body.get("client_id", "anonymous")),
-                        amount=float(body.get("amount", 0.0)),
-                    ),
-                    headers=rid_headers,
-                )
-                return
-
-            if parsed.path == "/v1/hydra/unstake":
-                self._send_json(
-                    engine.hydra_unstake(
-                        client_id=str(body.get("client_id", "anonymous")),
-                        amount=float(body.get("amount", 0.0)),
-                    ),
-                    headers=rid_headers,
-                )
-                return
-
-            if parsed.path == "/v1/hydra/channels/open":
-                channel_id = str(body.get("channel_id", "")).strip() or str(uuid.uuid4())
-                self._send_json(
-                    engine.hydra_open_channel(
-                        channel_id=channel_id,
-                        payer=str(body.get("payer", "anonymous")),
-                        payee=str(body.get("payee", "")),
-                        deposit=float(body.get("deposit", 0.0)),
-                        ttl_seconds=(
-                            int(body["ttl_seconds"])
-                            if body.get("ttl_seconds") is not None
-                            else None
-                        ),
-                    ),
-                    headers=rid_headers,
-                )
-                return
-
-            if parsed.path == "/v1/hydra/channels/charge":
-                provider_peer_id = (
-                    str(body.get("provider_peer_id"))
-                    if body.get("provider_peer_id") is not None
-                    else None
-                )
-                if provider_peer_id is None:
-                    payload = engine.hydra_charge_channel(
-                        channel_id=str(body.get("channel_id", "")),
-                        amount=float(body.get("amount", 0.0)),
-                    )
-                else:
-                    payload = engine.hydra_charge_channel(
-                        channel_id=str(body.get("channel_id", "")),
-                        amount=float(body.get("amount", 0.0)),
-                        provider_peer_id=provider_peer_id,
-                    )
-                self._send_json(payload, headers=rid_headers)
-                return
-
-            if parsed.path == "/v1/hydra/channels/reconcile":
-                self._send_json(
-                    engine.hydra_reconcile_channel(
-                        channel_id=str(body.get("channel_id", "")),
-                        total_spent=float(body.get("total_spent", 0.0)),
-                        nonce=int(body.get("nonce", 0)),
-                    ),
-                    headers=rid_headers,
-                )
-                return
-
-            if parsed.path == "/v1/hydra/channels/close":
-                self._send_json(
-                    engine.hydra_close_channel(
-                        channel_id=str(body.get("channel_id", "")),
-                    ),
-                    headers=rid_headers,
-                )
-                return
-
-            if parsed.path == "/v1/hydra/governance/vote":
-                self._send_json(
-                    engine.hydra_governance_vote(
-                        pubkey=str(body.get("pubkey", "anonymous")),
-                        proposal_id=str(body.get("proposal_id", "")),
-                        vote=str(body.get("vote", "")),
-                    ),
-                    headers=rid_headers,
-                )
                 return
 
             # ------------------------------------------------------------------
@@ -1968,8 +1840,6 @@ class OpenHydraHandler(BaseHTTPRequestHandler):
                 err_status = HTTPStatus.BAD_REQUEST
             elif message.startswith("insufficient_peers:") or message.startswith("no_viable_fallback:"):
                 err_status = HTTPStatus.SERVICE_UNAVAILABLE
-            elif message.startswith("hydra_") or message.startswith("hydra_bridge_"):
-                err_status = HTTPStatus.BAD_REQUEST
             else:
                 err_status = HTTPStatus.BAD_GATEWAY
             logger.warning("runtime_error req_id=%s: %s", request_id, message)
@@ -2041,16 +1911,6 @@ def serve(
         logger.warning("API key authentication is DISABLED — set --api-key for production")
     if rate_limiter:
         logger.info("Rate limiting enabled")
-
-    # Warn when the HYDRA ledger bridge is running in mock mode (default).
-    # All burn/mint/settlement calls are in-memory only — no real L1 settlement occurs.
-    engine = OpenHydraHandler.engine
-    if engine is not None and getattr(getattr(engine, "ledger_bridge", None), "mock_mode", False):
-        logger.warning(
-            "HYDRA_BRIDGE_MOCK_MODE=true — token burn/mint/settlement is simulated in memory only. "
-            "No real on-chain transactions will occur. "
-            "Set --no-hydra-ledger-bridge-mock-mode and wire a real L1 resolver for production."
-        )
 
     # ── Discovery warmup: pre-populate peer table in the background ────
     # Without this, the first inference request pays a ~5-15 s penalty for
@@ -2174,20 +2034,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--tier", type=int, default=2)
     parser.add_argument("--max-failovers-per-stage", type=int, default=1)
-    parser.add_argument("--ledger-path", default=".openhydra/credits.db")
-    parser.add_argument("--barter-decay-per-day", type=float, default=0.05)
-    parser.add_argument("--hydra-token-ledger-path", default=".openhydra/hydra_tokens.db")
-    parser.add_argument("--hydra-reward-per-1k-tokens", type=float, default=1.0)
-    parser.add_argument("--hydra-slash-per-failed-verification", type=float, default=0.0)
-    parser.add_argument("--hydra-channel-default-ttl-seconds", type=int, default=900)
-    parser.add_argument("--hydra-channel-max-open-per-payer", type=int, default=8)
-    parser.add_argument("--hydra-channel-min-deposit", type=float, default=0.01)
-    parser.add_argument("--hydra-supply-cap", type=float, default=69_000_000.0)
-    parser.add_argument("--hydra-ledger-bridge-mock-mode", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--hydra-stake-priority-boost", type=float, default=12.0)
-    parser.add_argument("--hydra-no-stake-penalty-events", type=int, default=8)
-    parser.add_argument("--hydra-governance-daily-mint-rate", type=float, default=250_000.0)
-    parser.add_argument("--hydra-governance-min-slash-penalty", type=float, default=0.1)
     parser.add_argument("--health-store-path", default=".openhydra/health.json")
     parser.add_argument("--required-replicas", type=int, default=3)
     parser.add_argument("--allow-dynamic-model-ids", action=argparse.BooleanOptionalAction, default=True)
@@ -2253,7 +2099,6 @@ def main() -> None:
         default=None,
         help=(
             "PostgreSQL connection URL (e.g. postgresql://user:pass@host:5432/db). "
-            "When set, Postgres is used for ledger storage instead of SQLite. "
             "Also readable from the DATABASE_URL environment variable."
         ),
     )
@@ -2311,20 +2156,6 @@ def main() -> None:
         verification_qos_min_success_rate=max(0.0, min(1.0, args.verification_qos_min_success_rate)),
         seed=args.seed,
         max_failovers_per_stage=max(0, args.max_failovers_per_stage),
-        ledger_path=args.ledger_path,
-        barter_decay_per_day=max(0.0, args.barter_decay_per_day),
-        hydra_token_ledger_path=args.hydra_token_ledger_path,
-        hydra_reward_per_1k_tokens=max(0.0, args.hydra_reward_per_1k_tokens),
-        hydra_slash_per_failed_verification=max(0.0, args.hydra_slash_per_failed_verification),
-        hydra_channel_default_ttl_seconds=max(1, args.hydra_channel_default_ttl_seconds),
-        hydra_channel_max_open_per_payer=max(1, args.hydra_channel_max_open_per_payer),
-        hydra_channel_min_deposit=max(0.0, args.hydra_channel_min_deposit),
-        hydra_supply_cap=max(0.0, float(args.hydra_supply_cap)),
-        hydra_ledger_bridge_mock_mode=bool(profile_settings["hydra_ledger_bridge_mock_mode"]),
-        hydra_stake_priority_boost=max(0.0, float(args.hydra_stake_priority_boost)),
-        hydra_no_stake_penalty_events=max(1, int(args.hydra_no_stake_penalty_events)),
-        hydra_governance_daily_mint_rate=max(0.0, float(args.hydra_governance_daily_mint_rate)),
-        hydra_governance_min_slash_penalty=max(0.0, float(args.hydra_governance_min_slash_penalty)),
         health_store_path=args.health_store_path,
         database_url=database_url,
         required_replicas=max(1, args.required_replicas),

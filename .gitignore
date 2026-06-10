@@ -33,6 +33,10 @@ htmlcov/
 .cache/
 *.npz
 
+# ── Plans & docs (internal, not published) ────────────────────────────────────
+docs/
+plans/
+
 # ── OpenHydra runtime data ────────────────────────────────────────────────────
 .openhydra/
 peers.local.json
@@ -52,6 +56,20 @@ peers.local.json
 ops/prod_secrets.env
 ops/certs/*.pem
 ops/certs/*.key
+
+# ── Bootstrap node sensitive artifacts ────────────────────────────────────────
+# Identity keys (generated on each node, never committed)
+**/libp2p_identity.key
+**/identity.key
+# Systemd drop-in overrides (contain per-node peer addresses)
+ops/bootstrap/*.d/
+# Exported iptables rules (node-specific)
+ops/bootstrap/rules.v4
+# SSH keys that may be copied locally for deploy
+ops/bootstrap/authorized_keys
+ops/bootstrap/deploy_key*
+# Geo-challenge shared secret
+ops/bootstrap/geo_seed.txt
 
 # ── Node / JS ─────────────────────────────────────────────────────────────────
 node_modules/

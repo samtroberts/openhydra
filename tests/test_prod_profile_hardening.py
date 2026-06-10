@@ -14,11 +14,10 @@ def _parser() -> argparse.ArgumentParser:
     return argparse.ArgumentParser(prog="test")
 
 
-def test_api_dev_profile_keeps_mock_ledger_default():
+def test_api_dev_profile_keeps_defaults():
     args = SimpleNamespace(
         deployment_profile="dev",
         secrets_file=None,
-        hydra_ledger_bridge_mock_mode=None,
         advanced_encryption_seed="openhydra-tier3-dev-seed",
         tls_enable=False,
         tls_root_cert_path=None,
@@ -28,15 +27,13 @@ def test_api_dev_profile_keeps_mock_ledger_default():
     )
     settings = _resolve_runtime_profile_settings(_parser(), args)
     assert settings["deployment_profile"] == "dev"
-    assert settings["hydra_ledger_bridge_mock_mode"] is True
 
 
-def test_api_prod_profile_forces_live_ledger_and_tls(monkeypatch: pytest.MonkeyPatch):
+def test_api_prod_profile_forces_tls_and_encryption_seed(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENHYDRA_ADVANCED_ENCRYPTION_SEED", "prod-advanced-seed")
     args = SimpleNamespace(
         deployment_profile="prod",
         secrets_file=None,
-        hydra_ledger_bridge_mock_mode=None,
         advanced_encryption_seed="openhydra-tier3-dev-seed",
         tls_enable=True,
         tls_root_cert_path="/certs/ca.pem",
@@ -45,24 +42,7 @@ def test_api_prod_profile_forces_live_ledger_and_tls(monkeypatch: pytest.MonkeyP
         tls_server_name_override="peer.internal",
     )
     settings = _resolve_runtime_profile_settings(_parser(), args)
-    assert settings["hydra_ledger_bridge_mock_mode"] is False
     assert settings["advanced_encryption_seed"] == "prod-advanced-seed"
-
-
-def test_api_prod_profile_rejects_mock_ledger():
-    args = SimpleNamespace(
-        deployment_profile="prod",
-        secrets_file=None,
-        hydra_ledger_bridge_mock_mode=True,
-        advanced_encryption_seed="prod-seed",
-        tls_enable=True,
-        tls_root_cert_path="/certs/ca.pem",
-        tls_client_cert_path="/certs/client.pem",
-        tls_client_key_path="/certs/client.key",
-        tls_server_name_override="peer.internal",
-    )
-    with pytest.raises(SystemExit):
-        _resolve_runtime_profile_settings(_parser(), args)
 
 
 def test_peer_prod_profile_requires_mtls_and_secrets(monkeypatch: pytest.MonkeyPatch):

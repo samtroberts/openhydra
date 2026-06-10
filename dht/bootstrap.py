@@ -168,8 +168,6 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
     default_geo_max_rtt_ms: float = 50.0
     default_geo_challenge_seed: str = "openhydra-geo-dev-seed"
     default_expert_min_reputation_score: float = 60.0
-    default_expert_min_staked_balance: float = 0.01
-    default_expert_require_stake: bool = True
     _lookup_buckets: dict[str, dict[str, float]] = {}
     _lookup_lock = threading.Lock()
     _rebalance_hints: dict[str, dict[str, Any]] = {}
@@ -250,7 +248,6 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             "privacy_noise_observed_variance_ema": float(payload.get("privacy_noise_observed_variance_ema", 0.0)),
             "privacy_noise_last_audit_tag": str(payload.get("privacy_noise_last_audit_tag", "")),
             "reputation_score": float(payload.get("reputation_score", 0.0)),
-            "staked_balance": float(payload.get("staked_balance", 0.0)),
             "expert_tags": _normalize_tags(payload.get("expert_tags", [])),
             "expert_layer_indices": _normalize_layer_indices(payload.get("expert_layer_indices", [])),
             "expert_router": bool(payload.get("expert_router", False)),
@@ -291,18 +288,12 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             return record
 
         reputation_score = max(0.0, float(record.get("reputation_score", 0.0)))
-        staked_balance = max(0.0, float(record.get("staked_balance", 0.0)))
         min_rep = max(0.0, float(self.default_expert_min_reputation_score))
-        min_stake = max(0.0, float(self.default_expert_min_staked_balance))
-        require_stake = bool(self.default_expert_require_stake)
 
         approved = reputation_score >= min_rep
         reason = "approved"
         if not approved:
             reason = "low_reputation"
-        elif require_stake and staked_balance < min_stake:
-            approved = False
-            reason = "unstaked_or_new"
 
         if approved:
             record["expert_admission_approved"] = True
@@ -645,8 +636,6 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
                         },
                         "expert_admission": {
                             "min_reputation_score": float(self.default_expert_min_reputation_score),
-                            "min_staked_balance": float(self.default_expert_min_staked_balance),
-                            "require_stake": bool(self.default_expert_require_stake),
                         },
                         "dsht_rebalance": self._lookup_rebalance_snapshot(),
                     }
@@ -807,8 +796,6 @@ def serve(
     geo_max_rtt_ms: float = 50.0,
     geo_challenge_seed: str = "openhydra-geo-dev-seed",
     expert_min_reputation_score: float = 60.0,
-    expert_min_staked_balance: float = 0.01,
-    expert_require_stake: bool = True,
 ) -> None:
     dht_node = InMemoryDhtNode(ttl_seconds=ttl_seconds)
     dht_node.start_background_pruner(interval_s=30.0)
@@ -823,8 +810,6 @@ def serve(
     DhtBootstrapHandler.default_geo_max_rtt_ms = max(1.0, float(geo_max_rtt_ms))
     DhtBootstrapHandler.default_geo_challenge_seed = str(geo_challenge_seed)
     DhtBootstrapHandler.default_expert_min_reputation_score = max(0.0, float(expert_min_reputation_score))
-    DhtBootstrapHandler.default_expert_min_staked_balance = max(0.0, float(expert_min_staked_balance))
-    DhtBootstrapHandler.default_expert_require_stake = bool(expert_require_stake)
     DhtBootstrapHandler._lookup_buckets = {}
     DhtBootstrapHandler._rebalance_hints = {}
     DhtBootstrapHandler._layer_rebalance_directives = {}
@@ -903,8 +888,6 @@ def main() -> None:
     parser.add_argument("--geo-max-rtt-ms", type=float, default=50.0)
     parser.add_argument("--geo-challenge-seed", default="openhydra-geo-dev-seed")
     parser.add_argument("--expert-min-reputation-score", type=float, default=60.0)
-    parser.add_argument("--expert-min-staked-balance", type=float, default=0.01)
-    parser.add_argument("--expert-require-stake", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--dht-backend",
         choices=["memory", "hivemind"],
@@ -957,8 +940,6 @@ def main() -> None:
         geo_max_rtt_ms=max(1.0, float(args.geo_max_rtt_ms)),
         geo_challenge_seed=str(profile_settings["geo_challenge_seed"]),
         expert_min_reputation_score=max(0.0, float(args.expert_min_reputation_score)),
-        expert_min_staked_balance=max(0.0, float(args.expert_min_staked_balance)),
-        expert_require_stake=bool(args.expert_require_stake),
     )
 
 

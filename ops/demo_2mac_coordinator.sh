@@ -97,8 +97,7 @@ python3 -m coordinator.api_server \
     --dht-url http://127.0.0.1:1 --dht-lookup-timeout 0.1 \
     --required-replicas 1 --pipeline-width 2 \
     --timeout-ms 120000 --max-latency-ms 300000 \
-    --audit-rate 0.0 --redundant-exec-rate 0.0 --auditor-rate 0.0 \
-    --hydra-ledger-bridge-mock-mode &
+    --audit-rate 0.0 --redundant-exec-rate 0.0 --auditor-rate 0.0 &
 COORD_PID=$!
 sleep 4
 

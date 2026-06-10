@@ -74,8 +74,6 @@ class DiscoveryService:
         A ``ReplicationMonitor`` for replication status.
     transport_config:
         A ``TransportConfig`` for gRPC transport settings.
-    ledger_bridge:
-        An ``OpenHydraLedgerBridge`` for stake queries.
     role_thresholds:
         A ``RoleThresholds`` for bandwidth role classification.
     """
@@ -94,7 +92,6 @@ class DiscoveryService:
         degradation_policy: DegradationPolicy,
         replication_monitor: Any,
         transport_config: TransportConfig,
-        ledger_bridge: Any,
         role_thresholds: Any,
         _metrics_lock: threading.Lock,
         _dht_lookup_attempts: int = 0,
@@ -117,7 +114,6 @@ class DiscoveryService:
         self.degradation_policy = degradation_policy
         self.replication_monitor = replication_monitor
         self.transport_config = transport_config
-        self.ledger_bridge = ledger_bridge
         self.role_thresholds = role_thresholds
         self._metrics_lock = _metrics_lock
         self._dht_lookup_attempts = _dht_lookup_attempts
@@ -652,7 +648,7 @@ class DiscoveryService:
         """Full discovery orchestration for a requested model.
 
         Scans the network, applies verification QoS gating, evaluates
-        degradation policy, ranks healthy peers by reputation and stake,
+        degradation policy, ranks healthy peers by reputation,
         and returns ranked candidates ready for pipeline assembly.
 
         Args:
@@ -820,18 +816,6 @@ class DiscoveryService:
 
         peer_ids = [item.peer.peer_id for item in model_health]
         reputations = self.health.scores(peer_ids)
-        stake_priority_boost = max(0.0, float(self.config.hydra_stake_priority_boost))
-        if stake_priority_boost > 0.0:
-            for peer_id in peer_ids:
-                staked_balance = max(0.0, float(self.ledger_bridge.verify_staked_balance(peer_id)))
-                if staked_balance <= 0.0:
-                    continue
-                # Optional stake increases routing priority but does not gate admission.
-                stake_bonus = stake_priority_boost * (staked_balance / (staked_balance + 1.0))
-                reputations[peer_id] = min(
-                    100.0,
-                    float(reputations.get(peer_id, 50.0)) + stake_bonus,
-                )
         bandwidth_by_peer = {item.peer.peer_id: item.peer.bandwidth_mbps for item in model_health}
 
         ranked = rank_peers(

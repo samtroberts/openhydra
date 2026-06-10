@@ -30,6 +30,7 @@ libp2p = { version = "0.54", features = [
     "gossipsub",
     "ping",
 ] }
+libp2p-connection-limits = "0.4"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

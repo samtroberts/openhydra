@@ -101,6 +101,7 @@ pub fn build_swarm(
     kad_config.set_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_publication_interval(Some(Duration::from_secs(120)));
+    kad_config.set_max_packet_size(64 * 1024);
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);

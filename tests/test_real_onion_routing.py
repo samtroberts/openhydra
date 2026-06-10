@@ -110,7 +110,6 @@ def test_real_onion_routing_with_privacy_noise(tmp_path):
         engine = CoordinatorEngine(
             EngineConfig(
                 peers_config_path=str(peers_config),
-                ledger_path=str(tmp_path / "credits.json"),
                 health_store_path=str(tmp_path / "health.json"),
                 audit_rate=0.0,
                 redundant_exec_rate=0.0,
@@ -120,7 +119,6 @@ def test_real_onion_routing_with_privacy_noise(tmp_path):
                 advanced_encryption_enabled=True,
                 advanced_encryption_seed=seed,
                 advanced_encryption_level="enhanced",
-                barter_decay_per_day=0.0,
             )
         )
         payload = engine.infer_stream(

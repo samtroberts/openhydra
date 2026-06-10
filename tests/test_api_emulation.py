@@ -175,10 +175,6 @@ class _MockSwarmEngine:
         self.calls.append("network_status")
         return {"peers": []}
 
-    def account_balance(self, client_id):
-        self.calls.append("account_balance")
-        return {"hydra": 0, "credits": 0}
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Group A — Engine routing: local_engine takes priority when set

@@ -92,14 +92,12 @@ def test_real_kv_cache_isolation_across_two_pytorch_nodes(tmp_path):
         engine = CoordinatorEngine(
             EngineConfig(
                 peers_config_path=str(peers_config),
-                ledger_path=str(tmp_path / "credits.json"),
                 health_store_path=str(tmp_path / "health.json"),
                 audit_rate=0.0,
                 redundant_exec_rate=0.0,
                 grounding_use_network=False,
                 required_replicas=1,
                 pytorch_generation_model_id=model_name,
-                barter_decay_per_day=0.0,
             )
         )
 

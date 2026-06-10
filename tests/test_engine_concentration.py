@@ -6,9 +6,7 @@ def test_network_status_emits_operator_concentration_alert(tmp_path, monkeypatch
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             operator_cap_fraction=0.33,
             required_replicas=1,
         )
