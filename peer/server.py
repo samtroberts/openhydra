@@ -3372,7 +3372,6 @@ def _announce_loop(
     announce_ttl_sec: int,
     session_manager: TorrentSessionManager | None,
     announced_reputation_score: float,
-    announced_staked_balance: float,
     peer_public_key: str = "",
     announce_private_key: object = None,
     announce_public_key_hex: str = "",
@@ -3500,7 +3499,6 @@ def _announce_loop(
             privacy_noise_observed_variance_ema=float(service.shard.privacy_noise_observed_variance_ema),
             privacy_noise_last_audit_tag=str(service.shard.privacy_noise_last_audit_tag),
             reputation_score=max(0.0, float(announced_reputation_score)),
-            staked_balance=max(0.0, float(announced_staked_balance)),
             expert_tags=tuple(service.expert_tags),
             expert_layer_indices=tuple(service.expert_layer_indices),
             expert_router=bool(service.expert_router),
@@ -3807,7 +3805,6 @@ def serve(
     privacy_noise_variance: float = 0.0,
     geo_challenge_seed: str = "openhydra-geo-dev-seed",
     announced_reputation_score: float = 0.0,
-    announced_staked_balance: float = 0.0,
     expert_tags: tuple[str, ...] = (),
     expert_layer_indices: tuple[int, ...] = (),
     expert_router: bool = False,
@@ -4282,7 +4279,6 @@ def serve(
                     "announce_ttl_sec": announce_ttl_sec,
                     "session_manager": session_manager,
                     "announced_reputation_score": max(0.0, float(announced_reputation_score)),
-                    "announced_staked_balance": max(0.0, float(announced_staked_balance)),
                     "peer_public_key": service.peer_public_key,
                     "announce_private_key": _announce_private_key,
                     "announce_public_key_hex": _announce_public_key_hex,
@@ -4742,7 +4738,6 @@ def main() -> None:
     parser.add_argument("--tensor-autoencoder-latent-dim", type=int, default=1024)
     parser.add_argument("--privacy-noise-variance", type=float, default=0.0)
     parser.add_argument("--announced-reputation-score", type=float, default=0.0)
-    parser.add_argument("--announced-staked-balance", type=float, default=0.0)
     parser.add_argument("--geo-challenge-seed", default="openhydra-geo-dev-seed")
     parser.add_argument("--expert-tags", default="", help="Comma-separated expert tags, e.g. coding,math,legal")
     parser.add_argument("--expert-layer-indices", default="", help="Comma-separated layer indices for expert placement")
@@ -4750,7 +4745,7 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         default=".openhydra",
-        help="Directory for persistent peer state (identity keyfiles, ledger, etc.)",
+        help="Directory for persistent peer state (identity keyfiles, etc.)",
     )
     parser.add_argument(
         "--identity-path",
@@ -4820,7 +4815,6 @@ def main() -> None:
         privacy_noise_variance=max(0.0, float(args.privacy_noise_variance)),
         geo_challenge_seed=str(deployment_settings["geo_challenge_seed"]),
         announced_reputation_score=max(0.0, float(args.announced_reputation_score)),
-        announced_staked_balance=max(0.0, float(args.announced_staked_balance)),
         expert_tags=_parse_csv_tags(args.expert_tags),
         expert_layer_indices=_parse_csv_ints(args.expert_layer_indices),
         expert_router=bool(args.expert_router),

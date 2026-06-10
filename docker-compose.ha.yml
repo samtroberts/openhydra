@@ -43,10 +43,6 @@ services:
       - --pipeline-width
       - "1"
       - --allow-degradation-default
-      - --ledger-path
-      - /data/credits.db
-      - --hydra-token-ledger-path
-      - /data/hydra_tokens.db
       - --health-store-path
       - /data/health.json
     volumes:
@@ -83,10 +79,6 @@ services:
       - --pipeline-width
       - "1"
       - --allow-degradation-default
-      - --ledger-path
-      - /data/credits.db
-      - --hydra-token-ledger-path
-      - /data/hydra_tokens.db
       - --health-store-path
       - /data/health.json
     volumes:

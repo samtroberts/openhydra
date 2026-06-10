@@ -142,14 +142,6 @@ def _make_infer_service(monkeypatch):
             penalized_peers=[],
         ),
     )
-    svc.ledger = SimpleNamespace(
-        spend=lambda client_id, amount: True,
-        earn=lambda peer_id, tokens_served: None,
-    )
-    svc.hydra = SimpleNamespace(
-        mint_for_inference=lambda **kw: None,
-    )
-
     return svc, calls
 
 

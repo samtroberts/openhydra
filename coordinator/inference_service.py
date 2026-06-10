@@ -188,12 +188,6 @@ class InferenceService:
         A ``KvAffinityService`` for KV-cache affinity lookups/updates.
     health:
         A ``HealthScorer`` instance.
-    ledger:
-        A barter credit ledger.
-    hydra:
-        The HYDRA token economy instance.
-    ledger_bridge:
-        An ``OpenHydraLedgerBridge``.
     verifier:
         A ``MysteryShopper`` for verification.
     draft_model:
@@ -215,9 +209,6 @@ class InferenceService:
         pipeline_service: Any,
         kv_affinity_service: Any,
         health: Any,
-        ledger: Any,
-        hydra: Any,
-        ledger_bridge: Any,
         verifier: Any,
         draft_model: DraftTokenModel,
         grounding_client: Any,
@@ -239,9 +230,6 @@ class InferenceService:
         self.pipeline_service = pipeline_service
         self.kv_affinity_service = kv_affinity_service
         self.health = health
-        self.ledger = ledger
-        self.hydra = hydra
-        self.ledger_bridge = ledger_bridge
         self.verifier = verifier
         self.draft_model = draft_model
         self.grounding_client = grounding_client
@@ -954,18 +942,6 @@ class InferenceService:
                 penalized.append(peer_id)
             # Conflicting outcomes for the same peer are treated as neutral.
 
-        slash_amount = max(0.0, float(self.config.hydra_slash_per_failed_verification))
-        if slash_amount > 0.0:
-            unstaked_penalty_events = max(1, int(self.config.hydra_no_stake_penalty_events))
-            for peer_id in penalized:
-                staked_balance = max(0.0, float(self.ledger_bridge.verify_staked_balance(peer_id)))
-                if staked_balance > 0.0:
-                    self.ledger_bridge.slash_stake(peer_id, min(slash_amount, staked_balance))
-                    continue
-                # No stake to slash: aggressively penalize reputation to suppress malicious routing.
-                for _ in range(unstaked_penalty_events):
-                    self.health.record_verification(peer_id, success=False)
-
         return {
             "rewarded_peers": sorted(rewarded),
             "penalized_peers": sorted(penalized),
@@ -1021,7 +997,6 @@ class InferenceService:
                     "expert_admission_approved": bool(item.peer.expert_admission_approved),
                     "expert_admission_reason": str(item.peer.expert_admission_reason or "approved"),
                     "dht_reputation_score": round(float(item.peer.reputation_score), 6),
-                    "dht_staked_balance": round(float(item.peer.staked_balance), 6),
                     "expert_tags": list(item.peer.expert_tags),
                     "expert_layer_indices": list(item.peer.expert_layer_indices),
                     "expert_router": bool(item.peer.expert_router),
@@ -1253,8 +1228,8 @@ class InferenceService:
 
         Runs the primary pipeline, then triggers mystery-shopper verification
         (secondary and optionally tertiary redundant executions).  Applies
-        verification feedback, earns barter credits, mints HYDRA rewards,
-        and returns the complete response with pipeline traces and metadata.
+        verification feedback and returns the complete response with pipeline
+        traces and metadata.
 
         Args:
             prompt: The text prompt.
@@ -1289,9 +1264,6 @@ class InferenceService:
             "infer_start req_id=%s model=%s client=%s",
             request_id, model_id or self.config.default_model, client_id,
         )
-        if priority and not self.ledger.spend(client_id, 1.0):
-            raise RuntimeError("insufficient_priority_credits")
-
         # Phase 2: record demand signal for the auto-scaler.
         self.discovery_service._request_log.record(str(model_id or self.config.default_model))
 
@@ -2379,16 +2351,6 @@ class InferenceService:
             except ImportError:
                 pass  # speculative_swarm not available — skip DSD
 
-        hydra_reward_rate = max(0.0, float(self.config.hydra_reward_per_1k_tokens))
-        for trace in primary.traces:
-            self.ledger.earn(trace.peer_id, tokens_served=max_tokens)
-            if hydra_reward_rate > 0.0:
-                self.hydra.mint_for_inference(
-                    peer_id=trace.peer_id,
-                    tokens_served=max_tokens,
-                    reward_per_1k_tokens=hydra_reward_rate,
-                )
-
         replication = self._engine._replication_dict(prep.decision.served_model, len(prep.health))
         concentration = concentration_metrics(
             [item.peer for item in prep.health],
@@ -2494,9 +2456,6 @@ class InferenceService:
             "infer_stream_start req_id=%s model=%s client=%s",
             request_id, model_id or self.config.default_model, client_id,
         )
-        if priority and not self.ledger.spend(client_id, 1.0):
-            raise RuntimeError("insufficient_priority_credits")
-
         # Streaming makes many short gRPC round-trips (one per token), so a
         # fixed overall deadline would prematurely kill the stream.  Each hop
         # already has an independent per-stage timeout from InferenceChain.
@@ -2522,7 +2481,6 @@ class InferenceService:
                 f"Network redundancy for {_served} is currently too low for "
                 f"extended context. Maximum allowed output is {_elastic_ceiling} tokens."
             )
-        hydra_reward_rate = max(0.0, float(self.config.hydra_reward_per_1k_tokens))
         pytorch_autoregressive = self._pipeline_uses_pytorch_runtime(prep.primary_pipeline)
         requested_decode_controls = self._normalize_decode_controls(
             decode_do_sample=decode_do_sample,
@@ -2755,14 +2713,6 @@ class InferenceService:
                     if token_text:
                         generated_tokens.append(token_text)
                         yield token_text
-                    for trace in _step_result.traces:
-                        self.ledger.earn(trace.peer_id, tokens_served=1)
-                        if hydra_reward_rate > 0.0:
-                            self.hydra.mint_for_inference(
-                                peer_id=trace.peer_id,
-                                tokens_served=1,
-                                reward_per_1k_tokens=hydra_reward_rate,
-                            )
                     if len(generated_tokens) >= max_stream_tokens:
                         return
                 return
@@ -2937,15 +2887,6 @@ class InferenceService:
                         if token_text:
                             generated_tokens.append(token_text)
                             yield token_text
-                        for trace in commit_result.traces:
-                            self.ledger.earn(trace.peer_id, tokens_served=1)
-                            if hydra_reward_rate > 0.0:
-                                self.hydra.mint_for_inference(
-                                    peer_id=trace.peer_id,
-                                    tokens_served=1,
-                                    reward_per_1k_tokens=hydra_reward_rate,
-                                )
-
                         if len(generated_tokens) >= max_stream_tokens:
                             return
                 return
@@ -3140,15 +3081,6 @@ class InferenceService:
                         if len(generated_tokens) >= max_stream_tokens:
                             break
                         generated_tokens.append(token)
-                        for trace in step_result.traces:
-                            self.ledger.earn(trace.peer_id, tokens_served=1)
-                            if hydra_reward_rate > 0.0:
-                                self.hydra.mint_for_inference(
-                                    peer_id=trace.peer_id,
-                                    tokens_served=1,
-                                    reward_per_1k_tokens=hydra_reward_rate,
-                                )
-
                         working_prompt = f"{working_prompt} {token}".strip()
                         if first:
                             chunk = token[0].upper() + token[1:] if token else token

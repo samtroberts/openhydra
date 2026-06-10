@@ -188,7 +188,6 @@ class PeerEndpoint:
     privacy_noise_observed_variance_ema: float = 0.0
     privacy_noise_last_audit_tag: str = ""
     reputation_score: float = 0.0
-    staked_balance: float = 0.0
     expert_tags: tuple[str, ...] = ()
     expert_layer_indices: tuple[int, ...] = ()
     expert_router: bool = False
@@ -277,7 +276,6 @@ class PeerEndpoint:
             privacy_noise_observed_variance_ema=float(data.get("privacy_noise_observed_variance_ema", 0.0)),
             privacy_noise_last_audit_tag=str(data.get("privacy_noise_last_audit_tag", "")),
             reputation_score=float(data.get("reputation_score", 0.0)),
-            staked_balance=float(data.get("staked_balance", 0.0)),
             expert_tags=normalize_tags(data.get("expert_tags", [])) if admission else (),
             expert_layer_indices=normalize_layer_indices(data.get("expert_layer_indices", [])) if admission else (),
             expert_router=bool(data.get("expert_router", False)) if admission else False,

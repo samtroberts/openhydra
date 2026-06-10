@@ -39,8 +39,6 @@ class HealthService:
         An ``EngineConfig`` (or duck-typed equivalent).
     replication_monitor:
         The ``ReplicationMonitor`` used to evaluate replication status.
-    ledger_bridge:
-        The ``OpenHydraLedgerBridge`` for stake slash operations.
     model_catalog:
         List of ``ModelAvailability`` objects.
     normalize_peer_model:
@@ -58,7 +56,6 @@ class HealthService:
         health: HealthScorer,
         config: Any,
         replication_monitor: ReplicationMonitor,
-        ledger_bridge: Any,
         model_catalog: list[Any],
         normalize_peer_model: Callable[[PeerEndpoint], str],
         required_replicas: Callable[[str], int],
@@ -70,7 +67,6 @@ class HealthService:
         self.health = health
         self.config = config
         self.replication_monitor = replication_monitor
-        self.ledger_bridge = ledger_bridge
         self.model_catalog = model_catalog
         self._normalize_peer_model = normalize_peer_model
         self._required_replicas = required_replicas
@@ -203,18 +199,6 @@ class HealthService:
                 penalized.append(peer_id)
             # Conflicting outcomes for the same peer are treated as neutral.
 
-        slash_amount = max(0.0, float(self.config.hydra_slash_per_failed_verification))
-        if slash_amount > 0.0:
-            unstaked_penalty_events = max(1, int(self.config.hydra_no_stake_penalty_events))
-            for peer_id in penalized:
-                staked_balance = max(0.0, float(self.ledger_bridge.verify_staked_balance(peer_id)))
-                if staked_balance > 0.0:
-                    self.ledger_bridge.slash_stake(peer_id, min(slash_amount, staked_balance))
-                    continue
-                # No stake to slash: aggressively penalize reputation to suppress malicious routing.
-                for _ in range(unstaked_penalty_events):
-                    self.health.record_verification(peer_id, success=False)
-
         return {
             "rewarded_peers": sorted(rewarded),
             "penalized_peers": sorted(penalized),
@@ -271,7 +255,6 @@ class HealthService:
                     "expert_admission_approved": bool(item.peer.expert_admission_approved),
                     "expert_admission_reason": str(item.peer.expert_admission_reason or "approved"),
                     "dht_reputation_score": round(float(item.peer.reputation_score), 6),
-                    "dht_staked_balance": round(float(item.peer.staked_balance), 6),
                     "expert_tags": list(item.peer.expert_tags),
                     "expert_layer_indices": list(item.peer.expert_layer_indices),
                     "expert_router": bool(item.peer.expert_router),

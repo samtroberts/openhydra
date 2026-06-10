@@ -56,10 +56,6 @@ class StatusService:
         A ``threading.Lock`` protecting ``_dht_peer_cache``.
     _request_log:
         A ``RequestLog`` for demand snapshots.
-    ledger_bridge:
-        An ``OpenHydraLedgerBridge`` for bridge summary.
-    hydra:
-        The HYDRA token economy instance.
     _metrics_lock:
         A ``threading.Lock`` protecting counter variables.
     model_catalog:
@@ -83,8 +79,6 @@ class StatusService:
         _dht_peer_cache: dict[str, dict[str, Any]],
         _dht_peer_cache_lock: threading.Lock,
         _request_log: Any,
-        ledger_bridge: Any,
-        hydra: Any,
         _metrics_lock: threading.Lock,
         model_catalog: list[ModelAvailability],
         catalogue_by_model: dict[str, ModelAvailability],
@@ -108,8 +102,6 @@ class StatusService:
         self._dht_peer_cache = _dht_peer_cache
         self._dht_peer_cache_lock = _dht_peer_cache_lock
         self._request_log = _request_log
-        self.ledger_bridge = ledger_bridge
-        self.hydra = hydra
         self._metrics_lock = _metrics_lock
         self.model_catalog = model_catalog
         self.catalogue_by_model = catalogue_by_model
@@ -280,7 +272,7 @@ class StatusService:
                     }
                     for model in self.model_catalog
                 },
-                "hydra_economy": self.hydra.summary(),
+
                 "verification_alerts": {},
                 "models": self._catalog_model_ids(),
                 "alerts": ["no_healthy_peers", "under_replicated"],
@@ -470,8 +462,6 @@ class StatusService:
             "runtime_profiles": runtime_by_model,
             "expert_profiles": expert_by_model,
             "verification_feedback": verification_feedback_by_model,
-            "hydra_economy": self.hydra.summary(),
-            "hydra_bridge": self.ledger_bridge.summary(),
             "verification_alerts": verification_alerts,
             "models": self._catalog_model_ids(),
             "alerts": alerts,
@@ -504,16 +494,11 @@ class StatusService:
             kv_retrieve_ops = int(self._kv_retrieve_ops_total_ref[0])
             inference_reqs = int(self._inference_requests_total_ref[0])
         dht_lookup_success_rate = (float(dht_successes) / float(dht_attempts)) if dht_attempts else 0.0
-        bridge = self.ledger_bridge.summary()
         return {
             "dht_lookup_attempts": dht_attempts,
             "dht_lookup_successes": dht_successes,
             "dht_lookup_failures": dht_failures,
             "dht_lookup_success_rate": round(dht_lookup_success_rate, 6),
-            "hydra_bridge_total_minted": float(bridge.get("total_minted", 0.0)),
-            "hydra_bridge_total_burned": float(bridge.get("total_burned", 0.0)),
-            "hydra_bridge_total_supply": float(bridge.get("total_supply", 0.0)),
-            "hydra_bridge_supply_cap": float(bridge.get("supply_cap", 0.0)),
             # Phase D: KV + inference proxy counters
             "kv_store_ops_total":       kv_store_ops,
             "kv_retrieve_ops_total":    kv_retrieve_ops,

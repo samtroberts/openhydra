@@ -148,135 +148,6 @@ def test_completion_payload_forwards_decode_controls():
     assert engine.last_kwargs["decode_seed"] == 7
 
 
-def test_hydra_account_route_forwards_client_id():
-    class _DummyEngine:
-        def __init__(self):
-            self.config = SimpleNamespace(default_model="openhydra-toy-345m")
-            self.last_client_id = None
-
-        def hydra_account(self, client_id):
-            self.last_client_id = client_id
-            return {"hydra": {"peer_id": client_id}}
-
-    engine = _DummyEngine()
-    handler = OpenHydraHandler.__new__(OpenHydraHandler)
-    handler.engine = engine
-    handler.path = "/v1/hydra/account?client_id=alice"
-    handler.client_address = ("127.0.0.1", 0)
-    captured = {}
-    handler._send_json = lambda payload, status=200, headers=None: captured.update({"payload": payload, "status": status})
-
-    handler.do_GET()
-
-    assert engine.last_client_id == "alice"
-    assert captured["payload"]["hydra"]["peer_id"] == "alice"
-
-
-def test_hydra_transfer_route_forwards_payload():
-    class _DummyEngine:
-        def __init__(self):
-            self.config = SimpleNamespace(default_model="openhydra-toy-345m")
-            self.called = None
-
-        def hydra_transfer(self, from_client_id, to_client_id, amount):
-            self.called = (from_client_id, to_client_id, amount)
-            return {"ok": True}
-
-    engine = _DummyEngine()
-    handler = OpenHydraHandler.__new__(OpenHydraHandler)
-    handler.engine = engine
-    handler.path = "/v1/hydra/transfer"
-    handler.client_address = ("127.0.0.1", 0)
-    handler._read_json = lambda: {"from_client_id": "alice", "to_client_id": "bob", "amount": 1.25}
-    captured = {}
-    handler._send_json = lambda payload, status=200, headers=None: captured.update({"payload": payload, "status": status})
-
-    handler.do_POST()
-
-    assert engine.called == ("alice", "bob", 1.25)
-    assert captured["payload"] == {"ok": True}
-
-
-def test_hydra_channel_open_forwards_ttl_seconds():
-    class _DummyEngine:
-        def __init__(self):
-            self.config = SimpleNamespace(default_model="openhydra-toy-345m")
-            self.called = None
-
-        def hydra_open_channel(self, channel_id, payer, payee, deposit, ttl_seconds=None):
-            self.called = (channel_id, payer, payee, deposit, ttl_seconds)
-            return {"hydra_channel": {"channel_id": channel_id}}
-
-    engine = _DummyEngine()
-    handler = OpenHydraHandler.__new__(OpenHydraHandler)
-    handler.engine = engine
-    handler.path = "/v1/hydra/channels/open"
-    handler.client_address = ("127.0.0.1", 0)
-    handler._read_json = lambda: {
-        "channel_id": "ch-ttl",
-        "payer": "alice",
-        "payee": "bob",
-        "deposit": 2.0,
-        "ttl_seconds": 120,
-    }
-    captured = {}
-    handler._send_json = lambda payload, status=200, headers=None: captured.update({"payload": payload, "status": status})
-
-    handler.do_POST()
-
-    assert engine.called == ("ch-ttl", "alice", "bob", 2.0, 120)
-    assert captured["payload"]["hydra_channel"]["channel_id"] == "ch-ttl"
-
-
-def test_hydra_governance_params_route_returns_payload():
-    class _DummyEngine:
-        def __init__(self):
-            self.config = SimpleNamespace(default_model="openhydra-toy-345m")
-            self.called = False
-
-        def hydra_governance_params(self):
-            self.called = True
-            return {"hydra_governance": {"params": {"supply_cap": 69_000_000.0}}}
-
-    engine = _DummyEngine()
-    handler = OpenHydraHandler.__new__(OpenHydraHandler)
-    handler.engine = engine
-    handler.path = "/v1/hydra/governance/params"
-    handler.client_address = ("127.0.0.1", 0)
-    captured = {}
-    handler._send_json = lambda payload, status=200, headers=None: captured.update({"payload": payload, "status": status})
-
-    handler.do_GET()
-
-    assert engine.called is True
-    assert captured["payload"]["hydra_governance"]["params"]["supply_cap"] == 69_000_000.0
-
-
-def test_hydra_governance_vote_route_forwards_payload():
-    class _DummyEngine:
-        def __init__(self):
-            self.config = SimpleNamespace(default_model="openhydra-toy-345m")
-            self.called = None
-
-        def hydra_governance_vote(self, pubkey, proposal_id, vote):
-            self.called = (pubkey, proposal_id, vote)
-            return {"hydra_governance_vote": {"accepted": True}}
-
-    engine = _DummyEngine()
-    handler = OpenHydraHandler.__new__(OpenHydraHandler)
-    handler.engine = engine
-    handler.path = "/v1/hydra/governance/vote"
-    handler.client_address = ("127.0.0.1", 0)
-    handler._read_json = lambda: {"pubkey": "alice", "proposal_id": "cap-upd-1", "vote": "yes"}
-    captured = {}
-    handler._send_json = lambda payload, status=200, headers=None: captured.update({"payload": payload, "status": status})
-
-    handler.do_POST()
-
-    assert engine.called == ("alice", "cap-upd-1", "yes")
-    assert captured["payload"]["hydra_governance_vote"]["accepted"] is True
-
-
 def test_metrics_endpoint_returns_prometheus_telemetry():
     class _DummyEngine:
         def metrics_snapshot(self):
@@ -285,10 +156,6 @@ def test_metrics_endpoint_returns_prometheus_telemetry():
                 "dht_lookup_successes": 6,
                 "dht_lookup_failures": 2,
                 "dht_lookup_success_rate": 0.75,
-                "hydra_bridge_total_minted": 21.0,
-                "hydra_bridge_total_burned": 13.5,
-                "hydra_bridge_total_supply": 100.0,
-                "hydra_bridge_supply_cap": 69_000_000.0,
             }
 
     with OpenHydraHandler._metrics_lock:
@@ -309,8 +176,6 @@ def test_metrics_endpoint_returns_prometheus_telemetry():
     assert "openhydra_http_requests_total" in payload
     assert "openhydra_http_request_latency_seconds_avg" in payload
     assert "openhydra_dht_lookup_success_rate 0.75" in payload
-    assert "openhydra_hydra_bridge_total_burned_total 13.5" in payload
-    assert "openhydra_hydra_bridge_total_minted_total 21.0" in payload
 
 
 def test_no_viable_model_error_maps_to_503():

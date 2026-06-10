@@ -12,9 +12,7 @@ def test_engine_load_candidate_peers_from_dht(monkeypatch, tmp_path):
         EngineConfig(
             peers_config_path=None,
             dht_url="http://127.0.0.1:8468",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -72,9 +70,7 @@ def test_engine_prefers_dht_duplicate_over_peer_config(monkeypatch, tmp_path):
         EngineConfig(
             peers_config_path=str(peer_config_path),
             dht_url="http://127.0.0.1:8468",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -113,9 +109,7 @@ def test_engine_passes_dht_advanced_lookup_options(monkeypatch, tmp_path):
             dht_lookup_sloppy_factor=2,
             dht_lookup_dsht_replicas=5,
             dht_preferred_region="us-east",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -153,9 +147,7 @@ def test_engine_uses_cached_dht_peers_on_lookup_timeout(monkeypatch, tmp_path):
             peers_config_path=None,
             dht_url="http://127.0.0.1:8468",
             dht_lookup_cache_ttl_s=300.0,
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -181,9 +173,7 @@ def test_engine_uses_multi_dht_urls_when_configured(monkeypatch, tmp_path):
         EngineConfig(
             peers_config_path=None,
             dht_urls=["http://127.0.0.1:8468", "http://127.0.0.2:8468"],
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -206,13 +196,11 @@ def test_engine_routes_dynamic_model_id_from_healthy_peers(monkeypatch, tmp_path
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             allow_dynamic_model_ids=True,
             grounding_use_network=False,
             audit_rate=0.0,
             redundant_exec_rate=0.0,
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -244,13 +232,11 @@ def test_engine_rejects_dynamic_model_id_when_disabled(monkeypatch, tmp_path):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             allow_dynamic_model_ids=False,
             grounding_use_network=False,
             audit_rate=0.0,
             redundant_exec_rate=0.0,
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -279,9 +265,7 @@ def test_engine_resolves_catalog_hf_model_id(tmp_path):
             peers_config_path="/tmp/unused.json",
             model_catalog_path=str(catalog_path),
             default_model="openhydra-qwen3.5-0.8b",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
     assert engine._resolve_runtime_model_id("openhydra-qwen3.5-0.8b") == "Qwen/Qwen3.5-0.8B"
@@ -292,9 +276,7 @@ def test_engine_prefers_pipeline_runtime_model_id(tmp_path):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             pytorch_generation_model_id="Qwen/Qwen3.5-0.8B",
         )
     )
@@ -331,9 +313,7 @@ def test_list_models_includes_catalog_hf_model_id(tmp_path):
             peers_config_path="/tmp/unused.json",
             model_catalog_path=str(catalog_path),
             default_model="openhydra-qwen3.5-0.8b",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
     payload = engine.list_models()
@@ -368,9 +348,7 @@ def test_discover_finds_peer_by_hf_id_when_catalog_alias_requested(tmp_path, mon
             peers_config_path="/tmp/unused.json",
             model_catalog_path=str(catalog_path),
             default_model="openhydra-qwen3.5-0.8b",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             grounding_use_network=False,
@@ -427,9 +405,7 @@ def test_dedupe_preserves_sharding_fields(tmp_path):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
     peer = PeerEndpoint(
@@ -456,9 +432,7 @@ def test_dedupe_preserves_p2p_and_identity_fields(tmp_path):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
     peer = PeerEndpoint(
@@ -492,9 +466,7 @@ def test_load_candidate_peers_preserves_sharding_fields(monkeypatch, tmp_path):
         EngineConfig(
             peers_config_path=None,
             dht_url="http://127.0.0.1:8468",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
         )
     )
 

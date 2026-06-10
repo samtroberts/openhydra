@@ -98,7 +98,7 @@ python3 -m coordinator.api_server \
     --required-replicas 1 --pipeline-width 2 \
     --timeout-ms 120000 --max-latency-ms 300000 \
     --audit-rate 0.0 --redundant-exec-rate 0.0 --auditor-rate 0.0 \
-    --hydra-ledger-bridge-mock-mode &
+    &
 COORD_PID=$!
 sleep 4
 

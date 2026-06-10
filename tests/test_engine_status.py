@@ -6,9 +6,7 @@ def test_network_status_handles_no_peers(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             required_replicas=3,
         )
     )
@@ -35,9 +33,7 @@ def test_network_status_aggregates_runtime_profiles(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             required_replicas=1,
         )
     )
