@@ -199,3 +199,67 @@ class TestPrune:
         d.register_manifest(m)
         assert d.prune_stale() == 0
         assert len(d.all_manifests()) == 1
+
+
+# ---------------------------------------------------------------------------
+# DHT discovery
+# ---------------------------------------------------------------------------
+
+class MockDHTNode:
+    def __init__(self, providers=None, records=None):
+        self._providers = providers or []
+        self._records = records or {}
+
+    def get_providers(self, key: bytes) -> list[str]:
+        return self._providers
+
+    def get_record_raw(self, key: bytes) -> bytes | None:
+        return self._records.get(key)
+
+
+class TestDHTDiscovery:
+    def test_discover_from_dht(self, key):
+        m = _make_manifest("p1", "12D3KooW1", ["llama3:8b"], key)
+        manifest_key = b"/openhydra/supernode/12D3KooW1"
+
+        dht = MockDHTNode(
+            providers=["12D3KooW1"],
+            records={manifest_key: m.to_cbor()},
+        )
+        d = SupernodeDiscovery()
+        results = d.discover_from_dht("llama3:8b", dht)
+        assert len(results) == 1
+        assert results[0].peer_id == "p1"
+
+    def test_dht_skips_cached(self, key):
+        m = _make_manifest("p1", "12D3KooW1", ["llama3:8b"], key)
+        dht = MockDHTNode(
+            providers=["12D3KooW1"],
+            records={b"/openhydra/supernode/12D3KooW1": m.to_cbor()},
+        )
+        d = SupernodeDiscovery()
+        d.register_manifest(m)
+
+        results = d.discover_from_dht("llama3:8b", dht)
+        assert len(results) == 1
+
+    def test_dht_no_providers(self, key):
+        dht = MockDHTNode(providers=[])
+        d = SupernodeDiscovery()
+        results = d.discover_from_dht("llama3:8b", dht)
+        assert len(results) == 0
+
+    def test_dht_missing_record(self, key):
+        dht = MockDHTNode(providers=["12D3KooW1"], records={})
+        d = SupernodeDiscovery()
+        results = d.discover_from_dht("llama3:8b", dht)
+        assert len(results) == 0
+
+    def test_dht_bad_cbor(self, key):
+        dht = MockDHTNode(
+            providers=["12D3KooW1"],
+            records={b"/openhydra/supernode/12D3KooW1": b"not-cbor"},
+        )
+        d = SupernodeDiscovery()
+        results = d.discover_from_dht("llama3:8b", dht)
+        assert len(results) == 0

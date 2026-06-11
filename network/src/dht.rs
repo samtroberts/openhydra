@@ -32,6 +32,14 @@ pub fn decode_record(data: &[u8]) -> Result<PeerRecord, String> {
     PeerRecord::from_cbor(data).map_err(|e| format!("cbor decode: {e}"))
 }
 
+/// Build a Kademlia record key for a supernode manifest.
+///
+/// Key format: `/openhydra/supernode/{peer_id}`
+/// Used by the supernode publisher to store CBOR-encoded manifests.
+pub fn supernode_record_key(peer_id: &str) -> kad::RecordKey {
+    kad::RecordKey::new(&format!("/openhydra/supernode/{peer_id}"))
+}
+
 /// Extract the model_id from a Kademlia record key.
 ///
 /// Key format: `/openhydra/model/{model_id}/{peer_id}`

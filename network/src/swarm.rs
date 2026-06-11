@@ -101,6 +101,7 @@ pub fn build_swarm(
     kad_config.set_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_publication_interval(Some(Duration::from_secs(120)));
+    kad_config.set_max_packet_size(64 * 1024);
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
@@ -211,6 +212,9 @@ pub fn build_swarm(
             .with_interval(Duration::from_secs(15)),
     );
 
+    // Supernode prompt routing (Phase 1d).
+    let prompt_router = crate::prompt::prompt_behaviour();
+
     // libp2p-stream behaviour for persistent tensor streams (Fix 1).
     let stream = libp2p_stream::Behaviour::new();
     let stream_control = stream.new_control();
@@ -225,6 +229,7 @@ pub fn build_swarm(
         grpc_proxy,
         gossipsub,
         ping,
+        prompt_router,
         stream,
     };
 

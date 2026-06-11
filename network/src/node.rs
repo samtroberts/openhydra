@@ -38,6 +38,9 @@ use crate::types::PeerRecord;
 struct NodeInner {
     cmd_tx: mpsc::Sender<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
+    prompt_queue: Arc<SharedProxyQueue>,
+    prompt_stream_writers: crate::prompt_stream::PromptStreamWriters,
+    prompt_stream_readers: crate::prompt_stream::PromptStreamReaders,
     /// Handle to the background thread running tokio + swarm.
     _thread: std::thread::JoinHandle<()>,
 }
@@ -80,7 +83,7 @@ fn dirs_default_identity() -> PathBuf {
 /// a Shutdown command is received or the sender is dropped.
 pub fn start_node(
     config: &NodeConfig,
-) -> Result<(mpsc::Sender<SwarmCommand>, Arc<SharedProxyQueue>, std::thread::JoinHandle<()>), String> {
+) -> Result<(mpsc::Sender<SwarmCommand>, Arc<SharedProxyQueue>, Arc<SharedProxyQueue>, crate::prompt_stream::PromptStreamWriters, crate::prompt_stream::PromptStreamReaders, std::thread::JoinHandle<()>), String> {
     // Load or generate identity.
     let identity = Identity::load_or_create(&config.identity_path)
         .map_err(|e| format!("identity: {e}"))?;
@@ -108,6 +111,18 @@ pub fn start_node(
     let proxy_queue = Arc::new(SharedProxyQueue::new());
     let proxy_queue_clone = Arc::clone(&proxy_queue);
 
+    // Phase 1d: separate queue for prompt routing requests.
+    let prompt_queue = Arc::new(SharedProxyQueue::new());
+    let prompt_queue_clone = Arc::clone(&prompt_queue);
+
+    // Prompt stream: shared state between Python and Rust.
+    let prompt_stream_writers: crate::prompt_stream::PromptStreamWriters =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let prompt_stream_writers_clone = Arc::clone(&prompt_stream_writers);
+    let prompt_stream_readers: crate::prompt_stream::PromptStreamReaders =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let prompt_stream_readers_clone = Arc::clone(&prompt_stream_readers);
+
     // Use a oneshot to communicate any startup error from the background thread.
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -133,7 +148,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, stream_control)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, prompt_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, prompt_stream_writers_clone, prompt_stream_readers_clone).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -150,7 +165,7 @@ pub fn start_node(
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, proxy_queue, thread))
+    Ok((cmd_tx, proxy_queue, prompt_queue, prompt_stream_writers, prompt_stream_readers, thread))
 }
 
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.
@@ -360,11 +375,14 @@ impl PyP2PNode {
             bootstrap_peers: self.config.bootstrap_peers.clone(),
         };
         let result = py.allow_threads(|| start_node(&config));
-        let (cmd_tx, proxy_queue, thread) = result
+        let (cmd_tx, proxy_queue, prompt_queue, prompt_stream_writers, prompt_stream_readers, thread) = result
             .map_err(|e| PyRuntimeError::new_err(format!("start failed: {e}")))?;
         self.inner = Some(NodeInner {
             cmd_tx,
             proxy_queue,
+            prompt_queue,
+            prompt_stream_writers,
+            prompt_stream_readers,
             _thread: thread,
         });
         Ok(())
@@ -916,6 +934,177 @@ impl PyP2PNode {
     fn public_key_hex(&self) -> PyResult<String> {
         let bytes = self.public_key_bytes()?;
         Ok(hex::encode(bytes))
+    }
+
+    // ── Phase 1d: Prompt routing methods ────────────────────────────
+
+    /// Send a prompt request to a connected peer and wait for the response.
+    fn send_prompt_request(&self, py: Python<'_>, target_peer_id: String, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::PromptForward {
+                peer_id: target_peer_id,
+                data,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Poll for the next inbound prompt request from a remote peer.
+    /// Returns (request_id, data_bytes) or None if queue is empty.
+    #[pyo3(signature = (timeout_ms=500))]
+    fn poll_prompt_request(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<(String, Vec<u8>)>> {
+        let inner = self.require_started()?;
+        let queue = Arc::clone(&inner.prompt_queue);
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        Ok(py.allow_threads(move || queue.pop(timeout)))
+    }
+
+    /// Send a response to an inbound prompt request.
+    fn respond_prompt(&self, py: Python<'_>, request_id: String, data: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::RespondPrompt { request_id, data })
+                .map_err(|_| "swarm not running".to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    // ── Prompt stream methods ───────────────────────────────────────
+
+    /// Open a prompt stream to a remote supernode. Returns a stream_id
+    /// for polling response chunks.
+    fn open_prompt_stream(&self, py: Python<'_>, peer_id: String, data: Vec<u8>) -> PyResult<String> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::OpenPromptStream {
+                peer_id,
+                data,
+                reply,
+            })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Poll for the next response chunk from a prompt stream.
+    /// Returns bytes or None on timeout. Empty bytes = stream closed.
+    #[pyo3(signature = (stream_id, timeout_ms=500))]
+    fn poll_prompt_chunk(&self, py: Python<'_>, stream_id: String, timeout_ms: u64) -> PyResult<Option<Vec<u8>>> {
+        let inner = self.require_started()?;
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let queue = {
+            let readers = inner.prompt_stream_readers.lock().unwrap();
+            readers.get(&stream_id).cloned()
+        };
+        match queue {
+            Some(q) => {
+                let result = py.allow_threads(move || q.pop(timeout));
+                match result {
+                    Some((_id, data)) => Ok(Some(data)),
+                    None => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Send a chunk to a prompt stream (server side).
+    /// Blocks if channel is full (backpressure from network to GPU).
+    fn send_prompt_chunk(&self, py: Python<'_>, stream_id: String, data: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let writers = Arc::clone(&inner.prompt_stream_writers);
+        py.allow_threads(move || {
+            let writers_guard = writers.lock().unwrap();
+            if let Some(tx) = writers_guard.get(&stream_id) {
+                let tx = tx.clone();
+                drop(writers_guard);
+                tx.blocking_send(data)
+                    .map_err(|_| "prompt stream channel closed".to_string())
+            } else {
+                Err(format!("unknown stream_id: {stream_id}"))
+            }
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Close a prompt stream (both client and server side).
+    fn close_prompt_stream(&self, py: Python<'_>, stream_id: String) -> PyResult<()> {
+        let inner = self.require_started()?;
+        {
+            let mut writers = inner.prompt_stream_writers.lock().unwrap();
+            writers.remove(&stream_id);
+        }
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            cmd_tx
+                .blocking_send(SwarmCommand::ClosePromptStream { stream_id })
+                .map_err(|_| "swarm not running".to_string())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    // ── DHT methods ─────────────────────────────────────────────────
+
+    /// Kademlia: start providing a key (supernode advertises model).
+    fn start_providing(&self, py: Python<'_>, key: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::StartProviding { key, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Kademlia: get providers for a key. Returns list of PeerId strings.
+    fn get_providers(&self, py: Python<'_>, key: Vec<u8>) -> PyResult<Vec<String>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::GetProviders { key, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Kademlia: stop providing a key (graceful shutdown).
+    fn stop_providing(&self, py: Python<'_>, key: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::StopProviding { key, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Kademlia: put a raw record (CBOR manifest, etc).
+    fn put_record_raw(&self, py: Python<'_>, key: Vec<u8>, value: Vec<u8>) -> PyResult<()> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::PutRecordRaw { key, value, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    /// Kademlia: get a raw record. Returns bytes or None.
+    fn get_record_raw(&self, py: Python<'_>, key: Vec<u8>) -> PyResult<Option<Vec<u8>>> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        py.allow_threads(move || {
+            send_and_wait(&cmd_tx, |reply| SwarmCommand::GetRecordRaw { key, reply })
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))?
+        .map_err(|e| PyRuntimeError::new_err(e))
     }
 }
 

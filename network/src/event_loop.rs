@@ -18,6 +18,7 @@ use crate::batcher::{Batcher, BatchItem, BatchKey, DtypeTag, FlushedBatch};
 use crate::behaviour::{OpenHydraBehaviour, OpenHydraBehaviourEvent};
 use crate::dht;
 use crate::dispatcher::{self, DispatchAction, DispatchMode, Dispatcher, PeerStatusCache};
+use crate::prompt::{PromptRequest as PromptReq, PromptResponse as PromptResp};
 use crate::forward_msg;
 use crate::ipc::IpcBridge;
 use crate::ipc_codec::IpcForwardHeader;
@@ -288,6 +289,55 @@ pub enum SwarmCommand {
         socket_path: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Phase 1d: Forward a prompt request to a supernode via the
+    /// `/openhydra/prompt/1.0.0` protocol. Returns the response bytes.
+    PromptForward {
+        peer_id: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// Phase 1d: Send a response to an inbound prompt request.
+    RespondPrompt {
+        request_id: String,
+        data: Vec<u8>,
+    },
+    /// Open a prompt stream to a remote supernode (client side).
+    /// Returns stream_id on success.
+    OpenPromptStream {
+        peer_id: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Close a prompt stream (client side cleanup).
+    ClosePromptStream {
+        stream_id: String,
+    },
+    /// Kademlia: start providing a key (supernode advertises model availability).
+    StartProviding {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Kademlia: get providers for a key (discover supernodes by model).
+    GetProviders {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<String>, String>>,
+    },
+    /// Kademlia: stop providing a key (graceful shutdown cleanup).
+    StopProviding {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Kademlia: put a raw record (supernode manifest storage).
+    PutRecordRaw {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Kademlia: get a raw record (supernode manifest retrieval).
+    GetRecordRaw {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
     /// Graceful shutdown.
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -366,6 +416,20 @@ struct LoopState {
     tensor_mgr: Option<Arc<TensorStreamManager>>,
     /// Fix 1: inbound stream response handles for RespondProxy.
     inbound_stream_responses: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<libp2p::Stream>>>>>,
+    /// Phase 1d: Pending prompt forward requests: request_id → reply channel.
+    pending_prompt: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Phase 1d: Inbound prompt response channels: request_id → ResponseChannel.
+    inbound_prompt_channels: HashMap<String, request_response::ResponseChannel<PromptResp>>,
+    /// Phase 1d: Counter for generating unique inbound prompt request IDs.
+    inbound_prompt_counter: u64,
+    /// Pending Kademlia GetProviders queries (supernode discovery).
+    pending_get_providers: HashMap<kad::QueryId, PendingGetProviders>,
+    /// Pending Kademlia GetRecord (raw) queries.
+    pending_get_record_raw: HashMap<kad::QueryId, PendingGetRecordRaw>,
+    /// Counter for generating unique client-side prompt stream IDs.
+    prompt_stream_counter: u64,
+    /// libp2p-stream control handle for opening prompt streams (client side).
+    stream_control: Option<libp2p_stream::Control>,
     /// Phase 2: DCUtR success event queue (peer_ids as strings).
     dcutr_event_queue: VecDeque<String>,
     /// Phase 2: tunnel close event queue.
@@ -426,6 +490,15 @@ struct PendingDiscover {
     reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
 }
 
+struct PendingGetProviders {
+    providers: Vec<String>,
+    reply: oneshot::Sender<Result<Vec<String>, String>>,
+}
+
+struct PendingGetRecordRaw {
+    reply: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+}
+
 impl LoopState {
     fn new(
         ipc_response_tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
@@ -457,6 +530,13 @@ impl LoopState {
             peer_quic_addrs: HashMap::new(),
             tensor_mgr: None,
             inbound_stream_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pending_prompt: HashMap::new(),
+            inbound_prompt_channels: HashMap::new(),
+            inbound_prompt_counter: 0,
+            pending_get_providers: HashMap::new(),
+            pending_get_record_raw: HashMap::new(),
+            prompt_stream_counter: 0,
+            stream_control: None,
             dcutr_event_queue: VecDeque::new(),
             tunnel_close_queue: VecDeque::new(),
             dispatcher: Dispatcher::new(DispatchMode::Peer),
@@ -479,9 +559,12 @@ pub async fn run_event_loop(
     mut swarm: libp2p::Swarm<OpenHydraBehaviour>,
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
+    prompt_queue: Arc<SharedProxyQueue>,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
     mut stream_control: libp2p_stream::Control,
     keypair: libp2p::identity::Keypair,
+    prompt_stream_writers: crate::prompt_stream::PromptStreamWriters,
+    prompt_stream_readers: crate::prompt_stream::PromptStreamReaders,
 ) {
     // CP-2: IPC response channel — spawned IPC tasks send (request_id, data)
     // back here so the event loop can forward via request_response.
@@ -494,6 +577,10 @@ pub async fn run_event_loop(
         mpsc::unbounded_channel::<RingEvent>();
 
     let mut state = LoopState::new(ipc_response_tx, ring_event_tx);
+
+    // Client-side prompt stream cancel senders — local to event loop.
+    let prompt_stream_cancels: crate::prompt_stream::PromptStreamCancels =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Fix 1: set up persistent tensor streams.
     let (repunch_tx, mut repunch_rx) = mpsc::unbounded_channel::<PeerId>();
@@ -509,6 +596,24 @@ pub async fn run_event_loop(
         Arc::clone(&proxy_queue),
         Arc::clone(&state.inbound_stream_responses),
     );
+
+    // Register prompt stream protocol on the same stream behaviour.
+    match stream_control.accept(crate::prompt_stream::PROMPT_STREAM_PROTOCOL) {
+        Ok(incoming) => {
+            crate::prompt_stream::spawn_prompt_stream_responder(
+                incoming,
+                Arc::clone(&prompt_queue),
+                Arc::clone(&prompt_stream_writers),
+            );
+            info!("prompt_stream_responder: accepting inbound streams on {:?}", crate::prompt_stream::PROMPT_STREAM_PROTOCOL);
+        }
+        Err(e) => {
+            warn!("prompt_stream_responder: accept failed: {e}");
+        }
+    }
+
+    // Store stream_control clone for prompt stream client (OpenPromptStream).
+    state.stream_control = Some(stream_control.clone());
 
     // Kick off Kademlia bootstrap (populate routing table from bootstrap peers).
     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -934,6 +1039,99 @@ pub async fn run_event_loop(
                             }
                         }
                     }
+                    Some(SwarmCommand::PromptForward { peer_id, data, reply }) => {
+                        handle_prompt_forward(&mut swarm, &peer_id, data, reply, &mut state);
+                    }
+                    Some(SwarmCommand::RespondPrompt { request_id, data }) => {
+                        if let Some(channel) = state.inbound_prompt_channels.remove(&request_id) {
+                            if let Err(e) = swarm.behaviour_mut().prompt_router.send_response(channel, PromptResp(data)) {
+                                warn!("prompt respond failed: {:?}", e);
+                            }
+                        } else {
+                            warn!("prompt respond: unknown request_id={}", request_id);
+                        }
+                    }
+                    Some(SwarmCommand::OpenPromptStream { peer_id, data, reply }) => {
+                        state.prompt_stream_counter += 1;
+                        let stream_id = format!("pstream-client-{}", state.prompt_stream_counter);
+                        if let Some(ref control) = state.stream_control {
+                            let control = control.clone();
+                            let pid: PeerId = match peer_id.parse() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("invalid peer_id: {e}")));
+                                    continue;
+                                }
+                            };
+                            let sid = stream_id.clone();
+                            let readers = Arc::clone(&prompt_stream_readers);
+                            let cancels = Arc::clone(&prompt_stream_cancels);
+                            tokio::spawn(async move {
+                                match crate::prompt_stream::open_prompt_stream(
+                                    control, pid, data, readers, cancels, sid.clone(),
+                                ).await {
+                                    Ok(()) => { let _ = reply.send(Ok(sid)); }
+                                    Err(e) => { let _ = reply.send(Err(e)); }
+                                }
+                            });
+                        } else {
+                            let _ = reply.send(Err("stream_control not initialized".into()));
+                        }
+                    }
+                    Some(SwarmCommand::ClosePromptStream { stream_id }) => {
+                        if let Some(cancel_tx) = prompt_stream_cancels.lock().unwrap().remove(&stream_id) {
+                            let _ = cancel_tx.send(true);
+                        }
+                        prompt_stream_readers.lock().unwrap().remove(&stream_id);
+                    }
+                    Some(SwarmCommand::StartProviding { key, reply }) => {
+                        let record_key = kad::RecordKey::new(&key);
+                        match swarm.behaviour_mut().kademlia.start_providing(record_key) {
+                            Ok(_) => {
+                                info!(key = ?String::from_utf8_lossy(&key), "kademlia start_providing issued");
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("start_providing: {e}")));
+                            }
+                        }
+                    }
+                    Some(SwarmCommand::GetProviders { key, reply }) => {
+                        let record_key = kad::RecordKey::new(&key);
+                        let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+                        state.pending_get_providers.insert(query_id, PendingGetProviders {
+                            providers: Vec::new(),
+                            reply,
+                        });
+                    }
+                    Some(SwarmCommand::StopProviding { key, reply }) => {
+                        let record_key = kad::RecordKey::new(&key);
+                        swarm.behaviour_mut().kademlia.stop_providing(&record_key);
+                        info!(key = ?String::from_utf8_lossy(&key), "kademlia stop_providing");
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(SwarmCommand::PutRecordRaw { key, value, reply }) => {
+                        let record = kad::Record {
+                            key: kad::RecordKey::new(&key),
+                            value,
+                            publisher: None,
+                            expires: None,
+                        };
+                        match swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
+                            Ok(_) => {
+                                info!(key = ?String::from_utf8_lossy(&key), "kademlia put_record_raw issued");
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("put_record: {e}")));
+                            }
+                        }
+                    }
+                    Some(SwarmCommand::GetRecordRaw { key, reply }) => {
+                        let record_key = kad::RecordKey::new(&key);
+                        let query_id = swarm.behaviour_mut().kademlia.get_record(record_key);
+                        state.pending_get_record_raw.insert(query_id, PendingGetRecordRaw { reply });
+                    }
                     // Phase 4.1: Graceful shutdown — publish PEER_DEPARTED
                     // gossip and remove self from Kademlia before exiting.
                     Some(SwarmCommand::Shutdown { reply }) => {
@@ -1056,7 +1254,7 @@ pub async fn run_event_loop(
             }
             // Process swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
+                handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue, &prompt_queue);
             }
         }
     }
@@ -1167,6 +1365,7 @@ fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
     proxy_queue: &SharedProxyQueue,
+    prompt_queue: &SharedProxyQueue,
 ) {
     match event {
         // ── Kademlia ──
@@ -1306,6 +1505,11 @@ fn handle_swarm_event(
         // ── gRPC Proxy ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::GrpcProxy(proxy_event)) => {
             handle_grpc_proxy_event(proxy_event, swarm, state, proxy_queue);
+        }
+
+        // ── Prompt Router (Phase 1d) ──
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::PromptRouter(prompt_event)) => {
+            handle_prompt_router_event(prompt_event, state, prompt_queue);
         }
 
         // ── Gossipsub (PR-3 / B1) ──
@@ -1712,6 +1916,13 @@ fn handle_kad_event(
                                 debug!(%provider_pid, "provider found but no data in cache or local store");
                             }
                         }
+                    } else if let Some(pending) = state.pending_get_providers.get_mut(&id) {
+                        for provider in providers {
+                            let pid_str = provider.to_base58();
+                            if !pending.providers.contains(&pid_str) {
+                                pending.providers.push(pid_str);
+                            }
+                        }
                     }
                 }
                 Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
@@ -1722,11 +1933,16 @@ fn handle_kad_event(
                             .map(|r| record_to_discovered(&r))
                             .collect();
                         let _ = pending.reply.send(Ok(peers));
+                    } else if let Some(pending) = state.pending_get_providers.remove(&id) {
+                        info!(count = pending.providers.len(), "kademlia get_providers finished");
+                        let _ = pending.reply.send(Ok(pending.providers));
                     }
                 }
                 Err(e) => {
                     if let Some(pending) = state.pending_discovers.remove(&id) {
                         let _ = pending.reply.send(Err(format!("kademlia get_providers: {e:?}")));
+                    } else if let Some(pending) = state.pending_get_providers.remove(&id) {
+                        let _ = pending.reply.send(Err(format!("get_providers: {e:?}")));
                     }
                 }
             }
@@ -1753,8 +1969,10 @@ fn handle_kad_event(
         } => {
             match result {
                 Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord { record, .. })) => {
-                    // Decode the record and add to pending discover results.
-                    if let Some(pending) = state.pending_discovers.get_mut(&id) {
+                    // Check if this is a raw record lookup first.
+                    if let Some(pending) = state.pending_get_record_raw.remove(&id) {
+                        let _ = pending.reply.send(Ok(Some(record.value)));
+                    } else if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         match dht::decode_record(&record.value) {
                             Ok(peer_record) => {
                                 // Auto-populate Kademlia's routing table with
@@ -1813,6 +2031,10 @@ fn handle_kad_event(
                     }
                 }
                 Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+                    // Check raw record lookups.
+                    if let Some(pending) = state.pending_get_record_raw.remove(&id) {
+                        let _ = pending.reply.send(Ok(None));
+                    }
                     // Query complete — send results back.
                     if let Some(pending) = state.pending_discovers.remove(&id) {
                         let peers = pending
@@ -1824,6 +2046,9 @@ fn handle_kad_event(
                     }
                 }
                 Err(e) => {
+                    if let Some(pending) = state.pending_get_record_raw.remove(&id) {
+                        let _ = pending.reply.send(Err(format!("kademlia get_record: {e:?}")));
+                    }
                     if let Some(pending) = state.pending_discovers.remove(&id) {
                         let _ = pending.reply.send(Err(format!("kademlia get_record: {e:?}")));
                     }
@@ -3047,6 +3272,69 @@ fn handle_close_tunnel(
     _state: &mut LoopState,
 ) {
     debug!("close_tunnel: not yet implemented");
+}
+
+// ── Phase 1d: Prompt Router handlers ────────────────────────────────
+
+fn handle_prompt_router_event(
+    event: request_response::Event<PromptReq, PromptResp>,
+    state: &mut LoopState,
+    prompt_queue: &SharedProxyQueue,
+) {
+    match event {
+        request_response::Event::Message { peer, message } => {
+            match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    state.inbound_prompt_counter += 1;
+                    let req_id = format!("prompt-{}", state.inbound_prompt_counter);
+                    info!(%peer, bytes = request.0.len(), id = %req_id, "prompt request queued");
+                    prompt_queue.push((req_id.clone(), request.0));
+                    state.inbound_prompt_channels.insert(req_id, channel);
+                }
+                request_response::Message::Response { request_id, response } => {
+                    if let Some(reply) = state.pending_prompt.remove(&request_id) {
+                        let _ = reply.send(Ok(response.0));
+                    }
+                }
+            }
+        }
+        request_response::Event::OutboundFailure { request_id, error, .. } => {
+            warn!(?error, "prompt outbound failure");
+            if let Some(reply) = state.pending_prompt.remove(&request_id) {
+                let _ = reply.send(Err(format!("prompt outbound: {error:?}")));
+            }
+        }
+        request_response::Event::InboundFailure { error, .. } => {
+            warn!(?error, "prompt inbound failure");
+        }
+        _ => {}
+    }
+}
+
+fn handle_prompt_forward(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    peer_id_str: &str,
+    data: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    state: &mut LoopState,
+) {
+    let peer_id: PeerId = match peer_id_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = reply.send(Err(format!("invalid peer_id: {e}")));
+            return;
+        }
+    };
+
+    if swarm.is_connected(&peer_id) {
+        let req_id = swarm
+            .behaviour_mut()
+            .prompt_router
+            .send_request(&peer_id, PromptReq(data));
+        state.pending_prompt.insert(req_id, reply);
+    } else {
+        let _ = reply.send(Err(format!("peer not connected: {peer_id}")));
+    }
 }
 
 #[cfg(test)]

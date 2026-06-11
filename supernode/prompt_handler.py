@@ -141,11 +141,93 @@ class PromptHandlerLoop:
         wire: WirePromptRequest,
         cancel_event: threading.Event,
     ) -> None:
+        is_stream = req_id.startswith("pstream-")
+        if is_stream:
+            self._handle_prompt_stream(req_id, wire, cancel_event)
+        else:
+            self._handle_prompt_request_response(req_id, wire, cancel_event)
+
+    def _handle_prompt_stream(
+        self,
+        req_id: str,
+        wire: WirePromptRequest,
+        cancel_event: threading.Event,
+    ) -> None:
+        """Stream path: send individual token chunks via send_prompt_chunk."""
         adapter_req = _wire_to_adapter_request(wire)
         try:
             token_count = 0
             t0 = time.monotonic()
             first_token_time: float | None = None
+            finish_reason = "stop"
+
+            async def _stream():
+                nonlocal token_count, first_token_time, finish_reason
+                async for chunk in self._adapter.generate(adapter_req):
+                    if cancel_event.is_set():
+                        finish_reason = "cancelled"
+                        break
+                    if chunk.token:
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        token_count += 1
+                        token_chunk = WireChunk(
+                            request_id=wire.request_id,
+                            chunk_type="token",
+                            token=chunk.token,
+                        )
+                        self._p2p_node.send_prompt_chunk(
+                            stream_id=req_id,
+                            data=bytes([METHOD_PROMPT_REQUEST]) + token_chunk.to_cbor(),
+                        )
+                    if chunk.finish_reason:
+                        finish_reason = chunk.finish_reason
+
+            asyncio.run(_stream())
+            elapsed = time.monotonic() - t0
+            tps = token_count / elapsed if elapsed > 0 else 0.0
+            ttft_ms = int((first_token_time - t0) * 1000) if first_token_time else 0
+
+            done_chunk = WireChunk(
+                request_id=wire.request_id,
+                chunk_type="done",
+                finish_reason=finish_reason,
+                usage=UsageStats(
+                    completion_tokens=token_count,
+                    tokens_per_second=round(tps, 2),
+                    time_to_first_token_ms=ttft_ms,
+                ),
+            )
+            self._p2p_node.send_prompt_chunk(
+                stream_id=req_id,
+                data=bytes([METHOD_PROMPT_REQUEST]) + done_chunk.to_cbor(),
+            )
+            self._p2p_node.close_prompt_stream(stream_id=req_id)
+            logger.info(
+                "prompt_stream_done request_id=%s tokens=%d tps=%.1f ttft=%dms",
+                wire.request_id, token_count, tps, ttft_ms,
+            )
+
+        except BackendError as e:
+            logger.warning("prompt_stream_backend_error request_id=%s: %s", wire.request_id, e)
+            self._send_stream_error(req_id, wire.request_id, str(e), retryable=True)
+        except Exception as e:
+            logger.error("prompt_stream_crash request_id=%s: %s", wire.request_id, e, exc_info=True)
+            self._send_stream_error(req_id, wire.request_id, str(e), retryable=False)
+
+    def _handle_prompt_request_response(
+        self,
+        req_id: str,
+        wire: WirePromptRequest,
+        cancel_event: threading.Event,
+    ) -> None:
+        """Request-response path: accumulate text, send done chunk with full text."""
+        adapter_req = _wire_to_adapter_request(wire)
+        try:
+            token_count = 0
+            t0 = time.monotonic()
+            first_token_time: float | None = None
+            accumulated_text: list[str] = []
 
             async def _stream():
                 nonlocal token_count, first_token_time
@@ -157,6 +239,7 @@ class PromptHandlerLoop:
                         if first_token_time is None:
                             first_token_time = time.monotonic()
                         token_count += 1
+                        accumulated_text.append(chunk.token)
                     if chunk.finish_reason:
                         return chunk.finish_reason
                 return "stop"
@@ -169,6 +252,7 @@ class PromptHandlerLoop:
             done_chunk = WireChunk(
                 request_id=wire.request_id,
                 chunk_type="done",
+                token="".join(accumulated_text),
                 finish_reason=finish_reason if not cancel_event.is_set() else "cancelled",
                 usage=UsageStats(
                     completion_tokens=token_count,
@@ -206,3 +290,21 @@ class PromptHandlerLoop:
             )
         except Exception as e:
             logger.warning("prompt_error_send_failed: %s", e)
+
+    def _send_stream_error(
+        self, req_id: str, request_id: str, error: str, retryable: bool,
+    ) -> None:
+        chunk = WireChunk(
+            request_id=request_id,
+            chunk_type="error",
+            error=error,
+            retryable=retryable,
+        )
+        try:
+            self._p2p_node.send_prompt_chunk(
+                stream_id=req_id,
+                data=bytes([METHOD_PROMPT_REQUEST]) + chunk.to_cbor(),
+            )
+            self._p2p_node.close_prompt_stream(stream_id=req_id)
+        except Exception as e:
+            logger.warning("prompt_stream_error_send_failed: %s", e)

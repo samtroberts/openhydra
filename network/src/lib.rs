@@ -12,6 +12,7 @@ pub mod dlpack;
 pub mod forward_msg;
 pub mod ipc;
 pub mod ipc_codec;
+pub mod prompt;
 pub mod proxy;
 pub mod ring;
 pub mod sampler_bridge;
@@ -23,7 +24,9 @@ pub mod proto {
 }
 pub mod dht;
 pub mod event_loop;
+pub mod prompt_stream;
 pub mod identity;
+pub mod prompt_stream;
 pub mod mdns;
 pub mod nat;
 pub mod node;

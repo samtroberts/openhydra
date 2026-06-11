@@ -10,6 +10,8 @@ from .manifest import (
     SupernodeManifest,
     normalize_model_id,
     MANIFEST_TTL_MS,
+    supernode_record_key,
+    model_provider_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,3 +129,53 @@ class SupernodeDiscovery:
         for pid in stale:
             self.remove_manifest(pid)
         return len(stale)
+
+    def discover_from_dht(
+        self, model_id: str, p2p_node: Any,
+    ) -> list[SupernodeManifest]:
+        """Discover supernodes via Kademlia DHT provider records.
+
+        1. get_providers(model_key) → list of PeerId strings
+        2. For each: skip if already cached and fresh
+        3. get_record_raw(supernode_key) → CBOR manifest
+        4. Validate signature + freshness, register in local cache
+        """
+        key = model_provider_key(model_id)
+        try:
+            provider_ids = p2p_node.get_providers(key=key.encode())
+        except Exception as e:
+            logger.warning("dht_get_providers_failed model=%s: %s", model_id, e)
+            return self.discover_supernodes(model_id)
+
+        new_count = 0
+        for peer_id in provider_ids:
+            with self._lock:
+                cached = self._manifests.get(peer_id)
+            if cached and not cached.is_stale() and cached.manifest.is_fresh():
+                continue
+
+            manifest_key = supernode_record_key(peer_id)
+            try:
+                raw = p2p_node.get_record_raw(key=manifest_key.encode())
+            except Exception as e:
+                logger.warning("dht_get_record_failed peer=%s: %s", peer_id, e)
+                continue
+            if raw is None:
+                continue
+
+            try:
+                manifest = SupernodeManifest.from_cbor(raw)
+            except Exception as e:
+                logger.warning("dht_manifest_decode_failed peer=%s: %s", peer_id, e)
+                continue
+
+            if self.register_manifest(manifest):
+                new_count += 1
+
+        if new_count > 0:
+            logger.info(
+                "dht_discover model=%s providers=%d new=%d",
+                model_id, len(provider_ids), new_count,
+            )
+
+        return self.discover_supernodes(model_id)

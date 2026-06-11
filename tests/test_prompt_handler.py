@@ -60,6 +60,8 @@ class MockP2PNode:
     def __init__(self):
         self._prompt_inbox: list[tuple[str, bytes]] = []
         self._responses: dict[str, bytes] = {}
+        self._stream_chunks: dict[str, list[bytes]] = {}
+        self._stream_closed: set[str] = set()
         self._lock = threading.Lock()
         self._has_request = threading.Event()
 
@@ -83,6 +85,16 @@ class MockP2PNode:
         with self._lock:
             self._responses[request_id] = data
 
+    def send_prompt_chunk(self, stream_id: str, data: bytes) -> None:
+        with self._lock:
+            if stream_id not in self._stream_chunks:
+                self._stream_chunks[stream_id] = []
+            self._stream_chunks[stream_id].append(data)
+
+    def close_prompt_stream(self, stream_id: str) -> None:
+        with self._lock:
+            self._stream_closed.add(stream_id)
+
     def get_response(self, req_id: str, timeout: float = 5.0) -> bytes | None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -91,6 +103,16 @@ class MockP2PNode:
                     return self._responses.pop(req_id)
             time.sleep(0.05)
         return None
+
+    def get_stream_chunks(self, stream_id: str, timeout: float = 5.0) -> list[bytes]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if stream_id in self._stream_closed:
+                    return self._stream_chunks.get(stream_id, [])
+            time.sleep(0.05)
+        with self._lock:
+            return self._stream_chunks.get(stream_id, [])
 
 
 class TestWireToAdapterRequest:
@@ -219,3 +241,79 @@ class TestPromptHandlerLoop:
         c2 = WireChunk.from_cbor(r2[1:])
         assert c1.chunk_type == "done"
         assert c2.chunk_type == "done"
+
+    def test_request_response_includes_text(self, node, handler):
+        """Request-response done chunk includes accumulated text."""
+        self._send_prompt(node)
+        resp_data = node.get_response("r1")
+        assert resp_data is not None
+        chunk = WireChunk.from_cbor(resp_data[1:])
+        assert chunk.chunk_type == "done"
+        assert chunk.token == "Hello world"
+
+
+class TestPromptHandlerStreamPath:
+    """Tests for the pstream- prefix stream path."""
+
+    @pytest.fixture
+    def node(self):
+        return MockP2PNode()
+
+    @pytest.fixture
+    def adapter(self):
+        return StubAdapter()
+
+    @pytest.fixture
+    def handler(self, node, adapter):
+        stop = threading.Event()
+        h = PromptHandlerLoop(p2p_node=node, adapter=adapter, stop_event=stop)
+        h.start()
+        yield h
+        stop.set()
+        h.stop()
+
+    def _send_stream_prompt(self, node, req_id="pstream-1", model_id="test:1b"):
+        wire = WirePromptRequest(request_id=req_id, model_id=model_id, prompt="hello")
+        payload = bytes([METHOD_PROMPT_REQUEST]) + wire.to_cbor()
+        node.enqueue_prompt(req_id, payload)
+
+    def test_stream_sends_individual_tokens(self, node, handler):
+        self._send_stream_prompt(node)
+        chunks = node.get_stream_chunks("pstream-1")
+        assert len(chunks) >= 3  # 2 tokens + 1 done
+        token_chunks = []
+        done_chunk = None
+        for raw in chunks:
+            c = WireChunk.from_cbor(raw[1:])
+            if c.chunk_type == "token":
+                token_chunks.append(c)
+            elif c.chunk_type == "done":
+                done_chunk = c
+        assert len(token_chunks) == 2
+        assert token_chunks[0].token == "Hello"
+        assert token_chunks[1].token == " world"
+        assert done_chunk is not None
+        assert done_chunk.finish_reason == "stop"
+        assert done_chunk.usage.completion_tokens == 2
+
+    def test_stream_closes(self, node, handler):
+        self._send_stream_prompt(node)
+        node.get_stream_chunks("pstream-1")
+        with node._lock:
+            assert "pstream-1" in node._stream_closed
+
+    def test_stream_error(self, node):
+        stop = threading.Event()
+        adapter = StubAdapter(fail_before_token=True)
+        handler = PromptHandlerLoop(p2p_node=node, adapter=adapter, stop_event=stop)
+        handler.start()
+        try:
+            self._send_stream_prompt(node, req_id="pstream-err")
+            chunks = node.get_stream_chunks("pstream-err")
+            assert len(chunks) >= 1
+            last = WireChunk.from_cbor(chunks[-1][1:])
+            assert last.chunk_type == "error"
+            assert "backend down" in last.error
+        finally:
+            stop.set()
+            handler.stop()

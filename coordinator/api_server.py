@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import signal
+import socket
 import threading
 import time
 import uuid
@@ -1925,7 +1926,17 @@ def serve(
         daemon=True,
     ).start()
 
-    server = ThreadingHTTPServer((host, port), OpenHydraHandler)
+    class _DualStackHTTPServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            super().server_bind()
+
+    if host in ("0.0.0.0", "::"):
+        server = _DualStackHTTPServer(("::", port), OpenHydraHandler)
+    else:
+        server = ThreadingHTTPServer((host, port), OpenHydraHandler)
 
     def _on_sigterm(signum: int, _frame: object) -> None:
         # Called on the main thread; server.shutdown() blocks until
@@ -1935,8 +1946,8 @@ def serve(
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
-    logger.info("OpenHydra API listening on http://%s:%d", host, port)
-    print(f"OpenHydra API listening on http://{host}:{port}")
+    logger.info("OpenHydra API listening on http://%s:%d (dual-stack)", host, port)
+    print(f"OpenHydra API listening on http://{host}:{port} (dual-stack)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

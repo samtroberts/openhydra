@@ -194,12 +194,28 @@ class SupernodeRouter:
         text_parts: list[str] = []
         token_count = 0
         finish_reason = "stop"
+        backend_usage: dict | None = None
 
         async for chunk in self._generate(req):
             text_parts.append(chunk.token)
             token_count += 1
             if chunk.finish_reason:
                 finish_reason = chunk.finish_reason
+            if chunk.usage:
+                backend_usage = chunk.usage
+
+        usage: dict[str, Any] = {
+            "prompt_tokens": 0,
+            "completion_tokens": token_count,
+            "total_tokens": token_count,
+        }
+        if backend_usage:
+            if "eval_count" in backend_usage:
+                usage["completion_tokens"] = backend_usage["eval_count"]
+            if "prompt_eval_count" in backend_usage:
+                usage["prompt_tokens"] = backend_usage["prompt_eval_count"]
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            usage["backend"] = backend_usage
 
         return {
             "id": req.request_id,
@@ -211,11 +227,7 @@ class SupernodeRouter:
                 "message": {"role": "assistant", "content": "".join(text_parts)},
                 "finish_reason": finish_reason,
             }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": token_count,
-                "total_tokens": token_count,
-            },
+            "usage": usage,
         }
 
     async def _text_completion_async(
@@ -224,12 +236,28 @@ class SupernodeRouter:
         text_parts: list[str] = []
         token_count = 0
         finish_reason = "stop"
+        backend_usage: dict | None = None
 
         async for chunk in self._generate(req):
             text_parts.append(chunk.token)
             token_count += 1
             if chunk.finish_reason:
                 finish_reason = chunk.finish_reason
+            if chunk.usage:
+                backend_usage = chunk.usage
+
+        usage: dict[str, Any] = {
+            "prompt_tokens": 0,
+            "completion_tokens": token_count,
+            "total_tokens": token_count,
+        }
+        if backend_usage:
+            if "eval_count" in backend_usage:
+                usage["completion_tokens"] = backend_usage["eval_count"]
+            if "prompt_eval_count" in backend_usage:
+                usage["prompt_tokens"] = backend_usage["prompt_eval_count"]
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            usage["backend"] = backend_usage
 
         return {
             "id": req.request_id,
@@ -241,11 +269,7 @@ class SupernodeRouter:
                 "text": "".join(text_parts),
                 "finish_reason": finish_reason,
             }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": token_count,
-                "total_tokens": token_count,
-            },
+            "usage": usage,
         }
 
     async def _generate(self, req: PromptRequest):
