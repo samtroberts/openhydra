@@ -32,11 +32,15 @@ import urllib.request
 # Markers that indicate the pre-F4 failure mode (or other circuit collapse).
 _DEATH_MARKERS = (
     "write timed out",
-    "circuit",
+    "circuit died",
+    "circuit closed",
+    "circuit collapse",
+    "max_circuit",
     "ring: tensor_stream re-inject failed",
+    "reinjectfailed",
     "session timed out",
     "stream reset",
-    "InsufficientData",
+    "insufficientdata",
 )
 
 
