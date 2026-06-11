@@ -32,19 +32,39 @@ impl ActivationBuffer {
             ));
         }
         // Parse header: 2 × little-endian float32.
-        let seq_len = f32::from_le_bytes(
+        let seq_f = f32::from_le_bytes(
             packed[0..4]
                 .try_into()
                 .map_err(|_| "header parse failed")?,
-        ) as usize;
-        let hidden_size = f32::from_le_bytes(
+        );
+        let hidden_f = f32::from_le_bytes(
             packed[4..8]
                 .try_into()
                 .map_err(|_| "header parse failed")?,
-        ) as usize;
+        );
+        // Audit M1: these dimensions come from attacker-controlled bytes.
+        // Reject non-finite / negative values before the `as usize` cast
+        // (NaN/Inf/negative saturate to arbitrary values otherwise).
+        if !seq_f.is_finite() || !hidden_f.is_finite() || seq_f < 0.0 || hidden_f < 0.0 {
+            return Err(format!(
+                "invalid activation header dims: seq={seq_f} hidden={hidden_f}"
+            ));
+        }
+        let seq_len = seq_f as usize;
+        let hidden_size = hidden_f as usize;
 
         let payload_bytes = packed.len() - 8;
-        let expected_bytes = seq_len * hidden_size * 4;
+        // Audit M1: use checked arithmetic. In release builds `*` wraps on
+        // overflow — an attacker could choose seq/hidden whose wrapped
+        // product equals a tiny payload length, passing validation while the
+        // tensor advertises a huge shape that DLPack later reads past the
+        // end of the buffer.
+        let expected_bytes = seq_len
+            .checked_mul(hidden_size)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                format!("activation dims overflow: seq={seq_len} hidden={hidden_size}")
+            })?;
         if payload_bytes != expected_bytes {
             return Err(format!(
                 "activation size mismatch: got {} payload bytes, expected {} (seq={} hidden={})",
@@ -262,6 +282,28 @@ mod tests {
     #[test]
     fn test_from_packed_too_short() {
         assert!(ActivationBuffer::from_packed(vec![0, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn test_from_packed_rejects_overflow_dims() {
+        // Audit M1: huge dims whose product overflows usize must be rejected
+        // (not wrap to match a tiny payload). 2^40 * 2^40 * 4 overflows u64.
+        let big = (1u64 << 40) as f32;
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&big.to_le_bytes()); // seq
+        packed.extend_from_slice(&big.to_le_bytes()); // hidden
+        packed.extend_from_slice(&[0u8; 8]); // tiny payload
+        assert!(ActivationBuffer::from_packed(packed).is_err());
+    }
+
+    #[test]
+    fn test_from_packed_rejects_non_finite_dims() {
+        // Audit M1: NaN / negative dims must be rejected before the cast.
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&f32::NAN.to_le_bytes());
+        packed.extend_from_slice(&(-1.0f32).to_le_bytes());
+        packed.extend_from_slice(&[0u8; 8]);
+        assert!(ActivationBuffer::from_packed(packed).is_err());
     }
 
     #[test]
