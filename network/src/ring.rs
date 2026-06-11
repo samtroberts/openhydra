@@ -380,19 +380,34 @@ pub struct RingManager {
     sessions: HashMap<String, RingSessionState>,
     /// Shard map: which peer holds which layers.
     shard_map: HashMap<String, LayerRange>,
-    /// Maps request_id → session_id for PushResult routing.
+    /// Maps request_id → pending-request record for PushResult routing.
     ///
     /// When the ring manager sends a ForwardMsg to stage 0, it registers
     /// the request_id here. When the last peer's PushResult arrives, the
     /// event loop calls `is_ring_request(request_id)` to check ownership
     /// before routing to the ring manager (vs SharedProxyQueue/Python).
-    pending_requests: HashMap<String, String>,
+    ///
+    /// The record also pins the `expected_peer` — the libp2p peer_id of the
+    /// final ring hop that is legitimately allowed to deliver this result —
+    /// so `route_push_result` can reject forged callbacks (audit F1).
+    pending_requests: HashMap<String, PendingRequest>,
     /// CP-5: Maps request_id → chunk_index for prefill PushResult routing.
     ///
     /// When a prefill chunk is injected, its request_id is registered here
     /// alongside the chunk_index. When the PushResult arrives, we look up
     /// the chunk_index to store the partial activation in the correct slot.
     prefill_request_chunks: HashMap<String, usize>,
+}
+
+/// A pending ring request awaiting its PushResult callback.
+///
+/// `expected_peer` is the libp2p peer_id (canonical string form) of the
+/// final hop in the ring route — the only peer permitted to deliver the
+/// callback for this request. It is empty only when the route could not be
+/// resolved at registration time (defensive; treated as "cannot verify").
+struct PendingRequest {
+    session_id: String,
+    expected_peer: String,
 }
 
 /// Internal state for a single ring session.
@@ -724,11 +739,18 @@ impl RingManager {
     /// PushResult from the last peer.
     pub fn register_request(&mut self, request_id: String, session_id: String) {
         // B3: Refresh activity timestamp for timeout watchdog.
-        if let Some(s) = self.sessions.get_mut(&session_id) {
+        // Audit F1: pin the expected callback peer = final hop of the route.
+        let expected_peer = if let Some(s) = self.sessions.get_mut(&session_id) {
             s.last_inject_time = std::time::Instant::now();
-        }
-        info!(%request_id, %session_id, "ring: registered request");
-        self.pending_requests.insert(request_id, session_id);
+            s.config.route.last().map(|h| h.peer_id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        info!(%request_id, %session_id, %expected_peer, "ring: registered request");
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest { session_id, expected_peer },
+        );
     }
 
     /// Check if a request_id belongs to a ring session.
@@ -742,7 +764,9 @@ impl RingManager {
 
     /// Look up the session_id for a given request_id.
     pub fn lookup_session(&self, request_id: &str) -> Option<&str> {
-        self.pending_requests.get(request_id).map(|s| s.as_str())
+        self.pending_requests
+            .get(request_id)
+            .map(|p| p.session_id.as_str())
     }
 
     /// Number of pending request_id → session_id mappings.
@@ -870,15 +894,21 @@ impl RingManager {
         chunk_index: usize,
     ) {
         // B3: Refresh activity timestamp for timeout watchdog.
-        if let Some(s) = self.sessions.get_mut(&session_id) {
+        // Audit F1: pin the expected callback peer = final hop of the route.
+        let expected_peer = if let Some(s) = self.sessions.get_mut(&session_id) {
             s.last_inject_time = std::time::Instant::now();
-        }
+            s.config.route.last().map(|h| h.peer_id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
         info!(
             %request_id, %session_id, %chunk_index,
             "ring: registered prefill chunk request"
         );
-        self.pending_requests
-            .insert(request_id.clone(), session_id);
+        self.pending_requests.insert(
+            request_id.clone(),
+            PendingRequest { session_id, expected_peer },
+        );
         self.prefill_request_chunks
             .insert(request_id, chunk_index);
     }
@@ -910,12 +940,37 @@ impl RingManager {
     pub fn route_push_result(
         &mut self,
         request_id: &str,
+        from_peer: &str,
         header: &IpcResponseHeader,
         activation: Vec<u8>,
     ) -> RingAction {
-        // Remove the pending request mapping (consumed on use).
+        // Audit F1: authenticate the callback BEFORE consuming the mapping.
+        // The PushResult must arrive from the final ring hop we registered;
+        // any other peer (a route member trying to short-circuit the ring,
+        // or an outsider that guessed the request_id) is rejected and the
+        // pending mapping is LEFT IN PLACE so the genuine callback can still
+        // be honoured. We peek first, then remove only on success.
+        match self.pending_requests.get(request_id) {
+            None => return RingAction::NotRingRequest,
+            Some(pending) => {
+                if !pending.expected_peer.is_empty()
+                    && pending.expected_peer != from_peer
+                {
+                    warn!(
+                        %request_id, %from_peer,
+                        expected = %pending.expected_peer,
+                        "ring: rejected push_result from unexpected peer (forgery?)"
+                    );
+                    // Treat as not-ours: don't consume, don't error the
+                    // session — the legitimate peer may still deliver.
+                    return RingAction::NotRingRequest;
+                }
+            }
+        }
+
+        // Authenticated — now consume the pending request mapping.
         let session_id = match self.pending_requests.remove(request_id) {
-            Some(sid) => sid,
+            Some(p) => p.session_id,
             None => return RingAction::NotRingRequest,
         };
 
@@ -1019,8 +1074,8 @@ impl RingManager {
         let removing: Vec<String> = self
             .pending_requests
             .iter()
-            .filter_map(|(rid, sid)| {
-                if sid == session_id {
+            .filter_map(|(rid, pending)| {
+                if pending.session_id == session_id {
                     Some(rid.clone())
                 } else {
                     None
@@ -1380,7 +1435,7 @@ mod tests {
         };
         let activation = vec![0u8; 16]; // 4 floats
 
-        let action = mgr.route_push_result("req-pr-001", &header, activation.clone());
+        let action = mgr.route_push_result("req-pr-001", "peer-B", &header, activation.clone());
         match action {
             RingAction::NeedSample { session_id, request_id, activation: act } => {
                 assert_eq!(session_id, "ring-001");
@@ -1391,8 +1446,42 @@ mod tests {
         }
 
         // Pending request consumed — second call returns NotRingRequest.
-        let action2 = mgr.route_push_result("req-pr-001", &header, vec![]);
+        let action2 = mgr.route_push_result("req-pr-001", "peer-B", &header, vec![]);
         assert!(matches!(action2, RingAction::NotRingRequest));
+    }
+
+    #[test]
+    fn test_route_push_result_rejects_forged_peer() {
+        // Audit F1: a PushResult from a peer other than the registered final
+        // hop must be rejected, and the pending mapping must survive so the
+        // genuine peer can still deliver.
+        use crate::ipc_codec::{IpcStatus, ActivationDtype, IpcResponseHeader};
+
+        let mut mgr = RingManager::new();
+        let _handle = mgr.start_session(test_config()); // route ends at peer-B
+        mgr.register_request("req-forge".into(), "ring-001".into());
+
+        let header = IpcResponseHeader {
+            status: IpcStatus::Ok,
+            request_id: "req-forge".into(),
+            activation_dtype: ActivationDtype::Fp32,
+            activation_shape: vec![1, 1, 4],
+            ..Default::default()
+        };
+
+        // Forged: comes from peer-A (an intermediate hop), not peer-B.
+        let forged = mgr.route_push_result("req-forge", "peer-A", &header, vec![0u8; 16]);
+        assert!(
+            matches!(forged, RingAction::NotRingRequest),
+            "forged callback must be rejected, got {:?}", forged
+        );
+        // Mapping survived — genuine peer-B can still deliver.
+        assert!(mgr.is_ring_request("req-forge"));
+        let genuine = mgr.route_push_result("req-forge", "peer-B", &header, vec![0u8; 16]);
+        assert!(
+            matches!(genuine, RingAction::NeedSample { .. }),
+            "genuine callback must succeed, got {:?}", genuine
+        );
     }
 
     #[test]
@@ -1402,7 +1491,7 @@ mod tests {
         let mut mgr = RingManager::new();
         let header = IpcResponseHeader::default();
 
-        let action = mgr.route_push_result("unknown-req", &header, vec![]);
+        let action = mgr.route_push_result("unknown-req", "peer-B", &header, vec![]);
         assert!(matches!(action, RingAction::NotRingRequest));
     }
 
@@ -1421,7 +1510,7 @@ mod tests {
             ..Default::default()
         };
 
-        let action = mgr.route_push_result("req-err", &header, vec![]);
+        let action = mgr.route_push_result("req-err", "peer-B", &header, vec![]);
         match action {
             RingAction::Error { session_id, reason } => {
                 assert_eq!(session_id, "ring-001");
@@ -1443,7 +1532,7 @@ mod tests {
         mgr.sessions.remove("ring-001");
 
         let header = IpcResponseHeader::default();
-        let action = mgr.route_push_result("req-orphan", &header, vec![]);
+        let action = mgr.route_push_result("req-orphan", "peer-B", &header, vec![]);
         match action {
             RingAction::Error { session_id, reason } => {
                 assert_eq!(session_id, "ring-001");
@@ -1647,7 +1736,7 @@ mod tests {
 
         // Chunk 0 PushResult — not all received yet.
         let chunk0_result = vec![10u8; 128 * 2 * 4]; // processed chunk 0
-        let action = mgr.route_push_result("req-c0", &header, chunk0_result.clone());
+        let action = mgr.route_push_result("req-c0", "peer-B", &header, chunk0_result.clone());
         match action {
             RingAction::PrefillChunkReceived {
                 session_id,
@@ -1670,7 +1759,7 @@ mod tests {
             request_id: "req-c1".into(),
             ..Default::default()
         };
-        let action = mgr.route_push_result("req-c1", &header1, chunk1_result.clone());
+        let action = mgr.route_push_result("req-c1", "peer-B", &header1, chunk1_result.clone());
         match action {
             RingAction::NeedSample {
                 session_id,
@@ -1720,15 +1809,15 @@ mod tests {
 
         // Chunks arrive out of order: 2, 0, 1.
         let r2 = vec![2u8; 128 * 2 * 4];
-        let action = mgr.route_push_result("req-c2", &ok_header("req-c2"), r2.clone());
+        let action = mgr.route_push_result("req-c2", "peer-B", &ok_header("req-c2"), r2.clone());
         assert!(matches!(action, RingAction::PrefillChunkReceived { chunk_index: 2, .. }));
 
         let r0 = vec![0u8; 128 * 2 * 4];
-        let action = mgr.route_push_result("req-c0", &ok_header("req-c0"), r0.clone());
+        let action = mgr.route_push_result("req-c0", "peer-B", &ok_header("req-c0"), r0.clone());
         assert!(matches!(action, RingAction::PrefillChunkReceived { chunk_index: 0, .. }));
 
         let r1 = vec![1u8; 128 * 2 * 4];
-        let action = mgr.route_push_result("req-c1", &ok_header("req-c1"), r1.clone());
+        let action = mgr.route_push_result("req-c1", "peer-B", &ok_header("req-c1"), r1.clone());
         // All received — concatenated in ORDER (0, 1, 2), not arrival order.
         match action {
             RingAction::NeedSample { activation, .. } => {
