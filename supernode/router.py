@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -42,7 +43,21 @@ class SupernodeRouter:
         self._adapters[name] = adapter
 
     def _run(self, coro):
-        return asyncio.run(coro)
+        """Run a coroutine from a sync context.
+
+        If no event loop is running, uses asyncio.run() directly.
+        If called from within a running loop (e.g. aiohttp handler),
+        offloads to a background thread to avoid the nested asyncio.run()
+        RuntimeError.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — safe to use asyncio.run()
+            return asyncio.run(coro)
+        # Already inside an event loop — run in a background thread
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
 
     # ------------------------------------------------------------------
     # Model listing

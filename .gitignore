@@ -52,6 +52,7 @@ peers.local.json
 ops/prod_secrets.env
 ops/certs/*.pem
 ops/certs/*.key
+ops/bootstrap/deploy_libp2p.sh
 
 # ── Node / JS ─────────────────────────────────────────────────────────────────
 node_modules/

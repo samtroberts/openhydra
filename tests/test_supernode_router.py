@@ -497,3 +497,57 @@ class TestFailover:
         body = {"model": "llama3:8b", "messages": [{"role": "user", "content": "hi"}]}
         tokens = list(r.chat_completion_stream(body))
         assert "partial" in tokens
+
+
+# ---------------------------------------------------------------------------
+# Nested event loop — _run() inside a running asyncio loop
+# ---------------------------------------------------------------------------
+
+class TestNestedEventLoop:
+    """Verify _run() works when called from within a running event loop."""
+
+    def test_list_models_from_async_context(self):
+        """list_models_openai should work inside asyncio.run()."""
+        async def _inner():
+            router = SupernodeRouter()
+            router.register_adapter("mock", MockAdapter())
+            result = router.list_models_openai()
+            assert result["object"] == "list"
+            assert len(result["data"]) == 1
+            assert result["data"][0]["id"] == "test-model:7b"
+
+        asyncio.run(_inner())
+
+    def test_chat_completion_from_async_context(self):
+        """chat_completion should work inside asyncio.run()."""
+        async def _inner():
+            router = SupernodeRouter()
+            router.register_adapter("mock", MockAdapter())
+            body = {"model": "test-model:7b", "messages": [{"role": "user", "content": "hi"}]}
+            result = router.chat_completion(body)
+            assert result["choices"][0]["message"]["content"] == "Hello world!"
+
+        asyncio.run(_inner())
+
+    def test_stream_from_async_context(self):
+        """chat_completion_stream should work inside asyncio.run()."""
+        async def _inner():
+            router = SupernodeRouter()
+            router.register_adapter("mock", MockAdapter())
+            body = {"model": "test-model:7b", "messages": [{"role": "user", "content": "hi"}]}
+            tokens = list(router.chat_completion_stream(body))
+            assert tokens == ["Hello", " world", "!"]
+
+        asyncio.run(_inner())
+
+    def test_list_supernodes_from_async_context(self):
+        """list_supernodes should work inside asyncio.run()."""
+        async def _inner():
+            router = SupernodeRouter()
+            router.register_adapter("mock", MockAdapter())
+            result = router.list_supernodes()
+            assert len(result) == 1
+            assert result[0]["name"] == "mock"
+            assert result[0]["healthy"] is True
+
+        asyncio.run(_inner())

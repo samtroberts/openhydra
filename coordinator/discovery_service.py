@@ -358,14 +358,8 @@ class DiscoveryService:
                 runtime_id = peer.runtime_model_id or ""
                 if model_id in model_filter or (runtime_id and runtime_id in model_filter):
                     peers.append(peer.replace(model_id=model_id))
-            # Static peers config is authoritative — skip DHT discovery
-            # to avoid pinging ~25 unreachable relay peers (saves ~51s).
             if peers:
-                logger.info(
-                    "static_peers_loaded: count=%d (skipping DHT discovery)",
-                    len(peers),
-                )
-                return peers
+                logger.info("static_peers_loaded count=%d", len(peers))
 
         dht_sources = self._configured_dht_urls()
         if dht_sources:
