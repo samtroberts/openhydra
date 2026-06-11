@@ -501,6 +501,16 @@ def main() -> None:
             "Default: http://localhost:11434 for Ollama."
         ),
     )
+    parser.add_argument(
+        "--client",
+        action="store_true",
+        default=False,
+        help=(
+            "Run as a supernode client — discovers remote supernodes via "
+            "Kademlia DHT, routes prompts through libp2p. "
+            "Serves an OpenAI-compatible API on --api-port."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1628,6 +1638,61 @@ def main() -> None:
         OpenHydraHandler.supernode_router = _bridge_router
         logger.info("bridge_supernode_router_wired")
 
+    # ── Client mode: discover remote supernodes via DHT ─────────────────
+    _client_discovery_stop = threading.Event()
+    _client_discovery_thread: threading.Thread | None = None
+
+    if getattr(args, "client", False) and _p2p_node is not None:
+        from supernode.router import SupernodeRouter
+        from supernode.discovery import SupernodeDiscovery
+        from supernode.selector import PromptRouter
+        from supernode.libp2p_adapter import LibP2PAdapter
+
+        _client_discovery = SupernodeDiscovery()
+        _client_prompt_router = PromptRouter(_client_discovery)
+        _client_router = SupernodeRouter(
+            prompt_router=_client_prompt_router,
+        )
+
+        _client_libp2p_id = str(getattr(_p2p_node, "libp2p_peer_id", "") or "")
+
+        def _client_discovery_loop():
+            while not _client_discovery_stop.is_set():
+                try:
+                    models = _p2p_node.discover_models() if hasattr(_p2p_node, "discover_models") else []
+                    if not models:
+                        models = ["tinyllama:latest", "llama3:latest"]
+                    for model_id in models:
+                        found = _client_discovery.discover_from_dht(model_id, _p2p_node)
+                        for manifest in found:
+                            adapter_key = manifest.libp2p_peer_id
+                            if adapter_key and adapter_key not in _client_prompt_router._adapters:
+                                adapter = LibP2PAdapter(
+                                    p2p_node=_p2p_node,
+                                    target_peer_id=manifest.libp2p_peer_id,
+                                    manifest=manifest,
+                                    origin_peer_id=_client_libp2p_id,
+                                )
+                                _client_prompt_router.register_adapter(adapter_key, adapter)
+                                logger.info(
+                                    "client_adapter_registered peer=%s models=%s",
+                                    manifest.peer_id,
+                                    [m.model_id for m in manifest.models],
+                                )
+                except Exception as _disc_err:
+                    logger.warning("client_discovery_error: %s", _disc_err)
+                _client_discovery_stop.wait(60)
+
+        _client_discovery_thread = threading.Thread(
+            target=_client_discovery_loop, daemon=True, name="client-discovery"
+        )
+        _client_discovery_thread.start()
+        logger.info("client_discovery_started")
+
+        from coordinator.api_server import OpenHydraHandler
+        OpenHydraHandler.supernode_router = _client_router
+        logger.info("client_supernode_router_wired")
+
     # Start the coordinator HTTP API on the main thread (blocking).
     # Signal handling (SIGTERM, SIGINT) is already wired inside coordinator_serve.
     try:
@@ -1642,6 +1707,9 @@ def main() -> None:
             capacity_snapshot_ref=_capacity_snapshot_ref,
         )
     finally:
+        if _client_discovery_thread is not None:
+            _client_discovery_stop.set()
+            _client_discovery_thread.join(timeout=3)
         if _bridge_publisher is not None:
             _bridge_publisher.stop()
         if _bridge_prompt_handler is not None:
