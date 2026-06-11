@@ -349,6 +349,12 @@ pub struct RingToken {
     pub latency_ms: f64,
     /// Session this token belongs to.
     pub session_id: String,
+    /// Audit F7: set when the session was aborted (e.g. watchdog timeout)
+    /// rather than producing a token. The caller observes this instead of a
+    /// silently-closed channel and can surface a real error.
+    pub is_error: bool,
+    /// Human-readable abort reason when `is_error` is true.
+    pub error_message: String,
 }
 
 // ── Ring handle (returned to caller) ──────────────────────────────────
@@ -540,6 +546,8 @@ impl RingManager {
             is_eos,
             latency_ms,
             session_id: session_id.to_string(),
+            is_error: false,
+            error_message: String::new(),
         };
 
         // Emit to caller (non-blocking — if the channel is full, the token
@@ -565,6 +573,27 @@ impl RingManager {
         self.sessions
             .remove(session_id)
             .map(|s| s.generated_ids)
+    }
+
+    /// Audit F7: abort a session and notify the caller with an error token
+    /// before tearing it down, so the caller sees a real failure reason
+    /// instead of a silently-closed token channel. Used by the timeout
+    /// watchdog. Returns true if a session was actually removed.
+    pub fn fail_session(&mut self, session_id: &str, reason: &str) -> bool {
+        if let Some(session) = self.sessions.get(session_id) {
+            let err_token = RingToken {
+                token_id: 0,
+                token_text: String::new(),
+                is_eos: true,
+                latency_ms: 0.0,
+                session_id: session_id.to_string(),
+                is_error: true,
+                error_message: reason.to_string(),
+            };
+            // Best-effort: the caller may have already gone away.
+            let _ = session.token_tx.try_send(err_token);
+        }
+        self.remove_session(session_id).is_some()
     }
 
     /// Abort a session due to a hop failure.
@@ -1050,9 +1079,13 @@ impl RingManager {
             }
         }
 
-        // Standard decode path. Take a mutable borrow to read session state
-        // for logging (no immutable borrow is live at this point).
-        let session = self.sessions.get(&session_id).unwrap();
+        // Standard decode path. Audit F7: refresh the activity timestamp now
+        // that a PushResult has arrived — the head-sampler call that follows
+        // may legitimately take up to SAMPLER_RECV_TIMEOUT (~30s), which
+        // equals the watchdog floor; without this refresh a slow-but-healthy
+        // session could be reaped mid-sample.
+        let session = self.sessions.get_mut(&session_id).unwrap();
+        session.last_inject_time = std::time::Instant::now();
         info!(
             %session_id, %request_id,
             tokens_remaining = session.tokens_remaining,
@@ -1400,6 +1433,27 @@ mod tests {
         assert_eq!(mgr.pending_request_count(), 0);
         assert!(!mgr.is_ring_request("req-a"));
         assert!(!mgr.is_ring_request("req-b"));
+    }
+
+    #[test]
+    fn test_fail_session_emits_error_token_and_removes() {
+        // Audit F7: a timed-out/aborted session notifies the caller with an
+        // is_error token before being torn down.
+        let mut mgr = RingManager::new();
+        let mut handle = mgr.start_session(test_config());
+        mgr.register_request("req-fs".into(), "ring-001".into());
+
+        assert!(mgr.fail_session("ring-001", "no activity for 31s"));
+
+        let tok = handle.token_rx.try_recv().expect("error token emitted");
+        assert!(tok.is_error);
+        assert_eq!(tok.session_id, "ring-001");
+        assert!(tok.error_message.contains("no activity"));
+        // Session and its pending requests are gone.
+        assert!(!mgr.is_ring_request("req-fs"));
+        assert_eq!(mgr.pending_request_count(), 0);
+        // Failing a non-existent session is a no-op (returns false).
+        assert!(!mgr.fail_session("ring-001", "again"));
     }
 
     #[test]

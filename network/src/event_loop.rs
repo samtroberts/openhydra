@@ -1049,7 +1049,9 @@ pub async fn run_event_loop(
                 let timed_out = state.ring_manager.check_timeouts();
                 for (session_id, reason) in timed_out {
                     warn!(%session_id, %reason, "ring: session timed out, aborting");
-                    state.ring_manager.remove_session(&session_id);
+                    // Audit F7: notify the caller with an error token before
+                    // tearing down, instead of silently closing the channel.
+                    state.ring_manager.fail_session(&session_id, &reason);
                 }
             }
             // B5: Proactive relay reservation renewal.

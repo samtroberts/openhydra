@@ -292,8 +292,16 @@ async fn sampler_event_loop(
                     continue;
                 }
 
-                // Read response.
-                let recv_result: Result<(SampleResponse, Vec<u8>), String> = async {
+                // Read response. Audit F9: bound the read with the same
+                // timeout the caller uses. Without this, a Python sampler
+                // that accepts the request but never replies (deadlock /
+                // GIL-stuck) wedges this loop on read_exact forever — every
+                // queued Sample command then times out caller-side while the
+                // loop never advances and never reconnects, failing ALL ring
+                // sessions on this coordinator until process restart. On
+                // timeout we drop the connection so the next command
+                // reconnects.
+                let recv_fut = async {
                     let mut len_buf = [0u8; 4];
                     s.read_exact(&mut len_buf)
                         .await
@@ -310,8 +318,20 @@ async fn sampler_event_loop(
                         .map_err(|e| format!("read body: {e}"))?;
 
                     decode_response(&body)
-                }
-                .await;
+                };
+                let recv_result: Result<(SampleResponse, Vec<u8>), String> =
+                    match tokio::time::timeout(SAMPLER_RECV_TIMEOUT, recv_fut).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            warn!(
+                                "SamplerBridge read timed out ({}s), dropping connection",
+                                SAMPLER_RECV_TIMEOUT.as_secs()
+                            );
+                            stream = None;
+                            let _ = reply.send(Err("sampler read timed out".into()));
+                            continue;
+                        }
+                    };
 
                 match recv_result {
                     Ok((resp, emb)) => {
