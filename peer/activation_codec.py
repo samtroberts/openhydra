@@ -166,6 +166,12 @@ def dequantize_int8(data: bytes, scales: list[float]) -> list[float]:
     if not data:
         return []
     scale = float(scales[0]) if scales else 1.0
+    # Audit 2.3: scales arrive from an untrusted peer. A non-finite scale
+    # (NaN/Inf) would poison every dequantized value (and propagate to
+    # downstream ring stages). Treat it as a zeroed activation rather than
+    # multiplying garbage through the pipeline.
+    if scale != scale or scale in (float("inf"), float("-inf")):
+        scale = 0.0
     if _HAS_NUMPY:
         return _dequantize_np(data, scale).tolist()  # type: ignore[no-any-return]
     return _dequantize_py(data, scale)
