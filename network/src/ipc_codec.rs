@@ -396,6 +396,16 @@ fn is_zero_f64(v: &f64) -> bool {
 /// values are 50–500; `BATCH_MAGIC` = 1,212,498,498 — zero collision risk.
 pub const BATCH_MAGIC: u32 = 0x48435442;
 
+/// Minimum on-wire bytes for a single batch item (audit 2.2).
+///
+/// Every item carries at least a 4-byte header-length prefix, a non-empty
+/// CBOR header, and a 4-byte activation-length prefix, so it cannot be
+/// smaller than this. Used to clamp the pre-allocation in the batch
+/// decoders so an attacker-supplied `batch_count` (a raw u32, up to ~4.3 B)
+/// cannot drive a multi-terabyte `Vec::with_capacity` that aborts the
+/// process before any per-item validation runs.
+const MIN_BATCH_ITEM_BYTES: usize = 8;
+
 /// Check if a wire message is a batch (starts with BATCH_MAGIC).
 pub fn is_batch_message(data: &[u8]) -> bool {
     data.len() >= 4
@@ -585,7 +595,11 @@ pub fn decode_batch_request(data: &[u8]) -> Result<Vec<(IpcForwardHeader, Vec<u8
 
     let batch_count =
         u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-    let mut results = Vec::with_capacity(batch_count);
+    // Audit 2.2: clamp the pre-allocation to what the buffer could possibly
+    // hold. The loop below still validates and errors on truncation; this
+    // only bounds the up-front reservation.
+    let cap = batch_count.min(data.len() / MIN_BATCH_ITEM_BYTES);
+    let mut results = Vec::with_capacity(cap);
     let mut offset = 8;
 
     for i in 0..batch_count {
@@ -639,7 +653,9 @@ pub fn decode_batch_response(data: &[u8]) -> Result<Vec<(IpcResponseHeader, Vec<
 
     let batch_count =
         u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-    let mut results = Vec::with_capacity(batch_count);
+    // Audit 2.2: clamp the pre-allocation (see decode_batch_request).
+    let cap = batch_count.min(data.len() / MIN_BATCH_ITEM_BYTES);
+    let mut results = Vec::with_capacity(cap);
     let mut offset = 8;
 
     for i in 0..batch_count {
@@ -1007,6 +1023,20 @@ mod tests {
         assert!(is_batch_message(&encoded));
         let decoded = decode_batch_request(&encoded).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_batch_count_overflow_does_not_oom() {
+        // Audit 2.2: a tiny frame claiming u32::MAX items must NOT try to
+        // pre-allocate billions of entries — it must error on truncation.
+        let mut data = Vec::new();
+        data.extend_from_slice(&BATCH_MAGIC.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // claim ~4.3B items
+        // No item bytes follow.
+        let req = decode_batch_request(&data);
+        assert!(req.is_err(), "huge batch_count must error, not allocate");
+        let resp = decode_batch_response(&data);
+        assert!(resp.is_err(), "huge batch_count must error, not allocate");
     }
 
     #[test]
