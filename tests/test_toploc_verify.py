@@ -75,6 +75,63 @@ class TestVerifyHash:
         assert v(perturbed, hash_val) is False
 
 
+class TestActivationHashTransport:
+    """Audit H1/H2: the TOPLOC hash must survive the OHV2 wire round-trip.
+
+    The peer encodes the 32-byte digest as lowercase hex into the OHV2
+    header; the coordinator decodes it back to raw bytes via OHV2Response
+    before verify_hash. A regression here (e.g. str() on the digest, or
+    dropping the field on the push path) silently disables verification.
+    """
+
+    def test_encode_helper_produces_hex_not_repr(self):
+        from peer.server import _activation_hash_to_hex
+        digest = bytes(range(32))  # 32-byte digest with a 0x00 and high bytes
+        hexed = _activation_hash_to_hex(digest)
+        assert hexed == digest.hex()
+        assert len(hexed) == 64
+        # The old bug: str(digest) starts with "b'" — must never happen.
+        assert not hexed.startswith("b'")
+
+    def test_encode_helper_handles_str_and_empty(self):
+        from peer.server import _activation_hash_to_hex
+        assert _activation_hash_to_hex(b"") == ""
+        assert _activation_hash_to_hex(None) == ""
+        # Already-hex string passes through unchanged.
+        assert _activation_hash_to_hex("abcd1234") == "abcd1234"
+
+    def test_ohv2_response_decodes_hex_back_to_digest(self):
+        from peer.ohv2_adapter import OHV2Response
+        digest = bytes(range(32))
+        resp = OHV2Response({"activation_hash": digest.hex()})
+        assert resp.activation_hash == digest
+
+    def test_ohv2_response_rejects_non_hex_fail_closed(self):
+        from peer.ohv2_adapter import OHV2Response
+        # Legacy/corrupted repr-style value must NOT be silently accepted.
+        resp = OHV2Response({"activation_hash": "b'\\xab\\x12'"})
+        assert resp.activation_hash == b""
+
+    def test_full_roundtrip_verifies(self):
+        """digest -> hex header -> OHV2Response decode -> verify_hash True."""
+        from verification.toploc import activation_hash, verify_hash
+        from peer.server import _activation_hash_to_hex
+        from peer.ohv2_adapter import OHV2Response
+
+        activation = [263.0, 2217.0, 7826.0, -1.5, 0.0]
+        digest = activation_hash(activation)
+
+        # Peer side: encode into the OHV2 header.
+        header = {"activation_hash": _activation_hash_to_hex(digest)}
+        # Coordinator side: decode and verify.
+        decoded = OHV2Response(header).activation_hash
+        assert decoded == digest
+        assert verify_hash(activation, decoded) is True
+
+        # Tampered activation must still fail after the round-trip.
+        assert verify_hash([263.0, 2217.0, 7826.0, -1.5, 999.0], decoded) is False
+
+
 class TestMysterShopperWithToploc:
     def test_verify_uses_hash_when_available(self):
         """When activation_hash is present in ChainResult, mystery shopper

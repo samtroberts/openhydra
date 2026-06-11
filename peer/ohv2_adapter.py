@@ -425,11 +425,23 @@ class OHV2Response:
 
     @property
     def activation_hash(self) -> bytes:
+        # Audit H1/H2: the OHV2 wire carries the 32-byte SHA-256 digest as
+        # canonical lowercase hex. Decode it back to raw bytes so the
+        # coordinator's verify_hash compares digest-to-digest. Decoding hex
+        # as ASCII (the previous `_v.encode()`) produced wrong bytes and made
+        # verification always fail.
         _v = self._d.get("activation_hash", b"")
         if isinstance(_v, bytes):
-            return _v
+            return _v  # already raw digest (e.g. CBOR bytes)
         if isinstance(_v, str):
-            return _v.encode() if _v else b""
+            if not _v:
+                return b""
+            try:
+                return bytes.fromhex(_v)
+            except ValueError:
+                # Not canonical hex (legacy/corrupted) — fail closed so
+                # verification rejects rather than silently passing garbage.
+                return b""
         if isinstance(_v, list):
             return bytes(_v)
         return b""
