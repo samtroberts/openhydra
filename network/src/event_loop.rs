@@ -365,7 +365,8 @@ struct LoopState {
     /// Fix 1: tensor stream manager reference.
     tensor_mgr: Option<Arc<TensorStreamManager>>,
     /// Fix 1: inbound stream response handles for RespondProxy.
-    inbound_stream_responses: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<libp2p::Stream>>>>>,
+    /// Audit F4: value is the split write-half, not the whole stream.
+    inbound_stream_responses: Arc<tokio::sync::Mutex<crate::tensor_stream::InboundStreamMap>>,
     /// Phase 2: DCUtR success event queue (peer_ids as strings).
     dcutr_event_queue: VecDeque<String>,
     /// Phase 2: tunnel close event queue.
