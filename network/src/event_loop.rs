@@ -601,6 +601,13 @@ pub async fn run_event_loop(
     let mut relay_renewal_ticker = tokio::time::interval(std::time::Duration::from_secs(1800));
     relay_renewal_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // F3: Relay-dial retry driver — fires often enough to honour the
+    // 500ms–8s exponential backoff scheduled in relay_dial_retries. The
+    // dial itself is gated on each entry's next_attempt_at, so this ticker
+    // is cheap (it only acts on peers with a due, scheduled retry).
+    let mut relay_retry_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    relay_retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         // Retry dialing non-relay bootstrap peers every 15s until connected or retry cap hit.
         if !non_relay_bootstrap.is_empty()
@@ -1079,6 +1086,19 @@ pub async fn run_event_loop(
                     }
                 }
             }
+            // F3: Drive any due relay-dial retries (scheduled with backoff).
+            _ = relay_retry_ticker.tick() => {
+                let now = tokio::time::Instant::now();
+                let due: Vec<PeerId> = state
+                    .relay_dial_retries
+                    .iter()
+                    .filter(|(_, (_, next_at))| now >= *next_at)
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                for pid in due {
+                    drive_relay_retry(&mut swarm, &mut state, pid);
+                }
+            }
             // Process swarm events.
             event = swarm.select_next_some() => {
                 handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
@@ -1187,6 +1207,74 @@ fn handle_resolve(
 }
 
 /// Process a swarm event.
+/// F3: advance the relay-dial retry state machine for one peer.
+///
+/// Called both from `OutgoingConnectionError` (on failure) and from the
+/// `relay_retry_ticker` (to drive scheduled attempts). A retry is only
+/// dialed when `now >= next_attempt_at`, so failures that arrive faster than
+/// the backoff window are coalesced into a single spaced attempt instead of
+/// burning all five retries in milliseconds. After 5 spaced attempts
+/// (~500ms,1s,2s,4s,8s) the peer is evicted and its ring sessions aborted.
+fn drive_relay_retry(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    pid: PeerId,
+) {
+    if swarm.is_connected(&pid) {
+        state.relay_dial_retries.remove(&pid);
+        return;
+    }
+    let pid_str = pid.to_string();
+
+    // No active ring session → existing behaviour: evict immediately.
+    if !state.ring_manager.peer_has_active_session(&pid_str) {
+        state.relay_dial_retries.remove(&pid);
+        swarm.behaviour_mut().kademlia.remove_peer(&pid);
+        state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
+        info!(%pid, "evicted unreachable peer after dial failure");
+        return;
+    }
+
+    let now = tokio::time::Instant::now();
+    let entry = state
+        .relay_dial_retries
+        .entry(pid)
+        .or_insert((0, now));
+    // Not yet due — a scheduled attempt is pending; ignore this trigger.
+    if now < entry.1 {
+        return;
+    }
+    entry.0 += 1;
+
+    if entry.0 <= 5 {
+        let backoff_ms = 500 * (1u64 << (entry.0 - 1).min(4));
+        entry.1 = now + std::time::Duration::from_millis(backoff_ms);
+        info!(%pid, attempt = entry.0, backoff_ms, "relay_reconnect: dialing via relay");
+        for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+            if let Ok(relay_ma) = relay_str.parse::<Multiaddr>() {
+                let circuit_addr = relay_ma
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                    .with(libp2p::multiaddr::Protocol::P2p(pid));
+                if swarm.dial(circuit_addr).is_ok() {
+                    break;
+                }
+            }
+        }
+    } else {
+        warn!(%pid, "relay_reconnect: max retries (5) exceeded, evicting");
+        state.relay_dial_retries.remove(&pid);
+        swarm.behaviour_mut().kademlia.remove_peer(&pid);
+        state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
+        // B4 + F7: abort ring sessions for this peer (emits a caller-visible
+        // error token per session inside abort_sessions_for_peer).
+        let aborted = state.ring_manager.abort_sessions_for_peer(&pid_str);
+        for (sid, _) in &aborted {
+            warn!(%sid, %pid, "ring: aborted session after relay retry exhaustion");
+        }
+        info!(%pid, "evicted unreachable peer after relay retries exhausted");
+    }
+}
+
 fn handle_swarm_event(
     event: SwarmEvent<OpenHydraBehaviourEvent>,
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
@@ -1625,54 +1713,14 @@ fn handle_swarm_event(
         // ring sessions, immediate eviction otherwise.
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             warn!(?peer_id, %error, "outgoing_connection_error");
-            if let Some(ref pid) = peer_id {
-                if !swarm.is_connected(pid) {
-                    let pid_str = pid.to_string();
-                    let has_ring = state.ring_manager.peer_has_active_session(&pid_str);
-
-                    if has_ring {
-                        // B2: Retry via relay with exponential backoff.
-                        let entry = state
-                            .relay_dial_retries
-                            .entry(*pid)
-                            .or_insert((0, tokio::time::Instant::now()));
-                        entry.0 += 1;
-                        entry.1 = tokio::time::Instant::now();
-
-                        if entry.0 <= 5 {
-                            let backoff_ms = 500 * (1u64 << (entry.0 - 1).min(4));
-                            info!(
-                                %pid, attempt = entry.0, backoff_ms,
-                                "relay_reconnect: retrying via relay"
-                            );
-                            for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-                                if let Ok(relay_ma) = relay_str.parse::<Multiaddr>() {
-                                    let circuit_addr = relay_ma
-                                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
-                                        .with(libp2p::multiaddr::Protocol::P2p(*pid));
-                                    if swarm.dial(circuit_addr).is_ok() {
-                                        break;
-                                    }
-                                }
-                            }
-                        } else {
-                            warn!(%pid, "relay_reconnect: max retries (5) exceeded, evicting");
-                            state.relay_dial_retries.remove(pid);
-                            swarm.behaviour_mut().kademlia.remove_peer(pid);
-                            state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
-                            // B4: also abort ring sessions for this peer.
-                            let aborted = state.ring_manager.abort_sessions_for_peer(&pid_str);
-                            for (sid, _) in &aborted {
-                                warn!(%sid, %pid, "ring: aborted session after relay retry exhaustion");
-                            }
-                            info!(%pid, "evicted unreachable peer after relay retries exhausted");
-                        }
-                    } else {
-                        // No active ring session — existing behavior: immediate eviction.
-                        swarm.behaviour_mut().kademlia.remove_peer(pid);
-                        state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
-                        info!(%pid, "evicted unreachable peer after dial failure");
-                    }
+            if let Some(pid) = peer_id {
+                if !swarm.is_connected(&pid) {
+                    // F3: route through the scheduled-retry helper. The first
+                    // failure dials immediately; subsequent failures within
+                    // the backoff window are no-ops (the relay_retry_ticker
+                    // drives the next spaced attempt), so a fast-failing relay
+                    // no longer burns all 5 attempts in milliseconds.
+                    drive_relay_retry(swarm, state, pid);
                 }
             }
         }

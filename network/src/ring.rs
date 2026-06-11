@@ -662,6 +662,20 @@ impl RingManager {
             .collect();
         let mut aborted = Vec::new();
         for session_id in to_abort {
+            // Audit F7: notify the caller with an error token before tearing
+            // the session down, so a peer disconnect surfaces as a real error
+            // instead of a silently-closed channel.
+            if let Some(session) = self.sessions.get(&session_id) {
+                let _ = session.token_tx.try_send(RingToken {
+                    token_id: 0,
+                    token_text: String::new(),
+                    is_eos: true,
+                    latency_ms: 0.0,
+                    session_id: session_id.clone(),
+                    is_error: true,
+                    error_message: format!("ring peer {peer_id} disconnected"),
+                });
+            }
             if let Some((_lr, ids)) = self.abort_session(&session_id, peer_id) {
                 aborted.push((session_id, ids));
             }
