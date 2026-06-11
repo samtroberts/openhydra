@@ -106,6 +106,28 @@ def _exponential_backoff_delay(
     return min(float(cap_seconds), float(base_seconds) * (2.0 ** clamped))
 
 
+def _activation_hash_to_hex(value) -> str:
+    """Encode a TOPLOC activation hash for the OHV2 wire (audit H1/H2).
+
+    The hash is a 32-byte SHA-256 digest (``bytes``). The OHV2
+    ``activation_hash`` header field is a string carrying its canonical
+    lowercase-hex form. ``str()`` on the raw digest yields the Python repr
+    (``"b'\\xab..'"``) and silently breaks ``verify_hash`` on the
+    coordinator, so always go through ``bytes.hex()``.
+
+    Accepts ``bytes``/``bytearray`` (hex-encoded) or ``str`` (assumed to be
+    already-hex and passed through). Empty input → empty string.
+    """
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    # Unexpected type — be conservative and emit nothing rather than a repr.
+    return ""
+
+
 def _derive_relay_addresses(
     dht_urls: list[str],
     relay_port: int = 50052,
@@ -336,7 +358,11 @@ def _proxy_handler_loop(
         _block_idx = int(getattr(response, "block_index", 0) or 0)
         if _block_idx:
             _resp_hdr["block_index"] = _block_idx
-        _ahash = str(getattr(response, "activation_hash", "") or "")
+        # TOPLOC integrity hash (audit H1/H2). The hash is a 32-byte SHA-256
+        # digest; carry it as lowercase hex (the canonical OHV2 encoding).
+        # NEVER str() the raw bytes — that produces the Python repr and
+        # silently breaks verify_hash on the coordinator.
+        _ahash = _activation_hash_to_hex(getattr(response, "activation_hash", b""))
         if _ahash:
             _resp_hdr["activation_hash"] = _ahash
         _packed = bytes(getattr(response, "activation_packed", b"") or b"")
@@ -2802,6 +2828,12 @@ class PeerService:
             _resp_hdr["slot_id"] = int(slot_id or 0)
             _resp_hdr["block_size"] = int(getattr(response, "block_size", 0) or 0)
             _resp_hdr["block_index"] = int(getattr(response, "block_index", 0) or 0)
+            # TOPLOC integrity hash (audit H2). The push/ring path is the
+            # production hot path — previously the hash was dropped here, so
+            # the coordinator skipped verification entirely. Carry it as hex.
+            _ahash = _activation_hash_to_hex(getattr(response, "activation_hash", b""))
+            if _ahash:
+                _resp_hdr["activation_hash"] = _ahash
 
             _cb_libp2p = str(callback_libp2p_peer_id or '').strip()
             if not _cb_libp2p or self._p2p_node is None:

@@ -317,6 +317,13 @@ pub struct IpcResponseHeader {
     pub metadata_json: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error_message: String,
+    /// TOPLOC integrity hash of the activation (audit H1/H2).
+    ///
+    /// CANONICAL ENCODING: lowercase hex of the 32-byte SHA-256 digest.
+    /// The Python peer MUST encode with `bytes.hex()` and decode with
+    /// `bytes.fromhex()`. Do NOT `str()` the raw digest — that yields the
+    /// Python repr (`"b'\\xab..'"`), corrupts the hash, and silently breaks
+    /// `verify_hash` on the coordinator. Empty string means "no hash".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub activation_hash: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
