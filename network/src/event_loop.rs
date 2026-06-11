@@ -294,6 +294,15 @@ pub enum SwarmCommand {
     },
 }
 
+/// Maximum number of queued inbound proxy requests (audit 2.4).
+///
+/// Any connected peer can stream framed messages faster than Python drains
+/// `poll_proxy_request`. Without a bound the `VecDeque` grows without limit
+/// (memory-exhaustion DoS). Drop-oldest on overflow, mirroring the gossip
+/// inbound queue (`GOSSIP_INBOUND_QUEUE_MAX`). Sized generously so it only
+/// trips under genuine flooding, never normal backpressure.
+pub const PROXY_QUEUE_MAX: usize = 4096;
+
 /// Thread-safe queue for inbound proxy requests, shared between the
 /// event loop (producer) and Python poll_proxy_request (consumer).
 /// Bypasses the command channel to avoid event-loop round-trip latency.
@@ -312,6 +321,12 @@ impl SharedProxyQueue {
 
     pub fn push(&self, item: (String, Vec<u8>)) {
         let mut q = self.queue.lock().unwrap();
+        // Audit 2.4: drop-oldest on overflow so a flooding peer cannot grow
+        // this queue without bound.
+        if q.len() >= PROXY_QUEUE_MAX {
+            q.pop_front();
+            warn!("shared_proxy_queue_overflow: dropped oldest inbound request");
+        }
         q.push_back(item);
         self.condvar.notify_one();
     }
@@ -3090,6 +3105,21 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shared_proxy_queue_caps_at_max() {
+        // Audit 2.4: pushing past PROXY_QUEUE_MAX drops oldest, never grows
+        // unbounded.
+        let q = SharedProxyQueue::new();
+        for i in 0..(PROXY_QUEUE_MAX + 100) {
+            q.push((format!("req-{i}"), vec![0u8; 4]));
+        }
+        let len = q.queue.lock().unwrap().len();
+        assert_eq!(len, PROXY_QUEUE_MAX, "queue must be capped at PROXY_QUEUE_MAX");
+        // Oldest dropped: the first surviving item is req-100, not req-0.
+        let front = q.queue.lock().unwrap().front().unwrap().0.clone();
+        assert_eq!(front, "req-100");
+    }
 
     #[test]
     fn test_record_to_discovered_direct() {
