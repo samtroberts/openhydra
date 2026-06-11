@@ -218,6 +218,15 @@ pub fn decode_response(data: &[u8]) -> Result<(IpcResponseHeader, &[u8]), String
         return Err(format!("ForwardMsg response bad magic: 0x{magic:08X}"));
     }
 
+    // Audit 2.2: mirror decode()'s version gate (decode_response runs on the
+    // same untrusted network bytes and previously validated only the magic).
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != FORWARD_MSG_VERSION {
+        return Err(format!(
+            "ForwardMsg response unsupported version: {version} (expected {FORWARD_MSG_VERSION})"
+        ));
+    }
+
     let header_len = u16::from_le_bytes(data[10..12].try_into().unwrap()) as usize;
 
     let min_len = PREAMBLE_SIZE + header_len + 4;
