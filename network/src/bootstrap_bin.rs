@@ -143,12 +143,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay::Config {
             max_reservations: 256,
             max_circuits: 512,
-            max_circuits_per_peer: 8,
-            // 1 hour — defense-in-depth while peer-side renewal (B5) is pending.
+            // Audit 4.1: 8 → 4. A free Ed25519 identity can hold up to this
+            // many circuit slots; halving it doubles the identities an
+            // attacker needs to squat all 512 slots. The single-host vector
+            // is closed by the per-IP firewall caps in network_limits.sh; a
+            // distributed (many-IP, many-identity) attacker is bounded by
+            // shortening the durations below once peer-side reservation
+            // renewal (Phase 3 F6) is verified working.
+            max_circuits_per_peer: 4,
+            // TODO(F6): drop to ~600-900s once B5 reservation renewal is
+            // fixed. Kept at 1 hour for now so legitimate long sessions over
+            // a relay do not lose their reservation while renewal is broken
+            // (renewal currently stacks listeners instead of refreshing).
             reservation_duration: Duration::from_secs(3600),
-            // 64 MB per circuit — supports ~4000 tokens at ~16 KB/token (2 hops).
+            // TODO(F6): lower toward ~24 MB (real legit ceiling is ~12 MB at
+            // 800 tokens) once renewal lets long sessions span circuits. At
+            // 64 MB × 512 circuits the relay can forward up to 32 GB
+            // (metered-transfer amplification).
             max_circuit_bytes: 64 * 1024 * 1024,
-            // 1 hour per circuit — matches reservation_duration.
+            // TODO(F6): shorten alongside reservation_duration.
             max_circuit_duration: Duration::from_secs(3600),
             ..Default::default()
         },

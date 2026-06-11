@@ -1,6 +1,6 @@
 [Unit]
 Description=OpenHydra DHT Bootstrap Node
-Documentation=https://github.com/your-org/openhydra
+Documentation=https://github.com/samtroberts/openhydra
 After=network-online.target
 Wants=network-online.target
 

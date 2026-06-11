@@ -10,7 +10,7 @@
 set -euo pipefail
 
 DOMAIN="${1:?usage: setup_nanode.sh <domain>}"
-REPO_URL="${OPENHYDRA_REPO_URL:-https://github.com/your-org/openhydra.git}"
+REPO_URL="${OPENHYDRA_REPO_URL:-https://github.com/samtroberts/openhydra.git}"
 VENV=/opt/openhydra/.venv
 SECRETS_FILE=/etc/openhydra/secrets.env
 SERVICE_FILE=/etc/systemd/system/openhydra-bootstrap.service
