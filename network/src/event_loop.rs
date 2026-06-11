@@ -1319,16 +1319,35 @@ fn handle_swarm_event(
                 // Phase 4.2: Fast-path eviction for PEER_DEPARTED messages.
                 // Parse and evict before queuing for Python to minimize the
                 // ghost peer window on clean shutdown.
+                //
+                // SECURITY (audit F2): only honour a departure announcement
+                // when the *signed message author* is the very peer being
+                // declared departed. Gossipsub runs with
+                // ``MessageAuthenticity::Signed`` + ``ValidationMode::Strict``
+                // (see bootstrap_bin.rs), so ``message.source`` is the
+                // cryptographically-verified author. Without this check any
+                // peer could broadcast forged departures for every honest peer
+                // and continuously purge the whole network's routing tables
+                // (discovery DoS). A peer may only announce *its own*
+                // departure; genuine third-party death is handled reactively
+                // by the ConnectionClosed → abort_sessions_for_peer path.
                 if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&message.data) {
                     if parsed.get("type").and_then(|v| v.as_str()) == Some("PEER_DEPARTED") {
                         if let Some(departed_id_str) = parsed.get("libp2p_peer_id").and_then(|v| v.as_str()) {
                             if let Ok(departed_pid) = departed_id_str.parse::<PeerId>() {
-                                swarm.behaviour_mut().kademlia.remove_peer(&departed_pid);
-                                info!(%departed_pid, "evicted departed peer via PEER_DEPARTED gossip");
+                                if message.source == Some(departed_pid) {
+                                    swarm.behaviour_mut().kademlia.remove_peer(&departed_pid);
+                                    info!(%departed_pid, "evicted departed peer via PEER_DEPARTED gossip");
+                                    state.known_peers.retain(|_, record| {
+                                        record.libp2p_peer_id != departed_id_str
+                                    });
+                                } else {
+                                    warn!(
+                                        ?message.source, %departed_pid,
+                                        "rejected PEER_DEPARTED: author does not match subject"
+                                    );
+                                }
                             }
-                            state.known_peers.retain(|_, record| {
-                                record.libp2p_peer_id != departed_id_str
-                            });
                         }
                     }
                 }
@@ -2119,8 +2138,10 @@ fn handle_grpc_proxy_event(
                         }
                         DispatchAction::PushResultBlocking(parsed_pr) => {
                             // CP-3: Check if this PushResult belongs to a ring session.
+                            let _from_peer = peer.to_string();
                             let ring_action = state.ring_manager.route_push_result(
                                 &parsed_pr.header.request_id,
+                                &_from_peer,
                                 &parsed_pr.header,
                                 parsed_pr.activation.clone(),
                             );
@@ -2220,8 +2241,10 @@ fn handle_grpc_proxy_event(
                             }
 
                             // CP-3: Check ring manager ownership.
+                            let _from_peer = peer.to_string();
                             let ring_action = state.ring_manager.route_push_result(
                                 &push_result.header.request_id,
+                                &_from_peer,
                                 &push_result.header,
                                 push_result.activation.clone(),
                             );
@@ -2658,10 +2681,17 @@ fn inject_prefill_chunk(
     };
 
     // Generate a unique request_id for this chunk's ring traversal.
+    // Audit F1: append 64 random bits so the id is unguessable.
     state.inbound_proxy_counter += 1;
     let chunk_request_id = format!(
-        "ring-{}-pf{}-c{}",
-        session_id, state.inbound_proxy_counter, chunk_info.chunk_index,
+        "ring-{}-pf{}-c{}-{:016x}",
+        session_id,
+        state.inbound_proxy_counter,
+        chunk_info.chunk_index,
+        {
+            use rand::Rng;
+            rand::thread_rng().gen::<u64>()
+        },
     );
 
     // Register for PushResult routing (last stage → ring manager).
@@ -2805,11 +2835,18 @@ fn handle_ring_event(
                 }
             };
 
-            // Generate a unique request_id for this ring pass.
+            // Generate a unique request_id for this ring pass. Audit F1:
+            // append 64 random bits so the id is unguessable — the
+            // session/counter prefix is kept only for log correlation.
             state.inbound_proxy_counter += 1;
             let new_request_id = format!(
-                "ring-{}-t{}",
-                session_id, state.inbound_proxy_counter,
+                "ring-{}-t{}-{:016x}",
+                session_id,
+                state.inbound_proxy_counter,
+                {
+                    use rand::Rng;
+                    rand::thread_rng().gen::<u64>()
+                },
             );
 
             // Register the new request_id so the returning PushResult
