@@ -147,11 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay::Config {
             max_reservations: 256,
             max_circuits: 512,
-            max_circuits_per_peer: 4,
+            max_circuits_per_peer: 8,
             // 1 hour — defense-in-depth while peer-side renewal (B5) is pending.
             reservation_duration: Duration::from_secs(3600),
-            // 5 MB per circuit — tightened from 64 MB.
-            max_circuit_bytes: 5 * 1024 * 1024,
+            // 64 MB per circuit — supports ~4000 tokens at ~16 KB/token (2 hops).
+            max_circuit_bytes: 64 * 1024 * 1024,
             // 1 hour per circuit — matches reservation_duration.
             max_circuit_duration: Duration::from_secs(3600),
             ..Default::default()
