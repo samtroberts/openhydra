@@ -15,8 +15,63 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
+import struct
 import time
 import uuid
+
+
+# Audit C-F1: hard ceiling on the number of float32 values the coordinator
+# will materialise from a single peer response. A malicious peer can return
+# up to the 100 MB transport cap, which `list(struct.unpack(...))` expands
+# into a ~10x-larger Python float list (memory-exhaustion DoS). A single
+# stage response is small in practice — prefill is chunked to <=128 tokens,
+# so even a 16K-wide hidden state is ~2M floats. The default (16M floats,
+# ~64 MB packed) sits well above any legitimate single response but below
+# the 100 MB transport cap, so it actually rejects abusive blobs. Tighten
+# via the env var in constrained deployments.
+_MAX_ACTIVATION_FLOATS = int(
+    os.environ.get("OPENHYDRA_MAX_ACTIVATION_FLOATS", str(16 * 1024 * 1024))
+)
+
+
+def _safe_unpack_activation(packed: bytes) -> list[float]:
+    """Unpack a float32 activation payload from untrusted peer bytes.
+
+    Defends against the C-F1 OOM: bounds the float count and tolerates a
+    non-multiple-of-4 length (truncating rather than raising the
+    ``struct.error`` that would escape the caller's failover catch).
+
+    Raises ``RuntimeError`` on anything malformed/oversized so the caller's
+    ``(grpc.RpcError, RuntimeError)`` failover path engages instead of the
+    request crashing.
+    """
+    usable = len(packed) - (len(packed) % 4)
+    n_floats = usable // 4
+    if n_floats <= 0:
+        return []
+    if n_floats > _MAX_ACTIVATION_FLOATS:
+        raise RuntimeError(
+            f"peer activation too large: {n_floats} floats "
+            f"> cap {_MAX_ACTIVATION_FLOATS}"
+        )
+    # Audit 2.3: peers are untrusted, so the floats may contain NaN/Inf which
+    # would poison head-sampling and any downstream ring stage this gets
+    # re-forwarded to. When numpy is available, decode + sanitize in one
+    # vectorized pass (frombuffer is zero-copy); non-finite values are mapped
+    # to 0.0. Falls back to plain struct unpacking otherwise.
+    try:
+        import numpy as _np
+        arr = _np.frombuffer(packed[:usable], dtype="<f4")
+        if not _np.isfinite(arr).all():
+            arr = _np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        return arr.astype(_np.float32).tolist()
+    except ImportError:
+        pass
+    try:
+        return list(struct.unpack(f"<{n_floats}f", packed[:usable]))
+    except struct.error as exc:  # pragma: no cover - guarded by slicing
+        raise RuntimeError(f"malformed peer activation: {exc}") from exc
 
 import grpc
 
@@ -524,11 +579,11 @@ class InferenceChain:
         )
 
         # Prefer activation_packed (binary) over repeated float activation.
+        # Audit C-F1: bound the unpack so a malicious/oversized peer response
+        # can't OOM the coordinator or crash on a ragged length.
         _resp_packed = bytes(getattr(response, "activation_packed", b"") or b"")
         if _resp_packed and len(_resp_packed) >= 4:
-            import struct as _struct_unpack
-            _n_floats = len(_resp_packed) // 4
-            resp_activation = list(_struct_unpack.unpack(f'<{_n_floats}f', _resp_packed))
+            resp_activation = _safe_unpack_activation(_resp_packed)
         else:
             resp_activation = list(response.activation)
 
@@ -1146,11 +1201,10 @@ class InferenceChain:
 
         total_ms = (time.perf_counter() - t_start) * 1000
         # Prefer packed bytes from response (push result).
+        # Audit C-F1: bound the unpack against malicious/oversized payloads.
         _push_packed = bytes(getattr(result_response, "activation_packed", b"") or b"")
         if _push_packed and len(_push_packed) >= 4:
-            import struct as _push_unpack
-            _n = len(_push_packed) // 4
-            activation = list(_push_unpack.unpack(f'<{_n}f', _push_packed))
+            activation = _safe_unpack_activation(_push_packed)
         else:
             activation = list(result_response.activation) if hasattr(result_response, "activation") else []
         output = ""
