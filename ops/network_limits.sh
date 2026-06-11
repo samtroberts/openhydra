@@ -143,9 +143,35 @@ info "SSH (22): ALLOW all"
 # ── 2c. Port 4001 — libp2p (Kademlia DHT + Circuit Relay + QUIC) ─────────────
 # TCP: Kademlia, relay circuits, direct TCP connections.
 # UDP: QUIC transport, AutoNAT probing, DCUtR hole-punching.
+#
+# Audit 4.2: cap connections PER SOURCE IP so a single host cannot exhaust
+# relay circuit / connection slots (the single-host half of the Sybil DoS
+# in bootstrap_bin.rs relay limits). connlimit bounds concurrent flows;
+# hashlimit bounds the new-connection rate. Defaults are generous — a
+# legitimate peer opens only a handful of connections — and env-tunable.
+OH_TCP_CONNLIMIT="${OH_TCP_CONNLIMIT:-64}"   # max concurrent TCP conns / src IP
+OH_UDP_CONNLIMIT="${OH_UDP_CONNLIMIT:-64}"   # max concurrent QUIC flows / src IP
+OH_NEWCONN_RATE="${OH_NEWCONN_RATE:-60/min}" # new TCP conns / src IP
+OH_NEWCONN_BURST="${OH_NEWCONN_BURST:-120}"
+
+# Reject excess concurrent TCP connections from one IP (/32).
+iptables -A OPENHYDRA -p tcp --dport 4001 \
+  -m connlimit --connlimit-above "$OH_TCP_CONNLIMIT" --connlimit-mask 32 \
+  -j REJECT --reject-with tcp-reset
+# Rate-limit NEW TCP connections per IP (SYN only — doesn't touch in-flight data).
+iptables -A OPENHYDRA -p tcp --dport 4001 --syn \
+  -m hashlimit --hashlimit-name oh4001tcp --hashlimit-mode srcip \
+  --hashlimit-above "$OH_NEWCONN_RATE" --hashlimit-burst "$OH_NEWCONN_BURST" \
+  -j DROP
 iptables -A OPENHYDRA -p tcp --dport 4001 -j ACCEPT
+# QUIC/UDP: cap concurrent flows per IP via UDP conntrack. We deliberately do
+# NOT rate-limit UDP data packets — that would throttle active inference
+# traffic (a single circuit is ~200 pkt/s at 15 TPS).
+iptables -A OPENHYDRA -p udp --dport 4001 \
+  -m connlimit --connlimit-above "$OH_UDP_CONNLIMIT" --connlimit-mask 32 \
+  -j DROP
 iptables -A OPENHYDRA -p udp --dport 4001 -j ACCEPT
-info "Port 4001 (libp2p): ALLOW TCP + UDP"
+info "Port 4001 (libp2p): per-IP caps — TCP concurrent=$OH_TCP_CONNLIMIT new=$OH_NEWCONN_RATE, UDP concurrent=$OH_UDP_CONNLIMIT"
 
 # ── 2d. ICMP rate limiting ────────────────────────────────────────────────────
 iptables -A OPENHYDRA -p icmp \
@@ -180,7 +206,21 @@ ip6tables -A OPENHYDRA -m state --state ESTABLISHED,RELATED -j ACCEPT
 ip6tables -A OPENHYDRA -p tcp --dport 22 -j ACCEPT
 
 # ── 3c. Port 4001 — libp2p (TCP + UDP) ───────────────────────────────────────
+# Audit 4.2: per-source caps. For IPv6 a single host typically controls an
+# entire /64, so limit per /64 (mask 64) rather than per /128 — otherwise an
+# attacker just rotates addresses within their own prefix.
+ip6tables -A OPENHYDRA -p tcp --dport 4001 \
+  -m connlimit --connlimit-above "$OH_TCP_CONNLIMIT" --connlimit-mask 64 \
+  -j REJECT --reject-with tcp-reset
+ip6tables -A OPENHYDRA -p tcp --dport 4001 --syn \
+  -m hashlimit --hashlimit-name oh4001tcp6 --hashlimit-mode srcip \
+  --hashlimit-srcmask 64 \
+  --hashlimit-above "$OH_NEWCONN_RATE" --hashlimit-burst "$OH_NEWCONN_BURST" \
+  -j DROP
 ip6tables -A OPENHYDRA -p tcp --dport 4001 -j ACCEPT
+ip6tables -A OPENHYDRA -p udp --dport 4001 \
+  -m connlimit --connlimit-above "$OH_UDP_CONNLIMIT" --connlimit-mask 64 \
+  -j DROP
 ip6tables -A OPENHYDRA -p udp --dport 4001 -j ACCEPT
 
 # ── 3d. ICMPv6 — MUST allow fully (NDP, path MTU discovery) ──────────────────

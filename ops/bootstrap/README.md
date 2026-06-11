@@ -45,7 +45,7 @@ export BOOTSTRAP_US_DOMAIN="bootstrap-us.openhydra.example"
 export BOOTSTRAP_EU_DOMAIN="bootstrap-eu.openhydra.example"
 export BOOTSTRAP_AP_DOMAIN="bootstrap-ap.openhydra.example"
 
-export OPENHYDRA_REPO_URL="https://github.com/your-org/openhydra.git"
+export OPENHYDRA_REPO_URL="https://github.com/samtroberts/openhydra.git"
 
 bash ops/bootstrap/deploy_all.sh
 ```
