@@ -21,6 +21,18 @@ use tracing::{debug, info, warn};
 
 use crate::event_loop::SharedProxyQueue;
 
+/// Write-half of a split tensor stream. Audit F4: inbound streams are split
+/// into independent read/write halves so the reader loop and `write_response`
+/// never contend on a single mutex held across a blocking read. `futures`'
+/// `split()` uses a `BiLock` that is released between polls, so a response can
+/// be written while the reader is parked waiting for the next frame.
+type TensorWriteHalf = futures::io::WriteHalf<Stream>;
+
+/// Map of inbound response handles: request_id → shared write-half of the
+/// stream the request arrived on. All request_ids from one physical stream
+/// share one `Arc<Mutex<TensorWriteHalf>>`.
+pub type InboundStreamMap = HashMap<String, Arc<Mutex<TensorWriteHalf>>>;
+
 /// The libp2p stream protocol for persistent tensor transfer.
 pub const TENSOR_STREAM_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/openhydra/tensor-stream/1.0.0");
@@ -344,7 +356,7 @@ impl TensorStreamManager {
 pub fn spawn_inbound_acceptor(
     mut incoming: libp2p_stream::IncomingStreams,
     proxy_queue: Arc<SharedProxyQueue>,
-    inbound_streams: Arc<Mutex<HashMap<String, Arc<Mutex<Stream>>>>>,
+    inbound_streams: Arc<Mutex<InboundStreamMap>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("tensor_stream_acceptor: accepting inbound streams");
@@ -360,43 +372,71 @@ pub fn spawn_inbound_acceptor(
 
 /// Handle one inbound tensor stream: read framed messages in a loop,
 /// push each to the proxy queue.
+///
+/// Audit F4: the stream is split into independent read/write halves. The
+/// reader loop owns the read half exclusively (no shared mutex held across
+/// the blocking `read_framed`), while a single shared `Arc<Mutex<WriteHalf>>`
+/// backs every response for this stream. A response can therefore be written
+/// while the reader is parked waiting for the next frame.
+///
+/// We register a write-handle in `inbound_streams` only for messages that
+/// expect a response. Fire-and-forget frames (the ring hot path) never get a
+/// `respond_proxy` callback, so registering one would leak an entry per token
+/// for the life of the stream. On loop exit we purge every request_id this
+/// stream registered, so nothing lingers after the peer disconnects.
 async fn handle_inbound_stream(
     peer_id: PeerId,
     stream: Stream,
     proxy_queue: Arc<SharedProxyQueue>,
-    inbound_streams: Arc<Mutex<HashMap<String, Arc<Mutex<Stream>>>>>,
+    inbound_streams: Arc<Mutex<InboundStreamMap>>,
 ) {
-    let stream = Arc::new(Mutex::new(stream));
+    use futures::AsyncReadExt;
+    let (mut read_half, write_half) = stream.split();
+    let write_half = Arc::new(Mutex::new(write_half));
+    // request_ids this stream registered a response handle for, so we can
+    // purge any that were never answered when the stream closes.
+    let mut registered: Vec<String> = Vec::new();
+
     loop {
-        let data = {
-            let mut s = stream.lock().await;
-            match read_framed(&mut *s).await {
-                Ok(data) => data,
-                Err(e) => {
-                    debug!(%peer_id, %e, "tensor_stream_inbound: read error, closing");
-                    break;
-                }
+        let data = match read_framed(&mut read_half).await {
+            Ok(data) => data,
+            Err(e) => {
+                debug!(%peer_id, %e, "tensor_stream_inbound: read error, closing");
+                break;
             }
         };
 
         // Generate a unique request ID for this inbound message.
-        // The Python side will call respond_proxy(req_id, response_data)
-        // which will write the response back on this stream.
         let req_id = format!("ts-{}-{}", peer_id, uuid_short());
 
-        // Store the stream handle so RespondProxy can write back.
-        inbound_streams
-            .lock()
-            .await
-            .insert(req_id.clone(), Arc::clone(&stream));
+        // Only register a write-handle when the message expects a response.
+        // Fire-and-forget methods (0x03/0x04) never trigger respond_proxy.
+        let method = data.first().copied().unwrap_or(0);
+        let is_fire_forget = method == crate::dispatcher::METHOD_FIRE_FORGET
+            || method == crate::dispatcher::METHOD_FIRE_FORGET_RESULT;
+        if !is_fire_forget {
+            inbound_streams
+                .lock()
+                .await
+                .insert(req_id.clone(), Arc::clone(&write_half));
+            registered.push(req_id.clone());
+        }
 
         proxy_queue.push((req_id, data));
     }
+
+    // Purge any unanswered response handles registered by this stream.
+    if !registered.is_empty() {
+        let mut map = inbound_streams.lock().await;
+        for rid in &registered {
+            map.remove(rid);
+        }
+    }
 }
 
-/// Write a length-prefixed frame to a stream.
-async fn write_framed(
-    stream: &mut Stream,
+/// Write a length-prefixed frame to a stream (or write-half of one).
+async fn write_framed<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     data: &[u8],
 ) -> Result<(), TensorStreamError> {
     use futures::AsyncWriteExt;
@@ -417,8 +457,8 @@ async fn write_framed(
     Ok(())
 }
 
-/// Read a length-prefixed frame from a stream.
-async fn read_framed(stream: &mut Stream) -> Result<Vec<u8>, TensorStreamError> {
+/// Read a length-prefixed frame from a stream (or read-half of one).
+async fn read_framed<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>, TensorStreamError> {
     use futures::AsyncReadExt;
     let mut len_buf = [0u8; 4];
     stream
@@ -448,19 +488,19 @@ fn uuid_short() -> String {
 
 /// Write a response on an inbound tensor stream (called from RespondProxy).
 pub async fn write_response(
-    inbound_streams: &Mutex<HashMap<String, Arc<Mutex<Stream>>>>,
+    inbound_streams: &Mutex<InboundStreamMap>,
     req_id: &str,
     data: &[u8],
 ) -> Result<(), TensorStreamError> {
-    let stream = {
+    let write_half = {
         let mut map = inbound_streams.lock().await;
         match map.remove(req_id) {
             Some(s) => s,
             None => return Err(TensorStreamError::UnknownReqId(req_id.to_string())),
         }
     };
-    let mut s = stream.lock().await;
-    write_framed(&mut *s, data).await
+    let mut w = write_half.lock().await;
+    write_framed(&mut *w, data).await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -509,5 +549,21 @@ mod tests {
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         assert_eq!(len, data.len());
         assert_eq!(&buf[4..], data);
+        let _ = (&mut a, &mut b);
+    }
+
+    #[tokio::test]
+    async fn test_write_then_read_framed_generic() {
+        // Audit F4: write_framed / read_framed are now generic over any
+        // AsyncWrite / AsyncRead (so they work on split write/read halves).
+        // Round-trip through an in-memory buffer to confirm the framing.
+        let payload = b"\x03some-fire-forget-activation-bytes";
+        let mut sink: Vec<u8> = Vec::new();
+        write_framed(&mut sink, payload).await.expect("write");
+        assert_eq!(sink.len(), 4 + payload.len());
+
+        let mut cursor = futures::io::Cursor::new(sink);
+        let got = read_framed(&mut cursor).await.expect("read");
+        assert_eq!(got, payload);
     }
 }
