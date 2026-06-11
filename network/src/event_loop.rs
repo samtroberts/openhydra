@@ -96,6 +96,13 @@ enum RingEvent {
         session_id: String,
         reason: String,
     },
+    /// Audit F11: a fire-and-forget ring re-injection send failed. The send
+    /// runs in a spawned task, so it reports failure back here to abort the
+    /// session immediately instead of waiting ~30s for the watchdog.
+    ReinjectFailed {
+        session_id: String,
+        reason: String,
+    },
 }
 
 /// CP-4: Metadata for a request waiting inside the Batcher.
@@ -2392,6 +2399,16 @@ fn handle_grpc_proxy_event(
             if let Some(reply) = state.pending_proxy.remove(&request_id) {
                 let _ = reply.send(Err(format!("proxy outbound: {error:?}")));
             }
+            // Audit F10: if this was a prefill chunk send, its ack mapping
+            // would otherwise leak and the prefill pipeline would stall until
+            // the watchdog. Clean it up and abort the session now.
+            if let Some(session_id) = state.prefill_stage0_acks.remove(&request_id) {
+                warn!(%session_id, "ring: prefill chunk send failed, aborting session");
+                state.ring_manager.fail_session(
+                    &session_id,
+                    "prefill chunk send failed",
+                );
+            }
         }
         request_response::Event::InboundFailure { error, .. } => {
             warn!(?error, "proxy inbound failure");
@@ -2927,11 +2944,19 @@ fn handle_ring_event(
                         if let Some(ref mgr) = state.tensor_mgr {
                             let mgr = Arc::clone(mgr);
                             let pid_owned = pid;
-                            let _sid = session_id.clone();
+                            let sid = session_id.clone();
                             let _rid = new_request_id.clone();
+                            // Audit F11: report send failure back to the event
+                            // loop so the session is aborted immediately
+                            // rather than stalling until the watchdog fires.
+                            let fail_tx = state.ring_event_tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = mgr.send_tensor(&pid_owned, &data).await {
                                     warn!(%pid_owned, %e, "ring: tensor_stream re-inject failed");
+                                    let _ = fail_tx.send(RingEvent::ReinjectFailed {
+                                        session_id: sid,
+                                        reason: format!("re-inject send failed: {e}"),
+                                    });
                                 }
                             });
                             info!(
@@ -2968,7 +2993,13 @@ fn handle_ring_event(
         }
         RingEvent::SampleFailed { session_id, reason } => {
             warn!(%session_id, %reason, "ring: HeadSampler failed, aborting session");
-            state.ring_manager.remove_session(&session_id);
+            state.ring_manager.fail_session(&session_id, &reason);
+        }
+        RingEvent::ReinjectFailed { session_id, reason } => {
+            // Audit F11: abort immediately with an error token instead of
+            // waiting for the watchdog.
+            warn!(%session_id, %reason, "ring: re-inject failed, aborting session");
+            state.ring_manager.fail_session(&session_id, &reason);
         }
     }
 }

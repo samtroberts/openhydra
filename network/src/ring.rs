@@ -550,10 +550,19 @@ impl RingManager {
             error_message: String::new(),
         };
 
-        // Emit to caller (non-blocking — if the channel is full, the token
-        // is buffered by the mpsc channel's capacity of 64).
-        if session.token_tx.try_send(token).is_err() {
-            warn!(%session_id, "ring: token channel full or closed");
+        // Emit to caller (non-blocking). Audit F8: distinguish full from
+        // closed. A *closed* channel means the caller (e.g. the HTTP client)
+        // has gone away — abort the session so the ring stops re-injecting
+        // and burning GPU/network on every peer to max_tokens.
+        match session.token_tx.try_send(token) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(%session_id, "ring: token channel full, dropping token");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(%session_id, "ring: token channel closed, aborting session");
+                return true; // signal complete → event loop tears down
+            }
         }
 
         let complete = is_eos || session.tokens_remaining == 0;
@@ -1433,6 +1442,19 @@ mod tests {
         assert_eq!(mgr.pending_request_count(), 0);
         assert!(!mgr.is_ring_request("req-a"));
         assert!(!mgr.is_ring_request("req-b"));
+    }
+
+    #[test]
+    fn test_record_token_aborts_on_closed_channel() {
+        // Audit F8: when the caller drops the token receiver, record_token
+        // returns true (complete) so the event loop stops the ring instead
+        // of burning compute to max_tokens.
+        let mut mgr = RingManager::new();
+        let handle = mgr.start_session(test_config());
+        // Caller goes away.
+        drop(handle);
+        let complete = mgr.record_token("ring-001", 42, "x".into(), false);
+        assert!(complete, "closed channel must signal completion to abort");
     }
 
     #[test]
