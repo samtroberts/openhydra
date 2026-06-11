@@ -19,6 +19,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::{autonat, gossipsub, identify, kad, ping, relay, Multiaddr, Swarm, Transport};
+use libp2p_connection_limits as connection_limits;
 use tracing::{debug, info, warn};
 
 // Re-use crate modules for identity and transport.
@@ -48,6 +49,8 @@ struct BootstrapBehaviour {
     /// Phase 5.6: Ping detects stale connections — without it, dead
     /// connections persist for the full idle_connection_timeout (600s).
     ping: ping::Behaviour,
+    /// Connection limits — prevents resource exhaustion from excessive connections.
+    connection_limits: connection_limits::Behaviour,
 }
 
 #[tokio::main]
@@ -108,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kad_config.set_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_publication_interval(Some(Duration::from_secs(240)));
+    kad_config.set_max_packet_size(64 * 1024);
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
@@ -143,11 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay::Config {
             max_reservations: 256,
             max_circuits: 512,
-            max_circuits_per_peer: 8,
+            max_circuits_per_peer: 4,
             // 1 hour — defense-in-depth while peer-side renewal (B5) is pending.
             reservation_duration: Duration::from_secs(3600),
-            // 64 MB per circuit — supports ~4000 tokens at ~16 KB/token (2 hops).
-            max_circuit_bytes: 64 * 1024 * 1024,
+            // 5 MB per circuit — tightened from 64 MB.
+            max_circuit_bytes: 5 * 1024 * 1024,
             // 1 hour per circuit — matches reservation_duration.
             max_circuit_duration: Duration::from_secs(3600),
             ..Default::default()
@@ -229,6 +233,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ping::Config::new().with_interval(Duration::from_secs(15)),
     );
 
+    let limits = connection_limits::ConnectionLimits::default()
+        .with_max_established_per_peer(Some(3))
+        .with_max_pending_incoming(Some(64))
+        .with_max_pending_outgoing(Some(64))
+        .with_max_established_incoming(Some(256))
+        .with_max_established_outgoing(Some(256));
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
@@ -237,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dcutr,
         gossipsub,
         ping,
+        connection_limits: connection_limits::Behaviour::new(limits),
     };
 
     // Phase 5.6: Reduced from 600s to 300s to match peer nodes and
@@ -446,6 +458,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         warn!(%peer, %error, "ping: failure");
                                     }
                                 }
+                            }
+                            BootstrapBehaviourEvent::ConnectionLimits(event) => {
+                                debug!(?event, "connection_limits event");
                             }
                         }
                     }

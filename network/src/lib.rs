@@ -24,7 +24,6 @@ pub mod proto {
 }
 pub mod dht;
 pub mod event_loop;
-pub mod prompt_stream;
 pub mod identity;
 pub mod prompt_stream;
 pub mod mdns;
