@@ -730,8 +730,29 @@ pub async fn run_event_loop(
         // bootstrap peers, then request relay reservations via listen_on.
         if relay_reservation_pending && tokio::time::Instant::now() >= relay_reservation_deadline {
             relay_reservation_pending = false;
+            // Dedup reservation targets by relay PeerId. BOOTSTRAP_RELAYS lists
+            // each relay twice (its v4 AND v6 address). Reserving on the SAME
+            // relay peer via both stacks makes libp2p hold ONE reservation per
+            // relay peer and EOF the duplicate listener (`listener_closed …
+            // Reservation(Io(UnexpectedEof))`, addresses=[]). The F-5 handler
+            // then retries that doomed duplicate forever, and each retry
+            // disrupts the working reservation to the same relay → permanent
+            // reservation churn → the NATted peer never holds a stable
+            // reservation and is unreachable via relay. Reserve ONCE per relay
+            // (first address wins; v4 is listed first and is universally
+            // reachable — and the only option for v6-less peers like cloud T4s).
+            let mut seen_relays = std::collections::HashSet::new();
             for relay_str in crate::relay::BOOTSTRAP_RELAYS {
                 if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+                    let relay_peer = relay_multiaddr.iter().find_map(|p| match p {
+                        libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                        _ => None,
+                    });
+                    if let Some(pid) = relay_peer {
+                        if !seen_relays.insert(pid) {
+                            continue; // already reserving on this relay peer
+                        }
+                    }
                     let listen_addr = relay_multiaddr
                         .with(libp2p::multiaddr::Protocol::P2pCircuit);
                     match swarm.listen_on(listen_addr.clone()) {
