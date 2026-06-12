@@ -819,12 +819,27 @@ def main() -> None:
                 _phase3_raw = _negotiator_json.loads(
                     open(_phase3_catalog_path).read()
                 )
-                _seen: set[str] = set()
+                _seen: dict[str, int] = {}
                 for _entry in _phase3_raw:
                     _mid = str(_entry.get("model_id", "")).strip()
-                    if not _mid or _mid in _seen:
+                    if not _mid:
                         continue
-                    _seen.add(_mid)
+                    if _mid in _seen:
+                        # Duplicate model_id in the catalog. We keep the
+                        # FIRST occurrence (as does coordinator.engine), so a
+                        # stale earlier row silently wins — that's how the
+                        # 4B got num_layers=36 instead of 32. Surface the
+                        # conflict loudly instead of mis-deriving the shard.
+                        _dup_layers = max(0, int(_entry.get("num_layers", 0)))
+                        if _dup_layers != _seen[_mid]:
+                            logger.warning(
+                                "phase3_catalog_duplicate_conflict: model=%s "
+                                "kept num_layers=%d, ignored duplicate with "
+                                "num_layers=%d — dedupe models.catalog.json",
+                                _mid, _seen[_mid], _dup_layers,
+                            )
+                        continue
+                    _seen[_mid] = max(0, int(_entry.get("num_layers", 0)))
                     _phase3_catalog.append(_MA(
                         model_id=_mid,
                         required_peers=int(_entry.get("required_peers", 1)),

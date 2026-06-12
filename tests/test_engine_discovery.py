@@ -260,6 +260,109 @@ def test_engine_rejects_dynamic_model_id_when_disabled(monkeypatch, tmp_path):
         engine.infer(prompt="hello", model_id=dynamic_model, grounding=False, allow_degradation=True)
 
 
+def test_engine_serves_whole_model_replica_below_required_peers(monkeypatch, tmp_path):
+    """A single peer holding the WHOLE model must serve even when the catalog
+    lists required_peers > 1 (the SHARD count). Coverage of [0, num_layers)
+    by the healthy peer set is what makes a model viable — not raw count.
+
+    Regression for the heterogeneous-swarm bug: a solo 9B node (required_peers
+    =2) returned no_viable_model/no_viable_fallback despite holding all layers.
+    """
+    catalog_path = tmp_path / "models.catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            [
+                {
+                    "model_id": "openhydra-qwen3.5-9b",
+                    "required_peers": 2,
+                    "hf_model_id": "Qwen/Qwen3.5-9B",
+                    "num_layers": 32,
+                }
+            ],
+            indent=2,
+        )
+    )
+    engine = CoordinatorEngine(
+        EngineConfig(
+            peers_config_path="/tmp/unused.json",
+            model_catalog_path=str(catalog_path),
+            default_model="openhydra-qwen3.5-9b",
+            ledger_path=str(tmp_path / "credits.json"),
+            health_store_path=str(tmp_path / "health.json"),
+            grounding_use_network=False,
+            audit_rate=0.0,
+            redundant_exec_rate=0.0,
+            barter_decay_per_day=0.0,
+        )
+    )
+
+    # One peer covering all 32 layers — a complete pipeline by itself, but
+    # only 1 peer vs required_peers=2.
+    whole = PeerEndpoint(
+        peer_id="solo-9b", host="127.0.0.1", port=5001,
+        model_id="openhydra-qwen3.5-9b",
+        layer_start=0, layer_end=32, total_layers=32,
+    )
+    health = [PeerHealth(peer=whole, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite")]
+
+    monkeypatch.setattr(
+        engine, "_scan_network",
+        lambda model_ids=None: (health, {"openhydra-qwen3.5-9b": 1}),
+    )
+    monkeypatch.setattr(engine, "_select_pipeline", lambda candidates, pipeline_width=None: [whole])
+    monkeypatch.setattr(
+        engine, "_run_chain",
+        lambda prompt, candidates, pipeline, max_tokens, request_id=None, deadline=None, **_: ChainResult(
+            request_id=request_id or "r1", text="whole ok", activation=[0.1],
+            traces=[StageTrace(peer_id=whole.peer_id, latency_ms=1.0, stage_index=0)],
+            latency_ms=5.0,
+        ),
+    )
+
+    payload = engine.infer(prompt="hi", model_id="openhydra-qwen3.5-9b", grounding=False, allow_degradation=True)
+    assert payload["model"]["served"] == "openhydra-qwen3.5-9b"
+    assert payload["model"]["degraded"] is False
+
+
+def test_engine_rejects_incomplete_coverage_below_required_peers(monkeypatch, tmp_path):
+    """The coverage override must NOT serve a model whose healthy peers leave a
+    layer gap — a single partial shard (e.g. only [0,16) of 32) is still
+    non-viable, so the count-based failure stands."""
+    catalog_path = tmp_path / "models.catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            [{
+                "model_id": "openhydra-qwen3.5-9b", "required_peers": 2,
+                "hf_model_id": "Qwen/Qwen3.5-9B", "num_layers": 32,
+            }],
+            indent=2,
+        )
+    )
+    engine = CoordinatorEngine(
+        EngineConfig(
+            peers_config_path="/tmp/unused.json",
+            model_catalog_path=str(catalog_path),
+            default_model="openhydra-qwen3.5-9b",
+            ledger_path=str(tmp_path / "credits.json"),
+            health_store_path=str(tmp_path / "health.json"),
+            grounding_use_network=False,
+            audit_rate=0.0, redundant_exec_rate=0.0, barter_decay_per_day=0.0,
+        )
+    )
+    partial = PeerEndpoint(
+        peer_id="partial-9b", host="127.0.0.1", port=5001,
+        model_id="openhydra-qwen3.5-9b",
+        layer_start=0, layer_end=16, total_layers=32,  # only half the model
+    )
+    health = [PeerHealth(peer=partial, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite")]
+    monkeypatch.setattr(
+        engine, "_scan_network",
+        lambda model_ids=None: (health, {"openhydra-qwen3.5-9b": 1}),
+    )
+    with pytest.raises(RuntimeError, match="no_viable_model:"):
+        engine.infer(prompt="hi", model_id="openhydra-qwen3.5-9b", grounding=False, allow_degradation=True)
+
+
 def test_engine_resolves_catalog_hf_model_id(tmp_path):
     catalog_path = tmp_path / "models.catalog.json"
     catalog_path.write_text(

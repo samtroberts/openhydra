@@ -298,8 +298,16 @@ impl Drop for PyP2PNode {
         if let Some(inner) = self.inner.take() {
             let (tx, rx) = oneshot::channel();
             if inner.cmd_tx.blocking_send(SwarmCommand::Shutdown { reply: tx }).is_ok() {
-                // Wait briefly for the shutdown to complete; don't block forever.
-                let _ = rx.blocking_recv();
+                // F14: bound the wait so interpreter shutdown can't hang if the
+                // event loop is wedged. Hand the oneshot to a helper thread and
+                // wait at most 500ms; if it doesn't complete, Drop proceeds
+                // (the process is exiting anyway).
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = rx.blocking_recv();
+                    let _ = done_tx.send(());
+                });
+                let _ = done_rx.recv_timeout(std::time::Duration::from_millis(500));
             }
         }
     }

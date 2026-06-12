@@ -51,76 +51,6 @@
     "description": "Qwen 3.5 27B FP8 \u2014 frontier thinking model, 64 layers, hybrid linear+full attention, FP8 quantized. 4-peer sharding on T4 GPUs."
   },
   {
-    "model_id": "openhydra-qwen3.5-27b",
-    "hf_model_id": "Qwen/Qwen3.5-27B",
-    "draft_model_id": "Qwen/Qwen3.5-0.8B",
-    "required_peers": 4,
-    "min_vram_gb": 16,
-    "shard_vram_gb": 7.0,
-    "shards_needed": 4,
-    "quality_tier": "frontier",
-    "recommended_quantization": "int4",
-    "num_layers": 48,
-    "context_length": 32768,
-    "languages": [
-      "en",
-      "multilingual"
-    ],
-    "tags": [
-      "chat",
-      "reasoning",
-      "large"
-    ],
-    "description": "Qwen 3.5 27B \u2014 frontier-class reasoning; requires 4 peers with int4."
-  },
-  {
-    "model_id": "openhydra-qwen3.5-9b",
-    "hf_model_id": "Qwen/Qwen3.5-9B",
-    "draft_model_id": "Qwen/Qwen3.5-0.8B",
-    "required_peers": 2,
-    "min_vram_gb": 18,
-    "shard_vram_gb": 9.0,
-    "shards_needed": 2,
-    "quality_tier": "advanced",
-    "recommended_quantization": "int8",
-    "num_layers": 32,
-    "context_length": 32768,
-    "languages": [
-      "en",
-      "multilingual"
-    ],
-    "tags": [
-      "chat",
-      "reasoning",
-      "medium"
-    ],
-    "description": "Qwen 3.5 9B \u2014 high-quality reasoning for 2-peer pipelines."
-  },
-  {
-    "model_id": "openhydra-qwen3.5-4b",
-    "hf_model_id": "Qwen/Qwen3.5-4B",
-    "mlx_model_id": "mlx-community/Qwen3.5-4B-MLX-4bit",
-    "draft_model_id": "Qwen/Qwen3.5-0.8B",
-    "dflash_draft_model_id": "z-lab/Qwen3.5-4B-DFlash",
-    "required_peers": 1,
-    "min_vram_gb": 9,
-    "shard_vram_gb": 9.0,
-    "shards_needed": 1,
-    "quality_tier": "standard",
-    "recommended_quantization": "int4",
-    "num_layers": 36,
-    "context_length": 32768,
-    "languages": [
-      "en",
-      "multilingual"
-    ],
-    "tags": [
-      "chat",
-      "medium"
-    ],
-    "description": "Qwen 3.5 4B \u2014 strong reasoning for single-peer deployment."
-  },
-  {
     "model_id": "openhydra-qwen3.5-2b",
     "hf_model_id": "Qwen/Qwen3.5-2B",
     "draft_model_id": "Qwen/Qwen3.5-0.8B",
@@ -141,29 +71,6 @@
       "small"
     ],
     "description": "Qwen 3.5 2B \u2014 compact model with strong multilingual capability."
-  },
-  {
-    "model_id": "openhydra-qwen3.5-0.8b",
-    "hf_model_id": "Qwen/Qwen3.5-0.8B",
-    "draft_model_id": null,
-    "required_peers": 1,
-    "min_vram_gb": 2,
-    "shard_vram_gb": 2.0,
-    "shards_needed": 1,
-    "quality_tier": "basic",
-    "recommended_quantization": "fp32",
-    "num_layers": 24,
-    "context_length": 32768,
-    "languages": [
-      "en",
-      "multilingual"
-    ],
-    "tags": [
-      "chat",
-      "small",
-      "fast"
-    ],
-    "description": "Qwen 3.5 0.8B \u2014 lightweight, ideal for single-peer deployment."
   },
   {
     "model_id": "openhydra-qwen2.5-7b-instruct",

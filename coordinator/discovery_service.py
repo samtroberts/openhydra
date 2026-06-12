@@ -30,6 +30,7 @@ from typing import Any
 from openhydra_defaults import PRODUCTION_BOOTSTRAP_URLS
 
 from coordinator.degradation import DegradationDecision, DegradationPolicy, ModelAvailability
+from coordinator.layer_coverage import LayerRange, is_complete_coverage
 from coordinator.path_finder import (
     PathFinder,
     PeerEndpoint,
@@ -234,6 +235,52 @@ class DiscoveryService:
     def _normalize_peer_model(self, peer: PeerEndpoint) -> str:
         """Return the peer's model ID, falling back to the default model."""
         return peer.model_id or self.config.default_model
+
+    def _coverage_complete_for_model(self, model_id: str, healthy: list) -> bool:
+        """Return ``True`` when the healthy peers for *model_id* together cover
+        the model's full layer range ``[0, num_layers)`` — i.e. they form a
+        complete pipeline.
+
+        This is the *coverage*-based notion of viability, distinct from the
+        raw peer-count-vs-``required_peers`` heuristic in
+        :class:`DegradationPolicy`.  The catalog's ``required_peers`` is the
+        *shard* count (peers needed when each holds a slice); a single peer
+        holding the WHOLE model — or any peer set whose ranges tile
+        ``[0, num_layers)`` — is serveable even when the raw count is lower.
+        """
+        item = self.catalogue_by_model.get(model_id)
+        total_layers = int(getattr(item, "num_layers", 0) or 0) if item is not None else 0
+        hf_alias = self._catalog_hf_model_id(model_id) or ""
+        matches = [
+            h for h in healthy
+            if self._normalize_peer_model(h.peer) in {model_id, hf_alias}
+        ]
+        if not matches:
+            return False
+        # Fall back to peer-announced depth when the catalog is silent.
+        if total_layers <= 0:
+            total_layers = max(
+                (int(getattr(h.peer, "total_layers", 0) or 0) for h in matches),
+                default=0,
+            )
+        if total_layers <= 0:
+            return False
+        ranges: list[LayerRange] = []
+        for h in matches:
+            pe = h.peer
+            ls = int(getattr(pe, "layer_start", 0) or 0)
+            le = int(getattr(pe, "layer_end", 0) or 0)
+            # An unsharded full-model replica announces layer_end=0 (and
+            # often total_layers=0): it covers the entire model.
+            if le <= ls:
+                ls, le = 0, total_layers
+            ranges.append(LayerRange(
+                peer_id=str(getattr(pe, "peer_id", "")),
+                layer_start=ls,
+                layer_end=le,
+                total_layers=total_layers,
+            ))
+        return is_complete_coverage(ranges, total_layers)
 
     # ------------------------------------------------------------------
     # Deduplication
@@ -792,6 +839,33 @@ class DiscoveryService:
                             "requested dynamic model has 0/1 healthy peers and no fallback model met required replicas"
                         ),
                     )
+
+        # Coverage-aware viability override. ``DegradationPolicy`` failed the
+        # model because the raw peer count is below the catalog's
+        # ``required_peers`` (the SHARD count). But a peer set whose layer
+        # ranges already cover ``[0, num_layers)`` — most commonly a single
+        # whole-model replica — is a complete pipeline and should serve.
+        # Skipped when the model is QoS-blocked (``requested_qos`` set), so a
+        # model failing verification can't be force-served this way.
+        if (
+            not decision.available
+            and requested_qos is None
+            and self._coverage_complete_for_model(requested_model, healthy)
+        ):
+            logger.info(
+                "select_model_coverage_override: model=%s has complete layer "
+                "coverage (whole-model replica or full shard set) despite peer "
+                "count below catalog required_peers — serving",
+                requested_model,
+            )
+            decision = DegradationDecision(
+                requested_model=requested_model,
+                served_model=requested_model,
+                degraded=False,
+                available=True,
+                reason="ok_coverage_complete",
+                detail="healthy peers provide full layer coverage",
+            )
 
         if requested_qos is not None:
             qos_prefix = (

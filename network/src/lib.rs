@@ -15,7 +15,6 @@ pub mod ipc_codec;
 pub mod proxy;
 pub mod ring;
 pub mod sampler_bridge;
-pub mod session;
 
 /// Prost-generated types from peer.proto.
 pub mod proto {

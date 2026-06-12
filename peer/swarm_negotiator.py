@@ -573,6 +573,34 @@ class SwarmNegotiator:
             if candidate is None:
                 continue
 
+            # Solo-node whole-model fallback. ``pick_best_fit`` will bite off
+            # only ``max_layers_hostable`` layers when the (conservative,
+            # VRAM-derived) hostable budget is smaller than the model depth.
+            # That is correct when OTHER peers exist to cover the remaining
+            # layers — but if no other peer covers any part of this model, a
+            # partial shard is non-functional: nobody serves the rest, so the
+            # ring can never complete. In that case claim the WHOLE model
+            # best-effort (the user pointed this node at this model; honour
+            # that over a pessimistic VRAM estimate, especially for quantized
+            # weights the catalog's fp16 budget doesn't account for). When
+            # peers DO exist, conflict_split / should_concede converge the
+            # swarm as before — this only changes the truly-alone case.
+            _other_covers = any(
+                c.libp2p_peer_id != self.libp2p_peer_id
+                and int(c.total_layers) == total_layers
+                and int(c.layer_end) > int(c.layer_start)
+                for c in claims
+            )
+            if not _other_covers and candidate != (0, total_layers):
+                logger.info(
+                    "swarm_negotiate_solo_whole: model=%s no other peer "
+                    "covers it — claiming whole model [0, %d) "
+                    "(override hostable=%d)",
+                    entry.model_id, total_layers,
+                    int(entry.max_layers_hostable),
+                )
+                candidate = (0, total_layers)
+
             if should_concede(
                 candidate,
                 peer_claims=claims,

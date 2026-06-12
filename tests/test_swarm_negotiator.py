@@ -357,6 +357,56 @@ def test_native_shard_empty_swarm_claims_whole_capable_model():
     assert a.source == SOURCE_FALLBACK_WHOLE
 
 
+def test_native_shard_solo_claims_whole_model_over_hostable_budget():
+    """A solo node whose VRAM-derived ``max_layers_hostable`` is *smaller*
+    than the model depth must still claim the WHOLE model on an empty swarm
+    — a partial shard with nobody to cover the rest is non-functional.
+
+    Regression for the heterogeneous-swarm bug: the 9B (32 layers) on a node
+    that estimates it can host only ~18 layers used to self-assign [0,18),
+    loading a dead partial shard. It must claim [0,32) instead.
+    """
+    report = _native_report(_cuda_t4(), _qwen_9b())
+    # Precondition: the budget really is below the model depth, otherwise
+    # this test wouldn't exercise the override.
+    cap = next(c for c in report.capacity if c.model_id == "openhydra-qwen3.5-9b")
+    assert cap.max_layers_hostable < cap.num_layers_total
+
+    neg = SwarmNegotiator(
+        capacity_report=report, libp2p_peer_id="me", dht_scan=_empty_scan,
+    )
+    a = neg.negotiate()
+    assert a is not None
+    assert a.model_id == "openhydra-qwen3.5-9b"
+    assert (a.layer_start, a.layer_end) == (0, 32)
+    assert a.source == SOURCE_FALLBACK_WHOLE
+
+
+def test_native_shard_partial_bite_preserved_when_other_peer_covers_rest():
+    """The solo-whole override must NOT fire when another peer already
+    covers part of the model — then a partial bite is correct (the other
+    peer serves the remainder)."""
+    # Another peer covers [0,8) of the 9B; my budget (~18) can't hold the
+    # whole [8,32) remainder (span 24), so I bite off the widest slice.
+    claims = [
+        PeerClaim(libp2p_peer_id="peer_a", model_id="openhydra-qwen3.5-9b",
+                  layer_start=0, layer_end=8, total_layers=32,
+                  available_vram_mb=1000),
+    ]
+    report = _native_report(_cuda_t4(), _qwen_9b())
+    cap = next(c for c in report.capacity if c.model_id == "openhydra-qwen3.5-9b")
+    neg = SwarmNegotiator(
+        capacity_report=report, libp2p_peer_id="me",
+        dht_scan=_fixed_scan(claims),
+    )
+    a = neg.negotiate()
+    assert a is not None
+    # Partial bite from the gap's left edge — NOT overridden to whole model.
+    assert a.layer_start == 8
+    assert a.layer_end == 8 + cap.max_layers_hostable
+    assert a.layer_end < 32
+
+
 def test_native_shard_plugs_middle_gap():
     """Two existing peers cover [0,8) and [16,24); we plug [8,16)."""
     claims = [

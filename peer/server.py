@@ -247,11 +247,20 @@ def _proxy_handler_loop(
                     _spin_end = time.perf_counter() + _keepalive_interval_s
                     fn = None
                     while time.perf_counter() < _spin_end:
-                        try:
-                            fn = _fwd_q.get_nowait()
-                            break
-                        except _queue.Empty:
-                            pass
+                        # Flame-graph finding (xctrace, 9B coordinator): the old
+                        # bare `get_nowait()` raised queue.Empty on EVERY empty
+                        # spin iteration — at thousands of iterations per 5ms
+                        # keepalive window that was ~12% of coordinator CPU spent
+                        # in BaseException + traceback create/destroy. Guard with
+                        # the non-raising `empty()` so the exception path only
+                        # fires on a genuine producer/consumer race (rare), while
+                        # the busy-spin still keeps the GPU in its active state.
+                        if not _fwd_q.empty():
+                            try:
+                                fn = _fwd_q.get_nowait()
+                                break
+                            except _queue.Empty:
+                                pass
                     if fn is None:
                         continue
                     try:
@@ -925,9 +934,18 @@ def _coordinator_handle_push_result(
         # config) OR are intentionally captured-by-value here
         # (ring_tokens_remaining, ring_generated_ids).
         if fire_next:
+            # WS-D#3: the ring route is constant for the session, so serialize
+            # it to bytes ONCE (cached on the session) instead of re-running
+            # json.dumps on every token in the reinject header build below.
+            if not session._cached_full_route_bytes:
+                _route0 = list(session.ring_full_route)
+                session._cached_full_route_bytes = PeerService._serialize_route_to_bytes(_route0)
+                session._cached_remaining_route_bytes = PeerService._serialize_route_to_bytes(_route0[1:])
             reinject_snapshot = {
                 "request_id": session.request_id,
                 "token_id": token_id,
+                "ring_full_route_bytes": session._cached_full_route_bytes,
+                "ring_remaining_route_bytes": session._cached_remaining_route_bytes,
                 "next_slot_id": next_slot_id_reserved if next_slot_id_reserved is not None else 0,
                 "pipeline_depth": session.pipeline_depth,
                 "total_stages": int(session.total_stages),
@@ -1013,13 +1031,13 @@ def _coordinator_handle_push_result(
             "ring_first_hop_address": snap["ring_first_hop_address"],
             "ring_first_hop_peer_id": snap["ring_first_hop_peer_id"],
             "ring_first_hop_libp2p_id": snap["ring_first_hop_libp2p_id"],
-            "ring_full_route": PeerService._serialize_route_to_bytes(route),
+            "ring_full_route": snap["ring_full_route_bytes"],
             "next_hop_address": _next_next,
             "next_hop_peer_id": _next_next_id,
             "final_callback_address": snap["final_callback_address"],
             "final_callback_request_id": snap["callback_request_id"],
             "final_callback_libp2p_peer_id": snap["final_callback_libp2p_peer_id"],
-            "remaining_route": PeerService._serialize_route_to_bytes(route[1:]),
+            "remaining_route": snap["ring_remaining_route_bytes"],
             "slot_id": snap["next_slot_id"],
             "pipeline_depth": snap["pipeline_depth"],
             "activation_dtype": 0,
@@ -1043,7 +1061,7 @@ def _coordinator_handle_push_result(
                         target_peer_id=_libp2p,
                         data=PROXY_METHOD_FIRE_FORGET + bytes(_wire),
                     )
-                    logging.info(
+                    logging.debug(
                         "coord_reinject_done: req=%s slot=%d via_relay (no_wait)",
                         _rid, _sid,
                     )
@@ -1828,6 +1846,12 @@ class PeerService:
                 elif _packed:
                     # PR-1: vectorised unpack via numpy. unpack_fp32 falls
                     # back to struct.unpack when numpy is unavailable.
+                    # NOTE: WS-D #1 (skip-unpack on MLX-sharded) was reverted —
+                    # it incorrectly emptied activation_in for stage-0
+                    # re-injection, where _packed is a 1-float token id (not a
+                    # hidden state), breaking the ring (ring_token_timeout
+                    # step=0). A correct version must gate on hidden-state
+                    # (non-first) stages only.
                     from peer.activation_codec import unpack_fp32 as _unpack_fp32
                     activation_in = _unpack_fp32(_packed)
                 else:
@@ -2051,7 +2075,18 @@ class PeerService:
                 except Exception:
                     # Fallback: materialise to float list for the legacy path.
                     _activation_for_proto = self.shard._hidden_to_payload(activation)
-            elif activation and len(activation) > 10:
+            elif activation:
+                # Pack ANY non-empty activation, not just len > 10. The OHV2
+                # response codec (``_encode_forward_response``) transmits ONLY
+                # ``activation_packed`` — it does NOT carry the repeated-float
+                # ``activation`` field. A short result (e.g. the last stage's
+                # single next-token id) left unpacked therefore vanishes on the
+                # OHV2 wire, so the coordinator sees an empty activation. This
+                # was swarm bug 2: single-node / per-token PyTorch decode
+                # returned 1 token (≤10) → dropped → empty completion. The old
+                # ``> 10`` threshold was only safe on the gRPC/protobuf path
+                # (which does carry the float field). Packing every non-empty
+                # activation is the cheap, transport-agnostic fix.
                 try:
                     # PR-1: vectorised pack (numpy). Falls back to struct.pack
                     # inside pack_fp32 when numpy is absent.

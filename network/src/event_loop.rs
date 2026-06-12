@@ -310,6 +310,17 @@ pub enum SwarmCommand {
 /// trips under genuine flooding, never normal backpressure.
 pub const PROXY_QUEUE_MAX: usize = 4096;
 
+/// Phase 2.4: TTL for inbound proxy response channels. A legitimate proxy
+/// request is answered in well under this; anything older is a leaked channel
+/// (Python responder crashed/dropped) and is swept by the reaper. Comfortably
+/// above any real per-token round-trip so it never trips on a live request.
+const PROXY_CHANNEL_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Phase 2.4: max concurrent unanswered proxy requests a single peer may hold.
+/// Bounds per-peer fairness (PROXY_QUEUE_MAX bounds total). Sized generously so
+/// it only trips under genuine per-peer flooding, never normal pipelining.
+const MAX_INFLIGHT_PER_PEER: usize = 256;
+
 /// Thread-safe queue for inbound proxy requests, shared between the
 /// event loop (producer) and Python poll_proxy_request (consumer).
 /// Bypasses the command channel to avoid event-loop round-trip latency.
@@ -367,7 +378,12 @@ struct LoopState {
     local_grpc_port: u16,
     /// Pending inbound proxy responses: request_id → (libp2p ResponseChannel, proxy_respond_tx sender)
     /// When Python calls RespondProxy, we find the channel here and send_response.
-    inbound_proxy_channels: HashMap<String, request_response::ResponseChannel<ProxyResponse>>,
+    // Phase 2.4: value carries (Instant, source PeerId). The Instant lets the
+    // reaper TTL-sweep channels whose Python responder never replied (bounding
+    // the leak vs relying only on libp2p's timeout); the PeerId lets the request
+    // handler enforce a per-peer inflight cap (fairness — one peer can't fill
+    // the global PROXY_QUEUE_MAX slots) by counting this peer's live channels.
+    inbound_proxy_channels: HashMap<String, (request_response::ResponseChannel<ProxyResponse>, std::time::Instant, PeerId)>,
     /// Counter for generating unique inbound request IDs.
     inbound_proxy_counter: u64,
     /// Proxy forward requests waiting for a relay connection to be established.
@@ -384,6 +400,11 @@ struct LoopState {
     last_repunch: HashMap<PeerId, std::time::Instant>,
     /// Fix 4: cached QUIC IPv6 addresses per peer (learned from Identify).
     peer_quic_addrs: HashMap<PeerId, Vec<Multiaddr>>,
+    /// F7: per-peer auto-QUIC-hole-punch attempt counter. Backs off after
+    /// repeated failures so a UDP-hostile path doesn't churn the connection
+    /// (the EU-relay case: 5s QUIC timeouts every ~90s). Reset on a successful
+    /// QUIC-direct connection.
+    quic_holepunch_attempts: HashMap<PeerId, u32>,
     /// Fix 1: tensor stream manager reference.
     tensor_mgr: Option<Arc<TensorStreamManager>>,
     /// Fix 1: inbound stream response handles for RespondProxy.
@@ -434,6 +455,16 @@ struct LoopState {
     gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
     /// B2: Per-peer relay dial retry state: (attempt_count, last_attempt).
     relay_dial_retries: HashMap<PeerId, (u32, tokio::time::Instant)>,
+    /// F-5: Per-relay-circuit RESERVATION retry state, keyed by the
+    /// ``/p2p-circuit`` listen multiaddr string: (attempt_count,
+    /// next_attempt_at). Distinct from ``relay_dial_retries`` (which retries
+    /// *dialing a remote peer* via relay) — this retries OUR OWN reservation
+    /// (``listen_on`` a circuit) so we stay reachable when a relay rejects or
+    /// drops the reservation. Without backoff a flapping relay caused either a
+    /// tight re-listen loop or (on a hard listen_on error) a permanent strand
+    /// for the whole session (the EU-relay gap). Cleared on NewListenAddr /
+    /// ReservationReqAccepted for that circuit.
+    relay_reservation_retries: HashMap<String, (u32, tokio::time::Instant)>,
 }
 
 /// PR-3: upper bound on pending inbound gossip messages.
@@ -478,6 +509,7 @@ impl LoopState {
             local_proxy_replies: HashMap::new(),
             last_repunch: HashMap::new(),
             peer_quic_addrs: HashMap::new(),
+            quic_holepunch_attempts: HashMap::new(),
             tensor_mgr: None,
             inbound_stream_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dcutr_event_queue: VecDeque::new(),
@@ -493,6 +525,7 @@ impl LoopState {
             prefill_stage0_acks: HashMap::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
             relay_dial_retries: HashMap::new(),
+            relay_reservation_retries: HashMap::new(),
         }
     }
 }
@@ -596,10 +629,13 @@ pub async fn run_event_loop(
     let mut ring_timeout_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     ring_timeout_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // B5: Relay reservation renewal — every 30 minutes (well before the
-    // 1-hour server-side reservation_duration from Workstream D).
-    let mut relay_renewal_ticker = tokio::time::interval(std::time::Duration::from_secs(1800));
-    relay_renewal_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // F6: B5's periodic re-listen was removed. It called `listen_on(circuit)`
+    // every 30 min unconditionally, creating a NEW listener each time without
+    // closing the old one (~144 leaked listeners/day → eventual per-peer
+    // reservation-cap denial). rust-libp2p's relay::client already auto-renews
+    // reservations for active listeners, and the reactive ExpiredListenAddr /
+    // ListenerClosed handlers below re-listen if a reservation actually drops —
+    // so the periodic re-listen was redundant and leaky.
 
     // F3: Relay-dial retry driver — fires often enough to honour the
     // 500ms–8s exponential backoff scheduled in relay_dial_retries. The
@@ -660,6 +696,9 @@ pub async fn run_event_loop(
                         }
                         Err(e) => {
                             warn!(addr = %listen_addr, error = %e, "relay listen failed");
+                            // F-5: don't strand a relay whose initial reservation
+                            // listen_on errored — schedule a backed-off retry.
+                            schedule_reservation_retry(&mut state, &listen_addr.to_string());
                         }
                     }
                 }
@@ -799,7 +838,7 @@ pub async fn run_event_loop(
                                     warn!(%request_id, %e, "tensor_stream_respond_failed");
                                 }
                             });
-                        } else if let Some(channel) = state.inbound_proxy_channels.remove(&request_id) {
+                        } else if let Some((channel, _, _)) = state.inbound_proxy_channels.remove(&request_id) {
                             if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
                                 warn!("proxy respond failed: {:?}", e);
                             }
@@ -1007,7 +1046,7 @@ pub async fn run_event_loop(
             // CP-2: IPC bridge responses — spawned tasks send completed
             // forward results back here for delivery via request_response.
             Some((req_id, data)) = ipc_response_rx.recv() => {
-                if let Some(channel) = state.inbound_proxy_channels.remove(&req_id) {
+                if let Some((channel, _, _)) = state.inbound_proxy_channels.remove(&req_id) {
                     if let Err(e) = swarm.behaviour_mut().grpc_proxy
                         .send_response(channel, ProxyResponse(data))
                     {
@@ -1043,6 +1082,19 @@ pub async fn run_event_loop(
                 if removed > 0 {
                     info!(removed, remaining = state.known_peers.len(), "known_peers reaper sweep");
                 }
+                // Phase 2.4: TTL-sweep leaked inbound proxy response channels.
+                // Normally a channel is removed when the Python responder replies
+                // (~lines 814/1022). If the responder crashes/drops, the channel
+                // and its buffers leak until libp2p's protocol timeout — this
+                // bounds that to PROXY_CHANNEL_TTL. Dropping the ResponseChannel
+                // closes it, so the remote peer fails fast instead of hanging.
+                let pc_before = state.inbound_proxy_channels.len();
+                state.inbound_proxy_channels.retain(|_, (_, t, _)| t.elapsed() < PROXY_CHANNEL_TTL);
+                let pc_swept = pc_before - state.inbound_proxy_channels.len();
+                if pc_swept > 0 {
+                    warn!(swept = pc_swept, remaining = state.inbound_proxy_channels.len(),
+                          "inbound_proxy_channels TTL sweep (leaked unanswered channels)");
+                }
             }
             // CP-4: Batch flush ticker — drain time-expired batches.
             _ = batch_ticker.tick() => {
@@ -1068,24 +1120,9 @@ pub async fn run_event_loop(
                     state.ring_manager.fail_session(&session_id, &reason);
                 }
             }
-            // B5: Proactive relay reservation renewal.
-            _ = relay_renewal_ticker.tick() => {
-                info!("relay_renewal: proactively re-requesting reservations");
-                for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-                    if let Ok(relay_ma) = relay_str.parse::<Multiaddr>() {
-                        let listen_addr =
-                            relay_ma.with(libp2p::multiaddr::Protocol::P2pCircuit);
-                        match swarm.listen_on(listen_addr.clone()) {
-                            Ok(_) => {
-                                debug!(addr = %listen_addr, "relay_renewal: reservation requested");
-                            }
-                            Err(e) => {
-                                warn!(addr = %listen_addr, %e, "relay_renewal: listen_on failed");
-                            }
-                        }
-                    }
-                }
-            }
+            // F6: B5 periodic relay-renewal removed (see comment at ticker
+            // decl). Reservation renewal is handled by libp2p auto-renewal +
+            // the reactive ExpiredListenAddr / ListenerClosed handlers.
             // F3: Drive any due relay-dial retries (scheduled with backoff).
             _ = relay_retry_ticker.tick() => {
                 let now = tokio::time::Instant::now();
@@ -1098,6 +1135,9 @@ pub async fn run_event_loop(
                 for pid in due {
                     drive_relay_retry(&mut swarm, &mut state, pid);
                 }
+                // F-5: drive any due relay-RESERVATION retries on the same
+                // ticker (re-listen on circuits whose reservation was lost).
+                drive_reservation_retries(&mut swarm, &mut state);
             }
             // Process swarm events.
             event = swarm.select_next_some() => {
@@ -1275,6 +1315,87 @@ fn drive_relay_retry(
     }
 }
 
+/// F-5: backoff schedule (in ms) for relay-RESERVATION retries.
+///
+/// ``attempt`` is 1-based (the attempt number we just made / are scheduling
+/// the wait after). Fast initial retries then exponential backoff, capped at
+/// 120 s: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 120s, 120s, … So a flapping or
+/// down relay neither tight-loops the event loop nor strands us permanently —
+/// we keep probing roughly every 2 minutes once backed off, and recover within
+/// a couple seconds of a brief blip. Pure + unit-tested.
+fn reservation_retry_delay_ms(attempt: u32) -> u64 {
+    // Cap the shift so ``1 << shift`` can't overflow and the value saturates
+    // at the 120 s ceiling well before then.
+    let shift = attempt.saturating_sub(1).min(7);
+    let ms = 1000u64.saturating_mul(1u64 << shift);
+    ms.min(120_000)
+}
+
+/// F-5: record that a relay reservation for ``circuit_addr`` is lost and
+/// schedule the next retry with backoff. Idempotent-ish: advances the attempt
+/// counter and pushes the next-attempt deadline out per the backoff schedule.
+fn schedule_reservation_retry(state: &mut LoopState, circuit_addr: &str) {
+    let now = tokio::time::Instant::now();
+    let entry = state
+        .relay_reservation_retries
+        .entry(circuit_addr.to_string())
+        .or_insert((0, now));
+    entry.0 = entry.0.saturating_add(1);
+    let delay = reservation_retry_delay_ms(entry.0);
+    entry.1 = now + std::time::Duration::from_millis(delay);
+    warn!(
+        circuit = %circuit_addr, attempt = entry.0, backoff_ms = delay,
+        "relay reservation lost — retry scheduled with backoff (F-5)",
+    );
+}
+
+/// F-5: re-issue any due relay-reservation ``listen_on`` requests. Driven by
+/// the existing `relay_retry_ticker` (250 ms). A circuit is retried only once
+/// its scheduled deadline passes, so repeated failure events coalesce into a
+/// single spaced attempt instead of a tight loop.
+fn drive_reservation_retries(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+) {
+    if state.relay_reservation_retries.is_empty() {
+        return;
+    }
+    let now = tokio::time::Instant::now();
+    // Collect due addrs first to avoid holding a borrow on `state` while we
+    // mutate the swarm and re-schedule.
+    let due: Vec<String> = state
+        .relay_reservation_retries
+        .iter()
+        .filter(|(_, (_, next))| now >= *next)
+        .map(|(addr, _)| addr.clone())
+        .collect();
+    for addr_str in due {
+        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+            match swarm.listen_on(addr.clone()) {
+                Ok(_) => info!(circuit = %addr_str, "relay re-reservation requested (F-5 retry)"),
+                Err(e) => warn!(circuit = %addr_str, %e, "relay re-reservation listen_on failed; will retry"),
+            }
+        } else {
+            warn!(circuit = %addr_str, "relay re-reservation skipped: unparseable circuit addr");
+        }
+        // Push the next attempt out per the backoff schedule. Cleared entirely
+        // on success (NewListenAddr / ReservationReqAccepted for this circuit).
+        schedule_reservation_retry(state, &addr_str);
+    }
+}
+
+/// F-5: a reservation succeeded for ``addr`` — clear any pending retry so we
+/// stop probing. Matches on the circuit substring so a peer-id-suffixed listen
+/// addr still clears the base circuit retry entry.
+fn clear_reservation_retry(state: &mut LoopState, addr: &str) {
+    if state.relay_reservation_retries.is_empty() {
+        return;
+    }
+    state
+        .relay_reservation_retries
+        .retain(|circuit, _| !addr.starts_with(circuit.as_str()) && !circuit.starts_with(addr));
+}
+
 fn handle_swarm_event(
     event: SwarmEvent<OpenHydraBehaviourEvent>,
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
@@ -1319,17 +1440,44 @@ fn handle_swarm_event(
                 if !quic_v6_addrs.is_empty() {
                     state.peer_quic_addrs.insert(peer_id, quic_v6_addrs.clone());
 
-                    // Auto QUIC hole-punch: if we don't have a QUIC-direct connection
-                    // to this peer, dial their QUIC IPv6 addresses.
+                    // Auto QUIC hole-punch: if we don't have a QUIC-direct
+                    // connection to this peer, dial their QUIC IPv6 addresses.
                     let has_quic = state.peer_connections.get(&peer_id)
                         .map_or(false, |info| info.quic_direct_v4 > 0 || info.quic_direct_v6 > 0);
-                    if !has_quic {
-                        for addr in &quic_v6_addrs {
-                            use libp2p::swarm::dial_opts::DialOpts;
-                            let ma = addr.clone();
-                            match swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build()) {
-                                Ok(()) => info!(%peer_id, %ma, "auto_quic_holepunch_dial"),
-                                Err(e) => debug!(%peer_id, %ma, %e, "auto_quic_holepunch_dial_failed"),
+                    if has_quic {
+                        // Already QUIC-direct — reset the back-off counter.
+                        state.quic_holepunch_attempts.remove(&peer_id);
+                    } else {
+                        // F7: skip public bootstrap relays — they're TCP-reachable
+                        // and hole-punch is meaningless for them; auto-QUIC-dialing
+                        // them is what churned the connection on UDP-hostile paths.
+                        let is_relay = quic_v6_addrs.iter().any(|a| {
+                            a.iter().any(|p| match p {
+                                libp2p::multiaddr::Protocol::Ip6(ip) =>
+                                    crate::relay::is_bootstrap_relay_ip(&ip.to_string()),
+                                libp2p::multiaddr::Protocol::Ip4(ip) =>
+                                    crate::relay::is_bootstrap_relay_ip(&ip.to_string()),
+                                _ => false,
+                            })
+                        });
+                        // F7: back off after MAX_QUIC_HOLEPUNCH_ATTEMPTS failures so a
+                        // UDP-filtered path stops re-dialing (and re-logging) every
+                        // identify cycle.
+                        const MAX_QUIC_HOLEPUNCH_ATTEMPTS: u32 = 3;
+                        let attempts = state.quic_holepunch_attempts.entry(peer_id).or_insert(0);
+                        if is_relay {
+                            debug!(%peer_id, "auto_quic_holepunch_skip: public relay");
+                        } else if *attempts >= MAX_QUIC_HOLEPUNCH_ATTEMPTS {
+                            debug!(%peer_id, attempts = *attempts, "auto_quic_holepunch_skip: backed off");
+                        } else {
+                            *attempts += 1;
+                            for addr in &quic_v6_addrs {
+                                use libp2p::swarm::dial_opts::DialOpts;
+                                let ma = addr.clone();
+                                match swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build()) {
+                                    Ok(()) => debug!(%peer_id, %ma, "auto_quic_holepunch_dial"),
+                                    Err(e) => debug!(%peer_id, %ma, %e, "auto_quic_holepunch_dial_failed"),
+                                }
                             }
                         }
                     }
@@ -1482,6 +1630,15 @@ fn handle_swarm_event(
         // Ping keepalive — log failures and evict unreachable peers
         // (Phase 1.6). Success is silent to avoid flooding logs.
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Ping(ping_event)) => {
+            // WS-H: feed the observed round-trip time to the tensor-stream
+            // manager so its adaptive write timeout reflects real path latency
+            // (previously `update_rtt` was never called → every peer used the
+            // default ceiling, which silently dropped large cross-ISP writes).
+            if let Ok(rtt) = ping_event.result {
+                if let Some(mgr) = state.tensor_mgr.as_ref() {
+                    mgr.update_rtt(&ping_event.peer, rtt);
+                }
+            }
             if let Err(ref e) = ping_event.result {
                 let peer = ping_event.peer;
                 warn!(%peer, error = %e, "ping failed");
@@ -1516,6 +1673,11 @@ fn handle_swarm_event(
             if is_direct_listen_candidate(&address) {
                 debug!(%address, "registering direct listen addr as external");
                 swarm.add_external_address(address.clone());
+            }
+            // F-5: a circuit listen addr coming up means the reservation
+            // succeeded — clear any pending backoff retry for it.
+            if address.to_string().contains("/p2p-circuit") {
+                clear_reservation_retry(state, &address.to_string());
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -1731,10 +1893,17 @@ fn handle_swarm_event(
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             warn!(%address, "listen_addr_expired");
             if address.to_string().contains("/p2p-circuit") {
+                // Normal renewal: try an immediate re-listen first (libp2p
+                // usually auto-renews; this covers the case it didn't). If the
+                // immediate attempt errors, fall into the F-5 backoff retry so
+                // a persistently-failing relay doesn't strand us.
                 info!(%address, "relay reservation expired, requesting renewal");
                 match swarm.listen_on(address.clone()) {
                     Ok(_) => info!(%address, "relay re-reservation requested"),
-                    Err(e) => warn!(%address, %e, "relay re-reservation failed"),
+                    Err(e) => {
+                        warn!(%address, %e, "relay re-reservation failed; scheduling backoff retry");
+                        schedule_reservation_retry(state, &address.to_string());
+                    }
                 }
             }
         }
@@ -1742,8 +1911,13 @@ fn handle_swarm_event(
             warn!(?addresses, ?reason, "listener_closed");
             for addr in &addresses {
                 if addr.to_string().contains("/p2p-circuit") {
-                    info!(%addr, "relay listener closed, re-opening");
-                    let _ = swarm.listen_on(addr.clone());
+                    // F-5: a closed circuit listener means the reservation
+                    // dropped/was rejected. Schedule a backed-off retry instead
+                    // of an immediate re-listen — an immediate re-listen against
+                    // a flapping or capped relay tight-loops the event loop and
+                    // spams the relay. The relay_retry_ticker drives the re-listen
+                    // once the backoff window elapses.
+                    schedule_reservation_retry(state, &addr.to_string());
                 }
             }
         }
@@ -1795,7 +1969,10 @@ fn handle_kad_event(
                                 .map(|cow| cow.into_owned());
                             if let Some(kad_record) = stored_value {
                                 if let Ok(record) = dht::decode_record(&kad_record.value) {
-                                    if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
+                                    // H1: reject unverified records (DHT poisoning).
+                                    if let Err(e) = dht::verify_peer_record(&record) {
+                                        warn!(%pid_str, %e, "dht_record_rejected: provider-store verify failed");
+                                    } else if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
                                         state.known_peers.insert(record.peer_id.clone(), record.clone());
                                         pending.records.push(record);
                                     }
@@ -1849,6 +2026,14 @@ fn handle_kad_event(
                     if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         match dht::decode_record(&record.value) {
                             Ok(peer_record) => {
+                                // H1: reject unverified records BEFORE trusting
+                                // any field — otherwise an attacker's record
+                                // injects an attacker multiaddr into the routing
+                                // table (add_address below) and poisons discovery.
+                                if let Err(e) = dht::verify_peer_record(&peer_record) {
+                                    warn!(%e, "dht_record_rejected: GetRecord verify failed");
+                                    return;
+                                }
                                 // Auto-populate Kademlia's routing table with
                                 // the peer's advertised relay_address so a
                                 // subsequent ``dial_peer`` / ``proxy_forward``
@@ -2101,6 +2286,25 @@ fn handle_grpc_proxy_event(
         request_response::Event::Message { peer, message } => {
             match message {
                 request_response::Message::Request { request_id: _, request, channel } => {
+                    // Phase 2.4: per-peer inflight cap. Count this peer's live
+                    // (unanswered) channels; if it already holds the cap, shed the
+                    // request by dropping `channel` (the peer's request times out).
+                    // PROXY_QUEUE_MAX bounds total memory; this bounds per-peer
+                    // fairness so one peer can't monopolise the queue. Count is
+                    // derived from the channel map (no separate counter to leak).
+                    // handle_swarm_event ends after this match, so the early
+                    // return cleanly finishes handling this rejected event.
+                    let peer_inflight = state
+                        .inbound_proxy_channels
+                        .values()
+                        .filter(|(_, _, p)| *p == peer)
+                        .count();
+                    if peer_inflight >= MAX_INFLIGHT_PER_PEER {
+                        warn!(%peer, inflight = peer_inflight, cap = MAX_INFLIGHT_PER_PEER,
+                              "per-peer inflight cap exceeded — shedding proxy request");
+                        drop(channel);
+                        return;
+                    }
                     // CP-2: Dispatch via Rust dispatcher.
                     //
                     // The dispatcher inspects the 1-byte method prefix and the
@@ -2122,7 +2326,7 @@ fn handle_grpc_proxy_event(
                                     request_id=%parsed.header.request_id,
                                     stage=%parsed.header.stage_index,
                                     "dispatch: ForwardToWorker → batcher");
-                                state.inbound_proxy_channels.insert(req_id.clone(), channel);
+                                state.inbound_proxy_channels.insert(req_id.clone(), (channel, std::time::Instant::now(), peer.clone()));
 
                                 // Extract batch key fields before moving the header.
                                 let batch_key = BatchKey {
@@ -2162,7 +2366,7 @@ fn handle_grpc_proxy_event(
                                 debug!(%peer, id=%req_id,
                                     "dispatch: ForwardMsg but no IPC bridge, fallthrough");
                                 proxy_queue.push((req_id.clone(), request.0));
-                                state.inbound_proxy_channels.insert(req_id, channel);
+                                state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                             }
                         }
                         DispatchAction::ForwardToWorkerAsync { ack, forward } => {
@@ -2301,7 +2505,7 @@ fn handle_grpc_proxy_event(
                                     state.inbound_proxy_counter += 1;
                                     let req_id = format!("proxy-{}", state.inbound_proxy_counter);
                                     proxy_queue.push((req_id.clone(), request.0));
-                                    state.inbound_proxy_channels.insert(req_id, channel);
+                                    state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                                 }
                             }
                         }
@@ -2406,7 +2610,7 @@ fn handle_grpc_proxy_event(
                             info!(%peer, bytes = request.0.len(), id = %req_id,
                                 "proxy request queued for Python (legacy)");
                             proxy_queue.push((req_id.clone(), request.0));
-                            state.inbound_proxy_channels.insert(req_id, channel);
+                            state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                         }
                         DispatchAction::UnsupportedMethod { response, reason } => {
                             warn!(%peer, %reason, "dispatch: unsupported method");
@@ -3123,12 +3327,29 @@ fn dispatch_flushed_batch(
 
             match bridge.forward_batch(ipc_items).await {
                 Ok(responses) => {
+                    let n_resp = responses.len();
                     for (i, resp) in responses.into_iter().enumerate() {
                         if i < dispatch_items.len() {
                             let (ref req_id, _, _, needs_response) = dispatch_items[i];
                             if needs_response {
                                 let data = encode_ipc_response_wire(req_id, &resp);
                                 let _ = tx.send((req_id.clone(), data));
+                            }
+                        }
+                    }
+                    // F15: if Python returned FEWER responses than items, the
+                    // unmatched callers (index >= n_resp) would never get a
+                    // reply — leaking their inbound_proxy_channel and hanging
+                    // the remote peer until its request-response timeout. Send
+                    // empty replies to the tail so they fail fast.
+                    if n_resp < dispatch_items.len() {
+                        warn!(
+                            got = n_resp, expected = dispatch_items.len(),
+                            "batch: fewer responses than items — empty-replying the remainder"
+                        );
+                        for (ref req_id, _, _, needs_response) in &dispatch_items[n_resp..] {
+                            if *needs_response {
+                                let _ = tx.send((req_id.clone(), Vec::new()));
                             }
                         }
                     }
@@ -3186,6 +3407,30 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reservation_retry_delay_backoff_schedule() {
+        // F-5: fast initial retries then exponential backoff capped at 120s.
+        assert_eq!(reservation_retry_delay_ms(1), 1_000);   // 1s
+        assert_eq!(reservation_retry_delay_ms(2), 2_000);   // 2s
+        assert_eq!(reservation_retry_delay_ms(3), 4_000);   // 4s
+        assert_eq!(reservation_retry_delay_ms(4), 8_000);   // 8s
+        assert_eq!(reservation_retry_delay_ms(5), 16_000);  // 16s
+        assert_eq!(reservation_retry_delay_ms(6), 32_000);  // 32s
+        assert_eq!(reservation_retry_delay_ms(7), 64_000);  // 64s
+        // Capped at 120s from attempt 8 onward — and never overflows for
+        // large/pathological attempt counts.
+        assert_eq!(reservation_retry_delay_ms(8), 120_000);
+        assert_eq!(reservation_retry_delay_ms(50), 120_000);
+        assert_eq!(reservation_retry_delay_ms(u32::MAX), 120_000);
+        // Monotonic non-decreasing.
+        let mut prev = 0u64;
+        for a in 1..=20u32 {
+            let d = reservation_retry_delay_ms(a);
+            assert!(d >= prev, "backoff must be non-decreasing at attempt {a}");
+            prev = d;
+        }
+    }
 
     #[test]
     fn test_shared_proxy_queue_caps_at_max() {
