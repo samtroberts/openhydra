@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::event_loop::SharedProxyQueue;
+use crate::relay::{CircuitMonitor, MigrationAction};
 
 /// Write-half of a split tensor stream. Audit F4: inbound streams are split
 /// into independent read/write halves so the reader loop and `write_response`
@@ -95,16 +96,50 @@ pub struct TensorStreamManager {
     /// uncallable, which is why RTT was never populated and every peer silently
     /// fell back to the 250ms default).
     peer_rtt: std::sync::Mutex<HashMap<PeerId, Duration>>,
+    /// WS-F F-6: per-peer circuit byte accounting → migration decisions. We
+    /// count bytes we push to each peer; when a peer is reached via a relay
+    /// circuit (the event loop gates on that) and usage crosses 85%/95% of the
+    /// per-circuit budget, we signal the event loop to pre-establish an
+    /// alternate relay circuit / cut over. Direct peers also accumulate here but
+    /// the event loop ignores their signals (no byte cap on a direct link).
+    circuit_monitors: Mutex<HashMap<PeerId, CircuitMonitor>>,
+    /// WS-F F-6: migration signals to the event loop: (peer, action).
+    migrate_tx: mpsc::UnboundedSender<(PeerId, MigrationAction)>,
 }
 
 impl TensorStreamManager {
-    pub fn new(control: Control, repunch_tx: mpsc::UnboundedSender<PeerId>) -> Self {
+    pub fn new(
+        control: Control,
+        repunch_tx: mpsc::UnboundedSender<PeerId>,
+        migrate_tx: mpsc::UnboundedSender<(PeerId, MigrationAction)>,
+    ) -> Self {
         Self {
             control: Mutex::new(control),
             outbound: Mutex::new(HashMap::new()),
             preferences: Mutex::new(HashMap::new()),
             repunch_tx,
             peer_rtt: std::sync::Mutex::new(HashMap::new()),
+            circuit_monitors: Mutex::new(HashMap::new()),
+            migrate_tx,
+        }
+    }
+
+    /// WS-F F-6: account `n` bytes pushed to `peer` and signal the event loop if
+    /// the per-circuit budget crossed a migration threshold. Cheap (a map
+    /// get-or-insert + counter); the migration decision is the pure
+    /// [`CircuitMonitor`]. Called after a successful send.
+    async fn account_circuit_bytes(&self, peer: &PeerId, n: usize) {
+        let action = {
+            let mut monitors = self.circuit_monitors.lock().await;
+            let mon = monitors
+                .entry(*peer)
+                .or_insert_with(CircuitMonitor::with_default_budget);
+            mon.record_bytes(n as u64)
+        };
+        if action != MigrationAction::Continue {
+            // Best-effort; the event loop gates on whether the peer is actually
+            // relay-reached before acting.
+            let _ = self.migrate_tx.send((*peer, action));
         }
     }
 
@@ -151,7 +186,10 @@ impl TensorStreamManager {
         // Try the primary path (cached stream).
         let result = self.try_send_with_timeout(peer, data).await;
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                self.account_circuit_bytes(peer, data.len()).await; // F-6
+                return Ok(());
+            }
             Err(TensorStreamError::NoCachedStream) => {
                 // No cached stream — open a new one.
             }
@@ -164,7 +202,13 @@ impl TensorStreamManager {
 
         // Open a new stream and send.
         match self.open_and_cache_stream(peer).await {
-            Ok(()) => self.try_send_with_timeout(peer, data).await,
+            Ok(()) => {
+                let r = self.try_send_with_timeout(peer, data).await;
+                if r.is_ok() {
+                    self.account_circuit_bytes(peer, data.len()).await; // F-6
+                }
+                r
+            }
             Err(e) => {
                 warn!(%peer, %e, "tensor_stream: open_stream failed");
                 Err(e)
@@ -226,6 +270,9 @@ impl TensorStreamManager {
             debug!(%peer, "tensor_stream: removed cached stream (peer disconnected)");
         }
         self.preferences.lock().await.remove(peer);
+        // F-6: drop the circuit byte counter — a reconnect starts a fresh
+        // circuit, so its budget resets (also bounds the map across churn).
+        self.circuit_monitors.lock().await.remove(peer);
     }
 
     /// Get the current transport preference for a peer (for observability).
