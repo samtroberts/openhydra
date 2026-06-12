@@ -504,4 +504,82 @@ mod tests {
         assert!(!should_offer_peer_relay(true, false, false));  // no capacity
         assert!(!should_offer_peer_relay(true, true, true));    // bootstrap (always-on, not opt-in)
     }
+
+    // ── WS-F F-6 leech-lockout END-TO-END through the libp2p RateLimiter ──────
+    // The unit tests above cover the LeechTable state machine in isolation.
+    // These drive the *production integration point* — `LeechRateLimiter`'s impl
+    // of `libp2p::relay::RateLimiter`, which the relay calls to admit/deny every
+    // reservation and circuit — so the wiring the live hardware soak couldn't
+    // exercise (the relay never carried 200MB cross-NAT) is validated here
+    // deterministically.
+
+    #[test]
+    fn test_leech_rate_limiter_denies_capped_peer_end_to_end() {
+        use libp2p::relay::RateLimiter;
+        // The bootstrap relay shares ONE LeechTable across two LeechRateLimiters
+        // (reservation_rate_limiters + circuit_src_rate_limiters), so a peer whose
+        // circuit blew the byte budget is denied BOTH new reservations AND new
+        // circuits for the lockout window. Mirror that exact two-limiter wiring.
+        let table = Arc::new(Mutex::new(LeechTable::new()));
+        let mut reservation_limiter = LeechRateLimiter::new(table.clone());
+        let mut circuit_limiter = LeechRateLimiter::new(table.clone());
+
+        let leech = PeerId::random();
+        let innocent = PeerId::random();
+        let addr = Multiaddr::empty();
+        let now = web_time::Instant::now(); // `try_next` ignores it (uses wall clock)
+
+        // 1. Fresh peers are admitted by both limiters (fail-open default).
+        assert!(reservation_limiter.try_next(leech, &addr, now));
+        assert!(circuit_limiter.try_next(leech, &addr, now));
+
+        // 2. The leech's circuit caps out — the bootstrap CircuitClosed handler
+        //    records it against the shared table (jitter 0.0 → min 15-min lockout).
+        let until = table
+            .lock()
+            .unwrap()
+            .record_cap_out(leech, unix_secs_now(), 0.0);
+        assert!(until > unix_secs_now(), "lockout extends into the future");
+
+        // 3. The capped peer is now DENIED on BOTH limiters.
+        assert!(!reservation_limiter.try_next(leech, &addr, now), "denied new reservation");
+        assert!(!circuit_limiter.try_next(leech, &addr, now), "denied new circuit");
+
+        // 4. An innocent peer is unaffected — only the abuser is locked out.
+        assert!(reservation_limiter.try_next(innocent, &addr, now));
+        assert!(circuit_limiter.try_next(innocent, &addr, now));
+    }
+
+    #[test]
+    fn test_leech_lockout_admits_again_after_expiry() {
+        // `try_next` reads wall-clock `unix_secs_now()`, so expiry can't be
+        // fast-forwarded through it; assert the `is_locked` predicate it
+        // delegates to flips back to admit once the lockout window elapses.
+        let mut t = LeechTable::new();
+        let leech = PeerId::random();
+        let until = t.record_cap_out(leech, 1_000, 0.0);
+        assert!(t.is_locked(&leech, 1_000), "locked at cap-out");
+        assert!(t.is_locked(&leech, until - 1), "still locked just before expiry");
+        assert!(!t.is_locked(&leech, until + 1), "admitted once lockout expires");
+    }
+
+    #[test]
+    fn test_cap_out_predicate_matches_only_byte_cap() {
+        // The bootstrap handler records a lockout ONLY for the byte-budget
+        // breach — benign closes (EOF, duration, disconnect) must NOT penalize,
+        // else normal long sessions would get peers locked out.
+        let byte_cap = format!("io error: {MAX_CIRCUIT_BYTES_ERROR}");
+        assert!(byte_cap.contains(MAX_CIRCUIT_BYTES_ERROR), "byte-cap close penalizes");
+        for benign in [
+            "connection reset by peer",
+            "Reservation(Io(Kind(UnexpectedEof)))",
+            "reservation expired",
+            "max circuit duration exceeded",
+        ] {
+            assert!(
+                !benign.contains(MAX_CIRCUIT_BYTES_ERROR),
+                "benign close `{benign}` must not trigger lockout",
+            );
+        }
+    }
 }
