@@ -2020,8 +2020,9 @@ class PeerService:
                     else:
                         activation = list(_fwd_result)
                     _fwd_ms = (time.perf_counter() - _t0) * 1000
-                    logger.info("shard_forward_ms: peer=%s stage=%d ms=%.1f",
-                                self.peer_id, int(request.stage_index), _fwd_ms)
+                    # debug: per-token in the autoregressive loop (timing/logging trim)
+                    logger.debug("shard_forward_ms: peer=%s stage=%d ms=%.1f",
+                                 self.peer_id, int(request.stage_index), _fwd_ms)
                 else:
                     activation = self.batch_queue.forward(
                         request.prompt,

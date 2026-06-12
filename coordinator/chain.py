@@ -572,7 +572,10 @@ class InferenceChain:
             response_latent_dim = len(activation)
 
         _t_deser_ms = (time.perf_counter() - _t_deser_start) * 1000
-        logging.info(
+        # debug: fires per token in the autoregressive loop — kept off the
+        # INFO hot path (per-token timing/logging trim). The user-facing
+        # TPS is logged once per request in autoregressive_sharded_done.
+        logging.debug(
             "PROFILE _request_stage: serial=%.1fms grpc=%.1fms deser=%.1fms total=%.1fms",
             _t_serial_ms, _t_grpc_ms, _t_deser_ms,
             _t_serial_ms + _t_grpc_ms + _t_deser_ms,
@@ -979,7 +982,7 @@ class InferenceChain:
             if not candidate_model:
                 candidate_model = str(getattr(last_stage, "model_id", "")).strip()
             decode_model_id = candidate_model or None
-        logging.info(
+        logging.debug(
             "chain_decode: backend=%s runtime_model_id=%s decode_model_id=%s activation_len=%d",
             _backend, getattr(last_stage, "runtime_model_id", ""), decode_model_id, len(activation),
         )
@@ -991,7 +994,7 @@ class InferenceChain:
             tokenizer_model_id=decode_model_id,
         )
         _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
-        logging.info("PROFILE phase_D_decode_text=%.1fms", _t_decode_ms)
+        logging.debug("PROFILE phase_D_decode_text=%.1fms", _t_decode_ms)
         if privacy_audit_violations:
             raise RuntimeError("privacy_audit_failed:" + ";".join(privacy_audit_violations))
         total_ms = (time.perf_counter() - started) * 1000.0
