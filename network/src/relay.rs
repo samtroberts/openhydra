@@ -192,6 +192,24 @@ pub fn unix_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// F-6: a 0.0–1.0 jitter fraction from the wall clock's sub-second nanos, for
+/// [`leech_lockout_secs`]. Spreads lockout expiries so a mass cap-out doesn't
+/// produce a synchronized retry storm — without pulling in an RNG dep on the
+/// relay binary. (`io::Error` close + cap-out are rare, so clock entropy is
+/// plenty here.)
+pub fn wallclock_jitter_frac() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1_000_000) as f64 / 1_000_000.0
+}
+
+/// Substring of the `io::Error` libp2p's relay raises when a circuit blows its
+/// `max_circuit_bytes` budget (copy_future.rs). Used by the relay event loop to
+/// distinguish a cap-out (= leech) from a normal circuit close.
+pub const MAX_CIRCUIT_BYTES_ERROR: &str = "Max circuit bytes reached";
+
 /// F-6 shared leech-lockout state: `peer -> lockout-expiry` (unix secs). The
 /// relay event loop calls [`LeechTable::record_cap_out`] on a byte-cap
 /// `CircuitClosed` (a peer that blew its per-circuit budget = sustained abuse);
