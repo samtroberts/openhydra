@@ -379,7 +379,7 @@ def _collect_network_block(p2p_node: Any | None) -> dict[str, Any]:
         except (TypeError, ValueError):
             return 0
 
-    return {
+    block: dict[str, Any] = {
         "dcutr": {
             "available": True,
             "successes": _as_int("successes"),
@@ -387,6 +387,27 @@ def _collect_network_block(p2p_node: Any | None) -> dict[str, Any]:
             "direct_peers_count": _as_int("direct_peers_count"),
         }
     }
+
+    # F-3: per-tier connection-success metrics. Best-effort + binding-guarded
+    # so an older wheel (no get_tier_metrics) just omits the block instead of
+    # erroring. Lets operators see which ladder rung carries connections
+    # (direct-v6 … relay) and compute success rates per tier.
+    get_tiers = getattr(p2p_node, "get_tier_metrics", None)
+    if callable(get_tiers):
+        try:
+            tm = get_tiers() or {}
+            block["connection_tiers"] = {
+                "available": True,
+                "tiers": dict(tm.get("tiers", {}) or {}),
+                "dcutr_successes": int(tm.get("dcutr_successes", 0) or 0),
+                "dcutr_failures": int(tm.get("dcutr_failures", 0) or 0),
+            }
+        except Exception as exc:  # pragma: no cover — defensive
+            block["connection_tiers"] = {"available": False, "reason": "runtime_error", "error": str(exc)[:200]}
+    else:
+        block["connection_tiers"] = {"available": False, "reason": "binding_missing"}
+
+    return block
 
 
 def _safe_free_memory() -> None:
