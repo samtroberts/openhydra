@@ -485,6 +485,34 @@ impl PyP2PNode {
         Ok(dict.into_py_any(py)?)
     }
 
+    /// F-3: per-tier connection-success metrics + DCUtR outcome counters.
+    ///
+    /// Returns a dict ``{"tiers": {tier_name: count, ...}, "dcutr_successes":
+    /// int, "dcutr_failures": int}``. ``tiers`` always contains every ladder
+    /// rung (``direct_tcp_v6``, ``direct_quic_v6``, ``direct_tcp_v4``,
+    /// ``direct_quic_v4``, ``relay``), 0 if unused — so callers can compute a
+    /// success *distribution* across the connection ladder without guessing
+    /// which keys exist.
+    fn get_tier_metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.require_started()?;
+        let cmd_tx = inner.cmd_tx.clone();
+        let (tiers, dcutr_successes, dcutr_failures) = py
+            .allow_threads(move || {
+                send_and_wait(&cmd_tx, |reply| SwarmCommand::GetTierMetrics { reply })
+            })
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+
+        let dict = pyo3::types::PyDict::new(py);
+        let tiers_dict = pyo3::types::PyDict::new(py);
+        for (name, count) in tiers {
+            tiers_dict.set_item(name, count)?;
+        }
+        dict.set_item("tiers", tiers_dict)?;
+        dict.set_item("dcutr_successes", dcutr_successes)?;
+        dict.set_item("dcutr_failures", dcutr_failures)?;
+        Ok(dict.into_py_any(py)?)
+    }
+
     /// Publish a raw bytes payload on the Gossipsub topic
     /// ``openhydra/swarm/v1/events`` (PR-3 / B1).
     ///

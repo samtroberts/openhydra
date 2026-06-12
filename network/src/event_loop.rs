@@ -46,6 +46,25 @@ fn classify_transport(addr_str: &str) -> TransportType {
     TransportType::TcpDirect
 }
 
+/// F-3: name the connection tier of an established connection for per-tier
+/// success metrics. Maps (transport, address-family) to one of the ladder
+/// rungs from WS-F's adaptive connection ladder so we can see which rung
+/// actually carries traffic (direct-v6 preferred → relay last resort).
+fn connection_tier(transport: TransportType, is_ipv6: bool) -> &'static str {
+    match transport {
+        TransportType::TcpRelay => "relay",
+        TransportType::QuicDirect => if is_ipv6 { "direct_quic_v6" } else { "direct_quic_v4" },
+        TransportType::TcpDirect => if is_ipv6 { "direct_tcp_v6" } else { "direct_tcp_v4" },
+    }
+}
+
+/// F-3: all tier names, in ladder-preference order. Used so the metrics dict
+/// always reports every tier (0 if never used), making success *rates*
+/// computable without guessing which keys exist.
+const CONNECTION_TIERS: [&str; 5] = [
+    "direct_tcp_v6", "direct_quic_v6", "direct_tcp_v4", "direct_quic_v4", "relay",
+];
+
 #[derive(Debug, Default)]
 struct PeerConnectionInfo {
     quic_direct_v4: u32,
@@ -174,6 +193,13 @@ pub enum SwarmCommand {
     /// Returns `(successes, failures, direct_peers_count)`.
     GetDcutrStats {
         reply: oneshot::Sender<(u64, u64, u64)>,
+    },
+    /// F-3: per-tier connection-success metrics. Returns
+    /// `(Vec<(tier_name, count)>, dcutr_successes, dcutr_failures)` — one entry
+    /// per ladder rung (always all rungs, 0 if unused) plus the DCUtR
+    /// hole-punch outcome counters.
+    GetTierMetrics {
+        reply: oneshot::Sender<(Vec<(String, u64)>, u64, u64)>,
     },
     /// Publish a raw bytes payload on the Gossipsub topic
     /// ``openhydra/swarm/v1/events`` (PR-3 / B1). The Python
@@ -392,6 +418,11 @@ struct LoopState {
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
+    /// F-3: cumulative per-tier connection-success counts, keyed by the
+    /// `connection_tier()` rung name. Surfaced via GetTierMetrics so operators
+    /// can see which ladder rung (direct-v6 … relay) actually carries
+    /// connections — the data that justifies (or refutes) ladder tuning.
+    tier_connect_success: std::collections::HashMap<&'static str, u64>,
     /// Fix 2: per-peer transport-type-aware connection tracking.
     peer_connections: HashMap<PeerId, PeerConnectionInfo>,
     /// Reply channels for local proxy forwards (Ouroboros: target == self).
@@ -505,6 +536,7 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
+            tier_connect_success: std::collections::HashMap::new(),
             peer_connections: HashMap::new(),
             local_proxy_replies: HashMap::new(),
             last_repunch: HashMap::new(),
@@ -745,6 +777,22 @@ pub async fn run_event_loop(
                             direct_count,
                         );
                         let _ = reply.send(snapshot);
+                    }
+                    Some(SwarmCommand::GetTierMetrics { reply }) => {
+                        // Report every ladder rung (0 if unused) so success
+                        // rates are computable Python-side without guessing keys.
+                        let tiers: Vec<(String, u64)> = CONNECTION_TIERS
+                            .iter()
+                            .map(|name| (
+                                (*name).to_string(),
+                                state.tier_connect_success.get(name).copied().unwrap_or(0),
+                            ))
+                            .collect();
+                        let _ = reply.send((
+                            tiers,
+                            state.dcutr_successes,
+                            state.dcutr_failures,
+                        ));
                     }
                     Some(SwarmCommand::PublishEvent { payload, reply }) => {
                         // PR-3: publish raw bytes on the Gossipsub topic.
@@ -1702,6 +1750,19 @@ fn handle_swarm_event(
             } else {
                 transport
             };
+
+            // F-3: count this established connection under its ladder tier.
+            // Done before the peer_connections borrow below to keep the field
+            // borrows disjoint. Every establishment counts (incl. AF-dup QUIC
+            // that gets closed just after) — the metric measures which rung
+            // reaches "established", which is the success signal we want.
+            {
+                let _tier_is_ipv6 = endpoint_ip.as_ref().map_or(false, |ip| ip.contains(':'));
+                *state
+                    .tier_connect_success
+                    .entry(connection_tier(transport, _tier_is_ipv6))
+                    .or_insert(0) += 1;
+            }
 
             let info = state.peer_connections.entry(peer_id).or_default();
 
@@ -3407,6 +3468,26 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_connection_tier_classification() {
+        // F-3: (transport, is_ipv6) → ladder rung name; every result must be a
+        // known tier so the metrics dict keys are stable.
+        assert_eq!(connection_tier(TransportType::QuicDirect, true), "direct_quic_v6");
+        assert_eq!(connection_tier(TransportType::QuicDirect, false), "direct_quic_v4");
+        assert_eq!(connection_tier(TransportType::TcpDirect, true), "direct_tcp_v6");
+        assert_eq!(connection_tier(TransportType::TcpDirect, false), "direct_tcp_v4");
+        // Relay is AF-agnostic (always reported as "relay").
+        assert_eq!(connection_tier(TransportType::TcpRelay, true), "relay");
+        assert_eq!(connection_tier(TransportType::TcpRelay, false), "relay");
+        // All produced names are in the canonical CONNECTION_TIERS set.
+        for t in [TransportType::QuicDirect, TransportType::TcpDirect, TransportType::TcpRelay] {
+            for v6 in [true, false] {
+                assert!(CONNECTION_TIERS.contains(&connection_tier(t, v6)),
+                    "tier {:?}/{} not in CONNECTION_TIERS", t, v6);
+            }
+        }
+    }
 
     #[test]
     fn test_reservation_retry_delay_backoff_schedule() {
