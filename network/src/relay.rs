@@ -8,6 +8,9 @@
 //! This module provides helpers for building relay multiaddrs and managing
 //! relay reservations.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use libp2p::{Multiaddr, PeerId};
 
 /// Build a relay circuit multiaddr for reaching a peer through a relay.
@@ -178,6 +181,100 @@ pub fn should_offer_peer_relay(
     !is_bootstrap && is_publicly_reachable && has_spare_capacity
 }
 
+/// F-6 wall-clock unix seconds. Used as the leech clock so the relay event loop
+/// (which sets lockouts) and the [`LeechRateLimiter`] (which reads them) share
+/// one comparable timebase, decoupled from the `web_time::Instant` the libp2p
+/// `RateLimiter` trait passes in.
+pub fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// F-6 shared leech-lockout state: `peer -> lockout-expiry` (unix secs). The
+/// relay event loop calls [`LeechTable::record_cap_out`] on a byte-cap
+/// `CircuitClosed` (a peer that blew its per-circuit budget = sustained abuse);
+/// [`LeechRateLimiter`] reads it to deny that peer's reservations/circuits until
+/// the lockout expires. Wrap in `Arc<Mutex<_>>` to share both sides.
+#[derive(Default)]
+pub struct LeechTable {
+    locked_until: HashMap<PeerId, u64>,
+}
+
+impl LeechTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `peer` capped out at `now_secs`; lock it for a jittered
+    /// 15-30 min window. **Longest-lockout-wins** — never shortens an existing
+    /// lockout. Returns the (possibly unchanged) lockout expiry.
+    pub fn record_cap_out(&mut self, peer: PeerId, now_secs: u64, jitter_frac: f64) -> u64 {
+        let until = now_secs.saturating_add(leech_lockout_secs(jitter_frac));
+        let e = self.locked_until.entry(peer).or_insert(0);
+        if until > *e {
+            *e = until;
+        }
+        *e
+    }
+
+    /// True while `peer` is locked out (reservation/circuit should be denied).
+    pub fn is_locked(&self, peer: &PeerId, now_secs: u64) -> bool {
+        self.locked_until.get(peer).map_or(false, |&u| now_secs < u)
+    }
+
+    /// Seconds until `peer`'s lockout expires (0 if not locked).
+    pub fn retry_after(&self, peer: &PeerId, now_secs: u64) -> u64 {
+        self.locked_until
+            .get(peer)
+            .map_or(0, |&u| u.saturating_sub(now_secs))
+    }
+
+    /// Drop expired entries (call periodically to bound memory). Returns the
+    /// number removed.
+    pub fn prune(&mut self, now_secs: u64) -> usize {
+        let before = self.locked_until.len();
+        self.locked_until.retain(|_, &mut u| now_secs < u);
+        before - self.locked_until.len()
+    }
+
+    pub fn locked_count(&self) -> usize {
+        self.locked_until.len()
+    }
+}
+
+/// F-6 libp2p relay [`RateLimiter`](libp2p::relay::RateLimiter) that denies
+/// reservations/circuits from leech-locked peers. Plug into
+/// `relay::Config.reservation_rate_limiters` AND `circuit_src_rate_limiters`
+/// (two instances sharing one `Arc<Mutex<LeechTable>>`) on the Linode bootstraps
+/// and opt-in peer-relays (F-4). The trait's `now: web_time::Instant` is ignored
+/// — we read wall-clock unix secs so the table is updatable from the event loop.
+/// Total/congestion caps stay with the relay's built-in
+/// `max_circuits`/`max_reservations`; this limiter only adds the time-based
+/// leech lockout on top.
+pub struct LeechRateLimiter {
+    table: Arc<Mutex<LeechTable>>,
+}
+
+impl LeechRateLimiter {
+    pub fn new(table: Arc<Mutex<LeechTable>>) -> Self {
+        Self { table }
+    }
+}
+
+impl libp2p::relay::RateLimiter for LeechRateLimiter {
+    fn try_next(&mut self, peer: PeerId, _addr: &Multiaddr, _now: web_time::Instant) -> bool {
+        let now_secs = unix_secs_now();
+        match self.table.lock() {
+            Ok(t) => !t.is_locked(&peer, now_secs),
+            // Poisoned lock: fail OPEN — never block legitimate peers because a
+            // panic poisoned the mutex; abuse is still bounded by the built-in caps.
+            Err(_) => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +355,44 @@ mod tests {
         assert_eq!(circuit_migration_action(b * 2, b), MigrationAction::Cutover);
         // Degenerate budget never triggers migration.
         assert_eq!(circuit_migration_action(1_000, 0), MigrationAction::Continue);
+    }
+
+    #[test]
+    fn test_leech_table_lockout_lifecycle() {
+        let peer = PeerId::random();
+        let mut t = LeechTable::new();
+        assert!(!t.is_locked(&peer, 1000));
+        // Cap out at t=1000 with min jitter → locked for 15 min (900s).
+        let until = t.record_cap_out(peer, 1000, 0.0);
+        assert_eq!(until, 1000 + LEECH_LOCKOUT_MIN_SECS);
+        assert!(t.is_locked(&peer, 1000));
+        assert!(t.is_locked(&peer, until - 1));
+        assert!(!t.is_locked(&peer, until)); // expired exactly at `until`
+        assert_eq!(t.retry_after(&peer, 1000), LEECH_LOCKOUT_MIN_SECS);
+        assert_eq!(t.retry_after(&peer, until + 50), 0);
+    }
+
+    #[test]
+    fn test_leech_table_longest_lockout_wins() {
+        let peer = PeerId::random();
+        let mut t = LeechTable::new();
+        let long = t.record_cap_out(peer, 1000, 1.0);  // +30 min
+        // A later cap-out with a SHORTER window must not shorten the lockout.
+        let after = t.record_cap_out(peer, 1100, 0.0);  // would be 1100+900 < long
+        assert_eq!(after, long, "shorter re-lock must not win");
+        assert!(after > 1100 + LEECH_LOCKOUT_MIN_SECS);
+    }
+
+    #[test]
+    fn test_leech_table_prune() {
+        let (p1, p2) = (PeerId::random(), PeerId::random());
+        let mut t = LeechTable::new();
+        t.record_cap_out(p1, 1000, 0.0);  // expires 1900
+        t.record_cap_out(p2, 1000, 1.0);  // expires 2800
+        assert_eq!(t.locked_count(), 2);
+        assert_eq!(t.prune(2000), 1);     // p1 expired, p2 still locked
+        assert_eq!(t.locked_count(), 1);
+        assert!(t.is_locked(&p2, 2000) && !t.is_locked(&p1, 2000));
     }
 
     #[test]

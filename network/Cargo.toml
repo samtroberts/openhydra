@@ -56,6 +56,9 @@ base64 = "0.22"
 rand = "0.8"
 futures = "0.3"
 async-trait = "0.1"
+# Matches the version libp2p-relay's RateLimiter trait uses for `now: Instant`
+# (web_time::Instant) — needed to impl the F-6 leech RateLimiter (relay.rs).
+web-time = "1.1"
 bytemuck = { version = "1", features = ["derive"] }
 prost = "0.13"
 libp2p-stream = "0.2.0-alpha"
