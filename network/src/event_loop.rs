@@ -594,8 +594,11 @@ pub async fn run_event_loop(
 
     // Fix 1: set up persistent tensor streams.
     let (repunch_tx, mut repunch_rx) = mpsc::unbounded_channel::<PeerId>();
+    // WS-F F-6: circuit-migration signals from the tensor stream manager.
+    let (migrate_tx, mut migrate_rx) =
+        mpsc::unbounded_channel::<(PeerId, crate::relay::MigrationAction)>();
     let tensor_control = stream_control.clone();
-    let tensor_mgr = Arc::new(TensorStreamManager::new(tensor_control, repunch_tx));
+    let tensor_mgr = Arc::new(TensorStreamManager::new(tensor_control, repunch_tx, migrate_tx));
     state.tensor_mgr = Some(Arc::clone(&tensor_mgr));
 
     // Accept inbound tensor streams.
@@ -1121,6 +1124,10 @@ pub async fn run_event_loop(
             Some(peer_id) = repunch_rx.recv() => {
                 handle_trigger_repunch(&mut swarm, peer_id, &mut state);
             }
+            // WS-F F-6: circuit-migration signals from TensorStreamManager.
+            Some((peer_id, action)) = migrate_rx.recv() => {
+                drive_circuit_migration(&mut swarm, &mut state, peer_id, action);
+            }
             // Phase 1.4: Periodic known_peers reaper — removes entries whose
             // libp2p_peer_id is no longer connected. Safety net for ghosts
             // that slip through individual eviction paths.
@@ -1451,6 +1458,54 @@ fn clear_reservation_retry(state: &mut LoopState, addr: &str) {
     state
         .relay_reservation_retries
         .retain(|circuit, _| !addr.starts_with(circuit.as_str()) && !circuit.starts_with(addr));
+}
+
+/// WS-F F-6: act on a circuit-migration signal from the tensor stream manager.
+///
+/// Only relay-reached peers have a per-circuit byte cap to migrate around (a
+/// direct link has no cap), so we gate on the peer currently being reached via
+/// a relay with no direct connection. At **pre-establish** (85% of budget) we
+/// dial the peer through the bootstrap relays so an alternate circuit is already
+/// open; when the capped circuit closes, libp2p's connection fallback +
+/// tensor_stream's open-on-demand route the next send over the warm alternate
+/// (the cutover), and the ring retries the in-flight token. The ring SESSION
+/// (KV + ring state) is independent of the transport, so it survives the swap.
+fn drive_circuit_migration(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer: PeerId,
+    action: crate::relay::MigrationAction,
+) {
+    let relay_reached = state
+        .peer_connections
+        .get(&peer)
+        .map_or(false, |info| info.tcp_relay > 0 && !info.has_direct());
+    if !relay_reached {
+        return; // direct link → no byte cap → nothing to migrate around
+    }
+    match action {
+        crate::relay::MigrationAction::PreEstablish => {
+            let mut dialed = 0u32;
+            for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+                if let Ok(relay_ma) = relay_str.parse::<Multiaddr>() {
+                    let circuit = relay_ma
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                        .with(libp2p::multiaddr::Protocol::P2p(peer));
+                    if swarm.dial(circuit).is_ok() {
+                        dialed += 1;
+                    }
+                }
+            }
+            info!(%peer, dialed, "F-6 migration: pre-established alternate relay circuits (circuit at 85% budget)");
+        }
+        crate::relay::MigrationAction::Cutover => {
+            // No forced stream surgery: when the capped circuit closes, libp2p
+            // falls back onto a pre-established circuit and tensor_stream
+            // re-opens there; the ring retries the token that was in flight.
+            debug!(%peer, "F-6 migration: circuit at cutover threshold — relying on fallback to a pre-established circuit");
+        }
+        crate::relay::MigrationAction::Continue => {}
+    }
 }
 
 fn handle_swarm_event(
