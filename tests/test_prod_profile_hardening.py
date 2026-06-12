@@ -102,6 +102,8 @@ def test_peer_prod_profile_rejects_non_mtls():
 
 def test_bootstrap_prod_profile_requires_geo_seed(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENHYDRA_GEO_CHALLENGE_SEED", "prod-geo-seed")
+    # H3: prod also requires a strong rebalance token.
+    monkeypatch.setenv("OPENHYDRA_REBALANCE_TOKEN", "prod-rebalance-token-strong")
     args = SimpleNamespace(
         deployment_profile="prod",
         secrets_file=None,
@@ -110,6 +112,20 @@ def test_bootstrap_prod_profile_requires_geo_seed(monkeypatch: pytest.MonkeyPatc
     )
     settings = _resolve_bootstrap_profile_settings(_parser(), args)
     assert settings["geo_challenge_seed"] == "prod-geo-seed"
+
+
+def test_bootstrap_prod_profile_requires_rebalance_token(monkeypatch: pytest.MonkeyPatch):
+    # H3: prod must refuse to start without OPENHYDRA_REBALANCE_TOKEN.
+    monkeypatch.setenv("OPENHYDRA_GEO_CHALLENGE_SEED", "prod-geo-seed")
+    monkeypatch.delenv("OPENHYDRA_REBALANCE_TOKEN", raising=False)
+    args = SimpleNamespace(
+        deployment_profile="prod",
+        secrets_file=None,
+        geo_challenge_seed="prod-geo-seed",
+        geo_challenge_enabled=True,
+    )
+    with pytest.raises(SystemExit):
+        _resolve_bootstrap_profile_settings(_parser(), args)
 
 
 def test_bootstrap_prod_profile_rejects_disabled_geo_challenge():

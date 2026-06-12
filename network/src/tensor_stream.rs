@@ -43,8 +43,17 @@ const MAX_MSG_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 /// Hard ceiling timeout for stalled writes (Fix 4).
 /// OS socket errors (BrokenPipe, ConnectionReset) catch most failures
 /// instantly. This timeout is only for connections that stall without
-/// erroring. Set aggressively to avoid pipeline hangs.
-const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+/// erroring — it is NOT a per-write budget.
+///
+/// WS-H: raised 250ms → 2s. The old 250ms silently dropped large activations
+/// on high-RTT cross-ISP links: a 9B/27B activation (256 KB+) over a ~285ms
+/// RTT path needs several round-trips in TCP slow-start (~2s worst case), so a
+/// blocking `write()` legitimately exceeds 250ms. Dropping that write kills the
+/// whole ring generation (120s step-0 timeout) — far worse than waiting. Small
+/// LAN writes return in <1ms and never approach this ceiling, so a higher value
+/// is safe; it only changes how fast a genuinely *stalled* (silent) write is
+/// abandoned, and OS socket errors already catch real disconnects instantly.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Read timeout for request-response mode. If the remote peer doesn't
 /// send a response within this window, the cached stream is discarded
@@ -80,7 +89,12 @@ pub struct TensorStreamManager {
     /// Fix 4: channel to send TriggerRepunch commands back to the event loop.
     repunch_tx: mpsc::UnboundedSender<PeerId>,
     /// Phase 5.4: per-peer RTT estimates for adaptive write timeout.
-    peer_rtt: Mutex<HashMap<PeerId, Duration>>,
+    /// WS-H: a std (sync) Mutex — it's locked only for a brief map get/insert
+    /// and is never held across an await, so it can be updated from the SYNC
+    /// `handle_swarm_event` ping handler (where `update_rtt` was previously
+    /// uncallable, which is why RTT was never populated and every peer silently
+    /// fell back to the 250ms default).
+    peer_rtt: std::sync::Mutex<HashMap<PeerId, Duration>>,
 }
 
 impl TensorStreamManager {
@@ -90,23 +104,32 @@ impl TensorStreamManager {
             outbound: Mutex::new(HashMap::new()),
             preferences: Mutex::new(HashMap::new()),
             repunch_tx,
-            peer_rtt: Mutex::new(HashMap::new()),
+            peer_rtt: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Phase 5.4: Update the RTT estimate for a peer (called from event loop
-    /// on ping success or observed round-trip times).
-    pub async fn update_rtt(&self, peer: &PeerId, rtt: Duration) {
-        self.peer_rtt.lock().await.insert(*peer, rtt);
+    /// Phase 5.4: Update the RTT estimate for a peer (called from the event
+    /// loop on ping success). WS-H: now sync so the sync ping handler can call it.
+    pub fn update_rtt(&self, peer: &PeerId, rtt: Duration) {
+        if let Ok(mut m) = self.peer_rtt.lock() {
+            m.insert(*peer, rtt);
+        }
     }
 
     /// Phase 5.4: Compute write timeout for a peer, adaptive to observed RTT.
-    /// Defaults to WRITE_TIMEOUT (250ms) if no RTT estimate available.
-    async fn write_timeout_for(&self, peer: &PeerId) -> Duration {
-        match self.peer_rtt.lock().await.get(peer) {
+    /// Defaults to WRITE_TIMEOUT (2s) if no RTT estimate available.
+    fn write_timeout_for(&self, peer: &PeerId) -> Duration {
+        let rtt = self.peer_rtt.lock().ok().and_then(|m| m.get(peer).copied());
+        match rtt {
             Some(rtt) => {
-                let adaptive = Duration::from_millis((rtt.as_millis() as u64 * 3).max(250));
-                adaptive.min(Duration::from_secs(5)) // cap at 5s
+                // WS-H: ×5 (not ×3) to cover TCP slow-start of a large first
+                // activation, floored at WRITE_TIMEOUT (2s) so a known-but-low
+                // RTT can't drop us back below the safe cross-ISP ceiling, and
+                // capped at 10s for pathological links.
+                let adaptive = Duration::from_millis(
+                    (rtt.as_millis() as u64 * 5).max(WRITE_TIMEOUT.as_millis() as u64),
+                );
+                adaptive.min(Duration::from_secs(10))
             }
             None => WRITE_TIMEOUT,
         }
@@ -265,7 +288,7 @@ impl TensorStreamManager {
             let mut map = self.outbound.lock().await;
             map.remove(peer).ok_or(TensorStreamError::NoCachedStream)?
         };
-        let timeout = self.write_timeout_for(peer).await;
+        let timeout = self.write_timeout_for(peer);
         let result = match tokio::time::timeout(timeout, write_framed(&mut stream, data)).await {
             Ok(result) => result,
             Err(_) => Err(TensorStreamError::Write(
@@ -293,7 +316,7 @@ impl TensorStreamManager {
             map.remove(peer).ok_or(TensorStreamError::NoCachedStream)?
         };
 
-        let timeout = self.write_timeout_for(peer).await;
+        let timeout = self.write_timeout_for(peer);
         match tokio::time::timeout(timeout, write_framed(&mut stream, data)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),

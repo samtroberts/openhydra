@@ -9,7 +9,68 @@ from peer.model_shard import (
     ToyShardConfig,
     _default_trust_remote_code,
     _tokenizer_eos_ids,
+    classify_cuda_arch,
 )
+
+
+@pytest.mark.parametrize(
+    "cc, arch",
+    [
+        ((6, 0), "pascal"),       # P100
+        ((6, 1), "pascal"),       # GTX 1050 / 1080
+        ((6, 2), "pascal"),       # Tegra
+        ((7, 0), "volta"),        # V100
+        ((7, 2), "volta"),        # Xavier
+        ((7, 5), "turing"),       # T4
+        ((8, 0), "ampere"),       # A100
+        ((8, 6), "ampere"),       # RTX 30-series / A40
+        ((8, 7), "ampere"),       # Orin
+        ((8, 9), "ada_lovelace"), # RTX 40-series / L4 / L40
+        ((9, 0), "hopper"),       # H100 / H200
+        ((10, 0), "blackwell"),   # B100 / B200 / GB200 (sm_100)
+        ((12, 0), "blackwell"),   # RTX 50-series (sm_120)
+        ((0, 0), "unknown"),      # CPU / no-CUDA
+    ],
+)
+def test_classify_cuda_arch(cc, arch):
+    assert classify_cuda_arch(cc) == arch
+
+
+def test_gpu_profile_capability_boundaries(monkeypatch):
+    """Capability flags must follow the documented arch boundaries."""
+    import torch
+    import peer.model_shard as ms
+
+    # Capability tables: (cc) -> expected flags. Keyed off real hardware.
+    cases = {
+        (6, 1): dict(has_tensor_cores=False, fp16_compute_fast=False,
+                     has_native_bf16=False, has_int8_tensor_cores=False,
+                     has_fp8=False, has_flash_attention=False),   # GTX 1050
+        (7, 0): dict(has_tensor_cores=True, fp16_compute_fast=True,
+                     has_native_bf16=False, has_int8_tensor_cores=False,
+                     has_fp8=False, has_flash_attention=False),   # V100
+        (7, 5): dict(has_tensor_cores=True, has_int8_tensor_cores=True,
+                     has_native_bf16=False, has_fp8=False,
+                     has_flash_attention=False),                  # T4
+        (8, 0): dict(has_native_bf16=True, has_flash_attention=True,
+                     has_fp8=False),                              # A100
+        (8, 9): dict(has_native_bf16=True, has_fp8=True,
+                     has_flash_attention=True),                   # Ada
+        (9, 0): dict(has_native_bf16=True, has_fp8=True,
+                     has_flash_attention=True),                   # Hopper
+    }
+    for cc, expected in cases.items():
+        ms._GPU_PROFILE_CACHE = None
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: cc)
+        prof = ms.get_gpu_profile()
+        for flag, want in expected.items():
+            assert prof[flag] is want, f"cc={cc} {flag}: got {prof[flag]} want {want}"
+        # dtype: bf16 on Ampere+, fp16 below.
+        assert prof["recommended_dtype"] == (
+            torch.bfloat16 if cc[0] >= 8 else torch.float16
+        )
+    ms._GPU_PROFILE_CACHE = None
 
 
 def test_model_shard_is_deterministic():

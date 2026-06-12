@@ -245,6 +245,11 @@ class MLXRuntime:
         self.shard_index = int(getattr(config, "shard_index", 0))
         self.total_shards = int(getattr(config, "total_shards", 1))
         self.max_context_tokens = int(getattr(config, "runtime_max_context_tokens", 2048))
+        # WS-C#1: pre-allocate the sharded KV buffer to at least this many tokens
+        # so a long generation never triggers a mid-decode KVCache resize (which
+        # recompiles the mx.compile-d shard fn — the MLX length-degradation).
+        # Default 1024 covers virtually all generations; capped at max_context.
+        self._kv_prealloc_tokens = int(getattr(config, "runtime_mlx_kv_prealloc_tokens", 1024))
         self._kv_cache: dict[str, Any] = {}
 
         # ── Watchdog: timeout wrapper for mx.eval() calls ────────────────────
@@ -260,10 +265,20 @@ class MLXRuntime:
             self.model_name, _req_mode,
         )
         _t0 = time.perf_counter()
-        self._model, _mlx_bundled_tokenizer = mlx_load(self.model_name)
+        # WS-H step 1: load LAZILY when this is a shard. mlx_lm.load(lazy=False)
+        # runs `mx.eval(model.parameters())` which materialises EVERY layer's
+        # weights into RAM — including layers this shard never runs. On an 8 GB
+        # Mac a 9B model (6 GB) thrashes hard from that full materialisation
+        # (the real blocker, confirmed: full load → swap death even with a
+        # 4-layer shard). With lazy=True the final eval is skipped: weights stay
+        # mmap'd and only `_selected_layers` get materialised on first use, so a
+        # shard's resident footprint ≈ its own layers, not the whole model.
+        # Gated on a flag (default on) so a single-node peer can opt out.
+        _lazy_load = bool(getattr(config, "runtime_mlx_lazy_load", True))
+        self._model, _mlx_bundled_tokenizer = mlx_load(self.model_name, lazy=_lazy_load)
         self._tokenizer = _mlx_bundled_tokenizer
         _load_s = time.perf_counter() - _t0
-        logging.info("mlx_runtime: loaded in %.1f s", _load_s)
+        logging.info("mlx_runtime: loaded in %.1f s (lazy=%s)", _load_s, _lazy_load)
 
         # Task 8.1a: detect Apple Silicon unified memory for zero-copy
         # activation packing (skip PyTorch intermediate on arm64 macOS).
@@ -315,7 +330,20 @@ class MLXRuntime:
                 )
 
         # Force Metal allocation of all parameters now, not lazily on first use.
-        self._watchdog.run(mx.eval, self._model.parameters())
+        # WS-H step 1: when this peer is a shard AND we loaded lazily, do NOT
+        # eval the whole model here — that would materialise every layer into
+        # RAM (the 8 GB-Mac 9B thrash). Defer to a SELECTIVE eval of only this
+        # shard's components, done right after layer selection below. A
+        # single-node peer (or lazy disabled) still materialises everything.
+        _will_shard = (
+            int(getattr(config, "total_shards", 1)) > 1
+            or bool(getattr(config, "runtime_layer_indices", ()) or ())
+        )
+        self._deferred_shard_eval = bool(_will_shard and _lazy_load)
+        if self._deferred_shard_eval:
+            logging.info("mlx_runtime: deferring param eval to selective shard eval (WS-H lazy load)")
+        else:
+            self._watchdog.run(mx.eval, self._model.parameters())
 
         # Pin MLX Metal buffers so macOS doesn't reclaim them under memory
         # pressure.  On 16 GB Macs the compressor can stall Metal heap
@@ -445,6 +473,31 @@ class MLXRuntime:
             for i in range(self._total_layers):
                 if i not in set(self._shard_layer_indices):
                     _all_layers[i] = None
+
+            # WS-H step 1: selectively materialise ONLY this shard's parameters.
+            # We skipped the whole-model eval above; eval the selected layers +
+            # (embed/norm/lm_head where present) so the shard's weights are
+            # Metal-resident for fast first-token, while every other layer stays
+            # lazy/mmap'd and never enters RAM. This is what lets an 8 GB Mac
+            # hold a 9B/27B *shard* without the full-model swap death.
+            if getattr(self, "_deferred_shard_eval", False):
+                from mlx.utils import tree_flatten as _tf_shard
+                _shard_mods: list[Any] = list(self._selected_layers)
+                for _m in (self._shard_embed_tokens, self._shard_norm, self._shard_lm_head):
+                    if _m is not None:
+                        _shard_mods.append(_m)
+                _shard_params: list[Any] = []
+                for _m in _shard_mods:
+                    _shard_params.extend(v for _, v in _tf_shard(_m.parameters()))
+                self._watchdog.run(mx.eval, _shard_params)
+                logging.info(
+                    "mlx_runtime: selective shard eval — materialised %d param tensors "
+                    "(%d layers%s%s%s)",
+                    len(_shard_params), len(self._selected_layers),
+                    " +embed" if self._shard_embed_tokens is not None else "",
+                    " +norm" if self._shard_norm is not None else "",
+                    " +lm_head" if self._shard_lm_head is not None else "",
+                )
 
             self._kv_cache_max = int(getattr(config, "runtime_kv_cache_max_entries", 256))
             logging.info(
@@ -576,6 +629,19 @@ class MLXRuntime:
         # Phase W: warmup.
         if bool(getattr(config, "runtime_warmup_on_start", False)):
             self._warmup()
+
+        # Flame-graph finding: the keepalive's per-generation gc.collect() showed
+        # ~2% of coordinator CPU — it rescans the whole heap, which now holds the
+        # model's millions of long-lived weight/module objects. gc.freeze() moves
+        # everything currently alive into the permanent generation so it is never
+        # rescanned, making each subsequent collect cheap (it only walks objects
+        # created after init — i.e. the small per-token garbage). Standard
+        # "freeze after init" serving pattern; cross-platform (helps any GC churn).
+        try:
+            gc.freeze()
+            logging.debug("gc.freeze() applied after model init (%d frozen)", gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1)
+        except Exception:
+            pass
 
     # ── Quantization helpers ───────────────────────────────────────────────────
 
@@ -941,12 +1007,33 @@ class MLXRuntime:
 
     # ── Sharded forward pass (Phase 3) ──────────────────────────────────────────
 
-    def _make_shard_cache(self) -> list[Any]:
-        """Create per-layer KV cache for this shard's layers only."""
+    def _make_shard_cache(self, target_len: int | None = None) -> list[Any]:
+        """Create per-layer KV cache for this shard's layers only.
+
+        WS-C#1: when ``target_len`` is given, pre-size each KVCache buffer to
+        the whole generation (prompt + max_tokens) so the buffer NEVER resizes
+        mid-decode. A resize grows the buffer by ``KVCache.step`` (256) and
+        changes its ``shape[2]`` — which is baked into the ``mx.compile``-d shard
+        fn as ``L_buf``. A changed L_buf forces a recompile, and that recompile
+        every 256 decoded tokens is the MLX "length-degradation" (ring TPS
+        decaying on long generations). Setting ``.step`` to target_len makes the
+        prefill allocate the full buffer in one shot (``n_steps`` rounds to 1
+        because prompt_len < step), so decode runs entirely in the compiled path.
+        """
         from mlx_lm.models.cache import make_prompt_cache
         full_cache = make_prompt_cache(self._model)
-        # Pick only the cache entries for our shard's layers.
-        return [full_cache[i] for i in self._shard_layer_indices]
+        shard = [full_cache[i] for i in self._shard_layer_indices]
+        if target_len and int(target_len) > 0:
+            tl = int(target_len)
+            _set = 0
+            for c in shard:
+                # Only standard KVCache (full-attention) grows/recompiles; the
+                # ArraysCache used by linear/Mamba layers has no `step`/`keys`.
+                if hasattr(c, "step"):
+                    c.step = tl
+                    _set += 1
+            logging.debug("kv_prealloc: target_len=%d set step on %d/%d caches", tl, _set, len(shard))
+        return shard
 
     # ── P6 compiled-shard helpers ─────────────────────────────────────────────
 
@@ -1513,7 +1600,29 @@ class MLXRuntime:
         ssm_mask = _create_ssm_mask(h, cache=ssm_cache_ref)
 
         # ── Run shard layers ───────────────────────────────────────
-        cache = cached_kv if cached_kv is not None else self._make_shard_cache()
+        # WS-C#1: on the first call of a session (prefill, cached_kv is None),
+        # h.shape[1] is the prompt length — pre-size the KV buffer to cover the
+        # whole generation (prompt + max_tokens, +8 margin), capped at the
+        # context limit, so the compiled decode path never triggers a
+        # buffer-resize recompile.
+        if cached_kv is not None:
+            cache = cached_kv
+        else:
+            # WS-C#1: size to cover the whole generation. NOTE: in ring/push
+            # mode this forward is called per-token with max_tokens=1, so the
+            # per-call value is useless for sizing — use a generous prealloc
+            # floor (config) instead, capped at the context limit. Pre-sizing
+            # the buffer once avoids the per-256-token KVCache resize that
+            # recompiles the shard fn (the MLX length-degradation). The larger
+            # buffer's per-token mask cost is a negligible Metal elementwise op,
+            # and the memory (~45 MB at 1024 deep for this shard) is modest.
+            _prealloc = max(int(max_tokens), int(self._kv_prealloc_tokens))
+            # Cap at max(context, prealloc): a stale/small runtime_max_context_tokens
+            # (seen as 64) must not shrink the prealloc below its configured size —
+            # the KVCache grows past max_context anyway, so it's not a hard limit.
+            _cap = max(int(self.max_context_tokens), int(self._kv_prealloc_tokens))
+            _target_len = min(int(h.shape[1]) + _prealloc + 8, _cap)
+            cache = self._make_shard_cache(_target_len)
 
         # P6: compiled path for decode (L=1, no special masks).
         # Proxy caches replace in-place KV mutations with lazy mx.where

@@ -21,7 +21,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/openhydra-dht --host 0.0.0.0 --port ${dht_port} --ttl-seconds 300
+# C1: bind LOOPBACK only — never expose the HTTP DHT directly to the internet.
+# (This is the DEPRECATED DigitalOcean path; the canonical ops/bootstrap/ deploy
+# fronts the DHT with nginx+TLS and runs --deployment-profile prod with a
+# rebalance token + per-IP firewall caps. If this path is ever revived, mirror
+# that: nginx/TLS in front, --deployment-profile prod --secrets-file, and run
+# ops/network_limits.sh. Until then, loopback bind means it is not reachable
+# from the internet even if provisioned by mistake.)
+ExecStart=/usr/local/bin/openhydra-dht --host 127.0.0.1 --port ${dht_port} --ttl-seconds 300
 Restart=always
 RestartSec=5
 StandardOutput=journal

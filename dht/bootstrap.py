@@ -58,6 +58,7 @@ class ThreadingHTTPServer(_StdThreadingHTTPServer):
             super().process_request(request, client_address)
         finally:
             self._connection_semaphore.release()
+import hmac
 import json
 import logging
 import secrets
@@ -163,6 +164,20 @@ def _resolve_bootstrap_profile_settings(parser: argparse.ArgumentParser, args: a
                 "prod profile requires strong geo challenge seed via "
                 "--geo-challenge-seed or OPENHYDRA_GEO_CHALLENGE_SEED"
             )
+        # H3: prod must authenticate /rebalance — refuse to start otherwise.
+        _rebalance_token = str(
+            os.environ.get("OPENHYDRA_REBALANCE_TOKEN", "")
+            or secret_store.get("OPENHYDRA_REBALANCE_TOKEN", "")
+            or ""
+        ).strip()
+        if not _rebalance_token or is_insecure_secret_value(_rebalance_token):
+            parser.error(
+                "prod profile requires a strong OPENHYDRA_REBALANCE_TOKEN to "
+                "authenticate /rebalance (set it in the secrets file / env)"
+            )
+        # H2: prod must require signed peer announcements.
+        if not bool(getattr(args, "require_signed_announce", True)):
+            parser.error("prod profile requires signed /announce (require_signed_announce)")
     return {
         "deployment_profile": profile,
         "geo_challenge_seed": geo_seed or str(getattr(args, "geo_challenge_seed")),
@@ -260,7 +275,8 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
         if not token:
             return True  # dev mode — no auth required
         auth = self.headers.get("Authorization", "")
-        if auth == f"Bearer {token}":
+        # M1: constant-time compare to avoid a token timing oracle.
+        if hmac.compare_digest(auth, f"Bearer {token}"):
             return True
         self._send_json(
             {"error": "unauthorized", "message": "valid Bearer token required"},
@@ -400,6 +416,11 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             if not _identity_verified:
                 logging.warning("identity_verify_rejected peer_id=%s", payload.get("peer_id"))
                 return {"error": "identity_verification_failed"}
+        elif getattr(self, "require_signed_announce", False):
+            # H2: in prod, reject unsigned announces outright (no anonymous
+            # records that can poison discovery with attacker-chosen fields).
+            logging.warning("unsigned_announce_rejected peer_id=%s", payload.get("peer_id"))
+            return {"error": "signature_required"}
         payload["identity_verified"] = _identity_verified
 
         dht = self._require_dht()
@@ -544,9 +565,25 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
             self._rebalance_hints[key] = hint
         return self._rebalance_hint_for_model(model_id)
 
+    def _client_ip(self) -> str:
+        """Real client IP behind nginx (which sets X-Real-IP / X-Forwarded-For).
+        Falls back to the socket peer (loopback when fronted by nginx)."""
+        xri = self.headers.get("X-Real-IP", "").strip()
+        if xri:
+            return xri
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        try:
+            return str(self.client_address[0])
+        except Exception:
+            return "unknown"
+
     def _allow_lookup(self, model_id: str) -> tuple[bool, int, dict[str, Any] | None]:
         now = time.time()
-        key = model_key(model_id)
+        # M5: rate-limit per client IP (+ model) so one abusive client can't
+        # trip the window for every legitimate peer looking up a popular model.
+        key = f"{self._client_ip()}|{model_key(model_id)}"
         window = max(1, int(self.default_lookup_window_seconds))
         limit = max(1, int(self.default_lookup_max_requests_per_window))
         with self._lookup_lock:
@@ -684,7 +721,7 @@ class DhtBootstrapHandler(BaseHTTPRequestHandler):
                 auth = self.headers.get("Authorization", "")
                 is_authed = bool(
                     self._rebalance_token
-                    and auth == f"Bearer {self._rebalance_token}"
+                    and hmac.compare_digest(auth, f"Bearer {self._rebalance_token}")
                 )
                 payload: dict[str, Any] = {"ok": True, "keys": dht.keys(), "stats": dht.stats()}
                 if is_authed or not self._rebalance_token:
@@ -988,6 +1025,10 @@ def main() -> None:
     args = parser.parse_args()
     profile_settings = _resolve_bootstrap_profile_settings(parser, args)
     configure_logging(json_logs=str(profile_settings.get("deployment_profile", "dev")) == "prod")
+    # H2: in prod, the announce handler rejects unsigned records.
+    DhtBootstrapHandler.require_signed_announce = (
+        str(profile_settings.get("deployment_profile", "dev")) == "prod"
+    )
 
     # Optionally start Hivemind signpost alongside HTTP bootstrap.
     _signpost_dht = None

@@ -1571,9 +1571,32 @@ class InferenceService:
             )
         elif (
             self.config.autoregressive_sharded_enabled
-            and len(prep.primary_pipeline) > 1
             and self._pipeline_uses_pytorch_runtime(prep.primary_pipeline)
+            and (
+                len(prep.primary_pipeline) > 1
+                # Single-node (1 stage) only for a PyTorch peer. A SINGLE
+                # full-model PyTorch peer also needs this outer decode loop:
+                # ``chain.run()``/one-shot decode extracts only the NEXT token
+                # from a PyTorch forward (``_logits_to_next_token_payload``
+                # returns 1 id) — it can't autoregress, so single-node PyTorch
+                # emitted 0–1 tokens (swarm bug 2; confirmed on the T4: forward
+                # returns out_len=1 but the one-shot path drops it → empty
+                # completion). MLX must NOT take this branch — ``MLXRuntime
+                # .forward`` generates the WHOLE sequence internally, so a
+                # single MLX peer stays on the chain.run path. Note
+                # ``_pipeline_uses_pytorch_runtime`` returns True for MLX too
+                # (it means "any real backend"), so the single-stage case must
+                # check the backend explicitly here.
+                or str(
+                    getattr(prep.primary_pipeline[0], "runtime_backend", "")
+                    if prep.primary_pipeline else ""
+                ).strip().lower().startswith("pytorch")
+            )
         ):
+            # The per-token ``_step_prefill``/``_step_decode`` loop below drives
+            # a 1-stage pipeline correctly — the peer holds all layers and the
+            # KV-cache prefill/decode steps are identical to the multi-peer
+            # last stage.
             # Phase 1A + Phase 6 fix: non-streaming sharded PyTorch pipelines
             # need an outer decode loop because the last-stage peer only
             # returns ONE token per chain.run() call (it can't autoregress

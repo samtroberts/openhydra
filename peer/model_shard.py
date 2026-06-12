@@ -98,8 +98,56 @@ def _gpu_available_hint() -> bool:
 _GPU_PROFILE_CACHE: dict | None = None
 
 
+def classify_cuda_arch(cc: tuple[int, int]) -> str:
+    """Map a CUDA compute capability ``(major, minor)`` to an NVIDIA
+    micro-architecture name.
+
+    Boundaries (per NVIDIA's CUDA programming guide):
+
+    - ``6.x``        → Pascal      (P100 6.0, GTX 10-series 6.1, Tegra 6.2)
+    - ``7.0`` / 7.2  → Volta       (V100, Titan V, Xavier)
+    - ``7.5``        → Turing      (T4, RTX 20-series, Quadro RTX)
+    - ``8.0/8.6/8.7``→ Ampere      (A100 8.0, RTX 30-series/A40 8.6, Orin 8.7)
+    - ``8.9``        → Ada Lovelace(RTX 40-series, L4, L40)
+    - ``9.0``        → Hopper      (H100, H200, GH200)
+    - ``10.x``/12.x  → Blackwell   (B100/B200/GB200 sm_100, RTX 50-series sm_120)
+
+    Returns ``"unknown"`` for capabilities outside these ranges (e.g. a
+    future arch or a CPU/no-CUDA profile with ``(0, 0)``).
+    """
+    major, minor = int(cc[0]), int(cc[1])
+    if major == 6:
+        return "pascal"
+    if major == 7:
+        return "turing" if minor >= 5 else "volta"
+    if major == 8:
+        return "ada_lovelace" if minor == 9 else "ampere"
+    if major == 9:
+        return "hopper"
+    if major >= 10:
+        # sm_100 (datacenter) and sm_120 (consumer) are both Blackwell;
+        # treat any 10+ major as Blackwell until a newer arch is mapped.
+        return "blackwell"
+    return "unknown"
+
+
 def get_gpu_profile() -> dict:
-    """Return a cached GPU architecture profile dict."""
+    """Return a cached GPU architecture profile dict.
+
+    The profile carries an ``arch`` name plus capability booleans so callers
+    can branch on *what the hardware can do* (tensor cores, BF16, FP8, INT8
+    tensor cores, Flash-Attention) rather than re-deriving it from the raw
+    compute capability.  Capability boundaries:
+
+    - tensor cores            : Volta+      (cc >= 7.0)  — Pascal has none, so
+                                its FP16 matmul runs on the slow 1:64 FP16 ALU
+                                path; FP16 there is a *memory* win, not compute.
+    - INT8 tensor cores       : Turing+     (cc >= 7.5)
+    - native BF16             : Ampere+     (cc >= 8.0)
+    - Flash-Attention (sm_80) : Ampere+     (cc >= 8.0)  — Volta/Turing fall back
+                                to the memory-efficient SDPA backend.
+    - FP8 tensor cores        : Ada/Hopper+ (cc >= 8.9)
+    """
     global _GPU_PROFILE_CACHE
     if _GPU_PROFILE_CACHE is not None:
         return _GPU_PROFILE_CACHE
@@ -108,9 +156,17 @@ def get_gpu_profile() -> dict:
 
     profile: dict = {
         "compute_capability": (0, 0),
+        "arch": "unknown",
+        # Back-compat coarse flags (kept so existing call sites don't break).
         "is_turing_or_older": True,
         "is_ampere_or_newer": False,
+        # Capability flags.
+        "has_tensor_cores": False,
+        "fp16_compute_fast": False,   # tensor cores → FP16 is a compute win
         "has_native_bf16": False,
+        "has_fp8": False,
+        "has_int8_tensor_cores": False,
+        "has_flash_attention": False,
         "recommended_dtype": _torch.float32,
         "use_sdpa_math_only": False,
     }
@@ -120,18 +176,32 @@ def get_gpu_profile() -> dict:
     try:
         cc = _torch.cuda.get_device_capability()
         profile["compute_capability"] = cc
+        profile["arch"] = classify_cuda_arch(cc)
         profile["is_turing_or_older"] = cc[0] < 8
         profile["is_ampere_or_newer"] = cc[0] >= 8
+        profile["has_tensor_cores"] = cc >= (7, 0)
+        profile["fp16_compute_fast"] = cc >= (7, 0)
         profile["has_native_bf16"] = cc[0] >= 8
+        profile["has_fp8"] = cc >= (8, 9)
+        profile["has_int8_tensor_cores"] = cc >= (7, 5)
+        profile["has_flash_attention"] = cc[0] >= 8
         if cc[0] >= 8:
+            # Ampere/Ada/Hopper/Blackwell: native BF16 + Flash-Attention.
             profile["recommended_dtype"] = _torch.bfloat16
         else:
+            # Pascal/Volta/Turing: no native BF16 → FP16.  On Pascal this is a
+            # memory choice (no tensor cores); on Volta/Turing it's also a
+            # compute win.  Force the Math SDPA backend for seq_len<=1 decode
+            # (no Flash-Attention before Ampere).
             profile["recommended_dtype"] = _torch.float16
             profile["use_sdpa_math_only"] = True
         logging.info(
-            "gpu_profile: cc=%d.%d turing_or_older=%s dtype=%s sdpa_math_only=%s",
-            cc[0], cc[1], profile["is_turing_or_older"],
-            profile["recommended_dtype"], profile["use_sdpa_math_only"],
+            "gpu_profile: cc=%d.%d arch=%s dtype=%s tensor_cores=%s bf16=%s "
+            "fp8=%s int8_tc=%s flash_attn=%s sdpa_math_only=%s",
+            cc[0], cc[1], profile["arch"], profile["recommended_dtype"],
+            profile["has_tensor_cores"], profile["has_native_bf16"],
+            profile["has_fp8"], profile["has_int8_tensor_cores"],
+            profile["has_flash_attention"], profile["use_sdpa_math_only"],
         )
     except Exception as e:
         logging.warning("gpu_profile_failed: %s", e)
@@ -174,7 +244,12 @@ class ToyShardConfig:
     runtime_model_id: str = "nickypro/tinyllama-15M"
     runtime_trust_remote_code: bool | None = None
     runtime_layer_indices: tuple[int, ...] = ()
-    runtime_max_context_tokens: int = 64
+    # Default sequence-length cap. Was 64 (a tinyllama-toy default) but nothing
+    # ever overrides it, so production runtimes silently truncated any prompt
+    # longer than 64 tokens (it bounds the encode_prompt token budget on both
+    # the MLX and PyTorch paths). 4096 is a safe general default — it only raises
+    # the budget cap; no buffer is sized by this value, so there is no memory cost.
+    runtime_max_context_tokens: int = 4096
     runtime_kv_cache_max_entries: int = 256
     # Path A Phase 5: force loading of ``final_norm`` + ``lm_head`` (or the
     # tied-embed linear) on EVERY shard, not just the last. Enables a
@@ -940,14 +1015,14 @@ class PyTorchRuntime:
                     from transformers import BitsAndBytesConfig
 
                     if self.quantization_bits == 4:
-                        # Use fp16 compute on pre-Ampere (T4/Pascal lack
-                        # native bf16); bf16 on Ampere+ (A100/H100).
-                        _bnb_compute_dtype = torch.bfloat16
-                        try:
-                            if torch.cuda.get_device_capability()[0] < 8:
-                                _bnb_compute_dtype = torch.float16
-                        except Exception:
-                            pass
+                        # BF16 compute on archs with native BF16 (Ampere+),
+                        # else FP16 (Pascal/Volta/Turing).  Keyed off the
+                        # cached GPU profile so the arch boundary lives in one
+                        # place (see get_gpu_profile / classify_cuda_arch).
+                        if get_gpu_profile()["has_native_bf16"]:
+                            _bnb_compute_dtype = torch.bfloat16
+                        else:
+                            _bnb_compute_dtype = torch.float16
                         quantization_config = BitsAndBytesConfig(
                             load_in_4bit=True,
                             bnb_4bit_quant_type="nf4",
@@ -1657,7 +1732,21 @@ class PyTorchRuntime:
             str(v) in ("cpu", "disk")
             for v in getattr(self._model, "hf_device_map", {}).values()
         )
-        if _dev_type == "cuda" and not _has_offload:
+        # Triton (the inductor backend torch.compile uses) requires CUDA
+        # compute capability >= 7.0 (Volta+). On Pascal (GTX 10-series, CC 6.1)
+        # and older, compilation SETUP succeeds but the first forward raises
+        # "device too old to be supported by the triton GPU compiler", which
+        # crashes inference (observed on the Asus GTX 1050). Gate compile on the
+        # same Volta+ boundary as tensor cores so Pascal stays on eager mode.
+        _gpu_prof = get_gpu_profile()
+        _triton_capable = bool(_gpu_prof.get("has_tensor_cores", False))
+        if _dev_type == "cuda" and not _has_offload and not _triton_capable:
+            logging.info(
+                "torch_compile: skipped — GPU cc=%s arch=%s lacks Triton support "
+                "(needs cc>=7.0); using eager mode",
+                _gpu_prof.get("compute_capability"), _gpu_prof.get("arch"),
+            )
+        if _dev_type == "cuda" and not _has_offload and _triton_capable:
             try:
                 _compile_fn = getattr(self._torch, "compile", None)
                 if callable(_compile_fn):
@@ -1668,14 +1757,25 @@ class PyTorchRuntime:
                     # "reduce-overhead" adds JIT cost with zero benefit.
                     # "default" fuses ops via Triton without requiring
                     # fixed tensor shapes.
+                    # ``dynamic=True``: autoregressive decode changes the
+                    # sequence/cache shapes every step (input_ids [1,1] but a
+                    # growing past_len → growing attention_mask / position_ids /
+                    # cache_position). With static specialization dynamo
+                    # recompiles on each new length and quickly hits
+                    # ``config.recompile_limit (8)`` — ~80 s/token of JIT churn
+                    # (observed on the single-node 4B decode). A single
+                    # dynamic-shape graph compiles ~once and serves every decode
+                    # length. This is the PyTorch analog of the MLX
+                    # KV-prealloc fix (WS-C#1) that killed mx.compile recompiles.
                     self._model = _compile_fn(
                         self._model,
                         mode="default",
                         fullgraph=False,
+                        dynamic=True,
                     )
                     self._torch_compiled = True
                     logging.info(
-                        "torch_compile: enabled mode=reduce-overhead device=%s",
+                        "torch_compile: enabled mode=default dynamic=True device=%s",
                         self._device,
                     )
             except Exception as _compile_exc:
