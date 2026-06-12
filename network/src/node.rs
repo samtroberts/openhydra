@@ -47,6 +47,8 @@ pub struct NodeConfig {
     pub identity_path: PathBuf,
     pub listen_addrs: Vec<String>,
     pub bootstrap_peers: Vec<String>,
+    /// WS-F F-4: opt into being a temporary peer-relay (off by default).
+    pub enable_peer_relay: bool,
 }
 
 impl Default for NodeConfig {
@@ -65,6 +67,7 @@ impl Default for NodeConfig {
                 "/ip6/::/udp/4001/quic-v1".into(),
             ],
             bootstrap_peers: Vec::new(),
+            enable_peer_relay: false,
         }
     }
 }
@@ -100,6 +103,7 @@ pub fn start_node(
 
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
+    let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
 
     // Create the command channel.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(256);
@@ -127,13 +131,14 @@ pub fn start_node(
                     listen_addrs,
                     bootstrap_peers,
                     protocol_version: "openhydra/0.1.0".into(),
+                    enable_peer_relay,
                 };
 
                 let keypair_for_loop = identity.keypair.clone();
                 match swarm::build_swarm(&identity, opts) {
-                    Ok((swarm, stream_control)) => {
+                    Ok((swarm, stream_control, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -322,12 +327,15 @@ impl PyP2PNode {
     ///     identity_key_path: Path to Ed25519 key file (default: ~/.openhydra/identity.key)
     ///     listen_addrs: Multiaddrs to listen on (default: ["/ip4/0.0.0.0/tcp/4001"])
     ///     bootstrap_peers: Bootstrap peer multiaddrs with /p2p/ suffix
+    ///     enable_peer_relay: WS-F F-4 — opt into being a temporary peer-relay
+    ///         for NATted peers (default False; only for publicly-reachable nodes)
     #[new]
-    #[pyo3(signature = (identity_key_path=None, listen_addrs=None, bootstrap_peers=None))]
+    #[pyo3(signature = (identity_key_path=None, listen_addrs=None, bootstrap_peers=None, enable_peer_relay=false))]
     fn new(
         identity_key_path: Option<String>,
         listen_addrs: Option<Vec<String>>,
         bootstrap_peers: Option<Vec<String>>,
+        enable_peer_relay: bool,
     ) -> PyResult<Self> {
         let config = NodeConfig {
             identity_path: identity_key_path
@@ -341,6 +349,7 @@ impl PyP2PNode {
                     "/ip6/::/udp/4001/quic-v1".into(),
                 ]),
             bootstrap_peers: bootstrap_peers.unwrap_or_default(),
+            enable_peer_relay,
         };
 
         // Pre-load identity to get peer IDs for properties.
@@ -366,6 +375,7 @@ impl PyP2PNode {
             identity_path: self.config.identity_path.clone(),
             listen_addrs: self.config.listen_addrs.clone(),
             bootstrap_peers: self.config.bootstrap_peers.clone(),
+            enable_peer_relay: self.config.enable_peer_relay,
         };
         let result = py.allow_threads(|| start_node(&config));
         let (cmd_tx, proxy_queue, thread) = result

@@ -496,6 +496,9 @@ struct LoopState {
     /// for the whole session (the EU-relay gap). Cleared on NewListenAddr /
     /// ReservationReqAccepted for that circuit.
     relay_reservation_retries: HashMap<String, (u32, tokio::time::Instant)>,
+    /// WS-F F-4: peer-relay leech table (None unless peer-relay mode is on).
+    /// The RelayServer event handler records byte-cap cap-outs here.
+    peer_relay_leech: Option<std::sync::Arc<std::sync::Mutex<crate::relay::LeechTable>>>,
 }
 
 /// PR-3: upper bound on pending inbound gossip messages.
@@ -558,6 +561,7 @@ impl LoopState {
             gossip_inbound_queue: std::collections::VecDeque::new(),
             relay_dial_retries: HashMap::new(),
             relay_reservation_retries: HashMap::new(),
+            peer_relay_leech: None,
         }
     }
 }
@@ -570,6 +574,10 @@ pub async fn run_event_loop(
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
     mut stream_control: libp2p_stream::Control,
     keypair: libp2p::identity::Keypair,
+    // WS-F F-4: shared leech table for the peer-relay server (None unless this
+    // node opted into peer-relay mode). The RelayServer event handler records
+    // byte-cap cap-outs into it; the relay::Config's LeechRateLimiter reads it.
+    peer_relay_leech: Option<std::sync::Arc<std::sync::Mutex<crate::relay::LeechTable>>>,
 ) {
     // CP-2: IPC response channel — spawned IPC tasks send (request_id, data)
     // back here so the event loop can forward via request_response.
@@ -582,6 +590,7 @@ pub async fn run_event_loop(
         mpsc::unbounded_channel::<RingEvent>();
 
     let mut state = LoopState::new(ipc_response_tx, ring_event_tx);
+    state.peer_relay_leech = peer_relay_leech; // WS-F F-4
 
     // Fix 1: set up persistent tensor streams.
     let (repunch_tx, mut repunch_rx) = mpsc::unbounded_channel::<PeerId>();
@@ -1582,6 +1591,30 @@ fn handle_swarm_event(
                     info!(%src_peer_id, "inbound circuit established from peer");
                 }
             }
+        }
+
+        // ── WS-F F-4: peer-relay SERVER events (only fire when peer-relay mode
+        // is on; Toggle::None emits none). Mirrors the bootstrap relay's F-6
+        // leech trigger: a circuit that blew its byte budget locks the source
+        // peer out so the LeechRateLimiter denies its next reservations.
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::RelayServer(relay_srv_event)) => {
+            if let libp2p::relay::Event::CircuitClosed { src_peer_id, error, .. } = &relay_srv_event {
+                if error
+                    .as_ref()
+                    .map(|e| e.to_string().contains(crate::relay::MAX_CIRCUIT_BYTES_ERROR))
+                    .unwrap_or(false)
+                {
+                    if let Some(table) = &state.peer_relay_leech {
+                        let now = crate::relay::unix_secs_now();
+                        if let Ok(mut t) = table.lock() {
+                            let until = t.record_cap_out(*src_peer_id, now, crate::relay::wallclock_jitter_frac());
+                            t.prune(now);
+                            warn!(%src_peer_id, lockout_until = until, "peer-relay leech: circuit exceeded byte budget — locked out (F-4/F-6)");
+                        }
+                    }
+                }
+            }
+            debug!(?relay_srv_event, "peer-relay server event");
         }
 
         // ── DCUtR ──

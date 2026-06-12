@@ -4,6 +4,7 @@
 //! AutoNAT, Identify, mDNS, and gRPC proxy into a single behaviour.
 
 use libp2p::request_response;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay};
 
@@ -16,6 +17,12 @@ pub struct OpenHydraBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     /// Circuit Relay v2 client — connects through relays when behind NAT.
     pub relay_client: relay::client::Behaviour,
+    /// WS-F F-4: optional Circuit Relay v2 SERVER. Disabled (`Toggle::None`)
+    /// unless this node opts into being a temporary peer-relay (operator flag,
+    /// for publicly-reachable nodes). When enabled it accepts reservations from
+    /// NATted peers and enforces the SAME caps + F-6 leech lockout as the Linode
+    /// bootstraps. Noise keeps relayed payloads E2E-encrypted (transport-only).
+    pub relay_server: Toggle<relay::Behaviour>,
     /// DCUtR — Direct Connection Upgrade through Relay (hole punching).
     pub dcutr: dcutr::Behaviour,
     /// AutoNAT — automatic NAT type detection via bootstrap probes.
