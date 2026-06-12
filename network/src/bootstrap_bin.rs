@@ -14,6 +14,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -24,6 +25,11 @@ use tracing::{debug, info, warn};
 // Re-use crate modules for identity and transport.
 // Note: since this is a [[bin]], we import the library crate.
 use openhydra_network::identity::Identity;
+// WS-F F-6: shared leech-lockout policy (per-circuit byte budget + lockout).
+use openhydra_network::relay::{
+    LeechRateLimiter, LeechTable, MAX_CIRCUIT_BYTES_ERROR, PER_CIRCUIT_BUDGET_BYTES,
+    unix_secs_now, wallclock_jitter_frac,
+};
 
 /// Bootstrap-specific behaviour — includes relay::Behaviour (server mode)
 /// and DCUtR for advertising hole-punch support in Identify.
@@ -137,35 +143,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // WS-F F-6: shared leech-lockout table. Updated below on a byte-cap
+    // CircuitClosed; read by the LeechRateLimiter plugged into the relay config
+    // so a peer that blows its per-circuit budget is denied new
+    // reservations/circuits for a jittered 15-30 min window.
+    let leech_table = Arc::new(Mutex::new(LeechTable::new()));
+
     // Relay server — accepts reservations from NATted peers.
-    let relay_server = relay::Behaviour::new(
-        peer_id,
-        relay::Config {
+    let relay_server = relay::Behaviour::new(peer_id, {
+        let mut cfg = relay::Config {
             max_reservations: 256,
             max_circuits: 512,
             // Audit 4.1: 8 → 4. A free Ed25519 identity can hold up to this
             // many circuit slots; halving it doubles the identities an
             // attacker needs to squat all 512 slots. The single-host vector
-            // is closed by the per-IP firewall caps in network_limits.sh; a
-            // distributed (many-IP, many-identity) attacker is bounded by
-            // shortening the durations below once peer-side reservation
-            // renewal (Phase 3 F6) is verified working.
+            // is closed by the per-IP firewall caps in network_limits.sh.
             max_circuits_per_peer: 4,
-            // TODO(F6): drop to ~600-900s once B5 reservation renewal is
-            // fixed. Kept at 1 hour for now so legitimate long sessions over
-            // a relay do not lose their reservation while renewal is broken
-            // (renewal currently stacks listeners instead of refreshing).
+            // Durations stay at 1h until F-6 client-side circuit MIGRATION
+            // lands (lowering them without migration would cut long relayed
+            // inferences mid-session — F-5 renewal alone isn't enough; the
+            // active circuit itself must migrate). See SESSION_STATE F-6 #2/#3.
             reservation_duration: Duration::from_secs(3600),
-            // TODO(F6): lower toward ~24 MB (real legit ceiling is ~12 MB at
-            // 800 tokens) once renewal lets long sessions span circuits. At
-            // 64 MB × 512 circuits the relay can forward up to 32 GB
-            // (metered-transfer amplification).
-            max_circuit_bytes: 64 * 1024 * 1024,
-            // TODO(F6): shorten alongside reservation_duration.
+            // F-6: per-circuit token budget (WS-F decision, ~25k tokens at
+            // 8 KB/token). Generous for any real session; long sessions span
+            // circuits via migration. Abuse beyond this triggers the leech
+            // lockout below, so the higher ceiling no longer amplifies DoS.
+            max_circuit_bytes: PER_CIRCUIT_BUDGET_BYTES,
             max_circuit_duration: Duration::from_secs(3600),
             ..Default::default()
-        },
-    );
+        };
+        // F-6: deny reservations AND circuits from leech-locked peers. Two
+        // limiters share one table (built-in max_* still bound congestion).
+        cfg.reservation_rate_limiters
+            .push(Box::new(LeechRateLimiter::new(leech_table.clone())));
+        cfg.circuit_src_rate_limiters
+            .push(Box::new(LeechRateLimiter::new(leech_table.clone())));
+        cfg
+    });
 
     // AutoNAT reporter — responds to NAT probes from peers.
     //
@@ -316,6 +330,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ) => {
                                 active_circuits = active_circuits.saturating_sub(1);
                                 info!(%src_peer_id, %dst_peer_id, ?error, active_circuits, "relay circuit closed");
+                                // F-6 leech lockout: a circuit closed because it
+                                // blew the per-circuit byte budget = sustained
+                                // abuse → lock the source peer out (jittered
+                                // 15-30 min) so the LeechRateLimiter denies its
+                                // next reservations/circuits. Only this specific
+                                // error counts; normal closes don't penalize.
+                                if error
+                                    .as_ref()
+                                    .map(|e| e.to_string().contains(MAX_CIRCUIT_BYTES_ERROR))
+                                    .unwrap_or(false)
+                                {
+                                    let now = unix_secs_now();
+                                    if let Ok(mut t) = leech_table.lock() {
+                                        let until = t.record_cap_out(src_peer_id, now, wallclock_jitter_frac());
+                                        t.prune(now); // bound memory (cap-outs are rare)
+                                        warn!(
+                                            %src_peer_id, lockout_until = until,
+                                            "leech: circuit exceeded byte budget — locked out (F-6)"
+                                        );
+                                    }
+                                }
                             }
                             // Task 7.1: Relay server — circuit/reservation lifecycle
                             BootstrapBehaviourEvent::RelayServer(
