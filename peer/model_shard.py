@@ -17,6 +17,7 @@ import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+import gc
 import hashlib
 import logging
 import math
@@ -1787,6 +1788,21 @@ class PyTorchRuntime:
         # ── Model warmup (Phase W) ────────────────────────────────────────────
         if bool(getattr(config, "runtime_warmup_on_start", False)):
             self._warmup()
+
+        # Freeze the post-init heap into the permanent GC generation (mirrors
+        # the MLX runtime). The model's module/parameter objects are long-lived,
+        # so excluding them from every subsequent gc.collect() keeps per-token
+        # collections cheap (they only walk per-token garbage). Marginal on the
+        # CUDA path (weights are C-backed torch tensors) but harmless and
+        # consistent cross-backend.
+        try:
+            gc.freeze()
+            logging.debug(
+                "gc.freeze() applied after PyTorch model init (%d frozen)",
+                gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1,
+            )
+        except Exception:
+            pass
 
     def _warmup(self) -> None:
         """JIT-compile GPU kernels by running one tiny forward pass at startup.
