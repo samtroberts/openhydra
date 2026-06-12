@@ -1,8 +1,10 @@
 //! Swarm creation and configuration.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::Config as SwarmConfig;
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, Multiaddr, PeerId, Swarm,
@@ -10,6 +12,7 @@ use libp2p::{
 };
 
 use crate::behaviour::OpenHydraBehaviour;
+use crate::relay::{LeechRateLimiter, LeechTable, PER_CIRCUIT_BUDGET_BYTES};
 
 /// PR-3: the single topic that carries all swarm-wide events. Keeping one
 /// topic for v1 intentionally bounds the blast radius — future versions can
@@ -26,6 +29,10 @@ pub struct SwarmOptions {
     pub bootstrap_peers: Vec<(PeerId, Multiaddr)>,
     /// Protocol version string for Identify.
     pub protocol_version: String,
+    /// WS-F F-4: opt into being a temporary peer-relay (Circuit Relay v2 SERVER)
+    /// for NATted peers. Off by default — only publicly-reachable nodes that
+    /// explicitly opt in should enable it.
+    pub enable_peer_relay: bool,
 }
 
 impl Default for SwarmOptions {
@@ -39,6 +46,7 @@ impl Default for SwarmOptions {
             ],
             bootstrap_peers: Vec::new(),
             protocol_version: "openhydra/0.1.0".to_string(),
+            enable_peer_relay: false,
         }
     }
 }
@@ -47,7 +55,16 @@ impl Default for SwarmOptions {
 pub fn build_swarm(
     identity: &Identity,
     opts: SwarmOptions,
-) -> Result<(Swarm<OpenHydraBehaviour>, libp2p_stream::Control), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Swarm<OpenHydraBehaviour>,
+        libp2p_stream::Control,
+        // WS-F F-4: the peer-relay's leech table (None unless opted in), so the
+        // event loop can record byte-cap cap-outs into it.
+        Option<Arc<Mutex<LeechTable>>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let peer_id = identity.libp2p_peer_id;
     let keypair = identity.keypair.clone();
 
@@ -215,9 +232,39 @@ pub fn build_swarm(
     let stream = libp2p_stream::Behaviour::new();
     let stream_control = stream.new_control();
 
+    // WS-F F-4: optional peer-relay SERVER. Off unless opted in. When enabled,
+    // it enforces the SAME caps + F-6 leech lockout as the Linode bootstraps via
+    // the shared LeechTable (returned so the event loop can record cap-outs).
+    let (relay_server, peer_relay_leech): (Toggle<relay::Behaviour>, Option<Arc<Mutex<LeechTable>>>) =
+        if opts.enable_peer_relay {
+            let leech_table = Arc::new(Mutex::new(LeechTable::new()));
+            let server = relay::Behaviour::new(peer_id, {
+                let mut cfg = relay::Config {
+                    // Smaller caps than a bootstrap — a peer-relay is a helpful
+                    // bonus, not core infra; keep its resource exposure modest.
+                    max_reservations: 64,
+                    max_circuits: 128,
+                    max_circuits_per_peer: 4,
+                    reservation_duration: Duration::from_secs(3600),
+                    max_circuit_bytes: PER_CIRCUIT_BUDGET_BYTES,
+                    max_circuit_duration: Duration::from_secs(3600),
+                    ..Default::default()
+                };
+                cfg.reservation_rate_limiters
+                    .push(Box::new(LeechRateLimiter::new(leech_table.clone())));
+                cfg.circuit_src_rate_limiters
+                    .push(Box::new(LeechRateLimiter::new(leech_table.clone())));
+                cfg
+            });
+            (Toggle::from(Some(server)), Some(leech_table))
+        } else {
+            (Toggle::from(None), None)
+        };
+
     let behaviour = OpenHydraBehaviour {
         kademlia,
         relay_client,
+        relay_server,
         dcutr,
         autonat,
         identify,
@@ -238,5 +285,5 @@ pub fn build_swarm(
         swarm.listen_on(addr.clone())?;
     }
 
-    Ok((swarm, stream_control))
+    Ok((swarm, stream_control, peer_relay_leech))
 }
