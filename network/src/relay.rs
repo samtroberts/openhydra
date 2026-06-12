@@ -293,6 +293,60 @@ impl libp2p::relay::RateLimiter for LeechRateLimiter {
     }
 }
 
+/// F-6 client-side circuit-migration monitor (the DECISION core; the hot-path
+/// byte-attribution + the transparent `tensor_stream` cutover are wired in the
+/// event loop). A NATted peer keeps one monitor per active relay circuit,
+/// feeds it the bytes it pushes through that circuit, and acts on the returned
+/// [`MigrationAction`]: **pre-establish** a fresh circuit at 85 % of the budget
+/// (once), then **cut over** the in-flight inference onto it at 95 % and close
+/// the old one. The ring session (KV + ring state) is logically independent of
+/// the circuit, so it survives the transport swap once the stream re-opens.
+#[derive(Debug, Clone)]
+pub struct CircuitMonitor {
+    bytes_used: u64,
+    budget: u64,
+    /// Latched so `PreEstablish` is emitted exactly once per circuit (the
+    /// caller should reserve the fresh circuit a single time, not every chunk).
+    preestablished: bool,
+}
+
+impl CircuitMonitor {
+    pub fn new(budget: u64) -> Self {
+        Self { bytes_used: 0, budget: budget.max(1), preestablished: false }
+    }
+
+    /// A monitor sized to the standard [`PER_CIRCUIT_BUDGET_BYTES`].
+    pub fn with_default_budget() -> Self {
+        Self::new(PER_CIRCUIT_BUDGET_BYTES)
+    }
+
+    /// Account `n` bytes pushed through the circuit and return the action to
+    /// take. `PreEstablish` is returned at most once (latched); `Cutover` fires
+    /// on every call once ≥95 % so a missed cutover retries on the next chunk.
+    pub fn record_bytes(&mut self, n: u64) -> MigrationAction {
+        self.bytes_used = self.bytes_used.saturating_add(n);
+        match circuit_migration_action(self.bytes_used, self.budget) {
+            MigrationAction::Cutover => MigrationAction::Cutover,
+            MigrationAction::PreEstablish if !self.preestablished => {
+                self.preestablished = true;
+                MigrationAction::PreEstablish
+            }
+            _ => MigrationAction::Continue,
+        }
+    }
+
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
+    }
+
+    /// Reset after a successful cutover onto a fresh circuit (re-arms the
+    /// pre-establish latch for the next migration).
+    pub fn reset(&mut self) {
+        self.bytes_used = 0;
+        self.preestablished = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +465,34 @@ mod tests {
         assert_eq!(t.prune(2000), 1);     // p1 expired, p2 still locked
         assert_eq!(t.locked_count(), 1);
         assert!(t.is_locked(&p2, 2000) && !t.is_locked(&p1, 2000));
+    }
+
+    #[test]
+    fn test_circuit_monitor_preestablish_then_cutover() {
+        let budget = PER_CIRCUIT_BUDGET_BYTES;
+        let mut m = CircuitMonitor::new(budget);
+        // Push to ~50% — keep going.
+        assert_eq!(m.record_bytes(budget / 2), MigrationAction::Continue);
+        // Cross 85% — pre-establish ONCE.
+        assert_eq!(m.record_bytes(budget * 36 / 100), MigrationAction::PreEstablish);
+        // Still in the 85–95% band — latched, so Continue (don't re-reserve).
+        assert_eq!(m.record_bytes(1), MigrationAction::Continue);
+        // Cross 95% — cut over (fires every call while ≥95% so a missed cutover retries).
+        assert_eq!(m.record_bytes(budget * 10 / 100), MigrationAction::Cutover);
+        assert_eq!(m.record_bytes(0), MigrationAction::Cutover);
+        assert!(m.bytes_used() >= budget * 95 / 100);
+    }
+
+    #[test]
+    fn test_circuit_monitor_reset_rearms() {
+        let budget = PER_CIRCUIT_BUDGET_BYTES;
+        let mut m = CircuitMonitor::new(budget);
+        assert_eq!(m.record_bytes(budget * 90 / 100), MigrationAction::PreEstablish);
+        // After cutover onto a fresh circuit, reset re-arms the latch + counter.
+        m.reset();
+        assert_eq!(m.bytes_used(), 0);
+        assert_eq!(m.record_bytes(budget / 2), MigrationAction::Continue);
+        assert_eq!(m.record_bytes(budget * 40 / 100), MigrationAction::PreEstablish);
     }
 
     #[test]
