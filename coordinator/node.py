@@ -231,6 +231,18 @@ def main() -> None:
             "Repeat for multiple."
         ),
     )
+    parser.add_argument(
+        "--peer-relay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "WS-F F-4: opt into acting as a temporary Circuit Relay v2 server "
+            "for other peers (in addition to the production bootstrap relays). "
+            "Off by default — a public, well-connected node can enable this to "
+            "offload relay traffic from the bootstrap nodes. Leech lockout and "
+            "per-circuit byte budgets (F-6) apply automatically."
+        ),
+    )
 
     # --- Runtime ---
     parser.add_argument("--runtime-backend", default="auto",
@@ -725,17 +737,36 @@ def main() -> None:
             ]
             _p2p_bootstrap_extra = getattr(args, "p2p_bootstrap", None) or []
             _p2p_bootstrap = list(PRODUCTION_LIBP2P_BOOTSTRAP_PEERS) + _p2p_bootstrap_extra
-            _p2p_node = P2PNode(
+            _enable_peer_relay = bool(getattr(args, "peer_relay", False))
+            _p2p_kwargs = dict(
                 identity_key_path=args.identity_path,
                 listen_addrs=_p2p_listen,
                 bootstrap_peers=_p2p_bootstrap,
             )
+            if _enable_peer_relay:
+                # WS-F F-4 kwarg only exists in wheels built from the
+                # rust-network-remediation branch. Passing it to an older
+                # wheel raises TypeError — surface that as a clear failure
+                # rather than silently dropping the flag.
+                try:
+                    _p2p_node = P2PNode(**_p2p_kwargs, enable_peer_relay=True)
+                except TypeError:
+                    logger.error(
+                        "--peer-relay requested but the installed openhydra_network "
+                        "wheel does not support it — rebuild: cd network && "
+                        "maturin build --release && pip install --force-reinstall "
+                        "target/wheels/*.whl"
+                    )
+                    raise
+            else:
+                _p2p_node = P2PNode(**_p2p_kwargs)
             _p2p_node.start()
             logger.info(
-                "p2p_node_started libp2p_peer_id=%s openhydra_peer_id=%s listen=%s",
+                "p2p_node_started libp2p_peer_id=%s openhydra_peer_id=%s listen=%s peer_relay=%s",
                 _p2p_node.libp2p_peer_id,
                 _p2p_node.openhydra_peer_id,
                 _p2p_listen,
+                _enable_peer_relay,
             )
         except ImportError:
             logger.warning(
