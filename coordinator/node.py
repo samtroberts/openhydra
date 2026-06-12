@@ -678,6 +678,24 @@ def main() -> None:
         "Qwen/Qwen3.5-0.8B": "mlx-community/Qwen3.5-0.8B-4bit",
     }
     _runtime_model_id = args.runtime_model_id or args.model_id
+    # On MLX, a bare catalog model_id (e.g. "openhydra-qwen3.5-0.8b") must be
+    # resolved to the catalog's mlx_model_id fork (e.g.
+    # "mlx-community/Qwen3.5-0.8B-MLX-8bit") — mlx_lm.load() can't fetch the
+    # catalog id directly (404). Only when the operator didn't pass an explicit
+    # --runtime-model-id and the id isn't already an HF/mlx path.
+    if (
+        args.runtime_backend == "mlx"
+        and not args.runtime_model_id
+        and "/" not in _runtime_model_id
+    ):
+        from peer.model_catalog import resolve_mlx_model_id as _resolve_mlx
+        _mlx_id = _resolve_mlx(
+            args.model_id,
+            catalog_path=getattr(args, "model_catalog_path", None) or "models.catalog.json",
+        )
+        if _mlx_id:
+            logger.info("mlx_model_resolved: %s -> %s", _runtime_model_id, _mlx_id)
+            _runtime_model_id = _mlx_id
     if args.runtime_backend == "mlx" and _runtime_model_id in _MLX_4BIT_MAP:
         _runtime_model_id = _MLX_4BIT_MAP[_runtime_model_id]
         logger.info("mlx_4bit_upgrade: %s -> %s", args.model_id, _runtime_model_id)
