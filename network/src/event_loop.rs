@@ -389,6 +389,11 @@ impl SharedProxyQueue {
 struct LoopState {
     /// Cached NAT info from AutoNAT probes.
     nat_info: NatInfo,
+    /// F-9: whether outbound IPv6 actually works (one-shot startup probe).
+    /// When false, we skip dialing IPv6 addresses/relay circuits so a
+    /// v6-incapable or partial-v6 host doesn't burn dial timeouts on
+    /// unreachable `/ip6/` addresses learned via identify/Kademlia.
+    ipv6_capable: bool,
     /// Known peers from Kademlia queries, keyed by OpenHydra peer_id.
     known_peers: HashMap<String, PeerRecord>,
     /// Pending Kademlia GET queries: query_id → reply channel.
@@ -528,6 +533,7 @@ impl LoopState {
                 external_port: 0,
                 is_public: false,
             },
+            ipv6_capable: probe_ipv6_capable(),
             known_peers: HashMap::new(),
             pending_discovers: HashMap::new(),
             external_addrs: Vec::new(),
@@ -1551,6 +1557,14 @@ fn handle_swarm_event(
             if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
                 debug!(%peer_id, protocol = %info.protocol_version, "identify received");
                 for addr in &info.listen_addrs {
+                    // F-9: skip IPv6 peer addresses on a host with no working
+                    // IPv6 — adding them to the routing table only leads libp2p
+                    // to later dial unreachable `/ip6/` addresses and eat
+                    // connection timeouts. (Relay v6 circuits are `/ip6/` too,
+                    // and equally undialable without v6.)
+                    if !state.ipv6_capable && is_ipv6_multiaddr(addr) {
+                        continue;
+                    }
                     swarm
                         .behaviour_mut()
                         .kademlia
@@ -1562,13 +1576,20 @@ fn handle_swarm_event(
                 }
 
                 // Fix 2/4: cache QUIC IPv6 addresses and auto-dial for hole-punch.
-                let quic_v6_addrs: Vec<Multiaddr> = info.listen_addrs.iter()
-                    .filter(|a| {
-                        let s = a.to_string();
-                        s.contains("/quic") && s.contains("/ip6/") && !s.contains("p2p-circuit")
-                    })
-                    .cloned()
-                    .collect();
+                // F-9: on a host with no working IPv6, never collect (and thus
+                // never auto-dial) peer QUIC v6 addrs — those dials are the
+                // costly ones (QUIC handshake timeouts on unreachable v6).
+                let quic_v6_addrs: Vec<Multiaddr> = if !state.ipv6_capable {
+                    Vec::new()
+                } else {
+                    info.listen_addrs.iter()
+                        .filter(|a| {
+                            let s = a.to_string();
+                            s.contains("/quic") && s.contains("/ip6/") && !s.contains("p2p-circuit")
+                        })
+                        .cloned()
+                        .collect()
+                };
 
                 if !quic_v6_addrs.is_empty() {
                     state.peer_quic_addrs.insert(peer_id, quic_v6_addrs.clone());
@@ -2892,7 +2913,7 @@ fn handle_proxy_forward(
         // had actually reserved on, and never fell through to EU/AP. A single
         // multi-addr dial lets libp2p race all circuits and connect via
         // whichever one holds the target's reservation.
-        let circuit_addrs = relay_circuit_addrs(peer_id);
+        let circuit_addrs = relay_circuit_addrs(peer_id, state.ipv6_capable);
         match swarm.dial(relay_dial_opts(peer_id, circuit_addrs)) {
             Ok(()) => {
                 state.pending_relay_forwards.push((peer_id, data, reply));
@@ -2905,12 +2926,37 @@ fn handle_proxy_forward(
     }
 }
 
+/// True if a multiaddr contains an `/ip6/` component (F-9 gating).
+fn is_ipv6_multiaddr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip6(_)))
+}
+
+/// F-9: one-shot probe for working outbound IPv6. Binds the v6 wildcard and
+/// `connect`s a UDP socket to a global v6 address — this sets the default
+/// destination WITHOUT sending any packet, and the kernel returns
+/// `ENETUNREACH`/`EHOSTUNREACH` immediately when there is no usable v6 route
+/// (no-v6 hosts AND partial-v6 hosts where the address is assigned but
+/// unroutable). Traffic-free, dependency-free, ~instant.
+fn probe_ipv6_capable() -> bool {
+    use std::net::UdpSocket;
+    // 2606:4700:4700::1111 = Cloudflare DNS (stable global v6). Port is
+    // irrelevant for a connectionless UDP connect.
+    let ok = UdpSocket::bind("[::]:0")
+        .and_then(|s| s.connect("[2606:4700:4700::1111]:53"))
+        .is_ok();
+    info!(ipv6_capable = ok, "F-9: outbound IPv6 capability probe");
+    ok
+}
+
 /// Finding A helper: build a `/<relay>/p2p-circuit/p2p/<target>` multiaddr for
-/// every known bootstrap relay, so a single dial can race all of them.
-fn relay_circuit_addrs(peer_id: PeerId) -> Vec<Multiaddr> {
+/// every known bootstrap relay, so a single dial can race all of them. F-9:
+/// when the host has no working IPv6, drop the `/ip6/` relay circuits — dialing
+/// them would only burn timeouts on unreachable addresses.
+fn relay_circuit_addrs(peer_id: PeerId, ipv6_capable: bool) -> Vec<Multiaddr> {
     crate::relay::BOOTSTRAP_RELAYS
         .iter()
         .filter_map(|s| s.parse::<Multiaddr>().ok())
+        .filter(|relay| ipv6_capable || !is_ipv6_multiaddr(relay))
         .map(|relay| {
             relay
                 .with(libp2p::multiaddr::Protocol::P2pCircuit)
@@ -3004,7 +3050,7 @@ fn handle_proxy_forward_no_wait(
         info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing via relay");
         // Finding A: one multi-address dial across all relay circuits (see
         // handle_proxy_forward) instead of break-on-first-queued (always US).
-        match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(peer_id))) {
+        match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(peer_id, state.ipv6_capable))) {
             Ok(()) => {
                 let (dummy_tx, _dummy_rx) = oneshot::channel();
                 state.pending_relay_forwards.push((peer_id, data, dummy_tx));
@@ -3588,6 +3634,52 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_ipv6_multiaddr() {
+        // F-9: detect /ip6/ in plain and relay-circuit multiaddrs.
+        let v4: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
+        let v6: Multiaddr = "/ip6/2001:db8::1/tcp/4001".parse().unwrap();
+        let v4_circuit: Multiaddr =
+            "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"
+                .parse().unwrap();
+        let v6_circuit: Multiaddr =
+            "/ip6/2001:db8::1/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"
+                .parse().unwrap();
+        assert!(!is_ipv6_multiaddr(&v4));
+        assert!(is_ipv6_multiaddr(&v6));
+        assert!(!is_ipv6_multiaddr(&v4_circuit));
+        assert!(is_ipv6_multiaddr(&v6_circuit));
+    }
+
+    #[test]
+    fn test_relay_circuit_addrs_v6_gating() {
+        // F-9: BOOTSTRAP_RELAYS has both v4 and v6 entries per relay. With
+        // ipv6_capable=false the result must contain ZERO /ip6/ circuits;
+        // with =true it must contain at least one (proves we didn't drop them
+        // unconditionally). Every entry must be a p2p-circuit to the target.
+        let target: PeerId =
+            "12D3KooWRL36gMob4EcmXGb1wWd1HnzihPd8KBpiNdxF59kDUhCN".parse().unwrap();
+
+        let no_v6 = relay_circuit_addrs(target, false);
+        assert!(!no_v6.is_empty(), "should still have v4 relay circuits");
+        assert!(
+            no_v6.iter().all(|a| !is_ipv6_multiaddr(a)),
+            "ipv6_capable=false must drop all /ip6/ circuits",
+        );
+        assert!(
+            no_v6.iter().all(|a| a.iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))),
+            "every entry must be a p2p-circuit",
+        );
+
+        let with_v6 = relay_circuit_addrs(target, true);
+        assert!(with_v6.len() > no_v6.len(), "v6-capable yields more circuits");
+        assert!(
+            with_v6.iter().any(|a| is_ipv6_multiaddr(a)),
+            "ipv6_capable=true must keep /ip6/ circuits",
+        );
+    }
 
     #[test]
     fn test_connection_tier_classification() {
