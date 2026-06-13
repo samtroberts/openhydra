@@ -1967,10 +1967,24 @@ class InferenceService:
                 # When push mode is enabled and pipeline has relay peers,
                 # use the ring: coordinator kicks off one push, tokens
                 # circulate peer-to-peer, emitted into a queue in real-time.
+                # F-10: a SINGLE whole-model peer in pure-coordinator Path A
+                # (``--no-local-peer --sample-on-coordinator``) must also take
+                # the ring path. The ring is the only transport that sets
+                # ``sample_on_coordinator`` on the wire (chain.py:1345) AND
+                # head-samples the returned hidden state on the coordinator via
+                # the PushResult handler. The non-ring ``_step_*`` fallback below
+                # reads ``_step_result.activation[0]`` as a sampled token id, so
+                # it cannot consume a hidden-state response — routing a single
+                # peer there left ``request.sample_on_coordinator`` False on the
+                # peer (server.py:1942) and ran a full peer-side generation.
+                # ``run_push_ring`` already handles n==1 (empty next-hop; the
+                # sole peer is both first and last, returns hidden, coordinator
+                # re-injects).
+                _soc = bool(getattr(self.config, "sample_on_coordinator", False))
                 _use_ring = (
                     not _dflash_active
                     and self.config.push_mode_enabled
-                    and len(prep.primary_pipeline) >= 2
+                    and (len(prep.primary_pipeline) >= 2 or _soc)
                     and self.config.push_callback_address
                 )
                 if _use_ring:
