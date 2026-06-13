@@ -1,5 +1,5 @@
 {
-  "include": ["coordinator", "peer", "economy"],
+  "include": ["coordinator", "peer"],
   "typeCheckingMode": "basic",
   "reportMissingImports": true,
   "reportMissingTypeStubs": false,

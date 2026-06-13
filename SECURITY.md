@@ -55,7 +55,6 @@ Understanding OpenHydra's trust model helps scope what we consider in-scope vuln
 - **Peer gRPC service** — unauthenticated remote code execution, TLS bypass, KV cache poisoning, model-output manipulation
 - **DHT bootstrap** — Sybil attacks, peer table poisoning, geo-challenge bypass
 - **Cryptography** — Ed25519 signature bypass, AES-GCM nonce reuse, key material disclosure
-- **HYDRA token economy** — double-spend, unauthorized minting/burning, channel hijacking
 - **Verification system** — Mystery Shopper bypass, collusion between malicious peers to evade auditing
 - **Dependency vulnerabilities** — critical CVEs in `grpcio`, `cryptography`, `torch`, `transformers`
 
@@ -90,7 +89,6 @@ Any vulnerability in these constructions or their usage should be reported priva
 
 The following are **intentional design decisions**, not vulnerabilities:
 
-- The HYDRA ledger bridge runs in **mock mode** by default. No real on-chain settlement occurs until the Solidity contract is deployed and wired. See `coordinator/ledger_bridge.py`.
 - In `dev` deployment profile, API key authentication is **disabled by default**. Enable it with `--api-key` for any internet-facing deployment.
 - The speculative decoding draft model is a **toy model**. Predictions are deterministic and do not reflect real model capability.
 

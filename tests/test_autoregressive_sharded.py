@@ -142,14 +142,6 @@ def _make_infer_service(monkeypatch):
             penalized_peers=[],
         ),
     )
-    svc.ledger = SimpleNamespace(
-        spend=lambda client_id, amount: True,
-        earn=lambda peer_id, tokens_served: None,
-    )
-    svc.hydra = SimpleNamespace(
-        mint_for_inference=lambda **kw: None,
-    )
-
     return svc, calls
 
 
@@ -158,7 +150,7 @@ def _run_infer_autoregressive(svc, max_tokens: int) -> Any:
     the ``primary`` ``ChainResult`` built by that branch.
 
     We short-circuit after the branch builds primary via a patched
-    verification/ledger/response path so we don't have to stub the full
+    verification/response path so we don't have to stub the full
     response pipeline.
     """
     from coordinator.inference_service import InferenceService

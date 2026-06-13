@@ -55,7 +55,7 @@ except ImportError:
 _HISTORY_FILE = Path.home() / ".openhydra_history"
 
 _COMMANDS = [
-    "/chat", "/ask", "/status", "/balance", "/models",
+    "/chat", "/ask", "/status", "/models",
     "/model", "/session", "/compaction", "/help", "/exit", "/quit",
 ]
 
@@ -196,20 +196,6 @@ class OpenHydraShell(cmd.Cmd):
         print(f"  Peers      : {peers}")
         print(f"  Models     : {models}")
         print(f"  Replication: {replication}")
-
-    def do_balance(self, line: str) -> None:
-        """balance [client_id] — Show balance, stake, and rewards for a client."""
-        client_id = line.strip() or self._client_id
-        result = self._request("GET", f"/v1/account/balance?client_id={client_id}")
-        if not result:
-            return
-        if "error" in result:
-            print(f"Error: {json.dumps(result, indent=2)}")
-            return
-        print(f"  Client ID : {client_id}")
-        print(f"  Balance   : {result.get('balance', 'N/A')}")
-        print(f"  Stake     : {result.get('stake', 'N/A')}")
-        print(f"  Rewards   : {result.get('rewards', 'N/A')}")
 
     def do_models(self, line: str) -> None:
         """models — List available model IDs."""
@@ -403,7 +389,6 @@ if _USE_RICH:
                 "chat":       self._cmd_chat,
                 "ask":        self._cmd_ask,
                 "status":     self._cmd_status,
-                "balance":    self._cmd_balance,
                 "models":     self._cmd_models,
                 "model":      self._cmd_model,
                 "session":    self._cmd_session,
@@ -478,17 +463,6 @@ if _USE_RICH:
             print(f"  Models     : {models_val}")
             print(f"  Replication: {replication}")
 
-        def _cmd_balance(self, args: str) -> None:
-            client_id = args.strip() or self._client_id
-            result = self._request("GET", f"/v1/account/balance?client_id={client_id}")
-            if "error" in result:
-                print(f"\033[31merror: {result['error']}\033[0m")
-                return
-            print(f"  Client ID : {client_id}")
-            print(f"  Balance   : {result.get('balance', 'N/A')}")
-            print(f"  Stake     : {result.get('stake', 'N/A')}")
-            print(f"  Rewards   : {result.get('rewards', 'N/A')}")
-
         def _cmd_models(self, args: str) -> None:
             result = self._request("GET", "/v1/models")
             if "error" in result:
@@ -555,7 +529,6 @@ if _USE_RICH:
   /chat <message>        Send a chat message (streaming, session tracked)
   /ask <prompt>          Single completion (no session)
   /status                Network status summary
-  /balance [client_id]   Account balance
   /models                List all models (pretty table)
   /model <id>|clear      Set or clear active model
   /session reset|show    Manage current chat session
@@ -595,7 +568,7 @@ def main() -> None:
         "--api-key", default=None, help="API key (or OPENHYDRA_API_KEY env)"
     )
     parser.add_argument(
-        "--client-id", default="cli", help="Client ID for balance/economy"
+        "--client-id", default="cli", help="Client ID for requests"
     )
     parser.add_argument("--model", default=None, help="Default model to use")
     args = parser.parse_args()

@@ -29,9 +29,6 @@ dev = [
   "pytest-asyncio>=0.23",
   "pytest-cov>=5.0",
 ]
-postgres = [
-  "psycopg2-binary>=2.9,<3",
-]
 # Phase 2 KV cache compaction (arXiv:2602.16284 — Attention Matching) β fitting
 # via NNLS. Phase 1 works without it using the log-ratio fallback.
 kv-compaction = [

@@ -37,9 +37,6 @@ from coordinator.peer_selector import ScoredPeer, rank_peers
 from coordinator.replication_monitor import ReplicationMonitor
 from coordinator.speculative import DraftTokenModel, PyTorchDraftModel, select_verified_tokens, select_verified_token_ids
 from coordinator.transport import TransportConfig
-from coordinator.ledger_bridge import OpenHydraLedgerBridge
-from economy.barter import SqliteCreditLedger
-from economy.token import SqliteHydraTokenEconomy
 from grounding.client_rag import GroundingClient, GroundingConfig, inject_grounding
 from peer.crypto import required_layers_for_level
 from peer.model_shard import ModelShard
@@ -79,22 +76,7 @@ class EngineConfig:
     verification_qos_min_success_rate: float = 0.0
     seed: int = 7
     max_failovers_per_stage: int = 1
-    ledger_path: str = ".openhydra/credits.db"
-    barter_decay_per_day: float = 0.05
-    hydra_token_ledger_path: str = ".openhydra/hydra_tokens.db"
-    hydra_reward_per_1k_tokens: float = 1.0
-    hydra_slash_per_failed_verification: float = 0.0
-    hydra_channel_default_ttl_seconds: int = 900
-    hydra_channel_max_open_per_payer: int = 8
-    hydra_channel_min_deposit: float = 0.01
-    hydra_supply_cap: float = 69_000_000.0
-    hydra_ledger_bridge_mock_mode: bool = True
-    hydra_stake_priority_boost: float = 12.0
-    hydra_no_stake_penalty_events: int = 8
-    hydra_governance_daily_mint_rate: float = 250_000.0
-    hydra_governance_min_slash_penalty: float = 0.1
     health_store_path: str = ".openhydra/health.json"
-    database_url: str | None = None
     required_replicas: int = 3
     default_model: str = "openhydra-qwen3.5-0.8b"
     allow_dynamic_model_ids: bool = True
@@ -268,46 +250,6 @@ class CoordinatorEngine:
     def __init__(self, config: EngineConfig):
         self.config = config
 
-        # ── Ledger + economy core objects ──────────────────────────────────
-        if config.database_url:
-            from economy.postgres import PostgresCreditLedger, PostgresHydraTokenEconomy
-            self.ledger = PostgresCreditLedger(config.database_url, decay_per_day=config.barter_decay_per_day)
-            self.hydra = PostgresHydraTokenEconomy(
-                config.database_url,
-                channel_default_ttl_seconds=max(1, int(config.hydra_channel_default_ttl_seconds)),
-                channel_max_open_per_payer=max(1, int(config.hydra_channel_max_open_per_payer)),
-                channel_min_deposit=max(0.0, float(config.hydra_channel_min_deposit)),
-                supply_cap=max(0.0, float(config.hydra_supply_cap)),
-            )
-            logger.info("ledger_backend=postgres dsn=***")
-        else:
-            self.ledger = SqliteCreditLedger(config.ledger_path, decay_per_day=config.barter_decay_per_day)
-            self.hydra = SqliteHydraTokenEconomy(
-                config.hydra_token_ledger_path,
-                channel_default_ttl_seconds=max(1, int(config.hydra_channel_default_ttl_seconds)),
-                channel_max_open_per_payer=max(1, int(config.hydra_channel_max_open_per_payer)),
-                channel_min_deposit=max(0.0, float(config.hydra_channel_min_deposit)),
-                supply_cap=max(0.0, float(config.hydra_supply_cap)),
-            )
-            logger.info("ledger_backend=sqlite")
-
-        _recovery = self.hydra.recover()
-        logger.info(
-            "ledger_recovery open_channels=%d expired=%d accounts=%d minted=%.2f burned=%.2f",
-            int(_recovery["open_channels"]), int(_recovery["expired_on_recovery"]),
-            int(_recovery["total_accounts"]), float(_recovery["total_minted"]),
-            float(_recovery["total_burned"]),
-        )
-
-        self.ledger_bridge = OpenHydraLedgerBridge(
-            mock_mode=bool(config.hydra_ledger_bridge_mock_mode),
-            supply_cap=max(0.0, float(config.hydra_supply_cap)),
-            daily_mint_rate=max(0.0, float(config.hydra_governance_daily_mint_rate)),
-            min_slash_penalty=max(0.0, float(config.hydra_governance_min_slash_penalty)),
-            external_stake_resolver=self._hydra_stake_balance,
-            external_stake_slasher=self._hydra_slash_stake,
-        )
-
         # ── Infrastructure objects ─────────────────────────────────────────
         self.health = HealthScorer(config.health_store_path)
         self.replication_monitor = ReplicationMonitor(required_replicas=config.required_replicas)
@@ -347,7 +289,6 @@ class CoordinatorEngine:
         self._pytorch_draft_model_cache: dict[tuple[str, str], PyTorchDraftModel] = {}
         self._kv_affinity: dict[tuple[str, str], dict[str, Any]] = {}
         self._tokenizer_cache: dict[str, Any] = {}
-        self._channel_provider_spend: dict[str, dict[str, float]] = {}
         self._dht_peer_cache: dict[str, dict[str, Any]] = {}
         self._dht_peer_cache_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
@@ -378,7 +319,6 @@ class CoordinatorEngine:
             self._active_model_roster = [self.config.default_model]
 
         # ── Extracted services ─────────────────────────────────────────────
-        from coordinator.economy_service import EconomyService
         from coordinator.kv_affinity_service import KvAffinityService
         from coordinator.tokenization_service import TokenizationService
         from coordinator.health_service import HealthService
@@ -386,8 +326,6 @@ class CoordinatorEngine:
         from coordinator.pipeline_service import PipelineService
         from coordinator.status_service import StatusService
         from coordinator.inference_service import InferenceService
-
-        self._economy = EconomyService(ledger=self.ledger, hydra=self.hydra, ledger_bridge=self.ledger_bridge)
 
         self._kv_affinity_svc = KvAffinityService(config=self.config, kv_affinity=self._kv_affinity)
 
@@ -399,7 +337,7 @@ class CoordinatorEngine:
 
         self._health_svc = HealthService(
             health=self.health, config=self.config, replication_monitor=self.replication_monitor,
-            ledger_bridge=self.ledger_bridge, model_catalog=self.model_catalog,
+            model_catalog=self.model_catalog,
             normalize_peer_model=self._normalize_peer_model,
             required_replicas=self._required_replicas,
             role_for_peer=self._role_for_peer,
@@ -415,7 +353,7 @@ class CoordinatorEngine:
             _active_model_roster=self._active_model_roster, _request_log=self._request_log,
             model_catalog=self.model_catalog, catalogue_by_model=self.catalogue_by_model,
             degradation_policy=self.degradation_policy, replication_monitor=self.replication_monitor,
-            transport_config=self.transport_config, ledger_bridge=self.ledger_bridge,
+            transport_config=self.transport_config,
             role_thresholds=self.role_thresholds, _metrics_lock=self._metrics_lock,
             _dht_lookup_attempts=self._dht_lookup_attempts,
             _dht_lookup_successes=self._dht_lookup_successes,
@@ -433,7 +371,7 @@ class CoordinatorEngine:
             config=self.config, health=self.health, auto_scaler=self._auto_scaler,
             _active_model_roster=self._active_model_roster,
             _dht_peer_cache=self._dht_peer_cache, _dht_peer_cache_lock=self._dht_peer_cache_lock,
-            _request_log=self._request_log, ledger_bridge=self.ledger_bridge, hydra=self.hydra,
+            _request_log=self._request_log,
             _metrics_lock=self._metrics_lock, model_catalog=self.model_catalog,
             catalogue_by_model=self.catalogue_by_model, discovery_service=self._discovery_svc,
             replication_monitor=self.replication_monitor, role_thresholds=self.role_thresholds,
@@ -446,8 +384,7 @@ class CoordinatorEngine:
         self._inference_svc = InferenceService(
             config=self.config, discovery_service=self._discovery_svc,
             pipeline_service=self._pipeline_svc, kv_affinity_service=self._kv_affinity_svc,
-            health=self.health, ledger=self.ledger, hydra=self.hydra,
-            ledger_bridge=self.ledger_bridge, verifier=self.verifier,
+            health=self.health, verifier=self.verifier,
             draft_model=self.draft_model, grounding_client=self.grounding_client,
             replication_monitor=self.replication_monitor, transport_config=self.transport_config,
             _metrics_lock=self._metrics_lock,
@@ -469,29 +406,6 @@ class CoordinatorEngine:
     # ══════════════════════════════════════════════════════════════════════
     # Kept: helpers used by __init__ (called before services exist)
     # ══════════════════════════════════════════════════════════════════════
-
-    def _hydra_stake_balance(self, pubkey: str) -> float:
-        """Return the staked HYDRA balance for a public key (0.0 on error)."""
-        try:
-            snapshot = self.hydra.account_snapshot(pubkey)
-        except RuntimeError:
-            return 0.0
-        return max(0.0, float(snapshot.get("stake", 0.0)))
-
-    def _hydra_slash_stake(self, pubkey: str, amount: float) -> float:
-        """Slash up to ``amount`` staked tokens from a peer (0.0 on error)."""
-        requested = max(0.0, float(amount))
-        if requested <= 0.0:
-            return 0.0
-        available = self._hydra_stake_balance(pubkey)
-        if available <= 0.0:
-            return 0.0
-        slash_amount = min(available, requested)
-        try:
-            payload = self.hydra.slash(peer_id=pubkey, amount=slash_amount)
-        except RuntimeError:
-            return 0.0
-        return max(0.0, float(payload.get("slashed", 0.0)))
 
     def _load_model_catalog(self) -> list[ModelAvailability]:
         """Load the model catalog from JSON or create a single-model default."""
@@ -969,75 +883,9 @@ class CoordinatorEngine:
         return self._status_svc.metrics_snapshot()
 
     # ══════════════════════════════════════════════════════════════════════
-    # Facade delegates: EconomyService
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _record_channel_provider_spend(self, channel_id: str, provider_peer_id: str, amount: float) -> None:
-        """Delegate to EconomyService."""
-        self._economy._record_channel_provider_spend(channel_id, provider_peer_id, amount)
-
-    def _set_channel_payee_spend(self, channel_id: str, payee_peer_id: str, total_spent: float) -> None:
-        """Delegate to EconomyService."""
-        self._economy._set_channel_payee_spend(channel_id, payee_peer_id, total_spent)
-
-    def _bridge_settle_channel_close(self, close_payload: dict[str, Any]) -> dict[str, Any]:
-        """Delegate to EconomyService."""
-        return self._economy._bridge_settle_channel_close(close_payload)
-
-    def account_balance(self, client_id: str) -> dict[str, Any]:
-        """Return combined barter + HYDRA balance. Delegate to EconomyService."""
-        return self._economy.account_balance(client_id)
-
-    def hydra_status(self) -> dict[str, Any]:
-        """Return HYDRA economy summary. Delegate to EconomyService."""
-        return self._economy.hydra_status()
-
-    def hydra_account(self, client_id: str) -> dict[str, Any]:
-        """Return HYDRA account snapshot. Delegate to EconomyService."""
-        return self._economy.hydra_account(client_id)
-
-    def hydra_governance_params(self) -> dict[str, Any]:
-        """Return governance parameters. Delegate to EconomyService."""
-        return self._economy.hydra_governance_params()
-
-    def hydra_governance_vote(self, pubkey: str, proposal_id: str, vote: str) -> dict[str, Any]:
-        """Submit a governance vote. Delegate to EconomyService."""
-        return self._economy.hydra_governance_vote(pubkey, proposal_id, vote)
-
-    def hydra_transfer(self, from_client_id: str, to_client_id: str, amount: float) -> dict[str, Any]:
-        """Transfer HYDRA tokens. Delegate to EconomyService."""
-        return self._economy.hydra_transfer(from_client_id, to_client_id, amount)
-
-    def hydra_stake(self, client_id: str, amount: float) -> dict[str, Any]:
-        """Stake HYDRA tokens. Delegate to EconomyService."""
-        return self._economy.hydra_stake(client_id, amount)
-
-    def hydra_unstake(self, client_id: str, amount: float) -> dict[str, Any]:
-        """Unstake HYDRA tokens. Delegate to EconomyService."""
-        return self._economy.hydra_unstake(client_id, amount)
-
-    def hydra_open_channel(self, channel_id: str, payer: str, payee: str, deposit: float, ttl_seconds: int | None = None) -> dict[str, Any]:
-        """Open a state channel. Delegate to EconomyService."""
-        return self._economy.hydra_open_channel(channel_id, payer, payee, deposit, ttl_seconds)
-
-    def hydra_charge_channel(self, channel_id: str, amount: float, provider_peer_id: str | None = None) -> dict[str, Any]:
-        """Charge a state channel. Delegate to EconomyService."""
-        return self._economy.hydra_charge_channel(channel_id, amount, provider_peer_id)
-
-    def hydra_reconcile_channel(self, channel_id: str, total_spent: float, nonce: int) -> dict[str, Any]:
-        """Reconcile a state channel. Delegate to EconomyService."""
-        return self._economy.hydra_reconcile_channel(channel_id, total_spent, nonce)
-
-    def hydra_close_channel(self, channel_id: str) -> dict[str, Any]:
-        """Close a state channel and settle. Delegate to EconomyService."""
-        return self._economy.hydra_close_channel(channel_id)
-
-    # ══════════════════════════════════════════════════════════════════════
     # Kept: close
     # ══════════════════════════════════════════════════════════════════════
 
     def close(self) -> None:
-        """Shut down all persistent resources (health store, ledgers)."""
+        """Shut down all persistent resources (health store)."""
         self.health.close()
-        self.ledger.close()
-        self.hydra.close()

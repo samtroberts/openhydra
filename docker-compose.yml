@@ -26,36 +26,12 @@ services:
     networks:
       - openhydra_net
 
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      - POSTGRES_DB=openhydra
-      - POSTGRES_USER=openhydra
-      - POSTGRES_PASSWORD=openhydra
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./ops/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
-    ports:
-      - "5432:5432"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U openhydra"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    networks:
-      - openhydra_net
-
   node:
     image: openhydra:latest
     entrypoint: []
     depends_on:
       bootstrap:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql://openhydra:openhydra@postgres:5432/openhydra
     command:
       - openhydra-node
       - --peer-id
@@ -135,4 +111,3 @@ networks:
 volumes:
   prometheus_data: {}
   grafana_data: {}
-  postgres_data: {}

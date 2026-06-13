@@ -19,7 +19,6 @@ OpenHydra is a peer-to-peer inference network that turns idle hardware into a gl
 - **No central server.** Every node is both client and server. The network is the computer.
 - **Auto-discovery.** Peers find each other via Kademlia DHT + mDNS. No IPs to configure.
 - **Privacy by default.** Onion routing + AES-256-GCM encryption + differential privacy. No peer sees your full query.
-- **Earn while you idle.** HYDRA tokens and barter credits for every request your node serves.
 
 ---
 
@@ -445,7 +444,7 @@ The libp2p layer itself (3 relay reservations accepted across US/EU/AP bootstrap
 Each node bundles two components in a single process:
 
 - **Peer** — a libp2p inference service that loads one model shard (or a full model) and announces itself to the Kademlia DHT. All tensor traffic (forward requests, push results, pings) flows over the native libp2p request/response protocol (`/openhydra/tensor/1.0.0`) via QUIC or TCP.
-- **Coordinator** — an OpenAI-compatible HTTP API that discovers peers, assembles inference pipelines, and manages verification + token economy.
+- **Coordinator** — an OpenAI-compatible HTTP API that discovers peers, assembles inference pipelines, and manages verification.
 
 ### Peer Discovery
 
@@ -531,10 +530,9 @@ Full catalog: [`models.catalog.json`](models.catalog.json)
 peer/              Inference engine: libp2p service, model shard, MLX/PyTorch runtimes,
                    KV compaction, request coalescing, P2P model cache, batching
 coordinator/       HTTP API, pipeline routing, chain failover, speculative decode,
-                   auto-scaler, verification, economy
+                   auto-scaler, verification
 network/           Rust libp2p networking layer (Kademlia, Circuit Relay, mDNS, PyO3)
 dht/               HTTP DHT bootstrap server
-economy/           Barter credits + HYDRA token + state channels (SQLite & Postgres)
 verification/      Mystery Shopper, redundant execution, auditor spot-checks
 ops/               Terraform, Docker Compose, Prometheus/Grafana, deploy scripts
 tests/             1100+ tests (unit + integration + API emulation)

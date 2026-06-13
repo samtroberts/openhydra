@@ -43,7 +43,7 @@ jobs:
       - name: Run tests with coverage
         run: |
           python -m pytest tests/ -q --tb=short \
-            --cov=coordinator --cov=peer --cov=economy --cov=dht \
+            --cov=coordinator --cov=peer --cov=dht \
             --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
             --cov-fail-under=60
@@ -90,7 +90,7 @@ jobs:
         continue-on-error: true
 
       - name: Type check (basic)
-        run: basedpyright coordinator/ peer/ economy/ --level basic
+        run: basedpyright coordinator/ peer/ --level basic
         continue-on-error: true
 
   # ── Security — dependency vulnerability scan ────────────────────────────────

@@ -20,9 +20,7 @@ def _engine_with_catalog(tmp_path):
         EngineConfig(
             peers_config_path="/tmp/unused.json",
             model_catalog_path=str(catalog_path),
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             audit_rate=0.0,
         )
     )
@@ -95,9 +93,7 @@ def test_engine_degrades_when_verification_qos_breached(tmp_path, monkeypatch):
         EngineConfig(
             peers_config_path="/tmp/unused.json",
             model_catalog_path=str(catalog_path),
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             audit_rate=0.0,
             verification_qos_min_events=2,
             verification_qos_min_success_rate=0.8,
@@ -159,9 +155,7 @@ def test_engine_raises_when_qos_breached_and_degradation_disabled(tmp_path, monk
         EngineConfig(
             peers_config_path="/tmp/unused.json",
             model_catalog_path=str(catalog_path),
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             audit_rate=0.0,
             verification_qos_min_events=1,
             verification_qos_min_success_rate=0.95,

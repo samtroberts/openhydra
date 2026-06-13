@@ -33,8 +33,6 @@ def _reset_bootstrap(ttl_seconds: int = 60) -> None:
     DhtBootstrapHandler.default_geo_max_rtt_ms = 50.0
     DhtBootstrapHandler.default_geo_challenge_seed = "openhydra-geo-dev-seed"
     DhtBootstrapHandler.default_expert_min_reputation_score = 60.0
-    DhtBootstrapHandler.default_expert_min_staked_balance = 0.01
-    DhtBootstrapHandler.default_expert_require_stake = True
     DhtBootstrapHandler._lookup_buckets = {}
     DhtBootstrapHandler._rebalance_hints = {}
 
@@ -75,7 +73,6 @@ def test_load_peers_from_dht_returns_endpoints():
                 "runtime_estimated_tokens_per_sec": 280.0,
                 "runtime_estimated_memory_mb": 640,
                 "reputation_score": 91.0,
-                "staked_balance": 0.5,
                 "expert_tags": ["vision", "CODE", "vision"],
                 "expert_layer_indices": [5, 1, -2, "x", 5],
                 "expert_router": True,
