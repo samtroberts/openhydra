@@ -149,6 +149,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reservations/circuits for a jittered 15-30 min window.
     let leech_table = Arc::new(Mutex::new(LeechTable::new()));
 
+    // Ops knob: allow overriding the per-circuit byte budget at runtime via
+    // OPENHYDRA_PER_CIRCUIT_BUDGET_BYTES (decimal bytes) without a rebuild.
+    // Defaults to the compiled PER_CIRCUIT_BUDGET_BYTES (200 MB). Lowering it
+    // is how the F-6 leech-lockout is validated against a live relay; unset
+    // (or set to 0) to restore the production cap. Values <= 0 / unparseable
+    // fall back to the default.
+    let per_circuit_budget_bytes: u64 = std::env::var("OPENHYDRA_PER_CIRCUIT_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(PER_CIRCUIT_BUDGET_BYTES);
+    if per_circuit_budget_bytes != PER_CIRCUIT_BUDGET_BYTES {
+        info!(
+            budget_bytes = per_circuit_budget_bytes,
+            default_bytes = PER_CIRCUIT_BUDGET_BYTES,
+            "per-circuit byte budget OVERRIDDEN via OPENHYDRA_PER_CIRCUIT_BUDGET_BYTES",
+        );
+    }
+
     // Relay server — accepts reservations from NATted peers.
     let relay_server = relay::Behaviour::new(peer_id, {
         let mut cfg = relay::Config {
@@ -168,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 8 KB/token). Generous for any real session; long sessions span
             // circuits via migration. Abuse beyond this triggers the leech
             // lockout below, so the higher ceiling no longer amplifies DoS.
-            max_circuit_bytes: PER_CIRCUIT_BUDGET_BYTES,
+            max_circuit_bytes: per_circuit_budget_bytes,
             max_circuit_duration: Duration::from_secs(3600),
             ..Default::default()
         };
