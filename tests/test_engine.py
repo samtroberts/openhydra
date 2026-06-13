@@ -10,10 +10,8 @@ def _engine(tmp_path):
     return CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -150,54 +148,6 @@ def test_extract_prompt_expert_layer_indices_parses_hints(tmp_path):
     assert layers == [8, 12]
 
 
-def test_priority_requires_credits_and_earns_for_serving(tmp_path, monkeypatch):
-    engine = _engine(tmp_path)
-
-    peer = PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=1)
-    health = [PeerHealth(peer=peer, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite")]
-
-    monkeypatch.setattr(
-        engine,
-        "_discover_for_model",
-        lambda requested_model, allow_degradation: (
-            health,
-            [peer],
-            type("Decision", (), {
-                "requested_model": requested_model,
-                "served_model": "openhydra-toy-345m",
-                "degraded": False,
-                "available": True,
-                "reason": "ok",
-                "detail": "ok",
-            })(),
-            {"openhydra-toy-345m": 1},
-        ),
-    )
-    monkeypatch.setattr(engine, "_select_pipeline", lambda candidates, pipeline_width=None: [peer])
-
-    def fake_run_chain(prompt, candidates, pipeline, max_tokens, request_id=None, deadline=None):
-        return ChainResult(
-            request_id=request_id or "r1",
-            text="Hydra output.",
-            activation=[0.1],
-            traces=[StageTrace(peer_id="peer-a", latency_ms=1.0, stage_index=0)],
-            latency_ms=5.0,
-        )
-
-    monkeypatch.setattr(engine, "_run_chain", fake_run_chain)
-
-    with pytest.raises(RuntimeError, match="insufficient_priority_credits"):
-        engine.infer(prompt="hello", priority=True, client_id="user-1")
-
-    engine.ledger.earn("user-1", tokens_served=1000)
-    payload = engine.infer(prompt="hello", priority=True, client_id="user-1", grounding=False)
-
-    assert payload["response"] == "Hydra output."
-    assert payload["replication"]["under_replicated"] is True
-    assert engine.ledger.balance("user-1") == pytest.approx(0.0, abs=1e-6)
-    assert engine.ledger.balance("peer-a") > 0.0
-
-
 def _wire_single_peer(monkeypatch, engine):
     peer = PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=1)
     peer_b = PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=2)
@@ -230,14 +180,12 @@ def test_infer_moe_geo_reorders_pipeline_for_requested_experts(tmp_path, monkeyp
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             moe_geo_enabled=True,
             moe_geo_min_tag_matches=1,
             dht_preferred_region="us-east",
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -342,13 +290,11 @@ def test_infer_moe_geo_reorders_pipeline_for_requested_layers(tmp_path, monkeypa
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             moe_geo_enabled=True,
             moe_geo_min_layer_matches=1,
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -447,12 +393,10 @@ def test_tier2_verification_uses_redundant_exec_rate(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=1.0,
             redundant_exec_rate=0.0,
             tier=2,
-            barter_decay_per_day=0.0,
         )
     )
     _wire_single_peer(monkeypatch, engine)
@@ -481,12 +425,10 @@ def test_tier1_verification_uses_audit_rate(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=1.0,
             redundant_exec_rate=0.0,
             tier=1,
-            barter_decay_per_day=0.0,
         )
     )
     _wire_single_peer(monkeypatch, engine)
@@ -515,12 +457,10 @@ def test_verification_feedback_updates_health_for_winner_and_loser(tmp_path, mon
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             tier=2,
             redundant_exec_rate=1.0,
             audit_rate=0.0,
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -579,13 +519,11 @@ def test_auditor_spotcheck_penalizes_only_divergent_tertiary(tmp_path, monkeypat
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             tier=2,
             redundant_exec_rate=1.0,
             auditor_rate=1.0,
             audit_rate=0.0,
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -690,13 +628,11 @@ def test_infer_stream_pipeline_parallel_prefetch_hits(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             pipeline_parallel_enabled=True,
             pipeline_parallel_workers=1,
-            barter_decay_per_day=0.0,
         )
     )
     _wire_single_peer(monkeypatch, engine)
@@ -741,13 +677,11 @@ def test_infer_stream_speculative_batches_and_accepts_mismatches(tmp_path, monke
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             speculative_enabled=True,
             speculative_draft_tokens=3,
-            barter_decay_per_day=0.0,
         )
     )
     _wire_single_peer(monkeypatch, engine)
@@ -797,7 +731,6 @@ def test_infer_stream_speculative_adaptive_batching(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
@@ -808,7 +741,6 @@ def test_infer_stream_speculative_adaptive_batching(tmp_path, monkeypatch):
             speculative_max_draft_tokens=4,
             speculative_acceptance_low_watermark=0.55,
             speculative_acceptance_high_watermark=0.80,
-            barter_decay_per_day=0.0,
         )
     )
     _wire_single_peer(monkeypatch, engine)
@@ -866,7 +798,6 @@ def test_run_chain_passes_tensor_autoencoder_config(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
@@ -875,7 +806,6 @@ def test_run_chain_passes_tensor_autoencoder_config(tmp_path, monkeypatch):
             advanced_encryption_enabled=True,
             advanced_encryption_seed="enc-seed",
             advanced_encryption_level="enhanced",
-            barter_decay_per_day=0.0,
         )
     )
 
@@ -953,13 +883,11 @@ def test_infer_stream_payload_includes_encryption_config(tmp_path, monkeypatch):
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
             redundant_exec_rate=0.0,
             advanced_encryption_enabled=True,
             advanced_encryption_level="maximum",
-            barter_decay_per_day=0.0,
         )
     )
     _wire_single_peer(monkeypatch, engine)
@@ -979,129 +907,3 @@ def test_infer_stream_payload_includes_encryption_config(tmp_path, monkeypatch):
     assert payload["encryption"]["enabled"] is True
     assert payload["encryption"]["level"] == "maximum"
     assert payload["encryption"]["layers_per_hop"] == 3
-
-
-def test_infer_mints_hydra_rewards_and_account_balance_includes_hydra(tmp_path, monkeypatch):
-    engine = CoordinatorEngine(
-        EngineConfig(
-            peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
-            hydra_token_ledger_path=str(tmp_path / "hydra_tokens.json"),
-            health_store_path=str(tmp_path / "health.json"),
-            audit_rate=0.0,
-            redundant_exec_rate=0.0,
-            hydra_reward_per_1k_tokens=2.0,
-            barter_decay_per_day=0.0,
-        )
-    )
-    _wire_single_peer(monkeypatch, engine)
-
-    def fake_run_chain(prompt, candidates, pipeline, max_tokens, request_id=None, deadline=None):
-        return ChainResult(
-            request_id=request_id or "r1",
-            text="Hydra output.",
-            activation=[0.1],
-            traces=[StageTrace(peer_id="peer-a", latency_ms=1.0, stage_index=0)],
-            latency_ms=5.0,
-        )
-
-    monkeypatch.setattr(engine, "_run_chain", fake_run_chain)
-    engine.infer(prompt="hello", max_tokens=5, grounding=False)
-
-    account = engine.account_balance("peer-a")
-    assert "hydra" in account
-    assert account["hydra"]["balance"] == 0.01
-
-    status = engine.network_status()
-    assert "hydra_economy" in status
-    assert status["hydra_economy"]["total_minted"] >= 0.01
-
-
-def test_verification_penalty_slashes_hydra_stake_when_enabled(tmp_path, monkeypatch):
-    engine = CoordinatorEngine(
-        EngineConfig(
-            peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
-            hydra_token_ledger_path=str(tmp_path / "hydra_tokens.json"),
-            health_store_path=str(tmp_path / "health.json"),
-            tier=2,
-            redundant_exec_rate=1.0,
-            audit_rate=0.0,
-            hydra_reward_per_1k_tokens=0.0,
-            hydra_slash_per_failed_verification=0.5,
-            barter_decay_per_day=0.0,
-        )
-    )
-
-    peer_a = PeerEndpoint(peer_id="peer-a", host="127.0.0.1", port=1)
-    peer_b = PeerEndpoint(peer_id="peer-b", host="127.0.0.1", port=2)
-    health = [
-        PeerHealth(peer=peer_a, healthy=True, latency_ms=10.0, load_pct=0.0, daemon_mode="polite"),
-        PeerHealth(peer=peer_b, healthy=True, latency_ms=11.0, load_pct=0.0, daemon_mode="polite"),
-    ]
-
-    monkeypatch.setattr(
-        engine,
-        "_discover_for_model",
-        lambda requested_model, allow_degradation: (
-            health,
-            [peer_a, peer_b],
-            type("Decision", (), {
-                "requested_model": requested_model,
-                "served_model": "openhydra-toy-345m",
-                "degraded": False,
-                "available": True,
-                "reason": "ok",
-                "detail": "ok",
-            })(),
-            {"openhydra-toy-345m": 2},
-        ),
-    )
-    monkeypatch.setattr(engine, "_select_pipeline", lambda candidates, pipeline_width=None: [candidates[0]])
-
-    def fake_run_chain(prompt, candidates, pipeline, max_tokens, request_id=None, deadline=None):
-        chosen = pipeline[0].peer_id
-        text = "alpha" if chosen == "peer-a" else "beta"
-        return ChainResult(
-            request_id=request_id or "r1",
-            text=text,
-            activation=[0.1],
-            traces=[StageTrace(peer_id=chosen, latency_ms=1.0, stage_index=0)],
-            latency_ms=5.0,
-        )
-
-    monkeypatch.setattr(engine, "_run_chain", fake_run_chain)
-    engine.hydra.mint_for_inference("peer-a", tokens_served=1000, reward_per_1k_tokens=1.0)
-    engine.hydra.stake("peer-a", 0.5)
-
-    payload = engine.infer(prompt="hello", grounding=False, pipeline_width=1)
-    assert payload["verification"]["audited"] is True
-    assert payload["verification"]["winner"] == "secondary"
-
-    slashed = engine.hydra.account_snapshot("peer-a")
-    assert slashed["stake"] == 0.0
-    assert slashed["slashed_total"] == 0.5
-
-
-def test_hydra_channel_policy_reflects_engine_config(tmp_path):
-    engine = CoordinatorEngine(
-        EngineConfig(
-            peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
-            hydra_token_ledger_path=str(tmp_path / "hydra_tokens.json"),
-            hydra_channel_default_ttl_seconds=123,
-            hydra_channel_max_open_per_payer=4,
-            hydra_channel_min_deposit=0.25,
-            health_store_path=str(tmp_path / "health.json"),
-            audit_rate=0.0,
-            redundant_exec_rate=0.0,
-            barter_decay_per_day=0.0,
-        )
-    )
-
-    summary = engine.hydra_status()["hydra"]
-    assert summary["channel_policy"] == {
-        "default_ttl_seconds": 123,
-        "max_open_per_payer": 4,
-        "min_deposit": 0.25,
-    }

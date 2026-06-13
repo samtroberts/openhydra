@@ -55,8 +55,6 @@ pub struct PeerRecord {
     // Reputation
     #[serde(default)]
     pub reputation_score: f64,
-    #[serde(default)]
-    pub staked_balance: f64,
 
     // Expert specialization
     #[serde(default)]
@@ -230,7 +228,6 @@ impl Default for PeerRecord {
             runtime_estimated_memory_mb: 0,
             privacy_noise_variance: 0.0,
             reputation_score: 0.0,
-            staked_balance: 0.0,
             expert_tags: Vec::new(),
             expert_layer_indices: Vec::new(),
             layer_start: 0,

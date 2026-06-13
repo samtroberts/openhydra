@@ -6,9 +6,7 @@ def test_network_status_includes_verification_feedback_by_model(tmp_path, monkey
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             required_replicas=1,
         )
     )
@@ -41,9 +39,7 @@ def test_network_status_emits_verification_degraded_alert(tmp_path, monkeypatch)
     engine = CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
-            barter_decay_per_day=0.0,
             required_replicas=1,
             verification_alert_min_events=3,
             verification_alert_min_success_rate=0.8,

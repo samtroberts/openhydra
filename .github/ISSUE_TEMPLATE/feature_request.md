@@ -19,7 +19,6 @@ Other solutions or features you've considered.
 - [ ] Coordinator (routing, API server, engine)
 - [ ] Peer (inference runtime, gRPC server)
 - [ ] DHT (peer discovery, bootstrap)
-- [ ] Economy (HYDRA tokens, ledger)
 - [ ] Desktop app (Tauri/React)
 - [ ] Documentation
 - [ ] Other

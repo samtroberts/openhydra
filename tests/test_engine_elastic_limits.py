@@ -16,10 +16,8 @@ def _make_engine(tmp_path):
     return CoordinatorEngine(
         EngineConfig(
             peers_config_path="/tmp/unused.json",
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             audit_rate=0.0,
-            barter_decay_per_day=0.0,
         )
     )
 

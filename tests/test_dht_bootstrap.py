@@ -38,8 +38,6 @@ def _reset_bootstrap(ttl_seconds: int = 60) -> None:
     DhtBootstrapHandler.default_geo_max_rtt_ms = 50.0
     DhtBootstrapHandler.default_geo_challenge_seed = "openhydra-geo-dev-seed"
     DhtBootstrapHandler.default_expert_min_reputation_score = 60.0
-    DhtBootstrapHandler.default_expert_min_staked_balance = 0.01
-    DhtBootstrapHandler.default_expert_require_stake = True
     DhtBootstrapHandler._lookup_buckets = {}
     DhtBootstrapHandler._rebalance_hints = {}
 
@@ -152,7 +150,6 @@ def test_bootstrap_announce_and_lookup_preserves_expert_metadata():
                 "host": "127.0.0.1",
                 "port": 50061,
                 "reputation_score": 92.0,
-                "staked_balance": 1.2,
                 "expert_tags": ["vision", "CODE", "vision"],
                 "expert_layer_indices": [7, 2, 7, -1, "x"],
                 "expert_router": True,
@@ -173,7 +170,7 @@ def test_bootstrap_announce_and_lookup_preserves_expert_metadata():
         thread.join(timeout=2.0)
 
 
-def test_bootstrap_rejects_expert_claim_for_low_reputation_or_unstaked_peer():
+def test_bootstrap_rejects_expert_claim_for_low_reputation_peer():
     _reset_bootstrap(ttl_seconds=60)
 
     try:
@@ -195,7 +192,6 @@ def test_bootstrap_rejects_expert_claim_for_low_reputation_or_unstaked_peer():
                 "host": "127.0.0.1",
                 "port": 50062,
                 "reputation_score": 20.0,
-                "staked_balance": 0.0,
                 "expert_tags": ["niche-finance"],
                 "expert_layer_indices": [10],
                 "expert_router": True,
@@ -207,7 +203,7 @@ def test_bootstrap_rejects_expert_claim_for_low_reputation_or_unstaked_peer():
         peer = data["peers"][0]
         assert peer["peer_id"] == "peer-lowrep"
         assert peer["expert_admission_approved"] is False
-        assert peer["expert_admission_reason"] in {"low_reputation", "unstaked_or_new"}
+        assert peer["expert_admission_reason"] == "low_reputation"
         assert peer["expert_tags"] == []
         assert peer["expert_layer_indices"] == []
         assert peer["expert_router"] is False

@@ -16,9 +16,8 @@ services:
   # coordinator service. nginx handles all inbound traffic; neither replica
   # exposes a port directly to the host.
   #
-  # Both replicas share the `openhydra_state` named volume so that the SQLite
-  # ledger files are readable by either instance (the application must use
-  # WAL mode or an equivalent locking strategy for concurrent access).
+  # Both replicas share the `openhydra_state` named volume so that the
+  # health-store file is readable by either instance.
   # ---------------------------------------------------------------------------
   coordinator-1:
     image: openhydra:latest
@@ -43,10 +42,6 @@ services:
       - --pipeline-width
       - "1"
       - --allow-degradation-default
-      - --ledger-path
-      - /data/credits.db
-      - --hydra-token-ledger-path
-      - /data/hydra_tokens.db
       - --health-store-path
       - /data/health.json
     volumes:
@@ -83,10 +78,6 @@ services:
       - --pipeline-width
       - "1"
       - --allow-degradation-default
-      - --ledger-path
-      - /data/credits.db
-      - --hydra-token-ledger-path
-      - /data/hydra_tokens.db
       - --health-store-path
       - /data/health.json
     volumes:
@@ -124,7 +115,7 @@ services:
       - openhydra_net
 
 # -----------------------------------------------------------------------------
-# Named volume shared by both coordinator replicas for SQLite ledger files
+# Named volume shared by both coordinator replicas for the health-store file
 # -----------------------------------------------------------------------------
 volumes:
   openhydra_state: {}

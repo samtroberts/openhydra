@@ -69,12 +69,10 @@ def _build_engine(tmp_path, port: int, model_name: str) -> CoordinatorEngine:
             default_model="openhydra-qwen3.5-0.8b",
             required_replicas=1,
             timeout_ms=15000,
-            ledger_path=str(tmp_path / "credits.json"),
             health_store_path=str(tmp_path / "health.json"),
             grounding_use_network=False,
             audit_rate=0.0,
             redundant_exec_rate=0.0,
-            barter_decay_per_day=0.0,
             pytorch_generation_model_id=model_name,
         )
     )

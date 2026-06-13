@@ -42,7 +42,6 @@ class TestFromDict:
             "privacy_noise_observed_variance_ema": 0.009,
             "privacy_noise_last_audit_tag": "abc123",
             "reputation_score": 85.0,
-            "staked_balance": 1000.0,
             "expert_tags": ["math", "code"],
             "expert_layer_indices": [0, 1, 2],
             "expert_router": True,

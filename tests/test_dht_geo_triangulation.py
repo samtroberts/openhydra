@@ -37,8 +37,6 @@ def _reset_geo_bootstrap(*, seed: str, max_rtt_ms: float) -> None:
     DhtBootstrapHandler.default_geo_max_rtt_ms = float(max_rtt_ms)
     DhtBootstrapHandler.default_geo_challenge_seed = seed
     DhtBootstrapHandler.default_expert_min_reputation_score = 60.0
-    DhtBootstrapHandler.default_expert_min_staked_balance = 0.01
-    DhtBootstrapHandler.default_expert_require_stake = True
     DhtBootstrapHandler._lookup_buckets = {}
     DhtBootstrapHandler._rebalance_hints = {}
 

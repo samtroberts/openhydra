@@ -85,7 +85,6 @@ make test
 | Extra | Command | Purpose |
 |---|---|---|
 | KV compaction research | `pip install -e ".[kv-compaction]"` | transformers + scipy for Phase 1–4 |
-| PostgreSQL ledger | `pip install -e ".[postgres]"` | psycopg2 for production ledger backend |
 | Interactive shell | `pip install -e ".[shell]"` | prompt_toolkit for `openhydra-shell` |
 
 ---
@@ -97,7 +96,7 @@ make test
 python -m pytest tests/ -q
 
 # With coverage report
-python -m pytest tests/ --cov=coordinator --cov=peer --cov=economy --cov=dht
+python -m pytest tests/ --cov=coordinator --cov=peer --cov=dht
 
 # Full suite including real-tensor tests (requires PyTorch + HF model download)
 OPENHYDRA_RUN_REAL_TENSOR_TEST=1 python -m pytest tests/ -q
