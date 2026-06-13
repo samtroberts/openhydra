@@ -1570,7 +1570,10 @@ fn handle_swarm_event(
                         .kademlia
                         .add_address(&peer_id, addr.clone());
                 }
-                if !info.observed_addr.to_string().is_empty() {
+                if !info.observed_addr.to_string().is_empty()
+                    && (state.ipv6_capable || !is_ipv6_multiaddr(&info.observed_addr))
+                {
+                    // F-9: don't advertise a v6 external addr we can't serve.
                     debug!(addr = %info.observed_addr, "adding observed addr as external");
                     swarm.add_external_address(info.observed_addr);
                 }
@@ -1848,7 +1851,10 @@ fn handle_swarm_event(
             // DCUtR candidate set for same-LAN peers (where they *are* the
             // right answer). Reachable public addresses get confirmed via
             // ``ExternalAddrConfirmed`` and light up the DCUtR hot path.
-            if is_direct_listen_candidate(&address) {
+            if is_direct_listen_candidate(&address)
+                && (state.ipv6_capable || !is_ipv6_multiaddr(&address))
+            {
+                // F-9: don't advertise a v6 external addr we can't serve.
                 debug!(%address, "registering direct listen addr as external");
                 swarm.add_external_address(address.clone());
             }
@@ -2927,7 +2933,7 @@ fn handle_proxy_forward(
 }
 
 /// True if a multiaddr contains an `/ip6/` component (F-9 gating).
-fn is_ipv6_multiaddr(addr: &Multiaddr) -> bool {
+pub(crate) fn is_ipv6_multiaddr(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip6(_)))
 }
 
@@ -2937,7 +2943,7 @@ fn is_ipv6_multiaddr(addr: &Multiaddr) -> bool {
 /// `ENETUNREACH`/`EHOSTUNREACH` immediately when there is no usable v6 route
 /// (no-v6 hosts AND partial-v6 hosts where the address is assigned but
 /// unroutable). Traffic-free, dependency-free, ~instant.
-fn probe_ipv6_capable() -> bool {
+pub(crate) fn probe_ipv6_capable() -> bool {
     use std::net::UdpSocket;
     // 2606:4700:4700::1111 = Cloudflare DNS (stable global v6). Port is
     // irrelevant for a connectionless UDP connect.
