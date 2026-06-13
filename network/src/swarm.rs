@@ -280,8 +280,17 @@ pub fn build_swarm(
 
     let mut swarm = Swarm::new(combined_transport, behaviour, peer_id, swarm_config);
 
-    // Listen on configured addresses.
+    // Listen on configured addresses. F-9 cross-peer half: on a host with no
+    // working IPv6, do NOT listen on /ip6/ addresses — otherwise we'd advertise
+    // (via identify listen_addrs) v6 addresses we can't actually serve, leading
+    // remote peers to waste dial timeouts on our unreachable v6. "Don't
+    // advertise what you can't serve" — mirrors the F-9 dial-side gating.
+    let ipv6_capable = crate::event_loop::probe_ipv6_capable();
     for addr in &opts.listen_addrs {
+        if !ipv6_capable && crate::event_loop::is_ipv6_multiaddr(addr) {
+            tracing::info!(%addr, "F-9: skipping IPv6 listen addr (no working outbound IPv6)");
+            continue;
+        }
         swarm.listen_on(addr.clone())?;
     }
 
