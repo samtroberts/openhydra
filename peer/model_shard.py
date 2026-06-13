@@ -3726,6 +3726,16 @@ class PyTorchRuntime:
                 and is_last
                 and self.total_layers > 0
                 and len(self.layer_indices) == self.total_layers
+                # Path A: when the coordinator wants the raw hidden state
+                # (``return_hidden_state``), the optimized full-model forward is
+                # the WRONG path — it runs ``self._model(**kwargs)`` which always
+                # applies final_norm + lm_head and yields logits/a sampled token,
+                # never the [seq, hidden] pre-head state the coordinator's
+                # StandaloneHead needs (it produced an empty payload →
+                # ``invalid_hidden_payload: too short``). Fall through to the
+                # manual layer path below, which already emits the hidden via
+                # ``_hidden_to_payload`` (same code the sharded last stage uses).
+                and not return_hidden_state
             )
             if full_model_stage:
                 input_ids = self._activation_to_input_ids(activation, prompt, max_tokens)
