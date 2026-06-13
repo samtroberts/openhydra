@@ -2884,30 +2884,53 @@ fn handle_proxy_forward(
         state.pending_proxy.insert(req_id, reply);
     } else {
         info!(%peer_id, "proxy_forward: peer not connected, dialing via relay");
-        let mut dialed = false;
-        for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-            if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
-                let circuit_addr = relay_multiaddr
-                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
-                    .with(libp2p::multiaddr::Protocol::P2p(peer_id));
-                info!(%peer_id, addr = %circuit_addr, "dialing peer through relay");
-                match swarm.dial(circuit_addr) {
-                    Ok(_) => {
-                        dialed = true;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(%peer_id, error=%e, "relay dial failed, trying next");
-                    }
-                }
+        // Finding A: dial the peer ONCE via every bootstrap-relay circuit as a
+        // multi-address DialOpts, instead of looping and breaking on the first
+        // swarm.dial()==Ok. swarm.dial() returns Ok the instant the dial is
+        // *enqueued*, not when it connects — so the old break-on-first always
+        // picked BOOTSTRAP_RELAYS[0] (US) regardless of which relay the target
+        // had actually reserved on, and never fell through to EU/AP. A single
+        // multi-addr dial lets libp2p race all circuits and connect via
+        // whichever one holds the target's reservation.
+        let circuit_addrs = relay_circuit_addrs(peer_id);
+        match swarm.dial(relay_dial_opts(peer_id, circuit_addrs)) {
+            Ok(()) => {
+                state.pending_relay_forwards.push((peer_id, data, reply));
+            }
+            Err(e) => {
+                warn!(%peer_id, error=%e, "proxy_forward: relay dial failed");
+                let _ = reply.send(Err("proxy_forward: relay dial failed".into()));
             }
         }
-        if dialed {
-            state.pending_relay_forwards.push((peer_id, data, reply));
-        } else {
-            let _ = reply.send(Err("proxy_forward: no relay dial succeeded".into()));
-        }
     }
+}
+
+/// Finding A helper: build a `/<relay>/p2p-circuit/p2p/<target>` multiaddr for
+/// every known bootstrap relay, so a single dial can race all of them.
+fn relay_circuit_addrs(peer_id: PeerId) -> Vec<Multiaddr> {
+    crate::relay::BOOTSTRAP_RELAYS
+        .iter()
+        .filter_map(|s| s.parse::<Multiaddr>().ok())
+        .map(|relay| {
+            relay
+                .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                .with(libp2p::multiaddr::Protocol::P2p(peer_id))
+        })
+        .collect()
+}
+
+/// Finding A helper: a single multi-address dial to `peer_id` over the given
+/// relay-circuit addresses. `PeerCondition::Disconnected` so we only dial when
+/// there is no established connection (we're in the not-connected branch).
+fn relay_dial_opts(
+    peer_id: PeerId,
+    addrs: Vec<Multiaddr>,
+) -> libp2p::swarm::dial_opts::DialOpts {
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    DialOpts::peer_id(peer_id)
+        .condition(PeerCondition::Disconnected)
+        .addresses(addrs)
+        .build()
 }
 
 /// Fire-and-forget variant of handle_proxy_forward.
@@ -2979,28 +3002,16 @@ fn handle_proxy_forward_no_wait(
             .send_request(&peer_id, ProxyRequest(data));
     } else {
         info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing via relay");
-        let mut dialed = false;
-        for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-            if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
-                let circuit_addr = relay_multiaddr
-                    .with(libp2p::multiaddr::Protocol::P2pCircuit)
-                    .with(libp2p::multiaddr::Protocol::P2p(peer_id));
-                match swarm.dial(circuit_addr) {
-                    Ok(_) => {
-                        dialed = true;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(%peer_id, error=%e, "no_wait relay dial failed, trying next");
-                    }
-                }
+        // Finding A: one multi-address dial across all relay circuits (see
+        // handle_proxy_forward) instead of break-on-first-queued (always US).
+        match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(peer_id))) {
+            Ok(()) => {
+                let (dummy_tx, _dummy_rx) = oneshot::channel();
+                state.pending_relay_forwards.push((peer_id, data, dummy_tx));
             }
-        }
-        if dialed {
-            let (dummy_tx, _dummy_rx) = oneshot::channel();
-            state.pending_relay_forwards.push((peer_id, data, dummy_tx));
-        } else {
-            warn!(%peer_id, "proxy_forward_no_wait: no relay dial succeeded — data dropped");
+            Err(e) => {
+                warn!(%peer_id, error=%e, "proxy_forward_no_wait: relay dial failed — data dropped");
+            }
         }
     }
 }
