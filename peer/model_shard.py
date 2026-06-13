@@ -1748,41 +1748,61 @@ class PyTorchRuntime:
                 _gpu_prof.get("compute_capability"), _gpu_prof.get("arch"),
             )
         if _dev_type == "cuda" and not _has_offload and _triton_capable:
-            try:
-                _compile_fn = getattr(self._torch, "compile", None)
-                if callable(_compile_fn):
-                    # P8: Use mode="default" (Triton codegen) instead of
-                    # "reduce-overhead" (CUDA Graphs). Qwen3.5's dynamic
-                    # KV cache + hybrid Mamba layers cause graph breaks on
-                    # every decode step, so CUDA Graphs never capture —
-                    # "reduce-overhead" adds JIT cost with zero benefit.
-                    # "default" fuses ops via Triton without requiring
-                    # fixed tensor shapes.
-                    # ``dynamic=True``: autoregressive decode changes the
-                    # sequence/cache shapes every step (input_ids [1,1] but a
-                    # growing past_len → growing attention_mask / position_ids /
-                    # cache_position). With static specialization dynamo
-                    # recompiles on each new length and quickly hits
-                    # ``config.recompile_limit (8)`` — ~80 s/token of JIT churn
-                    # (observed on the single-node 4B decode). A single
-                    # dynamic-shape graph compiles ~once and serves every decode
-                    # length. This is the PyTorch analog of the MLX
-                    # KV-prealloc fix (WS-C#1) that killed mx.compile recompiles.
-                    self._model = _compile_fn(
-                        self._model,
-                        mode="default",
-                        fullgraph=False,
-                        dynamic=True,
-                    )
-                    self._torch_compiled = True
-                    logging.info(
-                        "torch_compile: enabled mode=default dynamic=True device=%s",
-                        self._device,
-                    )
-            except Exception as _compile_exc:
+            _compile_fn = getattr(self._torch, "compile", None)
+            if callable(_compile_fn):
+                # P9: ASYNC torch.compile (serve eager, swap when warm).
+                #
+                # mode="default" (Triton codegen, not "reduce-overhead" CUDA
+                # Graphs — Qwen3.5's dynamic KV cache + hybrid Mamba break graph
+                # capture) + dynamic=True (one dynamic-shape graph serves every
+                # decode length instead of recompiling per length → hitting
+                # recompile_limit). See P4–P8 history.
+                #
+                # WHY ASYNC: the FIRST forward of a freshly compiled model pays
+                # the full dynamo-trace + inductor-codegen cost — measured
+                # ~196 s on a Tesla T4 / torch 2.12 (GPU 0 % the whole time:
+                # CPU-bound graph compilation, not math). Done synchronously,
+                # that 196 s lands on the first real request, blowing past the
+                # coordinator's 120 s ring timeout → every cold Path-A request
+                # fails (root-caused 2026-06-13). Instead we keep serving EAGER
+                # immediately and compile + warm up in a background daemon
+                # thread, then atomically swap the model handle in. The swap is
+                # a single attribute assignment (atomic under the GIL); a
+                # forward reads ``self._model`` once per call and gets a
+                # consistent eager-or-compiled model. The warm-up forward runs
+                # the SAME underlying nn.Modules as any concurrent eager
+                # request, but both are eval()/no_grad read-only over shared
+                # weights with no shared KV session, so neither mutates the
+                # other's state.
+                def _async_compile_and_swap(_fn=_compile_fn):
+                    try:
+                        _compiled = _fn(
+                            self._model,
+                            mode="default",
+                            fullgraph=False,
+                            dynamic=True,
+                        )
+                        self._warmup_compiled_model(_compiled)
+                        self._model = _compiled  # atomic swap-in
+                        self._torch_compiled = True
+                        logging.info(
+                            "torch_compile: async warm-up complete — compiled "
+                            "model swapped in (device=%s)", self._device,
+                        )
+                    except Exception as _compile_exc:
+                        logging.info(
+                            "torch_compile: async compile failed — staying "
+                            "eager: %s", _compile_exc,
+                        )
+                import threading as _compile_threading
+                _compile_threading.Thread(
+                    target=_async_compile_and_swap,
+                    name="oh-torch-compile",
+                    daemon=True,
+                ).start()
                 logging.info(
-                    "torch_compile: skipped — %s (falling back to eager mode)",
-                    _compile_exc,
+                    "torch_compile: compiling in background (mode=default "
+                    "dynamic=True); serving eager until warm",
                 )
 
         # ── Model warmup (Phase W) ────────────────────────────────────────────
@@ -1874,6 +1894,37 @@ class PyTorchRuntime:
         except Exception:
             pass
         return 0.0
+
+    def _warmup_compiled_model(self, compiled_model: Any) -> None:
+        """Trigger torch.compile's one-time dynamo+inductor compilation by
+        running a representative dummy forward.
+
+        Called from the async-compile background thread (see the P9 block in
+        the loader) so the ~196 s compile cost is paid off the request path.
+        Mirrors the cold full-model forward shape (single-token, ``use_cache``,
+        plus a llama-family attention mask) so the warmed graph serves real
+        Path-A requests. Runs eval()/no_grad, no KV session — read-only over
+        the shared weights, safe alongside a concurrent eager request.
+        """
+        import time as _time
+        import torch
+        _dev = self._device
+        ids = torch.ones((1, 1), dtype=torch.long, device=_dev)
+        kw: dict[str, Any] = {"input_ids": ids, "use_cache": True}
+        if self._decoder_family in {"llama", "qwen_llama"}:
+            kw["attention_mask"] = torch.ones((1, 1), dtype=torch.bool, device=_dev)
+        _t0 = _time.perf_counter()
+        with torch.no_grad():
+            compiled_model(**kw)
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        logging.info(
+            "torch_compile: warm-up forward completed in %.1fs",
+            _time.perf_counter() - _t0,
+        )
 
     def _patch_depthwise_conv1d_t4_fallback(self) -> None:
         """Wrap every depthwise ``nn.Conv1d`` in the model with a fallback
