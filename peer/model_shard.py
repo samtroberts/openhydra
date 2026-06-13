@@ -1747,7 +1747,28 @@ class PyTorchRuntime:
                 "(needs cc>=7.0); using eager mode",
                 _gpu_prof.get("compute_capability"), _gpu_prof.get("arch"),
             )
-        if _dev_type == "cuda" and not _has_offload and _triton_capable:
+        # P10: torch.compile is OFF by default. Live validation on a Tesla T4
+        # (2026-06-13) showed the compiled Qwen3.5 model is NET-NEGATIVE for real
+        # autoregressive inference: with the hybrid Mamba layers + a growing
+        # DynamicCache, the decode forward's shape changes every token
+        # (past_len++), so torch.compile RECOMPILES per step even with
+        # dynamic=True — hitting the recompile_limit churn. Observed: eager
+        # completes a 24-token generation in ~73s, but the COMPILED model never
+        # completes it (per-step `deadline_exceeded` recompiles, GPU 0%, request
+        # times out > 240s). The async swap (P9) correctly moves the first
+        # compile off the request path, but the underlying compiled graph is the
+        # problem. So default to eager (correct + actually completes); set
+        # OPENHYDRA_TORCH_COMPILE=1 only to experiment.
+        _compile_opt_in = os.environ.get("OPENHYDRA_TORCH_COMPILE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if _dev_type == "cuda" and not _has_offload and _triton_capable and not _compile_opt_in:
+            logging.info(
+                "torch_compile: DISABLED by default (eager) — compiled Qwen3.5 "
+                "recompiles per decode step and breaks autoregressive inference; "
+                "set OPENHYDRA_TORCH_COMPILE=1 to opt in",
+            )
+        if _dev_type == "cuda" and not _has_offload and _triton_capable and _compile_opt_in:
             _compile_fn = getattr(self._torch, "compile", None)
             if callable(_compile_fn):
                 # P9: ASYNC torch.compile (serve eager, swap when warm).
