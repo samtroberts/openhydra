@@ -1920,7 +1920,16 @@ class PyTorchRuntime:
                     return _orig(input, weight, bias)
                 except RuntimeError as exc:
                     msg = str(exc)
-                    if "GET was unable to find an engine" not in msg:
+                    # cuDNN's engine lookup reports this two ways on T4
+                    # depthwise conv1d at seq_len<4: "GET was unable to find
+                    # an engine ..." (heuristic path, cudnn.benchmark=False)
+                    # and "FIND was unable to find an engine ..." (autotune
+                    # path, cudnn.benchmark=True). Both mean the same missing
+                    # kernel — match the common substring so the retry fires
+                    # regardless of the benchmark flag. (Verified on a Tesla
+                    # T4 / cuDNN 9.2: GET with benchmark off, FIND with it on;
+                    # the cudnn-disabled retry succeeds for both in ~0.26s.)
+                    if "unable to find an engine" not in msg:
                         raise
                     # Retry with cuDNN disabled — torch's native
                     # implementation has kernels for every shape.

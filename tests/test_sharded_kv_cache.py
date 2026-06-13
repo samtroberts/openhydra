@@ -233,3 +233,69 @@ def test_identity_swap_allows_parameters_iteration_without_crash():
     # with meta tensors present, ``p + 0`` would raise.
     for p in m.parameters():
         _ = p + 0
+
+
+# ── T4 depthwise-conv1d cuDNN fallback matcher ──────────────────────────
+#
+# Qwen3.5 ``linear_attn`` depthwise Conv1d at seq_len<4 fails cuDNN engine
+# lookup on Turing T4s. PyTorchRuntime._patch_depthwise_conv1d_t4_fallback
+# wraps the conv to retry with cuDNN disabled. cuDNN reports the failure two
+# ways depending on ``torch.backends.cudnn.benchmark``:
+#   * "GET was unable to find an engine ..."  (benchmark=False, heuristic)
+#   * "FIND was unable to find an engine ..." (benchmark=True, autotune)
+# Verified on a live Tesla T4 / cuDNN 9.2. The matcher must catch BOTH (it
+# keys on the common "unable to find an engine" substring), else a peer with
+# benchmark=True hard-errors on every single-token decode.
+
+def _run_conv_fallback(error_message: str):
+    """Apply the real patch to a depthwise Conv1d whose first call raises
+    ``error_message``; return (succeeded, original_call_count)."""
+    import types
+
+    from peer.model_shard import PyTorchRuntime
+
+    conv = nn.Conv1d(4, 4, kernel_size=4, groups=4, padding=3)
+
+    calls = {"n": 0}
+    _native = conv._conv_forward
+
+    def _flaky(inp, weight, bias):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(error_message)
+        return _native(inp, weight, bias)
+
+    conv._conv_forward = _flaky
+
+    holder = nn.Module()
+    holder.add_module("conv", conv)
+    fake_runtime = types.SimpleNamespace(_model=holder)
+
+    PyTorchRuntime._patch_depthwise_conv1d_t4_fallback(fake_runtime)
+
+    x = torch.zeros(1, 4, 1)  # seq_len=1, the failing shape
+    out = conv._conv_forward(x, conv.weight, conv.bias)
+    return out is not None, calls["n"]
+
+
+def test_conv1d_fallback_catches_get_variant():
+    ok, n = _run_conv_fallback(
+        "GET was unable to find an engine to execute this computation"
+    )
+    assert ok
+    assert n == 2  # first raised, retry (cuDNN disabled) succeeded
+
+
+def test_conv1d_fallback_catches_find_variant():
+    ok, n = _run_conv_fallback(
+        "FIND was unable to find an engine to execute this computation"
+    )
+    assert ok
+    assert n == 2
+
+
+def test_conv1d_fallback_reraises_unrelated_error():
+    import pytest
+
+    with pytest.raises(RuntimeError, match="some other CUDA error"):
+        _run_conv_fallback("some other CUDA error")
