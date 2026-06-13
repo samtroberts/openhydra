@@ -1263,6 +1263,23 @@ def main() -> None:
                 f"Got {_rmi!r}, which is not a valid HF repo id "
                 "(missing the ``user/repo`` slash)."
             )
+        # F-10: Path A (coordinator-terminated) is fundamentally push-based —
+        # the sole peer returns its hidden state via PushResult and the
+        # coordinator head-samples + re-injects through the ring. The
+        # ``_coordinator_proxy_handler_loop`` that drains
+        # ``PROXY_METHOD_PUSH_RESULT`` is started unconditionally below, but
+        # the ring is only selected when ``push_mode_enabled`` is True
+        # (inference_service ``_use_ring``). ``--push-mode`` is opt-in, so a
+        # pure-coordinator launch that forgot it would fall into the non-ring
+        # ``_step_*`` loop, which never sets ``sample_on_coordinator`` on the
+        # wire (peer ran a full generation instead of returning hidden). Force
+        # push mode on here so pure-coordinator always uses the ring.
+        if not bool(getattr(args, "push_mode", False)):
+            args.push_mode = True
+            logger.info(
+                "pure_coordinator_mode: forcing --push-mode on (Path A "
+                "requires the PushResult/ring transport)",
+            )
         logger.info(
             "pure_coordinator_mode: --no-local-peer set → skipping peer "
             "thread; loading standalone head from %s", _runtime_model_id,

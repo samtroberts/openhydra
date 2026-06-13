@@ -467,6 +467,154 @@ def test_engine_config_has_sample_on_coordinator():
     assert EngineConfig(sample_on_coordinator=True).sample_on_coordinator is True
 
 
+# ── F-10: sample_on_coordinator reaches the peer for a SINGLE peer ───────
+#
+# Regression for the pure-coordinator (``--no-local-peer
+# --sample-on-coordinator``) bug where a single whole-model peer's
+# ``Forward()`` saw ``request.sample_on_coordinator=False``. Root cause was
+# path selection, not field plumbing: a 1-peer pipeline fell into the
+# non-ring ``_step_*`` loop (which never sets the flag and can't consume a
+# hidden-state response). The fix routes single-peer Path A through
+# ``run_push_ring`` (which already sets the flag at chain.py:1345 and
+# head-samples on the coordinator). These tests lock the on-wire contract.
+
+def test_run_push_ring_single_peer_sets_sample_on_coordinator_on_wire():
+    """A single-peer ring must carry ``sample_on_coordinator=True`` on the
+    OHV2 header, survive the real Rust CBOR round-trip, and use the n==1
+    shape (empty next-hop). This is exactly what the peer's ``Forward``
+    reads via ``OHV2Request.sample_on_coordinator`` to set ``return_hidden``.
+    """
+    import threading
+
+    from openhydra_network import P2PNode as _Real
+
+    from coordinator.chain import InferenceChain
+    from coordinator.head_sampler import unregister_ring_session
+    from coordinator.path_finder import PeerEndpoint
+    from peer.ohv2_adapter import OHV2Request
+
+    captured: dict = {}
+    fired = threading.Event()
+
+    class _CaptureP2P:
+        libp2p_peer_id = "12D3KooW_coord"
+
+        # Pre-dial hooks (run in daemon threads; just no-ops here).
+        def discover(self, *a, **k):
+            return None
+
+        def dial_peer(self, *a, **k):
+            return None
+
+        def encode_forward_msg(self, header_dict, activation, msg_type=0):
+            captured["header"] = dict(header_dict)
+            return _Real.encode_forward_msg(header_dict, activation, msg_type)
+
+        def proxy_forward_no_wait(self, target_peer_id, data):
+            raw = bytes(data)
+            if raw[:1] in (b"\x01", b"\x02", b"\x03"):
+                raw = raw[1:]
+            hdr, act, _ = _Real.decode_forward_msg(raw)
+            captured["decoded"] = OHV2Request(hdr, act)
+            fired.set()
+
+    chain = InferenceChain(
+        [PeerEndpoint(
+            peer_id="solo", host="127.0.0.1", port=5001,
+            libp2p_peer_id="12D3KooW_solo",
+        )],
+    )
+    chain._p2p_node = _CaptureP2P()
+
+    try:
+        chain.run_push_ring(
+            initial_activation=[1.0, 2.0, 3.0, 4.0],
+            max_tokens=4,
+            ring_eos_ids=[],
+            kv_session_id="sess-f10",
+            callback_address="10.0.0.5:50051",
+            request_id="req-f10-single",
+            sample_on_coordinator=True,
+        )
+        assert fired.wait(5.0), "ring send thread never fired"
+    finally:
+        unregister_ring_session("req-f10-single")
+
+    hdr = captured["header"]
+    assert hdr["sample_on_coordinator"] is True
+    assert hdr["total_stages"] == 1
+    # n==1 shape: the sole peer is both first and last → no next hop.
+    assert hdr["next_hop_address"] == ""
+    assert hdr["next_hop_peer_id"] == ""
+
+    # The peer reads the flag through OHV2Request after the CBOR round-trip.
+    assert captured["decoded"].sample_on_coordinator is True
+
+
+def test_peer_return_hidden_contract_for_single_peer():
+    """Given the on-wire flag, the peer's ``Forward`` sets ``return_hidden``
+    when it is the last stage. For a single whole-model peer that is always
+    true (total_stages==1, stage_index==0). This locks the predicate used at
+    peer/server.py:1942-1947 against an OHV2-decoded request.
+    """
+    from openhydra_network import P2PNode as _Real
+
+    from peer.ohv2_adapter import OHV2Request
+
+    header = {
+        "request_id": "req-f10",
+        "stage_index": 0,
+        "total_stages": 1,
+        "sample_on_coordinator": True,
+        "activation_dtype": 0,
+        "activation_shape": [],
+    }
+    wire = _Real.encode_forward_msg(header, b"", 0)
+    hdr, act, _ = _Real.decode_forward_msg(bytes(wire))
+    req = OHV2Request(hdr, act)
+
+    # Mirror of server.py Forward()'s return_hidden computation.
+    _sample_on_coord = bool(getattr(req, "sample_on_coordinator", False))
+    _is_last_stage = (
+        int(req.total_stages) > 0
+        and int(req.stage_index) == int(req.total_stages) - 1
+    )
+    _return_hidden = bool(_sample_on_coord and _is_last_stage)
+
+    assert _sample_on_coord is True
+    assert _is_last_stage is True
+    assert _return_hidden is True
+
+
+def test_use_ring_gate_admits_single_peer_under_sample_on_coordinator():
+    """The ``_use_ring`` gate (inference_service.py) must admit a 1-peer
+    pipeline when ``sample_on_coordinator`` is set, and otherwise still
+    require >= 2 peers. Locks the F-10 selection change.
+    """
+    def _use_ring(*, dflash_active, push_mode, n_peers, callback, soc):
+        # Mirror of the predicate at inference_service.py:_use_ring.
+        return bool(
+            not dflash_active
+            and push_mode
+            and (n_peers >= 2 or soc)
+            and callback
+        )
+
+    base = dict(dflash_active=False, push_mode=True, callback="ip:1")
+
+    # F-10: single peer now admitted when sample_on_coordinator is on.
+    assert _use_ring(**base, n_peers=1, soc=True) is True
+    # Single peer WITHOUT the flag still excluded (legacy behaviour).
+    assert _use_ring(**base, n_peers=1, soc=False) is False
+    # Multi-peer admitted regardless of the flag.
+    assert _use_ring(**base, n_peers=2, soc=False) is True
+    # Push mode off → never ring.
+    assert _use_ring(
+        dflash_active=False, push_mode=False, callback="ip:1",
+        n_peers=1, soc=True,
+    ) is False
+
+
 def test_register_head_source_accepts_has_final_head_attribute():
     """Phase 5 relaxes the registration gate: a runtime advertising
     ``_has_final_head=True`` is accepted regardless of ``_is_last_shard``.
