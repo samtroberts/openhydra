@@ -37,6 +37,10 @@ pub mod types;
 /// workspace refactor.
 pub mod model_id;
 
+/// Router scoring & ranking (protocol.md §5) — M1.3. Ports the peer-ranking logic
+/// from `coordinator/peer_selector.py`; resolve/route stages land on top.
+pub mod router;
+
 /// Python module entry point.
 #[cfg(feature = "pyo3")]
 mod python {
