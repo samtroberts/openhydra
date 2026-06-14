@@ -20,6 +20,7 @@
 //! no live engine and no `reqwest`/`tokio` in the dependency tree yet.
 
 pub mod adapter;
+pub mod consumer;
 pub mod http;
 pub mod ollama;
 pub mod provider;
@@ -29,6 +30,7 @@ pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
     ServeOutcome,
 };
+pub use consumer::request_completion;
 pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
