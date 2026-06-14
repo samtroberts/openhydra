@@ -52,6 +52,8 @@ def _make_engine(infer_resp=None, infer_chat_resp=None, stream_chunks=None):
             return infer_resp or {
                 "request_id": "req-123",
                 "response": "Hello world",
+                "completion_tokens": 2,
+                "prompt_tokens": 1,
                 "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
             }
 
@@ -60,6 +62,8 @@ def _make_engine(infer_resp=None, infer_chat_resp=None, stream_chunks=None):
             return infer_chat_resp or {
                 "request_id": "req-456",
                 "response": "Hi there",
+                "completion_tokens": 2,
+                "prompt_tokens": 1,
                 "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
             }
 

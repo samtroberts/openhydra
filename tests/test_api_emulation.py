@@ -134,6 +134,8 @@ class _MockSwarmEngine:
         return {
             "request_id": "swarm-req-1",
             "response": "Swarm response",
+            "completion_tokens": 2,
+            "prompt_tokens": 1,
             "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
         }
 
@@ -151,6 +153,8 @@ class _MockSwarmEngine:
         return {
             "request_id": "swarm-req-1",
             "response": "Swarm text",
+            "completion_tokens": 2,
+            "prompt_tokens": 1,
             "model": {"served": "openhydra-toy-345m", "requested": "openhydra-toy-345m"},
         }
 
