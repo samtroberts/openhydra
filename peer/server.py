@@ -1319,6 +1319,9 @@ class PeerService:
         self._next_hop_rtts: dict[str, float] = {}
         self._next_hop_rtts_lock = threading.Lock()
         self._kv_cache: dict[str, list[float]] = {}
+        # protocol.md §4 (M1.2) — live decode-throughput EWMA (tokens/s), fed from
+        # the decode hot path (record_decode_latency_ms); 0.0 until the first token.
+        self._observed_tps_ewma: float = 0.0
         self.last_request_thread_id: int | None = None
         self.last_inference_thread_id: int | None = None
         self.onion_layers_peeled = 0
@@ -1558,6 +1561,23 @@ class PeerService:
             while len(self._kv_cache) > self.kv_cache_max_entries:
                 oldest_key = next(iter(self._kv_cache))
                 self._kv_cache.pop(oldest_key, None)
+
+    def record_decode_latency_ms(self, ms: float) -> None:
+        """Feed a per-decode-step latency into the live throughput EWMA (M1.2 §4).
+
+        One forward ≈ one decoded token, so instantaneous tokens/s = 1000/ms. Cheap
+        (a few float ops); called from the decode hot path where the latency is
+        already measured, so it adds no extra timing cost.
+        """
+        if ms <= 0.0:
+            return
+        inst_tps = 1000.0 / ms
+        prev = self._observed_tps_ewma
+        self._observed_tps_ewma = inst_tps if prev <= 0.0 else (0.8 * prev + 0.2 * inst_tps)
+
+    def observed_tokens_per_sec(self) -> float:
+        """Live measured decode throughput (tokens/s); 0.0 until the first token."""
+        return float(self._observed_tps_ewma)
 
     def _load_pct(self) -> float:
         with self._lock:
@@ -2028,10 +2048,14 @@ class PeerService:
                     else:
                         activation = list(_fwd_result)
                     _fwd_ms = (time.perf_counter() - _t0) * 1000
+                    self.record_decode_latency_ms(_fwd_ms)  # live throughput EWMA (M1.2)
                     # debug: per-token in the autoregressive loop (timing/logging trim)
                     logger.debug("shard_forward_ms: peer=%s stage=%d ms=%.1f",
                                  self.peer_id, int(request.stage_index), _fwd_ms)
                 else:
+                    # TODO(M1.2 gap#1): the batched decode path has no _fwd_ms, so it
+                    # doesn't feed record_decode_latency_ms — live throughput is sampled
+                    # only on the non-batch path above. Instrument batch_queue.forward.
                     activation = self.batch_queue.forward(
                         request.prompt,
                         activation_in,
@@ -3548,6 +3572,17 @@ def _announce_loop(
         _prev_layer_start = _effective_layer_start
         _prev_layer_end = _effective_layer_end
 
+        # protocol.md §4 (M1.2) — capability-record values for this announce.
+        try:
+            from peer.model_catalog import resolve_context_length as _resolve_ctx_len
+
+            _announce_context_length = int(_resolve_ctx_len(str(_effective_model_id)))
+        except Exception:
+            _announce_context_length = 0
+        _announce_hw_class = (
+            f"{runtime_profile.get('target', 'cpu')}"
+            f"{'-gpu' if runtime_profile.get('gpu_available') else ''}"
+        )
         announcement = Announcement(
             peer_id=service.peer_id,
             model_id=str(_effective_model_id),
@@ -3566,6 +3601,11 @@ def _announce_loop(
             runtime_target=str(runtime_profile.get("target", "cpu")),
             runtime_model_id=str(runtime_profile.get("runtime_model_id", "")),
             canonical_model_id=str(getattr(service, "canonical_model_id", "") or ""),
+            context_length=int(_announce_context_length),
+            max_output_tokens=0,  # TODO(M1.2 gap#2): source from catalog/config (static 0).
+            throughput_tok_s=float(service.observed_tokens_per_sec()),
+            queue_depth=int(getattr(service, "_inflight", 0) or 0),
+            hardware_class=str(_announce_hw_class),
             quantization_mode=str(runtime_profile.get("quantization_mode", "fp32")),
             quantization_bits=int(runtime_profile.get("quantization_bits", 0)),
             runtime_gpu_available=bool(runtime_profile.get("gpu_available", False)),

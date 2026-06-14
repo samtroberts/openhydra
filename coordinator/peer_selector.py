@@ -26,6 +26,8 @@ class ScoredPeer:
     load_pct: float
     reputation: float
     bandwidth_mbps: float
+    throughput_tok_s: float = 0.0
+    queue_depth: int = 0
 
 
 def compute_routing_score(
@@ -35,6 +37,8 @@ def compute_routing_score(
     bandwidth_mbps: float,
     tier: int,
     s2s_rtt_ms: float = 0.0,
+    throughput_tok_s: float = 0.0,
+    queue_depth: int = 0,
 ) -> float:
     """Compute a routing score for peer pipeline ranking.
 
@@ -55,13 +59,17 @@ def compute_routing_score(
     bw_norm = max(0.0, bandwidth_mbps) / 1000.0
     # S2S RTT: 0 means no measurement available (neutral). Higher = worse.
     s2s_penalty = 1.0 / max(1.0, s2s_rtt_ms) if s2s_rtt_ms > 0 else 0.5
+    # Throughput (protocol.md §4): normalise against a 50 tok/s reference; higher is better.
+    tput_norm = min(1.0, max(0.0, throughput_tok_s) / 50.0)
+    # Queue depth: fewer queued/in-flight requests is better (live capacity signal).
+    queue_term = 1.0 / (1.0 + max(0, queue_depth))
 
     if tier <= 2:
-        # Latency-focused: 40% ping, 25% load, 20% reputation, 5% bandwidth, 10% S2S
-        w1, w2, w3, w4, w5 = 0.40, 0.25, 0.20, 0.05, 0.10
+        # Latency-focused: ping/load/reputation/bandwidth/S2S/throughput/queue
+        w1, w2, w3, w4, w5, w6, w7 = 0.30, 0.18, 0.15, 0.05, 0.07, 0.15, 0.10
     else:
-        # Balanced: 25% ping, 20% load, 25% reputation, 15% bandwidth, 15% S2S
-        w1, w2, w3, w4, w5 = 0.25, 0.20, 0.25, 0.15, 0.15
+        # Balanced: ping/load/reputation/bandwidth/S2S/throughput/queue
+        w1, w2, w3, w4, w5, w6, w7 = 0.20, 0.15, 0.20, 0.10, 0.10, 0.15, 0.10
 
     return (
         (w1 * (1.0 / latency_ms))
@@ -69,6 +77,8 @@ def compute_routing_score(
         + (w3 * rep_norm)
         + (w4 * bw_norm)
         + (w5 * s2s_penalty)
+        + (w6 * tput_norm)
+        + (w7 * queue_term)
     )
 
 
@@ -115,6 +125,8 @@ def rank_peers(
                 bandwidth_mbps=bandwidth,
                 tier=tier,
                 s2s_rtt_ms=s2s_rtt,
+                throughput_tok_s=float(getattr(item.peer, "throughput_tok_s", 0.0) or 0.0),
+                queue_depth=int(getattr(item.peer, "queue_depth", 0) or 0),
             )
 
         scored.append(
@@ -125,6 +137,8 @@ def rank_peers(
                 load_pct=item.load_pct,
                 reputation=reputation,
                 bandwidth_mbps=bandwidth,
+                throughput_tok_s=float(getattr(item.peer, "throughput_tok_s", 0.0) or 0.0),
+                queue_depth=int(getattr(item.peer, "queue_depth", 0) or 0),
             )
         )
 

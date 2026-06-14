@@ -2397,6 +2397,13 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
         relay_address: r.relay_address.clone(),
         runtime_backend: r.runtime_backend.clone(),
         runtime_model_id: r.runtime_model_id.clone(),
+        // protocol.md §4 (M1.2) — carry the capability fields through discover().
+        canonical_model_id: r.canonical_model_id.clone(),
+        context_length: r.context_length,
+        max_output_tokens: r.max_output_tokens,
+        throughput_tok_s: r.throughput_tok_s,
+        queue_depth: r.queue_depth,
+        hardware_class: r.hardware_class.clone(),
         reachable_address,
     }
 }

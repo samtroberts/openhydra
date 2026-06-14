@@ -30,6 +30,7 @@ __all__ = [
     "resolve_hf_model_id",
     "resolve_mlx_model_id",
     "resolve_dflash_draft_model_id",
+    "resolve_context_length",
 ]
 
 
@@ -157,3 +158,22 @@ def resolve_dflash_draft_model_id(
     if entry is None:
         return ""
     return str(entry.get("dflash_draft_model_id", "") or "").strip()
+
+
+def resolve_context_length(
+    model_id: str,
+    *,
+    catalog_path: str | Path | None = None,
+) -> int:
+    """Return the catalog ``context_length`` for ``model_id`` (0 if unknown).
+
+    A static capability field (protocol.md §4) advertised in the capability record;
+    sourced from the catalog rather than the runtime profile.
+    """
+    entry = _read_catalog_entry(model_id, catalog_path=catalog_path)
+    if entry is None:
+        return 0
+    try:
+        return max(0, int(entry.get("context_length", 0) or 0))
+    except (TypeError, ValueError):
+        return 0

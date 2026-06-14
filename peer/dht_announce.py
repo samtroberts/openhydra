@@ -46,6 +46,13 @@ class Announcement:
     # unresolvable (legacy/toy peers); never computed here — dht_announce is a
     # dumb carrier and must not touch tokenizers/engines.
     canonical_model_id: str = ""
+    # protocol.md §4 capability record (M1.2) — populated at the announce site
+    # (live values for throughput/queue; static for the rest). Carrier only.
+    context_length: int = 0
+    max_output_tokens: int = 0
+    throughput_tok_s: float = 0.0  # live measured decode throughput (tokens/s)
+    queue_depth: int = 0  # live in-flight request count
+    hardware_class: str = ""
     quantization_mode: str = "fp32"
     quantization_bits: int = 0
     runtime_gpu_available: bool = False

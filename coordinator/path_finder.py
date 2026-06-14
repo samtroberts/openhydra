@@ -180,6 +180,12 @@ class PeerEndpoint:
     runtime_model_id: str = ""
     # protocol.md §4 — advertised canonical model id (family/params/quant/template_hash).
     canonical_model_id: str = ""
+    # protocol.md §4 capability fields (M1.2) — advertised by providers, used by ranking.
+    context_length: int = 0
+    max_output_tokens: int = 0
+    throughput_tok_s: float = 0.0  # live measured decode throughput (tokens/s)
+    queue_depth: int = 0  # live count of queued/in-flight requests
+    hardware_class: str = ""
     quantization_mode: str = "fp32"
     quantization_bits: int = 0
     runtime_gpu_available: bool = False
@@ -269,6 +275,11 @@ class PeerEndpoint:
             runtime_target=str(data.get("runtime_target", "cpu")),
             runtime_model_id=str(data.get("runtime_model_id", "")),
             canonical_model_id=str(data.get("canonical_model_id", "")).strip(),
+            context_length=int(data.get("context_length", 0) or 0),
+            max_output_tokens=int(data.get("max_output_tokens", 0) or 0),
+            throughput_tok_s=float(data.get("throughput_tok_s", 0.0) or 0.0),
+            queue_depth=int(data.get("queue_depth", 0) or 0),
+            hardware_class=str(data.get("hardware_class", "")).strip(),
             quantization_mode=str(data.get("quantization_mode", "fp32")),
             quantization_bits=int(data.get("quantization_bits", 0)),
             runtime_gpu_available=bool(data.get("runtime_gpu_available", False)),

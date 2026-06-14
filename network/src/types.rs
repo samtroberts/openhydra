@@ -160,6 +160,14 @@ pub struct DiscoveredPeer {
     pub relay_address: String,
     pub runtime_backend: String,
     pub runtime_model_id: String,
+    // protocol.md §4 capability fields (M1.2) — surfaced from PeerRecord so the
+    // libp2p discover() path is not blind to canonical id / live capacity.
+    pub canonical_model_id: String,
+    pub context_length: u32,
+    pub max_output_tokens: u32,
+    pub throughput_tok_s: f64,
+    pub queue_depth: u32,
+    pub hardware_class: String,
     /// The resolved reachable address (direct or via relay).
     pub reachable_address: String,
 }

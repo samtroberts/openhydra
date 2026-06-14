@@ -93,6 +93,33 @@ def test_dumb_carrier_default_is_empty():
     assert asdict(ann)["canonical_model_id"] == ""
 
 
+def test_capability_fields_propagate_through_announcement():
+    # M1.2: the §4 capability fields ride the same asdict() carrier that feeds
+    # p2p_node.announce() -> the Rust PeerRecord, and parse back into PeerEndpoint.
+    ann = Announcement(
+        peer_id="p",
+        model_id="openhydra-qwen3.5-2b",
+        host="h",
+        port=1,
+        context_length=32768,
+        max_output_tokens=4096,
+        throughput_tok_s=13.4,
+        queue_depth=2,
+        hardware_class="cuda-gpu",
+    )
+    record = asdict(ann)
+    assert record["context_length"] == 32768
+    assert record["max_output_tokens"] == 4096
+    assert record["throughput_tok_s"] == 13.4
+    assert record["queue_depth"] == 2
+    assert record["hardware_class"] == "cuda-gpu"
+    ep = PeerEndpoint.from_dict(record)
+    assert ep.context_length == 32768
+    assert ep.throughput_tok_s == 13.4
+    assert ep.queue_depth == 2
+    assert ep.hardware_class == "cuda-gpu"
+
+
 # --- step 3: discovery refuses incompatible providers ---
 
 
