@@ -322,6 +322,19 @@ def consumer_request_receipt(
     return CoSignedReceipt(payload, consumer_sig, provider_sig)
 
 
+def _record_reputation(node, peer_id: str, outcome: str) -> None:
+    """Best-effort feedback into the node's M2.2 reputation store. Reputation is
+    auxiliary to the receipt's primary purpose, so a node stand-in without the FFI
+    method (or a store hiccup) must never break the receipt/inference flow."""
+    recorder = getattr(node, "record_reputation_outcome", None)
+    if recorder is None:
+        return
+    try:
+        recorder(peer_id, outcome)
+    except Exception:  # noqa: BLE001 — never let reputation bookkeeping fail the request
+        pass
+
+
 def request_receipt_for_route(
     node,
     outcome: dict,
@@ -329,7 +342,8 @@ def request_receipt_for_route(
     *,
     transport: Callable[[bytes], bytes] | None = None,
 ) -> CoSignedReceipt | None:
-    """Auto-fire the consumer→provider co-signed receipt right after a whole-model route.
+    """Auto-fire the consumer→provider co-signed receipt right after a whole-model route,
+    and report the outcome into the node's M2.2 reputation store (protocol.md §7).
 
     Wires `P2PNode.resolve_and_route`'s outcome straight into the M2.1 handshake: it
     reads the serving provider's identity (`outcome["provider_pub"]`, the raw 32-byte
@@ -337,18 +351,36 @@ def request_receipt_for_route(
     then signs + exchanges the receipt for `tokens` of `outcome["model_id"]` using the
     node's *internal* key (never crosses the FFI).
 
+    The result feeds reputation, keyed by the serving `peer_id`:
+
+    * a valid, counter-signed receipt → ``"honored"`` (returns the receipt);
+    * a provider rejection — bad/tampered signature, explicit refusal, replay (surfaces
+      as ``ValueError``) → ``"rejected"`` (re-raises);
+    * a network drop / timeout / vanished provider (any other exception) → ``"failed"``
+      (re-raises).
+
     `transport` defaults to a live libp2p round-trip to the serving peer
     (`lambda r: node.proxy_forward(outcome["peer_id"], r)`); tests inject the provider's
-    secure handler directly. Returns the co-signed receipt, or **None** when the
-    provider advertised no public key (a legacy peer that cannot be receipted) — the
-    caller treats a missing receipt as a soft miss, not a stream failure.
+    secure handler directly. Returns **None** when the provider advertised no public key
+    (a legacy peer that cannot be receipted) — a soft miss, no reputation event, not a
+    stream failure.
     """
     provider_pub = bytes(outcome.get("provider_pub") or b"")
+    peer_id = outcome["peer_id"]
     if len(provider_pub) != 32:
-        return None  # legacy/unkeyed provider — nothing to co-sign against
+        return None  # legacy/unkeyed provider — nothing to co-sign or to score
     if transport is None:
-        peer_id = outcome["peer_id"]
         transport = lambda req: bytes(node.proxy_forward(peer_id, req))  # noqa: E731
-    return consumer_request_receipt(
-        node, transport, provider_pub, outcome["model_id"], int(tokens)
-    )
+    try:
+        receipt = consumer_request_receipt(
+            node, transport, provider_pub, outcome["model_id"], int(tokens)
+        )
+    except ValueError:
+        # provider rejected / bad signature / tampered payload / replay → a trust hit.
+        _record_reputation(node, peer_id, "rejected")
+        raise
+    except Exception:  # noqa: BLE001 — network drop / timeout / provider vanished.
+        _record_reputation(node, peer_id, "failed")
+        raise
+    _record_reputation(node, peer_id, "honored")
+    return receipt

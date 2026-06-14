@@ -211,11 +211,48 @@ def test_auto_fire_receipt_from_route_outcome(tmp_path):
     assert receipt.payload.tokens == 512
     assert receipt.payload.provider_pub == provider_pub
     assert len(ledger) == 1
+    # M2.2: the successful handshake reported "honored" into the consumer's store,
+    # lifting the serving peer above the neutral baseline.
+    assert consumer_node.reputation_score(outcome["peer_id"]) > 50.0
+
+
+def test_auto_fire_records_rejected_on_provider_refusal(tmp_path):
+    # The provider returns an error response (explicit reject / bad sig / replay) →
+    # consumer_request_receipt raises ValueError → the peer is scored "rejected".
+    consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"))
+    outcome = {"model_id": MODEL, "peer_id": "peerReject", "response": b"x", "degraded": False,
+               "provider_pub": bytes([9]) * 32}
+
+    transport = lambda _req: rc._RECEIPT_ERR + b"replayed_nonce"  # noqa: E731
+
+    with pytest.raises(ValueError):
+        rc.request_receipt_for_route(consumer_node, outcome, 512, transport=transport)
+    # rejected ⇒ multiplicative ×0.6 from neutral 50 ≈ 30 (and below baseline).
+    rejected = consumer_node.reputation_score("peerReject")
+    assert 25.0 < rejected < 35.0
+
+
+def test_auto_fire_records_failed_on_network_drop(tmp_path):
+    # The transport raises a non-ValueError (network drop / timeout / peer vanished) →
+    # the peer is scored "failed", which stings harder than a rejection.
+    consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"))
+    outcome = {"model_id": MODEL, "peer_id": "peerGone", "response": b"x", "degraded": False,
+               "provider_pub": bytes([9]) * 32}
+
+    def drop(_req):
+        raise RuntimeError("connection reset by peer")
+
+    with pytest.raises(RuntimeError):
+        rc.request_receipt_for_route(consumer_node, outcome, 512, transport=drop)
+    # failed ⇒ multiplicative ×0.4 from neutral 50 ≈ 20 (harder hit than rejected's ~30).
+    failed = consumer_node.reputation_score("peerGone")
+    assert 15.0 < failed < 25.0
 
 
 def test_auto_fire_skips_legacy_provider_without_key(tmp_path):
     # A legacy provider that advertised no public key → empty provider_pub on the
-    # outcome. The auto-fire is a soft miss (returns None), not a stream failure.
+    # outcome. The auto-fire is a soft miss (returns None), not a stream failure, and
+    # records no reputation event.
     consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"))
     outcome = {"model_id": MODEL, "peer_id": "legacy", "response": b"x", "degraded": False, "provider_pub": b""}
 
@@ -224,6 +261,7 @@ def test_auto_fire_skips_legacy_provider_without_key(tmp_path):
         raise AssertionError("transport should not be called for an unkeyed provider")
 
     assert rc.request_receipt_for_route(consumer_node, outcome, 100, transport=transport) is None
+    assert consumer_node.reputation_score("legacy") == 50.0  # untouched neutral baseline
 
 
 def test_secure_provider_refuses_receipt_naming_another_provider(tmp_path):
