@@ -98,3 +98,69 @@ def test_replay_rejected_by_ledger():
 def test_malformed_key_length_raises():
     with pytest.raises(ValueError):
         rc.public_key(b"too-short")
+
+
+# --- receipt exchange over the (injected) proxy transport ---
+
+
+def test_wire_request_round_trips():
+    _, consumer_pub = _identity(7)
+    _, provider_pub = _identity(9)
+    payload = rc.ReceiptPayload.for_completion(provider_pub, consumer_pub, MODEL, 512)
+    consumer_sig = b"\xab" * 64
+    decoded, sig = rc.decode_receipt_request(rc.encode_receipt_request(payload, consumer_sig))
+    assert decoded == payload
+    assert sig == consumer_sig
+
+
+def test_exchange_round_trip_consumer_to_provider():
+    consumer_sk, consumer_pub = _identity(7)
+    provider_sk, provider_pub = _identity(9)
+    payload = rc.ReceiptPayload.for_completion(provider_pub, consumer_pub, MODEL, 512)
+
+    provider_ledger = rc.ReceiptLedger()
+    # The transport wires the consumer request straight into the provider handler;
+    # live, this is `lambda req: node.proxy_forward(provider_peer_id, req)`.
+    transport = lambda req: rc.handle_receipt_request(req, provider_sk, provider_ledger)  # noqa: E731
+
+    provider_sig = rc.exchange_receipt(transport, payload, consumer_sk)
+    assert len(provider_sig) == 64
+    assert len(provider_ledger) == 1  # provider verified + committed before responding
+
+
+def test_exchange_replay_rejected_over_transport():
+    consumer_sk, consumer_pub = _identity(7)
+    provider_sk, provider_pub = _identity(9)
+    payload = rc.ReceiptPayload.for_completion(provider_pub, consumer_pub, MODEL, 512)
+    provider_ledger = rc.ReceiptLedger()
+    transport = lambda req: rc.handle_receipt_request(req, provider_sk, provider_ledger)  # noqa: E731
+
+    rc.exchange_receipt(transport, payload, consumer_sk)  # first ok
+    with pytest.raises(ValueError, match="replayed_nonce"):
+        rc.exchange_receipt(transport, payload, consumer_sk)  # replay → provider error response
+    assert len(provider_ledger) == 1
+
+
+def test_consumer_detects_provider_payload_tampering():
+    # A greedy provider co-signs an inflated payload and returns OK; the consumer
+    # verifies the provider signature against the ORIGINAL payload it sent, so the
+    # tamper is caught client-side.
+    consumer_sk, consumer_pub = _identity(7)
+    provider_sk, provider_pub = _identity(9)
+    payload = rc.ReceiptPayload.for_completion(provider_pub, consumer_pub, MODEL, 512)
+
+    def malicious_transport(req: bytes) -> bytes:
+        recv_payload, consumer_sig = rc.decode_receipt_request(req)
+        inflated = rc.ReceiptPayload(
+            provider_pub=recv_payload.provider_pub,
+            consumer_pub=recv_payload.consumer_pub,
+            model_id=recv_payload.model_id,
+            tokens=999_999,
+            nonce=recv_payload.nonce,
+            ts_unix_ms=recv_payload.ts_unix_ms,
+        )
+        provider_sig = rc.provider_cosign(inflated, provider_sk, consumer_sig)
+        return rc._RECEIPT_OK + provider_sig
+
+    with pytest.raises(ValueError, match="bad_provider_sig"):
+        rc.exchange_receipt(malicious_transport, payload, consumer_sk)

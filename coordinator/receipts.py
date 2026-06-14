@@ -23,8 +23,10 @@ storage, gossip replication, and monotonic counters are M2.3.
 from __future__ import annotations
 
 import os
+import struct
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import openhydra_network as _ohn
 
@@ -142,3 +144,110 @@ class ReceiptLedger:
 
     def __len__(self) -> int:
         return len(self._receipts)
+
+
+# --- Receipt exchange over libp2p (protocol.md §6 live handshake) ---
+#
+# The handshake is a single request/response over the proxy transport, NOT a
+# streamed await: after a whole-model serve, the consumer signs a receipt and
+# proxy_forward()s it to the provider; the provider verifies + co-signs + ledgers
+# and returns its signature. The consumer then verifies the co-signed receipt.
+#
+# A 1-byte method prefix (0x07) demultiplexes it from Forward/Ping/… on the peer's
+# proxy-request loop (peer/server.py). The transport is injected (a bytes->bytes
+# callable), so the protocol is testable single-process and, live, is just
+# `lambda req: node.proxy_forward(provider_peer_id, req)`.
+
+RECEIPT_METHOD_PREFIX = b"\x07"  # libp2p proxy method byte for the receipt exchange
+_RECEIPT_OK = b"\x00"
+_RECEIPT_ERR = b"\x01"
+
+# Request layout after the 1-byte prefix: provider_pub(32) consumer_pub(32)
+# nonce(16) tokens(u64 LE) ts(u64 LE) consumer_sig(64) model_len(u16 LE) model.
+_REQ_FIXED = 32 + 32 + 16 + 8 + 8 + 64 + 2
+
+
+def encode_receipt_request(payload: ReceiptPayload, consumer_sig: bytes) -> bytes:
+    """Consumer→provider receipt message (prefixed with RECEIPT_METHOD_PREFIX)."""
+    model = payload.model_id.encode("utf-8")
+    return b"".join(
+        [
+            RECEIPT_METHOD_PREFIX,
+            payload.provider_pub,
+            payload.consumer_pub,
+            payload.nonce,
+            struct.pack("<Q", int(payload.tokens)),
+            struct.pack("<Q", int(payload.ts_unix_ms)),
+            consumer_sig,
+            struct.pack("<H", len(model)),
+            model,
+        ]
+    )
+
+
+def decode_receipt_request(data: bytes) -> tuple[ReceiptPayload, bytes]:
+    """Parse a consumer→provider receipt message → (payload, consumer_sig)."""
+    if not data or data[0:1] != RECEIPT_METHOD_PREFIX:
+        raise ValueError("receipt request: missing 0x07 method prefix")
+    body = data[1:]
+    if len(body) < _REQ_FIXED:
+        raise ValueError("receipt request: truncated")
+    provider_pub = body[0:32]
+    consumer_pub = body[32:64]
+    nonce = body[64:80]
+    tokens = struct.unpack_from("<Q", body, 80)[0]
+    ts_unix_ms = struct.unpack_from("<Q", body, 88)[0]
+    consumer_sig = body[96:160]
+    (model_len,) = struct.unpack_from("<H", body, 160)
+    model_id = body[162 : 162 + model_len].decode("utf-8")
+    if len(body) != _REQ_FIXED + model_len:
+        raise ValueError("receipt request: trailing bytes")
+    payload = ReceiptPayload(
+        provider_pub=provider_pub,
+        consumer_pub=consumer_pub,
+        model_id=model_id,
+        tokens=tokens,
+        nonce=nonce,
+        ts_unix_ms=ts_unix_ms,
+    )
+    return payload, consumer_sig
+
+
+def handle_receipt_request(message: bytes, provider_signing_key: bytes, ledger: ReceiptLedger) -> bytes:
+    """Provider side: decode → co-sign → verify + ledger → response bytes.
+
+    Never raises into the proxy loop — a rejection (bad consumer signature, replay,
+    malformed message) becomes an error response so the consumer learns why. On
+    success returns ``0x00 || provider_sig`` (65 bytes).
+    """
+    try:
+        payload, consumer_sig = decode_receipt_request(message)
+        provider_sig = provider_cosign(payload, provider_signing_key, consumer_sig)
+        ledger.record(payload, consumer_sig, provider_sig)  # verifies + replay-guards + holds
+        return _RECEIPT_OK + provider_sig
+    except ValueError as exc:
+        return _RECEIPT_ERR + str(exc).encode("utf-8")
+
+
+def exchange_receipt(
+    transport: Callable[[bytes], bytes],
+    payload: ReceiptPayload,
+    consumer_signing_key: bytes,
+) -> bytes:
+    """Consumer side: sign → send over ``transport`` → verify the returned co-signature.
+
+    ``transport(request_bytes) -> response_bytes`` is the network round-trip — live,
+    ``lambda req: node.proxy_forward(provider_peer_id, req)``. Returns the 64-byte
+    provider signature; raises ``ValueError`` if the provider rejected the receipt or
+    its co-signature doesn't verify (so a provider cannot alter the payload either).
+    """
+    consumer_sig = consumer_sign(payload, consumer_signing_key)
+    response = transport(encode_receipt_request(payload, consumer_sig))
+    if not response or response[0:1] != _RECEIPT_OK:
+        reason = response[1:].decode("utf-8", "replace") if response else "empty response"
+        raise ValueError(f"provider rejected receipt: {reason}")
+    provider_sig = response[1:65]
+    if len(provider_sig) != 64:
+        raise ValueError("receipt response: short provider signature")
+    verify(payload, consumer_sig, provider_sig)  # consumer independently verifies the co-signed receipt
+    return provider_sig
