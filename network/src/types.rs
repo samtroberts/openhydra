@@ -172,6 +172,10 @@ pub struct DiscoveredPeer {
     // resolve_and_route can score on load + reputation (RTT via ping is deferred).
     pub load_pct: f64,
     pub reputation_score: f64,
+    /// The provider's ed25519 public key (hex), surfaced from `PeerRecord.public_key`
+    /// (M2.1). The consumer needs this to address a co-signed receipt at the provider's
+    /// identity after a whole-model route; `""` for a legacy peer that announced none.
+    pub public_key: String,
     /// The resolved reachable address (direct or via relay).
     pub reachable_address: String,
 }

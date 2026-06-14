@@ -481,6 +481,9 @@ impl PyP2PNode {
                     .iter()
                     .map(|dp| crate::router::Candidate {
                         canonical_model_id: dp.canonical_model_id.clone(),
+                        // M2.1: carry the provider's ed25519 key (hex) so a winning route
+                        // can surface it for the consumer's co-signed-receipt handshake.
+                        public_key: dp.public_key.clone(),
                         score: crate::router::PeerScoreInput {
                             peer_id: dp.peer_id.clone(),
                             // TODO(M1.3): measure RTT via a ping survey — deferred (a
@@ -522,6 +525,12 @@ impl PyP2PNode {
                 dict.set_item("peer_id", o.peer_id)?;
                 dict.set_item("response", pyo3::types::PyBytes::new(py, &o.response))?;
                 dict.set_item("degraded", o.degraded)?;
+                // M2.1: surface the serving provider's raw 32-byte ed25519 public key so
+                // the consumer can immediately fire a co-signed receipt at its identity.
+                // The record carries it as hex; a malformed/absent key yields empty bytes
+                // (a legacy provider that advertised none simply can't be receipted).
+                let provider_pub = hex::decode(&o.public_key).unwrap_or_default();
+                dict.set_item("provider_pub", pyo3::types::PyBytes::new(py, &provider_pub))?;
                 Ok(dict.into_py_any(py)?)
             }
             Err(crate::router::RouteError::NoProvider) => Err(PyRuntimeError::new_err(

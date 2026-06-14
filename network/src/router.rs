@@ -135,6 +135,9 @@ pub struct Candidate {
     pub canonical_model_id: String,
     /// Scoring inputs; `score.peer_id` is the peer to route to.
     pub score: PeerScoreInput,
+    /// The provider's ed25519 public key (hex), carried through so the winning route
+    /// can surface it for the M2.1 receipt handshake; `""` for a legacy provider.
+    pub public_key: String,
 }
 
 /// The result of a successful route.
@@ -146,6 +149,9 @@ pub struct RouteOutcome {
     pub response: Vec<u8>,
     /// True when served by a fallback (nearest-smaller same-family) model.
     pub degraded: bool,
+    /// The serving provider's ed25519 public key (hex), so the consumer can fire the
+    /// M2.1 co-signed receipt at its identity; `""` if the provider advertised none.
+    pub public_key: String,
 }
 
 /// Why a request could not be routed.
@@ -202,11 +208,19 @@ where
         let inputs: Vec<PeerScoreInput> = compatible.iter().map(|c| c.score.clone()).collect();
         for sp in rank_peers(&inputs, tier) {
             if let Ok(response) = route(&sp.peer_id, request) {
+                // Surface the winning provider's public key (for the M2.1 receipt) by
+                // looking it back up from the compatible candidate we just routed to.
+                let public_key = compatible
+                    .iter()
+                    .find(|c| c.score.peer_id == sp.peer_id)
+                    .map(|c| c.public_key.clone())
+                    .unwrap_or_default();
                 return Ok(RouteOutcome {
                     model_id: model_id.clone(),
                     peer_id: sp.peer_id,
                     response,
                     degraded: idx > 0,
+                    public_key,
                 });
             }
             // this peer failed to route → fail over to the next-ranked peer
@@ -326,6 +340,7 @@ mod tests {
         Candidate {
             canonical_model_id: canonical.to_string(),
             score,
+            public_key: format!("{peer_id}-pubkey"), // distinct per peer for assertions
         }
     }
 
@@ -428,6 +443,26 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, RouteError::NoProvider);
+    }
+
+    #[test]
+    fn outcome_carries_winning_provider_public_key() {
+        // M2.1: the routed-to peer's public key is surfaced on the outcome so the
+        // consumer can address a co-signed receipt at the provider's identity.
+        let cands = vec![
+            candidate("slow", TPL_A, |p| p.throughput_tok_s = 5.0),
+            candidate("fast", TPL_A, |p| p.throughput_tok_s = 45.0),
+        ];
+        let out = resolve_and_route(
+            &[("m".into(), "qwen3.5/2b/*/*".into())],
+            b"req",
+            2,
+            |_| cands.clone(),
+            |peer, _| Ok(format!("served-by-{peer}").into_bytes()),
+        )
+        .unwrap();
+        assert_eq!(out.peer_id, "fast");
+        assert_eq!(out.public_key, "fast-pubkey"); // the winner's key, not the runner-up's
     }
 
     #[test]

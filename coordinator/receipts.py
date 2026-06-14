@@ -320,3 +320,35 @@ def consumer_request_receipt(
     provider_sig = response[1:65]
     verify(payload, consumer_sig, provider_sig)  # consumer independently verifies (no keys)
     return CoSignedReceipt(payload, consumer_sig, provider_sig)
+
+
+def request_receipt_for_route(
+    node,
+    outcome: dict,
+    tokens: int,
+    *,
+    transport: Callable[[bytes], bytes] | None = None,
+) -> CoSignedReceipt | None:
+    """Auto-fire the consumer→provider co-signed receipt right after a whole-model route.
+
+    Wires `P2PNode.resolve_and_route`'s outcome straight into the M2.1 handshake: it
+    reads the serving provider's identity (`outcome["provider_pub"]`, the raw 32-byte
+    ed25519 key surfaced by the router) and the peer to reach (`outcome["peer_id"]`),
+    then signs + exchanges the receipt for `tokens` of `outcome["model_id"]` using the
+    node's *internal* key (never crosses the FFI).
+
+    `transport` defaults to a live libp2p round-trip to the serving peer
+    (`lambda r: node.proxy_forward(outcome["peer_id"], r)`); tests inject the provider's
+    secure handler directly. Returns the co-signed receipt, or **None** when the
+    provider advertised no public key (a legacy peer that cannot be receipted) — the
+    caller treats a missing receipt as a soft miss, not a stream failure.
+    """
+    provider_pub = bytes(outcome.get("provider_pub") or b"")
+    if len(provider_pub) != 32:
+        return None  # legacy/unkeyed provider — nothing to co-sign against
+    if transport is None:
+        peer_id = outcome["peer_id"]
+        transport = lambda req: bytes(node.proxy_forward(peer_id, req))  # noqa: E731
+    return consumer_request_receipt(
+        node, transport, provider_pub, outcome["model_id"], int(tokens)
+    )

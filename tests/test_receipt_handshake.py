@@ -186,6 +186,46 @@ def test_secure_two_node_exchange(tmp_path):
     # The consumer never sees either private key — it only passed pubkeys + the node.
 
 
+def test_auto_fire_receipt_from_route_outcome(tmp_path):
+    # Simulates the live consumer flow: resolve_and_route returns an outcome carrying
+    # the serving provider's raw public key (surfaced by the Rust router); the consumer
+    # auto-fires the co-signed receipt straight off that outcome at stream completion.
+    consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"))
+    provider_node = ohn.P2PNode(identity_key_path=str(tmp_path / "provider.key"))
+    provider_pub = bytes(provider_node.public_key_bytes())
+
+    # The shape P2PNode.resolve_and_route returns (response elided), incl. provider_pub.
+    outcome = {
+        "model_id": MODEL,
+        "peer_id": "12D3KooWProvider",
+        "response": b"...streamed tokens...",
+        "degraded": False,
+        "provider_pub": provider_pub,
+    }
+
+    ledger = rc.ReceiptLedger()
+    transport = lambda req: rc.handle_receipt_request_secure(req, provider_node, ledger)  # noqa: E731
+    receipt = rc.request_receipt_for_route(consumer_node, outcome, 512, transport=transport)
+
+    assert receipt is not None
+    assert receipt.payload.tokens == 512
+    assert receipt.payload.provider_pub == provider_pub
+    assert len(ledger) == 1
+
+
+def test_auto_fire_skips_legacy_provider_without_key(tmp_path):
+    # A legacy provider that advertised no public key → empty provider_pub on the
+    # outcome. The auto-fire is a soft miss (returns None), not a stream failure.
+    consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"))
+    outcome = {"model_id": MODEL, "peer_id": "legacy", "response": b"x", "degraded": False, "provider_pub": b""}
+
+    # transport must never be invoked when there is no key to receipt against.
+    def transport(_req):
+        raise AssertionError("transport should not be called for an unkeyed provider")
+
+    assert rc.request_receipt_for_route(consumer_node, outcome, 100, transport=transport) is None
+
+
 def test_secure_provider_refuses_receipt_naming_another_provider(tmp_path):
     # A receipt addressed to provider B, delivered to provider A's handler: A refuses
     # to co-sign a receipt that names a different provider's identity.

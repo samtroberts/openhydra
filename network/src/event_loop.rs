@@ -2406,6 +2406,9 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
         hardware_class: r.hardware_class.clone(),
         load_pct: r.load_pct,
         reputation_score: r.reputation_score,
+        // M2.1 — carry the provider's ed25519 public key (hex) so the consumer can
+        // address a co-signed receipt at its identity after a whole-model route.
+        public_key: r.public_key.clone(),
         reachable_address,
     }
 }
