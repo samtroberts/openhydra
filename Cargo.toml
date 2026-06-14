@@ -1,12 +1,14 @@
 # OpenHydra Rust workspace.
 #
-# Split (M2.3): a pure, synchronous `protocol` crate (canonical model id, routing
-# math, co-signed receipts, verification policy, persistent ledger) and the async
-# `network` crate (rust-libp2p + Kademlia + the PyO3 FFI) that wires it into the live
-# node. `protocol` has no async / libp2p / pyo3 dependency; `network` depends on it.
+# - `protocol` — pure, synchronous core (canonical model id, routing math, co-signed
+#   receipts, verification policy, persistent ledger). No async / libp2p / pyo3.
+# - `network`  — rust-libp2p + Kademlia + the PyO3 FFI; depends on `protocol`.
+# - `agent`    — the pure-protocol agent (M3.1+): BYO-engine adapters (Ollama/vLLM/…)
+#   and the eventual HTTP/SSE gateway. It proxies inference to *external* engines and
+#   never runs a model. Depends on `protocol`.
 [workspace]
 resolver = "2"
-members = ["network", "protocol"]
+members = ["network", "protocol", "agent"]
 # The patched libp2p-quic lives inside the `network` tree and is consumed via the
 # [patch] below, not as a workspace member.
 exclude = ["network/patched-deps/libp2p-quic"]

@@ -1,0 +1,22 @@
+[package]
+name = "openhydra-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "OpenHydra agent — BYO-engine adapters + the HTTP/SSE gateway. Proxies inference to external engines (Ollama/vLLM/…); never runs a model."
+license = "Apache-2.0"
+
+[lib]
+name = "openhydra_agent"
+
+[dependencies]
+# Canonical model id + (later) routing/receipts/verify. The agent is a thin shell
+# over the pure protocol core.
+openhydra-protocol = { path = "../protocol" }
+# Parse engine HTTP responses (Ollama /api/tags, /api/show, …).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# NOTE: no reqwest/tokio yet — detection parsing + canonical mapping are pure and the
+# HTTP transport is injected behind the `HttpClient` trait (testable against fixtures).
+# The live reqwest-backed client + the streaming completion proxy land in the next step.
