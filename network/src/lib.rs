@@ -41,6 +41,10 @@ pub mod model_id;
 /// from `coordinator/peer_selector.py`; resolve/route stages land on top.
 pub mod router;
 
+/// Co-signed inference receipts (protocol.md §6) — M2.1. Nested ed25519 signatures
+/// + in-memory replay protection; the persistent ledger is M2.3.
+pub mod receipts;
+
 /// Python module entry point.
 #[cfg(feature = "pyo3")]
 mod python {
