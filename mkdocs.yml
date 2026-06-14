@@ -44,6 +44,7 @@ plugins:
 
 nav:
   - Home: index.md
+  - Protocol: protocol.md
   - Architecture: architecture.md
   - Quick Start: quickstart.md
   - API Reference: api-reference.md
