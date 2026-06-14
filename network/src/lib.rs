@@ -48,6 +48,7 @@ pub mod receipts;
 /// Python module entry point.
 #[cfg(feature = "pyo3")]
 mod python {
+    use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
     use pyo3::prelude::*;
 
     #[pymodule]
@@ -71,6 +72,11 @@ mod python {
         m.add_function(wrap_pyfunction!(is_compatible, m)?)?;
         m.add_function(wrap_pyfunction!(chat_template_hash, m)?)?;
         m.add_function(wrap_pyfunction!(parse_hf_model_name, m)?)?;
+        // Co-signed receipts (protocol.md §6) — M2.1.
+        m.add_function(wrap_pyfunction!(ed25519_public_key, m)?)?;
+        m.add_function(wrap_pyfunction!(receipt_sign_consumer, m)?)?;
+        m.add_function(wrap_pyfunction!(receipt_cosign_provider, m)?)?;
+        m.add_function(wrap_pyfunction!(receipt_verify, m)?)?;
         Ok(())
     }
 
@@ -143,5 +149,131 @@ mod python {
     #[pyfunction]
     fn parse_hf_model_name(hf_model_id: &str) -> (String, String, Vec<String>) {
         crate::model_id::parse_hf_model_name(hf_model_id)
+    }
+
+    // --- Co-signed receipts (protocol.md §6) — M2.1 FFI ---
+    //
+    // Keys and signatures cross the boundary as raw bytes (length-validated here):
+    // 32-byte ed25519 signing-key seeds / public keys, 64-byte signatures, 16-byte
+    // nonces. Raw bytes are the natural, allocation-light ed25519 representation.
+
+    fn vk_from(bytes: &[u8]) -> PyResult<VerifyingKey> {
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("expected a 32-byte public key"))?;
+        VerifyingKey::from_bytes(&arr)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid public key: {e}")))
+    }
+
+    fn sk_from(bytes: &[u8]) -> PyResult<SigningKey> {
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("expected a 32-byte signing key"))?;
+        Ok(SigningKey::from_bytes(&arr))
+    }
+
+    fn sig_from(bytes: &[u8]) -> PyResult<Signature> {
+        let arr: [u8; 64] = bytes
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("expected a 64-byte signature"))?;
+        Ok(Signature::from_bytes(&arr))
+    }
+
+    fn payload_from(
+        provider_pub: &[u8],
+        consumer_pub: &[u8],
+        model_id: &str,
+        tokens: u64,
+        nonce: &[u8],
+        ts_unix_ms: u64,
+    ) -> PyResult<crate::receipts::ReceiptPayload> {
+        let nonce: [u8; 16] = nonce
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("expected a 16-byte nonce"))?;
+        Ok(crate::receipts::ReceiptPayload {
+            provider: vk_from(provider_pub)?,
+            consumer: vk_from(consumer_pub)?,
+            model_id: model_id.to_string(),
+            tokens,
+            nonce,
+            ts_unix_ms,
+        })
+    }
+
+    /// Derive the 32-byte ed25519 public key from a 32-byte signing-key seed.
+    #[pyfunction]
+    fn ed25519_public_key(py: Python<'_>, signing_key: Vec<u8>) -> PyResult<PyObject> {
+        let pk = sk_from(&signing_key)?.verifying_key();
+        Ok(pyo3::types::PyBytes::new(py, pk.as_bytes()).into())
+    }
+
+    /// Consumer-side signature over the receipt payload. Returns 64 bytes.
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    fn receipt_sign_consumer(
+        py: Python<'_>,
+        consumer_signing_key: Vec<u8>,
+        provider_pub: Vec<u8>,
+        consumer_pub: Vec<u8>,
+        model_id: &str,
+        tokens: u64,
+        nonce: Vec<u8>,
+        ts_unix_ms: u64,
+    ) -> PyResult<PyObject> {
+        let ck = sk_from(&consumer_signing_key)?;
+        let payload = payload_from(&provider_pub, &consumer_pub, model_id, tokens, &nonce, ts_unix_ms)?;
+        let sig = crate::receipts::consumer_sign(&payload, &ck);
+        Ok(pyo3::types::PyBytes::new(py, &sig.to_bytes()).into())
+    }
+
+    /// Provider-side co-signature over (payload ‖ consumer_sig). Returns 64 bytes.
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    fn receipt_cosign_provider(
+        py: Python<'_>,
+        provider_signing_key: Vec<u8>,
+        provider_pub: Vec<u8>,
+        consumer_pub: Vec<u8>,
+        model_id: &str,
+        tokens: u64,
+        nonce: Vec<u8>,
+        ts_unix_ms: u64,
+        consumer_sig: Vec<u8>,
+    ) -> PyResult<PyObject> {
+        let pk = sk_from(&provider_signing_key)?;
+        let payload = payload_from(&provider_pub, &consumer_pub, model_id, tokens, &nonce, ts_unix_ms)?;
+        let csig = sig_from(&consumer_sig)?;
+        let sig = crate::receipts::provider_cosign(&payload, &csig, &pk);
+        Ok(pyo3::types::PyBytes::new(py, &sig.to_bytes()).into())
+    }
+
+    /// Verify a full co-signed receipt. Returns None on success; raises ValueError
+    /// ("receipt rejected: bad_consumer_sig" / "…bad_provider_sig") on rejection.
+    #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
+    fn receipt_verify(
+        provider_pub: Vec<u8>,
+        consumer_pub: Vec<u8>,
+        model_id: &str,
+        tokens: u64,
+        nonce: Vec<u8>,
+        ts_unix_ms: u64,
+        consumer_sig: Vec<u8>,
+        provider_sig: Vec<u8>,
+    ) -> PyResult<()> {
+        let payload = payload_from(&provider_pub, &consumer_pub, model_id, tokens, &nonce, ts_unix_ms)?;
+        let receipt = crate::receipts::CoSignedReceipt {
+            payload,
+            consumer_sig: sig_from(&consumer_sig)?,
+            provider_sig: sig_from(&provider_sig)?,
+        };
+        crate::receipts::verify_receipt(&receipt).map_err(|e| {
+            let which = match e {
+                crate::receipts::ReceiptError::BadConsumerSig => "bad_consumer_sig",
+                crate::receipts::ReceiptError::BadProviderSig => "bad_provider_sig",
+                crate::receipts::ReceiptError::ReplayedNonce => "replayed_nonce",
+            };
+            pyo3::exceptions::PyValueError::new_err(format!("receipt rejected: {which}"))
+        })
     }
 }
