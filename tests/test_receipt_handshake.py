@@ -264,6 +264,62 @@ def test_auto_fire_skips_legacy_provider_without_key(tmp_path):
     assert consumer_node.reputation_score("legacy") == 50.0  # untouched neutral baseline
 
 
+def test_ledger_rehydrates_reputation_and_nonce_across_restart(tmp_path):
+    # The full M2.3 loop end to end through the FFI: a successful handshake commits an
+    # honored receipt to a file-backed ledger; a NEW node on the same db_path auto-
+    # rehydrates the reputation bump + burnt nonce into Python in its constructor.
+    import gc
+
+    db_path = str(tmp_path / "ledger.redb")
+    provider_node = ohn.P2PNode(identity_key_path=str(tmp_path / "provider.key"))
+    provider_pub = bytes(provider_node.public_key_bytes())
+    peer_id = "12D3KooWProvider"
+    outcome = {"model_id": MODEL, "peer_id": peer_id, "response": b"...", "degraded": False,
+               "provider_pub": provider_pub}
+
+    # First node instance (file-backed ledger): run the handshake → commit_honored_receipt.
+    consumer1 = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"), db_path=db_path)
+    provider_ledger = rc.ReceiptLedger()
+    transport = lambda req: rc.handle_receipt_request_secure(req, provider_node, provider_ledger)  # noqa: E731
+    receipt = rc.request_receipt_for_route(consumer1, outcome, 512, transport=transport)
+    assert receipt is not None
+    nonce = receipt.payload.nonce
+
+    score_before = consumer1.reputation_score(peer_id)
+    assert score_before > 50.0, "honored receipt lifted the provider above neutral"
+    assert consumer1.has_seen_nonce(nonce), "nonce burnt in the live replay guard"
+
+    # Close the first node (drop the Store → its redb commits are already durable).
+    del consumer1
+    gc.collect()
+
+    # Second node instance on the SAME db_path: the constructor must auto-rehydrate.
+    consumer2 = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"), db_path=db_path)
+    assert consumer2.reputation_score(peer_id) == pytest.approx(score_before, abs=0.5), \
+        "reputation rehydrated from the ledger on restart"
+    assert consumer2.has_seen_nonce(nonce), "spent nonce rehydrated into the replay guard"
+    # A peer/nonce it never saw stays at the neutral baseline / unseen.
+    assert consumer2.reputation_score("never-seen") == 50.0
+    assert not consumer2.has_seen_nonce(b"\x00" * 16)
+
+
+def test_in_memory_ledger_does_not_persist(tmp_path):
+    # With no db_path the ledger is ephemeral: a fresh node sees none of the prior state.
+    consumer1 = ohn.P2PNode(identity_key_path=str(tmp_path / "c.key"))  # in-memory ledger
+    provider_node = ohn.P2PNode(identity_key_path=str(tmp_path / "p.key"))
+    outcome = {"model_id": MODEL, "peer_id": "peerZ", "response": b"x", "degraded": False,
+               "provider_pub": bytes(provider_node.public_key_bytes())}
+    ledger = rc.ReceiptLedger()
+    transport = lambda req: rc.handle_receipt_request_secure(req, provider_node, ledger)  # noqa: E731
+    receipt = rc.request_receipt_for_route(consumer1, outcome, 256, transport=transport)
+    assert consumer1.reputation_score("peerZ") > 50.0  # bumped in-memory this run
+
+    # A brand-new in-memory node shares nothing with the first.
+    consumer2 = ohn.P2PNode(identity_key_path=str(tmp_path / "c.key"))
+    assert consumer2.reputation_score("peerZ") == 50.0
+    assert not consumer2.has_seen_nonce(receipt.payload.nonce)
+
+
 def test_secure_provider_refuses_receipt_naming_another_provider(tmp_path):
     # A receipt addressed to provider B, delivered to provider A's handler: A refuses
     # to co-sign a receipt that names a different provider's identity.

@@ -37,7 +37,7 @@ pub mod types;
 // Re-export its modules at this crate's root so existing `crate::{model_id,router,
 // receipts,verify}::…` paths in node.rs / the PyO3 glue keep resolving unchanged — the
 // network crate is the async + FFI shell around this pure core.
-pub use openhydra_protocol::{model_id, receipts, router, verify};
+pub use openhydra_protocol::{model_id, receipts, router, store, verify};
 
 /// Python module entry point.
 #[cfg(feature = "pyo3")]

@@ -364,6 +364,12 @@ pub struct PyP2PNode {
     /// time-decayed score. `Arc` so it can be shared into the `resolve_and_route`
     /// discover closure that runs with the GIL released.
     reputation: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::verify::ReputationTracker>>>,
+    /// M2.3 — the persistent ledger (redb). File-backed when a `db_path` was given to the
+    /// constructor, else an ephemeral in-memory store. Honored receipts are flushed here
+    /// atomically; on boot the constructor rehydrates `reputation` + `nonces` from it.
+    store: Arc<crate::store::Store>,
+    /// M2.3 — in-memory replay guard, rehydrated from the ledger's NONCES table on boot.
+    nonces: Arc<std::sync::RwLock<crate::receipts::NonceTracker>>,
 }
 
 // Phase 4.3: Drop implementation for crash safety.
@@ -401,13 +407,16 @@ impl PyP2PNode {
     ///     bootstrap_peers: Bootstrap peer multiaddrs with /p2p/ suffix
     ///     enable_peer_relay: WS-F F-4 — opt into being a temporary peer-relay
     ///         for NATted peers (default False; only for publicly-reachable nodes)
+    ///     db_path: M2.3 — path to the persistent ledger (redb). When None, an ephemeral
+    ///         in-memory ledger is used (nothing survives a restart).
     #[new]
-    #[pyo3(signature = (identity_key_path=None, listen_addrs=None, bootstrap_peers=None, enable_peer_relay=false))]
+    #[pyo3(signature = (identity_key_path=None, listen_addrs=None, bootstrap_peers=None, enable_peer_relay=false, db_path=None))]
     fn new(
         identity_key_path: Option<String>,
         listen_addrs: Option<Vec<String>>,
         bootstrap_peers: Option<Vec<String>>,
         enable_peer_relay: bool,
+        db_path: Option<String>,
     ) -> PyResult<Self> {
         let config = NodeConfig {
             identity_path: identity_key_path
@@ -428,13 +437,30 @@ impl PyP2PNode {
         let identity = Identity::load_or_create(&config.identity_path)
             .map_err(|e| PyRuntimeError::new_err(format!("identity: {e}")))?;
 
+        // M2.3: open the persistent ledger (file-backed if db_path given, else ephemeral
+        // in-memory), then rehydrate reputation + the replay guard from it so a restart
+        // resumes with the trust scores and spent nonces it shut down with.
+        let store = match db_path {
+            Some(ref p) => crate::store::Store::open(p),
+            None => crate::store::Store::open_in_memory(),
+        }
+        .map_err(|e| PyRuntimeError::new_err(format!("ledger open: {e}")))?;
+
+        let mut reputation_map = std::collections::HashMap::new();
+        let mut nonce_tracker = crate::receipts::NonceTracker::new();
+        store
+            .load_state_into_memory(&mut nonce_tracker, &mut reputation_map)
+            .map_err(|e| PyRuntimeError::new_err(format!("ledger rehydrate: {e}")))?;
+
         Ok(Self {
             inner: None,
             config,
             libp2p_peer_id: identity.libp2p_peer_id.to_string(),
             openhydra_peer_id: identity.openhydra_peer_id.clone(),
             keypair: identity.keypair,
-            reputation: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            reputation: Arc::new(std::sync::RwLock::new(reputation_map)),
+            store: Arc::new(store),
+            nonces: Arc::new(std::sync::RwLock::new(nonce_tracker)),
         })
     }
 
@@ -1263,6 +1289,107 @@ impl PyP2PNode {
             .get(&peer_id)
             .map(|t| t.score_at(now_ms))
             .unwrap_or(crate::verify::NEUTRAL_REPUTATION))
+    }
+
+    /// Commit an **honored** receipt to the persistent ledger and bump the provider's
+    /// reputation, in one durable step (protocol.md §6/§7, M2.3).
+    ///
+    /// The receipt is passed by components (like `receipt_sign`/`receipt_cosign`) so the
+    /// byte encoding lives only in Rust. This method: assembles the `CoSignedReceipt`,
+    /// **re-verifies both signatures** (never bump trust on a bad receipt), computes the
+    /// provider's `+Honored` reputation, **flushes receipt + burnt nonce + reputation to
+    /// the redb ledger atomically**, and only then commits the bump to the in-memory map
+    /// and marks the nonce in the in-memory replay guard. Durability-first: if the flush
+    /// fails, in-memory state is left untouched.
+    ///
+    /// `peer_id` keys the reputation (the same key the router and `record_reputation_outcome`
+    /// use — keeping honored/rejected/failed unified). Returns the provider's new score.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_honored_receipt(
+        &self,
+        peer_id: String,
+        provider_pub: Vec<u8>,
+        consumer_pub: Vec<u8>,
+        model_id: &str,
+        tokens: u64,
+        nonce: Vec<u8>,
+        ts_unix_ms: u64,
+        consumer_sig: Vec<u8>,
+        provider_sig: Vec<u8>,
+    ) -> PyResult<f64> {
+        let payload = crate::receipts::payload_from_bytes(
+            &provider_pub,
+            &consumer_pub,
+            model_id,
+            tokens,
+            &nonce,
+            ts_unix_ms,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let consumer_sig_arr: [u8; 64] = consumer_sig.as_slice().try_into().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("consumer signature must be 64 bytes")
+        })?;
+        let provider_sig_arr: [u8; 64] = provider_sig.as_slice().try_into().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("provider signature must be 64 bytes")
+        })?;
+        let nonce_arr: [u8; 16] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("nonce must be 16 bytes"))?;
+        let receipt = crate::receipts::CoSignedReceipt {
+            payload,
+            consumer_sig: ed25519_dalek::Signature::from_bytes(&consumer_sig_arr),
+            provider_sig: ed25519_dalek::Signature::from_bytes(&provider_sig_arr),
+        };
+        // Defense in depth — never persist or reward a receipt that doesn't verify.
+        crate::receipts::verify_receipt(&receipt).map_err(|e| {
+            let which = match e {
+                crate::receipts::ReceiptError::BadConsumerSig => "bad_consumer_sig",
+                crate::receipts::ReceiptError::BadProviderSig => "bad_provider_sig",
+                crate::receipts::ReceiptError::ReplayedNonce => "replayed_nonce",
+            };
+            pyo3::exceptions::PyValueError::new_err(format!("receipt rejected: {which}"))
+        })?;
+
+        let now_ms = now_unix_ms();
+        // Update reputation under the write lock; flush to disk BEFORE committing the bump
+        // to memory, so a flush failure can't leave memory ahead of the durable ledger.
+        let new_score = {
+            let mut rep = self
+                .reputation
+                .write()
+                .map_err(|_| PyRuntimeError::new_err("reputation store poisoned"))?;
+            let mut updated = rep
+                .get(&peer_id)
+                .cloned()
+                .unwrap_or_else(|| crate::verify::ReputationTracker::new(now_ms));
+            let score = updated.record(crate::verify::VerificationOutcome::Honored, now_ms);
+            self.store
+                .flush_receipt_and_reputation(&receipt, &peer_id, &updated)
+                .map_err(|e| PyRuntimeError::new_err(format!("ledger flush: {e}")))?;
+            rep.insert(peer_id.clone(), updated); // commit to memory only after a durable flush
+            score
+        };
+        // The nonce is already durable (flushed above); mirror it into the in-memory guard.
+        self.nonces
+            .write()
+            .map_err(|_| PyRuntimeError::new_err("nonce guard poisoned"))?
+            .mark_seen(nonce_arr);
+        Ok(new_score)
+    }
+
+    /// Whether a receipt nonce has already been spent, per the in-memory replay guard
+    /// (rehydrated from the ledger on boot). A restart-durable replay check at the FFI.
+    fn has_seen_nonce(&self, nonce: Vec<u8>) -> PyResult<bool> {
+        let nonce_arr: [u8; 16] = nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("nonce must be 16 bytes"))?;
+        let guard = self
+            .nonces
+            .read()
+            .map_err(|_| PyRuntimeError::new_err("nonce guard poisoned"))?;
+        Ok(guard.contains(&nonce_arr))
     }
 
     /// Rank discovered peers exactly as `resolve_and_route`'s internal rank stage does —

@@ -335,6 +335,34 @@ def _record_reputation(node, peer_id: str, outcome: str) -> None:
         pass
 
 
+def _commit_honored(node, peer_id: str, receipt: CoSignedReceipt) -> None:
+    """Durably commit an honored receipt to the node's M2.3 ledger: receipt + burnt
+    nonce + provider reputation bump in one atomic redb flush (`commit_honored_receipt`).
+
+    Best-effort: if the node has no ledger FFI (a stand-in) or the flush fails, fall back
+    to an in-memory-only reputation bump — bookkeeping must never crash the receipt/
+    inference path. The receipt is passed by components so the byte encoding stays in
+    Rust (one source of truth)."""
+    commit = getattr(node, "commit_honored_receipt", None)
+    if commit is not None:
+        try:
+            commit(
+                peer_id,
+                receipt.payload.provider_pub,
+                receipt.payload.consumer_pub,
+                receipt.payload.model_id,
+                int(receipt.payload.tokens),
+                receipt.payload.nonce,
+                int(receipt.payload.ts_unix_ms),
+                receipt.consumer_sig,
+                receipt.provider_sig,
+            )
+            return
+        except Exception:  # noqa: BLE001 — fall back to the in-memory bump below
+            pass
+    _record_reputation(node, peer_id, "honored")
+
+
 def request_receipt_for_route(
     node,
     outcome: dict,
@@ -382,5 +410,7 @@ def request_receipt_for_route(
     except Exception:  # noqa: BLE001 — network drop / timeout / provider vanished.
         _record_reputation(node, peer_id, "failed")
         raise
-    _record_reputation(node, peer_id, "honored")
+    # Honored: durably commit the receipt + nonce + reputation bump to the ledger
+    # (falls back to an in-memory bump if the node has no ledger).
+    _commit_honored(node, peer_id, receipt)
     return receipt

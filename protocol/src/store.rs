@@ -78,6 +78,18 @@ impl Store {
         Ok(store)
     }
 
+    /// Open an **ephemeral** in-memory ledger (no file). Used as the node's default when
+    /// no `db_path` is configured: every API works identically, but nothing survives a
+    /// restart. Handy for tests and stateless/throwaway nodes.
+    pub fn open_in_memory() -> Result<Self, StoreError> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(StoreError::from)?;
+        let store = Self { db };
+        store.init_tables()?;
+        Ok(store)
+    }
+
     /// Materialize all table definitions (idempotent).
     fn init_tables(&self) -> Result<(), StoreError> {
         let wtx = self.db.begin_write().map_err(StoreError::from)?;
