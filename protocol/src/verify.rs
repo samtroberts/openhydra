@@ -157,6 +157,36 @@ impl ReputationTracker {
     pub fn last_update_ms(&self) -> u64 {
         self.last_update_ms
     }
+
+    /// Serialize the snapshot for the persistent store (M2.3): `score:f64[8] ‖
+    /// last_update_ms:u64[8] ‖ half_life_ms:u64[8]`, all little-endian = 24 bytes. The
+    /// f64 is stored by its exact bit pattern so a rehydrated tracker decays identically.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&self.score.to_le_bytes());
+        b[8..16].copy_from_slice(&self.last_update_ms.to_le_bytes());
+        b[16..24].copy_from_slice(&self.half_life_ms.to_le_bytes());
+        b
+    }
+
+    /// Reconstruct a tracker from [`to_bytes`](Self::to_bytes). Returns `Err` if the
+    /// blob is not exactly 24 bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() != 24 {
+            return Err(format!("reputation snapshot must be 24 bytes, got {}", data.len()));
+        }
+        let mut f = [0u8; 8];
+        f.copy_from_slice(&data[0..8]);
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&data[8..16]);
+        let mut h = [0u8; 8];
+        h.copy_from_slice(&data[16..24]);
+        Ok(Self {
+            score: f64::from_le_bytes(f),
+            last_update_ms: u64::from_le_bytes(a),
+            half_life_ms: u64::from_le_bytes(h),
+        })
+    }
 }
 
 /// Reputation → proof-of-inference sample rate (protocol.md §7): trusted providers are
@@ -208,6 +238,28 @@ mod tests {
         let t = ReputationTracker::new(1_000);
         assert_eq!(t.raw_score(), NEUTRAL_REPUTATION);
         assert_eq!(t.score_at(1_000), NEUTRAL_REPUTATION);
+    }
+
+    #[test]
+    fn tracker_bytes_roundtrip_preserves_decay() {
+        // A snapshot survives serialization with its exact state, so a rehydrated
+        // tracker decays to the same value as the original.
+        let mut t = ReputationTracker::with_half_life(1_000, DAY_MS);
+        t.record(VerificationOutcome::Honored, 1_000);
+        t.record(VerificationOutcome::Honored, 1_000);
+        let blob = t.to_bytes();
+        assert_eq!(blob.len(), 24);
+        let back = ReputationTracker::from_bytes(&blob).unwrap();
+        assert_eq!(back.raw_score().to_bits(), t.raw_score().to_bits()); // exact bits
+        assert_eq!(back.last_update_ms(), t.last_update_ms());
+        // Same decayed value a day later → the half-life state round-tripped too.
+        assert_eq!(back.score_at(1_000 + DAY_MS), t.score_at(1_000 + DAY_MS));
+    }
+
+    #[test]
+    fn tracker_from_bytes_rejects_wrong_length() {
+        assert!(ReputationTracker::from_bytes(&[0u8; 23]).is_err());
+        assert!(ReputationTracker::from_bytes(&[0u8; 25]).is_err());
     }
 
     #[test]

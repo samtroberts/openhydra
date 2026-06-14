@@ -23,9 +23,13 @@
 //! the live node state yet — the value encodings, gossip replication, and the
 //! materialized-view rebuild from signed receipts land on top in the rest of M2.3.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use redb::{Database, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+
+use crate::receipts::{CoSignedReceipt, NonceTracker};
+use crate::verify::ReputationTracker;
 
 /// Receipts, keyed by 16-byte nonce → opaque serialized receipt blob.
 const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts");
@@ -155,6 +159,79 @@ impl Store {
         let t = rtx.open_table(NONCES).map_err(StoreError::from)?;
         Ok(t.get(nonce).map_err(StoreError::from)?.is_some())
     }
+
+    // ── Atomic transaction flush + boot rehydration ──
+
+    /// Atomically persist one completed transaction: the co-signed `receipt`, its
+    /// now-spent nonce, and `peer_id`'s updated `reputation` snapshot — **all in a single
+    /// `redb` write transaction**. The all-or-nothing commit means a crash mid-flush can
+    /// never leave a receipt without its replay-guard nonce (which would let it be
+    /// double-counted), nor a reputation bump without the receipt that justified it.
+    ///
+    /// The nonce is taken from `receipt.payload.nonce`. `peer_id` is whichever peer the
+    /// reputation update is *about* (e.g. the serving provider, for a consumer-side
+    /// honored receipt) — the caller passes the post-update tracker.
+    pub fn flush_receipt_and_reputation(
+        &self,
+        receipt: &CoSignedReceipt,
+        peer_id: &str,
+        reputation: &ReputationTracker,
+    ) -> Result<(), StoreError> {
+        let nonce = receipt.payload.nonce;
+        let receipt_blob = receipt.to_bytes();
+        let rep_blob = reputation.to_bytes();
+
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(RECEIPTS).map_err(StoreError::from)?;
+            t.insert(nonce.as_slice(), receipt_blob.as_slice()).map_err(StoreError::from)?;
+        }
+        {
+            let mut t = wtx.open_table(NONCES).map_err(StoreError::from)?;
+            t.insert(nonce.as_slice(), ()).map_err(StoreError::from)?;
+        }
+        {
+            let mut t = wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
+            t.insert(peer_id, rep_blob.as_slice()).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?; // one atomic commit for all three writes
+        Ok(())
+    }
+
+    /// Rehydrate in-memory state from the store on boot: repopulate the replay guard with
+    /// every spent nonce, and the reputation map with every persisted peer snapshot — so a
+    /// restart resumes with the same trust scores and replay protection it shut down with.
+    ///
+    /// Operates on the protocol crate's own pure types (`NonceTracker`, `HashMap<String,
+    /// ReputationTracker>`); the live node wraps the map in its `Arc<RwLock<…>>` and calls
+    /// this under the write lock at startup. Existing in-memory entries are preserved;
+    /// persisted reputation snapshots overwrite same-peer entries (the store is the source
+    /// of truth on boot).
+    pub fn load_state_into_memory(
+        &self,
+        nonce_tracker: &mut NonceTracker,
+        reputation: &mut HashMap<String, ReputationTracker>,
+    ) -> Result<(), StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+
+        let nonces = rtx.open_table(NONCES).map_err(StoreError::from)?;
+        for entry in nonces.iter().map_err(StoreError::from)? {
+            let (key, _) = entry.map_err(StoreError::from)?;
+            let bytes = key.value();
+            let nonce: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| StoreError(format!("corrupt nonce key: {} bytes", bytes.len())))?;
+            nonce_tracker.mark_seen(nonce);
+        }
+
+        let reps = rtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
+        for entry in reps.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            let tracker = ReputationTracker::from_bytes(val.value()).map_err(StoreError)?;
+            reputation.insert(key.value().to_string(), tracker);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -234,5 +311,65 @@ mod tests {
         store.put_receipt(&nonce, b"second").unwrap();
         assert_eq!(store.get_receipt(&nonce).unwrap().as_deref(), Some(&b"second"[..]));
         assert_eq!(store.receipt_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn flush_then_reopen_rehydrates_reputation_and_nonce() {
+        // The full M2.3 loop: a simulated Honored transaction is flushed atomically,
+        // then a fresh Store against the same file rehydrates the burnt nonce + updated
+        // reputation back into in-memory state — exactly what a node does on restart.
+        use crate::receipts::{build_receipt, verify_receipt, ReceiptPayload};
+        use crate::verify::{ReputationTracker, VerificationOutcome};
+        use ed25519_dalek::SigningKey;
+
+        let (_dir, path) = temp_db();
+        let consumer = SigningKey::from_bytes(&[7u8; 32]);
+        let provider = SigningKey::from_bytes(&[9u8; 32]);
+        let peer_id = "12D3KooWProvider";
+        let nonce = [42u8; 16];
+
+        let payload = ReceiptPayload {
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen3.5/2b/fp16/5632a1b48425a5ae".to_string(),
+            tokens: 512,
+            nonce,
+            ts_unix_ms: 1_700_000_000_000,
+        };
+        let receipt = build_receipt(payload, &consumer, &provider);
+
+        // Post-transaction reputation: an honored receipt lifts the provider above neutral.
+        let now = 1_700_000_000_000u64;
+        let mut tracker = ReputationTracker::new(now);
+        let honored_score = tracker.record(VerificationOutcome::Honored, now);
+        assert!(honored_score > 50.0);
+
+        // Flush the whole transaction atomically, then close the DB.
+        {
+            let store = Store::open(&path).unwrap();
+            store.flush_receipt_and_reputation(&receipt, peer_id, &tracker).unwrap();
+            assert_eq!(store.receipt_count().unwrap(), 1);
+        }
+
+        // Reopen (simulated restart) and rehydrate into fresh in-memory state.
+        let reopened = Store::open(&path).unwrap();
+        let mut nonces = NonceTracker::new();
+        let mut reputation: HashMap<String, ReputationTracker> = HashMap::new();
+        reopened.load_state_into_memory(&mut nonces, &mut reputation).unwrap();
+
+        // The spent nonce is back in the replay guard.
+        assert!(nonces.contains(&nonce), "burnt nonce must rehydrate into the replay guard");
+        assert_eq!(nonces.len(), 1);
+
+        // The provider's updated reputation is back in the map, decaying identically.
+        let rt = reputation.get(peer_id).expect("provider reputation must rehydrate");
+        assert_eq!(rt.score_at(now), honored_score, "rehydrated score matches the flushed one");
+        assert!(rt.score_at(now) > 50.0);
+
+        // And the stored receipt blob still decodes and verifies.
+        let blob = reopened.get_receipt(&nonce).unwrap().expect("receipt persisted");
+        let decoded = CoSignedReceipt::from_bytes(&blob).unwrap();
+        assert_eq!(decoded.payload.tokens, 512);
+        assert_eq!(verify_receipt(&decoded), Ok(()), "signatures survived the flush");
     }
 }

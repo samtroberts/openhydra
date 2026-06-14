@@ -125,6 +125,81 @@ pub struct CoSignedReceipt {
     pub provider_sig: Signature,
 }
 
+/// Fixed prefix of [`CoSignedReceipt::to_bytes`]: the two 32-byte keys, 16-byte nonce,
+/// two u64s, two 64-byte signatures, and the u32 model-id length.
+const RECEIPT_BLOB_FIXED: usize = 32 + 32 + 16 + 8 + 8 + 64 + 64 + 4;
+
+impl CoSignedReceipt {
+    /// Serialize to a self-describing byte blob for the persistent ledger (M2.3).
+    ///
+    /// Layout (little-endian): `provider[32] consumer[32] nonce[16] tokens:u64[8]
+    /// ts_unix_ms:u64[8] consumer_sig[64] provider_sig[64] model_len:u32[4]
+    /// model_id[model_len]`. This is the **full reversible record** — distinct from
+    /// [`ReceiptPayload::canonical_bytes`], which is the domain-tagged *signed preimage*
+    /// and carries no signatures.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let model = self.payload.model_id.as_bytes();
+        let mut b = Vec::with_capacity(RECEIPT_BLOB_FIXED + model.len());
+        b.extend_from_slice(self.payload.provider.as_bytes());
+        b.extend_from_slice(self.payload.consumer.as_bytes());
+        b.extend_from_slice(&self.payload.nonce);
+        b.extend_from_slice(&self.payload.tokens.to_le_bytes());
+        b.extend_from_slice(&self.payload.ts_unix_ms.to_le_bytes());
+        b.extend_from_slice(&self.consumer_sig.to_bytes());
+        b.extend_from_slice(&self.provider_sig.to_bytes());
+        b.extend_from_slice(&(model.len() as u32).to_le_bytes());
+        b.extend_from_slice(model);
+        b
+    }
+
+    /// Reconstruct a receipt from [`to_bytes`](Self::to_bytes). Validates key bytes and
+    /// the trailing length; signatures are reconstructed verbatim (call
+    /// [`verify_receipt`] to re-check them). Returns `Err` on a malformed blob.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < RECEIPT_BLOB_FIXED {
+            return Err(format!(
+                "receipt blob too short: {} < {RECEIPT_BLOB_FIXED}",
+                data.len()
+            ));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&data[0..32]);
+        let provider = VerifyingKey::from_bytes(&key).map_err(|e| format!("bad provider key: {e}"))?;
+        key.copy_from_slice(&data[32..64]);
+        let consumer = VerifyingKey::from_bytes(&key).map_err(|e| format!("bad consumer key: {e}"))?;
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&data[64..80]);
+        let mut u8x8 = [0u8; 8];
+        u8x8.copy_from_slice(&data[80..88]);
+        let tokens = u64::from_le_bytes(u8x8);
+        u8x8.copy_from_slice(&data[88..96]);
+        let ts_unix_ms = u64::from_le_bytes(u8x8);
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&data[96..160]);
+        let consumer_sig = Signature::from_bytes(&sig);
+        sig.copy_from_slice(&data[160..224]);
+        let provider_sig = Signature::from_bytes(&sig);
+        let mut u8x4 = [0u8; 4];
+        u8x4.copy_from_slice(&data[224..228]);
+        let model_len = u32::from_le_bytes(u8x4) as usize;
+        if data.len() != RECEIPT_BLOB_FIXED + model_len {
+            return Err(format!(
+                "receipt blob length mismatch: {} != {}",
+                data.len(),
+                RECEIPT_BLOB_FIXED + model_len
+            ));
+        }
+        let model_id = std::str::from_utf8(&data[RECEIPT_BLOB_FIXED..RECEIPT_BLOB_FIXED + model_len])
+            .map_err(|e| format!("bad model id utf8: {e}"))?
+            .to_string();
+        Ok(CoSignedReceipt {
+            payload: ReceiptPayload { provider, consumer, model_id, tokens, nonce, ts_unix_ms },
+            consumer_sig,
+            provider_sig,
+        })
+    }
+}
+
 /// Why a receipt was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptError {
@@ -212,6 +287,18 @@ impl NonceTracker {
             return Err(ReceiptError::ReplayedNonce);
         }
         Ok(())
+    }
+
+    /// Insert a raw nonce as already-spent — used to **rehydrate** the guard from the
+    /// persistent store on boot (the durable side records bare nonces, not whole
+    /// receipts). Returns `true` if newly inserted, `false` if already present.
+    pub fn mark_seen(&mut self, nonce: [u8; 16]) -> bool {
+        self.seen.insert(nonce)
+    }
+
+    /// Whether this nonce has already been spent.
+    pub fn contains(&self, nonce: &[u8; 16]) -> bool {
+        self.seen.contains(nonce)
     }
 
     /// Number of distinct nonces accepted so far.
@@ -340,6 +427,42 @@ mod tests {
         let mut tracker = NonceTracker::new();
         assert_eq!(tracker.accept(&r), Err(ReceiptError::BadConsumerSig));
         assert!(tracker.is_empty()); // a bad receipt must not burn the nonce
+    }
+
+    #[test]
+    fn receipt_bytes_roundtrip() {
+        // The persistent-ledger codec is reversible and signature-preserving.
+        let (c, p) = keys();
+        let r = build_receipt(payload(&c, &p, 512, [42u8; 16]), &c, &p);
+        let blob = r.to_bytes();
+        let back = CoSignedReceipt::from_bytes(&blob).unwrap();
+        assert_eq!(back.payload.tokens, 512);
+        assert_eq!(back.payload.nonce, [42u8; 16]);
+        assert_eq!(back.payload.model_id, r.payload.model_id);
+        assert_eq!(back.payload.provider.as_bytes(), r.payload.provider.as_bytes());
+        assert_eq!(back.consumer_sig.to_bytes(), r.consumer_sig.to_bytes());
+        assert_eq!(back.provider_sig.to_bytes(), r.provider_sig.to_bytes());
+        // Signatures survive the round-trip — the decoded receipt still verifies.
+        assert_eq!(verify_receipt(&back), Ok(()));
+    }
+
+    #[test]
+    fn receipt_from_bytes_rejects_malformed() {
+        assert!(CoSignedReceipt::from_bytes(b"too short").is_err());
+        let (c, p) = keys();
+        let mut blob = build_receipt(payload(&c, &p, 1, [1u8; 16]), &c, &p).to_bytes();
+        blob.push(0xFF); // trailing byte → declared model_len no longer matches
+        assert!(CoSignedReceipt::from_bytes(&blob).is_err());
+    }
+
+    #[test]
+    fn nonce_tracker_mark_seen_and_contains() {
+        let mut t = NonceTracker::new();
+        assert!(!t.contains(&[5u8; 16]));
+        assert!(t.mark_seen([5u8; 16])); // newly inserted
+        assert!(!t.mark_seen([5u8; 16])); // already present
+        assert!(t.contains(&[5u8; 16]));
+        assert_eq!(t.len(), 1);
     }
 
     #[test]
