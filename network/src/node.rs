@@ -198,6 +198,72 @@ fn send_and_wait<T>(
         .map_err(|_| "swarm dropped reply channel".to_string())
 }
 
+// ── M2.2: reputation store helpers ──
+
+type RepStore = std::sync::RwLock<std::collections::HashMap<String, crate::verify::ReputationTracker>>;
+
+/// Current Unix time in milliseconds — the live clock fed to the (otherwise
+/// clock-injected) reputation math. Falls back to 0 if the system clock predates the
+/// epoch (decay then simply treats no time as elapsed).
+#[cfg(feature = "pyo3")]
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The reputation the router should use for a peer: a locally-observed, time-decayed
+/// score overrides the static DHT value when we've interacted with the peer; otherwise
+/// fall back to the DHT's `reputation_score` (or the neutral baseline if it advertised
+/// none). Shared by `resolve_and_route` (production) and `rank_discovered` (test seam)
+/// so both apply the identical override.
+#[cfg(feature = "pyo3")]
+fn effective_reputation(store: &RepStore, peer_id: &str, dht_reputation: f64, now_ms: u64) -> f64 {
+    if let Ok(guard) = store.read() {
+        if let Some(tracker) = guard.get(peer_id) {
+            return tracker.score_at(now_ms); // local, time-decayed score wins
+        }
+    }
+    if dht_reputation > 0.0 {
+        dht_reputation
+    } else {
+        crate::verify::NEUTRAL_REPUTATION
+    }
+}
+
+/// Parse the FFI outcome string into a `VerificationOutcome`.
+#[cfg(feature = "pyo3")]
+fn parse_outcome(s: &str) -> PyResult<crate::verify::VerificationOutcome> {
+    use crate::verify::VerificationOutcome::{Failed, Honored, Rejected};
+    match s.to_ascii_lowercase().as_str() {
+        "honored" => Ok(Honored),
+        "rejected" => Ok(Rejected),
+        "failed" => Ok(Failed),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown reputation outcome '{other}' (expected honored|rejected|failed)"
+        ))),
+    }
+}
+
+/// Read an optional f64 from a peer dict (missing/None → `default`).
+#[cfg(feature = "pyo3")]
+fn dict_get_f64(d: &Bound<'_, pyo3::types::PyDict>, key: &str, default: f64) -> PyResult<f64> {
+    match d.get_item(key)? {
+        Some(v) if !v.is_none() => Ok(v.extract::<f64>()?),
+        _ => Ok(default),
+    }
+}
+
+/// Read an optional u32 from a peer dict (missing/None → `default`).
+#[cfg(feature = "pyo3")]
+fn dict_get_u32(d: &Bound<'_, pyo3::types::PyDict>, key: &str, default: u32) -> PyResult<u32> {
+    match d.get_item(key)? {
+        Some(v) if !v.is_none() => Ok(v.extract::<u32>()?),
+        _ => Ok(default),
+    }
+}
+
 // ── PyDict ↔ serde_json conversion helpers (OHV2 wire format) ──
 //
 // These convert between PyDict and serde_json::Value for the
@@ -292,6 +358,12 @@ pub struct PyP2PNode {
     openhydra_peer_id: String,
     /// Ed25519 keypair for signing (retained for 6.0 identity methods).
     keypair: libp2p::identity::Keypair,
+    /// M2.2 — live per-peer reputation, keyed by `peer_id`. Updated via
+    /// `record_reputation_outcome` (the FFI feedback loop) and consulted by the router
+    /// to override the static DHT `reputation_score` with a locally-observed,
+    /// time-decayed score. `Arc` so it can be shared into the `resolve_and_route`
+    /// discover closure that runs with the GIL released.
+    reputation: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::verify::ReputationTracker>>>,
 }
 
 // Phase 4.3: Drop implementation for crash safety.
@@ -362,6 +434,7 @@ impl PyP2PNode {
             libp2p_peer_id: identity.libp2p_peer_id.to_string(),
             openhydra_peer_id: identity.openhydra_peer_id.clone(),
             keypair: identity.keypair,
+            reputation: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -466,6 +539,10 @@ impl PyP2PNode {
         let inner = self.require_started()?;
         let cmd_tx_d = inner.cmd_tx.clone();
         let cmd_tx_r = inner.cmd_tx.clone();
+        // M2.2: share the live reputation store into the (GIL-released) discover closure,
+        // and stamp one `now` for the whole call so decay is consistent across ranking.
+        let rep_store = Arc::clone(&self.reputation);
+        let now_ms = now_unix_ms();
 
         let outcome = py.allow_threads(move || {
             // discover: DHT lookup → router Candidates (RTT via ping is deferred).
@@ -491,11 +568,14 @@ impl PyP2PNode {
                             // here so latency does not bias ranking yet.
                             latency_ms: 1.0,
                             load_pct: dp.load_pct,
-                            reputation: if dp.reputation_score > 0.0 {
-                                dp.reputation_score
-                            } else {
-                                50.0 // unknown reputation → neutral default (matches Python)
-                            },
+                            // M2.2: a locally-observed, time-decayed score overrides the
+                            // static DHT reputation; unknown peers fall back to neutral.
+                            reputation: effective_reputation(
+                                &rep_store,
+                                &dp.peer_id,
+                                dp.reputation_score,
+                                now_ms,
+                            ),
                             bandwidth_mbps: 0.0,
                             s2s_rtt_ms: 0.0,
                             throughput_tok_s: dp.throughput_tok_s,
@@ -1148,6 +1228,89 @@ impl PyP2PNode {
     fn public_key_hex(&self) -> PyResult<String> {
         let bytes = self.public_key_bytes()?;
         Ok(hex::encode(bytes))
+    }
+
+    // ── M2.2: reputation feedback loop ──
+
+    /// Record a verification/receipt outcome for a peer into the live reputation store
+    /// (protocol.md §7). `outcome` is one of ``"honored"``, ``"rejected"``, ``"failed"``.
+    /// The Python receipt lifecycle calls this after a transaction so the router can
+    /// downrank misbehaving providers. Returns the peer's new (post-update) score.
+    /// Raises ``ValueError`` on an unknown outcome string.
+    fn record_reputation_outcome(&self, peer_id: String, outcome: &str) -> PyResult<f64> {
+        let outcome = parse_outcome(outcome)?;
+        let now_ms = now_unix_ms();
+        let mut guard = self
+            .reputation
+            .write()
+            .map_err(|_| PyRuntimeError::new_err("reputation store poisoned"))?;
+        let tracker = guard
+            .entry(peer_id)
+            .or_insert_with(|| crate::verify::ReputationTracker::new(now_ms));
+        Ok(tracker.record(outcome, now_ms))
+    }
+
+    /// The peer's current locally-observed, time-decayed reputation score. Returns the
+    /// neutral baseline (50.0) for a peer we've never recorded an outcome for — the same
+    /// value the router uses for an unknown peer. Read-only (does not mutate the store).
+    fn reputation_score(&self, peer_id: String) -> PyResult<f64> {
+        let now_ms = now_unix_ms();
+        let guard = self
+            .reputation
+            .read()
+            .map_err(|_| PyRuntimeError::new_err("reputation store poisoned"))?;
+        Ok(guard
+            .get(&peer_id)
+            .map(|t| t.score_at(now_ms))
+            .unwrap_or(crate::verify::NEUTRAL_REPUTATION))
+    }
+
+    /// Rank discovered peers exactly as `resolve_and_route`'s internal rank stage does —
+    /// applying the **same** local-reputation override (`effective_reputation`) — but
+    /// over a caller-supplied candidate list instead of a live DHT discovery. This is the
+    /// in-process seam for exercising the reputation→ranking path without a live swarm.
+    ///
+    /// `peers` is a list of dicts (as `discover()` returns); only the scoring keys are
+    /// read: ``peer_id`` (required), and optional ``reputation_score``, ``throughput_tok_s``,
+    /// ``queue_depth``, ``load_pct``, ``latency_ms``. Returns a list of
+    /// ``{"peer_id", "score"}`` dicts, best-first.
+    fn rank_discovered(
+        &self,
+        py: Python<'_>,
+        peers: &Bound<'_, pyo3::types::PyList>,
+        tier: u8,
+    ) -> PyResult<PyObject> {
+        let now_ms = now_unix_ms();
+        let mut inputs: Vec<crate::router::PeerScoreInput> = Vec::with_capacity(peers.len());
+        for item in peers.iter() {
+            let d = item
+                .downcast::<pyo3::types::PyDict>()
+                .map_err(|_| PyRuntimeError::new_err("rank_discovered: each peer must be a dict"))?;
+            let peer_id: String = match d.get_item("peer_id")? {
+                Some(v) => v.extract()?,
+                None => return Err(PyRuntimeError::new_err("rank_discovered: peer missing 'peer_id'")),
+            };
+            let dht_rep = dict_get_f64(d, "reputation_score", 0.0)?;
+            inputs.push(crate::router::PeerScoreInput {
+                latency_ms: dict_get_f64(d, "latency_ms", 1.0)?,
+                load_pct: dict_get_f64(d, "load_pct", 0.0)?,
+                // identical override to the live resolve_and_route discover closure.
+                reputation: effective_reputation(&self.reputation, &peer_id, dht_rep, now_ms),
+                bandwidth_mbps: 0.0,
+                s2s_rtt_ms: 0.0,
+                throughput_tok_s: dict_get_f64(d, "throughput_tok_s", 0.0)?,
+                queue_depth: dict_get_u32(d, "queue_depth", 0)?,
+                peer_id,
+            });
+        }
+        let out = pyo3::types::PyList::empty(py);
+        for sp in crate::router::rank_peers(&inputs, tier) {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("peer_id", sp.peer_id)?;
+            dict.set_item("score", sp.score)?;
+            out.append(dict)?;
+        }
+        Ok(out.into_py_any(py)?)
     }
 }
 
