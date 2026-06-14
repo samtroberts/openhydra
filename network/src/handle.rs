@@ -86,6 +86,16 @@ impl NetworkHandle {
         })?
     }
 
+    /// Forward `data` to `peer_id` and block for the one-shot response (the consumer's
+    /// serve round-trip: `SERVE_REQUEST` → buffered framed completion).
+    pub fn proxy_forward(&self, peer_id: String, data: Vec<u8>) -> Result<Vec<u8>, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::ProxyForward {
+            peer_id,
+            data,
+            reply,
+        })?
+    }
+
     /// Block up to `timeout` for the next inbound proxy request `(request_id, data)`.
     pub fn poll_inbound(&self, timeout: Duration) -> Option<(String, Vec<u8>)> {
         self.proxy_queue.pop(timeout)

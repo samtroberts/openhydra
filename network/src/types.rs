@@ -144,7 +144,7 @@ pub struct NatInfo {
 }
 
 /// A discovered peer — returned by `P2PNode.discover()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiscoveredPeer {
     pub peer_id: String,
     pub libp2p_peer_id: String,
