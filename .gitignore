@@ -68,6 +68,9 @@ yarn.lock
 # ── Tauri / Rust ──────────────────────────────────────────────────────────────
 desktop/src-tauri/target/
 desktop/src-tauri/WixTools/
+# Cargo workspace (M2.3 split) shares one build dir at the repo root.
+/target/
+network/target/
 *.rlib
 Cargo.lock
 

@@ -32,25 +32,12 @@ pub mod tensor_stream;
 pub mod transport;
 pub mod types;
 
-/// Canonical model identity & equivalence (protocol.md §4) — M1.1. Pure Rust
-/// (sha2/hex only); will be extracted to the `protocol` crate in the iterative
-/// workspace refactor.
-pub mod model_id;
-
-/// Router scoring & ranking (protocol.md §5) — M1.3. Ports the peer-ranking logic
-/// from `coordinator/peer_selector.py`; resolve/route stages land on top.
-pub mod router;
-
-/// Co-signed inference receipts (protocol.md §6) — M2.1. Nested ed25519 signatures
-/// + in-memory replay protection; the persistent ledger is M2.3.
-pub mod receipts;
-
-/// Verification policy (protocol.md §7) — M2.2 scaffold. Pure logic & math for the
-/// trust layer: reputation feedback (`ReputationTracker`) with time-decay, and the
-/// reputation→sample-rate policy. Activation hashing (TOPLOC) and redundant-execution
-/// comparison are documented stubs to be ported on top; nothing is wired into the DHT
-/// or router yet.
-pub mod verify;
+// Protocol core (canonical id §4, routing math §5, receipts §6, verify policy §7) now
+// lives in the pure, synchronous `openhydra-protocol` crate (M2.3 workspace split).
+// Re-export its modules at this crate's root so existing `crate::{model_id,router,
+// receipts,verify}::…` paths in node.rs / the PyO3 glue keep resolving unchanged — the
+// network crate is the async + FFI shell around this pure core.
+pub use openhydra_protocol::{model_id, receipts, router, verify};
 
 /// Python module entry point.
 #[cfg(feature = "pyo3")]

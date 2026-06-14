@@ -1,0 +1,22 @@
+# OpenHydra Rust workspace.
+#
+# Split (M2.3): a pure, synchronous `protocol` crate (canonical model id, routing
+# math, co-signed receipts, verification policy, persistent ledger) and the async
+# `network` crate (rust-libp2p + Kademlia + the PyO3 FFI) that wires it into the live
+# node. `protocol` has no async / libp2p / pyo3 dependency; `network` depends on it.
+[workspace]
+resolver = "2"
+members = ["network", "protocol"]
+# The patched libp2p-quic lives inside the `network` tree and is consumed via the
+# [patch] below, not as a workspace member.
+exclude = ["network/patched-deps/libp2p-quic"]
+
+# `[profile.*]` and `[patch.*]` are honored only in the workspace root manifest, so
+# they move here from network/Cargo.toml. The patch path is relative to this file.
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+
+[patch.crates-io]
+libp2p-quic = { path = "network/patched-deps/libp2p-quic" }

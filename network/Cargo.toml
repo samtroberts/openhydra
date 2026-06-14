@@ -37,6 +37,9 @@ tokio = { version = "1", features = ["full"] }
 # Python bindings (only linked when building the cdylib via maturin)
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
+# Pure protocol core (canonical id, routing math, receipts, verify, ledger).
+openhydra-protocol = { path = "../protocol" }
+
 # Crypto — compatible with OpenHydra's existing Ed25519 keys
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
@@ -74,14 +77,9 @@ prost-build = "0.13"
 [dev-dependencies]
 tempfile = "3"
 
-[profile.release]
-strip = true
-opt-level = "s"
-lto = true
-
-
-[patch.crates-io]
-libp2p-quic = { path = "patched-deps/libp2p-quic" }
+# NOTE: `[profile.*]` and `[patch.crates-io]` moved to the workspace root manifest
+# (../Cargo.toml) — Cargo honors them only there. The libp2p-quic patch path is now
+# `network/patched-deps/libp2p-quic`, relative to that root manifest.
 
 [[bin]]
 name = "openhydra-bootstrap"
