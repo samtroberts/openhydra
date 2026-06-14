@@ -22,6 +22,7 @@
 pub mod adapter;
 pub mod http;
 pub mod ollama;
+pub mod provider;
 pub mod serve;
 
 pub use adapter::{
@@ -30,6 +31,7 @@ pub use adapter::{
 };
 pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;
+pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};
 
 /// An Ollama adapter backed by the live reqwest transport, pointed at `base_url`

@@ -164,6 +164,38 @@ pub fn handle_serve_request(
     }
 }
 
+/// Frame a buffered sequence of encoded chunks for one-shot delivery: repeated
+/// `[u32-LE len][encoded ServeChunk]`. The first transport is buffered request/response
+/// (the inbound libp2p reply is one-shot); push-based incremental streaming is a later
+/// refinement that pushes each [`ServeChunk`] to the consumer's `reply_to` directly.
+pub fn frame_response(encoded_chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for c in encoded_chunks {
+        buf.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        buf.extend_from_slice(c);
+    }
+    buf
+}
+
+/// Parse a [`frame_response`] buffer back into chunks (consumer side).
+pub fn parse_response(buffer: &[u8]) -> Result<Vec<ServeChunk>, AdapterError> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buffer.len() {
+        if i + 4 > buffer.len() {
+            return Err(AdapterError::Parse("serve response: truncated length prefix".into()));
+        }
+        let len = u32::from_le_bytes(buffer[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        if i + len > buffer.len() {
+            return Err(AdapterError::Parse("serve response: truncated chunk body".into()));
+        }
+        out.push(ServeChunk::decode(&buffer[i..i + len])?);
+        i += len;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +292,25 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0], ServeChunk::Error(_)));
         assert!(!summary.ok);
+    }
+
+    #[test]
+    fn frame_response_round_trips() {
+        let chunks: Vec<Vec<u8>> = vec![
+            ServeChunk::Delta("Hi".into()).encode(),
+            ServeChunk::Delta(" there".into()).encode(),
+            ServeChunk::Done { tokens: 2 }.encode(),
+        ];
+        let parsed = parse_response(&frame_response(&chunks)).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ServeChunk::Delta("Hi".into()),
+                ServeChunk::Delta(" there".into()),
+                ServeChunk::Done { tokens: 2 },
+            ]
+        );
+        assert!(parse_response(b"\xff\xff\xff\xff").is_err()); // truncated chunk body
     }
 
     #[test]

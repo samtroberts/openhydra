@@ -13,6 +13,9 @@ name = "openhydra_agent"
 # Canonical model id + (later) routing/receipts/verify. The agent is a thin shell
 # over the pure protocol core.
 openhydra-protocol = { path = "../protocol" }
+# libp2p swarm, via the non-pyo3 NetworkHandle. default-features = false drops the pyo3
+# feature so the agent links no Python.
+openhydra-network = { path = "../network", default-features = false }
 # Parse engine HTTP responses (Ollama /api/tags, /api/show, …).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
