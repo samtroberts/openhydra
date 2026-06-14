@@ -127,6 +127,94 @@ pub fn rank_peers(peers: &[PeerScoreInput], tier: u8) -> Vec<ScoredPeer> {
     scored
 }
 
+/// A candidate provider seen by the router: its advertised canonical model id plus
+/// the scoring signals (built from a `DiscoveredPeer` + its §4 capability fields).
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    /// The provider's advertised canonical model id (`""` if it didn't advertise one).
+    pub canonical_model_id: String,
+    /// Scoring inputs; `score.peer_id` is the peer to route to.
+    pub score: PeerScoreInput,
+}
+
+/// The result of a successful route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteOutcome {
+    /// The model id actually served (a fallback when `degraded`).
+    pub model_id: String,
+    pub peer_id: String,
+    pub response: Vec<u8>,
+    /// True when served by a fallback (nearest-smaller same-family) model.
+    pub degraded: bool,
+}
+
+/// Why a request could not be routed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteError {
+    /// No compatible, reachable provider across all candidate models.
+    NoProvider,
+}
+
+/// Resolve → (graceful) degrade → rank → route, with the network I/O **injected**.
+///
+/// `model_candidates` is an ordered list of `(model_id, request_canonical_id)`: the
+/// exact request first, then nearest-smaller same-family fallbacks (the caller
+/// supplies the order from the catalog — that governance lives with the catalog).
+/// For each candidate model:
+///
+/// 1. `discover(model_id)` yields its providers;
+/// 2. providers whose advertised canonical id is *incompatible* with the request are
+///    dropped (a provider that advertised none is kept — backward-compatible);
+/// 3. the rest are ranked by [`rank_peers`];
+/// 4. `route(peer_id, request)` is tried best-first, failing over to the next-ranked
+///    peer on error.
+///
+/// The first model that yields a successful route wins; `degraded` is set for any
+/// non-first candidate. Returns [`RouteError::NoProvider`] if nothing routes.
+///
+/// I/O is injected so the orchestration is unit-testable without a live swarm; the
+/// PyO3 method supplies real `discover`/`route` closures backed by the libp2p
+/// `Discover`/`ProxyForward` commands.
+pub fn resolve_and_route<D, R>(
+    model_candidates: &[(String, String)],
+    request: &[u8],
+    tier: u8,
+    mut discover: D,
+    mut route: R,
+) -> Result<RouteOutcome, RouteError>
+where
+    D: FnMut(&str) -> Vec<Candidate>,
+    R: FnMut(&str, &[u8]) -> Result<Vec<u8>, String>,
+{
+    for (idx, (model_id, req_canonical)) in model_candidates.iter().enumerate() {
+        let candidates = discover(model_id);
+        let compatible: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|c| {
+                req_canonical.is_empty()
+                    || c.canonical_model_id.is_empty()
+                    || crate::model_id::is_compatible(req_canonical, &c.canonical_model_id)
+            })
+            .collect();
+        if compatible.is_empty() {
+            continue; // graceful degradation → next (nearest-smaller) candidate
+        }
+        let inputs: Vec<PeerScoreInput> = compatible.iter().map(|c| c.score.clone()).collect();
+        for sp in rank_peers(&inputs, tier) {
+            if let Ok(response) = route(&sp.peer_id, request) {
+                return Ok(RouteOutcome {
+                    model_id: model_id.clone(),
+                    peer_id: sp.peer_id,
+                    response,
+                    degraded: idx > 0,
+                });
+            }
+            // this peer failed to route → fail over to the next-ranked peer
+        }
+    }
+    Err(RouteError::NoProvider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +312,135 @@ mod tests {
         ];
         let scored = rank_peers(&peers, 1);
         assert_eq!(scored[0].score, scored[1].score);
+    }
+
+    // --- resolve_and_route orchestration (I/O injected) ---
+
+    fn candidate(peer_id: &str, canonical: &str, f: impl FnOnce(&mut PeerScoreInput)) -> Candidate {
+        let mut score = PeerScoreInput {
+            peer_id: peer_id.to_string(),
+            latency_ms: 10.0,
+            ..Default::default()
+        };
+        f(&mut score);
+        Candidate {
+            canonical_model_id: canonical.to_string(),
+            score,
+        }
+    }
+
+    const TPL_A: &str = "qwen3.5/2b/fp16/aaaaaaaaaaaaaaaa";
+    const TPL_B: &str = "qwen3.5/2b/fp16/bbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn routes_to_highest_ranked_compatible_peer() {
+        let cands = vec![
+            candidate("slow", TPL_A, |p| p.throughput_tok_s = 5.0),
+            candidate("fast", TPL_A, |p| p.throughput_tok_s = 45.0),
+        ];
+        let out = resolve_and_route(
+            &[("openhydra-qwen3.5-2b".into(), "qwen3.5/2b/*/*".into())],
+            b"req",
+            2,
+            |_| cands.clone(),
+            |peer, _| Ok(format!("served-by-{peer}").into_bytes()),
+        )
+        .unwrap();
+        assert_eq!(out.peer_id, "fast");
+        assert_eq!(out.response, b"served-by-fast");
+        assert!(!out.degraded);
+    }
+
+    #[test]
+    fn filters_incompatible_canonical_id() {
+        // The incompatible (different template) peer is dropped despite higher throughput.
+        let cands = vec![
+            candidate("wrong-tpl", TPL_B, |p| p.throughput_tok_s = 99.0),
+            candidate("right", TPL_A, |p| p.throughput_tok_s = 1.0),
+        ];
+        let out = resolve_and_route(
+            &[("m".into(), TPL_A.into())],
+            b"req",
+            2,
+            |_| cands.clone(),
+            |peer, _| Ok(peer.as_bytes().to_vec()),
+        )
+        .unwrap();
+        assert_eq!(out.peer_id, "right");
+    }
+
+    #[test]
+    fn graceful_degradation_to_nearest_smaller() {
+        // The 9b request has no live providers → fall back to the smaller 2b model.
+        let out = resolve_and_route(
+            &[
+                ("openhydra-qwen3.5-9b".into(), "qwen3.5/9b/*/*".into()),
+                ("openhydra-qwen3.5-2b".into(), "qwen3.5/2b/*/*".into()),
+            ],
+            b"req",
+            2,
+            |model_id| {
+                if model_id == "openhydra-qwen3.5-2b" {
+                    vec![candidate("small", TPL_A, |_| {})]
+                } else {
+                    vec![] // 9b: no live providers
+                }
+            },
+            |peer, _| Ok(peer.as_bytes().to_vec()),
+        )
+        .unwrap();
+        assert_eq!(out.model_id, "openhydra-qwen3.5-2b");
+        assert_eq!(out.peer_id, "small");
+        assert!(out.degraded);
+    }
+
+    #[test]
+    fn route_fails_over_to_next_ranked_peer() {
+        let cands = vec![
+            candidate("best-but-dead", TPL_A, |p| p.throughput_tok_s = 45.0),
+            candidate("backup", TPL_A, |p| p.throughput_tok_s = 5.0),
+        ];
+        let out = resolve_and_route(
+            &[("m".into(), "qwen3.5/2b/*/*".into())],
+            b"req",
+            2,
+            |_| cands.clone(),
+            |peer, _| {
+                if peer == "best-but-dead" {
+                    Err("connection refused".into())
+                } else {
+                    Ok(peer.as_bytes().to_vec())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(out.peer_id, "backup"); // failed over from the higher-ranked dead peer
+    }
+
+    #[test]
+    fn no_provider_when_nothing_compatible_anywhere() {
+        let err = resolve_and_route(
+            &[("m".into(), TPL_A.into())],
+            b"req",
+            2,
+            |_| vec![candidate("x", "gemma-4/e4b/fp16/cccccccccccccccc", |_| {})], // wrong family
+            |peer, _| Ok(peer.as_bytes().to_vec()),
+        )
+        .unwrap_err();
+        assert_eq!(err, RouteError::NoProvider);
+    }
+
+    #[test]
+    fn provider_without_canonical_id_is_kept() {
+        // Backward-compat: a legacy provider that advertised no canonical id is eligible.
+        let out = resolve_and_route(
+            &[("m".into(), TPL_A.into())],
+            b"req",
+            2,
+            |_| vec![candidate("legacy", "", |_| {})],
+            |peer, _| Ok(peer.as_bytes().to_vec()),
+        )
+        .unwrap();
+        assert_eq!(out.peer_id, "legacy");
     }
 }
