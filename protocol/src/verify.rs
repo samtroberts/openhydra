@@ -13,8 +13,8 @@
 //!
 //! 1. **Proof-of-inference (sampling).** A TOPLOC-style hash of the model's
 //!    activations lets a verifier confirm a result is consistent with the claimed
-//!    model, checked on a *sampled* fraction of requests. The activation-hash port
-//!    (`verification/toploc.py` → here) is deferred — see [`activation_hash`].
+//!    model, checked on a *sampled* fraction of requests. Ported byte-identically from
+//!    `verification/toploc.py` — see [`activation_hash`] / [`verify_activation_hash`].
 //! 2. **Redundant execution.** A sampled fraction of requests are run on ≥2
 //!    providers and compared. The comparison logic is deferred — see [`agrees`].
 //! 3. **Reputation.** Providers accrue a reputation score from verification
@@ -204,26 +204,64 @@ pub fn sample_rate_for_reputation(reputation: f64, min_rate: f64, max_rate: f64)
     rate.clamp(min_rate.min(max_rate), min_rate.max(max_rate))
 }
 
-// ── Deferred verification primitives (TOPLOC port + redundant-execution) ──
-//
-// These are intentionally stubs in the M2.2 scaffold. The reputation math above is the
-// piece built now; the activation-hash and agreement primitives are the heavier port
-// (`verification/toploc.py`) and land on top of this module next.
+// ── Verification primitives (TOPLOC proof-of-inference) ──
 
-/// **Deferred (M2.2 follow-up).** TOPLOC-style activation hash over a model's
-/// activations, used for sampled proof-of-inference. Will hash the OHV2 byte-level
-/// activations directly (no tensor copy). Not yet implemented.
-#[allow(dead_code)]
-pub fn activation_hash(_activations: &[u8]) -> Option<[u8; 32]> {
-    None // scaffold: real TOPLOC hashing is the next step on this module
+/// TOPLOC locality-sensitive activation hash (protocol.md §7) — a **byte-identical**
+/// Rust port of `verification/toploc.py::activation_hash`, so a digest computed by a
+/// Python peer verifies against one computed here, and vice versa, during the
+/// Python→Rust transition. (TOPLOC applies to the *sharded* path, where activations
+/// exist; the whole-model path returns text, not activations — see plan §7.)
+///
+/// Each value is quantized, then the packed bytes are SHA-256'd:
+/// * a **token id** (`|v| > 1.5`) → its rounded value as a 4-byte little-endian `i32`;
+/// * a **hidden state** (`|v| <= 1.5`) → an 8-bit bucket `round((v + 1.0) * 127.5)`
+///   clamped to `[0, 255]`, one byte.
+///
+/// An empty activation hashes the literal `b"empty"`.
+///
+/// **Rounding is half-to-even** (`round_ties_even`) to match Python's `round()`. A naive
+/// half-away-from-zero round would diverge on exact-half bucket boundaries and cause
+/// false verification failures — exactly the kind of silent mismatch this hash exists to
+/// catch, so the parity is pinned by golden vectors generated from the Python reference.
+pub fn activation_hash(activation: &[f64]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if activation.is_empty() {
+        hasher.update(b"empty");
+    } else {
+        let mut packed: Vec<u8> = Vec::with_capacity(activation.len());
+        for &v in activation {
+            if v.abs() > 1.5 {
+                // Token id → 4-byte LE i32 of the (banker's-)rounded value.
+                let id = v.round_ties_even() as i32;
+                packed.extend_from_slice(&id.to_le_bytes());
+            } else {
+                // Hidden state → one 8-bit bucket in [0, 255].
+                let bucket = (((v + 1.0) * 127.5).round_ties_even()).clamp(0.0, 255.0) as u8;
+                packed.push(bucket);
+            }
+        }
+        hasher.update(&packed);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Verify an activation vector against an expected 32-byte TOPLOC digest. Mirrors
+/// `verification/toploc.py::verify_hash`: an empty/wrong-length `expected` fails closed.
+pub fn verify_activation_hash(activation: &[f64], expected: &[u8]) -> bool {
+    expected.len() == 32 && activation_hash(activation) == expected
 }
 
 /// **Deferred (M2.2 follow-up).** Whether two providers' results for the same request
 /// agree under the redundant-execution audit. Will compare activation hashes / sampled
-/// logits within tolerance. Not yet implemented.
+/// logits within tolerance. Not yet implemented (the redundant-exec comparison still
+/// lives in Python `verification/redundant.py`).
 #[allow(dead_code)]
 pub fn agrees(_a: &[u8], _b: &[u8]) -> bool {
-    false // scaffold: real comparison logic is the next step on this module
+    false // scaffold: real comparison logic lands when verification moves into Rust
 }
 
 #[cfg(test)]
@@ -403,5 +441,61 @@ mod tests {
         let (lo, hi) = (0.01, 0.5);
         assert!((sample_rate_for_reputation(999.0, lo, hi) - lo).abs() < 1e-9);
         assert!((sample_rate_for_reputation(-50.0, lo, hi) - hi).abs() < 1e-9);
+    }
+
+    // ── TOPLOC activation hash ──
+    //
+    // Golden digests generated from the Python reference (`verification/toploc.py`) — a
+    // mismatch means the Rust port diverged from what live Python peers compute, which
+    // would cause false verification failures. These pin the exact byte layout +
+    // banker's rounding. Regenerate via:
+    //   python3 -c "from verification.toploc import activation_hash as H; print(H(<vec>).hex())"
+
+    fn hx(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn toploc_matches_python_golden_vectors() {
+        let cases: &[(&[f64], &str)] = &[
+            (&[], "2e1cfa82b035c26cbbbdae632cea070514eb8b773f616aaeaf668e2f0be8f10d"),
+            (&[1.0, 2.0, 3.0, 4.0], "b53fee71a9a7f14107ee19b68ddbf198e102c0881286d1be327928ac97467c9e"),
+            (&[0.5, -0.3, 1.0], "c95cbccbc375d32d5fabcde2e5015c6735295a2f933251ac8eceb20dffa0dda4"),
+            (&[263.0, 2217.0, 7826.0, -1.5, 0.0], "a06c1b5c64fa2ac6d5a33c5b56243dea31b4612830d725d25956db72a6253cfb"),
+            (&[-1.0, 0.0, 1.0], "5240672d7b51756b829ad0ef8d9468b7a078afa2f410484fd3892dab47becb72"),
+            // 1.5/-1.5 are hidden states (|v| > 1.5 is the token threshold); 1.6/-1.6 are token ids.
+            (&[1.5, -1.5, 1.6, -1.6], "93399f682d2dfb1d2f8741b3cfee2e44e9309ded0ebefbfce39f7130684d7dae"),
+            // (0+1)*127.5 = 127.5 → banker's-rounds to 128 (a naive round would also give 128 here,
+            // but the golden still anchors the tie behaviour against Python's round()).
+            (&[0.0], "76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71"),
+            (&[-263.0, -1.6], "e5df279826e7f401dd7437e98b33aa5cafe061b213d22b6b8f96daed7e9b67ff"),
+        ];
+        for (vec, hex) in cases {
+            assert_eq!(activation_hash(vec), hx(hex), "TOPLOC mismatch for {vec:?}");
+        }
+    }
+
+    #[test]
+    fn toploc_is_deterministic_and_tamper_sensitive() {
+        let a = [263.0, 2217.0, 7826.0, -0.25];
+        assert_eq!(activation_hash(&a), activation_hash(&a)); // deterministic
+        let tampered = [263.0, 2217.0, 7826.0, 999.0]; // one value changed
+        assert_ne!(activation_hash(&a), activation_hash(&tampered));
+        // A token-id vs hidden-state reinterpretation of the same magnitude differs too.
+        assert_ne!(activation_hash(&[2.0]), activation_hash(&[1.0]));
+    }
+
+    #[test]
+    fn verify_activation_hash_fails_closed() {
+        let a = [1.0, 2.0, 3.0];
+        let good = activation_hash(&a);
+        assert!(verify_activation_hash(&a, &good));
+        assert!(!verify_activation_hash(&[1.0, 2.0, 4.0], &good)); // tampered
+        assert!(!verify_activation_hash(&a, b"")); // empty digest fails closed
+        assert!(!verify_activation_hash(&a, &good[..31])); // wrong length fails closed
     }
 }
