@@ -168,6 +168,10 @@ pub struct DiscoveredPeer {
     pub throughput_tok_s: f64,
     pub queue_depth: u32,
     pub hardware_class: String,
+    // Ranking signals (M1.3) — also surfaced from PeerRecord so the router's
+    // resolve_and_route can score on load + reputation (RTT via ping is deferred).
+    pub load_pct: f64,
+    pub reputation_score: f64,
     /// The resolved reachable address (direct or via relay).
     pub reachable_address: String,
 }

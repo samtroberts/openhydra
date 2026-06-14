@@ -2404,6 +2404,8 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
         throughput_tok_s: r.throughput_tok_s,
         queue_depth: r.queue_depth,
         hardware_class: r.hardware_class.clone(),
+        load_pct: r.load_pct,
+        reputation_score: r.reputation_score,
         reachable_address,
     }
 }

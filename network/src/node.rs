@@ -445,6 +445,91 @@ impl PyP2PNode {
         Ok(result.into_py_any(py)?)
     }
 
+    /// Resolve → (graceful) degrade → rank → route a request, end to end (M1.3).
+    ///
+    /// `model_candidates` is an ordered list of `(model_id, request_canonical_id)`:
+    /// the exact request first, then nearest-smaller same-family fallbacks (the caller
+    /// computes that order from the catalog). For each model this discovers providers
+    /// over the DHT, drops canonical-id-incompatible ones, ranks the rest
+    /// (`protocol::router`), and proxies the request to the best reachable peer,
+    /// failing over to the next-ranked peer / next candidate model as needed.
+    ///
+    /// Returns a dict ``{model_id, peer_id, response: bytes, degraded: bool}`` on
+    /// success, or raises ``RuntimeError("no_provider: …")`` when nothing routes.
+    fn resolve_and_route(
+        &self,
+        py: Python<'_>,
+        model_candidates: Vec<(String, String)>,
+        request: Vec<u8>,
+        tier: u8,
+    ) -> PyResult<PyObject> {
+        let inner = self.require_started()?;
+        let cmd_tx_d = inner.cmd_tx.clone();
+        let cmd_tx_r = inner.cmd_tx.clone();
+
+        let outcome = py.allow_threads(move || {
+            // discover: DHT lookup → router Candidates (RTT via ping is deferred).
+            let discover = |model_id: &str| -> Vec<crate::router::Candidate> {
+                let peers = match send_and_wait(&cmd_tx_d, |reply| SwarmCommand::Discover {
+                    model_id: model_id.to_string(),
+                    reply,
+                }) {
+                    Ok(Ok(peers)) => peers,
+                    _ => Vec::new(), // discover error → treat as no providers (degrade)
+                };
+                peers
+                    .iter()
+                    .map(|dp| crate::router::Candidate {
+                        canonical_model_id: dp.canonical_model_id.clone(),
+                        score: crate::router::PeerScoreInput {
+                            peer_id: dp.peer_id.clone(),
+                            // TODO(M1.3): measure RTT via a ping survey — deferred (a
+                            // concurrent ping fan-out is its own perf pass). Neutral 1.0
+                            // here so latency does not bias ranking yet.
+                            latency_ms: 1.0,
+                            load_pct: dp.load_pct,
+                            reputation: if dp.reputation_score > 0.0 {
+                                dp.reputation_score
+                            } else {
+                                50.0 // unknown reputation → neutral default (matches Python)
+                            },
+                            bandwidth_mbps: 0.0,
+                            s2s_rtt_ms: 0.0,
+                            throughput_tok_s: dp.throughput_tok_s,
+                            queue_depth: dp.queue_depth,
+                        },
+                    })
+                    .collect()
+            };
+            // route: proxy the request to a chosen peer over libp2p.
+            let route = |peer_id: &str, data: &[u8]| -> Result<Vec<u8>, String> {
+                match send_and_wait(&cmd_tx_r, |reply| SwarmCommand::ProxyForward {
+                    peer_id: peer_id.to_string(),
+                    data: data.to_vec(),
+                    reply,
+                }) {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) | Err(e) => Err(e),
+                }
+            };
+            crate::router::resolve_and_route(&model_candidates, &request, tier, discover, route)
+        });
+
+        match outcome {
+            Ok(o) => {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("model_id", o.model_id)?;
+                dict.set_item("peer_id", o.peer_id)?;
+                dict.set_item("response", pyo3::types::PyBytes::new(py, &o.response))?;
+                dict.set_item("degraded", o.degraded)?;
+                Ok(dict.into_py_any(py)?)
+            }
+            Err(crate::router::RouteError::NoProvider) => Err(PyRuntimeError::new_err(
+                "no_provider: no compatible live provider for any candidate model",
+            )),
+        }
+    }
+
     /// Get current NAT status.
     ///
     /// Returns:
