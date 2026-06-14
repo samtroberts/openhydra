@@ -16,11 +16,12 @@
 //! Provider *selection* (discover → filter → rank → pick) and the HTTP front door land on
 //! top of this; this is just "talk to one provider".
 
+use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::DiscoveredPeer;
 use openhydra_protocol::model_id::is_compatible;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
 
-use crate::adapter::AdapterError;
+use crate::adapter::{AdapterError, ChatMessage};
 use crate::provider::SERVE_REQUEST;
 use crate::serve::{parse_response, ServeChunk, ServeRequest, ServeSummary};
 
@@ -111,10 +112,59 @@ pub fn request_completion(
     ))
 }
 
+/// A consumer node: discovers providers and serves completions over the swarm — the
+/// **synchronous core** the HTTP/SSE gateway wraps (`complete` blocks; the gateway calls
+/// it from a `spawn_blocking` task and streams the deltas).
+pub struct ConsumerNode {
+    net: NetworkHandle,
+    tier: u8,
+}
+
+impl ConsumerNode {
+    pub fn new(net: NetworkHandle) -> Self {
+        Self { net, tier: 2 }
+    }
+
+    /// Discover a provider for `model`, pick the best, and stream the completion's text
+    /// deltas to `on_delta`. Returns the [`ServeSummary`] (token count → receipt) on
+    /// success. `model` is the engine handle / DHT key (e.g. `"qwen2.5:7b"`).
+    pub fn complete(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ServeSummary, AdapterError> {
+        let peers = self
+            .net
+            .discover(model)
+            .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
+        // "" canonical → any provider of this model_id (template-hash filtering is later).
+        let provider = select_provider(&peers, "", self.tier)
+            .ok_or_else(|| AdapterError::Http(format!("no provider for model '{model}'")))?;
+
+        let request = ServeRequest {
+            reply_to: self.net.libp2p_peer_id().to_string(),
+            model_ref: provider.model_id.clone(),
+            messages,
+            max_tokens,
+            temperature,
+        };
+        let provider_libp2p = provider.libp2p_peer_id.clone();
+        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            self.net
+                .proxy_forward(provider_libp2p.clone(), framed.to_vec())
+                .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
+        };
+        request_completion(&mut transport, &request, on_delta)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{ChatMessage, DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
+    use crate::adapter::{DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
     use crate::provider::handle_serve_inbound;
 
     /// A canned engine: emits fixed deltas (or fails).

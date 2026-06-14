@@ -30,7 +30,7 @@ pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
     ServeOutcome,
 };
-pub use consumer::{request_completion, select_provider, SelectedProvider};
+pub use consumer::{request_completion, select_provider, ConsumerNode, SelectedProvider};
 pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};

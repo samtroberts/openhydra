@@ -31,9 +31,15 @@ pub const SERVE_REQUEST: u8 = 0x10;
 
 /// Build the DHT record advertising one detected model.
 ///
-/// `model_id` (the DHT key consumers look up) is the canonical id when known, else the
-/// engine handle; `canonical_model_id` carries the precise id for the router's
-/// `is_compatible` filter. `host`/`port` are advisory — routing is by `libp2p_peer_id`.
+/// `model_id` (the DHT key consumers look up) is the **engine handle** (e.g. Ollama's
+/// `"qwen2.5:7b"`) — the familiar name a consumer requests; it's also what the provider's
+/// adapter serves (`ServeRequest.model_ref`). `canonical_model_id` carries the precise
+/// `family/params/quant/template_hash` for the router's `is_compatible` filter.
+/// `host`/`port` are advisory — routing is by `libp2p_peer_id`.
+///
+/// MVP-limitation: keying on the engine handle means the same model served via two
+/// different engines (Ollama vs vLLM) advertises under different ids; a normalized
+/// cross-engine discovery key is the model-id-governance refinement (deferred).
 pub fn build_peer_record(
     model: &DetectedModel,
     openhydra_peer_id: &str,
@@ -42,14 +48,9 @@ pub fn build_peer_record(
     host: &str,
     port: u16,
 ) -> PeerRecord {
-    let model_id = if model.canonical_id.is_empty() {
-        model.engine_ref.clone()
-    } else {
-        model.canonical_id.clone()
-    };
     PeerRecord {
         peer_id: openhydra_peer_id.to_string(),
-        model_id,
+        model_id: model.engine_ref.clone(),
         host: host.to_string(),
         port,
         canonical_model_id: model.canonical_id.clone(),
@@ -147,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_record_keys_on_canonical_id_and_carries_identity() {
+    fn peer_record_keys_on_engine_handle_and_carries_canonical_id() {
         let r = build_peer_record(
             &detected("qwen2/7.6b/q4_k_m/abcd0123abcd0123"),
             "oh-peer",
@@ -157,17 +158,17 @@ mod tests {
             4001,
         );
         assert_eq!(r.peer_id, "oh-peer");
-        assert_eq!(r.model_id, "qwen2/7.6b/q4_k_m/abcd0123abcd0123"); // canonical id is the DHT key
-        assert_eq!(r.canonical_model_id, "qwen2/7.6b/q4_k_m/abcd0123abcd0123");
+        assert_eq!(r.model_id, "qwen2.5:7b"); // engine handle is the DHT key consumers request
+        assert_eq!(r.canonical_model_id, "qwen2/7.6b/q4_k_m/abcd0123abcd0123"); // precise, for filtering
         assert_eq!(r.libp2p_peer_id, "12D3KooWlibp2p");
         assert_eq!(r.public_key, "deadbeef");
         assert_eq!(r.port, 4001);
     }
 
     #[test]
-    fn peer_record_falls_back_to_engine_ref_without_canonical_id() {
+    fn peer_record_keys_on_engine_handle_even_without_canonical_id() {
         let r = build_peer_record(&detected(""), "oh", "lib", "pk", "", 0);
-        assert_eq!(r.model_id, "qwen2.5:7b"); // engine handle when no canonical id
+        assert_eq!(r.model_id, "qwen2.5:7b"); // always the engine handle
         assert_eq!(r.canonical_model_id, "");
     }
 
