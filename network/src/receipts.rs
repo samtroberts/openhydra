@@ -73,13 +73,48 @@ impl ReceiptPayload {
 /// Bytes the **provider** co-signs: the consumer-signed payload plus the consumer's
 /// signature, so the provider's signature commits to *exactly* what the consumer
 /// signed.
-fn cosign_bytes(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8> {
+pub fn cosign_bytes(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8> {
     let payload_bytes = payload.canonical_bytes();
     let mut b = Vec::with_capacity(COSIGN_DOMAIN.len() + payload_bytes.len() + 64);
     b.extend_from_slice(COSIGN_DOMAIN);
     b.extend_from_slice(&payload_bytes);
     b.extend_from_slice(&consumer_sig.to_bytes());
     b
+}
+
+/// Build a [`ReceiptPayload`] from raw byte components (32-byte public keys, 16-byte
+/// nonce), validating lengths. For the FFI / node-method callers.
+pub fn payload_from_bytes(
+    provider_pub: &[u8],
+    consumer_pub: &[u8],
+    model_id: &str,
+    tokens: u64,
+    nonce: &[u8],
+    ts_unix_ms: u64,
+) -> Result<ReceiptPayload, String> {
+    let provider = VerifyingKey::from_bytes(
+        provider_pub
+            .try_into()
+            .map_err(|_| "provider public key must be 32 bytes".to_string())?,
+    )
+    .map_err(|e| format!("invalid provider public key: {e}"))?;
+    let consumer = VerifyingKey::from_bytes(
+        consumer_pub
+            .try_into()
+            .map_err(|_| "consumer public key must be 32 bytes".to_string())?,
+    )
+    .map_err(|e| format!("invalid consumer public key: {e}"))?;
+    let nonce: [u8; 16] = nonce
+        .try_into()
+        .map_err(|_| "nonce must be 16 bytes".to_string())?;
+    Ok(ReceiptPayload {
+        provider,
+        consumer,
+        model_id: model_id.to_string(),
+        tokens,
+        nonce,
+        ts_unix_ms,
+    })
 }
 
 /// A complete, co-signed receipt.

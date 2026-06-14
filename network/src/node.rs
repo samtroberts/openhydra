@@ -1033,6 +1033,98 @@ impl PyP2PNode {
             .map_err(|e| PyRuntimeError::new_err(format!("sign failed: {e}")))
     }
 
+    /// Sign a receipt payload as the CONSUMER, using this node's **internal** ed25519
+    /// identity key — the key never crosses the FFI. The node is the consumer;
+    /// `provider_pub` names the peer that served the request. Returns the 64-byte
+    /// consumer signature (protocol.md §6, M2.1).
+    fn receipt_sign(
+        &self,
+        py: Python<'_>,
+        provider_pub: Vec<u8>,
+        model_id: &str,
+        tokens: u64,
+        nonce: Vec<u8>,
+        ts_unix_ms: u64,
+    ) -> PyResult<PyObject> {
+        let consumer_pub = self.public_key_bytes()?;
+        let payload = crate::receipts::payload_from_bytes(
+            &provider_pub,
+            &consumer_pub,
+            model_id,
+            tokens,
+            &nonce,
+            ts_unix_ms,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let sig = self
+            .keypair
+            .sign(&payload.canonical_bytes())
+            .map_err(|e| PyRuntimeError::new_err(format!("sign failed: {e}")))?;
+        Ok(pyo3::types::PyBytes::new(py, &sig).into_py_any(py)?)
+    }
+
+    /// Co-sign a receipt as the PROVIDER, using this node's **internal** ed25519
+    /// identity key, after verifying the whole package. `provider_pub` must equal this
+    /// node's identity (a peer cannot be made to co-sign a receipt naming a different
+    /// provider). Returns the 64-byte provider signature; raises on a key mismatch or
+    /// a bad consumer signature (protocol.md §6, M2.1).
+    #[allow(clippy::too_many_arguments)]
+    fn receipt_cosign(
+        &self,
+        py: Python<'_>,
+        provider_pub: Vec<u8>,
+        consumer_pub: Vec<u8>,
+        model_id: &str,
+        tokens: u64,
+        nonce: Vec<u8>,
+        ts_unix_ms: u64,
+        consumer_sig: Vec<u8>,
+    ) -> PyResult<PyObject> {
+        if provider_pub != self.public_key_bytes()? {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "receipt: provider key does not match this node's identity",
+            ));
+        }
+        let payload = crate::receipts::payload_from_bytes(
+            &provider_pub,
+            &consumer_pub,
+            model_id,
+            tokens,
+            &nonce,
+            ts_unix_ms,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let consumer_sig_arr: [u8; 64] = consumer_sig.as_slice().try_into().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("consumer signature must be 64 bytes")
+        })?;
+        let consumer_sig_obj = ed25519_dalek::Signature::from_bytes(&consumer_sig_arr);
+        // Co-sign (payload ‖ consumer_sig) with the node's internal identity key.
+        let cosign = crate::receipts::cosign_bytes(&payload, &consumer_sig_obj);
+        let provider_sig = self
+            .keypair
+            .sign(&cosign)
+            .map_err(|e| PyRuntimeError::new_err(format!("sign failed: {e}")))?;
+        let provider_sig_arr: [u8; 64] = provider_sig
+            .as_slice()
+            .try_into()
+            .map_err(|_| PyRuntimeError::new_err("produced a bad signature length"))?;
+        // Verify the whole package before returning — rejects a bad consumer signature.
+        let receipt = crate::receipts::CoSignedReceipt {
+            payload,
+            consumer_sig: consumer_sig_obj,
+            provider_sig: ed25519_dalek::Signature::from_bytes(&provider_sig_arr),
+        };
+        crate::receipts::verify_receipt(&receipt).map_err(|e| {
+            let which = match e {
+                crate::receipts::ReceiptError::BadConsumerSig => "bad_consumer_sig",
+                crate::receipts::ReceiptError::BadProviderSig => "bad_provider_sig",
+                crate::receipts::ReceiptError::ReplayedNonce => "replayed_nonce",
+            };
+            pyo3::exceptions::PyValueError::new_err(format!("receipt rejected: {which}"))
+        })?;
+        Ok(pyo3::types::PyBytes::new(py, &provider_sig).into_py_any(py)?)
+    }
+
     /// Export the raw 32-byte Ed25519 public key.
     fn public_key_bytes(&self) -> PyResult<Vec<u8>> {
         let ed25519_pk = self

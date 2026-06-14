@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("openhydra_network")
+ohn = pytest.importorskip("openhydra_network")
 from coordinator import receipts as rc  # noqa: E402
 
 MODEL = "qwen3.5/2b/fp16/5632a1b48425a5ae"
@@ -164,3 +164,38 @@ def test_consumer_detects_provider_payload_tampering():
 
     with pytest.raises(ValueError, match="bad_provider_sig"):
         rc.exchange_receipt(malicious_transport, payload, consumer_sk)
+
+
+# --- secure node-identity path (private keys never leave Rust) ---
+
+
+def test_secure_two_node_exchange(tmp_path):
+    # Two real node identities; the consumer signs and the provider co-signs each with
+    # its own *internal* key (node.receipt_sign / node.receipt_cosign). Transport is
+    # injected (live: consumer_node.proxy_forward) — no swarm.
+    consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "consumer.key"))
+    provider_node = ohn.P2PNode(identity_key_path=str(tmp_path / "provider.key"))
+    provider_pub = bytes(provider_node.public_key_bytes())
+
+    ledger = rc.ReceiptLedger()
+    transport = lambda req: rc.handle_receipt_request_secure(req, provider_node, ledger)  # noqa: E731
+    receipt = rc.consumer_request_receipt(consumer_node, transport, provider_pub, MODEL, 512)
+
+    assert receipt.payload.tokens == 512
+    assert len(ledger) == 1
+    # The consumer never sees either private key — it only passed pubkeys + the node.
+
+
+def test_secure_provider_refuses_receipt_naming_another_provider(tmp_path):
+    # A receipt addressed to provider B, delivered to provider A's handler: A refuses
+    # to co-sign a receipt that names a different provider's identity.
+    consumer_node = ohn.P2PNode(identity_key_path=str(tmp_path / "c.key"))
+    provider_a = ohn.P2PNode(identity_key_path=str(tmp_path / "a.key"))
+    provider_b = ohn.P2PNode(identity_key_path=str(tmp_path / "b.key"))
+    b_pub = bytes(provider_b.public_key_bytes())
+
+    ledger = rc.ReceiptLedger()
+    transport = lambda req: rc.handle_receipt_request_secure(req, provider_a, ledger)  # noqa: E731
+    with pytest.raises(ValueError, match="provider key does not match"):
+        rc.consumer_request_receipt(consumer_node, transport, b_pub, MODEL, 100)
+    assert len(ledger) == 0

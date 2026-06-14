@@ -138,6 +138,16 @@ class ReceiptLedger:
         self._receipts.append(receipt)
         return receipt
 
+    def add_verified(self, payload: ReceiptPayload, consumer_sig: bytes, provider_sig: bytes) -> CoSignedReceipt:
+        """Hold an already-verified receipt (crypto checked by node.receipt_cosign in
+        Rust); reject a replayed nonce. Used by the secure provider path."""
+        if payload.nonce in self._nonces:
+            raise ValueError("receipt rejected: replayed_nonce")
+        self._nonces.add(payload.nonce)
+        receipt = CoSignedReceipt(payload, consumer_sig, provider_sig)
+        self._receipts.append(receipt)
+        return receipt
+
     @property
     def receipts(self) -> list[CoSignedReceipt]:
         return list(self._receipts)
@@ -251,3 +261,62 @@ def exchange_receipt(
         raise ValueError("receipt response: short provider signature")
     verify(payload, consumer_sig, provider_sig)  # consumer independently verifies the co-signed receipt
     return provider_sig
+
+
+# --- Secure node-identity paths (keys stay locked in the Rust daemon) ---
+#
+# These keep the ed25519 private key inside Rust: the node signs with its internal
+# identity via node.receipt_sign / node.receipt_cosign — nothing is passed in Python.
+
+
+def handle_receipt_request_secure(message: bytes, node, ledger: ReceiptLedger) -> bytes:
+    """Provider side using the node's internal identity (key never leaves Rust).
+
+    `node.receipt_cosign` verifies the consumer signature + co-signs with the node's
+    own key; the ledger then replay-guards and holds. Rejections become an error
+    response, never an exception into the proxy loop.
+    """
+    try:
+        payload, consumer_sig = decode_receipt_request(message)
+        provider_sig = node.receipt_cosign(
+            payload.provider_pub,
+            payload.consumer_pub,
+            payload.model_id,
+            payload.tokens,
+            payload.nonce,
+            payload.ts_unix_ms,
+            consumer_sig,
+        )
+        ledger.add_verified(payload, consumer_sig, provider_sig)  # replay-guard + hold
+        return _RECEIPT_OK + provider_sig
+    except ValueError as exc:
+        return _RECEIPT_ERR + str(exc).encode("utf-8")
+
+
+def consumer_request_receipt(
+    node,
+    transport: Callable[[bytes], bytes],
+    provider_pub: bytes,
+    model_id: str,
+    tokens: int,
+    *,
+    nonce: bytes | None = None,
+    ts_unix_ms: int | None = None,
+) -> CoSignedReceipt:
+    """Consumer side using the node's internal identity. Signs with `node.receipt_sign`,
+    sends over `transport` (live: `lambda r: node.proxy_forward(provider_peer_id, r)`),
+    and verifies the co-signature. Returns the co-signed receipt; raises if the provider
+    rejected it or the co-signature doesn't verify.
+    """
+    consumer_pub = bytes(node.public_key_bytes())
+    nonce = nonce if nonce is not None else new_nonce()
+    ts = ts_unix_ms if ts_unix_ms is not None else int(time.time() * 1000)
+    payload = ReceiptPayload(provider_pub, consumer_pub, model_id, int(tokens), nonce, ts)
+    consumer_sig = node.receipt_sign(provider_pub, model_id, int(tokens), nonce, ts)
+    response = transport(encode_receipt_request(payload, consumer_sig))
+    if not response or response[0:1] != _RECEIPT_OK:
+        reason = response[1:].decode("utf-8", "replace") if response else "empty response"
+        raise ValueError(f"provider rejected receipt: {reason}")
+    provider_sig = response[1:65]
+    verify(payload, consumer_sig, provider_sig)  # consumer independently verifies (no keys)
+    return CoSignedReceipt(payload, consumer_sig, provider_sig)

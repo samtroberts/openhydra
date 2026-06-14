@@ -159,6 +159,7 @@ PROXY_METHOD_FIRE_FORGET = b'\x03'  # ForwardRequest → ACK immediately, Forwar
 PROXY_METHOD_FIRE_FORGET_RESULT = b'\x04'  # ForwardResponse → ACK immediately, PushResult() in background
 PROXY_METHOD_PING = b'\x05'                # PingRequest → call Ping(), block for response
 PROXY_METHOD_GET_STATUS = b'\x06'          # PeerStatusRequest → call GetPeerStatus(), block for response
+PROXY_METHOD_RECEIPT = b'\x07'             # co-signed receipt (protocol.md §6) → verify + co-sign + ledger
 
 
 def _proxy_handler_loop(
@@ -377,6 +378,11 @@ def _proxy_handler_loop(
         _packed = bytes(getattr(response, "activation_packed", b"") or b"")
         return bytes(p2p_node.encode_response_msg(_resp_hdr, _packed))
 
+    # protocol.md §6 (M2.1): in-memory ledger of co-signed receipts this provider has
+    # accepted. Persistence (and penalising served-but-unreceipted requests) is M2.x.
+    from coordinator.receipts import ReceiptLedger, handle_receipt_request_secure
+
+    _receipt_ledger = ReceiptLedger()
     logging.info("proxy_handler_loop started")
     while not stop_event.is_set():
         try:
@@ -452,6 +458,13 @@ def _proxy_handler_loop(
                         request_id=req_id,
                         data=PROXY_METHOD_GET_STATUS + status_resp.SerializeToString(),
                     )
+                elif raw and raw[0:1] == PROXY_METHOD_RECEIPT:
+                    # protocol.md §6 (M2.1): a co-signed receipt. The node verifies the
+                    # consumer signature + co-signs with its internal identity key (the
+                    # key never leaves Rust) and ledgers it. Reply carries a status byte
+                    # + provider signature, or an error.
+                    receipt_resp = handle_receipt_request_secure(raw, p2p_node, _receipt_ledger)
+                    p2p_node.respond_proxy(request_id=req_id, data=receipt_resp)
                 else:
                     # Forward path (0x01 prefix or legacy no-prefix).
                     payload = raw[1:] if raw and raw[0:1] == PROXY_METHOD_FORWARD else raw
