@@ -21,6 +21,7 @@
 
 pub mod adapter;
 pub mod consumer;
+pub mod gateway;
 pub mod http;
 pub mod ollama;
 pub mod provider;
@@ -31,6 +32,7 @@ pub use adapter::{
     ServeOutcome,
 };
 pub use consumer::{request_completion, select_provider, ConsumerNode, SelectedProvider};
+pub use gateway::serve_http;
 pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};

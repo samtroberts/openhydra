@@ -23,6 +23,12 @@ serde_json = "1"
 # trait; the async gateway will call it via spawn_blocking). rustls-tls (not native-tls)
 # keeps the eventual single static binary free of a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Consumer HTTP/SSE gateway (the front door). axum's SSE + a tokio runtime; ConsumerNode
+# is sync (blocking libp2p), so the handler runs it on spawn_blocking and streams deltas
+# through a channel.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1"
 
 # Pure detection/serve logic is injected behind the `HttpClient` trait and unit-tested
 # against fixtures (no live engine); `ReqwestClient` is the production transport.
