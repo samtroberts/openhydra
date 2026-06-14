@@ -32,6 +32,11 @@ pub mod tensor_stream;
 pub mod transport;
 pub mod types;
 
+/// Canonical model identity & equivalence (protocol.md §4) — M1.1. Pure Rust
+/// (sha2/hex only); will be extracted to the `protocol` crate in the iterative
+/// workspace refactor.
+pub mod model_id;
+
 /// Python module entry point.
 #[cfg(feature = "pyo3")]
 mod python {
@@ -53,6 +58,11 @@ mod python {
         m.add_class::<crate::dlpack::PyRustTensor>()?;
         m.add_function(wrap_pyfunction!(decode_activation, m)?)?;
         m.add_function(wrap_pyfunction!(encode_activation, m)?)?;
+        // Canonical model identity (protocol.md §4) — M1.1.
+        m.add_function(wrap_pyfunction!(canonical_id_from_hf, m)?)?;
+        m.add_function(wrap_pyfunction!(is_compatible, m)?)?;
+        m.add_function(wrap_pyfunction!(chat_template_hash, m)?)?;
+        m.add_function(wrap_pyfunction!(parse_hf_model_name, m)?)?;
         Ok(())
     }
 
@@ -94,5 +104,36 @@ mod python {
 
         // Return as Python bytes.
         Ok(pyo3::types::PyBytes::new(py, &packed).into())
+    }
+
+    // --- Canonical model identity (protocol.md §4) — M1.1 ---
+
+    /// Compute the canonical model id from an HF id, runtime quant, and the
+    /// engine's live chat template. Returns `family/params/quant/template_hash`.
+    /// Raises `ValueError` on an empty template / component.
+    #[pyfunction]
+    fn canonical_id_from_hf(hf_model_id: &str, quant: &str, chat_template: &str) -> PyResult<String> {
+        crate::model_id::canonical_id_from_hf(hf_model_id, quant, chat_template)
+            .map(|c| c.to_string())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// True if a provider's concrete canonical id is compatible with a (possibly
+    /// wildcarded) request id. Malformed ids return False.
+    #[pyfunction]
+    fn is_compatible(request: &str, provider: &str) -> bool {
+        crate::model_id::is_compatible(request, provider)
+    }
+
+    /// Stable 16-hex-char hash of a tokenizer chat template.
+    #[pyfunction]
+    fn chat_template_hash(template: &str) -> String {
+        crate::model_id::chat_template_hash(template)
+    }
+
+    /// Heuristically split an HF model id into `(family, params, variants)`.
+    #[pyfunction]
+    fn parse_hf_model_name(hf_model_id: &str) -> (String, String, Vec<String>) {
+        crate::model_id::parse_hf_model_name(hf_model_id)
     }
 }

@@ -1280,6 +1280,14 @@ class PeerService:
         # async-pipeline executor sizing across resharding events.
         self._boot_pipeline_depth = max(1, int(pipeline_depth or 1))
         self.runtime_profile = dict(self.shard.runtime_profile())
+        # protocol.md §4 — resolve the canonical model id here, at the load site
+        # (the shard's tokenizer holds the chat template). dht_announce stays a
+        # dumb carrier and never sees the tokenizer. "" when unresolvable.
+        from peer.canonical_id import resolve_canonical_model_id
+
+        self.canonical_model_id = resolve_canonical_model_id(
+            self.shard, self.model_id, self.runtime_profile
+        )
         # Path A (client-terminated pipeline): register this peer's runtime
         # with the coordinator-side HeadSampler when the shard owns the
         # last transformer layer. Idempotent — safe to re-register on
@@ -3557,6 +3565,7 @@ def _announce_loop(
             runtime_backend=str(runtime_profile.get("backend", "toy_cpu")),
             runtime_target=str(runtime_profile.get("target", "cpu")),
             runtime_model_id=str(runtime_profile.get("runtime_model_id", "")),
+            canonical_model_id=str(getattr(service, "canonical_model_id", "") or ""),
             quantization_mode=str(runtime_profile.get("quantization_mode", "fp32")),
             quantization_bits=int(runtime_profile.get("quantization_bits", 0)),
             runtime_gpu_available=bool(runtime_profile.get("gpu_available", False)),

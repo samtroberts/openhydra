@@ -178,6 +178,8 @@ class PeerEndpoint:
     runtime_backend: str = "toy_cpu"
     runtime_target: str = "cpu"
     runtime_model_id: str = ""
+    # protocol.md §4 — advertised canonical model id (family/params/quant/template_hash).
+    canonical_model_id: str = ""
     quantization_mode: str = "fp32"
     quantization_bits: int = 0
     runtime_gpu_available: bool = False
@@ -266,6 +268,7 @@ class PeerEndpoint:
             runtime_backend=str(data.get("runtime_backend", "toy_cpu")),
             runtime_target=str(data.get("runtime_target", "cpu")),
             runtime_model_id=str(data.get("runtime_model_id", "")),
+            canonical_model_id=str(data.get("canonical_model_id", "")).strip(),
             quantization_mode=str(data.get("quantization_mode", "fp32")),
             quantization_bits=int(data.get("quantization_bits", 0)),
             runtime_gpu_available=bool(data.get("runtime_gpu_available", False)),
@@ -733,3 +736,30 @@ def maybe_request_hole_punch(
     return request_hole_punch(
         gossip, self_libp2p_peer_id=self_libp2p_peer_id, peer=peer
     )
+
+
+def filter_compatible_peers(
+    peers: list["PeerEndpoint"], required_canonical_id: str | None
+) -> list["PeerEndpoint"]:
+    """Drop peers whose advertised canonical model id is incompatible with the
+    request (protocol.md §4).
+
+    Compatibility is decided by the Rust ``openhydra_network.is_compatible``. Peers
+    that advertise no canonical id (legacy/toy nodes, or models without a chat
+    template) are KEPT — refusal applies only to an explicit, incompatible
+    advertisement, which keeps the change additive. Returns the list unchanged when
+    no request canonical id is given, or when the Rust extension is unavailable.
+    """
+    req = str(required_canonical_id or "").strip()
+    if not req:
+        return list(peers)
+    try:
+        import openhydra_network as _ohn
+    except Exception:  # pragma: no cover — extension missing in some envs
+        return list(peers)
+    out: list[PeerEndpoint] = []
+    for p in peers:
+        adv = str(getattr(p, "canonical_model_id", "") or "").strip()
+        if not adv or _ohn.is_compatible(req, adv):
+            out.append(p)
+    return out

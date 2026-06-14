@@ -35,6 +35,7 @@ from coordinator.path_finder import (
     PathFinder,
     PeerEndpoint,
     PeerHealth,
+    filter_compatible_peers,
     load_peer_config,
     load_peers_from_dht,
 )
@@ -335,7 +336,11 @@ class DiscoveryService:
                 if _e_rb and _e_rb != "toy_cpu" and (_n_rb in ("", "toy_cpu")):
                     new_peer = new_peer.replace(runtime_backend=existing.runtime_backend)
             deduped[key] = new_peer
-        return list(deduped.values())
+        # protocol.md §4 — refuse providers whose advertised canonical model id is
+        # incompatible with the request. No-op unless config.required_canonical_id
+        # is set; peers that advertise no canonical id are kept (backward-compat).
+        required_cid = getattr(self.config, "required_canonical_id", None)
+        return filter_compatible_peers(list(deduped.values()), required_cid)
 
     # ------------------------------------------------------------------
     # DHT URL resolution

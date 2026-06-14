@@ -41,6 +41,11 @@ class Announcement:
     runtime_backend: str = "toy_cpu"
     runtime_target: str = "cpu"
     runtime_model_id: str = ""
+    # protocol.md §4 — canonical model id (family/params/quant/template_hash),
+    # resolved at the model-load site (see peer/canonical_id.py). "" when
+    # unresolvable (legacy/toy peers); never computed here — dht_announce is a
+    # dumb carrier and must not touch tokenizers/engines.
+    canonical_model_id: str = ""
     quantization_mode: str = "fp32"
     quantization_bits: int = 0
     runtime_gpu_available: bool = False
