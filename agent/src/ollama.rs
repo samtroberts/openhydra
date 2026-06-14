@@ -482,4 +482,29 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AdapterError::Parse(_)));
     }
+
+    /// Live end-to-end check against a real Ollama. Ignored by default (CI/this env have
+    /// no engine); run manually with `cargo test -p openhydra-agent -- --ignored` on a
+    /// machine with Ollama up and ≥1 model pulled.
+    #[test]
+    #[ignore = "requires a live Ollama at 127.0.0.1:11434 with >=1 model"]
+    fn live_smoke_detect_and_serve() {
+        let agent = crate::live_ollama(DEFAULT_OLLAMA_URL).unwrap();
+        let models = agent.detect_models().unwrap();
+        assert!(!models.is_empty(), "no Ollama models found");
+
+        let req = InferenceRequest {
+            model_ref: models[0].engine_ref.clone(),
+            messages: vec![crate::adapter::ChatMessage {
+                role: "user".into(),
+                content: "Reply with one word.".into(),
+            }],
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+        };
+        let mut out = String::new();
+        let outcome = agent.serve_stream(&req, &mut |d| out.push_str(d)).unwrap();
+        assert!(!out.is_empty(), "engine streamed no text");
+        assert!(outcome.tokens > 0);
+    }
 }

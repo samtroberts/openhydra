@@ -20,10 +20,18 @@
 //! no live engine and no `reqwest`/`tokio` in the dependency tree yet.
 
 pub mod adapter;
+pub mod http;
 pub mod ollama;
 
 pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
     ServeOutcome,
 };
+pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;
+
+/// An Ollama adapter backed by the live reqwest transport, pointed at `base_url`
+/// (e.g. [`ollama::DEFAULT_OLLAMA_URL`]). The convenience entry point for a provider.
+pub fn live_ollama(base_url: &str) -> Result<OllamaAdapter<ReqwestClient>, AdapterError> {
+    Ok(OllamaAdapter::new(base_url, ReqwestClient::new()?))
+}

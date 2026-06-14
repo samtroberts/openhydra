@@ -16,7 +16,10 @@ openhydra-protocol = { path = "../protocol" }
 # Parse engine HTTP responses (Ollama /api/tags, /api/show, …).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Live HTTP transport to the local engine. Blocking client (matches the sync HttpClient
+# trait; the async gateway will call it via spawn_blocking). rustls-tls (not native-tls)
+# keeps the eventual single static binary free of a system OpenSSL dependency.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
-# NOTE: no reqwest/tokio yet — detection parsing + canonical mapping are pure and the
-# HTTP transport is injected behind the `HttpClient` trait (testable against fixtures).
-# The live reqwest-backed client + the streaming completion proxy land in the next step.
+# Pure detection/serve logic is injected behind the `HttpClient` trait and unit-tested
+# against fixtures (no live engine); `ReqwestClient` is the production transport.
