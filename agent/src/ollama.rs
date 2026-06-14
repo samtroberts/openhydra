@@ -24,7 +24,9 @@ use serde::Deserialize;
 
 use openhydra_protocol::model_id::{canonical_model_id, chat_template_hash, normalize_chat_template};
 
-use crate::adapter::{AdapterError, DetectedModel, EngineAdapter, HttpClient};
+use crate::adapter::{
+    AdapterError, DetectedModel, EngineAdapter, HttpClient, InferenceRequest, ServeOutcome,
+};
 
 /// Default local Ollama endpoint.
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -62,6 +64,65 @@ struct TagDetails {
 struct ShowResponse {
     #[serde(default)]
     template: String,
+}
+
+// `/api/chat` streaming chunk (newline-delimited JSON). We read the message delta, the
+// `done` flag, and `eval_count` (present on the final chunk — the engine's own
+// completion-token count).
+#[derive(Debug, Default, Deserialize)]
+struct ChatStreamChunk {
+    #[serde(default)]
+    message: ChatStreamMessage,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    eval_count: Option<u64>,
+    /// Present when Ollama returns an error mid-stream.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatStreamMessage {
+    #[serde(default)]
+    content: String,
+}
+
+/// Build the Ollama `/api/chat` request body (always streaming). `max_tokens`/
+/// `temperature` map to Ollama's `options.{num_predict,temperature}`; omitted when unset.
+fn build_chat_body(req: &InferenceRequest) -> String {
+    let messages: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+    let mut options = serde_json::Map::new();
+    if let Some(n) = req.max_tokens {
+        options.insert("num_predict".into(), serde_json::json!(n));
+    }
+    if let Some(t) = req.temperature {
+        options.insert("temperature".into(), serde_json::json!(t));
+    }
+    let mut body = serde_json::json!({
+        "model": req.model_ref,
+        "messages": messages,
+        "stream": true,
+    });
+    if !options.is_empty() {
+        body["options"] = serde_json::Value::Object(options);
+    }
+    body.to_string()
+}
+
+/// Parse one `/api/chat` chunk line. An `error` field becomes an `AdapterError::Http`
+/// (the engine refused / failed mid-stream); malformed JSON is a parse error.
+fn parse_chat_chunk(line: &str) -> Result<ChatStreamChunk, AdapterError> {
+    let chunk: ChatStreamChunk =
+        serde_json::from_str(line).map_err(|e| AdapterError::Parse(e.to_string()))?;
+    if let Some(err) = &chunk.error {
+        return Err(AdapterError::Http(format!("ollama: {err}")));
+    }
+    Ok(chunk)
 }
 
 /// Compute the canonical id for one Ollama model, or `""` when it can't be determined.
@@ -146,6 +207,43 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
             })
             .collect())
     }
+
+    fn serve_stream(
+        &self,
+        request: &InferenceRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ServeOutcome, AdapterError> {
+        let body = build_chat_body(request);
+        let lines = self
+            .http
+            .post_stream(&format!("{}/api/chat", self.base_url), &body)?;
+
+        let mut chunk_tokens = 0u64;
+        let mut eval_count = None;
+        let mut done = false;
+        for line in lines {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue; // keep-alive / blank framing line
+            }
+            let chunk = parse_chat_chunk(&line)?;
+            if !chunk.message.content.is_empty() {
+                on_delta(&chunk.message.content);
+                chunk_tokens += 1;
+            }
+            if chunk.eval_count.is_some() {
+                eval_count = chunk.eval_count; // authoritative count on the final chunk
+            }
+            if chunk.done {
+                done = true;
+                break;
+            }
+        }
+        Ok(ServeOutcome {
+            tokens: eval_count.unwrap_or(chunk_tokens),
+            done,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -184,10 +282,13 @@ mod tests {
         "parameters": "stop \"<|im_end|>\""
     }"#;
 
-    /// Inject canned `/api/tags` + `/api/show` bodies (no network).
+    /// Inject canned `/api/tags` + `/api/show` bodies and `/api/chat` stream lines (no
+    /// network). The chat stream is a lazy iterator over fixture lines.
+    #[derive(Default)]
     struct MockHttp {
         tags: String,
         show: String,
+        stream_lines: Vec<String>,
     }
 
     impl HttpClient for MockHttp {
@@ -205,13 +306,43 @@ mod tests {
                 Err(AdapterError::Http(format!("unexpected POST {url}")))
             }
         }
+        fn post_stream(
+            &self,
+            url: &str,
+            _body: &str,
+        ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError> {
+            if url.ends_with("/api/chat") {
+                Ok(Box::new(self.stream_lines.clone().into_iter().map(Ok)))
+            } else {
+                Err(AdapterError::Http(format!("unexpected POST {url}")))
+            }
+        }
     }
 
     fn adapter(tags: &str, show: &str) -> OllamaAdapter<MockHttp> {
         OllamaAdapter::new(
             DEFAULT_OLLAMA_URL,
-            MockHttp { tags: tags.into(), show: show.into() },
+            MockHttp { tags: tags.into(), show: show.into(), stream_lines: vec![] },
         )
+    }
+
+    fn serve_adapter(lines: &[&str]) -> OllamaAdapter<MockHttp> {
+        OllamaAdapter::new(
+            DEFAULT_OLLAMA_URL,
+            MockHttp {
+                stream_lines: lines.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn user_req(prompt: &str) -> InferenceRequest {
+        InferenceRequest {
+            model_ref: "qwen2.5:7b".into(),
+            messages: vec![crate::adapter::ChatMessage { role: "user".into(), content: prompt.into() }],
+            max_tokens: Some(128),
+            temperature: Some(0.7),
+        }
     }
 
     #[test]
@@ -271,5 +402,84 @@ mod tests {
         assert_ne!(a, c, "a different chat template → a different canonical id");
         assert_eq!(canonical_for("", "7.6B", "Q4_K_M", "t"), ""); // missing family
         assert_eq!(canonical_for("qwen2", "7.6B", "Q4_K_M", ""), ""); // missing template
+    }
+
+    // ── streaming completion proxy ──
+
+    #[test]
+    fn build_chat_body_has_stream_messages_and_options() {
+        let body = build_chat_body(&user_req("hi there"));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "qwen2.5:7b");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["messages"][0]["content"], "hi there");
+        assert_eq!(v["options"]["num_predict"], 128);
+        assert_eq!(v["options"]["temperature"], 0.7);
+    }
+
+    #[test]
+    fn serve_stream_concatenates_deltas_and_reports_engine_token_count() {
+        let lines = [
+            r#"{"message":{"role":"assistant","content":"Hello"},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":", "},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":"world"},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":""},"done":true,"eval_count":7}"#,
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(out, "Hello, world");
+        assert!(outcome.done);
+        assert_eq!(outcome.tokens, 7, "uses Ollama's authoritative eval_count");
+    }
+
+    #[test]
+    fn serve_stream_falls_back_to_chunk_count_without_eval_count() {
+        let lines = [
+            r#"{"message":{"content":"a"},"done":false}"#,
+            r#"{"message":{"content":"b"},"done":false}"#,
+            r#"{"message":{"content":""},"done":true}"#, // no eval_count
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(out, "ab");
+        assert_eq!(outcome.tokens, 2); // 2 non-empty content chunks
+    }
+
+    #[test]
+    fn serve_stream_stops_at_done_and_skips_blank_lines() {
+        let lines = [
+            "",
+            r#"{"message":{"content":"x"},"done":false}"#,
+            r#"{"message":{"content":""},"done":true,"eval_count":1}"#,
+            r#"{"message":{"content":"LEAKED"},"done":false}"#, // after done — must be ignored
+        ];
+        let mut out = String::new();
+        serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(out, "x", "nothing after the done chunk is emitted");
+    }
+
+    #[test]
+    fn serve_stream_surfaces_engine_error_chunk() {
+        let lines = [r#"{"error":"model 'ghost' not found"}"#];
+        let err = serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |_| {})
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Http(_)));
+    }
+
+    #[test]
+    fn serve_stream_malformed_chunk_is_a_parse_error() {
+        let lines = [r#"{"message":{"content":"ok"},"done":false}"#, "not json"];
+        let err = serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |_| {})
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Parse(_)));
     }
 }

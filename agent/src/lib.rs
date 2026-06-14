@@ -22,5 +22,8 @@
 pub mod adapter;
 pub mod ollama;
 
-pub use adapter::{AdapterError, DetectedModel, EngineAdapter, HttpClient};
+pub use adapter::{
+    AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
+    ServeOutcome,
+};
 pub use ollama::OllamaAdapter;

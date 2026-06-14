@@ -43,6 +43,46 @@ pub trait HttpClient {
     fn get(&self, url: &str) -> Result<String, AdapterError>;
     /// `POST {url}` with a JSON `body` → response body as a string.
     fn post_json(&self, url: &str, body: &str) -> Result<String, AdapterError>;
+    /// `POST {url}` with a JSON `body`, streaming the response as a **lazy** iterator of
+    /// raw chunk lines (e.g. Ollama's newline-delimited JSON). The iterator owns its
+    /// reader so it can be pulled as tokens arrive — the point of streaming, not a
+    /// buffered `Vec`. The live impl wraps `reqwest` in a `BufReader::lines()`; tests
+    /// hand back fixture lines.
+    fn post_stream(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError>;
+}
+
+/// One chat message in an inference request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// A request to serve a streaming chat completion from an engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceRequest {
+    /// The engine's handle for the model (e.g. Ollama's `"qwen2.5:7b"`) — i.e.
+    /// [`DetectedModel::engine_ref`].
+    pub model_ref: String,
+    pub messages: Vec<ChatMessage>,
+    /// Cap on generated tokens, if any.
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+}
+
+/// The result of a served stream, after the last token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeOutcome {
+    /// Completion tokens generated — the engine's own count where it reports one (Ollama
+    /// `eval_count`), else the number of non-empty content chunks emitted. Feeds the
+    /// co-signed receipt's token count.
+    pub tokens: u64,
+    /// Whether the engine signalled a clean end-of-stream (vs the stream just ending).
+    pub done: bool,
 }
 
 /// A model an engine currently serves, ready to advertise to the swarm.
@@ -73,6 +113,14 @@ pub trait EngineAdapter {
     /// advertisement. Returns an empty list if the engine serves nothing.
     fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError>;
 
-    // TODO(M3.1 next): `serve` — proxy an inbound chat/completion request to the engine
-    // and stream tokens back. That adds the async transport; detection stays sync.
+    /// Proxy a streaming chat completion to the engine, invoking `on_delta` with each
+    /// text fragment as it arrives, and returning the [`ServeOutcome`] when the stream
+    /// ends. `on_delta` is `&mut dyn` (not generic) so the trait stays object-safe — the
+    /// gateway holds adapters behind `dyn EngineAdapter`. The caller forwards each delta
+    /// to its SSE response and uses `ServeOutcome.tokens` for the receipt.
+    fn serve_stream(
+        &self,
+        request: &InferenceRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ServeOutcome, AdapterError>;
 }
