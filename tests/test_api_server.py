@@ -378,6 +378,8 @@ def test_post_completions_returns_engine_response():
             return {
                 "response": "hello",
                 "request_id": "r1",
+                "completion_tokens": 1,
+                "prompt_tokens": 1,
                 "model": {"served": "openhydra-test", "requested": "openhydra-test", "reason": "none", "detail": ""},
             }
 
@@ -408,6 +410,8 @@ def test_post_chat_completions_returns_engine_response():
             return {
                 "response": "hi there",
                 "request_id": "r2",
+                "completion_tokens": 2,
+                "prompt_tokens": 1,
                 "model": {"served": "openhydra-test", "requested": "openhydra-test", "reason": "none", "detail": ""},
             }
 
@@ -593,3 +597,62 @@ def test_validate_infer_params_rejects_bad_pipeline_width():
     err = _validate_infer_params({"pipeline_width": 999})
     assert err is not None
     assert "pipeline_width" in err
+
+
+def test_strict_token_counts_uses_payload_not_word_count():
+    from coordinator.api_server import _strict_token_counts, _usage_from_payload
+    # 5 words but only 2 generated tokens — must report 2, never the word count.
+    payload = {"response": "a b c d e", "completion_tokens": 2, "prompt_tokens": 3}
+    assert _strict_token_counts(payload) == (3, 2)
+    assert _usage_from_payload(payload) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+
+
+def test_strict_token_counts_allows_zero():
+    # A ring timeout producing zero tokens is a legitimate result, not an error.
+    from coordinator.api_server import _strict_token_counts
+    assert _strict_token_counts({"completion_tokens": 0}) == (0, 0)
+
+
+def test_strict_token_counts_raises_when_key_absent():
+    # No silent word-count fallback — a missing field is a bug, surfaced loudly.
+    from coordinator.api_server import _strict_token_counts
+    with pytest.raises(KeyError):
+        _strict_token_counts({"response": "hello world"})
+
+
+def test_zero_completion_tokens_renders_usage_not_500():
+    """End-to-end: a ring timeout yielding zero tokens returns 200 with
+    usage.completion_tokens == 0 — not a 500 from the strict helper."""
+    class _ZeroEngine:
+        config = SimpleNamespace(default_model="openhydra-test")
+        def infer(self, **kwargs):
+            return {
+                "response": "",
+                "request_id": "rz",
+                "completion_tokens": 0,
+                "prompt_tokens": 4,
+                "model": {"served": "openhydra-test", "requested": "openhydra-test", "reason": "none", "detail": ""},
+            }
+
+    prev_key = OpenHydraHandler._api_key
+    prev_rl = OpenHydraHandler._rate_limiter
+    try:
+        OpenHydraHandler._api_key = None
+        OpenHydraHandler._rate_limiter = None
+        handler, captured = _build_handler_with_engine(_ZeroEngine())
+        handler.path = "/v1/completions"
+        handler._read_json = lambda: {"prompt": "anything", "max_tokens": 10}
+        handler.do_POST()
+    finally:
+        OpenHydraHandler._api_key = prev_key
+        OpenHydraHandler._rate_limiter = prev_rl
+
+    assert captured.get("status", 200) == 200
+    usage = captured["payload"]["usage"]
+    assert usage["completion_tokens"] == 0
+    assert usage["prompt_tokens"] == 4
+    assert usage["total_tokens"] == 4

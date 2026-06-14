@@ -2401,6 +2401,11 @@ class InferenceService:
             "response": response_text,
             "primary_response": primary.text,
             "latency_ms": round(primary.latency_ms, 2),
+            # Actual token count: ``primary.activation`` carries one float per
+            # generated token ID. Use this for ``completion_tokens`` in the API
+            # response instead of a ``len(text.split())`` word-count estimate.
+            "completion_tokens": len(primary.activation) if primary.activation else 0,
+            "prompt_tokens": prompt_tokens_est,
             "pipeline": [asdict(trace) for trace in primary.traces],
             "verification": asdict(verification),
             "verification_feedback": verification_feedback,
