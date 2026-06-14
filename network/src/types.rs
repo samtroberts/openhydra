@@ -48,6 +48,25 @@ pub struct PeerRecord {
     #[serde(default)]
     pub runtime_estimated_memory_mb: u64,
 
+    // protocol.md §4 — canonical model id + capability record (M1.2). All
+    // #[serde(default)] so pre-M1.2 records (lacking these keys) still decode.
+    // (region / requires_relay / reputation_score / runtime_backend already exist
+    // above and cover the spec's region/requires_relay/reputation/backend.)
+    #[serde(default)]
+    pub canonical_model_id: String,
+    #[serde(default)]
+    pub context_length: u32,
+    #[serde(default)]
+    pub max_output_tokens: u32,
+    /// Live measured decode throughput (tokens/s), distinct from the static
+    /// `runtime_estimated_tokens_per_sec` estimate above.
+    #[serde(default)]
+    pub throughput_tok_s: f64,
+    #[serde(default)]
+    pub queue_depth: u32,
+    #[serde(default)]
+    pub hardware_class: String,
+
     // Privacy
     #[serde(default)]
     pub privacy_noise_variance: f64,
@@ -191,6 +210,54 @@ mod tests {
     }
 
     #[test]
+    fn test_cbor_roundtrip_capability_fields() {
+        // protocol.md §4 (M1.2): the new capability fields survive a CBOR round-trip.
+        let record = PeerRecord {
+            peer_id: "cap-peer".into(),
+            model_id: "openhydra-qwen3.5-2b".into(),
+            canonical_model_id: "qwen3.5/2b/fp16/5632a1b48425a5ae".into(),
+            context_length: 32768,
+            max_output_tokens: 4096,
+            throughput_tok_s: 13.4,
+            queue_depth: 2,
+            hardware_class: "nvidia-t4".into(),
+            ..Default::default()
+        };
+        let decoded = PeerRecord::from_cbor(&record.to_cbor().unwrap()).unwrap();
+        assert_eq!(decoded.canonical_model_id, "qwen3.5/2b/fp16/5632a1b48425a5ae");
+        assert_eq!(decoded.context_length, 32768);
+        assert_eq!(decoded.max_output_tokens, 4096);
+        assert_eq!(decoded.throughput_tok_s, 13.4);
+        assert_eq!(decoded.queue_depth, 2);
+        assert_eq!(decoded.hardware_class, "nvidia-t4");
+    }
+
+    #[test]
+    fn test_cbor_backward_compat_missing_new_fields() {
+        // An "old" record (pre-M1.2) lacks the §4 capability keys entirely. With
+        // #[serde(default)] it must still decode, defaulting the new fields — so a
+        // freshly-upgraded node can still read records announced by older peers.
+        use ciborium::value::Value;
+        let old = Value::Map(vec![
+            (Value::Text("peer_id".into()), Value::Text("old-peer".into())),
+            (Value::Text("model_id".into()), Value::Text("m".into())),
+            (Value::Text("host".into()), Value::Text("10.0.0.9".into())),
+            (Value::Text("port".into()), Value::Integer(50051u16.into())),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&old, &mut buf).unwrap();
+
+        let decoded = PeerRecord::from_cbor(&buf).unwrap();
+        assert_eq!(decoded.peer_id, "old-peer");
+        assert_eq!(decoded.canonical_model_id, ""); // all §4 fields defaulted
+        assert_eq!(decoded.context_length, 0);
+        assert_eq!(decoded.max_output_tokens, 0);
+        assert_eq!(decoded.throughput_tok_s, 0.0);
+        assert_eq!(decoded.queue_depth, 0);
+        assert_eq!(decoded.hardware_class, "");
+    }
+
+    #[test]
     fn test_json_roundtrip() {
         let json = r#"{
             "peer_id": "mac-a",
@@ -204,6 +271,10 @@ mod tests {
         let record: PeerRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.peer_id, "mac-a");
         assert_eq!(record.nat_type, "unknown"); // default
+        // §4 capability fields default to empty/zero when absent from the record.
+        assert_eq!(record.canonical_model_id, "");
+        assert_eq!(record.context_length, 0);
+        assert_eq!(record.hardware_class, "");
     }
 }
 
@@ -226,6 +297,12 @@ impl Default for PeerRecord {
             runtime_gpu_available: false,
             runtime_estimated_tokens_per_sec: 0.0,
             runtime_estimated_memory_mb: 0,
+            canonical_model_id: String::new(),
+            context_length: 0,
+            max_output_tokens: 0,
+            throughput_tok_s: 0.0,
+            queue_depth: 0,
+            hardware_class: String::new(),
             privacy_noise_variance: 0.0,
             reputation_score: 0.0,
             expert_tags: Vec::new(),
