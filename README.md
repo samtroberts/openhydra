@@ -306,6 +306,8 @@ On Apple Silicon, use `--standalone-head-backend mlx` with an MLX-quantised mode
 
 Measured on real hardware from a clean `git clone` + Quick Start install. Push ring topology, KV-aware caching, deterministic seed (`seed=42`, `temperature=0.7`) — outputs are reproducible.
 
+**Latest (OHV2 binary ring mode, 2026-06):** Qwen 3.5 2B hits **17 tok/s** on two T4 GPUs — **17 tok/s** across two T4 GPUs on a LAN, **12–13 tok/s** over a cross-ISP relay, and **8 tok/s** on two M1 MacBook Airs.
+
 ### Headline numbers
 
 | Model | Hardware | Transport | 64 tok | 128 tok | 256 tok |
