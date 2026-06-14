@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// An error from talking to, or interpreting, an engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterError {
@@ -55,8 +57,9 @@ pub trait HttpClient {
     ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError>;
 }
 
-/// One chat message in an inference request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One chat message in an inference request. Serializable — it crosses the swarm as
+/// part of a serve request (see [`crate::serve`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,

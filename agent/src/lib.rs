@@ -22,6 +22,7 @@
 pub mod adapter;
 pub mod http;
 pub mod ollama;
+pub mod serve;
 
 pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
@@ -29,6 +30,7 @@ pub use adapter::{
 };
 pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;
+pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};
 
 /// An Ollama adapter backed by the live reqwest transport, pointed at `base_url`
 /// (e.g. [`ollama::DEFAULT_OLLAMA_URL`]). The convenience entry point for a provider.
