@@ -184,8 +184,8 @@ fn parse_bootstrap_peers(addrs: &[String]) -> Result<Vec<(PeerId, Multiaddr)>, S
 // ── Blocking helpers (used by PyO3 methods with GIL released) ──
 
 /// Send a command and wait for the reply, blocking the current thread.
-#[cfg(feature = "pyo3")]
-fn send_and_wait<T>(
+/// Shared by the pyo3 `P2PNode` methods and the non-pyo3 [`crate::handle::NetworkHandle`].
+pub(crate) fn send_and_wait<T>(
     cmd_tx: &mpsc::Sender<SwarmCommand>,
     make_cmd: impl FnOnce(oneshot::Sender<T>) -> SwarmCommand,
 ) -> Result<T, String> {

@@ -39,6 +39,11 @@ pub mod types;
 // network crate is the async + FFI shell around this pure core.
 pub use openhydra_protocol::{model_id, receipts, router, store, verify};
 
+/// Non-pyo3 Rust API over the swarm — used by the pure-protocol `agent` crate (which
+/// builds with `default-features = false`, no Python). Wraps `start_node` + the command
+/// channel + the inbound proxy queue into a tidy synchronous handle.
+pub mod handle;
+
 /// Python module entry point.
 #[cfg(feature = "pyo3")]
 mod python {
