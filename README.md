@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">OpenHydra</h1>
-  <p align="center"><strong>Turn on. Tune in. Drop in.</strong></p>
-  <p align="center"><em>Your laptop is a supercomputer waiting to happen.</em></p>
+  <p align="center"><strong>Run AI in a herd, not a data center.</strong></p>
+  <p align="center"><em>A peer-to-peer protocol for free, distributed AI inference.</em></p>
 </p>
 
 <p align="center">
@@ -11,14 +11,17 @@
 
 ---
 
-OpenHydra is a peer-to-peer inference network that turns idle hardware into a global AI swarm. Any Mac, NVIDIA GPU, or AMD GPU can join. No central server. No API keys. No $20/month subscription. Just start a node and you're contributing compute.
+OpenHydra is a peer-to-peer **protocol** for free, distributed AI inference. Plug in whatever you already run — Ollama, vLLM, LM Studio, llama.cpp, Exo — and join a global network that routes inference to whoever has the model. Requests run on a single node at native local speed; models too big for any one machine fall back to sharding across peers. No central server. No API keys. No subscription. Think BitTorrent, for AI inference.
+
+> **Evolving:** OpenHydra started as a sharded inference network (a "faster Petals"). It is becoming a general, engine-agnostic inference protocol — see the [Protocol design](docs/protocol.md). Sharded inference is retained as the fallback for very large models.
 
 **Why OpenHydra?**
 
-- **No VRAM ceiling.** A 70B model that needs 140 GB runs across 8 peers, each contributing 18 GB.
-- **No central server.** Every node is both client and server. The network is the computer.
-- **Auto-discovery.** Peers find each other via Kademlia DHT + mDNS. No IPs to configure.
-- **Privacy by default.** Onion routing + AES-256-GCM encryption + differential privacy. No peer sees your full query.
+- **Plug in any engine.** Already running Ollama, vLLM, LM Studio, llama.cpp, or Exo? Join with a thin adapter and keep your stack. Any Mac, NVIDIA, or AMD GPU — any platform.
+- **No VRAM ceiling.** Run any Hugging Face model. Ones too big for your machine shard across peers — a 70B that needs 140 GB runs across 8 peers, ~18 GB each.
+- **Free, by reciprocity.** Give-to-get: serve inference to earn priority when you consume. No tokens, no crypto, no $20/month.
+- **No central server.** Peers discover each other over a Kademlia DHT + mDNS with NAT hole-punching and relay fallback. The network is the computer.
+- **Private options.** Per-hop AES-256-GCM encryption, trusted-peer pinning, and LAN-only or sharded modes where no single peer sees your full prompt.
 
 ---
 
@@ -444,7 +447,7 @@ The libp2p layer itself (3 relay reservations accepted across US/EU/AP bootstrap
 Each node bundles two components in a single process:
 
 - **Peer** — a libp2p inference service that loads one model shard (or a full model) and announces itself to the Kademlia DHT. All tensor traffic (forward requests, push results, pings) flows over the native libp2p request/response protocol (`/openhydra/tensor/1.0.0`) via QUIC or TCP.
-- **Coordinator** — an OpenAI-compatible HTTP API that discovers peers, assembles inference pipelines, and manages verification.
+- **Coordinator** — an OpenAI-compatible HTTP API that discovers peers, routes requests to providers, assembles inference pipelines, and manages verification.
 
 ### Peer Discovery
 
@@ -529,11 +532,11 @@ Full catalog: [`models.catalog.json`](models.catalog.json)
 ```
 peer/              Inference engine: libp2p service, model shard, MLX/PyTorch runtimes,
                    KV compaction, request coalescing, P2P model cache, batching
-coordinator/       HTTP API, pipeline routing, chain failover, speculative decode,
+coordinator/       HTTP API, provider routing, pipeline failover, speculative decode,
                    auto-scaler, verification
 network/           Rust libp2p networking layer (Kademlia, Circuit Relay, mDNS, PyO3)
 dht/               HTTP DHT bootstrap server
-verification/      Mystery Shopper, redundant execution, auditor spot-checks
+verification/      Redundant execution, auditor spot-checks, reputation
 ops/               Terraform, Docker Compose, Prometheus/Grafana, deploy scripts
 tests/             1100+ tests (unit + integration + API emulation)
 ```
@@ -719,9 +722,8 @@ Only applies to `--sample-on-coordinator` mode. The coordinator didn't successfu
 | Layer | Mechanism |
 |-------|-----------|
 | **Identity** | Ed25519 keys at `~/.openhydra/identity.key` (mode 0600) |
-| **Transport** | X25519 ECDH + AES-256-GCM per activation |
-| **Routing** | Onion routing — layered encryption through pipeline stages |
-| **Privacy** | Differential privacy noise injection with verifiable audit tags |
+| **Transport** | X25519 ECDH + AES-256-GCM per hop |
+| **Privacy modes** | Trusted-peer pinning; LAN-only and sharded routing so no single peer sees your full prompt |
 | **NAT Traversal** | libp2p Circuit Relay v2 + DCUtR hole punching |
 
 ---
