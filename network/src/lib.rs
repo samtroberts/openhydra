@@ -45,6 +45,13 @@ pub mod router;
 /// + in-memory replay protection; the persistent ledger is M2.3.
 pub mod receipts;
 
+/// Verification policy (protocol.md §7) — M2.2 scaffold. Pure logic & math for the
+/// trust layer: reputation feedback (`ReputationTracker`) with time-decay, and the
+/// reputation→sample-rate policy. Activation hashing (TOPLOC) and redundant-execution
+/// comparison are documented stubs to be ported on top; nothing is wired into the DHT
+/// or router yet.
+pub mod verify;
+
 /// Python module entry point.
 #[cfg(feature = "pyo3")]
 mod python {
