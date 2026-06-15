@@ -130,6 +130,45 @@ fn main() {
     }
 }
 
+/// If `OH_PROFILE_SECS` is set (and built with `--features profiling`), sample the whole
+/// process for that many seconds and write an SVG flamegraph to `/tmp/oh_flame.svg`. The
+/// guard samples all threads via SIGPROF (no kernel perf), so it works in containers.
+#[cfg(feature = "profiling")]
+fn start_profiler_if_requested() {
+    let secs = match std::env::var("OH_PROFILE_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        Some(s) => s,
+        None => return,
+    };
+    let guard = match pprof::ProfilerGuardBuilder::default()
+        .frequency(997)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+    {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("openhydra-agent: profiler failed to start: {e}");
+            return;
+        }
+    };
+    eprintln!("openhydra-agent: profiling {secs}s → /tmp/oh_flame.svg");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        match guard.report().build() {
+            Ok(report) => match std::fs::File::create("/tmp/oh_flame.svg") {
+                Ok(f) => {
+                    let _ = report.flamegraph(f);
+                    eprintln!("openhydra-agent: wrote /tmp/oh_flame.svg");
+                }
+                Err(e) => eprintln!("openhydra-agent: flamegraph file error: {e}"),
+            },
+            Err(e) => eprintln!("openhydra-agent: profiler report failed: {e}"),
+        }
+    });
+}
+
+#[cfg(not(feature = "profiling"))]
+fn start_profiler_if_requested() {}
+
 /// Surface the network crate's `tracing` events under `RUST_LOG` (default: warnings).
 /// Without a subscriber, libp2p/Kademlia/relay diagnostics are invisible.
 fn init_tracing() {
@@ -140,6 +179,7 @@ fn init_tracing() {
 
 fn run() -> Result<(), String> {
     init_tracing();
+    start_profiler_if_requested();
     let cli = Cli::parse();
     let config = cli.node.into_config();
     // Start the swarm first; both roles need the live node.
