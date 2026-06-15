@@ -410,12 +410,23 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
 > happens — they're the immediate next work after the protocol core, not a late
 > "markets & reach" phase. **M3.1 is the first step.**
 
-**M3.1 — Ollama engine adapter** · WS-ENGINE · Rust · ~1.5w · **← NEXT**
+**M3.1 — Ollama engine adapter** · WS-ENGINE · Rust · ~1.5w · **✅ DONE (exit test passed live 2026-06-15)**
 - `agent::adapters::ollama`: detect local Ollama models (quant + ctx via `/api/tags`,
   `/api/show`), advertise canonical ids, proxy inbound swarm requests to Ollama's
-  OpenAI shim. The "anyone running Ollama flips a switch" flagship.
+  OpenAI shim. The "anyone running Ollama flips a switch" flagship. Built end-to-end:
+  Ollama adapter → provider swarm wiring (announce + serve loop) → consumer gateway
+  (axum HTTP/SSE) → co-signed receipt at EOS → redb ledger. Runnable `openhydra-agent`
+  binary (`provide` / `serve` roles).
 - **Exit test:** a machine with Ollama and zero OpenHydra model files joins the swarm
-  and serves a verified request from its Ollama models.
+  and serves a verified request from its Ollama models. **PASSED** — GPU1 (Lightning,
+  Ollama `qwen2.5:0.5b`, behind NAT) provider ↔ Mac gateway (behind NAT), cross-NAT via
+  the Linode Circuit Relay: gateway discovered the provider, routed over the relay, Ollama
+  streamed the completion back as OpenAI SSE, and the co-signed receipt settled + ledgered
+  on the provider (15 tokens). Two bugs surfaced + fixed by the live run: (1) provider
+  one-shot announce → **periodic re-announce** within the relays' 300s provider-record TTL;
+  (2) `get_providers` discover returned only the provider PeerId and dropped it (the full
+  signed `PeerRecord` lives on the relays, not locally) → **chain a `get_record`** to pull
+  it, and keep partial results on query timeout.
 
 **M3.2 — Additional adapters** · WS-ENGINE · Rust · ~2w
 - vLLM, LM Studio, Exo (OpenAI-compatible → thin), then llama.cpp server and Apple
@@ -518,7 +529,7 @@ for now** (the app assumes the user supplies/points at a local engine). Gated on
 ## 5. Sequencing & critical path
 
 ```
-Phase 1 (M1.1→M1.3 ✅)  ─►  Phase 2 (M2.1✅ M2.2→M2.4)  ─►  Phase 3 (M3.1 engine adapter ← NEXT, M3.x)
+Phase 1 (M1.1→M1.3 ✅)  ─►  Phase 2 (M2.1✅ M2.2→M2.4)  ─►  Phase 3 (M3.1 engine adapter ✅, M3.x ← NEXT)
    (Rust crates, called by the Python host via PyO3 during transition)
         └───────────────────────────────────► R1 (gateway) ─► R2 (delete Python) ─► R3 (package)
                                                    Phase 4 (sharded) ❌ removed
