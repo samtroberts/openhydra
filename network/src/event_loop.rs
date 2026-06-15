@@ -405,6 +405,18 @@ struct LoopState {
     pending_record_fetches: HashMap<kad::QueryId, kad::QueryId>,
     /// External addresses discovered by AutoNAT / Identify.
     external_addrs: Vec<Multiaddr>,
+    /// R-DHT-4: external addresses currently mapped by UPnP/NAT-PMP (the IGD
+    /// behaviour confirms them once, on first map, but does NOT re-emit on
+    /// renewal). Tracked here so the re-assert ticker can restore a UPnP address
+    /// that the R-DHT-2 AutoNAT-`Private` demotion retracted, once AutoNAT is no
+    /// longer asserting we're unreachable. Entries are added on `NewExternalAddr`
+    /// and removed on `ExpiredExternalAddr` (the mapping genuinely lapsed).
+    upnp_external_addrs: std::collections::HashSet<Multiaddr>,
+    /// R-DHT-2/4: whether AutoNAT currently holds a confidence-latched `Private`
+    /// verdict. While true, the UPnP re-assert is suppressed — a genuinely broken
+    /// port map keeps AutoNAT at `Private`, so it must never be re-promoted into a
+    /// black hole; the re-assert only fires once AutoNAT clears (Public/Unknown).
+    autonat_private: bool,
     /// Relay addresses we've reserved.
     #[allow(dead_code)]
     relay_addrs: Vec<Multiaddr>,
@@ -556,6 +568,8 @@ impl LoopState {
             pending_discovers: HashMap::new(),
             pending_record_fetches: HashMap::new(),
             external_addrs: Vec::new(),
+            upnp_external_addrs: std::collections::HashSet::new(),
+            autonat_private: false,
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
             local_grpc_port: 50051,
@@ -722,6 +736,17 @@ pub async fn run_event_loop(
     // fires immediately; we skip persisting an empty table on that one.
     let mut routing_save_ticker = tokio::time::interval(std::time::Duration::from_secs(300));
     routing_save_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // R-DHT-4: periodically re-assert UPnP-mapped external addresses. The IGD
+    // behaviour confirms a mapping only once (not on renewal), so if an
+    // AutoNAT-`Private` demotion retracted the address, nothing would restore it
+    // until a full remap. This ticker re-adds any tracked UPnP address that has
+    // fallen out of the confirmed set — but ONLY while AutoNAT is not asserting
+    // `Private` (a genuinely-broken map keeps AutoNAT at `Private`, so it is never
+    // re-promoted into a black hole). 120 s ≫ AutoNAT's confidence-latch time, so
+    // AutoNAT always wins the race against a truly-unreachable map.
+    let mut upnp_reassert_ticker = tokio::time::interval(std::time::Duration::from_secs(120));
+    upnp_reassert_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // F6: B5's periodic re-listen was removed. It called `listen_on(circuit)`
     // every 30 min unconditionally, creating a NEW listener each time without
@@ -1257,6 +1282,23 @@ pub async fn run_event_loop(
                             Ok(()) => debug!(contacts = entries.len(), "R-DHT-6: persisted routing table"),
                             Err(e) => warn!(%e, "R-DHT-6: routing table persist failed"),
                         }
+                    }
+                }
+            }
+            // R-DHT-4: re-assert UPnP external addresses (recover from a transient
+            // AutoNAT-Private demotion). Suppressed while AutoNAT holds Private.
+            _ = upnp_reassert_ticker.tick() => {
+                if !state.upnp_external_addrs.is_empty() {
+                    let confirmed: std::collections::HashSet<Multiaddr> =
+                        swarm.external_addresses().cloned().collect();
+                    let missing = upnp_addrs_to_reassert(
+                        &state.upnp_external_addrs,
+                        &confirmed,
+                        state.autonat_private,
+                    );
+                    for addr in missing {
+                        info!(%addr, "R-DHT-4: re-asserting UPnP external addr (AutoNAT not Private)");
+                        swarm.add_external_address(addr);
                     }
                 }
             }
@@ -2041,9 +2083,15 @@ fn handle_swarm_event(
             match upnp_event {
                 libp2p::upnp::Event::NewExternalAddr(addr) => {
                     info!(%addr, "R-DHT-4: UPnP mapped a public address (promotes via ExternalAddrConfirmed)");
+                    // Remember it so the re-assert ticker can restore it if an
+                    // AutoNAT-Private demotion later retracts it (the IGD behaviour
+                    // only confirms once, not on renewal).
+                    state.upnp_external_addrs.insert(addr);
                 }
                 libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
                     info!(%addr, "R-DHT-4: UPnP mapping expired");
+                    // The lease genuinely lapsed — stop re-asserting it.
+                    state.upnp_external_addrs.remove(&addr);
                 }
                 libp2p::upnp::Event::GatewayNotFound => {
                     debug!("R-DHT-4: no UPnP/IGD gateway found (expected off home routers)");
@@ -2600,6 +2648,7 @@ fn handle_autonat_event(
                 libp2p::autonat::NatStatus::Public(addr) => {
                     state.nat_info.nat_type = "open".into();
                     state.nat_info.is_public = true;
+                    state.autonat_private = false; // R-DHT-4: re-assert may resume
                     if let Some(ip) = extract_ip_from_multiaddr(&addr) {
                         state.nat_info.external_ip = ip.clone();
                         // Classify by address family.
@@ -2625,6 +2674,7 @@ fn handle_autonat_event(
                 libp2p::autonat::NatStatus::Private => {
                     state.nat_info.nat_type = "symmetric".into();
                     state.nat_info.is_public = false;
+                    state.autonat_private = true; // R-DHT-4: suppress UPnP re-assert
                     // R-DHT-2: reachability was lost (e.g. network changed, or an
                     // earlier observed-address confirmation was over-eager). Retract
                     // our direct external addresses so Kademlia auto-demotes back to
@@ -2648,6 +2698,11 @@ fn handle_autonat_event(
                 libp2p::autonat::NatStatus::Unknown => {
                     state.nat_info.nat_type = "unknown".into();
                     state.nat_info.is_public = false;
+                    // R-DHT-4: AutoNAT no longer *asserts* unreachability (it just
+                    // can't determine one) — allow the UPnP re-assert to trust the
+                    // mapping again. A genuinely broken map stays `Private`, not
+                    // `Unknown`, so this doesn't re-promote a black hole.
+                    state.autonat_private = false;
                 }
             }
         }
@@ -2882,6 +2937,28 @@ fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
         }
     }
     saw_ip
+}
+
+/// R-DHT-4: decide which UPnP-mapped external addresses to re-assert this tick.
+///
+/// Returns the tracked UPnP addresses that have dropped out of the swarm's
+/// `confirmed` external set (so re-adding them is meaningful, not a redundant
+/// re-confirmation) — **but an empty list whenever AutoNAT currently holds a
+/// `Private` verdict**. A genuinely-broken port map keeps AutoNAT at `Private`,
+/// so suppressing the re-assert there is what stops a black hole from being
+/// re-promoted; once AutoNAT clears (Public/Unknown) the address is restored.
+fn upnp_addrs_to_reassert(
+    upnp: &std::collections::HashSet<Multiaddr>,
+    confirmed: &std::collections::HashSet<Multiaddr>,
+    autonat_private: bool,
+) -> Vec<Multiaddr> {
+    if autonat_private {
+        return Vec::new();
+    }
+    upnp.iter()
+        .filter(|a| !confirmed.contains(*a))
+        .cloned()
+        .collect()
 }
 
 /// Extract an IP string from a multiaddr like `/ip4/1.2.3.4/tcp/4001`.
@@ -4118,6 +4195,28 @@ mod tests {
 
         // A relay-circuit address is never "us being reachable".
         assert!(!g("/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"));
+    }
+
+    #[test]
+    fn test_upnp_reassert_decision() {
+        let a: Multiaddr = "/ip4/45.79.190.172/tcp/4001".parse().unwrap();
+        let b: Multiaddr = "/ip6/2a03:4000:41:ed1::1/tcp/4001".parse().unwrap();
+        let upnp: std::collections::HashSet<Multiaddr> = [a.clone(), b.clone()].into_iter().collect();
+
+        // AutoNAT not Private, both addrs already confirmed → nothing to re-assert.
+        let confirmed: std::collections::HashSet<Multiaddr> = [a.clone(), b.clone()].into_iter().collect();
+        assert!(upnp_addrs_to_reassert(&upnp, &confirmed, false).is_empty());
+
+        // AutoNAT not Private, `a` dropped from the confirmed set → re-assert just `a`.
+        let confirmed: std::collections::HashSet<Multiaddr> = [b.clone()].into_iter().collect();
+        assert_eq!(upnp_addrs_to_reassert(&upnp, &confirmed, false), vec![a.clone()]);
+
+        // AutoNAT Private → suppress entirely, even though `a` is missing (a broken
+        // map keeps AutoNAT Private; must not be re-promoted into a black hole).
+        assert!(upnp_addrs_to_reassert(&upnp, &confirmed, true).is_empty());
+
+        // No tracked UPnP addresses → nothing to do.
+        assert!(upnp_addrs_to_reassert(&std::collections::HashSet::new(), &confirmed, false).is_empty());
     }
 
     #[test]
