@@ -398,6 +398,10 @@ struct LoopState {
     known_peers: HashMap<String, PeerRecord>,
     /// Pending Kademlia GET queries: query_id → reply channel.
     pending_discovers: HashMap<kad::QueryId, PendingDiscover>,
+    /// Chained `get_record` fetches spawned by a `get_providers` discover, mapping the
+    /// record query_id → the originating discover's query_id. Lets the GetRecord handler
+    /// route a fetched provider record back into the right pending discover.
+    pending_record_fetches: HashMap<kad::QueryId, kad::QueryId>,
     /// External addresses discovered by AutoNAT / Identify.
     external_addrs: Vec<Multiaddr>,
     /// Relay addresses we've reserved.
@@ -513,10 +517,16 @@ struct LoopState {
 const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 
 struct PendingDiscover {
-    #[allow(dead_code)]
     model_id: String,
     records: Vec<PeerRecord>,
     reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
+    /// Set once the `get_providers` query terminates (found-all or timed-out). Until then,
+    /// more providers — and thus more chained record fetches — may still arrive.
+    providers_done: bool,
+    /// In-flight `get_record` fetches for providers whose full `PeerRecord` wasn't held
+    /// locally (cross-relay, the record lives on the bootstrap nodes, not on us). The
+    /// reply is sent only once `providers_done && outstanding == 0`.
+    outstanding: usize,
 }
 
 impl LoopState {
@@ -536,6 +546,7 @@ impl LoopState {
             ipv6_capable: probe_ipv6_capable(),
             known_peers: HashMap::new(),
             pending_discovers: HashMap::new(),
+            pending_record_fetches: HashMap::new(),
             external_addrs: Vec::new(),
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
@@ -1313,6 +1324,8 @@ fn handle_discover(
             model_id: model_id.to_string(),
             records: Vec::new(),
             reply,
+            providers_done: false,
+            outstanding: 0,
         },
     );
 }
@@ -2175,24 +2188,50 @@ fn handle_kad_event(
                                     }
                                 }
                             } else {
-                                debug!(%provider_pid, "provider found but no data in cache or local store");
+                                // 3. Cross-relay: the full record was put_record'd to the
+                                //    bootstrap nodes, not replicated to us. Chain a
+                                //    get_record to fetch it, and defer this discover's reply
+                                //    until the fetch lands (GetRecord handler + finalize).
+                                let rec_qid =
+                                    swarm.behaviour_mut().kademlia.get_record(per_peer_key);
+                                state.pending_record_fetches.insert(rec_qid, id);
+                                pending.outstanding += 1;
+                                debug!(%provider_pid, "provider record not local; fetching via get_record");
                             }
                         }
                     }
                 }
                 Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
-                    if let Some(pending) = state.pending_discovers.remove(&id) {
-                        let peers = pending
-                            .records
-                            .into_iter()
-                            .map(|r| record_to_discovered(&r))
-                            .collect();
-                        let _ = pending.reply.send(Ok(peers));
+                    // The provider list is complete. Reply now only if no record fetches are
+                    // still outstanding; otherwise the last fetch to finalize sends the reply.
+                    if let Some(pending) = state.pending_discovers.get_mut(&id) {
+                        pending.providers_done = true;
+                        if pending.outstanding == 0 {
+                            let pending = state.pending_discovers.remove(&id).expect("present");
+                            let peers: Vec<DiscoveredPeer> =
+                                pending.records.iter().map(record_to_discovered).collect();
+                            let _ = pending.reply.send(Ok(peers));
+                        }
                     }
                 }
                 Err(e) => {
-                    if let Some(pending) = state.pending_discovers.remove(&id) {
-                        let _ = pending.reply.send(Err(format!("kademlia get_providers: {e:?}")));
+                    // The get_providers query timed out / failed. Do NOT discard providers
+                    // already found: if any records resolved (or fetches are still in
+                    // flight) keep them; only surface the error when we have nothing.
+                    if let Some(pending) = state.pending_discovers.get_mut(&id) {
+                        pending.providers_done = true;
+                        if pending.outstanding == 0 {
+                            let pending = state.pending_discovers.remove(&id).expect("present");
+                            if pending.records.is_empty() {
+                                let _ = pending
+                                    .reply
+                                    .send(Err(format!("kademlia get_providers: {e:?}")));
+                            } else {
+                                let peers: Vec<DiscoveredPeer> =
+                                    pending.records.iter().map(record_to_discovered).collect();
+                                let _ = pending.reply.send(Ok(peers));
+                            }
+                        }
                     }
                 }
             }
@@ -2217,6 +2256,26 @@ fn handle_kad_event(
             result: kad::QueryResult::GetRecord(result),
             ..
         } => {
+            // Is this a record fetch chained from a get_providers discover (cross-relay)?
+            if let Some(discover_id) = state.pending_record_fetches.get(&id).copied() {
+                match result {
+                    Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord { record, .. })) => {
+                        ingest_discovered_record(swarm, state, discover_id, &record.value);
+                        // Got the provider's record — this fetch is resolved.
+                        if state.pending_record_fetches.remove(&id).is_some() {
+                            finalize_discover_fetch(state, discover_id);
+                        }
+                    }
+                    Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) | Err(_) => {
+                        // Terminal without a record — still resolve the fetch so the
+                        // discover can complete (one fewer provider).
+                        if state.pending_record_fetches.remove(&id).is_some() {
+                            finalize_discover_fetch(state, discover_id);
+                        }
+                    }
+                }
+                return;
+            }
             match result {
                 Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord { record, .. })) => {
                     // Decode the record and add to pending discover results.
@@ -2366,6 +2425,63 @@ fn handle_autonat_event(event: libp2p::autonat::Event, state: &mut LoopState) {
             }
         }
         _ => {}
+    }
+}
+
+/// Decode + verify a fetched `PeerRecord`, make it dialable (add its advertised
+/// relay address to the routing table so a later `proxy_forward` can reach a NAT'd
+/// provider), cache it, and append it to the named pending discover (deduped).
+fn ingest_discovered_record(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    discover_id: kad::QueryId,
+    value: &[u8],
+) {
+    let peer_record = match dht::decode_record(value) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("failed to decode fetched DHT record: {e}");
+            return;
+        }
+    };
+    // H1: reject unverified records before trusting any field (DHT poisoning).
+    if let Err(e) = dht::verify_peer_record(&peer_record) {
+        warn!(%e, "dht_record_rejected: fetched record verify failed");
+        return;
+    }
+    // Install the relay-circuit address so the peer is dialable (mirrors the legacy
+    // GetRecord path; without it, discover returns a record but the address book is empty).
+    if !peer_record.relay_address.is_empty() && !peer_record.libp2p_peer_id.is_empty() {
+        if let (Ok(pid), Ok(ma)) = (
+            peer_record.libp2p_peer_id.parse::<PeerId>(),
+            peer_record.relay_address.parse::<Multiaddr>(),
+        ) {
+            let update = swarm.behaviour_mut().kademlia.add_address(&pid, ma.clone());
+            debug!(%pid, %ma, ?update, "discover_auto_added_address");
+        }
+    }
+    let pid_str = peer_record.libp2p_peer_id.clone();
+    state.known_peers.insert(peer_record.peer_id.clone(), peer_record.clone());
+    if let Some(pending) = state.pending_discovers.get_mut(&discover_id) {
+        if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
+            pending.records.push(peer_record);
+        }
+    }
+}
+
+/// One chained record fetch resolved: decrement the discover's outstanding count and, if
+/// the provider list is also complete, send the accumulated peers back to the caller.
+fn finalize_discover_fetch(state: &mut LoopState, discover_id: kad::QueryId) {
+    if let Some(pending) = state.pending_discovers.get_mut(&discover_id) {
+        if pending.outstanding > 0 {
+            pending.outstanding -= 1;
+        }
+        if pending.providers_done && pending.outstanding == 0 {
+            let pending = state.pending_discovers.remove(&discover_id).expect("present");
+            let peers: Vec<DiscoveredPeer> =
+                pending.records.iter().map(record_to_discovered).collect();
+            let _ = pending.reply.send(Ok(peers));
+        }
     }
 }
 
