@@ -23,7 +23,15 @@ use openhydra_protocol::router::{rank_peers, PeerScoreInput};
 
 use crate::adapter::{AdapterError, ChatMessage};
 use crate::provider::SERVE_REQUEST;
+use crate::receipt::request_receipt;
 use crate::serve::{parse_response, ServeChunk, ServeRequest, ServeSummary};
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The provider the consumer chose to serve a request.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,12 +160,52 @@ impl ConsumerNode {
             temperature,
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
+        let summary = {
+            let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                self.net
+                    .proxy_forward(provider_libp2p.clone(), framed.to_vec())
+                    .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
+            };
+            request_completion(&mut transport, &request, on_delta)?
+        };
+
+        // Settle the co-signed receipt at EOS (best-effort — the tokens are already
+        // delivered; a failed/slow settlement must not fail the completion).
+        if summary.ok && summary.tokens > 0 {
+            self.settle_receipt(&provider, summary.tokens);
+        }
+        Ok(summary)
+    }
+
+    /// Fire the co-signed receipt for a completed request. Skips a provider that
+    /// advertised no usable public key; swallows all errors (trust settlement is
+    /// auxiliary to delivering the completion).
+    fn settle_receipt(&self, provider: &SelectedProvider, tokens: u64) {
+        let provider_pub = match hex::decode(&provider.public_key) {
+            Ok(b) if b.len() == 32 => b,
+            _ => return, // legacy / unkeyed provider — nothing to settle against
+        };
+        let consumer_pub = match self.net.public_key_bytes() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
+        let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
             self.net
                 .proxy_forward(provider_libp2p.clone(), framed.to_vec())
-                .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
+                .map_err(AdapterError::Http)
         };
-        request_completion(&mut transport, &request, on_delta)
+        let _ = request_receipt(
+            &sign,
+            &mut transport,
+            &provider_pub,
+            &consumer_pub,
+            &provider.model_id,
+            tokens,
+            rand::random::<[u8; 16]>(),
+            now_unix_ms(),
+        );
     }
 }
 

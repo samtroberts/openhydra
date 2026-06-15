@@ -23,6 +23,7 @@ use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
+use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{frame_response, handle_serve_request};
 
 /// libp2p proxy method byte for an inference serve request (consumer → provider). Sits
@@ -122,10 +123,25 @@ impl<A: EngineAdapter> Provider<A> {
     pub fn run_inbound(&self, timeout: std::time::Duration) -> ! {
         loop {
             if let Some((request_id, data)) = self.net.poll_inbound(timeout) {
-                let response = handle_serve_inbound(&data, &self.adapter);
+                let response = self.dispatch(&data);
                 // Best-effort reply; if the swarm is gone the next poll will error too.
                 let _ = self.net.respond(request_id, response);
             }
+        }
+    }
+
+    /// Route one inbound request by its method byte: serve completions, settle receipts.
+    fn dispatch(&self, data: &[u8]) -> Vec<u8> {
+        match data.first() {
+            Some(&RECEIPT_REQUEST) => {
+                let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
+                let provider_pub = self.net.public_key_bytes().unwrap_or_default();
+                let (response, _accepted) = handle_receipt_inbound(data, &sign, &provider_pub);
+                // TODO(M2.3): ledger `_accepted` co-signed receipts via protocol::store.
+                response
+            }
+            // SERVE_REQUEST (and any unknown byte → a framed Error from the serve handler).
+            _ => handle_serve_inbound(data, &self.adapter),
         }
     }
 }

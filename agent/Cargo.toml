@@ -19,6 +19,8 @@ openhydra-network = { path = "../network", default-features = false }
 # Signature type for the co-signed receipt handshake (the crypto lives in
 # openhydra-protocol::receipts; the node signs via NetworkHandle, key never exported).
 ed25519-dalek = "2"
+rand = "0.8"   # receipt nonces
+hex = "0.4"    # decode a provider's hex public key from the DHT record
 # Parse engine HTTP responses (Ollama /api/tags, /api/show, …).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

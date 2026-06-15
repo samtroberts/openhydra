@@ -32,6 +32,9 @@ pub struct NetworkHandle {
     libp2p_peer_id: String,
     openhydra_peer_id: String,
     public_key_hex: String,
+    /// The node's ed25519 identity keypair — used to sign receipts. **Never exported**
+    /// (the agent signs via [`sign`](NetworkHandle::sign); only signatures cross out).
+    keypair: libp2p::identity::Keypair,
 }
 
 impl NetworkHandle {
@@ -49,6 +52,7 @@ impl NetworkHandle {
                 .map_err(|e| format!("identity not ed25519: {e}"))?;
             hex::encode(pk.to_bytes())
         };
+        let keypair = identity.keypair.clone();
         let (cmd_tx, proxy_queue, thread) = start_node(&config)?;
         Ok(Self {
             cmd_tx,
@@ -57,7 +61,24 @@ impl NetworkHandle {
             libp2p_peer_id,
             openhydra_peer_id,
             public_key_hex,
+            keypair,
         })
+    }
+
+    /// Sign `data` with the node's identity key (RFC-8032 ed25519, 64 bytes). The key
+    /// never leaves the handle — used for co-signing receipts.
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.keypair.sign(data).map_err(|e| format!("sign: {e}"))
+    }
+
+    /// The node's raw 32-byte ed25519 public key (for receipt payloads).
+    pub fn public_key_bytes(&self) -> Result<Vec<u8>, String> {
+        let pk = self
+            .keypair
+            .public()
+            .try_into_ed25519()
+            .map_err(|e| format!("identity not ed25519: {e}"))?;
+        Ok(pk.to_bytes().to_vec())
     }
 
     /// libp2p PeerId (the `proxy_forward` dial target / `reply_to` for serve requests).
