@@ -28,24 +28,48 @@ actual property — while keeping libp2p's cryptographic-identity security model
 
 ## 2. What "reachable" means (promotion gate)
 
-A peer may be promoted to Kademlia **server** (store + route + answer) **only** when it has
-a confirmed-reachable address. "Reachable" =
+A peer may be promoted to Kademlia **server** (store + route + answer) **only** when it is
+reachable by an **arbitrary querier** — a peer it has never previously contacted. That is the
+property a DHT server must have: lookups arrive from strangers. This is stricter than
+"reachable by *some* correspondent", and the difference is what keeps us from black-holing.
+
+**Universally reachable → promote:**
 
 1. **Public IPv4** (rare for residential, common for servers/VPS), or
 2. **Public IPv6** (globally routable, usually un-NATed — high modern coverage; this is the
    underrated near-term win), or
-3. Behind **full-cone / restricted-cone NAT** (the UDP "outbound opens inbound" property —
-   others can reach the observed `IP:port`), or
-4. **DCUtR-direct** connectivity established (a hole-punched direct path), or
-5. A **UPnP/NAT-PMP-mapped** port on a cooperating router.
+3. Behind **full-cone NAT** (the mapping accepts inbound from *any* source, so an un-primed
+   prober reaches the observed `IP:port`), or
+4. A **UPnP/NAT-PMP-mapped** port on a cooperating, publicly-routable gateway.
+
+**Only *per-remote* reachable → stay client** (do NOT promote — implemented decision
+2026-06-15):
+
+- **Restricted / port-restricted-cone NAT** — the mapping only admits inbound from an IP (or
+  IP:port) it has *already sent to*. A random querier it hasn't contacted cannot reach it, so
+  promoting it advertises a server that black-holes every stranger's lookup. AutoNAT's
+  dial-back (from an un-primed prober) correctly returns `Private` for these.
+- **DCUtR-direct** — a successful hole-punch proves reachability to *that one peer* on that one
+  path, not to the network; for symmetric NAT it can even succeed while the mapping is
+  per-destination. So DCUtR success is **not** a promotion trigger on its own; AutoNAT is the
+  authoritative signal and already promotes the full-cone/public cases that are genuinely
+  universal.
 
 **CGNAT and symmetric-NAT peers stay clients.** BitTorrent does the same — it does not make
-*every* node a server; it makes every *reachable* node a server and absorbs the rest via
-scale. Promotion must be **conditional**: never `set_mode(Server)` unconditionally —
+*every* node a server; it makes every *universally-reachable* node a server and absorbs the
+rest via scale. Promotion must be **conditional**: never `set_mode(Server)` unconditionally —
 advertising as a server while unreachable causes **black-hole routing** (queries routed to
-you time out, degrading the DHT for everyone). Instead, feed confirmed-reachable addresses
-into the swarm's external-address set (`add_external_address`, already wired at
-`event_loop.rs:1591` / the `ExternalAddrConfirmed` handler) and let auto-mode promote.
+you time out, degrading the DHT for everyone).
+
+**Implemented mechanism (R-DHT-2):** Kademlia 0.46 runs in auto-mode and promotes to
+`Mode::Server` on the first confirmed external address. We confirm an address
+(`add_external_address`) only when it passes `is_globally_reachable_addr` (rejects
+RFC1918/CGNAT/loopback/link-local/ULA/doc/`p2p-circuit`) **and** is corroborated by a real
+reachability signal: a global public/IPv6 listen address, an AutoNAT `Public` verdict (the
+authoritative full-cone/public test), or a UPnP `ExternalAddrConfirmed`. An AutoNAT `Private`
+verdict **retracts** our direct external addresses so the node auto-demotes back to client —
+so a peer that loses reachability stops black-holing. This lands the server set exactly on the
+"universally reachable" group above.
 
 ## 3. BitTorrent contrast (why theirs doesn't degrade)
 
