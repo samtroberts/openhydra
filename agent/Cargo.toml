@@ -34,6 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = "0.1"
+# CLI for the `openhydra-agent` binary (provide / serve roles + node/engine flags).
+clap = { version = "4", features = ["derive"] }
 
 # Pure detection/serve logic is injected behind the `HttpClient` trait and unit-tested
 # against fixtures (no live engine); `ReqwestClient` is the production transport.
