@@ -42,38 +42,74 @@ pub fn parse_model_id_from_key(key: &[u8]) -> Option<String> {
     Some(stripped[..slash_pos].to_string())
 }
 
-/// Compute canonical bytes for signing a PeerRecord.
+/// Compute the canonical signing preimage for a `PeerRecord`.
 ///
-/// Matches the Python canonical format:
-/// `json.dumps({"host": host, "model_id": model_id, "peer_id": peer_id, "port": port}, sort_keys=True)`
-/// Keys are already alphabetical, so the JSON is deterministic.
-pub fn canonical_bytes(record: &PeerRecord) -> Vec<u8> {
+/// **v2 (2026-06-15 audit).** The legacy v1 preimage signed only
+/// `{host, model_id, peer_id, port}`, leaving the *rest* of the record —
+/// `libp2p_peer_id`, `relay_address`, `requires_relay`, `nat_type`, and the
+/// M1.2/M1.3 capability/ranking fields — **unsigned**, i.e. tamperable by a
+/// relaying peer. v2 covers **every field a consumer trusts** for identity,
+/// routing, or ranking, with a domain-separation header (`openhydra-peer-record-v2`)
+/// so a signature can't be replayed across formats/protocols.
+///
+/// Deliberately **excluded**:
+/// * `signature` — the output of signing.
+/// * `reputation_score` — externally assigned; a peer must never self-attest its
+///   own reputation (the consumer uses its local `ReputationTracker` instead).
+///
+/// Determinism: signer and verifier are both Rust and use identical `format!`
+/// rendering, so the byte string is reproducible. (This diverges from the legacy
+/// Python 4-field format; the agent/protocol path is Rust-only post-pivot.)
+pub fn canonical_bytes(r: &PeerRecord) -> Vec<u8> {
     format!(
-        r#"{{"host": "{}", "model_id": "{}", "peer_id": "{}", "port": {}}}"#,
-        record.host, record.model_id, record.peer_id, record.port,
+        "openhydra-peer-record-v2\n\
+         peer_id={}\nmodel_id={}\ncanonical_model_id={}\n\
+         host={}\nhost_ipv6={}\nport={}\n\
+         libp2p_peer_id={}\npublic_key={}\n\
+         relay_address={}\nrequires_relay={}\nnat_type={}\nregion={}\n\
+         runtime_backend={}\nruntime_model_id={}\n\
+         layer_start={}\nlayer_end={}\ntotal_layers={}\n\
+         context_length={}\nmax_output_tokens={}\n\
+         throughput_tok_s={}\nqueue_depth={}\nload_pct={}\nhardware_class={}\n\
+         updated_unix_ms={}",
+        r.peer_id, r.model_id, r.canonical_model_id,
+        r.host, r.host_ipv6, r.port,
+        r.libp2p_peer_id, r.public_key,
+        r.relay_address, r.requires_relay, r.nat_type, r.region.as_deref().unwrap_or(""),
+        r.runtime_backend, r.runtime_model_id,
+        r.layer_start, r.layer_end, r.total_layers,
+        r.context_length, r.max_output_tokens,
+        r.throughput_tok_s, r.queue_depth, r.load_pct, r.hardware_class,
+        r.updated_unix_ms,
     )
     .into_bytes()
 }
 
-/// Sign a PeerRecord with the given keypair and populate its `signature`
-/// and `public_key` fields.  Returns the mutated record (Task 6.2).
+/// Sign a PeerRecord with the given keypair and populate its `signature`,
+/// `public_key`, and `libp2p_peer_id` fields (Task 6.2).
+///
+/// Order matters (v2): `public_key` and `libp2p_peer_id` are now part of the
+/// signed preimage, so they must be populated **before** `canonical_bytes` is
+/// computed — otherwise the verifier (which sees the populated values) would
+/// recompute a different preimage and reject the signature.
 pub fn sign_peer_record(
     record: &PeerRecord,
     keypair: &libp2p::identity::Keypair,
 ) -> Result<PeerRecord, String> {
-    let canonical = canonical_bytes(record);
-    let sig_bytes = keypair
-        .sign(&canonical)
-        .map_err(|e| format!("sign failed: {e}"))?;
     let ed25519_pk = keypair
         .public()
         .try_into_ed25519()
         .map_err(|e| format!("not ed25519: {e}"))?;
     let mut signed = record.clone();
-    signed.signature = base64_urlsafe_encode(&sig_bytes);
     signed.public_key = hex::encode(ed25519_pk.to_bytes());
     signed.libp2p_peer_id =
         libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+    // Sign over the fully-populated record (incl. the two fields just set).
+    let canonical = canonical_bytes(&signed);
+    let sig_bytes = keypair
+        .sign(&canonical)
+        .map_err(|e| format!("sign failed: {e}"))?;
+    signed.signature = base64_urlsafe_encode(&sig_bytes);
     Ok(signed)
 }
 
@@ -224,6 +260,63 @@ mod tests {
         // Attacker rewrites host after signing → must fail.
         signed.host = "6.6.6.6".into();
         assert!(verify_peer_record(&signed).is_err());
+    }
+
+    #[test]
+    fn test_v2_signs_routing_and_capability_fields() {
+        // v2 audit fix: fields that were UNSIGNED under v1 must now be covered.
+        // Tampering any of them after signing must be rejected.
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let base = PeerRecord {
+            peer_id: "p".into(),
+            model_id: "m".into(),
+            host: "1.2.3.4".into(),
+            port: 50051,
+            relay_address: "/ip4/9.9.9.9/tcp/4001/p2p-circuit".into(),
+            requires_relay: true,
+            nat_type: "open".into(),
+            throughput_tok_s: 13.4,
+            queue_depth: 1,
+            layer_start: 0,
+            layer_end: 12,
+            total_layers: 24,
+            canonical_model_id: "qwen3.5/2b/fp16/abcd".into(),
+            ..Default::default()
+        };
+        let signed = sign_peer_record(&base, &kp).unwrap();
+        verify_peer_record(&signed).unwrap(); // genuine record verifies
+
+        // Each of these was forgeable under v1; now each must fail verification.
+        let mut t = signed.clone(); t.relay_address = "/ip4/6.6.6.6/tcp/4001".into();
+        assert!(verify_peer_record(&t).is_err(), "relay_address must be signed");
+        let mut t = signed.clone(); t.requires_relay = false;
+        assert!(verify_peer_record(&t).is_err(), "requires_relay must be signed");
+        let mut t = signed.clone(); t.throughput_tok_s = 9999.0;
+        assert!(verify_peer_record(&t).is_err(), "throughput must be signed");
+        let mut t = signed.clone(); t.queue_depth = 0;
+        assert!(verify_peer_record(&t).is_err(), "queue_depth must be signed");
+        let mut t = signed.clone(); t.layer_end = 24;
+        assert!(verify_peer_record(&t).is_err(), "layer_end must be signed");
+        let mut t = signed.clone(); t.canonical_model_id = "evil/model".into();
+        assert!(verify_peer_record(&t).is_err(), "canonical_model_id must be signed");
+        let mut t = signed.clone(); t.nat_type = "symmetric".into();
+        assert!(verify_peer_record(&t).is_err(), "nat_type must be signed");
+    }
+
+    #[test]
+    fn test_v2_reputation_not_self_attested() {
+        // reputation_score is intentionally EXCLUDED from the signed preimage:
+        // a peer must not be able to bind a self-claimed reputation. Changing it
+        // does NOT invalidate the signature (the consumer ignores it in favour of
+        // its local ReputationTracker).
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut signed = sign_peer_record(
+            &PeerRecord { host: "1.2.3.4".into(), port: 1, ..Default::default() },
+            &kp,
+        )
+        .unwrap();
+        signed.reputation_score = 100.0;
+        assert!(verify_peer_record(&signed).is_ok());
     }
 
     #[test]

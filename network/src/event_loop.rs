@@ -536,6 +536,24 @@ const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 /// property. Travels on the same single topic as the other control events.
 const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
 
+/// R-DHT-1 audit fix: how long a `known_peers` entry we are NOT connected to may
+/// survive in the reaper. A PEX-learned provider is, by definition, one we have
+/// no live connection to (we heard it over gossip via a relay) — reaping it
+/// purely on connection status defeated gossip discovery. We instead keep it
+/// while it's *fresh* (its signed `updated_unix_ms` is within this window),
+/// matching the 300 s DHT record TTL; a provider that stops (re)announcing then
+/// ages out, while a live one is kept refreshed by each gossip.
+const KNOWN_PEER_TTL_MS: u64 = 300_000;
+
+/// Current wall-clock time in Unix milliseconds (0 if the clock is before the
+/// epoch, which never happens in practice).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 struct PendingDiscover {
     model_id: String,
     records: Vec<PeerRecord>,
@@ -1229,12 +1247,24 @@ pub async fn run_event_loop(
             // that slip through individual eviction paths.
             _ = reaper_interval.tick() => {
                 let before = state.known_peers.len();
+                let now_ms = now_unix_ms();
                 state.known_peers.retain(|_openhydra_id, record| {
                     if record.libp2p_peer_id.is_empty() {
                         return true; // keep records without libp2p binding
                     }
                     match record.libp2p_peer_id.parse::<PeerId>() {
-                        Ok(pid) => swarm.is_connected(&pid),
+                        // Keep if we have a live connection (the original ghost-peer
+                        // guard) OR if the record is still fresh. The freshness arm
+                        // is the R-DHT-1 audit fix: a PEX-learned provider we never
+                        // connected to must survive on its TTL, or this reaper would
+                        // evict it ~60 s after we learned it and break gossip
+                        // discovery for any re-announce interval > 60 s.
+                        Ok(pid) => {
+                            swarm.is_connected(&pid)
+                                || (record.updated_unix_ms != 0
+                                    && now_ms.saturating_sub(record.updated_unix_ms)
+                                        < KNOWN_PEER_TTL_MS)
+                        }
                         Err(_) => false, // unparseable peer_id = stale
                     }
                 });
@@ -1296,9 +1326,18 @@ pub async fn run_event_loop(
                         &confirmed,
                         state.autonat_private,
                     );
+                    let restored_global = missing.iter().any(is_globally_reachable_addr);
                     for addr in missing {
                         info!(%addr, "R-DHT-4: re-asserting UPnP external addr (AutoNAT not Private)");
                         swarm.add_external_address(addr);
+                    }
+                    // Audit fix: under R-DHT-2 explicit Kad mode, re-adding an
+                    // external address no longer auto-promotes — so the re-assert
+                    // must also restore server mode. A UPnP mapping is a positive
+                    // reachability signal and we only get here when AutoNAT isn't
+                    // asserting Private, so promoting is correct.
+                    if restored_global {
+                        swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
                     }
                 }
             }
