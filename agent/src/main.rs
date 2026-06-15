@@ -109,6 +109,11 @@ struct ProvideArgs {
     /// does not survive a restart.
     #[arg(long)]
     db: Option<PathBuf>,
+
+    /// Seconds between DHT re-announcements. Must stay below the relays' provider-record
+    /// TTL (300s) or the node periodically falls out of discovery.
+    #[arg(long, default_value_t = 120)]
+    reannounce_secs: u64,
 }
 
 #[derive(Args)]
@@ -125,7 +130,16 @@ fn main() {
     }
 }
 
+/// Surface the network crate's `tracing` events under `RUST_LOG` (default: warnings).
+/// Without a subscriber, libp2p/Kademlia/relay diagnostics are invisible.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+}
+
 fn run() -> Result<(), String> {
+    init_tracing();
     let cli = Cli::parse();
     let config = cli.node.into_config();
     // Start the swarm first; both roles need the live node.
@@ -177,9 +191,13 @@ fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
         eprintln!("openhydra-agent: announced {announced} model(s) from {}", args.engine);
     }
 
-    eprintln!("openhydra-agent: serving inbound requests (Ctrl-C to stop)");
-    // Blocks forever (returns `!`); poll in short slices to stay responsive.
-    provider.run_inbound(Duration::from_millis(500))
+    eprintln!(
+        "openhydra-agent: serving inbound requests, re-announcing every {}s (Ctrl-C to stop)",
+        args.reannounce_secs,
+    );
+    // Blocks forever (returns `!`); poll in short slices to stay responsive and
+    // re-announce within the relays' provider-record TTL.
+    provider.run_inbound(Duration::from_millis(500), Duration::from_secs(args.reannounce_secs))
 }
 
 /// Consumer role: run the HTTP/SSE gateway until the process exits.

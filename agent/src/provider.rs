@@ -146,15 +146,33 @@ impl<A: EngineAdapter> Provider<A> {
         Ok(models.len())
     }
 
-    /// Blocking serve loop: poll inbound requests, serve them, reply. Runs until the
-    /// process exits (call on a dedicated thread). Polls in `timeout` slices so it stays
-    /// responsive; a failed reply is logged-by-return and the loop continues.
-    pub fn run_inbound(&self, timeout: std::time::Duration) -> ! {
+    /// Blocking serve loop: poll inbound requests, serve them, reply, and **periodically
+    /// re-announce** our models. Runs until the process exits (call on a dedicated thread).
+    ///
+    /// Polls in `poll_timeout` slices so it stays responsive; a failed reply is
+    /// logged-by-return and the loop continues. Every `reannounce_every` it re-publishes
+    /// the DHT records: the bootstrap relays expire provider records on a short TTL
+    /// (300s today), and the very first announce at startup can race an empty routing
+    /// table — so a one-shot announce silently vanishes. Re-announcing on an interval
+    /// shorter than the TTL keeps the node discoverable.
+    pub fn run_inbound(
+        &self,
+        poll_timeout: std::time::Duration,
+        reannounce_every: std::time::Duration,
+    ) -> ! {
+        let mut last_announce = std::time::Instant::now();
         loop {
-            if let Some((request_id, data)) = self.net.poll_inbound(timeout) {
+            if let Some((request_id, data)) = self.net.poll_inbound(poll_timeout) {
                 let response = self.dispatch(&data);
                 // Best-effort reply; if the swarm is gone the next poll will error too.
                 let _ = self.net.respond(request_id, response);
+            }
+            if last_announce.elapsed() >= reannounce_every {
+                match self.announce_models() {
+                    Ok(n) => eprintln!("openhydra-agent: re-announced {n} model(s)"),
+                    Err(e) => eprintln!("openhydra-agent: re-announce failed: {e}"),
+                }
+                last_announce = std::time::Instant::now();
             }
         }
     }
