@@ -245,6 +245,12 @@ pub fn build_swarm(
         peer_id,
     )?;
 
+    // R-DHT-11: AutoNAT v2 client (per-address reachability verification). Default
+    // config (OsRng, default probe interval). Tests the swarm's external-address
+    // candidates against v2 servers and reports per-address verdicts that drive
+    // R-DHT-2 promotion. No-op until a v2 server (a bootstrap) is reachable.
+    let autonat_v2_client = autonat::v2::client::Behaviour::default();
+
     // gRPC proxy (cross-ISP tunneling through relay).
     let grpc_proxy = crate::proxy::proxy_behaviour();
 
@@ -346,6 +352,7 @@ pub fn build_swarm(
         relay_server,
         dcutr,
         autonat,
+        autonat_v2_client,
         identify,
         mdns,
         grpc_proxy,

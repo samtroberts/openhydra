@@ -1765,9 +1765,48 @@ fn handle_swarm_event(
             handle_kad_event(kad_event, swarm, state);
         }
 
-        // ── AutoNAT ──
+        // ── AutoNAT v1 ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Autonat(autonat_event)) => {
             handle_autonat_event(autonat_event, swarm, state);
+        }
+
+        // ── AutoNAT v2 (R-DHT-11) ──
+        // Per-address verdict from a v2 server: `Ok` ⇒ this *specific* address is
+        // reachable by an arbitrary peer (the reliable promotion signal v1 lacked;
+        // also covers IPv6 explicitly). `Err` ⇒ that address is not reachable.
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::AutonatV2Client(ev)) => {
+            match &ev.result {
+                Ok(()) if is_globally_reachable_addr(&ev.tested_addr) => {
+                    info!(addr = %ev.tested_addr, server = %ev.server,
+                        "R-DHT-11: AutoNAT v2 confirmed reachable → promoting to Kad server");
+                    if !state.external_addrs.iter().any(|a| a == &ev.tested_addr) {
+                        state.external_addrs.push(ev.tested_addr.clone());
+                    }
+                    state.autonat_private = false;
+                    swarm.add_external_address(ev.tested_addr.clone());
+                    swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
+                }
+                Ok(()) => {
+                    debug!(addr = %ev.tested_addr, "R-DHT-11: AutoNAT v2 OK but non-global addr; not promoting");
+                }
+                Err(e) => {
+                    // This address is not reachable. Retract it if we'd confirmed
+                    // it, and demote to client if no direct external remains.
+                    debug!(addr = %ev.tested_addr, server = %ev.server, ?e,
+                        "R-DHT-11: AutoNAT v2 says address not reachable");
+                    if state.external_addrs.iter().any(|a| a == &ev.tested_addr) {
+                        swarm.remove_external_address(&ev.tested_addr);
+                        state.external_addrs.retain(|a| a != &ev.tested_addr);
+                        let has_direct = state
+                            .external_addrs
+                            .iter()
+                            .any(|a| !a.to_string().contains("/p2p-circuit"));
+                        if !has_direct {
+                            swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Client));
+                        }
+                    }
+                }
+            }
         }
 
         // ── Identify ──

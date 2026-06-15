@@ -134,21 +134,33 @@ Add `libp2p-upnp` so home-router-NAT nodes can map their listen port and become 
 Helps the full/restricted-cone home-router case; **does not** help CGNAT. One tool in the
 reachability kit.
 
-### R-DHT-5 · Reliable DCUtR (UDP hole-punch)
-Fix the failing DCUtR path (observed: `Handshake timed out` / `Address already in use
-(os error 48)` — a client-side port-reuse conflict). DCUtR-direct connectivity is a
-reachability source (§2.4) → more servers, and removes the relay hop for data too. Likely
-client-side (no bootstrap redeploy).
+### R-DHT-5 · Reliable DCUtR (UDP hole-punch) — **investigated: UPSTREAM (macOS/libp2p), use QUIC**
+Original symptom: `Address already in use (os error 48)` on the TCP hole-punch. **Traced into
+`libp2p-tcp 0.42`**: both the listener and the hole-punch dial socket correctly set
+`SO_REUSEADDR` + `SO_REUSEPORT` (`create_socket`), so the flags are right. The EADDRINUSE is a
+**macOS kernel limitation** — macOS rejects binding a *connected* socket to the listener's port
+even with `SO_REUSEPORT` (the exact pattern TCP hole-punch needs). **Not an OpenHydra bug.**
+The working path is **QUIC** hole-punch (UDP socket reuse; confirmed by the cross-ISP Jio↔Airtel
+direct-QUIC benchmarks), and TCP hole-punch works on Linux peers. Also: since R-DHT-2 made
+DCUtR-direct *not* a server-promotion trigger, DCUtR's only remaining value is the data-path
+relay-hop removal — lower priority. **Decision: don't patch libp2p; rely on QUIC; documented.**
 
 ### R-DHT-6 · Persistent routing table + active maintenance
 Cache good nodes to disk and reload on restart (BitTorrent does this); run periodic bucket
 refresh / `bootstrap()`; ping + evict dead nodes. Survives churn instead of amplifying it.
 
-### R-DHT-7 · One-query discovery
-Store the provider's full connection info (addresses + ed25519 pubkey) **as the provider
-record value**, so a single lookup returns everything — drop the `get_providers` →
-`get_record` chain. Halves the failure surface and latency; also removes the early-reply /
-stale-candidate fragility seen in the consumer.
+### R-DHT-7 · One-query discovery — **SUPERSEDED by R-DHT-1 PEX (+ libp2p-constrained)**
+Original idea: store the full record as the provider value so one lookup returns everything.
+**Investigated: libp2p's model can't do this** — provider records carry `PeerId` + addresses
+(not arbitrary values), and `kad::Record` is single-value-per-key, so "many providers per
+model" inherently needs enumerate-then-fetch. A practical one-query path (`get_providers` +
+derive the ed25519 pubkey from the PeerId + dial via the routing-table address) is possible but
+sacrifices the capability/ranking metadata (M1.2/M1.3) **and** the openhydra reputation id.
+**More importantly, R-DHT-1 gossip PEX (live-validated) already achieves zero-query discovery
+with the full signed record**, so R-DHT-7's goal is met for the common case; the residual is
+only the cold-start DHT-only path, where the two-query chain already works (M3.1-validated) with
+early-reply. **Decision: not worth rewriting the delicate, live-tested discover path for a
+marginal cold-start gain. Superseded.**
 
 ### R-DHT-8 · Liveness-aware, churn-tolerant records
 Evict dead providers fast (disconnect-eviction + 300 s TTL exist; the issue is a *tiny*
@@ -184,6 +196,22 @@ knobs, currently on defaults in `network/src/swarm.rs:114`:
   must never reach routing/credit logic, since the trust layer is the whole product.
 
 These are pure peer-side Kad tuning (no bootstrap redeploy) and compound with R-DHT-2/6/7/8.
+
+### R-DHT-11 · AutoNAT v1 → v2 migration (reachability-signal quality)
+The 2026-06-15 live test exposed two AutoNAT **v1** weaknesses that directly hurt R-DHT-2:
+(a) v1 can't reliably produce a negative verdict — for an unreachable node the server's
+dial-backs time out one-by-one past the client's request timeout, so the status stays
+`Unknown` (never `Private`), and (b) v1 effectively tested only one address family (the
+bootstrap only ever dialed the home node's v4, never its v6). **AutoNAT v2** fixes both: the
+client asks a server to dial-back a **specific** address and returns a per-address
+`result: Ok|Err` — a clean positive *and* negative verdict, per address (so IPv6 can be
+confirmed explicitly). Implemented **additively** (`libp2p-autonat 0.13` ships both): peers run
+`autonat::v2::client` (drives R-DHT-2 promotion on `Ok` for a globally-routable `tested_addr`;
+demotes on `Err`), bootstraps run `autonat::v2::server`, alongside the existing v1 so nothing
+breaks mid-transition. **Activation step (deferred ops): redeploy the 4 bootstraps** with the
+v2 server; until then v1 remains the live signal and the v2 client is a harmless no-op. v2
+improves signal *quality* (faster, per-address, reliable), not reachability — a firewalled node
+still correctly stays a client.
 
 ## 5. Sequencing
 

@@ -25,8 +25,17 @@ pub struct OpenHydraBehaviour {
     pub relay_server: Toggle<relay::Behaviour>,
     /// DCUtR — Direct Connection Upgrade through Relay (hole punching).
     pub dcutr: dcutr::Behaviour,
-    /// AutoNAT — automatic NAT type detection via bootstrap probes.
+    /// AutoNAT v1 — NAT detection via bootstrap probes. Kept during the v2
+    /// transition for back-compat with bootstraps not yet serving v2.
     pub autonat: autonat::Behaviour,
+    /// R-DHT-11: AutoNAT **v2 client**. Asks v2 servers to dial-back a *specific*
+    /// candidate address and returns a per-address verdict (`result: Ok` ⇒ that
+    /// exact address is reachable by an arbitrary peer). This fixes the two v1
+    /// weaknesses the live test exposed: v1 can't reliably emit a negative
+    /// verdict (it times out into `Unknown`), and it tested only one address
+    /// family. Drives R-DHT-2 promotion on a positive per-address result.
+    /// (Activates once the bootstraps run the v2 server — see `bootstrap_bin`.)
+    pub autonat_v2_client: autonat::v2::client::Behaviour,
     /// Identify — exchange peer metadata on connect.
     pub identify: identify::Behaviour,
     /// mDNS — zero-config LAN peer discovery.

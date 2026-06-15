@@ -38,6 +38,11 @@ struct BootstrapBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     relay_server: relay::Behaviour,
     autonat: autonat::Behaviour,
+    /// R-DHT-11: AutoNAT **v2 server**. Answers a peer's request to dial-back a
+    /// *specific* address and report whether it's reachable — the reliable,
+    /// per-address signal that drives the peer-side R-DHT-2 promotion. Runs
+    /// alongside the v1 server during the transition.
+    autonat_v2_server: autonat::v2::server::Behaviour,
     identify: identify::Behaviour,
     dcutr: libp2p::dcutr::Behaviour,
     /// Gossipsub (B1 rendezvous support).
@@ -275,10 +280,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ping::Config::new().with_interval(Duration::from_secs(15)),
     );
 
+    // R-DHT-11: AutoNAT v2 server — dials back specific addresses on request so
+    // peers get reliable per-address reachability verdicts.
+    let autonat_v2_server = autonat::v2::server::Behaviour::default();
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
         autonat,
+        autonat_v2_server,
         identify,
         dcutr,
         gossipsub,
@@ -429,6 +439,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             BootstrapBehaviourEvent::Autonat(other) => {
                                 debug!(?other, "autonat event");
+                            }
+
+                            // R-DHT-11: AutoNAT v2 server — answered a peer's
+                            // per-address dial-back request.
+                            BootstrapBehaviourEvent::AutonatV2Server(ev) => {
+                                debug!(?ev, "autonat v2 server: dial-back handled");
                             }
 
                             // Task 7.1: Gossipsub — message forwarding & topic membership
