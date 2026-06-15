@@ -37,11 +37,10 @@ use openhydra_network::relay::{
 struct BootstrapBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     relay_server: relay::Behaviour,
-    autonat: autonat::Behaviour,
-    /// R-DHT-11: AutoNAT **v2 server**. Answers a peer's request to dial-back a
-    /// *specific* address and report whether it's reachable — the reliable,
-    /// per-address signal that drives the peer-side R-DHT-2 promotion. Runs
-    /// alongside the v1 server during the transition.
+    /// R-DHT-11: AutoNAT **v2 server** (the only AutoNAT — v1 retired). Answers a
+    /// peer's request to dial-back a *specific* address and report whether it's
+    /// reachable — the reliable, per-address signal that drives the peer-side
+    /// R-DHT-2 promotion.
     autonat_v2_server: autonat::v2::server::Behaviour,
     identify: identify::Behaviour,
     dcutr: libp2p::dcutr::Behaviour,
@@ -207,31 +206,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // AutoNAT reporter — responds to NAT probes from peers.
     //
-    // A3 DCUtR fix: configure this node to act as an authoritative
-    // reporter for every peer that probes it, including peers whose
-    // candidate external addrs fall in LAN / ULA space (``only_global_ips
-    // = false``). Without this, a peer behind NAT that registered its LAN
-    // IP as an external candidate (PR A3 event_loop.rs change) would
-    // never get a Falsified verdict — the bootstrap would silently skip
-    // the probe, leaving AutoNAT in ``Unknown`` forever and DCUtR
-    // dormant.
-    //
-    // Throttle limits are relaxed above the libp2p defaults so a steady
-    // swarm of a few dozen peers probing at the same time doesn't get
-    // rate-limited out. Each probe is cheap (a single TCP dial) so the
-    // bootstrap can comfortably serve ~500 req/min.
-    let autonat = autonat::Behaviour::new(
-        peer_id,
-        autonat::Config {
-            boot_delay: Duration::from_secs(1),
-            only_global_ips: false,
-            throttle_clients_global_max: 128,
-            throttle_clients_peer_max: 8,
-            throttle_clients_period: Duration::from_secs(1),
-            ..Default::default()
-        },
-    );
-
     // Identify.
     let identify = identify::Behaviour::new(
         identify::Config::new("openhydra/0.1.0".to_string(), keypair.public())
@@ -280,14 +254,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ping::Config::new().with_interval(Duration::from_secs(15)),
     );
 
-    // R-DHT-11: AutoNAT v2 server — dials back specific addresses on request so
-    // peers get reliable per-address reachability verdicts.
+    // R-DHT-11: AutoNAT v2 server (the only AutoNAT — v1 retired) — dials back
+    // specific addresses on request so peers get reliable per-address
+    // reachability verdicts.
     let autonat_v2_server = autonat::v2::server::Behaviour::default();
 
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
-        autonat,
         autonat_v2_server,
         identify,
         dcutr,
@@ -431,14 +405,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             BootstrapBehaviourEvent::Kademlia(kad::Event::ModeChanged { new_mode }) => {
                                 info!(?new_mode, "kademlia: mode changed");
-                            }
-
-                            // Task 7.1: AutoNAT — NAT status monitoring
-                            BootstrapBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new }) => {
-                                info!(?old, ?new, "autonat: NAT status changed");
-                            }
-                            BootstrapBehaviourEvent::Autonat(other) => {
-                                debug!(?other, "autonat event");
                             }
 
                             // R-DHT-11: AutoNAT v2 server — answered a peer's

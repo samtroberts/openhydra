@@ -25,16 +25,14 @@ pub struct OpenHydraBehaviour {
     pub relay_server: Toggle<relay::Behaviour>,
     /// DCUtR — Direct Connection Upgrade through Relay (hole punching).
     pub dcutr: dcutr::Behaviour,
-    /// AutoNAT v1 — NAT detection via bootstrap probes. Kept during the v2
-    /// transition for back-compat with bootstraps not yet serving v2.
-    pub autonat: autonat::Behaviour,
-    /// R-DHT-11: AutoNAT **v2 client**. Asks v2 servers to dial-back a *specific*
-    /// candidate address and returns a per-address verdict (`result: Ok` ⇒ that
-    /// exact address is reachable by an arbitrary peer). This fixes the two v1
-    /// weaknesses the live test exposed: v1 can't reliably emit a negative
-    /// verdict (it times out into `Unknown`), and it tested only one address
-    /// family. Drives R-DHT-2 promotion on a positive per-address result.
-    /// (Activates once the bootstraps run the v2 server — see `bootstrap_bin`.)
+    /// AutoNAT **v2 client** (the only AutoNAT — v1 retired). Asks v2 servers to
+    /// dial-back a *specific* candidate address and returns a per-address verdict
+    /// (`result: Ok` ⇒ that exact address is reachable by an arbitrary peer). This
+    /// fixes the two v1 weaknesses the live test exposed: v1 couldn't reliably emit
+    /// a negative verdict (it timed out into `Unknown`, so demotion never fired)
+    /// and it tested only one address family. Drives R-DHT-2 promotion on a
+    /// positive per-address result, and the consumer-facing `nat_info` /
+    /// UPnP-re-assert suppression that v1's `StatusChanged` used to own.
     pub autonat_v2_client: autonat::v2::client::Behaviour,
     /// Identify — exchange peer metadata on connect.
     pub identify: identify::Behaviour,

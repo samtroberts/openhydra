@@ -1805,14 +1805,13 @@ fn handle_swarm_event(
         }
 
         // ── AutoNAT v1 ──
-        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Autonat(autonat_event)) => {
-            handle_autonat_event(autonat_event, swarm, state);
-        }
-
-        // ── AutoNAT v2 (R-DHT-11) ──
+        // ── AutoNAT v2 (R-DHT-11; the only AutoNAT — v1 retired) ──
         // Per-address verdict from a v2 server: `Ok` ⇒ this *specific* address is
         // reachable by an arbitrary peer (the reliable promotion signal v1 lacked;
-        // also covers IPv6 explicitly). `Err` ⇒ that address is not reachable.
+        // also covers IPv6 explicitly). `Err` ⇒ that address is not reachable. This
+        // handler also owns the two side-effects v1's `StatusChanged` used to own:
+        // populating `nat_info` (surfaced via the NatStatus query) and toggling
+        // `autonat_private` (which gates the R-DHT-4 UPnP re-assert).
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::AutonatV2Client(ev)) => {
             match &ev.result {
                 Ok(()) if is_globally_reachable_addr(&ev.tested_addr) => {
@@ -1821,7 +1820,20 @@ fn handle_swarm_event(
                     if !state.external_addrs.iter().any(|a| a == &ev.tested_addr) {
                         state.external_addrs.push(ev.tested_addr.clone());
                     }
-                    state.autonat_private = false;
+                    state.autonat_private = false; // R-DHT-4: re-assert may resume
+                    // Reachable on a direct global addr ⇒ "open". Record the
+                    // verified external IP (classified by family) for the
+                    // NatStatus query consumers (was v1's NatStatus::Public path).
+                    state.nat_info.nat_type = "open".into();
+                    state.nat_info.is_public = true;
+                    if let Some(ip) = extract_ip_from_multiaddr(&ev.tested_addr) {
+                        state.nat_info.external_ip = ip.clone();
+                        if ip.contains(':') {
+                            state.nat_info.external_ipv6 = ip;
+                        } else {
+                            state.nat_info.external_ipv4 = ip;
+                        }
+                    }
                     swarm.add_external_address(ev.tested_addr.clone());
                     swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
                 }
@@ -1841,7 +1853,17 @@ fn handle_swarm_event(
                             .iter()
                             .any(|a| !a.to_string().contains("/p2p-circuit"));
                         if !has_direct {
+                            // No verified-reachable direct address remains: we're
+                            // effectively private. Demote to client, mark
+                            // nat_info accordingly, and suppress the UPnP re-assert
+                            // (this was v1's NatStatus::Private path — but driven
+                            // by a concrete failed dial-back rather than a v1
+                            // `Private` verdict that for unreachable nodes only
+                            // ever timed out into `Unknown`).
                             swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Client));
+                            state.nat_info.nat_type = "symmetric".into();
+                            state.nat_info.is_public = false;
+                            state.autonat_private = true; // R-DHT-4: suppress re-assert
                         }
                     }
                 }
@@ -1874,8 +1896,9 @@ fn handle_swarm_event(
                 // AutoNAT could not reliably tear down — a `Private` verdict for an
                 // unreachable node times out into `Unknown`, so the demotion never
                 // fired. libp2p still surfaces observed addrs as
-                // `NewExternalAddrCandidate`s; AutoNAT probes those and only a
-                // positive `Public` verdict promotes us (see handle_autonat_event).
+                // `NewExternalAddrCandidate`s; AutoNAT v2 probes those and only a
+                // positive per-address verdict promotes us (see the
+                // AutonatV2Client handler).
                 debug!(addr = %info.observed_addr, "identify observed addr (AutoNAT candidate; not auto-confirmed)");
 
                 // Fix 2/4: cache QUIC IPv6 addresses and auto-dial for hole-punch.
@@ -2195,9 +2218,9 @@ fn handle_swarm_event(
             // server, and AutoNAT could not reliably demote it (the `Private` verdict
             // for an unreachable node never latched; it timed out into `Unknown`).
             // So we no longer confirm listen addresses as external here. Promotion
-            // now requires a positive AutoNAT `Public` verdict — the only signal that
-            // actually proves an arbitrary querier can reach us — or a UPnP mapping
-            // (see handle_autonat_event / the UPnP handler). "No verdict" → stay
+            // now requires a positive AutoNAT v2 per-address verdict — the only
+            // signal that actually proves an arbitrary querier can reach us — or a
+            // UPnP mapping (see the AutonatV2Client / UPnP handlers). "No verdict" → stay
             // client (safe), never a black hole. DCUtR is unaffected: it offers our
             // listen addrs during hole-punch regardless of external confirmation.
             //
@@ -2712,89 +2735,6 @@ fn handle_kad_event(
 }
 
 /// Handle AutoNAT events.
-fn handle_autonat_event(
-    event: libp2p::autonat::Event,
-    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
-    state: &mut LoopState,
-) {
-    match event {
-        libp2p::autonat::Event::StatusChanged { old, new } => {
-            info!(?old, ?new, "AutoNAT status changed");
-            match new {
-                libp2p::autonat::NatStatus::Public(addr) => {
-                    state.nat_info.nat_type = "open".into();
-                    state.nat_info.is_public = true;
-                    state.autonat_private = false; // R-DHT-4: re-assert may resume
-                    if let Some(ip) = extract_ip_from_multiaddr(&addr) {
-                        state.nat_info.external_ip = ip.clone();
-                        // Classify by address family.
-                        if ip.contains(':') {
-                            state.nat_info.external_ipv6 = ip;
-                        } else {
-                            state.nat_info.external_ipv4 = ip;
-                        }
-                    }
-                    // R-DHT-2: AutoNAT consensus that we are publicly reachable is
-                    // the authoritative promotion signal (§2 — full/restricted-cone
-                    // NAT and public hosts reach `Public`; symmetric/CGNAT reach
-                    // `Private`). Confirm the verified-reachable address so Kademlia
-                    // auto-promotes us to **server** and the DHT grows with the
-                    // network instead of resting solely on the 3 relays. Gate on
-                    // global routability so a quirky AutoNAT verdict over a
-                    // private/circuit address can never promote a black hole.
-                    if is_globally_reachable_addr(&addr) {
-                        info!(%addr, "R-DHT-2: AutoNAT Public on a direct global addr → promoting to Kad server");
-                        // Advertise the verified-reachable address...
-                        swarm.add_external_address(addr);
-                        // ...and EXPLICITLY promote to server. This is the only
-                        // reliable proof an arbitrary querier can reach us; explicit
-                        // mode means a relay-circuit or listen addr can never
-                        // promote us on its own (see swarm.rs set_mode(Client)).
-                        swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
-                    }
-                }
-                libp2p::autonat::NatStatus::Private => {
-                    state.nat_info.nat_type = "symmetric".into();
-                    state.nat_info.is_public = false;
-                    state.autonat_private = true; // R-DHT-4: suppress UPnP re-assert
-                    // R-DHT-2: reachability was lost (e.g. network changed, or an
-                    // earlier observed-address confirmation was over-eager). Retract
-                    // our direct external addresses so Kademlia auto-demotes back to
-                    // **client** — a node that can't be reached must not advertise
-                    // itself as a server and swallow queries. Relay-circuit addrs
-                    // were never confirmed as external, so nothing to retract there.
-                    let direct_externals: Vec<Multiaddr> = state
-                        .external_addrs
-                        .iter()
-                        .filter(|a| !a.to_string().contains("/p2p-circuit"))
-                        .cloned()
-                        .collect();
-                    for addr in direct_externals {
-                        info!(%addr, "R-DHT-2: AutoNAT Private → retracting external addr (Kad demote to client)");
-                        swarm.remove_external_address(&addr);
-                    }
-                    state
-                        .external_addrs
-                        .retain(|a| a.to_string().contains("/p2p-circuit"));
-                    // Explicitly demote: we are not reachable, so we must not serve
-                    // the DHT (would black-hole queries routed to us).
-                    swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Client));
-                }
-                libp2p::autonat::NatStatus::Unknown => {
-                    state.nat_info.nat_type = "unknown".into();
-                    state.nat_info.is_public = false;
-                    // R-DHT-4: AutoNAT no longer *asserts* unreachability (it just
-                    // can't determine one) — allow the UPnP re-assert to trust the
-                    // mapping again. A genuinely broken map stays `Private`, not
-                    // `Unknown`, so this doesn't re-promote a black hole.
-                    state.autonat_private = false;
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Decode + verify a fetched `PeerRecord`, make it dialable (add its advertised
 /// relay address to the routing table so a later `proxy_forward` can reach a NAT'd
 /// provider), cache it, and append it to the named pending discover (deduped).

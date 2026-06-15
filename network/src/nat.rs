@@ -1,27 +1,11 @@
-//! NAT detection helpers using AutoNAT results.
+//! NAT detection helpers.
 //!
-//! AutoNAT runs inside the swarm and probes reachability via bootstrap peers.
-//! This module translates AutoNAT events into OpenHydra NatInfo.
+//! AutoNAT v2 runs inside the swarm and probes per-address reachability via
+//! bootstrap (v2 server) peers. The event handler (`event_loop`) translates those
+//! per-address verdicts directly into the OpenHydra `NatInfo`; this module holds
+//! the small shared helpers (`requires_relay`, `build_nat_info`).
 
 use crate::types::NatInfo;
-
-/// Map a libp2p AutoNAT status to an OpenHydra nat_type string.
-///
-/// AutoNAT reports:
-/// - `Public(addr)` → the external address is reachable → "open"
-/// - `Private` → behind NAT, not directly reachable → "symmetric" (conservative)
-/// - `Unknown` → not enough probes yet → "unknown"
-pub fn nat_type_from_autonat(is_public: bool, is_unknown: bool) -> &'static str {
-    if is_unknown {
-        "unknown"
-    } else if is_public {
-        "open"
-    } else {
-        // AutoNAT can't distinguish full_cone from symmetric.
-        // We conservatively report "symmetric" so we always set requires_relay=true.
-        "symmetric"
-    }
-}
 
 /// Whether TCP relay is required for this NAT type.
 ///
@@ -59,14 +43,6 @@ pub fn build_nat_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_nat_type_mapping() {
-        assert_eq!(nat_type_from_autonat(true, false), "open");
-        assert_eq!(nat_type_from_autonat(false, false), "symmetric");
-        assert_eq!(nat_type_from_autonat(false, true), "unknown");
-        assert_eq!(nat_type_from_autonat(true, true), "unknown"); // unknown takes priority
-    }
 
     #[test]
     fn test_requires_relay() {
