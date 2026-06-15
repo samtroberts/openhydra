@@ -210,6 +210,37 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically ledger one **accepted** co-signed receipt: persist the receipt blob under
+    /// its nonce *and* burn that nonce in the replay guard, in a single write transaction.
+    ///
+    /// Returns `Ok(true)` if newly recorded, `Ok(false)` if the nonce was already spent (a
+    /// replay — nothing is written or overwritten). Unlike
+    /// [`flush_receipt_and_reputation`](Self::flush_receipt_and_reputation) this touches no
+    /// reputation: it's the **provider-side** "I served this, here is the co-signed proof"
+    /// entry, with no trust-score change implied. The all-or-nothing commit means a crash
+    /// can never persist the receipt without burning its nonce (which would let the same
+    /// receipt be re-ledgered).
+    pub fn record_receipt(&self, receipt: &CoSignedReceipt) -> Result<bool, StoreError> {
+        let nonce = receipt.payload.nonce;
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        let newly = {
+            let mut nonces = wtx.open_table(NONCES).map_err(StoreError::from)?;
+            if nonces.get(nonce.as_slice()).map_err(StoreError::from)?.is_some() {
+                false // replay: nonce already spent
+            } else {
+                nonces.insert(nonce.as_slice(), ()).map_err(StoreError::from)?;
+                true
+            }
+        };
+        if newly {
+            let blob = receipt.to_bytes();
+            let mut receipts = wtx.open_table(RECEIPTS).map_err(StoreError::from)?;
+            receipts.insert(nonce.as_slice(), blob.as_slice()).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?; // atomic for both writes (or the no-op replay)
+        Ok(newly)
+    }
+
     /// Rehydrate in-memory state from the store on boot: repopulate the replay guard with
     /// every spent nonce, and the reputation map with every persisted peer snapshot — so a
     /// restart resumes with the same trust scores and replay protection it shut down with.
@@ -323,6 +354,44 @@ mod tests {
         store.put_receipt(&nonce, b"second").unwrap();
         assert_eq!(store.get_receipt(&nonce).unwrap().as_deref(), Some(&b"second"[..]));
         assert_eq!(store.receipt_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn record_receipt_is_atomic_and_replay_safe() {
+        // The provider-side ledger entry: an accepted co-signed receipt persists with its
+        // nonce burnt in one shot; re-submitting the same receipt is a no-op replay.
+        use crate::receipts::{build_receipt, ReceiptPayload};
+        use ed25519_dalek::SigningKey;
+
+        let (_dir, path) = temp_db();
+        let consumer = SigningKey::from_bytes(&[3u8; 32]);
+        let provider = SigningKey::from_bytes(&[5u8; 32]);
+        let nonce = [11u8; 16];
+        let payload = ReceiptPayload {
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),
+            tokens: 128,
+            nonce,
+            ts_unix_ms: 1_700_000_000_000,
+        };
+        let receipt = build_receipt(payload, &consumer, &provider);
+
+        let store = Store::open(&path).unwrap();
+
+        // First record: newly ledgered.
+        assert_eq!(store.record_receipt(&receipt).unwrap(), true);
+        assert_eq!(store.receipt_count().unwrap(), 1);
+        assert!(store.has_nonce(&nonce).unwrap(), "nonce burnt in the same txn");
+
+        // Second record of the same receipt: replay → false, nothing changes.
+        assert_eq!(store.record_receipt(&receipt).unwrap(), false);
+        assert_eq!(store.receipt_count().unwrap(), 1, "replay must not add a row");
+
+        // And the stored blob still decodes back to the same receipt.
+        let blob = store.get_receipt(&nonce).unwrap().expect("receipt persisted");
+        let decoded = CoSignedReceipt::from_bytes(&blob).unwrap();
+        assert_eq!(decoded.payload.tokens, 128);
     }
 
     #[test]

@@ -21,6 +21,8 @@
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
+use openhydra_protocol::receipts::CoSignedReceipt;
+use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
@@ -77,23 +79,50 @@ pub fn handle_serve_inbound(data: &[u8], adapter: &dyn EngineAdapter) -> Vec<u8>
     frame_response(&chunks)
 }
 
+/// Persist an accepted co-signed receipt to the ledger, if a store is configured.
+///
+/// Best-effort and side-effecting only: a missing store or a ledger error never fails the
+/// request (the consumer already holds the same co-signed receipt as its own proof). Pure
+/// enough to unit-test without a live node — the signing/co-signing happens upstream in
+/// [`handle_receipt_inbound`]; this is just the persistence decision.
+fn ledger_receipt(store: Option<&Store>, accepted: Option<&CoSignedReceipt>) {
+    if let (Some(store), Some(receipt)) = (store, accepted) {
+        match store.record_receipt(receipt) {
+            Ok(true) => {
+                eprintln!("openhydra-agent: ledgered receipt ({} tokens)", receipt.payload.tokens)
+            }
+            Ok(false) => eprintln!("openhydra-agent: receipt replay ignored (nonce already spent)"),
+            Err(e) => eprintln!("openhydra-agent: ledger error (receipt not persisted): {e}"),
+        }
+    }
+}
+
 /// An engine joined to the swarm: advertises its models and serves inbound requests.
 pub struct Provider<A: EngineAdapter> {
     adapter: A,
     net: NetworkHandle,
     host: String,
     port: u16,
+    /// Ledger for accepted co-signed receipts. `None` → receipts are co-signed and returned
+    /// but not persisted (the swarm still works; this node just keeps no local record).
+    store: Option<Store>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
     pub fn new(adapter: A, net: NetworkHandle) -> Self {
-        Self { adapter, net, host: String::new(), port: 0 }
+        Self { adapter, net, host: String::new(), port: 0, store: None }
     }
 
     /// Set the advisory host/port advertised in records (routing is via libp2p regardless).
     pub fn with_address(mut self, host: impl Into<String>, port: u16) -> Self {
         self.host = host.into();
         self.port = port;
+        self
+    }
+
+    /// Attach a ledger so accepted co-signed receipts are persisted (M2.3).
+    pub fn with_store(mut self, store: Store) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -136,8 +165,9 @@ impl<A: EngineAdapter> Provider<A> {
             Some(&RECEIPT_REQUEST) => {
                 let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
                 let provider_pub = self.net.public_key_bytes().unwrap_or_default();
-                let (response, _accepted) = handle_receipt_inbound(data, &sign, &provider_pub);
-                // TODO(M2.3): ledger `_accepted` co-signed receipts via protocol::store.
+                let (response, accepted) = handle_receipt_inbound(data, &sign, &provider_pub);
+                // Persist the accepted co-signed receipt (best-effort; never fails the reply).
+                ledger_receipt(self.store.as_ref(), accepted.as_ref());
                 response
             }
             // SERVE_REQUEST (and any unknown byte → a framed Error from the serve handler).
@@ -239,5 +269,45 @@ mod tests {
         let response = handle_serve_inbound(&[0xEE, 1, 2, 3], &StubAdapter);
         let chunks = parse_response(&response).unwrap();
         assert!(matches!(chunks.as_slice(), [ServeChunk::Error(_)]));
+    }
+
+    fn test_receipt(nonce: [u8; 16], tokens: u64) -> CoSignedReceipt {
+        use openhydra_protocol::receipts::{build_receipt, ReceiptPayload};
+        use ed25519_dalek::SigningKey;
+        let consumer = SigningKey::from_bytes(&[3u8; 32]);
+        let provider = SigningKey::from_bytes(&[5u8; 32]);
+        let payload = ReceiptPayload {
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),
+            tokens,
+            nonce,
+            ts_unix_ms: 1_700_000_000_000,
+        };
+        build_receipt(payload, &consumer, &provider)
+    }
+
+    #[test]
+    fn ledger_receipt_persists_when_store_present_and_is_replay_safe() {
+        let store = Store::open_in_memory().unwrap();
+        let receipt = test_receipt([11u8; 16], 128);
+
+        ledger_receipt(Some(&store), Some(&receipt));
+        assert_eq!(store.receipt_count().unwrap(), 1);
+
+        // Replaying the same receipt must not add a second row.
+        ledger_receipt(Some(&store), Some(&receipt));
+        assert_eq!(store.receipt_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn ledger_receipt_is_a_noop_without_a_store_or_receipt() {
+        let store = Store::open_in_memory().unwrap();
+        // No receipt to ledger.
+        ledger_receipt(Some(&store), None);
+        assert_eq!(store.receipt_count().unwrap(), 0);
+        // No store configured → nothing persisted, no panic.
+        let receipt = test_receipt([22u8; 16], 64);
+        ledger_receipt(None, Some(&receipt));
     }
 }

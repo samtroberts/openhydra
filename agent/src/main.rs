@@ -30,6 +30,7 @@ use openhydra_agent::{live_ollama, serve_http, Provider};
 use openhydra_agent::ollama::DEFAULT_OLLAMA_URL;
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
+use openhydra_protocol::store::Store;
 
 /// OpenHydra agent — a gateway in front of whatever inference engine you already run.
 #[derive(Parser)]
@@ -103,6 +104,11 @@ struct ProvideArgs {
     /// Advisory port advertised in records.
     #[arg(long, default_value_t = 0)]
     port: u16,
+
+    /// Path to the receipt ledger (redb). Omit for an ephemeral in-memory ledger that
+    /// does not survive a restart.
+    #[arg(long)]
+    db: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -139,7 +145,22 @@ fn run() -> Result<(), String> {
 /// Provider role: detect + announce the engine's models, then serve inbound forever.
 fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
     let adapter = live_ollama(&args.engine).map_err(|e| format!("engine {}: {e}", args.engine))?;
-    let provider = Provider::new(adapter, net).with_address(args.host, args.port);
+
+    // Open the receipt ledger: file-backed if --db was given (durable across restarts),
+    // else an ephemeral in-memory ledger.
+    let store = match &args.db {
+        Some(path) => {
+            let s = Store::open(path).map_err(|e| format!("open ledger {}: {e}", path.display()))?;
+            eprintln!("openhydra-agent: receipt ledger at {}", path.display());
+            s
+        }
+        None => {
+            eprintln!("openhydra-agent: receipt ledger in-memory (ephemeral; pass --db to persist)");
+            Store::open_in_memory().map_err(|e| format!("open in-memory ledger: {e}"))?
+        }
+    };
+
+    let provider = Provider::new(adapter, net).with_address(args.host, args.port).with_store(store);
 
     let announced = provider
         .announce_models()
