@@ -122,6 +122,30 @@ providers.
 *servers*. Until R-DHT-2 lands, a handful more well-distributed relays improves redundancy.
 Never bootstrap to a single relay.
 
+### R-DHT-10 · libp2p Kademlia config + security hardening
+The protocol is **libp2p Kad** (not KRPC — §3), so robustness is ultimately *its* tuning.
+R-DHT-2/6/7/8 are the structural pieces; this item names the remaining **config + security**
+knobs, currently on defaults in `network/src/swarm.rs:114`:
+
+- **Replication & query breadth.** Set an explicit `replication_factor` (records are not
+  deliberately spread today) and review query parallelism (α) so a lookup contacts enough
+  independent nodes to survive a few dead/lying ones.
+- **Timeouts & caching.** Revisit `query_timeout` (the 10 s tail that dominated latency on a
+  near-empty DHT) and Kademlia's learned-record caching so repeat lookups don't re-hit the
+  network.
+- **Republication coherence.** Reconcile the **two** republish mechanisms — Kad's
+  `publication_interval` (120 s) vs the agent's own provider re-announce loop — so they
+  don't fight or double-publish; align both comfortably under the 300 s record TTL.
+- **Eclipse / sybil resistance.** Lookups should use **disjoint paths** (S/Kademlia-style)
+  so an attacker can't capture a key's neighbourhood; node-ids are already cryptographic
+  (ed25519) which resists trivial sybil, but query-time hardening still matters.
+- **Query-time record verification (promote "H1" to a named invariant).** The discover
+  handler already rejects unsigned / unverifiable `PeerRecord`s before trusting any field
+  (`event_loop.rs` H1). Make this a first-class, tested DHT invariant — a poisoned record
+  must never reach routing/credit logic, since the trust layer is the whole product.
+
+These are pure peer-side Kad tuning (no bootstrap redeploy) and compound with R-DHT-2/6/7/8.
+
 ## 5. Sequencing
 
 ```
