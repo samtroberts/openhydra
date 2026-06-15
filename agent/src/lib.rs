@@ -25,6 +25,7 @@ pub mod gateway;
 pub mod http;
 pub mod ollama;
 pub mod provider;
+pub mod receipt;
 pub mod serve;
 
 pub use adapter::{
