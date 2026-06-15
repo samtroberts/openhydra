@@ -1788,21 +1788,17 @@ fn handle_swarm_event(
                         .kademlia
                         .add_address(&peer_id, addr.clone());
                 }
-                // R-DHT-2: an Identify *observed* address is what a single remote
-                // peer reports seeing — only confirm it as external (→ Kad server
-                // promotion) when it is globally routable. A NAT'd peer's observed
-                // address can be a private/CGNAT mapping or a per-destination
-                // symmetric-NAT binding that no third party can dial; confirming it
-                // would advertise us as a black-hole server. The genuine
-                // full/restricted-cone case still reaches an AutoNAT `Public`
-                // verdict below, which is the authoritative promotion signal.
-                if !info.observed_addr.to_string().is_empty()
-                    && (state.ipv6_capable || !is_ipv6_multiaddr(&info.observed_addr))
-                    && is_globally_reachable_addr(&info.observed_addr)
-                {
-                    debug!(addr = %info.observed_addr, "adding globally-routable observed addr as external");
-                    swarm.add_external_address(info.observed_addr);
-                }
+                // R-DHT-2 (revised after the 2026-06-15 live test): do NOT confirm
+                // an Identify *observed* address as external. An observed addr is
+                // only what one peer claims to see; for a CGNAT/symmetric or
+                // firewalled node it is not reachable by an arbitrary querier, and
+                // confirming it optimistically created a black-hole server that
+                // AutoNAT could not reliably tear down — a `Private` verdict for an
+                // unreachable node times out into `Unknown`, so the demotion never
+                // fired. libp2p still surfaces observed addrs as
+                // `NewExternalAddrCandidate`s; AutoNAT probes those and only a
+                // positive `Public` verdict promotes us (see handle_autonat_event).
+                debug!(addr = %info.observed_addr, "identify observed addr (AutoNAT candidate; not auto-confirmed)");
 
                 // Fix 2/4: cache QUIC IPv6 addresses and auto-dial for hole-punch.
                 // F-9: on a host with no working IPv6, never collect (and thus
@@ -2082,10 +2078,18 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Upnp(upnp_event)) => {
             match upnp_event {
                 libp2p::upnp::Event::NewExternalAddr(addr) => {
-                    info!(%addr, "R-DHT-4: UPnP mapped a public address (promotes via ExternalAddrConfirmed)");
-                    // Remember it so the re-assert ticker can restore it if an
-                    // AutoNAT-Private demotion later retracts it (the IGD behaviour
-                    // only confirms once, not on renewal).
+                    info!(%addr, "R-DHT-4: UPnP mapped a public address");
+                    // A successful UPnP map on a publicly-routable gateway is a
+                    // positive reachability signal → explicitly promote (auto-mode
+                    // is off; see swarm.rs). The libp2p-upnp behaviour only confirms
+                    // on a routable gateway (NonRoutableGateway otherwise), but
+                    // re-check global routability as defence in depth.
+                    if is_globally_reachable_addr(&addr) {
+                        swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
+                    }
+                    // Remember it so the re-assert ticker can restore the advertised
+                    // address if an AutoNAT-Private demotion later retracts it (the
+                    // IGD behaviour only confirms once, not on renewal).
                     state.upnp_external_addrs.insert(addr);
                 }
                 libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
@@ -2105,26 +2109,20 @@ fn handle_swarm_event(
         // ── Connection lifecycle ──
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
-            // R-DHT-2: register a listen address as a confirmed external address
-            // (→ Kademlia auto-promotes to server) ONLY when it is globally
-            // routable. In libp2p-kad 0.46, `add_external_address` is an
-            // unconditional *confirmation* (the old candidate/confidence-scoring
-            // model AutoNAT could falsify is gone) — so confirming a LAN address
-            // here would advertise us as a server reachable at `192.168.x`, which
-            // off-LAN queriers can't dial: a black hole. Public hosts (cloud/VPS)
-            // and global-IPv6 nodes still confirm and promote correctly.
+            // R-DHT-2 (revised after the 2026-06-15 live test): a globally-routable
+            // *listen* address is NOT proof of inbound reachability. The live test
+            // showed a home node with a global IPv6 (2406:…) still sits behind a
+            // default-deny router firewall — externally unreachable — yet the old
+            // "confirm the global listen addr → promote" path made it a black-hole
+            // server, and AutoNAT could not reliably demote it (the `Private` verdict
+            // for an unreachable node never latched; it timed out into `Unknown`).
+            // So we no longer confirm listen addresses as external here. Promotion
+            // now requires a positive AutoNAT `Public` verdict — the only signal that
+            // actually proves an arbitrary querier can reach us — or a UPnP mapping
+            // (see handle_autonat_event / the UPnP handler). "No verdict" → stay
+            // client (safe), never a black hole. DCUtR is unaffected: it offers our
+            // listen addrs during hole-punch regardless of external confirmation.
             //
-            // DCUtR is unaffected: it offers our *listen* addresses during
-            // hole-punch regardless of external confirmation, and same-LAN peers
-            // pair via mDNS+direct dial rather than DCUtR. The relay-circuit and
-            // F-9 v6 gating below are unchanged.
-            if is_direct_listen_candidate(&address)
-                && is_globally_reachable_addr(&address)
-                && (state.ipv6_capable || !is_ipv6_multiaddr(&address))
-            {
-                debug!(%address, "confirming globally-routable listen addr as external (Kad server promotion)");
-                swarm.add_external_address(address.clone());
-            }
             // F-5: a circuit listen addr coming up means the reservation
             // succeeded — clear any pending backoff retry for it.
             if address.to_string().contains("/p2p-circuit") {
@@ -2667,8 +2665,14 @@ fn handle_autonat_event(
                     // global routability so a quirky AutoNAT verdict over a
                     // private/circuit address can never promote a black hole.
                     if is_globally_reachable_addr(&addr) {
-                        info!(%addr, "R-DHT-2: AutoNAT Public → confirming external addr (Kad server promotion)");
+                        info!(%addr, "R-DHT-2: AutoNAT Public on a direct global addr → promoting to Kad server");
+                        // Advertise the verified-reachable address...
                         swarm.add_external_address(addr);
+                        // ...and EXPLICITLY promote to server. This is the only
+                        // reliable proof an arbitrary querier can reach us; explicit
+                        // mode means a relay-circuit or listen addr can never
+                        // promote us on its own (see swarm.rs set_mode(Client)).
+                        swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
                     }
                 }
                 libp2p::autonat::NatStatus::Private => {
@@ -2694,6 +2698,9 @@ fn handle_autonat_event(
                     state
                         .external_addrs
                         .retain(|a| a.to_string().contains("/p2p-circuit"));
+                    // Explicitly demote: we are not reachable, so we must not serve
+                    // the DHT (would black-hole queries routed to us).
+                    swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Client));
                 }
                 libp2p::autonat::NatStatus::Unknown => {
                     state.nat_info.nat_type = "unknown".into();
@@ -2836,38 +2843,6 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
     }
 }
 
-/// A3 DCUtR fix: decide whether a newly-bound listen address is a sensible
-/// DCUtR external candidate.
-///
-/// Returns ``false`` for:
-/// * ``/p2p-circuit/`` multiaddrs (relay-originated, useless for hole punching)
-/// * loopback IPs (``127.0.0.0/8``, ``::1``)
-/// * unspecified / wildcard IPs (``0.0.0.0``, ``::``)
-///
-/// Everything else — LAN / ULA / public — is returned as a candidate.
-/// AutoNAT then probes the candidates; unreachable ones get falsified and
-/// only contribute within the LAN scope where they're valid.
-fn is_direct_listen_candidate(addr: &Multiaddr) -> bool {
-    if addr.to_string().contains("/p2p-circuit") {
-        return false;
-    }
-    for proto in addr.iter() {
-        match proto {
-            libp2p::multiaddr::Protocol::Ip4(ip) => {
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return false;
-                }
-            }
-            libp2p::multiaddr::Protocol::Ip6(ip) => {
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    true
-}
 
 /// R-DHT-2 (server-mode promotion gate): is this multiaddr a *globally reachable*
 /// direct address — one we may safely confirm as external and thereby promote

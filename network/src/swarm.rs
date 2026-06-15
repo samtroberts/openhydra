@@ -186,6 +186,19 @@ pub fn build_swarm(
         kademlia.add_address(peer, addr.clone());
     }
 
+    // R-DHT-2 (revised after the 2026-06-15 live test): take EXPLICIT control of
+    // Kademlia's mode instead of relying on its automatic mode. Auto-mode promotes
+    // to server on *any* confirmed external address — and libp2p confirms the
+    // relay `/p2p-circuit` reservation address as external, so a relay-only node
+    // would auto-promote into a server reachable only via a relay (a black hole).
+    // We instead start as a client and flip to server ONLY when AutoNAT positively
+    // confirms a direct, globally-routable address (or a UPnP mapping does) — see
+    // the AutoNAT/UPnP handlers in `event_loop`. This decouples "act as a DHT
+    // server" (reachability-gated) from "advertise this address" (still done via
+    // add_external_address, including the circuit addr, so peers can reach us for
+    // *data* over the relay even while we remain a DHT client).
+    kademlia.set_mode(Some(kad::Mode::Client));
+
     // DCUtR (hole punching).
     let dcutr = dcutr::Behaviour::new(peer_id);
 

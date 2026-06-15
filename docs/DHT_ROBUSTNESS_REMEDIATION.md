@@ -61,15 +61,30 @@ rest via scale. Promotion must be **conditional**: never `set_mode(Server)` unco
 advertising as a server while unreachable causes **black-hole routing** (queries routed to
 you time out, degrading the DHT for everyone).
 
-**Implemented mechanism (R-DHT-2):** Kademlia 0.46 runs in auto-mode and promotes to
-`Mode::Server` on the first confirmed external address. We confirm an address
-(`add_external_address`) only when it passes `is_globally_reachable_addr` (rejects
-RFC1918/CGNAT/loopback/link-local/ULA/doc/`p2p-circuit`) **and** is corroborated by a real
-reachability signal: a global public/IPv6 listen address, an AutoNAT `Public` verdict (the
-authoritative full-cone/public test), or a UPnP `ExternalAddrConfirmed`. An AutoNAT `Private`
-verdict **retracts** our direct external addresses so the node auto-demotes back to client —
-so a peer that loses reachability stops black-holing. This lands the server set exactly on the
-"universally reachable" group above.
+**Implemented mechanism (R-DHT-2, revised after the 2026-06-15 live test):** we take
+**explicit control of Kademlia's mode** rather than relying on libp2p's automatic mode. The
+peer is created with `set_mode(Some(Mode::Client))` and flips to `Mode::Server` **only** on a
+positive **AutoNAT `Public`** verdict (or a UPnP mapping) for a direct, globally-routable
+address (`is_globally_reachable_addr`); an AutoNAT `Private` verdict flips it back to `Client`
+and retracts the direct external addresses. Address *advertising* (`add_external_address`,
+including the relay-circuit addr so peers can reach us for **data**) is kept separate from the
+DHT **server** role (reachability-gated).
+
+**Why explicit mode, not auto-mode (the live test's lesson):** Kad auto-mode promotes to
+server on *any* confirmed external address, and the live test showed two ways that
+black-holes a node:
+1. A home node with a global IPv6 (`2406:…`) sits behind a default-deny router firewall —
+   externally unreachable (confirmed: inbound `:4001` timed out from two dual-stack hosts) —
+   yet auto-mode promoted it on the **listen address**. AutoNAT could not demote it: AutoNAT
+   v1 can't reliably produce a `Private` verdict for an unreachable node (the server's
+   dial-backs time out one-by-one and exceed the client's request timeout, so the verdict
+   stays `Unknown`, never `Private`). It is good at confirming `Public` (a fast successful
+   dial-back), bad at confirming `Private`.
+2. libp2p auto-confirms the relay **`/p2p-circuit`** reservation as an external address, so a
+   relay-only node auto-promoted into a "server" reachable only through a relay.
+Both are why promotion must be driven by a *positive* reachability proof (AutoNAT `Public`)
+under explicit mode control, with "no verdict" → stay client. This lands the server set
+exactly on the "universally reachable" group above and never black-holes.
 
 ## 3. BitTorrent contrast (why theirs doesn't degrade)
 
