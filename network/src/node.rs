@@ -105,6 +105,11 @@ pub fn start_node(
     let bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
 
+    // R-DHT-6: persist/reload the routing table beside the identity key. Derived
+    // here (config is a borrow that can't move into the thread) and handed to the
+    // event loop.
+    let routing_cache_path = Some(crate::routing_cache::cache_path_for(&config.identity_path));
+
     // Create the command channel.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(256);
 
@@ -138,7 +143,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, stream_control, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));

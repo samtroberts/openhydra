@@ -23,6 +23,7 @@ use crate::ipc::IpcBridge;
 use crate::ipc_codec::IpcForwardHeader;
 use crate::proxy::{self, ProxyRequest, ProxyResponse};
 use crate::ring::{RingAction, RingConfig, RingHandle, RingManager};
+use crate::routing_cache;
 use crate::sampler_bridge::{SamplerBridge, SampleRequest};
 use crate::tensor_stream::{self, TensorStreamManager};
 use crate::types::{DiscoveredPeer, NatInfo, PeerRecord};
@@ -516,6 +517,13 @@ struct LoopState {
 /// roughly an hour of breathing room before oldest-drop kicks in.
 const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 
+/// R-DHT-1 (gossip provider PEX): the gossipsub envelope `type` a provider uses
+/// to advertise its signed `PeerRecord` swarm-wide. Consumers fast-path this in
+/// Rust (verify + author-check + cache into `known_peers`) so discovery keeps
+/// working even when the Kademlia DHT is fully degraded — BitTorrent's PEX
+/// property. Travels on the same single topic as the other control events.
+const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
+
 struct PendingDiscover {
     model_id: String,
     records: Vec<PeerRecord>,
@@ -595,6 +603,10 @@ pub async fn run_event_loop(
     // node opted into peer-relay mode). The RelayServer event handler records
     // byte-cap cap-outs into it; the relay::Config's LeechRateLimiter reads it.
     peer_relay_leech: Option<std::sync::Arc<std::sync::Mutex<crate::relay::LeechTable>>>,
+    // R-DHT-6: where to persist/reload the Kademlia routing table. `None`
+    // disables persistence (e.g. tests). Set by `start_node` to a file beside
+    // the identity key.
+    routing_cache_path: Option<std::path::PathBuf>,
 ) {
     // CP-2: IPC response channel — spawned IPC tasks send (request_id, data)
     // back here so the event loop can forward via request_response.
@@ -644,6 +656,20 @@ pub async fn run_event_loop(
         }
     }
 
+    // R-DHT-6: warm-start the routing table from the persisted cache so a fresh
+    // process rejoins with known-good contacts instead of leaning entirely on the
+    // bootstrap relays. Best-effort: a missing/corrupt cache just yields nothing.
+    if let Some(ref cache_path) = routing_cache_path {
+        let warm = routing_cache::load(cache_path);
+        let n = warm.len();
+        for (peer_id, addr) in warm {
+            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+        }
+        if n > 0 {
+            info!(contacts = n, ?cache_path, "R-DHT-6: warm-started routing table from cache");
+        }
+    }
+
     // Relay reservations are requested after a short delay (see below)
     // to ensure Kademlia has connected to the bootstrap peers first.
     // The relay client behaviour sends the reservation request on an
@@ -689,6 +715,13 @@ pub async fn run_event_loop(
     // B3: Ring session timeout watchdog — checks every 5s for stale sessions.
     let mut ring_timeout_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     ring_timeout_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // R-DHT-6: periodically snapshot the routing table to disk (BitTorrent-style)
+    // so the next start warm-rejoins. 5 min cadence — frequent enough to capture
+    // a useful contact set, infrequent enough to be negligible I/O. First tick
+    // fires immediately; we skip persisting an empty table on that one.
+    let mut routing_save_ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+    routing_save_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // F6: B5's periodic re-listen was removed. It called `listen_on(circuit)`
     // every 30 min unconditionally, creating a NEW listener each time without
@@ -1198,6 +1231,35 @@ pub async fn run_event_loop(
                           "inbound_proxy_channels TTL sweep (leaked unanswered channels)");
                 }
             }
+            // R-DHT-6: snapshot the routing table to disk for warm restarts.
+            _ = routing_save_ticker.tick() => {
+                if let Some(ref cache_path) = routing_cache_path {
+                    let entries: Vec<(PeerId, Vec<Multiaddr>)> = swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .kbuckets()
+                        .flat_map(|bucket| {
+                            bucket
+                                .iter()
+                                .map(|e| {
+                                    (
+                                        *e.node.key.preimage(),
+                                        e.node.value.iter().cloned().collect::<Vec<_>>(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    // Skip writing an empty table (e.g. the immediate first tick
+                    // before any contacts are learned) — don't clobber a good cache.
+                    if !entries.is_empty() {
+                        match routing_cache::save(cache_path, &entries) {
+                            Ok(()) => debug!(contacts = entries.len(), "R-DHT-6: persisted routing table"),
+                            Err(e) => warn!(%e, "R-DHT-6: routing table persist failed"),
+                        }
+                    }
+                }
+            }
             // CP-4: Batch flush ticker — drain time-expired batches.
             _ = batch_ticker.tick() => {
                 if state.batcher.has_pending() {
@@ -1295,6 +1357,11 @@ fn handle_announce(
                         peer_id = %signed_record.peer_id,
                         "announced to kademlia (provider + record)"
                     );
+                    // R-DHT-1: also advertise this signed record over gossipsub so
+                    // peers learn us without the DHT (PEX). Best-effort — a publish
+                    // failure (e.g. no gossip mesh peers yet) must never fail the
+                    // announce; the next periodic re-announce will retry.
+                    publish_provider_pex(swarm, &signed_record);
                     let _ = reply.send(Ok(()));
                 }
                 Err(e) => {
@@ -1308,6 +1375,84 @@ fn handle_announce(
     }
 }
 
+/// R-DHT-1: publish a signed `PeerRecord` as a `PROVIDER_ANNOUNCE` gossipsub
+/// message so the swarm learns this provider independently of the DHT (PEX).
+/// Best-effort: a publish error is logged at debug and swallowed — callers must
+/// not let it fail the announce.
+fn publish_provider_pex(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, record: &PeerRecord) {
+    let envelope = serde_json::json!({
+        "type": PROVIDER_ANNOUNCE_TYPE,
+        "record": record,
+    });
+    let payload = match serde_json::to_vec(&envelope) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%e, "provider_pex: failed to encode envelope");
+            return;
+        }
+    };
+    let topic = libp2p::gossipsub::IdentTopic::new(crate::swarm::GOSSIPSUB_TOPIC);
+    match swarm.behaviour_mut().gossipsub.publish(topic, payload) {
+        Ok(_) => debug!(
+            model_id = %record.model_id,
+            peer_id = %record.peer_id,
+            "provider_pex: gossiped PROVIDER_ANNOUNCE"
+        ),
+        // InsufficientPeers is expected right after startup before the mesh forms;
+        // the periodic re-announce will publish again once peers are connected.
+        Err(e) => debug!(%e, "provider_pex: gossip publish skipped"),
+    }
+}
+
+/// R-DHT-1: ingest an inbound `PROVIDER_ANNOUNCE` gossip message (PEX). Verifies
+/// the embedded signed record AND that the gossip author equals the record's
+/// `libp2p_peer_id` (see [`dht::pex_record_is_authentic`]) before caching it into
+/// `known_peers`, where `handle_discover` can return it without the DHT.
+fn handle_provider_pex(
+    state: &mut LoopState,
+    parsed: &serde_json::Value,
+    source: Option<PeerId>,
+) {
+    // The verified gossip author. Strict signing guarantees this is present for
+    // accepted messages, but guard anyway — no author means no trust anchor.
+    let source_str = match source {
+        Some(pid) => pid.to_base58(),
+        None => {
+            debug!("provider_pex: dropping advert with no signed author");
+            return;
+        }
+    };
+    let record: PeerRecord = match parsed.get("record") {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(%e, "provider_pex: malformed record in advert");
+                return;
+            }
+        },
+        None => {
+            debug!("provider_pex: advert missing record field");
+            return;
+        }
+    };
+    if let Err(e) = dht::pex_record_is_authentic(&record, &source_str) {
+        warn!(%source_str, %e, "provider_pex: rejected advert (failed authenticity)");
+        return;
+    }
+    let is_new = !state.known_peers.contains_key(&record.peer_id);
+    state.known_peers.insert(record.peer_id.clone(), record.clone());
+    if is_new {
+        info!(
+            model_id = %record.model_id,
+            peer_id = %record.peer_id,
+            libp2p = %record.libp2p_peer_id,
+            "provider_pex: learned new provider via gossip"
+        );
+    } else {
+        debug!(peer_id = %record.peer_id, "provider_pex: refreshed cached provider");
+    }
+}
+
 /// Handle a discover command: find providers for the model via Kademlia
 /// provider API (Task 2.1: Option C).
 fn handle_discover(
@@ -1316,13 +1461,31 @@ fn handle_discover(
     reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
     state: &mut LoopState,
 ) {
+    // R-DHT-1: pre-seed the result from the local cache (`known_peers`), which is
+    // populated by DHT reads AND by gossip PEX (`PROVIDER_ANNOUNCE`). This makes
+    // discovery DHT-independent: if `get_providers` returns nothing — or the DHT is
+    // entirely unreachable — the early-reply / convergence path still returns any
+    // provider we learned over gossip. Exclude our own record. The get_providers
+    // FoundProviders handler dedups by `libp2p_peer_id`, so a provider present in
+    // both the cache and the DHT is not double-counted.
+    let local_id = swarm.local_peer_id().to_base58();
+    let seed: Vec<PeerRecord> = state
+        .known_peers
+        .values()
+        .filter(|r| r.model_id == model_id && r.libp2p_peer_id != local_id)
+        .cloned()
+        .collect();
+    if !seed.is_empty() {
+        debug!(model_id, seeded = seed.len(), "discover: pre-seeded from PEX/DHT cache");
+    }
+
     let key = dht::model_provider_key(model_id);
     let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
     state.pending_discovers.insert(
         query_id,
         PendingDiscover {
             model_id: model_id.to_string(),
-            records: Vec::new(),
+            records: seed,
             reply,
             providers_done: false,
             outstanding: 0,
@@ -1562,7 +1725,7 @@ fn handle_swarm_event(
 
         // ── AutoNAT ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Autonat(autonat_event)) => {
-            handle_autonat_event(autonat_event, state);
+            handle_autonat_event(autonat_event, swarm, state);
         }
 
         // ── Identify ──
@@ -1583,11 +1746,19 @@ fn handle_swarm_event(
                         .kademlia
                         .add_address(&peer_id, addr.clone());
                 }
+                // R-DHT-2: an Identify *observed* address is what a single remote
+                // peer reports seeing — only confirm it as external (→ Kad server
+                // promotion) when it is globally routable. A NAT'd peer's observed
+                // address can be a private/CGNAT mapping or a per-destination
+                // symmetric-NAT binding that no third party can dial; confirming it
+                // would advertise us as a black-hole server. The genuine
+                // full/restricted-cone case still reaches an AutoNAT `Public`
+                // verdict below, which is the authoritative promotion signal.
                 if !info.observed_addr.to_string().is_empty()
                     && (state.ipv6_capable || !is_ipv6_multiaddr(&info.observed_addr))
+                    && is_globally_reachable_addr(&info.observed_addr)
                 {
-                    // F-9: don't advertise a v6 external addr we can't serve.
-                    debug!(addr = %info.observed_addr, "adding observed addr as external");
+                    debug!(addr = %info.observed_addr, "adding globally-routable observed addr as external");
                     swarm.add_external_address(info.observed_addr);
                 }
 
@@ -1786,8 +1957,19 @@ fn handle_swarm_event(
                 // (discovery DoS). A peer may only announce *its own*
                 // departure; genuine third-party death is handled reactively
                 // by the ConnectionClosed → abort_sessions_for_peer path.
+                // R-DHT-1: PROVIDER_ANNOUNCE (gossip PEX) is consumed entirely in
+                // Rust — verified and cached into `known_peers` — and deliberately
+                // NOT forwarded to Python. Providers re-announce on a timer, so
+                // queuing every advert would crowd real PEER_DEAD /
+                // REQUEST_HOLE_PUNCH events out of the bounded inbound queue. This
+                // flag suppresses the queue push below for fully-handled messages.
+                let mut handled_internally = false;
                 if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&message.data) {
-                    if parsed.get("type").and_then(|v| v.as_str()) == Some("PEER_DEPARTED") {
+                    let msg_type = parsed.get("type").and_then(|v| v.as_str());
+                    if msg_type == Some(PROVIDER_ANNOUNCE_TYPE) {
+                        handled_internally = true;
+                        handle_provider_pex(state, &parsed, message.source);
+                    } else if msg_type == Some("PEER_DEPARTED") {
                         if let Some(departed_id_str) = parsed.get("libp2p_peer_id").and_then(|v| v.as_str()) {
                             if let Ok(departed_pid) = departed_id_str.parse::<PeerId>() {
                                 if message.source == Some(departed_pid) {
@@ -1810,14 +1992,17 @@ fn handle_swarm_event(
                 // Queue the payload for Python to poll. ``propagation_source``
                 // is the immediate gossip hop (NOT necessarily the original
                 // author) — we surface it so Python can build a 2-observer
-                // quorum from distinct hop sources when needed.
-                if state.gossip_inbound_queue.len() >= GOSSIP_INBOUND_QUEUE_MAX {
-                    state.gossip_inbound_queue.pop_front();
-                    warn!("gossipsub_queue_overflow: dropped oldest message");
+                // quorum from distinct hop sources when needed. R-DHT-1:
+                // Rust-consumed messages (PROVIDER_ANNOUNCE) skip the queue.
+                if !handled_internally {
+                    if state.gossip_inbound_queue.len() >= GOSSIP_INBOUND_QUEUE_MAX {
+                        state.gossip_inbound_queue.pop_front();
+                        warn!("gossipsub_queue_overflow: dropped oldest message");
+                    }
+                    state
+                        .gossip_inbound_queue
+                        .push_back((propagation_source.to_string(), message.data));
                 }
-                state
-                    .gossip_inbound_queue
-                    .push_back((propagation_source.to_string(), message.data));
             }
         }
 
@@ -1850,25 +2035,24 @@ fn handle_swarm_event(
         // ── Connection lifecycle ──
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
-            // A3 DCUtR fix: register non-loopback, non-wildcard, non-circuit
-            // listen addresses as external address candidates *before* the
-            // relay reservations come in (relay reservations fire 5s after
-            // startup — see relay_reservation_deadline at the top of the
-            // event loop). This gives DCUtR a pool of real direct addresses
-            // to offer during hole-punch negotiation instead of only the
-            // ``/p2p-circuit/`` multiaddrs that Identify would otherwise
-            // observe once the peer is relay-bound.
+            // R-DHT-2: register a listen address as a confirmed external address
+            // (→ Kademlia auto-promotes to server) ONLY when it is globally
+            // routable. In libp2p-kad 0.46, `add_external_address` is an
+            // unconditional *confirmation* (the old candidate/confidence-scoring
+            // model AutoNAT could falsify is gone) — so confirming a LAN address
+            // here would advertise us as a server reachable at `192.168.x`, which
+            // off-LAN queriers can't dial: a black hole. Public hosts (cloud/VPS)
+            // and global-IPv6 nodes still confirm and promote correctly.
             //
-            // Safety: AutoNAT will probe each candidate; truly unreachable
-            // LAN addresses get falsified and only contribute to the
-            // DCUtR candidate set for same-LAN peers (where they *are* the
-            // right answer). Reachable public addresses get confirmed via
-            // ``ExternalAddrConfirmed`` and light up the DCUtR hot path.
+            // DCUtR is unaffected: it offers our *listen* addresses during
+            // hole-punch regardless of external confirmation, and same-LAN peers
+            // pair via mDNS+direct dial rather than DCUtR. The relay-circuit and
+            // F-9 v6 gating below are unchanged.
             if is_direct_listen_candidate(&address)
+                && is_globally_reachable_addr(&address)
                 && (state.ipv6_capable || !is_ipv6_multiaddr(&address))
             {
-                // F-9: don't advertise a v6 external addr we can't serve.
-                debug!(%address, "registering direct listen addr as external");
+                debug!(%address, "confirming globally-routable listen addr as external (Kad server promotion)");
                 swarm.add_external_address(address.clone());
             }
             // F-5: a circuit listen addr coming up means the reservation
@@ -2382,7 +2566,11 @@ fn handle_kad_event(
 }
 
 /// Handle AutoNAT events.
-fn handle_autonat_event(event: libp2p::autonat::Event, state: &mut LoopState) {
+fn handle_autonat_event(
+    event: libp2p::autonat::Event,
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+) {
     match event {
         libp2p::autonat::Event::StatusChanged { old, new } => {
             info!(?old, ?new, "AutoNAT status changed");
@@ -2399,10 +2587,41 @@ fn handle_autonat_event(event: libp2p::autonat::Event, state: &mut LoopState) {
                             state.nat_info.external_ipv4 = ip;
                         }
                     }
+                    // R-DHT-2: AutoNAT consensus that we are publicly reachable is
+                    // the authoritative promotion signal (§2 — full/restricted-cone
+                    // NAT and public hosts reach `Public`; symmetric/CGNAT reach
+                    // `Private`). Confirm the verified-reachable address so Kademlia
+                    // auto-promotes us to **server** and the DHT grows with the
+                    // network instead of resting solely on the 3 relays. Gate on
+                    // global routability so a quirky AutoNAT verdict over a
+                    // private/circuit address can never promote a black hole.
+                    if is_globally_reachable_addr(&addr) {
+                        info!(%addr, "R-DHT-2: AutoNAT Public → confirming external addr (Kad server promotion)");
+                        swarm.add_external_address(addr);
+                    }
                 }
                 libp2p::autonat::NatStatus::Private => {
                     state.nat_info.nat_type = "symmetric".into();
                     state.nat_info.is_public = false;
+                    // R-DHT-2: reachability was lost (e.g. network changed, or an
+                    // earlier observed-address confirmation was over-eager). Retract
+                    // our direct external addresses so Kademlia auto-demotes back to
+                    // **client** — a node that can't be reached must not advertise
+                    // itself as a server and swallow queries. Relay-circuit addrs
+                    // were never confirmed as external, so nothing to retract there.
+                    let direct_externals: Vec<Multiaddr> = state
+                        .external_addrs
+                        .iter()
+                        .filter(|a| !a.to_string().contains("/p2p-circuit"))
+                        .cloned()
+                        .collect();
+                    for addr in direct_externals {
+                        info!(%addr, "R-DHT-2: AutoNAT Private → retracting external addr (Kad demote to client)");
+                        swarm.remove_external_address(&addr);
+                    }
+                    state
+                        .external_addrs
+                        .retain(|a| a.to_string().contains("/p2p-circuit"));
                 }
                 libp2p::autonat::NatStatus::Unknown => {
                     state.nat_info.nat_type = "unknown".into();
@@ -2559,6 +2778,76 @@ fn is_direct_listen_candidate(addr: &Multiaddr) -> bool {
         }
     }
     true
+}
+
+/// R-DHT-2 (server-mode promotion gate): is this multiaddr a *globally reachable*
+/// direct address — one we may safely confirm as external and thereby promote
+/// ourselves into a Kademlia **server**?
+///
+/// libp2p-kad 0.46 runs in automatic mode: the instant the swarm has ANY
+/// confirmed external address, Kademlia flips to `Mode::Server` (stores records,
+/// answers queries). Confirming a non-routable address therefore advertises us as
+/// a server reachable at an address no remote node can actually dial — queries
+/// routed to us **black-hole**, degrading the DHT for everyone (the exact failure
+/// §2 of the remediation plan forbids).
+///
+/// So we confirm ONLY addresses in a globally-routable IP range:
+/// * IPv4 — reject private (RFC1918), CGNAT (100.64/10), loopback, link-local,
+///   unspecified, broadcast, documentation. A NAT'd peer's LAN listen addr
+///   (`192.168.x`, `10.x`) is rejected here — it must NOT promote us to server.
+/// * IPv6 — reject loopback, unspecified, link-local (fe80::/10), unique-local
+///   (fc00::/7 ULA), documentation (2001:db8::/32). A global IPv6 is accepted —
+///   it is normally un-NATed and the underrated near-term reachability win (R-DHT-3).
+/// * Any `/p2p-circuit` address — reject. A relay forwarding for us is not us
+///   being reachable.
+///
+/// This gate decides *eligibility* only. The actual promotion is still driven by
+/// confirmation events: a global listen/observed address plus an AutoNAT `Public`
+/// verdict (full/restricted-cone NAT and public hosts reach `Public`; symmetric
+/// NAT / CGNAT reach `Private` and stay clients — §2).
+fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
+    if addr.to_string().contains("/p2p-circuit") {
+        return false;
+    }
+    let mut saw_ip = false;
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                saw_ip = true;
+                // 100.64.0.0/10 — carrier-grade NAT (RFC6598). Not in std's
+                // is_private(), but just as un-routable from the public internet.
+                let o = ip.octets();
+                let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
+                if ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+                    || is_cgnat
+                {
+                    return false;
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                saw_ip = true;
+                let seg = ip.segments();
+                let is_link_local = (seg[0] & 0xffc0) == 0xfe80; // fe80::/10
+                let is_unique_local = (seg[0] & 0xfe00) == 0xfc00; // fc00::/7
+                let is_documentation = seg[0] == 0x2001 && seg[1] == 0x0db8; // 2001:db8::/32
+                if ip.is_loopback()
+                    || ip.is_unspecified()
+                    || is_link_local
+                    || is_unique_local
+                    || is_documentation
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_ip
 }
 
 /// Extract an IP string from a multiaddr like `/ip4/1.2.3.4/tcp/4001`.
@@ -3767,6 +4056,35 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_globally_reachable_addr_gate() {
+        let g = |s: &str| is_globally_reachable_addr(&s.parse::<Multiaddr>().unwrap());
+
+        // Globally routable — eligible to promote us to a Kad server.
+        assert!(g("/ip4/45.79.190.172/tcp/4001"));
+        assert!(g("/ip6/2a03:4000:41:ed1::1/tcp/4001"));
+        assert!(g("/ip4/8.8.8.8/udp/4001/quic-v1"));
+
+        // Private / LAN (RFC1918) — a NAT'd peer's listen addr must NOT promote.
+        assert!(!g("/ip4/192.168.1.5/tcp/4001"));
+        assert!(!g("/ip4/10.0.0.9/tcp/4001"));
+        assert!(!g("/ip4/172.16.4.4/tcp/4001"));
+        // CGNAT (100.64/10) and link-local / loopback / unspecified.
+        assert!(!g("/ip4/100.64.1.1/tcp/4001"));
+        assert!(!g("/ip4/169.254.1.1/tcp/4001"));
+        assert!(!g("/ip4/127.0.0.1/tcp/4001"));
+        assert!(!g("/ip4/0.0.0.0/tcp/4001"));
+
+        // IPv6 non-global: ULA (fc00::/7), link-local (fe80::/10), loopback, doc.
+        assert!(!g("/ip6/fd00::1/tcp/4001"));
+        assert!(!g("/ip6/fe80::1/tcp/4001"));
+        assert!(!g("/ip6/::1/tcp/4001"));
+        assert!(!g("/ip6/2001:db8::1/tcp/4001"));
+
+        // A relay-circuit address is never "us being reachable".
+        assert!(!g("/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"));
+    }
 
     #[test]
     fn test_is_ipv6_multiaddr() {

@@ -27,6 +27,7 @@ pub mod mdns;
 pub mod nat;
 pub mod node;
 pub mod relay;
+pub mod routing_cache;
 pub mod swarm;
 pub mod tensor_stream;
 pub mod transport;

@@ -110,14 +110,73 @@ pub fn build_swarm(
     })
     .boxed();
 
-    // Kademlia configuration
+    // Kademlia configuration.
+    //
+    // R-DHT-10: the discovery layer is libp2p Kad (not KRPC), so robustness is
+    // ultimately *its* tuning. These knobs were previously on defaults; each is
+    // now set explicitly so the behaviour is intentional and survives upstream
+    // default changes.
     let mut kad_config = kad::Config::new(
         libp2p::StreamProtocol::new("/openhydra/kad/1.0.0"),
     );
+
+    // Query timeout. The iterative-lookup ceiling. Left at 10 s: long enough for a
+    // multi-hop cross-continent lookup to converge, short enough that a dead-DHT
+    // lookup fails fast. The old "10 s tail dominates latency" problem is mitigated
+    // upstream by the early-reply path (maybe_reply_discover) + R-DHT-1 PEX seeding,
+    // which return the instant providers are in hand rather than awaiting convergence.
     kad_config.set_query_timeout(Duration::from_secs(10));
+
+    // Replication & query breadth.
+    // * replication_factor (K) — replicate each record to the K closest nodes so a
+    //   handful of dead/lying nodes can't sink it. Explicit K=20 (libp2p K_VALUE);
+    //   on a small network it simply caps at the nodes available.
+    // * parallelism (α) + disjoint_query_paths — run α=3 *disjoint* lookup paths
+    //   (S/Kademlia). An attacker must capture the key's neighbourhood on ALL three
+    //   independent paths to eclipse a lookup, not just one — eclipse/sybil
+    //   resistance on top of the cryptographic ed25519 node-ids.
+    let k = std::num::NonZeroUsize::new(20).expect("20 > 0");
+    let alpha = std::num::NonZeroUsize::new(3).expect("3 > 0");
+    kad_config.set_replication_factor(k);
+    kad_config.set_parallelism(alpha);
+    kad_config.disjoint_query_paths(true);
+
+    // Republication coherence — reconcile every lifetime knob against the 300 s TTL
+    // so records never silently expire and the two republish mechanisms (Kad's own
+    // vs the agent's provider re-announce loop) stay comfortably inside the window:
+    //   record TTL / provider TTL        = 300 s   (hard expiry)
+    //   record (re)publication interval  = 120 s   (publisher refreshes its records)
+    //   provider publication interval    = 120 s   (publisher refreshes provider recs)
+    //   record replication interval      =  60 s   (spread copies to K closest between
+    //                                               publications — directly addresses
+    //                                               "records aren't deliberately spread")
+    // All refresh intervals are << 300 s, so a record is re-published ~2× and
+    // re-replicated ~5× before it can lapse.
     kad_config.set_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_provider_record_ttl(Some(Duration::from_secs(300)));
     kad_config.set_publication_interval(Some(Duration::from_secs(120)));
+    kad_config.set_provider_publication_interval(Some(Duration::from_secs(120)));
+    kad_config.set_replication_interval(Some(Duration::from_secs(60)));
+
+    // Learned-record caching — on a successful lookup, cache the record at the
+    // closest nodes that didn't return it (up to max_peers), so a popular model's
+    // record stops re-hitting the network on every repeat discover. Default is 1;
+    // 3 widens the cache footprint for hot keys at negligible cost.
+    kad_config.set_caching(kad::Caching::Enabled { max_peers: 3 });
+
+    // Active maintenance — periodically re-run bootstrap() to refresh buckets and
+    // evict dead nodes (pairs with R-DHT-6's persistent routing table). Explicit
+    // 5 min interval.
+    kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(300)));
+
+    // NOTE (H1 / query-time record verification): poisoned records are rejected on
+    // the *read* side — every discover path runs `dht::verify_peer_record` before
+    // any field is trusted (event_loop.rs). We deliberately leave Kad's inbound
+    // record filtering on its default (no `StoreInserts::FilterBoth`): enabling it
+    // would route every inbound PUT through a manual accept/store handler, and
+    // without that handler records would silently never be stored. The read-side
+    // invariant already prevents a poisoned record from reaching routing/credit
+    // logic; promoting to write-side filtering is tracked as future hardening.
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);

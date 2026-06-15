@@ -129,6 +129,36 @@ pub fn verify_peer_record(record: &PeerRecord) -> Result<(), String> {
     }
 }
 
+/// R-DHT-1 (gossip provider PEX): decide whether a provider record learned over
+/// gossipsub may be trusted and cached.
+///
+/// Two independent checks, both required:
+/// 1. The record self-verifies (`verify_peer_record`): valid Ed25519 signature and
+///    the embedded `public_key` derives the advertised `libp2p_peer_id`.
+/// 2. The gossip was authored by that same peer — `gossip_source` is the
+///    cryptographically-verified message author (gossipsub runs Signed + Strict),
+///    and it MUST equal `record.libp2p_peer_id`.
+///
+/// Check 2 is what stops PEX poisoning / amplification: without it any swarm
+/// member (or a malicious relay) could flood forged "provider X serves model Y"
+/// records for peers it does not control, steering consumers at black holes —
+/// the exact discovery-DoS that BitTorrent's PEX has to defend against. A peer
+/// may only advertise its *own* provider record. Mirrors the PEER_DEPARTED
+/// author-check in the event loop.
+pub fn pex_record_is_authentic(record: &PeerRecord, gossip_source: &str) -> Result<(), String> {
+    verify_peer_record(record)?;
+    if record.libp2p_peer_id.is_empty() {
+        return Err("pex record missing libp2p_peer_id".into());
+    }
+    if record.libp2p_peer_id != gossip_source {
+        return Err(format!(
+            "pex author mismatch: record={} gossip_source={gossip_source}",
+            record.libp2p_peer_id
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +238,48 @@ mod tests {
             sign_peer_record(&PeerRecord { port: 1, ..Default::default() }, &kp).unwrap();
         signed.libp2p_peer_id = "12D3KooWFakePeerIdThatDoesNotMatchTheKey".into();
         assert!(verify_peer_record(&signed).is_err());
+    }
+
+    #[test]
+    fn test_pex_accepts_self_authored_record() {
+        // A provider gossiping its OWN signed record (gossip_source == its peer id)
+        // is accepted.
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let signed = sign_peer_record(
+            &PeerRecord {
+                model_id: "m".into(),
+                host: "1.2.3.4".into(),
+                port: 50051,
+                ..Default::default()
+            },
+            &kp,
+        )
+        .unwrap();
+        let source = signed.libp2p_peer_id.clone();
+        pex_record_is_authentic(&signed, &source).unwrap();
+    }
+
+    #[test]
+    fn test_pex_rejects_relayed_third_party_record() {
+        // PEX poisoning: a *different* peer (B) gossips A's genuine, validly-signed
+        // record. The signature checks out, but the gossip author != record author,
+        // so it must be rejected — a peer may only advertise its own provider record.
+        let kp_a = libp2p::identity::Keypair::generate_ed25519();
+        let signed_a = sign_peer_record(
+            &PeerRecord { host: "1.2.3.4".into(), port: 50051, ..Default::default() },
+            &kp_a,
+        )
+        .unwrap();
+        let kp_b = libp2p::identity::Keypair::generate_ed25519();
+        let source_b = libp2p::PeerId::from_public_key(&kp_b.public()).to_string();
+        assert!(pex_record_is_authentic(&signed_a, &source_b).is_err());
+    }
+
+    #[test]
+    fn test_pex_rejects_unsigned_record() {
+        let unsigned = PeerRecord { host: "1.2.3.4".into(), port: 1, ..Default::default() };
+        // Even if the (empty) libp2p_peer_id matched the source, the missing
+        // signature must still fail the verify step.
+        assert!(pex_record_is_authentic(&unsigned, "").is_err());
     }
 }
