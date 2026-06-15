@@ -46,6 +46,12 @@ pub struct SelectedProvider {
     pub model_id: String,
 }
 
+/// Per-provider attempt budget for the serve round-trip. Generous enough for a real
+/// generation (including a cold model load on the provider), but bounded so a dead /
+/// stale-but-advertised provider frees its slot for failover instead of hanging the
+/// request on libp2p's ~15s (or unbounded) request-response wait.
+const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Pick the best provider from `peers` for a request whose canonical id is
 /// `request_canonical` (use `""` to match any provider of the discovered model_id).
 ///
@@ -57,6 +63,19 @@ pub fn select_provider(
     request_canonical: &str,
     tier: u8,
 ) -> Option<SelectedProvider> {
+    rank_providers(peers, request_canonical, tier).into_iter().next()
+}
+
+/// All compatible providers for the request, **in preference order** (best first).
+///
+/// Same filter + [`rank_peers`] scoring as [`select_provider`], but returns the whole
+/// ranked list so the caller can fail over to the next provider when one is dead or
+/// unreachable (discovery can surface stale-but-still-advertised providers).
+pub fn rank_providers(
+    peers: &[DiscoveredPeer],
+    request_canonical: &str,
+    tier: u8,
+) -> Vec<SelectedProvider> {
     let compatible: Vec<&DiscoveredPeer> = peers
         .iter()
         .filter(|p| {
@@ -66,7 +85,7 @@ pub fn select_provider(
         })
         .collect();
     if compatible.is_empty() {
-        return None;
+        return Vec::new();
     }
     let inputs: Vec<PeerScoreInput> = compatible
         .iter()
@@ -81,14 +100,20 @@ pub fn select_provider(
             queue_depth: p.queue_depth,
         })
         .collect();
-    let top = rank_peers(&inputs, tier).into_iter().next()?;
-    let p = compatible.iter().find(|p| p.peer_id == top.peer_id)?;
-    Some(SelectedProvider {
-        libp2p_peer_id: p.libp2p_peer_id.clone(),
-        peer_id: p.peer_id.clone(),
-        public_key: p.public_key.clone(),
-        model_id: p.model_id.clone(),
-    })
+    rank_peers(&inputs, tier)
+        .into_iter()
+        .filter_map(|ranked| {
+            compatible
+                .iter()
+                .find(|p| p.peer_id == ranked.peer_id)
+                .map(|p| SelectedProvider {
+                    libp2p_peer_id: p.libp2p_peer_id.clone(),
+                    peer_id: p.peer_id.clone(),
+                    public_key: p.public_key.clone(),
+                    model_id: p.model_id.clone(),
+                })
+        })
+        .collect()
 }
 
 /// Send `request` over `transport`, stream each delta to `on_delta`, and return the
@@ -149,36 +174,71 @@ impl ConsumerNode {
             .net
             .discover(model)
             .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
-        tracing::debug!(elapsed = ?t_discover.elapsed(), peers = peers.len(), "discover");
         // "" canonical → any provider of this model_id (template-hash filtering is later).
-        let provider = select_provider(&peers, "", self.tier)
-            .ok_or_else(|| AdapterError::Http(format!("no provider for model '{model}'")))?;
-        let t_serve = std::time::Instant::now();
-
-        let request = ServeRequest {
-            reply_to: self.net.libp2p_peer_id().to_string(),
-            model_ref: provider.model_id.clone(),
-            messages,
-            max_tokens,
-            temperature,
-        };
-        let provider_libp2p = provider.libp2p_peer_id.clone();
-        let summary = {
-            let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-                self.net
-                    .proxy_forward(provider_libp2p.clone(), framed.to_vec())
-                    .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
-            };
-            request_completion(&mut transport, &request, on_delta)?
-        };
-        tracing::debug!(elapsed = ?t_serve.elapsed(), "serve (proxy_forward + generation)");
-
-        // Settle the co-signed receipt at EOS (best-effort — the tokens are already
-        // delivered; a failed/slow settlement must not fail the completion).
-        if summary.ok && summary.tokens > 0 {
-            self.settle_receipt(&provider, summary.tokens);
+        let candidates = rank_providers(&peers, "", self.tier);
+        tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
+        if candidates.is_empty() {
+            return Err(AdapterError::Http(format!("no provider for model '{model}'")));
         }
-        Ok(summary)
+        let total = candidates.len();
+
+        // Try providers in preference order. A dead/stale-but-advertised provider can't
+        // hang the request (bounded proxy_forward) and we fail over to the next — but only
+        // while nothing has been streamed yet, since partial output can't be un-sent.
+        let mut delivered = false;
+        let mut last_err: Option<AdapterError> = None;
+        for (i, provider) in candidates.into_iter().enumerate() {
+            let request = ServeRequest {
+                reply_to: self.net.libp2p_peer_id().to_string(),
+                model_ref: provider.model_id.clone(),
+                messages: messages.clone(),
+                max_tokens,
+                temperature,
+            };
+            let provider_libp2p = provider.libp2p_peer_id.clone();
+            let t_serve = std::time::Instant::now();
+            let result = {
+                let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                    self.net
+                        .proxy_forward_timeout(
+                            provider_libp2p.clone(),
+                            framed.to_vec(),
+                            ATTEMPT_TIMEOUT,
+                        )
+                        .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
+                };
+                let mut guarded = |d: &str| {
+                    delivered = true;
+                    on_delta(d);
+                };
+                request_completion(&mut transport, &request, &mut guarded)
+            };
+            match result {
+                Ok(summary) => {
+                    tracing::debug!(elapsed = ?t_serve.elapsed(), attempt = i + 1, "serve ok");
+                    // Settle the co-signed receipt at EOS (best-effort — tokens already
+                    // delivered; a failed/slow settlement must not fail the completion).
+                    if summary.ok && summary.tokens > 0 {
+                        self.settle_receipt(&provider, summary.tokens);
+                    }
+                    return Ok(summary);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %provider.libp2p_peer_id, attempt = i + 1, total,
+                        error = %e, "provider attempt failed"
+                    );
+                    if delivered {
+                        // Already streamed part of a completion to the client — failing over
+                        // would duplicate output. Surface the error instead.
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AdapterError::Http(format!("all providers failed for '{model}'"))))
     }
 
     /// Fire the co-signed receipt for a completed request. Skips a provider that
@@ -342,5 +402,20 @@ mod tests {
         let peers = vec![discovered("x", "gemma-4/e4b/fp16/cccccccccccccccc", 10.0)];
         assert!(select_provider(&peers, TPL_A, 2).is_none());
         assert!(select_provider(&[], TPL_A, 2).is_none());
+    }
+
+    #[test]
+    fn rank_providers_returns_all_compatible_best_first_for_failover() {
+        // The failover list: every compatible provider, ranked — so a dead top pick can
+        // hand off to the next. Incompatible ones are still dropped.
+        let peers = vec![
+            discovered("slow", TPL_A, 5.0),
+            discovered("incompatible", TPL_B, 99.0),
+            discovered("fast", TPL_A, 45.0),
+        ];
+        let ranked = rank_providers(&peers, TPL_A, 2);
+        let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
+        assert_eq!(ids, vec!["fast", "slow"]); // best first, incompatible excluded
+        assert!(rank_providers(&[], TPL_A, 2).is_empty());
     }
 }

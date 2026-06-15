@@ -32,7 +32,9 @@ pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
     ServeOutcome,
 };
-pub use consumer::{request_completion, select_provider, ConsumerNode, SelectedProvider};
+pub use consumer::{
+    rank_providers, request_completion, select_provider, ConsumerNode, SelectedProvider,
+};
 pub use gateway::serve_http;
 pub use http::ReqwestClient;
 pub use ollama::OllamaAdapter;

@@ -117,6 +117,34 @@ impl NetworkHandle {
         })?
     }
 
+    /// Like [`proxy_forward`](Self::proxy_forward) but bounded by `timeout`. A dead or
+    /// unreachable provider otherwise blocks until libp2p's own request-response timeout
+    /// (≈15s) — or, worst case, indefinitely — with no way for the caller to give up and
+    /// try another provider. Runs the blocking round-trip on a worker thread and bounds
+    /// the wait; on timeout the worker is abandoned (its late reply, if any, is dropped).
+    pub fn proxy_forward_timeout(
+        &self,
+        peer_id: String,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd_tx = self.cmd_tx.clone();
+        std::thread::spawn(move || {
+            let res = send_and_wait(&cmd_tx, |reply| SwarmCommand::ProxyForward {
+                peer_id,
+                data,
+                reply,
+            });
+            let _ = tx.send(res); // receiver may be gone (we timed out) — that's fine
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(inner)) => inner, // worker ran send_and_wait → the proxy result
+            Ok(Err(e)) => Err(e),   // event loop / channel failure
+            Err(_) => Err(format!("proxy_forward timed out after {timeout:?}")),
+        }
+    }
+
     /// Block up to `timeout` for the next inbound proxy request `(request_id, data)`.
     pub fn poll_inbound(&self, timeout: Duration) -> Option<(String, Vec<u8>)> {
         self.proxy_queue.pop(timeout)
