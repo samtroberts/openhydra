@@ -144,13 +144,16 @@ impl ConsumerNode {
         temperature: Option<f64>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
+        let t_discover = std::time::Instant::now();
         let peers = self
             .net
             .discover(model)
             .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
+        tracing::debug!(elapsed = ?t_discover.elapsed(), peers = peers.len(), "discover");
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         let provider = select_provider(&peers, "", self.tier)
             .ok_or_else(|| AdapterError::Http(format!("no provider for model '{model}'")))?;
+        let t_serve = std::time::Instant::now();
 
         let request = ServeRequest {
             reply_to: self.net.libp2p_peer_id().to_string(),
@@ -168,6 +171,7 @@ impl ConsumerNode {
             };
             request_completion(&mut transport, &request, on_delta)?
         };
+        tracing::debug!(elapsed = ?t_serve.elapsed(), "serve (proxy_forward + generation)");
 
         // Settle the co-signed receipt at EOS (best-effort — the tokens are already
         // delivered; a failed/slow settlement must not fail the completion).

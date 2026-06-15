@@ -2200,39 +2200,25 @@ fn handle_kad_event(
                             }
                         }
                     }
+                    // Reply the instant the resolved providers are in hand (local hits with no
+                    // outstanding fetches) — don't wait for the query's slow convergence tail.
+                    maybe_reply_discover(state, id);
                 }
                 Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
-                    // The provider list is complete. Reply now only if no record fetches are
-                    // still outstanding; otherwise the last fetch to finalize sends the reply.
+                    // Query converged: mark done so an *empty* result can return (a populated
+                    // one already replied early via maybe_reply_discover above).
                     if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         pending.providers_done = true;
-                        if pending.outstanding == 0 {
-                            let pending = state.pending_discovers.remove(&id).expect("present");
-                            let peers: Vec<DiscoveredPeer> =
-                                pending.records.iter().map(record_to_discovered).collect();
-                            let _ = pending.reply.send(Ok(peers));
-                        }
                     }
+                    maybe_reply_discover(state, id);
                 }
-                Err(e) => {
-                    // The get_providers query timed out / failed. Do NOT discard providers
-                    // already found: if any records resolved (or fetches are still in
-                    // flight) keep them; only surface the error when we have nothing.
+                Err(_e) => {
+                    // get_providers timed out / failed: mark done so a no-provider result can
+                    // resolve. Any providers already resolved were returned early.
                     if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         pending.providers_done = true;
-                        if pending.outstanding == 0 {
-                            let pending = state.pending_discovers.remove(&id).expect("present");
-                            if pending.records.is_empty() {
-                                let _ = pending
-                                    .reply
-                                    .send(Err(format!("kademlia get_providers: {e:?}")));
-                            } else {
-                                let peers: Vec<DiscoveredPeer> =
-                                    pending.records.iter().map(record_to_discovered).collect();
-                                let _ = pending.reply.send(Ok(peers));
-                            }
-                        }
                     }
+                    maybe_reply_discover(state, id);
                 }
             }
         }
@@ -2469,20 +2455,33 @@ fn ingest_discovered_record(
     }
 }
 
-/// One chained record fetch resolved: decrement the discover's outstanding count and, if
-/// the provider list is also complete, send the accumulated peers back to the caller.
+/// Reply to a pending discover the moment its result is settled, **without waiting for the
+/// get_providers query to converge** (that tail is a fixed ~10s timeout that otherwise
+/// dominates per-request latency). "Settled" = no record fetches still outstanding AND
+/// either at least one provider record resolved (fast path) or the query has fully finished
+/// (so an empty result can return). Ranking / empty handling is the consumer's job.
+fn maybe_reply_discover(state: &mut LoopState, discover_id: kad::QueryId) {
+    let ready = match state.pending_discovers.get(&discover_id) {
+        Some(p) => p.outstanding == 0 && (!p.records.is_empty() || p.providers_done),
+        None => return,
+    };
+    if ready {
+        let pending = state.pending_discovers.remove(&discover_id).expect("present");
+        let peers: Vec<DiscoveredPeer> =
+            pending.records.iter().map(record_to_discovered).collect();
+        let _ = pending.reply.send(Ok(peers));
+    }
+}
+
+/// One chained record fetch resolved: drop the discover's outstanding count and try to
+/// reply (it will the instant the last fetch lands — see [`maybe_reply_discover`]).
 fn finalize_discover_fetch(state: &mut LoopState, discover_id: kad::QueryId) {
     if let Some(pending) = state.pending_discovers.get_mut(&discover_id) {
         if pending.outstanding > 0 {
             pending.outstanding -= 1;
         }
-        if pending.providers_done && pending.outstanding == 0 {
-            let pending = state.pending_discovers.remove(&discover_id).expect("present");
-            let peers: Vec<DiscoveredPeer> =
-                pending.records.iter().map(record_to_discovered).collect();
-            let _ = pending.reply.send(Ok(peers));
-        }
     }
+    maybe_reply_discover(state, discover_id);
 }
 
 /// Convert a PeerRecord into a DiscoveredPeer.
