@@ -2032,6 +2032,28 @@ fn handle_swarm_event(
             }
         }
 
+        // ── UPnP (R-DHT-4) ──
+        // The mapped-address *confirmation* is handled automatically: the upnp
+        // behaviour emits `ToSwarm::ExternalAddrConfirmed`, which the swarm routes
+        // to the `SwarmEvent::ExternalAddrConfirmed` handler below (→ R-DHT-2 Kad
+        // server promotion). These generated events are informational/diagnostic.
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Upnp(upnp_event)) => {
+            match upnp_event {
+                libp2p::upnp::Event::NewExternalAddr(addr) => {
+                    info!(%addr, "R-DHT-4: UPnP mapped a public address (promotes via ExternalAddrConfirmed)");
+                }
+                libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
+                    info!(%addr, "R-DHT-4: UPnP mapping expired");
+                }
+                libp2p::upnp::Event::GatewayNotFound => {
+                    debug!("R-DHT-4: no UPnP/IGD gateway found (expected off home routers)");
+                }
+                libp2p::upnp::Event::NonRoutableGateway => {
+                    debug!("R-DHT-4: UPnP gateway is itself NATed (CGNAT/double-NAT) — no public mapping");
+                }
+            }
+        }
+
         // ── Connection lifecycle ──
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
@@ -2686,8 +2708,17 @@ fn maybe_reply_discover(state: &mut LoopState, discover_id: kad::QueryId) {
     };
     if ready {
         let pending = state.pending_discovers.remove(&discover_id).expect("present");
-        let peers: Vec<DiscoveredPeer> =
+        let mut peers: Vec<DiscoveredPeer> =
             pending.records.iter().map(record_to_discovered).collect();
+        // R-DHT-8: stamp the liveness hint — is there a live libp2p connection to
+        // this provider right now? The consumer prefers connected providers so the
+        // failover path becomes the exception, not the rule. All records here are
+        // already H1/PEX-verified, so we never surface an unverified candidate.
+        for p in &mut peers {
+            if let Ok(pid) = p.libp2p_peer_id.parse::<PeerId>() {
+                p.connected = state.peer_connections.contains_key(&pid);
+            }
+        }
         let _ = pending.reply.send(Ok(peers));
     }
 }
@@ -2744,6 +2775,9 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
         // address a co-signed receipt at its identity after a whole-model route.
         public_key: r.public_key.clone(),
         reachable_address,
+        // R-DHT-8: liveness is stamped by `maybe_reply_discover` (which has the
+        // live connection table); default false here.
+        connected: false,
     }
 }
 

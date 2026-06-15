@@ -291,6 +291,13 @@ pub fn build_swarm(
     let stream = libp2p_stream::Behaviour::new();
     let stream_control = stream.new_control();
 
+    // R-DHT-4: UPnP/NAT-PMP. Default behaviour searches for an IGD gateway on
+    // first poll and maps each listen port; on success it confirms the mapped
+    // external address with the swarm (→ Kad server promotion via R-DHT-2). A
+    // peer with no IGD gateway just gets a GatewayNotFound event and is otherwise
+    // unaffected.
+    let upnp = libp2p::upnp::tokio::Behaviour::default();
+
     // WS-F F-4: optional peer-relay SERVER. Off unless opted in. When enabled,
     // it enforces the SAME caps + F-6 leech lockout as the Linode bootstraps via
     // the shared LeechTable (returned so the event loop can record cap-outs).
@@ -332,6 +339,7 @@ pub fn build_swarm(
         gossipsub,
         ping,
         stream,
+        upnp,
     };
 
     let swarm_config = SwarmConfig::with_tokio_executor()

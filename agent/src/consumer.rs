@@ -100,7 +100,7 @@ pub fn rank_providers(
             queue_depth: p.queue_depth,
         })
         .collect();
-    rank_peers(&inputs, tier)
+    let mut ranked: Vec<SelectedProvider> = rank_peers(&inputs, tier)
         .into_iter()
         .filter_map(|ranked| {
             compatible
@@ -113,7 +113,20 @@ pub fn rank_providers(
                     model_id: p.model_id.clone(),
                 })
         })
-        .collect()
+        .collect();
+
+    // R-DHT-8: prefer providers we already have a live connection to. The
+    // capability/reputation score (above) decides order *within* the connected
+    // and disconnected groups; this stable partition just floats live providers
+    // to the front so a stale-but-still-advertised record is only tried after
+    // every connected provider — failover as the exception, not the rule.
+    let connected: std::collections::HashSet<&str> = peers
+        .iter()
+        .filter(|p| p.connected)
+        .map(|p| p.peer_id.as_str())
+        .collect();
+    ranked.sort_by_key(|sp| !connected.contains(sp.peer_id.as_str()));
+    ranked
 }
 
 /// Send `request` over `transport`, stream each delta to `on_delta`, and return the
@@ -435,5 +448,33 @@ mod tests {
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
         assert_eq!(ids, vec!["fast", "slow"]); // best first, incompatible excluded
         assert!(rank_providers(&[], TPL_A, 2).is_empty());
+    }
+
+    #[test]
+    fn rank_providers_floats_connected_above_higher_scored_disconnected() {
+        // R-DHT-8: a live (connected) provider is preferred even when a
+        // disconnected one scores higher on throughput — a stale-but-advertised
+        // record shouldn't be dialed first and eat a failover round-trip.
+        let mut fast_dead = discovered("fast_dead", TPL_A, 45.0);
+        fast_dead.connected = false;
+        let mut slow_live = discovered("slow_live", TPL_A, 5.0);
+        slow_live.connected = true;
+        let ranked = rank_providers(&[fast_dead, slow_live], TPL_A, 2);
+        let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
+        // Connected first; the disconnected (higher-scored) one is still present
+        // as a failover fallback, just after.
+        assert_eq!(ids, vec!["slow_live", "fast_dead"]);
+    }
+
+    #[test]
+    fn rank_providers_score_order_within_connected_group() {
+        // Within the connected group, capability score still decides order.
+        let mut fast = discovered("fast", TPL_A, 45.0);
+        fast.connected = true;
+        let mut slow = discovered("slow", TPL_A, 5.0);
+        slow.connected = true;
+        let ranked = rank_providers(&[slow, fast], TPL_A, 2);
+        let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
+        assert_eq!(ids, vec!["fast", "slow"]);
     }
 }

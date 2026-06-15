@@ -29,6 +29,9 @@ libp2p = { version = "0.54", features = [
     "request-response",
     "gossipsub",
     "ping",
+    # R-DHT-4: UPnP/NAT-PMP port mapping so home-router-NAT peers can map their
+    # listen port and become reachable (feeds the R-DHT-2 promotion gate).
+    "upnp",
 ] }
 
 # Async runtime

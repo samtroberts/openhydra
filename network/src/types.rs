@@ -178,6 +178,14 @@ pub struct DiscoveredPeer {
     pub public_key: String,
     /// The resolved reachable address (direct or via relay).
     pub reachable_address: String,
+    /// R-DHT-8 (liveness hint): true when the local node currently has a live
+    /// libp2p connection to this provider at discover time. The consumer's
+    /// `rank_providers` prefers connected providers so a live peer is tried
+    /// before a stale-but-still-advertised one — turning the failover path from
+    /// the common case into the exception. `#[serde(default)]` so older records
+    /// decode to `false`.
+    #[serde(default)]
+    pub connected: bool,
 }
 
 impl PeerRecord {
