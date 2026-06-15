@@ -26,8 +26,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
-use openhydra_agent::{live_ollama, serve_http, Provider};
-use openhydra_agent::ollama::DEFAULT_OLLAMA_URL;
+use openhydra_agent::{
+    live_ollama, live_openai, serve_http, EngineAdapter, Provider, DEFAULT_LM_STUDIO_URL,
+    DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
+};
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
 use openhydra_protocol::store::Store;
@@ -91,11 +93,41 @@ enum Role {
     Serve(ServeArgs),
 }
 
+/// Which local engine an agent proxies to. Selects the adapter; the `--engine` URL
+/// defaults to the kind's standard port when omitted.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum EngineKind {
+    /// Ollama native API (`/api/*`) — rich metadata, full canonical ids.
+    Ollama,
+    /// vLLM (OpenAI-compatible `/v1/*`).
+    Vllm,
+    /// LM Studio (OpenAI-compatible `/v1/*`).
+    LmStudio,
+    /// Any other OpenAI-compatible server (Exo, llama.cpp `--api`, LocalAI, …).
+    Openai,
+}
+
+impl EngineKind {
+    /// The engine's conventional local base URL, used when `--engine` is omitted.
+    fn default_url(self) -> &'static str {
+        match self {
+            EngineKind::Ollama => DEFAULT_OLLAMA_URL,
+            EngineKind::Vllm | EngineKind::Openai => DEFAULT_VLLM_URL,
+            EngineKind::LmStudio => DEFAULT_LM_STUDIO_URL,
+        }
+    }
+}
+
 #[derive(Args)]
 struct ProvideArgs {
-    /// Base URL of the local engine to proxy to (Ollama's HTTP API).
-    #[arg(long, default_value = DEFAULT_OLLAMA_URL)]
-    engine: String,
+    /// Which local engine to proxy to.
+    #[arg(long = "engine-kind", value_enum, default_value_t = EngineKind::Ollama)]
+    engine_kind: EngineKind,
+
+    /// Base URL of the local engine. Defaults to the engine kind's standard port
+    /// (Ollama 11434, vLLM/OpenAI 8000, LM Studio 1234).
+    #[arg(long)]
+    engine: Option<String>,
 
     /// Advisory host advertised in records (routing is by libp2p peer id regardless).
     #[arg(long, default_value = "")]
@@ -196,10 +228,44 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// Provider role: detect + announce the engine's models, then serve inbound forever.
+/// Provider role: pick the engine adapter from `--engine-kind`, then detect + announce +
+/// serve. The post-adapter logic is generic over [`EngineAdapter`] (see [`run_provider`]),
+/// so each kind monomorphises without boxing.
 fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
-    let adapter = live_ollama(&args.engine).map_err(|e| format!("engine {}: {e}", args.engine))?;
+    let url = args
+        .engine
+        .clone()
+        .unwrap_or_else(|| args.engine_kind.default_url().to_string());
+    // Bind the adapter first so its construction borrow of `url` ends before `url` is
+    // moved into `run_provider`.
+    match args.engine_kind {
+        EngineKind::Ollama => {
+            let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
+            run_provider(a, url, args, net)
+        }
+        EngineKind::Vllm => {
+            let a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
+            run_provider(a, url, args, net)
+        }
+        EngineKind::LmStudio => {
+            let a = live_openai(&url, "lm-studio").map_err(|e| format!("engine {url}: {e}"))?;
+            run_provider(a, url, args, net)
+        }
+        EngineKind::Openai => {
+            let a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
+            run_provider(a, url, args, net)
+        }
+    }
+}
 
+/// Run a provider over a chosen engine adapter: open the ledger, announce the engine's
+/// models, then serve inbound requests forever. Generic so every [`EngineKind`] reuses it.
+fn run_provider<A: EngineAdapter>(
+    adapter: A,
+    engine_url: String,
+    args: ProvideArgs,
+    net: NetworkHandle,
+) -> Result<(), String> {
     // Open the receipt ledger: file-backed if --db was given (durable across restarts),
     // else an ephemeral in-memory ledger.
     let store = match &args.db {
@@ -218,17 +284,16 @@ fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
 
     let announced = provider
         .announce_models()
-        .map_err(|e| format!("announce models from {}: {e}", args.engine))?;
+        .map_err(|e| format!("announce models from {engine_url}: {e}"))?;
     if announced == 0 {
         // Not fatal — the operator may pull models later — but the node serves nothing
         // until something is advertised, so make the silence visible.
         eprintln!(
-            "openhydra-agent: WARNING — engine {} reported 0 models; serving nothing until \
-             models are pulled and the node re-announces (restart to re-detect)",
-            args.engine,
+            "openhydra-agent: WARNING — engine {engine_url} reported 0 models; serving nothing \
+             until models are pulled and the node re-announces (restart to re-detect)",
         );
     } else {
-        eprintln!("openhydra-agent: announced {announced} model(s) from {}", args.engine);
+        eprintln!("openhydra-agent: announced {announced} model(s) from {engine_url}");
     }
 
     eprintln!(
