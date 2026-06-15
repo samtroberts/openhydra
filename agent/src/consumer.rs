@@ -136,8 +136,14 @@ pub fn request_completion(
     for chunk in parse_response(&response)? {
         match chunk {
             ServeChunk::Delta(text) => on_delta(&text),
-            ServeChunk::Done { tokens, gen_ns } => {
-                return Ok(ServeSummary { tokens, ok: true, gen_ns })
+            ServeChunk::Done { tokens, metrics } => {
+                return Ok(ServeSummary {
+                    tokens,
+                    ok: true,
+                    metrics,
+                    discover_ns: 0,
+                    proxy_roundtrip_ns: 0,
+                })
             }
             ServeChunk::Error(msg) => return Err(AdapterError::Http(msg)),
         }
@@ -178,6 +184,7 @@ impl ConsumerNode {
             .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         let candidates = rank_providers(&peers, "", self.tier);
+        let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
             return Err(AdapterError::Http(format!("no provider for model '{model}'")));
@@ -199,15 +206,21 @@ impl ConsumerNode {
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             let t_serve = std::time::Instant::now();
+            let mut proxy_roundtrip_ns = 0u64;
             let result = {
+                let rt = &mut proxy_roundtrip_ns;
                 let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-                    self.net
+                    let t = std::time::Instant::now();
+                    let r = self
+                        .net
                         .proxy_forward_timeout(
                             provider_libp2p.clone(),
                             framed.to_vec(),
                             ATTEMPT_TIMEOUT,
                         )
-                        .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
+                        .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")));
+                    *rt = t.elapsed().as_nanos() as u64;
+                    r
                 };
                 let mut guarded = |d: &str| {
                     delivered = true;
@@ -216,7 +229,9 @@ impl ConsumerNode {
                 request_completion(&mut transport, &request, &mut guarded)
             };
             match result {
-                Ok(summary) => {
+                Ok(mut summary) => {
+                    summary.discover_ns = discover_ns;
+                    summary.proxy_roundtrip_ns = proxy_roundtrip_ns;
                     tracing::debug!(elapsed = ?t_serve.elapsed(), attempt = i + 1, "serve ok");
                     // Settle the co-signed receipt at EOS (best-effort — tokens already
                     // delivered; a failed/slow settlement must not fail the completion).
@@ -305,7 +320,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true, gen_ns: 0 })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default() })
         }
     }
 
@@ -331,7 +346,8 @@ mod tests {
         let summary =
             request_completion(&mut transport, &request(), &mut |d| out.push_str(d)).unwrap();
         assert_eq!(out, "Hello world");
-        assert_eq!(summary, ServeSummary { tokens: 5, ok: true, gen_ns: 0 });
+        assert_eq!(summary.tokens, 5);
+        assert!(summary.ok);
     }
 
     #[test]

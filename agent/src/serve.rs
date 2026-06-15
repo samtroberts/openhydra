@@ -24,7 +24,18 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::adapter::{AdapterError, ChatMessage, EngineAdapter, InferenceRequest};
+use crate::adapter::{AdapterError, ChatMessage, EngineAdapter, EngineMetrics, InferenceRequest};
+
+/// Per-request metrics carried on the terminal `Done` frame: the engine's own numbers
+/// plus the provider's serve-side wall time (so the consumer can separate network RTT
+/// from provider processing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServeMetrics {
+    /// The engine's own per-request metrics (Ollama `eval_*`/`prompt_eval_*`/`load_*`).
+    pub engine: EngineMetrics,
+    /// Provider wall time inside `serve_stream` (engine HTTP call + reading its stream), ns.
+    pub provider_serve_ns: u64,
+}
 
 /// A consumer's request for a provider to serve a streaming completion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,8 +73,8 @@ pub enum ServeChunk {
     /// A text fragment of the completion.
     Delta(String),
     /// End of stream + the completion token count (for the co-signed receipt) and the
-    /// engine's native generation time in ns (for native-TPS reporting; 0 if unknown).
-    Done { tokens: u64, gen_ns: u64 },
+    /// per-request [`ServeMetrics`] (engine numbers + provider serve time).
+    Done { tokens: u64, metrics: ServeMetrics },
     /// The provider/engine failed; the stream ends with this instead of `Done`.
     Error(String),
 }
@@ -77,11 +88,14 @@ impl ServeChunk {
                 b.extend_from_slice(s.as_bytes());
                 b
             }
-            ServeChunk::Done { tokens, gen_ns } => {
-                let mut b = Vec::with_capacity(17);
+            ServeChunk::Done { tokens, metrics } => {
+                // tag · u64 tokens · JSON(metrics). One frame per request, so JSON's fine
+                // and keeps the metric set extensible.
+                let json = serde_json::to_vec(metrics).unwrap_or_default();
+                let mut b = Vec::with_capacity(9 + json.len());
                 b.push(TAG_DONE);
                 b.extend_from_slice(&tokens.to_le_bytes());
-                b.extend_from_slice(&gen_ns.to_le_bytes());
+                b.extend_from_slice(&json);
                 b
             }
             ServeChunk::Error(s) => {
@@ -98,15 +112,11 @@ impl ServeChunk {
             Some(&TAG_DELTA) => Ok(ServeChunk::Delta(
                 String::from_utf8_lossy(&bytes[1..]).into_owned(),
             )),
-            Some(&TAG_DONE) if bytes.len() >= 17 => {
+            Some(&TAG_DONE) if bytes.len() >= 9 => {
                 let mut t = [0u8; 8];
                 t.copy_from_slice(&bytes[1..9]);
-                let mut g = [0u8; 8];
-                g.copy_from_slice(&bytes[9..17]);
-                Ok(ServeChunk::Done {
-                    tokens: u64::from_le_bytes(t),
-                    gen_ns: u64::from_le_bytes(g),
-                })
+                let metrics = serde_json::from_slice(&bytes[9..]).unwrap_or_default();
+                Ok(ServeChunk::Done { tokens: u64::from_le_bytes(t), metrics })
             }
             Some(&TAG_ERROR) => Ok(ServeChunk::Error(
                 String::from_utf8_lossy(&bytes[1..]).into_owned(),
@@ -123,9 +133,13 @@ pub struct ServeSummary {
     pub tokens: u64,
     /// Whether the stream completed cleanly (vs ending in an error frame).
     pub ok: bool,
-    /// Engine's native generation time in ns (Ollama `eval_duration`), 0 if unknown.
-    /// `tokens / (gen_ns/1e9)` = native engine TPS.
-    pub gen_ns: u64,
+    /// Engine + provider-serve metrics from the `Done` frame.
+    pub metrics: ServeMetrics,
+    /// Consumer-side: time spent in `discover` (ns). Set by the consumer; 0 provider-side.
+    pub discover_ns: u64,
+    /// Consumer-side: the `proxy_forward` round-trip (ns) = network RTT + provider serve.
+    /// Set by the consumer; 0 provider-side.
+    pub proxy_roundtrip_ns: u64,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -144,7 +158,13 @@ pub fn handle_serve_request(
         Ok(r) => r,
         Err(e) => {
             send_chunk(&ServeChunk::Error(format!("bad serve request: {e}")).encode());
-            return ServeSummary { tokens: 0, ok: false, gen_ns: 0 };
+            return ServeSummary {
+                tokens: 0,
+                ok: false,
+                metrics: ServeMetrics::default(),
+                discover_ns: 0,
+                proxy_roundtrip_ns: 0,
+            };
         }
     };
 
@@ -156,20 +176,30 @@ pub fn handle_serve_request(
     };
 
     // Scope the delta sink so its &mut borrow of `send_chunk` ends before the terminal
-    // Done/Error frame is sent.
+    // Done/Error frame is sent. Time the whole serve so the consumer can separate network
+    // RTT from provider-side processing.
+    let serve_start = std::time::Instant::now();
     let outcome = {
         let mut on_delta = |d: &str| send_chunk(&ServeChunk::Delta(d.to_string()).encode());
         adapter.serve_stream(&infer, &mut on_delta)
     };
+    let provider_serve_ns = serve_start.elapsed().as_nanos() as u64;
 
     match outcome {
         Ok(o) => {
-            send_chunk(&ServeChunk::Done { tokens: o.tokens, gen_ns: o.gen_ns }.encode());
-            ServeSummary { tokens: o.tokens, ok: true, gen_ns: o.gen_ns }
+            let metrics = ServeMetrics { engine: o.engine, provider_serve_ns };
+            send_chunk(&ServeChunk::Done { tokens: o.tokens, metrics }.encode());
+            ServeSummary { tokens: o.tokens, ok: true, metrics, discover_ns: 0, proxy_roundtrip_ns: 0 }
         }
         Err(e) => {
             send_chunk(&ServeChunk::Error(e.to_string()).encode());
-            ServeSummary { tokens: 0, ok: false, gen_ns: 0 }
+            ServeSummary {
+                tokens: 0,
+                ok: false,
+                metrics: ServeMetrics { provider_serve_ns, ..Default::default() },
+                discover_ns: 0,
+                proxy_roundtrip_ns: 0,
+            }
         }
     }
 }
@@ -246,7 +276,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true, gen_ns: 0 })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default() })
         }
     }
 
@@ -268,7 +298,13 @@ mod tests {
     fn serve_chunk_round_trips_each_variant() {
         for c in [
             ServeChunk::Delta("héllo".into()), // multi-byte utf8
-            ServeChunk::Done { tokens: 4096, gen_ns: 1_234_567 },
+            ServeChunk::Done {
+                tokens: 4096,
+                metrics: ServeMetrics {
+                    engine: EngineMetrics { eval_count: 4096, eval_duration_ns: 1_234_567, ..Default::default() },
+                    provider_serve_ns: 9_000,
+                },
+            },
             ServeChunk::Error("boom".into()),
         ] {
             assert_eq!(ServeChunk::decode(&c.encode()).unwrap(), c);
@@ -283,16 +319,14 @@ mod tests {
             fail: None,
         };
         let (frames, summary) = collect_chunks(&req("c").encode(), &adapter);
-        assert_eq!(
-            frames,
-            vec![
-                ServeChunk::Delta("Hello".into()),
-                ServeChunk::Delta(", ".into()),
-                ServeChunk::Delta("world".into()),
-                ServeChunk::Done { tokens: 9, gen_ns: 0 },
-            ]
-        );
-        assert_eq!(summary, ServeSummary { tokens: 9, ok: true, gen_ns: 0 });
+        // The metrics' provider_serve_ns is wall-timed, so check the deltas + Done.tokens
+        // structurally rather than comparing the whole metrics struct.
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0], ServeChunk::Delta("Hello".into()));
+        assert_eq!(frames[2], ServeChunk::Delta("world".into()));
+        assert!(matches!(frames[3], ServeChunk::Done { tokens: 9, .. }));
+        assert_eq!(summary.tokens, 9);
+        assert!(summary.ok);
     }
 
     #[test]
@@ -309,7 +343,7 @@ mod tests {
         let chunks: Vec<Vec<u8>> = vec![
             ServeChunk::Delta("Hi".into()).encode(),
             ServeChunk::Delta(" there".into()).encode(),
-            ServeChunk::Done { tokens: 2, gen_ns: 99 }.encode(),
+            ServeChunk::Done { tokens: 2, metrics: ServeMetrics::default() }.encode(),
         ];
         let parsed = parse_response(&frame_response(&chunks)).unwrap();
         assert_eq!(
@@ -317,7 +351,7 @@ mod tests {
             vec![
                 ServeChunk::Delta("Hi".into()),
                 ServeChunk::Delta(" there".into()),
-                ServeChunk::Done { tokens: 2, gen_ns: 99 },
+                ServeChunk::Done { tokens: 2, metrics: ServeMetrics::default() },
             ]
         );
         assert!(parse_response(b"\xff\xff\xff\xff").is_err()); // truncated chunk body

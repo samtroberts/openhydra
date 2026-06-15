@@ -251,7 +251,7 @@ mod tests {
         ) -> Result<ServeOutcome, AdapterError> {
             on_delta("Hello");
             on_delta(" world");
-            Ok(ServeOutcome { tokens: 5, done: true, gen_ns: 0 })
+            Ok(ServeOutcome { tokens: 5, done: true, engine: Default::default() })
         }
     }
 
@@ -272,14 +272,10 @@ mod tests {
     fn serves_an_inbound_request_into_a_framed_completion() {
         let response = handle_serve_inbound(&serve_request_bytes(), &StubAdapter);
         let chunks = parse_response(&response).unwrap();
-        assert_eq!(
-            chunks,
-            vec![
-                ServeChunk::Delta("Hello".into()),
-                ServeChunk::Delta(" world".into()),
-                ServeChunk::Done { tokens: 5, gen_ns: 0 },
-            ]
-        );
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], ServeChunk::Delta("Hello".into()));
+        assert_eq!(chunks[1], ServeChunk::Delta(" world".into()));
+        assert!(matches!(chunks[2], ServeChunk::Done { tokens: 5, .. }));
     }
 
     #[test]

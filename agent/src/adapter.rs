@@ -77,6 +77,26 @@ pub struct InferenceRequest {
     pub temperature: Option<f64>,
 }
 
+/// Raw counters/timings the engine itself reports for one request — Ollama's
+/// `total_duration` / `load_duration` / `prompt_eval_*` / `eval_*`. All durations are
+/// nanoseconds; 0 where the engine reports nothing. This is the **provider-local ground
+/// truth**: the pipeline cannot change these numbers, only add transport overhead on top.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineMetrics {
+    /// Whole-request time on the engine (load + prefill + generation + its own overhead).
+    pub total_duration_ns: u64,
+    /// Time to load the model into memory/VRAM (large on a cold start, ~0 when warm).
+    pub load_duration_ns: u64,
+    /// Prompt (input) tokens.
+    pub prompt_eval_count: u64,
+    /// Prefill time — evaluating the prompt before the first output token.
+    pub prompt_eval_duration_ns: u64,
+    /// Generated (output) tokens.
+    pub eval_count: u64,
+    /// Generation time for the output tokens (the basis for native gen-TPS).
+    pub eval_duration_ns: u64,
+}
+
 /// The result of a served stream, after the last token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServeOutcome {
@@ -86,10 +106,8 @@ pub struct ServeOutcome {
     pub tokens: u64,
     /// Whether the engine signalled a clean end-of-stream (vs the stream just ending).
     pub done: bool,
-    /// The engine's own generation time in nanoseconds (Ollama `eval_duration`), or 0 if
-    /// not reported. `tokens / (gen_ns/1e9)` is the **native** engine TPS — distinct from
-    /// the pipeline's end-to-end TPS (which folds in discovery + transport).
-    pub gen_ns: u64,
+    /// The engine's own per-request metrics (Ollama `eval_*`/`prompt_eval_*`/`load_*`).
+    pub engine: EngineMetrics,
 }
 
 /// A model an engine currently serves, ready to advertise to the swarm.

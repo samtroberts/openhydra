@@ -56,16 +56,29 @@ enum GatewayEvent {
     Error(String),
 }
 
-/// Build the terminal `chat.completion.chunk` carrying `finish_reason:stop` plus an
-/// `openhydra` block with both TPS figures: the engine's **native** rate (from Ollama's
-/// `eval_duration`) and OpenHydra's **pipeline** rate (tokens ÷ end-to-end wall, which
-/// folds in discovery + transport overhead).
+/// Build the terminal `chat.completion.chunk` with `finish_reason:stop` plus an
+/// `openhydra` block carrying three views of one request:
+/// * **engine** — Ollama's own ground-truth numbers (native/prefill TPS, prompt tokens,
+///   load/prefill/eval/total times). The pipeline can't change these.
+/// * **pipeline** — OpenHydra's end-to-end view (pipeline TPS, wall, overhead vs the
+///   engine total, and consumer-observed TTFT — which equals wall under the buffered
+///   transport, since the consumer gets nothing until generation finishes).
+/// * **hops_ms** — where the wall-clock goes: discover · proxy round-trip · provider
+///   serve · inferred network RTT (round-trip − provider serve) · gateway overhead.
 fn metrics_chunk(id: &str, model: &str, summary: &ServeSummary, wall: std::time::Duration) -> String {
-    let wall_s = wall.as_secs_f64();
-    let gen_s = summary.gen_ns as f64 / 1e9;
-    let native_tps = if gen_s > 0.0 { summary.tokens as f64 / gen_s } else { 0.0 };
-    let pipeline_tps = if wall_s > 0.0 { summary.tokens as f64 / wall_s } else { 0.0 };
-    let overhead_ms = (wall_s - gen_s) * 1000.0;
+    let e = &summary.metrics.engine;
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let ms = |ns: u64| ns / 1_000_000;
+    let tps = |n: u64, dur_ns: u64| if dur_ns > 0 { n as f64 / (dur_ns as f64 / 1e9) } else { 0.0 };
+
+    let wall_ns = wall.as_nanos() as u64;
+    let provider_serve_ns = summary.metrics.provider_serve_ns;
+    let net_rtt_ns = summary.proxy_roundtrip_ns.saturating_sub(provider_serve_ns);
+    let gateway_ns = wall_ns
+        .saturating_sub(summary.proxy_roundtrip_ns)
+        .saturating_sub(summary.discover_ns);
+    let pipeline_tps = if wall_ns > 0 { summary.tokens as f64 / (wall_ns as f64 / 1e9) } else { 0.0 };
+
     serde_json::json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -73,11 +86,28 @@ fn metrics_chunk(id: &str, model: &str, summary: &ServeSummary, wall: std::time:
         "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
         "openhydra": {
             "tokens": summary.tokens,
-            "native_tps": (native_tps * 10.0).round() / 10.0,
-            "pipeline_tps": (pipeline_tps * 10.0).round() / 10.0,
-            "engine_gen_ms": (gen_s * 1000.0).round() as u64,
-            "wall_ms": (wall_s * 1000.0).round() as u64,
-            "overhead_ms": overhead_ms.round() as i64,
+            "engine": {
+                "native_tps": r1(tps(e.eval_count, e.eval_duration_ns)),
+                "prefill_tps": r1(tps(e.prompt_eval_count, e.prompt_eval_duration_ns)),
+                "prompt_tokens": e.prompt_eval_count,
+                "load_ms": ms(e.load_duration_ns),
+                "prompt_eval_ms": ms(e.prompt_eval_duration_ns),
+                "eval_ms": ms(e.eval_duration_ns),
+                "engine_total_ms": ms(e.total_duration_ns),
+            },
+            "pipeline": {
+                "pipeline_tps": r1(pipeline_tps),
+                "wall_ms": ms(wall_ns),
+                "overhead_ms": ms(wall_ns.saturating_sub(e.total_duration_ns)),
+                "ttft_ms": ms(wall_ns), // buffered transport: no token reaches the client until done
+            },
+            "hops_ms": {
+                "discover": ms(summary.discover_ns),
+                "proxy_roundtrip": ms(summary.proxy_roundtrip_ns),
+                "provider_serve": ms(provider_serve_ns),
+                "network_rtt": ms(net_rtt_ns),
+                "gateway_overhead": ms(gateway_ns),
+            },
         },
     })
     .to_string()
@@ -149,8 +179,9 @@ async fn chat_completions(
             GatewayEvent::Delta(t) => chunk_json(&id_s, &model_s, Some(&t), None),
             GatewayEvent::Done(summary) => {
                 let wall = started.elapsed();
-                let native = if summary.gen_ns > 0 {
-                    summary.tokens as f64 / (summary.gen_ns as f64 / 1e9)
+                let eval_ns = summary.metrics.engine.eval_duration_ns;
+                let native = if eval_ns > 0 {
+                    summary.metrics.engine.eval_count as f64 / (eval_ns as f64 / 1e9)
                 } else {
                     0.0
                 };
@@ -160,6 +191,8 @@ async fn chat_completions(
                     native_tps = native,
                     pipeline_tps = pipeline,
                     wall_ms = wall.as_millis() as u64,
+                    provider_serve_ms = summary.metrics.provider_serve_ns / 1_000_000,
+                    proxy_roundtrip_ms = summary.proxy_roundtrip_ns / 1_000_000,
                     "completion done"
                 );
                 metrics_chunk(&id_s, &model_s, &summary, wall)

@@ -75,11 +75,19 @@ struct ChatStreamChunk {
     message: ChatStreamMessage,
     #[serde(default)]
     done: bool,
+    // Engine metrics — all present on the final (`done`) chunk.
     #[serde(default)]
     eval_count: Option<u64>,
-    /// Generation time in nanoseconds (final chunk) — the engine's native gen TPS basis.
     #[serde(default)]
     eval_duration: Option<u64>,
+    #[serde(default)]
+    total_duration: Option<u64>,
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
     /// Present when Ollama returns an error mid-stream.
     #[serde(default)]
     error: Option<String>,
@@ -223,7 +231,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
 
         let mut chunk_tokens = 0u64;
         let mut eval_count = None;
-        let mut eval_duration = None;
+        let mut engine = crate::adapter::EngineMetrics::default();
         let mut done = false;
         for line in lines {
             let line = line?;
@@ -235,11 +243,15 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
                 on_delta(&chunk.message.content);
                 chunk_tokens += 1;
             }
+            // The metrics all arrive together on the final chunk.
             if chunk.eval_count.is_some() {
-                eval_count = chunk.eval_count; // authoritative count on the final chunk
-            }
-            if chunk.eval_duration.is_some() {
-                eval_duration = chunk.eval_duration; // engine's own gen time (final chunk)
+                eval_count = chunk.eval_count; // authoritative count
+                engine.eval_count = chunk.eval_count.unwrap_or(0);
+                engine.eval_duration_ns = chunk.eval_duration.unwrap_or(0);
+                engine.total_duration_ns = chunk.total_duration.unwrap_or(0);
+                engine.load_duration_ns = chunk.load_duration.unwrap_or(0);
+                engine.prompt_eval_count = chunk.prompt_eval_count.unwrap_or(0);
+                engine.prompt_eval_duration_ns = chunk.prompt_eval_duration.unwrap_or(0);
             }
             if chunk.done {
                 done = true;
@@ -249,7 +261,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         Ok(ServeOutcome {
             tokens: eval_count.unwrap_or(chunk_tokens),
             done,
-            gen_ns: eval_duration.unwrap_or(0),
+            engine,
         })
     }
 }
