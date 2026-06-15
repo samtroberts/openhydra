@@ -136,7 +136,9 @@ pub fn request_completion(
     for chunk in parse_response(&response)? {
         match chunk {
             ServeChunk::Delta(text) => on_delta(&text),
-            ServeChunk::Done { tokens } => return Ok(ServeSummary { tokens, ok: true }),
+            ServeChunk::Done { tokens, gen_ns } => {
+                return Ok(ServeSummary { tokens, ok: true, gen_ns })
+            }
             ServeChunk::Error(msg) => return Err(AdapterError::Http(msg)),
         }
     }
@@ -303,7 +305,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, gen_ns: 0 })
         }
     }
 
@@ -329,7 +331,7 @@ mod tests {
         let summary =
             request_completion(&mut transport, &request(), &mut |d| out.push_str(d)).unwrap();
         assert_eq!(out, "Hello world");
-        assert_eq!(summary, ServeSummary { tokens: 5, ok: true });
+        assert_eq!(summary, ServeSummary { tokens: 5, ok: true, gen_ns: 0 });
     }
 
     #[test]

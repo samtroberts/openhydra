@@ -251,7 +251,7 @@ mod tests {
         ) -> Result<ServeOutcome, AdapterError> {
             on_delta("Hello");
             on_delta(" world");
-            Ok(ServeOutcome { tokens: 5, done: true })
+            Ok(ServeOutcome { tokens: 5, done: true, gen_ns: 0 })
         }
     }
 
@@ -277,7 +277,7 @@ mod tests {
             vec![
                 ServeChunk::Delta("Hello".into()),
                 ServeChunk::Delta(" world".into()),
-                ServeChunk::Done { tokens: 5 },
+                ServeChunk::Done { tokens: 5, gen_ns: 0 },
             ]
         );
     }

@@ -61,8 +61,9 @@ const TAG_ERROR: u8 = 0x03;
 pub enum ServeChunk {
     /// A text fragment of the completion.
     Delta(String),
-    /// End of stream + the completion token count (for the co-signed receipt).
-    Done { tokens: u64 },
+    /// End of stream + the completion token count (for the co-signed receipt) and the
+    /// engine's native generation time in ns (for native-TPS reporting; 0 if unknown).
+    Done { tokens: u64, gen_ns: u64 },
     /// The provider/engine failed; the stream ends with this instead of `Done`.
     Error(String),
 }
@@ -76,10 +77,11 @@ impl ServeChunk {
                 b.extend_from_slice(s.as_bytes());
                 b
             }
-            ServeChunk::Done { tokens } => {
-                let mut b = Vec::with_capacity(9);
+            ServeChunk::Done { tokens, gen_ns } => {
+                let mut b = Vec::with_capacity(17);
                 b.push(TAG_DONE);
                 b.extend_from_slice(&tokens.to_le_bytes());
+                b.extend_from_slice(&gen_ns.to_le_bytes());
                 b
             }
             ServeChunk::Error(s) => {
@@ -96,10 +98,15 @@ impl ServeChunk {
             Some(&TAG_DELTA) => Ok(ServeChunk::Delta(
                 String::from_utf8_lossy(&bytes[1..]).into_owned(),
             )),
-            Some(&TAG_DONE) if bytes.len() >= 9 => {
+            Some(&TAG_DONE) if bytes.len() >= 17 => {
                 let mut t = [0u8; 8];
                 t.copy_from_slice(&bytes[1..9]);
-                Ok(ServeChunk::Done { tokens: u64::from_le_bytes(t) })
+                let mut g = [0u8; 8];
+                g.copy_from_slice(&bytes[9..17]);
+                Ok(ServeChunk::Done {
+                    tokens: u64::from_le_bytes(t),
+                    gen_ns: u64::from_le_bytes(g),
+                })
             }
             Some(&TAG_ERROR) => Ok(ServeChunk::Error(
                 String::from_utf8_lossy(&bytes[1..]).into_owned(),
@@ -116,6 +123,9 @@ pub struct ServeSummary {
     pub tokens: u64,
     /// Whether the stream completed cleanly (vs ending in an error frame).
     pub ok: bool,
+    /// Engine's native generation time in ns (Ollama `eval_duration`), 0 if unknown.
+    /// `tokens / (gen_ns/1e9)` = native engine TPS.
+    pub gen_ns: u64,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -134,7 +144,7 @@ pub fn handle_serve_request(
         Ok(r) => r,
         Err(e) => {
             send_chunk(&ServeChunk::Error(format!("bad serve request: {e}")).encode());
-            return ServeSummary { tokens: 0, ok: false };
+            return ServeSummary { tokens: 0, ok: false, gen_ns: 0 };
         }
     };
 
@@ -154,12 +164,12 @@ pub fn handle_serve_request(
 
     match outcome {
         Ok(o) => {
-            send_chunk(&ServeChunk::Done { tokens: o.tokens }.encode());
-            ServeSummary { tokens: o.tokens, ok: true }
+            send_chunk(&ServeChunk::Done { tokens: o.tokens, gen_ns: o.gen_ns }.encode());
+            ServeSummary { tokens: o.tokens, ok: true, gen_ns: o.gen_ns }
         }
         Err(e) => {
             send_chunk(&ServeChunk::Error(e.to_string()).encode());
-            ServeSummary { tokens: 0, ok: false }
+            ServeSummary { tokens: 0, ok: false, gen_ns: 0 }
         }
     }
 }
@@ -236,7 +246,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, gen_ns: 0 })
         }
     }
 
@@ -258,7 +268,7 @@ mod tests {
     fn serve_chunk_round_trips_each_variant() {
         for c in [
             ServeChunk::Delta("héllo".into()), // multi-byte utf8
-            ServeChunk::Done { tokens: 4096 },
+            ServeChunk::Done { tokens: 4096, gen_ns: 1_234_567 },
             ServeChunk::Error("boom".into()),
         ] {
             assert_eq!(ServeChunk::decode(&c.encode()).unwrap(), c);
@@ -279,10 +289,10 @@ mod tests {
                 ServeChunk::Delta("Hello".into()),
                 ServeChunk::Delta(", ".into()),
                 ServeChunk::Delta("world".into()),
-                ServeChunk::Done { tokens: 9 },
+                ServeChunk::Done { tokens: 9, gen_ns: 0 },
             ]
         );
-        assert_eq!(summary, ServeSummary { tokens: 9, ok: true });
+        assert_eq!(summary, ServeSummary { tokens: 9, ok: true, gen_ns: 0 });
     }
 
     #[test]
@@ -299,7 +309,7 @@ mod tests {
         let chunks: Vec<Vec<u8>> = vec![
             ServeChunk::Delta("Hi".into()).encode(),
             ServeChunk::Delta(" there".into()).encode(),
-            ServeChunk::Done { tokens: 2 }.encode(),
+            ServeChunk::Done { tokens: 2, gen_ns: 99 }.encode(),
         ];
         let parsed = parse_response(&frame_response(&chunks)).unwrap();
         assert_eq!(
@@ -307,7 +317,7 @@ mod tests {
             vec![
                 ServeChunk::Delta("Hi".into()),
                 ServeChunk::Delta(" there".into()),
-                ServeChunk::Done { tokens: 2 },
+                ServeChunk::Done { tokens: 2, gen_ns: 99 },
             ]
         );
         assert!(parse_response(b"\xff\xff\xff\xff").is_err()); // truncated chunk body

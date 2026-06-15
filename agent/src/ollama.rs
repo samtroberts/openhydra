@@ -77,6 +77,9 @@ struct ChatStreamChunk {
     done: bool,
     #[serde(default)]
     eval_count: Option<u64>,
+    /// Generation time in nanoseconds (final chunk) — the engine's native gen TPS basis.
+    #[serde(default)]
+    eval_duration: Option<u64>,
     /// Present when Ollama returns an error mid-stream.
     #[serde(default)]
     error: Option<String>,
@@ -220,6 +223,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
 
         let mut chunk_tokens = 0u64;
         let mut eval_count = None;
+        let mut eval_duration = None;
         let mut done = false;
         for line in lines {
             let line = line?;
@@ -234,6 +238,9 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
             if chunk.eval_count.is_some() {
                 eval_count = chunk.eval_count; // authoritative count on the final chunk
             }
+            if chunk.eval_duration.is_some() {
+                eval_duration = chunk.eval_duration; // engine's own gen time (final chunk)
+            }
             if chunk.done {
                 done = true;
                 break;
@@ -242,6 +249,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         Ok(ServeOutcome {
             tokens: eval_count.unwrap_or(chunk_tokens),
             done,
+            gen_ns: eval_duration.unwrap_or(0),
         })
     }
 }

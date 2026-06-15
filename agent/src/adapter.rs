@@ -86,6 +86,10 @@ pub struct ServeOutcome {
     pub tokens: u64,
     /// Whether the engine signalled a clean end-of-stream (vs the stream just ending).
     pub done: bool,
+    /// The engine's own generation time in nanoseconds (Ollama `eval_duration`), or 0 if
+    /// not reported. `tokens / (gen_ns/1e9)` is the **native** engine TPS — distinct from
+    /// the pipeline's end-to-end TPS (which folds in discovery + transport).
+    pub gen_ns: u64,
 }
 
 /// A model an engine currently serves, ready to advertise to the swarm.

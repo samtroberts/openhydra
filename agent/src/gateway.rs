@@ -31,6 +31,7 @@ use openhydra_network::handle::NetworkHandle;
 
 use crate::adapter::ChatMessage;
 use crate::consumer::ConsumerNode;
+use crate::serve::ServeSummary;
 
 #[derive(Clone)]
 struct AppState {
@@ -51,8 +52,35 @@ struct ChatRequest {
 /// What the worker thread sends back as the completion progresses.
 enum GatewayEvent {
     Delta(String),
-    Done,
+    Done(ServeSummary),
     Error(String),
+}
+
+/// Build the terminal `chat.completion.chunk` carrying `finish_reason:stop` plus an
+/// `openhydra` block with both TPS figures: the engine's **native** rate (from Ollama's
+/// `eval_duration`) and OpenHydra's **pipeline** rate (tokens ÷ end-to-end wall, which
+/// folds in discovery + transport overhead).
+fn metrics_chunk(id: &str, model: &str, summary: &ServeSummary, wall: std::time::Duration) -> String {
+    let wall_s = wall.as_secs_f64();
+    let gen_s = summary.gen_ns as f64 / 1e9;
+    let native_tps = if gen_s > 0.0 { summary.tokens as f64 / gen_s } else { 0.0 };
+    let pipeline_tps = if wall_s > 0.0 { summary.tokens as f64 / wall_s } else { 0.0 };
+    let overhead_ms = (wall_s - gen_s) * 1000.0;
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+        "openhydra": {
+            "tokens": summary.tokens,
+            "native_tps": (native_tps * 10.0).round() / 10.0,
+            "pipeline_tps": (pipeline_tps * 10.0).round() / 10.0,
+            "engine_gen_ms": (gen_s * 1000.0).round() as u64,
+            "wall_ms": (wall_s * 1000.0).round() as u64,
+            "overhead_ms": overhead_ms.round() as i64,
+        },
+    })
+    .to_string()
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -89,6 +117,7 @@ async fn chat_completions(
 ) -> impl IntoResponse {
     let id = format!("chatcmpl-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed));
     let model = req.model.clone();
+    let started = std::time::Instant::now();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
 
     let node = state.node.clone();
@@ -104,8 +133,8 @@ async fn chat_completions(
             req.temperature,
             &mut on_delta,
         ) {
-            Ok(_summary) => {
-                let _ = tx.send(GatewayEvent::Done);
+            Ok(summary) => {
+                let _ = tx.send(GatewayEvent::Done(summary));
             }
             Err(e) => {
                 let _ = tx.send(GatewayEvent::Error(e.to_string()));
@@ -118,7 +147,23 @@ async fn chat_completions(
     let body = UnboundedReceiverStream::new(rx).map(move |ev| {
         let data = match ev {
             GatewayEvent::Delta(t) => chunk_json(&id_s, &model_s, Some(&t), None),
-            GatewayEvent::Done => chunk_json(&id_s, &model_s, None, Some("stop")),
+            GatewayEvent::Done(summary) => {
+                let wall = started.elapsed();
+                let native = if summary.gen_ns > 0 {
+                    summary.tokens as f64 / (summary.gen_ns as f64 / 1e9)
+                } else {
+                    0.0
+                };
+                let pipeline = summary.tokens as f64 / wall.as_secs_f64().max(1e-9);
+                tracing::info!(
+                    tokens = summary.tokens,
+                    native_tps = native,
+                    pipeline_tps = pipeline,
+                    wall_ms = wall.as_millis() as u64,
+                    "completion done"
+                );
+                metrics_chunk(&id_s, &model_s, &summary, wall)
+            }
             GatewayEvent::Error(m) => error_json(&id_s, &model_s, &m),
         };
         Ok::<Event, std::convert::Infallible>(Event::default().data(data))
