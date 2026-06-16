@@ -65,6 +65,13 @@ struct NodeArgs {
     /// Opt into acting as a temporary circuit-relay for other peers (off by default).
     #[arg(long)]
     peer_relay: bool,
+
+    /// Experimental: Tier-2 connection reversal — when this node holds only a relayed
+    /// connection to a peer that advertises globally-routable direct addresses, dial
+    /// those directly to escape the relay (off by default). The one NAT escape that
+    /// works on symmetric CGNAT. See docs/PEER_CONNECTIVITY.md.
+    #[arg(long)]
+    connection_reversal: bool,
 }
 
 impl NodeArgs {
@@ -72,6 +79,7 @@ impl NodeArgs {
     fn into_config(self) -> NodeConfig {
         let mut config = NodeConfig {
             enable_peer_relay: self.peer_relay,
+            enable_connection_reversal: self.connection_reversal,
             bootstrap_peers: self.bootstrap,
             ..NodeConfig::default()
         };

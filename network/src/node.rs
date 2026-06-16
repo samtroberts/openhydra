@@ -32,6 +32,12 @@ pub struct NodeConfig {
     pub bootstrap_peers: Vec<String>,
     /// WS-F F-4: opt into being a temporary peer-relay (off by default).
     pub enable_peer_relay: bool,
+    /// Tier-2 connection reversal (off by default): when this node holds only a
+    /// relayed connection to a peer that advertises globally-routable direct
+    /// addresses, dial those directly to escape the relay. The one NAT-escape that
+    /// works on symmetric CGNAT (our outbound dial traverses our own NAT), where
+    /// DCUtR's simultaneous-open cannot. See docs/PEER_CONNECTIVITY.md.
+    pub enable_connection_reversal: bool,
 }
 
 impl Default for NodeConfig {
@@ -51,6 +57,7 @@ impl Default for NodeConfig {
             ],
             bootstrap_peers: Vec::new(),
             enable_peer_relay: false,
+            enable_connection_reversal: false,
         }
     }
 }
@@ -87,6 +94,7 @@ pub fn start_node(
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
+    let enable_connection_reversal = config.enable_connection_reversal; // Tier-2 (captured into the thread)
 
     // R-DHT-6: persist/reload the routing table beside the identity key. Derived
     // here (config is a borrow that can't move into the thread) and handed to the
@@ -126,7 +134,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, stream_control, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));

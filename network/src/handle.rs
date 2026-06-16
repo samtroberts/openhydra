@@ -187,6 +187,7 @@ mod tests {
             ],
             bootstrap_peers: vec![],
             enable_peer_relay: false,
+            enable_connection_reversal: false,
         }
     }
 

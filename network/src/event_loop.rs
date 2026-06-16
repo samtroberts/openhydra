@@ -445,6 +445,15 @@ struct LoopState {
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
+    /// Tier-2 connection reversal (off unless `NodeConfig.enable_connection_reversal`).
+    enable_connection_reversal: bool,
+    /// Per-peer reversal dial back-off (mirrors `quic_holepunch_attempts`).
+    reversal_attempts: HashMap<PeerId, u32>,
+    /// Peers we've reverse-dialed, awaiting a direct connection (the success signal).
+    reversal_pending: std::collections::HashSet<PeerId>,
+    /// KPI counters: reversal dials issued / relay→direct upgrades achieved.
+    reversal_dials: u64,
+    reversal_successes: u64,
     /// F-3: cumulative per-tier connection-success counts, keyed by the
     /// `connection_tier()` rung name. Surfaced via GetTierMetrics so operators
     /// can see which ladder rung (direct-v6 … relay) actually carries
@@ -601,6 +610,11 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
+            enable_connection_reversal: false,
+            reversal_attempts: HashMap::new(),
+            reversal_pending: std::collections::HashSet::new(),
+            reversal_dials: 0,
+            reversal_successes: 0,
             tier_connect_success: std::collections::HashMap::new(),
             peer_connections: HashMap::new(),
             local_proxy_replies: HashMap::new(),
@@ -644,6 +658,8 @@ pub async fn run_event_loop(
     // disables persistence (e.g. tests). Set by `start_node` to a file beside
     // the identity key.
     routing_cache_path: Option<std::path::PathBuf>,
+    // Tier-2 connection reversal flag (NodeConfig.enable_connection_reversal).
+    enable_connection_reversal: bool,
 ) {
     // CP-2: IPC response channel — spawned IPC tasks send (request_id, data)
     // back here so the event loop can forward via request_response.
@@ -656,6 +672,7 @@ pub async fn run_event_loop(
         mpsc::unbounded_channel::<RingEvent>();
 
     let mut state = LoopState::new(ipc_response_tx, ring_event_tx);
+    state.enable_connection_reversal = enable_connection_reversal;
     state.peer_relay_leech = peer_relay_leech; // WS-F F-4
 
     // Fix 1: set up persistent tensor streams.
@@ -1978,6 +1995,52 @@ fn handle_swarm_event(
                         }
                     }
                 }
+
+                // ── Connection reversal (Tier 2) ──
+                // If enabled and we hold no *direct* connection to this peer (only a
+                // relay), dial the globally-routable direct addresses they advertised.
+                // Our outbound dial traverses our own NAT even on symmetric CGNAT — the
+                // one escape DCUtR can't provide. Safe by construction: we only dial a
+                // peer we're already in an authenticated session with, only addrs libp2p
+                // surfaced via Identify, only globally-routable ones, with per-peer
+                // back-off. See docs/PEER_CONNECTIVITY.md.
+                if state.enable_connection_reversal {
+                    let has_direct = state
+                        .peer_connections
+                        .get(&peer_id)
+                        .is_some_and(|c| c.has_direct());
+                    if !has_direct {
+                        let candidates = reversal_candidate_addrs(
+                            &info.listen_addrs,
+                            state.ipv6_capable,
+                            &quic_v6_addrs,
+                        );
+                        if !candidates.is_empty() {
+                            const MAX_REVERSAL_ATTEMPTS: u32 = 3;
+                            let attempts = state.reversal_attempts.entry(peer_id).or_insert(0);
+                            if *attempts < MAX_REVERSAL_ATTEMPTS {
+                                *attempts += 1;
+                                state.reversal_pending.insert(peer_id);
+                                for addr in &candidates {
+                                    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+                                    let opts = DialOpts::peer_id(peer_id)
+                                        .addresses(vec![addr.clone()])
+                                        .condition(PeerCondition::Always)
+                                        .build();
+                                    match swarm.dial(opts) {
+                                        Ok(()) => {
+                                            state.reversal_dials += 1;
+                                            info!(%peer_id, %addr, "connection_reversal_dial");
+                                        }
+                                        Err(e) => {
+                                            debug!(%peer_id, %addr, %e, "connection_reversal_dial_failed")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2268,6 +2331,15 @@ fn handle_swarm_event(
             } else {
                 transport
             };
+
+            // Connection reversal: a *direct* connection to a peer we reverse-dialed
+            // is a relay→direct upgrade — count it and clear the back-off.
+            if transport != TransportType::TcpRelay && state.reversal_pending.remove(&peer_id) {
+                state.reversal_successes += 1;
+                state.reversal_attempts.remove(&peer_id);
+                info!(%peer_id, %addr_str, successes = state.reversal_successes,
+                    "connection_reversal_success");
+            }
 
             // F-3: count this established connection under its ladder tier.
             // Done before the peer_connections borrow below to keep the field
@@ -2908,6 +2980,61 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
 /// binary, which uses it to confirm its public *listen* addresses as external (a bootstrap
 /// is unambiguously public, so unlike a peer it may trust its listen addrs — see
 /// `bootstrap_bin`'s `NewListenAddr` handler).
+/// Tier-2 connection-reversal candidates: from a peer's advertised `listen_addrs`,
+/// the globally-routable, locally-dialable direct addresses to reverse-dial — minus
+/// any already handled elsewhere (`already_dialed`, e.g. the QUIC-v6 hole-punch set).
+/// Drops `/p2p-circuit` explicitly, plus (via `is_globally_reachable_addr`) private,
+/// CGNAT, loopback, link-local and ULA ranges; and IPv6 on a v6-incapable host.
+fn reversal_candidate_addrs(
+    listen_addrs: &[Multiaddr],
+    ipv6_capable: bool,
+    already_dialed: &[Multiaddr],
+) -> Vec<Multiaddr> {
+    listen_addrs
+        .iter()
+        .filter(|a| !already_dialed.contains(a))
+        .filter(|a| !a.to_string().contains("p2p-circuit"))
+        .filter(|a| ipv6_capable || !is_ipv6_multiaddr(a))
+        .filter(|a| is_globally_reachable_addr(a))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod reversal_tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn reversal_candidates_keep_only_routable_dialable_new_addrs() {
+        let listen = vec![
+            ma("/ip4/1.1.1.1/udp/4001/quic-v1"),            // public v4 → keep
+            ma("/ip4/192.168.1.5/tcp/4001"),                // private → drop
+            ma("/ip4/100.64.0.9/udp/4001/quic-v1"),         // CGNAT → drop
+            ma("/ip6/2606:4700:4700::1111/udp/4001/quic-v1"), // public v6
+            ma("/ip4/45.79.190.172/tcp/4001/p2p-circuit"),  // relay circuit → drop
+        ];
+
+        // v6-capable host, nothing pre-dialed → keep both public addrs.
+        let got = reversal_candidate_addrs(&listen, true, &[]);
+        assert!(got.contains(&ma("/ip4/1.1.1.1/udp/4001/quic-v1")));
+        assert!(got.contains(&ma("/ip6/2606:4700:4700::1111/udp/4001/quic-v1")));
+        assert_eq!(got.len(), 2);
+
+        // v6-incapable host drops the v6 addr.
+        let got4 = reversal_candidate_addrs(&listen, false, &[]);
+        assert_eq!(got4, vec![ma("/ip4/1.1.1.1/udp/4001/quic-v1")]);
+
+        // Already-dialed addrs are excluded (no double-dial vs the QUIC-v6 path).
+        let pre = vec![ma("/ip6/2606:4700:4700::1111/udp/4001/quic-v1")];
+        let got_excl = reversal_candidate_addrs(&listen, true, &pre);
+        assert_eq!(got_excl, vec![ma("/ip4/1.1.1.1/udp/4001/quic-v1")]);
+    }
+}
+
 pub fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
     if addr.to_string().contains("/p2p-circuit") {
         return false;
