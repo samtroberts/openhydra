@@ -5,11 +5,10 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-//! A tidy, synchronous Rust handle over the swarm — the API the pure-protocol `agent`
-//! crate drives (it builds `default-features = false`, so no pyo3/Python).
+//! A tidy, synchronous Rust handle over the swarm — the API the `agent` crate drives.
 //!
-//! This is the same plumbing the pyo3 `P2PNode` uses (`start_node` + a `SwarmCommand`
-//! channel + the inbound `SharedProxyQueue`), wrapped so a Rust caller gets
+//! Wraps `start_node` + a `SwarmCommand` channel + the inbound `SharedProxyQueue`
+//! so a Rust caller gets
 //! `announce` / `discover` / `poll_inbound` / `respond` / `push` without touching tokio
 //! channels. All methods are blocking and must be called from outside a tokio runtime
 //! (a plain thread), like the agent's provider loop.

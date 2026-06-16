@@ -11,12 +11,12 @@ build:
 release:
 	$(CARGO) build --release -p openhydra-agent
 
-# Test the whole workspace without the pyo3 feature (no Python toolchain needed).
+# Test the whole workspace (pure Rust — no Python toolchain needed).
 test:
-	$(CARGO) test --workspace --no-default-features
+	$(CARGO) test --workspace
 
 clippy:
-	$(CARGO) clippy --workspace --no-default-features --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 fmt:
 	$(CARGO) fmt --all

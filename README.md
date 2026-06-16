@@ -78,8 +78,7 @@ cargo build --release -p openhydra-agent
 # → ./target/release/openhydra-agent
 ```
 
-The agent links no Python (`openhydra-network` is built with
-`default-features = false`, dropping the pyo3 feature).
+The whole workspace is pure Rust — no Python toolchain is required.
 
 ### Share your engine (provider)
 
@@ -148,7 +147,7 @@ A three-crate Rust workspace:
 
 - **`network/`** — the libp2p swarm: Kademlia DHT, mDNS, Circuit Relay v2,
   DCUtR, AutoNAT v2, UPnP, and the request/response proxy. Exposes a synchronous
-  `NetworkHandle` to the agent (and an optional pyo3 extension, off by default).
+  `NetworkHandle` to the agent and the `openhydra-bootstrap` binary.
 - **`protocol/`** — pure protocol logic: canonical model-id resolution, capability
   records, the router (resolve → rank → route), co-signed receipts, and the redb
   receipt ledger.

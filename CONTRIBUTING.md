@@ -68,23 +68,17 @@ cd openhydra
 cargo build -p openhydra-agent           # or: make build
 
 # 3. Run the test suite
-make test                                 # cargo test --workspace --no-default-features
+make test                                 # cargo test --workspace
 ```
 
-> **Note on the pyo3 feature.** The `network` crate has an optional `pyo3`
-> extension-module build (a Python wheel via `maturin`), enabled by default for
-> `cargo build -p openhydra-network`. It is legacy and slated for removal; the
-> agent and the test suite build with `--no-default-features`, so you do **not**
-> need a Python toolchain to develop OpenHydra. Plain `cargo build` of the
-> `network` cdylib will fail to *link* standalone (that's expected for a pyo3
-> extension module — only `maturin` links it correctly).
+The workspace is pure Rust — no Python toolchain is required.
 
 ---
 
 ## Running Tests
 
 ```bash
-# Whole workspace, no pyo3 (no Python toolchain needed)
+# Whole workspace
 make test
 # equivalently:
 cargo test --workspace --no-default-features

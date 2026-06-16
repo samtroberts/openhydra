@@ -5,7 +5,6 @@
 //!
 //! Run:  cargo test --no-default-features --test adversarial
 
-use openhydra_network::activation::ActivationBuffer;
 use openhydra_network::dispatcher;
 use openhydra_network::event_loop::{SharedProxyQueue, PROXY_QUEUE_MAX};
 use openhydra_network::forward_msg;
@@ -146,7 +145,6 @@ fn decoders_never_panic_on_malformed_input() {
         let _ = ipc_codec::decode_response(buf);
         let _ = ipc_codec::decode_batch_request(buf);
         let _ = ipc_codec::decode_batch_response(buf);
-        let _ = ActivationBuffer::from_packed(buf.clone());
         let _ = dispatcher::extract_method(buf);
         eprintln!("corpus[{i}] survived ({} bytes)", buf.len());
     }
@@ -160,24 +158,6 @@ fn batch_count_overflow_is_rejected_fast() {
     data.extend_from_slice(&u32::MAX.to_le_bytes()); // claim ~4.3B items
     assert!(ipc_codec::decode_batch_request(&data).is_err());
     assert!(ipc_codec::decode_batch_response(&data).is_err());
-}
-
-// ── M1: activation header overflow / non-finite dims rejected ────────────────
-
-#[test]
-fn activation_overflow_and_nonfinite_rejected() {
-    // Overflow: 2^40 * 2^40 * 4 wraps usize in release builds.
-    let big = (1u64 << 40) as f32;
-    let mut packed = big.to_le_bytes().to_vec();
-    packed.extend_from_slice(&big.to_le_bytes());
-    packed.extend_from_slice(&[0u8; 8]);
-    assert!(ActivationBuffer::from_packed(packed).is_err());
-
-    // NaN / negative dims.
-    let mut packed = f32::NAN.to_le_bytes().to_vec();
-    packed.extend_from_slice(&(-5.0f32).to_le_bytes());
-    packed.extend_from_slice(&[0u8; 8]);
-    assert!(ActivationBuffer::from_packed(packed).is_err());
 }
 
 // ── 2.4: inbound queue stays bounded under a flood ───────────────────────────

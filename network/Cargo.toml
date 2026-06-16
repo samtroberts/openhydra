@@ -8,7 +8,7 @@ license = "Apache-2.0"
 
 [lib]
 name = "openhydra_network"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 # libp2p — P2P networking stack
@@ -36,9 +36,6 @@ libp2p = { version = "0.54", features = [
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# Python bindings (only linked when building the cdylib via maturin)
-pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
 # Pure protocol core (canonical id, routing math, receipts, verify, ledger).
 openhydra-protocol = { path = "../protocol" }
@@ -71,8 +68,6 @@ libp2p-stream = "0.2.0-alpha"
 thiserror = "1"
 quinn = { version = "0.11", default-features = false }
 
-[features]
-default = ["pyo3"]
 
 [build-dependencies]
 prost-build = "0.13"
