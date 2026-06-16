@@ -81,6 +81,6 @@ echo "All nodes deployed. Checking health..."
 sleep 3
 for DOMAIN in "$BOOTSTRAP_US_DOMAIN" "$BOOTSTRAP_EU_DOMAIN" "$BOOTSTRAP_AP_DOMAIN"; do
     echo -n "  $DOMAIN: "
-    curl -sf "https://${DOMAIN}/health" | python3 -m json.tool --no-ensure-ascii 2>/dev/null \
+    curl -sf "https://${DOMAIN}/health" \
         || echo "UNREACHABLE (DNS/TLS may still be propagating)"
 done

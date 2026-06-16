@@ -65,10 +65,7 @@ sudo systemctl start openhydra-bootstrap.service
 5. Verify all three endpoints:
 
 ```bash
-curl -s https://bootstrap-us.openhydra.example/health | python3 -m json.tool
-curl -s https://bootstrap-eu.openhydra.example/health | python3 -m json.tool
-curl -s https://bootstrap-ap.openhydra.example/health | python3 -m json.tool
-```
+curl -s https://bootstrap-us.openhydra.example/healthcurl -s https://bootstrap-eu.openhydra.example/healthcurl -s https://bootstrap-ap.openhydra.example/health```
 
 ## Alternative: Manual Single-Node Setup
 
@@ -80,44 +77,21 @@ bash /opt/openhydra/ops/bootstrap/setup_nanode.sh bootstrap-us.openhydra.example
 
 Then edit `/etc/openhydra/secrets.env`, start the service, and verify `/health`.
 
-## Coordinator Configuration
+## Using a bootstrap from an agent
+
+These nodes are libp2p bootstrap/relay peers (the Rust `openhydra-bootstrap`
+binary, dual-stack TCP+QUIC on :4001). An `openhydra-agent` (provider or
+gateway) joins the swarm through them with `--bootstrap`:
 
 ```bash
-python -m coordinator.api_server \
-  --dht-url https://bootstrap-us.openhydra.example \
-  --dht-url https://bootstrap-eu.openhydra.example \
-  --dht-url https://bootstrap-ap.openhydra.example \
-  --model-catalog-path ./models.catalog.json
+openhydra-agent \
+  --bootstrap /dns4/bootstrap-us.openhydra.example/udp/4001/quic-v1/p2p/<PEER_ID> \
+  provide --engine-kind ollama
 ```
 
-Coordinator behavior:
-
-- Queries all bootstrap URLs concurrently
-- Merges results by `peer_id`, keeping newest `updated_unix_ms`
-- Raises only if all bootstrap lookups fail
-
-## Peer Configuration
-
-```bash
-python -m peer.server \
-  --peer-id my-peer-01 \
-  --host 0.0.0.0 --port 50051 \
-  --advertise-host <YOUR_PUBLIC_IP> \
-  --shard-index 0 --total-shards 1 \
-  --dht-url https://bootstrap-us.openhydra.example \
-  --dht-url https://bootstrap-eu.openhydra.example \
-  --dht-url https://bootstrap-ap.openhydra.example \
-  --runtime-backend pytorch_cpu \
-  --runtime-model-id Qwen/Qwen3.5-0.8B \
-  --quantization-mode int4 \
-  --data-dir ~/.openhydra
-```
-
-Peer behavior:
-
-- Announces to all bootstrap URLs each interval
-- Partial announce failures are warnings only
-- Peer continues operating as long as at least one bootstrap is reachable
+On a LAN, mDNS discovers peers without a bootstrap; across networks, pass one or
+more `--bootstrap` multiaddrs. NAT'd agents reserve a relay slot on a reachable
+bootstrap automatically (Circuit Relay v2) and hole-punch via DCUtR when possible.
 
 ## Service Lifecycle
 
@@ -132,8 +106,7 @@ sudo journalctl -u openhydra-bootstrap.service -f
 ## Health Check
 
 ```bash
-curl -s https://bootstrap-us.openhydra.example/health | python3 -m json.tool
-```
+curl -s https://bootstrap-us.openhydra.example/health```
 
 Expected response includes `"status": "ok"` and `peers_count`.
 

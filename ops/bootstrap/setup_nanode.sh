@@ -11,7 +11,6 @@ set -euo pipefail
 
 DOMAIN="${1:?usage: setup_nanode.sh <domain>}"
 REPO_URL="${OPENHYDRA_REPO_URL:-https://github.com/samtroberts/openhydra.git}"
-VENV=/opt/openhydra/.venv
 SECRETS_FILE=/etc/openhydra/secrets.env
 SERVICE_FILE=/etc/systemd/system/openhydra-bootstrap.service
 NGINX_CONF=/etc/nginx/sites-available/openhydra-bootstrap.conf
@@ -46,11 +45,8 @@ else
     git clone "$REPO_URL" /opt/openhydra
 fi
 
-# --- Python venv (bootstrap-only deps — no ML packages) ---
-# python3 resolves to 3.12 on Ubuntu 24.04.
-python3 -m venv "$VENV"
-"$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet grpcio protobuf cryptography
+# The bootstrap is a single static Rust binary (openhydra-bootstrap) with no
+# runtime dependencies, so there is no Python venv or pip install step here.
 
 # --- Secrets file (create skeleton if absent) ---
 if [ ! -f "$SECRETS_FILE" ]; then
@@ -61,7 +57,7 @@ if [ ! -f "$SECRETS_FILE" ]; then
 OPENHYDRA_GEO_CHALLENGE_SEED=REPLACE_WITH_SHARED_SECRET
 EOS
     # Must be owned by the service user and mode 600 (no group/world bits)
-    # so openhydra_secrets.py's permission check passes.
+    # so the bootstrap's secrets-file permission check passes.
     chown openhydra:openhydra "$SECRETS_FILE"
     chmod 600 "$SECRETS_FILE"
     echo "!!! Edit $SECRETS_FILE and set OPENHYDRA_GEO_CHALLENGE_SEED before starting the service !!!"
@@ -113,4 +109,4 @@ echo "  1. Edit $SECRETS_FILE"
 echo "     Set OPENHYDRA_GEO_CHALLENGE_SEED to the shared secret"
 echo "     (must be identical on all bootstrap nodes)"
 echo "  2. sudo systemctl start openhydra-bootstrap.service"
-echo "  3. Verify: curl -s https://${DOMAIN}/health | python3 -m json.tool"
+echo "  3. Verify: curl -s https://${DOMAIN}/health"

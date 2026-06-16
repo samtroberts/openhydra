@@ -125,7 +125,6 @@ landing/
 # ── Internal / non-public files ───────────────────────────────────────────────
 landing/
 desktop/
-docs/
 sdk/
 web/
 torrent/

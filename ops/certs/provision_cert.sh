@@ -2,8 +2,8 @@
 # ops/certs/provision_cert.sh
 #
 # Provision a Let's Encrypt TLS certificate for OpenHydra using certbot.
-# Installs the cert + key to /etc/openhydra/certs/ and generates the paths
-# needed by openhydra-coordinator --tls-* flags.
+# Installs the cert + key to /etc/openhydra/certs/ for a TLS-terminating reverse
+# proxy (nginx) in front of the `openhydra-agent serve` gateway.
 #
 # Usage:
 #   sudo ./ops/certs/provision_cert.sh --domain api.example.com --email you@example.com
@@ -19,13 +19,12 @@
 #   --renew                Renew all existing certbot certificates and re-deploy
 #   -h, --help             Print this help and exit
 #
-# After provisioning, the coordinator can be started with:
-#   openhydra-coordinator \
-#     --tls-enable \
-#     --tls-root-cert-path   /etc/openhydra/certs/ca-bundle.pem \
-#     --tls-client-cert-path /etc/openhydra/certs/fullchain.pem \
-#     --tls-client-key-path  /etc/openhydra/certs/privkey.pem \
-#     --tls-server-name-override <domain>
+# After provisioning, point an nginx (or other TLS-terminating proxy) server
+# block at the cert + key and proxy_pass to a local `openhydra-agent serve`
+# gateway (default 127.0.0.1:8080):
+#   ssl_certificate     /etc/openhydra/certs/fullchain.pem;
+#   ssl_certificate_key /etc/openhydra/certs/privkey.pem;
+#   location / { proxy_pass http://127.0.0.1:8080; }
 
 set -euo pipefail
 
@@ -182,16 +181,14 @@ echo "    fullchain:  $CERT_DIR/fullchain.pem"
 echo "    privkey:    $CERT_DIR/privkey.pem"
 echo "    CA bundle:  $CERT_DIR/ca-bundle.pem"
 echo ""
-echo "Start the coordinator with TLS:"
+echo "Wire these into your nginx (TLS-terminating proxy) in front of the gateway:"
 echo ""
-echo "    openhydra-coordinator \\"
-echo "      --tls-enable \\"
-echo "      --tls-root-cert-path   $CERT_DIR/ca-bundle.pem \\"
-echo "      --tls-client-cert-path $CERT_DIR/fullchain.pem \\"
-echo "      --tls-client-key-path  $CERT_DIR/privkey.pem \\"
-echo "      --tls-server-name-override $DOMAIN \\"
-echo "      --dht-url http://bootstrap:8468 \\"
-echo "      --host 0.0.0.0 --port 8080"
+echo "    server {"
+echo "      listen 443 ssl;"
+echo "      server_name $DOMAIN;"
+echo "      ssl_certificate     $CERT_DIR/fullchain.pem;"
+echo "      ssl_certificate_key $CERT_DIR/privkey.pem;"
+echo "      location / { proxy_pass http://127.0.0.1:8080; }   # openhydra-agent serve"
+echo "    }"
 echo ""
-echo "Or use the nginx HA overlay (recommended for production):"
-echo "    docker-compose -f docker-compose.yml -f docker-compose.ha.yml up -d"
+echo "A reference HA upstream config is in ops/ha/nginx.conf."

@@ -1,5 +1,11 @@
 # OpenHydra Benchmarks
 
+> **Historical — the Python benchmark scripts described below were removed in the
+> R2 cutover** (the sharded-inference engine they exercised no longer exists).
+> This file is retained as a record of the methodology; the resulting data lives
+> in [`benchmarks/`](../../benchmarks/). For the current Rust protocol, end-to-end
+> throughput is the external engine's native tokens/sec plus transport overhead.
+
 Benchmarks for validating sharded-inference code paths end-to-end against real
 models on Lightning T4 GPUs. These scripts bypass parts of the coordinator on
 purpose so they stay useful as a **control reference** when the coordinator
