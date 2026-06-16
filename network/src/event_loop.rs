@@ -152,6 +152,11 @@ pub enum SwarmCommand {
     NatStatus {
         reply: oneshot::Sender<NatInfo>,
     },
+    /// List the distinct model ids currently known (PEX-learned / discovered providers in
+    /// `known_peers`). Powers the gateway's `GET /v1/models`.
+    KnownModels {
+        reply: oneshot::Sender<Vec<String>>,
+    },
     /// Resolve a reachable address for a peer (direct or via relay).
     ResolveAddress {
         peer_id: String,
@@ -875,6 +880,17 @@ pub async fn run_event_loop(
                     }
                     Some(SwarmCommand::NatStatus { reply }) => {
                         let _ = reply.send(state.nat_info.clone());
+                    }
+                    Some(SwarmCommand::KnownModels { reply }) => {
+                        let mut models: Vec<String> = state
+                            .known_peers
+                            .values()
+                            .map(|r| r.model_id.clone())
+                            .filter(|m| !m.is_empty())
+                            .collect();
+                        models.sort();
+                        models.dedup();
+                        let _ = reply.send(models);
                     }
                     Some(SwarmCommand::ResolveAddress { peer_id, reply }) => {
                         handle_resolve(&state, &peer_id, reply);

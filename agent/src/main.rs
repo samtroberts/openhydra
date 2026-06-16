@@ -156,6 +156,11 @@ struct ServeArgs {
     /// Address the HTTP/SSE gateway binds (loopback by default — no firewall prompt).
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: String,
+
+    /// Require this API key on `/v1/*` (`Authorization: Bearer <key>`). Omit — or set the
+    /// `OPENHYDRA_API_KEY` env var — to leave the gateway open (fine on loopback).
+    #[arg(long)]
+    api_key: Option<String>,
 }
 
 fn main() {
@@ -314,6 +319,12 @@ fn run_provider<A: EngineAdapter>(
 
 /// Consumer role: run the HTTP/SSE gateway until the process exits.
 fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
-    eprintln!("openhydra-agent: gateway listening on http://{}", args.bind);
-    serve_http(net, &args.bind).map_err(|e| format!("gateway on {}: {e}", args.bind))
+    // CLI flag wins; otherwise fall back to the env var (avoids depending on clap's `env`).
+    let api_key = args.api_key.or_else(|| std::env::var("OPENHYDRA_API_KEY").ok());
+    eprintln!(
+        "openhydra-agent: gateway listening on http://{} (auth: {})",
+        args.bind,
+        if api_key.is_some() { "API key required on /v1/*" } else { "open" },
+    );
+    serve_http(net, &args.bind, api_key).map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

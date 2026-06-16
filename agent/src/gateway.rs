@@ -19,7 +19,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use axum::extract::Request;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -38,6 +40,9 @@ use crate::serve::ServeSummary;
 #[derive(Clone)]
 struct AppState {
     node: Arc<ConsumerNode>,
+    /// When set, `/v1/*` requires `Authorization: Bearer <key>`. `None` ⇒ open (the
+    /// loopback default).
+    api_key: Option<Arc<String>>,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -393,25 +398,97 @@ fn log_completion(summary: &ServeSummary, wall: std::time::Duration) {
     );
 }
 
+/// `GET /v1/models` — the models this gateway currently knows a provider for (PEX-learned
+/// / discovered). Dynamic in a decentralized swarm: empty until gossip arrives, then grows
+/// as providers announce. The blocking swarm query runs on a plain OS thread (same reason
+/// as `complete` — `blocking_send` needs a non-tokio context).
+async fn list_models(State(state): State<AppState>) -> Response {
+    let node = state.node.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(node.known_models());
+    });
+    match rx.await {
+        Ok(Ok(models)) => {
+            let data: Vec<Value> = models
+                .iter()
+                .map(|m| json!({ "id": m, "object": "model", "created": 0, "owned_by": "openhydra" }))
+                .collect();
+            Json(json!({ "object": "list", "data": data })).into_response()
+        }
+        Ok(Err(e)) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
+        Err(_) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "models query failed",
+            "internal_error",
+        ),
+    }
+}
+
+/// Constant-time byte comparison — avoids leaking the API key length/prefix via timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Auth middleware for `/v1/*`: when an API key is configured, require a matching
+/// `Authorization: Bearer <key>`; otherwise pass through (open, for loopback).
+async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(key) = &state.api_key {
+        let presented = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let ok = presented.is_some_and(|t| constant_time_eq(t, key));
+        if !ok {
+            return openai_error(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid API key",
+                "invalid_request_error",
+            );
+        }
+    }
+    next.run(req).await
+}
+
 async fn health() -> Response {
     Json(json!({ "status": "ok" })).into_response()
 }
 
-/// The gateway router over a started swarm node.
-pub fn router(net: NetworkHandle) -> Router {
-    Router::new()
+/// The gateway router over a started swarm node. `api_key` (when `Some`) gates the `/v1/*`
+/// routes behind `Authorization: Bearer <key>`; `/health` is always open.
+pub fn router(net: NetworkHandle, api_key: Option<String>) -> Router {
+    let state = AppState {
+        node: Arc::new(ConsumerNode::new(net)),
+        api_key: api_key.map(Arc::new),
+    };
+    // The `/v1/*` routes are auth-gated; `/health` stays open for liveness probes.
+    let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(list_models))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+    Router::new()
         .route("/health", get(health))
-        .with_state(AppState { node: Arc::new(ConsumerNode::new(net)) })
+        .merge(v1)
+        .with_state(state)
 }
 
 /// Run the gateway, blocking. Builds its own multi-thread tokio runtime and serves until
-/// the process exits. `bind` is e.g. `"127.0.0.1:8080"`.
-pub fn serve_http(net: NetworkHandle, bind: &str) -> std::io::Result<()> {
+/// the process exits. `bind` is e.g. `"127.0.0.1:8080"`; `api_key` optionally protects
+/// `/v1/*`.
+pub fn serve_http(net: NetworkHandle, bind: &str, api_key: Option<String>) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
-        axum::serve(listener, router(net)).await
+        axum::serve(listener, router(net, api_key)).await
     })
 }
 
@@ -487,5 +564,13 @@ mod tests {
     fn usage_value_sums_tokens() {
         let v = usage_value(&summary(10, 5));
         assert_eq!(v["total_tokens"], 15);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical() {
+        assert!(constant_time_eq("sk-secret-123", "sk-secret-123"));
+        assert!(!constant_time_eq("sk-secret-123", "sk-secret-124"));
+        assert!(!constant_time_eq("sk-secret", "sk-secret-123")); // length mismatch
+        assert!(!constant_time_eq("", "x"));
     }
 }
