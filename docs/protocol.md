@@ -94,13 +94,19 @@ APIs (llama.cpp server, Apple Foundation Models) get a dedicated shim.
 
 ### Transport & discovery
 
-The networking layer is a Rust **libp2p** stack (exposed to Python via PyO3):
+The networking layer is a Rust **libp2p** stack:
 
 - **Kademlia DHT** for peer and model discovery.
 - **QUIC + TCP** transports.
 - **DCUtR hole-punching** and **Circuit Relay v2** fallback for NAT traversal.
 - **AutoNAT** for reachability detection.
 - **gossipsub** for swarm-wide events.
+
+How these combine into a connection-establishment *ladder* (IPv6-direct →
+connection reversal → DCUtR → relay), how to keep connections steady and the
+DHT full of reachable providers, and — because relay is a per-token latency tax
+on inference — how to keep traffic **off the relay**, are covered in
+[PEER_CONNECTIVITY.md](PEER_CONNECTIVITY.md).
 
 Model records live in the DHT under a stable key
 (`/openhydra/model/{model_id}/{peer_id}`), so resolving "who has model *X*?" is a
