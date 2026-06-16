@@ -7,23 +7,25 @@
 
 //! The consumer front door: an OpenAI-compatible HTTP/SSE gateway over [`ConsumerNode`].
 //!
-//! `POST /v1/chat/completions` discovers a provider for the requested model, streams the
-//! completion over libp2p, and relays it to the client as Server-Sent Events.
+//! `POST /v1/chat/completions` discovers a provider for the requested model and relays the
+//! completion to the client — as Server-Sent Events when `stream: true`, or as a single
+//! `chat.completion` JSON object otherwise (the OpenAI default). `GET /health` is a
+//! liveness probe.
 //!
-//! [`ConsumerNode::complete`] is synchronous and blocks on libp2p (`blocking_send`), so
-//! the handler runs it on a **plain OS thread** (outside any tokio context, where
-//! `blocking_send` is valid — `spawn_blocking` threads have murkier runtime-context
-//! semantics) and pipes the deltas back through an unbounded channel into the async SSE
-//! stream.
+//! [`ConsumerNode::complete`] is synchronous and blocks on libp2p (`blocking_send`), so the
+//! handler runs it on a **plain OS thread** (outside any tokio context, where
+//! `blocking_send` is valid) and pipes the deltas back through an unbounded channel.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{extract::State, Json, Router};
 use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
@@ -41,31 +43,111 @@ struct AppState {
 /// The OpenAI chat-completions request fields we honour (others ignored).
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
+    #[serde(default)]
     model: String,
+    #[serde(default)]
     messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f64>,
+    /// OpenAI default is `false` → a single JSON object; `true` → an SSE stream.
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 /// What the worker thread sends back as the completion progresses.
 enum GatewayEvent {
     Delta(String),
-    Done(ServeSummary),
+    Done(Box<ServeSummary>),
     Error(String),
 }
 
-/// Build the terminal `chat.completion.chunk` with `finish_reason:stop` plus an
-/// `openhydra` block carrying three views of one request:
-/// * **engine** — Ollama's own ground-truth numbers (native/prefill TPS, prompt tokens,
-///   load/prefill/eval/total times). The pipeline can't change these.
-/// * **pipeline** — OpenHydra's end-to-end view (pipeline TPS, wall, overhead vs the
-///   engine total, and consumer-observed TTFT — which equals wall under the buffered
-///   transport, since the consumer gets nothing until generation finishes).
-/// * **hops_ms** — where the wall-clock goes: discover · proxy round-trip · provider
-///   serve · inferred network RTT (round-trip − provider serve) · gateway overhead.
-fn metrics_chunk(id: &str, model: &str, summary: &ServeSummary, wall: std::time::Duration) -> String {
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> String {
+    format!("chatcmpl-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ── OpenAI error mapping ─────────────────────────────────────────────────────
+
+/// Map a `ConsumerNode::complete` error string to an HTTP status + OpenAI error `type`.
+/// The error originates as a `String` (the engine/transport surface is stringly-typed),
+/// so we classify by substring — coarse but stable, and far better than a blanket 500.
+fn classify_error(msg: &str) -> (StatusCode, &'static str) {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("no provider") {
+        // Nobody currently serves this model on the swarm.
+        (StatusCode::SERVICE_UNAVAILABLE, "no_provider")
+    } else if m.contains("timed out") || m.contains("timeout") {
+        (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
+    } else {
+        // Engine/transport failure relayed from the provider.
+        (StatusCode::BAD_GATEWAY, "upstream_error")
+    }
+}
+
+/// An OpenAI-shaped error response: `{ "error": { message, type, code } }` with a status.
+fn openai_error(status: StatusCode, message: &str, etype: &str) -> Response {
+    (
+        status,
+        Json(json!({ "error": { "message": message, "type": etype, "code": Value::Null } })),
+    )
+        .into_response()
+}
+
+/// Reject obviously-invalid requests before spending a discovery/route on them. Returns
+/// the error response to send when invalid, or `None` when the request is acceptable.
+fn validate(req: &ChatRequest) -> Option<Response> {
+    if req.model.trim().is_empty() {
+        return Some(openai_error(
+            StatusCode::BAD_REQUEST,
+            "missing required field: model",
+            "invalid_request_error",
+        ));
+    }
+    if req.messages.is_empty() {
+        return Some(openai_error(
+            StatusCode::BAD_REQUEST,
+            "missing or empty field: messages",
+            "invalid_request_error",
+        ));
+    }
+    None
+}
+
+// ── Response builders (pure) ─────────────────────────────────────────────────
+
+/// `usage` object: prompt tokens are the engine's count (0 if it reports none),
+/// completion tokens are what the pipeline counted.
+fn usage_value(summary: &ServeSummary) -> Value {
+    let prompt = summary.metrics.engine.prompt_eval_count;
+    let completion = summary.tokens;
+    json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    })
+}
+
+/// The `openhydra` telemetry block: three views of one request (engine ground-truth,
+/// pipeline end-to-end, and where the wall-clock went hop-by-hop).
+fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration) -> Value {
     let e = &summary.metrics.engine;
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let ms = |ns: u64| ns / 1_000_000;
@@ -79,137 +161,247 @@ fn metrics_chunk(id: &str, model: &str, summary: &ServeSummary, wall: std::time:
         .saturating_sub(summary.discover_ns);
     let pipeline_tps = if wall_ns > 0 { summary.tokens as f64 / (wall_ns as f64 / 1e9) } else { 0.0 };
 
-    serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "model": model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
-        "openhydra": {
-            "tokens": summary.tokens,
-            "engine": {
-                "native_tps": r1(tps(e.eval_count, e.eval_duration_ns)),
-                "prefill_tps": r1(tps(e.prompt_eval_count, e.prompt_eval_duration_ns)),
-                "prompt_tokens": e.prompt_eval_count,
-                "load_ms": ms(e.load_duration_ns),
-                "prompt_eval_ms": ms(e.prompt_eval_duration_ns),
-                "eval_ms": ms(e.eval_duration_ns),
-                "engine_total_ms": ms(e.total_duration_ns),
-            },
-            "pipeline": {
-                "pipeline_tps": r1(pipeline_tps),
-                "wall_ms": ms(wall_ns),
-                "overhead_ms": ms(wall_ns.saturating_sub(e.total_duration_ns)),
-                "ttft_ms": ms(wall_ns), // buffered transport: no token reaches the client until done
-            },
-            "hops_ms": {
-                "discover": ms(summary.discover_ns),
-                "proxy_roundtrip": ms(summary.proxy_roundtrip_ns),
-                "provider_serve": ms(provider_serve_ns),
-                "network_rtt": ms(net_rtt_ns),
-                "gateway_overhead": ms(gateway_ns),
-            },
+    json!({
+        "tokens": summary.tokens,
+        "engine": {
+            "native_tps": r1(tps(e.eval_count, e.eval_duration_ns)),
+            "prefill_tps": r1(tps(e.prompt_eval_count, e.prompt_eval_duration_ns)),
+            "prompt_tokens": e.prompt_eval_count,
+            "load_ms": ms(e.load_duration_ns),
+            "prompt_eval_ms": ms(e.prompt_eval_duration_ns),
+            "eval_ms": ms(e.eval_duration_ns),
+            "engine_total_ms": ms(e.total_duration_ns),
+        },
+        "pipeline": {
+            "pipeline_tps": r1(pipeline_tps),
+            "wall_ms": ms(wall_ns),
+            "overhead_ms": ms(wall_ns.saturating_sub(e.total_duration_ns)),
+            "ttft_ms": ms(wall_ns), // buffered transport: no token reaches the client until done
+        },
+        "hops_ms": {
+            "discover": ms(summary.discover_ns),
+            "proxy_roundtrip": ms(summary.proxy_roundtrip_ns),
+            "provider_serve": ms(provider_serve_ns),
+            "network_rtt": ms(net_rtt_ns),
+            "gateway_overhead": ms(gateway_ns),
         },
     })
-    .to_string()
 }
 
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// An OpenAI `chat.completion.chunk`: a content delta, or (with `finish`) the terminator.
-fn chunk_json(id: &str, model: &str, content: Option<&str>, finish: Option<&str>) -> String {
-    let delta = match content {
-        Some(c) => serde_json::json!({ "content": c }),
-        None => serde_json::json!({}),
-    };
-    serde_json::json!({
+/// One streaming `chat.completion.chunk` carrying an arbitrary `delta`.
+fn stream_chunk(id: &str, model: &str, created: u64, delta: Value, finish: Option<&str>) -> String {
+    json!({
         "id": id,
         "object": "chat.completion.chunk",
+        "created": created,
         "model": model,
         "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
     })
     .to_string()
 }
 
-fn error_json(id: &str, model: &str, message: &str) -> String {
-    serde_json::json!({
+/// The non-streaming `chat.completion` object.
+fn completion_object(
+    id: &str,
+    model: &str,
+    created: u64,
+    content: &str,
+    summary: &ServeSummary,
+    wall: std::time::Duration,
+) -> Value {
+    json!({
         "id": id,
-        "object": "chat.completion.chunk",
+        "object": "chat.completion",
+        "created": created,
         "model": model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
-        "error": { "message": message },
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": "stop",
+        }],
+        "usage": usage_value(summary),
+        "openhydra": openhydra_block(summary, wall),
     })
-    .to_string()
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
-) -> impl IntoResponse {
-    let id = format!("chatcmpl-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let model = req.model.clone();
-    let started = std::time::Instant::now();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+// ── Handler ──────────────────────────────────────────────────────────────────
 
-    let node = state.node.clone();
-    let model_for_thread = model.clone();
+/// Spawn the blocking `complete` on a plain OS thread, returning the event channel and the
+/// start instant. The worker forwards each delta, then a terminal `Done`/`Error`.
+fn spawn_worker(
+    node: Arc<ConsumerNode>,
+    model: String,
+    messages: Vec<ChatMessage>,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    std::time::Instant,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+    let started = std::time::Instant::now();
     std::thread::spawn(move || {
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
         };
-        match node.complete(
-            &model_for_thread,
-            req.messages,
-            req.max_tokens,
-            req.temperature,
-            &mut on_delta,
-        ) {
+        match node.complete(&model, messages, max_tokens, temperature, &mut on_delta) {
             Ok(summary) => {
-                let _ = tx.send(GatewayEvent::Done(summary));
+                let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
                 let _ = tx.send(GatewayEvent::Error(e.to_string()));
             }
         }
     });
+    (rx, started)
+}
 
-    let id_s = id.clone();
-    let model_s = model.clone();
+async fn chat_completions(
+    State(state): State<AppState>,
+    body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // Malformed JSON / wrong content-type → 400, OpenAI-shaped (not axum's plain text).
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => {
+            return openai_error(StatusCode::BAD_REQUEST, &rej.body_text(), "invalid_request_error")
+        }
+    };
+    if let Some(resp) = validate(&req) {
+        return resp;
+    }
+
+    let id = next_id();
+    let created = unix_now();
+    let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
+    let (rx, started) = spawn_worker(
+        state.node.clone(),
+        req.model.clone(),
+        req.messages,
+        req.max_tokens,
+        req.temperature,
+    );
+
+    if req.stream {
+        stream_response(id, req.model, created, want_usage, rx, started)
+    } else {
+        buffered_response(id, req.model, created, rx, started).await
+    }
+}
+
+/// `stream: true` → SSE. First an assistant-role chunk, then content deltas, then a
+/// terminal `stop` chunk (with `usage` when requested) carrying the `openhydra` block, then
+/// the OpenAI `[DONE]` sentinel. A mid-flight failure is surfaced as an error chunk.
+fn stream_response(
+    id: String,
+    model: String,
+    created: u64,
+    want_usage: bool,
+    rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    started: std::time::Instant,
+) -> Response {
+    let role = {
+        let data = stream_chunk(&id, &model, created, json!({ "role": "assistant" }), None);
+        tokio_stream::once(Ok::<Event, std::convert::Infallible>(Event::default().data(data)))
+    };
+    let (id_s, model_s) = (id.clone(), model.clone());
     let body = UnboundedReceiverStream::new(rx).map(move |ev| {
         let data = match ev {
-            GatewayEvent::Delta(t) => chunk_json(&id_s, &model_s, Some(&t), None),
+            GatewayEvent::Delta(t) => {
+                stream_chunk(&id_s, &model_s, created, json!({ "content": t }), None)
+            }
             GatewayEvent::Done(summary) => {
                 let wall = started.elapsed();
-                let eval_ns = summary.metrics.engine.eval_duration_ns;
-                let native = if eval_ns > 0 {
-                    summary.metrics.engine.eval_count as f64 / (eval_ns as f64 / 1e9)
-                } else {
-                    0.0
-                };
-                let pipeline = summary.tokens as f64 / wall.as_secs_f64().max(1e-9);
-                tracing::info!(
-                    tokens = summary.tokens,
-                    native_tps = native,
-                    pipeline_tps = pipeline,
-                    wall_ms = wall.as_millis() as u64,
-                    provider_serve_ms = summary.metrics.provider_serve_ns / 1_000_000,
-                    proxy_roundtrip_ms = summary.proxy_roundtrip_ns / 1_000_000,
-                    "completion done"
-                );
-                metrics_chunk(&id_s, &model_s, &summary, wall)
+                log_completion(&summary, wall);
+                let mut chunk: Value =
+                    serde_json::from_str(&stream_chunk(&id_s, &model_s, created, json!({}), Some("stop")))
+                        .unwrap_or_else(|_| json!({}));
+                chunk["openhydra"] = openhydra_block(&summary, wall);
+                if want_usage {
+                    chunk["usage"] = usage_value(&summary);
+                }
+                chunk.to_string()
             }
-            GatewayEvent::Error(m) => error_json(&id_s, &model_s, &m),
+            GatewayEvent::Error(m) => {
+                let (_, etype) = classify_error(&m);
+                json!({
+                    "id": id_s, "object": "chat.completion.chunk", "created": created, "model": model_s,
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
+                    "error": { "message": m, "type": etype },
+                })
+                .to_string()
+            }
         };
         Ok::<Event, std::convert::Infallible>(Event::default().data(data))
     });
-    // OpenAI clients expect a trailing `data: [DONE]`.
     let done = tokio_stream::once(Ok(Event::default().data("[DONE]")));
-    Sse::new(body.chain(done))
+    Sse::new(role.chain(body).chain(done)).into_response()
+}
+
+/// `stream: false` (the OpenAI default) → collect the whole completion and return a single
+/// `chat.completion` object, or a proper HTTP error if the route failed.
+async fn buffered_response(
+    id: String,
+    model: String,
+    created: u64,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    started: std::time::Instant,
+) -> Response {
+    let mut content = String::new();
+    let mut outcome: Option<Result<Box<ServeSummary>, String>> = None;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            GatewayEvent::Delta(t) => content.push_str(&t),
+            GatewayEvent::Done(s) => outcome = Some(Ok(s)),
+            GatewayEvent::Error(m) => outcome = Some(Err(m)),
+        }
+    }
+    match outcome {
+        Some(Ok(summary)) => {
+            let wall = started.elapsed();
+            log_completion(&summary, wall);
+            Json(completion_object(&id, &model, created, &content, &summary, wall)).into_response()
+        }
+        Some(Err(m)) => {
+            let (status, etype) = classify_error(&m);
+            openai_error(status, &m, etype)
+        }
+        None => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "gateway worker produced no result",
+            "internal_error",
+        ),
+    }
+}
+
+fn log_completion(summary: &ServeSummary, wall: std::time::Duration) {
+    let eval_ns = summary.metrics.engine.eval_duration_ns;
+    let native = if eval_ns > 0 {
+        summary.metrics.engine.eval_count as f64 / (eval_ns as f64 / 1e9)
+    } else {
+        0.0
+    };
+    let pipeline = summary.tokens as f64 / wall.as_secs_f64().max(1e-9);
+    tracing::info!(
+        tokens = summary.tokens,
+        native_tps = native,
+        pipeline_tps = pipeline,
+        wall_ms = wall.as_millis() as u64,
+        provider_serve_ms = summary.metrics.provider_serve_ns / 1_000_000,
+        proxy_roundtrip_ms = summary.proxy_roundtrip_ns / 1_000_000,
+        "completion done"
+    );
+}
+
+async fn health() -> Response {
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 /// The gateway router over a started swarm node.
 pub fn router(net: NetworkHandle) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/health", get(health))
         .with_state(AppState { node: Arc::new(ConsumerNode::new(net)) })
 }
 
@@ -226,33 +418,74 @@ pub fn serve_http(net: NetworkHandle, bind: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::EngineMetrics;
+
+    fn summary(tokens: u64, prompt: u64) -> ServeSummary {
+        ServeSummary {
+            tokens,
+            ok: true,
+            metrics: crate::serve::ServeMetrics {
+                engine: EngineMetrics { prompt_eval_count: prompt, eval_count: tokens, ..Default::default() },
+                provider_serve_ns: 500_000_000,
+            },
+            proxy_roundtrip_ns: 600_000_000,
+            discover_ns: 1_000_000,
+        }
+    }
 
     #[test]
-    fn delta_chunk_is_openai_shaped() {
-        let v: serde_json::Value =
-            serde_json::from_str(&chunk_json("id1", "qwen2.5:7b", Some("Hi"), None)).unwrap();
+    fn request_defaults_to_non_streaming() {
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert!(!req.stream, "OpenAI default is stream:false");
+    }
+
+    #[test]
+    fn validation_rejects_empty_model_and_messages() {
+        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into() }], max_tokens: None, temperature: None, stream: false, stream_options: None };
+        assert!(validate(&r).is_some());
+        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, temperature: None, stream: false, stream_options: None };
+        assert!(validate(&r).is_some());
+        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into() }], max_tokens: None, temperature: None, stream: false, stream_options: None };
+        assert!(validate(&r).is_none());
+    }
+
+    #[test]
+    fn error_classification_maps_to_status() {
+        assert_eq!(classify_error("engine http error: no provider for model 'm'").0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(classify_error("proxy_forward: proxy_forward timed out after 45s").0, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(classify_error("engine http error: connection refused").0, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn completion_object_is_openai_shaped() {
+        let s = summary(27, 46);
+        let v = completion_object("chatcmpl-1", "unsloth/Llama-3.2-1B-Instruct", 1_700_000_000, "hello world", &s, std::time::Duration::from_millis(500));
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "hello world");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 46);
+        assert_eq!(v["usage"]["completion_tokens"], 27);
+        assert_eq!(v["usage"]["total_tokens"], 73);
+        assert!(v["created"].is_u64());
+        assert!(v["openhydra"]["tokens"] == 27);
+    }
+
+    #[test]
+    fn stream_chunk_carries_created_and_delta() {
+        let v: Value = serde_json::from_str(&stream_chunk("id1", "m", 1_700_000_000, json!({"content":"Hi"}), None)).unwrap();
         assert_eq!(v["object"], "chat.completion.chunk");
-        assert_eq!(v["model"], "qwen2.5:7b");
+        assert_eq!(v["created"], 1_700_000_000u64);
         assert_eq!(v["choices"][0]["delta"]["content"], "Hi");
         assert!(v["choices"][0]["finish_reason"].is_null());
+        let stop: Value = serde_json::from_str(&stream_chunk("id1", "m", 1, json!({}), Some("stop"))).unwrap();
+        assert_eq!(stop["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
-    fn done_chunk_has_empty_delta_and_stop() {
-        let v: serde_json::Value =
-            serde_json::from_str(&chunk_json("id1", "m", None, Some("stop"))).unwrap();
-        assert_eq!(v["choices"][0]["finish_reason"], "stop");
-        assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn parses_openai_request() {
-        let body = r#"{"model":"qwen2.5:7b","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}"#;
-        let req: ChatRequest = serde_json::from_str(body).unwrap();
-        assert_eq!(req.model, "qwen2.5:7b");
-        assert_eq!(req.messages.len(), 1);
-        assert_eq!(req.messages[0].role, "user");
-        assert_eq!(req.max_tokens, Some(64));
-        assert_eq!(req.temperature, None); // absent → None (unknown fields like `stream` ignored)
+    fn usage_value_sums_tokens() {
+        let v = usage_value(&summary(10, 5));
+        assert_eq!(v["total_tokens"], 15);
     }
 }
