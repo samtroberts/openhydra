@@ -33,6 +33,7 @@ pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
     ServeOutcome,
 };
+pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
 pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};
 pub use consumer::{
@@ -57,4 +58,10 @@ pub fn live_openai(
     name: &'static str,
 ) -> Result<OpenAiAdapter<ReqwestClient>, AdapterError> {
     Ok(OpenAiAdapter::new(base_url, name, ReqwestClient::new()?))
+}
+
+/// A llama.cpp (`llama-server`) adapter backed by the live reqwest transport, pointed at
+/// `base_url` (e.g. [`DEFAULT_LLAMACPP_URL`]).
+pub fn live_llamacpp(base_url: &str) -> Result<LlamaCppAdapter<ReqwestClient>, AdapterError> {
+    Ok(LlamaCppAdapter::new(base_url, ReqwestClient::new()?))
 }

@@ -193,56 +193,71 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
         request: &InferenceRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError> {
-        let body = build_chat_body(request);
-        let lines = self
-            .http
-            .post_stream(&format!("{}/v1/chat/completions", self.base_url), &body)?;
+        serve_chat_completions(
+            &self.http,
+            &format!("{}/v1/chat/completions", self.base_url),
+            request,
+            on_delta,
+        )
+    }
+}
 
-        let mut chunk_tokens = 0u64;
-        let mut usage: Option<Usage> = None;
-        let mut done = false;
-        for line in lines {
-            let line = line?;
-            let Some(payload) = sse_payload(&line) else {
-                continue; // SSE comment / framing / non-data field
-            };
-            if payload == "[DONE]" {
+/// Stream a chat completion from any OpenAI-compatible `chat_url`
+/// (`…/v1/chat/completions`). Factored out of [`OpenAiAdapter`] so the llama.cpp adapter
+/// — which serves over the same OpenAI route but detects models bespoke-ly — reuses it.
+pub(crate) fn serve_chat_completions<H: HttpClient>(
+    http: &H,
+    chat_url: &str,
+    request: &InferenceRequest,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ServeOutcome, AdapterError> {
+    let body = build_chat_body(request);
+    let lines = http.post_stream(chat_url, &body)?;
+
+    let mut chunk_tokens = 0u64;
+    let mut usage: Option<Usage> = None;
+    let mut done = false;
+    for line in lines {
+        let line = line?;
+        let Some(payload) = sse_payload(&line) else {
+            continue; // SSE comment / framing / non-data field
+        };
+        if payload == "[DONE]" {
+            done = true;
+            break;
+        }
+        let chunk = parse_chunk(payload)?;
+        for choice in &chunk.choices {
+            if let Some(content) = &choice.delta.content {
+                if !content.is_empty() {
+                    on_delta(content);
+                    chunk_tokens += 1;
+                }
+            }
+            if choice.finish_reason.is_some() {
+                // A clean stop; keep reading — the usage chunk may still follow.
                 done = true;
-                break;
-            }
-            let chunk = parse_chunk(payload)?;
-            for choice in &chunk.choices {
-                if let Some(content) = &choice.delta.content {
-                    if !content.is_empty() {
-                        on_delta(content);
-                        chunk_tokens += 1;
-                    }
-                }
-                if choice.finish_reason.is_some() {
-                    // A clean stop; keep reading — the usage chunk may still follow.
-                    done = true;
-                }
-            }
-            if chunk.usage.is_some() {
-                usage = chunk.usage;
             }
         }
-
-        let engine = EngineMetrics {
-            // OpenAI exposes counts (when usage is included) but no per-stage timings.
-            prompt_eval_count: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
-            eval_count: usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
-            ..EngineMetrics::default()
-        };
-        // Prefer the engine's authoritative completion-token count; fall back to the
-        // number of non-empty content chunks when the server reports no usage.
-        let tokens = usage
-            .as_ref()
-            .map(|u| u.completion_tokens)
-            .filter(|&t| t > 0)
-            .unwrap_or(chunk_tokens);
-        Ok(ServeOutcome { tokens, done, engine })
+        if chunk.usage.is_some() {
+            usage = chunk.usage;
+        }
     }
+
+    let engine = EngineMetrics {
+        // OpenAI exposes counts (when usage is included) but no per-stage timings.
+        prompt_eval_count: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+        eval_count: usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+        ..EngineMetrics::default()
+    };
+    // Prefer the engine's authoritative completion-token count; fall back to the number
+    // of non-empty content chunks when the server reports no usage.
+    let tokens = usage
+        .as_ref()
+        .map(|u| u.completion_tokens)
+        .filter(|&t| t > 0)
+        .unwrap_or(chunk_tokens);
+    Ok(ServeOutcome { tokens, done, engine })
 }
 
 #[cfg(test)]

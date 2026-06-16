@@ -27,8 +27,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_ollama, live_openai, serve_http, EngineAdapter, Provider, DEFAULT_LM_STUDIO_URL,
-    DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
+    live_llamacpp, live_ollama, live_openai, serve_http, EngineAdapter, Provider,
+    DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -103,7 +103,9 @@ enum EngineKind {
     Vllm,
     /// LM Studio (OpenAI-compatible `/v1/*`).
     LmStudio,
-    /// Any other OpenAI-compatible server (Exo, llama.cpp `--api`, LocalAI, …).
+    /// llama.cpp (`llama-server`) — OpenAI serve route + `/props` canonical-id detection.
+    LlamaCpp,
+    /// Any other OpenAI-compatible server (Exo, LocalAI, …).
     Openai,
 }
 
@@ -114,6 +116,7 @@ impl EngineKind {
             EngineKind::Ollama => DEFAULT_OLLAMA_URL,
             EngineKind::Vllm | EngineKind::Openai => DEFAULT_VLLM_URL,
             EngineKind::LmStudio => DEFAULT_LM_STUDIO_URL,
+            EngineKind::LlamaCpp => DEFAULT_LLAMACPP_URL,
         }
     }
 }
@@ -125,7 +128,7 @@ struct ProvideArgs {
     engine_kind: EngineKind,
 
     /// Base URL of the local engine. Defaults to the engine kind's standard port
-    /// (Ollama 11434, vLLM/OpenAI 8000, LM Studio 1234).
+    /// (Ollama 11434, vLLM/OpenAI 8000, LM Studio 1234, llama.cpp 8080).
     #[arg(long)]
     engine: Option<String>,
 
@@ -249,6 +252,10 @@ fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
         }
         EngineKind::LmStudio => {
             let a = live_openai(&url, "lm-studio").map_err(|e| format!("engine {url}: {e}"))?;
+            run_provider(a, url, args, net)
+        }
+        EngineKind::LlamaCpp => {
+            let a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
             run_provider(a, url, args, net)
         }
         EngineKind::Openai => {
