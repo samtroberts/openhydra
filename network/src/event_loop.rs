@@ -3567,11 +3567,28 @@ fn handle_proxy_forward(
     // reliable over both direct and relay connections. Tensor stream is
     // only used in the fire-and-forget path (proxy_forward_no_wait / push mode).
     if swarm.is_connected(&peer_id) {
-        // C3: Log transport type at dispatch time.
-        let transport = state.peer_connections.get(&peer_id)
-            .map(|info| if info.has_direct() { "direct" } else { "relay" })
-            .unwrap_or("unknown");
-        debug!(%peer_id, %transport, bytes = data.len(), "proxy_forward");
+        // Truthful dispatch log. `send_request` dispatches via NotifyHandler::Any,
+        // so when a peer has BOTH a direct and a relay connection the chosen path
+        // is arbitrary — the old single "direct"/"relay" label (derived from
+        // has_direct()) hid that ambiguity and could claim "direct" while the
+        // request actually rode the relay. Log the real connection composition
+        // instead; "ambiguous(direct+relay)" flags exactly the case where the
+        // (still-unfixed) connection-selection bug bites.
+        let (direct_conns, relay_conns) = state
+            .peer_connections
+            .get(&peer_id)
+            .map(|i| (i.direct_count(), i.tcp_relay))
+            .unwrap_or((0, 0));
+        let path = if direct_conns > 0 && relay_conns > 0 {
+            "ambiguous(direct+relay)"
+        } else if direct_conns > 0 {
+            "direct"
+        } else if relay_conns > 0 {
+            "relay"
+        } else {
+            "unknown"
+        };
+        info!(%peer_id, path, direct_conns, relay_conns, bytes = data.len(), "proxy_forward dispatch");
         let req_id = swarm
             .behaviour_mut()
             .grpc_proxy
