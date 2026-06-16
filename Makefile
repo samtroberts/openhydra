@@ -1,33 +1,35 @@
-PYTHON ?= python3
+CARGO ?= cargo
 
-.PHONY: venv install proto test demo run-api run-api-dht run-dht gen-certs genesis
+.PHONY: build release test clippy fmt provide serve clean
 
-venv:
-	$(PYTHON) -m venv .venv
+# Build the agent (debug). The agent links no Python — openhydra-network is
+# pulled with default-features = false, dropping the pyo3 feature.
+build:
+	$(CARGO) build -p openhydra-agent
 
-install:
-	$(PYTHON) -m pip install -r requirements.txt
+# Optimised static-ish binary at target/release/openhydra-agent.
+release:
+	$(CARGO) build --release -p openhydra-agent
 
-proto:
-	$(PYTHON) -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. peer/peer.proto
-
+# Test the whole workspace without the pyo3 feature (no Python toolchain needed).
 test:
-	pytest
+	$(CARGO) test --workspace --no-default-features
 
-demo:
-	@echo "Start peers and run coordinator.client_cli"
+clippy:
+	$(CARGO) clippy --workspace --no-default-features --all-targets -- -D warnings
 
-run-dht:
-	$(PYTHON) -m dht.bootstrap --host 127.0.0.1 --port 8468
+fmt:
+	$(CARGO) fmt --all
 
-run-api:
-	$(PYTHON) -m coordinator.api_server --peers ./peers.local.json --host 127.0.0.1 --port 8080
+# Run a provider in front of your local engine. Override ENGINE_KIND, e.g.
+#   make provide ENGINE_KIND=vllm
+ENGINE_KIND ?= ollama
+provide: release
+	./target/release/openhydra-agent provide --engine-kind $(ENGINE_KIND)
 
-run-api-dht:
-	$(PYTHON) -m coordinator.api_server --dht-url http://127.0.0.1:8468 --host 127.0.0.1 --port 8080
+# Run the OpenAI-compatible gateway on 127.0.0.1:8080.
+serve: release
+	./target/release/openhydra-agent serve
 
-gen-certs:
-	./scripts/gen_dev_certs.sh
-
-genesis:
-	$(PYTHON) -m torrent.genesis --model-id openhydra-toy-345m
+clean:
+	$(CARGO) clean
