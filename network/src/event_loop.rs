@@ -2887,7 +2887,12 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
 /// confirmation events: a global listen/observed address plus an AutoNAT `Public`
 /// verdict (full/restricted-cone NAT and public hosts reach `Public`; symmetric
 /// NAT / CGNAT reach `Private` and stay clients — §2).
-fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
+/// Whether `addr` is a directly globally-routable address (rejects circuit, private,
+/// CGNAT, loopback, link-local, ULA, and documentation ranges). Shared with the bootstrap
+/// binary, which uses it to confirm its public *listen* addresses as external (a bootstrap
+/// is unambiguously public, so unlike a peer it may trust its listen addrs — see
+/// `bootstrap_bin`'s `NewListenAddr` handler).
+pub fn is_globally_reachable_addr(addr: &Multiaddr) -> bool {
     if addr.to_string().contains("/p2p-circuit") {
         return false;
     }

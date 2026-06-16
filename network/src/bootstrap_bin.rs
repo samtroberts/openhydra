@@ -314,6 +314,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match event {
                     libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                         info!(%address, "new listen address");
+                        // A bootstrap is unambiguously public (its public IP sits directly
+                        // on the interface), so confirm each globally-routable listen addr
+                        // as an EXTERNAL address. Without this the relay server has no
+                        // external addresses to put in reservations and hands clients an
+                        // empty reservation (`NoAddressesInReservation`), breaking all
+                        // cross-NAT circuit routing. This restores what AutoNAT v1 used to
+                        // do here (it emitted ExternalAddrConfirmed on its Public verdict);
+                        // retiring v1 left only the v2 *server*, which confirms other peers,
+                        // never the bootstrap itself. Safe for a bootstrap (unlike a peer,
+                        // which may be firewalled — see event_loop's R-DHT-2 reasoning).
+                        if openhydra_network::event_loop::is_globally_reachable_addr(&address) {
+                            info!(%address, "confirming public listen addr as external (relay reservations)");
+                            swarm.add_external_address(address.clone());
+                        }
                     }
                     libp2p::swarm::SwarmEvent::Behaviour(event) => {
                         match event {
