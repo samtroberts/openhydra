@@ -17,9 +17,7 @@ benches was the only thing producing coherent output.
 
 ## Prerequisites
 
-- Two Lightning Studios with a T4 GPU each (`s_01knk4fr41phzt8w0ad8q49cjy` and
-  `s_01knk4ftdeeng3zctxh2zq0w3m` in the session history — substitute your own
-  studio IDs).
+- Two Lightning Studios with a T4 GPU each (use your own studio IDs).
 - SSH tunnels from the Mac to each studio forwarding the peer gRPC port:
   ```bash
   ssh -o ServerAliveInterval=10 -N -L 50099:127.0.0.1:50051 <studio-1>@ssh.lightning.ai &
