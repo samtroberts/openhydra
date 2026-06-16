@@ -110,10 +110,6 @@ Thumbs.db
 *.log
 logs/
 
-# ── Generated proto files ─────────────────────────────────────────────────────
-peer/proto/*_pb2*.py
-peer/proto/*_pb2*.pyi
-
 # ── Internal planning / session files ─────────────────────────────────────────
 plans/
 codex_prompt*.md

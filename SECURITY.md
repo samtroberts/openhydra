@@ -24,7 +24,7 @@ If you discover a security issue in OpenHydra, report it privately via one of th
 Include in your report:
 - A description of the vulnerability and its potential impact
 - Steps to reproduce (proof-of-concept code if applicable)
-- Affected components (`peer/`, `coordinator/`, `dht/`, etc.)
+- Affected components (`agent/`, `network/`, `protocol/`)
 - Any suggested mitigations
 
 We aim to acknowledge reports within **48 hours** and provide an initial assessment within **7 days**.
@@ -47,41 +47,44 @@ We ask that reporters keep the vulnerability confidential until a patch is relea
 
 ## Security Model
 
-Understanding OpenHydra's trust model helps scope what we consider in-scope vulnerabilities:
+OpenHydra is a pure-Rust protocol: a single `openhydra-agent` binary that routes,
+verifies, and credits inference served by external engines over libp2p. Every byte
+received from a peer is attacker-controlled. Understanding this trust model helps
+scope what we consider in-scope vulnerabilities.
 
 ### In-scope
 
-- **Coordinator API** — authentication bypass, rate-limit evasion, injection attacks, information disclosure via response headers
-- **Peer gRPC service** — unauthenticated remote code execution, TLS bypass, KV cache poisoning, model-output manipulation
-- **DHT bootstrap** — Sybil attacks, peer table poisoning, geo-challenge bypass
-- **Cryptography** — Ed25519 signature bypass, AES-GCM nonce reuse, key material disclosure
-- **Verification system** — Mystery Shopper bypass, collusion between malicious peers to evade auditing
-- **Dependency vulnerabilities** — critical CVEs in `grpcio`, `cryptography`, `torch`, `transformers`
+- **Consumer gateway** (`openhydra-agent serve`) — authentication bypass on `/v1/*`, request smuggling, injection, information disclosure
+- **Provider serve path** (`openhydra-agent provide`) — malformed-request handling, resource exhaustion, engine-proxy abuse
+- **libp2p swarm / transport** — Noise/TLS downgrade, relay-circuit abuse, DCUtR/AutoNAT manipulation, message-framing attacks on the `/openhydra/*` protocols
+- **DHT** — Sybil attacks, routing-table / provider-record poisoning, geo-challenge bypass
+- **Receipts & cryptography** — Ed25519 signature bypass or forgery, receipt replay, ledger tampering, identity-key disclosure
+- **Dependency vulnerabilities** — critical CVEs in core crates (`libp2p`, `ed25519-dalek`, `rustls`, `axum`, `reqwest`, `redb`)
 
 ### Out-of-scope
 
-- Volumetric DDoS (handled at the Cloudflare / Linode network edge)
+- Volumetric DDoS (handled at the network edge)
 - Issues only reproducible with physical access to the server
 - Social engineering of maintainers
-- Security issues in the toy/deterministic model backend (not intended for production inference)
-- Self-XSS in the desktop application
+- Vulnerabilities in a third-party inference engine itself (report those upstream); the operator chooses what their engine exposes
 - Issues requiring a malicious local user on the same machine
 
 ---
 
 ## Cryptographic Primitives
 
-OpenHydra uses the following cryptographic constructions:
+OpenHydra uses the following cryptographic constructions, all implemented in Rust:
 
 | Use | Primitive | Implementation |
 |-----|-----------|----------------|
-| Peer identity | Ed25519 | `cryptography` (PyCA) |
-| Transport encryption | TLS 1.3 / mTLS | gRPC built-in |
-| Per-hop activation encryption | X25519 + AES-256-GCM | `cryptography` (PyCA) |
-| DHT geo-challenge | Ed25519 signature over nonce | `cryptography` (PyCA) |
-| HYDRA token integrity | HMAC-SHA256 (mock mode) | `hmac` (stdlib) |
+| Peer identity & receipt signatures | Ed25519 | `libp2p-identity` / `ed25519-dalek` |
+| Transport encryption | Noise (TCP) / TLS 1.3 (QUIC) | `libp2p` |
+| DHT geo-challenge | Ed25519 signature over a nonce | `ed25519-dalek` |
 
-Any vulnerability in these constructions or their usage should be reported privately.
+The node's Ed25519 identity key **never leaves the Rust daemon** — receipts are
+co-signed in-process and only the resulting signatures and public keys cross the
+wire. Any vulnerability in these constructions or their usage should be reported
+privately.
 
 ---
 
@@ -89,8 +92,12 @@ Any vulnerability in these constructions or their usage should be reported priva
 
 The following are **intentional design decisions**, not vulnerabilities:
 
-- In `dev` deployment profile, API key authentication is **disabled by default**. Enable it with `--api-key` for any internet-facing deployment.
-- The speculative decoding draft model is a **toy model**. Predictions are deterministic and do not reflect real model capability.
+- The consumer gateway binds loopback (`127.0.0.1:8080`) by default and leaves
+  `/v1/*` open. For any non-loopback or internet-facing deployment, require a key
+  with `--api-key` (or the `OPENHYDRA_API_KEY` env var) and terminate TLS at a
+  reverse proxy.
+- Provider operators are responsible for what their local engine exposes; OpenHydra
+  routes by model id and does not sandbox the engine.
 
 ---
 

@@ -1,137 +1,107 @@
 # OpenHydra — Mac Install Guide (Apple Silicon)
 
-Run a sharded LLM across multiple Macs over the internet. No servers, no cloud — just peer-to-peer.
+Share the model you already run locally — and consume models other peers serve —
+over a peer-to-peer network. No servers, no cloud. OpenHydra does **not** run a
+model itself; it sits in front of a local inference engine (Ollama is easiest on a
+Mac) and routes requests across the swarm.
 
 ## Prerequisites
 
 - macOS 14+ (Sonoma or newer) on Apple Silicon (M1/M2/M3/M4)
-- 8GB+ RAM
-- ~10GB free disk space (model weights + dependencies)
-- IPv6 connectivity (most ISPs provide this; check with `ifconfig | grep inet6`)
+- 8 GB+ RAM
+- A Rust toolchain (we install it below)
+- A local inference engine — this guide uses **[Ollama](https://ollama.com)**
+- IPv6 connectivity helps for direct cross-NAT links but is not required (the swarm
+  falls back to relays). Check with `ifconfig | grep inet6`.
 
 ## Install
 
-Open Terminal and run these commands one by one:
+Open Terminal and run these one by one:
 
 ```bash
 # 1. Install Homebrew (skip if already installed)
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-# 2. Install system dependencies
-brew install python@3.12 rust protobuf
-xcode-select --install   # skip if Xcode CLI tools already installed
+# 2. Install Rust and an inference engine
+brew install rust ollama
 
-# 3. Clone OpenHydra and checkout the right branch
+# 3. Clone and build the agent (links no Python; ~2–4 min the first time)
 git clone https://github.com/samtroberts/openhydra.git
 cd openhydra
-git checkout feat/unified-libp2p-transport
+cargo build --release -p openhydra-agent
+# → ./target/release/openhydra-agent
 
-# 4. Create a virtual environment
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# 5. Install Python dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install -r requirements-mlx.txt
-
-# 6. Build the P2P networking module (Rust → Python, takes ~2-5 min)
-pip install maturin
-cd network && maturin develop --release && cd ..
-
-# 7. Verify everything works
-python3 -c "import openhydra_network; print('P2P networking: OK')"
-python3 -c "import mlx.core; print('MLX (Metal GPU): OK')"
-python3 -c "import torch; print('PyTorch: OK')"
+# 4. Start Ollama and pull a small model
+ollama serve &                 # runs on 127.0.0.1:11434
+ollama pull llama3.2           # ~2 GB
 ```
 
 ## Run
 
-OpenHydra shards a model's layers across two Macs. Mac1 runs layers 0-12 (and the coordinator), Mac2 runs layers 12-24.
+OpenHydra has two roles, each a separate process. On a single Mac you can run both;
+across two Macs, one provides and the other consumes (or both do both).
 
-### Mac2 — the second peer (layers 12-24)
-
-Replace `<MAC1_IPV6>` and `<MAC1_PEER_ID>` with values Mac1 gives you after it starts.
-
-```bash
-cd openhydra
-source .venv/bin/activate
-
-python3 -m coordinator.node \
-  --peer-id mac2 \
-  --p2p-enabled \
-  --push-mode \
-  --pipeline-depth 1 \
-  --runtime-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
-  --hf-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
-  --layer-start 12 --layer-end 24 \
-  --p2p-bootstrap "/ip6/<MAC1_IPV6>/tcp/4001/p2p/<MAC1_PEER_ID>"
-```
-
-The first run downloads ~2.5GB of model weights from HuggingFace. After that, weights are cached locally.
-
-**What you should see:**
-
-```
-INFO  announced to kademlia model_id=openhydra-qwen3.5-2b peer_id=mac2
-INFO  peer_discovered peer_id=mac1 ...
-INFO  connection_established peer_id=... endpoint=Dialer
-```
-
-Once you see `peer_discovered`, the two Macs are connected and sharding inference.
-
-### If direct IPv6 doesn't work
-
-If the direct `--p2p-bootstrap` connection fails (e.g. firewall blocks port 4001), omit that flag entirely — both Macs will discover each other via the public bootstrap DHT and connect through a relay:
+### Provider — share your Ollama models
 
 ```bash
-python3 -m coordinator.node \
-  --peer-id mac2 \
-  --p2p-enabled \
-  --push-mode \
-  --pipeline-depth 1 \
-  --runtime-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
-  --hf-model-id mlx-community/Qwen3.5-2B-MLX-8bit \
-  --layer-start 12 --layer-end 24
+./target/release/openhydra-agent provide --engine-kind ollama
 ```
 
-This routes through Circuit Relay v2 nodes (US/EU/AP). Slower (~3 TPS vs ~12 TPS direct) but works behind any NAT.
+You should see the node come up, detect Ollama, and announce its models:
+
+```
+openhydra-agent: node up — libp2p=12D3KooW… openhydra=…
+openhydra-agent: announced 1 model(s) from http://127.0.0.1:11434
+openhydra-agent: serving inbound requests, re-announcing every 120s (Ctrl-C to stop)
+```
+
+Add `--db ~/.openhydra/ledger.redb` to persist the receipt ledger across restarts.
+
+### Consumer — run the OpenAI-compatible gateway
+
+In a second terminal (same Mac or another):
+
+```bash
+./target/release/openhydra-agent serve            # binds 127.0.0.1:8080
+```
+
+On a LAN, mDNS discovers the provider automatically. Across networks, point the
+gateway (or provider) at a known peer/relay with `--bootstrap <multiaddr>`; the
+swarm hole-punches (DCUtR) or falls back to Circuit Relay v2 behind NAT.
 
 ## Sending prompts
 
-Once both Macs show `peer_discovered`, send prompts to **Mac1** (the coordinator):
+Point any OpenAI-compatible client at the gateway:
 
 ```bash
-curl http://<MAC1_IP>:8080/v1/chat/completions \
+curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "openhydra-qwen3.5-2b",
+    "model": "llama3.2",
     "messages": [{"role": "user", "content": "Explain P2P networking in 3 sentences"}],
-    "max_tokens": 128
+    "stream": true
   }'
 ```
 
-From Mac1 itself, use `http://127.0.0.1:8080/v1/chat/completions`.
+The gateway also serves `GET /v1/models` (model ids discovered on the swarm) and
+`GET /health`. The model id must match what a provider advertises — check
+`/v1/models` if a request returns `503 no_provider`.
 
-## Expected performance
+## Notes on performance
 
-| Transport | TPS (Qwen3.5-2B, 2×Mac M1) |
-|---|---|
-| LAN (same WiFi/ethernet) | 12-17 tokens/sec |
-| Direct IPv6 (cross-ISP) | 7-8 tokens/sec |
-| Relay (fallback) | ~3 tokens/sec |
+End-to-end throughput is your engine's native tokens/sec plus transport overhead.
+A direct LAN or IPv6 link adds only a few milliseconds; a relayed cross-NAT path
+adds one hop. The engine (Ollama/MLX/llama.cpp) — not OpenHydra — determines raw
+generation speed.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `protoc: command not found` | `brew install protobuf` |
-| `maturin: command not found` | `pip install maturin` (make sure venv is active) |
-| Rust build fails with linker error about `ring` | Try `MACOSX_DEPLOYMENT_TARGET=14.0 cd network && maturin develop --release && cd ..` |
-| Rust build fails with "cargo lock" | `find ~/.cargo/registry -name '.cargo-lock' -delete` then retry |
-| `import openhydra_network` fails | `cd network && maturin develop --release && cd ..` |
-| No global IPv6 address | Check `ifconfig en0 \| grep inet6` — if only `fe80::` (link-local), your router/ISP doesn't provide IPv6. Use relay mode instead. |
-| Peer not discovered after 60s | Check that both Macs have outbound access on TCP+UDP port 4001. Try relay mode (omit `--p2p-bootstrap`). |
-| `ConnectionClosed` during generation | Relay hiccup — just retry the prompt |
-| Very slow first response | Model is downloading from HuggingFace (~2.5GB for 8-bit). Check `~/.cache/huggingface/` |
+| `cargo: command not found` | `brew install rust`, then reopen the terminal |
+| Build fails with a linker error about `ring` | `MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p openhydra-agent` |
+| `503 no_provider` from the gateway | No provider is serving that model id — start a `provide` agent and confirm the id in `GET /v1/models` |
+| Provider logs `0 models` | Pull a model in your engine (`ollama pull …`) and restart the provider so it re-detects |
+| Peer not discovered on a LAN | Some Wi-Fi routers block mDNS multicast — pass `--bootstrap` with the other node's multiaddr |
+| No global IPv6 address | `ifconfig en0 \| grep inet6` shows only `fe80::` (link-local) → rely on relay mode (the default fallback) |
 | `MallocStackLogging` warnings | Harmless macOS diagnostic messages — ignore them |

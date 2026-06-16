@@ -26,10 +26,10 @@ OpenHydra follows the [Contributor Covenant](https://www.contributor-covenant.or
 
 Open a [GitHub Issue](../../issues/new?template=bug_report.md) and include:
 
-- Your OS, Python version, and hardware (CPU/GPU/RAM)
+- Your OS, Rust toolchain version (`rustc --version`), and which inference engine you ran (Ollama / vLLM / llama.cpp / …)
 - Steps to reproduce
 - Expected vs actual behaviour
-- Relevant log output (redact any API keys or secrets)
+- Relevant log output — run with `RUST_LOG=info` (or `debug`) and redact any API keys or secrets
 
 ### Requesting Features
 
@@ -51,84 +51,74 @@ Open a [GitHub Issue](../../issues/new?template=feature_request.md) with:
 
 ## Development Setup
 
+OpenHydra is a pure-Rust workspace — three crates (`network/`, `protocol/`, `agent/`) and a single binary, `openhydra-agent`. There is no Python in any role.
+
 ### Prerequisites
 
-- **Python 3.11+**
-- **C/C++ compiler**: `xcode-select --install` (macOS) or `apt install build-essential libssl-dev` (Linux)
-- **Apple Silicon**: `pip install "openhydra-network[mlx]"` for GPU acceleration
-- **NVIDIA**: `pip install torch --index-url https://download.pytorch.org/whl/cu124`
+- **Rust toolchain** (stable) — install via <https://rustup.rs>
+- **A C/C++ compiler** — `xcode-select --install` (macOS) or `apt install build-essential libssl-dev pkg-config` (Linux)
+- **An inference engine** for end-to-end testing (optional for unit tests) — e.g. [Ollama](https://ollama.com), vLLM, LM Studio, or llama.cpp
 
 ```bash
 # 1. Clone
 git clone https://github.com/samtroberts/openhydra.git
 cd openhydra
 
-# 2. Create virtual environment
-make venv
-source .venv/bin/activate
+# 2. Build the agent (links no Python)
+cargo build -p openhydra-agent           # or: make build
 
-# 3. Install all dependencies
-make install
-
-# 4. Compile protobuf definitions
-make proto
-
-# 5. Optional: install interactive shell extras
-pip install -e ".[shell]"
-
-# 6. Verify everything works
-make test
+# 3. Run the test suite
+make test                                 # cargo test --workspace --no-default-features
 ```
 
-### Optional extras
-
-| Extra | Command | Purpose |
-|---|---|---|
-| KV compaction research | `pip install -e ".[kv-compaction]"` | transformers + scipy for Phase 1–4 |
-| Interactive shell | `pip install -e ".[shell]"` | prompt_toolkit for `openhydra-shell` |
+> **Note on the pyo3 feature.** The `network` crate has an optional `pyo3`
+> extension-module build (a Python wheel via `maturin`), enabled by default for
+> `cargo build -p openhydra-network`. It is legacy and slated for removal; the
+> agent and the test suite build with `--no-default-features`, so you do **not**
+> need a Python toolchain to develop OpenHydra. Plain `cargo build` of the
+> `network` cdylib will fail to *link* standalone (that's expected for a pyo3
+> extension module — only `maturin` links it correctly).
 
 ---
 
 ## Running Tests
 
 ```bash
-# Fast suite (~2.5 min, 1045+ tests)
-python -m pytest tests/ -q
+# Whole workspace, no pyo3 (no Python toolchain needed)
+make test
+# equivalently:
+cargo test --workspace --no-default-features
 
-# With coverage report
-python -m pytest tests/ --cov=coordinator --cov=peer --cov=dht
+# A single crate
+cargo test -p openhydra-agent --no-default-features
 
-# Full suite including real-tensor tests (requires PyTorch + HF model download)
-OPENHYDRA_RUN_REAL_TENSOR_TEST=1 python -m pytest tests/ -q
-
-# Single module
-python -m pytest tests/test_kv_compaction.py -v
-
-# Lint check (style + security rules)
-pip install ruff && ruff check . --config pyproject.toml
+# Lint (clippy, warnings as errors) and format
+make clippy        # cargo clippy --workspace --no-default-features --all-targets -- -D warnings
+make fmt           # cargo fmt --all
 ```
 
-All pull requests must pass the test suite with zero failures before review.
+All pull requests must pass `make test` and `make clippy` with zero failures before review.
 
 ---
 
 ## Pull Request Guidelines
 
 - **One concern per PR** — keep diffs focused and reviewable
-- **Tests required** — new behaviour must have matching tests; aim for ≥80 % coverage on changed lines
+- **Tests required** — new behaviour must have matching tests
 - **No secrets** — never commit `.env`, `*.pem`, `*.key`, API tokens, or seed phrases
-- **Descriptive commits** — prefer `feat(coordinator): add per-key rate-limit tiers` over `fix stuff`
-- **Update the progress tracker** — if your PR completes a roadmap item, mark it in `OpenHydra_progress.md`
+- **Descriptive commits** — prefer `feat(agent): add per-key rate-limit tiers` over `fix stuff`
 
 ### Commit style (Conventional Commits)
 
 ```
-feat(peer): add QUIC transport option
-fix(dht): handle empty lookup response gracefully
-docs(readme): clarify ARM deployment steps
-test(kv_compaction): add auto-mode boundary tests
-refactor(coordinator): extract rate-limit logic into middleware
+feat(agent): add an LM Studio engine adapter
+fix(network): handle empty Kademlia lookup response gracefully
+docs(readme): clarify the provider/gateway split
+test(protocol): add receipt round-trip boundary tests
+refactor(network): extract relay-reservation logic
 ```
+
+Scopes map to the crates: `agent`, `network`, `protocol` (plus `docs`, `ops`, `ci`).
 
 ---
 
@@ -144,11 +134,10 @@ See [LICENSE](LICENSE) for the full license text.
 
 Look for issues labelled **`good first issue`** — these are scoped tasks suitable for new contributors:
 
-- Adding entries to `models.catalog.json`
-- Improving error messages and logging
+- Adding a new engine adapter under `agent/src/adapters/`
+- Improving error messages and `tracing` diagnostics
 - Writing additional unit tests
 - Documentation and example improvements
-- SDK improvements (`sdk/python/`, `sdk/typescript/`)
 
 ---
 
