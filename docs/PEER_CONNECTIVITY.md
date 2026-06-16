@@ -181,5 +181,86 @@ metric for everything in this document.
 5. **Measure the relay→direct upgrade rate** and treat it as the headline
    connectivity KPI.
 
+## Appendix — Connection reversal (Tier 2): implementation scope
+
+The single highest-leverage gap from the ladder above. Today the flow is strictly
+consumer-dials-provider, so a NAT'd provider resolves to a relay. Connection
+reversal makes the **provider** (the NAT'd side) dial a **reachable consumer**, so
+inference runs direct. It is the only escape on **symmetric CGNAT**, where DCUtR
+(simultaneous-open) structurally fails.
+
+**Key enabler:** libp2p `request_response` is **bidirectional once connected** — the
+provider only reverses the *connection direction*, not the request/response roles.
+Once the provider dials in, the consumer's existing `proxy_forward → send_request`
+runs unchanged over that connection. The provider's outbound dial succeeds even on
+symmetric CGNAT (outbound flows always traverse the NAT).
+
+### Design — two options
+
+**Option A (recommended): provider-side proactive direct-upgrade.** On accepting a
+**relayed inbound** connection, the provider checks whether the remote peer
+(consumer) has **globally-routable** addresses libp2p already learned via
+Identify/observed-addr, and if so **dials them directly**; libp2p migrates traffic
+off the relay. No new wire protocol, no consumer-side changes (Identify already
+advertises listen addrs over the circuit). It is the v4 + relayed-trigger
+generalization of the existing auto-QUIC-IPv6 upgrade in `event_loop.rs`.
+
+**Option B (fallback/general): explicit reverse-connect signal.** A control frame the
+consumer sends the provider **over the relay circuit it already opens** (not gossip),
+carrying its reachable multiaddrs. More general, but needs the anti-abuse gates built
+explicitly. Prefer A; keep B for the case where Identify-over-relay is insufficient.
+
+### Change list (Option A)
+
+| # | Change | File |
+|---|---|---|
+| 1 | `SwarmCommand::GetExternalAddrs` + `NetworkHandle::external_addrs()` (surface `state.external_addrs` + UPnP addrs) | `event_loop.rs`, `handle.rs` |
+| 2 | On `ConnectionEstablished` over a `/p2p-circuit` endpoint, look up the peer's Identify-learned addrs | `event_loop.rs` |
+| 3 | If any pass `is_globally_reachable_addr`, dial them: `DialOpts::peer_id(p).addresses(addrs).condition(Always)` | `event_loop.rs` |
+| 4 | Prefer the resulting direct connection; tear down the relay circuit only after direct is confirmed carrying traffic | `event_loop.rs` |
+| 5 | Reversal-upgrade counters + extend `GetDcutrStats` (feeds the relay→direct KPI above) | `event_loop.rs` |
+| 6 | Feature flag `enable_connection_reversal` (default **off**) | `node.rs` `NodeConfig`, `main.rs` |
+
+Option A needs **no** `provider.rs`/`consumer.rs` agent-logic changes — it is a
+network-layer behavior. (Option B adds consumer "I'm reachable → request reversal"
+logic + a proxy control-frame.)
+
+### Anti-abuse (amplification / DoS — the part to get right)
+
+Option A is safe by construction: it (1) only ever dials a peer it is **already** in
+an authenticated relayed session with, (2) only dials **libp2p-observed/Identify**
+addresses, never self-reported ones, (3) **validates** every candidate with
+`is_globally_reachable_addr` (drops CGNAT/private/loopback/ULA/circuit), and (4)
+**rate-limits** reversal dials per-peer and globally (reuse the relay leech-table
+pattern). Optionally reputation-gate the upgrade.
+
+### Edge cases
+- **Both peers NAT'd** → no globally-routable addrs → fall through to DCUtR then relay
+  (reversal is purely additive).
+- **Consumer also symmetric-CGNAT** → its addrs fail the routable filter → no reversal
+  attempted (correct).
+- **Stale Identify addrs** → dial fails fast, session stays on relay, failure counted.
+- **Migration race** → never drop the working relay path before the direct one is
+  observed carrying a response.
+- **Both have IPv6** → Tier 1 wins before reversal is needed.
+
+### Validation
+- **Unit:** address-validation + gating (routable filter, rate-limit, reputation floor).
+- **Integration:** 2-node with a simulated relay; assert the relayed session upgrades
+  to direct and `reversal_successes` increments.
+- **Live cross-NAT (mandatory before default-on):** NAT'd provider on ACT/CGNAT
+  (GPU1 or Mac) ↔ reachable consumer (public VPS / public-IPv6 Mac). Measure the
+  **relay→direct upgrade rate** and **TPS before/after** — target: symmetric-CGNAT
+  sessions climb from the ~3 TPS relay floor toward the ~7.6 TPS direct number.
+
+### Risk & rollout
+Moderate-risk (touches the live event loop the bootstraps share): feature-flag off →
+unit/integration green → live cross-NAT validation → default on. Compiler + the
+network test suite are guardrails; the live test is the real gate. **Effort:** ~1–1.5
+weeks for Option A incl. live validation; +~0.5w for Option B if needed.
+
+---
+
 See also: [protocol.md](protocol.md) §3 (Transport & discovery),
+[PROTOCOL_IMPLEMENTATION_PLAN.md](PROTOCOL_IMPLEMENTATION_PLAN.md) §8 (next actions),
 `docs/DHT_ROBUSTNESS_REMEDIATION.md` (the R-DHT-1…11 work this builds on).

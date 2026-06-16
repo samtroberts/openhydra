@@ -4,8 +4,8 @@
 > document's *what*. It maps the spec onto the code that exists today, fixes the
 > implementation language, and breaks the work into ordered, verifiable milestones.
 
-**Status:** draft v3 (**pure-protocol pivot**) · **Branch:** `main` (worked in the
-`openhydra-netfix` worktree) · **Author:** planning pass 2026-06-14
+**Status:** v4 — **pivot shipped** (snapshot below) · **Branch:** `main` (worked in the
+`openhydra-netfix` worktree) · **Original planning pass:** 2026-06-14 · **Status refresh:** 2026-06-16
 
 ---
 
@@ -37,7 +37,50 @@ verification) and prove it end-to-end *before* deleting the Python engine + coor
 
 ---
 
+## ✅ Current status (2026-06-16): the pivot is shipped
+
+The pure-protocol pivot is **complete and live on `main`.** OpenHydra is now a
+single-language Rust project — the Python coordinator/engine tree and the PyO3
+bridge are **deleted**, and the Rust `openhydra-agent` is the sole host. **The
+detailed sections below are the original plan; the PyO3-transition framing in
+§0–§2 and §5 is now *historical* — that bridge is gone.** This banner is the
+source of truth for current state.
+
+**Done:** Phase 1 (M1.1–M1.3) · M2.1 receipts · M2.2 verification *primitives*
+(`protocol::verify`) · M2.3 redb ledger (`protocol::store`) · M3.1 Ollama adapter ·
+M3.2 adapters (vLLM / LM Studio / llama.cpp / OpenAI-compatible) · **R1** HTTP/SSE
+gateway (`agent/src/gateway.rs` — non-streaming + streaming, `GET /v1/models`,
+optional API-key auth) · **R2** cutover (Python tree deleted, single static binary) ·
+**R2b-1** (pyo3/FFI removed → `network` is a pure rlib) · all of R-DHT-1…11
+(DHT + NAT-traversal hardening). The §5 near-term goal — *"an Ollama-friendly swarm
+serving verified inference end-to-end with no Python in the path"* — is **achieved.**
+
+**Remaining:**
+
+| Area | Item | Notes |
+|---|---|---|
+| Incentive layer | **M3.3 — scarcity pricing on** | the `scarcity_multiplier` switch is **not yet wired** (no pricing code in `protocol/`) |
+| Incentive layer | **M2.4 — cold-start correctness** | priority-not-access under an empty ledger |
+| Incentive layer | Verification *depth* | redundant-exec / sampling *enforcement* in the router, beyond the built hash + reputation primitives |
+| Incentive layer | Priority-not-access *enforcement* | wire the ledger ratio → rate-cap into routing |
+| Reach | **R3 — packaging** | Homebrew / signed single-binary install |
+| Reach | **Desktop D1–D3** | the Tauri one-click app — now unblocked by R1 |
+| Adapters | Apple Foundation Models | optional macOS Swift-FFI adapter (own crate) |
+| Connectivity | **Connection reversal (Tier 2)** | NAT'd provider dials a reachable consumer — escapes relay on symmetric CGNAT (see [PEER_CONNECTIVITY.md](PEER_CONNECTIVITY.md)) |
+| Cleanup | R2b-2 → R2b-3 | excise the legacy IPC/sharding Rust modules woven into `event_loop.rs`, then drop the `proto` mod once `dispatcher` is gone |
+
+**Critical-path read:** the original plan's near-term goal is met. What remains splits
+into (a) **finishing the incentive layer** (M2.4 + M3.3 + enforcement — so give-to-get
+actually bites) and (b) **reach** (R3 + Desktop — adoption). Connection reversal is
+orthogonal and arguably the highest-leverage item for real-world cross-NAT usability.
+
+---
+
 ## 0. Where we actually are (grounding)
+
+> **Historical (2026-06-14).** This table described the pre-pivot codebase. It is kept
+> for context; see the status banner above for current state. Statuses below are
+> annotated `→ now:` where they changed.
 
 The spec's roadmap reads as four greenfield phases. The codebase says otherwise —
 **the protocol substrate is largely built, and the hardest part of it is already Rust.**
@@ -304,7 +347,7 @@ means `cargo test` in the owning crate, plus golden vectors (§6).
 
 ### Phase 1 — Protocol core hardened (whole-model routing, end to end)
 
-**M1.1 — Canonical model id** · WS-ID · Rust · ~2w
+**M1.1 — Canonical model id** · WS-ID · Rust · ~2w · **✅ DONE** (`protocol::model_id`)
 - `model_id` module — **landed inside the existing `network` crate** (`network/src/model_id.rs`,
   M1.1 core: 20 tests green, clippy/fmt clean). Starting in-crate keeps the workspace
   refactor *iterative* — extract to a `protocol` crate later, not up front. `CanonicalModelId`
@@ -346,7 +389,7 @@ means `cargo test` in the owning crate, plus golden vectors (§6).
      length `template_hash`; add hex + length validation for concrete (non-wildcard)
      provider ids (harmless for matching today, but a bogus provider hash isn't rejected).
 
-**M1.2 — Capability records on the wire** · WS-CAP · Rust · ~1w
+**M1.2 — Capability records on the wire** · WS-CAP · Rust · ~1w · **✅ DONE**
 - Extend the DHT `PeerRecord` (already Rust, `network/src/types.rs`) with the spec §4
   set used by ranking: `context_length`, `max_output_tokens`, `throughput_tok_s`,
   `queue_depth`, `backend`, `hardware_class`, `region`, `requires_relay`, `reputation`,
@@ -354,7 +397,7 @@ means `cargo test` in the owning crate, plus golden vectors (§6).
 - **Exit test:** records round-trip through the DHT with the new fields; a seeded
   multi-peer test proves ranking orders by live health/RTT/throughput/queue.
 
-**M1.3 — Router: resolve → rank → route (in Rust)** · WS-CAP · Rust · ~2w
+**M1.3 — Router: resolve → rank → route (in Rust)** · WS-CAP · Rust · ~2w · **✅ DONE** (`protocol::router`)
 - Port ranking + resolution (`coordinator/peer_selector.py`, `discovery_service.py`,
   `path_finder.py`) into `protocol::router` — pure scoring (liveness, RTT, throughput,
   queue, reputation, contribution ratio). Drive
@@ -368,7 +411,7 @@ means `cargo test` in the owning crate, plus golden vectors (§6).
 
 Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rust.**
 
-**M2.1 — Co-signed receipts** · WS-RCPT · Rust · ~2w
+**M2.1 — Co-signed receipts** · WS-RCPT · Rust · ~2w · **✅ DONE** (`protocol::receipts`)
 - `protocol::receipts`: `sign_provider(sign_consumer(provider, consumer, model_id,
   tokens, nonce, ts))` with the existing `ed25519-dalek` keys; nonce store
   (double-count), monotonic per-peer counters (rollback). Plumb into the lifecycle
@@ -377,7 +420,7 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
   count / replayed nonce rejected; property tests over signing; golden vectors fix the
   byte layout.
 
-**M2.2 — Verification policy** · WS-VERIFY · Rust · ~2.5w
+**M2.2 — Verification policy** · WS-VERIFY · Rust · ~2.5w · **⚠️ PARTIAL** (`protocol::verify` — hash + reputation primitives built; sampled redundant-exec *enforcement* in the router pending)
 - Port TOPLOC hashing into `protocol::verify`; build the *policy*: sampled
   proof-of-inference (rate tuned by reputation), redundant execution (run a sampled
   fraction on ≥2 providers, compare), reputation feedback that downranks repeat
@@ -385,7 +428,7 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
 - **Exit test:** a deliberately-bad provider is caught by sampled verification and
   downranked out of routing within N requests; sample rate scales with reputation.
 
-**M2.3 — Credit ledger & priority-not-access** · WS-CREDIT · Rust · ~2.5w
+**M2.3 — Credit ledger & priority-not-access** · WS-CREDIT · Rust · ~2.5w · **⚠️ PARTIAL** (redb ledger `protocol::store` ✅; priority-not-access *enforcement* + scarcity pricing pending — see M3.3)
 - `protocol::ledger` over **`redb`** (pure-Rust, ACID, crash-safe — chosen over `sled`,
   which is unmaintained/crash-risky; `rusqlite`/SQLite is the battle-tested alt, already
   used in-repo for `credits.db`): single fungible balance; `price = compute_weight ×
@@ -428,7 +471,7 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
   signed `PeerRecord` lives on the relays, not locally) → **chain a `get_record`** to pull
   it, and keep partial results on query timeout.
 
-**M3.2 — Additional adapters** · WS-ENGINE · Rust · ~2w
+**M3.2 — Additional adapters** · WS-ENGINE · Rust · ~2w · **✅ DONE** (vLLM / LM Studio / llama.cpp / OpenAI-compatible in `agent/src/adapters/`; Apple Foundation Models still pending)
 - vLLM, LM Studio, Exo (OpenAI-compatible → thin), then llama.cpp server and Apple
   Foundation Models (bespoke shims) behind a stable `EngineAdapter` trait.
 - **Structure:** the M3.1 Ollama adapter ships as a single `agent/src/ollama.rs`. The
@@ -440,12 +483,12 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
 - **Exit test:** each adapter passes one conformance suite (detect → advertise → serve
   → receipt).
 
-**M3.3 — Scarcity pricing on** · WS-CREDIT · Rust · ~1w
+**M3.3 — Scarcity pricing on** · WS-CREDIT · Rust · ~1w · **❌ NOT STARTED** (no pricing code wired yet)
 - Enable the damped multiplier with real rolling supply/demand per model class.
 - **Exit test:** under-supplied class earns/costs more within the clamp; smooth across
   epochs (no oscillation).
 
-**M3.4 — Private-swarm tooling** · WS-SWARM · Rust · ~1.5w
+**M3.4 — Private-swarm tooling** · WS-SWARM · Rust · ~1.5w · **❌ NOT STARTED**
 - Allow-list / shared-secret scoping of discovery, routing, verification, ledger.
 - **Exit test:** a 3-machine private swarm self-bootstraps with no public peers; an
   outsider can't discover or route to it.
@@ -463,7 +506,7 @@ banner). The final "delete the Python engine + coordinator" step lives in the **
 Runs alongside Phases 1–3; consumes the crates they produce. Gated only on the HTTP
 front door, not on the credit/verification rules (those are already Rust).
 
-**R1 — Rust HTTP/SSE gateway** · ~3w · **(critical path — the consumer front door)**
+**R1 — Rust HTTP/SSE gateway** · ~3w · **(critical path — the consumer front door)** · **✅ DONE** (`agent/src/gateway.rs`: streaming + non-streaming, `GET /v1/models`, API-key auth)
 - `openhydra-agent`: OpenAI/Ollama-compatible HTTP+SSE server (`axum`/`hyper`)
   fronting the libp2p core via `proxy_forward` + a streaming variant. The new host's
   front door. With no sharded tier, R1 + the M3.1 engine adapter together *are* the
@@ -471,7 +514,7 @@ front door, not on the credit/verification rules (those are already Rust).
 - **Exit test:** an OpenAI SDK client hits the Rust daemon and gets a streamed
   completion routed over libp2p to a provider's local engine — no Python anywhere.
 
-**R2 — Cutover: delete the Python engine + coordinator** · ~2w (protocol logic already Rust)
+**R2 — Cutover: delete the Python engine + coordinator** · ~2w (protocol logic already Rust) · **✅ DONE (2026-06-16)** — Python tree deleted; `network` is now a pure rlib (R2b-1) with the legacy IPC/sharding modules slated for R2b-2
 - Once R1 + the engine adapter serve a request end-to-end, `openhydra-agent` becomes the
   sole host: **delete** the Python coordinator/inference engine (the §1.3 removal list)
   and retire the transitional `openhydra-pyext` Python-host glue. There is no Python
@@ -479,7 +522,7 @@ front door, not on the credit/verification rules (those are already Rust).
 - **Exit test:** `openhydra` runs as a single static binary with **no Python env at
   all**; a provider serves by proxying to its local engine; the Python tree is gone.
 
-**R3 — Packaging & distribution** · ~1.5w
+**R3 — Packaging & distribution** · ~1.5w · **❌ NOT STARTED** (now unblocked — R1/R2 done)
 - Static binary, Homebrew formula, signed releases, one-line install, `--join` toggle.
 - **Exit test:** clean machine, `brew install openhydra && openhydra --join`, serving
   within minutes, no toolchain.
@@ -494,7 +537,7 @@ the agent; the React frontend is the control panel. Engine bundling is **out of 
 for now** (the app assumes the user supplies/points at a local engine). Gated on the
 `openhydra-agent` crate existing (≈ R1).
 
-**D1 — Tauri shell over the shared crates** · WS-DIST · ~2.5w
+**D1 — Tauri shell over the shared crates** · WS-DIST · ~2.5w · **❌ NOT STARTED** (gated on R1 ✅ → now unblocked)
 - Wire `desktop/src-tauri` to depend on `openhydra-agent`/`openhydra-protocol`/
   `openhydra-network`; run the agent in-process (or as a managed sidecar). Build the
   React control panel: join/leave swarm, pick local models to seed, live peers,
@@ -502,7 +545,7 @@ for now** (the app assumes the user supplies/points at a local engine). Gated on
 - **Exit test:** launching the app starts the agent and shows live swarm state; toggling
   "join" advertises the node and serves a request end-to-end from the GUI.
 
-**D2 — Per-OS one-click installers + signing** · WS-DIST · ~2w
+**D2 — Per-OS one-click installers + signing** · WS-DIST · ~2w · **❌ NOT STARTED**
 - Tauri bundler targets: `.dmg`/`.app` (macOS), `.msi`/NSIS `.exe` (Windows),
   `.deb`/`.rpm`/`.AppImage` (Linux). Apple Developer ID signing + **notarization**;
   Windows **Authenticode** signing. Tauri **auto-updater** channel + signed update
@@ -518,7 +561,7 @@ for now** (the app assumes the user supplies/points at a local engine). Gated on
   installer and reaches a running app with **no terminal and no security warnings**;
   a shipped update auto-applies.
 
-**D3 — Tray, autostart & background seeding** · WS-DIST · ~1w
+**D3 — Tray, autostart & background seeding** · WS-DIST · ~1w · **❌ NOT STARTED**
 - System-tray presence, run-in-background (close-to-tray), autostart-on-login — the
   "always seeding" behavior of a torrent client. Surface seed/serve status in the tray.
 - **Exit test:** the app keeps serving from the tray after the window is closed and
@@ -529,11 +572,13 @@ for now** (the app assumes the user supplies/points at a local engine). Gated on
 ## 5. Sequencing & critical path
 
 ```
-Phase 1 (M1.1→M1.3 ✅)  ─►  Phase 2 (M2.1✅ M2.2→M2.4)  ─►  Phase 3 (M3.1 engine adapter ✅, M3.x ← NEXT)
-   (Rust crates, called by the Python host via PyO3 during transition)
-        └───────────────────────────────────► R1 (gateway) ─► R2 (delete Python) ─► R3 (package)
-                                                   Phase 4 (sharded) ❌ removed
+Phase 1 (M1.1→M1.3 ✅) ─► Phase 2 (M2.1 ✅ · M2.2/M2.3 ⚠️ · M2.4 ❌) ─► Phase 3 (M3.1 ✅ · M3.2 ✅ · M3.3/M3.4 ❌)
+        └──────────────────────────► R1 gateway ✅ ─► R2 delete-Python ✅ ─► R2b-1 de-pyo3 ✅ ─► R3 package ❌
+                                          Phase 4 (sharded) ❌ removed   ·   Desktop D1–D3 ❌ (unblocked)
 ```
+
+> The PyO3-during-transition note that used to sit under this diagram is gone:
+> R2b-1 removed PyO3 entirely; the network crate is a pure rlib.
 
 - **Critical path to a usable network:** M1.1 → M1.2 → M1.3 → M2.1 → (M2.2) → **M3.1
   engine adapter → R1 gateway** — a verifiable, Ollama-friendly swarm that serves real
@@ -587,17 +632,27 @@ Phase 1 (M1.1→M1.3 ✅)  ─►  Phase 2 (M2.1✅ M2.2→M2.4)  ─►  Phase 
 
 ---
 
-## 8. Immediate next actions
+## 8. Immediate next actions (2026-06-16)
 
-1. **Scaffold the Rust protocol module.** Add a `model_id` module to the `network`
-   crate (fastest start) or stand up the `protocol/` workspace crate now if you prefer
-   the clean split up front. Add `sha2` to deps.
-2. **Land the M1.1 golden vectors** — the 16 catalog entries' expected
-   `(family, params)` + canonical-id equivalence cases — as the Rust test fixture, so
-   the implementation is written against a fixed contract.
-3. **Implement M1.1 in Rust** (`CanonicalModelId`, `chat_template_hash`, parser, quant
-   normalization, `is_compatible`) to green `cargo test`.
-4. **Expose M1.1 via PyO3** (`openhydra-pyext`, or a temporary export from the existing
-   cdylib) and wire it into `dht_announce` advertising + `discovery_service` matching,
-   with a 2-node integration test — closing M1.1 without waiting for the host inversion.
-5. Decide whether to **create the workspace now** vs. promote at the R-track (see §1.2).
+The protocol core + Rust inference path + cutover are done (see the status banner).
+The open work, roughly in priority order:
+
+1. **Connection reversal (Tier-2 NAT traversal).** Highest-leverage for real-world
+   cross-NAT usability: let a NAT'd provider dial a reachable consumer so inference
+   escapes the relay on symmetric CGNAT (where DCUtR can't help). Scope + design in
+   [PEER_CONNECTIVITY.md](PEER_CONNECTIVITY.md) (provider-side proactive direct-upgrade,
+   feature-flagged, live cross-NAT validation required).
+2. **Finish the incentive layer so give-to-get bites:**
+   - **M3.3 scarcity pricing** — wire the `scarcity_multiplier` (clamped 0.5–2×) over a
+     rolling supply/demand signal per model class. *(No pricing code exists yet.)*
+   - **Priority-not-access enforcement** — feed the ledger's time-decayed ratio →
+     `rate_cap` into the router so a leecher is throttled (never blocked) under contention.
+   - **M2.4 cold-start correctness** + **verification depth** (sampled redundant-exec
+     enforcement, beyond the built hash/reputation primitives).
+   - Build the **Rust simulation harness** (§6) — it's the exit test for all of the above.
+3. **Reach:** **R3** packaging (Homebrew / signed single-binary) → **Desktop D1–D3**
+   (the Tauri one-click app, now unblocked by R1).
+4. **Cleanup:** **R2b-2** (excise the legacy IPC/sharding Rust modules woven into
+   `event_loop.rs` — see [PEER_CONNECTIVITY.md] note + `r2-cutover-plan` memory) →
+   **R2b-3** (drop the `proto` mod + build.rs prost step once `dispatcher` is gone).
+5. **Optional:** Apple Foundation Models adapter (macOS Swift-FFI, its own crate).
