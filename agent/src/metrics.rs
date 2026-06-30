@@ -85,6 +85,7 @@ pub struct Metrics {
     completions_ok: AtomicU64,
     completions_error: AtomicU64,
     completion_tokens: AtomicU64,
+    rate_limited: AtomicU64,
     request_duration: Histogram,
     discover_duration: Histogram,
     proxy_roundtrip: Histogram,
@@ -104,6 +105,7 @@ impl Metrics {
             completions_ok: AtomicU64::new(0),
             completions_error: AtomicU64::new(0),
             completion_tokens: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
             request_duration: Histogram::new(LATENCY_BUCKETS),
             discover_duration: Histogram::new(LATENCY_BUCKETS),
             proxy_roundtrip: Histogram::new(LATENCY_BUCKETS),
@@ -137,6 +139,11 @@ impl Metrics {
         self.completions_error.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A request was shed by the ingress rate-limiter (returned 429).
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render the whole registry to the Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(2048);
@@ -151,6 +158,7 @@ impl Metrics {
         counter(&mut out, "openhydra_completions_total", "Completions served successfully.", &self.completions_ok);
         counter(&mut out, "openhydra_completion_errors_total", "Completions that failed.", &self.completions_error);
         counter(&mut out, "openhydra_completion_tokens_total", "Completion tokens served.", &self.completion_tokens);
+        counter(&mut out, "openhydra_rate_limited_total", "Requests shed by the ingress rate-limiter (429).", &self.rate_limited);
         self.request_duration.render("openhydra_request_duration_seconds", "End-to-end completion wall time.", &mut out);
         self.discover_duration.render("openhydra_discover_seconds", "Provider-discovery latency.", &mut out);
         self.proxy_roundtrip.render("openhydra_proxy_roundtrip_seconds", "Provider proxy round-trip latency.", &mut out);

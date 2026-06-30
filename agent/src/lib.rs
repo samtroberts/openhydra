@@ -29,6 +29,7 @@ pub mod hardening;
 pub mod http;
 pub mod metrics;
 pub mod provider;
+pub mod ratelimit;
 pub mod receipt;
 pub mod serve;
 pub mod telemetry;
@@ -39,6 +40,7 @@ pub use adapter::{
     ServeOutcome,
 };
 pub use aup::{AupDecision, AupPolicy};
+pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
 pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};

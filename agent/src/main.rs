@@ -28,7 +28,8 @@ use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
     live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, EngineAdapter, Provider,
-    DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
+    RateLimitConfig, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL,
+    DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -162,6 +163,45 @@ impl AupArgs {
     }
 }
 
+/// Ingress DoS rate-limit (the gateway's own front door — `serve` only). Every lever defaults
+/// to off; concurrency is the primary one (each completion ties up a generation for seconds),
+/// rps/burst the secondary anti-flood guard. Keyed by API key → socket IP (never a spoofable
+/// header unless `--trusted-proxy`).
+#[derive(Args, Clone)]
+struct RateLimitArgs {
+    /// Max concurrent in-flight requests per identity (0 = off — the primary lever).
+    #[arg(long, default_value_t = 0)]
+    rate_limit_max_inflight: u32,
+
+    /// Sustained requests/sec per identity (0 = off).
+    #[arg(long, default_value_t = 0)]
+    rate_limit_rps: u32,
+
+    /// Token-bucket burst capacity (0 → defaults to the rps value).
+    #[arg(long, default_value_t = 0)]
+    rate_limit_burst: u32,
+
+    /// Hard cap on distinct tracked identities (memory bound; idle ones are evicted).
+    #[arg(long, default_value_t = 10_000)]
+    rate_limit_max_tracked: usize,
+
+    /// Trust `X-Forwarded-For` for per-IP keying — only set this behind a reverse proxy you
+    /// control, since the header is otherwise client-spoofable.
+    #[arg(long)]
+    trusted_proxy: bool,
+}
+
+impl RateLimitArgs {
+    fn into_config(&self) -> RateLimitConfig {
+        RateLimitConfig {
+            rps: self.rate_limit_rps as f64,
+            burst: self.rate_limit_burst as f64,
+            max_inflight: self.rate_limit_max_inflight,
+            max_tracked: self.rate_limit_max_tracked,
+        }
+    }
+}
+
 #[derive(Args)]
 struct ProvideArgs {
     /// Which local engine to proxy to.
@@ -220,6 +260,9 @@ struct ServeArgs {
 
     #[command(flatten)]
     aup: AupArgs,
+
+    #[command(flatten)]
+    rate_limit: RateLimitArgs,
 }
 
 fn main() {
@@ -402,6 +445,8 @@ fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
         if api_key.is_some() { "API key required on /v1/*" } else { "open" },
     );
     let aup = args.aup.clone().into_policy();
-    serve_http(net, &args.bind, api_key, store, aup)
+    let rate_limit = args.rate_limit.into_config();
+    let trusted_proxy = args.rate_limit.trusted_proxy;
+    serve_http(net, &args.bind, api_key, store, aup, rate_limit, trusted_proxy)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

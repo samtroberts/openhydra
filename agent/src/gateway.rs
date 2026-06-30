@@ -16,10 +16,11 @@
 //! handler runs it on a **plain OS thread** (outside any tokio context, where
 //! `blocking_send` is valid) and pipes the deltas back through an unbounded channel.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -37,6 +38,7 @@ use crate::adapter::ChatMessage;
 use crate::aup::{AupDecision, AupPolicy};
 use crate::consumer::ConsumerNode;
 use crate::metrics::Metrics;
+use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use openhydra_protocol::store::Store;
 use crate::serve::ServeSummary;
 
@@ -50,6 +52,11 @@ struct AppState {
     metrics: Arc<Metrics>,
     /// Acceptable-use policy floor applied to inbound completion requests (default permissive).
     aup: Arc<AupPolicy>,
+    /// Ingress DoS rate-limiter (per-identity concurrency + token bucket; default off).
+    rate_limiter: Arc<RateLimiter>,
+    /// Honor `X-Forwarded-For` for per-IP keying (only behind a trusted reverse proxy — the
+    /// header is client-spoofable). Default `false`: key off the unspoofable socket address.
+    trusted_proxy: bool,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -93,6 +100,13 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -488,6 +502,66 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
     next.run(req).await
 }
 
+/// The client identity to rate-limit by — most-unforgeable first: the operator-issued API
+/// key (validated by `require_api_key` upstream) → the socket peer IP → a trusted-proxy
+/// `X-Forwarded-For`. The raw XFF header is client-spoofable, so it is honored only when
+/// `trusted_proxy` is set; otherwise an attacker could forge a fresh identity per request.
+fn rate_limit_identity(state: &AppState, peer: SocketAddr, req: &Request) -> String {
+    if state.api_key.is_some() {
+        if let Some(token) = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            return format!("key:{token}");
+        }
+    }
+    if state.trusted_proxy {
+        if let Some(ip) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return format!("ip:{ip}");
+        }
+    }
+    format!("ip:{}", peer.ip())
+}
+
+/// Ingress DoS rate-limit middleware: per-identity concurrency cap + token bucket. Runs after
+/// `require_api_key` (so it can key off a validated API key); a shed request returns `429`
+/// with `Retry-After`. The `_guard` is held across the request and frees the in-flight slot
+/// on drop (including cancellation). A no-op when the limiter is inactive.
+async fn rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !state.rate_limiter.is_active() {
+        return next.run(req).await;
+    }
+    let identity = rate_limit_identity(&state, peer, &req);
+    match state.rate_limiter.try_acquire(&identity, unix_now_ms()) {
+        Ok(_guard) => next.run(req).await,
+        Err(_) => {
+            state.metrics.record_rate_limited();
+            let mut resp = openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded",
+                "rate_limit_exceeded",
+            );
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+            resp
+        }
+    }
+}
+
 async fn health() -> Response {
     Json(json!({ "status": "ok" })).into_response()
 }
@@ -510,6 +584,8 @@ pub fn router(
     api_key: Option<String>,
     store: Option<Store>,
     aup: AupPolicy,
+    rate_limit_cfg: RateLimitConfig,
+    trusted_proxy: bool,
 ) -> Router {
     let node = match store {
         Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
@@ -520,12 +596,17 @@ pub fn router(
         api_key: api_key.map(Arc::new),
         metrics: Arc::new(Metrics::new()),
         aup: Arc::new(aup),
+        rate_limiter: Arc::new(RateLimiter::new(rate_limit_cfg)),
+        trusted_proxy,
     };
-    // The `/v1/*` routes are auth-gated; `/health` and `/metrics` stay open for liveness
-    // probes and Prometheus scraping.
+    // The `/v1/*` routes are auth-gated then rate-limited; `/health` and `/metrics` stay open
+    // for liveness probes and Prometheus scraping. `route_layer`s run outermost-last, so
+    // adding `rate_limit` first and `require_api_key` last makes auth run *before* the
+    // limiter — the limiter can then key off the validated API key.
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     Router::new()
         .route("/health", get(health))
@@ -537,17 +618,24 @@ pub fn router(
 /// Run the gateway, blocking. Builds its own multi-thread tokio runtime and serves until
 /// the process exits. `bind` is e.g. `"127.0.0.1:8080"`; `api_key` optionally protects
 /// `/v1/*`.
+#[allow(clippy::too_many_arguments)]
 pub fn serve_http(
     net: NetworkHandle,
     bind: &str,
     api_key: Option<String>,
     store: Option<Store>,
     aup: AupPolicy,
+    rate_limit_cfg: RateLimitConfig,
+    trusted_proxy: bool,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
-        axum::serve(listener, router(net, api_key, store, aup)).await
+        // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
+        // rate-limit middleware (the unspoofable per-IP key).
+        let app = router(net, api_key, store, aup, rate_limit_cfg, trusted_proxy)
+            .into_make_service_with_connect_info::<SocketAddr>();
+        axum::serve(listener, app).await
     })
 }
 
