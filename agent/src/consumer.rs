@@ -25,7 +25,10 @@ use openhydra_protocol::model_id::is_compatible;
 use openhydra_protocol::receipts::NonceTracker;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
 use openhydra_protocol::store::Store;
-use openhydra_protocol::verify::{ReputationTracker, VerificationOutcome};
+use openhydra_protocol::verify::{
+    resolve_audit, sample_rate_for_reputation, AuditReport, RedundantVerdict, ReputationTracker,
+    VerificationOutcome, NEUTRAL_REPUTATION,
+};
 
 use crate::adapter::{AdapterError, ChatMessage};
 use crate::provider::SERVE_REQUEST;
@@ -57,6 +60,17 @@ pub struct SelectedProvider {
 /// stale-but-advertised provider frees its slot for failover instead of hanging the
 /// request on libp2p's ~15s (or unbounded) request-response wait.
 const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Redundant-execution audit sampling bounds (M2.2(b)), fed to
+/// [`sample_rate_for_reputation`]. A fully-trusted provider is audited rarely
+/// ([`AUDIT_MIN_RATE`]); a fresh / low-reputation one often ([`AUDIT_MAX_RATE`]), since the
+/// audit re-runs the work on a second provider and so costs real compute. Tunable.
+const AUDIT_MIN_RATE: f64 = 0.02;
+const AUDIT_MAX_RATE: f64 = 0.5;
+
+/// Token budget for an audit challenge completion — kept short to bound the audit's compute
+/// cost while leaving enough output to discriminate an honest run from a freeloader.
+const AUDIT_MAX_TOKENS: u32 = 64;
 
 /// Pick the best provider from `peers` for a request whose canonical id is
 /// `request_canonical` (use `""` to match any provider of the discovered model_id).
@@ -396,6 +410,120 @@ impl ConsumerNode {
             now_unix_ms(),
         );
     }
+
+    /// The redundant-execution audit sampling rate for `peer_id` (M2.2(b)): low for a
+    /// trusted provider, high for a fresh / low-reputation one. A background sampler draws
+    /// against this to decide whether to [`audit_model`](Self::audit_model) after serving.
+    /// Pure read of the earned-reputation map — exposed so the trigger policy is testable
+    /// and tunable separately from the dispatch.
+    pub fn audit_rate_for(&self, peer_id: &str, now_ms: u64) -> f64 {
+        let rep = self.earned_reputation(peer_id, now_ms).unwrap_or(NEUTRAL_REPUTATION);
+        sample_rate_for_reputation(rep, AUDIT_MIN_RATE, AUDIT_MAX_RATE)
+    }
+
+    /// Dispatch `challenge` to one specific `provider` deterministically (`temperature = 0`)
+    /// and return its **full** completion text (the audit compares whole outputs, not a
+    /// streamed view). Bounded by [`ATTEMPT_TIMEOUT`] so a dead provider can't stall the
+    /// audit.
+    fn dispatch_full(
+        &self,
+        provider: &SelectedProvider,
+        challenge: &[ChatMessage],
+    ) -> Result<String, AdapterError> {
+        let request = ServeRequest {
+            reply_to: self.net.libp2p_peer_id().to_string(),
+            model_ref: provider.model_id.clone(),
+            messages: challenge.to_vec(),
+            max_tokens: Some(AUDIT_MAX_TOKENS),
+            // Redundant-execution comparison only holds for greedy decoding — a sampled
+            // (temperature > 0) answer would legitimately differ between honest providers.
+            temperature: Some(0.0),
+        };
+        let provider_libp2p = provider.libp2p_peer_id.clone();
+        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            self.net
+                .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), ATTEMPT_TIMEOUT)
+                .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
+        };
+        let mut output = String::new();
+        let mut sink = |delta: &str| output.push_str(delta);
+        request_completion(&mut transport, &request, &mut sink)?;
+        Ok(output)
+    }
+
+    /// Run one **redundant-execution audit** (M2.2(b)) for `model`: send the same
+    /// deterministic `challenge` to up to two distinct providers of the model, compare
+    /// their full outputs via [`resolve_audit`], and record the resulting reputation
+    /// outcomes (a confirmed outlier → `Failed`; agreeing providers → `Honored`; a
+    /// non-responder → `Rejected`). On a 1-vs-1 `Inconclusive` split, escalates to a third
+    /// provider (if discovery surfaced one) for a majority before recording.
+    ///
+    /// This is the *audit* path — separate from [`complete`](Self::complete) and off the
+    /// user's latency path (the user already has their answer; a background sampler invokes
+    /// this against a sampled fraction, rate from [`audit_rate_for`](Self::audit_rate_for)).
+    /// Use an unpredictable `challenge` (see [`default_challenge`]) so a provider can't
+    /// pre-cache the answer. Errors only if fewer than two providers are discoverable.
+    ///
+    /// *Caveat:* providers of the same canonical `model_id` may run different quantizations
+    /// / engine builds whose greedy output differs; [`agrees`](openhydra_protocol::verify::agrees)
+    /// absorbs benign late divergence and the `Inconclusive`-on-tie rule avoids punishing on
+    /// ambiguous evidence, but heterogeneous fleets weaken the signal (reputation still
+    /// carries the long-run trust).
+    pub fn audit_model(
+        &self,
+        model: &str,
+        challenge: &[ChatMessage],
+    ) -> Result<AuditReport, AdapterError> {
+        let now = now_unix_ms();
+        let peers = self
+            .net
+            .discover(model)
+            .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
+        let candidates =
+            rank_providers_with_reputation(&peers, "", self.tier, &|pid| self.earned_reputation(pid, now));
+        if candidates.len() < 2 {
+            return Err(AdapterError::Http(format!(
+                "redundant-exec audit needs ≥2 providers for '{model}', found {}",
+                candidates.len()
+            )));
+        }
+
+        // Dispatch to the top two, then escalate to a third only if they can't decide.
+        let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(3);
+        for provider in candidates.iter().take(2) {
+            let out = self.dispatch_full(provider, challenge).map_err(|e| e.to_string());
+            results.push((provider.peer_id.clone(), out));
+        }
+        let mut report = resolve_audit(&results);
+        if report.verdict == RedundantVerdict::Inconclusive {
+            if let Some(third) = candidates.get(2) {
+                let out = self.dispatch_full(third, challenge).map_err(|e| e.to_string());
+                results.push((third.peer_id.clone(), out));
+                report = resolve_audit(&results);
+            }
+        }
+
+        for (peer_id, outcome) in &report.outcomes {
+            self.record_outcome(peer_id, *outcome, now);
+        }
+        Ok(report)
+    }
+}
+
+/// An unpredictable, deterministic-to-answer audit challenge (M2.2(b)). The embedded random
+/// nonce defeats answer-caching (a provider can't have precomputed it), and the
+/// echo-then-restate instruction yields a long shared prefix that two honest runs of the
+/// same model reproduce while a freeloader cannot. Prompt design is heuristic and tunable.
+pub fn default_challenge() -> Vec<ChatMessage> {
+    let nonce: u128 = rand::random();
+    vec![ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "Verification probe {nonce:032x}. Respond with exactly, and nothing else: \
+             first the token {nonce:032x} on its own line, then on the next line the single \
+             sentence \"This is a deterministic audit response.\""
+        ),
+    }]
 }
 
 #[cfg(test)]
@@ -584,6 +712,18 @@ mod tests {
         let ranked = rank_providers_with_reputation(&peers, TPL_A, 2, &earned);
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
         assert_eq!(ids, vec!["good", "bad"], "low earned reputation must rank a provider last");
+    }
+
+    #[test]
+    fn default_challenge_is_unpredictable_and_well_formed() {
+        // A single user-role message; the random nonce makes successive challenges differ
+        // (so a provider can't pre-cache the answer) and appear twice (echo + restate).
+        let c1 = default_challenge();
+        let c2 = default_challenge();
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0].role, "user");
+        assert_ne!(c1[0].content, c2[0].content, "challenge nonce must vary");
+        assert!(c1[0].content.contains("deterministic audit response"));
     }
 
     #[test]
