@@ -203,6 +203,26 @@ impl CreditAccount {
     }
 }
 
+/// Maximum multiple of a provider's base serve delay applied to the deepest leecher (M2.3
+/// enforcement) — bounds the throttle so it always *slows*, never *blocks* ("priority, not
+/// access"). At [`RATE_FLOOR`] the multiplier reaches exactly this.
+pub const MAX_THROTTLE_MULT: f64 = 9.0;
+
+/// Multiplier on a provider's base serve delay for a consumer whose give/take serve-rate is
+/// `rate_cap` (M2.3 enforcement). `0.0` for a contributor (`rate_cap >= 1.0` → served with no
+/// added delay); it rises as the cap falls toward [`RATE_FLOOR`], clamped to
+/// [`MAX_THROTTLE_MULT`] so even a deep leecher's wait stays bounded. Pure — the agent
+/// multiplies its base `Duration` by this and applies the delay off the poll thread.
+///
+/// Monotone non-increasing in `rate_cap`: a worse give/take ratio earns a longer wait.
+pub fn throttle_multiplier(rate_cap: f64) -> f64 {
+    if rate_cap >= 1.0 {
+        return 0.0;
+    }
+    let r = rate_cap.max(RATE_FLOOR);
+    ((1.0 - r) / r).min(MAX_THROTTLE_MULT)
+}
+
 /// Minimal bounds-checked reader for [`CreditAccount::from_bytes`].
 struct Cur<'a> {
     d: &'a [u8],
@@ -231,6 +251,21 @@ mod tests {
     use super::*;
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn throttle_multiplier_zero_for_contributors_bounded_for_leechers() {
+        // Contributor (or clamped over-1.0) → no added delay.
+        assert_eq!(throttle_multiplier(1.0), 0.0);
+        assert_eq!(throttle_multiplier(1.5), 0.0);
+        // Half rate → one base delay; the floor → the bounded maximum.
+        assert!((throttle_multiplier(0.5) - 1.0).abs() < 1e-9);
+        assert!((throttle_multiplier(RATE_FLOOR) - MAX_THROTTLE_MULT).abs() < 1e-9);
+        // A cap below the floor is clamped to the floor → still the bounded maximum.
+        assert!((throttle_multiplier(0.0) - MAX_THROTTLE_MULT).abs() < 1e-9);
+        // Monotone: a worse ratio earns a longer wait.
+        assert!(throttle_multiplier(0.2) > throttle_multiplier(0.4));
+        assert!(throttle_multiplier(0.4) > throttle_multiplier(0.9));
+    }
 
     // ── the M2.3 sim harness (exit test) ──
 

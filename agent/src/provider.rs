@@ -20,18 +20,25 @@
 //! the loop itself is thin glue over the live swarm.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
-use openhydra_protocol::credit::CreditAccount;
+use openhydra_protocol::credit::{throttle_multiplier, CreditAccount};
 use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
-use crate::serve::{frame_response, handle_serve_request};
+use crate::serve::{frame_response, handle_serve_request, ServeRequest};
 use crate::workpool::WorkerPool;
+
+/// Base serve delay scaled by [`throttle_multiplier`] for a throttled (leecher) consumer
+/// (M2.3 enforcement). Modest — even the deepest leecher's wait is `BASE_THROTTLE *
+/// MAX_THROTTLE_MULT` (≈1.8s at the defaults), a slowdown, never a block. Tunable.
+const BASE_THROTTLE: Duration = Duration::from_millis(200);
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -122,6 +129,10 @@ pub struct Provider<A: EngineAdapter> {
     /// announces as its `reply_to`, derived at receipt time from the consumer's ed25519
     /// pubkey. Rehydrated from `store` when one is attached, flushed on each accrual.
     credit: Mutex<HashMap<String, CreditAccount>>,
+    /// Count of worker threads currently sleeping in an M2.3 throttle delay. Read to reserve
+    /// at least one non-throttling worker (see [`maybe_throttle`](Self::maybe_throttle)), so a
+    /// flood of leechers can never put every worker to sleep at once.
+    throttling: AtomicUsize,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -133,6 +144,7 @@ impl<A: EngineAdapter> Provider<A> {
             port: 0,
             store: None,
             credit: Mutex::new(HashMap::new()),
+            throttling: AtomicUsize::new(0),
         }
     }
 
@@ -197,6 +209,37 @@ impl<A: EngineAdapter> Provider<A> {
             .unwrap_or(1.0)
     }
 
+    /// M2.3 **enforcement**: before serving, slow a leecher proportionally to its give/take
+    /// deficit — *priority, not access* (throttle, never block). Only `SERVE_REQUEST`s are
+    /// throttled; a contributor (`rate_cap >= 1.0` → multiplier `0`) and every non-serve
+    /// method pass straight through.
+    ///
+    /// Runs on a worker thread (post-pool, so the delay never blocks the poll loop), and is
+    /// **budget-capped**: it only sleeps while fewer than `max_concurrency - 1` workers are
+    /// already throttling, so at least one worker always stays free to serve immediately.
+    /// A flood of leechers therefore can't put the whole pool to sleep and stall an arriving
+    /// contributor — the soft throttle simply stops biting once the budget is spent.
+    fn maybe_throttle(&self, data: &[u8], max_concurrency: usize) {
+        if data.first() != Some(&SERVE_REQUEST) {
+            return; // receipts and unknown methods are never throttled
+        }
+        let reply_to = match ServeRequest::decode(&data[1..]) {
+            Ok(req) => req.reply_to,
+            Err(_) => return, // unparseable → let dispatch emit the error frame
+        };
+        let mult = throttle_multiplier(self.consumer_rate_cap(&reply_to));
+        if mult <= 0.0 {
+            return; // contributor — full speed
+        }
+        // Reserve ≥1 non-throttling worker: only sleep if we are not the one that would
+        // exhaust the pool's throttle budget.
+        let already = self.throttling.fetch_add(1, Ordering::SeqCst);
+        if already + 1 < max_concurrency {
+            std::thread::sleep(BASE_THROTTLE.mul_f64(mult));
+        }
+        self.throttling.fetch_sub(1, Ordering::SeqCst);
+    }
+
     /// Detect the engine's models and announce a record for each. Returns how many were
     /// announced.
     pub fn announce_models(&self) -> Result<usize, AdapterError> {
@@ -247,6 +290,9 @@ impl<A: EngineAdapter> Provider<A> {
                 // slow one doesn't head-of-line-block the rest.
                 let provider = Arc::clone(&self);
                 pool.submit(move || {
+                    // M2.3: throttle a leecher first (off the poll thread, budget-capped so
+                    // it never stalls the pool); contributors pass straight through.
+                    provider.maybe_throttle(&data, max_concurrency);
                     let response = provider.dispatch(&data);
                     // Best-effort reply; if the swarm is gone the next poll will error too.
                     let _ = provider.net.respond(request_id, response);

@@ -486,12 +486,18 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
     *Cross-process note:* provide/serve are separate roles; one ledger materializes when
     both use the same `--db` and merges on rehydrate. Live single-process unification lands
     with inc4.
-  - **inc4 ⏳ ENFORCEMENT** (consult `rate_cap` to actually throttle) — **gated on a
-    provider concurrency model**: the serve loop is strictly serial
-    (`provider.rs::run_inbound`: poll → run inference → respond), so a per-request throttle
-    delay would head-of-line-block every other consumer. Needs concurrent serving (worker
-    pool / priority admission) first; converges with the M2.2(b) audit-sampler trigger.
-    Scarcity pricing stays M3.3.
+  - **inc4 ✅ ENFORCEMENT**: unblocked by the **concurrent serve loop**
+    (`workpool::WorkerPool` + `run_inbound(Arc<Self>, …, max_concurrency)` — the poll thread
+    hands each request to a bounded pool, so a delay no longer head-of-line-blocks). The
+    worker calls `provider.maybe_throttle`: pure `credit::throttle_multiplier(rate_cap)`
+    (`0` for contributors, up to `MAX_THROTTLE_MULT=9×` a `BASE_THROTTLE=200ms` base at the
+    floor) scales a delay applied off the poll thread, **budget-capped** to leave ≥1 worker
+    free so a leecher flood can't stall the pool (priority, not access — slowed, never
+    blocked). `provide --max-concurrency` (default 8). Live-validation under real contention
+    pending the harness; scarcity pricing stays M3.3.
+  - The same concurrent serve loop is the host for the **M2.2(b) audit-sampler trigger**
+    (consumer-side follow-up: fire `audit_model` against `audit_rate_for` off the response
+    path).
 
 **M2.4 — Cold-start correctness** · WS-CREDIT/WS-SWARM · Rust · ~0.5w
 - **Exit test:** simulated "launch" load → everyone served, credit inert; ramp demand
