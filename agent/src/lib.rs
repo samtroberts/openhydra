@@ -31,6 +31,7 @@ pub mod metrics;
 pub mod provider;
 pub mod receipt;
 pub mod serve;
+pub mod telemetry;
 pub mod workpool;
 
 pub use adapter::{

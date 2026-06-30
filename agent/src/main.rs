@@ -271,16 +271,10 @@ fn start_profiler_if_requested() {
 #[cfg(not(feature = "profiling"))]
 fn start_profiler_if_requested() {}
 
-/// Surface the network crate's `tracing` events under `RUST_LOG` (default: warnings).
-/// Without a subscriber, libp2p/Kademlia/relay diagnostics are invisible.
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
-}
-
 fn run() -> Result<(), String> {
-    init_tracing();
+    // Surface the network crate's `tracing` events under `RUST_LOG` (default: warnings) and,
+    // with `--features otel` + `OTEL_EXPORTER_OTLP_ENDPOINT`, export request spans over OTLP.
+    openhydra_agent::telemetry::init();
     start_profiler_if_requested();
     let cli = Cli::parse();
     let config = cli.node.into_config();

@@ -42,6 +42,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # In-process sampling profiler (SIGPROF/setitimer — needs no kernel perf, works in
 # locked-down containers). Opt-in via the `profiling` feature; emits an SVG flamegraph.
 pprof = { version = "0.13", features = ["flamegraph"], optional = true }
+# OpenTelemetry/OTLP span export (#33), behind the heavy `otel` feature — the default build
+# pulls none of it. HTTP/protobuf transport over the existing blocking reqwest (no tonic);
+# the request-path `tracing` spans export to an OTLP collector when the feature is on.
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", optional = true }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-blocking-client"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
 
 # PQC0.2 process hardening: disable core dumps + best-effort mlockall so secret key
 # material never reaches disk (swap / core files). Unix-only; no-op elsewhere.
@@ -50,6 +57,12 @@ libc = "0.2"
 
 [features]
 profiling = ["dep:pprof"]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 # Pure detection/serve logic is injected behind the `HttpClient` trait and unit-tested
 # against fixtures (no live engine); `ReqwestClient` is the production transport.

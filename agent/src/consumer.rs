@@ -307,6 +307,15 @@ impl ConsumerNode {
     /// Discover a provider for `model`, pick the best, and stream the completion's text
     /// deltas to `on_delta`. Returns the [`ServeSummary`] (token count → receipt) on
     /// success. `model` is the engine handle / DHT key (e.g. `"qwen2.5:7b"`).
+    #[tracing::instrument(
+        name = "complete",
+        skip_all,
+        fields(
+            model = %model,
+            provider = tracing::field::Empty,
+            tokens = tracing::field::Empty,
+        )
+    )]
     pub fn complete(
         self: &Arc<Self>,
         model: &str,
@@ -316,11 +325,15 @@ impl ConsumerNode {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
+        // The `complete` span (from #[instrument]); we fill in `provider`/`tokens` on success.
+        let req_span = tracing::Span::current();
         let t_discover = std::time::Instant::now();
-        let peers = self
-            .net
-            .discover(model)
-            .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
+        let peers = {
+            let _span = tracing::info_span!("discover", model = %model).entered();
+            self.net
+                .discover(model)
+                .map_err(|e| AdapterError::Http(format!("discover: {e}")))?
+        };
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
         // a provider that has failed this consumer ranks below an untried one.
@@ -340,6 +353,12 @@ impl ConsumerNode {
         let mut delivered = false;
         let mut last_err: Option<AdapterError> = None;
         for (i, provider) in candidates.into_iter().enumerate() {
+            let _attempt_span = tracing::info_span!(
+                "serve_attempt",
+                attempt = i + 1,
+                provider = %provider.libp2p_peer_id,
+            )
+            .entered();
             let request = ServeRequest {
                 reply_to: self.net.libp2p_peer_id().to_string(),
                 model_ref: provider.model_id.clone(),
@@ -383,6 +402,8 @@ impl ConsumerNode {
                     }
                     // M2.2(a): a clean served completion earns the provider reputation.
                     self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
+                    req_span.record("provider", provider.peer_id.as_str());
+                    req_span.record("tokens", summary.tokens);
                     // M2.2(b): sampled background redundant-exec audit of this provider (off
                     // the response path — the caller already has its completion).
                     self.maybe_audit(model, &provider.peer_id);
