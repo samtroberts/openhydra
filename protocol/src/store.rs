@@ -28,6 +28,7 @@ use std::path::Path;
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+use crate::credit::CreditAccount;
 use crate::receipts::{CoSignedReceipt, NonceTracker};
 use crate::verify::ReputationTracker;
 
@@ -35,6 +36,8 @@ use crate::verify::ReputationTracker;
 const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts");
 /// Durable per-peer reputation snapshot, keyed by `peer_id` → opaque blob.
 const PEER_REPUTATION: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_reputation");
+/// Durable per-peer give/take credit snapshot (M2.3), keyed by `peer_id` → opaque blob.
+const PEER_CREDIT: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_credit");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
 
@@ -96,6 +99,7 @@ impl Store {
         {
             wtx.open_table(RECEIPTS).map_err(StoreError::from)?;
             wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
+            wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
         }
         wtx.commit().map_err(StoreError::from)?;
@@ -150,6 +154,45 @@ impl Store {
         let t = rtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
         let got = t.get(peer_id).map_err(StoreError::from)?;
         Ok(got.map(|g| g.value().to_vec()))
+    }
+
+    // ── PEER_CREDIT (M2.3 give/take) ──
+
+    /// Checkpoint a peer's give/take credit snapshot blob.
+    pub fn put_credit(&self, peer_id: &str, blob: &[u8]) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
+            t.insert(peer_id, blob).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Read a peer's credit snapshot blob, or `None` if we hold none.
+    pub fn get_credit(&self, peer_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
+        let got = t.get(peer_id).map_err(StoreError::from)?;
+        Ok(got.map(|g| g.value().to_vec()))
+    }
+
+    /// Rehydrate the in-memory give/take credit map from the store on boot (M2.3),
+    /// keyed by peer id. Mirrors the reputation rehydration in
+    /// [`load_state_into_memory`](Self::load_state_into_memory); kept separate so callers
+    /// that don't track credit aren't forced to thread an extra map.
+    pub fn load_credit_into_memory(
+        &self,
+        credit: &mut HashMap<String, CreditAccount>,
+    ) -> Result<(), StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            let account = CreditAccount::from_bytes(val.value()).map_err(StoreError)?;
+            credit.insert(key.value().to_string(), account);
+        }
+        Ok(())
     }
 
     // ── NONCES (replay protection) ──
@@ -316,6 +359,25 @@ mod tests {
     }
 
     #[test]
+    fn credit_snapshot_roundtrips_and_rehydrates() {
+        // M2.3: a give/take credit account persists and rehydrates with its full state.
+        use crate::credit::CreditAccount;
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get_credit("unknown").unwrap(), None);
+
+        let mut acct = CreditAccount::new(1_000);
+        acct.record_consumed(60_000, 1_000); // a leecher
+        store.put_credit("peerC", &acct.to_bytes()).unwrap();
+
+        let mut credit = std::collections::HashMap::new();
+        store.load_credit_into_memory(&mut credit).unwrap();
+        let back = credit.get("peerC").expect("credit must rehydrate");
+        // Same rate_cap as the original → the decay/give/take state round-tripped.
+        assert_eq!(back.rate_cap(1_000).to_bits(), acct.rate_cap(1_000).to_bits());
+    }
+
+    #[test]
     fn persists_across_a_simulated_restart() {
         // Write, drop the Store (closing the DB file), then reopen the SAME path and
         // assert every table's data survived — proving on-disk durability, not just
@@ -360,6 +422,7 @@ mod tests {
     fn record_receipt_is_atomic_and_replay_safe() {
         // The provider-side ledger entry: an accepted co-signed receipt persists with its
         // nonce burnt in one shot; re-submitting the same receipt is a no-op replay.
+        use crate::crypto_agility::SigAlg;
         use crate::receipts::{build_receipt, ReceiptPayload};
         use ed25519_dalek::SigningKey;
 
@@ -368,6 +431,7 @@ mod tests {
         let provider = SigningKey::from_bytes(&[5u8; 32]);
         let nonce = [11u8; 16];
         let payload = ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
             provider: provider.verifying_key(),
             consumer: consumer.verifying_key(),
             model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),
@@ -410,6 +474,7 @@ mod tests {
         let nonce = [42u8; 16];
 
         let payload = ReceiptPayload {
+            sig_alg: crate::crypto_agility::SigAlg::Ed25519,
             provider: provider.verifying_key(),
             consumer: consumer.verifying_key(),
             model_id: "qwen3.5/2b/fp16/5632a1b48425a5ae".to_string(),

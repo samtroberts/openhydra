@@ -28,16 +28,26 @@ use std::collections::HashSet;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+use crate::crypto_agility::SigAlg;
+
 /// Domain separator for the consumer-signed payload (prevents cross-protocol
-/// signature reuse). Versioned: a change is a wire-format bump.
-pub const RECEIPT_DOMAIN: &[u8] = b"openhydra/receipt/v1";
+/// signature reuse). Versioned: a change is a wire-format bump. **v2** binds the
+/// signature-algorithm discriminant into the preimage (PQC0.1 crypto-agility).
+pub const RECEIPT_DOMAIN: &[u8] = b"openhydra/receipt/v2";
 /// Domain separator for the provider's co-signature over (payload ‖ consumer_sig).
-pub const COSIGN_DOMAIN: &[u8] = b"openhydra/receipt-cosign/v1";
+pub const COSIGN_DOMAIN: &[u8] = b"openhydra/receipt-cosign/v2";
+
+/// Serialization format version for [`CoSignedReceipt::to_bytes`] — v2 is the
+/// agile, length-prefixed layout (PQC0.1). Bumped on any layout change.
+const RECEIPT_FORMAT_V2: u8 = 2;
 
 /// The content both parties sign over (the consumer directly, the provider via the
 /// co-signature). Identities are ed25519 public keys.
 #[derive(Debug, Clone)]
 pub struct ReceiptPayload {
+    /// Signature algorithm both parties use. Bound into the signed preimage so a
+    /// wire-level attacker cannot strip or downgrade it (PQC0.1 crypto-agility).
+    pub sig_alg: SigAlg,
     /// The serving provider's public key.
     pub provider: VerifyingKey,
     /// The consuming client's public key.
@@ -55,10 +65,12 @@ pub struct ReceiptPayload {
 impl ReceiptPayload {
     /// Canonical bytes the **consumer** signs. Deterministic: a fixed payload always
     /// produces the same bytes (and, with ed25519's RFC-8032 determinism, the same
-    /// signature — see the golden test).
+    /// signature — see the golden test). The `sig_alg` byte is bound in right after the
+    /// domain so the chosen algorithm is signed over (no silent downgrade).
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(RECEIPT_DOMAIN.len() + 32 + 32 + 4 + self.model_id.len() + 8 + 16 + 8);
+        let mut b = Vec::with_capacity(RECEIPT_DOMAIN.len() + 1 + 32 + 32 + 4 + self.model_id.len() + 8 + 16 + 8);
         b.extend_from_slice(RECEIPT_DOMAIN);
+        b.push(self.sig_alg.to_u8());
         b.extend_from_slice(self.provider.as_bytes());
         b.extend_from_slice(self.consumer.as_bytes());
         b.extend_from_slice(&(self.model_id.len() as u32).to_le_bytes());
@@ -108,6 +120,9 @@ pub fn payload_from_bytes(
         .try_into()
         .map_err(|_| "nonce must be 16 bytes".to_string())?;
     Ok(ReceiptPayload {
+        // The raw-bytes / FFI constructor is the classical Ed25519 path. PQC payloads
+        // are built explicitly with their `sig_alg` set (PQC3.1).
+        sig_alg: SigAlg::Ed25519,
         provider,
         consumer,
         model_id: model_id.to_string(),
@@ -125,75 +140,125 @@ pub struct CoSignedReceipt {
     pub provider_sig: Signature,
 }
 
-/// Fixed prefix of [`CoSignedReceipt::to_bytes`]: the two 32-byte keys, 16-byte nonce,
-/// two u64s, two 64-byte signatures, and the u32 model-id length.
-const RECEIPT_BLOB_FIXED: usize = 32 + 32 + 16 + 8 + 8 + 64 + 64 + 4;
+/// Minimal forward-only byte reader for [`CoSignedReceipt::from_bytes`] — bounds-checked
+/// so a truncated/oversized blob errors instead of panicking.
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).ok_or("length overflow")?;
+        if end > self.data.len() {
+            return Err(format!(
+                "receipt blob truncated: need {n} bytes at offset {}, have {}",
+                self.pos,
+                self.data.len() - self.pos
+            ));
+        }
+        let s = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn arr<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        Ok(self.take(N)?.try_into().expect("take returns exactly N"))
+    }
+    /// A `u16`-length-prefixed slice (used for the variable-length signatures).
+    fn lp16(&mut self) -> Result<&'a [u8], String> {
+        let len = u16::from_le_bytes(self.arr::<2>()?) as usize;
+        self.take(len)
+    }
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+}
+
+/// Reconstruct a signature of the given algorithm from its raw bytes. Today only
+/// Ed25519 (64 bytes) is materializable into the [`Signature`] type; a known-but-
+/// unimplemented PQC algorithm is rejected rather than silently mishandled (PQC3.1
+/// generalizes the signature type).
+fn read_sig(alg: SigAlg, bytes: &[u8]) -> Result<Signature, String> {
+    match alg {
+        SigAlg::Ed25519 => {
+            let arr: [u8; 64] = bytes
+                .try_into()
+                .map_err(|_| format!("ed25519 signature must be 64 bytes, got {}", bytes.len()))?;
+            Ok(Signature::from_bytes(&arr))
+        }
+        other => Err(format!("signature algorithm not implemented in this build: {other:?}")),
+    }
+}
 
 impl CoSignedReceipt {
-    /// Serialize to a self-describing byte blob for the persistent ledger (M2.3).
+    /// Serialize to a self-describing, **algorithm-agile** byte blob for the persistent
+    /// ledger (M2.3) and receipt exchange.
     ///
-    /// Layout (little-endian): `provider[32] consumer[32] nonce[16] tokens:u64[8]
-    /// ts_unix_ms:u64[8] consumer_sig[64] provider_sig[64] model_len:u32[4]
-    /// model_id[model_len]`. This is the **full reversible record** — distinct from
-    /// [`ReceiptPayload::canonical_bytes`], which is the domain-tagged *signed preimage*
-    /// and carries no signatures.
+    /// Layout (little-endian, PQC0.1 v2): `format:u8(=2) sig_alg:u8 provider[32]
+    /// consumer[32] nonce[16] tokens:u64[8] ts_unix_ms:u64[8] consumer_sig_len:u16[2]
+    /// consumer_sig[len] provider_sig_len:u16[2] provider_sig[len] model_len:u32[4]
+    /// model_id[model_len]`.
+    ///
+    /// Signatures are **length-prefixed** (not fixed at 64 bytes) so a future ML-DSA /
+    /// hybrid signature (PQC3.1) fits without another format change. This is the full
+    /// reversible record — distinct from [`ReceiptPayload::canonical_bytes`], the
+    /// domain-tagged *signed preimage* (which carries no signatures).
     pub fn to_bytes(&self) -> Vec<u8> {
         let model = self.payload.model_id.as_bytes();
-        let mut b = Vec::with_capacity(RECEIPT_BLOB_FIXED + model.len());
+        let csig = self.consumer_sig.to_bytes();
+        let psig = self.provider_sig.to_bytes();
+        let mut b = Vec::with_capacity(
+            2 + 32 + 32 + 16 + 8 + 8 + 2 + csig.len() + 2 + psig.len() + 4 + model.len(),
+        );
+        b.push(RECEIPT_FORMAT_V2);
+        b.push(self.payload.sig_alg.to_u8());
         b.extend_from_slice(self.payload.provider.as_bytes());
         b.extend_from_slice(self.payload.consumer.as_bytes());
         b.extend_from_slice(&self.payload.nonce);
         b.extend_from_slice(&self.payload.tokens.to_le_bytes());
         b.extend_from_slice(&self.payload.ts_unix_ms.to_le_bytes());
-        b.extend_from_slice(&self.consumer_sig.to_bytes());
-        b.extend_from_slice(&self.provider_sig.to_bytes());
+        b.extend_from_slice(&(csig.len() as u16).to_le_bytes());
+        b.extend_from_slice(&csig);
+        b.extend_from_slice(&(psig.len() as u16).to_le_bytes());
+        b.extend_from_slice(&psig);
         b.extend_from_slice(&(model.len() as u32).to_le_bytes());
         b.extend_from_slice(model);
         b
     }
 
-    /// Reconstruct a receipt from [`to_bytes`](Self::to_bytes). Validates key bytes and
-    /// the trailing length; signatures are reconstructed verbatim (call
+    /// Reconstruct a receipt from [`to_bytes`](Self::to_bytes). Validates the format
+    /// version, the (registry-checked) `sig_alg`, key bytes, signature lengths, and
+    /// rejects any trailing bytes. Signatures are reconstructed verbatim (call
     /// [`verify_receipt`] to re-check them). Returns `Err` on a malformed blob.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() < RECEIPT_BLOB_FIXED {
-            return Err(format!(
-                "receipt blob too short: {} < {RECEIPT_BLOB_FIXED}",
-                data.len()
-            ));
+        let mut cur = Cursor { data, pos: 0 };
+        let fmt = cur.u8()?;
+        if fmt != RECEIPT_FORMAT_V2 {
+            return Err(format!("unsupported receipt format version: {fmt}"));
         }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&data[0..32]);
-        let provider = VerifyingKey::from_bytes(&key).map_err(|e| format!("bad provider key: {e}"))?;
-        key.copy_from_slice(&data[32..64]);
-        let consumer = VerifyingKey::from_bytes(&key).map_err(|e| format!("bad consumer key: {e}"))?;
-        let mut nonce = [0u8; 16];
-        nonce.copy_from_slice(&data[64..80]);
-        let mut u8x8 = [0u8; 8];
-        u8x8.copy_from_slice(&data[80..88]);
-        let tokens = u64::from_le_bytes(u8x8);
-        u8x8.copy_from_slice(&data[88..96]);
-        let ts_unix_ms = u64::from_le_bytes(u8x8);
-        let mut sig = [0u8; 64];
-        sig.copy_from_slice(&data[96..160]);
-        let consumer_sig = Signature::from_bytes(&sig);
-        sig.copy_from_slice(&data[160..224]);
-        let provider_sig = Signature::from_bytes(&sig);
-        let mut u8x4 = [0u8; 4];
-        u8x4.copy_from_slice(&data[224..228]);
-        let model_len = u32::from_le_bytes(u8x4) as usize;
-        if data.len() != RECEIPT_BLOB_FIXED + model_len {
-            return Err(format!(
-                "receipt blob length mismatch: {} != {}",
-                data.len(),
-                RECEIPT_BLOB_FIXED + model_len
-            ));
+        let sig_alg = SigAlg::from_u8(cur.u8()?).map_err(|e| e.to_string())?;
+        let provider =
+            VerifyingKey::from_bytes(&cur.arr::<32>()?).map_err(|e| format!("bad provider key: {e}"))?;
+        let consumer =
+            VerifyingKey::from_bytes(&cur.arr::<32>()?).map_err(|e| format!("bad consumer key: {e}"))?;
+        let nonce = cur.arr::<16>()?;
+        let tokens = u64::from_le_bytes(cur.arr::<8>()?);
+        let ts_unix_ms = u64::from_le_bytes(cur.arr::<8>()?);
+        let consumer_sig = read_sig(sig_alg, cur.lp16()?)?;
+        let provider_sig = read_sig(sig_alg, cur.lp16()?)?;
+        let model_len = u32::from_le_bytes(cur.arr::<4>()?) as usize;
+        let model_bytes = cur.take(model_len)?;
+        if cur.remaining() != 0 {
+            return Err(format!("receipt blob has {} trailing bytes", cur.remaining()));
         }
-        let model_id = std::str::from_utf8(&data[RECEIPT_BLOB_FIXED..RECEIPT_BLOB_FIXED + model_len])
+        let model_id = std::str::from_utf8(model_bytes)
             .map_err(|e| format!("bad model id utf8: {e}"))?
             .to_string();
         Ok(CoSignedReceipt {
-            payload: ReceiptPayload { provider, consumer, model_id, tokens, nonce, ts_unix_ms },
+            payload: ReceiptPayload { sig_alg, provider, consumer, model_id, tokens, nonce, ts_unix_ms },
             consumer_sig,
             provider_sig,
         })
@@ -210,6 +275,9 @@ pub enum ReceiptError {
     BadProviderSig,
     /// This nonce was already seen — a replay / double-submission.
     ReplayedNonce,
+    /// The payload names a signature algorithm this build cannot verify (PQC0.1 — a
+    /// known-but-unimplemented discriminant; e.g. ML-DSA before PQC3.1).
+    UnsupportedAlg(SigAlg),
 }
 
 /// Consumer-side signature over the payload.
@@ -249,6 +317,11 @@ pub fn build_receipt(
 /// **and** the provider co-signature verifies against (payload ‖ consumer_sig),
 /// each against the public key named in the payload.
 pub fn verify_receipt(receipt: &CoSignedReceipt) -> Result<(), ReceiptError> {
+    // Crypto-agility (PQC0.1): only verify with an algorithm this build implements.
+    // Today that is Ed25519; a reserved PQC discriminant is rejected, never downgraded.
+    if !receipt.payload.sig_alg.is_implemented() {
+        return Err(ReceiptError::UnsupportedAlg(receipt.payload.sig_alg));
+    }
     let payload_bytes = receipt.payload.canonical_bytes();
     receipt
         .payload
@@ -322,6 +395,7 @@ mod tests {
 
     fn payload(consumer: &SigningKey, provider: &SigningKey, tokens: u64, nonce: [u8; 16]) -> ReceiptPayload {
         ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
             provider: provider.verifying_key(),
             consumer: consumer.verifying_key(),
             model_id: "qwen3.5/2b/fp16/5632a1b48425a5ae".to_string(),
@@ -476,5 +550,57 @@ mod tests {
         assert_eq!(r1.consumer_sig.to_bytes(), r2.consumer_sig.to_bytes());
         assert_eq!(r1.provider_sig.to_bytes(), r2.provider_sig.to_bytes());
         assert_eq!(verify_receipt(&r1), Ok(()));
+    }
+
+    // ── PQC0.1 crypto-agility ──────────────────────────────────────────────
+
+    #[test]
+    fn sig_alg_is_bound_into_preimage() {
+        // Two payloads identical except for sig_alg must produce different signed
+        // bytes — otherwise an attacker could downgrade the algorithm undetected.
+        let (c, p) = keys();
+        let mut a = payload(&c, &p, 512, [1u8; 16]);
+        a.sig_alg = SigAlg::Ed25519;
+        let mut b = payload(&c, &p, 512, [1u8; 16]);
+        b.sig_alg = SigAlg::MlDsa65;
+        assert_ne!(a.canonical_bytes(), b.canonical_bytes());
+    }
+
+    #[test]
+    fn unimplemented_alg_payload_is_rejected_not_verified() {
+        // A receipt claiming a reserved-but-unimplemented algorithm must be rejected
+        // explicitly, never silently treated as classical.
+        let (c, p) = keys();
+        let mut r = build_receipt(payload(&c, &p, 512, [1u8; 16]), &c, &p);
+        r.payload.sig_alg = SigAlg::MlDsa65;
+        assert_eq!(verify_receipt(&r), Err(ReceiptError::UnsupportedAlg(SigAlg::MlDsa65)));
+    }
+
+    #[test]
+    fn from_bytes_rejects_unknown_sig_alg_discriminant() {
+        let (c, p) = keys();
+        let mut blob = build_receipt(payload(&c, &p, 1, [1u8; 16]), &c, &p).to_bytes();
+        // byte[0] = format version (2), byte[1] = sig_alg discriminant.
+        assert_eq!(blob[0], RECEIPT_FORMAT_V2);
+        blob[1] = 0xFF; // not a known SigAlg
+        assert!(CoSignedReceipt::from_bytes(&blob).is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_format_version() {
+        let (c, p) = keys();
+        let mut blob = build_receipt(payload(&c, &p, 1, [1u8; 16]), &c, &p).to_bytes();
+        blob[0] = 1; // an old/unsupported format version
+        assert!(CoSignedReceipt::from_bytes(&blob).is_err());
+    }
+
+    #[test]
+    fn v2_blob_roundtrips_with_alg_preserved() {
+        let (c, p) = keys();
+        let r = build_receipt(payload(&c, &p, 777, [9u8; 16]), &c, &p);
+        let back = CoSignedReceipt::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back.payload.sig_alg, SigAlg::Ed25519);
+        assert_eq!(back.payload.tokens, 777);
+        assert_eq!(verify_receipt(&back), Ok(()));
     }
 }

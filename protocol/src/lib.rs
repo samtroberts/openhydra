@@ -13,12 +13,16 @@
 //! protocol can be unit-tested (and later reused, e.g. in a verifier or a CLI) without
 //! standing up a swarm or a Python interpreter.
 //!
+//! - [`crypto_agility`] — algorithm registry: versioned wire discriminants (PQC0.1)
 //! - [`model_id`] — canonical model identity & equivalence (protocol.md §4)
 //! - [`router`] — provider scoring / ranking + resolve→route orchestration (§5)
 //! - [`receipts`] — co-signed inference receipts, nested ed25519 (§6)
 //! - [`verify`] — verification policy: reputation feedback + decay (§7)
+//! - [`credit`] — give/take credit accounting + rate-cap throttle (§6, M2.3)
 //! - [`store`] — persistent ledger over `redb` (§6 credit ledger, M2.3)
 
+pub mod credit;
+pub mod crypto_agility;
 pub mod model_id;
 pub mod receipts;
 pub mod router;
