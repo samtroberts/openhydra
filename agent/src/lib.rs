@@ -37,11 +37,12 @@ pub mod telemetry;
 pub mod workpool;
 
 pub use adapter::{
-    AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
-    ServeOutcome,
+    AdapterError, ChatMessage, DetectedModel, EmbeddingAdapter, EmbeddingResponse, EngineAdapter,
+    HttpClient, InferenceRequest, ServeOutcome,
 };
+pub use adapters::embeddings::{OpenAiEmbeddingAdapter, DEFAULT_OPENAI_EMBEDDINGS_URL};
 pub use aup::{AupDecision, AupPolicy};
-pub use byok::{ByokConfig, ByokProvider};
+pub use byok::{ByokConfig, ByokProvider, EmbeddingConfig};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use adapters::anthropic::{AnthropicAdapter, DEFAULT_ANTHROPIC_URL};
 pub use adapters::gemini::{GeminiAdapter, DEFAULT_GEMINI_URL};
@@ -97,4 +98,14 @@ pub fn live_gemini(
     api_key: &str,
 ) -> Result<GeminiAdapter<ReqwestClient>, AdapterError> {
     Ok(GeminiAdapter::new(base_url, api_key, ReqwestClient::new()?))
+}
+
+/// An OpenAI-compatible embeddings BYOK adapter backed by the live reqwest transport, with the
+/// operator's `api_key`. `base_url` is usually [`DEFAULT_OPENAI_EMBEDDINGS_URL`] (or a
+/// Gemini-OAI-compat / Voyage / local endpoint).
+pub fn live_openai_embeddings(
+    base_url: &str,
+    api_key: &str,
+) -> Result<OpenAiEmbeddingAdapter<ReqwestClient>, AdapterError> {
+    Ok(OpenAiEmbeddingAdapter::new(base_url, api_key, ReqwestClient::new()?))
 }

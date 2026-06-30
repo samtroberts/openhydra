@@ -34,9 +34,9 @@ use tokio_stream::StreamExt;
 
 use openhydra_network::handle::NetworkHandle;
 
-use crate::adapter::{ChatMessage, EngineAdapter, InferenceRequest};
+use crate::adapter::{ChatMessage, EmbeddingAdapter, EngineAdapter, InferenceRequest};
 use crate::aup::{AupDecision, AupPolicy};
-use crate::byok::{ByokConfig, ByokProvider};
+use crate::byok::{ByokConfig, ByokProvider, EmbeddingConfig};
 use crate::consumer::ConsumerNode;
 use crate::metrics::Metrics;
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
@@ -62,6 +62,8 @@ struct AppState {
     /// BYOK passthrough routing (#34): mapped models call a hosted backend directly instead
     /// of the swarm. Empty by default.
     byok: Arc<ByokConfig>,
+    /// BYOK embeddings routing (#34): `/v1/embeddings` for configured models. Empty by default.
+    embeddings: Arc<EmbeddingConfig>,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -646,6 +648,103 @@ async fn rate_limit(
     }
 }
 
+/// `POST /v1/embeddings` request (the OpenAI shape we honour). `input` is one string or many.
+#[derive(Debug, Deserialize)]
+struct EmbeddingRequest {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    input: EmbedInput,
+}
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbedInput {
+    One(String),
+    Many(Vec<String>),
+}
+impl Default for EmbedInput {
+    fn default() -> Self {
+        EmbedInput::Many(Vec::new())
+    }
+}
+impl EmbedInput {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            EmbedInput::One(s) => vec![s],
+            EmbedInput::Many(v) => v,
+        }
+    }
+}
+
+/// `POST /v1/embeddings` (#34): a configured BYOK embeddings model is served by the hosted
+/// OpenAI-compatible backend (non-streaming). Models that aren't configured are rejected —
+/// this gateway has no swarm embeddings path. Key: caller `X-Provider-Api-Key`, else operator.
+async fn embeddings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<EmbeddingRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => {
+            return openai_error(StatusCode::BAD_REQUEST, &rej.body_text(), "invalid_request_error")
+        }
+    };
+    if req.model.trim().is_empty() {
+        return openai_error(StatusCode::BAD_REQUEST, "missing required field: model", "invalid_request_error");
+    }
+    if !state.embeddings.handles(&req.model) {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            &format!("'{}' is not a configured embeddings model", req.model),
+            "invalid_request_error",
+        );
+    }
+    let caller_key = headers.get("x-provider-api-key").and_then(|v| v.to_str().ok());
+    let key = match state.embeddings.resolve_key(caller_key) {
+        Some(k) => k,
+        None => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                &format!("no API key available for embeddings model '{}'", req.model),
+                "invalid_request_error",
+            )
+        }
+    };
+    let inputs = req.input.into_vec();
+    if inputs.is_empty() {
+        return openai_error(StatusCode::BAD_REQUEST, "missing or empty field: input", "invalid_request_error");
+    }
+    let base_url = state.embeddings.base_url().to_string();
+    let model = req.model.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::live_openai_embeddings(&base_url, &key).and_then(|a| a.embed(&model, &inputs))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(resp)) => {
+            let data: Vec<Value> = resp
+                .vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| json!({ "object": "embedding", "index": i, "embedding": v }))
+                .collect();
+            Json(json!({
+                "object": "list",
+                "data": data,
+                "model": req.model,
+                "usage": { "prompt_tokens": resp.prompt_tokens, "total_tokens": resp.prompt_tokens },
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => {
+            let (status, etype) = classify_error(&e.to_string());
+            openai_error(status, &e.to_string(), etype)
+        }
+        Err(_) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, "embeddings task failed", "internal_error"),
+    }
+}
+
 async fn health() -> Response {
     Json(json!({ "status": "ok" })).into_response()
 }
@@ -672,6 +771,7 @@ pub fn router(
     rate_limit_cfg: RateLimitConfig,
     trusted_proxy: bool,
     byok: ByokConfig,
+    embeddings_cfg: EmbeddingConfig,
 ) -> Router {
     let node = match store {
         Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
@@ -685,6 +785,7 @@ pub fn router(
         rate_limiter: Arc::new(RateLimiter::new(rate_limit_cfg)),
         trusted_proxy,
         byok: Arc::new(byok),
+        embeddings: Arc::new(embeddings_cfg),
     };
     // The `/v1/*` routes are auth-gated then rate-limited; `/health` and `/metrics` stay open
     // for liveness probes and Prometheus scraping. `route_layer`s run outermost-last, so
@@ -692,6 +793,7 @@ pub fn router(
     // limiter — the limiter can then key off the validated API key.
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
@@ -715,13 +817,14 @@ pub fn serve_http(
     rate_limit_cfg: RateLimitConfig,
     trusted_proxy: bool,
     byok: ByokConfig,
+    embeddings_cfg: EmbeddingConfig,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok)
+        let app = router(net, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })

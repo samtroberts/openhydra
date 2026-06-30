@@ -68,6 +68,18 @@ pub trait HttpClient {
         self.get(url)
     }
 
+    /// `POST {url}` (non-streaming JSON) with extra request `headers` — used by the hosted
+    /// embeddings adapters (an `Authorization: Bearer` key). Default delegates to
+    /// [`post_json`](Self::post_json); the live transport overrides it to send them.
+    fn post_json_with_headers(
+        &self,
+        url: &str,
+        body: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<String, AdapterError> {
+        self.post_json(url, body)
+    }
+
     /// `POST {url}` streaming with extra request `headers`. Default delegates to
     /// [`post_stream`](Self::post_stream); the live transport overrides it to send them.
     fn post_stream_with_headers(
@@ -171,4 +183,19 @@ pub trait EngineAdapter {
         request: &InferenceRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError>;
+}
+
+/// The result of an embeddings request: one vector per input, in input order, plus the
+/// backend's prompt-token count (0 if it reports none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingResponse {
+    pub vectors: Vec<Vec<f32>>,
+    pub prompt_tokens: u64,
+}
+
+/// A backend that produces embedding vectors (non-streaming — distinct from the chat
+/// [`EngineAdapter`]). Implemented by the BYOK embeddings adapters.
+pub trait EmbeddingAdapter {
+    /// Embed each of `inputs` with `model`, returning one vector per input (in order).
+    fn embed(&self, model: &str, inputs: &[String]) -> Result<EmbeddingResponse, AdapterError>;
 }

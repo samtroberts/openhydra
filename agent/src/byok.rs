@@ -15,7 +15,7 @@
 //! user can bring their own), else the operator's configured key. A mapped model with no key
 //! available is refused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Which hosted backend a BYOK model routes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,48 @@ impl ByokConfig {
     }
 }
 
+/// BYOK embeddings routing (#34): the model names served by a single OpenAI-compatible
+/// embeddings backend (OpenAI / Gemini-OAI-compat / Voyage / local), plus its base URL and
+/// operator key. Separate from the chat [`ByokConfig`] because embeddings are non-streaming
+/// and a different endpoint.
+#[derive(Debug, Clone)]
+pub struct EmbeddingConfig {
+    models: HashSet<String>,
+    base_url: String,
+    api_key: Option<String>,
+}
+
+impl EmbeddingConfig {
+    pub fn new(models: Vec<String>, base_url: String, api_key: Option<String>) -> Self {
+        Self { models: models.into_iter().collect(), base_url, api_key }
+    }
+
+    pub fn empty() -> Self {
+        Self { models: HashSet::new(), base_url: String::new(), api_key: None }
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.models.is_empty()
+    }
+
+    /// Whether `model` is routed to the embeddings backend.
+    pub fn handles(&self, model: &str) -> bool {
+        self.models.contains(model)
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Caller-supplied key wins (bring-your-own), else the operator's; `None` → refuse.
+    pub fn resolve_key(&self, caller_key: Option<&str>) -> Option<String> {
+        caller_key
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.api_key.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +194,20 @@ mod tests {
         assert_eq!(c.resolve_key(ByokProvider::Gemini, None), None);
         // …but a caller key still works.
         assert_eq!(c.resolve_key(ByokProvider::Gemini, Some("user-gemini")).as_deref(), Some("user-gemini"));
+    }
+
+    #[test]
+    fn embedding_config_routes_and_resolves_keys() {
+        let e = EmbeddingConfig::new(
+            vec!["text-embedding-3-small".into()],
+            "https://api.openai.com".into(),
+            Some("op-key".into()),
+        );
+        assert!(e.is_active());
+        assert!(e.handles("text-embedding-3-small"));
+        assert!(!e.handles("qwen2.5"));
+        assert_eq!(e.resolve_key(Some("caller")).as_deref(), Some("caller"));
+        assert_eq!(e.resolve_key(None).as_deref(), Some("op-key"));
+        assert_eq!(EmbeddingConfig::empty().resolve_key(None), None);
     }
 }

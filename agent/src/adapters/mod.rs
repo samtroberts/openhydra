@@ -26,8 +26,11 @@
 //! operator's key, not swarm-provider-side:
 //! * [`anthropic`] — Claude Messages API (`/v1/messages`).
 //! * [`gemini`] — Google Generative Language API (`:streamGenerateContent`).
+//! * [`embeddings`] — OpenAI-compatible `/v1/embeddings` (non-streaming vectors; OpenAI,
+//!   Gemini's OAI-compat endpoint, Voyage, or a local engine).
 
 pub mod anthropic;
+pub mod embeddings;
 pub mod gemini;
 pub mod llama_cpp;
 pub mod ollama;

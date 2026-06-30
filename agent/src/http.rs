@@ -87,6 +87,28 @@ impl HttpClient for ReqwestClient {
             .map_err(http_err)
     }
 
+    fn post_json_with_headers(
+        &self,
+        url: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<String, AdapterError> {
+        let mut req = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.send()
+            .map_err(http_err)?
+            .error_for_status()
+            .map_err(http_err)?
+            .text()
+            .map_err(http_err)
+    }
+
     fn post_stream_with_headers(
         &self,
         url: &str,

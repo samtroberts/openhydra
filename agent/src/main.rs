@@ -27,9 +27,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig, EngineAdapter,
-    Provider, RateLimitConfig, DEFAULT_ANTHROPIC_URL, DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL,
-    DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
+    live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig, EmbeddingConfig,
+    EngineAdapter, Provider, RateLimitConfig, DEFAULT_ANTHROPIC_URL, DEFAULT_GEMINI_URL,
+    DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_EMBEDDINGS_URL,
+    DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -230,6 +231,20 @@ struct ByokArgs {
     /// Override the Gemini base URL (default Google's; for proxies/tests).
     #[arg(long)]
     gemini_url: Option<String>,
+
+    /// Route this model name to the OpenAI-compatible embeddings backend (`/v1/embeddings`).
+    /// Repeatable.
+    #[arg(long = "byok-embedding-model")]
+    byok_embedding_model: Vec<String>,
+
+    /// Embeddings backend base URL (default OpenAI; point at a Gemini-OAI-compat / Voyage /
+    /// local endpoint).
+    #[arg(long)]
+    embedding_url: Option<String>,
+
+    /// Operator embeddings key (falls back to `OPENAI_API_KEY`).
+    #[arg(long)]
+    embedding_key: Option<String>,
 }
 
 impl ByokArgs {
@@ -243,6 +258,15 @@ impl ByokArgs {
             self.byok_gemini_model,
             self.gemini_url.unwrap_or_else(|| DEFAULT_GEMINI_URL.to_string()),
             gemini_key,
+        )
+    }
+
+    fn embedding_config(&self) -> EmbeddingConfig {
+        let key = self.embedding_key.clone().or_else(|| std::env::var("OPENAI_API_KEY").ok());
+        EmbeddingConfig::new(
+            self.byok_embedding_model.clone(),
+            self.embedding_url.clone().unwrap_or_else(|| DEFAULT_OPENAI_EMBEDDINGS_URL.to_string()),
+            key,
         )
     }
 }
@@ -495,7 +519,8 @@ fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
     let aup = args.aup.clone().into_policy();
     let rate_limit = args.rate_limit.into_config();
     let trusted_proxy = args.rate_limit.trusted_proxy;
+    let embeddings = args.byok.embedding_config();
     let byok = args.byok.clone().into_config();
-    serve_http(net, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok)
+    serve_http(net, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }
