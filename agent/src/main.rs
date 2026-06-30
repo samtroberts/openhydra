@@ -157,6 +157,13 @@ struct ProvideArgs {
     /// TTL (300s) or the node periodically falls out of discovery.
     #[arg(long, default_value_t = 120)]
     reannounce_secs: u64,
+
+    /// Maximum concurrent serves. The poll loop hands each request to a worker pool of this
+    /// size instead of serving inline, so one long generation can't head-of-line-block the
+    /// rest. The external engine has its own concurrency limit; this just caps how many we
+    /// dispatch at once. Default 8.
+    #[arg(long, default_value_t = 8)]
+    max_concurrency: usize,
 }
 
 #[derive(Args)]
@@ -288,7 +295,7 @@ fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
 
 /// Run a provider over a chosen engine adapter: open the ledger, announce the engine's
 /// models, then serve inbound requests forever. Generic so every [`EngineKind`] reuses it.
-fn run_provider<A: EngineAdapter>(
+fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     adapter: A,
     engine_url: String,
     args: ProvideArgs,
@@ -329,8 +336,13 @@ fn run_provider<A: EngineAdapter>(
         args.reannounce_secs,
     );
     // Blocks forever (returns `!`); poll in short slices to stay responsive and
-    // re-announce within the relays' provider-record TTL.
-    provider.run_inbound(Duration::from_millis(500), Duration::from_secs(args.reannounce_secs))
+    // re-announce within the relays' provider-record TTL. Serves concurrently via a bounded
+    // worker pool so one slow generation can't block the others.
+    std::sync::Arc::new(provider).run_inbound(
+        Duration::from_millis(500),
+        Duration::from_secs(args.reannounce_secs),
+        args.max_concurrency,
+    )
 }
 
 /// Consumer role: run the HTTP/SSE gateway until the process exits.

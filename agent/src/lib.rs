@@ -29,6 +29,7 @@ pub mod http;
 pub mod provider;
 pub mod receipt;
 pub mod serve;
+pub mod workpool;
 
 pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,

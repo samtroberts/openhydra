@@ -20,7 +20,7 @@
 //! the loop itself is thin glue over the live swarm.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
@@ -31,6 +31,7 @@ use openhydra_protocol::store::Store;
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{frame_response, handle_serve_request};
+use crate::workpool::WorkerPool;
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -225,17 +226,31 @@ impl<A: EngineAdapter> Provider<A> {
     /// (300s today), and the very first announce at startup can race an empty routing
     /// table — so a one-shot announce silently vanishes. Re-announcing on an interval
     /// shorter than the TTL keeps the node discoverable.
+    /// `max_concurrency` bounds in-flight serves: the poll loop hands each request to a
+    /// [`WorkerPool`] of that many threads instead of serving inline, so a long generation
+    /// (or an M2.3 throttle delay) on one request no longer blocks the others. Re-announce
+    /// still runs on the poll thread between polls.
     pub fn run_inbound(
-        &self,
+        self: Arc<Self>,
         poll_timeout: std::time::Duration,
         reannounce_every: std::time::Duration,
-    ) -> ! {
+        max_concurrency: usize,
+    ) -> !
+    where
+        A: Send + Sync + 'static,
+    {
+        let pool = WorkerPool::new(max_concurrency);
         let mut last_announce = std::time::Instant::now();
         loop {
             if let Some((request_id, data)) = self.net.poll_inbound(poll_timeout) {
-                let response = self.dispatch(&data);
-                // Best-effort reply; if the swarm is gone the next poll will error too.
-                let _ = self.net.respond(request_id, response);
+                // Serve off the poll thread so the loop can keep accepting requests and a
+                // slow one doesn't head-of-line-block the rest.
+                let provider = Arc::clone(&self);
+                pool.submit(move || {
+                    let response = provider.dispatch(&data);
+                    // Best-effort reply; if the swarm is gone the next poll will error too.
+                    let _ = provider.net.respond(request_id, response);
+                });
             }
             if last_announce.elapsed() >= reannounce_every {
                 match self.announce_models() {
