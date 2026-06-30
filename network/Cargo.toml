@@ -42,6 +42,8 @@ openhydra-protocol = { path = "../protocol" }
 
 # Crypto — compatible with OpenHydra's existing Ed25519 keys
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# PQC0.2 key hygiene: scrub transient secret-key byte buffers on the load/save path.
+zeroize = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

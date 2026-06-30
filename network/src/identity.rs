@@ -13,6 +13,7 @@ use std::path::Path;
 use libp2p::identity;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 /// JSON format of `~/.openhydra/identity.key`.
 #[derive(Deserialize)]
@@ -48,25 +49,33 @@ impl Identity {
             }
         }
 
-        let data = std::fs::read_to_string(path)?;
-        let file: IdentityFile = serde_json::from_str(&data)?;
+        let mut data = std::fs::read_to_string(path)?;
+        let mut file: IdentityFile = serde_json::from_str(&data)?;
 
-        let private_bytes = hex::decode(&file.private_key)?;
+        let mut private_bytes = hex::decode(&file.private_key)?;
         if private_bytes.len() != 32 {
-            return Err(format!(
-                "expected 32-byte private key, got {} bytes",
-                private_bytes.len()
-            )
-            .into());
+            let n = private_bytes.len();
+            private_bytes.zeroize();
+            file.private_key.zeroize();
+            data.zeroize();
+            return Err(format!("expected 32-byte private key, got {n} bytes").into());
         }
 
-        // Build libp2p Ed25519 keypair from the raw 32-byte secret.
+        // Build libp2p Ed25519 keypair from the raw 32-byte secret. `try_from_bytes`
+        // takes the buffer by `&mut` and zeroizes it on success.
         let mut key_bytes: [u8; 32] = private_bytes.as_slice().try_into()
             .map_err(|_| "private key must be exactly 32 bytes")?;
         let secret = identity::ed25519::SecretKey::try_from_bytes(&mut key_bytes)?;
         let ed25519_keypair = identity::ed25519::Keypair::from(secret);
         let keypair = identity::Keypair::from(ed25519_keypair);
         let libp2p_peer_id = keypair.public().to_peer_id();
+
+        // PQC0.2: scrub every transient copy of the secret (libp2p already zeroized
+        // `key_bytes`). The `SigningKey` inside `keypair` keeps the live secret and
+        // zeroizes itself on drop.
+        private_bytes.zeroize();
+        file.private_key.zeroize();
+        data.zeroize();
 
         Ok(Identity {
             keypair,
@@ -105,7 +114,12 @@ impl Identity {
             "private_key": hex::encode(secret_bytes),
             "peer_id": &openhydra_peer_id,
         });
-        std::fs::write(path, serde_json::to_string_pretty(&json)?)?;
+        // PQC0.2: zeroize the serialized secret-bearing string after it's written. (The
+        // hex secret inside the `json` Value is a transient residual covered by the
+        // process-level core-dump/swap hardening applied at agent startup.)
+        let mut serialized = serde_json::to_string_pretty(&json)?;
+        std::fs::write(path, &serialized)?;
+        serialized.zeroize();
 
         #[cfg(unix)]
         {

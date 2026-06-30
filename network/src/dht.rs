@@ -1,6 +1,7 @@
 //! Kademlia DHT operations for peer record storage and discovery.
 
 use libp2p::kad;
+use openhydra_protocol::crypto_agility::SigAlg;
 
 use crate::types::PeerRecord;
 
@@ -61,8 +62,10 @@ pub fn parse_model_id_from_key(key: &[u8]) -> Option<String> {
 /// rendering, so the byte string is reproducible. (This diverges from the legacy
 /// Python 4-field format; the agent/protocol path is Rust-only post-pivot.)
 pub fn canonical_bytes(r: &PeerRecord) -> Vec<u8> {
+    // v3 (PQC0.1): binds the `sig_alg` discriminant into the preimage right after the
+    // domain header, so a wire-level attacker cannot strip or downgrade the algorithm.
     format!(
-        "openhydra-peer-record-v2\n\
+        "openhydra-peer-record-v3\nsig_alg={}\n\
          peer_id={}\nmodel_id={}\ncanonical_model_id={}\n\
          host={}\nhost_ipv6={}\nport={}\n\
          libp2p_peer_id={}\npublic_key={}\n\
@@ -72,6 +75,7 @@ pub fn canonical_bytes(r: &PeerRecord) -> Vec<u8> {
          context_length={}\nmax_output_tokens={}\n\
          throughput_tok_s={}\nqueue_depth={}\nload_pct={}\nhardware_class={}\n\
          updated_unix_ms={}",
+        r.sig_alg,
         r.peer_id, r.model_id, r.canonical_model_id,
         r.host, r.host_ipv6, r.port,
         r.libp2p_peer_id, r.public_key,
@@ -104,7 +108,10 @@ pub fn sign_peer_record(
     signed.public_key = hex::encode(ed25519_pk.to_bytes());
     signed.libp2p_peer_id =
         libp2p::PeerId::from_public_key(&keypair.public()).to_string();
-    // Sign over the fully-populated record (incl. the two fields just set).
+    // Crypto-agility (PQC0.1): this path signs with Ed25519; record it so the
+    // verifier dispatches correctly and the algorithm is bound into the preimage.
+    signed.sig_alg = SigAlg::Ed25519.to_u8();
+    // Sign over the fully-populated record (incl. the fields just set).
     let canonical = canonical_bytes(&signed);
     let sig_bytes = keypair
         .sign(&canonical)
@@ -139,6 +146,12 @@ fn base64_urlsafe_decode(s: &str) -> Result<Vec<u8>, String> {
 pub fn verify_peer_record(record: &PeerRecord) -> Result<(), String> {
     if record.signature.is_empty() || record.public_key.is_empty() {
         return Err("missing signature or public_key".into());
+    }
+    // Crypto-agility (PQC0.1): reject an unknown or known-but-unimplemented signature
+    // algorithm before trusting any field — never silently treat it as classical.
+    let alg = SigAlg::from_u8(record.sig_alg).map_err(|e| e.to_string())?;
+    if !alg.is_implemented() {
+        return Err(format!("unsupported signature algorithm: {alg:?}"));
     }
     // Decode the ed25519 public key (hex, matches sign_peer_record).
     let pk_bytes =
@@ -260,6 +273,42 @@ mod tests {
         // Attacker rewrites host after signing → must fail.
         signed.host = "6.6.6.6".into();
         assert!(verify_peer_record(&signed).is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_unknown_sig_alg() {
+        // PQC0.1: a record claiming an unknown algorithm discriminant is rejected.
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut signed = sign_peer_record(
+            &PeerRecord { host: "1.2.3.4".into(), port: 50051, ..Default::default() },
+            &kp,
+        )
+        .unwrap();
+        signed.sig_alg = 0xFF; // not a known SigAlg
+        let err = verify_peer_record(&signed).unwrap_err();
+        assert!(err.contains("unknown"), "expected unknown-alg error, got: {err}");
+    }
+
+    #[test]
+    fn test_verify_rejects_unimplemented_sig_alg() {
+        // PQC0.1: a reserved-but-unimplemented PQC algorithm (ML-DSA = 2) must be
+        // rejected, never silently treated as classical Ed25519.
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut signed = sign_peer_record(
+            &PeerRecord { host: "1.2.3.4".into(), port: 50051, ..Default::default() },
+            &kp,
+        )
+        .unwrap();
+        signed.sig_alg = SigAlg::MlDsa65.to_u8();
+        let err = verify_peer_record(&signed).unwrap_err();
+        assert!(err.contains("unsupported"), "expected unsupported-alg error, got: {err}");
+    }
+
+    #[test]
+    fn test_default_record_is_ed25519() {
+        // The serde/Default discriminant must be classical Ed25519, so an unsigned
+        // default record and freshly-signed records agree on the algorithm.
+        assert_eq!(PeerRecord::default().sig_alg, SigAlg::Ed25519.to_u8());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! `PeerEndpoint` dataclass, serializable to both CBOR (for Kademlia
 //! records) and Python dicts (via serde_json → PyO3).
 
+use openhydra_protocol::crypto_agility::SigAlg;
 use serde::{Deserialize, Serialize};
 
 /// A peer's full announcement record — stored in Kademlia DHT.
@@ -113,12 +114,20 @@ pub struct PeerRecord {
     /// Ed25519 signature hex over canonical record bytes (Task 6.2).
     #[serde(default)]
     pub signature: String,
+    /// Signature-algorithm discriminant (PQC0.1 crypto-agility). Bound into the
+    /// signed preimage ([`crate::dht::canonical_bytes`]) so it can't be downgraded.
+    /// Defaults to Ed25519 (=1) for records lacking the field.
+    #[serde(default = "default_sig_alg")]
+    pub sig_alg: u8,
 
     // Timestamp
     #[serde(default)]
     pub updated_unix_ms: u64,
 }
 
+fn default_sig_alg() -> u8 {
+    SigAlg::Ed25519.to_u8()
+}
 fn default_daemon_mode() -> String {
     "polite".to_string()
 }
@@ -342,6 +351,7 @@ impl Default for PeerRecord {
             libp2p_peer_id: String::new(),
             public_key: String::new(),
             signature: String::new(),
+            sig_alg: SigAlg::Ed25519.to_u8(),
             updated_unix_ms: 0,
         }
     }

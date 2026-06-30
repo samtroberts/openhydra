@@ -80,6 +80,17 @@ impl NetworkHandle {
         Ok(pk.to_bytes().to_vec())
     }
 
+    /// Derive the libp2p PeerId string for a raw 32-byte ed25519 public key. Lets the
+    /// provider key per-peer state (M2.3 credit) by the same libp2p id a consumer
+    /// announces (its `reply_to`), given only the ed25519 pubkey carried in a co-signed
+    /// receipt. (Stateless — takes `&self` only to sit alongside the other identity helpers.)
+    pub fn peer_id_from_ed25519_pubkey(&self, pubkey: &[u8]) -> Result<String, String> {
+        let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(pubkey)
+            .map_err(|e| format!("bad ed25519 pubkey: {e}"))?;
+        let pk = libp2p::identity::PublicKey::from(ed);
+        Ok(libp2p::PeerId::from_public_key(&pk).to_string())
+    }
+
     /// libp2p PeerId (the `proxy_forward` dial target / `reply_to` for serve requests).
     pub fn libp2p_peer_id(&self) -> &str {
         &self.libp2p_peer_id
