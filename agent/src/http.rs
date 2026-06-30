@@ -71,15 +71,37 @@ impl HttpClient for ReqwestClient {
         url: &str,
         body: &str,
     ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError> {
-        let resp = self
+        self.post_stream_with_headers(url, body, &[])
+    }
+
+    fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<String, AdapterError> {
+        let mut req = self.client.get(url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.send()
+            .map_err(http_err)?
+            .error_for_status()
+            .map_err(http_err)?
+            .text()
+            .map_err(http_err)
+    }
+
+    fn post_stream_with_headers(
+        &self,
+        url: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError> {
+        let mut req = self
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .send()
-            .map_err(http_err)?
-            .error_for_status()
-            .map_err(http_err)?;
+            .body(body.to_string());
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().map_err(http_err)?.error_for_status().map_err(http_err)?;
         // The Lines iterator owns the BufReader which owns the Response → 'static, so it
         // can be boxed and pulled lazily as chunks arrive.
         let reader = std::io::BufReader::new(resp);

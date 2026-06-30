@@ -21,7 +21,14 @@
 //! * [`llama_cpp`] — `llama-server`. Serves over the OpenAI route (reuses [`openai`]'s
 //!   stream) but detects bespoke-ly via `/props`, whose chat template + GGUF path yield a
 //!   full canonical id.
+//!
+//! **BYOK (hosted) backends** — used gateway-side as a passthrough to a frontier API with the
+//! operator's key, not swarm-provider-side:
+//! * [`anthropic`] — Claude Messages API (`/v1/messages`).
+//! * [`gemini`] — Google Generative Language API (`:streamGenerateContent`).
 
+pub mod anthropic;
+pub mod gemini;
 pub mod llama_cpp;
 pub mod ollama;
 pub mod openai;

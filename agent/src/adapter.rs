@@ -55,6 +55,29 @@ pub trait HttpClient {
         url: &str,
         body: &str,
     ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError>;
+
+    /// `GET {url}` with extra request `headers` — e.g. an auth header for a hosted BYOK
+    /// backend (Anthropic `x-api-key`, Gemini `x-goog-api-key`). The default drops the
+    /// headers and calls [`get`](Self::get); the live transport overrides it so a key is
+    /// actually sent. (Local engines need no auth, so existing adapters/mocks are untouched.)
+    fn get_with_headers(
+        &self,
+        url: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<String, AdapterError> {
+        self.get(url)
+    }
+
+    /// `POST {url}` streaming with extra request `headers`. Default delegates to
+    /// [`post_stream`](Self::post_stream); the live transport overrides it to send them.
+    fn post_stream_with_headers(
+        &self,
+        url: &str,
+        body: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError> {
+        self.post_stream(url, body)
+    }
 }
 
 /// One chat message in an inference request. Serializable — it crosses the swarm as

@@ -41,6 +41,8 @@ pub use adapter::{
 };
 pub use aup::{AupDecision, AupPolicy};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
+pub use adapters::anthropic::{AnthropicAdapter, DEFAULT_ANTHROPIC_URL};
+pub use adapters::gemini::{GeminiAdapter, DEFAULT_GEMINI_URL};
 pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
 pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};
@@ -74,4 +76,23 @@ pub fn live_openai(
 /// `base_url` (e.g. [`DEFAULT_LLAMACPP_URL`]).
 pub fn live_llamacpp(base_url: &str) -> Result<LlamaCppAdapter<ReqwestClient>, AdapterError> {
     Ok(LlamaCppAdapter::new(base_url, ReqwestClient::new()?))
+}
+
+/// An Anthropic (Claude) BYOK adapter backed by the live reqwest transport — a hosted
+/// passthrough backend with the operator's `api_key`. `base_url` is usually
+/// [`DEFAULT_ANTHROPIC_URL`].
+pub fn live_anthropic(
+    base_url: &str,
+    api_key: &str,
+) -> Result<AnthropicAdapter<ReqwestClient>, AdapterError> {
+    Ok(AnthropicAdapter::new(base_url, api_key, ReqwestClient::new()?))
+}
+
+/// A Google Gemini BYOK adapter backed by the live reqwest transport, with the operator's
+/// `api_key`. `base_url` is usually [`DEFAULT_GEMINI_URL`].
+pub fn live_gemini(
+    base_url: &str,
+    api_key: &str,
+) -> Result<GeminiAdapter<ReqwestClient>, AdapterError> {
+    Ok(GeminiAdapter::new(base_url, api_key, ReqwestClient::new()?))
 }
