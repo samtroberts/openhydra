@@ -19,14 +19,25 @@
 //! The pure pieces — record construction and the method-byte dispatch — are unit-tested;
 //! the loop itself is thin glue over the live swarm.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
+use openhydra_protocol::credit::CreditAccount;
 use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{frame_response, handle_serve_request};
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// libp2p proxy method byte for an inference serve request (consumer → provider). Sits
 /// alongside the existing peer method bytes (0x01 Forward … 0x07 Receipt).
@@ -106,11 +117,22 @@ pub struct Provider<A: EngineAdapter> {
     /// Ledger for accepted co-signed receipts. `None` → receipts are co-signed and returned
     /// but not persisted (the swarm still works; this node just keeps no local record).
     store: Option<Store>,
+    /// M2.3 give/take credit, keyed by **consumer libp2p PeerId** — the same id a consumer
+    /// announces as its `reply_to`, derived at receipt time from the consumer's ed25519
+    /// pubkey. Rehydrated from `store` when one is attached, flushed on each accrual.
+    credit: Mutex<HashMap<String, CreditAccount>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
     pub fn new(adapter: A, net: NetworkHandle) -> Self {
-        Self { adapter, net, host: String::new(), port: 0, store: None }
+        Self {
+            adapter,
+            net,
+            host: String::new(),
+            port: 0,
+            store: None,
+            credit: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Set the advisory host/port advertised in records (routing is via libp2p regardless).
@@ -120,10 +142,58 @@ impl<A: EngineAdapter> Provider<A> {
         self
     }
 
-    /// Attach a ledger so accepted co-signed receipts are persisted (M2.3).
-    pub fn with_store(mut self, store: Store) -> Self {
-        self.store = Some(store);
-        self
+    /// Attach a ledger so accepted co-signed receipts are persisted (M2.3), and rehydrate
+    /// the give/take credit map from it so throttling survives a restart.
+    pub fn with_store(self, store: Store) -> Self {
+        if let Ok(mut map) = self.credit.lock() {
+            if let Err(e) = store.load_credit_into_memory(&mut map) {
+                eprintln!("openhydra-agent: could not rehydrate credit from store: {e}");
+            }
+        }
+        Self { store: Some(store), ..self }
+    }
+
+    /// Accrue a consumer's give/take after it co-signs a receipt: it **consumed**
+    /// `tokens` from us (M2.3). Keyed by the consumer's libp2p id (derived from the
+    /// receipt's ed25519 pubkey), so it matches the `reply_to` seen at serve time. The
+    /// snapshot is flushed durably. Best-effort — never affects the reply.
+    fn record_consumption(&self, accepted: &CoSignedReceipt) {
+        let now = now_unix_ms();
+        let consumer_id = match self
+            .net
+            .peer_id_from_ed25519_pubkey(accepted.payload.consumer.as_bytes())
+        {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        let snapshot = {
+            let mut map = match self.credit.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let acct = map.entry(consumer_id.clone()).or_insert_with(|| CreditAccount::new(now));
+            acct.record_consumed(accepted.payload.tokens, now);
+            acct.to_bytes()
+        };
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_credit(&consumer_id, &snapshot) {
+                eprintln!("openhydra-agent: credit persist failed: {e}");
+            }
+        }
+    }
+
+    /// The current serve-rate cap in `[credit::RATE_FLOOR, 1.0]` for a consumer (by its
+    /// libp2p id), from its give/take balance (M2.3). `1.0` when we hold no record (the
+    /// starter grant). The throttle that *consults* this lands with the provider
+    /// concurrency model (a per-request delay in today's serial loop would head-of-line
+    /// block other consumers — see the M2.3 increment-2 note).
+    pub fn consumer_rate_cap(&self, consumer_libp2p_id: &str) -> f64 {
+        let now = now_unix_ms();
+        self.credit
+            .lock()
+            .ok()
+            .and_then(|m| m.get(consumer_libp2p_id).map(|a| a.rate_cap(now)))
+            .unwrap_or(1.0)
     }
 
     /// Detect the engine's models and announce a record for each. Returns how many were
@@ -186,6 +256,10 @@ impl<A: EngineAdapter> Provider<A> {
                 let (response, accepted) = handle_receipt_inbound(data, &sign, &provider_pub);
                 // Persist the accepted co-signed receipt (best-effort; never fails the reply).
                 ledger_receipt(self.store.as_ref(), accepted.as_ref());
+                // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
+                if let Some(receipt) = &accepted {
+                    self.record_consumption(receipt);
+                }
                 response
             }
             // SERVE_REQUEST (and any unknown byte → a framed Error from the serve handler).
@@ -286,11 +360,13 @@ mod tests {
     }
 
     fn test_receipt(nonce: [u8; 16], tokens: u64) -> CoSignedReceipt {
+        use openhydra_protocol::crypto_agility::SigAlg;
         use openhydra_protocol::receipts::{build_receipt, ReceiptPayload};
         use ed25519_dalek::SigningKey;
         let consumer = SigningKey::from_bytes(&[3u8; 32]);
         let provider = SigningKey::from_bytes(&[5u8; 32]);
         let payload = ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
             provider: provider.verifying_key(),
             consumer: consumer.verifying_key(),
             model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),

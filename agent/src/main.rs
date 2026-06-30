@@ -169,9 +169,17 @@ struct ServeArgs {
     /// `OPENHYDRA_API_KEY` env var — to leave the gateway open (fine on loopback).
     #[arg(long)]
     api_key: Option<String>,
+
+    /// Persist earned provider reputation to this redb file (durable across restarts).
+    /// Omit for an ephemeral, in-memory reputation.
+    #[arg(long)]
+    db: Option<PathBuf>,
 }
 
 fn main() {
+    // PQC0.2: keep secret key material off disk (core dumps / swap) before anything
+    // loads or generates the identity key. Best-effort; never fails startup.
+    openhydra_agent::harden_process();
     if let Err(e) = run() {
         eprintln!("openhydra-agent: {e}");
         std::process::exit(1);
@@ -329,10 +337,20 @@ fn run_provider<A: EngineAdapter>(
 fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
     // CLI flag wins; otherwise fall back to the env var (avoids depending on clap's `env`).
     let api_key = args.api_key.or_else(|| std::env::var("OPENHYDRA_API_KEY").ok());
+    // M2.2(a): persist earned provider reputation across restarts if --db was given.
+    let store = match &args.db {
+        Some(path) => {
+            let s = Store::open(path)
+                .map_err(|e| format!("open reputation db {}: {e}", path.display()))?;
+            eprintln!("openhydra-agent: reputation persisted at {}", path.display());
+            Some(s)
+        }
+        None => None,
+    };
     eprintln!(
         "openhydra-agent: gateway listening on http://{} (auth: {})",
         args.bind,
         if api_key.is_some() { "API key required on /v1/*" } else { "open" },
     );
-    serve_http(net, &args.bind, api_key).map_err(|e| format!("gateway on {}: {e}", args.bind))
+    serve_http(net, &args.bind, api_key, store).map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

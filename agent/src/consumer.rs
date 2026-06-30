@@ -16,10 +16,16 @@
 //! Provider *selection* (discover → filter → rank → pick) and the HTTP front door land on
 //! top of this; this is just "talk to one provider".
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::DiscoveredPeer;
 use openhydra_protocol::model_id::is_compatible;
+use openhydra_protocol::receipts::NonceTracker;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
+use openhydra_protocol::store::Store;
+use openhydra_protocol::verify::{ReputationTracker, VerificationOutcome};
 
 use crate::adapter::{AdapterError, ChatMessage};
 use crate::provider::SERVE_REQUEST;
@@ -71,10 +77,27 @@ pub fn select_provider(
 /// Same filter + [`rank_peers`] scoring as [`select_provider`], but returns the whole
 /// ranked list so the caller can fail over to the next provider when one is dead or
 /// unreachable (discovery can surface stale-but-still-advertised providers).
+///
+/// Uses each provider's *self-reported* DHT reputation (always neutral post-v2, since the
+/// signed record excludes `reputation_score`). For **earned** reputation from the
+/// consumer's local [`ReputationTracker`], use [`rank_providers_with_reputation`].
 pub fn rank_providers(
     peers: &[DiscoveredPeer],
     request_canonical: &str,
     tier: u8,
+) -> Vec<SelectedProvider> {
+    rank_providers_with_reputation(peers, request_canonical, tier, &|_| None)
+}
+
+/// As [`rank_providers`], but `earned_reputation(peer_id)` may override a provider's
+/// reputation with the consumer's locally-earned score (M2.2(a)). `Some(score)` wins;
+/// `None` falls back to the self-reported DHT value (neutral when absent). This is the
+/// closed loop that downranks a provider that has misbehaved with *this* consumer.
+pub fn rank_providers_with_reputation(
+    peers: &[DiscoveredPeer],
+    request_canonical: &str,
+    tier: u8,
+    earned_reputation: &dyn Fn(&str) -> Option<f64>,
 ) -> Vec<SelectedProvider> {
     let compatible: Vec<&DiscoveredPeer> = peers
         .iter()
@@ -93,7 +116,10 @@ pub fn rank_providers(
             peer_id: p.peer_id.clone(),
             latency_ms: 1.0, // RTT survey deferred (matches the M1.3 router default)
             load_pct: p.load_pct,
-            reputation: if p.reputation_score > 0.0 { p.reputation_score } else { 50.0 },
+            // Earned reputation (local tracker) wins; else the self-reported DHT value;
+            // else neutral. A provider that failed *us* ranks below an untried one.
+            reputation: earned_reputation(&p.peer_id)
+                .unwrap_or(if p.reputation_score > 0.0 { p.reputation_score } else { 50.0 }),
             bandwidth_mbps: 0.0,
             s2s_rtt_ms: 0.0,
             throughput_tok_s: p.throughput_tok_s,
@@ -172,11 +198,64 @@ pub fn request_completion(
 pub struct ConsumerNode {
     net: NetworkHandle,
     tier: u8,
+    /// Per-provider earned reputation (M2.2(a)), keyed by OpenHydra peer_id — the same key
+    /// the receipts use. Mutated on `&self` (the gateway calls `complete` from a blocking
+    /// task), so it lives behind a `Mutex`.
+    reputation: Mutex<HashMap<String, ReputationTracker>>,
+    /// Optional durable backing for `reputation` (M2.2(a) persistence). When present, the
+    /// map is rehydrated from it at startup and each outcome is flushed back, so trust
+    /// survives a restart. `None` = ephemeral, in-memory reputation.
+    store: Option<Store>,
 }
 
 impl ConsumerNode {
+    /// An in-memory consumer (reputation is not persisted across restarts).
     pub fn new(net: NetworkHandle) -> Self {
-        Self { net, tier: 2 }
+        Self { net, tier: 2, reputation: Mutex::new(HashMap::new()), store: None }
+    }
+
+    /// A consumer whose earned reputation is **persisted** to `store`: the map is
+    /// rehydrated from it now, and every outcome is flushed back durably (M2.2(a)).
+    pub fn with_store(net: NetworkHandle, store: Store) -> Self {
+        let mut reputation = HashMap::new();
+        // The consumer doesn't replay-guard nonces (that's the provider's job); this
+        // throwaway tracker just satisfies the shared rehydration API.
+        let mut nonces = NonceTracker::new();
+        if let Err(e) = store.load_state_into_memory(&mut nonces, &mut reputation) {
+            tracing::warn!(error = %e, "could not rehydrate reputation from store; starting fresh");
+        }
+        Self { net, tier: 2, reputation: Mutex::new(reputation), store: Some(store) }
+    }
+
+    /// The consumer's locally-earned reputation for `peer_id`, decayed to `now_ms`, or
+    /// `None` if this consumer has no history with it (→ neutral in ranking).
+    fn earned_reputation(&self, peer_id: &str, now_ms: u64) -> Option<f64> {
+        self.reputation.lock().ok()?.get(peer_id).map(|t| t.score_at(now_ms))
+    }
+
+    /// Record a verification outcome for `peer_id` (M2.2(a)): a served + clean completion
+    /// is `Honored`; a failed/refused serve attempt is `Rejected`. Updates the in-memory
+    /// tracker, then best-effort persists the snapshot (reputation is advisory — a failed
+    /// write must never break the request path). Feeds the next ranking so a provider that
+    /// misbehaves with this consumer is downranked out of routing.
+    fn record_outcome(&self, peer_id: &str, outcome: VerificationOutcome, now_ms: u64) {
+        let snapshot = {
+            let mut map = match self.reputation.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let tracker = map
+                .entry(peer_id.to_string())
+                .or_insert_with(|| ReputationTracker::new(now_ms));
+            tracker.record(outcome, now_ms);
+            tracker.to_bytes()
+        };
+        // Persist outside the lock (don't hold the Mutex across the redb write).
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_reputation(peer_id, &snapshot) {
+                tracing::debug!(error = %e, peer_id, "reputation persist failed");
+            }
+        }
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
@@ -196,13 +275,18 @@ impl ConsumerNode {
         temperature: Option<f64>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
+        let now = now_unix_ms();
         let t_discover = std::time::Instant::now();
         let peers = self
             .net
             .discover(model)
             .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
         // "" canonical → any provider of this model_id (template-hash filtering is later).
-        let candidates = rank_providers(&peers, "", self.tier);
+        // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
+        // a provider that has failed this consumer ranks below an untried one.
+        let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid| {
+            self.earned_reputation(pid, now)
+        });
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
@@ -257,6 +341,8 @@ impl ConsumerNode {
                     if summary.ok && summary.tokens > 0 {
                         self.settle_receipt(&provider, summary.tokens);
                     }
+                    // M2.2(a): a clean served completion earns the provider reputation.
+                    self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
                     return Ok(summary);
                 }
                 Err(e) => {
@@ -264,6 +350,9 @@ impl ConsumerNode {
                         provider = %provider.libp2p_peer_id, attempt = i + 1, total,
                         error = %e, "provider attempt failed"
                     );
+                    // M2.2(a): a failed/refused serve attempt costs the provider
+                    // reputation, so a dead/erroring one is downranked on the next discover.
+                    self.record_outcome(&provider.peer_id, VerificationOutcome::Rejected, now);
                     if delivered {
                         // Already streamed part of a completion to the client — failing over
                         // would duplicate output. Surface the error instead.
@@ -482,5 +571,31 @@ mod tests {
         let ranked = rank_providers(&[slow, fast], TPL_A, 2);
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
         assert_eq!(ids, vec!["fast", "slow"]);
+    }
+
+    // ── M2.2(a): earned-reputation-aware ranking ──
+
+    #[test]
+    fn earned_reputation_downranks_a_provider_that_failed_us() {
+        // The closed loop: two equal-throughput providers, both self-reporting neutral;
+        // the one with a low EARNED reputation ranks last.
+        let peers = vec![discovered("bad", TPL_A, 20.0), discovered("good", TPL_A, 20.0)];
+        let earned = |pid: &str| if pid == "bad" { Some(5.0) } else { None };
+        let ranked = rank_providers_with_reputation(&peers, TPL_A, 2, &earned);
+        let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
+        assert_eq!(ids, vec!["good", "bad"], "low earned reputation must rank a provider last");
+    }
+
+    #[test]
+    fn no_earned_history_falls_back_to_the_plain_ranking() {
+        // Earned reputation only ever *overrides* — with no history (lookup → None for
+        // all), the result must equal the plain reputation-agnostic ranking.
+        let peers = vec![discovered("a", TPL_A, 5.0), discovered("b", TPL_A, 45.0)];
+        let with_none = rank_providers_with_reputation(&peers, TPL_A, 2, &|_| None);
+        let plain = rank_providers(&peers, TPL_A, 2);
+        assert_eq!(
+            with_none.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+            plain.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+        );
     }
 }

@@ -43,6 +43,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # locked-down containers). Opt-in via the `profiling` feature; emits an SVG flamegraph.
 pprof = { version = "0.13", features = ["flamegraph"], optional = true }
 
+# PQC0.2 process hardening: disable core dumps + best-effort mlockall so secret key
+# material never reaches disk (swap / core files). Unix-only; no-op elsewhere.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 profiling = ["dep:pprof"]
 

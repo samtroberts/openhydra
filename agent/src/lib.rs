@@ -24,6 +24,7 @@ pub mod adapter;
 pub mod adapters;
 pub mod consumer;
 pub mod gateway;
+pub mod hardening;
 pub mod http;
 pub mod provider;
 pub mod receipt;
@@ -37,9 +38,11 @@ pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
 pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};
 pub use consumer::{
-    rank_providers, request_completion, select_provider, ConsumerNode, SelectedProvider,
+    rank_providers, rank_providers_with_reputation, request_completion, select_provider,
+    ConsumerNode, SelectedProvider,
 };
 pub use gateway::serve_http;
+pub use hardening::harden_process;
 pub use http::ReqwestClient;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};

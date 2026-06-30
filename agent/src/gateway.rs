@@ -35,6 +35,7 @@ use openhydra_network::handle::NetworkHandle;
 
 use crate::adapter::ChatMessage;
 use crate::consumer::ConsumerNode;
+use openhydra_protocol::store::Store;
 use crate::serve::ServeSummary;
 
 #[derive(Clone)]
@@ -465,9 +466,13 @@ async fn health() -> Response {
 
 /// The gateway router over a started swarm node. `api_key` (when `Some`) gates the `/v1/*`
 /// routes behind `Authorization: Bearer <key>`; `/health` is always open.
-pub fn router(net: NetworkHandle, api_key: Option<String>) -> Router {
+pub fn router(net: NetworkHandle, api_key: Option<String>, store: Option<Store>) -> Router {
+    let node = match store {
+        Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
+        None => ConsumerNode::new(net),
+    };
     let state = AppState {
-        node: Arc::new(ConsumerNode::new(net)),
+        node: Arc::new(node),
         api_key: api_key.map(Arc::new),
     };
     // The `/v1/*` routes are auth-gated; `/health` stays open for liveness probes.
@@ -484,11 +489,16 @@ pub fn router(net: NetworkHandle, api_key: Option<String>) -> Router {
 /// Run the gateway, blocking. Builds its own multi-thread tokio runtime and serves until
 /// the process exits. `bind` is e.g. `"127.0.0.1:8080"`; `api_key` optionally protects
 /// `/v1/*`.
-pub fn serve_http(net: NetworkHandle, bind: &str, api_key: Option<String>) -> std::io::Result<()> {
+pub fn serve_http(
+    net: NetworkHandle,
+    bind: &str,
+    api_key: Option<String>,
+    store: Option<Store>,
+) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
-        axum::serve(listener, router(net, api_key)).await
+        axum::serve(listener, router(net, api_key, store)).await
     })
 }
 

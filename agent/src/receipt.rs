@@ -44,6 +44,7 @@ fn receipt_err(e: ReceiptError) -> AdapterError {
         ReceiptError::BadConsumerSig => "bad_consumer_sig",
         ReceiptError::BadProviderSig => "bad_provider_sig",
         ReceiptError::ReplayedNonce => "replayed_nonce",
+        ReceiptError::UnsupportedAlg(_) => "unsupported_sig_alg",
     };
     AdapterError::Http(format!("receipt rejected: {which}"))
 }
