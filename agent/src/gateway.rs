@@ -35,6 +35,7 @@ use openhydra_network::handle::NetworkHandle;
 
 use crate::adapter::ChatMessage;
 use crate::consumer::ConsumerNode;
+use crate::metrics::Metrics;
 use openhydra_protocol::store::Store;
 use crate::serve::ServeSummary;
 
@@ -44,6 +45,8 @@ struct AppState {
     /// When set, `/v1/*` requires `Authorization: Bearer <key>`. `None` ⇒ open (the
     /// loopback default).
     api_key: Option<Arc<String>>,
+    /// Gateway-side Prometheus metrics (#33), scraped at `/metrics`.
+    metrics: Arc<Metrics>,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -273,6 +276,7 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, &rej.body_text(), "invalid_request_error")
         }
     };
+    state.metrics.incr_chat();
     if let Some(resp) = validate(&req) {
         return resp;
     }
@@ -289,9 +293,9 @@ async fn chat_completions(
     );
 
     if req.stream {
-        stream_response(id, req.model, created, want_usage, rx, started)
+        stream_response(id, req.model, created, want_usage, rx, started, state.metrics.clone())
     } else {
-        buffered_response(id, req.model, created, rx, started).await
+        buffered_response(id, req.model, created, rx, started, state.metrics.clone()).await
     }
 }
 
@@ -305,6 +309,7 @@ fn stream_response(
     want_usage: bool,
     rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     started: std::time::Instant,
+    metrics: Arc<Metrics>,
 ) -> Response {
     let role = {
         let data = stream_chunk(&id, &model, created, json!({ "role": "assistant" }), None);
@@ -319,6 +324,12 @@ fn stream_response(
             GatewayEvent::Done(summary) => {
                 let wall = started.elapsed();
                 log_completion(&summary, wall);
+                metrics.record_completion(
+                    summary.tokens,
+                    wall,
+                    summary.discover_ns,
+                    summary.proxy_roundtrip_ns,
+                );
                 let mut chunk: Value =
                     serde_json::from_str(&stream_chunk(&id_s, &model_s, created, json!({}), Some("stop")))
                         .unwrap_or_else(|_| json!({}));
@@ -329,6 +340,7 @@ fn stream_response(
                 chunk.to_string()
             }
             GatewayEvent::Error(m) => {
+                metrics.record_error();
                 let (_, etype) = classify_error(&m);
                 json!({
                     "id": id_s, "object": "chat.completion.chunk", "created": created, "model": model_s,
@@ -352,6 +364,7 @@ async fn buffered_response(
     created: u64,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     started: std::time::Instant,
+    metrics: Arc<Metrics>,
 ) -> Response {
     let mut content = String::new();
     let mut outcome: Option<Result<Box<ServeSummary>, String>> = None;
@@ -366,9 +379,16 @@ async fn buffered_response(
         Some(Ok(summary)) => {
             let wall = started.elapsed();
             log_completion(&summary, wall);
+            metrics.record_completion(
+                summary.tokens,
+                wall,
+                summary.discover_ns,
+                summary.proxy_roundtrip_ns,
+            );
             Json(completion_object(&id, &model, created, &content, &summary, wall)).into_response()
         }
         Some(Err(m)) => {
+            metrics.record_error();
             let (status, etype) = classify_error(&m);
             openai_error(status, &m, etype)
         }
@@ -404,6 +424,7 @@ fn log_completion(summary: &ServeSummary, wall: std::time::Duration) {
 /// as providers announce. The blocking swarm query runs on a plain OS thread (same reason
 /// as `complete` — `blocking_send` needs a non-tokio context).
 async fn list_models(State(state): State<AppState>) -> Response {
+    state.metrics.incr_models();
     let node = state.node.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -464,6 +485,17 @@ async fn health() -> Response {
     Json(json!({ "status": "ok" })).into_response()
 }
 
+/// `GET /metrics` — Prometheus text exposition (#33). Open (no API key), like `/health`, so
+/// a scraper needn't hold the gateway key; it exposes only aggregate counters/latencies, no
+/// request content. Bind to loopback (the default) if that aggregate is sensitive.
+async fn metrics_endpoint(State(state): State<AppState>) -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render_prometheus(),
+    )
+        .into_response()
+}
+
 /// The gateway router over a started swarm node. `api_key` (when `Some`) gates the `/v1/*`
 /// routes behind `Authorization: Bearer <key>`; `/health` is always open.
 pub fn router(net: NetworkHandle, api_key: Option<String>, store: Option<Store>) -> Router {
@@ -474,14 +506,17 @@ pub fn router(net: NetworkHandle, api_key: Option<String>, store: Option<Store>)
     let state = AppState {
         node: Arc::new(node),
         api_key: api_key.map(Arc::new),
+        metrics: Arc::new(Metrics::new()),
     };
-    // The `/v1/*` routes are auth-gated; `/health` stays open for liveness probes.
+    // The `/v1/*` routes are auth-gated; `/health` and `/metrics` stay open for liveness
+    // probes and Prometheus scraping.
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint))
         .merge(v1)
         .with_state(state)
 }

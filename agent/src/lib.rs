@@ -26,6 +26,7 @@ pub mod consumer;
 pub mod gateway;
 pub mod hardening;
 pub mod http;
+pub mod metrics;
 pub mod provider;
 pub mod receipt;
 pub mod serve;
