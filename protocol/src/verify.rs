@@ -15,8 +15,11 @@
 //!    activations lets a verifier confirm a result is consistent with the claimed
 //!    model, checked on a *sampled* fraction of requests. Ported byte-identically from
 //!    `verification/toploc.py` — see [`activation_hash`] / [`verify_activation_hash`].
-//! 2. **Redundant execution.** A sampled fraction of requests are run on ≥2
-//!    providers and compared. The comparison logic is deferred — see [`agrees`].
+//! 2. **Redundant execution (M2.2(b)).** A sampled fraction of deterministic
+//!    (`temperature = 0`) requests are run on ≥2 providers of the same canonical
+//!    `model_id` and compared — see [`agrees`] (near-match, tolerant of benign cross-
+//!    hardware divergence) and [`redundant_verdict`] (majority resolution → `Failed` for
+//!    the outlier). The *orchestration* (sampled dual-dispatch in the agent) lands on top.
 //! 3. **Reputation.** Providers accrue a reputation score from verification
 //!    outcomes; repeat failures downrank them out of routing. This is the piece
 //!    built now: [`ReputationTracker`].
@@ -255,13 +258,174 @@ pub fn verify_activation_hash(activation: &[f64], expected: &[u8]) -> bool {
     expected.len() == 32 && activation_hash(activation) == expected
 }
 
-/// **Deferred (M2.2 follow-up).** Whether two providers' results for the same request
-/// agree under the redundant-execution audit. Will compare activation hashes / sampled
-/// logits within tolerance. Not yet implemented (the redundant-exec comparison still
-/// lives in Python `verification/redundant.py`).
-#[allow(dead_code)]
-pub fn agrees(_a: &[u8], _b: &[u8]) -> bool {
-    false // scaffold: real comparison logic lands when verification moves into Rust
+/// Agreement threshold for [`agrees`] (M2.2(b)): two greedy (`temperature = 0`)
+/// completions of the same canonical `model_id` must share at least this fraction of a
+/// leading common prefix (relative to the longer output) to count as agreeing.
+///
+/// Why a *prefix* fraction and not exact equality: greedy decoding is **not**
+/// bit-identical across hardware / engine builds — fp-accumulation order, GPU kernels,
+/// and quantization can make two honest providers' token streams diverge partway through
+/// a long answer (and, once greedy decoders pick different tokens, their contexts differ
+/// so they rarely re-converge). The shared *leading* run is therefore the honest signal:
+/// two real runs of the same model agree for a long prefix; a freeloader that returns
+/// canned / empty / wrong-model text diverges almost immediately and fails this bar.
+///
+/// **Tunable** (the simulator sweeps it — see the plan's M2.2 overhead note). Set
+/// conservatively high so that *agreement* is a strong claim; the majority resolution in
+/// [`redundant_verdict`] then ensures an honest provider that merely diverges early is
+/// ruled `Inconclusive` (no penalty) rather than falsely `Failed`.
+pub const AGREEMENT_THRESHOLD: f64 = 0.9;
+
+/// Fraction of identical leading characters shared by `a` and `b`, relative to the longer
+/// (after trimming trailing whitespace — stop-token handling commonly differs by a
+/// trailing newline). `1.0` for identical, `0.0` for an empty-vs-nonempty or
+/// first-character divergence. Two empty strings agree (`1.0`).
+pub fn common_prefix_ratio(a: &str, b: &str) -> f64 {
+    let a = a.trim_end();
+    let b = b.trim_end();
+    let longer = a.chars().count().max(b.chars().count());
+    if longer == 0 {
+        return 1.0; // both empty (after trim) → trivially identical
+    }
+    let shared = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    shared as f64 / longer as f64
+}
+
+/// Whether two providers' completions for the *same deterministic request* agree under
+/// the redundant-execution audit (M2.2(b)): their [`common_prefix_ratio`] meets
+/// [`AGREEMENT_THRESHOLD`].
+///
+/// **Scope.** This catches *gross* divergence — a provider not running the claimed model
+/// at all (canned, empty, truncated, or wrong-model output). It does **not** prove
+/// semantic correctness, nor catch a subtle late corruption; that is an accepted limit of
+/// redundant execution over heterogeneous engines, mitigated by majority voting
+/// ([`redundant_verdict`]) and reputation decay. TOPLOC activation hashing
+/// ([`activation_hash`]) would tighten this but is dormant on the BYO-engine text path
+/// (the engine returns text, not activations).
+pub fn agrees(a: &str, b: &str) -> bool {
+    common_prefix_ratio(a, b) >= AGREEMENT_THRESHOLD
+}
+
+/// The outcome of a redundant-execution audit over the outputs of N providers that served
+/// the same deterministic request. Produced by [`redundant_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedundantVerdict {
+    /// Every output agrees with a strict majority — no fault detected. Each provider is
+    /// [`Honored`](VerificationOutcome::Honored).
+    Agree,
+    /// A strict majority agree; the listed indices are the dissenting outliers, each
+    /// [`Failed`](VerificationOutcome::Failed). Majority members are `Honored`.
+    Outliers(Vec<usize>),
+    /// No strict majority (a tie such as 2-vs-2, all-distinct outputs, or fewer than two
+    /// samples). The audit is inconclusive — penalise no one; re-sample or escalate to an
+    /// additional provider.
+    Inconclusive,
+}
+
+impl RedundantVerdict {
+    /// The reputation outcome to record for the provider at `index` in the audited set,
+    /// or `None` to leave it unchanged (an inconclusive audit punishes — and rewards —
+    /// no one).
+    pub fn outcome_for(&self, index: usize) -> Option<VerificationOutcome> {
+        match self {
+            RedundantVerdict::Agree => Some(VerificationOutcome::Honored),
+            RedundantVerdict::Outliers(outliers) => Some(if outliers.contains(&index) {
+                VerificationOutcome::Failed
+            } else {
+                VerificationOutcome::Honored
+            }),
+            RedundantVerdict::Inconclusive => None,
+        }
+    }
+}
+
+/// Resolve a redundant-execution audit: given the `outputs` of N providers that served the
+/// **same deterministic request**, decide who (if anyone) disagrees with the majority.
+///
+/// A provider is "in the majority" if its output [`agrees`] with a strict majority of the
+/// set (more than half, counting itself). If everyone is in the majority → [`Agree`]; if
+/// some are and some are not → the rest are [`Outliers`]; if no strict majority exists (a
+/// tie, all-distinct, or `n < 2`) → [`Inconclusive`], which is the signal to escalate to
+/// another provider rather than punish on ambiguous evidence.
+///
+/// Agreement is not transitive (it is a similarity threshold), so membership is decided by
+/// pairwise-agreement *count*, not by clustering — robust to a near-boundary output that
+/// agrees with some peers but not others.
+///
+/// [`Agree`]: RedundantVerdict::Agree
+/// [`Outliers`]: RedundantVerdict::Outliers
+/// [`Inconclusive`]: RedundantVerdict::Inconclusive
+pub fn redundant_verdict(outputs: &[&str]) -> RedundantVerdict {
+    let n = outputs.len();
+    if n < 2 {
+        return RedundantVerdict::Inconclusive; // can't cross-check a single sample
+    }
+    // For each output, how many of the N (including itself) does it agree with?
+    let counts: Vec<usize> = (0..n)
+        .map(|i| (0..n).filter(|&j| agrees(outputs[i], outputs[j])).count())
+        .collect();
+    // Strict majority: agrees with more than half the set.
+    let in_majority: Vec<bool> = counts.iter().map(|&c| c * 2 > n).collect();
+    if in_majority.iter().all(|&b| b) {
+        RedundantVerdict::Agree
+    } else if in_majority.iter().any(|&b| b) {
+        let outliers = (0..n).filter(|&i| !in_majority[i]).collect();
+        RedundantVerdict::Outliers(outliers)
+    } else {
+        RedundantVerdict::Inconclusive // no strict majority — escalate, don't punish
+    }
+}
+
+/// The resolved outcome of one redundant-execution audit round (M2.2(b)), produced by
+/// [`resolve_audit`] from the per-provider dispatch results. Pure data — the agent layer
+/// turns `outcomes` into reputation updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditReport {
+    /// The agreement verdict over the providers that *responded*.
+    pub verdict: RedundantVerdict,
+    /// `(peer_id, outcome)` for every provider whose reputation should move: responders get
+    /// their [`RedundantVerdict::outcome_for`] result (omitted when the audit is
+    /// inconclusive — no one is punished or rewarded on ambiguous evidence), and a provider
+    /// that failed to return a usable completion gets [`Rejected`](VerificationOutcome::Rejected).
+    pub outcomes: Vec<(String, VerificationOutcome)>,
+    /// Providers that did not return a usable completion for the challenge (errored / timed
+    /// out). Recorded `Rejected` and excluded from the agreement set — a non-answer is a
+    /// refusal to serve, not a wrong answer.
+    pub non_responders: Vec<String>,
+}
+
+/// Resolve a redundant-execution audit from the per-provider dispatch `results`:
+/// `(peer_id, Ok(full_output) | Err(reason))` for each audited provider.
+///
+/// Non-responders (an `Err`) are split out as `Rejected` and excluded from the agreement
+/// set; the [`verdict`](AuditReport::verdict) is computed over the responders via
+/// [`redundant_verdict`], and each responder's reputation outcome is its
+/// [`RedundantVerdict::outcome_for`]. This is the pure core of the agent's `audit_model`
+/// orchestration — testable without a swarm.
+pub fn resolve_audit(results: &[(String, Result<String, String>)]) -> AuditReport {
+    let mut responders: Vec<(&str, &str)> = Vec::new();
+    let mut non_responders: Vec<String> = Vec::new();
+    for (peer_id, result) in results {
+        match result {
+            Ok(output) => responders.push((peer_id.as_str(), output.as_str())),
+            Err(_) => non_responders.push(peer_id.clone()),
+        }
+    }
+
+    let outputs: Vec<&str> = responders.iter().map(|(_, out)| *out).collect();
+    let verdict = redundant_verdict(&outputs);
+
+    let mut outcomes: Vec<(String, VerificationOutcome)> = Vec::new();
+    for (i, (peer_id, _)) in responders.iter().enumerate() {
+        if let Some(outcome) = verdict.outcome_for(i) {
+            outcomes.push(((*peer_id).to_string(), outcome));
+        }
+    }
+    for peer_id in &non_responders {
+        outcomes.push((peer_id.clone(), VerificationOutcome::Rejected));
+    }
+
+    AuditReport { verdict, outcomes, non_responders }
 }
 
 #[cfg(test)]
@@ -497,5 +661,184 @@ mod tests {
         assert!(!verify_activation_hash(&[1.0, 2.0, 4.0], &good)); // tampered
         assert!(!verify_activation_hash(&a, b"")); // empty digest fails closed
         assert!(!verify_activation_hash(&a, &good[..31])); // wrong length fails closed
+    }
+
+    // ---- M2.2(b) redundant-execution comparison ----------------------------------
+
+    #[test]
+    fn agrees_on_identical_and_trailing_whitespace() {
+        let s = "The capital of France is Paris.";
+        assert!(agrees(s, s));
+        assert_eq!(common_prefix_ratio(s, s), 1.0);
+        // Stop-token handling commonly differs by a trailing newline — normalized away.
+        assert!(agrees(s, &format!("{s}\n")));
+        assert!(agrees(&format!("{s}  "), s));
+    }
+
+    #[test]
+    fn agrees_tolerates_benign_late_divergence() {
+        // Two honest providers on different hardware: a long identical prefix, then a
+        // late divergence (greedy decoders rarely re-converge). Above threshold → agree.
+        let a = "Here is a forty word answer that is identical for a very long stretch \
+                 before the two honest providers diverge on the last token alpha";
+        let b = "Here is a forty word answer that is identical for a very long stretch \
+                 before the two honest providers diverge on the last token omega";
+        assert!(common_prefix_ratio(a, b) >= AGREEMENT_THRESHOLD);
+        assert!(agrees(a, b));
+    }
+
+    #[test]
+    fn disagrees_on_gross_divergence() {
+        let real = "The capital of France is Paris, a city on the Seine.";
+        // A freeloader returning canned / empty / wrong-model text diverges immediately.
+        assert!(!agrees(real, "")); // empty
+        assert!(!agrees(real, "Sure! I can help with that.")); // canned, early divergence
+        assert!(!agrees(real, "The capital of Germany is Berlin.")); // wrong answer
+        assert_eq!(common_prefix_ratio(real, ""), 0.0);
+    }
+
+    #[test]
+    fn empty_vs_empty_agrees() {
+        assert!(agrees("", ""));
+        assert!(agrees("\n", "  ")); // both empty after trim
+    }
+
+    #[test]
+    fn verdict_all_agree() {
+        let a = "Paris is the capital of France.";
+        assert_eq!(redundant_verdict(&[a, a, a]), RedundantVerdict::Agree);
+        assert_eq!(redundant_verdict(&[a, a]), RedundantVerdict::Agree);
+    }
+
+    #[test]
+    fn verdict_single_outlier_in_three() {
+        let good = "Paris is the capital of France.";
+        let bad = "I am unable to answer that question right now.";
+        // Provider at index 1 is the liar; the other two agree → it is the outlier.
+        assert_eq!(
+            redundant_verdict(&[good, bad, good]),
+            RedundantVerdict::Outliers(vec![1])
+        );
+    }
+
+    #[test]
+    fn verdict_two_disagree_is_inconclusive() {
+        // A 1-vs-1 split can't say who is wrong → escalate, don't punish.
+        let a = "Paris is the capital of France.";
+        let b = "Lyon is the capital of France.";
+        assert_eq!(redundant_verdict(&[a, b]), RedundantVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn verdict_even_tie_is_inconclusive() {
+        // 2-vs-2: no strict majority → inconclusive.
+        let a = "Answer A, identical for the pair, long enough to clear the threshold.";
+        let b = "Answer B, identical for the pair, long enough to clear the threshold.";
+        assert_eq!(redundant_verdict(&[a, a, b, b]), RedundantVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn verdict_all_distinct_is_inconclusive() {
+        assert_eq!(
+            redundant_verdict(&["alpha answer one", "bravo answer two", "carol answer three"]),
+            RedundantVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn verdict_below_two_samples_is_inconclusive() {
+        assert_eq!(redundant_verdict(&[]), RedundantVerdict::Inconclusive);
+        assert_eq!(redundant_verdict(&["only one"]), RedundantVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn verdict_outcome_mapping() {
+        // Majority members are Honored; the outlier is Failed; inconclusive → no change.
+        let v = RedundantVerdict::Outliers(vec![1]);
+        assert_eq!(v.outcome_for(0), Some(VerificationOutcome::Honored));
+        assert_eq!(v.outcome_for(1), Some(VerificationOutcome::Failed));
+        assert_eq!(v.outcome_for(2), Some(VerificationOutcome::Honored));
+        assert_eq!(
+            RedundantVerdict::Agree.outcome_for(0),
+            Some(VerificationOutcome::Honored)
+        );
+        assert_eq!(RedundantVerdict::Inconclusive.outcome_for(0), None);
+    }
+
+    #[test]
+    fn verdict_minority_pair_is_flagged() {
+        // 3 agree, 2 agree only with each other: the pair is the minority → both outliers.
+        let maj = "The majority answer, shared verbatim by three honest providers here.";
+        let min = "A different answer, shared only by the two colluding minority nodes.";
+        assert_eq!(
+            redundant_verdict(&[maj, maj, maj, min, min]),
+            RedundantVerdict::Outliers(vec![3, 4])
+        );
+    }
+
+    // ---- M2.2(b) audit resolution (pure core of agent orchestration) -------------
+
+    fn ok(peer: &str, out: &str) -> (String, Result<String, String>) {
+        (peer.to_string(), Ok(out.to_string()))
+    }
+    fn err(peer: &str) -> (String, Result<String, String>) {
+        (peer.to_string(), Err("timed out".to_string()))
+    }
+
+    #[test]
+    fn audit_all_agree_honors_everyone() {
+        let a = "Paris is the capital of France, on the Seine.";
+        let report = resolve_audit(&[ok("p1", a), ok("p2", a), ok("p3", a)]);
+        assert_eq!(report.verdict, RedundantVerdict::Agree);
+        assert!(report.non_responders.is_empty());
+        for (_, oc) in &report.outcomes {
+            assert_eq!(*oc, VerificationOutcome::Honored);
+        }
+        assert_eq!(report.outcomes.len(), 3);
+    }
+
+    #[test]
+    fn audit_outlier_is_failed_majority_honored() {
+        let good = "Paris is the capital of France, on the Seine.";
+        let bad = "I cannot help with that request at this time.";
+        let report = resolve_audit(&[ok("p1", good), ok("liar", bad), ok("p3", good)]);
+        assert_eq!(report.verdict, RedundantVerdict::Outliers(vec![1]));
+        let map: std::collections::HashMap<_, _> = report.outcomes.iter().cloned().collect();
+        assert_eq!(map["p1"], VerificationOutcome::Honored);
+        assert_eq!(map["p3"], VerificationOutcome::Honored);
+        assert_eq!(map["liar"], VerificationOutcome::Failed);
+    }
+
+    #[test]
+    fn audit_non_responder_is_rejected_and_excluded() {
+        // A timeout is a refusal to serve (Rejected), not a wrong answer (Failed); the two
+        // responders that agree are still Honored.
+        let a = "The same long deterministic answer shared by both honest responders here.";
+        let report = resolve_audit(&[ok("p1", a), err("dead"), ok("p2", a)]);
+        assert_eq!(report.verdict, RedundantVerdict::Agree); // over the 2 responders
+        assert_eq!(report.non_responders, vec!["dead".to_string()]);
+        let map: std::collections::HashMap<_, _> = report.outcomes.iter().cloned().collect();
+        assert_eq!(map["p1"], VerificationOutcome::Honored);
+        assert_eq!(map["p2"], VerificationOutcome::Honored);
+        assert_eq!(map["dead"], VerificationOutcome::Rejected);
+    }
+
+    #[test]
+    fn audit_two_way_disagreement_punishes_no_one() {
+        // 1-vs-1: inconclusive → no reputation change for either responder.
+        let a = "Paris is the capital of France.";
+        let b = "Lyon is the capital of France.";
+        let report = resolve_audit(&[ok("p1", a), ok("p2", b)]);
+        assert_eq!(report.verdict, RedundantVerdict::Inconclusive);
+        assert!(report.outcomes.is_empty(), "inconclusive audit must not move reputation");
+    }
+
+    #[test]
+    fn audit_single_responder_is_inconclusive() {
+        // One responder + one dead: can't cross-check → no verdict-based outcome, but the
+        // dead one is still Rejected.
+        let report = resolve_audit(&[ok("p1", "an answer"), err("dead")]);
+        assert_eq!(report.verdict, RedundantVerdict::Inconclusive);
+        assert_eq!(report.outcomes, vec![("dead".to_string(), VerificationOutcome::Rejected)]);
     }
 }

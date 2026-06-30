@@ -438,9 +438,20 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
      is downranked out of routing. This is the closed loop the exit test really needs.
   2. **Redundant-execution with deterministic decode — M2.2(b), the robust output check.**
      Re-run a sampled fraction at `temperature=0` on ≥2 providers of the same canonical
-     `model_id` and compare via `agrees()` (currently a `false` stub); on disagreement
-     escalate to a 3rd for majority, then feed `Failed`. *Caveat: temp=0 is not
-     bit-identical across hardware/engine builds → needs a near-match tolerance.*
+     `model_id` and compare via `agrees()`; on disagreement escalate to a 3rd for
+     majority, then feed `Failed`. *Caveat: temp=0 is not bit-identical across
+     hardware/engine builds → needs a near-match tolerance.*
+     - **inc1 ✅ (pure primitive, `protocol::verify`):** `agrees()` is now real — a
+       near-match check (`common_prefix_ratio ≥ AGREEMENT_THRESHOLD`, tolerant of benign
+       late cross-HW divergence, fails a freeloader's canned/empty/wrong-model output) —
+       plus `redundant_verdict(outputs) → Agree | Outliers(ix) | Inconclusive` (majority
+       by pairwise agreement; a 1-vs-1 or 2-vs-2 tie is Inconclusive → escalate, not
+       punish) and `RedundantVerdict::outcome_for(i)` mapping majority→`Honored` /
+       outlier→`Failed`. 13 unit tests.
+     - **inc2 ⏳ (agent orchestration):** sampled deterministic dual-dispatch — issue an
+       unpredictable temp=0 challenge to ≥2 providers of the same `model_id`, compare,
+       record outcomes; escalate to a 3rd on Inconclusive. *Live validation gated on the
+       parked ≥2-provider cross-NAT harness* (same dependency as M2.3 inc3 enforcement).
   3. **Logprob-fingerprint — optional, weaker.** Where the engine exposes `logprobs`, a
      cheaper-but-weaker fingerprint is possible: a middle ground, not the primitive.
   - **`verify::activation_hash` (TOPLOC) is retained but DORMANT** — it revives if an
