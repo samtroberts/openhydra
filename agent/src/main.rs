@@ -27,9 +27,9 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, EngineAdapter, Provider,
-    RateLimitConfig, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL,
-    DEFAULT_VLLM_URL,
+    live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig, EngineAdapter,
+    Provider, RateLimitConfig, DEFAULT_ANTHROPIC_URL, DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL,
+    DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -202,6 +202,51 @@ impl RateLimitArgs {
     }
 }
 
+/// BYOK passthrough (#34, `serve` only): map specific model names to a hosted frontier
+/// backend the gateway calls directly with the operator's key. Keys fall back to the
+/// providers' standard env vars; a caller may override per-request via `X-Provider-Api-Key`.
+#[derive(Args, Clone)]
+struct ByokArgs {
+    /// Route this model name to Anthropic (Claude). Repeatable.
+    #[arg(long = "byok-anthropic-model")]
+    byok_anthropic_model: Vec<String>,
+
+    /// Route this model name to Google Gemini. Repeatable.
+    #[arg(long = "byok-gemini-model")]
+    byok_gemini_model: Vec<String>,
+
+    /// Operator Anthropic key (falls back to `ANTHROPIC_API_KEY`).
+    #[arg(long)]
+    anthropic_key: Option<String>,
+
+    /// Operator Gemini key (falls back to `GEMINI_API_KEY`).
+    #[arg(long)]
+    gemini_key: Option<String>,
+
+    /// Override the Anthropic base URL (default `https://api.anthropic.com`; for proxies/tests).
+    #[arg(long)]
+    anthropic_url: Option<String>,
+
+    /// Override the Gemini base URL (default Google's; for proxies/tests).
+    #[arg(long)]
+    gemini_url: Option<String>,
+}
+
+impl ByokArgs {
+    fn into_config(self) -> ByokConfig {
+        let anthropic_key = self.anthropic_key.or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+        let gemini_key = self.gemini_key.or_else(|| std::env::var("GEMINI_API_KEY").ok());
+        ByokConfig::new(
+            self.byok_anthropic_model,
+            self.anthropic_url.unwrap_or_else(|| DEFAULT_ANTHROPIC_URL.to_string()),
+            anthropic_key,
+            self.byok_gemini_model,
+            self.gemini_url.unwrap_or_else(|| DEFAULT_GEMINI_URL.to_string()),
+            gemini_key,
+        )
+    }
+}
+
 #[derive(Args)]
 struct ProvideArgs {
     /// Which local engine to proxy to.
@@ -263,6 +308,9 @@ struct ServeArgs {
 
     #[command(flatten)]
     rate_limit: RateLimitArgs,
+
+    #[command(flatten)]
+    byok: ByokArgs,
 }
 
 fn main() {
@@ -447,6 +495,7 @@ fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
     let aup = args.aup.clone().into_policy();
     let rate_limit = args.rate_limit.into_config();
     let trusted_proxy = args.rate_limit.trusted_proxy;
-    serve_http(net, &args.bind, api_key, store, aup, rate_limit, trusted_proxy)
+    let byok = args.byok.clone().into_config();
+    serve_http(net, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

@@ -34,11 +34,13 @@ use tokio_stream::StreamExt;
 
 use openhydra_network::handle::NetworkHandle;
 
-use crate::adapter::ChatMessage;
+use crate::adapter::{ChatMessage, EngineAdapter, InferenceRequest};
 use crate::aup::{AupDecision, AupPolicy};
+use crate::byok::{ByokConfig, ByokProvider};
 use crate::consumer::ConsumerNode;
 use crate::metrics::Metrics;
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
+use crate::serve::ServeMetrics;
 use openhydra_protocol::store::Store;
 use crate::serve::ServeSummary;
 
@@ -57,6 +59,9 @@ struct AppState {
     /// Honor `X-Forwarded-For` for per-IP keying (only behind a trusted reverse proxy — the
     /// header is client-spoofable). Default `false`: key off the unspoofable socket address.
     trusted_proxy: bool,
+    /// BYOK passthrough routing (#34): mapped models call a hosted backend directly instead
+    /// of the swarm. Empty by default.
+    byok: Arc<ByokConfig>,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -284,6 +289,7 @@ fn spawn_worker(
 
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     // Malformed JSON / wrong content-type → 400, OpenAI-shaped (not axum's plain text).
@@ -305,19 +311,97 @@ async fn chat_completions(
     let id = next_id();
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
-    let (rx, started) = spawn_worker(
-        state.node.clone(),
-        req.model.clone(),
-        req.messages,
-        req.max_tokens,
-        req.temperature,
-    );
+
+    // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing
+    // the swarm. The key is the caller's `X-Provider-Api-Key` if present, else the operator's.
+    let (rx, started) = if let Some(provider) = state.byok.provider_for(&req.model) {
+        let caller_key = headers.get("x-provider-api-key").and_then(|v| v.to_str().ok());
+        let key = match state.byok.resolve_key(provider, caller_key) {
+            Some(k) => k,
+            None => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("no API key available for BYOK model '{}'", req.model),
+                    "invalid_request_error",
+                )
+            }
+        };
+        spawn_byok_worker(
+            provider,
+            state.byok.base_url(provider).to_string(),
+            key,
+            req.model.clone(),
+            req.messages,
+            req.max_tokens,
+            req.temperature,
+        )
+    } else {
+        spawn_worker(
+            state.node.clone(),
+            req.model.clone(),
+            req.messages,
+            req.max_tokens,
+            req.temperature,
+        )
+    };
 
     if req.stream {
         stream_response(id, req.model, created, want_usage, rx, started, state.metrics.clone())
     } else {
         buffered_response(id, req.model, created, rx, started, state.metrics.clone()).await
     }
+}
+
+/// Like [`spawn_worker`] but serves a BYOK model by calling the hosted backend directly
+/// (#34), translating its [`ServeOutcome`](crate::adapter::ServeOutcome) into the same
+/// `GatewayEvent` stream the SSE/buffered responders consume. Runs on a plain OS thread (the
+/// adapters are blocking).
+#[allow(clippy::too_many_arguments)]
+fn spawn_byok_worker(
+    provider: ByokProvider,
+    base_url: String,
+    key: String,
+    model: String,
+    messages: Vec<ChatMessage>,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    std::time::Instant,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let request = InferenceRequest { model_ref: model, messages, max_tokens, temperature };
+        let mut on_delta = |d: &str| {
+            let _ = tx.send(GatewayEvent::Delta(d.to_string()));
+        };
+        let result = match provider {
+            ByokProvider::Anthropic => crate::live_anthropic(&base_url, &key)
+                .and_then(|a| a.serve_stream(&request, &mut on_delta)),
+            ByokProvider::Gemini => crate::live_gemini(&base_url, &key)
+                .and_then(|a| a.serve_stream(&request, &mut on_delta)),
+        };
+        match result {
+            Ok(outcome) => {
+                let summary = ServeSummary {
+                    tokens: outcome.tokens,
+                    ok: outcome.done,
+                    metrics: ServeMetrics {
+                        engine: outcome.engine,
+                        provider_serve_ns: started.elapsed().as_nanos() as u64,
+                    },
+                    discover_ns: 0,
+                    proxy_roundtrip_ns: 0,
+                };
+                let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
+            }
+            Err(e) => {
+                let _ = tx.send(GatewayEvent::Error(e.to_string()));
+            }
+        }
+    });
+    (rx, started)
 }
 
 /// `stream: true` → SSE. First an assistant-role chunk, then content deltas, then a
@@ -579,6 +663,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
 
 /// The gateway router over a started swarm node. `api_key` (when `Some`) gates the `/v1/*`
 /// routes behind `Authorization: Bearer <key>`; `/health` is always open.
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     net: NetworkHandle,
     api_key: Option<String>,
@@ -586,6 +671,7 @@ pub fn router(
     aup: AupPolicy,
     rate_limit_cfg: RateLimitConfig,
     trusted_proxy: bool,
+    byok: ByokConfig,
 ) -> Router {
     let node = match store {
         Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
@@ -598,6 +684,7 @@ pub fn router(
         aup: Arc::new(aup),
         rate_limiter: Arc::new(RateLimiter::new(rate_limit_cfg)),
         trusted_proxy,
+        byok: Arc::new(byok),
     };
     // The `/v1/*` routes are auth-gated then rate-limited; `/health` and `/metrics` stay open
     // for liveness probes and Prometheus scraping. `route_layer`s run outermost-last, so
@@ -627,13 +714,14 @@ pub fn serve_http(
     aup: AupPolicy,
     rate_limit_cfg: RateLimitConfig,
     trusted_proxy: bool,
+    byok: ByokConfig,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, api_key, store, aup, rate_limit_cfg, trusted_proxy)
+        let app = router(net, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })

@@ -23,6 +23,7 @@
 pub mod adapter;
 pub mod adapters;
 pub mod aup;
+pub mod byok;
 pub mod consumer;
 pub mod gateway;
 pub mod hardening;
@@ -40,6 +41,7 @@ pub use adapter::{
     ServeOutcome,
 };
 pub use aup::{AupDecision, AupPolicy};
+pub use byok::{ByokConfig, ByokProvider};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use adapters::anthropic::{AnthropicAdapter, DEFAULT_ANTHROPIC_URL};
 pub use adapters::gemini::{GeminiAdapter, DEFAULT_GEMINI_URL};
