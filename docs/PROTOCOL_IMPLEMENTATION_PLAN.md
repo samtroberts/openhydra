@@ -448,10 +448,14 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
        by pairwise agreement; a 1-vs-1 or 2-vs-2 tie is Inconclusive → escalate, not
        punish) and `RedundantVerdict::outcome_for(i)` mapping majority→`Honored` /
        outlier→`Failed`. 13 unit tests.
-     - **inc2 ⏳ (agent orchestration):** sampled deterministic dual-dispatch — issue an
-       unpredictable temp=0 challenge to ≥2 providers of the same `model_id`, compare,
-       record outcomes; escalate to a 3rd on Inconclusive. *Live validation gated on the
-       parked ≥2-provider cross-NAT harness* (same dependency as M2.3 inc3 enforcement).
+     - **inc2 ✅ (agent orchestration):** sampled deterministic dual-dispatch
+       (`consumer.rs::audit_model`) — unpredictable temp=0 challenge to ≥2 providers of the
+       same `model_id`, compare, record outcomes; escalate to a 3rd on Inconclusive.
+     - **inc3 ✅ (trigger):** `consumer.rs::maybe_audit` fires after a served completion
+       (inside `complete`, now `self: &Arc<Self>`), draws against the rep-weighted
+       `audit_rate_for`, and on a hit spawns a **detached background thread** running
+       `audit_model` with a fresh `default_challenge` — off the caller's latency path.
+       *Live e2e still gated on the parked ≥2-provider cross-NAT harness.*
   3. **Logprob-fingerprint — optional, weaker.** Where the engine exposes `logprobs`, a
      cheaper-but-weaker fingerprint is possible: a middle ground, not the primitive.
   - **`verify::activation_hash` (TOPLOC) is retained but DORMANT** — it revives if an

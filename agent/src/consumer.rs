@@ -17,7 +17,7 @@
 //! top of this; this is just "talk to one provider".
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::DiscoveredPeer;
@@ -308,7 +308,7 @@ impl ConsumerNode {
     /// deltas to `on_delta`. Returns the [`ServeSummary`] (token count → receipt) on
     /// success. `model` is the engine handle / DHT key (e.g. `"qwen2.5:7b"`).
     pub fn complete(
-        &self,
+        self: &Arc<Self>,
         model: &str,
         messages: Vec<ChatMessage>,
         max_tokens: Option<u32>,
@@ -383,6 +383,9 @@ impl ConsumerNode {
                     }
                     // M2.2(a): a clean served completion earns the provider reputation.
                     self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
+                    // M2.2(b): sampled background redundant-exec audit of this provider (off
+                    // the response path — the caller already has its completion).
+                    self.maybe_audit(model, &provider.peer_id);
                     return Ok(summary);
                 }
                 Err(e) => {
@@ -490,6 +493,29 @@ impl ConsumerNode {
     pub fn audit_rate_for(&self, peer_id: &str, now_ms: u64) -> f64 {
         let rep = self.earned_reputation(peer_id, now_ms).unwrap_or(NEUTRAL_REPUTATION);
         sample_rate_for_reputation(rep, AUDIT_MIN_RATE, AUDIT_MAX_RATE)
+    }
+
+    /// M2.2(b) trigger: after serving, *sometimes* audit the provider that served. Draws
+    /// against [`audit_rate_for`](Self::audit_rate_for) (rare for a trusted provider, up to
+    /// [`AUDIT_MAX_RATE`] for a fresh/suspect one); on a hit it spawns a **detached
+    /// background thread** that runs [`audit_model`](Self::audit_model) with a fresh
+    /// unpredictable [`default_challenge`], so the redundant-exec cross-check never touches
+    /// the caller's latency path. The audit records its own outcomes (a confirmed outlier →
+    /// `Failed`); here we only log the verdict. A `< 2 providers` error just means the model
+    /// can't be cross-checked right now — logged at debug, not an error.
+    fn maybe_audit(self: &Arc<Self>, model: &str, provider_peer_id: &str) {
+        let rate = self.audit_rate_for(provider_peer_id, now_unix_ms());
+        if rand::random::<f64>() >= rate {
+            return; // not sampled this time
+        }
+        let node = Arc::clone(self);
+        let model = model.to_string();
+        std::thread::spawn(move || match node.audit_model(&model, &default_challenge()) {
+            Ok(report) => {
+                tracing::info!(model, verdict = ?report.verdict, "redundant-exec audit complete")
+            }
+            Err(e) => tracing::debug!(model, error = %e, "redundant-exec audit skipped"),
+        });
     }
 
     /// Dispatch `challenge` to one specific `provider` deterministically (`temperature = 0`)
