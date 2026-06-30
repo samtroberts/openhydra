@@ -427,6 +427,28 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
   failures into the router (M1.3).
 - **Exit test:** a deliberately-bad provider is caught by sampled verification and
   downranked out of routing within N requests; sample rate scales with reputation.
+- **⚑ Post-pivot reframing (2026-06-27).** TOPLOC activation-hashing was designed for the
+  *sharded* path — it hashes hidden activations. The pivot **removed sharding**; the
+  BYO-engine path proxies black-box engines that return **text, not activations**, so
+  **activation-TOPLOC is inapplicable to the current architecture.** The verification
+  ladder for the text world:
+  1. **Reputation-from-delivery — M2.2(a), the core (fully applicable today).** Wire
+     `verify::ReputationTracker` into the live consumer path + the router's
+     `PeerScoreInput.reputation`: a provider that errors / refuses to co-sign / disappears
+     is downranked out of routing. This is the closed loop the exit test really needs.
+  2. **Redundant-execution with deterministic decode — M2.2(b), the robust output check.**
+     Re-run a sampled fraction at `temperature=0` on ≥2 providers of the same canonical
+     `model_id` and compare via `agrees()` (currently a `false` stub); on disagreement
+     escalate to a 3rd for majority, then feed `Failed`. *Caveat: temp=0 is not
+     bit-identical across hardware/engine builds → needs a near-match tolerance.*
+  3. **Logprob-fingerprint — optional, weaker.** Where the engine exposes `logprobs`, a
+     cheaper-but-weaker fingerprint is possible: a middle ground, not the primitive.
+  - **`verify::activation_hash` (TOPLOC) is retained but DORMANT** — it revives if an
+    in-process Candle/Burn engine is added (activations exist again; see
+    `docs/PQC_IMPLEMENTATION_PLAN.md` and the enclave/Candle direction).
+  - **Revised exit test:** a provider that refuses/errors is downranked out of routing
+    within N requests (M2.2(a)); a provider returning *wrong output* is caught by sampled
+    redundant-exec and downranked (M2.2(b)).
 
 **M2.3 — Credit ledger & priority-not-access** · WS-CREDIT · Rust · ~2.5w · **⚠️ PARTIAL** (redb ledger `protocol::store` ✅; priority-not-access *enforcement* + scarcity pricing pending — see M3.3)
 - `protocol::ledger` over **`redb`** (pure-Rust, ACID, crash-safe — chosen over `sled`,
