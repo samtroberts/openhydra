@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::DiscoveredPeer;
+use openhydra_protocol::credit::CreditAccount;
 use openhydra_protocol::model_id::is_compatible;
 use openhydra_protocol::receipts::NonceTracker;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
@@ -216,20 +217,35 @@ pub struct ConsumerNode {
     /// the receipts use. Mutated on `&self` (the gateway calls `complete` from a blocking
     /// task), so it lives behind a `Mutex`.
     reputation: Mutex<HashMap<String, ReputationTracker>>,
-    /// Optional durable backing for `reputation` (M2.2(a) persistence). When present, the
-    /// map is rehydrated from it at startup and each outcome is flushed back, so trust
-    /// survives a restart. `None` = ephemeral, in-memory reputation.
+    /// Optional durable backing for `reputation` (M2.2(a)) and `credit` (M2.3). When
+    /// present, both maps are rehydrated from it at startup and flushed back on each
+    /// update, so trust and give/take survive a restart. `None` = ephemeral.
     store: Option<Store>,
+    /// M2.3 give-side credit, keyed by **provider libp2p PeerId** — the dial target we
+    /// settled a receipt with. When a provider co-signs our receipt it *served* us, so we
+    /// record its contribution (`record_served`) here, the symmetric half of the provider's
+    /// take-side `record_consumption`. Shares the store's `PEER_CREDIT` table with the
+    /// provider role: a node that both serves and provides against the **same `--db`** builds
+    /// one give/take ledger per counterparty. (Within a single process only this role
+    /// mutates it; cross-process unification merges on rehydrate — full live unification
+    /// lands with the combined-role / enforcement work.)
+    credit: Mutex<HashMap<String, CreditAccount>>,
 }
 
 impl ConsumerNode {
-    /// An in-memory consumer (reputation is not persisted across restarts).
+    /// An in-memory consumer (reputation and credit are not persisted across restarts).
     pub fn new(net: NetworkHandle) -> Self {
-        Self { net, tier: 2, reputation: Mutex::new(HashMap::new()), store: None }
+        Self {
+            net,
+            tier: 2,
+            reputation: Mutex::new(HashMap::new()),
+            store: None,
+            credit: Mutex::new(HashMap::new()),
+        }
     }
 
-    /// A consumer whose earned reputation is **persisted** to `store`: the map is
-    /// rehydrated from it now, and every outcome is flushed back durably (M2.2(a)).
+    /// A consumer whose earned reputation (M2.2(a)) and give-side credit (M2.3) are
+    /// **persisted** to `store`: both maps are rehydrated now and flushed back durably.
     pub fn with_store(net: NetworkHandle, store: Store) -> Self {
         let mut reputation = HashMap::new();
         // The consumer doesn't replay-guard nonces (that's the provider's job); this
@@ -238,7 +254,17 @@ impl ConsumerNode {
         if let Err(e) = store.load_state_into_memory(&mut nonces, &mut reputation) {
             tracing::warn!(error = %e, "could not rehydrate reputation from store; starting fresh");
         }
-        Self { net, tier: 2, reputation: Mutex::new(reputation), store: Some(store) }
+        let mut credit = HashMap::new();
+        if let Err(e) = store.load_credit_into_memory(&mut credit) {
+            tracing::warn!(error = %e, "could not rehydrate credit from store; starting fresh");
+        }
+        Self {
+            net,
+            tier: 2,
+            reputation: Mutex::new(reputation),
+            store: Some(store),
+            credit: Mutex::new(credit),
+        }
     }
 
     /// The consumer's locally-earned reputation for `peer_id`, decayed to `now_ms`, or
@@ -399,7 +425,9 @@ impl ConsumerNode {
                 .proxy_forward(provider_libp2p.clone(), framed.to_vec())
                 .map_err(AdapterError::Http)
         };
-        let _ = request_receipt(
+        // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
+        // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
+        if request_receipt(
             &sign,
             &mut transport,
             &provider_pub,
@@ -408,7 +436,50 @@ impl ConsumerNode {
             tokens,
             rand::random::<[u8; 16]>(),
             now_unix_ms(),
-        );
+        )
+        .is_ok()
+        {
+            self.record_contribution(&provider.libp2p_peer_id, tokens);
+        }
+    }
+
+    /// Record that `provider_libp2p_id` **served** us `tokens` (M2.3 give-side): the provider
+    /// earns give/take credit in our ledger, keyed by its libp2p id. The counterparty is our
+    /// own node, so the per-counterparty cap bounds how much any one provider can earn from
+    /// serving *us* alone (anti-collusion). Best-effort persisted; a failed write never
+    /// affects the completion (credit is advisory).
+    fn record_contribution(&self, provider_libp2p_id: &str, tokens: u64) {
+        let now = now_unix_ms();
+        let me = self.net.libp2p_peer_id().to_string();
+        let snapshot = {
+            let mut map = match self.credit.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let acct = map
+                .entry(provider_libp2p_id.to_string())
+                .or_insert_with(|| CreditAccount::new(now));
+            acct.record_served(&me, tokens, now);
+            acct.to_bytes()
+        };
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_credit(provider_libp2p_id, &snapshot) {
+                tracing::debug!(error = %e, provider_libp2p_id, "credit persist failed");
+            }
+        }
+    }
+
+    /// The give/take **balance** we hold for a provider (by libp2p id), decayed to now —
+    /// `STARTER_GRANT` when we've no record. Positive ⇒ a net contributor to us. Exposed for
+    /// observability and tests; the provider role consults its own map's `rate_cap` to
+    /// throttle (enforcement is the concurrency-gated step).
+    pub fn provider_balance(&self, provider_libp2p_id: &str) -> f64 {
+        let now = now_unix_ms();
+        self.credit
+            .lock()
+            .ok()
+            .and_then(|m| m.get(provider_libp2p_id).map(|a| a.balance(now)))
+            .unwrap_or(openhydra_protocol::credit::STARTER_GRANT)
     }
 
     /// The redundant-execution audit sampling rate for `peer_id` (M2.2(b)): low for a

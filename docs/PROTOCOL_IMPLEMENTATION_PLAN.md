@@ -474,6 +474,24 @@ Spec center of gravity, biggest greenfield. Each rule: **vectors first, then Rus
 - **Exit test:** simulation harness — a leecher is throttled to the floor under
   contention while a contributor stays full-speed; a collusion ring minting mutual
   receipts gains ~no usable credit; decay reduces a stale balance on schedule.
+- **Increment status:**
+  - **inc1 ✅** credit core `protocol::credit::CreditAccount` (decayed give/take balance,
+    `rate_cap` floor, per-counterparty anti-collusion cap, bytes codec; 10 sim tests).
+  - **inc2 ✅** persistence + **take-side** accrual: `store::PEER_CREDIT` + the provider
+    records `record_consumed` per accepted receipt, keyed by consumer libp2p id.
+  - **inc3 ✅** **give-side** accrual: on a successfully co-signed receipt the consumer
+    records the provider's `record_served` (`consumer.rs::record_contribution`, keyed by
+    provider libp2p id, counterparty = self for the anti-collusion cap), sharing the
+    `PEER_CREDIT` table. This closes the give/take loop — balances rise, not only fall.
+    *Cross-process note:* provide/serve are separate roles; one ledger materializes when
+    both use the same `--db` and merges on rehydrate. Live single-process unification lands
+    with inc4.
+  - **inc4 ⏳ ENFORCEMENT** (consult `rate_cap` to actually throttle) — **gated on a
+    provider concurrency model**: the serve loop is strictly serial
+    (`provider.rs::run_inbound`: poll → run inference → respond), so a per-request throttle
+    delay would head-of-line-block every other consumer. Needs concurrent serving (worker
+    pool / priority admission) first; converges with the M2.2(b) audit-sampler trigger.
+    Scarcity pricing stays M3.3.
 
 **M2.4 — Cold-start correctness** · WS-CREDIT/WS-SWARM · Rust · ~0.5w
 - **Exit test:** simulated "launch" load → everyone served, credit inert; ramp demand
