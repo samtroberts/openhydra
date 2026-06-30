@@ -27,7 +27,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_llamacpp, live_ollama, live_openai, serve_http, EngineAdapter, Provider,
+    live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, EngineAdapter, Provider,
     DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
@@ -129,6 +129,39 @@ impl EngineKind {
     }
 }
 
+/// Acceptable-use policy limits (the AUP floor). Every limit defaults to off (permissive);
+/// set any to opt in. Shared by `provide` (applied to inbound serve requests from the open
+/// network — the security-critical point) and `serve` (the gateway front door).
+#[derive(Args, Clone)]
+struct AupArgs {
+    /// Reject a request with more than this many messages (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    aup_max_messages: usize,
+
+    /// Reject a request whose total prompt exceeds this many characters (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    aup_max_prompt_chars: usize,
+
+    /// Reject a request whose explicit `max_tokens` exceeds this (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    aup_max_completion_tokens: u32,
+
+    /// Refuse any request containing this (case-insensitive) substring. Repeatable.
+    #[arg(long = "aup-deny")]
+    aup_deny: Vec<String>,
+}
+
+impl AupArgs {
+    fn into_policy(self) -> AupPolicy {
+        AupPolicy {
+            max_messages: self.aup_max_messages,
+            max_prompt_chars: self.aup_max_prompt_chars,
+            max_completion_tokens: self.aup_max_completion_tokens,
+            denied_substrings: self.aup_deny,
+        }
+    }
+}
+
 #[derive(Args)]
 struct ProvideArgs {
     /// Which local engine to proxy to.
@@ -164,6 +197,9 @@ struct ProvideArgs {
     /// dispatch at once. Default 8.
     #[arg(long, default_value_t = 8)]
     max_concurrency: usize,
+
+    #[command(flatten)]
+    aup: AupArgs,
 }
 
 #[derive(Args)]
@@ -181,6 +217,9 @@ struct ServeArgs {
     /// Omit for an ephemeral, in-memory reputation.
     #[arg(long)]
     db: Option<PathBuf>,
+
+    #[command(flatten)]
+    aup: AupArgs,
 }
 
 fn main() {
@@ -315,7 +354,11 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         }
     };
 
-    let provider = Provider::new(adapter, net).with_address(args.host, args.port).with_store(store);
+    let aup = args.aup.clone().into_policy();
+    let provider = Provider::new(adapter, net)
+        .with_address(args.host, args.port)
+        .with_store(store)
+        .with_aup(aup);
 
     let announced = provider
         .announce_models()
@@ -364,5 +407,7 @@ fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
         args.bind,
         if api_key.is_some() { "API key required on /v1/*" } else { "open" },
     );
-    serve_http(net, &args.bind, api_key, store).map_err(|e| format!("gateway on {}: {e}", args.bind))
+    let aup = args.aup.clone().into_policy();
+    serve_http(net, &args.bind, api_key, store, aup)
+        .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

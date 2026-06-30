@@ -22,6 +22,7 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod aup;
 pub mod consumer;
 pub mod gateway;
 pub mod hardening;
@@ -36,6 +37,7 @@ pub use adapter::{
     AdapterError, ChatMessage, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
     ServeOutcome,
 };
+pub use aup::{AupDecision, AupPolicy};
 pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
 pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};

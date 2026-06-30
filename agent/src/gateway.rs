@@ -34,6 +34,7 @@ use tokio_stream::StreamExt;
 use openhydra_network::handle::NetworkHandle;
 
 use crate::adapter::ChatMessage;
+use crate::aup::{AupDecision, AupPolicy};
 use crate::consumer::ConsumerNode;
 use crate::metrics::Metrics;
 use openhydra_protocol::store::Store;
@@ -47,6 +48,8 @@ struct AppState {
     api_key: Option<Arc<String>>,
     /// Gateway-side Prometheus metrics (#33), scraped at `/metrics`.
     metrics: Arc<Metrics>,
+    /// Acceptable-use policy floor applied to inbound completion requests (default permissive).
+    aup: Arc<AupPolicy>,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -280,6 +283,10 @@ async fn chat_completions(
     if let Some(resp) = validate(&req) {
         return resp;
     }
+    // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
+    if let AupDecision::Deny(reason) = state.aup.evaluate(&req.messages, req.max_tokens) {
+        return openai_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error");
+    }
 
     let id = next_id();
     let created = unix_now();
@@ -498,7 +505,12 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
 
 /// The gateway router over a started swarm node. `api_key` (when `Some`) gates the `/v1/*`
 /// routes behind `Authorization: Bearer <key>`; `/health` is always open.
-pub fn router(net: NetworkHandle, api_key: Option<String>, store: Option<Store>) -> Router {
+pub fn router(
+    net: NetworkHandle,
+    api_key: Option<String>,
+    store: Option<Store>,
+    aup: AupPolicy,
+) -> Router {
     let node = match store {
         Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
         None => ConsumerNode::new(net),
@@ -507,6 +519,7 @@ pub fn router(net: NetworkHandle, api_key: Option<String>, store: Option<Store>)
         node: Arc::new(node),
         api_key: api_key.map(Arc::new),
         metrics: Arc::new(Metrics::new()),
+        aup: Arc::new(aup),
     };
     // The `/v1/*` routes are auth-gated; `/health` and `/metrics` stay open for liveness
     // probes and Prometheus scraping.
@@ -529,11 +542,12 @@ pub fn serve_http(
     bind: &str,
     api_key: Option<String>,
     store: Option<Store>,
+    aup: AupPolicy,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
-        axum::serve(listener, router(net, api_key, store)).await
+        axum::serve(listener, router(net, api_key, store, aup)).await
     })
 }
 

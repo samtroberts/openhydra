@@ -31,8 +31,9 @@ use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
+use crate::aup::{AupDecision, AupPolicy};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
-use crate::serve::{frame_response, handle_serve_request, ServeRequest};
+use crate::serve::{frame_response, handle_serve_request, ServeChunk, ServeRequest};
 use crate::workpool::WorkerPool;
 
 /// Base serve delay scaled by [`throttle_multiplier`] for a throttled (leecher) consumer
@@ -133,6 +134,10 @@ pub struct Provider<A: EngineAdapter> {
     /// at least one non-throttling worker (see [`maybe_throttle`](Self::maybe_throttle)), so a
     /// flood of leechers can never put every worker to sleep at once.
     throttling: AtomicUsize,
+    /// Acceptable-use policy floor: an inbound serve request the operator's policy refuses is
+    /// answered with an `Error` frame instead of being run through the engine. Default
+    /// permissive (allow everything) until limits are configured.
+    aup: AupPolicy,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -145,6 +150,7 @@ impl<A: EngineAdapter> Provider<A> {
             store: None,
             credit: Mutex::new(HashMap::new()),
             throttling: AtomicUsize::new(0),
+            aup: AupPolicy::permissive(),
         }
     }
 
@@ -153,6 +159,30 @@ impl<A: EngineAdapter> Provider<A> {
         self.host = host.into();
         self.port = port;
         self
+    }
+
+    /// Attach an acceptable-use policy (AUP floor) applied to inbound serve requests. Default
+    /// is permissive (allow everything).
+    pub fn with_aup(mut self, aup: AupPolicy) -> Self {
+        self.aup = aup;
+        self
+    }
+
+    /// AUP floor: if `data` is a serve request the policy refuses, return the framed `Error`
+    /// to send back **instead of** serving it; otherwise `None` (serve normally). Receipts and
+    /// unparseable frames are not policy-checked here — they fall through to `dispatch`.
+    fn aup_refusal(&self, data: &[u8]) -> Option<Vec<u8>> {
+        if !self.aup.is_active() || data.first() != Some(&SERVE_REQUEST) {
+            return None;
+        }
+        let req = ServeRequest::decode(&data[1..]).ok()?;
+        match self.aup.evaluate(&req.messages, req.max_tokens) {
+            AupDecision::Deny(reason) => Some(frame_response(&[ServeChunk::Error(format!(
+                "rejected by acceptable-use policy: {reason}"
+            ))
+            .encode()])),
+            AupDecision::Allow => None,
+        }
     }
 
     /// Attach a ledger so accepted co-signed receipts are persisted (M2.3), and rehydrate
@@ -293,7 +323,11 @@ impl<A: EngineAdapter> Provider<A> {
                     // M2.3: throttle a leecher first (off the poll thread, budget-capped so
                     // it never stalls the pool); contributors pass straight through.
                     provider.maybe_throttle(&data, max_concurrency);
-                    let response = provider.dispatch(&data);
+                    // AUP floor: refuse a policy-violating serve request without running it.
+                    let response = match provider.aup_refusal(&data) {
+                        Some(refusal) => refusal,
+                        None => provider.dispatch(&data),
+                    };
                     // Best-effort reply; if the swarm is gone the next poll will error too.
                     let _ = provider.net.respond(request_id, response);
                 });
