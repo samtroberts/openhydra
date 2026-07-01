@@ -38,6 +38,13 @@ pub struct NodeConfig {
     /// works on symmetric CGNAT (our outbound dial traverses our own NAT), where
     /// DCUtR's simultaneous-open cannot. See docs/PEER_CONNECTIVITY.md.
     pub enable_connection_reversal: bool,
+    /// #43-W2: CPE gateway address for the PCP (RFC 6887) inbound-v6
+    /// firewall-pinhole maintainer. `None` (default) disables PCP entirely. When
+    /// set, the node periodically asks this gateway to open its listen ports
+    /// inbound on its global v6 so AutoNAT can confirm reachability and promote
+    /// it — the v6 sibling of R-DHT-4's v4 UPnP/NAT-PMP mapping. Opt-in because
+    /// gateway discovery is not yet automatic and PCP is unvalidated live.
+    pub pcp_gateway: Option<std::net::IpAddr>,
 }
 
 impl Default for NodeConfig {
@@ -58,6 +65,7 @@ impl Default for NodeConfig {
             bootstrap_peers: Vec::new(),
             enable_peer_relay: false,
             enable_connection_reversal: false,
+            pcp_gateway: None,
         }
     }
 }
@@ -107,6 +115,14 @@ pub fn start_node(
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
     let enable_connection_reversal = config.enable_connection_reversal; // Tier-2 (captured into the thread)
 
+    // #43-W2: resolve the opt-in PCP v6-pinhole wiring (gateway + the listen
+    // ports to open inbound). None disables PCP. Derived here while we still hold
+    // `listen_addrs`, then moved into the thread.
+    let pcp_bind = config.pcp_gateway.map(|gateway| crate::pcp::PcpBind {
+        gateway,
+        ports: crate::pcp::ports_from_listen_addrs(&listen_addrs),
+    });
+
     // R-DHT-6: persist/reload the routing table beside the identity key. Derived
     // here (config is a borrow that can't move into the thread) and handed to the
     // event loop.
@@ -150,7 +166,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, stream_control, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));

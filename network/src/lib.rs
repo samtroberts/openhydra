@@ -25,6 +25,7 @@ pub mod identity;
 pub mod mdns;
 pub mod nat;
 pub mod node;
+pub mod pcp;
 pub mod relay;
 pub mod routing_cache;
 pub mod swarm;

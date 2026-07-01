@@ -74,6 +74,14 @@ struct NodeArgs {
     /// works on symmetric CGNAT. See docs/PEER_CONNECTIVITY.md.
     #[arg(long)]
     connection_reversal: bool,
+
+    /// Experimental (#43-W2): CPE gateway IP for the PCP (RFC 6887) inbound-v6
+    /// firewall-pinhole maintainer. Off unless set. When your router speaks PCP,
+    /// this opens the listen ports inbound on your global IPv6 so AutoNAT can
+    /// confirm reachability and promote the node to a relay/server — the v6
+    /// sibling of the v4 UPnP/NAT-PMP mapping. See docs/IPV6_REACHABILITY.md.
+    #[arg(long = "pcp-gateway")]
+    pcp_gateway: Option<std::net::IpAddr>,
 }
 
 impl NodeArgs {
@@ -83,6 +91,7 @@ impl NodeArgs {
             enable_peer_relay: self.peer_relay,
             enable_connection_reversal: self.connection_reversal,
             bootstrap_peers: self.bootstrap,
+            pcp_gateway: self.pcp_gateway,
             ..NodeConfig::default()
         };
         if let Some(identity) = self.identity {

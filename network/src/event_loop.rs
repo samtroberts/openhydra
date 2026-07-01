@@ -706,6 +706,8 @@ pub async fn run_event_loop(
     // so the provider run-loop can re-announce its DHT record (fresh relay
     // addresses, same pinned PeerId) the moment connectivity is rebuilt.
     net_generation: Arc<std::sync::atomic::AtomicU64>,
+    // #43-W2: opt-in PCP v6 firewall-pinhole wiring (None = disabled).
+    pcp_bind: Option<crate::pcp::PcpBind>,
 ) {
     // CP-2: IPC response channel — spawned IPC tasks send (request_id, data)
     // back here so the event loop can forward via request_response.
@@ -728,6 +730,22 @@ pub async fn run_event_loop(
     // sequence below IS a bootstrap, so a reactive trigger from the initial
     // NewListenAddr burst must not immediately re-run it.
     state.last_rebootstrap = Some(tokio::time::Instant::now());
+
+    // #43-W2: opt-in PCP v6 firewall-pinhole maintainer. When an operator
+    // supplied the CPE gateway, spawn a task that periodically opens our listen
+    // ports inbound on the global v6 and reports each confirmed external addr
+    // over `pcp_candidate_rx`; the select arm below adds them as external
+    // addresses so AutoNAT probes them (→ promotion), mirroring the UPnP path.
+    let (pcp_candidate_tx, mut pcp_candidate_rx) = mpsc::unbounded_channel::<Multiaddr>();
+    if let Some(bind) = pcp_bind {
+        if bind.ports.is_empty() {
+            warn!(gateway = %bind.gateway, "pcp: no concrete listen ports to pinhole; PCP disabled");
+        } else {
+            info!(gateway = %bind.gateway, ports = ?bind.ports,
+                "pcp: starting v6 firewall-pinhole maintainer (#43-W2)");
+            tokio::spawn(crate::pcp::run_maintainer(bind.gateway, bind.ports, pcp_candidate_tx));
+        }
+    }
 
     // Fix 1: set up persistent tensor streams.
     let (repunch_tx, mut repunch_rx) = mpsc::unbounded_channel::<PeerId>();
@@ -1481,6 +1499,16 @@ pub async fn run_event_loop(
             // #42: connectivity watchdog + debounced reactive rebootstrap.
             _ = heal_ticker.tick() => {
                 drive_heal(&mut swarm, &mut state);
+            }
+            // #43-W2: a PCP pinhole confirmed an inbound v6 addr — advertise it
+            // as an external candidate so AutoNAT probes it and, if reachable,
+            // promotes us (the same path UPnP/AutoNAT use).
+            Some(addr) = pcp_candidate_rx.recv() => {
+                if !state.external_addrs.iter().any(|a| a == &addr) {
+                    info!(%addr, "pcp: adding confirmed external v6 addr (AutoNAT will verify)");
+                    swarm.add_external_address(addr.clone());
+                    state.external_addrs.push(addr);
+                }
             }
             // Process swarm events.
             event = swarm.select_next_some() => {
