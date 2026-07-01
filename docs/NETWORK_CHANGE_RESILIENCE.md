@@ -1,9 +1,23 @@
 # Network-Change Resilience (design)
 
-**Status:** design only — not implemented. Filed after a live roam (Airtel → ACT
-+ laptop sleep) on 2026-07-01 left a long-running `serve` node stranded:
-stale `::1` relay dials, flapping listeners, dead reservations, and
-`no provider` on discovery until a manual restart.
+**Status:** IMPLEMENTED 2026-07-02 (#42, commit `6f0e422`) — compile + unit
+tests only; NOT yet live-validated (the roam/wake path needs a physical network
+change to exercise). Filed after a live roam (Airtel → ACT + laptop sleep) on
+2026-07-01 left a long-running `serve` node stranded: stale `::1` relay dials,
+flapping listeners, dead reservations, and `no provider` on discovery until a
+manual restart.
+
+**What shipped vs this design:** `rebootstrap()` (re-seed Kad + re-dial ALL
+bootstrap peers incl. relays + re-request only missing reservations via a
+`reserved_circuits` set + clear hole-punch/reversal back-off + bump
+`net_generation`); a 5 s `heal_ticker` driving the connectivity watchdog
+(sustained 0 connected peers past a 20 s grace) and the debounced (3 s) reactive
+trigger with a 30 s cooldown; stale-state expiry on real (non-circuit) listener
+close/expiry (`expire_direct_external_addrs` → demote to Kad client); and the
+`net_generation` counter surfaced through `NetworkHandle::network_generation()`
+so the provider re-announces immediately on change. Deferred from the design
+below: OS wake/path signals (`NWPathMonitor`/netlink) and the Prometheus metric
+surface (`rebootstrap_count` is tracked in-state + logged, not yet exported).
 
 ## Problem
 

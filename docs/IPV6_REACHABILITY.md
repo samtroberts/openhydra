@@ -1,6 +1,18 @@
 # IPv6 Reachability — PCP v6 pinholing + v6-biased DCUtR (design)
 
-**Status:** design only — not implemented.
+**Status:** IMPLEMENTED 2026-07-02 — compile + unit tests only; the v6 network
+paths are NOT live-validated (no PCP-capable CPE was reachable; the firewalled-v6
+DCUtR pair needs a physical v6↔v6 test).
+- **W1** (v6-biased hole-punch) — commit `6f0e422`: auto QUIC-v6 punch attempt
+  cap raised 3→8 (a firewall punch is reliable once timed, so a firewalled-v6
+  peer isn't shelved after 3 uncoordinated misses); back-off cleared on
+  `rebootstrap()`; a `quic_v6_holepunch_dials` counter. The *coordinated* punch
+  remains libp2p DCUtR (already present); its v6 effectiveness is still untested.
+- **W2** (PCP RFC-6887 v6 firewall pinhole) — commit `1626f4c`: new
+  `network/src/pcp.rs` (pure wire codec, unit-tested; best-effort async client;
+  opt-in maintainer) wired behind `--pcp-gateway <IP>` (off by default).
+  Confirmed external v6 addrs feed AutoNAT → promotion. The network round-trip is
+  unvalidated and gateway auto-discovery is a follow-up (operator supplies it).
 
 ## The finding (2026-07-01, live-verified)
 
