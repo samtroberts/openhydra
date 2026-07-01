@@ -1,8 +1,22 @@
 # Network-Change Resilience (design)
 
-**Status:** IMPLEMENTED 2026-07-02 (#42, commit `6f0e422`) — compile + unit
-tests only; NOT yet live-validated (the roam/wake path needs a physical network
-change to exercise). Filed after a live roam (Airtel → ACT + laptop sleep) on
+**Status:** IMPLEMENTED 2026-07-02 (#42, commit `6f0e422`) — and **LIVE-VALIDATED
+2026-07-02** on a real double roam (Asus provider, GTX 1050 + Ollama/tinyllama:
+"Don Quixote" ACT WiFi → "Pixel 2" Airtel hotspot → back), observed from a netcup
+consumer. Both roams fired the exact designed sequence with **no restart and an
+unchanged pinned peer id** (same PID throughout):
+`rebootstrap: rebuilding connectivity reason="reactive: interface change"`
+(count=1 out, count=2 back) → relay re-reservations (all 3 accepted ~400ms on
+return) → `network change (generation N) — re-announcing` (gen 1 and 2). The
+bootstrap journal showed the same identity reconnecting from the hotspot within
+~90s of the roam. Post-return end-to-end inference recovered immediately
+(completion in 2.2s, discover 1ms). Caveat: *sustained serving from the hotspot
+itself* was degraded by Airtel CGNAT connection churn (~30s evictions,
+reservations wouldn't stick) — a documented network condition (see the CGNAT
+notes in memory/benchmarks), not a heal failure; the heal loop kept
+re-establishing throughout. The consumer-side zombie-connection masking
+(dispatching onto dead pre-roam connections) is a separate, now-observed issue —
+candidate follow-up: liveness-gate `proxy_forward` connection selection. Filed after a live roam (Airtel → ACT + laptop sleep) on
 2026-07-01 left a long-running `serve` node stranded: stale `::1` relay dials,
 flapping listeners, dead reservations, and `no provider` on discovery until a
 manual restart.
