@@ -22,8 +22,11 @@ protocol errors) are counted per peer; after `ZOMBIE_FAILURE_THRESHOLD` (2)
 consecutive failures the peer's connections are force-closed and fresh relay
 circuits are redialed, so the next dispatch rides a live path instead of a
 zombie. A successful round-trip resets the streak; the dispatch log now carries
-`failure_streak` for visibility. Unit-tested (`test_zombie_failure_gating`);
-not yet live-validated under a repeat roam. Filed after a live roam (Airtel → ACT + laptop sleep) on
+`failure_streak` for visibility. Unit-tested (`test_zombie_failure_gating`) **and live-validated on a repeat
+roam (2026-07-02 round 2)**: two timeouts → `zombie_evict` fired → errors
+flipped to fast-fail `ConnectionClosed` with active redials (two evict cycles
+as hotspot CGNAT churned), replacing round 1's 6+ minutes of silent zombie
+masking; post-return recovery 2.2s. Filed after a live roam (Airtel → ACT + laptop sleep) on
 2026-07-01 left a long-running `serve` node stranded: stale `::1` relay dials,
 flapping listeners, dead reservations, and `no provider` on discovery until a
 manual restart.
