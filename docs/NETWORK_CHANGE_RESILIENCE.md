@@ -15,8 +15,15 @@ itself* was degraded by Airtel CGNAT connection churn (~30s evictions,
 reservations wouldn't stick) — a documented network condition (see the CGNAT
 notes in memory/benchmarks), not a heal failure; the heal loop kept
 re-establishing throughout. The consumer-side zombie-connection masking
-(dispatching onto dead pre-roam connections) is a separate, now-observed issue —
-candidate follow-up: liveness-gate `proxy_forward` connection selection. Filed after a live roam (Airtel → ACT + laptop sleep) on
+(dispatching onto dead pre-roam connections) is a separate issue observed during
+this test — **fixed 2026-07-02**: `proxy_forward` is now liveness-gated. Proxy
+outbound *path* failures (timeout / connection-closed / dial / io — never
+protocol errors) are counted per peer; after `ZOMBIE_FAILURE_THRESHOLD` (2)
+consecutive failures the peer's connections are force-closed and fresh relay
+circuits are redialed, so the next dispatch rides a live path instead of a
+zombie. A successful round-trip resets the streak; the dispatch log now carries
+`failure_streak` for visibility. Unit-tested (`test_zombie_failure_gating`);
+not yet live-validated under a repeat roam. Filed after a live roam (Airtel → ACT + laptop sleep) on
 2026-07-01 left a long-running `serve` node stranded: stale `::1` relay dials,
 flapping listeners, dead reservations, and `no provider` on discovery until a
 manual restart.

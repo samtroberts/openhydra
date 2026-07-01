@@ -561,6 +561,15 @@ struct LoopState {
     degraded_since: Option<tokio::time::Instant>,
     /// How many times connectivity was rebuilt (metric / log).
     rebootstrap_count: u64,
+    /// #42 follow-up (zombie connections): consecutive proxy outbound *path*
+    /// failures (timeout / closed / dial / io) per peer. During the live roam
+    /// test the consumer kept dispatching onto dead pre-roam connections for
+    /// 6+ minutes — `send_request` picks ANY existing connection, and zombie
+    /// TCP/circuit conns linger long after the peer left that network. When a
+    /// peer's streak reaches `ZOMBIE_FAILURE_THRESHOLD`, its connections are
+    /// force-closed and a fresh relay redial is issued so the next dispatch
+    /// rides a live path. Reset on any successful response.
+    proxy_failure_streak: HashMap<PeerId, u32>,
     /// #43-W1: count of auto QUIC-v6 hole-punch dials issued (pairs with the
     /// `direct_quic_v6` tier-success metric to show punches that actually land).
     quic_v6_holepunch_dials: u64,
@@ -678,6 +687,7 @@ impl LoopState {
             pending_rebootstrap_at: None,
             degraded_since: None,
             rebootstrap_count: 0,
+            proxy_failure_streak: HashMap::new(),
             quic_v6_holepunch_dials: 0,
             peer_relay_leech: None,
         }
@@ -2064,6 +2074,46 @@ fn drive_heal(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopSta
             state.degraded_since = Some(now);
         }
     }
+}
+
+// ── #42 follow-up: zombie-connection liveness gating ───────────────────────
+/// Consecutive proxy outbound *path* failures to one peer before its
+/// connections are presumed zombies and force-closed. 2 balances the live
+/// failure modes: a single timeout can be a transiently slow provider (a long
+/// generation, a CGNAT blip), but two in a row on the same peer — while
+/// `send_request` is free to pick any of its connections — means every path we
+/// hold is suspect. The roam incident this fixes burned 6+ minutes of
+/// consecutive timeouts against connections whose network the peer had left.
+const ZOMBIE_FAILURE_THRESHOLD: u32 = 2;
+
+/// Record a proxy outbound failure for `peer` and decide whether to evict its
+/// connections. `dead_path` = the failure class implicates the transport path
+/// (timeout / connection closed / dial failure / io) rather than the protocol
+/// (an `UnsupportedProtocols` peer is alive and answering — never evict on it).
+/// Returns `true` when the streak reaches [`ZOMBIE_FAILURE_THRESHOLD`]; the
+/// streak resets so a re-established peer starts clean. Pure + unit-tested.
+fn record_proxy_failure(
+    streaks: &mut HashMap<PeerId, u32>,
+    peer: PeerId,
+    dead_path: bool,
+) -> bool {
+    if !dead_path {
+        return false;
+    }
+    let streak = streaks.entry(peer).or_insert(0);
+    *streak += 1;
+    if *streak >= ZOMBIE_FAILURE_THRESHOLD {
+        streaks.remove(&peer);
+        true
+    } else {
+        false
+    }
+}
+
+/// A proxy round-trip to `peer` succeeded — its current path is live, so any
+/// accumulated failure streak is stale. Pure + unit-tested.
+fn record_proxy_success(streaks: &mut HashMap<PeerId, u32>, peer: &PeerId) {
+    streaks.remove(peer);
 }
 
 /// WS-F F-6: act on a circuit-migration signal from the tensor stream manager.
@@ -3832,15 +3882,42 @@ fn handle_grpc_proxy_event(
                         }
                     } else if let Some(reply) = state.pending_proxy.remove(&request_id) {
                         // Outbound response received — deliver to waiting proxy forward.
+                        // #zombie: a successful round-trip proves the current path is
+                        // live — clear any accumulated failure streak for this peer.
+                        record_proxy_success(&mut state.proxy_failure_streak, &peer);
                         let _ = reply.send(Ok(response.0));
                     }
                 }
             }
         }
-        request_response::Event::OutboundFailure { request_id, error, .. } => {
-            warn!(?error, "proxy outbound failure");
+        request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+            warn!(%peer, ?error, "proxy outbound failure");
             if let Some(reply) = state.pending_proxy.remove(&request_id) {
                 let _ = reply.send(Err(format!("proxy outbound: {error:?}")));
+            }
+            // #zombie (#42 live-roam finding): `send_request` picks ANY existing
+            // connection, so zombie pre-roam connections mask a roamed peer's
+            // fresh path until they reap (observed: 6+ min of timeouts). Classify
+            // path failures vs protocol failures; after ZOMBIE_FAILURE_THRESHOLD
+            // consecutive path failures, force-close every connection to the
+            // peer and redial fresh relay circuits so the NEXT dispatch rides a
+            // live path (the roamed peer's new reservation is reachable — its
+            // re-announced record was never the problem, our stale conns were).
+            let dead_path = matches!(
+                error,
+                request_response::OutboundFailure::Timeout
+                    | request_response::OutboundFailure::ConnectionClosed
+                    | request_response::OutboundFailure::DialFailure
+                    | request_response::OutboundFailure::Io(_)
+            );
+            if record_proxy_failure(&mut state.proxy_failure_streak, peer, dead_path) {
+                warn!(%peer, threshold = ZOMBIE_FAILURE_THRESHOLD,
+                    "zombie_evict: consecutive proxy path failures — closing presumed-dead connections and redialing via relay");
+                let _ = swarm.disconnect_peer_id(peer);
+                let circuit_addrs = relay_circuit_addrs(peer, state.ipv6_capable);
+                if let Err(e) = swarm.dial(relay_dial_opts(peer, circuit_addrs)) {
+                    debug!(%peer, %e, "zombie_evict: relay redial enqueue failed");
+                }
             }
             // Audit F10: if this was a prefill chunk send, its ack mapping
             // would otherwise leak and the prefill pipeline would stall until
@@ -3914,7 +3991,10 @@ fn handle_proxy_forward(
         } else {
             "unknown"
         };
-        info!(%peer_id, path, direct_conns, relay_conns, bytes = data.len(), "proxy_forward dispatch");
+        // #zombie: surface the live failure streak so ops can see a suspect
+        // path before the eviction threshold trips.
+        let failure_streak = state.proxy_failure_streak.get(&peer_id).copied().unwrap_or(0);
+        info!(%peer_id, path, direct_conns, relay_conns, failure_streak, bytes = data.len(), "proxy_forward dispatch");
         let req_id = swarm
             .behaviour_mut()
             .grpc_proxy
@@ -4700,6 +4780,42 @@ mod tests {
         assert!(!r(
             "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"
         ));
+    }
+
+    #[test]
+    fn test_zombie_failure_gating() {
+        let mut streaks: HashMap<PeerId, u32> = HashMap::new();
+        let p = PeerId::random();
+
+        // A protocol-level failure (peer alive, e.g. UnsupportedProtocols)
+        // never counts toward eviction and leaves no streak behind.
+        assert!(!record_proxy_failure(&mut streaks, p, false));
+        assert!(streaks.is_empty());
+
+        // First dead-path failure: suspect but tolerated (could be one slow
+        // generation). Second consecutive: evict — and the streak resets so a
+        // re-established peer starts clean.
+        assert!(!record_proxy_failure(&mut streaks, p, true));
+        assert_eq!(streaks.get(&p), Some(&1));
+        assert!(record_proxy_failure(&mut streaks, p, true));
+        assert!(streaks.is_empty());
+
+        // A successful round-trip clears an in-progress streak: the next
+        // failure starts over at 1 instead of tripping the threshold.
+        assert!(!record_proxy_failure(&mut streaks, p, true));
+        record_proxy_success(&mut streaks, &p);
+        assert!(!record_proxy_failure(&mut streaks, p, true));
+        assert_eq!(streaks.get(&p), Some(&1));
+
+        // Streaks are per-peer: q's failures don't advance p's streak.
+        let q = PeerId::random();
+        assert!(!record_proxy_failure(&mut streaks, q, true));
+        assert!(record_proxy_failure(&mut streaks, p, true)); // p reaches 2
+        assert_eq!(streaks.get(&q), Some(&1)); // q untouched at 1
+
+        // A protocol failure mid-streak doesn't advance OR reset the count.
+        assert!(!record_proxy_failure(&mut streaks, q, false));
+        assert_eq!(streaks.get(&q), Some(&1));
     }
 
     #[test]
