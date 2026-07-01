@@ -11,8 +11,23 @@ DCUtR pair needs a physical v6↔v6 test).
 - **W2** (PCP RFC-6887 v6 firewall pinhole) — commit `1626f4c`: new
   `network/src/pcp.rs` (pure wire codec, unit-tested; best-effort async client;
   opt-in maintainer) wired behind `--pcp-gateway <IP>` (off by default).
-  Confirmed external v6 addrs feed AutoNAT → promotion. The network round-trip is
-  unvalidated and gateway auto-discovery is a follow-up (operator supplies it).
+  Confirmed external v6 addrs feed AutoNAT → promotion. **Live-exercised
+  2026-07-02 against a real CPE (TP-Link Archer C5 v6.8):** the maintainer
+  started, derived `[(TCP,4001),(UDP,4001)]` from the listen addrs, sent real
+  MAP requests, and handled failure cleanly — the router **refused UDP :5351**
+  (no PCP server; definitive, not a timeout). So: client request/failure paths
+  live-validated; the **success path (granted pinhole → promotion) still needs
+  a PCP-capable CPE.** Product datum: users behind such routers stay
+  relay-bound for inbound v6 — the "bounded fraction" measured on real
+  hardware. (Manual-pinhole side experiment, same day: a hand-added router
+  IPv6-firewall rule for the node's stable v6 :4001 was reachable from the
+  public internet — netcup TCP-connected through it — but promotion did NOT
+  follow passively: AutoNAT only probes *observed* candidates, and peers
+  observe the node's rotating privacy v6, never the stable pinholed one. A
+  `--advertise-addr`-style operator flag was rejected as product-contrary —
+  real users won't manually pinhole. Refinement candidates: shorter PCP retry
+  on transient failures (currently ~1h after a refusal), and advertising the
+  stable (non-temporary) v6 as a candidate when a pinhole mechanism confirms.)
 
 ## The finding (2026-07-01, live-verified)
 
