@@ -34,6 +34,12 @@ pub struct NetworkHandle {
     /// The node's ed25519 identity keypair — used to sign receipts. **Never exported**
     /// (the agent signs via [`sign`](NetworkHandle::sign); only signatures cross out).
     keypair: libp2p::identity::Keypair,
+    /// #42: bumped by the event loop on every `rebootstrap()` (network change).
+    /// The provider run-loop reads it each poll iteration and re-announces its
+    /// DHT record the moment it changes, so a roam/wake refreshes the record's
+    /// relay addresses under the *same* pinned PeerId without waiting out the
+    /// periodic re-announce interval.
+    net_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl NetworkHandle {
@@ -52,7 +58,7 @@ impl NetworkHandle {
             hex::encode(pk.to_bytes())
         };
         let keypair = identity.keypair.clone();
-        let (cmd_tx, proxy_queue, thread) = start_node(&config)?;
+        let (cmd_tx, proxy_queue, thread, net_generation) = start_node(&config)?;
         Ok(Self {
             cmd_tx,
             proxy_queue,
@@ -61,7 +67,17 @@ impl NetworkHandle {
             openhydra_peer_id,
             public_key_hex,
             keypair,
+            net_generation,
         })
+    }
+
+    /// #42: the current network generation. The event loop bumps this each time
+    /// it rebuilds connectivity after a network change (roam / wake / interface
+    /// up-down). A provider polls it and re-announces its models whenever the
+    /// value advances — refreshing the DHT record's relay addresses under the
+    /// same PeerId. A consumer can ignore it. Cheap (a relaxed atomic load).
+    pub fn network_generation(&self) -> u64 {
+        self.net_generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sign `data` with the node's identity key (RFC-8032 ed25519, 64 bytes). The key

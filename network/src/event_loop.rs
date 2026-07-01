@@ -532,6 +532,38 @@ struct LoopState {
     /// for the whole session (the EU-relay gap). Cleared on NewListenAddr /
     /// ReservationReqAccepted for that circuit.
     relay_reservation_retries: HashMap<String, (u32, tokio::time::Instant)>,
+    // ── #42: network-change resilience ────────────────────────────────
+    /// User-supplied bootstrap peers, retained so `rebootstrap()` can re-dial
+    /// them on a network change (the startup list is otherwise consumed by the
+    /// run-loop locals). Identity is stable across a roam; only addresses churn.
+    bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    /// Monotonically bumped every time connectivity is rebuilt (`rebootstrap()`).
+    /// Read by the provider run-loop (via `NetworkHandle::network_generation`)
+    /// to trigger an immediate model re-announce so the DHT record carries the
+    /// new relay addresses under the *same* pinned PeerId. Shared with the handle.
+    net_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Circuit listen-addrs we currently hold a live reservation for (inserted
+    /// on NewListenAddr, removed on Expired/Closed). Lets `rebootstrap()`
+    /// re-request only the *missing* reservations instead of blindly
+    /// `listen_on`-ing every relay again — which would leak duplicate circuit
+    /// listeners (the F6 hazard).
+    reserved_circuits: std::collections::HashSet<String>,
+    /// Last time `rebootstrap()` ran — cooldown so a burst of triggers (a roam
+    /// emits many NewListenAddr) collapses into one rebuild.
+    last_rebootstrap: Option<tokio::time::Instant>,
+    /// Debounced reactive-rebootstrap deadline. A real (non-loopback,
+    /// non-circuit) listener change sets this to now+debounce; the heal ticker
+    /// fires the rebuild once it's due, so a burst settles into one heal.
+    pending_rebootstrap_at: Option<tokio::time::Instant>,
+    /// When the connectivity watchdog first observed 0 connected peers (None =
+    /// healthy). Sustained degradation past the grace window triggers a
+    /// rebootstrap — the wake-from-sleep / roam catch-all.
+    degraded_since: Option<tokio::time::Instant>,
+    /// How many times connectivity was rebuilt (metric / log).
+    rebootstrap_count: u64,
+    /// #43-W1: count of auto QUIC-v6 hole-punch dials issued (pairs with the
+    /// `direct_quic_v6` tier-success metric to show punches that actually land).
+    quic_v6_holepunch_dials: u64,
     /// WS-F F-4: peer-relay leech table (None unless peer-relay mode is on).
     /// The RelayServer event handler records byte-cap cap-outs here.
     peer_relay_leech: Option<std::sync::Arc<std::sync::Mutex<crate::relay::LeechTable>>>,
@@ -637,6 +669,16 @@ impl LoopState {
             gossip_inbound_queue: std::collections::VecDeque::new(),
             relay_dial_retries: HashMap::new(),
             relay_reservation_retries: HashMap::new(),
+            // #42: set to the shared handle in run_event_loop; a real interface
+            // change or watchdog rebuild bumps it.
+            bootstrap_peers: Vec::new(),
+            net_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reserved_circuits: std::collections::HashSet::new(),
+            last_rebootstrap: None,
+            pending_rebootstrap_at: None,
+            degraded_since: None,
+            rebootstrap_count: 0,
+            quic_v6_holepunch_dials: 0,
             peer_relay_leech: None,
         }
     }
@@ -660,6 +702,10 @@ pub async fn run_event_loop(
     routing_cache_path: Option<std::path::PathBuf>,
     // Tier-2 connection reversal flag (NodeConfig.enable_connection_reversal).
     enable_connection_reversal: bool,
+    // #42: shared network-generation counter. Bumped on every `rebootstrap()`
+    // so the provider run-loop can re-announce its DHT record (fresh relay
+    // addresses, same pinned PeerId) the moment connectivity is rebuilt.
+    net_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // CP-2: IPC response channel — spawned IPC tasks send (request_id, data)
     // back here so the event loop can forward via request_response.
@@ -674,6 +720,14 @@ pub async fn run_event_loop(
     let mut state = LoopState::new(ipc_response_tx, ring_event_tx);
     state.enable_connection_reversal = enable_connection_reversal;
     state.peer_relay_leech = peer_relay_leech; // WS-F F-4
+    // #42: retain the bootstrap list + share the generation counter so
+    // `rebootstrap()` can re-dial and signal the provider on a network change.
+    state.bootstrap_peers = bootstrap_peers.clone();
+    state.net_generation = net_generation;
+    // Cover the startup window with the rebootstrap cooldown: the inline startup
+    // sequence below IS a bootstrap, so a reactive trigger from the initial
+    // NewListenAddr burst must not immediately re-run it.
+    state.last_rebootstrap = Some(tokio::time::Instant::now());
 
     // Fix 1: set up persistent tensor streams.
     let (repunch_tx, mut repunch_rx) = mpsc::unbounded_channel::<PeerId>();
@@ -802,6 +856,13 @@ pub async fn run_event_loop(
     // is cheap (it only acts on peers with a due, scheduled retry).
     let mut relay_retry_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     relay_retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // #42: network-change heal ticker — drives the connectivity watchdog
+    // (rebuild after sustained loss of all peers, i.e. wake/roam) and fires any
+    // debounced reactive rebootstrap. 5 s is snappy enough to recover a roam
+    // within the debounce+grace budget while staying negligible when healthy.
+    let mut heal_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    heal_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Retry dialing non-relay bootstrap peers every 15s until connected or retry cap hit.
@@ -1417,6 +1478,10 @@ pub async fn run_event_loop(
                 // ticker (re-listen on circuits whose reservation was lost).
                 drive_reservation_retries(&mut swarm, &mut state);
             }
+            // #42: connectivity watchdog + debounced reactive rebootstrap.
+            _ = heal_ticker.tick() => {
+                drive_heal(&mut swarm, &mut state);
+            }
             // Process swarm events.
             event = swarm.select_next_some() => {
                 handle_swarm_event(event, &mut swarm, &mut state, &proxy_queue);
@@ -1777,6 +1842,202 @@ fn clear_reservation_retry(state: &mut LoopState, addr: &str) {
         .retain(|circuit, _| !addr.starts_with(circuit.as_str()) && !circuit.starts_with(addr));
 }
 
+// ── #42: network-change resilience ────────────────────────────────────────
+/// How long connectivity must stay degraded (0 connected peers) before the
+/// watchdog rebuilds it. Long enough that a brief blip doesn't trigger a
+/// needless rebuild, short enough to recover a roam/wake promptly.
+const DEGRADED_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+/// Debounce window that collapses a burst of listener changes (a roam emits
+/// several NewListenAddr/Expired in quick succession) into one rebuild.
+const REBOOTSTRAP_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Minimum spacing between rebuilds — a cooldown so triggers that keep firing
+/// (a flapping interface) can't spin the bootstrap sequence.
+const REBOOTSTRAP_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Is `addr` a real (non-loopback, non-circuit) interface address — i.e. does
+/// its appearance/disappearance signal an actual network change? Loopback
+/// (127.0.0.1 / ::1) churns on nothing meaningful, and `/p2p-circuit` addrs are
+/// relay reservations owned by the F-5 path, not interface events. Pure.
+fn is_real_interface_addr(addr: &Multiaddr) -> bool {
+    if addr.to_string().contains("/p2p-circuit") {
+        return false;
+    }
+    !addr.iter().any(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
+
+/// Arm a debounced rebootstrap after a real interface change. Coalesces a burst
+/// (roam) into a single rebuild fired `REBOOTSTRAP_DEBOUNCE` after the last
+/// trigger; the heal ticker does the firing.
+fn arm_reactive_rebootstrap(state: &mut LoopState, reason: &str) {
+    state.pending_rebootstrap_at = Some(tokio::time::Instant::now() + REBOOTSTRAP_DEBOUNCE);
+    debug!(reason, "network-change: reactive rebootstrap armed (debounced)");
+}
+
+/// An interface went away — drop the direct external addresses tied to it and
+/// demote to Kad client so AutoNAT re-confirms on the *new* network rather than
+/// advertising a dead address. Circuit/relay external addrs are left to the F-5
+/// reservation path. Called on a real (non-circuit) listener close/expiry.
+fn expire_direct_external_addrs(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+) {
+    let stale: Vec<Multiaddr> = state
+        .external_addrs
+        .iter()
+        .filter(|a| !a.to_string().contains("/p2p-circuit"))
+        .cloned()
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    for a in &stale {
+        swarm.remove_external_address(a);
+    }
+    state
+        .external_addrs
+        .retain(|a| a.to_string().contains("/p2p-circuit"));
+    // No verified-reachable direct addr remains → back to client; AutoNAT will
+    // re-probe fresh candidates on the new network and re-promote if reachable.
+    swarm
+        .behaviour_mut()
+        .kademlia
+        .set_mode(Some(kad::Mode::Client));
+    state.autonat_private = false;
+    state.nat_info.nat_type = "unknown".into();
+    state.nat_info.is_public = false;
+    info!(
+        dropped = stale.len(),
+        "network-change: expired stale direct external addrs, demoted to Kad client"
+    );
+}
+
+/// Rebuild connectivity under the *same* pinned identity — the network changed
+/// (roam / wake / interface up-down), so the routing table, bootstrap
+/// connections and relay reservations are stale. Idempotent and cheap.
+///
+/// (A) re-establish connectivity: re-seed Kademlia, re-dial every bootstrap peer
+/// **including the relays** (the `non_relay_bootstrap` startup retry deliberately
+/// skips relays, so nothing else re-dials a relay whose connection died on a
+/// roam), and re-request any relay reservation we no longer hold. Clears the
+/// hole-punch / reversal back-off so a fresh network gets fresh punch attempts.
+/// (B) signal the provider: bump `net_generation` so it re-announces its record
+/// with the new addresses (same PeerId, new relay path).
+fn rebootstrap(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    reason: &str,
+) {
+    state.rebootstrap_count += 1;
+    state.last_rebootstrap = Some(tokio::time::Instant::now());
+    info!(
+        reason,
+        count = state.rebootstrap_count,
+        "rebootstrap: rebuilding connectivity (network change)"
+    );
+
+    // Re-seed Kademlia from the bootstrap peers.
+    if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+        debug!(%e, "rebootstrap: kademlia.bootstrap deferred (no peers yet)");
+    }
+
+    // Re-dial every bootstrap peer (relays included) to re-establish the direct
+    // links a roam/wake tore down. libp2p dedups if a connection already exists.
+    for (peer_id, addr) in &state.bootstrap_peers {
+        let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
+        if let Err(e) = swarm.dial(dial_addr.clone()) {
+            debug!(%peer_id, %dial_addr, %e, "rebootstrap: bootstrap re-dial failed");
+        }
+    }
+
+    // Re-request only the relay reservations we don't currently hold. Reserving
+    // a circuit we already have would leak a duplicate listener (F6), so skip
+    // any circuit still in `reserved_circuits`; the F-5 reactive path owns those
+    // that genuinely dropped.
+    let mut seen_relays = std::collections::HashSet::new();
+    for relay_str in crate::relay::BOOTSTRAP_RELAYS {
+        if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+            let relay_peer = relay_multiaddr.iter().find_map(|p| match p {
+                libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                _ => None,
+            });
+            if let Some(pid) = relay_peer {
+                if !seen_relays.insert(pid) {
+                    continue;
+                }
+            }
+            let listen_addr = relay_multiaddr.with(libp2p::multiaddr::Protocol::P2pCircuit);
+            let listen_str = listen_addr.to_string();
+            if state.reserved_circuits.contains(&listen_str) {
+                continue; // already reserved — don't leak a duplicate listener
+            }
+            match swarm.listen_on(listen_addr.clone()) {
+                Ok(_) => info!(addr = %listen_addr, "rebootstrap: re-requesting relay reservation"),
+                Err(e) => {
+                    warn!(addr = %listen_addr, %e, "rebootstrap: relay re-reservation failed");
+                    schedule_reservation_retry(state, &listen_str);
+                }
+            }
+        }
+    }
+
+    // #43-W1: a new network is a fresh chance to hole-punch — clear the QUIC-v6
+    // punch and reversal back-off so shelved peers get re-attempted.
+    state.quic_holepunch_attempts.clear();
+    state.reversal_attempts.clear();
+
+    // (B) signal the provider to re-announce (fresh relay addr, same PeerId).
+    state
+        .net_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run `rebootstrap` unless one ran within the cooldown. Central choke so the
+/// watchdog and the reactive trigger can't double-fire a rebuild.
+fn maybe_rebootstrap(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    reason: &str,
+) {
+    if let Some(last) = state.last_rebootstrap {
+        if last.elapsed() < REBOOTSTRAP_COOLDOWN {
+            debug!(reason, "rebootstrap suppressed (cooldown)");
+            return;
+        }
+    }
+    rebootstrap(swarm, state, reason);
+}
+
+/// The connectivity watchdog tick: rebuild if we've had zero connected peers for
+/// longer than `DEGRADED_GRACE` (wake-from-sleep / roam catch-all), and fire any
+/// due debounced reactive rebootstrap. Runs on the heal ticker.
+fn drive_heal(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, state: &mut LoopState) {
+    let now = tokio::time::Instant::now();
+    // Fire a due debounced reactive rebootstrap first (a real interface change).
+    if let Some(at) = state.pending_rebootstrap_at {
+        if now >= at {
+            state.pending_rebootstrap_at = None;
+            maybe_rebootstrap(swarm, state, "reactive: interface change");
+        }
+    }
+    // Connectivity watchdog: sustained 0 connected peers ⇒ rebuild.
+    let connected = swarm.network_info().num_peers() > 0;
+    if connected {
+        state.degraded_since = None;
+    } else {
+        let since = *state.degraded_since.get_or_insert(now);
+        if now.duration_since(since) >= DEGRADED_GRACE {
+            maybe_rebootstrap(swarm, state, "watchdog: no connected peers");
+            // Reset the timer so we wait a full grace window (plus the cooldown)
+            // before the next watchdog-driven attempt.
+            state.degraded_since = Some(now);
+        }
+    }
+}
+
 /// WS-F F-6: act on a circuit-migration signal from the tensor stream manager.
 ///
 /// Only relay-reached peers have a per-circuit byte cap to migrate around (a
@@ -1973,10 +2234,17 @@ fn handle_swarm_event(
                                 _ => false,
                             })
                         });
-                        // F7: back off after MAX_QUIC_HOLEPUNCH_ATTEMPTS failures so a
-                        // UDP-filtered path stops re-dialing (and re-logging) every
-                        // identify cycle.
-                        const MAX_QUIC_HOLEPUNCH_ATTEMPTS: u32 = 3;
+                        // F7 / #43-W1: back off after MAX_QUIC_HOLEPUNCH_ATTEMPTS
+                        // so a UDP-filtered path stops re-dialing (and re-logging)
+                        // every identify cycle. The cap was 3; raised to 8 for the
+                        // v6 case: a stateful-firewall v6 punch is *reliable once
+                        // correctly timed* (no port translation, unlike v4 CGNAT),
+                        // so a firewalled-v6 peer shouldn't be permanently shelved
+                        // after only 3 uncoordinated misses — it deserves more
+                        // eager retries alongside libp2p's coordinated DCUtR. The
+                        // back-off is also cleared wholesale on `rebootstrap()`, so
+                        // a network change re-enables punching from scratch.
+                        const MAX_QUIC_HOLEPUNCH_ATTEMPTS: u32 = 8;
                         let attempts = state.quic_holepunch_attempts.entry(peer_id).or_insert(0);
                         if is_relay {
                             debug!(%peer_id, "auto_quic_holepunch_skip: public relay");
@@ -1988,7 +2256,10 @@ fn handle_swarm_event(
                                 use libp2p::swarm::dial_opts::DialOpts;
                                 let ma = addr.clone();
                                 match swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build()) {
-                                    Ok(()) => debug!(%peer_id, %ma, "auto_quic_holepunch_dial"),
+                                    Ok(()) => {
+                                        state.quic_v6_holepunch_dials += 1;
+                                        debug!(%peer_id, %ma, "auto_quic_holepunch_dial");
+                                    }
                                     Err(e) => debug!(%peer_id, %ma, %e, "auto_quic_holepunch_dial_failed"),
                                 }
                             }
@@ -2307,6 +2578,14 @@ fn handle_swarm_event(
             // succeeded — clear any pending backoff retry for it.
             if address.to_string().contains("/p2p-circuit") {
                 clear_reservation_retry(state, &address.to_string());
+                // #42: track live reservations so rebootstrap re-requests only
+                // the missing ones (avoids leaking duplicate circuit listeners).
+                state.reserved_circuits.insert(address.to_string());
+            } else if is_real_interface_addr(&address) {
+                // #42: a real interface came up (roam / wake / new link) — arm a
+                // debounced rebuild so the routing table, bootstrap connections
+                // and relay reservations refresh for the new network.
+                arm_reactive_rebootstrap(state, "new listen addr");
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -2544,6 +2823,8 @@ fn handle_swarm_event(
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             warn!(%address, "listen_addr_expired");
             if address.to_string().contains("/p2p-circuit") {
+                // #42: reservation is no longer live — stop treating it as held.
+                state.reserved_circuits.remove(&address.to_string());
                 // Normal renewal: try an immediate re-listen first (libp2p
                 // usually auto-renews; this covers the case it didn't). If the
                 // immediate attempt errors, fall into the F-5 backoff retry so
@@ -2556,12 +2837,21 @@ fn handle_swarm_event(
                         schedule_reservation_retry(state, &address.to_string());
                     }
                 }
+            } else if is_real_interface_addr(&address) {
+                // #42: a real interface address went away (roam / interface
+                // down) — expire the stale direct external addrs tied to it and
+                // arm a debounced rebuild for the new network.
+                expire_direct_external_addrs(swarm, state);
+                arm_reactive_rebootstrap(state, "expired listen addr");
             }
         }
         SwarmEvent::ListenerClosed { addresses, reason, .. } => {
             warn!(?addresses, ?reason, "listener_closed");
+            let mut real_interface_closed = false;
             for addr in &addresses {
                 if addr.to_string().contains("/p2p-circuit") {
+                    // #42: reservation dropped — no longer held.
+                    state.reserved_circuits.remove(&addr.to_string());
                     // F-5: a closed circuit listener means the reservation
                     // dropped/was rejected. Schedule a backed-off retry instead
                     // of an immediate re-listen — an immediate re-listen against
@@ -2569,7 +2859,15 @@ fn handle_swarm_event(
                     // spams the relay. The relay_retry_ticker drives the re-listen
                     // once the backoff window elapses.
                     schedule_reservation_retry(state, &addr.to_string());
+                } else if is_real_interface_addr(addr) {
+                    real_interface_closed = true;
                 }
+            }
+            if real_interface_closed {
+                // #42: a real interface listener closed (roam / wake) — expire
+                // stale direct external addrs and arm a debounced rebuild.
+                expire_direct_external_addrs(swarm, state);
+                arm_reactive_rebootstrap(state, "listener closed");
             }
         }
         SwarmEvent::ListenerError { error, .. } => {
@@ -4353,6 +4651,27 @@ mod tests {
 
         // A relay-circuit address is never "us being reachable".
         assert!(!g("/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"));
+    }
+
+    #[test]
+    fn test_is_real_interface_addr() {
+        let r = |s: &str| is_real_interface_addr(&s.parse::<Multiaddr>().unwrap());
+
+        // Real interface addrs (LAN or global, v4 or v6) — their up/down IS a
+        // network change and should arm a rebootstrap.
+        assert!(r("/ip4/192.168.1.5/tcp/4001"));
+        assert!(r("/ip4/45.79.190.172/udp/4001/quic-v1"));
+        assert!(r("/ip6/2406:7400:56:7e7::e4c6/tcp/4001"));
+        assert!(r("/ip4/10.0.0.9/tcp/4001"));
+
+        // Loopback churns on nothing meaningful — must NOT trigger a rebuild.
+        assert!(!r("/ip4/127.0.0.1/tcp/4001"));
+        assert!(!r("/ip6/::1/udp/4001/quic-v1"));
+
+        // Relay-circuit reservations are the F-5 path's job, not interface events.
+        assert!(!r(
+            "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"
+        ));
     }
 
     #[test]

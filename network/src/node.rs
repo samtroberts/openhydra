@@ -73,7 +73,18 @@ fn dirs_default_identity() -> PathBuf {
 /// a Shutdown command is received or the sender is dropped.
 pub fn start_node(
     config: &NodeConfig,
-) -> Result<(mpsc::Sender<SwarmCommand>, Arc<SharedProxyQueue>, std::thread::JoinHandle<()>), String> {
+) -> Result<
+    (
+        mpsc::Sender<SwarmCommand>,
+        Arc<SharedProxyQueue>,
+        std::thread::JoinHandle<()>,
+        // #42: shared network-generation counter — bumped on every rebootstrap
+        // so the handle (and the provider run-loop) can observe a network change
+        // and re-announce.
+        Arc<std::sync::atomic::AtomicU64>,
+    ),
+    String,
+> {
     // Load or generate identity.
     let identity = Identity::load_or_create(&config.identity_path)
         .map_err(|e| format!("identity: {e}"))?;
@@ -108,6 +119,11 @@ pub fn start_node(
     let proxy_queue = Arc::new(SharedProxyQueue::new());
     let proxy_queue_clone = Arc::clone(&proxy_queue);
 
+    // #42: shared network-generation counter — one clone into the event loop
+    // (which bumps it on rebootstrap), one returned to the handle.
+    let net_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let net_generation_loop = Arc::clone(&net_generation);
+
     // Use a oneshot to communicate any startup error from the background thread.
     let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -134,7 +150,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, stream_control, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));
@@ -151,7 +167,7 @@ pub fn start_node(
         .map_err(|_| "background thread died during startup".to_string())?
         .map_err(|e| format!("startup failed: {e}"))?;
 
-    Ok((cmd_tx, proxy_queue, thread))
+    Ok((cmd_tx, proxy_queue, thread, net_generation))
 }
 
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.

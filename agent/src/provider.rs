@@ -314,6 +314,12 @@ impl<A: EngineAdapter> Provider<A> {
     {
         let pool = WorkerPool::new(max_concurrency);
         let mut last_announce = std::time::Instant::now();
+        // #42: track the network generation. The event loop bumps it whenever it
+        // rebuilds connectivity after a network change (roam / wake / interface
+        // up-down); when it advances we re-announce immediately so the DHT record
+        // carries the new relay addresses under the same pinned PeerId, instead
+        // of waiting out the periodic `reannounce_every` interval.
+        let mut last_generation = self.net.network_generation();
         loop {
             if let Some((request_id, data)) = self.net.poll_inbound(poll_timeout) {
                 // Serve off the poll thread so the loop can keep accepting requests and a
@@ -332,7 +338,16 @@ impl<A: EngineAdapter> Provider<A> {
                     let _ = provider.net.respond(request_id, response);
                 });
             }
-            if last_announce.elapsed() >= reannounce_every {
+            // #42: a network change → re-announce now (not on the slow interval).
+            let generation = self.net.network_generation();
+            let network_changed = generation != last_generation;
+            if network_changed {
+                last_generation = generation;
+                eprintln!(
+                    "openhydra-agent: network change (generation {generation}) — re-announcing"
+                );
+            }
+            if network_changed || last_announce.elapsed() >= reannounce_every {
                 match self.announce_models() {
                     Ok(n) => eprintln!("openhydra-agent: re-announced {n} model(s)"),
                     Err(e) => eprintln!("openhydra-agent: re-announce failed: {e}"),
