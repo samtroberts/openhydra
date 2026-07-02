@@ -33,10 +33,14 @@ impl ReqwestClient {
     /// Build a client with a short connect timeout (the engine is local) and **no**
     /// read timeout — a completion stream may legitimately run for minutes.
     pub fn new() -> Result<Self, AdapterError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .map_err(http_err)?;
+        Self::with_connect_timeout(Duration::from_secs(5))
+    }
+
+    /// Like [`new`](Self::new) but with an explicit connect timeout — used by engine
+    /// auto-detection, which probes several ports and wants to fail fast on a dead one
+    /// (still no read timeout, so an adapter built this way serves long streams fine).
+    pub fn with_connect_timeout(connect: Duration) -> Result<Self, AdapterError> {
+        let client = Client::builder().connect_timeout(connect).build().map_err(http_err)?;
         Ok(Self { client })
     }
 }

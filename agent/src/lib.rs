@@ -22,7 +22,13 @@
 
 pub mod adapter;
 pub mod adapters;
+/// Opt-in engine autostart (starts LM Studio / Ollama when down). Feature-gated so the lean
+/// build carries no process-spawning code.
+#[cfg(feature = "engine-autostart")]
+pub mod autostart;
 pub mod aup;
+/// Engine auto-detection (`--engine-kind auto`) + the multi-engine union adapter.
+pub mod detect;
 pub mod byok;
 pub mod consumer;
 pub mod gateway;
@@ -45,6 +51,7 @@ pub use aup::{AupDecision, AupPolicy};
 pub use byok::{ByokConfig, ByokProvider, EmbeddingConfig};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use adapters::anthropic::{AnthropicAdapter, DEFAULT_ANTHROPIC_URL};
+pub use adapters::exo::{ExoAdapter, DEFAULT_EXO_URL};
 pub use adapters::gemini::{GeminiAdapter, DEFAULT_GEMINI_URL};
 pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
@@ -79,6 +86,12 @@ pub fn live_openai(
 /// `base_url` (e.g. [`DEFAULT_LLAMACPP_URL`]).
 pub fn live_llamacpp(base_url: &str) -> Result<LlamaCppAdapter<ReqwestClient>, AdapterError> {
     Ok(LlamaCppAdapter::new(base_url, ReqwestClient::new()?))
+}
+
+/// An Exo cluster adapter backed by the live reqwest transport, pointed at the head node's
+/// `base_url` (e.g. [`DEFAULT_EXO_URL`]). Detects only placed-and-ready models via `/state`.
+pub fn live_exo(base_url: &str) -> Result<ExoAdapter<ReqwestClient>, AdapterError> {
+    Ok(ExoAdapter::new(base_url, ReqwestClient::new()?))
 }
 
 /// An Anthropic (Claude) BYOK adapter backed by the live reqwest transport — a hosted

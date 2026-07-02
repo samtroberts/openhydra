@@ -27,10 +27,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig, EmbeddingConfig,
-    EngineAdapter, Provider, RateLimitConfig, DEFAULT_ANTHROPIC_URL, DEFAULT_GEMINI_URL,
-    DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_EMBEDDINGS_URL,
-    DEFAULT_VLLM_URL,
+    live_exo, live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig,
+    EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig, DEFAULT_ANTHROPIC_URL,
+    DEFAULT_EXO_URL, DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL,
+    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -114,8 +114,12 @@ enum Role {
 
 /// Which local engine an agent proxies to. Selects the adapter; the `--engine` URL
 /// defaults to the kind's standard port when omitted.
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum EngineKind {
+    /// Auto-detect (the default): probe the standard ports, serve **every** engine found
+    /// (the union of their models), and — with `--engine-autostart` — start one if none is
+    /// up. Zero-config for the common case where you just run one engine.
+    Auto,
     /// Ollama native API (`/api/*`) — rich metadata, full canonical ids.
     Ollama,
     /// vLLM (OpenAI-compatible `/v1/*`).
@@ -124,7 +128,10 @@ enum EngineKind {
     LmStudio,
     /// llama.cpp (`llama-server`) — OpenAI serve route + `/props` canonical-id detection.
     LlamaCpp,
-    /// Any other OpenAI-compatible server (Exo, LocalAI, …).
+    /// Exo MLX cluster — OpenAI serve route + `/state` detection (announces only
+    /// placed-and-ready models, not Exo's whole downloadable catalog).
+    Exo,
+    /// Any other OpenAI-compatible server (LocalAI, …).
     Openai,
 }
 
@@ -132,10 +139,13 @@ impl EngineKind {
     /// The engine's conventional local base URL, used when `--engine` is omitted.
     fn default_url(self) -> &'static str {
         match self {
-            EngineKind::Ollama => DEFAULT_OLLAMA_URL,
+            // Auto never resolves a single URL (it scans standard ports and branches to
+            // `provide_auto` before this is called); map it to Ollama's for exhaustiveness.
+            EngineKind::Auto | EngineKind::Ollama => DEFAULT_OLLAMA_URL,
             EngineKind::Vllm | EngineKind::Openai => DEFAULT_VLLM_URL,
             EngineKind::LmStudio => DEFAULT_LM_STUDIO_URL,
             EngineKind::LlamaCpp => DEFAULT_LLAMACPP_URL,
+            EngineKind::Exo => DEFAULT_EXO_URL,
         }
     }
 }
@@ -282,14 +292,22 @@ impl ByokArgs {
 
 #[derive(Args)]
 struct ProvideArgs {
-    /// Which local engine to proxy to.
-    #[arg(long = "engine-kind", value_enum, default_value_t = EngineKind::Ollama)]
+    /// Which local engine to proxy to. Defaults to `auto` (detect + serve whatever's running).
+    #[arg(long = "engine-kind", value_enum, default_value_t = EngineKind::Auto)]
     engine_kind: EngineKind,
 
     /// Base URL of the local engine. Defaults to the engine kind's standard port
     /// (Ollama 11434, vLLM/OpenAI 8000, LM Studio 1234, llama.cpp 8080).
     #[arg(long)]
     engine: Option<String>,
+
+    /// If the engine's server isn't already up, start it before announcing. Off by default.
+    /// Only applies to engines OpenHydra can launch unattended — `ollama` (`ollama serve`)
+    /// and `lm-studio` (`lms server start`, whose OpenAI server is a separate toggle from
+    /// the app). vLLM / llama.cpp / Exo need a model or cluster argument, so those you still
+    /// start yourself. Needs the `engine-autostart` build feature (on by default).
+    #[arg(long)]
+    engine_autostart: bool,
 
     /// Advisory host advertised in records (routing is by libp2p peer id regardless).
     #[arg(long, default_value = "")]
@@ -420,34 +438,180 @@ fn run() -> Result<(), String> {
 /// serve. The post-adapter logic is generic over [`EngineAdapter`] (see [`run_provider`]),
 /// so each kind monomorphises without boxing.
 fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
+    // Auto mode scans the standard ports and serves the union of whatever's running — the
+    // zero-config default. It handles its own autostart, so it branches out before we resolve
+    // a single engine URL.
+    if args.engine_kind == EngineKind::Auto {
+        return provide_auto(net, args);
+    }
+
     let url = args
         .engine
         .clone()
         .unwrap_or_else(|| args.engine_kind.default_url().to_string());
     // Bind the adapter first so its construction borrow of `url` ends before `url` is
-    // moved into `run_provider`.
+    // moved into `run_single_engine`.
     match args.engine_kind {
+        EngineKind::Auto => unreachable!("handled above"),
         EngineKind::Ollama => {
             let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_provider(a, url, args, net)
+            run_single_engine(a, url, args, net)
         }
         EngineKind::Vllm => {
             let a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
-            run_provider(a, url, args, net)
+            run_single_engine(a, url, args, net)
         }
         EngineKind::LmStudio => {
             let a = live_openai(&url, "lm-studio").map_err(|e| format!("engine {url}: {e}"))?;
-            run_provider(a, url, args, net)
+            run_single_engine(a, url, args, net)
         }
         EngineKind::LlamaCpp => {
             let a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_provider(a, url, args, net)
+            run_single_engine(a, url, args, net)
+        }
+        EngineKind::Exo => {
+            let a = live_exo(&url).map_err(|e| format!("engine {url}: {e}"))?;
+            run_single_engine(a, url, args, net)
         }
         EngineKind::Openai => {
             let a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
-            run_provider(a, url, args, net)
+            run_single_engine(a, url, args, net)
         }
     }
+}
+
+/// Provider over a single explicitly-chosen engine: optionally autostart it, then run. The
+/// autostart hook lives here (not in [`run_provider`]) so auto mode — which does its own
+/// autostart across engines — doesn't double-handle it.
+fn run_single_engine<A: EngineAdapter + Send + Sync + 'static>(
+    adapter: A,
+    url: String,
+    args: ProvideArgs,
+    net: NetworkHandle,
+) -> Result<(), String> {
+    ensure_engine_if_requested(&args, &url, &adapter)?;
+    run_provider(adapter, url, args, net)
+}
+
+/// Auto-detect provider: probe the standard ports and serve the union of every engine found.
+/// If none is up and `--engine-autostart` was given, try to start one, then re-detect. Fails
+/// fast with an actionable message if nothing can be found or started.
+fn provide_auto(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
+    if args.engine.is_some() {
+        eprintln!(
+            "openhydra-agent: --engine is ignored in auto mode (auto scans the standard ports); \
+             pass --engine-kind to target one engine at a custom URL",
+        );
+    }
+
+    let mut engines = openhydra_agent::detect::detect_engines();
+    if engines.is_empty() && args.engine_autostart {
+        eprintln!("openhydra-agent: no engine detected — --engine-autostart: attempting to start one");
+        if autostart_when_none_detected() {
+            engines = openhydra_agent::detect::detect_engines();
+        }
+    }
+    if engines.is_empty() {
+        return Err(no_engine_message(args.engine_autostart));
+    }
+
+    let summary = engines
+        .iter()
+        .map(|e| {
+            let n = e.models.len();
+            format!("{}({n} model{}) @ {}", e.label, if n == 1 { "" } else { "s" }, e.url)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("openhydra-agent: auto-detected {} engine(s): {summary}", engines.len());
+
+    // The MultiAdapter re-probes on every re-announce tick, so engines/models started later
+    // are absorbed with no restart. Drop the decision-scan's adapters; it rebuilds its own.
+    run_provider(openhydra_agent::detect::MultiAdapter::new(), "auto".to_string(), args, net)
+}
+
+/// The fail-fast message when auto mode finds no engine (§5 of the autostart plan).
+fn no_engine_message(autostart_tried: bool) -> String {
+    let base = "no local engine detected on the standard ports (ollama :11434, llama.cpp :8080, \
+        LM Studio :1234, vLLM :8000, Exo :52415). Start your engine's server, or pass \
+        --engine-kind/--engine to target one";
+    if autostart_tried {
+        format!("{base}. (--engine-autostart could not start one — is Ollama or LM Studio installed?)")
+    } else {
+        format!("{base}. Tip: pass --engine-autostart to have OpenHydra start Ollama / LM Studio for you")
+    }
+}
+
+/// Auto-mode autostart (real impl): with nothing detected, try to start a known headless-ish
+/// engine — Ollama first (pure daemon), then LM Studio. Returns whether one came up.
+#[cfg(feature = "engine-autostart")]
+fn autostart_when_none_detected() -> bool {
+    use openhydra_agent::autostart::{ensure_running, LaunchSpec};
+    if let (Ok(a), Some(spec)) = (live_ollama(DEFAULT_OLLAMA_URL), LaunchSpec::for_engine("ollama")) {
+        if ensure_running(DEFAULT_OLLAMA_URL, &spec, || a.detect_models().is_ok()).is_ok() {
+            return true;
+        }
+    }
+    if let (Ok(a), Some(spec)) =
+        (live_openai(DEFAULT_LM_STUDIO_URL, "lm-studio"), LaunchSpec::for_engine("lm-studio"))
+    {
+        if ensure_running(DEFAULT_LM_STUDIO_URL, &spec, || a.detect_models().is_ok()).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Auto-mode autostart (feature disabled): nothing to start.
+#[cfg(not(feature = "engine-autostart"))]
+fn autostart_when_none_detected() -> bool {
+    false
+}
+
+/// Autostart hook (real impl): when `--engine-autostart` is set, ensure the engine's server
+/// is up — launching LM Studio / Ollama if we have a launcher for it — before we announce.
+/// Readiness reuses the adapter's own detection, so "up" means exactly what announce checks.
+#[cfg(feature = "engine-autostart")]
+fn ensure_engine_if_requested<A: EngineAdapter>(
+    args: &ProvideArgs,
+    engine_url: &str,
+    adapter: &A,
+) -> Result<(), String> {
+    use openhydra_agent::autostart::LaunchSpec;
+    if !args.engine_autostart {
+        return Ok(());
+    }
+    match LaunchSpec::for_engine(adapter.engine_name()) {
+        Some(spec) => openhydra_agent::autostart::ensure_running(engine_url, &spec, || {
+            adapter.detect_models().is_ok()
+        }),
+        None => {
+            // vLLM / llama.cpp / Exo need a model or cluster arg we can't invent; leave them
+            // to the operator. If it's down, the announce step below reports it.
+            eprintln!(
+                "openhydra-agent: --engine-autostart has no launcher for {} — start it yourself",
+                adapter.engine_name(),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Autostart hook (feature disabled): the flag parses but does nothing except warn, so a lean
+/// `--no-default-features` build never links a process-spawning path.
+#[cfg(not(feature = "engine-autostart"))]
+fn ensure_engine_if_requested<A: EngineAdapter>(
+    args: &ProvideArgs,
+    _engine_url: &str,
+    _adapter: &A,
+) -> Result<(), String> {
+    if args.engine_autostart {
+        eprintln!(
+            "openhydra-agent: WARNING — --engine-autostart ignored (built without the \
+             engine-autostart feature)",
+        );
+    }
+    Ok(())
 }
 
 /// Run a provider over a chosen engine adapter: open the ledger, announce the engine's

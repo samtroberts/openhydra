@@ -56,6 +56,11 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 libc = "0.2"
 
 [features]
+default = ["engine-autostart"]
+# Opt-in engine autostart (`--engine-autostart`): the only code that spawns a child
+# process (starts LM Studio / Ollama's server when it's down). On by default; drop it for
+# a lean pure-protocol build that carries no process-management path (`--no-default-features`).
+engine-autostart = []
 profiling = ["dep:pprof"]
 otel = [
     "dep:opentelemetry",
