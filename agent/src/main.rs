@@ -646,11 +646,13 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         .announce_models()
         .map_err(|e| format!("announce models from {engine_url}: {e}"))?;
     if announced == 0 {
-        // Not fatal — the operator may pull models later — but the node serves nothing
-        // until something is advertised, so make the silence visible.
+        // Not fatal — the operator may load models later — but the node serves nothing
+        // until something is advertised, so make the silence visible. No restart needed:
+        // the serve loop re-detects and re-announces on every interval below.
         eprintln!(
             "openhydra-agent: WARNING — engine {engine_url} reported 0 models; serving nothing \
-             until models are pulled and the node re-announces (restart to re-detect)",
+             until a model is loaded — the node re-detects automatically every {}s (no restart needed)",
+            args.reannounce_secs,
         );
     } else {
         eprintln!("openhydra-agent: announced {announced} model(s) from {engine_url}");

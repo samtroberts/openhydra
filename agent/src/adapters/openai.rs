@@ -15,8 +15,10 @@
 //! metadata, so detected models carry an **empty canonical id** (advertised
 //! uncanonicalised — the router still keeps them) and are addressed by the engine's own
 //! model id. The completion-token count comes from the final `usage` chunk, requested via
-//! `stream_options.include_usage`; the API reports no per-stage timings, so the returned
-//! [`EngineMetrics`] durations are 0 (the pipeline measures end-to-end instead).
+//! `stream_options.include_usage`. The API reports no per-stage timings, so — since the
+//! engine is local — the adapter *measures* them provider-locally (time-to-first-token ≈
+//! prefill, first-to-last ≈ decode) to fill [`EngineMetrics`] with a real native gen-TPS
+//! instead of a misleading zero.
 //!
 //! Parsing is pure; HTTP is injected via [`HttpClient`](crate::adapter::HttpClient).
 
@@ -212,11 +214,15 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<ServeOutcome, AdapterError> {
     let body = build_chat_body(request);
+    let start = std::time::Instant::now();
     let lines = http.post_stream(chat_url, &body)?;
 
     let mut chunk_tokens = 0u64;
     let mut usage: Option<Usage> = None;
     let mut done = false;
+    // The OpenAI stream carries no timings; the engine is local, so measure them here —
+    // start→first-token ≈ prefill, first-token→end ≈ decode.
+    let mut first_token_at: Option<std::time::Instant> = None;
     for line in lines {
         let line = line?;
         let Some(payload) = sse_payload(&line) else {
@@ -230,6 +236,9 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
         for choice in &chunk.choices {
             if let Some(content) = &choice.delta.content {
                 if !content.is_empty() {
+                    if first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     on_delta(content);
                     chunk_tokens += 1;
                 }
@@ -243,13 +252,8 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
             usage = chunk.usage;
         }
     }
+    let end = std::time::Instant::now();
 
-    let engine = EngineMetrics {
-        // OpenAI exposes counts (when usage is included) but no per-stage timings.
-        prompt_eval_count: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
-        eval_count: usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
-        ..EngineMetrics::default()
-    };
     // Prefer the engine's authoritative completion-token count; fall back to the number
     // of non-empty content chunks when the server reports no usage.
     let tokens = usage
@@ -257,6 +261,25 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
         .map(|u| u.completion_tokens)
         .filter(|&t| t > 0)
         .unwrap_or(chunk_tokens);
+
+    let total_duration_ns = end.duration_since(start).as_nanos() as u64;
+    let (prompt_eval_duration_ns, eval_duration_ns) = match first_token_at {
+        Some(t) => (
+            t.duration_since(start).as_nanos() as u64,
+            end.duration_since(t).as_nanos() as u64,
+        ),
+        None => (total_duration_ns, 0), // no content streamed → no decode phase
+    };
+    let engine = EngineMetrics {
+        prompt_eval_count: usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+        // Drives native gen-TPS: use the resolved token count so TPS is right even when
+        // the server sends no `usage` block.
+        eval_count: tokens,
+        prompt_eval_duration_ns,
+        eval_duration_ns,
+        total_duration_ns,
+        ..EngineMetrics::default()
+    };
     Ok(ServeOutcome { tokens, done, engine })
 }
 
@@ -366,6 +389,22 @@ mod tests {
         assert_eq!(out, "abc");
         assert_eq!(outcome.tokens, 3); // no usage reported → count content chunks
         assert!(outcome.done);
+    }
+
+    #[test]
+    fn serve_stream_sets_eval_count_and_measured_timings() {
+        let (_out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        // native gen-TPS needs a non-zero eval_count even when the server sends no usage.
+        assert_eq!(outcome.engine.eval_count, 2);
+        assert_eq!(outcome.engine.eval_count, outcome.tokens);
+        // Timings are measured provider-locally; these invariants hold regardless of clock.
+        assert!(outcome.engine.total_duration_ns >= outcome.engine.eval_duration_ns);
+        assert!(outcome.engine.total_duration_ns >= outcome.engine.prompt_eval_duration_ns);
     }
 
     #[test]
