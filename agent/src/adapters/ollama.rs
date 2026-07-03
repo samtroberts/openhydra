@@ -225,6 +225,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError> {
         let body = build_chat_body(request);
+        let start = std::time::Instant::now();
         let lines = self
             .http
             .post_stream(&format!("{}/api/chat", self.base_url), &body)?;
@@ -233,6 +234,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         let mut eval_count = None;
         let mut engine = crate::adapter::EngineMetrics::default();
         let mut done = false;
+        let mut first_token_at: Option<std::time::Instant> = None;
         for line in lines {
             let line = line?;
             if line.trim().is_empty() {
@@ -240,6 +242,9 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
             }
             let chunk = parse_chat_chunk(&line)?;
             if !chunk.message.content.is_empty() {
+                if first_token_at.is_none() {
+                    first_token_at = Some(std::time::Instant::now());
+                }
                 on_delta(&chunk.message.content);
                 chunk_tokens += 1;
             }
@@ -258,11 +263,22 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
                 break;
             }
         }
-        Ok(ServeOutcome {
-            tokens: eval_count.unwrap_or(chunk_tokens),
-            done,
-            engine,
-        })
+        let tokens = eval_count.unwrap_or(chunk_tokens);
+        // Ollama normally reports authoritative eval timing, but occasionally omits
+        // eval_duration (or the whole metrics chunk) on an otherwise-normal completion —
+        // which would make native gen-TPS a misleading zero. Backfill from the measured
+        // decode time (engine is local → first-token→end ≈ decode) and ensure eval_count
+        // reflects the tokens actually streamed.
+        if engine.eval_duration_ns == 0 && tokens > 0 {
+            if let Some(t) = first_token_at {
+                engine.eval_duration_ns =
+                    std::time::Instant::now().duration_since(t).as_nanos() as u64;
+            }
+            if engine.eval_count == 0 {
+                engine.eval_count = tokens;
+            }
+        }
+        Ok(ServeOutcome { tokens, done, engine })
     }
 }
 
@@ -468,6 +484,27 @@ mod tests {
             .unwrap();
         assert_eq!(out, "ab");
         assert_eq!(outcome.tokens, 2); // 2 non-empty content chunks
+        // Backfill: with no metrics chunk, eval_count is filled from the streamed tokens so
+        // native gen-TPS is computable rather than a degenerate zero.
+        assert_eq!(outcome.engine.eval_count, 2);
+    }
+
+    #[test]
+    fn serve_stream_backfills_eval_duration_when_ollama_omits_it() {
+        // The observed quirk: a normal completion with eval_count but no eval_duration.
+        // Without the backfill, native gen-TPS would be a misleading zero.
+        let lines = [
+            r#"{"message":{"content":"a"},"done":false}"#,
+            r#"{"message":{"content":"b"},"done":true,"eval_count":2}"#, // no eval_duration
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(outcome.tokens, 2);
+        assert_eq!(outcome.engine.eval_count, 2);
+        // eval_duration is now the measured decode time (> 0), not the engine's missing 0.
+        assert!(outcome.engine.eval_duration_ns > 0);
     }
 
     #[test]
