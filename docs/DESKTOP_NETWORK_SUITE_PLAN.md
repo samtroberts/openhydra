@@ -236,29 +236,62 @@ positioning. **Payments are off the roadmap for the foreseeable future** (revisi
 at substantial network scale, >v4), which removes the processor-compliance blocker
 that argued for exclusion. Legal/compliance/monetary machinery in general is >v4.
 
-Guardrails that ship WITH the feature (not >v4 — same release as the first abliterated
-model on any official surface):
+**Surfaces & ratio — DECIDED (owner, 2026-07-03):**
+- **Two instruments, right venue each:** a **grid** in the app (the models board — sortable,
+  metric-rich, utilitarian) and an auto-scrolling **ticker** on the **landing page** (motion/
+  brand). Abliterated model *names* appear **unhidden and un-euphemised** in both — their
+  unremarkable presence *alongside* mainstream models is the signal ("this network lists
+  Dolphin next to Llama without flinching").
+- **Ratio depends on whether the surface is curated or data-driven:**
+  - *Curated* surfaces (landing ticker, first-run starter catalog) → **~50/50** abliterated:
+    regular. 50/50 is itself the message — uncensored models ranked as neither special nor
+    lesser, just models; it embodies the neutrality USP better than an apologetic 20–30% or
+    a try-hard 60–80%.
+  - *Data-driven* surfaces (the app's "Top on the network" grid, trending) → **emergent
+    ratio — do NOT force 50/50.** Show what's actually live/popular; forcing a ratio onto
+    real telemetry destroys the trust that makes the grid worth showing. If the thesis is
+    right, uncensored models rank high on their own — organic proof beats a rigged list.
+- **Docs/FAQ** is the honest, discoverable home for the "can I run uncensored models? — yes,
+  here's how + your responsibility as a provider" content.
+- Softer catalog label ("Unrestricted"/"Unfiltered") over "Abliterated/Uncensored" reduces
+  regulator/press bait at zero cost to the in-group who know what it means. (Owner's call.)
 
-1. **Informed opt-in for providers, never ambient.** An "Uncensored" *tagged section*
-   of the board/catalog, collapsed by default, behind a one-time acknowledgment
-   (what these models are; that the provider is the serving endpoint for strangers;
-   18+). Poll pledges for tagged models never auto-pull without that gate. A general
-   disclaimer alone protects the project surface, not the volunteer — the gate is
-   what makes hosting *informed*.
-2. **Pair with the AUP floor (#40):** a provider can host an uncensored model AND set
-   their own refusal boundaries — "uncensored model, operator-set limits" is itself a
-   second differentiator.
-3. **Marketing intensity — signal over headline (recommended):** the headline USP
-   stays "decentralized, free, reciprocal, any open model — we don't gatekeep"; the
-   uncensored tag is visible in the catalog for those who look. The target community
-   reads between lines; this captures most of the USP without becoming "The
-   Uncensored Network" in a regulator's or journalist's framing. (Owner may choose
-   louder framing; this is the risk-adjusted default.)
-4. **Honest enforcement posture if regulation arrives:** the real levers are official
-   surfaces only — delist from catalog/board/polls, filter app defaults, refuse
-   records at project-operated bootstraps (partial). A self-bootstrapped swarm cannot
-   be stopped; public commitments must therefore say "enforced on every surface we
-   operate," never "removed from the network."
+**Guardrails:**
+
+1. **Informed-consent gate on the HOST ACTION — couples to *action*, not *visibility*.**
+   The gate is required only by the in-app **"host / run this abliterated model"** action
+   (models board / pledge flow / wizard). Seeing a *name* (landing ticker, a grid listing)
+   is speech, creates no provider liability, and needs **no** gate — so the ticker ships
+   independently. **Invariant (not a calendar date):** the gate must land **in the same
+   release as** the in-app host action for abliterated models — never a shippable build that
+   one-click-hosts one without it. Since the board/host-flow is unbuilt (phase P5),
+   **deferring the gate to when that UI is built is correct** — it's coupling, not lateness.
+   The gate = auto-fetched **HF model-card excerpt** + a **fixed OpenHydra notice** that does
+   not depend on the card's honesty (what abliteration means · "you are the serving endpoint;
+   strangers' requests run on your hardware and IP" · "you are responsible for your local-law
+   compliance") + a **remembered consent checkbox**, **blocking on the host side**, light/
+   optional on the consumer side. One-time-per-model, remembered (nag-free, so people
+   actually read it).
+2. **Pair with the AUP floor (#40):** a provider can host an uncensored model AND set their
+   own refusal boundaries — "uncensored model, operator-set limits" is itself a second
+   differentiator.
+3. **Marketing — signal over headline, but 50/50 on curated surfaces (owner):** the headline
+   USP stays the *principle* — "OpenHydra doesn't decide what you run / your machine, your
+   models" — which is unimpeachable (a freedom statement, not a content claim). The 50/50
+   ticker + unhidden names carry the concrete signal without the copy ever shouting
+   "uncensored." Let community/"most-hosted" surfaces do the rest organically.
+4. **Enforcement — react in real time, do NOT pre-build (owner, 2026-07-03):** predicting
+   how regulation forms is a fools' errand, and shipping speculative enforcement hooks
+   signals presumed liability and invites scrutiny. Build delisting/filtering **if and when**
+   regulation actually lands. The ONE thing to preserve now: **keep the socket, not the
+   lever** — official surfaces (catalog/board/poll/app-defaults/project bootstraps) stay
+   centralized-enough that a future operator *can* act on them; just don't architect a
+   fully-decentralized catalog with no override that would leave you unable to comply later.
+   Public commitments must say "enforced on every surface we operate," never "removed from
+   the network" (a self-bootstrapped swarm can't be stopped). Note: no-payments-for-now also
+   means no KYC/accounts/stored identity → the network stays fully pseudonymous exactly while
+   it serves its most sensitive content, and the compliance-heavy machinery arrives (>v4)
+   only when the catalog policy would be re-examined anyway — self-consistent sequencing.
 
 ### 3.6 Effort
 Control-plane API ~1 session (Worker + KV is small); board view + startup card ~1
