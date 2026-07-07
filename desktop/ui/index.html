@@ -26,6 +26,9 @@
     <nav class="sidebar">
       <div class="nav-section">Node</div>
       <button class="nav-item nav-active" data-view="dashboard">▦ Dashboard <span id="navModels" class="badge">0</span></button>
+      <button class="nav-item" data-view="peers">◇ Peers <span id="navPeers" class="badge">0</span></button>
+      <button class="nav-item" data-view="dht">⌗ DHT</button>
+      <button class="nav-item" data-view="swarm">✳ Swarm</button>
       <button class="nav-item" data-view="logs">≣ Logs</button>
       <div class="nav-section">Tools</div>
       <button class="nav-item" data-view="chat">◧ Chat</button>
@@ -80,6 +83,56 @@
             </div>
           </div>
           <pre id="logBox" class="logbox mono">—</pre>
+        </div>
+      </section>
+
+      <!-- Peers -->
+      <section id="view-peers" class="view hidden">
+        <div id="peersOffline" class="banner hidden">Start a role to see connected peers.
+          <button class="btn-link" id="peersStart">Start sharing →</button></div>
+        <div class="panel panel-fill">
+          <div class="panel-head"><span>Connected peers <span id="peersCount" class="badge">0</span></span>
+            <span class="dim" id="peersLegend">● direct · ◐ mixed · ○ relay</span></div>
+          <table class="tbl">
+            <thead><tr><th>Peer</th><th>Path</th><th>QUIC v4/v6</th><th>TCP</th><th>Relay</th><th>Fail streak</th></tr></thead>
+            <tbody id="peerRows"><tr><td colspan="6" class="dim">—</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- DHT -->
+      <section id="view-dht" class="view hidden">
+        <div id="dhtOffline" class="banner hidden">Start a role to see DHT state.</div>
+        <div class="strip strip-3">
+          <div class="stat"><div class="stat-k">Kademlia mode</div><div id="dhtMode" class="stat-v">—</div></div>
+          <div class="stat"><div class="stat-k">Routing peers</div><div id="dhtKadPeers" class="stat-v">—</div></div>
+          <div class="stat"><div class="stat-k">NAT</div><div id="dhtNat" class="stat-v">—</div></div>
+          <div class="stat"><div class="stat-k">IPv6 capable</div><div id="dhtV6" class="stat-v">—</div></div>
+          <div class="stat"><div class="stat-k">Net generation</div><div id="dhtGen" class="stat-v">—</div></div>
+        </div>
+        <div class="dht-grid">
+          <div class="panel">
+            <div class="panel-head"><span>Relay reservations <span id="dhtResvCount" class="badge">0</span></span></div>
+            <div id="dhtReservations" class="addr-list mono"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><span>External addresses <span id="dhtExtCount" class="badge">0</span></span></div>
+            <div id="dhtExternal" class="addr-list mono"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><span>NAT-traversal counters</span></div>
+          <div id="dhtCounters" class="counter-grid"></div>
+        </div>
+      </section>
+
+      <!-- Swarm graph -->
+      <section id="view-swarm" class="view hidden">
+        <div id="swarmOffline" class="banner hidden">Start a role to visualize the swarm.</div>
+        <div class="panel panel-fill swarm-panel">
+          <div class="panel-head"><span>Swarm</span>
+            <span class="dim" id="swarmLegend">◆ you · ● direct · ○ relay · edges = live connections</span></div>
+          <div id="swarmStage" class="swarm-stage"><svg id="swarmSvg" viewBox="0 0 800 460" preserveAspectRatio="xMidYMid meet"></svg></div>
         </div>
       </section>
 

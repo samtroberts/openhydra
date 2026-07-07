@@ -307,6 +307,35 @@ body {
 [data-theme="dark"] .tbl td { border-bottom-color: #1d332b; }
 [data-theme="dark"] .modal { background: #000a; }
 
+/* ── peers / DHT / swarm (P1 network views) ── */
+.strip-3 { grid-template-columns: repeat(5, 1fr); }
+.dht-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.addr-list { padding: 8px 12px; max-height: 150px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+.addr-list > div { color: var(--muted); font-size: 10.5px; user-select: text; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addr-list:empty::before { content: "none"; color: var(--dim); font-size: 12px; }
+.counter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1px; background: var(--border); }
+.counter { background: var(--surface); padding: 9px 12px; }
+.counter-k { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+.counter-v { font-family: var(--serif); font-size: 15px; font-weight: 600; color: var(--text); }
+.path-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+.path-direct { background: var(--green); }
+.path-mixed { background: var(--amber); }
+.path-relay { background: var(--dim); }
+.path-none { background: var(--red); }
+.streak-bad { color: var(--red); font-weight: 700; }
+
+.swarm-panel { min-height: 0; }
+.swarm-stage { flex: 1; min-height: 0; display: flex; }
+#swarmSvg { width: 100%; height: 100%; }
+.swarm-edge { stroke-width: 1.5; opacity: .5; }
+.swarm-edge-direct { stroke: var(--green); }
+.swarm-edge-relay { stroke: var(--dim); stroke-dasharray: 4 3; }
+.swarm-node { stroke: var(--surface); stroke-width: 2; }
+.swarm-node-self { fill: var(--violet); }
+.swarm-node-direct { fill: var(--green); }
+.swarm-node-relay { fill: var(--dim); }
+.swarm-label { font: 9px var(--mono); fill: var(--muted); }
+
 /* ── modal ── */
 .modal { position: fixed; inset: 0; background: #2a231855; display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal-card {

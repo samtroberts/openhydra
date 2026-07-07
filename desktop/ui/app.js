@@ -28,6 +28,28 @@ function mock(cmd, args) {
       { label: "exo", url: "http://127.0.0.1:52415", models: ["mlx-community/Llama-3.2-1B-Instruct-4bit"] },
     ];
   if (cmd === "gateway_health") return true;
+  if (cmd === "status_snapshot")
+    return {
+      role: "provider", agent_version: "0.1.0",
+      libp2p_peer_id: "12D3KooWEVGKuH5uEqhR7PfkV4k8RrZbwivLedrY6cGQDKDEuXRH",
+      network: {
+        nat: { nat_type: "unknown", is_public: false }, autonat_private: false, ipv6_capable: true,
+        kad_server_mode: false, kad_routing_peers: 8, network_generation: 0,
+        listen_addrs: ["/ip4/0.0.0.0/tcp/4111", "/ip4/0.0.0.0/udp/4111/quic-v1"],
+        external_addrs: ["/ip4/49.36.1.2/udp/4111/quic-v1"],
+        relay_reservations: ["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL…/p2p-circuit", "/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEz…/p2p-circuit"],
+        peers: [
+          { peer_id: "12D3KooWM2qsVg5WbR6ukzDL7dvThvr1X5JsVU6h6Sfz7hnn2XN7", quic_direct_v4: 0, quic_direct_v6: 0, tcp_direct: 1, tcp_relay: 0, failure_streak: 0, path: "direct" },
+          { peer_id: "12D3KooWHNQ9nMedAbcd1234efGh5678ijKl90mnOpQrStUvWxYz", quic_direct_v4: 1, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 0, failure_streak: 0, path: "direct" },
+          { peer_id: "12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT", quic_direct_v4: 0, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 1, failure_streak: 0, path: "relay" },
+          { peer_id: "12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo", quic_direct_v4: 0, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 1, failure_streak: 2, path: "relay" },
+        ],
+        known_models: ["llama3.2:1b"],
+        known_providers: [{ model_id: "llama3.2:1b", libp2p_peer_id: "12D3KooWEVGK…", openhydra_peer_id: "7a13…" }],
+        counters: { dcutr_successes: 0, dcutr_failures: 0, reversal_dials: 0, reversal_successes: 0, tier_connect_success: { direct_quic_v6: 7, direct_quic_v4: 2, direct_tcp_v4: 3, relay: 3 } },
+      },
+      transfers: { requests_served: 0, tokens_served: 0, serve_errors: 0, aup_refusals: 0, receipts_ledgered: 0, per_model: {} },
+    };
   if (cmd === "web_search")
     return [{ title: "Example result", url: "https://example.com", snippet: "A relevant snippet about " + (args?.query || "") }];
   if (cmd === "chat_completion") {
@@ -90,6 +112,7 @@ document.querySelectorAll(".nav-item").forEach((el) => {
     document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("nav-active", n === el));
     document.querySelectorAll(".view").forEach((v) => v.classList.toggle("hidden", v.id !== `view-${activeView}`));
     render();
+    refreshStatus(); // network views fetch immediately on entry
   });
 });
 
@@ -528,6 +551,86 @@ async function saveSettingsFn() {
   catch (e) { alert(`save failed: ${e}`); }
 }
 
+// ── network views (P1): peers / DHT / swarm, fed by the agent's status endpoint ──
+let snap = null;
+
+function peerShort(p) { return p.length > 18 ? `${p.slice(0, 12)}…${p.slice(-4)}` : p; }
+
+function renderNetworkViews() {
+  const offline = !snap;
+  for (const id of ["peersOffline", "dhtOffline", "swarmOffline"]) $(id).classList.toggle("hidden", !offline);
+  $("navPeers").textContent = snap ? snap.network.peers.length : 0;
+  if (!snap) {
+    $("peerRows").innerHTML = `<tr><td colspan="6" class="dim">—</td></tr>`;
+    $("swarmSvg").innerHTML = "";
+    return;
+  }
+  const n = snap.network;
+
+  // Peers table
+  $("peersCount").textContent = n.peers.length;
+  $("peerRows").innerHTML = n.peers.length
+    ? n.peers.map((p) => `<tr>
+        <td class="mono">${esc(peerShort(p.peer_id))}</td>
+        <td><span class="path-dot path-${p.path}"></span>${p.path}</td>
+        <td>${p.quic_direct_v4}/${p.quic_direct_v6}</td>
+        <td>${p.tcp_direct}</td>
+        <td>${p.tcp_relay}</td>
+        <td class="${p.failure_streak > 0 ? "streak-bad" : ""}">${p.failure_streak}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="dim">No peers connected yet — the node is dialing bootstraps.</td></tr>`;
+
+  // DHT view
+  $("dhtMode").textContent = n.kad_server_mode ? "server (reachable)" : "client (NAT'd)";
+  $("dhtKadPeers").textContent = n.kad_routing_peers;
+  $("dhtNat").textContent = `${n.nat.nat_type}${n.nat.is_public ? " · public" : ""}`;
+  $("dhtV6").textContent = n.ipv6_capable ? "yes" : "no";
+  $("dhtGen").textContent = n.network_generation;
+  const addrList = (arr) => arr.length ? arr.map((a) => `<div title="${esc(a)}">${esc(a)}</div>`).join("") : "";
+  $("dhtReservations").innerHTML = addrList(n.relay_reservations);
+  $("dhtResvCount").textContent = n.relay_reservations.length;
+  $("dhtExternal").innerHTML = addrList(n.external_addrs);
+  $("dhtExtCount").textContent = n.external_addrs.length;
+  const c = n.counters;
+  const counters = [
+    ["DCUtR ✓", c.dcutr_successes], ["DCUtR ✗", c.dcutr_failures],
+    ["Reversal dials", c.reversal_dials], ["Reversal ✓", c.reversal_successes],
+    ...Object.entries(c.tier_connect_success || {}).map(([k, v]) => [k.replace(/_/g, " "), v]),
+  ];
+  $("dhtCounters").innerHTML = counters.map(([k, v]) =>
+    `<div class="counter"><div class="counter-k">${esc(k)}</div><div class="counter-v">${v}</div></div>`).join("");
+
+  if (activeView === "swarm") drawSwarm(n);
+}
+
+/// Radial swarm graph: self at center, connected peers on a ring, edges colored by path.
+function drawSwarm(n) {
+  const svg = $("swarmSvg");
+  const W = 800, H = 460, cx = W / 2, cy = H / 2;
+  const peers = n.peers;
+  const R = Math.min(cx, cy) - 70;
+  let out = "";
+  // edges first (under nodes)
+  peers.forEach((p, i) => {
+    const a = (i / Math.max(peers.length, 1)) * Math.PI * 2 - Math.PI / 2;
+    const x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+    const cls = p.path === "relay" ? "swarm-edge-relay" : "swarm-edge-direct";
+    out += `<line class="swarm-edge ${cls}" x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+  });
+  // peer nodes
+  peers.forEach((p, i) => {
+    const a = (i / Math.max(peers.length, 1)) * Math.PI * 2 - Math.PI / 2;
+    const x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+    const cls = p.path === "relay" ? "swarm-node-relay" : "swarm-node-direct";
+    const r = p.failure_streak > 0 ? 7 : 10;
+    out += `<circle class="swarm-node ${cls}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}"><title>${esc(p.peer_id)} (${p.path})</title></circle>`;
+    out += `<text class="swarm-label" x="${x.toFixed(1)}" y="${(y + 22).toFixed(1)}" text-anchor="middle">${esc(peerShort(p.peer_id).slice(0, 10))}</text>`;
+  });
+  // self
+  out += `<circle class="swarm-node swarm-node-self" cx="${cx}" cy="${cy}" r="14"><title>this node</title></circle>`;
+  out += `<text class="swarm-label" x="${cx}" y="${cy + 30}" text-anchor="middle">you</text>`;
+  svg.innerHTML = out;
+}
+
 // ── polling ──
 async function refresh() {
   try { state = await call("get_state"); render(); } catch (_) {}
@@ -535,11 +638,17 @@ async function refresh() {
 async function refreshEngines() {
   try { engines = await call("detect_engines_now"); renderModels(); } catch (_) {}
 }
+async function refreshStatus() {
+  // Only fetch when a network view is visible (peers/dht/swarm) — cheap otherwise.
+  if (!["peers", "dht", "swarm"].includes(activeView)) return;
+  try { snap = await call("status_snapshot"); renderNetworkViews(); } catch (_) { snap = null; renderNetworkViews(); }
+}
 
 // ── wiring ──
 $("provBtn").addEventListener("click", () => toggleRole("provider"));
 $("gwBtn").addEventListener("click", () => toggleRole("gateway"));
 $("chatStartGw").addEventListener("click", () => toggleRole("gateway"));
+$("peersStart").addEventListener("click", () => toggleRole("provider"));
 $("settingsBtn").addEventListener("click", openSettings);
 $("saveSettings").addEventListener("click", saveSettingsFn);
 $("refreshEngines").addEventListener("click", refreshEngines);
@@ -577,3 +686,4 @@ refresh();
 refreshEngines();
 setInterval(refresh, 2000);
 setInterval(refreshEngines, 10000);
+setInterval(refreshStatus, 2500);

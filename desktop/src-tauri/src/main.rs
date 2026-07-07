@@ -116,6 +116,29 @@ const LOG_CAP: usize = 500;
 /// Listen ports for the two roles (distinct identities + ports, like the live tests).
 const PROVIDER_PORT: u16 = 4111;
 const GATEWAY_PORT: u16 = 4112;
+/// Loopback ports for each role's `--status-bind` introspection endpoint (P0/P1).
+const PROVIDER_STATUS_PORT: u16 = 9464;
+const GATEWAY_STATUS_PORT: u16 = 9465;
+
+/// A per-launch random bearer token for the status endpoints, so another local user or
+/// process can't read this node's peer/DHT data. Derived once at process start from the
+/// pid + a monotonic-ish counter (Math.random-free; the runtime forbids system-time RNG
+/// helpers but std's `RandomState` gives us entropy for a hash seed).
+fn status_token() -> &'static str {
+    use std::sync::OnceLock;
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_usize(&TOKEN as *const _ as usize);
+        format!("{:016x}{:016x}", h.finish(), {
+            let mut h2 = std::collections::hash_map::RandomState::new().build_hasher();
+            h2.write_u64(h.finish());
+            h2.finish()
+        })
+    })
+}
 
 // ── Settings (persisted at ~/.openhydra/desktop.json) ──
 
@@ -338,6 +361,7 @@ fn spawn_role(
     role: &Arc<Mutex<Role>>,
     identity: &str,
     listen_port: u16,
+    status_port: u16,
     bootstraps: &[String],
     subcommand: &[String],
 ) -> Result<(), String> {
@@ -355,7 +379,10 @@ fn spawn_role(
         .arg("--listen")
         .arg(format!("/ip4/0.0.0.0/tcp/{listen_port}"))
         .arg("--listen")
-        .arg(format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1"));
+        .arg(format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1"))
+        // P1: read-only introspection endpoint the app polls, loopback + bearer token.
+        .arg("--status-bind")
+        .arg(format!("127.0.0.1:{status_port}"));
     for b in bootstraps {
         let b = b.trim();
         if !b.is_empty() {
@@ -365,6 +392,7 @@ fn spawn_role(
     cmd.args(subcommand)
         // info-level network events feed the relay/announce status lines.
         .env("RUST_LOG", "openhydra_network=info,info")
+        .env("OPENHYDRA_STATUS_TOKEN", status_token())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -435,7 +463,14 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if settings.engine_autostart {
         sub.push("--engine-autostart".into());
     }
-    spawn_role(&state.provider, "desktop-provider.key", PROVIDER_PORT, &settings.bootstraps, &sub)
+    spawn_role(
+        &state.provider,
+        "desktop-provider.key",
+        PROVIDER_PORT,
+        PROVIDER_STATUS_PORT,
+        &settings.bootstraps,
+        &sub,
+    )
 }
 
 #[tauri::command]
@@ -446,7 +481,14 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
         "--bind".into(),
         format!("127.0.0.1:{}", settings.gateway_port),
     ];
-    spawn_role(&state.gateway, "desktop-consumer.key", GATEWAY_PORT, &settings.bootstraps, &sub)
+    spawn_role(
+        &state.gateway,
+        "desktop-consumer.key",
+        GATEWAY_PORT,
+        GATEWAY_STATUS_PORT,
+        &settings.bootstraps,
+        &sub,
+    )
 }
 
 #[tauri::command]
@@ -464,6 +506,47 @@ struct EngineView {
     label: String,
     url: String,
     models: Vec<String>,
+}
+
+/// P1: fetch a role's `--status-bind` snapshot (bearer-gated loopback GET), returning the
+/// raw JSON the agent serves. Provider-first (it carries peers + transfer counters), then
+/// the gateway. Returns `null` if neither role is running / reachable — the UI treats that
+/// as "start a role to see the network views".
+#[tauri::command]
+async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<serde_json::Value>, ()> {
+    let prov = state.provider.lock().map(|r| r.status.running).unwrap_or(false);
+    let gw = state.gateway.lock().map(|r| r.status.running).unwrap_or(false);
+    let port = if prov {
+        Some(PROVIDER_STATUS_PORT)
+    } else if gw {
+        Some(GATEWAY_STATUS_PORT)
+    } else {
+        None
+    };
+    let Some(port) = port else { return Ok(None) };
+    Ok(tauri::async_runtime::spawn_blocking(move || fetch_status(port, "/status"))
+        .await
+        .ok()
+        .flatten())
+}
+
+/// Blocking loopback GET of the status endpoint. Zero-dep: the agent serves tiny
+/// `Connection: close` JSON, so a `std::net::TcpStream` request/read is enough (no reqwest
+/// needed for a same-host call, and it avoids CORS in the webview entirely).
+fn fetch_status(port: u16, path: &str) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        status_token(),
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let body = raw.split("\r\n\r\n").nth(1)?;
+    serde_json::from_str(body).ok()
 }
 
 /// Probe the local engines right now (the agent crate's own concurrent detection).
@@ -625,6 +708,7 @@ fn main() {
             gateway_health,
             chat_completion,
             web_search,
+            status_snapshot,
             save_settings,
         ])
         .setup(|app| {
