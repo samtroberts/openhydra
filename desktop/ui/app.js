@@ -2,6 +2,15 @@
 // memory, attachments, web-augmented chat, blind council). Talks to the Rust backend via
 // Tauri IPC; in a plain browser (layout preview) it renders demo state instead.
 
+// App-like polish: tag macOS (traffic-light inset) and suppress the browser right-click
+// context menu everywhere except real text fields (where paste/copy is expected).
+if (/Mac/.test(navigator.platform)) document.documentElement.classList.add("is-mac");
+document.addEventListener("contextmenu", (e) => {
+  const t = e.target;
+  const editable = t.matches?.("input, textarea") || t.isContentEditable;
+  if (!editable) e.preventDefault();
+});
+
 const tauri = window.__TAURI__?.core;
 async function call(cmd, args) {
   if (tauri) return tauri.invoke(cmd, args);
