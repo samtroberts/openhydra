@@ -225,29 +225,40 @@ sharded clusters):
 - Poll candidates beyond the curated seed: free-text suggestion box, admin-approved
   into the ballot (prevents ballot spam/squatting).
 
-### 3.5 Abliterated models — honest answer
+### 3.5 Abliterated models — DECIDED (owner, 2026-07-03): include as a differentiator,
+### with guardrails
+
 Context: "abliterated" = refusal behavior surgically removed from open-weight models;
-popular in the local-AI scene, and they *would* poll well.
+popular in the local-AI scene, and they *would* poll well. **Owner decision:** they are
+part of OpenHydra's USP — no network/app markets uncensored-model hosting, and "we
+don't gatekeep" is coherent with the project's decentralized/counterculture
+positioning. **Payments are off the roadmap for the foreseeable future** (revisit only
+at substantial network scale, >v4), which removes the processor-compliance blocker
+that argued for exclusion. Legal/compliance/monetary machinery in general is >v4.
 
-Recommendation: **protocol-neutral, catalog-curated — don't feature them in the
-official board/poll; don't pretend the protocol can ban them.**
+Guardrails that ship WITH the feature (not >v4 — same release as the first abliterated
+model on any official surface):
 
-- *Protocol level:* OpenHydra routes by model id; operators choose what their engines
-  serve. A protocol-level ban is neither enforceable nor philosophically consistent
-  with BYO-engine. Providers already have the per-operator AUP floor (#40) as their
-  own control, plus the ability to simply not host a model.
-- *Catalog/poll level (the part we curate):* featuring abliterated models on the
-  official startup surface makes every volunteer provider — who may not understand
-  what they're pulling — the serving endpoint for uncensored output to strangers,
-  routed through infrastructure with your name on it. That's provider legal exposure
-  (jurisdiction-dependent), a reputational tail-risk while the network is young, a
-  direct conflict with the planned payments layer (processors are unforgiving about
-  exactly this), and a likely app-store/distribution problem for the desktop app.
-- *Practical line:* the board lists mainstream open models; the poll ballot is
-  curated; nothing stops an operator hosting whatever their local law allows, and
-  discovery still works for any model id — it just isn't *promoted* by the network's
-  official surfaces. Revisit when there's a moderation/verification story (and a
-  legal entity) that can carry it.
+1. **Informed opt-in for providers, never ambient.** An "Uncensored" *tagged section*
+   of the board/catalog, collapsed by default, behind a one-time acknowledgment
+   (what these models are; that the provider is the serving endpoint for strangers;
+   18+). Poll pledges for tagged models never auto-pull without that gate. A general
+   disclaimer alone protects the project surface, not the volunteer — the gate is
+   what makes hosting *informed*.
+2. **Pair with the AUP floor (#40):** a provider can host an uncensored model AND set
+   their own refusal boundaries — "uncensored model, operator-set limits" is itself a
+   second differentiator.
+3. **Marketing intensity — signal over headline (recommended):** the headline USP
+   stays "decentralized, free, reciprocal, any open model — we don't gatekeep"; the
+   uncensored tag is visible in the catalog for those who look. The target community
+   reads between lines; this captures most of the USP without becoming "The
+   Uncensored Network" in a regulator's or journalist's framing. (Owner may choose
+   louder framing; this is the risk-adjusted default.)
+4. **Honest enforcement posture if regulation arrives:** the real levers are official
+   surfaces only — delist from catalog/board/polls, filter app defaults, refuse
+   records at project-operated bootstraps (partial). A self-bootstrapped swarm cannot
+   be stopped; public commitments must therefore say "enforced on every surface we
+   operate," never "removed from the network."
 
 ### 3.6 Effort
 Control-plane API ~1 session (Worker + KV is small); board view + startup card ~1
