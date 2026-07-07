@@ -1,0 +1,113 @@
+# R3 packaging: on a version tag, build the CLI agent + the Tauri desktop app for every
+# platform and attach the artifacts to a draft GitHub Release.
+#
+# Artifacts per platform:
+#   macOS (arm64 + x86_64): openhydra-agent binary, OpenHydra.app in a .dmg
+#   Linux x86_64:           openhydra-agent binary, .deb + .AppImage
+#   Windows x86_64:         openhydra-agent.exe, .msi + NSIS setup .exe
+#
+# Signing/notarization is intentionally NOT wired yet (needs the Apple Developer ID /
+# Windows cert secrets); bundles are unsigned, the release is created as a DRAFT for
+# manual review before publishing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14 # Apple Silicon
+            triple: aarch64-apple-darwin
+          - platform: macos-13 # Intel
+            triple: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Linux webkit deps
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libssl-dev protobuf-compiler
+
+      - name: Protoc (mac)
+        if: startsWith(matrix.platform, 'macos')
+        run: brew install protobuf
+
+      - name: Protoc (windows)
+        if: startsWith(matrix.platform, 'windows')
+        run: choco install -y protoc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+
+      # 1) The CLI agent — release binary, also embedded in the app as its sidecar.
+      - name: Build openhydra-agent
+        run: cargo build --release -p openhydra-agent
+
+      - name: Stage sidecar
+        shell: bash
+        run: |
+          mkdir -p desktop/src-tauri/binaries
+          EXT=""
+          if [[ "${{ matrix.triple }}" == *windows* ]]; then EXT=".exe"; fi
+          cp "target/release/openhydra-agent$EXT" \
+             "desktop/src-tauri/binaries/openhydra-agent-${{ matrix.triple }}$EXT"
+
+      # 2) The desktop app + installers.
+      - name: Build desktop app
+        working-directory: desktop
+        run: |
+          npm ci || npm install
+          npm exec tauri build
+        shell: bash
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          EXT=""
+          if [[ "${{ matrix.triple }}" == *windows* ]]; then EXT=".exe"; fi
+          cp "target/release/openhydra-agent$EXT" "dist/openhydra-agent-${{ matrix.triple }}$EXT"
+          B=desktop/src-tauri/target/release/bundle
+          find "$B" -name "*.dmg" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.deb" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.AppImage" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.msi" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*setup*.exe" -exec cp {} dist/ \; 2>/dev/null || true
+          ls -la dist/
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          draft: true
+          files: dist/*
+
+      - name: Upload workflow artifacts (non-tag runs)
+        uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: openhydra-${{ matrix.triple }}
+          path: dist/*

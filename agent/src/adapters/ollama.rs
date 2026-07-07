@@ -225,7 +225,6 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError> {
         let body = build_chat_body(request);
-        let start = std::time::Instant::now();
         let lines = self
             .http
             .post_stream(&format!("{}/api/chat", self.base_url), &body)?;

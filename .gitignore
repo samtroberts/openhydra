@@ -66,8 +66,6 @@ package-lock.json
 yarn.lock
 
 # ── Tauri / Rust ──────────────────────────────────────────────────────────────
-desktop/src-tauri/target/
-desktop/src-tauri/WixTools/
 # Cargo workspace (M2.3 split) shares one build dir at the repo root.
 /target/
 network/target/
@@ -116,15 +114,11 @@ codex_prompt*.md
 peers*.json
 OpenHydra_Project_Analysis.docx
 
-# ── Desktop app (source kept locally, not on GitHub) ─────────────────────────
-desktop/
-
 # ── Landing page (moved to samtroberts/openhydra-landing) ────────────────────
 landing/
 
 # ── Internal / non-public files ───────────────────────────────────────────────
 landing/
-desktop/
 sdk/
 web/
 torrent/
@@ -146,3 +140,12 @@ scripts/ab_pipeline_depth.sh
 *.orig
 *.bak
 .hypothesis/
+
+# desktop app (Tauri): source IS tracked; build outputs are not
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
+desktop/src-tauri/gen/
+desktop/src-tauri/WixTools/
+!desktop/package-lock.json
+!desktop/src-tauri/Cargo.lock

@@ -1,0 +1,36 @@
+# OpenHydra Desktop — Tauri v2 shell around the openhydra-agent.
+#
+# Standalone workspace (NOT a member of the repo root workspace): Tauri's dependency
+# tree is huge and GUI-only, so keeping it out of the root lockfile keeps the core
+# protocol crates' builds/CI lean. It path-depends on `openhydra-agent` as a library
+# for engine detection; the provider/gateway roles run as supervised child processes
+# of the CLI binary (bundled as a sidecar), which stays the single source of truth.
+[package]
+name = "openhydra-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "OpenHydra desktop app — share your machine's inference engines and use the network"
+license = "Apache-2.0"
+
+[workspace]
+
+# Standalone workspace ⇒ the repo root's [patch] section does NOT apply here; re-declare
+# the patched libp2p-quic (initial_mtu) that openhydra-network requires.
+[patch.crates-io]
+libp2p-quic = { path = "../../network/patched-deps/libp2p-quic" }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Engine detection (detect_engines / MultiAdapter's probe) + the blocking HTTP client
+# used for the gateway health check. The GUI never runs the swarm in-process.
+openhydra-agent = { path = "../../agent" }
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true

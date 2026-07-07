@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenHydra</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">OpenHydra</span>
+      <span class="brand-sub">decentralized inference</span>
+    </div>
+    <div class="topbar-right">
+      <span id="netChip" class="chip chip-idle">idle</span>
+      <button id="settingsBtn" class="btn btn-ghost" title="Settings">⚙︎ Settings</button>
+    </div>
+  </header>
+
+  <div id="bootstrapBanner" class="banner hidden">
+    No bootstrap peers configured — the node can only see your LAN (mDNS).
+    <button class="btn btn-link" onclick="openSettings()">Add bootstraps in Settings →</button>
+  </div>
+  <div id="agentBanner" class="banner banner-err hidden">
+    openhydra-agent binary not found — the app bundle is missing its sidecar.
+  </div>
+
+  <main class="grid">
+    <!-- Provider -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Share this machine</h2>
+          <p class="muted">Advertise your local engines' models to the network and serve inference.</p>
+        </div>
+        <button id="provBtn" class="btn btn-primary">Start sharing</button>
+      </div>
+      <div class="rows">
+        <div class="row"><span>Status</span><span id="provStatus" class="chip chip-idle">stopped</span></div>
+        <div class="row"><span>Peer id</span><code id="provPeer" class="mono">—</code></div>
+        <div class="row"><span>Detected</span><span id="provEngines" class="val">—</span></div>
+        <div class="row"><span>Models announced</span><span id="provAnnounced" class="val">—</span></div>
+        <div class="row"><span>Relay reservations</span><span id="provRelays" class="val">—</span></div>
+      </div>
+      <div class="subhead">
+        <h3>Local engines</h3>
+        <button id="refreshEngines" class="btn btn-ghost btn-sm">↻ Refresh</button>
+      </div>
+      <div id="engineList" class="engines"><div class="muted pad">probing…</div></div>
+    </section>
+
+    <!-- Gateway -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Use the network</h2>
+          <p class="muted">A local OpenAI-compatible endpoint backed by providers on the swarm.</p>
+        </div>
+        <button id="gwBtn" class="btn btn-primary">Start gateway</button>
+      </div>
+      <div class="rows">
+        <div class="row"><span>Status</span><span id="gwStatus" class="chip chip-idle">stopped</span></div>
+        <div class="row"><span>Peer id</span><code id="gwPeer" class="mono">—</code></div>
+        <div class="row">
+          <span>Endpoint</span>
+          <span class="endpoint"><code id="gwUrl" class="mono">—</code>
+          <button id="copyUrl" class="btn btn-ghost btn-sm" title="Copy">⧉</button></span>
+        </div>
+      </div>
+      <div class="hint">
+        <div class="hint-title">Point any OpenAI client at it:</div>
+        <pre id="gwSnippet" class="mono snippet">—</pre>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section class="card card-wide">
+      <div class="card-head">
+        <h2>Logs</h2>
+        <div class="tabs">
+          <button id="tabProv" class="tab tab-active">Provider</button>
+          <button id="tabGw" class="tab">Gateway</button>
+        </div>
+      </div>
+      <pre id="logBox" class="logbox mono">—</pre>
+    </section>
+  </main>
+
+  <!-- Settings modal -->
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-card">
+      <h2>Settings</h2>
+      <label class="field">
+        <span>Bootstrap peers <span class="muted">(one multiaddr per line, <code>/ip4/…/tcp/4001/p2p/…</code>)</span></span>
+        <textarea id="setBootstraps" rows="4" class="mono" spellcheck="false"></textarea>
+      </label>
+      <label class="field">
+        <span>Gateway port</span>
+        <input id="setPort" type="number" min="1024" max="65535" />
+      </label>
+      <label class="field field-check">
+        <input id="setAutostart" type="checkbox" />
+        <span>Start my engine automatically if it's down (Ollama / LM Studio)</span>
+      </label>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
+        <button id="saveSettings" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
