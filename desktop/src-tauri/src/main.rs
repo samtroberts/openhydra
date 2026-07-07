@@ -474,6 +474,46 @@ async fn detect_engines_now() -> Vec<EngineView> {
     .unwrap_or_default()
 }
 
+/// One chat message from the UI (Chat/Code views).
+#[derive(Deserialize, Clone)]
+struct ChatMsgIn {
+    role: String,
+    content: String,
+}
+
+/// Run a (non-streaming) chat completion through the LOCAL gateway — so the Chat/Code
+/// views exercise the same network path as any OpenAI client pointed at this node:
+/// gateway → discover → provider → engine. Returns the gateway's full JSON (including
+/// the `openhydra` metrics block the UI shows under each reply). Rust-side HTTP so the
+/// webview needs no CORS story.
+#[tauri::command]
+async fn chat_completion(
+    state: tauri::State<'_, AppState>,
+    model: String,
+    messages: Vec<ChatMsgIn>,
+    max_tokens: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
+    let body = serde_json::json!({
+        "model": model,
+        "messages": messages
+            .iter()
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .collect::<Vec<_>>(),
+        "max_tokens": max_tokens,
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        use openhydra_agent::adapter::HttpClient;
+        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let resp = client
+            .post_json(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
+            .map_err(|e| format!("gateway: {e}"))?;
+        serde_json::from_str::<serde_json::Value>(&resp).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Is the local gateway answering? (backend-side to avoid webview CORS)
 #[tauri::command]
 async fn gateway_health(state: tauri::State<'_, AppState>) -> Result<bool, ()> {
@@ -521,6 +561,7 @@ fn main() {
             stop_gateway,
             detect_engines_now,
             gateway_health,
+            chat_completion,
             save_settings,
         ])
         .setup(|app| {

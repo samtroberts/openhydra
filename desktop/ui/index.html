@@ -7,110 +7,149 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-dot"></span>
-      <span class="brand-name">OpenHydra</span>
-      <span class="brand-sub">decentralized inference</span>
-    </div>
-    <div class="topbar-right">
-      <span id="netChip" class="chip chip-idle">idle</span>
-      <button id="settingsBtn" class="btn btn-ghost" title="Settings">⚙︎ Settings</button>
-    </div>
+<div class="app">
+
+  <!-- toolbar -->
+  <header class="toolbar">
+    <div class="brand"><img src="logo.png" alt="" class="brand-logo" /><span class="brand-name">OpenHydra</span></div>
+    <div class="tool-sep"></div>
+    <button id="provBtn" class="tbtn tbtn-start" title="Share this machine's engines">▶ Share</button>
+    <button id="gwBtn" class="tbtn tbtn-start" title="Local OpenAI endpoint over the network">▶ Gateway</button>
+    <div class="tool-spacer"></div>
+    <span id="netChip" class="chip chip-idle">idle</span>
+    <button id="settingsBtn" class="tbtn" title="Settings">⚙</button>
   </header>
 
-  <div id="bootstrapBanner" class="banner hidden">
-    No bootstrap peers configured — the node can only see your LAN (mDNS).
-    <button class="btn btn-link" onclick="openSettings()">Add bootstraps in Settings →</button>
+  <div class="body">
+    <!-- sidebar -->
+    <nav class="sidebar">
+      <div class="nav-section">Node</div>
+      <button class="nav-item nav-active" data-view="dashboard">▦ Dashboard <span id="navModels" class="badge">0</span></button>
+      <button class="nav-item" data-view="logs">≣ Logs</button>
+      <div class="nav-section">Tools</div>
+      <button class="nav-item" data-view="chat">◧ Chat</button>
+      <button class="nav-item" data-view="code">⌥ Code</button>
+      <div class="side-foot">
+        <div class="side-foot-row">peer <code id="sidePeer" class="mono">—</code></div>
+      </div>
+    </nav>
+
+    <!-- content -->
+    <main class="content">
+
+      <!-- Dashboard -->
+      <section id="view-dashboard" class="view">
+        <div id="bootstrapBanner" class="banner hidden">
+          No bootstrap peers configured — LAN (mDNS) only.
+          <button class="btn-link" onclick="openSettings()">Add bootstraps →</button>
+        </div>
+        <div id="agentBanner" class="banner banner-err hidden">openhydra-agent sidecar missing from the bundle.</div>
+
+        <div class="strip">
+          <div class="stat"><div class="stat-k">Provider</div><div id="dashProv" class="stat-v">stopped</div></div>
+          <div class="stat"><div class="stat-k">Gateway</div><div id="dashGw" class="stat-v">stopped</div></div>
+          <div class="stat"><div class="stat-k">Announced</div><div id="dashAnnounced" class="stat-v">—</div></div>
+          <div class="stat"><div class="stat-k">Relays</div><div id="dashRelays" class="stat-v">—</div></div>
+          <div class="stat stat-wide"><div class="stat-k">Endpoint</div>
+            <div class="stat-v mono" id="dashUrl">—</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span>Models</span>
+            <button id="refreshEngines" class="tbtn tbtn-sm">↻ Rescan engines</button>
+          </div>
+          <table class="tbl">
+            <thead><tr><th>Model</th><th>Engine</th><th>Endpoint</th><th>Status</th></tr></thead>
+            <tbody id="modelRows"><tr><td colspan="4" class="dim">probing…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Logs -->
+      <section id="view-logs" class="view hidden">
+        <div class="panel panel-fill">
+          <div class="panel-head">
+            <span>Logs</span>
+            <div class="tabs">
+              <button id="tabProv" class="tab tab-active">Provider</button>
+              <button id="tabGw" class="tab">Gateway</button>
+            </div>
+          </div>
+          <pre id="logBox" class="logbox mono">—</pre>
+        </div>
+      </section>
+
+      <!-- Chat -->
+      <section id="view-chat" class="view hidden">
+        <div class="workbar">
+          <input id="chatModel" class="model-input mono" list="modelOptions" placeholder="model (e.g. llama3.2:1b)" spellcheck="false" />
+          <span class="dim" id="chatVia">via local gateway</span>
+          <button id="chatClear" class="tbtn tbtn-sm">Clear</button>
+        </div>
+        <div id="chatGateHint" class="banner hidden">Gateway is stopped — chat runs over the network through it.
+          <button class="btn-link" id="chatStartGw">Start gateway →</button></div>
+        <div id="chatScroll" class="chat-scroll">
+          <div class="dim center" id="chatEmpty">Ask anything — requests route through the swarm to whichever provider serves the model.</div>
+        </div>
+        <div class="composer">
+          <textarea id="chatInput" rows="2" placeholder="Message…  (Enter to send, Shift+Enter for newline)" spellcheck="false"></textarea>
+          <button id="chatSend" class="tbtn tbtn-start">Send</button>
+        </div>
+      </section>
+
+      <!-- Code -->
+      <section id="view-code" class="view hidden">
+        <div class="workbar">
+          <input id="codeModel" class="model-input mono" list="modelOptions" placeholder="model" spellcheck="false" />
+          <span class="dim">code mode · concise, fenced output</span>
+          <button id="codeClear" class="tbtn tbtn-sm">Clear</button>
+        </div>
+        <div id="codeScroll" class="code-scroll">
+          <div class="dim center" id="codeEmpty">Describe the code you want. Replies render as annotated, copyable code cards.</div>
+        </div>
+        <div class="composer">
+          <textarea id="codeInput" rows="2" placeholder="e.g. a Rust function that parses a multiaddr…" spellcheck="false"></textarea>
+          <button id="codeSend" class="tbtn tbtn-start">Generate</button>
+        </div>
+      </section>
+
+    </main>
   </div>
-  <div id="agentBanner" class="banner banner-err hidden">
-    openhydra-agent binary not found — the app bundle is missing its sidecar.
-  </div>
 
-  <main class="grid">
-    <!-- Provider -->
-    <section class="card">
-      <div class="card-head">
-        <div>
-          <h2>Share this machine</h2>
-          <p class="muted">Advertise your local engines' models to the network and serve inference.</p>
-        </div>
-        <button id="provBtn" class="btn btn-primary">Start sharing</button>
-      </div>
-      <div class="rows">
-        <div class="row"><span>Status</span><span id="provStatus" class="chip chip-idle">stopped</span></div>
-        <div class="row"><span>Peer id</span><code id="provPeer" class="mono">—</code></div>
-        <div class="row"><span>Detected</span><span id="provEngines" class="val">—</span></div>
-        <div class="row"><span>Models announced</span><span id="provAnnounced" class="val">—</span></div>
-        <div class="row"><span>Relay reservations</span><span id="provRelays" class="val">—</span></div>
-      </div>
-      <div class="subhead">
-        <h3>Local engines</h3>
-        <button id="refreshEngines" class="btn btn-ghost btn-sm">↻ Refresh</button>
-      </div>
-      <div id="engineList" class="engines"><div class="muted pad">probing…</div></div>
-    </section>
+  <!-- status bar -->
+  <footer class="statusbar">
+    <span class="seg"><i id="stProvDot" class="dot"></i> provider</span>
+    <span class="seg"><i id="stGwDot" class="dot"></i> gateway</span>
+    <span class="seg">models <b id="stModels">0</b></span>
+    <span class="seg">relays <b id="stRelays">0</b></span>
+    <span class="seg">▼ <b id="stTokens">0</b> tok</span>
+    <span class="seg">engine <b id="stTps">—</b> tok/s</span>
+    <span class="seg seg-end mono" id="stPeer">—</span>
+  </footer>
 
-    <!-- Gateway -->
-    <section class="card">
-      <div class="card-head">
-        <div>
-          <h2>Use the network</h2>
-          <p class="muted">A local OpenAI-compatible endpoint backed by providers on the swarm.</p>
-        </div>
-        <button id="gwBtn" class="btn btn-primary">Start gateway</button>
-      </div>
-      <div class="rows">
-        <div class="row"><span>Status</span><span id="gwStatus" class="chip chip-idle">stopped</span></div>
-        <div class="row"><span>Peer id</span><code id="gwPeer" class="mono">—</code></div>
-        <div class="row">
-          <span>Endpoint</span>
-          <span class="endpoint"><code id="gwUrl" class="mono">—</code>
-          <button id="copyUrl" class="btn btn-ghost btn-sm" title="Copy">⧉</button></span>
-        </div>
-      </div>
-      <div class="hint">
-        <div class="hint-title">Point any OpenAI client at it:</div>
-        <pre id="gwSnippet" class="mono snippet">—</pre>
-      </div>
-    </section>
-
-    <!-- Logs -->
-    <section class="card card-wide">
-      <div class="card-head">
-        <h2>Logs</h2>
-        <div class="tabs">
-          <button id="tabProv" class="tab tab-active">Provider</button>
-          <button id="tabGw" class="tab">Gateway</button>
-        </div>
-      </div>
-      <pre id="logBox" class="logbox mono">—</pre>
-    </section>
-  </main>
+  <datalist id="modelOptions"></datalist>
 
   <!-- Settings modal -->
   <div id="settingsModal" class="modal hidden">
     <div class="modal-card">
       <h2>Settings</h2>
       <label class="field">
-        <span>Bootstrap peers <span class="muted">(one multiaddr per line, <code>/ip4/…/tcp/4001/p2p/…</code>)</span></span>
+        <span>Bootstrap peers <span class="dim">(one multiaddr per line)</span></span>
         <textarea id="setBootstraps" rows="4" class="mono" spellcheck="false"></textarea>
       </label>
-      <label class="field">
-        <span>Gateway port</span>
-        <input id="setPort" type="number" min="1024" max="65535" />
-      </label>
-      <label class="field field-check">
-        <input id="setAutostart" type="checkbox" />
-        <span>Start my engine automatically if it's down (Ollama / LM Studio)</span>
-      </label>
+      <label class="field"><span>Gateway port</span><input id="setPort" type="number" min="1024" max="65535" /></label>
+      <label class="field field-check"><input id="setAutostart" type="checkbox" />
+        <span>Start my engine automatically if it's down (Ollama / LM Studio)</span></label>
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
-        <button id="saveSettings" class="btn btn-primary">Save</button>
+        <button class="tbtn" onclick="closeSettings()">Cancel</button>
+        <button id="saveSettings" class="tbtn tbtn-start">Save</button>
       </div>
     </div>
   </div>
 
-  <script src="app.js"></script>
+</div>
+<script src="app.js"></script>
 </body>
 </html>
