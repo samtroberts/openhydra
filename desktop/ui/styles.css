@@ -28,8 +28,10 @@ body {
   font: 13px/1.5 var(--sans);
   -webkit-font-smoothing: antialiased;
   /* App-like, not web-like: no text selection or I-beam cursor by default, no
-     rubber-band overscroll. Selection + I-beam are re-enabled per element below. */
-  user-select: none; cursor: default; overflow: hidden; overscroll-behavior: none;
+     rubber-band overscroll. WKWebView needs the -webkit- prefix or it still
+     word-selects on double-click. Selection + I-beam are re-enabled per element below. */
+  user-select: none; -webkit-user-select: none; cursor: default;
+  overflow: hidden; overscroll-behavior: none;
 }
 .mono { font-family: var(--mono); font-size: 11.5px; }
 
@@ -37,7 +39,7 @@ body {
 .mono, .logbox, .msg, .seat-body, .code-prose, .code-card pre, .snippet,
 .stat-v.mono, .addr-list > div, input, textarea, .field, .rows code,
 .side-foot-row code, .seg-end, .msg-meta {
-  user-select: text;
+  user-select: text; -webkit-user-select: text;
 }
 input, textarea, .logbox, .msg, .seat-body, .code-card pre { cursor: auto; }
 
@@ -57,13 +59,14 @@ input, textarea, .logbox, .msg, .seat-body, .code-card pre { cursor: auto; }
 .toolbar {
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
   background: var(--surface); border-bottom: 1px solid var(--border);
-  /* Overlay title bar: the toolbar IS the draggable window title area (no separate
-     OS title strip). Interactive children opt back out with `no-drag` below. */
-  -webkit-app-region: drag;
 }
+/* Overlay title bar: the toolbar is the draggable window title area (no separate OS
+   title strip). Dragging uses Tauri's `data-tauri-drag-region` attribute (in the HTML),
+   not the Electron `-webkit-app-region` CSS — WKWebView ignores the latter. Interactive
+   controls simply don't carry the attribute, so clicks on them aren't swallowed. */
+[data-tauri-drag-region] { cursor: default; }
 /* macOS overlay traffic lights sit top-left; inset the toolbar so the brand clears them. */
 .is-mac .toolbar { padding-left: 78px; }
-.toolbar button, .toolbar .chip, .toolbar input, .toolbar select { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 8px; margin-right: 4px; }
 .brand-logo { width: 26px; height: 26px; object-fit: contain; }
 .brand-name { font-family: var(--serif); font-weight: 600; font-size: 15px; letter-spacing: -.01em; }

@@ -3,5 +3,9 @@
   "identifier": "default",
   "description": "Main window: core IPC to the app's own commands.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize"
+  ]
 }

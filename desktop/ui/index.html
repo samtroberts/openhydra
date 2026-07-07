@@ -9,13 +9,14 @@
 <body>
 <div class="app">
 
-  <!-- toolbar -->
-  <header class="toolbar">
-    <div class="brand"><img src="logo.png" alt="" class="brand-logo" /><span class="brand-name">OpenHydra</span></div>
-    <div class="tool-sep"></div>
+  <!-- toolbar (data-tauri-drag-region = window drag handle + double-click zoom;
+       interactive buttons/chip omit it so their clicks aren't swallowed) -->
+  <header class="toolbar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region><img src="logo.png" alt="" class="brand-logo" data-tauri-drag-region /><span class="brand-name" data-tauri-drag-region>OpenHydra</span></div>
+    <div class="tool-sep" data-tauri-drag-region></div>
     <button id="provBtn" class="tbtn tbtn-start" title="Share this machine's engines">▶ Share</button>
     <button id="gwBtn" class="tbtn tbtn-start" title="Local OpenAI endpoint over the network">▶ Gateway</button>
-    <div class="tool-spacer"></div>
+    <div class="tool-spacer" data-tauri-drag-region></div>
     <span id="netChip" class="chip chip-idle">idle</span>
     <button id="themeBtn" class="tbtn" title="Toggle theme">◐</button>
     <button id="settingsBtn" class="tbtn" title="Settings">⚙</button>
