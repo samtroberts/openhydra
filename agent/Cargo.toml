@@ -55,6 +55,10 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Isolated identity dirs for the status-endpoint tests (mirrors network's dev-deps).
+tempfile = "3"
+
 [features]
 default = ["engine-autostart"]
 # Opt-in engine autostart (`--engine-autostart`): the only code that spawns a child

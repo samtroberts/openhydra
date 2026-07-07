@@ -34,6 +34,7 @@ use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::aup::{AupDecision, AupPolicy};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{frame_response, handle_serve_request, ServeChunk, ServeRequest};
+use crate::status::TransferStats;
 use crate::workpool::WorkerPool;
 
 /// Base serve delay scaled by [`throttle_multiplier`] for a throttled (leecher) consumer
@@ -138,6 +139,9 @@ pub struct Provider<A: EngineAdapter> {
     /// answered with an `Error` frame instead of being run through the engine. Default
     /// permissive (allow everything) until limits are configured.
     aup: AupPolicy,
+    /// P0 introspection: shared transfer counters read by the `--status-bind` server.
+    /// `None` → no counting (status endpoint not enabled).
+    stats: Option<Arc<TransferStats>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -151,7 +155,15 @@ impl<A: EngineAdapter> Provider<A> {
             credit: Mutex::new(HashMap::new()),
             throttling: AtomicUsize::new(0),
             aup: AupPolicy::permissive(),
+            stats: None,
         }
+    }
+
+    /// Attach shared transfer counters (P0 introspection — the `--status-bind` server
+    /// reads them; the serve path updates them once per request).
+    pub fn with_stats(mut self, stats: Arc<TransferStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// Set the advisory host/port advertised in records (routing is via libp2p regardless).
@@ -331,7 +343,12 @@ impl<A: EngineAdapter> Provider<A> {
                     provider.maybe_throttle(&data, max_concurrency);
                     // AUP floor: refuse a policy-violating serve request without running it.
                     let response = match provider.aup_refusal(&data) {
-                        Some(refusal) => refusal,
+                        Some(refusal) => {
+                            if let Some(stats) = &provider.stats {
+                                stats.aup_refusals.fetch_add(1, Ordering::Relaxed);
+                            }
+                            refusal
+                        }
                         None => provider.dispatch(&data),
                     };
                     // Best-effort reply; if the swarm is gone the next poll will error too.
@@ -369,10 +386,31 @@ impl<A: EngineAdapter> Provider<A> {
                 // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
                 if let Some(receipt) = &accepted {
                     self.record_consumption(receipt);
+                    if let Some(stats) = &self.stats {
+                        stats.receipts_ledgered.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 response
             }
-            // SERVE_REQUEST (and any unknown byte → a framed Error from the serve handler).
+            // A serve request: run it, and — when the status endpoint is on — fold the
+            // outcome into the shared transfer counters (per-model tokens + native TPS).
+            Some(&SERVE_REQUEST) => {
+                let model_ref = ServeRequest::decode(&data[1..]).ok().map(|r| r.model_ref);
+                let mut chunks: Vec<Vec<u8>> = Vec::new();
+                let summary =
+                    handle_serve_request(&data[1..], &self.adapter, &mut |c| chunks.push(c.to_vec()));
+                if let (Some(stats), Some(model)) = (&self.stats, model_ref) {
+                    let e = &summary.metrics.engine;
+                    let native_tps = if e.eval_duration_ns > 0 {
+                        e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
+                    } else {
+                        0.0
+                    };
+                    stats.record_serve(&model, summary.tokens, native_tps, summary.ok);
+                }
+                frame_response(&chunks)
+            }
+            // Unknown method byte → a framed Error from the serve handler.
             _ => handle_serve_inbound(data, &self.adapter),
         }
     }

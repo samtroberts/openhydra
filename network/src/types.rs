@@ -139,7 +139,7 @@ fn default_nat_type() -> String {
 }
 
 /// NAT detection result — returned by `P2PNode.nat_status()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatInfo {
     pub nat_type: String,
     /// First confirmed external address (backward compat).
@@ -355,4 +355,68 @@ impl Default for PeerRecord {
             updated_unix_ms: 0,
         }
     }
+}
+
+// ── P0 introspection: the status snapshot (desktop app / status endpoint) ──
+
+/// One connected peer's live connection profile — from the event loop's
+/// transport-aware `peer_connections` tracking plus the zombie-gating failure streak.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub peer_id: String,
+    pub quic_direct_v4: u32,
+    pub quic_direct_v6: u32,
+    pub tcp_direct: u32,
+    pub tcp_relay: u32,
+    /// Consecutive proxy path-failures (#43 zombie gating); 0 = healthy.
+    pub failure_streak: u32,
+    /// Derived label: `direct` / `relay` / `mixed` (both kinds live).
+    pub path: String,
+}
+
+/// One provider record this node knows (PEX-learned / discovered) — the `/status/swarm`
+/// row: which peer claims to serve which model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownProvider {
+    pub model_id: String,
+    pub openhydra_peer_id: String,
+    pub libp2p_peer_id: String,
+}
+
+/// Cumulative connectivity counters (NAT-traversal outcomes since start).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetCounters {
+    pub dcutr_successes: u64,
+    pub dcutr_failures: u64,
+    pub reversal_dials: u64,
+    pub reversal_successes: u64,
+    /// Per-ladder-rung connection successes (F-3), keyed by rung name.
+    pub tier_connect_success: std::collections::HashMap<String, u64>,
+}
+
+/// Read-only introspection snapshot of the running node — the network half of the
+/// agent's `--status-bind` endpoint (P0 of the network-suite plan). Everything here
+/// already existed in the event loop's state; this only exposes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    pub nat: NatInfo,
+    /// AutoNAT currently holds a confidence-latched Private verdict.
+    pub autonat_private: bool,
+    /// Outbound IPv6 confirmed working at startup (F-9).
+    pub ipv6_capable: bool,
+    /// Kademlia mode: true = server (reachable, in others' routing tables).
+    pub kad_server_mode: bool,
+    /// Total entries across our Kademlia k-buckets.
+    pub kad_routing_peers: usize,
+    /// #42 network generation (bumped on each connectivity rebuild).
+    pub network_generation: u64,
+    pub listen_addrs: Vec<String>,
+    pub external_addrs: Vec<String>,
+    /// Active relay-circuit listen addrs (our reservations).
+    pub relay_reservations: Vec<String>,
+    pub peers: Vec<PeerStatus>,
+    /// Distinct model ids seen on the network (PEX/discovery cache).
+    pub known_models: Vec<String>,
+    pub known_providers: Vec<KnownProvider>,
+    pub counters: NetCounters,
 }

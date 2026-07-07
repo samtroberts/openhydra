@@ -21,7 +21,22 @@ use tokio::sync::mpsc;
 use crate::event_loop::{SharedProxyQueue, SwarmCommand};
 use crate::identity::Identity;
 use crate::node::{send_and_wait, start_node, NodeConfig};
-use crate::types::{DiscoveredPeer, PeerRecord};
+use crate::types::{DiscoveredPeer, PeerRecord, StatusSnapshot};
+
+/// A lightweight, cloneable handle that can ONLY read the node's status snapshot —
+/// safe to hand to a background thread (the agent's `--status-bind` HTTP server)
+/// without moving the full [`NetworkHandle`] out of its owning role.
+#[derive(Clone)]
+pub struct StatusClient {
+    cmd_tx: mpsc::Sender<SwarmCommand>,
+}
+
+impl StatusClient {
+    /// One read-only snapshot of the node's live network state.
+    pub fn status(&self) -> Result<StatusSnapshot, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::Status { reply })
+    }
+}
 
 /// A running swarm node, driven synchronously.
 pub struct NetworkHandle {
@@ -118,6 +133,17 @@ impl NetworkHandle {
     /// Hex-encoded 32-byte ed25519 public key (for `PeerRecord.public_key` / receipts).
     pub fn public_key_hex(&self) -> &str {
         &self.public_key_hex
+    }
+
+    /// P0 introspection: one read-only snapshot of the node's live network state.
+    pub fn status(&self) -> Result<StatusSnapshot, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::Status { reply })
+    }
+
+    /// A cloneable read-only status handle for a background thread (the agent's
+    /// `--status-bind` server) — see [`StatusClient`].
+    pub fn status_client(&self) -> StatusClient {
+        StatusClient { cmd_tx: self.cmd_tx.clone() }
     }
 
     /// Publish a peer record to the Kademlia DHT.
@@ -229,5 +255,24 @@ mod tests {
         // Empty DHT → no providers; returns promptly (must not hang).
         let peers = net.discover("openhydra-smoke-nonexistent").unwrap();
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn status_snapshot_is_sane_on_a_fresh_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetworkHandle::start(loopback_config(dir.path())).unwrap();
+        // Give the swarm a beat to bind its loopback listeners.
+        std::thread::sleep(Duration::from_millis(400));
+        let snap = net.status().unwrap();
+        assert!(!snap.listen_addrs.is_empty(), "loopback listeners should be up");
+        assert!(!snap.kad_server_mode, "fresh nodes start as Kad clients (R-DHT-2)");
+        assert_eq!(snap.network_generation, 0);
+        assert!(snap.peers.is_empty(), "no peers on an isolated node");
+        assert!(snap.known_models.is_empty());
+        // The cloneable read-only client returns the same shape from another thread.
+        let client = net.status_client();
+        let handle = std::thread::spawn(move || client.status().unwrap());
+        let snap2 = handle.join().unwrap();
+        assert_eq!(snap2.listen_addrs.len(), snap.listen_addrs.len());
     }
 }

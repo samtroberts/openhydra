@@ -26,7 +26,9 @@ use crate::ring::{RingAction, RingConfig, RingHandle, RingManager};
 use crate::routing_cache;
 use crate::sampler_bridge::{SamplerBridge, SampleRequest};
 use crate::tensor_stream::{self, TensorStreamManager};
-use crate::types::{DiscoveredPeer, NatInfo, PeerRecord};
+use crate::types::{
+    DiscoveredPeer, KnownProvider, NatInfo, NetCounters, PeerRecord, PeerStatus, StatusSnapshot,
+};
 
 // ── Fix 2: Transport classification ────────────────────────────────────
 
@@ -151,6 +153,11 @@ pub enum SwarmCommand {
     /// Get current NAT status.
     NatStatus {
         reply: oneshot::Sender<NatInfo>,
+    },
+    /// P0 introspection: one read-only snapshot of the node's live network state
+    /// (NAT, Kademlia, peers, reservations, counters) for the agent's status endpoint.
+    Status {
+        reply: oneshot::Sender<StatusSnapshot>,
     },
     /// List the distinct model ids currently known (PEX-learned / discovered providers in
     /// `known_peers`). Powers the gateway's `GET /v1/models`.
@@ -422,6 +429,9 @@ struct LoopState {
     /// port map keeps AutoNAT at `Private`, so it must never be re-promoted into a
     /// black hole; the re-assert only fires once AutoNAT clears (Public/Unknown).
     autonat_private: bool,
+    /// P0 introspection: mirrors the last `kademlia.set_mode(..)` call (libp2p exposes
+    /// no getter). true = Server (reachable; lives in others' routing tables).
+    kad_server_mode: bool,
     /// Relay addresses we've reserved.
     #[allow(dead_code)]
     relay_addrs: Vec<Multiaddr>,
@@ -643,6 +653,7 @@ impl LoopState {
             external_addrs: Vec::new(),
             upnp_external_addrs: std::collections::HashSet::new(),
             autonat_private: false,
+            kad_server_mode: false, // nodes start as Kad clients (R-DHT-2)
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
             local_grpc_port: 50051,
@@ -986,6 +997,96 @@ pub async fn run_event_loop(
                     }
                     Some(SwarmCommand::NatStatus { reply }) => {
                         let _ = reply.send(state.nat_info.clone());
+                    }
+                    Some(SwarmCommand::Status { reply }) => {
+                        // P0 introspection: assemble the read-only snapshot from state the
+                        // loop already tracks. No hot-path cost — runs only when asked.
+                        let peers = state
+                            .peer_connections
+                            .iter()
+                            .map(|(pid, info)| {
+                                let direct = info.direct_count() > 0;
+                                let relayed = info.tcp_relay > 0;
+                                PeerStatus {
+                                    peer_id: pid.to_string(),
+                                    quic_direct_v4: info.quic_direct_v4,
+                                    quic_direct_v6: info.quic_direct_v6,
+                                    tcp_direct: info.tcp_direct,
+                                    tcp_relay: info.tcp_relay,
+                                    failure_streak: state
+                                        .proxy_failure_streak
+                                        .get(pid)
+                                        .copied()
+                                        .unwrap_or(0),
+                                    path: match (direct, relayed) {
+                                        (true, true) => "mixed",
+                                        (true, false) => "direct",
+                                        (false, true) => "relay",
+                                        (false, false) => "none",
+                                    }
+                                    .to_string(),
+                                }
+                            })
+                            .collect();
+                        let mut known_models: Vec<String> = state
+                            .known_peers
+                            .values()
+                            .map(|r| r.model_id.clone())
+                            .filter(|m| !m.is_empty())
+                            .collect();
+                        known_models.sort();
+                        known_models.dedup();
+                        let known_providers = state
+                            .known_peers
+                            .values()
+                            .map(|r| KnownProvider {
+                                model_id: r.model_id.clone(),
+                                openhydra_peer_id: r.peer_id.clone(),
+                                libp2p_peer_id: r.libp2p_peer_id.clone(),
+                            })
+                            .collect();
+                        let kad_routing_peers = swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .kbuckets()
+                            .map(|b| b.num_entries())
+                            .sum();
+                        let snapshot = StatusSnapshot {
+                            nat: state.nat_info.clone(),
+                            autonat_private: state.autonat_private,
+                            ipv6_capable: state.ipv6_capable,
+                            kad_server_mode: state.kad_server_mode,
+                            kad_routing_peers,
+                            network_generation: state
+                                .net_generation
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            listen_addrs: swarm.listeners().map(|a| a.to_string()).collect(),
+                            external_addrs: state
+                                .external_addrs
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect(),
+                            relay_reservations: state
+                                .reserved_circuits
+                                .iter()
+                                .cloned()
+                                .collect(),
+                            peers,
+                            known_models,
+                            known_providers,
+                            counters: NetCounters {
+                                dcutr_successes: state.dcutr_successes,
+                                dcutr_failures: state.dcutr_failures,
+                                reversal_dials: state.reversal_dials,
+                                reversal_successes: state.reversal_successes,
+                                tier_connect_success: state
+                                    .tier_connect_success
+                                    .iter()
+                                    .map(|(k, v)| (k.to_string(), *v))
+                                    .collect(),
+                            },
+                        };
+                        let _ = reply.send(snapshot);
                     }
                     Some(SwarmCommand::KnownModels { reply }) => {
                         let mut models: Vec<String> = state
@@ -1460,6 +1561,7 @@ pub async fn run_event_loop(
                     // asserting Private, so promoting is correct.
                     if restored_global {
                         swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
+                        state.kad_server_mode = true;
                     }
                 }
             }
@@ -1944,6 +2046,7 @@ fn expire_direct_external_addrs(
         .behaviour_mut()
         .kademlia
         .set_mode(Some(kad::Mode::Client));
+    state.kad_server_mode = false;
     state.autonat_private = false;
     state.nat_info.nat_type = "unknown".into();
     state.nat_info.is_public = false;
@@ -2208,6 +2311,7 @@ fn handle_swarm_event(
                     }
                     swarm.add_external_address(ev.tested_addr.clone());
                     swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
+                    state.kad_server_mode = true;
                 }
                 Ok(()) => {
                     debug!(addr = %ev.tested_addr, "R-DHT-11: AutoNAT v2 OK but non-global addr; not promoting");
@@ -2233,6 +2337,7 @@ fn handle_swarm_event(
                             // `Private` verdict that for unreachable nodes only
                             // ever timed out into `Unknown`).
                             swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Client));
+                            state.kad_server_mode = false;
                             state.nat_info.nat_type = "symmetric".into();
                             state.nat_info.is_public = false;
                             state.autonat_private = true; // R-DHT-4: suppress re-assert
@@ -2615,6 +2720,7 @@ fn handle_swarm_event(
                     // re-check global routability as defence in depth.
                     if is_globally_reachable_addr(&addr) {
                         swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
+                        state.kad_server_mode = true;
                     }
                     // Remember it so the re-assert ticker can restore the advertised
                     // address if an AutoNAT-Private demotion later retracts it (the

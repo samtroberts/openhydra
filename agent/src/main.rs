@@ -28,9 +28,9 @@ use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
     live_exo, live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig,
-    EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig, DEFAULT_ANTHROPIC_URL,
-    DEFAULT_EXO_URL, DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL,
-    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
+    EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig, StatusServer, TransferStats,
+    DEFAULT_ANTHROPIC_URL, DEFAULT_EXO_URL, DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL,
+    DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -82,6 +82,13 @@ struct NodeArgs {
     /// sibling of the v4 UPnP/NAT-PMP mapping. See docs/IPV6_REACHABILITY.md.
     #[arg(long = "pcp-gateway")]
     pcp_gateway: Option<std::net::IpAddr>,
+
+    /// Serve a read-only introspection endpoint (peers / DHT / swarm / transfer
+    /// counters as JSON) on this address, e.g. `127.0.0.1:9464` or `127.0.0.1:0`
+    /// (ephemeral). Off unless set; bind loopback unless you mean to expose it. If
+    /// `OPENHYDRA_STATUS_TOKEN` is set, requests must send it as a bearer token.
+    #[arg(long = "status-bind")]
+    status_bind: Option<String>,
 }
 
 impl NodeArgs {
@@ -419,6 +426,7 @@ fn run() -> Result<(), String> {
     openhydra_agent::telemetry::init();
     start_profiler_if_requested();
     let cli = Cli::parse();
+    let status_bind = cli.node.status_bind.clone();
     let config = cli.node.into_config();
     // Start the swarm first; both roles need the live node.
     let net = NetworkHandle::start(config)?;
@@ -428,8 +436,30 @@ fn run() -> Result<(), String> {
         net.openhydra_peer_id(),
     );
 
+    // P0 introspection: shared transfer counters + the optional read-only status endpoint.
+    // The provider role writes the counters; the gateway's transfers stay zero for now
+    // (its request metrics live on the Prometheus surface, #33).
+    let stats = std::sync::Arc::new(TransferStats::default());
+    if let Some(bind) = status_bind {
+        let role = match &cli.role {
+            Role::Provide(_) => "provider",
+            Role::Serve(_) => "gateway",
+        };
+        let local = StatusServer {
+            role,
+            agent_version: env!("CARGO_PKG_VERSION"),
+            libp2p_peer_id: net.libp2p_peer_id().to_string(),
+            openhydra_peer_id: net.openhydra_peer_id().to_string(),
+            net: net.status_client(),
+            stats: std::sync::Arc::clone(&stats),
+            token: std::env::var("OPENHYDRA_STATUS_TOKEN").ok(),
+        }
+        .spawn(&bind)?;
+        eprintln!("openhydra-agent: status endpoint at http://{local}/status");
+    }
+
     match cli.role {
-        Role::Provide(args) => provide(net, args),
+        Role::Provide(args) => provide(net, stats, args),
         Role::Serve(args) => serve(net, args),
     }
 }
@@ -437,12 +467,16 @@ fn run() -> Result<(), String> {
 /// Provider role: pick the engine adapter from `--engine-kind`, then detect + announce +
 /// serve. The post-adapter logic is generic over [`EngineAdapter`] (see [`run_provider`]),
 /// so each kind monomorphises without boxing.
-fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
+fn provide(
+    net: NetworkHandle,
+    stats: std::sync::Arc<TransferStats>,
+    args: ProvideArgs,
+) -> Result<(), String> {
     // Auto mode scans the standard ports and serves the union of whatever's running — the
     // zero-config default. It handles its own autostart, so it branches out before we resolve
     // a single engine URL.
     if args.engine_kind == EngineKind::Auto {
-        return provide_auto(net, args);
+        return provide_auto(net, stats, args);
     }
 
     let url = args
@@ -455,27 +489,27 @@ fn provide(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
         EngineKind::Auto => unreachable!("handled above"),
         EngineKind::Ollama => {
             let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net)
+            run_single_engine(a, url, args, net, stats)
         }
         EngineKind::Vllm => {
             let a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net)
+            run_single_engine(a, url, args, net, stats)
         }
         EngineKind::LmStudio => {
             let a = live_openai(&url, "lm-studio").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net)
+            run_single_engine(a, url, args, net, stats)
         }
         EngineKind::LlamaCpp => {
             let a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net)
+            run_single_engine(a, url, args, net, stats)
         }
         EngineKind::Exo => {
             let a = live_exo(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net)
+            run_single_engine(a, url, args, net, stats)
         }
         EngineKind::Openai => {
             let a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net)
+            run_single_engine(a, url, args, net, stats)
         }
     }
 }
@@ -488,15 +522,20 @@ fn run_single_engine<A: EngineAdapter + Send + Sync + 'static>(
     url: String,
     args: ProvideArgs,
     net: NetworkHandle,
+    stats: std::sync::Arc<TransferStats>,
 ) -> Result<(), String> {
     ensure_engine_if_requested(&args, &url, &adapter)?;
-    run_provider(adapter, url, args, net)
+    run_provider(adapter, url, args, net, stats)
 }
 
 /// Auto-detect provider: probe the standard ports and serve the union of every engine found.
 /// If none is up and `--engine-autostart` was given, try to start one, then re-detect. Fails
 /// fast with an actionable message if nothing can be found or started.
-fn provide_auto(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
+fn provide_auto(
+    net: NetworkHandle,
+    stats: std::sync::Arc<TransferStats>,
+    args: ProvideArgs,
+) -> Result<(), String> {
     if args.engine.is_some() {
         eprintln!(
             "openhydra-agent: --engine is ignored in auto mode (auto scans the standard ports); \
@@ -527,7 +566,7 @@ fn provide_auto(net: NetworkHandle, args: ProvideArgs) -> Result<(), String> {
 
     // The MultiAdapter re-probes on every re-announce tick, so engines/models started later
     // are absorbed with no restart. Drop the decision-scan's adapters; it rebuilds its own.
-    run_provider(openhydra_agent::detect::MultiAdapter::new(), "auto".to_string(), args, net)
+    run_provider(openhydra_agent::detect::MultiAdapter::new(), "auto".to_string(), args, net, stats)
 }
 
 /// The fail-fast message when auto mode finds no engine (§5 of the autostart plan).
@@ -621,6 +660,7 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     engine_url: String,
     args: ProvideArgs,
     net: NetworkHandle,
+    stats: std::sync::Arc<TransferStats>,
 ) -> Result<(), String> {
     // Open the receipt ledger: file-backed if --db was given (durable across restarts),
     // else an ephemeral in-memory ledger.
@@ -640,7 +680,8 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     let provider = Provider::new(adapter, net)
         .with_address(args.host, args.port)
         .with_store(store)
-        .with_aup(aup);
+        .with_aup(aup)
+        .with_stats(stats);
 
     let announced = provider
         .announce_models()

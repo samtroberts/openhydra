@@ -39,6 +39,8 @@ pub mod provider;
 pub mod ratelimit;
 pub mod receipt;
 pub mod serve;
+/// P0 introspection: the `--status-bind` endpoint (network snapshot + transfer counters).
+pub mod status;
 pub mod telemetry;
 pub mod workpool;
 
@@ -64,6 +66,7 @@ pub use gateway::serve_http;
 pub use hardening::harden_process;
 pub use http::ReqwestClient;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
+pub use status::{StatusServer, TransferStats};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};
 
 /// An Ollama adapter backed by the live reqwest transport, pointed at `base_url`
