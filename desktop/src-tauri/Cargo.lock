@@ -3844,6 +3844,7 @@ dependencies = [
 name = "openhydra-desktop"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "openhydra-agent",
  "serde",
  "serde_json",

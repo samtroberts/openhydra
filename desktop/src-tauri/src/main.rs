@@ -24,10 +24,92 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
+
+// ── Child-pid registry (crash/kill safety) ──
+//
+// `RunEvent::Exit` covers a normal quit, but NOT a SIGTERM/SIGINT to the app (observed
+// live: killing the app orphaned both agents, which kept the ports and served
+// invisibly). Two layers close that:
+// * a **signal handler** kills the registered pids before the app dies — the registry is
+//   plain atomics because only `kill(2)` is async-signal-safe, not mutexes;
+// * a **pidfile sweep at next launch** reaps agents that survived even SIGKILL (where no
+//   handler can run), matching on process name so a reused pid is never killed.
+
+static PROVIDER_PID: AtomicU32 = AtomicU32::new(0);
+static GATEWAY_PID: AtomicU32 = AtomicU32::new(0);
+
+fn pidfile() -> PathBuf {
+    openhydra_dir().join("desktop-agents.pid")
+}
+
+/// Record a role's child pid (0 = none) in its atomic slot + the on-disk pidfile.
+fn registry_set(slot: &AtomicU32, pid: u32) {
+    slot.store(pid, Ordering::SeqCst);
+    let (p, g) = (PROVIDER_PID.load(Ordering::SeqCst), GATEWAY_PID.load(Ordering::SeqCst));
+    if p == 0 && g == 0 {
+        let _ = std::fs::remove_file(pidfile());
+    } else {
+        let _ = std::fs::create_dir_all(openhydra_dir());
+        let _ = std::fs::write(pidfile(), format!("{p}\n{g}\n"));
+    }
+}
+
+/// At launch, kill agents a previous app instance left behind (its pidfile survived a
+/// SIGKILL/crash). Only pids whose command is actually `openhydra-agent` are touched —
+/// never a reused pid, and never agents the operator runs by hand.
+fn sweep_stale_agents() {
+    let Ok(content) = std::fs::read_to_string(pidfile()) else { return };
+    for pid in content.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+        if pid == 0 {
+            continue;
+        }
+        let is_agent = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("openhydra-agent"))
+            .unwrap_or(false);
+        if is_agent {
+            eprintln!("openhydra-desktop: reaping stale agent pid {pid} from a previous run");
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(pidfile());
+}
+
+/// Kill the registered children and re-raise. Only async-signal-safe calls in here.
+#[cfg(unix)]
+extern "C" fn on_signal(sig: libc::c_int) {
+    for slot in [&PROVIDER_PID, &GATEWAY_PID] {
+        let pid = slot.load(Ordering::SeqCst);
+        if pid != 0 {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() {
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_signal as libc::sighandler_t);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
 
 /// Cap on retained log lines per role (ring buffer).
 const LOG_CAP: usize = 500;
@@ -100,14 +182,19 @@ struct RoleStatus {
     exited: Option<String>,
 }
 
-#[derive(Default)]
 struct Role {
     child: Option<Child>,
     status: RoleStatus,
     logs: VecDeque<String>,
+    /// This role's slot in the signal-safe pid registry.
+    pid_slot: &'static AtomicU32,
 }
 
 impl Role {
+    fn new(pid_slot: &'static AtomicU32) -> Self {
+        Self { child: None, status: RoleStatus::default(), logs: VecDeque::new(), pid_slot }
+    }
+
     /// Reap a finished child, folding its exit status into the visible state.
     fn reap(&mut self) {
         if let Some(child) = &mut self.child {
@@ -116,6 +203,7 @@ impl Role {
                 self.status.pid = None;
                 self.status.exited = Some(format!("exited: {exit}"));
                 self.child = None;
+                registry_set(self.pid_slot, 0);
             }
         }
     }
@@ -127,6 +215,7 @@ impl Role {
         }
         self.status.running = false;
         self.status.pid = None;
+        registry_set(self.pid_slot, 0);
     }
 }
 
@@ -276,6 +365,7 @@ fn spawn_role(
     let stderr = child.stderr.take();
 
     let mut guard = role.lock().map_err(|e| e.to_string())?;
+    registry_set(guard.pid_slot, child.id());
     guard.status = RoleStatus { running: true, pid: Some(child.id()), ..Default::default() };
     guard.logs.clear();
     guard.child = Some(child);
@@ -413,10 +503,14 @@ fn kill_all(state: &AppState) {
 }
 
 fn main() {
+    // Reap agents a crashed/killed previous instance left behind, then arm the signal
+    // path so THIS instance can't leave any (see the pid-registry block above).
+    sweep_stale_agents();
+    install_signal_handlers();
     tauri::Builder::default()
         .manage(AppState {
-            provider: Arc::new(Mutex::new(Role::default())),
-            gateway: Arc::new(Mutex::new(Role::default())),
+            provider: Arc::new(Mutex::new(Role::new(&PROVIDER_PID))),
+            gateway: Arc::new(Mutex::new(Role::new(&GATEWAY_PID))),
             settings: Mutex::new(load_settings()),
         })
         .invoke_handler(tauri::generate_handler![

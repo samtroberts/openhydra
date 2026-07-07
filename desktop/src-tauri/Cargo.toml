@@ -30,6 +30,10 @@ serde_json = "1"
 # used for the gateway health check. The GUI never runs the swarm in-process.
 openhydra-agent = { path = "../../agent" }
 
+# Signal-safe child cleanup (kill registered agent pids on SIGTERM/SIGINT/SIGHUP).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 strip = true
 opt-level = "s"
