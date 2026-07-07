@@ -227,6 +227,86 @@ body {
 .dot-on { background: var(--green); box-shadow: 0 0 5px #2d5a4f66; }
 .dot-err { background: var(--red); }
 
+/* ── chat sessions rail ── */
+.view-split { flex-direction: row; gap: 12px; }
+.rail {
+  width: 168px; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px;
+  border-right: 1px solid var(--border); padding-right: 12px;
+}
+.rail-new { width: 100%; }
+.rail-list { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; }
+.rail-item {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  background: none; border: none; border-radius: 7px; padding: 6px 8px;
+  font: 500 12px var(--sans); color: var(--muted); cursor: pointer;
+  overflow: hidden;
+}
+.rail-item:hover { background: var(--s2); color: var(--text); }
+.rail-active { background: var(--s2); color: var(--text); font-weight: 600; }
+.rail-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-del { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 12px; padding: 0 2px; }
+.rail-del:hover { color: var(--red); }
+.split-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+
+/* presets + web toggle + attachments */
+.preset-select { width: 170px; }
+.web-toggle {
+  display: flex; align-items: center; gap: 5px; font: 600 12px var(--sans);
+  color: var(--muted); cursor: pointer; padding: 5px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+}
+.web-toggle:has(input:checked) { color: var(--green); border-color: #2d5a4f55; background: var(--green-wash); }
+.web-toggle input { accent-color: var(--green); }
+.attach-strip { display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+.attach-chip {
+  display: flex; align-items: center; gap: 6px; background: var(--s2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px;
+  font: 600 11px var(--mono); color: var(--muted);
+}
+.attach-chip button { background: none; border: none; color: var(--dim); cursor: pointer; }
+.attach-chip button:hover { color: var(--red); }
+
+/* ── council ── */
+.council-board {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px;
+  align-content: start;
+}
+.council-board > .center { grid-column: 1 / -1; }
+.seat { border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); display: flex; flex-direction: column; overflow: hidden; }
+.seat-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 12px; background: var(--s2); border-bottom: 1px solid var(--border);
+  font-family: var(--serif); font-weight: 600; font-size: 13px;
+}
+.seat-model { font-family: var(--mono); font-size: 10.5px; color: var(--green); }
+.seat-body { padding: 10px 12px; font-size: 12.5px; line-height: 1.6; user-select: text; white-space: pre-wrap; overflow-y: auto; max-height: 340px; }
+.seat .msg-meta { margin: 0 12px 10px; }
+.verdict {
+  border: 1px solid #2d5a4f55; border-radius: var(--r); background: var(--green-wash);
+  padding: 12px 14px; font-size: 13px; line-height: 1.6; user-select: text; white-space: pre-wrap;
+  flex-shrink: 0; max-height: 240px; overflow-y: auto;
+}
+.verdict-title { font-family: var(--serif); font-weight: 600; margin-bottom: 6px; color: var(--green); }
+
+/* settings row */
+.field-row { display: flex; gap: 12px; }
+.field-grow { flex: 1; }
+
+/* ── dark theme (landing's terminal green, app-wide) ── */
+[data-theme="dark"] {
+  --bg: #0f1b17; --surface: #152420; --s2: #1b2e28; --s3: #22382f;
+  --border: #274237; --text: #dceee6; --muted: #8fb3a5; --dim: #5f8273;
+  --green: #7dd3b8; --green-wash: #1f3a33; --green-deep: #0a1512;
+  --red: #e08b7f; --red-wash: #3a221e;
+}
+[data-theme="dark"] body { background: var(--bg); }
+[data-theme="dark"] .tbtn-start { background: #2d5a4f; border-color: #2d5a4f; color: #e4f5ef; }
+[data-theme="dark"] .tbtn-start:hover { background: #356a5d; border-color: #356a5d; }
+[data-theme="dark"] .tbl tbody tr:nth-child(even) td { background: #12211c; }
+[data-theme="dark"] .tbl td { border-bottom-color: #1d332b; }
+[data-theme="dark"] .modal { background: #000a; }
+
 /* ── modal ── */
 .modal { position: fixed; inset: 0; background: #2a231855; display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal-card {

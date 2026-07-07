@@ -17,6 +17,7 @@
     <button id="gwBtn" class="tbtn tbtn-start" title="Local OpenAI endpoint over the network">▶ Gateway</button>
     <div class="tool-spacer"></div>
     <span id="netChip" class="chip chip-idle">idle</span>
+    <button id="themeBtn" class="tbtn" title="Toggle theme">◐</button>
     <button id="settingsBtn" class="tbtn" title="Settings">⚙</button>
   </header>
 
@@ -29,6 +30,7 @@
       <div class="nav-section">Tools</div>
       <button class="nav-item" data-view="chat">◧ Chat</button>
       <button class="nav-item" data-view="code">⌥ Code</button>
+      <button class="nav-item" data-view="council">♄ Council</button>
       <div class="side-foot">
         <div class="side-foot-row">peer <code id="sidePeer" class="mono">—</code></div>
       </div>
@@ -82,20 +84,32 @@
       </section>
 
       <!-- Chat -->
-      <section id="view-chat" class="view hidden">
-        <div class="workbar">
-          <input id="chatModel" class="model-input mono" list="modelOptions" placeholder="model (e.g. llama3.2:1b)" spellcheck="false" />
-          <span class="dim" id="chatVia">via local gateway</span>
-          <button id="chatClear" class="tbtn tbtn-sm">Clear</button>
+      <section id="view-chat" class="view view-split hidden">
+        <div class="rail">
+          <button id="newSession" class="tbtn tbtn-sm rail-new">+ New chat</button>
+          <div id="sessionList" class="rail-list"></div>
         </div>
-        <div id="chatGateHint" class="banner hidden">Gateway is stopped — chat runs over the network through it.
-          <button class="btn-link" id="chatStartGw">Start gateway →</button></div>
-        <div id="chatScroll" class="chat-scroll">
-          <div class="dim center" id="chatEmpty">Ask anything — requests route through the swarm to whichever provider serves the model.</div>
-        </div>
-        <div class="composer">
-          <textarea id="chatInput" rows="2" placeholder="Message…  (Enter to send, Shift+Enter for newline)" spellcheck="false"></textarea>
-          <button id="chatSend" class="tbtn tbtn-start">Send</button>
+        <div class="split-main">
+          <div class="workbar">
+            <input id="chatModel" class="model-input mono" list="modelOptions" placeholder="model (e.g. llama3.2:1b)" spellcheck="false" />
+            <select id="chatPreset" class="model-input preset-select" title="System-prompt preset"></select>
+            <label id="webToggleWrap" class="web-toggle hidden" title="Search the web before answering">
+              <input type="checkbox" id="webToggle" /> web
+            </label>
+            <button id="chatClear" class="tbtn tbtn-sm">Clear</button>
+          </div>
+          <div id="chatGateHint" class="banner hidden">Gateway is stopped — chat runs over the network through it.
+            <button class="btn-link" id="chatStartGw">Start gateway →</button></div>
+          <div id="chatScroll" class="chat-scroll">
+            <div class="dim center" id="chatEmpty">Ask anything — requests route through the swarm to whichever provider serves the model.</div>
+          </div>
+          <div id="attachStrip" class="attach-strip hidden"></div>
+          <div class="composer">
+            <button id="attachBtn" class="tbtn" title="Attach a text file">📎</button>
+            <input id="attachFile" type="file" class="hidden" multiple accept=".txt,.md,.rs,.py,.js,.ts,.json,.toml,.yaml,.yml,.csv,.html,.css,.sh,.c,.h,.cpp,.go" />
+            <textarea id="chatInput" rows="2" placeholder="Message…  (Enter to send, Shift+Enter for newline)" spellcheck="false"></textarea>
+            <button id="chatSend" class="tbtn tbtn-start">Send</button>
+          </div>
         </div>
       </section>
 
@@ -113,6 +127,29 @@
           <textarea id="codeInput" rows="2" placeholder="e.g. a Rust function that parses a multiaddr…" spellcheck="false"></textarea>
           <button id="codeSend" class="tbtn tbtn-start">Generate</button>
         </div>
+      </section>
+
+      <!-- Council (blind compare + synthesis) -->
+      <section id="view-council" class="view hidden">
+        <div class="workbar">
+          <input id="cMod1" class="model-input mono council-model" list="modelOptions" placeholder="model 1" spellcheck="false" />
+          <input id="cMod2" class="model-input mono council-model" list="modelOptions" placeholder="model 2" spellcheck="false" />
+          <input id="cMod3" class="model-input mono council-model" list="modelOptions" placeholder="model 3 (optional)" spellcheck="false" />
+          <span class="dim">blind — answers are shuffled</span>
+        </div>
+        <div class="composer">
+          <textarea id="councilInput" rows="2" placeholder="One prompt, judged by the council…" spellcheck="false"></textarea>
+          <button id="councilAsk" class="tbtn tbtn-start">Convene</button>
+        </div>
+        <div id="councilBoard" class="council-board">
+          <div class="dim center">Pick 2–3 models and convene. Responses come back anonymized as Seat A/B/C — reveal or synthesize after reading.</div>
+        </div>
+        <div id="councilActions" class="workbar hidden">
+          <button id="councilReveal" class="tbtn tbtn-sm">Reveal models</button>
+          <input id="judgeModel" class="model-input mono" list="modelOptions" placeholder="judge model" spellcheck="false" />
+          <button id="councilSynth" class="tbtn tbtn-sm tbtn-start">Synthesize verdict</button>
+        </div>
+        <div id="councilVerdict" class="hidden"></div>
       </section>
 
     </main>
@@ -137,9 +174,17 @@
       <h2>Settings</h2>
       <label class="field">
         <span>Bootstrap peers <span class="dim">(one multiaddr per line)</span></span>
-        <textarea id="setBootstraps" rows="4" class="mono" spellcheck="false"></textarea>
+        <textarea id="setBootstraps" rows="3" class="mono" spellcheck="false"></textarea>
       </label>
-      <label class="field"><span>Gateway port</span><input id="setPort" type="number" min="1024" max="65535" /></label>
+      <div class="field-row">
+        <label class="field"><span>Gateway port</span><input id="setPort" type="number" min="1024" max="65535" /></label>
+        <label class="field field-grow"><span>Search URL <span class="dim">(SearXNG, optional)</span></span>
+          <input id="setSearch" type="text" class="mono" placeholder="http://127.0.0.1:8888" spellcheck="false" /></label>
+      </div>
+      <label class="field">
+        <span>Memory <span class="dim">(always included in chats — facts about you, style, context)</span></span>
+        <textarea id="setMemory" rows="3" spellcheck="false"></textarea>
+      </label>
       <label class="field field-check"><input id="setAutostart" type="checkbox" />
         <span>Start my engine automatically if it's down (Ollama / LM Studio)</span></label>
       <div class="modal-actions">

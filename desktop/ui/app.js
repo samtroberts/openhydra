@@ -1,5 +1,6 @@
-// OpenHydra Desktop UI — BiglyBT-style shell. Talks to the Rust backend via Tauri IPC;
-// in a plain browser (layout preview) it renders demo state instead.
+// OpenHydra Desktop UI — BiglyBT-style shell + AI-workspace tools (sessions, presets,
+// memory, attachments, web-augmented chat, blind council). Talks to the Rust backend via
+// Tauri IPC; in a plain browser (layout preview) it renders demo state instead.
 
 const tauri = window.__TAURI__?.core;
 async function call(cmd, args) {
@@ -13,31 +14,35 @@ function mock(cmd, args) {
     return {
       provider: {
         status: { running: true, pid: 4242, peer_id: "12D3KooWEVGKuH5uEqhR7PfkV4k8RrZbwivLedrY6cGQDKDEuXRH",
-          engines: "auto-detected 3 engine(s): ollama(2 models) @ http://127.0.0.1:11434, lm-studio(3 models) @ http://127.0.0.1:1234, exo(1 model) @ http://127.0.0.1:52415",
-          announced: 6, relays: 3, exited: null },
-        logs: ["openhydra-agent: node up — libp2p=12D3KooWEVGK…", "openhydra-agent: auto-detected 3 engine(s): …", "openhydra-agent: announced 6 model(s) from auto", "INFO relay reservation accepted ×3"],
+          engines: "auto-detected 3 engine(s)…", announced: 6, relays: 3, exited: null },
+        logs: ["openhydra-agent: node up — libp2p=12D3KooWEVGK…", "openhydra-agent: announced 6 model(s) from auto"],
       },
-      gateway: { status: { running: true, pid: 4243, peer_id: "12D3KooWKzuVb8tc…", engines: null, announced: null, relays: 2, exited: null }, logs: ["openhydra-agent: gateway listening on http://127.0.0.1:8080"] },
-      settings: { bootstraps: ["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL…"], gateway_port: 8080, engine_autostart: true },
+      gateway: { status: { running: true, pid: 4243, peer_id: "12D3KooWKzuVb8tc…", engines: null, announced: null, relays: 2, exited: null }, logs: [] },
+      settings: { bootstraps: ["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL…"], gateway_port: 8080, engine_autostart: true, search_url: "http://127.0.0.1:8888" },
       agent_found: true, gateway_url: "http://127.0.0.1:8080/v1",
     };
   if (cmd === "detect_engines_now")
     return [
       { label: "ollama", url: "http://127.0.0.1:11434", models: ["tinyllama:latest", "llama3.2:1b"] },
-      { label: "lm-studio", url: "http://127.0.0.1:1234", models: ["qwen3-0.6b-mlx", "qwen3.5-2b-mlx", "text-embedding-nomic-embed-text-v1.5"] },
+      { label: "lm-studio", url: "http://127.0.0.1:1234", models: ["qwen3-0.6b-mlx", "qwen3.5-2b-mlx"] },
       { label: "exo", url: "http://127.0.0.1:52415", models: ["mlx-community/Llama-3.2-1B-Instruct-4bit"] },
     ];
   if (cmd === "gateway_health") return true;
+  if (cmd === "web_search")
+    return [{ title: "Example result", url: "https://example.com", snippet: "A relevant snippet about " + (args?.query || "") }];
   if (cmd === "chat_completion") {
-    const isCode = (args?.messages || []).some((m) => m.role === "system");
+    const model = args?.model || "llama3.2:1b";
+    const sys = (args?.messages || []).some((m) => m.role === "system" && m.content.includes("coding"));
+    const judge = (args?.messages || []).some((m) => m.content?.includes("SEAT A"));
     return new Promise((r) => setTimeout(() => r({
-      choices: [{ message: { content: isCode
-        ? "Here is a minimal example:\n```rust\n// parse a multiaddr string\nfn parse(addr: &str) -> Result<Multiaddr, Error> {\n    let ma: Multiaddr = addr.parse()?;\n    Ok(ma)\n}\n```\nCall `parse(\"/ip4/1.2.3.4/tcp/4001\")` to try it."
-        : "Hello! I'm being served by a provider on the OpenHydra swarm — this reply routed gateway → discover → provider → engine." } }],
-      usage: { completion_tokens: 42 },
-      openhydra: { engine: { native_tps: 91.4 }, hops_ms: { network_rtt: 12, discover: 2 } },
-      model: args?.model || "llama3.2:1b",
-    }), 700));
+      choices: [{ message: { content: judge
+        ? "Verdict: SEAT B gave the most complete answer.\n\nSynthesis: combining the seats — the herd agrees the answer is 42."
+        : sys ? "```rust\nfn hello() { println!(\"herd\"); }\n```"
+        : `(${model}) The swarm answers: reciprocity beats rent-seeking.` } }],
+      usage: { completion_tokens: 24 + model.length },
+      openhydra: { engine: { native_tps: 60 + model.length }, hops_ms: { network_rtt: 9, discover: 2 } },
+      model,
+    }), 500 + Math.random() * 600));
   }
   return null;
 }
@@ -49,6 +54,34 @@ let activeView = "dashboard";
 let activeLogTab = "provider";
 let logsPinned = true;
 let lastTokens = 0, lastTps = "—";
+let attachments = []; // [{name, text}]
+
+// ── persistence (workspace state lives client-side) ──
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set(k, v) { localStorage.setItem(k, JSON.stringify(v)); },
+};
+const DEFAULT_PRESETS = [
+  { name: "Default", text: "" },
+  { name: "Concise", text: "Answer as briefly as possible. No preamble." },
+  { name: "Researcher", text: "Be rigorous. Distinguish facts from speculation; say when you are unsure." },
+  { name: "Socratic", text: "Answer, then pose one sharp follow-up question." },
+];
+let sessions = store.get("oh_sessions", []);
+let activeSession = store.get("oh_active", null);
+let presets = store.get("oh_presets", DEFAULT_PRESETS);
+let memory = store.get("oh_memory", "");
+if (document.documentElement) document.documentElement.dataset.theme = store.get("oh_theme", "light");
+
+function saveSessions() { store.set("oh_sessions", sessions); store.set("oh_active", activeSession); }
+function currentSession() {
+  let s = sessions.find((s) => s.id === activeSession);
+  if (!s) {
+    s = { id: Date.now().toString(36), name: "New chat", history: [], preset: "Default" };
+    sessions.unshift(s); activeSession = s.id; saveSessions();
+  }
+  return s;
+}
 
 // ── view switching ──
 document.querySelectorAll(".nav-item").forEach((el) => {
@@ -80,7 +113,6 @@ function render() {
   $("netChip").textContent = anyOn ? "online" : "idle";
   $("netChip").className = `chip ${anyOn ? "chip-on" : "chip-idle"}`;
 
-  // dashboard strip
   $("dashProv").textContent = p.running ? "sharing" : p.exited || "stopped";
   $("dashGw").textContent = g.running ? "serving" : g.exited || "stopped";
   $("dashAnnounced").textContent = p.announced ?? "—";
@@ -89,7 +121,6 @@ function render() {
   $("bootstrapBanner").classList.toggle("hidden", state.settings.bootstraps.length > 0);
   $("agentBanner").classList.toggle("hidden", state.agent_found);
 
-  // sidebar + status bar
   const peer = p.peer_id || g.peer_id;
   $("sidePeer").textContent = shortPeer(peer);
   $("stPeer").textContent = peer || "—";
@@ -100,10 +131,9 @@ function render() {
   $("stTokens").textContent = lastTokens;
   $("stTps").textContent = lastTps;
 
-  // chat gate hint
   $("chatGateHint").classList.toggle("hidden", g.running);
+  $("webToggleWrap").classList.toggle("hidden", !(state.settings.search_url || "").trim());
 
-  // logs
   if (activeView === "logs") {
     const logs = activeLogTab === "provider" ? state.provider.logs : state.gateway.logs;
     const box = $("logBox");
@@ -118,33 +148,51 @@ function render() {
 function renderModels() {
   const rows = [];
   const shared = state?.provider.status.running;
-  for (const e of engines) {
-    for (const m of e.models) {
+  for (const e of engines)
+    for (const m of e.models)
       rows.push(`<tr><td class="mono">${esc(m)}</td><td>${esc(e.label)}</td>
         <td class="mono">${esc(e.url)}</td>
         <td><span class="pill ${shared ? "pill-shared" : "pill-local"}">${shared ? "shared" : "local"}</span></td></tr>`);
-    }
-  }
   $("modelRows").innerHTML = rows.length
     ? rows.join("")
     : `<tr><td colspan="4" class="dim">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
   $("navModels").textContent = rows.length;
-  // model picker suggestions
   const models = engines.flatMap((e) => e.models);
   $("modelOptions").innerHTML = models.map((m) => `<option value="${esc(m)}">`).join("");
-  if (!$("chatModel").value && models[0]) $("chatModel").value = models[0];
-  if (!$("codeModel").value && models[0]) $("codeModel").value = models[0];
+  for (const id of ["chatModel", "codeModel", "cMod1", "judgeModel"])
+    if (!$(id).value && models[0]) $(id).value = models[0];
+  if (!$("cMod2").value && models[1]) $("cMod2").value = models[1];
 }
 
-// ── chat ──
-const chatHistory = [];
-function bubble(cls, text) {
+function renderPresets() {
+  const s = currentSession();
+  $("chatPreset").innerHTML = presets.map((p) => `<option ${p.name === s.preset ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+}
+
+// ── sessions ──
+function renderSessions() {
+  const list = $("sessionList");
+  list.innerHTML = "";
+  for (const s of sessions) {
+    const item = document.createElement("div");
+    item.className = `rail-item ${s.id === activeSession ? "rail-active" : ""}`;
+    item.innerHTML = `<span class="rail-name">${esc(s.name)}</span><button class="rail-del" title="Delete">✕</button>`;
+    item.querySelector(".rail-name").addEventListener("click", () => { activeSession = s.id; saveSessions(); renderSessions(); renderChat(); renderPresets(); });
+    item.addEventListener("click", (e) => { if (!e.target.classList.contains("rail-del")) { activeSession = s.id; saveSessions(); renderSessions(); renderChat(); renderPresets(); } });
+    item.querySelector(".rail-del").addEventListener("click", (e) => {
+      e.stopPropagation();
+      sessions = sessions.filter((x) => x.id !== s.id);
+      if (activeSession === s.id) activeSession = sessions[0]?.id ?? null;
+      saveSessions(); renderSessions(); renderChat(); renderPresets();
+    });
+    list.appendChild(item);
+  }
+}
+
+function bubbleEl(cls, text) {
   const d = document.createElement("div");
   d.className = `msg ${cls}`;
   d.textContent = text;
-  $("chatEmpty")?.remove();
-  $("chatScroll").appendChild(d);
-  $("chatScroll").scrollTop = $("chatScroll").scrollHeight;
   return d;
 }
 
@@ -155,41 +203,112 @@ function metaLine(resp) {
   if (oh.engine?.native_tps) parts.push(`${oh.engine.native_tps} tok/s engine`);
   if (oh.hops_ms?.network_rtt != null) parts.push(`rtt ${oh.hops_ms.network_rtt} ms`);
   if (oh.hops_ms?.discover != null) parts.push(`discover ${oh.hops_ms.discover} ms`);
-  if (resp.model) parts.push(esc(resp.model));
+  if (resp.model) parts.push(resp.model);
   return parts.join(" · ");
 }
 
+function renderChat() {
+  const s = currentSession();
+  const scroll = $("chatScroll");
+  scroll.innerHTML = "";
+  if (!s.history.length) {
+    scroll.innerHTML = `<div class="dim center">Ask anything — requests route through the swarm to whichever provider serves the model.</div>`;
+    return;
+  }
+  for (const m of s.history) {
+    if (m.role === "user") scroll.appendChild(bubbleEl("msg-user", m.content));
+    else if (m.role === "assistant") {
+      const b = bubbleEl("msg-bot", m.content);
+      if (m.meta) { const mm = document.createElement("div"); mm.className = "msg-meta"; mm.textContent = m.meta; b.appendChild(mm); }
+      scroll.appendChild(b);
+    }
+  }
+  scroll.scrollTop = scroll.scrollHeight;
+}
+
+/// System prompt = preset + memory (the Odysseus-style always-on context).
+function systemPrompt(presetName) {
+  const preset = presets.find((p) => p.name === presetName)?.text || "";
+  const mem = memory.trim() ? `Persistent user memory (honor it):\n${memory.trim()}` : "";
+  return [preset, mem].filter(Boolean).join("\n\n");
+}
+
 async function sendChat() {
+  const s = currentSession();
   const text = $("chatInput").value.trim();
   const model = $("chatModel").value.trim();
   if (!text || !model) return;
   $("chatInput").value = "";
-  bubble("msg-user", text);
-  chatHistory.push({ role: "user", content: text });
+
+  // attachments fold into this turn's content
+  let content = text;
+  if (attachments.length) {
+    const files = attachments.map((a) => `--- file: ${a.name} ---\n${a.text}`).join("\n\n");
+    content = `${files}\n\n${text}`;
+    attachments = []; renderAttachments();
+  }
+
+  s.history.push({ role: "user", content });
+  if (s.name === "New chat") { s.name = text.slice(0, 34); renderSessions(); }
+  renderChat();
   const wait = document.createElement("div");
   wait.className = "msg-wait"; wait.textContent = "thinking";
   $("chatScroll").appendChild(wait);
+
+  // optional web augmentation for this turn
+  const messages = [];
+  const sys = systemPrompt(s.preset);
+  if (sys) messages.push({ role: "system", content: sys });
+  if ($("webToggle").checked && (state?.settings.search_url || "").trim()) {
+    wait.textContent = "searching";
+    try {
+      const hits = await call("web_search", { query: text });
+      if (hits?.length) {
+        messages.push({ role: "system", content: "Fresh web results for the user's question:\n" +
+          hits.map((h, i) => `${i + 1}. ${h.title} — ${h.snippet} (${h.url})`).join("\n") +
+          "\nUse them where relevant and cite by number." });
+      }
+    } catch (e) { /* search down → answer without it */ }
+    wait.textContent = "thinking";
+  }
+  messages.push(...s.history.map(({ role, content }) => ({ role, content })));
+
   try {
-    const resp = await call("chat_completion", { model, messages: chatHistory, maxTokens: 1024 });
+    const resp = await call("chat_completion", { model, messages, maxTokens: 1024 });
     wait.remove();
-    const content = resp?.choices?.[0]?.message?.content ?? "(empty reply)";
-    chatHistory.push({ role: "assistant", content });
-    const b = bubble("msg-bot", content);
-    const meta = metaLine(resp);
-    if (meta) {
-      const m = document.createElement("div");
-      m.className = "msg-meta"; m.textContent = meta;
-      b.appendChild(m);
-    }
+    const reply = resp?.choices?.[0]?.message?.content ?? "(empty reply)";
+    s.history.push({ role: "assistant", content: reply, meta: metaLine(resp) });
+    saveSessions(); renderChat();
     if (resp.usage?.completion_tokens) lastTokens += resp.usage.completion_tokens;
     if (resp.openhydra?.engine?.native_tps) lastTps = resp.openhydra.engine.native_tps;
     render();
   } catch (e) {
     wait.remove();
-    bubble("msg-err", `${e}`);
-    chatHistory.pop(); // don't poison the next turn with an unanswered message
+    s.history.pop(); saveSessions(); renderChat();
+    const err = bubbleEl("msg-err", `${e}`);
+    $("chatScroll").appendChild(err);
   }
 }
+
+// ── attachments ──
+function renderAttachments() {
+  const strip = $("attachStrip");
+  strip.classList.toggle("hidden", !attachments.length);
+  strip.innerHTML = attachments.map((a, i) =>
+    `<span class="attach-chip">📄 ${esc(a.name)} <button data-i="${i}">✕</button></span>`).join("");
+  strip.querySelectorAll("button").forEach((b) =>
+    b.addEventListener("click", () => { attachments.splice(+b.dataset.i, 1); renderAttachments(); }));
+}
+
+$("attachBtn").addEventListener("click", () => $("attachFile").click());
+$("attachFile").addEventListener("change", async (e) => {
+  for (const f of e.target.files) {
+    if (f.size > 512 * 1024) { alert(`${f.name}: too large (512 KB max)`); continue; }
+    attachments.push({ name: f.name, text: await f.text() });
+  }
+  e.target.value = "";
+  renderAttachments();
+});
 
 // ── code view ──
 const KEYWORDS = new Set(("fn let mut pub use impl struct enum trait match if else for while loop return async await move " +
@@ -217,7 +336,6 @@ function highlight(code) {
   return out;
 }
 
-/// Split a model reply into prose + fenced code blocks.
 function parseFences(text) {
   const parts = [];
   const re = /```([\w+-]*)\n([\s\S]*?)```/g;
@@ -229,6 +347,27 @@ function parseFences(text) {
   }
   if (last < text.length) parts.push({ prose: text.slice(last).trim() });
   return parts.filter((p) => p.code != null || p.prose);
+}
+
+function codeCards(container, content) {
+  for (const part of parseFences(content)) {
+    if (part.code != null) {
+      const card = document.createElement("div");
+      card.className = "code-card";
+      card.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span>
+        <button class="code-copy">⎘ copy</button></div><pre>${highlight(part.code)}</pre>`;
+      card.querySelector(".code-copy").addEventListener("click", (ev) => {
+        navigator.clipboard?.writeText(part.code);
+        ev.target.textContent = "✓ copied";
+        setTimeout(() => (ev.target.textContent = "⎘ copy"), 1400);
+      });
+      container.appendChild(card);
+    } else {
+      const pr = document.createElement("div");
+      pr.className = "code-prose"; pr.textContent = part.prose;
+      container.appendChild(pr);
+    }
+  }
 }
 
 async function sendCode() {
@@ -255,41 +394,104 @@ async function sendCode() {
       maxTokens: 2048,
     });
     wait.remove();
-    const content = resp?.choices?.[0]?.message?.content ?? "";
-    for (const part of parseFences(content)) {
-      if (part.code != null) {
-        const card = document.createElement("div");
-        card.className = "code-card";
-        card.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span>
-          <button class="code-copy">⎘ copy</button></div><pre>${highlight(part.code)}</pre>`;
-        card.querySelector(".code-copy").addEventListener("click", (ev) => {
-          navigator.clipboard?.writeText(part.code);
-          ev.target.textContent = "✓ copied";
-          setTimeout(() => (ev.target.textContent = "⎘ copy"), 1400);
-        });
-        turn.appendChild(card);
-      } else {
-        const pr = document.createElement("div");
-        pr.className = "code-prose"; pr.textContent = part.prose;
-        turn.appendChild(pr);
-      }
-    }
+    codeCards(turn, resp?.choices?.[0]?.message?.content ?? "");
     const meta = metaLine(resp);
-    if (meta) {
-      const m = document.createElement("div");
-      m.className = "msg-meta"; m.textContent = meta;
-      turn.appendChild(m);
-    }
+    if (meta) { const m = document.createElement("div"); m.className = "msg-meta"; m.textContent = meta; turn.appendChild(m); }
     if (resp.usage?.completion_tokens) lastTokens += resp.usage.completion_tokens;
     if (resp.openhydra?.engine?.native_tps) lastTps = resp.openhydra.engine.native_tps;
     render();
   } catch (e) {
     wait.remove();
-    const err = document.createElement("div");
-    err.className = "msg msg-err"; err.textContent = `${e}`;
+    const err = bubbleEl("msg msg-err", `${e}`);
     turn.appendChild(err);
   }
   $("codeScroll").scrollTop = $("codeScroll").scrollHeight;
+}
+
+// ── council (Odysseus "compare": blind side-by-side + synthesis) ──
+let council = null; // { prompt, seats: [{model, content, meta}] } — seat order pre-shuffled
+
+async function convene() {
+  const prompt = $("councilInput").value.trim();
+  const models = ["cMod1", "cMod2", "cMod3"].map((id) => $(id).value.trim()).filter(Boolean);
+  if (!prompt || models.length < 2) { alert("Pick at least two models."); return; }
+  $("councilInput").value = "";
+  const board = $("councilBoard");
+  board.innerHTML = "";
+  $("councilActions").classList.add("hidden");
+  $("councilVerdict").classList.add("hidden");
+  $("councilVerdict").innerHTML = "";
+
+  // blind: shuffle seat order so position ≠ model
+  const shuffled = [...models].sort(() => Math.random() - 0.5);
+  const seats = shuffled.map((model, i) => ({ model, letter: String.fromCharCode(65 + i) }));
+  const els = seats.map((seat) => {
+    const el = document.createElement("div");
+    el.className = "seat";
+    el.innerHTML = `<div class="seat-head"><span>Seat ${seat.letter}</span><span class="seat-model hidden"></span></div>
+      <div class="seat-body"><span class="msg-wait">deliberating</span></div>`;
+    board.appendChild(el);
+    return el;
+  });
+
+  const results = await Promise.all(seats.map(async (seat, i) => {
+    try {
+      const resp = await call("chat_completion", {
+        model: seat.model,
+        messages: [{ role: "user", content: prompt }],
+        maxTokens: 1024,
+      });
+      const content = resp?.choices?.[0]?.message?.content ?? "(empty)";
+      els[i].querySelector(".seat-body").textContent = content;
+      const meta = document.createElement("div");
+      meta.className = "msg-meta";
+      meta.textContent = metaLine({ ...resp, model: undefined }); // keep it blind
+      els[i].appendChild(meta);
+      els[i].querySelector(".seat-model").textContent = seat.model;
+      if (resp.usage?.completion_tokens) lastTokens += resp.usage.completion_tokens;
+      return { ...seat, content };
+    } catch (e) {
+      els[i].querySelector(".seat-body").textContent = `${e}`;
+      els[i].querySelector(".seat-body").classList.add("msg-err");
+      return { ...seat, content: null };
+    }
+  }));
+
+  council = { prompt, seats: results.filter((s) => s.content != null) };
+  if (council.seats.length >= 2) $("councilActions").classList.remove("hidden");
+  render();
+}
+
+function reveal() {
+  document.querySelectorAll(".seat-model").forEach((el) => el.classList.remove("hidden"));
+}
+
+async function synthesize() {
+  if (!council) return;
+  const judge = $("judgeModel").value.trim();
+  if (!judge) { alert("Pick a judge model."); return; }
+  const verdictEl = $("councilVerdict");
+  verdictEl.className = "verdict";
+  verdictEl.innerHTML = `<div class="verdict-title">Synthesis</div><span class="msg-wait">the judge deliberates</span>`;
+  const brief = council.seats.map((s) => `SEAT ${s.letter}:\n${s.content}`).join("\n\n");
+  try {
+    const resp = await call("chat_completion", {
+      model: judge,
+      messages: [
+        { role: "system", content: "You are a strict judge. Given several anonymous answers to the same prompt, briefly say which seat answered best and why, then produce one improved, synthesized answer." },
+        { role: "user", content: `PROMPT:\n${council.prompt}\n\n${brief}` },
+      ],
+      maxTokens: 1024,
+    });
+    verdictEl.innerHTML = `<div class="verdict-title">Synthesis · judged by ${esc(judge)}</div>`;
+    const body = document.createElement("div");
+    body.textContent = resp?.choices?.[0]?.message?.content ?? "(empty)";
+    verdictEl.appendChild(body);
+    if (resp.usage?.completion_tokens) lastTokens += resp.usage.completion_tokens;
+    render();
+  } catch (e) {
+    verdictEl.innerHTML = `<div class="verdict-title">Synthesis failed</div>${esc(String(e))}`;
+  }
 }
 
 // ── actions ──
@@ -304,6 +506,8 @@ async function toggleRole(which) {
 function openSettings() {
   $("setBootstraps").value = state.settings.bootstraps.join("\n");
   $("setPort").value = state.settings.gateway_port;
+  $("setSearch").value = state.settings.search_url || "";
+  $("setMemory").value = memory;
   $("setAutostart").checked = state.settings.engine_autostart;
   $("settingsModal").classList.remove("hidden");
 }
@@ -311,11 +515,14 @@ function closeSettings() { $("settingsModal").classList.add("hidden"); }
 window.openSettings = openSettings;
 window.closeSettings = closeSettings;
 
-async function saveSettings() {
+async function saveSettingsFn() {
+  memory = $("setMemory").value;
+  store.set("oh_memory", memory);
   const settings = {
     bootstraps: $("setBootstraps").value.split("\n").map((s) => s.trim()).filter(Boolean),
     gateway_port: parseInt($("setPort").value, 10) || 8080,
     engine_autostart: $("setAutostart").checked,
+    search_url: $("setSearch").value.trim(),
   };
   try { await call("save_settings", { settings }); closeSettings(); await refresh(); }
   catch (e) { alert(`save failed: ${e}`); }
@@ -334,13 +541,23 @@ $("provBtn").addEventListener("click", () => toggleRole("provider"));
 $("gwBtn").addEventListener("click", () => toggleRole("gateway"));
 $("chatStartGw").addEventListener("click", () => toggleRole("gateway"));
 $("settingsBtn").addEventListener("click", openSettings);
-$("saveSettings").addEventListener("click", saveSettings);
+$("saveSettings").addEventListener("click", saveSettingsFn);
 $("refreshEngines").addEventListener("click", refreshEngines);
 $("chatSend").addEventListener("click", sendChat);
 $("codeSend").addEventListener("click", sendCode);
-$("chatClear").addEventListener("click", () => { chatHistory.length = 0; $("chatScroll").innerHTML = ""; });
+$("councilAsk").addEventListener("click", convene);
+$("councilReveal").addEventListener("click", reveal);
+$("councilSynth").addEventListener("click", synthesize);
+$("newSession").addEventListener("click", () => { activeSession = null; currentSession(); renderSessions(); renderChat(); renderPresets(); });
+$("chatClear").addEventListener("click", () => { const s = currentSession(); s.history = []; saveSessions(); renderChat(); });
 $("codeClear").addEventListener("click", () => { $("codeScroll").innerHTML = ""; });
-for (const [input, send] of [["chatInput", sendChat], ["codeInput", sendCode]]) {
+$("chatPreset").addEventListener("change", () => { currentSession().preset = $("chatPreset").value; saveSessions(); });
+$("themeBtn").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  store.set("oh_theme", next);
+});
+for (const [input, send] of [["chatInput", sendChat], ["codeInput", sendCode], ["councilInput", convene]]) {
   $(input).addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
@@ -352,6 +569,10 @@ $("logBox").addEventListener("scroll", () => {
   logsPinned = b.scrollTop + b.clientHeight >= b.scrollHeight - 8;
 });
 
+currentSession();
+renderSessions();
+renderChat();
+renderPresets();
 refresh();
 refreshEngines();
 setInterval(refresh, 2000);

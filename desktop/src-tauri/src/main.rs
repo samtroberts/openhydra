@@ -131,11 +131,20 @@ struct Settings {
     gateway_port: u16,
     /// Pass `--engine-autostart` to the provider (start LM Studio / Ollama if down).
     engine_autostart: bool,
+    /// Optional SearXNG-compatible search endpoint (e.g. `http://127.0.0.1:8888`) powering
+    /// the chat "web" toggle. Empty → the toggle is hidden. The operator brings their own
+    /// search backend, same BYO philosophy as engines.
+    search_url: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { bootstraps: Vec::new(), gateway_port: 8080, engine_autostart: true }
+        Self {
+            bootstraps: Vec::new(),
+            gateway_port: 8080,
+            engine_autostart: true,
+            search_url: String::new(),
+        }
     }
 }
 
@@ -514,6 +523,59 @@ async fn chat_completion(
     .map_err(|e| e.to_string())?
 }
 
+/// One web-search hit handed to the UI.
+#[derive(Serialize)]
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// Query the operator's SearXNG-compatible endpoint (`/search?format=json`) for the chat
+/// "web" toggle. Backend-side HTTP (no webview CORS); top 5 hits.
+#[tauri::command]
+async fn web_search(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<SearchHit>, String> {
+    let base = state.settings.lock().map_err(|e| e.to_string())?.search_url.trim().to_string();
+    if base.is_empty() {
+        return Err("no search endpoint configured (Settings → Search URL)".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        use openhydra_agent::adapter::HttpClient;
+        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let mut encoded = String::new();
+        for b in query.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(b as char)
+                }
+                _ => encoded.push_str(&format!("%{b:02X}")),
+            }
+        }
+        let url = format!("{}/search?q={encoded}&format=json", base.trim_end_matches('/'));
+        let body = client.get(&url).map_err(|e| format!("search: {e}"))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("search parse: {e}"))?;
+        Ok(json["results"]
+            .as_array()
+            .map(|rs| {
+                rs.iter()
+                    .take(5)
+                    .map(|r| SearchHit {
+                        title: r["title"].as_str().unwrap_or("").to_string(),
+                        url: r["url"].as_str().unwrap_or("").to_string(),
+                        snippet: r["content"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Is the local gateway answering? (backend-side to avoid webview CORS)
 #[tauri::command]
 async fn gateway_health(state: tauri::State<'_, AppState>) -> Result<bool, ()> {
@@ -562,6 +624,7 @@ fn main() {
             detect_engines_now,
             gateway_health,
             chat_completion,
+            web_search,
             save_settings,
         ])
         .setup(|app| {
