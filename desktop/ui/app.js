@@ -221,10 +221,40 @@ function renderSessions() {
   }
 }
 
+// Only these src schemes may become an <img> (ComfyUI returns data:image/…; some
+// engines return an http(s) image URL). Anything else stays escaped text — no innerHTML
+// from model output, so a reply can't inject markup.
+const IMG_SRC = /^(data:image\/[a-z.+-]+;base64,[A-Za-z0-9+/=]+|https?:\/\/\S+\.(?:png|jpe?g|gif|webp))$/i;
+
+/// Render an assistant message: markdown images (`![alt](src)`) become real <img>
+/// elements (ComfyUI txt2img output); everything else is plain text.
+function renderMessageContent(el, text) {
+  const re = /!\[[^\]]*\]\(([^)]+)\)/g;
+  let last = 0, m, rendered = false;
+  while ((m = re.exec(text))) {
+    if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const src = m[1].trim();
+    if (IMG_SRC.test(src)) {
+      const img = document.createElement("img");
+      img.className = "msg-img";
+      img.src = src; // property assignment (not innerHTML) — safe
+      img.alt = "generated image";
+      el.appendChild(img);
+      rendered = true;
+    } else {
+      el.appendChild(document.createTextNode(m[0])); // not an image src → leave as text
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) el.appendChild(document.createTextNode(text.slice(last)));
+  if (!rendered && !el.childNodes.length) el.textContent = text;
+}
+
 function bubbleEl(cls, text) {
   const d = document.createElement("div");
   d.className = `msg ${cls}`;
-  d.textContent = text;
+  if (cls.includes("msg-bot")) renderMessageContent(d, text);
+  else d.textContent = text;
   return d;
 }
 

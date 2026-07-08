@@ -202,6 +202,7 @@ input, textarea, .logbox, .msg, .seat-body, .code-card pre { cursor: auto; }
 .msg-user { align-self: flex-end; background: var(--s2); border: 1px solid var(--border); }
 .msg-bot { align-self: flex-start; background: var(--surface); border: 1px solid var(--border); }
 .msg-err { align-self: flex-start; background: var(--red-wash); border: 1px solid #a4463b44; color: var(--red); }
+.msg-img { display: block; max-width: 100%; border-radius: 8px; border: 1px solid var(--border); margin: 4px 0; }
 .msg-meta { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--border); font-family: var(--mono); font-size: 10px; color: var(--dim); }
 .msg-wait { align-self: flex-start; color: var(--muted); font-size: 12.5px; padding: 6px 2px; }
 .msg-wait::after { content: '…'; animation: pulse 1.2s infinite; }
