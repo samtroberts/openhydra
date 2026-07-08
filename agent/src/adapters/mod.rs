@@ -21,6 +21,9 @@
 //! * [`llama_cpp`] — `llama-server`. Serves over the OpenAI route (reuses [`openai`]'s
 //!   stream) but detects bespoke-ly via `/props`, whose chat template + GGUF path yield a
 //!   full canonical id.
+//! * [`comfyui`] — ComfyUI (image generation). Detects installed Stable-Diffusion
+//!   checkpoints as models; serves txt2img via a queued workflow, returning the image
+//!   as a base64 data-URL in the completion stream. Bills sampler steps as tokens.
 //! * [`exo`] — an Exo MLX cluster. Also serves over the OpenAI route, but detects via
 //!   `/state` (only placed-and-ready instances) so it advertises what it can actually serve,
 //!   not Exo's whole downloadable catalog (`/v1/models`).
@@ -33,6 +36,7 @@
 //!   Gemini's OAI-compat endpoint, Voyage, or a local engine).
 
 pub mod anthropic;
+pub mod comfyui;
 pub mod embeddings;
 pub mod exo;
 pub mod gemini;

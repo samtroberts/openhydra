@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
+use crate::adapters::comfyui::{ComfyUiAdapter, DEFAULT_COMFYUI_URL};
 use crate::adapters::exo::{ExoAdapter, DEFAULT_EXO_URL};
 use crate::adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 use crate::adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
@@ -68,6 +69,7 @@ fn probe_specs() -> Vec<ProbeSpec> {
         ProbeSpec { label: "lm-studio", url: DEFAULT_LM_STUDIO_URL, build: build_lmstudio },
         ProbeSpec { label: "vllm", url: DEFAULT_VLLM_URL, build: build_vllm },
         ProbeSpec { label: "exo", url: DEFAULT_EXO_URL, build: build_exo },
+        ProbeSpec { label: "comfyui", url: DEFAULT_COMFYUI_URL, build: build_comfyui },
     ]
 }
 
@@ -86,6 +88,9 @@ fn build_lmstudio(u: &str) -> Result<SharedAdapter, AdapterError> {
 }
 fn build_vllm(u: &str) -> Result<SharedAdapter, AdapterError> {
     Ok(Arc::new(OpenAiAdapter::new(u, "vllm", probe_client()?)))
+}
+fn build_comfyui(u: &str) -> Result<SharedAdapter, AdapterError> {
+    Ok(Arc::new(ComfyUiAdapter::new(u, probe_client()?)))
 }
 fn build_exo(u: &str) -> Result<SharedAdapter, AdapterError> {
     // Exo needs its own adapter (detects placed-and-ready models via /state, not the

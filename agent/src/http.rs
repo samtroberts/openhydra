@@ -57,6 +57,19 @@ impl HttpClient for ReqwestClient {
             .map_err(http_err)
     }
 
+    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        Ok(self
+            .client
+            .get(url)
+            .send()
+            .map_err(http_err)?
+            .error_for_status()
+            .map_err(http_err)?
+            .bytes()
+            .map_err(http_err)?
+            .to_vec())
+    }
+
     fn post_json(&self, url: &str, body: &str) -> Result<String, AdapterError> {
         self.client
             .post(url)

@@ -56,6 +56,14 @@ pub trait HttpClient {
         body: &str,
     ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError>;
 
+    /// `GET {url}` → raw response bytes — for engines whose outputs are binary (ComfyUI
+    /// images). Default errors so text-only mocks/transports are untouched; the live
+    /// transport overrides it.
+    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        let _ = url;
+        Err(AdapterError::Http("binary GET not supported by this transport".into()))
+    }
+
     /// `GET {url}` with extra request `headers` — e.g. an auth header for a hosted BYOK
     /// backend (Anthropic `x-api-key`, Gemini `x-goog-api-key`). The default drops the
     /// headers and calls [`get`](Self::get); the live transport overrides it so a key is

@@ -53,6 +53,7 @@ pub use aup::{AupDecision, AupPolicy};
 pub use byok::{ByokConfig, ByokProvider, EmbeddingConfig};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use adapters::anthropic::{AnthropicAdapter, DEFAULT_ANTHROPIC_URL};
+pub use adapters::comfyui::{ComfyUiAdapter, DEFAULT_COMFYUI_URL};
 pub use adapters::exo::{ExoAdapter, DEFAULT_EXO_URL};
 pub use adapters::gemini::{GeminiAdapter, DEFAULT_GEMINI_URL};
 pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
@@ -89,6 +90,12 @@ pub fn live_openai(
 /// `base_url` (e.g. [`DEFAULT_LLAMACPP_URL`]).
 pub fn live_llamacpp(base_url: &str) -> Result<LlamaCppAdapter<ReqwestClient>, AdapterError> {
     Ok(LlamaCppAdapter::new(base_url, ReqwestClient::new()?))
+}
+
+/// A ComfyUI adapter backed by the live reqwest transport, pointed at `base_url`
+/// (e.g. [`DEFAULT_COMFYUI_URL`]). Announces Stable-Diffusion checkpoints as models.
+pub fn live_comfyui(base_url: &str) -> Result<ComfyUiAdapter<ReqwestClient>, AdapterError> {
+    Ok(ComfyUiAdapter::new(base_url, ReqwestClient::new()?))
 }
 
 /// An Exo cluster adapter backed by the live reqwest transport, pointed at the head node's

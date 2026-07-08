@@ -27,10 +27,11 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_exo, live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy, ByokConfig,
-    EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig, StatusServer, TransferStats,
-    DEFAULT_ANTHROPIC_URL, DEFAULT_EXO_URL, DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL,
-    DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
+    live_comfyui, live_exo, live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy,
+    ByokConfig, EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig, StatusServer,
+    TransferStats, DEFAULT_ANTHROPIC_URL, DEFAULT_COMFYUI_URL, DEFAULT_EXO_URL,
+    DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL,
+    DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
 };
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
@@ -138,6 +139,9 @@ enum EngineKind {
     /// Exo MLX cluster — OpenAI serve route + `/state` detection (announces only
     /// placed-and-ready models, not Exo's whole downloadable catalog).
     Exo,
+    /// ComfyUI (image generation) — announces Stable-Diffusion checkpoints as models;
+    /// serves txt2img, returning the image as a data-URL in the completion. Steps = tokens.
+    Comfyui,
     /// Any other OpenAI-compatible server (LocalAI, …).
     Openai,
 }
@@ -153,6 +157,7 @@ impl EngineKind {
             EngineKind::LmStudio => DEFAULT_LM_STUDIO_URL,
             EngineKind::LlamaCpp => DEFAULT_LLAMACPP_URL,
             EngineKind::Exo => DEFAULT_EXO_URL,
+            EngineKind::Comfyui => DEFAULT_COMFYUI_URL,
         }
     }
 }
@@ -505,6 +510,10 @@ fn provide(
         }
         EngineKind::Exo => {
             let a = live_exo(&url).map_err(|e| format!("engine {url}: {e}"))?;
+            run_single_engine(a, url, args, net, stats)
+        }
+        EngineKind::Comfyui => {
+            let a = live_comfyui(&url).map_err(|e| format!("engine {url}: {e}"))?;
             run_single_engine(a, url, args, net, stats)
         }
         EngineKind::Openai => {

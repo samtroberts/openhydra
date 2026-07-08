@@ -21,6 +21,7 @@ openhydra-network = { path = "../network", default-features = false }
 ed25519-dalek = "2"
 rand = "0.8"   # receipt nonces
 hex = "0.4"    # decode a provider's hex public key from the DHT record
+base64 = "0.22" # ComfyUI adapter: image bytes -> data-URL in the completion stream
 # Parse engine HTTP responses (Ollama /api/tags, /api/show, …).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
