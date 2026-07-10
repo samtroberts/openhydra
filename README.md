@@ -38,10 +38,6 @@ in any role.
 - **Keys stay put.** Each node's ed25519 identity key never leaves the Rust
   daemon — receipts are co-signed in-process; only signatures cross the wire.
 
-See [docs/protocol.md](docs/protocol.md) for the protocol design and
-[docs/ENGINE_COMPATIBILITY.md](docs/ENGINE_COMPATIBILITY.md) for the engine
-support matrix.
-
 ---
 
 ## How it works
@@ -67,8 +63,7 @@ engine's native speed plus the routing/transport overhead.
 
 - A **Rust toolchain** (stable) — <https://rustup.rs>.
 - An **inference engine** running locally that you want to share (Ollama, vLLM,
-  LM Studio, or llama.cpp). On Apple Silicon, see
-  [docs/INSTALL_MAC.md](docs/INSTALL_MAC.md).
+  LM Studio, or llama.cpp).
 
 ### Build
 
@@ -137,8 +132,6 @@ The gateway also serves `GET /v1/models` (model ids discovered on the swarm) and
 | `llama-cpp`     | `llama-server` (`/props`)      | 8080         | `/props` → GGUF canonical id |
 | `openai`        | Any OpenAI-compatible (Exo, LocalAI, …) | 8000 | `/v1/models` |
 
-Details and per-engine notes: [docs/ENGINE_COMPATIBILITY.md](docs/ENGINE_COMPATIBILITY.md).
-
 ---
 
 ## Architecture
@@ -165,18 +158,7 @@ relays for NAT'd peers. Deploy scripts live in [`ops/bootstrap/`](ops/bootstrap/
 Historical throughput data from earlier builds lives in
 [`benchmarks/`](benchmarks/). Because OpenHydra now proxies to an external
 engine, end-to-end throughput is the engine's own tokens/sec plus the transport
-overhead (LAN direct ≈ a few ms; relayed cross-NAT paths add a hop). See
-[docs/protocol.md](docs/protocol.md) for the current measurement methodology.
-
----
-
-## Documentation
-
-- [Protocol design](docs/protocol.md)
-- [Engine compatibility](docs/ENGINE_COMPATIBILITY.md)
-- [macOS install notes](docs/INSTALL_MAC.md)
-- [Implementation plan](docs/PROTOCOL_IMPLEMENTATION_PLAN.md)
-- [DHT robustness remediation](docs/DHT_ROBUSTNESS_REMEDIATION.md)
+overhead (LAN direct ≈ a few ms; relayed cross-NAT paths add a hop).
 
 ---
 
