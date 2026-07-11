@@ -169,14 +169,17 @@ pub fn build_swarm(
     // 5 min interval.
     kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(300)));
 
-    // NOTE (H1 / query-time record verification): poisoned records are rejected on
-    // the *read* side — every discover path runs `dht::verify_peer_record` before
-    // any field is trusted (event_loop.rs). We deliberately leave Kad's inbound
-    // record filtering on its default (no `StoreInserts::FilterBoth`): enabling it
-    // would route every inbound PUT through a manual accept/store handler, and
-    // without that handler records would silently never be stored. The read-side
-    // invariant already prevents a poisoned record from reaching routing/credit
-    // logic; promoting to write-side filtering is tracked as future hardening.
+    // D-S3 (write-side record verification): reject poisoned records on the
+    // *inbound-PUT* side, not just at read time. Read-side verification
+    // (`dht::verify_peer_record` on every discover path) protects THIS node's
+    // routing/credit logic, but with Kad's default (unfiltered) inserts we still
+    // *store and re-replicate* whatever peers PUT to us — silently amplifying
+    // poison across the network. `FilterBoth` stops the auto-store: every inbound
+    // PutRecord / AddProvider now surfaces as a `kad::Event::InboundRequest` that
+    // the event loop must explicitly accept (see `handle_inbound_kad_request`),
+    // which verifies the signed record before calling `store_mut().put(...)`.
+    // A forged record is dropped instead of replicated.
+    kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
 
     let store = kad::store::MemoryStore::new(peer_id);
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);

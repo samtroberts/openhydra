@@ -160,15 +160,23 @@ pub fn verify_peer_record(record: &PeerRecord) -> Result<(), String> {
         .map_err(|e| format!("bad ed25519 public_key: {e}"))?;
     // Bind the key to the advertised libp2p_peer_id so a valid signature from
     // identity A cannot be replayed under identity B's peer id.
-    if !record.libp2p_peer_id.is_empty() {
-        let pubkey = libp2p::identity::PublicKey::from(ed_pk.clone());
-        let derived = libp2p::PeerId::from_public_key(&pubkey).to_string();
-        if record.libp2p_peer_id != derived {
-            return Err(format!(
-                "peer_id mismatch: record={} derived={derived}",
-                record.libp2p_peer_id
-            ));
-        }
+    //
+    // D-S4: this binding is UNCONDITIONAL. Previously it was skipped when
+    // `libp2p_peer_id` was empty — but the field is part of the signed preimage,
+    // so an attacker could sign a record with the field cleared and it would pass
+    // verification while dodging the key↔peer-id binding entirely (and any
+    // downstream code keying on the empty id). `sign_peer_record` always
+    // populates it, so no legitimate record is empty; reject rather than skip.
+    if record.libp2p_peer_id.is_empty() {
+        return Err("missing libp2p_peer_id".into());
+    }
+    let pubkey = libp2p::identity::PublicKey::from(ed_pk.clone());
+    let derived = libp2p::PeerId::from_public_key(&pubkey).to_string();
+    if record.libp2p_peer_id != derived {
+        return Err(format!(
+            "peer_id mismatch: record={} derived={derived}",
+            record.libp2p_peer_id
+        ));
     }
     let sig = base64_urlsafe_decode(&record.signature)?;
     if ed_pk.verify(&canonical_bytes(record), &sig) {
@@ -380,6 +388,23 @@ mod tests {
             sign_peer_record(&PeerRecord { port: 1, ..Default::default() }, &kp).unwrap();
         signed.libp2p_peer_id = "12D3KooWFakePeerIdThatDoesNotMatchTheKey".into();
         assert!(verify_peer_record(&signed).is_err());
+    }
+
+    #[test]
+    fn test_ds4_rejects_empty_peer_id_even_when_signed() {
+        // D-S4: an attacker signs a record with libp2p_peer_id CLEARED. Because
+        // the field is in the signed preimage, the signature is self-consistent —
+        // the old code skipped the key↔peer-id binding for empty ids and accepted
+        // it. It must now be rejected (no legitimate record is empty).
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut signed =
+            sign_peer_record(&PeerRecord { port: 1, ..Default::default() }, &kp).unwrap();
+        // Re-sign over the cleared field so the signature itself stays valid.
+        signed.libp2p_peer_id = String::new();
+        let canonical = canonical_bytes(&signed);
+        signed.signature = base64_urlsafe_encode(&kp.sign(&canonical).unwrap());
+        let err = verify_peer_record(&signed).unwrap_err();
+        assert!(err.contains("libp2p_peer_id"), "expected empty-peer-id error, got: {err}");
     }
 
     #[test]

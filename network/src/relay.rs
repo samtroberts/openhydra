@@ -75,6 +75,58 @@ pub fn is_bootstrap_relay_ip(ip: &str) -> bool {
     BOOTSTRAP_RELAY_IPS.contains(&ip)
 }
 
+/// D-S5: decide whether a record's self-declared `relay_address` is safe to
+/// inject into the Kademlia routing table for `expected_pid`.
+///
+/// A signed record proves *authorship*, not that the declared address is honest.
+/// If we blindly `add_address(pid, declared)` then we — and, via replication,
+/// every peer that caches the record — would dial whatever host the record
+/// names, turning the DHT into a reflection/amplification vector aimed at an
+/// arbitrary victim `ip:port`. We therefore accept ONLY a relay-**circuit**
+/// address whose relay hop is one of our own bootstrap relays and whose circuit
+/// target (when the address names one) matches the record's peer id. A
+/// legitimate NAT'd provider always advertises exactly this (it reserved on a
+/// bootstrap relay); anything else is malformed or hostile and is dropped.
+pub fn safe_injectable_circuit_addr(
+    relay_address: &str,
+    expected_pid: &PeerId,
+) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let ma: Multiaddr = relay_address.parse().ok()?;
+
+    let mut relay_ip: Option<String> = None;
+    let mut seen_circuit = false;
+    let mut target_after_circuit: Option<PeerId> = None;
+    for p in ma.iter() {
+        match p {
+            // The relay hop IP is the one *before* /p2p-circuit.
+            Protocol::Ip4(ip) if !seen_circuit => relay_ip = Some(ip.to_string()),
+            Protocol::Ip6(ip) if !seen_circuit => relay_ip = Some(ip.to_string()),
+            Protocol::P2pCircuit => seen_circuit = true,
+            // The target peer id is the one *after* /p2p-circuit.
+            Protocol::P2p(pid) if seen_circuit => target_after_circuit = Some(pid),
+            _ => {}
+        }
+    }
+
+    // Must be circuit-scoped through a *known* bootstrap relay.
+    if !seen_circuit {
+        return None;
+    }
+    match relay_ip {
+        Some(ip) if is_bootstrap_relay_ip(&ip) => {}
+        _ => return None,
+    }
+    // If the circuit names a target, it must be this peer — no seeding an
+    // address that dials on behalf of a different identity.
+    if let Some(t) = target_after_circuit {
+        if &t != expected_pid {
+            return None;
+        }
+    }
+    Some(ma)
+}
+
 // ─── WS-F F-6: relay cap + circuit migration + leech policy ──────────────────
 //
 // These are the SHARED policy primitives used by both the Linode bootstrap
@@ -581,5 +633,47 @@ mod tests {
                 "benign close `{benign}` must not trigger lockout",
             );
         }
+    }
+
+    // ── D-S5: only inject bootstrap-relay circuit addresses ────────────────
+
+    const US_RELAY_PID: &str = "12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb";
+
+    #[test]
+    fn ds5_accepts_bootstrap_circuit_addr_for_matching_target() {
+        let target = PeerId::random();
+        let good = format!("/ip4/45.79.190.172/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit/p2p/{target}");
+        assert!(safe_injectable_circuit_addr(&good, &target).is_some());
+        // Reservation-form (no explicit target) through a bootstrap is also fine.
+        let reservation = format!("/ip4/45.79.190.172/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit");
+        assert!(safe_injectable_circuit_addr(&reservation, &target).is_some());
+    }
+
+    #[test]
+    fn ds5_rejects_circuit_naming_a_different_target() {
+        let target = PeerId::random();
+        let other = PeerId::random();
+        let addr = format!("/ip4/45.79.190.172/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit/p2p/{target}");
+        // Record for `other` must not be able to seed an address that dials `target`.
+        assert!(safe_injectable_circuit_addr(&addr, &other).is_none());
+    }
+
+    #[test]
+    fn ds5_rejects_circuit_through_non_bootstrap_relay() {
+        // The reflection vector: a "circuit" whose relay hop is a victim host.
+        let target = PeerId::random();
+        let victim = format!("/ip4/9.9.9.9/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit/p2p/{target}");
+        assert!(safe_injectable_circuit_addr(&victim, &target).is_none());
+    }
+
+    #[test]
+    fn ds5_rejects_direct_address() {
+        // A signed record advertising a direct (non-circuit) victim address is
+        // dropped — this is exactly the DHT-amplification vector D-S5 closes.
+        let target = PeerId::random();
+        let direct = format!("/ip4/9.9.9.9/udp/443/quic-v1/p2p/{target}");
+        assert!(safe_injectable_circuit_addr(&direct, &target).is_none());
+        let garbage = "not-a-multiaddr";
+        assert!(safe_injectable_circuit_addr(garbage, &target).is_none());
     }
 }

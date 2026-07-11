@@ -3363,31 +3363,42 @@ fn handle_kad_event(
                                 // circuit), in which case we skip — the
                                 // direct host:port dial will be attempted by
                                 // the gRPC layer instead.
+                                // D-S5: only inject a bootstrap-relay circuit
+                                // address that names this peer — a signed record
+                                // proves authorship, not that the declared address
+                                // is honest, so a direct/foreign address here is a
+                                // reflection-attack vector and is dropped.
                                 if !peer_record.relay_address.is_empty()
                                     && !peer_record.libp2p_peer_id.is_empty()
                                 {
-                                    match (
-                                        peer_record.libp2p_peer_id.parse::<PeerId>(),
-                                        peer_record.relay_address.parse::<Multiaddr>(),
-                                    ) {
-                                        (Ok(pid), Ok(ma)) => {
-                                            let update = swarm
-                                                .behaviour_mut()
-                                                .kademlia
-                                                .add_address(&pid, ma.clone());
-                                            debug!(
-                                                %pid, %ma, ?update,
-                                                "discover_auto_added_address"
-                                            );
+                                    match peer_record.libp2p_peer_id.parse::<PeerId>() {
+                                        Ok(pid) => {
+                                            match crate::relay::safe_injectable_circuit_addr(
+                                                &peer_record.relay_address,
+                                                &pid,
+                                            ) {
+                                                Some(ma) => {
+                                                    let update = swarm
+                                                        .behaviour_mut()
+                                                        .kademlia
+                                                        .add_address(&pid, ma.clone());
+                                                    debug!(
+                                                        %pid, %ma, ?update,
+                                                        "discover_auto_added_address"
+                                                    );
+                                                }
+                                                None => {
+                                                    warn!(
+                                                        %pid,
+                                                        addr = %peer_record.relay_address,
+                                                        "discover: rejected non-injectable relay_address (D-S5)"
+                                                    );
+                                                }
+                                            }
                                         }
-                                        (Err(e), _) => {
+                                        Err(e) => {
                                             warn!(
                                                 "discover: invalid libp2p_peer_id in record: {e}"
-                                            );
-                                        }
-                                        (_, Err(e)) => {
-                                            warn!(
-                                                "discover: invalid relay_address in record: {e}"
                                             );
                                         }
                                     }
@@ -3435,6 +3446,12 @@ fn handle_kad_event(
                 }
             }
         }
+        // D-S3: with StoreInserts::FilterBoth, inbound PUTs are NOT auto-stored —
+        // we must explicitly accept them, which lets us verify signed records
+        // before storing/replicating so this node never amplifies poison.
+        kad::Event::InboundRequest { request } => {
+            handle_inbound_kad_request(request, swarm);
+        }
         kad::Event::RoutingUpdated { peer, .. } => {
             debug!(%peer, "kademlia routing updated");
         }
@@ -3451,6 +3468,52 @@ fn handle_kad_event(
         _ => {
             debug!(?event, "unhandled kademlia event");
         }
+    }
+}
+
+/// D-S3: accept-or-drop an inbound Kademlia PUT under `StoreInserts::FilterBoth`.
+///
+/// With filtering on, libp2p does NOT auto-store inbound records; each arrives
+/// here as an `InboundRequest` carrying the record, and we must explicitly write
+/// it back to the store to keep it (and let Kad replicate it onward). We verify
+/// the signed `PeerRecord` first — a forged/undecodable one is dropped, so this
+/// node never stores or re-replicates poison. Provider records carry no
+/// signature (the real signed record is fetched + verified on the read side), so
+/// they are stored as-is to preserve PEX/provider discovery.
+fn handle_inbound_kad_request(
+    request: kad::InboundRequest,
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+) {
+    match request {
+        kad::InboundRequest::PutRecord { source, record: Some(record), .. } => {
+            match dht::decode_record(&record.value) {
+                Ok(peer_record) => {
+                    if let Err(e) = dht::verify_peer_record(&peer_record) {
+                        warn!(%source, %e,
+                              "kad_put_rejected: inbound record failed verification (poison?)");
+                        return;
+                    }
+                    if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                        debug!(%source, ?e, "kad_put: store rejected verified record (capacity?)");
+                    }
+                }
+                Err(e) => {
+                    warn!(%source, %e, "kad_put_rejected: undecodable inbound record");
+                }
+            }
+        }
+        // Filtered but empty (shouldn't happen with FilterBoth) — nothing to store.
+        kad::InboundRequest::PutRecord { record: None, .. } => {}
+        kad::InboundRequest::AddProvider { record: Some(provider) } => {
+            // No signature to verify here; the read side fetches + verifies the
+            // provider's actual signed record before trusting it.
+            if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().add_provider(provider) {
+                debug!(?e, "kad_add_provider: store rejected (capacity?)");
+            }
+        }
+        kad::InboundRequest::AddProvider { record: None } => {}
+        // Read-side inbound requests (FindNode/GetProvider/GetRecord) need no action.
+        _ => {}
     }
 }
 
@@ -3478,13 +3541,20 @@ fn ingest_discovered_record(
     }
     // Install the relay-circuit address so the peer is dialable (mirrors the legacy
     // GetRecord path; without it, discover returns a record but the address book is empty).
+    // D-S5: gate the self-declared address through safe_injectable_circuit_addr so a
+    // signed-but-dishonest address can't seed the routing table with a victim host.
     if !peer_record.relay_address.is_empty() && !peer_record.libp2p_peer_id.is_empty() {
-        if let (Ok(pid), Ok(ma)) = (
-            peer_record.libp2p_peer_id.parse::<PeerId>(),
-            peer_record.relay_address.parse::<Multiaddr>(),
-        ) {
-            let update = swarm.behaviour_mut().kademlia.add_address(&pid, ma.clone());
-            debug!(%pid, %ma, ?update, "discover_auto_added_address");
+        if let Ok(pid) = peer_record.libp2p_peer_id.parse::<PeerId>() {
+            match crate::relay::safe_injectable_circuit_addr(&peer_record.relay_address, &pid) {
+                Some(ma) => {
+                    let update = swarm.behaviour_mut().kademlia.add_address(&pid, ma.clone());
+                    debug!(%pid, %ma, ?update, "discover_auto_added_address");
+                }
+                None => {
+                    warn!(%pid, addr = %peer_record.relay_address,
+                          "ingest: rejected non-injectable relay_address (D-S5)");
+                }
+            }
         }
     }
     let pid_str = peer_record.libp2p_peer_id.clone();
