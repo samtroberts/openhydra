@@ -150,6 +150,7 @@ pub fn handle_receipt_inbound(
     data: &[u8],
     sign: &dyn Fn(&[u8]) -> Vec<u8>,
     this_provider_pub: &[u8],
+    bind_check: &dyn Fn(&ReceiptPayload) -> Result<(), String>,
 ) -> (Vec<u8>, Option<CoSignedReceipt>) {
     if data.first() != Some(&RECEIPT_REQUEST) {
         return (err_response("unsupported method"), None);
@@ -160,6 +161,11 @@ pub fn handle_receipt_inbound(
     };
     if payload.provider.as_bytes() != this_provider_pub {
         return (err_response("receipt names a different provider"), None);
+    }
+    // B-S1: the receipt must settle against a real serve the provider recorded (right
+    // tokens/model, fresh, single-use). Reject before co-signing if the binding fails.
+    if let Err(reason) = bind_check(&payload) {
+        return (err_response(&reason), None);
     }
     let provider_sig = match to_sig(&sign(&cosign_bytes(&payload, &consumer_sig))) {
         Ok(s) => s,
@@ -197,7 +203,7 @@ mod tests {
         let psign = sign_with(&provider);
         // The transport IS the provider's handler — in-process round-trip.
         let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            Ok(handle_receipt_inbound(req, &psign, &provider_pub).0)
+            Ok(handle_receipt_inbound(req, &psign, &provider_pub, &|_: &ReceiptPayload| Ok::<(), String>(())).0)
         };
 
         let receipt = request_receipt(
@@ -227,7 +233,7 @@ mod tests {
         let a_pub = pubkey(&provider_a);
         // ...but it's delivered to A's handler.
         let mut transport =
-            |req: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(handle_receipt_inbound(req, &a_sign, &a_pub).0) };
+            |req: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(handle_receipt_inbound(req, &a_sign, &a_pub, &|_: &ReceiptPayload| Ok::<(), String>(())).0) };
 
         let err = request_receipt(
             &csign,
@@ -246,7 +252,7 @@ mod tests {
     #[test]
     fn provider_handler_ledgers_only_accepted_receipts() {
         let provider = signer(9);
-        let (_, accepted) = handle_receipt_inbound(b"\x99garbage", &sign_with(&provider), &pubkey(&provider));
+        let (_, accepted) = handle_receipt_inbound(b"\x99garbage", &sign_with(&provider), &pubkey(&provider), &|_: &ReceiptPayload| Ok::<(), String>(()));
         assert!(accepted.is_none()); // wrong method byte → no receipt to ledger
     }
 

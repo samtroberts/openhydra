@@ -165,7 +165,7 @@ mod tests {
             for _ in 0..8 {
                 let in_flight = Arc::clone(&in_flight);
                 let peak = Arc::clone(&peak);
-                pool.submit(move || {
+                let _ = pool.submit(move || {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(50));
@@ -186,7 +186,7 @@ mod tests {
         {
             let pool = WorkerPool::new(0);
             let c = Arc::clone(&counter);
-            pool.submit(move || {
+            let _ = pool.submit(move || {
                 c.fetch_add(1, Ordering::SeqCst);
             });
         }

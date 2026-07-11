@@ -51,6 +51,11 @@ pub struct ServeRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// The receipt nonce the consumer commits *before* the serve (B-S1). The provider
+    /// records the tokens it serves under this nonce and later co-signs the settlement
+    /// receipt only if the same nonce is presented with `tokens <= served`, the same model,
+    /// once, and fresh. Required: a serve carrying no committed nonce cannot be settled.
+    pub nonce: [u8; 16],
 }
 
 impl ServeRequest {
@@ -248,6 +253,7 @@ mod tests {
             messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
             max_tokens: Some(64),
             temperature: None,
+            nonce: [0u8; 16],
         }
     }
 

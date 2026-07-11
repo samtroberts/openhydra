@@ -234,13 +234,18 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
         }
         let chunk = parse_chunk(payload)?;
         for choice in &chunk.choices {
-            if let Some(content) = &choice.delta.content {
-                if !content.is_empty() {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(std::time::Instant::now());
+            // B-C4: once a finish_reason has been seen, stop emitting/counting content.
+            // Anything a (buggy or malicious) server sends after the finish must not
+            // inflate `chunk_tokens` — that count is the fallback that feeds the receipt.
+            if !done {
+                if let Some(content) = &choice.delta.content {
+                    if !content.is_empty() {
+                        if first_token_at.is_none() {
+                            first_token_at = Some(std::time::Instant::now());
+                        }
+                        on_delta(content);
+                        chunk_tokens += 1;
                     }
-                    on_delta(content);
-                    chunk_tokens += 1;
                 }
             }
             if choice.finish_reason.is_some() {

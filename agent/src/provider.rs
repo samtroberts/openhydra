@@ -118,6 +118,51 @@ fn ledger_receipt(store: Option<&Store>, accepted: Option<&CoSignedReceipt>) {
     }
 }
 
+/// What the provider recorded about a serve, keyed by the consumer-committed receipt nonce,
+/// so a settlement receipt can be validated against real work done (B-S1): same model,
+/// `tokens <= served`, single-use, and fresh. Bounded + TTL-pruned (B-S7).
+struct ServeCommitment {
+    model_id: String,
+    tokens: u64,
+    recorded_ms: u64,
+}
+
+/// How long a serve commitment stays settleable, and the receipt-freshness window (B-S1/S7).
+const COMMITMENT_TTL_MS: u64 = 5 * 60 * 1000;
+/// Allowance for consumer/provider clock skew on the receipt timestamp.
+const CLOCK_SKEW_MS: u64 = 60 * 1000;
+/// Hard cap on outstanding (un-settled) commitments — a backstop so a flood of serves whose
+/// receipts never arrive can't grow the map without bound.
+const MAX_COMMITMENTS: usize = 10_000;
+
+/// Pure B-S1/B-S7 validation, extracted so it is unit-testable without a live `Provider`.
+/// Prunes expired commitments, checks the receipt fields against the serve recorded under
+/// `nonce`, and consumes the commitment (single-use) on success. `Err(reason)` rejects the
+/// receipt before it is co-signed.
+fn validate_and_consume_commitment(
+    map: &mut HashMap<[u8; 16], ServeCommitment>,
+    nonce: &[u8; 16],
+    model_id: &str,
+    tokens: u64,
+    ts_unix_ms: u64,
+    now: u64,
+) -> Result<(), String> {
+    // Receipt-timestamp freshness (B-S7): reject stale or far-future receipts.
+    if ts_unix_ms + COMMITMENT_TTL_MS < now || ts_unix_ms > now + CLOCK_SKEW_MS {
+        return Err("receipt timestamp outside freshness window".into());
+    }
+    map.retain(|_, c| now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS);
+    let c = map.get(nonce).ok_or("no serve commitment for this receipt nonce")?;
+    if model_id != c.model_id {
+        return Err("receipt model does not match the served model".into());
+    }
+    if tokens > c.tokens {
+        return Err("receipt tokens exceed tokens actually served".into());
+    }
+    map.remove(nonce); // single-use
+    Ok(())
+}
+
 /// An engine joined to the swarm: advertises its models and serves inbound requests.
 pub struct Provider<A: EngineAdapter> {
     adapter: A,
@@ -142,6 +187,9 @@ pub struct Provider<A: EngineAdapter> {
     /// P0 introspection: shared transfer counters read by the `--status-bind` server.
     /// `None` → no counting (status endpoint not enabled).
     stats: Option<Arc<TransferStats>>,
+    /// B-S1/B-S7: receipt-nonce → what we served under it, so a settlement receipt is checked
+    /// against real work (tokens ≤ served, model match, single-use, fresh). Bounded + pruned.
+    serve_commitments: Mutex<HashMap<[u8; 16], ServeCommitment>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -156,6 +204,7 @@ impl<A: EngineAdapter> Provider<A> {
             throttling: AtomicUsize::new(0),
             aup: AupPolicy::permissive(),
             stats: None,
+            serve_commitments: Mutex::new(HashMap::new()),
         }
     }
 
@@ -195,6 +244,37 @@ impl<A: EngineAdapter> Provider<A> {
             .encode()])),
             AupDecision::Allow => None,
         }
+    }
+
+    /// B-S1: record what we just served under the consumer's committed nonce, so the
+    /// settlement receipt can be validated against it. Prunes expired commitments and
+    /// enforces a hard cap so the map stays bounded (B-S7).
+    fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64) {
+        let now = now_unix_ms();
+        let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, c| now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS);
+        if map.len() >= MAX_COMMITMENTS {
+            return; // backstop — refuse to grow past the cap (stale entries already pruned)
+        }
+        map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now });
+    }
+
+    /// B-S1/B-S7: validate a settlement receipt against the serve we recorded under its
+    /// nonce, and consume the commitment (single-use). `Err(reason)` rejects the receipt
+    /// *before* it is co-signed — closing the token-inflation hole.
+    fn check_and_consume_commitment(
+        &self,
+        p: &openhydra_protocol::receipts::ReceiptPayload,
+    ) -> Result<(), String> {
+        let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+        validate_and_consume_commitment(
+            &mut map,
+            &p.nonce,
+            &p.model_id,
+            p.tokens,
+            p.ts_unix_ms,
+            now_unix_ms(),
+        )
     }
 
     /// Attach a ledger so accepted co-signed receipts are persisted (M2.3), and rehydrate
@@ -391,7 +471,12 @@ impl<A: EngineAdapter> Provider<A> {
             Some(&RECEIPT_REQUEST) => {
                 let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
                 let provider_pub = self.net.public_key_bytes().unwrap_or_default();
-                let (response, accepted) = handle_receipt_inbound(data, &sign, &provider_pub);
+                // B-S1: only co-sign a receipt that settles a real serve we recorded.
+                let bind = |p: &openhydra_protocol::receipts::ReceiptPayload| {
+                    self.check_and_consume_commitment(p)
+                };
+                let (response, accepted) =
+                    handle_receipt_inbound(data, &sign, &provider_pub, &bind);
                 // Persist the accepted co-signed receipt (best-effort; never fails the reply).
                 ledger_receipt(self.store.as_ref(), accepted.as_ref());
                 // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
@@ -406,18 +491,25 @@ impl<A: EngineAdapter> Provider<A> {
             // A serve request: run it, and — when the status endpoint is on — fold the
             // outcome into the shared transfer counters (per-model tokens + native TPS).
             Some(&SERVE_REQUEST) => {
-                let model_ref = ServeRequest::decode(&data[1..]).ok().map(|r| r.model_ref);
+                let decoded = ServeRequest::decode(&data[1..]).ok();
                 let mut chunks: Vec<Vec<u8>> = Vec::new();
                 let summary =
                     handle_serve_request(&data[1..], &self.adapter, &mut |c| chunks.push(c.to_vec()));
-                if let (Some(stats), Some(model)) = (&self.stats, model_ref) {
+                // B-S1: record what we served under the consumer's committed nonce so its
+                // settlement receipt can be validated (right tokens/model, once, fresh).
+                if let Some(req) = &decoded {
+                    if summary.ok && summary.tokens > 0 {
+                        self.record_commitment(req.nonce, req.model_ref.clone(), summary.tokens);
+                    }
+                }
+                if let (Some(stats), Some(req)) = (&self.stats, &decoded) {
                     let e = &summary.metrics.engine;
                     let native_tps = if e.eval_duration_ns > 0 {
                         e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
                     } else {
                         0.0
                     };
-                    stats.record_serve(&model, summary.tokens, native_tps, summary.ok);
+                    stats.record_serve(&req.model_ref, summary.tokens, native_tps, summary.ok);
                 }
                 frame_response(&chunks)
             }
@@ -495,6 +587,7 @@ mod tests {
             messages: vec![],
             max_tokens: None,
             temperature: None,
+            nonce: [0u8; 16],
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -558,5 +651,72 @@ mod tests {
         // No store configured → nothing persisted, no panic.
         let receipt = test_receipt([22u8; 16], 64);
         ledger_receipt(None, Some(&receipt));
+    }
+
+    // ---- B-S1 / B-S7: serve-commitment binding ---------------------------------------
+
+    fn commit(map: &mut HashMap<[u8; 16], ServeCommitment>, n: [u8; 16], model: &str, tokens: u64, now: u64) {
+        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now });
+    }
+
+    #[test]
+    fn commitment_accepts_match_once_then_rejects_replay() {
+        let now = 1_000_000u64;
+        let mut map = HashMap::new();
+        commit(&mut map, [7u8; 16], "qwen2.5:7b", 100, now);
+        assert!(validate_and_consume_commitment(&mut map, &[7u8; 16], "qwen2.5:7b", 100, now, now).is_ok());
+        // Single-use: the commitment is consumed, so a replay of the same receipt is rejected.
+        assert!(validate_and_consume_commitment(&mut map, &[7u8; 16], "qwen2.5:7b", 100, now, now)
+            .unwrap_err()
+            .contains("no serve commitment"));
+    }
+
+    #[test]
+    fn commitment_allows_underclaim_rejects_overclaim() {
+        let now = 1_000_000u64;
+        let mut map = HashMap::new();
+        commit(&mut map, [8u8; 16], "m", 100, now);
+        // Claiming fewer tokens than served is harmless (only reduces the provider's credit).
+        assert!(validate_and_consume_commitment(&mut map, &[8u8; 16], "m", 40, now, now).is_ok());
+        // The B-S1 attack — claiming more than served — is rejected.
+        commit(&mut map, [9u8; 16], "m", 100, now);
+        assert!(validate_and_consume_commitment(&mut map, &[9u8; 16], "m", u64::MAX, now, now)
+            .unwrap_err()
+            .contains("exceed"));
+    }
+
+    #[test]
+    fn commitment_rejects_unknown_nonce_and_model_mismatch() {
+        let now = 1_000_000u64;
+        let mut map = HashMap::new();
+        assert!(validate_and_consume_commitment(&mut map, &[1u8; 16], "m", 1, now, now)
+            .unwrap_err()
+            .contains("no serve commitment"));
+        // Right nonce, wrong model → reject (no cross-model misattribution).
+        commit(&mut map, [2u8; 16], "cheap-model", 100, now);
+        assert!(validate_and_consume_commitment(&mut map, &[2u8; 16], "expensive-model", 100, now, now)
+            .unwrap_err()
+            .contains("model"));
+    }
+
+    #[test]
+    fn commitment_enforces_freshness_and_prunes_stale() {
+        let now = 10 * COMMITMENT_TTL_MS;
+        let mut map = HashMap::new();
+        commit(&mut map, [3u8; 16], "m", 100, now);
+        // Receipt timestamp older than the window, or far in the future → reject (B-S7).
+        assert!(validate_and_consume_commitment(&mut map, &[3u8; 16], "m", 100, 0, now)
+            .unwrap_err()
+            .contains("freshness"));
+        assert!(validate_and_consume_commitment(&mut map, &[3u8; 16], "m", 100, now + 10 * CLOCK_SKEW_MS, now)
+            .unwrap_err()
+            .contains("freshness"));
+        // A commitment older than the TTL is pruned on the next validate, bounding the map.
+        let mut map2 = HashMap::new();
+        commit(&mut map2, [4u8; 16], "m", 100, 0); // recorded at ts 0, now is 10*TTL later
+        assert!(validate_and_consume_commitment(&mut map2, &[4u8; 16], "m", 100, now, now)
+            .unwrap_err()
+            .contains("no serve commitment"));
+        assert!(map2.is_empty(), "stale commitment should have been pruned");
     }
 }

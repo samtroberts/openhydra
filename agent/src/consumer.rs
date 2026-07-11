@@ -359,12 +359,16 @@ impl ConsumerNode {
                 provider = %provider.libp2p_peer_id,
             )
             .entered();
+            // B-S1: commit the receipt nonce up front so the provider records what it serves
+            // under it; the settlement receipt then reuses this exact nonce.
+            let nonce = rand::random::<[u8; 16]>();
             let request = ServeRequest {
                 reply_to: self.net.libp2p_peer_id().to_string(),
                 model_ref: provider.model_id.clone(),
                 messages: messages.clone(),
                 max_tokens,
                 temperature,
+                nonce,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             let t_serve = std::time::Instant::now();
@@ -398,7 +402,7 @@ impl ConsumerNode {
                     // Settle the co-signed receipt at EOS (best-effort — tokens already
                     // delivered; a failed/slow settlement must not fail the completion).
                     if summary.ok && summary.tokens > 0 {
-                        self.settle_receipt(&provider, summary.tokens);
+                        self.settle_receipt(&provider, summary.tokens, nonce);
                     }
                     // M2.2(a): a clean served completion earns the provider reputation.
                     self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
@@ -433,7 +437,7 @@ impl ConsumerNode {
     /// Fire the co-signed receipt for a completed request. Skips a provider that
     /// advertised no usable public key; swallows all errors (trust settlement is
     /// auxiliary to delivering the completion).
-    fn settle_receipt(&self, provider: &SelectedProvider, tokens: u64) {
+    fn settle_receipt(&self, provider: &SelectedProvider, tokens: u64, nonce: [u8; 16]) {
         let provider_pub = match hex::decode(&provider.public_key) {
             Ok(b) if b.len() == 32 => b,
             _ => return, // legacy / unkeyed provider — nothing to settle against
@@ -458,7 +462,7 @@ impl ConsumerNode {
             &consumer_pub,
             &provider.model_id,
             tokens,
-            rand::random::<[u8; 16]>(),
+            nonce,
             now_unix_ms(),
         )
         .is_ok()
@@ -556,6 +560,8 @@ impl ConsumerNode {
             // Redundant-execution comparison only holds for greedy decoding — a sampled
             // (temperature > 0) answer would legitimately differ between honest providers.
             temperature: Some(0.0),
+            // Audit serves are never settled into a receipt, but the field is required.
+            nonce: rand::random::<[u8; 16]>(),
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -685,6 +691,7 @@ mod tests {
             messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
             max_tokens: Some(64),
             temperature: None,
+            nonce: [0u8; 16],
         }
     }
 
