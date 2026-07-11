@@ -38,11 +38,13 @@ pub struct SwarmOptions {
 impl Default for SwarmOptions {
     fn default() -> Self {
         Self {
+            // F-N5: these are compile-time-constant multiaddrs, so `expect` documents
+            // the invariant (and points at the offending literal) instead of a bare unwrap.
             listen_addrs: vec![
-                "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
-                "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
-                "/ip6/::/tcp/4001".parse().unwrap(),
-                "/ip6/::/udp/4001/quic-v1".parse().unwrap(),
+                "/ip4/0.0.0.0/tcp/4001".parse().expect("const listen multiaddr: ip4 tcp"),
+                "/ip4/0.0.0.0/udp/4001/quic-v1".parse().expect("const listen multiaddr: ip4 quic"),
+                "/ip6/::/tcp/4001".parse().expect("const listen multiaddr: ip6 tcp"),
+                "/ip6/::/udp/4001/quic-v1".parse().expect("const listen multiaddr: ip6 quic"),
             ],
             bootstrap_peers: Vec::new(),
             protocol_version: "openhydra/0.1.0".to_string(),
@@ -340,6 +342,12 @@ pub fn build_swarm(
         upnp,
     };
 
+    // F-N8 (note): a 300 s idle-connection timeout keeps an otherwise-silent
+    // connection open for up to 5 min. That is intentional for long inference
+    // sessions (a slow completion can idle the proxy stream between chunks), but
+    // it sits in tension with prompt dead-peer reaping — ping-failure eviction and
+    // the known_peers reaper are what actually detect a dead peer here, not this
+    // timeout. Kept at 300 s deliberately; revisit only if idle-conn count grows.
     let swarm_config = SwarmConfig::with_tokio_executor()
         .with_idle_connection_timeout(Duration::from_secs(300));
 

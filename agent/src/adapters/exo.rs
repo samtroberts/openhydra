@@ -121,7 +121,18 @@ impl<H: HttpClient> EngineAdapter for ExoAdapter<H> {
         let json = self.http.get(&format!("{}/state", self.base_url))?;
         let state: State =
             serde_json::from_str(&json).map_err(|e| AdapterError::Parse(e.to_string()))?;
-        Ok(serving_models(&state)
+        let serving = serving_models(&state);
+        // F-C8: /state parsed fine but nothing is serveable while instances exist —
+        // surface it, since an empty model list otherwise looks identical to "Exo
+        // is down" (the usual cause is a placed instance whose runners aren't all
+        // `RunnerReady` yet — still warming up or a stuck runner).
+        if serving.is_empty() && !state.instances.is_empty() {
+            tracing::debug!(
+                instances = state.instances.len(),
+                "exo: /state has instances but none are serveable (no placed instance has all runners RunnerReady)"
+            );
+        }
+        Ok(serving
             .into_iter()
             .map(|model_id| DetectedModel {
                 engine_ref: model_id,

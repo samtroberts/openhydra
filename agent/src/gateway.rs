@@ -174,7 +174,9 @@ fn usage_value(summary: &ServeSummary) -> Value {
     json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": prompt + completion,
+        // F-C7: saturating add (matches the saturating_sub nearby) so a bogus
+        // engine count can't panic the gateway on overflow.
+        "total_tokens": prompt.saturating_add(completion),
     })
 }
 

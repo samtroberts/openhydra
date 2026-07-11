@@ -176,9 +176,10 @@ impl EngineAdapter for MultiAdapter {
     fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
         let table = build_routes(&detect_engines());
         let models = table.models.clone();
-        if let Ok(mut guard) = self.table.write() {
-            *guard = table;
-        }
+        // F-C6: recover from a poisoned lock instead of silently skipping the
+        // update — otherwise we'd return (and announce) `models` while the route
+        // table the serve path reads stays stale, a hard-to-debug mismatch.
+        *self.table.write().unwrap_or_else(|e| e.into_inner()) = table;
         Ok(models)
     }
 
