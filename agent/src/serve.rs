@@ -172,7 +172,17 @@ pub fn handle_serve_request(
             };
         }
     };
+    handle_serve_request_parsed(req, adapter, send_chunk)
+}
 
+/// F-C5: serve an already-decoded [`ServeRequest`]. The provider decodes the request once on
+/// the inbound path and threads it through throttle/AUP/dispatch, so the hot serve path no
+/// longer re-decodes the (potentially large) prompt several times per request.
+pub fn handle_serve_request_parsed(
+    req: ServeRequest,
+    adapter: &dyn EngineAdapter,
+    send_chunk: &mut dyn FnMut(&[u8]),
+) -> ServeSummary {
     let infer = InferenceRequest {
         model_ref: req.model_ref,
         messages: req.messages,

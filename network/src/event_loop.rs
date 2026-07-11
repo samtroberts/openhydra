@@ -426,8 +426,14 @@ const MAX_INFLIGHT_PER_PEER: usize = 256;
 /// Thread-safe queue for inbound proxy requests, shared between the
 /// event loop (producer) and Python poll_proxy_request (consumer).
 /// Bypasses the command channel to avoid event-loop round-trip latency.
+/// An inbound proxy request handed to the agent: `(request_id, source_peer, data)`.
+/// E-S8: `source_peer` is the libp2p-authenticated peer that sent the request (or
+/// our own peer id for loopback), so the agent can rate-limit per real identity —
+/// a trustworthy key, unlike anything inside the (unverified) request bytes.
+pub type InboundProxyItem = (String, String, Vec<u8>);
+
 pub struct SharedProxyQueue {
-    queue: Mutex<VecDeque<(String, Vec<u8>)>>,
+    queue: Mutex<VecDeque<InboundProxyItem>>,
     condvar: Condvar,
 }
 
@@ -439,7 +445,7 @@ impl SharedProxyQueue {
         }
     }
 
-    pub fn push(&self, item: (String, Vec<u8>)) {
+    pub fn push(&self, item: InboundProxyItem) {
         let mut q = self.queue.lock().unwrap();
         // Audit 2.4: drop-oldest on overflow so a flooding peer cannot grow
         // this queue without bound.
@@ -451,7 +457,7 @@ impl SharedProxyQueue {
         self.condvar.notify_one();
     }
 
-    pub fn pop(&self, timeout: std::time::Duration) -> Option<(String, Vec<u8>)> {
+    pub fn pop(&self, timeout: std::time::Duration) -> Option<InboundProxyItem> {
         let mut q = self.queue.lock().unwrap();
         if let Some(item) = q.pop_front() {
             return Some(item);
@@ -3008,10 +3014,12 @@ fn handle_swarm_event(
             }
 
             // Send any queued proxy forwards that were waiting for this connection.
+            let mut flushed_for_peer = false;
             let mut remaining = Vec::new();
             for (target, data, reply, enqueued_at) in state.pending_relay_forwards.drain(..) {
                 if target == peer_id {
                     info!(%peer_id, "sending queued proxy forward after relay connection");
+                    flushed_for_peer = true;
                     let req_id = swarm
                         .behaviour_mut()
                         .grpc_proxy
@@ -3022,6 +3030,20 @@ fn handle_swarm_event(
                 }
             }
             state.pending_relay_forwards = remaining;
+
+            // C-N6: a forward we just flushed rode this connection only because it
+            // was the one available. If that was a *relay* connection and we still
+            // have no direct path, kick off a DCUtR hole-punch now so the NEXT
+            // forward to this peer can take the fast direct path (C-N1 then retires
+            // the relay once direct proves stable). A one-shot request_response call
+            // already dispatched can't be re-targeted, so this upgrades subsequent
+            // traffic, not the in-flight request.
+            if flushed_for_peer
+                && transport == TransportType::TcpRelay
+                && state.peer_connections.get(&peer_id).map_or(true, |i| !i.has_direct())
+            {
+                handle_trigger_repunch(swarm, peer_id, state);
+            }
         }
         SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, .. } => {
             let addr_str = match &endpoint {
@@ -3940,7 +3962,7 @@ fn handle_grpc_proxy_event(
                                 // No IPC bridge — fall through to SharedProxyQueue.
                                 debug!(%peer, id=%req_id,
                                     "dispatch: ForwardMsg but no IPC bridge, fallthrough");
-                                proxy_queue.push((req_id.clone(), request.0));
+                                proxy_queue.push((req_id.clone(), peer.to_string(), request.0));
                                 state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                             }
                         }
@@ -4079,7 +4101,7 @@ fn handle_grpc_proxy_event(
                                     // Not a ring request — fall through to Python.
                                     state.inbound_proxy_counter += 1;
                                     let req_id = format!("proxy-{}", state.inbound_proxy_counter);
-                                    proxy_queue.push((req_id.clone(), request.0));
+                                    proxy_queue.push((req_id.clone(), peer.to_string(), request.0));
                                     state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                                 }
                             }
@@ -4162,7 +4184,7 @@ fn handle_grpc_proxy_event(
                                     // Not a ring request — fall through to Python.
                                     state.inbound_proxy_counter += 1;
                                     let req_id = format!("proxy-{}", state.inbound_proxy_counter);
-                                    proxy_queue.push((req_id, request.0));
+                                    proxy_queue.push((req_id, peer.to_string(), request.0));
                                     // Channel already consumed by ACK — no need to store.
                                 }
                             }
@@ -4184,7 +4206,7 @@ fn handle_grpc_proxy_event(
                             let req_id = format!("proxy-{}", state.inbound_proxy_counter);
                             info!(%peer, bytes = request.0.len(), id = %req_id,
                                 "proxy request queued for Python (legacy)");
-                            proxy_queue.push((req_id.clone(), request.0));
+                            proxy_queue.push((req_id.clone(), peer.to_string(), request.0));
                             state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                         }
                         DispatchAction::UnsupportedMethod { response, reason } => {
@@ -4295,7 +4317,8 @@ fn handle_proxy_forward(
         info!("proxy_forward: target is self — routing locally");
         state.inbound_proxy_counter += 1;
         let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
-        proxy_queue.push((req_id.clone(), data));
+        let self_id = swarm.local_peer_id().to_string();
+        proxy_queue.push((req_id.clone(), self_id, data));
         state.local_proxy_replies.insert(req_id, reply);
         return;
     }
@@ -4456,7 +4479,8 @@ fn handle_proxy_forward_no_wait(
         debug!("proxy_forward_no_wait: target is self — routing locally (no reply)");
         state.inbound_proxy_counter += 1;
         let req_id = format!("proxy-local-{}", state.inbound_proxy_counter);
-        proxy_queue.push((req_id, data));
+        let self_id = swarm.local_peer_id().to_string();
+        proxy_queue.push((req_id, self_id, data));
         return;
     }
 
@@ -5289,7 +5313,7 @@ mod tests {
         // unbounded.
         let q = SharedProxyQueue::new();
         for i in 0..(PROXY_QUEUE_MAX + 100) {
-            q.push((format!("req-{i}"), vec![0u8; 4]));
+            q.push((format!("req-{i}"), "12D3KooWsrc".to_string(), vec![0u8; 4]));
         }
         let len = q.queue.lock().unwrap().len();
         assert_eq!(len, PROXY_QUEUE_MAX, "queue must be capped at PROXY_QUEUE_MAX");

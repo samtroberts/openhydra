@@ -204,8 +204,11 @@ impl NetworkHandle {
         }
     }
 
-    /// Block up to `timeout` for the next inbound proxy request `(request_id, data)`.
-    pub fn poll_inbound(&self, timeout: Duration) -> Option<(String, Vec<u8>)> {
+    /// Block up to `timeout` for the next inbound proxy request
+    /// `(request_id, source_peer, data)`. E-S8: `source_peer` is the
+    /// libp2p-authenticated sender (or our own id for loopback), suitable as a
+    /// per-peer rate-limit key.
+    pub fn poll_inbound(&self, timeout: Duration) -> Option<crate::event_loop::InboundProxyItem> {
         self.proxy_queue.pop(timeout)
     }
 

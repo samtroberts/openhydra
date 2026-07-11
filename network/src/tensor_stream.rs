@@ -492,7 +492,7 @@ async fn handle_inbound_stream(
             registered.push(req_id.clone());
         }
 
-        proxy_queue.push((req_id, data));
+        proxy_queue.push((req_id, peer_id.to_string(), data));
     }
 
     // Purge any unanswered response handles registered by this stream.

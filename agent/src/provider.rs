@@ -34,7 +34,9 @@ use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
-use crate::serve::{frame_response, handle_serve_request, ServeChunk, ServeRequest};
+use crate::serve::{
+    frame_response, handle_serve_request, handle_serve_request_parsed, ServeChunk, ServeRequest,
+};
 use crate::status::TransferStats;
 use crate::workpool::WorkerPool;
 
@@ -136,19 +138,19 @@ const CLOCK_SKEW_MS: u64 = 60 * 1000;
 /// receipts never arrive can't grow the map without bound.
 const MAX_COMMITMENTS: usize = 10_000;
 
-/// E-S8: sustained ceiling on inbound *receipt* settlements processed per second. Each
-/// receipt costs an Ed25519 verify + co-sign; unbounded, a peer can flood them to burn CPU
-/// and monopolize the worker pool, starving real serve requests. Honest volume is ~1 per
-/// completed serve, so this ceiling is far above legitimate need and only bites a flood.
-///
-/// NOTE (per-peer follow-up): `poll_inbound` does not surface the source libp2p peer, so this
-/// is a single **global** bucket — it caps total receipt-crypto/sec regardless of how an
-/// attacker labels the traffic (keying on the untrusted `consumer` field would be useless: an
-/// attacker cycles forged identities, each getting a fresh burst). A true per-peer limit needs
-/// the source peer threaded through the network→agent boundary; tracked as future work.
+/// E-S8: sustained ceiling on inbound *receipt* settlements processed per second, **per
+/// sending peer**. Each receipt costs an Ed25519 verify + co-sign; unbounded, a peer can flood
+/// them to burn CPU and monopolize the worker pool, starving real serve requests. Honest
+/// volume is ~1 per completed serve, so this ceiling is far above legitimate need and only
+/// bites a flood — and because it is keyed on the libp2p-authenticated sender (threaded in via
+/// `InboundProxyItem.source_peer`), one abusive peer can't shed another peer's settlements.
 const RECEIPT_RATE_RPS: f64 = 50.0;
-/// E-S8: token-bucket burst above the sustained receipt rate.
+/// E-S8: token-bucket burst above the sustained receipt rate (per peer).
 const RECEIPT_RATE_BURST: f64 = 100.0;
+/// E-S8: cap on distinct sender identities the receipt limiter tracks. The limiter reclaims
+/// idle (full-bucket) entries first, so a peer churning identities can't turn it into a memory
+/// DoS; memory is O(currently-throttled peers), bounded by this.
+const RECEIPT_RATE_MAX_TRACKED: usize = 4096;
 
 /// Pure B-S1/B-S7 validation, extracted so it is unit-testable without a live `Provider`.
 /// Prunes expired commitments, checks the receipt fields against the serve recorded under
@@ -227,7 +229,7 @@ impl<A: EngineAdapter> Provider<A> {
                 rps: RECEIPT_RATE_RPS,
                 burst: RECEIPT_RATE_BURST,
                 max_inflight: 0, // rate-only; concurrency is already bounded by the worker pool
-                max_tracked: 1,  // single global bucket (no per-peer identity at this layer)
+                max_tracked: RECEIPT_RATE_MAX_TRACKED, // per-peer buckets, bounded + idle-evicted
             })),
         }
     }
@@ -256,11 +258,11 @@ impl<A: EngineAdapter> Provider<A> {
     /// AUP floor: if `data` is a serve request the policy refuses, return the framed `Error`
     /// to send back **instead of** serving it; otherwise `None` (serve normally). Receipts and
     /// unparseable frames are not policy-checked here — they fall through to `dispatch`.
-    fn aup_refusal(&self, data: &[u8]) -> Option<Vec<u8>> {
-        if !self.aup.is_active() || data.first() != Some(&SERVE_REQUEST) {
+    fn aup_refusal(&self, req: Option<&ServeRequest>) -> Option<Vec<u8>> {
+        if !self.aup.is_active() {
             return None;
         }
-        let req = ServeRequest::decode(&data[1..]).ok()?;
+        let req = req?; // non-serve / unparseable → nothing to police (dispatch handles it)
         match self.aup.evaluate(&req.messages, req.max_tokens) {
             AupDecision::Deny(reason) => Some(frame_response(&[ServeChunk::Error(format!(
                 "rejected by acceptable-use policy: {reason}"
@@ -365,15 +367,11 @@ impl<A: EngineAdapter> Provider<A> {
     /// already throttling, so at least one worker always stays free to serve immediately.
     /// A flood of leechers therefore can't put the whole pool to sleep and stall an arriving
     /// contributor — the soft throttle simply stops biting once the budget is spent.
-    fn maybe_throttle(&self, data: &[u8], max_concurrency: usize) {
-        if data.first() != Some(&SERVE_REQUEST) {
-            return; // receipts and unknown methods are never throttled
-        }
-        let reply_to = match ServeRequest::decode(&data[1..]) {
-            Ok(req) => req.reply_to,
-            Err(_) => return, // unparseable → let dispatch emit the error frame
-        };
-        let mult = throttle_multiplier(self.consumer_rate_cap(&reply_to));
+    fn maybe_throttle(&self, req: Option<&ServeRequest>, max_concurrency: usize) {
+        // Receipts, unknown methods, and unparseable serves are never throttled (the last
+        // falls through to dispatch's error frame). F-C5: `req` is decoded once upstream.
+        let Some(req) = req else { return };
+        let mult = throttle_multiplier(self.consumer_rate_cap(&req.reply_to));
         if mult <= 0.0 {
             return; // contributor — full speed
         }
@@ -437,24 +435,34 @@ impl<A: EngineAdapter> Provider<A> {
         // of waiting out the periodic `reannounce_every` interval.
         let mut last_generation = self.net.network_generation();
         loop {
-            if let Some((request_id, data)) = self.net.poll_inbound(poll_timeout) {
+            if let Some((request_id, source_peer, data)) = self.net.poll_inbound(poll_timeout) {
                 // Serve off the poll thread so the loop can keep accepting requests and a
                 // slow one doesn't head-of-line-block the rest.
                 let provider = Arc::clone(&self);
                 let shed_id = request_id.clone();
                 let accepted = pool.submit(move || {
+                    // F-C5: decode the serve request ONCE here and thread it through
+                    // throttle / AUP / dispatch, instead of each re-decoding the (possibly
+                    // large) prompt. `None` for non-serve or unparseable frames.
+                    let parsed: Option<ServeRequest> = if data.first() == Some(&SERVE_REQUEST) {
+                        ServeRequest::decode(&data[1..]).ok()
+                    } else {
+                        None
+                    };
                     // M2.3: throttle a leecher first (off the poll thread, budget-capped so
                     // it never stalls the pool); contributors pass straight through.
-                    provider.maybe_throttle(&data, max_concurrency);
+                    provider.maybe_throttle(parsed.as_ref(), max_concurrency);
                     // AUP floor: refuse a policy-violating serve request without running it.
-                    let response = match provider.aup_refusal(&data) {
+                    let response = match provider.aup_refusal(parsed.as_ref()) {
                         Some(refusal) => {
                             if let Some(stats) = &provider.stats {
                                 stats.aup_refusals.fetch_add(1, Ordering::Relaxed);
                             }
                             refusal
                         }
-                        None => provider.dispatch(&data),
+                        // E-S8: the libp2p-authenticated sender keys the per-peer receipt
+                        // rate-limit, so one abusive peer can't shed everyone's settlements.
+                        None => provider.dispatch(&source_peer, &data, parsed),
                     };
                     // Best-effort reply; if the swarm is gone the next poll will error too.
                     let _ = provider.net.respond(request_id, response);
@@ -490,13 +498,16 @@ impl<A: EngineAdapter> Provider<A> {
     }
 
     /// Route one inbound request by its method byte: serve completions, settle receipts.
-    fn dispatch(&self, data: &[u8]) -> Vec<u8> {
+    /// `source_peer` is the libp2p-authenticated sender, used to rate-limit per peer.
+    /// `parsed` is the already-decoded serve request (F-C5), `None` for non-serve frames.
+    fn dispatch(&self, source_peer: &str, data: &[u8], parsed: Option<ServeRequest>) -> Vec<u8> {
         match data.first() {
             Some(&RECEIPT_REQUEST) => {
-                // E-S8: shed a receipt flood before spending any crypto. The guard is
-                // dropped immediately — we use the token bucket purely as a rate cap
-                // (concurrency is bounded by the worker pool).
-                if self.receipt_rl.try_acquire("receipt", now_unix_ms()).is_err() {
+                // E-S8: shed a receipt flood before spending any crypto, keyed on the
+                // authenticated sender so one abusive peer can't starve others' receipts.
+                // The guard drops immediately — we use the bucket purely as a rate cap
+                // (concurrency is already bounded by the worker pool).
+                if self.receipt_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
                     return frame_response(&[
                         ServeChunk::Error("receipt rate limited, retry".into()).encode(),
                     ]);
@@ -523,26 +534,40 @@ impl<A: EngineAdapter> Provider<A> {
             // A serve request: run it, and — when the status endpoint is on — fold the
             // outcome into the shared transfer counters (per-model tokens + native TPS).
             Some(&SERVE_REQUEST) => {
-                let decoded = ServeRequest::decode(&data[1..]).ok();
                 let mut chunks: Vec<Vec<u8>> = Vec::new();
-                let summary =
-                    handle_serve_request(&data[1..], &self.adapter, &mut |c| chunks.push(c.to_vec()));
-                // B-S1: record what we served under the consumer's committed nonce so its
-                // settlement receipt can be validated (right tokens/model, once, fresh).
-                if let Some(req) = &decoded {
-                    if summary.ok && summary.tokens > 0 {
-                        self.record_commitment(req.nonce, req.model_ref.clone(), summary.tokens);
+                let summary = match parsed {
+                    Some(req) => {
+                        // Capture the small fields we still need after `req` is moved into
+                        // the serve (which consumes `messages`), for commitment + stats.
+                        let nonce = req.nonce;
+                        let model_ref = req.model_ref.clone();
+                        let summary = handle_serve_request_parsed(
+                            req,
+                            &self.adapter,
+                            &mut |c| chunks.push(c.to_vec()),
+                        );
+                        // B-S1: record what we served under the consumer's committed nonce so
+                        // its settlement receipt can be validated (right tokens/model, once).
+                        if summary.ok && summary.tokens > 0 {
+                            self.record_commitment(nonce, model_ref.clone(), summary.tokens);
+                        }
+                        if let Some(stats) = &self.stats {
+                            let e = &summary.metrics.engine;
+                            let native_tps = if e.eval_duration_ns > 0 {
+                                e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
+                            } else {
+                                0.0
+                            };
+                            stats.record_serve(&model_ref, summary.tokens, native_tps, summary.ok);
+                        }
+                        summary
                     }
-                }
-                if let (Some(stats), Some(req)) = (&self.stats, &decoded) {
-                    let e = &summary.metrics.engine;
-                    let native_tps = if e.eval_duration_ns > 0 {
-                        e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
-                    } else {
-                        0.0
-                    };
-                    stats.record_serve(&req.model_ref, summary.tokens, native_tps, summary.ok);
-                }
+                    // Undecodable serve request → emit the framed "bad serve request" error.
+                    None => handle_serve_request(&data[1..], &self.adapter, &mut |c| {
+                        chunks.push(c.to_vec())
+                    }),
+                };
+                let _ = summary;
                 frame_response(&chunks)
             }
             // Unknown method byte → a framed Error from the serve handler.
@@ -643,26 +668,46 @@ mod tests {
         assert!(matches!(chunks.as_slice(), [ServeChunk::Error(_)]));
     }
 
-    #[test]
-    fn es8_receipt_limiter_admits_burst_then_sheds_then_refills() {
-        // Exercises the exact config wired onto Provider.receipt_rl, so a bad
-        // constant (e.g. burst=0 → sheds every receipt) is caught here.
-        let rl = Arc::new(RateLimiter::new(RateLimitConfig {
+    fn receipt_limiter() -> Arc<RateLimiter> {
+        // The exact config wired onto Provider.receipt_rl, so a bad constant
+        // (e.g. burst=0 → sheds every receipt) is caught here.
+        Arc::new(RateLimiter::new(RateLimitConfig {
             rps: RECEIPT_RATE_RPS,
             burst: RECEIPT_RATE_BURST,
             max_inflight: 0,
-            max_tracked: 1,
-        }));
+            max_tracked: RECEIPT_RATE_MAX_TRACKED,
+        }))
+    }
+
+    #[test]
+    fn es8_receipt_limiter_admits_burst_then_sheds_then_refills() {
+        let rl = receipt_limiter();
         let t = 1_000_000u64;
         for _ in 0..(RECEIPT_RATE_BURST as usize) {
-            assert!(rl.try_acquire("receipt", t).is_ok());
+            assert!(rl.try_acquire("12D3KooWPeerA", t).is_ok());
         }
         assert!(
-            rl.try_acquire("receipt", t).is_err(),
+            rl.try_acquire("12D3KooWPeerA", t).is_err(),
             "burst exhausted at the same instant → shed before any crypto"
         );
         // ~1s later the sustained rate has refilled tokens → admits again.
-        assert!(rl.try_acquire("receipt", t + 1000).is_ok());
+        assert!(rl.try_acquire("12D3KooWPeerA", t + 1000).is_ok());
+    }
+
+    #[test]
+    fn es8_receipt_limiter_is_per_peer_not_global() {
+        // A flooding peer exhausting its own bucket must not shed a well-behaved
+        // peer's settlement — the whole point of keying on the authenticated sender.
+        let rl = receipt_limiter();
+        let t = 2_000_000u64;
+        for _ in 0..(RECEIPT_RATE_BURST as usize) {
+            assert!(rl.try_acquire("12D3KooWFlooder", t).is_ok());
+        }
+        assert!(rl.try_acquire("12D3KooWFlooder", t).is_err(), "flooder exhausted its bucket");
+        assert!(
+            rl.try_acquire("12D3KooWHonest", t).is_ok(),
+            "an unrelated peer has its own independent bucket"
+        );
     }
 
     fn test_receipt(nonce: [u8; 16], tokens: u64) -> CoSignedReceipt {

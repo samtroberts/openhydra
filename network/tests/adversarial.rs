@@ -166,7 +166,7 @@ fn batch_count_overflow_is_rejected_fast() {
 fn shared_proxy_queue_bounded_under_flood() {
     let q = SharedProxyQueue::new();
     for i in 0..(PROXY_QUEUE_MAX * 3) {
-        q.push((format!("flood-{i}"), vec![0u8; 16]));
+        q.push((format!("flood-{i}"), "12D3KooWflood".to_string(), vec![0u8; 16]));
     }
     // Drain and count — must never exceed the cap.
     let mut drained = 0usize;
