@@ -93,6 +93,13 @@ struct PeerConnectionInfo {
     /// ids lets a *stabilized* direct path close them precisely (see the
     /// `relay_close_deadline` grace window) so only the fast path remains.
     relay_conn_ids: Vec<libp2p::swarm::ConnectionId>,
+    /// v6-pref (C-N1 follow-on): ConnectionIds of the *v4* QUIC direct connections
+    /// to this peer. Same problem as the relay case one rung up — with both a v4
+    /// and a v6 QUIC direct, `NotifyHandler::Any` keeps dispatching over the
+    /// (churn-prone, NAT-port-translated) v4 path instead of the stabler v6.
+    /// Tracking the v4 ids lets a *stabilized* v6 direct retire them (see
+    /// `v4_close_deadline`) so traffic settles on v6.
+    quic_v4_conn_ids: Vec<libp2p::swarm::ConnectionId>,
 }
 
 impl PeerConnectionInfo {
@@ -130,6 +137,25 @@ fn should_pursue_v6_upgrade(info: Option<&PeerConnectionInfo>) -> bool {
 fn relays_to_close(info: &PeerConnectionInfo) -> Vec<libp2p::swarm::ConnectionId> {
     if info.has_direct() {
         info.relay_conn_ids.clone()
+    } else {
+        Vec::new()
+    }
+}
+
+/// v6-pref: whether to arm the v4-close grace window — the peer holds BOTH a v6
+/// QUIC direct and at least one v4 QUIC direct, so once the v6 proves stable the
+/// v4 is redundant and traffic should settle on v6. Mirrors
+/// [`should_arm_relay_close`] one rung up (relay < v4-direct < v6-direct).
+fn should_arm_v4_close(info: &PeerConnectionInfo) -> bool {
+    info.quic_direct_v6 > 0 && !info.quic_v4_conn_ids.is_empty()
+}
+
+/// v6-pref: v4 QUIC ConnectionIds to retire for a peer whose grace window
+/// elapsed. Empty once the v6 direct has dropped — then we still want the v4
+/// (belt-and-suspenders to the un-arm on close), same safety as [`relays_to_close`].
+fn v4s_to_close(info: &PeerConnectionInfo) -> Vec<libp2p::swarm::ConnectionId> {
+    if info.quic_direct_v6 > 0 {
+        info.quic_v4_conn_ids.clone()
     } else {
         Vec::new()
     }
@@ -553,6 +579,10 @@ struct LoopState {
     /// instant at which the relay may be closed (direct-established-at + grace).
     /// Cleared if the direct path drops inside the window (so we keep the relay).
     relay_close_deadline: HashMap<PeerId, std::time::Instant>,
+    /// v6-pref (C-N1 follow-on): peers with both a v6 and a v4 QUIC direct, mapped
+    /// to the instant at which the v4 may be retired (v6-established-at + grace).
+    /// Cleared if the v6 direct drops inside the window (so we keep the v4).
+    v4_close_deadline: HashMap<PeerId, std::time::Instant>,
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
@@ -762,6 +792,7 @@ impl LoopState {
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
             relay_close_deadline: HashMap::new(),
+            v4_close_deadline: HashMap::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
             enable_connection_reversal: false,
@@ -1662,6 +1693,34 @@ pub async fn run_event_loop(
                     }
                     info!(%pid, closed = relay_ids.len(),
                           "C-N1: closed relay connection(s) — direct path stabilized");
+                }
+
+                // v6-pref: retire now-redundant v4 QUIC directs for peers whose v6
+                // direct has stabilised, so traffic settles on the v6 rung.
+                let v4_due: Vec<PeerId> = state
+                    .v4_close_deadline
+                    .iter()
+                    .filter(|(_, &deadline)| now >= deadline)
+                    .map(|(&pid, _)| pid)
+                    .collect();
+                for pid in v4_due {
+                    state.v4_close_deadline.remove(&pid);
+                    // Re-check: only retire v4 if the v6 direct is still up (else we
+                    // just un-armed and depend on v4 again — belt to that suspenders).
+                    let v4_ids = state
+                        .peer_connections
+                        .get(&pid)
+                        .map(v4s_to_close)
+                        .unwrap_or_default();
+                    if v4_ids.is_empty() {
+                        continue;
+                    }
+                    for cid in &v4_ids {
+                        // ConnectionClosed decrements quic_direct_v4 + drops the id.
+                        let _ = swarm.close_connection(*cid);
+                    }
+                    info!(%pid, closed = v4_ids.len(),
+                          "v6-pref: retired v4 QUIC direct(s) — v6 path stabilized");
                 }
             }
             // R-DHT-6: snapshot the routing table to disk for warm restarts.
@@ -2998,6 +3057,9 @@ fn handle_swarm_event(
                         info!(%peer_id, %addr_str, v6=info.quic_direct_v6, "quic_direct_v6_connected");
                     } else {
                         info.quic_direct_v4 += 1;
+                        // v6-pref: remember this v4 QUIC id so a later stable v6
+                        // direct can retire it precisely (see v4_close_deadline).
+                        info.quic_v4_conn_ids.push(connection_id);
                         info!(%peer_id, %addr_str, v4=info.quic_direct_v4, "quic_direct_v4_connected");
                     }
                     // Fix 4: proactively warm tensor stream on first QUIC connection of *either* AF.
@@ -3034,6 +3096,16 @@ fn handle_swarm_event(
             if should_arm_relay_close(info) {
                 state
                     .relay_close_deadline
+                    .entry(peer_id)
+                    .or_insert_with(|| std::time::Instant::now() + RELAY_CLOSE_GRACE);
+            }
+
+            // v6-pref: if this peer now has BOTH a v6 and a v4 QUIC direct, arm the
+            // grace window after which the redundant v4 is retired so traffic
+            // settles on v6. Same earliest-wins arming as the relay case.
+            if should_arm_v4_close(info) {
+                state
+                    .v4_close_deadline
                     .entry(peer_id)
                     .or_insert_with(|| std::time::Instant::now() + RELAY_CLOSE_GRACE);
             }
@@ -3095,6 +3167,9 @@ fn handle_swarm_event(
                             info.quic_direct_v6 = info.quic_direct_v6.saturating_sub(1);
                         } else {
                             info.quic_direct_v4 = info.quic_direct_v4.saturating_sub(1);
+                            // v6-pref: forget this v4 id (closed on its own or retired
+                            // by the grace sweep).
+                            info.quic_v4_conn_ids.retain(|&c| c != connection_id);
                         }
                     }
                     TransportType::TcpDirect => info.tcp_direct = info.tcp_direct.saturating_sub(1),
@@ -3110,9 +3185,15 @@ fn handle_swarm_event(
                 if !info.has_direct() {
                     state.relay_close_deadline.remove(&peer_id);
                 }
+                // v6-pref: if the v6 direct dropped, cancel any armed v4-close — we
+                // depend on the v4 again.
+                if info.quic_direct_v6 == 0 {
+                    state.v4_close_deadline.remove(&peer_id);
+                }
                 if info.quic_direct_v4 == 0 && info.quic_direct_v6 == 0 && info.tcp_direct == 0 && info.tcp_relay == 0 {
                     state.peer_connections.remove(&peer_id);
                     state.relay_close_deadline.remove(&peer_id);
+                    state.v4_close_deadline.remove(&peer_id);
                     debug!(%peer_id, "peer_fully_disconnected");
                 }
             }
@@ -5561,6 +5642,39 @@ mod tests {
         // Direct dropped in the window → keep the relay, close nothing.
         info.quic_direct_v4 = 0;
         assert!(relays_to_close(&info).is_empty());
+    }
+
+    // ── v6-pref (C-N1 follow-on): retire v4 QUIC once v6 stabilizes ────────
+
+    #[test]
+    fn v4_close_arms_only_when_both_v6_and_v4_quic_present() {
+        use libp2p::swarm::ConnectionId;
+        let mut info = PeerConnectionInfo::default();
+        // v4 only → don't arm (no v6 to prefer).
+        info.quic_direct_v4 = 1;
+        info.quic_v4_conn_ids.push(ConnectionId::new_unchecked(3));
+        assert!(!should_arm_v4_close(&info));
+        // v6 arrives alongside v4 → arm (v4 is now redundant).
+        info.quic_direct_v6 = 1;
+        assert!(should_arm_v4_close(&info));
+        // v6 only (no v4 tracked) → nothing to retire.
+        info.quic_direct_v4 = 0;
+        info.quic_v4_conn_ids.clear();
+        assert!(!should_arm_v4_close(&info));
+    }
+
+    #[test]
+    fn v4s_to_close_returns_ids_only_while_v6_survives() {
+        use libp2p::swarm::ConnectionId;
+        let mut info = PeerConnectionInfo::default();
+        info.quic_direct_v6 = 1;
+        info.quic_direct_v4 = 2;
+        info.quic_v4_conn_ids = vec![ConnectionId::new_unchecked(4), ConnectionId::new_unchecked(6)];
+        // v6 up → both v4 ids eligible for retirement.
+        assert_eq!(v4s_to_close(&info), info.quic_v4_conn_ids);
+        // v6 dropped in the window → keep the v4, retire nothing.
+        info.quic_direct_v6 = 0;
+        assert!(v4s_to_close(&info).is_empty());
     }
 
     // ── C-N2: pending_relay_forwards TTL sweep ─────────────────────────────
