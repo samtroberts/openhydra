@@ -14,26 +14,34 @@
 //! decouples polling from serving: the loop enqueues jobs and `n` workers run them
 //! concurrently, so one slow request no longer stalls the rest.
 //!
-//! Bounded on purpose: the external engine has its own concurrency limit, and unbounded
-//! thread-per-request would let a burst exhaust memory. `n` caps in-flight serves; excess
-//! requests queue.
+//! Bounded on purpose: the external engine has its own concurrency limit, and an unbounded
+//! backlog would let a burst exhaust memory. `n` caps in-flight serves; a small bounded
+//! queue absorbs bursts; beyond that [`WorkerPool::submit`] sheds (returns `false`) so the
+//! caller can reply "overloaded" rather than grow memory without bound.
 //!
 //! Pure & swarm-free (jobs are opaque `FnOnce`s), so the concurrency mechanism is unit-
 //! tested here without standing up a node.
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// A unit of work handed to the pool. Boxed + `Send` so it can cross to a worker thread.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Pending-queue slack per worker before [`WorkerPool::submit`] sheds. A little burst
+/// absorption without letting the backlog (each entry retains a request payload) grow
+/// without bound. See docs/CODEBASE_HARDENING_PLAN.md (A3).
+const QUEUE_DEPTH_PER_WORKER: usize = 4;
+/// Floor on the queue bound so a 1-worker pool still absorbs a small burst.
+const MIN_QUEUE: usize = 8;
+
 /// A fixed-size pool of worker threads draining a shared queue. Dropping the pool closes
 /// the queue, lets workers finish everything already submitted, then joins them.
 pub struct WorkerPool {
     /// `Option` so [`Drop`] can drop the sender *before* joining — closing the channel is
     /// what tells idle workers to exit once the queue drains.
-    tx: Option<Sender<Job>>,
+    tx: Option<SyncSender<Job>>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -43,7 +51,8 @@ impl WorkerPool {
     /// running it, so jobs execute concurrently — the lock only serialises the brief handoff.
     pub fn new(n: usize) -> Self {
         let n = n.max(1);
-        let (tx, rx) = mpsc::channel::<Job>();
+        let bound = n.saturating_mul(QUEUE_DEPTH_PER_WORKER).max(MIN_QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<Job>(bound);
         let rx = Arc::new(Mutex::new(rx));
         let handles = (0..n)
             .map(|_| {
@@ -68,10 +77,14 @@ impl WorkerPool {
         Self { tx: Some(tx), handles }
     }
 
-    /// Enqueue `job` for the next free worker. A no-op if the pool is shutting down.
-    pub fn submit<F: FnOnce() + Send + 'static>(&self, job: F) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(Box::new(job)); // receiver only gone during shutdown
+    /// Enqueue `job` for the next free worker. Returns `true` if it was queued, `false` if
+    /// the bounded queue is full (caller should shed — e.g. reply "overloaded") or the pool
+    /// is shutting down. Non-blocking either way, so the poll thread never stalls.
+    #[must_use]
+    pub fn submit<F: FnOnce() + Send + 'static>(&self, job: F) -> bool {
+        match &self.tx {
+            Some(tx) => tx.try_send(Box::new(job)).is_ok(),
+            None => false,
         }
     }
 }
@@ -93,19 +106,52 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn runs_every_submitted_job() {
+    fn runs_every_accepted_job() {
+        // Post-A3 the queue is bounded, so `submit` can shed under a burst. The invariant is
+        // now "every *accepted* job runs" — count acceptances and assert the pool drains
+        // exactly those. (With near-instant jobs the workers keep up, so this is typically
+        // all 100; the point is the equality, not the number.)
         let counter = Arc::new(AtomicUsize::new(0));
-        {
+        let accepted = {
             let pool = WorkerPool::new(4);
+            let mut accepted = 0usize;
             for _ in 0..100 {
                 let c = Arc::clone(&counter);
-                pool.submit(move || {
+                if pool.submit(move || {
                     c.fetch_add(1, Ordering::SeqCst);
-                });
+                }) {
+                    accepted += 1;
+                }
             }
-            // Drop joins after the queue drains — every job has run by here.
+            accepted
+            // Drop joins after the queue drains — every accepted job has run by here.
+        };
+        assert!(accepted > 0);
+        assert_eq!(counter.load(Ordering::SeqCst), accepted);
+    }
+
+    #[test]
+    fn sheds_when_bounded_queue_full() {
+        // One worker held busy on a lock; the bounded queue (MIN_QUEUE) fills and further
+        // submits are shed (`false`) instead of growing memory — the A3 invariant.
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let pool = WorkerPool::new(1); // bound = MIN_QUEUE
+        {
+            let gate = Arc::clone(&gate);
+            assert!(pool.submit(move || {
+                let _guard = gate.lock(); // blocks until `held` is released, then drops
+            }));
         }
-        assert_eq!(counter.load(Ordering::SeqCst), 100);
+        std::thread::sleep(Duration::from_millis(20)); // let the worker pick up the blocker
+        let mut shed = 0usize;
+        for _ in 0..50 {
+            if !pool.submit(|| {}) {
+                shed += 1;
+            }
+        }
+        assert!(shed > 0, "expected shedding once the bounded queue filled");
+        drop(held); // release the worker so the pool can drain + join on drop
     }
 
     #[test]

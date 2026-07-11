@@ -337,7 +337,8 @@ impl<A: EngineAdapter> Provider<A> {
                 // Serve off the poll thread so the loop can keep accepting requests and a
                 // slow one doesn't head-of-line-block the rest.
                 let provider = Arc::clone(&self);
-                pool.submit(move || {
+                let shed_id = request_id.clone();
+                let accepted = pool.submit(move || {
                     // M2.3: throttle a leecher first (off the poll thread, budget-capped so
                     // it never stalls the pool); contributors pass straight through.
                     provider.maybe_throttle(&data, max_concurrency);
@@ -354,6 +355,16 @@ impl<A: EngineAdapter> Provider<A> {
                     // Best-effort reply; if the swarm is gone the next poll will error too.
                     let _ = provider.net.respond(request_id, response);
                 });
+                if !accepted {
+                    // A3: the bounded serve queue is full — shed with a retryable error so
+                    // the consumer fails fast instead of waiting out its request timeout,
+                    // and provider memory stays bounded under a burst.
+                    // See docs/CODEBASE_HARDENING_PLAN.md (A3).
+                    let busy = frame_response(&[
+                        ServeChunk::Error("provider overloaded, retry".into()).encode(),
+                    ]);
+                    let _ = self.net.respond(shed_id, busy);
+                }
             }
             // #42: a network change → re-announce now (not on the slow interval).
             let generation = self.net.network_generation();

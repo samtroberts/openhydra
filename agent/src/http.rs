@@ -24,21 +24,36 @@ fn http_err(e: reqwest::Error) -> AdapterError {
     AdapterError::Http(e.to_string())
 }
 
+// Per-request total timeouts (A1). reqwest's *blocking* client exposes no idle/read
+// timeout, so each request bounds its **total** duration instead — a wedged engine can no
+// longer pin a serve worker forever. Values are generous so legitimate work never trips
+// them. See docs/CODEBASE_HARDENING_PLAN.md (A1).
+
+/// Quick GETs: detection probes, ComfyUI history poll, image fetch.
+const GET_TIMEOUT: Duration = Duration::from_secs(30);
+/// Non-streaming POSTs — some engines return a whole completion in the body.
+const POST_JSON_TIMEOUT: Duration = Duration::from_secs(120);
+/// Streaming completions: a **total** cap (not idle). Local generations finish well inside
+/// this; a stalled stream is reclaimed here instead of hanging a worker forever.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Production HTTP transport for engine adapters.
 pub struct ReqwestClient {
     client: Client,
 }
 
 impl ReqwestClient {
-    /// Build a client with a short connect timeout (the engine is local) and **no**
-    /// read timeout — a completion stream may legitimately run for minutes.
+    /// Build a client with a short connect timeout (the engine is local). Per-request total
+    /// timeouts (the module `*_TIMEOUT` consts) bound each call so a wedged engine can't pin
+    /// a serve worker forever.
     pub fn new() -> Result<Self, AdapterError> {
         Self::with_connect_timeout(Duration::from_secs(5))
     }
 
     /// Like [`new`](Self::new) but with an explicit connect timeout — used by engine
-    /// auto-detection, which probes several ports and wants to fail fast on a dead one
-    /// (still no read timeout, so an adapter built this way serves long streams fine).
+    /// auto-detection, which probes several ports and wants to fail fast on a dead one.
+    /// Per-request timeouts still apply, so an adapter built this way serves long streams
+    /// fine while a stalled request stays bounded.
     pub fn with_connect_timeout(connect: Duration) -> Result<Self, AdapterError> {
         let client = Client::builder().connect_timeout(connect).build().map_err(http_err)?;
         Ok(Self { client })
@@ -49,6 +64,7 @@ impl HttpClient for ReqwestClient {
     fn get(&self, url: &str) -> Result<String, AdapterError> {
         self.client
             .get(url)
+            .timeout(GET_TIMEOUT)
             .send()
             .map_err(http_err)?
             .error_for_status()
@@ -61,6 +77,7 @@ impl HttpClient for ReqwestClient {
         Ok(self
             .client
             .get(url)
+            .timeout(GET_TIMEOUT)
             .send()
             .map_err(http_err)?
             .error_for_status()
@@ -75,6 +92,7 @@ impl HttpClient for ReqwestClient {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string())
+            .timeout(POST_JSON_TIMEOUT)
             .send()
             .map_err(http_err)?
             .error_for_status()
@@ -92,7 +110,7 @@ impl HttpClient for ReqwestClient {
     }
 
     fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<String, AdapterError> {
-        let mut req = self.client.get(url);
+        let mut req = self.client.get(url).timeout(GET_TIMEOUT);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
@@ -114,7 +132,8 @@ impl HttpClient for ReqwestClient {
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string());
+            .body(body.to_string())
+            .timeout(POST_JSON_TIMEOUT);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
@@ -136,7 +155,8 @@ impl HttpClient for ReqwestClient {
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string());
+            .body(body.to_string())
+            .timeout(STREAM_TIMEOUT);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }

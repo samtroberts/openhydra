@@ -117,17 +117,29 @@ pub async fn handle_proxy_request(request: ProxyRequest, local_grpc_port: u16) -
     }
 }
 
+/// A wedged local engine must not hang the inbound-serve task forever. Bound the whole
+/// connect+write+read below the request_response protocol timeout (120s) so the local
+/// socket is reclaimed with a clean error before the remote peer's request expires.
+/// See docs/CODEBASE_HARDENING_PLAN.md (A2).
+const LOCAL_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(115);
+
 async fn forward_to_local(
     data: &[u8],
     target: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = TcpStream::connect(target).await?;
-    stream.write_all(data).await?;
-    stream.shutdown().await?;
-    let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await?;
-    Ok(resp)
+    tokio::time::timeout(LOCAL_FORWARD_TIMEOUT, async {
+        let mut stream = TcpStream::connect(target).await?;
+        stream.write_all(data).await?;
+        stream.shutdown().await?;
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await?;
+        Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(resp)
+    })
+    .await
+    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("local forward timed out after {}s", LOCAL_FORWARD_TIMEOUT.as_secs()).into()
+    })?
 }
 
 pub async fn start_proxy_listener() -> io::Result<(TcpListener, String)> {

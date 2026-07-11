@@ -196,17 +196,38 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
             })?
             .to_string();
 
-        // Poll history until the graph reports outputs (bounded).
+        // Poll history until the graph reports outputs (bounded). A transient /history
+        // blip must NOT abort an otherwise-healthy multi-minute render: retry until the
+        // deadline. The deadline is checked at the TOP of each iteration so a slow GET
+        // can't bypass it, and the GET is now bounded by the client's idle read timeout
+        // (A1). A *persistent* failure (ComfyUI died) gives up after MAX_POLL_ERRORS
+        // consecutive errors so we don't wait the full POLL_MAX_SECS on a dead engine.
+        // See docs/CODEBASE_HARDENING_PLAN.md (A4).
+        const MAX_POLL_ERRORS: u32 = 10;
         let deadline = started + std::time::Duration::from_secs(POLL_MAX_SECS);
+        let mut consecutive_errs: u32 = 0;
         let image = loop {
-            let hist = self.http.get(&format!("{}/history/{prompt_id}", self.base_url))?;
-            if let Some(img) = parse_history_image(&hist, &prompt_id) {
-                break img;
-            }
             if std::time::Instant::now() >= deadline {
                 return Err(AdapterError::Http(format!(
                     "comfyui generation timed out after {POLL_MAX_SECS}s (prompt {prompt_id})"
                 )));
+            }
+            match self.http.get(&format!("{}/history/{prompt_id}", self.base_url)) {
+                Ok(hist) => {
+                    consecutive_errs = 0;
+                    if let Some(img) = parse_history_image(&hist, &prompt_id) {
+                        break img;
+                    }
+                }
+                Err(e) => {
+                    consecutive_errs += 1;
+                    if consecutive_errs >= MAX_POLL_ERRORS {
+                        return Err(AdapterError::Http(format!(
+                            "comfyui /history unreachable ({consecutive_errs} consecutive errors, last: {e}); prompt {prompt_id}"
+                        )));
+                    }
+                    tracing::debug!(error = %e, consecutive_errs, prompt_id, "comfyui /history poll blip; retrying");
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         };
