@@ -27,7 +27,8 @@ use openhydra_protocol::receipts::NonceTracker;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
 use openhydra_protocol::store::Store;
 use openhydra_protocol::verify::{
-    resolve_audit, sample_rate_for_reputation, AuditReport, RedundantVerdict, ReputationTracker,
+    audit_body, resolve_audit, sample_rate_for_reputation, AuditReport, RedundantVerdict,
+    ReputationTracker,
     VerificationOutcome, NEUTRAL_REPUTATION,
 };
 
@@ -535,7 +536,8 @@ impl ConsumerNode {
         }
         let node = Arc::clone(self);
         let model = model.to_string();
-        std::thread::spawn(move || match node.audit_model(&model, &default_challenge()) {
+        let (challenge, nonce) = default_challenge();
+        std::thread::spawn(move || match node.audit_model(&model, &challenge, &nonce) {
             Ok(report) => {
                 tracing::info!(model, verdict = ?report.verdict, "redundant-exec audit complete")
             }
@@ -597,6 +599,7 @@ impl ConsumerNode {
         &self,
         model: &str,
         challenge: &[ChatMessage],
+        nonce: &str,
     ) -> Result<AuditReport, AdapterError> {
         let now = now_unix_ms();
         let peers = self
@@ -618,12 +621,29 @@ impl ConsumerNode {
             let out = self.dispatch_full(provider, challenge).map_err(|e| e.to_string());
             results.push((provider.peer_id.clone(), out));
         }
-        let mut report = resolve_audit(&results);
+        // B-S2: gate each response on the required nonce echo and compare only the generated
+        // *body* (after the nonce) — a freeloader that parrots the copyable prompt is filtered
+        // to a non-responder rather than agreeing its way to Honored.
+        let gate = |raw: &[(String, Result<String, String>)]| -> Vec<(String, Result<String, String>)> {
+            raw.iter()
+                .map(|(pid, r)| {
+                    let mapped = match r {
+                        Ok(out) => match audit_body(out, nonce) {
+                            Some(body) => Ok(body.to_string()),
+                            None => Err("audit response did not echo the challenge nonce".to_string()),
+                        },
+                        Err(e) => Err(e.clone()),
+                    };
+                    (pid.clone(), mapped)
+                })
+                .collect()
+        };
+        let mut report = resolve_audit(&gate(&results));
         if report.verdict == RedundantVerdict::Inconclusive {
             if let Some(third) = candidates.get(2) {
                 let out = self.dispatch_full(third, challenge).map_err(|e| e.to_string());
                 results.push((third.peer_id.clone(), out));
-                report = resolve_audit(&results);
+                report = resolve_audit(&gate(&results));
             }
         }
 
@@ -634,20 +654,23 @@ impl ConsumerNode {
     }
 }
 
-/// An unpredictable, deterministic-to-answer audit challenge (M2.2(b)). The embedded random
-/// nonce defeats answer-caching (a provider can't have precomputed it), and the
-/// echo-then-restate instruction yields a long shared prefix that two honest runs of the
-/// same model reproduce while a freeloader cannot. Prompt design is heuristic and tunable.
-pub fn default_challenge() -> Vec<ChatMessage> {
-    let nonce: u128 = rand::random();
-    vec![ChatMessage {
+/// An unpredictable, deterministic audit challenge (M2.2(b)), returned with its `nonce` so the
+/// verifier can require the echo and compare only the generated body (B-S2). The nonce defeats
+/// answer-caching; the **generative continuation** (not present in the prompt) is what two
+/// honest greedy runs of the same model reproduce and a prompt-parroting freeloader cannot.
+/// Prompt design is heuristic and tunable.
+pub fn default_challenge() -> (Vec<ChatMessage>, String) {
+    let nonce_val: u128 = rand::random();
+    let nonce = format!("{nonce_val:032x}");
+    let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: format!(
-            "Verification probe {nonce:032x}. Respond with exactly, and nothing else: \
-             first the token {nonce:032x} on its own line, then on the next line the single \
-             sentence \"This is a deterministic audit response.\""
+            "Verification probe {nonce}. Respond with no preamble or explanation. \
+             Line 1: output exactly the token {nonce}. From line 2 onward: deterministically \
+             continue this passage — \"A peer joins the distributed network by\""
         ),
-    }]
+    }];
+    (messages, nonce)
 }
 
 #[cfg(test)]
@@ -843,12 +866,13 @@ mod tests {
     fn default_challenge_is_unpredictable_and_well_formed() {
         // A single user-role message; the random nonce makes successive challenges differ
         // (so a provider can't pre-cache the answer) and appear twice (echo + restate).
-        let c1 = default_challenge();
-        let c2 = default_challenge();
+        let (c1, n1) = default_challenge();
+        let (c2, _) = default_challenge();
         assert_eq!(c1.len(), 1);
         assert_eq!(c1[0].role, "user");
         assert_ne!(c1[0].content, c2[0].content, "challenge nonce must vary");
-        assert!(c1[0].content.contains("deterministic audit response"));
+        assert!(c1[0].content.contains(&n1), "prompt must echo its nonce");
+        assert!(c1[0].content.contains("continue this passage"));
     }
 
     #[test]

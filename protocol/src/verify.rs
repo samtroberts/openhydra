@@ -428,12 +428,40 @@ pub fn resolve_audit(results: &[(String, Result<String, String>)]) -> AuditRepor
     AuditReport { verdict, outcomes, non_responders }
 }
 
+/// Extract the audit-response **body** — the model-generated continuation after the required
+/// nonce echo — or `None` if `output` does not echo `nonce_hex` near the start (B-S2). A
+/// valid redundant-exec response must reproduce the unpredictable nonce *and* a generated
+/// continuation that is not present in the prompt; comparing bodies (not the copyable nonce)
+/// means a freeloader that merely parrots the prompt cannot agree its way to `Honored`.
+pub fn audit_body<'a>(output: &'a str, nonce_hex: &str) -> Option<&'a str> {
+    let pos = output.find(nonce_hex)?;
+    if pos > 64 {
+        return None; // nonce not echoed near the start → not a proper response
+    }
+    Some(output[pos + nonce_hex.len()..].trim_start())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const HOUR_MS: u64 = 60 * 60 * 1000;
     const DAY_MS: u64 = 24 * HOUR_MS;
+
+    #[test]
+    fn audit_body_requires_nonce_echo_and_strips_it() {
+        let n = "0123456789abcdef0123456789abcdef";
+        // Nonce echoed on line 1 → body is the generated continuation after it.
+        assert_eq!(
+            audit_body(&format!("{n}\nthe network by broadcasting"), n),
+            Some("the network by broadcasting")
+        );
+        // A freeloader that omits the nonce → not a valid response (filtered out).
+        assert_eq!(audit_body("the network by broadcasting", n), None);
+        // Nonce buried far past the start (not a proper echo) → rejected.
+        let buried = format!("{}{n}", "x".repeat(100));
+        assert_eq!(audit_body(&buried, n), None);
+    }
 
     #[test]
     fn starts_neutral() {
