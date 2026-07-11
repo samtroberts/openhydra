@@ -75,6 +75,22 @@ pub fn is_bootstrap_relay_ip(ip: &str) -> bool {
     BOOTSTRAP_RELAY_IPS.contains(&ip)
 }
 
+/// The relay peer ids embedded in `BOOTSTRAP_RELAYS` — the always-trusted relay
+/// hops, regardless of runtime `--bootstrap` config (D-S5).
+pub fn bootstrap_relay_peer_ids() -> Vec<PeerId> {
+    use libp2p::multiaddr::Protocol;
+    BOOTSTRAP_RELAYS
+        .iter()
+        .filter_map(|s| s.parse::<Multiaddr>().ok())
+        .filter_map(|ma| {
+            ma.iter().find_map(|p| match p {
+                Protocol::P2p(pid) => Some(pid),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
 /// D-S5: decide whether a record's self-declared `relay_address` is safe to
 /// inject into the Kademlia routing table for `expected_pid`.
 ///
@@ -83,38 +99,42 @@ pub fn is_bootstrap_relay_ip(ip: &str) -> bool {
 /// every peer that caches the record — would dial whatever host the record
 /// names, turning the DHT into a reflection/amplification vector aimed at an
 /// arbitrary victim `ip:port`. We therefore accept ONLY a relay-**circuit**
-/// address whose relay hop is one of our own bootstrap relays and whose circuit
-/// target (when the address names one) matches the record's peer id. A
-/// legitimate NAT'd provider always advertises exactly this (it reserved on a
-/// bootstrap relay); anything else is malformed or hostile and is dropped.
+/// address whose relay hop is a relay this node **actually uses** — identified by
+/// its peer id against `trusted_relay_pids` (the runtime `--bootstrap` set ∪ the
+/// hardcoded `BOOTSTRAP_RELAYS`) — and whose circuit target (when named) matches
+/// the record's peer id. Keying on the relay's *peer id* rather than a static IP
+/// list is what lets a runtime-configured relay like netcup work (it's in
+/// `--bootstrap` but not the hardcoded IPs) while still rejecting a circuit whose
+/// hop is an unknown/attacker relay. A legitimate NAT'd provider always
+/// advertises exactly this (it reserved on a relay we also use).
 pub fn safe_injectable_circuit_addr(
     relay_address: &str,
     expected_pid: &PeerId,
+    trusted_relay_pids: &std::collections::HashSet<PeerId>,
 ) -> Option<Multiaddr> {
     use libp2p::multiaddr::Protocol;
     let ma: Multiaddr = relay_address.parse().ok()?;
 
-    let mut relay_ip: Option<String> = None;
     let mut seen_circuit = false;
+    let mut relay_hop_pid: Option<PeerId> = None;
     let mut target_after_circuit: Option<PeerId> = None;
     for p in ma.iter() {
         match p {
-            // The relay hop IP is the one *before* /p2p-circuit.
-            Protocol::Ip4(ip) if !seen_circuit => relay_ip = Some(ip.to_string()),
-            Protocol::Ip6(ip) if !seen_circuit => relay_ip = Some(ip.to_string()),
+            // The relay hop peer id is the /p2p/ *before* /p2p-circuit.
+            Protocol::P2p(pid) if !seen_circuit => relay_hop_pid = Some(pid),
             Protocol::P2pCircuit => seen_circuit = true,
-            // The target peer id is the one *after* /p2p-circuit.
+            // The target peer id is the /p2p/ *after* /p2p-circuit.
             Protocol::P2p(pid) if seen_circuit => target_after_circuit = Some(pid),
             _ => {}
         }
     }
 
-    // Must be circuit-scoped through a *known* bootstrap relay.
+    // Must be circuit-scoped through a relay whose peer id we trust at runtime.
     if !seen_circuit {
         return None;
     }
-    match relay_ip {
-        Some(ip) if is_bootstrap_relay_ip(&ip) => {}
+    match relay_hop_pid {
+        Some(pid) if trusted_relay_pids.contains(&pid) => {}
         _ => return None,
     }
     // If the circuit names a target, it must be this peer — no seeding an
@@ -635,45 +655,69 @@ mod tests {
         }
     }
 
-    // ── D-S5: only inject bootstrap-relay circuit addresses ────────────────
-
-    const US_RELAY_PID: &str = "12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb";
+    // ── D-S5: only inject circuit addresses through a trusted relay ────────
 
     #[test]
-    fn ds5_accepts_bootstrap_circuit_addr_for_matching_target() {
+    fn ds5_hardcoded_bootstrap_relay_pids_parse() {
+        // The BOOTSTRAP_RELAYS list must yield one relay peer id per entry.
+        assert_eq!(bootstrap_relay_peer_ids().len(), BOOTSTRAP_RELAYS.len());
+    }
+
+    #[test]
+    fn ds5_accepts_circuit_through_a_trusted_relay_for_matching_target() {
+        let relay = PeerId::random();
         let target = PeerId::random();
-        let good = format!("/ip4/45.79.190.172/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit/p2p/{target}");
-        assert!(safe_injectable_circuit_addr(&good, &target).is_some());
-        // Reservation-form (no explicit target) through a bootstrap is also fine.
-        let reservation = format!("/ip4/45.79.190.172/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit");
-        assert!(safe_injectable_circuit_addr(&reservation, &target).is_some());
+        let trusted: std::collections::HashSet<PeerId> = [relay].into_iter().collect();
+        let good = format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}");
+        assert!(safe_injectable_circuit_addr(&good, &target, &trusted).is_some());
+        // Reservation-form (no explicit target) through a trusted relay is fine too.
+        let reservation = format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit");
+        assert!(safe_injectable_circuit_addr(&reservation, &target, &trusted).is_some());
+    }
+
+    #[test]
+    fn ds5_accepts_runtime_configured_relay_not_in_hardcoded_ip_list() {
+        // Regression test for the netcup gap: a relay we use at runtime (in the
+        // trusted set via --bootstrap) is accepted even though its IP is nowhere
+        // in BOOTSTRAP_RELAYS — the whole point of keying on peer id.
+        let netcup = PeerId::random();
+        let target = PeerId::random();
+        let trusted: std::collections::HashSet<PeerId> = [netcup].into_iter().collect();
+        let addr = format!("/ip4/85.209.48.209/tcp/4001/p2p/{netcup}/p2p-circuit/p2p/{target}");
+        assert!(safe_injectable_circuit_addr(&addr, &target, &trusted).is_some());
+    }
+
+    #[test]
+    fn ds5_rejects_circuit_through_untrusted_relay() {
+        // The reflection vector: a circuit whose relay hop is a relay we don't use.
+        let unknown_relay = PeerId::random();
+        let target = PeerId::random();
+        let trusted: std::collections::HashSet<PeerId> = [PeerId::random()].into_iter().collect();
+        let addr =
+            format!("/ip4/45.79.190.172/tcp/4001/p2p/{unknown_relay}/p2p-circuit/p2p/{target}");
+        assert!(safe_injectable_circuit_addr(&addr, &target, &trusted).is_none());
     }
 
     #[test]
     fn ds5_rejects_circuit_naming_a_different_target() {
+        let relay = PeerId::random();
         let target = PeerId::random();
         let other = PeerId::random();
-        let addr = format!("/ip4/45.79.190.172/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit/p2p/{target}");
-        // Record for `other` must not be able to seed an address that dials `target`.
-        assert!(safe_injectable_circuit_addr(&addr, &other).is_none());
-    }
-
-    #[test]
-    fn ds5_rejects_circuit_through_non_bootstrap_relay() {
-        // The reflection vector: a "circuit" whose relay hop is a victim host.
-        let target = PeerId::random();
-        let victim = format!("/ip4/9.9.9.9/tcp/4001/p2p/{US_RELAY_PID}/p2p-circuit/p2p/{target}");
-        assert!(safe_injectable_circuit_addr(&victim, &target).is_none());
+        let trusted: std::collections::HashSet<PeerId> = [relay].into_iter().collect();
+        let addr = format!("/ip4/45.79.190.172/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}");
+        // A record for `other` must not seed an address that dials `target`.
+        assert!(safe_injectable_circuit_addr(&addr, &other, &trusted).is_none());
     }
 
     #[test]
     fn ds5_rejects_direct_address() {
         // A signed record advertising a direct (non-circuit) victim address is
         // dropped — this is exactly the DHT-amplification vector D-S5 closes.
+        let relay = PeerId::random();
         let target = PeerId::random();
+        let trusted: std::collections::HashSet<PeerId> = [relay].into_iter().collect();
         let direct = format!("/ip4/9.9.9.9/udp/443/quic-v1/p2p/{target}");
-        assert!(safe_injectable_circuit_addr(&direct, &target).is_none());
-        let garbage = "not-a-multiaddr";
-        assert!(safe_injectable_circuit_addr(garbage, &target).is_none());
+        assert!(safe_injectable_circuit_addr(&direct, &target, &trusted).is_none());
+        assert!(safe_injectable_circuit_addr("not-a-multiaddr", &target, &trusted).is_none());
     }
 }

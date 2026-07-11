@@ -3367,6 +3367,9 @@ fn handle_kad_event(
             }
             match result {
                 Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord { record, .. })) => {
+                    // D-S5: compute the trusted relay set before borrowing
+                    // `pending_discovers` mutably below (disjoint-borrow dodge).
+                    let trusted = trusted_relay_pids(state);
                     // Decode the record and add to pending discover results.
                     if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         match dht::decode_record(&record.value) {
@@ -3406,6 +3409,7 @@ fn handle_kad_event(
                                             match crate::relay::safe_injectable_circuit_addr(
                                                 &peer_record.relay_address,
                                                 &pid,
+                                                &trusted,
                                             ) {
                                                 Some(ma) => {
                                                     let update = swarm
@@ -3501,6 +3505,18 @@ fn handle_kad_event(
     }
 }
 
+/// D-S5: the set of relay peer ids this node trusts as circuit hops — the
+/// runtime `--bootstrap`/relay peers ∪ the hardcoded `BOOTSTRAP_RELAYS`. A
+/// provider's advertised `relay_address` is only injected into the routing table
+/// if its relay hop is in this set (so a runtime-configured relay like netcup is
+/// accepted while an arbitrary/attacker relay is rejected).
+fn trusted_relay_pids(state: &LoopState) -> std::collections::HashSet<PeerId> {
+    let mut set: std::collections::HashSet<PeerId> =
+        state.bootstrap_peers.iter().map(|(pid, _)| *pid).collect();
+    set.extend(crate::relay::bootstrap_relay_peer_ids());
+    set
+}
+
 /// D-S3: accept-or-drop an inbound Kademlia PUT under `StoreInserts::FilterBoth`.
 ///
 /// With filtering on, libp2p does NOT auto-store inbound records; each arrives
@@ -3575,7 +3591,8 @@ fn ingest_discovered_record(
     // signed-but-dishonest address can't seed the routing table with a victim host.
     if !peer_record.relay_address.is_empty() && !peer_record.libp2p_peer_id.is_empty() {
         if let Ok(pid) = peer_record.libp2p_peer_id.parse::<PeerId>() {
-            match crate::relay::safe_injectable_circuit_addr(&peer_record.relay_address, &pid) {
+            let trusted = trusted_relay_pids(state);
+            match crate::relay::safe_injectable_circuit_addr(&peer_record.relay_address, &pid, &trusted) {
                 Some(ma) => {
                     let update = swarm.behaviour_mut().kademlia.add_address(&pid, ma.clone());
                     debug!(%pid, %ma, ?update, "discover_auto_added_address");
