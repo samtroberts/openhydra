@@ -112,6 +112,18 @@ fn should_arm_relay_close(info: &PeerConnectionInfo) -> bool {
     info.has_direct() && !info.relay_conn_ids.is_empty()
 }
 
+/// v6-first upgrade gate (2026-07-12): whether to (still) pursue a v6 QUIC
+/// hole-punch to this peer. The goal is a *v6* QUIC direct — its firewall punch
+/// has no NAT port translation, so it is far more stable than a v4 CGNAT hole.
+/// We are "done" only once we already hold a v6 QUIC direct; a v4 QUIC direct is
+/// NOT sufficient. Previously the gate accepted ANY QUIC direct (incl. v4), so a
+/// node that reached a peer over v4 first never attempted the v6 upgrade and rode
+/// a churning v4 path (live-caught 2026-07-12, netcup↔Mac). The back-off at the
+/// call site still bounds wasted dials when the peer's v6 can't be reached.
+fn should_pursue_v6_upgrade(info: Option<&PeerConnectionInfo>) -> bool {
+    info.map_or(true, |i| i.quic_direct_v6 == 0)
+}
+
 /// C-N1: relay ConnectionIds to close for a peer whose grace window elapsed.
 /// Empty when the direct path has since dropped — in that case we still depend
 /// on the relay and must keep it (belt-and-suspenders to the un-arm on close).
@@ -2540,12 +2552,13 @@ fn handle_swarm_event(
                 if !quic_v6_addrs.is_empty() {
                     state.peer_quic_addrs.insert(peer_id, quic_v6_addrs.clone());
 
-                    // Auto QUIC hole-punch: if we don't have a QUIC-direct
-                    // connection to this peer, dial their QUIC IPv6 addresses.
-                    let has_quic = state.peer_connections.get(&peer_id)
-                        .map_or(false, |info| info.quic_direct_v4 > 0 || info.quic_direct_v6 > 0);
-                    if has_quic {
-                        // Already QUIC-direct — reset the back-off counter.
+                    // Auto QUIC hole-punch: pursue a *v6* QUIC direct to this peer
+                    // by dialing their QUIC IPv6 addresses. v6-first: a v4 QUIC
+                    // direct does NOT count as done — we keep upgrading toward v6
+                    // (bounded by the back-off below) because v6's firewall punch
+                    // is far more stable than a v4 CGNAT hole.
+                    if !should_pursue_v6_upgrade(state.peer_connections.get(&peer_id)) {
+                        // Already hold the preferred v6 QUIC direct — reset back-off.
                         state.quic_holepunch_attempts.remove(&peer_id);
                     } else {
                         // F7: skip public bootstrap relays — they're TCP-reachable
@@ -5498,6 +5511,26 @@ mod tests {
     }
 
     // ── C-N1: grace-delayed relay close ────────────────────────────────────
+
+    #[test]
+    fn v6_upgrade_pursued_until_a_v6_quic_direct_exists() {
+        // v6-first: keep pursuing v6 even when a v4 QUIC direct already exists.
+        let mut info = PeerConnectionInfo::default();
+        assert!(should_pursue_v6_upgrade(None), "no tracked conn → pursue");
+        assert!(should_pursue_v6_upgrade(Some(&info)), "no direct yet → pursue");
+        info.quic_direct_v4 = 1;
+        assert!(
+            should_pursue_v6_upgrade(Some(&info)),
+            "a v4 QUIC direct must NOT stop the v6 upgrade (the fix)"
+        );
+        info.tcp_direct = 1;
+        assert!(should_pursue_v6_upgrade(Some(&info)), "a tcp direct doesn't count either");
+        info.quic_direct_v6 = 1;
+        assert!(
+            !should_pursue_v6_upgrade(Some(&info)),
+            "once we hold a v6 QUIC direct we're done — don't churn"
+        );
+    }
 
     #[test]
     fn relay_close_arms_only_when_both_direct_and_relay_present() {
