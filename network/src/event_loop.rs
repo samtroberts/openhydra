@@ -3096,6 +3096,14 @@ fn handle_swarm_event(
                     tokio::spawn(async move { mgr.remove_peer(&pid).await });
                 }
 
+                // E-N3: prune the remaining per-peer maps that keyed off this
+                // peer. These grew unbounded because the disconnect cleanup
+                // evicted peer_connections / known_peers / kademlia but left
+                // last_repunch (debounce timestamps) and peer_quic_addrs (learned
+                // QUIC addrs) behind — one entry leaked per peer ever seen.
+                state.last_repunch.remove(&peer_id);
+                state.peer_quic_addrs.remove(&peer_id);
+
                 // B4: Abort ring sessions involving this peer.
                 let peer_id_str = peer_id.to_string();
                 let aborted = state.ring_manager.abort_sessions_for_peer(&peer_id_str);

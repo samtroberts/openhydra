@@ -11,6 +11,38 @@ use tracing::{info, warn};
 
 pub const PROXY_PROTOCOL: StreamProtocol = StreamProtocol::new("/openhydra/tensor/1.0.0");
 const MAX_MSG_SIZE: usize = 100 * 1024 * 1024;
+/// E-S6: cap on the buffer we reserve up-front. The 4-byte length header is
+/// attacker-controlled and unauthenticated, so we must NOT `vec![0u8; declared]`
+/// — a peer could declare 100 MB and send nothing, forcing that allocation per
+/// stream for free. Instead we reserve at most this much and grow the buffer only
+/// as real bytes arrive (see `read_framed`), so a lying header costs ~nothing and
+/// a large buffer only ever backs bytes the peer actually paid to send.
+const INITIAL_ALLOC_CAP: usize = 64 * 1024;
+
+/// Read a `u32`-length-prefixed frame without pre-allocating the declared length.
+/// Preserves exact framing (`read_exact` errors on EOF/short read) while bounding
+/// the up-front allocation to `INITIAL_ALLOC_CAP` (E-S6).
+async fn read_framed<T>(io: &mut T) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut len_buf = [0u8; 4];
+    io.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MSG_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "message exceeds MAX_MSG_SIZE"));
+    }
+    let mut buf = Vec::with_capacity(len.min(INITIAL_ALLOC_CAP));
+    let mut remaining = len;
+    let mut chunk = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        io.read_exact(&mut chunk[..want]).await?;
+        buf.extend_from_slice(&chunk[..want]);
+        remaining -= want;
+    }
+    Ok(buf)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyRequest(pub Vec<u8>);
@@ -34,15 +66,7 @@ impl Codec for GrpcProxyCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_MSG_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "too large"));
-        }
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(ProxyRequest(buf))
+        Ok(ProxyRequest(read_framed(io).await?))
     }
 
     async fn read_response<T>(
@@ -53,15 +77,7 @@ impl Codec for GrpcProxyCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_MSG_SIZE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "too large"));
-        }
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(ProxyResponse(buf))
+        Ok(ProxyResponse(read_framed(io).await?))
     }
 
     async fn write_request<T>(
@@ -218,5 +234,45 @@ mod tests {
                 prefix
             );
         }
+    }
+
+    // ── E-S6: framed read bounds the pre-auth allocation ───────────────────
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[tokio::test]
+    async fn read_framed_roundtrips_payload() {
+        let payload = vec![7u8; 128 * 1024]; // larger than INITIAL_ALLOC_CAP → exercises growth
+        let wire = framed(&payload);
+        let mut io: &[u8] = &wire;
+        let got = read_framed(&mut io).await.unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn read_framed_rejects_oversize_header() {
+        // Declared length above MAX_MSG_SIZE is rejected before any body read.
+        let mut wire = ((MAX_MSG_SIZE as u64 + 1) as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[0u8; 8]);
+        let mut io: &[u8] = &wire;
+        let err = read_framed(&mut io).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_framed_lying_header_errors_without_preallocating() {
+        // Header claims a huge body but the peer sends only a few bytes then EOF.
+        // The chunked reader never allocates the declared length — it errors on the
+        // short read instead of OOMing (E-S6: the old vec![0u8; len] would have
+        // reserved ~100 MB up-front here).
+        let mut wire = (100u32 * 1024 * 1024).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[1, 2, 3, 4]); // far fewer bytes than declared
+        let mut io: &[u8] = &wire;
+        let err = read_framed(&mut io).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

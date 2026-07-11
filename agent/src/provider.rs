@@ -32,6 +32,7 @@ use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::aup::{AupDecision, AupPolicy};
+use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{frame_response, handle_serve_request, ServeChunk, ServeRequest};
 use crate::status::TransferStats;
@@ -135,6 +136,20 @@ const CLOCK_SKEW_MS: u64 = 60 * 1000;
 /// receipts never arrive can't grow the map without bound.
 const MAX_COMMITMENTS: usize = 10_000;
 
+/// E-S8: sustained ceiling on inbound *receipt* settlements processed per second. Each
+/// receipt costs an Ed25519 verify + co-sign; unbounded, a peer can flood them to burn CPU
+/// and monopolize the worker pool, starving real serve requests. Honest volume is ~1 per
+/// completed serve, so this ceiling is far above legitimate need and only bites a flood.
+///
+/// NOTE (per-peer follow-up): `poll_inbound` does not surface the source libp2p peer, so this
+/// is a single **global** bucket — it caps total receipt-crypto/sec regardless of how an
+/// attacker labels the traffic (keying on the untrusted `consumer` field would be useless: an
+/// attacker cycles forged identities, each getting a fresh burst). A true per-peer limit needs
+/// the source peer threaded through the network→agent boundary; tracked as future work.
+const RECEIPT_RATE_RPS: f64 = 50.0;
+/// E-S8: token-bucket burst above the sustained receipt rate.
+const RECEIPT_RATE_BURST: f64 = 100.0;
+
 /// Pure B-S1/B-S7 validation, extracted so it is unit-testable without a live `Provider`.
 /// Prunes expired commitments, checks the receipt fields against the serve recorded under
 /// `nonce`, and consumes the commitment (single-use) on success. `Err(reason)` rejects the
@@ -190,6 +205,9 @@ pub struct Provider<A: EngineAdapter> {
     /// B-S1/B-S7: receipt-nonce → what we served under it, so a settlement receipt is checked
     /// against real work (tokens ≤ served, model match, single-use, fresh). Bounded + pruned.
     serve_commitments: Mutex<HashMap<[u8; 16], ServeCommitment>>,
+    /// E-S8: global token-bucket cap on inbound receipt settlements — sheds a receipt flood
+    /// *before* the Ed25519 verify+sign, so receipt crypto can't monopolize the worker pool.
+    receipt_rl: Arc<RateLimiter>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -205,6 +223,12 @@ impl<A: EngineAdapter> Provider<A> {
             aup: AupPolicy::permissive(),
             stats: None,
             serve_commitments: Mutex::new(HashMap::new()),
+            receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
+                rps: RECEIPT_RATE_RPS,
+                burst: RECEIPT_RATE_BURST,
+                max_inflight: 0, // rate-only; concurrency is already bounded by the worker pool
+                max_tracked: 1,  // single global bucket (no per-peer identity at this layer)
+            })),
         }
     }
 
@@ -469,6 +493,14 @@ impl<A: EngineAdapter> Provider<A> {
     fn dispatch(&self, data: &[u8]) -> Vec<u8> {
         match data.first() {
             Some(&RECEIPT_REQUEST) => {
+                // E-S8: shed a receipt flood before spending any crypto. The guard is
+                // dropped immediately — we use the token bucket purely as a rate cap
+                // (concurrency is bounded by the worker pool).
+                if self.receipt_rl.try_acquire("receipt", now_unix_ms()).is_err() {
+                    return frame_response(&[
+                        ServeChunk::Error("receipt rate limited, retry".into()).encode(),
+                    ]);
+                }
                 let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
                 let provider_pub = self.net.public_key_bytes().unwrap_or_default();
                 // B-S1: only co-sign a receipt that settles a real serve we recorded.
@@ -609,6 +641,28 @@ mod tests {
         let response = handle_serve_inbound(&[0xEE, 1, 2, 3], &StubAdapter);
         let chunks = parse_response(&response).unwrap();
         assert!(matches!(chunks.as_slice(), [ServeChunk::Error(_)]));
+    }
+
+    #[test]
+    fn es8_receipt_limiter_admits_burst_then_sheds_then_refills() {
+        // Exercises the exact config wired onto Provider.receipt_rl, so a bad
+        // constant (e.g. burst=0 → sheds every receipt) is caught here.
+        let rl = Arc::new(RateLimiter::new(RateLimitConfig {
+            rps: RECEIPT_RATE_RPS,
+            burst: RECEIPT_RATE_BURST,
+            max_inflight: 0,
+            max_tracked: 1,
+        }));
+        let t = 1_000_000u64;
+        for _ in 0..(RECEIPT_RATE_BURST as usize) {
+            assert!(rl.try_acquire("receipt", t).is_ok());
+        }
+        assert!(
+            rl.try_acquire("receipt", t).is_err(),
+            "burst exhausted at the same instant → shed before any crypto"
+        );
+        // ~1s later the sustained rate has refilled tokens → admits again.
+        assert!(rl.try_acquire("receipt", t + 1000).is_ok());
     }
 
     fn test_receipt(nonce: [u8; 16], tokens: u64) -> CoSignedReceipt {
