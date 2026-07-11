@@ -74,6 +74,13 @@ struct PeerConnectionInfo {
     quic_direct_v6: u32,
     tcp_direct: u32,
     tcp_relay: u32,
+    /// C-N1: ConnectionIds of the *relayed* (circuit) connections to this peer.
+    /// `request_response::send_request` dispatches via `NotifyHandler::Any`, so
+    /// while a peer has both a direct and a relay connection the chosen path is
+    /// arbitrary and throughput silently caps at relay speed. Tracking the relay
+    /// ids lets a *stabilized* direct path close them precisely (see the
+    /// `relay_close_deadline` grace window) so only the fast path remains.
+    relay_conn_ids: Vec<libp2p::swarm::ConnectionId>,
 }
 
 impl PeerConnectionInfo {
@@ -86,6 +93,46 @@ impl PeerConnectionInfo {
     }
 }
 
+/// C-N1: whether a peer with this connection mix should arm the relay-close
+/// grace window — it has both a direct path and at least one relay connection,
+/// so once the direct path proves stable the relay is redundant overhead.
+fn should_arm_relay_close(info: &PeerConnectionInfo) -> bool {
+    info.has_direct() && !info.relay_conn_ids.is_empty()
+}
+
+/// C-N1: relay ConnectionIds to close for a peer whose grace window elapsed.
+/// Empty when the direct path has since dropped — in that case we still depend
+/// on the relay and must keep it (belt-and-suspenders to the un-arm on close).
+fn relays_to_close(info: &PeerConnectionInfo) -> Vec<libp2p::swarm::ConnectionId> {
+    if info.has_direct() {
+        info.relay_conn_ids.clone()
+    } else {
+        Vec::new()
+    }
+}
+
+type PendingRelayForward = (PeerId, Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>, std::time::Instant);
+
+/// C-N2: partition queued relay-forwards into kept vs expired. Entries older
+/// than `ttl` get an `Err` reply (so a blocking caller unblocks instead of
+/// hanging on a relay dial that never connected) and are dropped; fresh entries
+/// are returned in order. `now` is injected for testability.
+fn sweep_relay_forwards(
+    forwards: Vec<PendingRelayForward>,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+) -> Vec<PendingRelayForward> {
+    let mut kept = Vec::with_capacity(forwards.len());
+    for (pid, data, reply, enqueued_at) in forwards {
+        if now.saturating_duration_since(enqueued_at) < ttl {
+            kept.push((pid, data, reply, enqueued_at));
+        } else {
+            let _ = reply.send(Err("relay dial timed out".into()));
+        }
+    }
+    kept
+}
+
 /// Snapshot returned by GetConnectionInfo command (Fix 4).
 pub struct ConnectionInfoSnapshot {
     pub has_quic: bool,
@@ -96,6 +143,22 @@ pub struct ConnectionInfoSnapshot {
 
 /// Debounce interval for TriggerRepunch (Fix 4).
 const REPUNCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// C-N1: how long a direct connection must survive before we close the peer's
+/// relay connection(s). Direct paths are most likely to flap in the window right
+/// after a hole-punch, which is exactly when we still want the warm relay as a
+/// fallback — so we only give up the relay once direct has proven stable.
+const RELAY_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
+/// C-N1: how often the grace-window sweep runs to close now-stable relays.
+const RELAY_CLOSE_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// C-N2: max age of a queued relay-forward before the reaper fails it and drops
+/// the reply channel + buffered bytes (bounds the leak when a relay dial never
+/// connects). Tied to the reaper tick, so effective sweep is TTL..TTL+reaper.
+const RELAY_FORWARD_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// C-N2: hard cap on queued relay-forwards so a peer we can never dial can't
+/// grow the queue without bound.
+const MAX_PENDING_RELAY_FORWARDS: usize = 512;
 
 /// CP-3: Events from spawned sampler tasks back to the event loop.
 ///
@@ -450,8 +513,16 @@ struct LoopState {
     /// Counter for generating unique inbound request IDs.
     inbound_proxy_counter: u64,
     /// Proxy forward requests waiting for a relay connection to be established.
-    /// (target_peer_id, data, reply_channel)
-    pending_relay_forwards: Vec<(PeerId, Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>)>,
+    /// (target_peer_id, data, reply_channel, enqueued_at)
+    /// C-N2: the `Instant` lets the reaper TTL-sweep entries whose relay dial
+    /// never connects (`OutgoingConnectionError` retries but a permanently
+    /// undialable peer would otherwise leak the reply channel + bytes forever).
+    pending_relay_forwards:
+        Vec<(PeerId, Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>, std::time::Instant)>,
+    /// C-N1: peers with both a direct and a relay connection, mapped to the
+    /// instant at which the relay may be closed (direct-established-at + grace).
+    /// Cleared if the direct path drops inside the window (so we keep the relay).
+    relay_close_deadline: HashMap<PeerId, std::time::Instant>,
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
@@ -660,6 +731,7 @@ impl LoopState {
             inbound_proxy_channels: HashMap::new(),
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
+            relay_close_deadline: HashMap::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
             enable_connection_reversal: false,
@@ -862,6 +934,12 @@ pub async fn run_event_loop(
     // B3: Ring session timeout watchdog — checks every 5s for stale sessions.
     let mut ring_timeout_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
     ring_timeout_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // C-N1: grace-window sweep — closes a peer's relay connection(s) once its
+    // direct path has survived RELAY_CLOSE_GRACE, so request_response can no
+    // longer arbitrarily pin traffic to the (slower) relay.
+    let mut relay_close_ticker = tokio::time::interval(RELAY_CLOSE_TICK);
+    relay_close_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // R-DHT-6: periodically snapshot the routing table to disk (BitTorrent-style)
     // so the next start warm-rejoins. 5 min cadence — frequent enough to capture
@@ -1507,6 +1585,53 @@ pub async fn run_event_loop(
                 if pc_swept > 0 {
                     warn!(swept = pc_swept, remaining = state.inbound_proxy_channels.len(),
                           "inbound_proxy_channels TTL sweep (leaked unanswered channels)");
+                }
+                // C-N2: TTL-sweep queued relay-forwards whose relay dial never
+                // connected. Without this a permanently-undialable target leaks
+                // its reply channel + buffered bytes forever (the drain only
+                // happens on ConnectionEstablished). Failing the reply lets the
+                // caller error out instead of hanging.
+                let rf_before = state.pending_relay_forwards.len();
+                let drained = std::mem::take(&mut state.pending_relay_forwards);
+                state.pending_relay_forwards =
+                    sweep_relay_forwards(drained, RELAY_FORWARD_TTL, std::time::Instant::now());
+                let rf_swept = rf_before - state.pending_relay_forwards.len();
+                if rf_swept > 0 {
+                    warn!(swept = rf_swept, remaining = state.pending_relay_forwards.len(),
+                          "pending_relay_forwards TTL sweep (relay dial never connected)");
+                }
+            }
+            // C-N1: close now-stable peers' relay connections so only the fast
+            // direct path remains (request_response's NotifyHandler::Any can no
+            // longer pin traffic to the relay).
+            _ = relay_close_ticker.tick() => {
+                let now = std::time::Instant::now();
+                let due: Vec<PeerId> = state
+                    .relay_close_deadline
+                    .iter()
+                    .filter(|(_, &deadline)| now >= deadline)
+                    .map(|(&pid, _)| pid)
+                    .collect();
+                for pid in due {
+                    state.relay_close_deadline.remove(&pid);
+                    // Re-check live state: only close relays if a direct path is
+                    // still up (it may have dropped and been un-armed already —
+                    // this is the belt to that suspenders) and relays still exist.
+                    let relay_ids = state
+                        .peer_connections
+                        .get(&pid)
+                        .map(relays_to_close)
+                        .unwrap_or_default();
+                    if relay_ids.is_empty() {
+                        continue;
+                    }
+                    for cid in &relay_ids {
+                        // ConnectionClosed will decrement tcp_relay and drop the
+                        // id from relay_conn_ids — no bookkeeping needed here.
+                        let _ = swarm.close_connection(*cid);
+                    }
+                    info!(%pid, closed = relay_ids.len(),
+                          "C-N1: closed relay connection(s) — direct path stabilized");
                 }
             }
             // R-DHT-6: snapshot the routing table to disk for warm restarts.
@@ -2863,14 +2988,28 @@ fn handle_swarm_event(
                     }
                     TransportType::TcpRelay => {
                         info.tcp_relay += 1;
+                        // C-N1: remember this relay connection so a later stable
+                        // direct path can close it precisely.
+                        info.relay_conn_ids.push(connection_id);
                         debug!(%peer_id, %addr_str, relay=info.tcp_relay, "tcp_relay_connected");
                     }
                 }
             }
 
+            // C-N1: if this peer now has BOTH a direct and a relay connection,
+            // arm the grace window after which the relay is closed. Only arm once
+            // (keep the earliest deadline) so a burst of duplicate connections
+            // can't keep pushing the close out. `info` is still borrowed here.
+            if should_arm_relay_close(info) {
+                state
+                    .relay_close_deadline
+                    .entry(peer_id)
+                    .or_insert_with(|| std::time::Instant::now() + RELAY_CLOSE_GRACE);
+            }
+
             // Send any queued proxy forwards that were waiting for this connection.
             let mut remaining = Vec::new();
-            for (target, data, reply) in state.pending_relay_forwards.drain(..) {
+            for (target, data, reply, enqueued_at) in state.pending_relay_forwards.drain(..) {
                 if target == peer_id {
                     info!(%peer_id, "sending queued proxy forward after relay connection");
                     let req_id = swarm
@@ -2879,12 +3018,12 @@ fn handle_swarm_event(
                         .send_request(&peer_id, ProxyRequest(data));
                     state.pending_proxy.insert(req_id, reply);
                 } else {
-                    remaining.push((target, data, reply));
+                    remaining.push((target, data, reply, enqueued_at));
                 }
             }
             state.pending_relay_forwards = remaining;
         }
-        SwarmEvent::ConnectionClosed { peer_id, endpoint, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint, .. } => {
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
@@ -2912,10 +3051,21 @@ fn handle_swarm_event(
                         }
                     }
                     TransportType::TcpDirect => info.tcp_direct = info.tcp_direct.saturating_sub(1),
-                    TransportType::TcpRelay => info.tcp_relay = info.tcp_relay.saturating_sub(1),
+                    TransportType::TcpRelay => {
+                        info.tcp_relay = info.tcp_relay.saturating_sub(1);
+                        // C-N1: forget this relay id (whether it closed on its own
+                        // or because the grace sweep closed it).
+                        info.relay_conn_ids.retain(|&c| c != connection_id);
+                    }
+                }
+                // C-N1: if the peer no longer has a direct path, cancel any armed
+                // relay-close — we now depend on the relay again.
+                if !info.has_direct() {
+                    state.relay_close_deadline.remove(&peer_id);
                 }
                 if info.quic_direct_v4 == 0 && info.quic_direct_v6 == 0 && info.tcp_direct == 0 && info.tcp_relay == 0 {
                     state.peer_connections.remove(&peer_id);
+                    state.relay_close_deadline.remove(&peer_id);
                     debug!(%peer_id, "peer_fully_disconnected");
                 }
             }
@@ -4116,10 +4266,20 @@ fn handle_proxy_forward(
         // had actually reserved on, and never fell through to EU/AP. A single
         // multi-addr dial lets libp2p race all circuits and connect via
         // whichever one holds the target's reservation.
+        // C-N2: shed if the queue is already at its cap — a peer we can never
+        // dial must not grow it without bound.
+        if state.pending_relay_forwards.len() >= MAX_PENDING_RELAY_FORWARDS {
+            warn!(%peer_id, cap = MAX_PENDING_RELAY_FORWARDS,
+                  "proxy_forward: pending_relay_forwards at cap — shedding");
+            let _ = reply.send(Err("proxy_forward: relay queue full".into()));
+            return;
+        }
         let circuit_addrs = relay_circuit_addrs(peer_id, state.ipv6_capable);
         match swarm.dial(relay_dial_opts(peer_id, circuit_addrs)) {
             Ok(()) => {
-                state.pending_relay_forwards.push((peer_id, data, reply));
+                state
+                    .pending_relay_forwards
+                    .push((peer_id, data, reply, std::time::Instant::now()));
             }
             Err(e) => {
                 warn!(%peer_id, error=%e, "proxy_forward: relay dial failed");
@@ -4253,10 +4413,19 @@ fn handle_proxy_forward_no_wait(
         info!(%peer_id, "proxy_forward_no_wait: peer not connected, dialing via relay");
         // Finding A: one multi-address dial across all relay circuits (see
         // handle_proxy_forward) instead of break-on-first-queued (always US).
+        // C-N2: same cap guard as the blocking path (fire-and-forget, so just
+        // drop rather than reply on overflow).
+        if state.pending_relay_forwards.len() >= MAX_PENDING_RELAY_FORWARDS {
+            warn!(%peer_id, cap = MAX_PENDING_RELAY_FORWARDS,
+                  "proxy_forward_no_wait: pending_relay_forwards at cap — dropping");
+            return;
+        }
         match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(peer_id, state.ipv6_capable))) {
             Ok(()) => {
                 let (dummy_tx, _dummy_rx) = oneshot::channel();
-                state.pending_relay_forwards.push((peer_id, data, dummy_tx));
+                state
+                    .pending_relay_forwards
+                    .push((peer_id, data, dummy_tx, std::time::Instant::now()));
             }
             Err(e) => {
                 warn!(%peer_id, error=%e, "proxy_forward_no_wait: relay dial failed — data dropped");
@@ -5178,5 +5347,71 @@ mod tests {
         info.tcp_direct = 0;
         info.tcp_relay = 1;
         assert!(!info.has_direct());
+    }
+
+    // ── C-N1: grace-delayed relay close ────────────────────────────────────
+
+    #[test]
+    fn relay_close_arms_only_when_both_direct_and_relay_present() {
+        use libp2p::swarm::ConnectionId;
+        let mut info = PeerConnectionInfo::default();
+        // Relay only → don't arm (we have no faster path to fall back from).
+        info.tcp_relay = 1;
+        info.relay_conn_ids.push(ConnectionId::new_unchecked(1));
+        assert!(!should_arm_relay_close(&info));
+        // Direct arrives → now redundant relay, arm the close.
+        info.quic_direct_v4 = 1;
+        assert!(should_arm_relay_close(&info));
+        // Direct only (no relay tracked) → nothing to close.
+        info.tcp_relay = 0;
+        info.relay_conn_ids.clear();
+        assert!(!should_arm_relay_close(&info));
+    }
+
+    #[test]
+    fn relays_to_close_returns_ids_only_while_direct_survives() {
+        use libp2p::swarm::ConnectionId;
+        let mut info = PeerConnectionInfo::default();
+        info.quic_direct_v4 = 1;
+        info.tcp_relay = 2;
+        info.relay_conn_ids = vec![ConnectionId::new_unchecked(7), ConnectionId::new_unchecked(9)];
+        // Direct up → both relay ids are eligible for closing.
+        assert_eq!(relays_to_close(&info), info.relay_conn_ids);
+        // Direct dropped in the window → keep the relay, close nothing.
+        info.quic_direct_v4 = 0;
+        assert!(relays_to_close(&info).is_empty());
+    }
+
+    // ── C-N2: pending_relay_forwards TTL sweep ─────────────────────────────
+
+    #[test]
+    fn relay_forward_sweep_expires_old_and_fails_reply_keeps_fresh() {
+        let now = std::time::Instant::now();
+        let old_at = now - std::time::Duration::from_secs(60);
+        let pid = PeerId::random();
+        let (tx_old, mut rx_old) = oneshot::channel::<Result<Vec<u8>, String>>();
+        let (tx_new, mut rx_new) = oneshot::channel::<Result<Vec<u8>, String>>();
+        let forwards = vec![
+            (pid, vec![1, 2, 3], tx_old, old_at),
+            (pid, vec![4, 5, 6], tx_new, now),
+        ];
+        let kept = sweep_relay_forwards(forwards, std::time::Duration::from_secs(30), now);
+        // Only the fresh entry survives.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, vec![4, 5, 6]);
+        // The expired entry's caller got an error (unblocked, not left hanging).
+        assert!(matches!(rx_old.try_recv(), Ok(Err(_))));
+        // The fresh entry's channel is still open (no reply sent yet).
+        assert!(matches!(rx_new.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn relay_forward_sweep_keeps_all_when_none_expired() {
+        let now = std::time::Instant::now();
+        let pid = PeerId::random();
+        let (tx, _rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        let forwards = vec![(pid, vec![9], tx, now)];
+        let kept = sweep_relay_forwards(forwards, std::time::Duration::from_secs(30), now);
+        assert_eq!(kept.len(), 1);
     }
 }
