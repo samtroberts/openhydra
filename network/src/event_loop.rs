@@ -43,7 +43,19 @@ fn classify_transport(addr_str: &str) -> TransportType {
     if addr_str.contains("p2p-circuit") {
         return TransportType::TcpRelay;
     }
-    if addr_str.contains("/quic") || addr_str.contains("/quic-v1") {
+    // A genuine *direct* connection always carries a transport layer (`/tcp/` or
+    // `/udp/`). A bare `/p2p/<peer>` address (no transport, no circuit) is how a
+    // *relayed* inbound connection is frequently represented on the LISTENER side
+    // — libp2p's `send_back_addr` there is just the source peer id. Classifying
+    // that as `TcpDirect` inflated a provider's `direct_conns`, so C-N1 could
+    // close a real relay believing a direct path existed. Without a transport
+    // component we cannot prove the connection is direct → treat it as relay (the
+    // conservative, and in practice correct, verdict). Live-caught 2026-07-12.
+    let has_transport = addr_str.contains("/tcp/") || addr_str.contains("/udp/");
+    if !has_transport {
+        return TransportType::TcpRelay;
+    }
+    if addr_str.contains("/quic") {
         return TransportType::QuicDirect;
     }
     TransportType::TcpDirect
@@ -5448,6 +5460,23 @@ mod tests {
         assert_eq!(
             classify_transport("/ip4/45.79.190.172/tcp/4001"),
             TransportType::TcpDirect,
+        );
+    }
+
+    #[test]
+    fn test_classify_transport_bare_p2p_is_not_direct() {
+        // Live-caught 2026-07-12: a relayed inbound connection's listener-side
+        // send_back_addr is a bare `/p2p/<peer>` (no transport, no circuit). It
+        // must NOT be counted as direct (that inflated provider direct_conns and
+        // could make C-N1 close a real relay). No `/tcp/` or `/udp/` → relay.
+        assert_eq!(
+            classify_transport("/p2p/12D3KooWSkRDF79TqQ476KaisamEZqgTkR1W6rKyDta7jCjwXZcZ"),
+            TransportType::TcpRelay,
+        );
+        // A genuine QUIC direct (has /udp/ + /quic-v1) still classifies correctly.
+        assert_eq!(
+            classify_transport("/ip4/85.209.48.209/udp/4101/quic-v1/p2p/12D3KooWSkRD"),
+            TransportType::QuicDirect,
         );
     }
 
