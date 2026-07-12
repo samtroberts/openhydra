@@ -71,6 +71,10 @@ yarn.lock
 network/target/
 *.rlib
 Cargo.lock
+# ...but DO track the root workspace lock: OpenHydra ships binaries, so builds, CI, and
+# releases must be reproducible and auditable (see .github/workflows/security.yml). Mirrors
+# the desktop lock negation further down this file.
+!/Cargo.lock
 
 # ── Terraform ─────────────────────────────────────────────────────────────────
 .terraform/

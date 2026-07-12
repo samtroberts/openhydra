@@ -1,0 +1,30 @@
+# cargo-audit ignore baseline — see .github/workflows/security.yml.
+#
+# Every entry is a KNOWN advisory in a TRANSITIVE dependency we cannot bump without a
+# coordinated PARENT upgrade (libp2p / rustls / igd). The gate still FAILS on any NEW
+# advisory not listed here, so this is a tracked baseline, not a blanket mute.
+#
+# To clear these: upgrade libp2p (pulls newer hickory-proto/ring/quinn), move off the old
+# rustls that drags in rustls-webpki 0.101, and bump igd-next (pulls quick-xml >=0.41).
+# The one directly-relevant remote DoS (quinn-proto RUSTSEC-2026-0185, out-of-order QUIC
+# stream reassembly) was FIXED by bumping quinn-proto to 0.11.15 — it is intentionally NOT
+# ignored here.
+[advisories]
+ignore = [
+    # ---- vulnerabilities (transitive; need a parent upgrade) ----
+    "RUSTSEC-2026-0119", # hickory-proto O(n^2) DNS name-compression CPU exhaustion — via libp2p-dns; fix = hickory >=0.26
+    "RUSTSEC-2026-0195", # quick-xml unbounded namespace-decl alloc DoS — via igd UPnP (LAN-only); fix = quick-xml >=0.41
+    "RUSTSEC-2026-0194", # quick-xml quadratic duplicate-attr check — via igd UPnP (LAN-only); fix = quick-xml >=0.41
+    "RUSTSEC-2025-0009", # ring 0.16 AES panic — only with overflow-checks (release builds unaffected); transitive pin; fix = ring 0.17
+    "RUSTSEC-2026-0104", # rustls-webpki 0.101 CRL-parse panic — old rustls transitive; fix = drop 0.101
+    "RUSTSEC-2026-0098", # rustls-webpki 0.101 name-constraint incorrectly accepted — old rustls transitive; fix = drop 0.101
+    "RUSTSEC-2026-0099", # rustls-webpki 0.101 wildcard name-constraint — old rustls transitive; fix = drop 0.101
+    # ---- unmaintained / unsound (informational) ----
+    "RUSTSEC-2024-0384", # instant unmaintained (transitive)
+    "RUSTSEC-2024-0436", # paste unmaintained (transitive proc-macro)
+    "RUSTSEC-2025-0010", # ring <0.17 unmaintained (see RUSTSEC-2025-0009)
+    "RUSTSEC-2026-0190", # anyhow Error::downcast_mut unsoundness (transitive)
+    "RUSTSEC-2026-0002", # lru IterMut Stacked-Borrows unsoundness (transitive)
+    "RUSTSEC-2026-0186", # memmap2 unchecked pointer-offset unsoundness (transitive)
+    "RUSTSEC-2024-0408", # pprof from_raw_parts unsoundness (dev/profiling only)
+]

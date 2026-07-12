@@ -1,0 +1,37 @@
+name: Security Audit
+
+# Dependency-vulnerability gate (RustSec advisories). Runs on any dependency change and
+# weekly, so newly-disclosed advisories in existing deps surface without a code push.
+# The known-transitive baseline lives in .cargo/audit.toml; this job FAILS on any advisory
+# not in that baseline.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+  schedule:
+    - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Honors .cargo/audit.toml (documented transitive baseline); non-zero exit on any
+      # advisory outside that baseline fails the job.
+      - name: Audit workspace dependencies
+        run: cargo audit
