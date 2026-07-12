@@ -1,40 +1,48 @@
 # OpenHydra Public V1 Mainnet Playbook
 
-## One-command canary rollout
+> **The previous contents of this file described the pre-pivot architecture and were
+> removed (G7b).** They referenced a Docker-Compose application canary
+> (`scripts/mainnet_canary.sh`, `scripts/slo_chaos_test.py`, `docker compose`, a `peer`
+> service, `/v1/completions`) — none of which exist in the pure-Rust BYO-engine protocol.
+> An operator following them hit `No such file or directory`. There is no central
+> "mainnet" application to canary-deploy: providers run the `openhydra-agent` binary
+> wrapping their own engine, and the only shared infrastructure is the bootstrap mesh.
+
+## What actually gets deployed
+
+| Component | Artifact | How |
+|-----------|----------|-----|
+| **Bootstrap mesh** (3 Linode + 1 netcup) | `openhydra-bootstrap` binary | [`ops/bootstrap/deploy_libp2p.sh`](bootstrap/deploy_libp2p.sh) — node-by-node rollout with per-node binary backup, health-check (active + re-meshed), and **auto-rollback + abort** on any failure, so at most one node is ever touched before a bad rollout stops. See [`ops/bootstrap/README.md`](bootstrap/README.md). |
+| **Provider / gateway node** | `openhydra-agent` binary | `openhydra-agent provide` (wraps a local engine) / `openhydra-agent serve` (OpenAI-compatible gateway). Runs standalone; discovers the mesh via the bootstrap DNS names. |
+
+## Bootstrap rollout (the one command that exists)
 
 ```bash
-./scripts/mainnet_canary.sh rollout openhydra-mainnet-canary
+./ops/bootstrap/deploy_libp2p.sh                 # build, then roll out node-by-node
+./ops/bootstrap/deploy_libp2p.sh path/to/binary  # deploy a prebuilt binary
+./ops/bootstrap/deploy_libp2p.sh --reconfigure-peers
 ```
 
-The rollout command performs:
+The script builds, rolls out one node at a time, backs up the old binary, restarts,
+health-checks that the node is active **and** re-meshed, and auto-rolls-back + aborts on
+any failure — the remaining ≥3 nodes keep the DHT alive throughout. One-time provisioning
+(identity keys, firewall, swap, disk) is out of its scope and done by hand per node.
 
-1. Preflight (`docker info`, `curl`, `python3`)
-2. Canary deploy (`docker compose -p <project> up -d --build`)
-3. Health gating (`/health`, `/metrics`)
-4. Smoke inference request (`/v1/completions`)
-5. Sustained load + chaos SLO test (`scripts/slo_chaos_test.py`)
-6. Checklist + SLO report generation under `.openhydra/canary_reports/`
+## Smoke test
 
-## One-command rollback
+The gateway speaks the OpenAI Chat Completions API. Verify a live node with:
 
 ```bash
-./scripts/mainnet_canary.sh rollback openhydra-mainnet-canary
+curl -s http://<node>:<port>/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"<announced-model>","messages":[{"role":"user","content":"ping"}]}'
 ```
 
-Rollback performs:
+(The old `/v1/completions` legacy-text endpoint no longer exists.)
 
-1. Log capture (`docker compose logs --no-color`)
-2. Stack teardown (`docker compose down -v --remove-orphans`)
-3. Rollback report generation under `.openhydra/canary_reports/`
+## TODO before a public V1
 
-## Recommended production env overrides
-
-```bash
-export OPENHYDRA_CANARY_SLO_DURATION_S=300
-export OPENHYDRA_CANARY_WORKERS=48
-export OPENHYDRA_CANARY_MIN_SUCCESS_RATE=0.99
-export OPENHYDRA_CANARY_MAX_P95_MS=900
-export OPENHYDRA_CANARY_CHAOS_AT_S=60
-export OPENHYDRA_CANARY_CHAOS_SERVICE=peer
-```
-
+This file is a redirect, not a full runbook. A real V1 launch still needs a documented,
+rehearsed procedure for: provider onboarding, mesh capacity/health monitoring
+(`ops/prometheus` + `ops/grafana` are wired), incident rollback for the agent fleet, and
+the SLO targets the removed canary harness used to assert. Track that as launch work.
