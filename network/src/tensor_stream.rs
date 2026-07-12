@@ -10,13 +10,13 @@
 //! as `GrpcProxyCodec` in proxy.rs).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use futures::prelude::*;
 use libp2p::{PeerId, Stream, StreamProtocol};
 use libp2p_stream::Control;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::event_loop::SharedProxyQueue;
@@ -40,6 +40,20 @@ pub const TENSOR_STREAM_PROTOCOL: StreamProtocol =
 
 /// Maximum message size (same as GrpcProxyCodec).
 const MAX_MSG_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
+/// Up-front allocation cap for an inbound frame (E-S6/G4). The read buffer starts at
+/// `min(declared_len, INITIAL_ALLOC_CAP)` and grows as bytes actually arrive, so a peer
+/// cannot force a 100 MB allocation by merely declaring a large length prefix.
+const INITIAL_ALLOC_CAP: usize = 64 * 1024; // 64 KB
+
+/// Global cap on concurrently-serviced inbound tensor streams (G4b). The acceptor spawns a
+/// reader task per accepted stream and pushes straight to the shared proxy queue; without a
+/// ceiling a flood of stream opens exhausts tasks/memory. Generous — only trips under abuse.
+const MAX_INBOUND_STREAMS_GLOBAL: usize = 1024;
+
+/// Per-peer cap on concurrent inbound tensor streams (G4b), so one peer cannot monopolise the
+/// global budget (or the drop-oldest proxy queue) and starve others.
+const MAX_INBOUND_STREAMS_PER_PEER: usize = 32;
 
 /// Hard ceiling timeout for stalled writes (Fix 4).
 /// OS socket errors (BrokenPipe, ConnectionReset) catch most failures
@@ -430,14 +444,63 @@ pub fn spawn_inbound_acceptor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("tensor_stream_acceptor: accepting inbound streams");
+        // G4b: bound concurrent inbound streams globally and per-peer. `per_peer` uses a std
+        // Mutex so the RAII decrement can run in a sync `Drop`; its critical sections are tiny.
+        let global = Arc::new(Semaphore::new(MAX_INBOUND_STREAMS_GLOBAL));
+        let per_peer: Arc<StdMutex<HashMap<PeerId, usize>>> = Arc::new(StdMutex::new(HashMap::new()));
         while let Some((peer_id, stream)) = incoming.next().await {
+            // Global cap: shed (close the stream) rather than pile up reader tasks.
+            let permit = match Arc::clone(&global).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(%peer_id, "tensor_stream_acceptor: global inbound-stream cap reached, dropping");
+                    drop(stream);
+                    continue;
+                }
+            };
+            // Per-peer cap: keep one peer from monopolising the global budget / proxy queue.
+            {
+                let mut counts = per_peer.lock().unwrap_or_else(|e| e.into_inner());
+                let n = counts.entry(peer_id).or_insert(0);
+                if *n >= MAX_INBOUND_STREAMS_PER_PEER {
+                    warn!(%peer_id, "tensor_stream_acceptor: per-peer inbound-stream cap reached, dropping");
+                    drop(stream); // `permit` also drops here, freeing the global slot
+                    continue;
+                }
+                *n += 1;
+            }
             info!(%peer_id, "tensor_stream_acceptor: inbound stream accepted");
+            let guard = PeerStreamGuard { counts: Arc::clone(&per_peer), peer: peer_id, _global: permit };
             let pq = Arc::clone(&proxy_queue);
             let streams = Arc::clone(&inbound_streams);
-            tokio::spawn(handle_inbound_stream(peer_id, stream, pq, streams));
+            tokio::spawn(async move {
+                let _guard = guard; // released (per-peer count −1, global permit freed) on task exit
+                handle_inbound_stream(peer_id, stream, pq, streams).await;
+            });
         }
         info!("tensor_stream_acceptor: stopped");
     })
+}
+
+/// RAII release of one inbound-stream slot (G4b): decrements the per-peer count (pruning the
+/// entry at zero so the map stays bounded) and, via `_global`, frees the global semaphore
+/// permit — both when the stream's reader task exits for any reason.
+struct PeerStreamGuard {
+    counts: Arc<StdMutex<HashMap<PeerId, usize>>>,
+    peer: PeerId,
+    _global: OwnedSemaphorePermit,
+}
+
+impl Drop for PeerStreamGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = counts.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
 }
 
 /// Handle one inbound tensor stream: read framed messages in a loop,
@@ -541,11 +604,23 @@ async fn read_framed<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Vec<u8>, Te
             "message too large: {len} > {MAX_MSG_SIZE}"
         )));
     }
-    let mut data = vec![0u8; len];
-    stream
-        .read_exact(&mut data)
-        .await
-        .map_err(|e| TensorStreamError::Read(e.to_string()))?;
+    // G4: do NOT pre-allocate the attacker-declared `len`. This is the primary inbound
+    // inference transport; any connected peer can open a stream, declare 100 MB, stall, and
+    // multiply across yamux substreams → OOM. Bound the up-front allocation to
+    // `INITIAL_ALLOC_CAP` and grow as bytes actually arrive (mirrors the E-S6 hardening in
+    // proxy.rs). `read_exact` still enforces exact framing (errors on EOF/short read).
+    let mut data = Vec::with_capacity(len.min(INITIAL_ALLOC_CAP));
+    let mut remaining = len;
+    let mut chunk = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        stream
+            .read_exact(&mut chunk[..want])
+            .await
+            .map_err(|e| TensorStreamError::Read(e.to_string()))?;
+        data.extend_from_slice(&chunk[..want]);
+        remaining -= want;
+    }
     Ok(data)
 }
 
@@ -632,6 +707,29 @@ mod tests {
         write_framed(&mut sink, payload).await.expect("write");
         assert_eq!(sink.len(), 4 + payload.len());
 
+        let mut cursor = futures::io::Cursor::new(sink);
+        let got = read_framed(&mut cursor).await.expect("read");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn read_framed_lying_header_errors_without_preallocating() {
+        // G4: header claims a 100 MB body but the peer sends only a few bytes then EOF. The
+        // chunked reader must error on the short read, never reserving the declared length
+        // (the old `vec![0u8; len]` would have committed ~100 MB up-front here).
+        let mut wire = (100u32 * 1024 * 1024).to_be_bytes().to_vec();
+        wire.extend_from_slice(&[1, 2, 3, 4]); // far fewer bytes than declared
+        let mut cursor = futures::io::Cursor::new(wire);
+        let err = read_framed(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, TensorStreamError::Read(_)));
+    }
+
+    #[tokio::test]
+    async fn read_framed_grows_past_initial_cap() {
+        // A payload larger than INITIAL_ALLOC_CAP round-trips intact via the growth loop.
+        let payload = vec![0xABu8; INITIAL_ALLOC_CAP * 2 + 123];
+        let mut sink: Vec<u8> = Vec::new();
+        write_framed(&mut sink, &payload).await.expect("write");
         let mut cursor = futures::io::Cursor::new(sink);
         let got = read_framed(&mut cursor).await.expect("read");
         assert_eq!(got, payload);

@@ -276,6 +276,22 @@ pub fn verify_activation_hash(activation: &[f64], expected: &[u8]) -> bool {
 /// ruled `Inconclusive` (no penalty) rather than falsely `Failed`.
 pub const AGREEMENT_THRESHOLD: f64 = 0.9;
 
+/// Minimum number of (trimmed) characters an audit *body* must carry to count as a
+/// substantive, comparable response. The nonce echo is copyable from the prompt, so the
+/// discriminating signal is the *generated continuation*; below this bar a "response"
+/// holds too little generated content to distinguish real inference from a no-op. A
+/// non-substantive body can neither agree with another ([`agrees`]) nor stand as a valid
+/// audit answer ([`audit_body`]) — it is a non-response. This closes the laundering path
+/// where two zero-work providers emit nothing, "agree" (`common_prefix_ratio("","") == 1.0`),
+/// form a majority, and rule the one honest provider the outlier.
+pub const MIN_AUDIT_BODY_CHARS: usize = 16;
+
+/// Whether an audit body carries enough generated content to be a comparable response
+/// (see [`MIN_AUDIT_BODY_CHARS`]).
+fn is_substantive_body(body: &str) -> bool {
+    body.trim().chars().count() >= MIN_AUDIT_BODY_CHARS
+}
+
 /// Fraction of identical leading characters shared by `a` and `b`, relative to the longer
 /// (after trimming trailing whitespace — stop-token handling commonly differs by a
 /// trailing newline). `1.0` for identical, `0.0` for an empty-vs-nonempty or
@@ -303,6 +319,15 @@ pub fn common_prefix_ratio(a: &str, b: &str) -> f64 {
 /// ([`activation_hash`]) would tighten this but is dormant on the BYO-engine text path
 /// (the engine returns text, not activations).
 pub fn agrees(a: &str, b: &str) -> bool {
+    // A non-substantive body (empty, whitespace-only, or below [`MIN_AUDIT_BODY_CHARS`])
+    // cannot agree with anything — otherwise two zero-work providers that emit nothing would
+    // "agree" (`common_prefix_ratio` returns 1.0 for two empty strings), form a strict
+    // majority, and launder the audit into ruling the one honest provider the outlier. With
+    // this guard the worst case for such a pair is `Inconclusive` (no one punished), never a
+    // false `Failed` for the honest provider.
+    if !is_substantive_body(a) || !is_substantive_body(b) {
+        return false;
+    }
     common_prefix_ratio(a, b) >= AGREEMENT_THRESHOLD
 }
 
@@ -438,7 +463,15 @@ pub fn audit_body<'a>(output: &'a str, nonce_hex: &str) -> Option<&'a str> {
     if pos > 64 {
         return None; // nonce not echoed near the start → not a proper response
     }
-    Some(output[pos + nonce_hex.len()..].trim_start())
+    let body = output[pos + nonce_hex.len()..].trim_start();
+    // The nonce alone is copyable from the prompt; a valid response must also carry a
+    // substantive generated continuation. An echo-only / empty continuation is not a
+    // response — reject it here so the caller records a non-responder rather than an empty
+    // body that could launder the agreement vote (M2.2(b) freeloader defense).
+    if !is_substantive_body(body) {
+        return None;
+    }
+    Some(body)
 }
 
 #[cfg(test)]
@@ -726,9 +759,44 @@ mod tests {
     }
 
     #[test]
-    fn empty_vs_empty_agrees() {
-        assert!(agrees("", ""));
-        assert!(agrees("\n", "  ")); // both empty after trim
+    fn empty_or_short_bodies_never_agree() {
+        // Two zero-work providers that emit nothing must NOT agree — the audit-laundering
+        // path (G2). common_prefix_ratio is still 1.0 for empties (it is a pure ratio), but
+        // `agrees` gates on substance first.
+        assert!(!agrees("", ""));
+        assert!(!agrees("\n", "  ")); // both empty after trim
+        assert_eq!(common_prefix_ratio("", ""), 1.0); // the primitive is unchanged
+        // Below MIN_AUDIT_BODY_CHARS → not comparable even if identical.
+        let tiny = "ok";
+        assert!(!agrees(tiny, tiny));
+    }
+
+    #[test]
+    fn empty_body_sybils_cannot_frame_the_honest_provider() {
+        // The concrete attack: two colluding Sybils return an empty audit body, the one
+        // honest provider returns a real continuation. Before G2 the two empties formed a
+        // majority and the honest provider was ruled the `Failed` outlier. Now the empties
+        // agree with no one, so no strict majority exists → Inconclusive (no one punished).
+        let honest = "The capital of France is Paris, a city on the river Seine.";
+        assert_eq!(
+            redundant_verdict(&[honest, "", ""]),
+            RedundantVerdict::Inconclusive,
+            "empty-body Sybils must not outvote the honest provider"
+        );
+        // And an empty body among an honest majority is itself the outlier, not the reverse.
+        assert_eq!(
+            redundant_verdict(&[honest, honest, ""]),
+            RedundantVerdict::Outliers(vec![2])
+        );
+    }
+
+    #[test]
+    fn audit_body_rejects_echo_only_continuation() {
+        let n = "0123456789abcdef0123456789abcdef";
+        // Nonce echoed but no substantive continuation → not a response (G2).
+        assert_eq!(audit_body(&format!("{n}"), n), None);
+        assert_eq!(audit_body(&format!("{n}\n  \n"), n), None);
+        assert_eq!(audit_body(&format!("{n} ok"), n), None); // continuation too short
     }
 
     #[test]

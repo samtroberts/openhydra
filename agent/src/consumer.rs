@@ -63,6 +63,12 @@ pub struct SelectedProvider {
 /// request on libp2p's ~15s (or unbounded) request-response wait.
 const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Bound on the detached receipt-settlement round-trip (G5). Settlement runs off the response
+/// path, so this only caps how long a provider that black-holes the RECEIPT_REQUEST can park
+/// the detached settlement thread — kept well below [`ATTEMPT_TIMEOUT`] since credit is
+/// advisory and a dropped settlement never affects the delivered completion.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Redundant-execution audit sampling bounds (M2.2(b)), fed to
 /// [`sample_rate_for_reputation`]. A fully-trusted provider is audited rarely
 /// ([`AUDIT_MIN_RATE`]); a fresh / low-reputation one often ([`AUDIT_MAX_RATE`]), since the
@@ -438,7 +444,8 @@ impl ConsumerNode {
     /// Fire the co-signed receipt for a completed request. Skips a provider that
     /// advertised no usable public key; swallows all errors (trust settlement is
     /// auxiliary to delivering the completion).
-    fn settle_receipt(&self, provider: &SelectedProvider, tokens: u64, nonce: [u8; 16]) {
+    fn settle_receipt(self: &Arc<Self>, provider: &SelectedProvider, tokens: u64, nonce: [u8; 16]) {
+        // Cheap up-front checks on the caller thread so an unkeyed provider costs no thread.
         let provider_pub = match hex::decode(&provider.public_key) {
             Ok(b) if b.len() == 32 => b,
             _ => return, // legacy / unkeyed provider — nothing to settle against
@@ -447,29 +454,40 @@ impl ConsumerNode {
             Ok(b) => b,
             Err(_) => return,
         };
-        let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
+        // G5: settlement is a *follow-up* round-trip to the provider, and `complete` emits the
+        // terminal `Done`/`[DONE]` only after it returns. Run inline, it let a provider that
+        // served correctly but then black-holes the RECEIPT_REQUEST pin the consumer's response
+        // thread and withhold `[DONE]` for the full protocol timeout — a flood → unbounded
+        // parked threads. Move it fully off the response path (detached, like `maybe_audit`) and
+        // bound the transport with `SETTLE_TIMEOUT` so a dead provider can't park the thread
+        // indefinitely. Credit is advisory, so a dropped settlement never affects the completion.
+        let node = Arc::clone(self);
         let provider_libp2p = provider.libp2p_peer_id.clone();
-        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            self.net
-                .proxy_forward(provider_libp2p.clone(), framed.to_vec())
-                .map_err(AdapterError::Http)
-        };
-        // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
-        // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
-        if request_receipt(
-            &sign,
-            &mut transport,
-            &provider_pub,
-            &consumer_pub,
-            &provider.model_id,
-            tokens,
-            nonce,
-            now_unix_ms(),
-        )
-        .is_ok()
-        {
-            self.record_contribution(&provider.libp2p_peer_id, tokens);
-        }
+        let model_id = provider.model_id.clone();
+        std::thread::spawn(move || {
+            let sign = |msg: &[u8]| node.net.sign(msg).unwrap_or_default();
+            let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                node.net
+                    .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), SETTLE_TIMEOUT)
+                    .map_err(AdapterError::Http)
+            };
+            // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
+            // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
+            if request_receipt(
+                &sign,
+                &mut transport,
+                &provider_pub,
+                &consumer_pub,
+                &model_id,
+                tokens,
+                nonce,
+                now_unix_ms(),
+            )
+            .is_ok()
+            {
+                node.record_contribution(&provider_libp2p, tokens);
+            }
+        });
     }
 
     /// Record that `provider_libp2p_id` **served** us `tokens` (M2.3 give-side): the provider

@@ -2794,9 +2794,15 @@ fn handle_swarm_event(
             match dcutr_event.result {
                 Ok(conn_id) => {
                     state.dcutr_successes += 1;
-                    let info = state.peer_connections.entry(peer).or_default();
-                    info.tcp_direct = info.tcp_direct.max(1);
-                    state.dcutr_event_queue.push_back(peer.to_string());
+                    // G6: do NOT synthesize a direct-connection counter here. The upgraded
+                    // connection (usually QUIC-v6, the preferred punch) fires its own
+                    // `ConnectionEstablished`, which is the *sole* source of truth for
+                    // `peer_connections` counts. A phantom `tcp_direct` with no `ConnectionId`
+                    // binding was never balanced by the matching `ConnectionClosed` (that closed
+                    // connection decrements `quic_direct_*`, not `tcp_direct`), so it stuck at 1
+                    // forever — `has_direct()` then lied and the C-N1 relay-close sweep could
+                    // tear down the peer's *only* working (relay) path. Removing the push to the
+                    // never-drained `dcutr_event_queue` here also closes its unbounded growth.
                     info!(
                         %peer, ?conn_id,
                         successes = state.dcutr_successes,

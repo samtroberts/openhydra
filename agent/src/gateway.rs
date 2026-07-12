@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -32,7 +33,17 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
 use openhydra_network::handle::NetworkHandle;
+
+/// Global backstop on concurrent generation workers (G3b), independent of the per-identity
+/// rate-limiter and always on. Each chat completion spawns a blocking OS thread that ties up
+/// a generation for seconds; without a ceiling a flood spread across many identities (each
+/// under its own `max_inflight`) could still exhaust threads/fds. A permit is held for the
+/// worker's lifetime; when none is free the gateway sheds with `503` rather than pile up
+/// threads. Set high so it only ever trips under genuine overload.
+const MAX_CONCURRENT_GENERATIONS: usize = 512;
 
 use crate::adapter::{ChatMessage, EmbeddingAdapter, EngineAdapter, InferenceRequest};
 use crate::aup::{AupDecision, AupPolicy};
@@ -56,6 +67,9 @@ struct AppState {
     aup: Arc<AupPolicy>,
     /// Ingress DoS rate-limiter (per-identity concurrency + token bucket; default off).
     rate_limiter: Arc<RateLimiter>,
+    /// Global backstop on concurrent generation workers ([`MAX_CONCURRENT_GENERATIONS`], G3b);
+    /// always on, independent of `rate_limiter`.
+    gen_limiter: Arc<Semaphore>,
     /// Honor `X-Forwarded-For` for per-IP keying (only behind a trusted reverse proxy — the
     /// header is client-spoofable). Default `false`: key off the unspoofable socket address.
     trusted_proxy: bool,
@@ -269,6 +283,7 @@ fn spawn_worker(
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
+    gen_permit: OwnedSemaphorePermit,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     std::time::Instant,
@@ -276,6 +291,9 @@ fn spawn_worker(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
     let started = std::time::Instant::now();
     std::thread::spawn(move || {
+        // Hold the global generation permit (G3b) for the worker's whole lifetime; it is
+        // released when this thread exits, freeing the slot for the next completion.
+        let _gen_permit = gen_permit;
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
         };
@@ -312,6 +330,20 @@ async fn chat_completions(
         return openai_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error");
     }
 
+    // G3b: acquire a slot in the global generation backstop before spawning a worker thread.
+    // Shed with 503 (not 429 — this is server capacity, not a per-caller limit) when full.
+    let gen_permit = match state.gen_limiter.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            state.metrics.record_rate_limited();
+            return openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server at generation capacity, retry shortly",
+                "server_overloaded",
+            );
+        }
+    };
+
     let id = next_id();
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
@@ -338,6 +370,7 @@ async fn chat_completions(
             req.messages,
             req.max_tokens,
             req.temperature,
+            gen_permit,
         )
     } else {
         spawn_worker(
@@ -346,6 +379,7 @@ async fn chat_completions(
             req.messages,
             req.max_tokens,
             req.temperature,
+            gen_permit,
         )
     };
 
@@ -369,6 +403,7 @@ fn spawn_byok_worker(
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
+    gen_permit: OwnedSemaphorePermit,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     std::time::Instant,
@@ -376,6 +411,8 @@ fn spawn_byok_worker(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
     let started = std::time::Instant::now();
     std::thread::spawn(move || {
+        // Hold the global generation permit (G3b) for the worker's whole lifetime.
+        let _gen_permit = gen_permit;
         let request = InferenceRequest { model_ref: model, messages, max_tokens, temperature };
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
@@ -606,11 +643,16 @@ fn rate_limit_identity(state: &AppState, peer: SocketAddr, req: &Request) -> Str
         }
     }
     if state.trusted_proxy {
+        // G3c: take the RIGHTMOST X-Forwarded-For entry, not the leftmost. Behind an appending
+        // proxy (nginx `$proxy_add_x_forwarded_for`) the trusted hop appends the peer IP it saw
+        // to the right; the leftmost tokens are whatever the client sent and are fully
+        // spoofable, so keying off them lets a caller forge a fresh identity per request and
+        // bypass per-IP limiting. The rightmost entry is the one our trusted proxy wrote.
         if let Some(ip) = req
             .headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.split(',').next_back())
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
@@ -635,7 +677,21 @@ async fn rate_limit(
     }
     let identity = rate_limit_identity(&state, peer, &req);
     match state.rate_limiter.try_acquire(&identity, unix_now_ms()) {
-        Ok(_guard) => next.run(req).await,
+        Ok(guard) => {
+            // G3: the in-flight slot must live as long as the *generation*, not just until the
+            // handler returns. For `stream:true` the handler returns the SSE `Response`
+            // immediately while the worker keeps generating, so dropping the guard here let
+            // streaming completions escape `max_inflight` entirely. Move the guard into the
+            // response body so it is released only when the body is fully sent (stream drained)
+            // or the client disconnects (body dropped) — correct for both streaming and buffered.
+            let resp = next.run(req).await;
+            let (parts, body) = resp.into_parts();
+            let guarded = body.into_data_stream().map(move |chunk| {
+                let _hold = &guard; // keep the slot occupied for the body's whole lifetime
+                chunk
+            });
+            Response::from_parts(parts, Body::from_stream(guarded))
+        }
         Err(_) => {
             state.metrics.record_rate_limited();
             let mut resp = openai_error(
@@ -785,6 +841,7 @@ pub fn router(
         metrics: Arc::new(Metrics::new()),
         aup: Arc::new(aup),
         rate_limiter: Arc::new(RateLimiter::new(rate_limit_cfg)),
+        gen_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_GENERATIONS)),
         trusted_proxy,
         byok: Arc::new(byok),
         embeddings: Arc::new(embeddings_cfg),

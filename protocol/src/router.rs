@@ -66,9 +66,14 @@ pub struct ScoredPeer {
 /// Both incorporate the §4 throughput and queue-depth signals.
 pub fn compute_routing_score(input: &PeerScoreInput, tier: u8) -> f64 {
     let latency_ms = input.latency_ms.max(1.0);
-    let headroom = (100.0 - input.load_pct).max(1.0);
+    // All peer-advertised scoring inputs are adversarial: a self-signed record passes
+    // `verify_peer_record` (own key) but its *values* are unchecked, so clamp every one to
+    // its sane domain before it touches the score. Without this a provider advertising e.g.
+    // `load_pct = -1e12` gets ~1e12 headroom and deterministically captures every route.
+    let load_pct = input.load_pct.clamp(0.0, 100.0);
+    let headroom = (100.0 - load_pct).max(1.0);
     let rep_norm = input.reputation.clamp(0.0, 100.0) / 100.0;
-    let bw_norm = input.bandwidth_mbps.max(0.0) / 1000.0;
+    let bw_norm = input.bandwidth_mbps.clamp(0.0, 10_000.0) / 1000.0;
     // S2S RTT: 0 means no measurement available (neutral). Higher = worse.
     let s2s_penalty = if input.s2s_rtt_ms > 0.0 {
         1.0 / input.s2s_rtt_ms.max(1.0)
@@ -264,6 +269,42 @@ mod tests {
             input("free", |p| p.load_pct = 5.0),
         ];
         assert_eq!(order(&peers, 2)[0], "free");
+    }
+
+    #[test]
+    fn hostile_load_pct_cannot_capture_the_route() {
+        // A malicious provider self-signs an out-of-domain load_pct to fabricate near-infinite
+        // headroom. Clamping to [0,100] neutralises it: it now scores *identically* to a
+        // legitimately-idle (0%) provider — bounded, not dominant. Advertising "I'm idle" is
+        // something any provider can do; it can no longer manufacture headroom to win outright.
+        let hostile = compute_routing_score(&input("a", |p| p.load_pct = -1e12), 2);
+        let idle = compute_routing_score(&input("a", |p| p.load_pct = 0.0), 2);
+        assert_eq!(hostile, idle);
+        assert!(hostile.is_finite());
+        // A high advertised load clamps to fully-loaded, not underflow.
+        assert!(compute_routing_score(&input("a", |p| p.load_pct = 1e9), 2).is_finite());
+        // The decisive property: with headroom bounded, load_pct can no longer override the
+        // other signals — an attacker claiming 0 load but with poor latency loses to a fast,
+        // lightly-loaded honest peer (pre-fix, headroom ≈ 1e12 dwarfed every other term).
+        let peers = [
+            input("attacker", |p| {
+                p.load_pct = -1e12;
+                p.latency_ms = 500.0;
+            }),
+            input("honest_fast", |p| {
+                p.load_pct = 20.0;
+                p.latency_ms = 5.0;
+            }),
+        ];
+        assert_eq!(order(&peers, 2)[0], "honest_fast");
+    }
+
+    #[test]
+    fn hostile_bandwidth_is_bounded() {
+        // Unbounded bandwidth_mbps must not let a peer buy the bw term outright.
+        let attacker = compute_routing_score(&input("bw", |p| p.bandwidth_mbps = 1e12), 2);
+        let capped = compute_routing_score(&input("bw", |p| p.bandwidth_mbps = 10_000.0), 2);
+        assert_eq!(attacker, capped);
     }
 
     #[test]
