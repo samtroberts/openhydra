@@ -4070,6 +4070,15 @@ fn handle_grpc_proxy_event(
                     // (parse → IPC → response) without Python's proxy handler.
                     // Legacy protobuf and PushResult messages fall through to
                     // SharedProxyQueue for Python handling (until CP-3).
+                    //
+                    // ⚠️ SECURITY / NOT-DEAD-CODE: `request.0` here is the RAW, UNTRUSTED body
+                    // of an inbound `request_response` message from ANY connected peer. This
+                    // means `dispatcher::dispatch` — and the `forward_msg` / legacy parsers it
+                    // invokes (the pre-pivot sharded/IPC modules) — run on hostile input on a
+                    // LIVE network path. They are reachable, not dead: a code audit that sees
+                    // "gated behind SwarmCommands with no senders" is WRONG about this entry
+                    // point. Keep those parsers hardened (length-guarded, bounded, borrow-not-
+                    // alloc, Err-not-panic). See dispatcher::dispatch and forward_msg::decode.
                     let action = state.dispatcher.dispatch(&request.0);
                     match action {
                         DispatchAction::ForwardToWorker(parsed) => {

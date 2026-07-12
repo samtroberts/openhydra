@@ -141,6 +141,13 @@ pub fn is_forward_msg(data: &[u8]) -> bool {
 /// Decode a ForwardMsg from raw wire bytes.
 ///
 /// Zero-copy for the activation payload: returns a reference into `data`.
+///
+/// ⚠️ SECURITY / NOT-DEAD-CODE: reached from `dispatcher::dispatch` on UNTRUSTED inbound
+/// `request_response` bytes from any peer — a LIVE network path, not dead legacy code. This
+/// function is deliberately hardened for that: it length-guards before every slice (no panic
+/// on short/truncated input), bounds the header (≤ u16::MAX), decodes CBOR from a bounded
+/// slice via `ciborium` (Err, not panic), and BORROWS the activation rather than allocating
+/// on the attacker-declared length (no unbounded-alloc DoS). Preserve these properties.
 pub fn decode(data: &[u8]) -> Result<DecodedForwardMsg<'_>, String> {
     if data.len() < PREAMBLE_SIZE {
         return Err(format!(

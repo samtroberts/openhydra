@@ -285,6 +285,13 @@ impl Dispatcher {
     ///
     /// `data` is the raw bytes from `request_response::Message::Request`.
     /// Returns a routing decision for the event loop to execute.
+    ///
+    /// ⚠️ SECURITY / NOT-DEAD-CODE: `data` is UNTRUSTED input from any connected peer
+    /// (called at `event_loop.rs`'s inbound `request_response` handler). This module and the
+    /// `forward_msg` / legacy parsers it calls are therefore reachable on a LIVE network path
+    /// even though the downstream sharded/IPC machinery is gated off (`ipc_bridge == None`)
+    /// post-pivot. Do NOT treat this file (or `forward_msg`/`ipc_codec`) as dead: the parsers
+    /// run on hostile bytes and must stay hardened (length-guarded, bounded, Err-not-panic).
     pub fn dispatch(&self, data: &[u8]) -> DispatchAction {
         let (method, payload) = extract_method(data);
 
