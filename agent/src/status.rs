@@ -153,10 +153,16 @@ impl StatusServer {
                 break;
             }
             if let Some(expected) = &self.token {
-                let lower = line.to_ascii_lowercase();
-                if let Some(rest) = lower.strip_prefix("authorization:") {
-                    if rest.trim() == format!("bearer {}", expected.to_ascii_lowercase()) {
-                        authorized = true;
+                // The header name and the "Bearer" scheme are case-insensitive, but the token
+                // value is NOT — downcasing it (as before) silently weakened mixed-case secrets.
+                // Compare the raw token in constant time so a match can't be recovered by timing
+                // the response prefix-by-prefix.
+                let line_t = line.trim_end();
+                if let Some(rest) = strip_ci_prefix(line_t, "authorization:") {
+                    if let Some(tok) = strip_ci_prefix(rest.trim_start(), "bearer ") {
+                        if constant_time_eq(tok.trim().as_bytes(), expected.as_bytes()) {
+                            authorized = true;
+                        }
                     }
                 }
             }
@@ -235,6 +241,49 @@ struct ErrBody {
 
 fn json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|e| format!(r#"{{"error":"serialize: {e}"}}"#))
+}
+
+/// Case-insensitively strip an ASCII `prefix` (an HTTP header name or auth scheme), returning
+/// the remainder with its original case preserved. `None` if `s` doesn't start with `prefix`.
+fn strip_ci_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let n = prefix.len();
+    if s.len() >= n && s.as_bytes()[..n].eq_ignore_ascii_case(prefix.as_bytes()) {
+        Some(&s[n..]) // `n` is a char boundary: the matched bytes are all ASCII
+    } else {
+        None
+    }
+}
+
+/// Constant-time byte equality. Length is allowed to leak (it's not the secret); the token
+/// value is compared without an early-exit so a match can't be timed out byte-by-byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::{constant_time_eq, strip_ci_prefix};
+
+    #[test]
+    fn ci_prefix_preserves_token_case() {
+        assert_eq!(strip_ci_prefix("Authorization: Bearer AbC123", "authorization:"), Some(" Bearer AbC123"));
+        assert_eq!(strip_ci_prefix("AUTHORIZATION:x", "authorization:"), Some("x"));
+        assert_eq!(strip_ci_prefix("x-other: y", "authorization:"), None);
+    }
+
+    #[test]
+    fn token_compare_is_case_sensitive() {
+        assert!(constant_time_eq(b"AbC123", b"AbC123"));
+        assert!(!constant_time_eq(b"abc123", b"AbC123")); // case matters now
+        assert!(!constant_time_eq(b"AbC12", b"AbC123")); // length differs
+    }
 }
 
 fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {

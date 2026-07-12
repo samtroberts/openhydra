@@ -187,7 +187,11 @@ impl CreditAccount {
         let last_update_ms = u64::from_le_bytes(c.arr::<8>()?);
         let half_life_ms = u64::from_le_bytes(c.arr::<8>()?);
         let n = u32::from_le_bytes(c.arr::<4>()?) as usize;
-        let mut by_counterparty = HashMap::with_capacity(n);
+        // Bound the pre-allocation against the bytes actually left (H): each entry needs ≥10
+        // bytes (2-byte len prefix + 8-byte amount), so a lying `n` can't force a multi-GB
+        // HashMap allocation before the loop below hits the truncation error.
+        let cap = n.min(c.remaining() / 10);
+        let mut by_counterparty = HashMap::with_capacity(cap);
         for _ in 0..n {
             let len = u16::from_le_bytes(c.arr::<2>()?) as usize;
             let cp = std::str::from_utf8(c.take(len)?)

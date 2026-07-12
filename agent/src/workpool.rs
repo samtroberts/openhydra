@@ -68,7 +68,14 @@ impl WorkerPool {
                         guard.recv()
                     };
                     match job {
-                        Ok(job) => job(),
+                        // Panic isolation (H): a panicking job must not unwind out of the
+                        // worker and permanently shrink the pool (eventual total shedding).
+                        // Catch it, log, and keep pulling the next job.
+                        Ok(job) => {
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                                tracing::warn!("workpool: job panicked (caught); worker continues");
+                            }
+                        }
                         Err(_) => break, // sender dropped and queue drained → exit
                     }
                 })

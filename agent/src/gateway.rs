@@ -773,6 +773,17 @@ async fn embeddings(
     if inputs.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "missing or empty field: input", "invalid_request_error");
     }
+    // AUP floor (H): the chat path enforces the operator's acceptable-use limits, but
+    // /v1/embeddings skipped it — an operator's size/deny caps couldn't bound embeddings.
+    // Reuse the same policy by treating each input string as a message (bounds input count
+    // via max-messages, total size via max-prompt-chars, and applies deny-substrings).
+    let aup_inputs: Vec<ChatMessage> = inputs
+        .iter()
+        .map(|t| ChatMessage { role: "user".to_string(), content: t.clone() })
+        .collect();
+    if let AupDecision::Deny(reason) = state.aup.evaluate(&aup_inputs, None) {
+        return openai_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error");
+    }
     let base_url = state.embeddings.base_url().to_string();
     let model = req.model.clone();
     let outcome = tokio::task::spawn_blocking(move || {

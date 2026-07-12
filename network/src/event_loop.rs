@@ -2344,6 +2344,19 @@ fn rebootstrap(
     state.quic_holepunch_attempts.clear();
     state.reversal_attempts.clear();
 
+    // H (F-9): re-probe IPv6 capability on every rebootstrap (roam/wake). It was previously
+    // evaluated only once at startup, so a node that booted on a v4-only link and roamed onto
+    // a v6-capable one would forgo the v6-first path (and the mirror case would keep dialing
+    // unreachable v6 relays) for the rest of the process lifetime. The probe is traffic-free.
+    let was_v6 = state.ipv6_capable;
+    state.ipv6_capable = probe_ipv6_capable();
+    if state.ipv6_capable != was_v6 {
+        info!(
+            ipv6_capable = state.ipv6_capable,
+            "F-9: IPv6 capability changed on rebootstrap (re-probed)"
+        );
+    }
+
     // (B) signal the provider to re-announce (fresh relay addr, same PeerId).
     state
         .net_generation
@@ -3237,6 +3250,11 @@ fn handle_swarm_event(
                 // QUIC addrs) behind — one entry leaked per peer ever seen.
                 state.last_repunch.remove(&peer_id);
                 state.peer_quic_addrs.remove(&peer_id);
+                // H (E-N3 follow-up): the sibling back-off maps keyed per peer were missed by
+                // the original E-N3 prune and leaked one entry per peer ever seen on a stable
+                // node. Evict them here too so every per-peer map clears on full disconnect.
+                state.quic_holepunch_attempts.remove(&peer_id);
+                state.reversal_attempts.remove(&peer_id);
 
                 // B4: Abort ring sessions involving this peer.
                 let peer_id_str = peer_id.to_string();
@@ -3649,6 +3667,18 @@ fn handle_inbound_kad_request(
                     if let Err(e) = dht::verify_peer_record(&peer_record) {
                         warn!(%source, %e,
                               "kad_put_rejected: inbound record failed verification (poison?)");
+                        return;
+                    }
+                    // H (key-binding): a valid signature proves the record is authentic but NOT
+                    // that it is stored under its canonical key. Without this, one valid identity
+                    // could replay its own signed record under thousands of distinct keys to fill
+                    // the bounded MemoryStore and block legitimate stores. Require the storage key
+                    // to be the one derived from the record's own (model_id, libp2p_peer_id).
+                    let expected_key =
+                        dht::peer_record_key(&peer_record.model_id, &peer_record.libp2p_peer_id);
+                    if record.key != expected_key {
+                        warn!(%source,
+                              "kad_put_rejected: record key not bound to its (model_id, libp2p_peer_id)");
                         return;
                     }
                     if let Err(e) = swarm.behaviour_mut().kademlia.store_mut().put(record) {

@@ -741,6 +741,32 @@ fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
         args.bind,
         if api_key.is_some() { "API key required on /v1/*" } else { "open" },
     );
+    // H (Wave 2): warn loudly when the gateway is exposed without auth. We don't block
+    // (loopback stays open by design), but a non-loopback bind with no API key is an OPEN
+    // inference gateway — and with BYOK models mapped it's an open, operator-funded proxy to
+    // paid frontier APIs. Mirrors the status endpoint's non-loopback warning.
+    let exposed = args
+        .bind
+        .parse::<std::net::SocketAddr>()
+        .map(|s| !s.ip().is_loopback())
+        .unwrap_or(true); // unparseable → assume exposed
+    if exposed && api_key.is_none() {
+        eprintln!(
+            "openhydra-agent: WARNING — gateway bound to a non-loopback address ({}) with NO API \
+             key: /v1/* is OPEN to anyone who can reach it. Set --api-key (or OPENHYDRA_API_KEY).",
+            args.bind
+        );
+        let byok_mapped = !args.byok.byok_anthropic_model.is_empty()
+            || !args.byok.byok_gemini_model.is_empty()
+            || !args.byok.byok_embedding_model.is_empty();
+        if byok_mapped {
+            eprintln!(
+                "openhydra-agent: WARNING — BYOK models are mapped on this OPEN gateway: an \
+                 unauthenticated caller who sends no X-Provider-Api-Key will spend YOUR operator \
+                 key on paid APIs. Require auth before exposing BYOK."
+            );
+        }
+    }
     let aup = args.aup.clone().into_policy();
     let rate_limit = args.rate_limit.into_config();
     let trusted_proxy = args.rate_limit.trusted_proxy;
