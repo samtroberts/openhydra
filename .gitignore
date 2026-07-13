@@ -154,3 +154,8 @@ desktop/src-tauri/gen/
 desktop/src-tauri/WixTools/
 !desktop/package-lock.json
 !desktop/src-tauri/Cargo.lock
+
+# Stray local artifacts — never commit (2026-07-12: swept in by an errant `git add -A`)
+/profiling/
+/_peers_disabled/
+/AWS Credits*
