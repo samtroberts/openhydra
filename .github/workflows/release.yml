@@ -2,7 +2,7 @@
 # platform and attach the artifacts to a draft GitHub Release.
 #
 # Artifacts per platform:
-#   macOS (arm64 + x86_64): openhydra-agent binary, OpenHydra.app in a .dmg
+#   macOS (arm64):          openhydra-agent binary, OpenHydra.app in a .dmg
 #   Linux x86_64:           openhydra-agent binary, .deb + .AppImage
 #   Windows x86_64:         openhydra-agent.exe, .msi + NSIS setup .exe
 #
@@ -27,8 +27,8 @@ jobs:
         include:
           - platform: macos-14 # Apple Silicon
             triple: aarch64-apple-darwin
-          - platform: macos-13 # Intel
-            triple: x86_64-apple-darwin
+          # Intel macOS (macos-13) intentionally omitted: GitHub is retiring Intel
+          # runners (jobs queue indefinitely) and we do not ship an x86_64 macOS build.
           - platform: ubuntu-22.04
             triple: x86_64-unknown-linux-gnu
           - platform: windows-latest
