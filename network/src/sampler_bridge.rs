@@ -230,6 +230,7 @@ impl SamplerBridge {
 ///
 /// Connects lazily on first sample request. Reconnects if the connection
 /// drops (Python HeadSampler restarts).
+#[cfg(unix)]
 async fn sampler_event_loop(
     socket_path: PathBuf,
     mut cmd_rx: mpsc::Receiver<SamplerCommand>,
@@ -358,9 +359,29 @@ async fn sampler_event_loop(
     }
 }
 
+/// Windows fallback: the legacy sampler bridge relies on Unix domain sockets,
+/// which are unavailable on Windows. This path is inactive in the pure-Rust
+/// build (there is no Python HeadSampler); drain commands with an error so
+/// callers never hang waiting for a reply.
+#[cfg(not(unix))]
+async fn sampler_event_loop(
+    _socket_path: PathBuf,
+    mut cmd_rx: mpsc::Receiver<SamplerCommand>,
+) {
+    warn!("SamplerBridge unavailable on this platform (requires Unix domain sockets)");
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            SamplerCommand::Shutdown => break,
+            SamplerCommand::Sample { reply, .. } => {
+                let _ = reply.send(Err("SamplerBridge not supported on this platform".into()));
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

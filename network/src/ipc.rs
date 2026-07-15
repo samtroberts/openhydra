@@ -231,6 +231,7 @@ impl Drop for IpcBridge {
 ///   1. Bind a Unix stream listener at `socket_path`.
 ///   2. Accept one connection from the Python DEALER worker.
 ///   3. Loop: encode forward request → send → recv response → dispatch.
+#[cfg(unix)]
 async fn ipc_event_loop(
     socket_path: PathBuf,
     mut cmd_rx: mpsc::Receiver<IpcCommand>,
@@ -479,7 +480,30 @@ async fn ipc_event_loop(
     info!("IPC event loop exited");
 }
 
-#[cfg(test)]
+/// Windows fallback: the legacy Python IPC bridge relies on Unix domain
+/// sockets, which are unavailable on Windows. This path is inactive in the
+/// pure-Rust build (there is no Python worker); drain commands with an error
+/// so callers never hang waiting for a reply.
+#[cfg(not(unix))]
+async fn ipc_event_loop(
+    _socket_path: PathBuf,
+    mut cmd_rx: mpsc::Receiver<IpcCommand>,
+) {
+    tracing::warn!("IPC bridge unavailable on this platform (requires Unix domain sockets)");
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            IpcCommand::Shutdown => break,
+            IpcCommand::Forward { reply, .. } => {
+                let _ = reply.send(Err("IPC bridge not supported on this platform".into()));
+            }
+            IpcCommand::ForwardBatch { reply, .. } => {
+                let _ = reply.send(Err("IPC bridge not supported on this platform".into()));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::ipc_codec::{IpcForwardHeader, IpcResponseHeader, IpcStatus, ActivationDtype};
