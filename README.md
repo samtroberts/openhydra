@@ -59,21 +59,52 @@ engine's native speed plus the routing/transport overhead.
 
 ## Quick Start
 
-### Prerequisites
+To **share** an engine you need an inference engine running locally (Ollama,
+vLLM, LM Studio, or llama.cpp). To only **consume** from the network, no engine
+is required.
 
-- A **Rust toolchain** (stable) — <https://rustup.rs>.
-- An **inference engine** running locally that you want to share (Ollama, vLLM,
-  LM Studio, or llama.cpp).
+### Install
 
-### Build
+#### Prebuilt binary (recommended)
+
+One line, no toolchain — installs the latest `openhydra-agent` for your platform:
 
 ```bash
-git clone <repo-url> openhydra && cd openhydra
+curl -fsSL https://openhydra.co/install.sh | sh
+```
+
+It drops the binary in `/usr/local/bin` (or `~/.local/bin` if that isn't
+writable). Prefer to grab it yourself? Download the right asset from the
+[latest release](https://github.com/samtroberts/openhydra/releases/latest),
+`chmod +x`, and put it on your `PATH`:
+
+| Platform              | Asset                                        |
+|-----------------------|----------------------------------------------|
+| macOS (Apple Silicon) | `openhydra-agent-aarch64-apple-darwin`       |
+| Linux (x86-64)        | `openhydra-agent-x86_64-unknown-linux-gnu`   |
+| Windows (x86-64)      | `openhydra-agent-x86_64-pc-windows-msvc.exe` |
+
+The binaries are not yet code-signed. On macOS, if Gatekeeper blocks the binary,
+clear the quarantine flag: `xattr -d com.apple.quarantine ./openhydra-agent`.
+(Intel Macs and Linux arm64 have no prebuilt binary yet — build from source.)
+
+#### Desktop app
+
+Prefer a GUI? Grab the installer for your OS from the
+[latest release](https://github.com/samtroberts/openhydra/releases/latest) —
+`.dmg` (macOS), `-setup.exe` / `.msi` (Windows), `.AppImage` / `.deb` (Linux) —
+or use the one-click links at [openhydra.co](https://openhydra.co).
+
+### Build from source
+
+Needs a stable [Rust toolchain](https://rustup.rs). The whole workspace is pure
+Rust — no Python toolchain is required.
+
+```bash
+git clone https://github.com/samtroberts/openhydra && cd openhydra
 cargo build --release -p openhydra-agent
 # → ./target/release/openhydra-agent
 ```
-
-The whole workspace is pure Rust — no Python toolchain is required.
 
 ### Share your engine (provider)
 

@@ -1,23 +1,38 @@
 # R3 packaging: on a version tag, build the CLI agent + the Tauri desktop app for every
-# platform and attach the artifacts to a draft GitHub Release.
+# platform, then publish the artifacts to Cloudflare R2 (the public download origin) and
+# — during the transition — also attach them to a draft GitHub Release.
 #
 # Artifacts per platform:
 #   macOS (arm64):          openhydra-agent binary, OpenHydra.app in a .dmg
 #   Linux x86_64:           openhydra-agent binary, .deb + .AppImage
 #   Windows x86_64:         openhydra-agent.exe, .msi + NSIS setup .exe
 #
+# Distribution: artifacts are uploaded to R2 under both an immutable  v<VERSION>/  prefix
+# and a mutable  latest/  prefix (stable filenames), plus a  latest.json  manifest that
+# the landing page + install.sh read. Serve the bucket at https://dl.openhydra.co.
+#
 # Signing/notarization is intentionally NOT wired yet (needs the Apple Developer ID /
-# Windows cert secrets); bundles are unsigned, the release is created as a DRAFT for
-# manual review before publishing.
+# Windows cert secrets); bundles are unsigned.
+#
+# Secrets required for the publish-r2 job (repo → Settings → Secrets → Actions):
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string to publish to R2 (no leading v)"
+        required: false
+        default: "0.2.0"
 
 permissions:
   contents: write
+
+env:
+  DIST_HOST: https://dl.openhydra.co
 
 jobs:
   desktop:
@@ -98,6 +113,15 @@ jobs:
           find "$B" -name "*setup*.exe" -exec cp {} dist/ \; 2>/dev/null || true
           ls -la dist/
 
+      # Always upload so publish-r2 can collect every platform's artifacts.
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openhydra-${{ matrix.triple }}
+          path: dist/*
+
+      # Transition belt-and-suspenders: keep a draft GitHub Release on tag runs.
+      # Remove this step once R2 is the sole download origin and the repo is private.
       - name: Upload to draft release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
@@ -105,9 +129,97 @@ jobs:
           draft: true
           files: dist/*
 
-      - name: Upload workflow artifacts (non-tag runs)
-        uses: actions/upload-artifact@v4
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # Publish every platform's artifacts to Cloudflare R2 + write latest.json.
+  publish-r2:
+    needs: desktop
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          name: openhydra-${{ matrix.triple }}
-          path: dist/*
+          path: artifacts
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Build R2 tree + latest.json
+        shell: bash
+        env:
+          DIST_HOST: ${{ env.DIST_HOST }}
+        run: |
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
+          [ -n "$VERSION" ] || VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          python3 - "$VERSION" "$DIST_HOST" <<'PY'
+          import sys, os, re, json, shutil
+          version, host = sys.argv[1], sys.argv[2].rstrip('/')
+          src = 'dist'
+          vdir = f'pub/v{version}'; ldir = 'pub/latest'
+          os.makedirs(vdir, exist_ok=True); os.makedirs(ldir, exist_ok=True)
+
+          # (regex on filename) -> stable "latest/" filename
+          STABLE = [
+            (re.compile(r'aarch64-apple-darwin$'),        'openhydra-agent-aarch64-apple-darwin'),
+            (re.compile(r'x86_64-unknown-linux-gnu$'),    'openhydra-agent-x86_64-unknown-linux-gnu'),
+            (re.compile(r'x86_64-pc-windows-msvc\.exe$'), 'openhydra-agent-x86_64-pc-windows-msvc.exe'),
+            (re.compile(r'\.dmg$'),                        'OpenHydra-macos-arm64.dmg'),
+            (re.compile(r'x64-setup\.exe$'),               'OpenHydra-windows-x64-setup.exe'),
+            (re.compile(r'\.msi$'),                        'OpenHydra-windows-x64.msi'),
+            (re.compile(r'\.AppImage$'),                   'OpenHydra-linux-x64.AppImage'),
+            (re.compile(r'\.deb$'),                        'OpenHydra-linux-x64.deb'),
+          ]
+          for name in sorted(os.listdir(src)):
+              p = os.path.join(src, name)
+              if not os.path.isfile(p): continue
+              shutil.copy(p, os.path.join(vdir, name))            # immutable archive
+              for rx, stable in STABLE:
+                  if rx.search(name):
+                      shutil.copy(p, os.path.join(ldir, stable))  # mutable pointer
+                      break
+
+          def url(stable): return f'{host}/latest/{stable}'
+          manifest = {
+            'version': version,
+            'base': host,
+            'app': {
+              'macos':   {'name': f'OpenHydra {version} (Apple Silicon)', 'file': 'OpenHydra-macos-arm64.dmg',       'url': url('OpenHydra-macos-arm64.dmg')},
+              'windows': {'name': f'OpenHydra {version} (Windows)',       'file': 'OpenHydra-windows-x64-setup.exe', 'url': url('OpenHydra-windows-x64-setup.exe')},
+              'linux':   {'name': f'OpenHydra {version} (Linux)',         'file': 'OpenHydra-linux-x64.AppImage',    'url': url('OpenHydra-linux-x64.AppImage')},
+            },
+            'cli': {
+              'macos':   url('openhydra-agent-aarch64-apple-darwin'),
+              'linux':   url('openhydra-agent-x86_64-unknown-linux-gnu'),
+              'windows': url('openhydra-agent-x86_64-pc-windows-msvc.exe'),
+            },
+          }
+          with open('pub/latest.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          print('built pub/ tree:')
+          for root,_,files in os.walk('pub'):
+              for fn in files: print(' ', os.path.join(root, fn))
+          PY
+
+      - name: Publish to R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Immutable versioned archive — cache hard.
+          aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
+            --endpoint-url "$EP" --cache-control "public, max-age=31536000, immutable"
+          # Mutable "latest" pointers — do not cache (so a new release is instant).
+          aws s3 cp "pub/latest/" "s3://${R2_BUCKET}/latest/" --recursive \
+            --endpoint-url "$EP" --cache-control "no-store, max-age=0"
+          aws s3 cp "pub/latest.json" "s3://${R2_BUCKET}/latest.json" \
+            --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
+            --content-type "application/json"
+          echo "Published v${VERSION} to R2 → ${DIST_HOST}"
