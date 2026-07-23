@@ -214,12 +214,14 @@ jobs:
               json.dump(manifest, f, indent=2)
 
           # --- Tauri auto-updater manifest (signed artifacts) ---
+          # Tauri v2 signs the shippable artifact itself (a sibling .sig): macOS
+          # .app.tar.gz, the NSIS -setup.exe, and the .AppImage.
           from datetime import datetime, timezone
-          udir = 'pub/updater'; os.makedirs(udir, exist_ok=True)
+          udir = f'pub/updater/v{version}'; os.makedirs(udir, exist_ok=True)
           UPD = [
-            (re.compile(r'\.app\.tar\.gz$'),      'darwin-aarch64'),
-            (re.compile(r'\.nsis\.zip$'),         'windows-x86_64'),
-            (re.compile(r'\.AppImage\.tar\.gz$'), 'linux-x86_64'),
+            (re.compile(r'\.app\.tar\.gz$'), 'darwin-aarch64'),
+            (re.compile(r'x64-setup\.exe$'), 'windows-x86_64'),
+            (re.compile(r'\.AppImage$'),     'linux-x86_64'),
           ]
           platforms = {}
           for name in sorted(os.listdir(src)):
@@ -231,12 +233,12 @@ jobs:
                       if not os.path.exists(sigp):
                           print(f'  WARN: no .sig for {name}'); break
                       shutil.copy(p, os.path.join(udir, name))
-                      platforms[plat] = {'signature': open(sigp).read().strip(), 'url': f'{host}/updater/{name}'}
+                      platforms[plat] = {'signature': open(sigp).read().strip(), 'url': f'{host}/updater/v{version}/{name}'}
                       break
           if platforms:
               upd = {'version': version, 'notes': f'OpenHydra {version}',
                      'pub_date': datetime.now(timezone.utc).isoformat(), 'platforms': platforms}
-              with open(os.path.join(udir, 'latest.json'), 'w') as f:
+              with open('pub/updater/latest.json', 'w') as f:
                   json.dump(upd, f, indent=2)
               print('  updater manifest platforms:', list(platforms))
           else:
