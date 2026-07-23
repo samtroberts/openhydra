@@ -90,12 +90,21 @@ jobs:
           cp "target/release/openhydra-agent$EXT" \
              "desktop/src-tauri/binaries/openhydra-agent-${{ matrix.triple }}$EXT"
 
-      # 2) The desktop app + installers.
+      # 2) The desktop app + installers (signed so the auto-updater accepts them).
       - name: Build desktop app
         working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           npm ci || npm install
-          npm exec tauri build
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Signing key present → building signed updater artifacts"
+            npm exec tauri build -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            echo "No signing key → normal build (updater artifacts skipped)"
+            npm exec tauri build
+          fi
         shell: bash
 
       - name: Collect artifacts
@@ -111,6 +120,11 @@ jobs:
           find "$B" -name "*.AppImage" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.msi" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*setup*.exe" -exec cp {} dist/ \; 2>/dev/null || true
+          # Updater artifacts (createUpdaterArtifacts) + their .sig signatures.
+          find "$B" -name "*.tar.gz" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.nsis.zip" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.msi.zip" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.sig" -exec cp {} dist/ \; 2>/dev/null || true
           ls -la dist/
 
       # Always upload so publish-r2 can collect every platform's artifacts.
@@ -198,6 +212,36 @@ jobs:
           }
           with open('pub/latest.json', 'w') as f:
               json.dump(manifest, f, indent=2)
+
+          # --- Tauri auto-updater manifest (signed artifacts) ---
+          from datetime import datetime, timezone
+          udir = 'pub/updater'; os.makedirs(udir, exist_ok=True)
+          UPD = [
+            (re.compile(r'\.app\.tar\.gz$'),      'darwin-aarch64'),
+            (re.compile(r'\.nsis\.zip$'),         'windows-x86_64'),
+            (re.compile(r'\.AppImage\.tar\.gz$'), 'linux-x86_64'),
+          ]
+          platforms = {}
+          for name in sorted(os.listdir(src)):
+              p = os.path.join(src, name)
+              if not os.path.isfile(p) or name.endswith('.sig'): continue
+              for rx, plat in UPD:
+                  if rx.search(name):
+                      sigp = p + '.sig'
+                      if not os.path.exists(sigp):
+                          print(f'  WARN: no .sig for {name}'); break
+                      shutil.copy(p, os.path.join(udir, name))
+                      platforms[plat] = {'signature': open(sigp).read().strip(), 'url': f'{host}/updater/{name}'}
+                      break
+          if platforms:
+              upd = {'version': version, 'notes': f'OpenHydra {version}',
+                     'pub_date': datetime.now(timezone.utc).isoformat(), 'platforms': platforms}
+              with open(os.path.join(udir, 'latest.json'), 'w') as f:
+                  json.dump(upd, f, indent=2)
+              print('  updater manifest platforms:', list(platforms))
+          else:
+              print('  WARN: no signed updater artifacts found (signing secrets set?)')
+
           print('built pub/ tree:')
           for root,_,files in os.walk('pub'):
               for fn in files: print(' ', os.path.join(root, fn))
@@ -222,4 +266,13 @@ jobs:
           aws s3 cp "pub/latest.json" "s3://${R2_BUCKET}/latest.json" \
             --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
             --content-type "application/json"
+          # Updater: signed archives (immutable) + the updater manifest (no-store).
+          if [ -d pub/updater ]; then
+            aws s3 cp "pub/updater/" "s3://${R2_BUCKET}/updater/" --recursive \
+              --exclude "latest.json" --endpoint-url "$EP" \
+              --cache-control "public, max-age=31536000, immutable"
+            aws s3 cp "pub/updater/latest.json" "s3://${R2_BUCKET}/updater/latest.json" \
+              --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
+              --content-type "application/json"
+          fi
           echo "Published v${VERSION} to R2 → ${DIST_HOST}"

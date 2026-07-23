@@ -693,6 +693,8 @@ fn main() {
     sweep_stale_agents();
     install_signal_handlers();
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState {
             provider: Arc::new(Mutex::new(Role::new(&PROVIDER_PID))),
             gateway: Arc::new(Mutex::new(Role::new(&GATEWAY_PID))),

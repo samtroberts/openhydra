@@ -17,6 +17,27 @@ async function call(cmd, args) {
   return mock(cmd, args);
 }
 
+// ── auto-update (Tauri desktop only; a no-op in the browser layout preview) ──
+async function checkForUpdates() {
+  const updater = window.__TAURI__?.updater, proc = window.__TAURI__?.process;
+  if (!updater?.check) return;
+  try {
+    const update = await updater.check();
+    if (update) {
+      const ok = window.confirm(
+        `OpenHydra ${update.version} is available (you have ${update.currentVersion}).\n\nDownload and install now? The app will restart.`
+      );
+      if (ok) {
+        await update.downloadAndInstall();
+        if (proc?.relaunch) await proc.relaunch();
+      }
+    }
+  } catch (e) {
+    console.warn("update check failed:", e);
+  }
+}
+setTimeout(checkForUpdates, 3000);
+
 // ── demo state for browser preview only ──
 function mock(cmd, args) {
   if (cmd === "get_state")
