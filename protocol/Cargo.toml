@@ -1,6 +1,6 @@
 [package]
 name = "openhydra-protocol"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 description = "OpenHydra protocol core — pure & synchronous: canonical model id, routing math, co-signed receipts, verification policy, persistent ledger"
