@@ -280,6 +280,40 @@ impl ConsumerNode {
         self.reputation.lock().ok()?.get(peer_id).map(|t| t.score_at(now_ms))
     }
 
+    /// Snapshot the consumer's give-to-get economy for the status endpoint: earned
+    /// reputation per provider (OpenHydra-keyed) and give-side credit balance per provider
+    /// (libp2p-keyed). Decayed to `now`. Pure reads of both maps; safe to call from a
+    /// background publisher thread.
+    pub fn economy_snapshot(&self) -> (Vec<crate::status::RepEntry>, Vec<crate::status::CreditEntry>) {
+        let now = now_unix_ms();
+        let reputation = self
+            .reputation
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .map(|(id, t)| crate::status::RepEntry {
+                        openhydra_peer_id: id.clone(),
+                        score: (t.score_at(now) * 10.0).round() / 10.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let credit = self
+            .credit
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .map(|(id, a)| crate::status::CreditEntry {
+                        libp2p_peer_id: id.clone(),
+                        balance: (a.balance(now) * 10.0).round() / 10.0,
+                        rate_cap: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (reputation, credit)
+    }
+
     /// Record a verification outcome for `peer_id` (M2.2(a)): a served + clean completion
     /// is `Honored`; a failed/refused serve attempt is `Rejected`. Updates the in-memory
     /// tracker, then best-effort persists the snapshot (reputation is advisory — a failed

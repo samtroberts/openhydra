@@ -19,6 +19,9 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+use crate::status::{EconomyStats, EconomyView};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
@@ -834,6 +837,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
 #[allow(clippy::too_many_arguments)]
 pub fn router(
     net: NetworkHandle,
+    economy: Arc<EconomyStats>,
     api_key: Option<String>,
     store: Option<Store>,
     aup: AupPolicy,
@@ -846,8 +850,20 @@ pub fn router(
         Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
         None => ConsumerNode::new(net),
     };
+    let node = Arc::new(node);
+    // Publish the consumer's give-to-get view (earned reputation of providers we've used +
+    // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
+    // reads are sync mutex snapshots, so it never touches the tokio runtime.
+    {
+        let node = Arc::clone(&node);
+        std::thread::spawn(move || loop {
+            let (reputation, credit) = node.economy_snapshot();
+            economy.publish(EconomyView::new("consumer", reputation, credit));
+            std::thread::sleep(Duration::from_secs(2));
+        });
+    }
     let state = AppState {
-        node: Arc::new(node),
+        node,
         api_key: api_key.map(Arc::new),
         metrics: Arc::new(Metrics::new()),
         aup: Arc::new(aup),
@@ -880,6 +896,7 @@ pub fn router(
 #[allow(clippy::too_many_arguments)]
 pub fn serve_http(
     net: NetworkHandle,
+    economy: Arc<EconomyStats>,
     bind: &str,
     api_key: Option<String>,
     store: Option<Store>,
@@ -894,7 +911,7 @@ pub fn serve_http(
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg)
+        let app = router(net, economy, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })

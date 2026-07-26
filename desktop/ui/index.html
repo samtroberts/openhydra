@@ -1,254 +1,368 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OpenHydra</title>
-  <link rel="stylesheet" href="styles.css" />
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>OpenHydra</title>
+<link rel="stylesheet" href="styles.css"/>
 </head>
 <body>
-<div class="app">
-
-  <!-- toolbar (data-tauri-drag-region = window drag handle + double-click zoom;
-       interactive buttons/chip omit it so their clicks aren't swallowed) -->
-  <header class="toolbar" data-tauri-drag-region>
-    <div class="brand" data-tauri-drag-region><img src="logo.png" alt="" class="brand-logo" data-tauri-drag-region /><span class="brand-name" data-tauri-drag-region>OpenHydra</span></div>
-    <div class="tool-sep" data-tauri-drag-region></div>
-    <button id="provBtn" class="tbtn tbtn-start" title="Share this machine's engines">▶ Share</button>
-    <button id="gwBtn" class="tbtn tbtn-start" title="Local OpenAI endpoint over the network">▶ Gateway</button>
-    <div class="tool-spacer" data-tauri-drag-region></div>
-    <span id="netChip" class="chip chip-idle">idle</span>
-    <button id="themeBtn" class="tbtn" title="Toggle theme">◐</button>
-    <button id="settingsBtn" class="tbtn" title="Settings">⚙</button>
-  </header>
+<div class="app" id="app" data-mode="home">
+  <div class="titlebar" data-tauri-drag-region>
+    <button class="iconbtn" id="navtoggle" title="Collapse sidebar"><span class="icon" data-i="panelleft"></span></button>
+    <button class="iconbtn dis" id="navback" title="Back"><span class="icon" data-i="chevl"></span></button>
+    <button class="iconbtn dis" id="navfwd" title="Forward"><span class="icon" data-i="chevr"></span></button>
+    <div class="brandmark" id="traymark" style="cursor:pointer" title="System-tray menu (preview)"><img class="brandlogo" src="logo.png" alt="OpenHydra"/>OpenHydra</div>
+    <div class="grow"></div>
+    <div class="row" style="gap:8px"><span class="mut" style="font-size:12.5px;font-weight:500">Sharing</span><div class="switch" id="sharingsw" title="Serve your models to the network — you're always connected; sharing is your choice"></div></div>
+    <button class="kbd" id="cmdk"><span class="icon" data-i="command"></span>K</button>
+    <button class="iconbtn" id="theme" title="Toggle theme"><span class="icon" data-i="theme"></span></button>
+  </div>
 
   <div class="body">
-    <!-- sidebar -->
     <nav class="sidebar">
-      <div class="nav-section">Node</div>
-      <button class="nav-item nav-active" data-view="dashboard">▦ Dashboard <span id="navModels" class="badge">0</span></button>
-      <button class="nav-item" data-view="peers">◇ Peers <span id="navPeers" class="badge">0</span></button>
-      <button class="nav-item" data-view="dht">⌗ DHT</button>
-      <button class="nav-item" data-view="swarm">✳ Swarm</button>
-      <button class="nav-item" data-view="logs">≣ Logs</button>
-      <div class="nav-section">Tools</div>
-      <button class="nav-item" data-view="chat">◧ Chat</button>
-      <button class="nav-item" data-view="code">⌥ Code</button>
-      <button class="nav-item" data-view="council">♄ Council</button>
-      <div class="side-foot">
-        <div class="side-foot-row">peer <code id="sidePeer" class="mono">—</code></div>
+      <div class="modeswitch" id="modeswitch">
+        <button data-m="home" data-on><span class="icon" data-i="homeic"></span>Home</button>
+        <button data-m="network"><span class="icon" data-i="network"></span>Network</button>
+      </div>
+      <div class="nav on" data-v="home" data-m="home"><span class="icon" data-i="plus"></span>New</div>
+      <div class="nav" data-v="activity" data-m="home"><span class="icon" data-i="activity"></span>Activity</div>
+      <div class="nav" data-v="connectors" data-m="home"><span class="icon" data-i="plug"></span>Connectors</div>
+      <div class="nav" data-v="providers" data-m="network"><span class="icon" data-i="package"></span>Providers</div>
+      <div class="nav" data-v="share" data-m="network"><span class="icon" data-i="zap"></span>Share</div>
+      <div class="nav" data-v="engines" data-m="network"><span class="icon" data-i="monitor"></span>Engines</div>
+      <div class="nav" data-v="ledger" data-m="network"><span class="icon" data-i="list"></span>Ledger</div>
+      <div class="nav" data-v="peers" data-m="network" data-tier="adv"><span class="icon" data-i="users"></span>Diagnostics and Stats</div>
+      <div class="navsec">Recents</div>
+      <div id="recsearchwrap" style="padding:0 2px 6px"><input id="recfilter" placeholder="Search chats" style="width:100%;height:26px;border:1px solid hsl(var(--input));border-radius:7px;background:hsl(var(--background));padding:0 8px;font:inherit;font-size:11.5px;color:hsl(var(--foreground));outline:none"/></div>
+      <button class="iconbtn" id="recsearchbtn" title="Search chats" style="display:none"><span class="icon" data-i="search"></span></button>
+      <div id="recents" style="overflow:auto;min-height:0">
+        <div class="nav recent" data-chat="design"><span class="icon" data-i="chat"></span>Design review</div>
+        <div class="nav recent" data-chat="rust"><span class="icon" data-i="chat"></span>Rust borrow error</div>
+        <div class="nav recent" data-chat="poster"><span class="icon" data-i="chat"></span>Poster concepts</div>
+      </div>
+      <div class="card click" id="relaunch" style="display:none;margin-top:auto;padding:10px 12px;display:flex;align-items:center;gap:10px">
+        <span class="icon" data-i="refresh" style="color:hsl(var(--muted-foreground))"></span>
+        <div style="min-width:0"><div style="font-weight:600;font-size:12.5px">Relaunch to update</div><div class="mut mono" style="font-size:11px" id="relaunchver">—</div></div>
+        <span class="icon" data-i="chevr" style="margin-left:auto;color:hsl(var(--muted-foreground))"></span>
+      </div>
+      <div class="sidefoot" id="gosettings" style="cursor:pointer;margin-top:8px" title="Settings">
+        <div class="avatar"><span class="icon" data-i="settings"></span></div>
+        <div style="min-width:0"><div style="font-weight:500;font-size:12.5px">Settings</div><div class="mut mono" style="font-size:11px" id="sidepeer">—</div></div>
       </div>
     </nav>
 
-    <!-- content -->
-    <main class="content">
+    <div class="main">
+      <div class="header">
+        <div class="htitle" id="htitle">Home</div>
+        <div class="grow"></div>
+        <button class="btn brand sm" id="becomeprov" style="display:none"><span class="icon" data-i="zap"></span>Become a Provider</button>
+        <div class="search" id="searchwrap"><span class="icon" data-i="search"></span><input id="search" placeholder="Search…" /></div>
+      </div>
 
-      <!-- Dashboard -->
-      <section id="view-dashboard" class="view">
-        <div id="bootstrapBanner" class="banner hidden">
-          No bootstrap peers configured — LAN (mDNS) only.
-          <button class="btn-link" onclick="openSettings()">Add bootstraps →</button>
-        </div>
-        <div id="agentBanner" class="banner banner-err hidden">openhydra-agent sidecar missing from the bundle.</div>
+      <div class="content">
 
-        <div class="strip">
-          <div class="stat"><div class="stat-k">Provider</div><div id="dashProv" class="stat-v">stopped</div></div>
-          <div class="stat"><div class="stat-k">Gateway</div><div id="dashGw" class="stat-v">stopped</div></div>
-          <div class="stat"><div class="stat-k">Announced</div><div id="dashAnnounced" class="stat-v">—</div></div>
-          <div class="stat"><div class="stat-k">Relays</div><div id="dashRelays" class="stat-v">—</div></div>
-          <div class="stat stat-wide"><div class="stat-k">Endpoint</div>
-            <div class="stat-v mono" id="dashUrl">—</div>
+        <!-- SHARE — your node: what you serve + what you earn (merges Dashboard · Serving · Tokens) -->
+        <section class="view" id="v-share">
+          <div class="row" style="margin-bottom:10px"><div class="ctitle">Your node</div><span class="badge ok" style="margin-left:8px"><span class="dot ok"></span>provider running</span><span class="mut" style="margin-left:auto;font-size:11.5px">2 models announced · gateway :8080</span></div>
+          <div class="grid g4">
+            <div class="card pad kpi"><div class="lbl">Tokens served</div><div class="val num">184.2k</div><div class="sub up"><span class="icon" data-i="activity"></span>▲ 12% vs yesterday</div></div>
+            <div class="card pad kpi"><div class="lbl">Credits earned</div><div class="val num">1,842</div><div class="sub">today · net +877</div></div>
+            <div class="card pad kpi"><div class="lbl">Give-to-get</div><div class="val num">1.9×</div><div class="sub">served ÷ used</div></div>
+            <div class="card pad kpi"><div class="lbl">Reputation</div><div class="val num">1.00</div><div class="sub"><span class="dot ok"></span>top-tier · own pricing</div></div>
           </div>
-        </div>
+          <div class="card pad spark placeholder" style="margin-top:14px" data-tier="adv">Served vs used · last 30 days</div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <span>Models</span>
-            <button id="refreshEngines" class="tbtn tbtn-sm">↻ Rescan engines</button>
+          <div class="card" style="margin-top:14px">
+            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Models you serve</div><div class="grow"></div><span class="badge ok">1 announced</span><button class="btn outline sm" id="addmodel"><span class="icon" data-i="plus"></span>Add model</button></div>
+            <table id="servetable"><thead><tr><th>Model</th><th>Engine</th><th>Requests</th><th>Tokens</th><th>Avg TPS</th><th>Status</th><th>Announce</th></tr></thead><tbody>
+              <tr><td><b>tinyllama</b></td><td>ollama</td><td class="num">298</td><td class="num">176k</td><td class="num">74</td><td><span class="badge secondary">ready</span></td><td><div class="switch" data-sw title="Announce on the network"></div></td></tr>
+              <tr><td><b>llama3</b> <span class="mut">· spills to CPU on 2GB</span></td><td>ollama</td><td class="num">14</td><td class="num">8.2k</td><td class="num">6</td><td><span class="badge warn">degraded</span></td><td><div class="switch" data-sw title="Not announced — you choose what to serve"></div></td></tr>
+            </tbody></table>
+            <div class="pager" style="justify-content:flex-start"><span class="mut">Toggle a model off to stop announcing it. You choose what to serve.</span></div>
           </div>
-          <table class="tbl">
-            <thead><tr><th>Model</th><th>Engine</th><th>Endpoint</th><th>Status</th></tr></thead>
-            <tbody id="modelRows"><tr><td colspan="4" class="dim">probing…</td></tr></tbody>
-          </table>
-        </div>
-      </section>
 
-      <!-- Logs -->
-      <section id="view-logs" class="view hidden">
-        <div class="panel panel-fill">
-          <div class="panel-head">
-            <span>Logs</span>
-            <div class="tabs">
-              <button id="tabProv" class="tab tab-active">Provider</button>
-              <button id="tabGw" class="tab">Gateway</button>
+          <div class="card pad" style="margin-top:14px;display:flex;align-items:center;gap:12px"><span class="live"><span class="dot ok pulse"></span>Incoming</span><span class="mut" style="font-size:12.5px">2 requests in flight · 512-token budget · from 12D3…m2, 12D3…kx</span></div>
+
+          <div class="card" style="margin-top:14px">
+            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Wanted on the network</div><span class="mut" style="margin-left:auto;font-size:12px">high demand · few providers</span></div>
+            <table id="wanttable"><thead><tr><th>Model</th><th>Demand</th><th>Providers</th><th></th></tr></thead><tbody>
+              <tr><td><b>qwen2.5-coder</b></td><td><span class="badge warn">high</span></td><td class="num">3</td><td style="text-align:right"><button class="btn outline sm dlmod">Share this model</button></td></tr>
+              <tr><td><b>nomic-embed</b></td><td><span class="badge secondary">rising</span></td><td class="num">3</td><td style="text-align:right"><button class="btn outline sm dlmod">Share this model</button></td></tr>
+            </tbody></table>
+          </div>
+        </section>
+
+        <!-- HOME — landing: greeting + prompt box. Sending starts a chat in Recents. -->
+        <section class="view on" id="v-home">
+          <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:460px;gap:20px">
+            <div style="display:flex;align-items:center;gap:13px"><img id="homelogo" src="logo.png" alt="" style="width:36px;height:36px;border-radius:9px"/><span style="font-size:27px;font-weight:600;letter-spacing:-.02em">Welcome to OpenHydra</span></div>
+            <div class="card" id="homecard" style="width:min(640px,94%);padding:12px 12px 10px">
+              <div class="input area" id="homeprompt" contenteditable="true" data-ph="How can I help you today?" style="border:0;min-height:54px;padding:6px 4px"></div>
+              <div class="row" style="gap:8px;margin-top:4px">
+                <div class="input select drop" id="homedrop" data-opts="" title="Model · from the network" style="width:auto;height:30px;flex:none;gap:7px;max-width:230px"><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">openhydra/auto</span><span class="icon" data-i="chev"></span></div>
+                <div class="grow"></div>
+                <button class="iconbtn" title="Attach files to context"><span class="icon" data-i="paperclip"></span></button>
+                <button class="iconbtn" title="Dictate"><span class="icon" data-i="mic"></span></button>
+                <button class="btn primary" id="homesend"><span class="icon" data-i="send"></span>Send</button>
+              </div>
+            </div>
+            <div class="mut" style="font-size:12px;display:flex;align-items:center;gap:7px">
+              <span id="homeconnecting" style="display:inline-flex;align-items:center;gap:7px"><span class="dot warn pulse"></span>Connecting to the network — models appear as peers are found…</span>
+              <span id="homeready" style="display:none">Private, peer-to-peer · <span class="num" id="homelive">4</span> models live on the network</span>
             </div>
           </div>
-          <pre id="logBox" class="logbox mono">—</pre>
-        </div>
-      </section>
+        </section>
 
-      <!-- Peers -->
-      <section id="view-peers" class="view hidden">
-        <div id="peersOffline" class="banner hidden">Start a role to see connected peers.
-          <button class="btn-link" id="peersStart">Start sharing →</button></div>
-        <div class="panel panel-fill">
-          <div class="panel-head"><span>Connected peers <span id="peersCount" class="badge">0</span></span>
-            <span class="dim" id="peersLegend">● direct · ◐ mixed · ○ relay</span></div>
-          <table class="tbl">
-            <thead><tr><th>Peer</th><th>Path</th><th>QUIC v4/v6</th><th>TCP</th><th>Relay</th><th>Fail streak</th></tr></thead>
-            <tbody id="peerRows"><tr><td colspan="6" class="dim">—</td></tr></tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- DHT -->
-      <section id="view-dht" class="view hidden">
-        <div id="dhtOffline" class="banner hidden">Start a role to see DHT state.</div>
-        <div class="strip strip-3">
-          <div class="stat"><div class="stat-k">Kademlia mode</div><div id="dhtMode" class="stat-v">—</div></div>
-          <div class="stat"><div class="stat-k">Routing peers</div><div id="dhtKadPeers" class="stat-v">—</div></div>
-          <div class="stat"><div class="stat-k">NAT</div><div id="dhtNat" class="stat-v">—</div></div>
-          <div class="stat"><div class="stat-k">IPv6 capable</div><div id="dhtV6" class="stat-v">—</div></div>
-          <div class="stat"><div class="stat-k">Net generation</div><div id="dhtGen" class="stat-v">—</div></div>
-        </div>
-        <div class="dht-grid">
-          <div class="panel">
-            <div class="panel-head"><span>Relay reservations <span id="dhtResvCount" class="badge">0</span></span></div>
-            <div id="dhtReservations" class="addr-list mono"></div>
+        <!-- ACTIVITY — your usage: tokens, credits, ledger (Home) -->
+        <section class="view" id="v-activity">
+          <div class="grid g4">
+            <div class="card pad kpi"><div class="lbl">Tokens served</div><div class="val num">184.2k</div><div class="sub up"><span class="dot ok"></span>+1,842 credits earned</div></div>
+            <div class="card pad kpi"><div class="lbl">Tokens used</div><div class="val num">96.5k</div><div class="sub">965 credits spent</div></div>
+            <div class="card pad kpi"><div class="lbl">Net balance</div><div class="val num">+877</div><div class="sub">credits available</div></div>
+            <div class="card pad kpi"><div class="lbl">Give-to-get</div><div class="val num">1.9×</div><div class="sub">served ÷ used</div></div>
           </div>
-          <div class="panel">
-            <div class="panel-head"><span>External addresses <span id="dhtExtCount" class="badge">0</span></span></div>
-            <div id="dhtExternal" class="addr-list mono"></div>
+          <div class="card pad spark placeholder" style="margin-top:14px" data-tier="adv">Served vs used · last 30 days</div>
+          <div class="mut" style="font-size:11.5px;margin-top:12px">Full transaction history lives in Network › Ledger.</div>
+        </section>
+
+        <!-- LEDGER — full transaction history (Network) -->
+        <section class="view" id="v-ledger">
+          <div class="card">
+            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Ledger</div><span class="mut" style="margin-left:auto;font-size:12px">served &amp; used · recent</span></div>
+            <table id="ledgertable"><thead><tr><th>When</th><th>Type</th><th>Model</th><th>Counterparty</th><th>Tokens</th><th>Credits</th></tr></thead><tbody>
+              <tr><td class="mut">2m ago</td><td><span class="badge ok">served</span></td><td>tinyllama</td><td class="mono">12D3…kx</td><td class="num">128</td><td class="num up">+1.3</td></tr>
+              <tr><td class="mut">14m ago</td><td><span class="badge secondary">used</span></td><td>qwen2.5:7b</td><td class="mono">12D3…m2</td><td class="num">512</td><td class="num" style="color:hsl(var(--danger))">−5.1</td></tr>
+              <tr><td class="mut">31m ago</td><td><span class="badge ok">served</span></td><td>tinyllama</td><td class="mono">12D3…SXB</td><td class="num">64</td><td class="num up">+0.6</td></tr>
+              <tr><td class="mut">1h ago</td><td><span class="badge secondary">used</span></td><td>openhydra/auto</td><td class="mono">12D3…qp</td><td class="num">210</td><td class="num" style="color:hsl(var(--danger))">−2.1</td></tr>
+            </tbody></table>
           </div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><span>NAT-traversal counters</span></div>
-          <div id="dhtCounters" class="counter-grid"></div>
-        </div>
-      </section>
+        </section>
 
-      <!-- Swarm graph -->
-      <section id="view-swarm" class="view hidden">
-        <div id="swarmOffline" class="banner hidden">Start a role to visualize the swarm.</div>
-        <div class="panel panel-fill swarm-panel">
-          <div class="panel-head"><span>Swarm</span>
-            <span class="dim" id="swarmLegend">◆ you · ● direct · ○ relay · edges = live connections</span></div>
-          <div id="swarmStage" class="swarm-stage"><svg id="swarmSvg" viewBox="0 0 800 460" preserveAspectRatio="xMidYMid meet"></svg></div>
-        </div>
-      </section>
-
-      <!-- Chat -->
-      <section id="view-chat" class="view view-split hidden">
-        <div class="rail">
-          <button id="newSession" class="tbtn tbtn-sm rail-new">+ New chat</button>
-          <div id="sessionList" class="rail-list"></div>
-        </div>
-        <div class="split-main">
-          <div class="workbar">
-            <input id="chatModel" class="model-input mono" list="modelOptions" placeholder="model (e.g. llama3.2:1b)" spellcheck="false" />
-            <select id="chatPreset" class="model-input preset-select" title="System-prompt preset"></select>
-            <label id="webToggleWrap" class="web-toggle hidden" title="Search the web before answering">
-              <input type="checkbox" id="webToggle" /> web
-            </label>
-            <button id="chatClear" class="tbtn tbtn-sm">Clear</button>
+        <!-- ENGINES — install engines + curated models to share (share role) -->
+        <section class="view" id="v-engines">
+          <div class="row" style="margin-bottom:10px"><div class="ctitle">Engines</div><span class="mut" style="margin-left:auto;font-size:11.5px">macOS · arm64 · 16 GB</span></div>
+          <div class="grid g3">
+            <div class="card pad">
+              <div class="row"><b style="font-size:13px">Ollama</b><span class="badge ok" style="margin-left:auto"><span class="dot ok"></span>running</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">General-purpose local LLMs.</div>
+              <div class="row"><span class="badge secondary">Default</span><button class="btn outline sm enginst" style="margin-left:auto">Manage</button></div>
+            </div>
+            <div class="card pad">
+              <div class="row"><b style="font-size:13px">LM Studio</b><span class="badge secondary" style="margin-left:auto">installed</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">MLX-optimised models on Apple silicon.</div>
+              <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Start</button></div>
+            </div>
+            <div class="card pad">
+              <div class="row"><b style="font-size:13px">llama.cpp</b><span class="badge" style="margin-left:auto">not installed</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">Lightweight GGUF runtime.</div>
+              <div class="row"><button class="btn brand sm enginst" style="margin-left:auto">Install</button></div>
+            </div>
+            <div class="card pad">
+              <div class="row"><b style="font-size:13px">ComfyUI</b><span class="badge" style="margin-left:auto">not installed</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">Image generation — Stable Diffusion, Flux.</div>
+              <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Guided install</button></div>
+            </div>
+            <div class="card pad">
+              <div class="row"><b style="font-size:13px">vLLM</b><span class="badge" style="margin-left:auto">not installed</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">High-throughput serving. Needs Python + GPU.</div>
+              <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Guided install</button></div>
+            </div>
+            <div class="card pad">
+              <div class="row"><b style="font-size:13px">Exo</b><span class="badge" style="margin-left:auto">not installed</span></div>
+              <div class="mut" style="font-size:12px;margin:6px 0 10px">Shard big models across your devices.</div>
+              <div class="row"><button class="btn outline sm enginst" style="margin-left:auto">Guided install</button></div>
+            </div>
           </div>
-          <div id="chatGateHint" class="banner hidden">Gateway is stopped — chat runs over the network through it.
-            <button class="btn-link" id="chatStartGw">Start gateway →</button></div>
-          <div id="chatScroll" class="chat-scroll">
-            <div class="dim center" id="chatEmpty">Ask anything — requests route through the swarm to whichever provider serves the model.</div>
+          <div class="card" style="margin-top:14px">
+            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Recommended models for Ollama</div><span class="mut" style="margin-left:auto;font-size:12px">filtered to your OS &amp; hardware</span></div>
+            <table id="rectable"><thead><tr><th>Model</th><th>Size</th><th>Fit</th><th>Providers</th><th></th></tr></thead><tbody>
+              <tr><td><b>qwen2.5:7b</b></td><td class="num">4.7 GB</td><td><span class="badge ok">fits ✓</span></td><td class="num">4</td><td style="text-align:right"><button class="btn outline sm dlmod">Download &amp; share</button></td></tr>
+              <tr><td><b>llama3.2:1b</b></td><td class="num">1.3 GB</td><td><span class="badge ok">fits ✓</span></td><td class="num">9</td><td style="text-align:right"><button class="btn outline sm dlmod">Download &amp; share</button></td></tr>
+              <tr><td><b>qwen2.5-coder</b></td><td class="num">4.7 GB</td><td><span class="badge ok">fits ✓</span></td><td class="num">3</td><td style="text-align:right"><button class="btn outline sm dlmod">Download &amp; share</button></td></tr>
+              <tr><td><b>mistral-small</b></td><td class="num">13 GB</td><td><span class="badge warn">tight ⚠</span></td><td class="num">2</td><td style="text-align:right"><button class="btn outline sm dlmod">Download &amp; share</button></td></tr>
+            </tbody></table>
+            <div class="pager" style="justify-content:flex-start"><span class="mut">Downloads via the engine, then announces automatically once live — toggle it off any time in Share.</span></div>
           </div>
-          <div id="attachStrip" class="attach-strip hidden"></div>
-          <div class="composer">
-            <button id="attachBtn" class="tbtn" title="Attach a text file">📎</button>
-            <input id="attachFile" type="file" class="hidden" multiple accept=".txt,.md,.rs,.py,.js,.ts,.json,.toml,.yaml,.yml,.csv,.html,.css,.sh,.c,.h,.cpp,.go" />
-            <textarea id="chatInput" rows="2" placeholder="Message…  (Enter to send, Shift+Enter for newline)" spellcheck="false"></textarea>
-            <button id="chatSend" class="tbtn tbtn-start">Send</button>
+        </section>
+
+        <!-- CHAT — unified surface: text · code · image. The model picker sets the mode. -->
+        <section class="view" id="v-chat">
+          <div class="three">
+            <div class="pane">
+              <h4><span id="chattitle">Design review</span><button class="iconbtn" id="inftoggle" title="Show / hide inference settings"><span class="icon" data-i="sliders"></span></button></h4>
+              <div class="panebody" id="thread">
+                <div class="msg me">Summarise the dep-uplift plan.</div>
+                <div class="msg ai">The uplift is a single libp2p 0.54→0.56 bump…</div>
+              </div>
+              <div class="composer" style="flex-direction:column;gap:8px;align-items:stretch">
+                <div class="input area" id="composer" contenteditable="true" data-ph="Message…"></div>
+                <div class="row" style="gap:8px">
+                  <div class="input select drop" id="modeldrop" data-opts="" title="Model · from the network — pick an image model to generate images here" style="width:auto;height:30px;flex:none;gap:7px;max-width:230px"><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">openhydra/auto</span><span class="icon" data-i="chev"></span></div>
+                  <div class="grow"></div>
+                  <button class="iconbtn" id="attach" title="Attach files to context"><span class="icon" data-i="paperclip"></span></button>
+                  <button class="iconbtn" id="dictate" title="Dictate"><span class="icon" data-i="mic"></span></button>
+                  <button class="btn primary" id="send"><span class="icon" data-i="send"></span><span id="sendlbl">Send</span></button>
+                </div>
+              </div>
+            </div>
+            <div class="pane">
+              <h4>Inference <span class="live"><span class="dot ok pulse"></span><span id="mcount" class="num">4</span> live</span></h4>
+              <div class="panebody">
+                <div class="field"><label>Tier</label><div class="input select drop" data-opts="best · any|fast · any|best · direct-only|cheapest"><span>best · any</span><span class="icon" data-i="chev"></span></div></div>
+                <div id="txtparams">
+                  <div class="field"><label id="tempk">Temperature · 0.7</label><div class="range" data-label="tempk" data-name="Temperature" data-min="0" data-max="2" data-val="0.7"><div class="fill"></div><div class="knob"></div></div><div class="desc">Wired through to the engine.</div></div>
+                  <div class="field"><label id="tokk">Max tokens · 512</label><div class="range" data-label="tokk" data-name="Max tokens" data-min="16" data-max="4096" data-val="512" data-int="1"><div class="fill"></div><div class="knob"></div></div></div>
+                  <div class="field"><label>Preset</label><div class="input select drop" data-opts="Load a preset…|Concise|Creative · temp 1.2|Deterministic · temp 0"><span>Load a preset…</span><span class="icon" data-i="chev"></span></div><div class="desc">Sets temperature + max tokens.</div></div>
+                </div>
+                <div id="imgparams" style="display:none">
+                  <div class="field"><label id="stepk">Steps · 4</label><div class="range" data-label="stepk" data-name="Steps" data-min="1" data-max="50" data-val="4" data-int="1"><div class="fill"></div><div class="knob"></div></div><div class="desc">Image model selected — generating in-thread.</div></div>
+                  <div class="field"><label>Size</label><div class="input select drop" data-opts="1024×1024|1152×896|896×1152|512×512"><span>1024×1024</span><span class="icon" data-i="chev"></span></div></div>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <!-- Code -->
-      <section id="view-code" class="view hidden">
-        <div class="workbar">
-          <input id="codeModel" class="model-input mono" list="modelOptions" placeholder="model" spellcheck="false" />
-          <span class="dim">code mode · concise, fenced output</span>
-          <button id="codeClear" class="tbtn tbtn-sm">Clear</button>
-        </div>
-        <div id="codeScroll" class="code-scroll">
-          <div class="dim center" id="codeEmpty">Describe the code you want. Replies render as annotated, copyable code cards.</div>
-        </div>
-        <div class="composer">
-          <textarea id="codeInput" rows="2" placeholder="e.g. a Rust function that parses a multiaddr…" spellcheck="false"></textarea>
-          <button id="codeSend" class="tbtn tbtn-start">Generate</button>
-        </div>
-      </section>
+        <!-- PROVIDERS -->
+        <section class="view" id="v-providers">
+          <div class="card pad" style="margin-bottom:14px;display:flex;gap:18px;align-items:center;font-size:12.5px;flex-wrap:wrap">
+            <span><b class="num">48.2M</b> <span class="mut">tokens served</span></span>
+            <span><b class="num">1,204</b> <span class="mut">providers</span></span>
+            <span><b class="num">86.5k</b> <span class="mut">requests today</span></span>
+            <span class="mut" style="margin-left:auto;font-size:11px">network-wide · mock until hosted stats land</span>
+          </div>
+          <div class="chips" id="provchips">
+            <span class="live"><span class="dot ok pulse"></span><span id="provcount" class="num">6</span> models · live</span>
+            <span class="chip on" data-cat="all" style="margin-left:6px">All</span><span class="chip" data-cat="chat">Chat</span>
+            <span class="chip" data-cat="code">Code</span><span class="chip" data-cat="image">Image</span><span class="chip" data-cat="embeddings">Embeddings</span>
+            <span class="chip" style="margin-left:auto">Sort: reputation <span class="icon" data-i="chev"></span></span>
+          </div>
+          <div class="tablecard">
+            <table id="provtable"><thead><tr><th>Model</th><th>Providers</th><th>Avg TPS</th><th>RTT</th><th>Reputation</th><th>Uptime*</th></tr></thead><tbody>
+              <tr class="prov" data-cat="chat"><td><b>qwen2.5:7b</b></td><td class="num">4</td><td class="num">44</td><td class="num">180 ms</td><td><span class="badge ok">0.98</span></td><td class="num">99.2%</td></tr>
+              <tr class="prov" data-cat="chat"><td><b>llama3.2:1b</b></td><td class="num">9</td><td class="num">96</td><td class="num">90 ms</td><td><span class="badge ok">0.95</span></td><td class="num">97.8%</td></tr>
+              <tr class="prov" data-cat="chat"><td><b>tinyllama</b> <span class="mut">· your Asus</span></td><td class="num">1</td><td class="num">75</td><td class="num">20 ms</td><td><span class="badge ok">1.00</span></td><td class="num">100%</td></tr>
+              <tr class="prov" data-cat="code"><td><b>qwen2.5-coder</b></td><td class="num">3</td><td class="num">38</td><td class="num">150 ms</td><td><span class="badge ok">0.91</span></td><td class="num">95.1%</td></tr>
+              <tr class="prov" data-cat="image"><td><b>flux-schnell</b> <span class="mut">· image</span></td><td class="num">2</td><td class="num">0.6/s</td><td class="num">210 ms</td><td><span class="badge warn">0.88</span></td><td class="num">92%</td></tr>
+              <tr class="prov" data-cat="embeddings"><td><b>nomic-embed</b> <span class="mut">· embeddings</span></td><td class="num">3</td><td>—</td><td class="num">70 ms</td><td><span class="badge ok">0.96</span></td><td class="num">98%</td></tr>
+            </tbody></table>
+            <div class="pager">TPS · RTT · reputation are live telemetry. *uptime is derived from liveness history.</div>
+          </div>
+        </section>
 
-      <!-- Council (blind compare + synthesis) -->
-      <section id="view-council" class="view hidden">
-        <div class="workbar">
-          <input id="cMod1" class="model-input mono council-model" list="modelOptions" placeholder="model 1" spellcheck="false" />
-          <input id="cMod2" class="model-input mono council-model" list="modelOptions" placeholder="model 2" spellcheck="false" />
-          <input id="cMod3" class="model-input mono council-model" list="modelOptions" placeholder="model 3 (optional)" spellcheck="false" />
-          <span class="dim">blind — answers are shuffled</span>
-        </div>
-        <div class="composer">
-          <textarea id="councilInput" rows="2" placeholder="One prompt, judged by the council…" spellcheck="false"></textarea>
-          <button id="councilAsk" class="tbtn tbtn-start">Convene</button>
-        </div>
-        <div id="councilBoard" class="council-board">
-          <div class="dim center">Pick 2–3 models and convene. Responses come back anonymized as Seat A/B/C — reveal or synthesize after reading.</div>
-        </div>
-        <div id="councilActions" class="workbar hidden">
-          <button id="councilReveal" class="tbtn tbtn-sm">Reveal models</button>
-          <input id="judgeModel" class="model-input mono" list="modelOptions" placeholder="judge model" spellcheck="false" />
-          <button id="councilSynth" class="tbtn tbtn-sm tbtn-start">Synthesize verdict</button>
-        </div>
-        <div id="councilVerdict" class="hidden"></div>
-      </section>
+        <!-- CONNECTORS -->
+        <section class="view" id="v-connectors">
+          <div class="card pad" style="margin-bottom:14px;font-size:13px"><b>OpenHydra is an OpenAI-compatible endpoint</b> at <span class="mono">http://127.0.0.1:8080/v1</span>. Point any tool with a custom base URL at it. <span class="badge ok">direct</span> plugs in as-is · <span class="badge warn">shim</span> needs an Anthropic→OpenAI proxy.</div>
+          <div class="conn">
+            <div class="conncard"><div class="hd"><b>OpenCode</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=oh-local
+# model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>VS Code · Continue</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">provider: openai
+apiBase: http://127.0.0.1:8080/v1
+model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>Claude Code</b><span class="badge warn" style="margin-left:auto">shim</span></div><div class="snippet"># Anthropic API → run a translating proxy
+# (LiteLLM) in front of OpenHydra
+ANTHROPIC_BASE_URL=http://127.0.0.1:4000<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>OpenClaw</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">openclaw config set model.baseUrl \
+  http://127.0.0.1:8080/v1
+openclaw config set model.name openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>Neovim · codecompanion</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">adapter = "openai_compatible"
+url = "http://127.0.0.1:8080/v1"
+model = "openhydra/auto"<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>Emacs · gptel</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">(gptel-make-openai "OpenHydra"
+  :host "127.0.0.1:8080" :protocol "http"
+  :models '("openhydra/auto"))<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>Pi</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">pi config set api.baseUrl \
+  http://127.0.0.1:8080/v1
+pi config set api.model openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><b>Hermes</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet"># Settings → Model provider → OpenAI-compatible
+base_url: http://127.0.0.1:8080/v1
+model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
+          </div>
+        </section>
 
-    </main>
-  </div>
+        <!-- PEERS — peers · DHT · swarm · logs, one place (Network, advanced) -->
+        <section class="view" id="v-peers" data-tier="adv">
+          <div class="chips" id="actchips" style="margin-bottom:14px">
+            <span class="chip on" data-act="peers">Peers <span class="num" style="margin-left:2px">7</span></span>
+            <span class="chip" data-act="dht">DHT</span>
+            <span class="chip" data-act="swarm">Swarm</span>
+            <span class="chip" data-act="logs">Logs</span>
+          </div>
 
-  <!-- status bar -->
-  <footer class="statusbar">
-    <span class="seg"><i id="stProvDot" class="dot"></i> provider</span>
-    <span class="seg"><i id="stGwDot" class="dot"></i> gateway</span>
-    <span class="seg">models <b id="stModels">0</b></span>
-    <span class="seg">relays <b id="stRelays">0</b></span>
-    <span class="seg">▼ <b id="stTokens">0</b> tok</span>
-    <span class="seg">engine <b id="stTps">—</b> tok/s</span>
-    <span class="seg seg-end mono" id="stPeer">—</span>
-  </footer>
+          <div class="acttab on" data-act="peers">
+            <div class="chips" id="peerchips"><span class="chip on" data-p="all">All</span><span class="chip" data-p="direct">Direct</span><span class="chip" data-p="relay">Relay</span><span class="chip" data-p="mixed">Mixed</span></div>
+            <div class="tablecard"><table id="peertable"><thead><tr><th>Peer</th><th>Path</th><th>QUIC v6</th><th>RTT</th><th>Reputation</th><th></th></tr></thead><tbody>
+              <tr data-p="direct"><td class="mono">12D3…N2v <span class="mut" style="font-family:var(--sans)">Asus</span></td><td><span class="badge ok">direct</span></td><td class="num">1</td><td class="num">20 ms</td><td><span class="badge ok">1.00</span></td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>
+              <tr data-p="mixed"><td class="mono">12D3…SXB</td><td><span class="badge secondary">mixed</span></td><td class="num">1</td><td class="num">140 ms</td><td><span class="badge ok">0.97</span></td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>
+              <tr data-p="relay"><td class="mono">12D3…EL5</td><td><span class="badge warn">relay</span></td><td class="num">0</td><td class="num">310 ms</td><td><span class="badge ok">0.90</span></td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>
+            </tbody></table><div class="pager"><span>3 of 7 peers</span><span class="grow"></span><span class="btn ghost sm">Rows 20 <span class="icon" data-i="chev"></span></span></div></div>
+            <div class="mut" style="font-size:11.5px;margin-top:10px">Bootstrap nodes are network infrastructure — they don't appear in your peer list.</div>
+          </div>
 
-  <datalist id="modelOptions"></datalist>
+          <div class="acttab" data-act="dht">
+            <div class="tablecard"><table><thead><tr><th>Key</th><th>Kind</th><th>Providers</th><th>TTL</th></tr></thead><tbody>
+              <tr><td class="mono">/oh/model/tinyllama</td><td><span class="badge secondary">provider</span></td><td class="num">1</td><td class="num">241s</td></tr>
+              <tr><td class="mono">/oh/model/qwen2.5:7b</td><td><span class="badge secondary">provider</span></td><td class="num">4</td><td class="num">188s</td></tr>
+            </tbody></table></div>
+            <div class="card pad mut" style="margin-top:14px;font-size:12.5px">kad_routing_peers: <span class="num">41</span> · server mode: no</div>
+          </div>
 
-  <!-- Settings modal -->
-  <div id="settingsModal" class="modal hidden">
-    <div class="modal-card">
-      <h2>Settings</h2>
-      <label class="field">
-        <span>Bootstrap peers <span class="dim">(one multiaddr per line)</span></span>
-        <textarea id="setBootstraps" rows="3" class="mono" spellcheck="false"></textarea>
-      </label>
-      <div class="field-row">
-        <label class="field"><span>Gateway port</span><input id="setPort" type="number" min="1024" max="65535" /></label>
-        <label class="field field-grow"><span>Search URL <span class="dim">(SearXNG, optional)</span></span>
-          <input id="setSearch" type="text" class="mono" placeholder="http://127.0.0.1:8888" spellcheck="false" /></label>
+          <div class="acttab" data-act="swarm">
+            <div class="grid g4"><div class="card pad kpi"><div class="lbl">Listeners</div><div class="val num">6</div></div><div class="card pad kpi"><div class="lbl">Reservations</div><div class="val num">3</div></div><div class="card pad kpi"><div class="lbl">DCUtR ok</div><div class="val num">1</div></div><div class="card pad kpi"><div class="lbl">AutoNAT</div><div class="val" style="font-size:17px">private</div></div></div>
+            <div class="card pad spark placeholder" style="margin-top:14px">Connections &amp; transports</div>
+          </div>
+
+          <div class="acttab" data-act="logs">
+            <div class="chips" id="logchips"><span class="chip on" data-log="provider">Provider</span><span class="chip" data-log="gateway">Gateway</span></div>
+            <div class="card" style="padding:14px;font-family:var(--mono);font-size:12px;line-height:1.7;height:360px;overflow:auto" id="logbody"></div>
+          </div>
+        </section>
+
+        <!-- SETTINGS -->
+        <section class="view" id="v-settings">
+          <div class="row" style="align-items:flex-start;gap:24px">
+            <div class="subnav" id="setnav"><div class="s on" data-p="identity">Identity</div><div class="s" data-p="network">Network</div><div class="s" data-p="engine">Engine</div><div class="s" data-p="byok">BYOK</div><div class="s" data-p="appearance">Appearance</div></div>
+            <div style="flex:1;max-width:440px">
+              <div class="setpanel on" data-p="identity"><div class="sectitle">Identity</div><div class="secsub" style="margin-bottom:16px">Your identity is a keypair on this machine. There is no account and nothing to sign in to.</div>
+                <div class="field"><label>Device name</label><div class="input" contenteditable="true" style="max-width:280px">MacBook Pro</div></div>
+                <div class="field"><label>Peer ID</label><div class="input mono" style="justify-content:space-between;gap:10px">12D3KooWQvXm4c…9tPqN2v<span class="cp" style="color:hsl(var(--brand));font-weight:600;font-size:10.5px;cursor:pointer;font-family:var(--sans)">Copy</span></div></div>
+                <div class="field"><label>Key file</label><div class="input mono">~/.openhydra/identity.key</div></div>
+                <button class="btn primary save">Save changes</button></div>
+              <div class="setpanel" data-p="network"><div class="sectitle">Network</div><div class="secsub" style="margin-bottom:16px">Bootstrap peers connect automatically — nothing to configure.</div>
+                <div class="field"><label>Gateway bind</label><div class="input mono">127.0.0.1:8080</div></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Act as a relay for other peers</label><div class="desc">Helps peers behind strict NATs. Uses a little bandwidth, earns reputation. Only activates when your node is publicly reachable.</div></div><div class="switch on" data-sw></div></div><button class="btn primary save">Save changes</button></div>
+              <div class="setpanel" data-p="engine"><div class="sectitle">Engine</div><div class="secsub" style="margin-bottom:16px">Local inference engine wrapped by your provider.</div>
+                <div class="field"><label>Engine</label><div class="input select drop" data-opts="auto-detect|ollama|vLLM|LM Studio|llama.cpp|Exo|ComfyUI"><span>auto-detect</span><span class="icon" data-i="chev"></span></div></div>
+                <div class="field"><label>Endpoint</label><div class="input mono">http://127.0.0.1:11434</div></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Start engine automatically if it's down</label><div class="desc">Autostarts your default engine when OpenHydra launches.</div></div><div class="switch on" data-sw></div></div><button class="btn primary save">Save changes</button></div>
+              <div class="setpanel" data-p="byok"><div class="sectitle">Bring your own keys</div><div class="secsub" style="margin-bottom:16px">Route to hosted frontier models with your keys.</div>
+                <div class="field"><label>Anthropic key</label><div class="input mono">••••••••••••</div></div>
+                <div class="field"><label>OpenAI key</label><div class="input mut">Not set</div></div><button class="btn primary save">Save changes</button></div>
+              <div class="setpanel" data-p="appearance"><div class="sectitle">Appearance</div><div class="secsub" style="margin-bottom:16px">Theme and default layout.</div>
+                <div class="field"><label>Theme</label><div class="input select drop" data-opts="System|Light|Dark" data-act="theme"><span>System</span><span class="icon" data-i="chev"></span></div></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Show advanced views</label><div class="desc">Peers (DHT · Swarm · Logs) and per-request params.</div></div><div class="switch" id="advsw"></div></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Guided tour</label><div class="desc">Replay the first-run walkthrough.</div></div><button class="btn outline sm" id="obreplay">Take the tour</button></div>
+                <button class="btn primary save">Save changes</button></div>
+            </div>
+          </div>
+        </section>
+
       </div>
-      <label class="field">
-        <span>Memory <span class="dim">(always included in chats — facts about you, style, context)</span></span>
-        <textarea id="setMemory" rows="3" spellcheck="false"></textarea>
-      </label>
-      <label class="field field-check"><input id="setAutostart" type="checkbox" />
-        <span>Start my engine automatically if it's down (Ollama / LM Studio)</span></label>
-      <div class="modal-actions">
-        <button class="tbtn" onclick="closeSettings()">Cancel</button>
-        <button id="saveSettings" class="tbtn tbtn-start">Save</button>
+
+      <div class="statusbar">
+        <span class="live" id="netstatus"><span class="dot warn pulse" id="netdot"></span><span id="netlabel">Initializing…</span></span>
+        <span class="sep"></span><span class="num" id="sbpeers">— peers</span>
+        <span class="sep"></span><span class="num" id="sbmodels">6 models</span>
+        <span class="sep"></span><span class="num" title="Tokens served / tokens used"><span class="up">▲ <span id="sbserved">0</span></span> <span style="margin-left:4px">▼ <span id="sbused">0</span></span></span>
+        <span class="sep"></span><span class="num" title="Give-to-get credits — lands with the credit ledger" id="sbcredits">— credits</span>
+        <span class="actions"><span class="mut mono" id="apiendpoint" style="font-size:11px;cursor:pointer" title="Local OpenAI-compatible endpoint — always on. Click to copy; see Connectors.">127.0.0.1:8080/v1</span></span>
       </div>
     </div>
   </div>
-
 </div>
+<input type="file" id="attachfile" multiple class="hidden" style="display:none" accept=".txt,.md,.rs,.py,.js,.ts,.json,.toml,.yaml,.yml,.csv,.html,.css,.sh,.c,.h,.cpp,.go"/>
 <script src="app.js"></script>
 </body>
 </html>

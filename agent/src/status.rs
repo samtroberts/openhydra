@@ -99,6 +99,75 @@ struct TransfersView {
     per_model: HashMap<String, ModelStats>,
 }
 
+/// One counterparty's earned reputation (consumer-side, keyed by **OpenHydra** peer id —
+/// the receipt/reputation key).
+#[derive(Debug, Clone, Serialize)]
+pub struct RepEntry {
+    pub openhydra_peer_id: String,
+    /// Earned reputation in `[0, 100]`, decayed to now (50 = neutral). See `verify.rs`.
+    pub score: f64,
+}
+
+/// One counterparty's give/take credit standing (keyed by **libp2p** peer id — the dial
+/// target). `rate_cap` is set only on the provider side (the serve-rate throttle we apply
+/// to that consumer); on the consumer side it's `None`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreditEntry {
+    pub libp2p_peer_id: String,
+    /// Give/take balance decayed to now (`credit::STARTER_GRANT` baseline). See `credit.rs`.
+    pub balance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_cap: Option<f64>,
+}
+
+/// The node's local view of the give-to-get economy (M2.2 reputation + M2.3 credit). This is
+/// **relational, not a wallet**: reputation is what *this* node has earned-assigned to the
+/// providers it used; credit is the pairwise give/take standing per counterparty. Published
+/// by the running role into [`EconomyStats`] and read by the status server.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct EconomyView {
+    /// "consumer" (gateway earned-rep + give-side credit) or "provider" (take-side credit).
+    pub role: String,
+    pub reputation: Vec<RepEntry>,
+    pub credit: Vec<CreditEntry>,
+    /// Mean earned reputation across known counterparties, or `None` if none yet.
+    pub avg_reputation: Option<f64>,
+    /// Sum of credit balances (a rough standing number; not money).
+    pub total_credit: f64,
+}
+
+impl EconomyView {
+    /// Assemble a view from the raw per-peer lists, computing the summary aggregates.
+    pub fn new(role: &str, reputation: Vec<RepEntry>, credit: Vec<CreditEntry>) -> Self {
+        let avg_reputation = if reputation.is_empty() {
+            None
+        } else {
+            Some((reputation.iter().map(|r| r.score).sum::<f64>() / reputation.len() as f64 * 10.0).round() / 10.0)
+        };
+        let total_credit = (credit.iter().map(|c| c.balance).sum::<f64>() * 10.0).round() / 10.0;
+        Self { role: role.to_string(), reputation, credit, avg_reputation, total_credit }
+    }
+}
+
+/// Shared, publish-once-poll-many economy handle: the running role publishes a fresh
+/// [`EconomyView`] on a short interval; the status server reads the latest under `/status`.
+/// A small mutex around a cheap clone — touched a few times a second at most.
+#[derive(Debug, Default)]
+pub struct EconomyStats {
+    inner: Mutex<EconomyView>,
+}
+
+impl EconomyStats {
+    pub fn publish(&self, view: EconomyView) {
+        if let Ok(mut g) = self.inner.lock() {
+            *g = view;
+        }
+    }
+    fn snapshot(&self) -> EconomyView {
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 /// Everything the status server needs, bundled for the serving thread.
 pub struct StatusServer {
     pub role: &'static str,
@@ -107,6 +176,11 @@ pub struct StatusServer {
     pub openhydra_peer_id: String,
     pub net: StatusClient,
     pub stats: Arc<TransferStats>,
+    /// Live give-to-get economy view, published by the running role (empty until the role
+    /// has interacted with a counterparty).
+    pub economy: Arc<EconomyStats>,
+    /// Process start (unix ms) — the status server derives `uptime_secs` from it.
+    pub started_at_ms: u64,
     /// Required bearer token, if any (`OPENHYDRA_STATUS_TOKEN`).
     pub token: Option<String>,
 }
@@ -185,11 +259,14 @@ impl StatusServer {
                     agent_version: self.agent_version,
                     libp2p_peer_id: &self.libp2p_peer_id,
                     openhydra_peer_id: &self.openhydra_peer_id,
+                    uptime_secs: uptime_secs(self.started_at_ms),
                     network: net,
                     transfers: self.stats.snapshot(),
+                    economy: self.economy.snapshot(),
                 }),
                 Err(e) => return respond(&mut stream, 500, &json(&ErrBody { error: e })),
             },
+            "/status/economy" => json(&self.economy.snapshot()),
             "/status/peers" => match self.net.status() {
                 Ok(net) => json(&net.peers),
                 Err(e) => return respond(&mut stream, 500, &json(&ErrBody { error: e })),
@@ -224,8 +301,20 @@ struct FullStatus<'a> {
     agent_version: &'a str,
     libp2p_peer_id: &'a str,
     openhydra_peer_id: &'a str,
+    /// Seconds since this agent process started.
+    uptime_secs: u64,
     network: openhydra_network::types::StatusSnapshot,
     transfers: TransfersView,
+    economy: EconomyView,
+}
+
+/// Wall-clock seconds since `started_at_ms` (saturating; 0 if the clock went backwards).
+fn uptime_secs(started_at_ms: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(started_at_ms);
+    now.saturating_sub(started_at_ms) / 1000
 }
 
 #[derive(Serialize)]
@@ -359,6 +448,8 @@ mod tests {
             openhydra_peer_id: net.openhydra_peer_id().to_string(),
             net: net.status_client(),
             stats: Arc::clone(&stats),
+            economy: Arc::new(EconomyStats::default()),
+            started_at_ms: 0,
             token: Some("s3cret".into()),
         }
         .spawn("127.0.0.1:0")

@@ -516,18 +516,60 @@ struct EngineView {
 async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<serde_json::Value>, ()> {
     let prov = state.provider.lock().map(|r| r.status.running).unwrap_or(false);
     let gw = state.gateway.lock().map(|r| r.status.running).unwrap_or(false);
-    let port = if prov {
-        Some(PROVIDER_STATUS_PORT)
-    } else if gw {
-        Some(GATEWAY_STATUS_PORT)
-    } else {
-        None
-    };
-    let Some(port) = port else { return Ok(None) };
-    Ok(tauri::async_runtime::spawn_blocking(move || fetch_status(port, "/status"))
-        .await
-        .ok()
-        .flatten())
+    if !prov && !gw {
+        return Ok(None);
+    }
+    // The two roles hold different halves of the economy: the provider process tracks
+    // take-side credit + serve-rate caps; the gateway (consumer) tracks earned reputation of
+    // the providers it used + give-side credit. Fetch provider-first for the base snapshot
+    // (peers + transfer counters), then — when both run — overlay the gateway's economy so the
+    // UI sees reputation and credit together.
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let base_port = if prov { PROVIDER_STATUS_PORT } else { GATEWAY_STATUS_PORT };
+        let mut base = fetch_status(base_port, "/status")?;
+        if prov && gw {
+            if let Some(gw_econ) = fetch_status(GATEWAY_STATUS_PORT, "/status/economy") {
+                merge_economy(&mut base, gw_econ);
+            }
+        }
+        Some(base)
+    })
+    .await
+    .ok()
+    .flatten())
+}
+
+/// Merge the gateway's economy view (earned reputation + give-side credit) into the provider
+/// snapshot's `economy` block: reputation is consumer-only, so it always comes from the
+/// gateway; credit entries are unioned by libp2p id (provider's take-side rate_cap wins).
+fn merge_economy(base: &mut serde_json::Value, gw_econ: serde_json::Value) {
+    let Some(econ) = base.get_mut("economy") else { return };
+    // Reputation: take the gateway's list wholesale (the provider role never has any).
+    if let Some(rep) = gw_econ.get("reputation").cloned() {
+        econ["reputation"] = rep;
+    }
+    if let Some(avg) = gw_econ.get("avg_reputation").cloned() {
+        econ["avg_reputation"] = avg;
+    }
+    // Credit: union by libp2p_peer_id, keeping the base (provider take-side, has rate_cap).
+    if let (Some(base_credit), Some(gw_credit)) = (
+        econ.get("credit").and_then(|c| c.as_array()).cloned(),
+        gw_econ.get("credit").and_then(|c| c.as_array()).cloned(),
+    ) {
+        let mut seen: std::collections::HashSet<String> = base_credit
+            .iter()
+            .filter_map(|c| c.get("libp2p_peer_id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        let mut merged = base_credit;
+        for c in gw_credit {
+            if let Some(id) = c.get("libp2p_peer_id").and_then(|v| v.as_str()) {
+                if seen.insert(id.to_string()) {
+                    merged.push(c);
+                }
+            }
+        }
+        econ["credit"] = serde_json::Value::Array(merged);
+    }
 }
 
 /// Blocking loopback GET of the status endpoint. Zero-dep: the agent serves tiny

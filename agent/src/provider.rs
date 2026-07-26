@@ -357,6 +357,28 @@ impl<A: EngineAdapter> Provider<A> {
             .unwrap_or(1.0)
     }
 
+    /// Snapshot the provider's take-side economy for the status endpoint: per-consumer
+    /// (libp2p-keyed) give/take balance and the serve-rate cap we currently apply to each.
+    /// The provider holds no reputation of its own (that's the consumers' view of it), so the
+    /// reputation list is always empty here. Pure read of the credit map.
+    pub fn economy_snapshot(&self) -> (Vec<crate::status::RepEntry>, Vec<crate::status::CreditEntry>) {
+        let now = now_unix_ms();
+        let credit = self
+            .credit
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .map(|(id, a)| crate::status::CreditEntry {
+                        libp2p_peer_id: id.clone(),
+                        balance: (a.balance(now) * 10.0).round() / 10.0,
+                        rate_cap: Some((a.rate_cap(now) * 100.0).round() / 100.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (Vec::new(), credit)
+    }
+
     /// M2.3 **enforcement**: before serving, slow a leecher proportionally to its give/take
     /// deficit — *priority, not access* (throttle, never block). Only `SERVE_REQUEST`s are
     /// throttled; a contributor (`rate_cap >= 1.0` → multiplier `0`) and every non-serve

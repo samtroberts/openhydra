@@ -28,8 +28,8 @@ use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
     live_comfyui, live_exo, live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy,
-    ByokConfig, EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig, StatusServer,
-    TransferStats, DEFAULT_ANTHROPIC_URL, DEFAULT_COMFYUI_URL, DEFAULT_EXO_URL,
+    ByokConfig, EconomyStats, EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig,
+    StatusServer, TransferStats, DEFAULT_ANTHROPIC_URL, DEFAULT_COMFYUI_URL, DEFAULT_EXO_URL,
     DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL,
     DEFAULT_OPENAI_EMBEDDINGS_URL, DEFAULT_VLLM_URL,
 };
@@ -445,6 +445,13 @@ fn run() -> Result<(), String> {
     // The provider role writes the counters; the gateway's transfers stay zero for now
     // (its request metrics live on the Prometheus surface, #33).
     let stats = std::sync::Arc::new(TransferStats::default());
+    // Give-to-get economy (M2.2 reputation + M2.3 credit): the running role publishes a
+    // fresh snapshot into this on a short interval; the status server reads it under /status.
+    let economy = std::sync::Arc::new(EconomyStats::default());
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     if let Some(bind) = status_bind {
         let role = match &cli.role {
             Role::Provide(_) => "provider",
@@ -457,6 +464,8 @@ fn run() -> Result<(), String> {
             openhydra_peer_id: net.openhydra_peer_id().to_string(),
             net: net.status_client(),
             stats: std::sync::Arc::clone(&stats),
+            economy: std::sync::Arc::clone(&economy),
+            started_at_ms,
             token: std::env::var("OPENHYDRA_STATUS_TOKEN").ok(),
         }
         .spawn(&bind)?;
@@ -464,9 +473,23 @@ fn run() -> Result<(), String> {
     }
 
     match cli.role {
-        Role::Provide(args) => provide(net, stats, args),
-        Role::Serve(args) => serve(net, args),
+        Role::Provide(args) => provide(net, stats, economy, args),
+        Role::Serve(args) => serve(net, economy, args),
     }
+}
+
+/// Publish `snapshot()` into `economy` every 2s on a background thread. `snapshot` returns
+/// the role's (reputation, credit) lists; `role` labels the perspective. Keeps the status
+/// endpoint's economy view fresh without touching the blocking serve/gateway loops.
+fn spawn_economy_publisher<F>(role: &'static str, economy: std::sync::Arc<EconomyStats>, snapshot: F)
+where
+    F: Fn() -> (Vec<openhydra_agent::RepEntry>, Vec<openhydra_agent::CreditEntry>) + Send + 'static,
+{
+    std::thread::spawn(move || loop {
+        let (reputation, credit) = snapshot();
+        economy.publish(openhydra_agent::EconomyView::new(role, reputation, credit));
+        std::thread::sleep(Duration::from_secs(2));
+    });
 }
 
 /// Provider role: pick the engine adapter from `--engine-kind`, then detect + announce +
@@ -475,13 +498,14 @@ fn run() -> Result<(), String> {
 fn provide(
     net: NetworkHandle,
     stats: std::sync::Arc<TransferStats>,
+    economy: std::sync::Arc<EconomyStats>,
     args: ProvideArgs,
 ) -> Result<(), String> {
     // Auto mode scans the standard ports and serves the union of whatever's running — the
     // zero-config default. It handles its own autostart, so it branches out before we resolve
     // a single engine URL.
     if args.engine_kind == EngineKind::Auto {
-        return provide_auto(net, stats, args);
+        return provide_auto(net, stats, economy, args);
     }
 
     let url = args
@@ -494,31 +518,31 @@ fn provide(
         EngineKind::Auto => unreachable!("handled above"),
         EngineKind::Ollama => {
             let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Vllm => {
             let a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::LmStudio => {
             let a = live_openai(&url, "lm-studio").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::LlamaCpp => {
             let a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Exo => {
             let a = live_exo(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Comfyui => {
             let a = live_comfyui(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Openai => {
             let a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats)
+            run_single_engine(a, url, args, net, stats, economy)
         }
     }
 }
@@ -532,9 +556,10 @@ fn run_single_engine<A: EngineAdapter + Send + Sync + 'static>(
     args: ProvideArgs,
     net: NetworkHandle,
     stats: std::sync::Arc<TransferStats>,
+    economy: std::sync::Arc<EconomyStats>,
 ) -> Result<(), String> {
     ensure_engine_if_requested(&args, &url, &adapter)?;
-    run_provider(adapter, url, args, net, stats)
+    run_provider(adapter, url, args, net, stats, economy)
 }
 
 /// Auto-detect provider: probe the standard ports and serve the union of every engine found.
@@ -543,6 +568,7 @@ fn run_single_engine<A: EngineAdapter + Send + Sync + 'static>(
 fn provide_auto(
     net: NetworkHandle,
     stats: std::sync::Arc<TransferStats>,
+    economy: std::sync::Arc<EconomyStats>,
     args: ProvideArgs,
 ) -> Result<(), String> {
     if args.engine.is_some() {
@@ -575,7 +601,7 @@ fn provide_auto(
 
     // The MultiAdapter re-probes on every re-announce tick, so engines/models started later
     // are absorbed with no restart. Drop the decision-scan's adapters; it rebuilds its own.
-    run_provider(openhydra_agent::detect::MultiAdapter::new(), "auto".to_string(), args, net, stats)
+    run_provider(openhydra_agent::detect::MultiAdapter::new(), "auto".to_string(), args, net, stats, economy)
 }
 
 /// The fail-fast message when auto mode finds no engine (§5 of the autostart plan).
@@ -670,6 +696,7 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     args: ProvideArgs,
     net: NetworkHandle,
     stats: std::sync::Arc<TransferStats>,
+    economy: std::sync::Arc<EconomyStats>,
 ) -> Result<(), String> {
     // Open the receipt ledger: file-backed if --db was given (durable across restarts),
     // else an ephemeral in-memory ledger.
@@ -715,7 +742,12 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     // Blocks forever (returns `!`); poll in short slices to stay responsive and
     // re-announce within the relays' provider-record TTL. Serves concurrently via a bounded
     // worker pool so one slow generation can't block the others.
-    std::sync::Arc::new(provider).run_inbound(
+    let provider = std::sync::Arc::new(provider);
+    // Publish the take-side credit view (per-consumer balance + serve-rate cap) to the status
+    // endpoint every 2s.
+    let pub_provider = std::sync::Arc::clone(&provider);
+    spawn_economy_publisher("provider", economy, move || pub_provider.economy_snapshot());
+    provider.run_inbound(
         Duration::from_millis(500),
         Duration::from_secs(args.reannounce_secs),
         args.max_concurrency,
@@ -723,7 +755,11 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
 }
 
 /// Consumer role: run the HTTP/SSE gateway until the process exits.
-fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
+fn serve(
+    net: NetworkHandle,
+    economy: std::sync::Arc<EconomyStats>,
+    args: ServeArgs,
+) -> Result<(), String> {
     // CLI flag wins; otherwise fall back to the env var (avoids depending on clap's `env`).
     let api_key = args.api_key.or_else(|| std::env::var("OPENHYDRA_API_KEY").ok());
     // M2.2(a): persist earned provider reputation across restarts if --db was given.
@@ -772,6 +808,6 @@ fn serve(net: NetworkHandle, args: ServeArgs) -> Result<(), String> {
     let trusted_proxy = args.rate_limit.trusted_proxy;
     let embeddings = args.byok.embedding_config();
     let byok = args.byok.clone().into_config();
-    serve_http(net, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings)
+    serve_http(net, economy, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }
