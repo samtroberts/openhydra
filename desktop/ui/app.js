@@ -15,7 +15,7 @@
 
   // ── browser-preview mock ──
   const mk = { provider: false, gateway: false };
-  function mock(cmd) {
+  function mock(cmd, args) {
     if (cmd === "start_provider") { mk.provider = true; return null; }
     if (cmd === "stop_provider") { mk.provider = false; return null; }
     if (cmd === "start_gateway") { mk.gateway = true; return null; }
@@ -38,8 +38,10 @@
           nat: { nat_type: "cone", is_public: false }, autonat_private: true, ipv6_capable: true, kad_server_mode: false, kad_routing_peers: 12, network_generation: 0,
           listen_addrs: ["/ip4/0.0.0.0/udp/4111/quic-v1"], external_addrs: ["/ip4/49.36.1.2/udp/4111/quic-v1"], relay_reservations: ["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL/p2p-circuit"],
           peers: [
+            { peer_id: "12D3KooWEL", quic_direct_v4: 0, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 1, failure_streak: 0, path: "relay" }, // bootstrap → filtered out
             { peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7", quic_direct_v4: 1, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 0, failure_streak: 0, path: "direct" },
             { peer_id: "12D3KooWEzegXr4qcjEW3WT", quic_direct_v4: 0, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 1, failure_streak: 0, path: "relay" },
+            ...Array.from({ length: 10 }, (_, i) => ({ peer_id: "12D3KooWPeer" + String(i).padStart(2, "0") + "abcd", quic_direct_v4: i % 2, quic_direct_v6: (i + 1) % 2, tcp_direct: 0, tcp_relay: i % 3 === 0 ? 1 : 0, failure_streak: 0, path: i % 3 === 0 ? "relay" : i % 3 === 1 ? "direct" : "mixed" })),
           ],
           known_models: ["tinyllama:latest", "llama3:latest", "qwen2.5:7b"],
           known_providers: [
@@ -57,11 +59,23 @@
         },
       };
     }
-    if (cmd === "chat_completion") return new Promise((r) => setTimeout(() => r({
-      choices: [{ message: { content: "The herd answers: reciprocity beats rent-seeking.\n\n```rust\nfn hi(){ println!(\"herd\"); }\n```" } }],
-      usage: { completion_tokens: 42 }, openhydra: { engine: { native_tps: 61 }, hops_ms: { network_rtt: 12 } }, model: "tinyllama:latest",
-    }), 500));
+    if (cmd === "chat_completion") {
+      // vary by prompt so the reasoning-model render paths are testable in the browser mock:
+      // "think" → inline <think> + answer, "empty" → empty content (thinking-mode strip)
+      const q = (args?.messages?.slice(-1)[0]?.content || "").toLowerCase();
+      let content = "The herd answers: reciprocity beats rent-seeking.\n\n```rust\nfn hi(){ println!(\"herd\"); }\n```";
+      if (/empty/.test(q)) content = "";
+      else if (/think/.test(q)) content = "<think>\nThe user greeted me. I should respond warmly and briefly.\n</think>\nHey! How can I help?";
+      return new Promise((r) => setTimeout(() => r({
+        choices: [{ message: { content, role: "assistant" } }],
+        usage: { completion_tokens: 42 }, openhydra: { engine: { native_tps: 61 }, hops_ms: { network_rtt: 12 } }, model: "qwen3.5-4b-mlx",
+      }), 400));
+    }
     if (cmd === "web_search") return [];
+    if (cmd === "load_sessions") return "";                       // #1 (mock: nothing persisted)
+    if (cmd === "save_sessions") return null;                     // #1
+    if (cmd === "device_hostname") return "Sam’s MacBook Air";    // #9
+    if (cmd === "export_logs") return "~/.openhydra/openhydra-logs-1785200000.txt"; // #4
     return null;
   }
 
@@ -122,11 +136,16 @@
   // ── persistence ──
   const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
   let sessions = store.get("oh_sessions", {}), sessionOrder = store.get("oh_order", []);
-  let deviceName = store.get("oh_device", /Mac/.test(navigator.platform) ? "MacBook Pro" : "This machine");
+  let deviceName = store.get("oh_device", "");   // #9: derived from the OS on boot if unset
   let usedTokens = store.get("oh_used", 0);
   root.dataset.theme = store.get("oh_theme", "light");
   if (store.get("oh_adv", false)) app.setAttribute("data-adv", "");
-  function saveSessions() { store.set("oh_sessions", sessions); store.set("oh_order", sessionOrder); }
+  function saveSessions() {
+    store.set("oh_sessions", sessions); store.set("oh_order", sessionOrder);
+    // #1: durable write-through to the Tauri backend file (WebView localStorage isn't durable
+    // across restarts on any platform). Fire-and-forget; localStorage stays as a fast cache.
+    try { call("save_sessions", { data: JSON.stringify({ sessions, order: sessionOrder, device: deviceName, used: usedTokens }) }); } catch {}
+  }
 
   // ── live state ──
   let state = null, engines = [], snap = null, activeView = "home", curChat = null, attachments = [];
@@ -263,11 +282,35 @@
   function hl(code) { let out = "", i = 0; const push = (c, s) => out += c ? `<span class="${c}">${esc(s)}</span>` : esc(s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return out; }
   function parseFences(t) { const p = [], re = /```([\w+-]*)\n([\s\S]*?)```/g; let last = 0, m; while ((m = re.exec(t))) { if (m.index > last) p.push({ prose: t.slice(last, m.index).trim() }); p.push({ lang: m[1] || "code", code: m[2] }); last = re.lastIndex; } if (last < t.length) p.push({ prose: t.slice(last).trim() }); return p.filter((x) => x.code != null || x.prose); }
   function metaRow(m) { return `<div class="msgmeta"><span>${esc(m.model)}</span><span class="num">${m.tok} tok</span><span class="num" title="End-to-end throughput — engine TPS with network latency">${m.tps} t/s herd</span><span class="num">${m.rtt} ms RTT</span><span>${m.at}</span></div>`; }
-  function botEl(content, meta) {
+  // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
+  // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand
+  // back an EMPTY content. Split any inline thinking out of the answer so the chat shows the
+  // real answer (or a clear note) instead of a blank bubble.
+  function splitThink(raw) {
+    raw = raw || ""; let reasoning = "";
+    raw = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_, t) => { reasoning += t + "\n"; return ""; });
+    raw = raw.replace(/<think>([\s\S]*)$/i, (_, t) => { reasoning += t; return ""; }); // unclosed / still thinking
+    return { answer: raw.trim(), reasoning: reasoning.trim() };
+  }
+  function botEl(content, meta, reasoning) {
     const d = document.createElement("div"); d.className = "msg ai";
-    for (const part of parseFences(content)) {
-      if (part.code != null) { const c = document.createElement("div"); c.className = "code-card"; c.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span><button class="code-copy">⎘ copy</button></div><pre>${hl(part.code)}</pre>`; c.querySelector(".code-copy").onclick = (ev) => { navigator.clipboard?.writeText(part.code); ev.target.textContent = "✓ copied"; setTimeout(() => ev.target.textContent = "⎘ copy", 1400); }; d.appendChild(c); }
-      else { const pr = document.createElement("div"); pr.style.whiteSpace = "pre-wrap"; const re = /!\[[^\]]*\]\(([^)]+)\)/g; let last = 0, m; while ((m = re.exec(part.prose))) { if (m.index > last) pr.appendChild(document.createTextNode(part.prose.slice(last, m.index))); const src = m[1].trim(); if (IMG_SRC.test(src)) { const img = document.createElement("img"); img.className = "micon-img"; img.style.cssText = "max-width:100%;border-radius:10px;border:1px solid hsl(var(--border));margin:6px 0;display:block;width:auto;height:auto"; img.src = src; pr.appendChild(img); } else pr.appendChild(document.createTextNode(m[0])); last = re.lastIndex; } if (last < part.prose.length) pr.appendChild(document.createTextNode(part.prose.slice(last))); d.appendChild(pr); }
+    if (reasoning) {
+      const det = document.createElement("details"); det.style.cssText = "margin:0 0 6px;font-size:12px";
+      det.innerHTML = `<summary style="cursor:pointer;color:hsl(var(--muted))">🧠 Thinking</summary>`;
+      const b = document.createElement("div"); b.style.cssText = "white-space:pre-wrap;margin-top:4px;padding:6px 10px;border-left:2px solid hsl(var(--border));color:hsl(var(--muted))"; b.textContent = reasoning; det.appendChild(b); d.appendChild(det);
+    }
+    if (content && content.trim()) {
+      for (const part of parseFences(content)) {
+        if (part.code != null) { const c = document.createElement("div"); c.className = "code-card"; c.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span><button class="code-copy">⎘ copy</button></div><pre>${hl(part.code)}</pre>`; c.querySelector(".code-copy").onclick = (ev) => { navigator.clipboard?.writeText(part.code); ev.target.textContent = "✓ copied"; setTimeout(() => ev.target.textContent = "⎘ copy", 1400); }; d.appendChild(c); }
+        else { const pr = document.createElement("div"); pr.style.whiteSpace = "pre-wrap"; const re = /!\[[^\]]*\]\(([^)]+)\)/g; let last = 0, m; while ((m = re.exec(part.prose))) { if (m.index > last) pr.appendChild(document.createTextNode(part.prose.slice(last, m.index))); const src = m[1].trim(); if (IMG_SRC.test(src)) { const img = document.createElement("img"); img.className = "micon-img"; img.style.cssText = "max-width:100%;border-radius:10px;border:1px solid hsl(var(--border));margin:6px 0;display:block;width:auto;height:auto"; img.src = src; pr.appendChild(img); } else pr.appendChild(document.createTextNode(m[0])); last = re.lastIndex; } if (last < part.prose.length) pr.appendChild(document.createTextNode(part.prose.slice(last))); d.appendChild(pr); }
+      }
+    } else {
+      // No visible answer — reasoning-model / thinking-mode case. Say so instead of a blank bubble.
+      const note = document.createElement("div"); note.className = "mut"; note.style.fontSize = "12.5px";
+      note.textContent = reasoning
+        ? "The model produced only reasoning — expand “Thinking” above, or ask it to answer directly."
+        : "The model returned no visible text — it may be in “thinking” mode. Ask it to answer directly, or turn off reasoning in the provider’s engine (e.g. add /no_think to the prompt).";
+      d.appendChild(note);
     }
     if (meta) { const mm = document.createElement("div"); mm.innerHTML = metaRow(meta); d.appendChild(mm.firstChild); }
     return d;
@@ -276,7 +319,7 @@
     const s = sessions[curChat]; const th = $("#thread"); if (!s) { th.innerHTML = ""; return; }
     $("#chattitle").textContent = s.t; th.innerHTML = "";
     if (!s.m.length) { th.innerHTML = `<div class="mut" style="margin:auto;text-align:center;font-size:12.5px">Ask anything — requests route through the network to whichever provider serves the model.</div>`; return; }
-    for (const x of s.m) { if (x[0] === "me") { const d = document.createElement("div"); d.className = "msg me"; d.textContent = x[1]; th.appendChild(d); } else th.appendChild(botEl(x[1], x[2])); }
+    for (const x of s.m) { if (x[0] === "me") { const d = document.createElement("div"); d.className = "msg me"; d.textContent = x[1]; th.appendChild(d); } else th.appendChild(botEl(x[1], x[2], x[3])); }
     th.scrollTop = th.scrollHeight;
   }
 
@@ -320,17 +363,22 @@
     try {
       const resp = await call("chat_completion", { model, messages, maxTokens: +($("[data-label='tokk']")?.dataset.val) || 1024 });
       wait.remove();
-      const reply = resp?.choices?.[0]?.message?.content ?? "(empty reply)";
+      const msg = resp?.choices?.[0]?.message || {};
+      const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer
+      const reasoning = [msg.reasoning_content, split.reasoning].filter(Boolean).join("\n").trim();
+      const reply = split.answer;                                  // may be "" — botEl shows a clear note
       const oh = resp?.openhydra || {};
       const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
       pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
       pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
-      s.m.push(["ai", reply, meta]); saveSessions(); renderChat();
+      s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();
       if (resp?.usage?.completion_tokens) { usedTokens += resp.usage.completion_tokens; store.set("oh_used", usedTokens); renderStatusbar(); }
     } catch (e) {
       wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
       const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
-      err.textContent = /504|timeout|timed out/i.test(String(e)) ? `The provider didn't respond in time (${secs}s). Cold model loads can be slow — try again; it warms up.` : `${e}`;
+      err.textContent = /504|timeout|timed out/i.test(String(e)) ? `The provider didn't respond in time (${secs}s). Cold model loads can be slow — try again; it warms up.`
+        : /control character|expected value|invalid|parse|json/i.test(String(e)) ? `The provider's response couldn't be read — some reasoning models emit raw formatting that breaks parsing. Try turning off thinking on the provider (e.g. /no_think).`
+        : `${e}`;
       th.appendChild(err);
     }
   }
@@ -340,6 +388,16 @@
   function homeSend() { const p = $("#homeprompt"); const t = p.textContent.trim(); p.textContent = ""; doSend(t, true); }
   $("#homesend").onclick = homeSend;
   $("#homeprompt").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); homeSend(); } };
+  // #2: paste PLAIN text only — a whole rich-HTML page (e.g. Wikipedia) into a contenteditable
+  // injects huge markup and broke the app. Strip formatting + cap the size.
+  const PASTE_CAP = 100 * 1024; // 100 KB
+  function plainPaste(e) {
+    e.preventDefault();
+    let t = (e.clipboardData || window.clipboardData)?.getData("text/plain") || "";
+    if (t.length > PASTE_CAP) { t = t.slice(0, PASTE_CAP); toast("Pasted text truncated to 100 KB"); }
+    document.execCommand("insertText", false, t); // inserts as plain text at the caret, replacing any selection
+  }
+  ["#homeprompt", "#composer"].forEach((s) => $(s)?.addEventListener("paste", plainPaste));
 
   // image mode (wireframe) — the picker sets it; the network decides if an image model exists
   let chatMode = "text";
@@ -369,14 +427,18 @@
     const up = snap?.uptime_secs != null ? ` · up ${fmtUptime(snap.uptime_secs)}` : "";
     head.querySelector(".mut").textContent = `${running ? (p.announced ?? 0) : 0} models announced · gateway :8080${up}`;
     const k = $$("#v-share .g4 .kpi .val");
-    const served = t?.tokens_served ?? 0, credit = econ().total_credit;
+    const served = t?.tokens_served ?? 0;
+    // #3 fix: "Credits earned" = net CONTRIBUTION (served − used), which RISES with serving and
+    // falls with using — the earlier `economy.total_credit` summed counterparty balances and
+    // moved the wrong way (provider's number dropped on serve). Contribution-based per decision.
+    const netCredits = served - usedTokens;
     const ratio = usedTokens > 0 ? (served / usedTokens) : (served > 0 ? null : 0);
     k[0].textContent = served;
-    k[1].textContent = credit != null ? Math.round(credit).toLocaleString() : "—";
+    k[1].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[2].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     k[3].textContent = "—";   // own reputation is held by the peers we serve — not locally knowable
     $$("#v-share .g4 .kpi .sub")[0].innerHTML = `${t?.requests_served ?? 0} requests served`;
-    $$("#v-share .g4 .kpi .sub")[1].textContent = credit != null ? "give-to-get credit (not money)" : "starts once you serve a peer";
+    $$("#v-share .g4 .kpi .sub")[1].textContent = "contribution · served − used (not money)";
     $$("#v-share .g4 .kpi .sub")[2].textContent = "served ÷ used";
     $$("#v-share .g4 .kpi .sub")[3].innerHTML = `<span class="mut">earned on the peers you serve</span>`;
     const per = t?.per_model || {}, rows = [];
@@ -408,9 +470,9 @@
       const cnt = (seenCount[m] || 0) + (local.has(m) ? 1 : 0);   // last-known count, sticky
       const tps = modelAvgTps(m);                                  // only for models we serve
       const rep = modelReputation(m, byOh);                        // earned rep of its providers
-      return `<tr class="prov" data-cat="${modelCat(m)}"><td>${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td class="num mut">—</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
+      return `<tr class="prov" data-cat="${modelCat(m)}"><td>${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
     });
-    $("#provtable tbody").innerHTML = rows.join("") || `<tr><td colspan="6" class="mut">${snap ? "No models discovered yet — they appear as peers announce." : "Connecting…"}</td></tr>`;
+    $("#provtable tbody").innerHTML = rows.join("") || `<tr><td colspan="5" class="mut">${snap ? "No models discovered yet — they appear as peers announce." : "Connecting…"}</td></tr>`;
     const cat = $("#provchips .chip.on")?.dataset.cat || "all";
     $$("#provtable .prov").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none");
   }
@@ -433,15 +495,16 @@
   }
   function renderActivity() {
     const t = snap?.transfers, k = $$("#v-activity .g4 .kpi .val");
-    const served = t?.tokens_served ?? 0, credit = econ().total_credit;
+    const served = t?.tokens_served ?? 0;
+    const netCredits = served - usedTokens;   // #3: net balance rises with serving, falls with using
     const ratio = usedTokens > 0 ? (served / usedTokens) : (served > 0 ? null : 0);
     k[0].textContent = served;
     k[1].textContent = usedTokens;
-    k[2].textContent = credit != null ? (credit >= 0 ? "+" : "") + Math.round(credit).toLocaleString() : "—";
+    k[2].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[3].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     $$("#v-activity .g4 .kpi .sub")[0].innerHTML = `<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} receipts co-signed`;
     $$("#v-activity .g4 .kpi .sub")[1].textContent = "this device";
-    $$("#v-activity .g4 .kpi .sub")[2].textContent = credit != null ? "give-to-get credit standing" : "credits · once you transact";
+    $$("#v-activity .g4 .kpi .sub")[2].textContent = "net contribution · served − used";
     $$("#v-activity .g4 .kpi .sub")[3].textContent = "served ÷ used";
     // Rolling per-chat throughput/latency — the only place an aggregated TPS/RTT is honest,
     // since the agent emits these per-request. Uptime rounds out the "your node" picture.
@@ -463,13 +526,31 @@
   function renderConnectors() {
     $("#v-connectors .cp") && $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied"); });
   }
+  // libp2p ids of the infrastructure we're connected to (bootstraps + circuit relays) — these
+  // aren't "peers" a user cares about, so we hide them from the Peers list.
+  function infraPeerIds() {
+    const s = new Set();
+    (snap?.network?.relay_reservations || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)\/p2p-circuit/); if (m) s.add(m[1]); });
+    (state?.settings?.bootstraps || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)/); if (m) s.add(m[1]); });
+    return s;
+  }
+  let peerLimit = 10;   // "View more" bumps this
   function renderPeers() {
-    if (!snap) { $("#peertable tbody").innerHTML = `<tr><td colspan="6" class="mut">Turn on Sharing or chat to connect, then peers appear here.</td></tr>`; return; }
+    if (!snap) { $("#peertable tbody").innerHTML = `<tr><td colspan="5" class="mut">Turn on Sharing or chat to connect, then peers appear here.</td></tr>`; const pc = $("#peercount"); if (pc) pc.textContent = "0 peers"; const pm = $("#peermore"); if (pm) pm.style.display = "none"; return; }
     const n = snap.network;
+    const infra = infraPeerIds();
+    const peers = (n.peers || []).filter((p) => !infra.has(p.peer_id));   // hide bootstraps/relays
     const repL = repByLibp2p();
-    $("#peertable tbody").innerHTML = n.peers.length ? n.peers.map((p) => `<tr data-p="${p.path}"><td class="mono">${peerShort(p.peer_id)}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${p.path}</span></td><td class="num">${p.quic_direct_v6}</td><td class="num">${p.failure_streak > 0 ? "—" : "·"}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>`).join("") : `<tr><td colspan="6" class="mut">No peers connected yet — dialing bootstraps.</td></tr>`;
+    const shown = peers.slice(0, peerLimit);
+    $("#peertable tbody").innerHTML = shown.length ? shown.map((p) => `<tr data-p="${p.path}"><td class="mono">${peerShort(p.peer_id)}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${p.path}</span></td><td class="num">${p.quic_direct_v6}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>`).join("") : `<tr><td colspan="5" class="mut">${n.peers.length ? "Only infrastructure connected — waiting for network peers." : "No peers connected yet — connecting."}</td></tr>`;
     injectIcons($("#peertable"));
-    $("#actchips .chip .num") && ($("#actchips .chip .num").textContent = n.peers.length);
+    // dynamic count + View more
+    const pc = $("#peercount"); if (pc) pc.textContent = peers.length <= peerLimit ? `${peers.length} peer${peers.length === 1 ? "" : "s"}` : `${shown.length} of ${peers.length} peers`;
+    const pm = $("#peermore"); if (pm) { pm.style.display = peers.length > peerLimit ? "" : "none"; pm.onclick = () => { peerLimit += 10; renderPeers(); }; }
+    // re-apply the active Direct/Relay/Mixed chip so the 2.5s poll doesn't reset it to All
+    const pp = $("#peerchips .chip.on")?.dataset.p || "all";
+    $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) ? "" : "none");
+    $("#actchips .chip .num") && ($("#actchips .chip .num").textContent = peers.length);
     $$("#peertable .rowmenu").forEach((cell) => cell.onclick = (e) => { e.stopPropagation(); menu(cell, [{ label: "Copy peer id", fn: () => toast("Copied") }, { sep: 1 }, { label: "Drop connection", fn: () => toast("Dropped") }]); });
     // DHT
     $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono">/oh/model/${esc(m)}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td><td class="num">—</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No records yet.</td></tr>`;
@@ -483,12 +564,16 @@
   function renderLogs() { const logs = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || []; $("#logbody").innerHTML = logs.length ? logs.map(esc).join("<br>") : "—"; }
   function renderSettings() {
     const p = state; if (!p) return;
-    const id = $('.setpanel[data-p="identity"]'); id.querySelector('[contenteditable]').textContent = deviceName;
+    // #9: don't clobber the device-name field while the user is editing it (the 2.5s poll
+    // re-renders Settings; overwriting a focused field was why it "couldn't be changed").
+    const id = $('.setpanel[data-p="identity"]'); const dn = id.querySelector('[contenteditable]');
+    if (document.activeElement !== dn) dn.textContent = deviceName;
     id.querySelectorAll(".input")[1].childNodes[0].textContent = (p.provider.status.peer_id || p.gateway.status.peer_id || "—");
     $('.setpanel[data-p="network"] .input.mono').textContent = `127.0.0.1:${p.settings.gateway_port}`;
     const eng = $('.setpanel[data-p="engine"]'); eng.querySelectorAll(".input.mono")[0].textContent = engines[0]?.url || "http://127.0.0.1:11434";
     eng.querySelector('.switch').classList.toggle("on", !!p.settings.engine_autostart);
     $("#advsw").classList.toggle("on", app.hasAttribute("data-adv"));
+    $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4
   }
 
   // ── status bar + lifecycle ──
@@ -525,11 +610,15 @@
   $$("[data-sw]").forEach((sw) => { if (sw.closest("#servetable")) return; sw.onclick = () => sw.classList.toggle("on"); });
   $$(".save").forEach((b) => b.onclick = async () => {
     deviceName = ($('.setpanel[data-p="identity"] [contenteditable]').textContent || deviceName).trim(); store.set("oh_device", deviceName);
-    const settings = { bootstraps: state?.settings?.bootstraps || [], gateway_port: state?.settings?.gateway_port || 8080, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "" };
+    saveSessions();   // #9: persist the (edited) device name to the durable file too
+    const settings = { bootstraps: state?.settings?.bootstraps || [], gateway_port: state?.settings?.gateway_port || 8080, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
     try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
   });
   $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
   $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.toggleAttribute("data-adv", on); $("#advsw").classList.toggle("on", on); store.set("oh_adv", on); if (!on && activeView === "peers") go("providers"); };
+  // #4: verbose-logs toggle (persist on Save) + Send-logs export
+  $("#verboselogsw") && ($("#verboselogsw").onclick = () => $("#verboselogsw").classList.toggle("on"));
+  $("#sendlogsbtn") && ($("#sendlogsbtn").onclick = async () => { try { const path = await call("export_logs"); toast(path ? `Logs saved: ${path}` : "No logs yet"); } catch (e) { toast(`Export failed: ${e}`); } });
 
   // ── connectors copy (wireframe .cp) ──
   $$(".cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied to clipboard"); });
@@ -584,8 +673,12 @@
   // ── boot ──
   $(".header").style.display = "none"; // Home landing has no header
   $("#homelogo").src = "logo.png";
-  renderRecents();
   (async () => {
+    // #1: hydrate chat sessions from the durable backend file (localStorage is only a cache).
+    try { const blob = await call("load_sessions"); if (blob) { const d = JSON.parse(blob); if (d.sessions) sessions = d.sessions; if (d.order) sessionOrder = d.order; if (d.device) deviceName = d.device; if (typeof d.used === "number") { usedTokens = d.used; store.set("oh_used", usedTokens); } } } catch {}
+    // #9: default device name from the OS if the user hasn't set/restored one.
+    if (!deviceName) { try { deviceName = await call("device_hostname"); } catch {} if (!deviceName) deviceName = /Mac/.test(navigator.platform) ? "This Mac" : "This machine"; store.set("oh_device", deviceName); }
+    renderRecents(); renderStatusbar();
     await refresh(); await refreshEngines();
     await ensureGateway();  // eager: warm discovery so the first chat isn't a cold 504
     await refreshStatus();

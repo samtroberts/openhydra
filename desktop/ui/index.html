@@ -239,7 +239,7 @@
             <span class="chip" style="margin-left:auto">Sort: reputation <span class="icon" data-i="chev"></span></span>
           </div>
           <div class="tablecard">
-            <table id="provtable"><thead><tr><th>Model</th><th>Providers</th><th>Avg TPS</th><th>RTT</th><th>Reputation</th><th>Uptime*</th></tr></thead><tbody>
+            <table id="provtable"><thead><tr><th>Model</th><th>Providers</th><th>Avg TPS</th><th>Reputation</th><th>Uptime*</th></tr></thead><tbody>
               <tr class="prov" data-cat="chat"><td><b>qwen2.5:7b</b></td><td class="num">4</td><td class="num">44</td><td class="num">180 ms</td><td><span class="badge ok">0.98</span></td><td class="num">99.2%</td></tr>
               <tr class="prov" data-cat="chat"><td><b>llama3.2:1b</b></td><td class="num">9</td><td class="num">96</td><td class="num">90 ms</td><td><span class="badge ok">0.95</span></td><td class="num">97.8%</td></tr>
               <tr class="prov" data-cat="chat"><td><b>tinyllama</b> <span class="mut">· your Asus</span></td><td class="num">1</td><td class="num">75</td><td class="num">20 ms</td><td><span class="badge ok">1.00</span></td><td class="num">100%</td></tr>
@@ -247,7 +247,7 @@
               <tr class="prov" data-cat="image"><td><b>flux-schnell</b> <span class="mut">· image</span></td><td class="num">2</td><td class="num">0.6/s</td><td class="num">210 ms</td><td><span class="badge warn">0.88</span></td><td class="num">92%</td></tr>
               <tr class="prov" data-cat="embeddings"><td><b>nomic-embed</b> <span class="mut">· embeddings</span></td><td class="num">3</td><td>—</td><td class="num">70 ms</td><td><span class="badge ok">0.96</span></td><td class="num">98%</td></tr>
             </tbody></table>
-            <div class="pager">TPS · RTT · reputation are live telemetry. *uptime is derived from liveness history.</div>
+            <div class="pager">TPS · reputation are live telemetry. *uptime is derived from liveness history.</div>
           </div>
         </section>
 
@@ -293,11 +293,11 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
 
           <div class="acttab on" data-act="peers">
             <div class="chips" id="peerchips"><span class="chip on" data-p="all">All</span><span class="chip" data-p="direct">Direct</span><span class="chip" data-p="relay">Relay</span><span class="chip" data-p="mixed">Mixed</span></div>
-            <div class="tablecard"><table id="peertable"><thead><tr><th>Peer</th><th>Path</th><th>QUIC v6</th><th>RTT</th><th>Reputation</th><th></th></tr></thead><tbody>
+            <div class="tablecard"><table id="peertable"><thead><tr><th>Peer</th><th>Path</th><th>QUIC v6</th><th>Reputation</th><th></th></tr></thead><tbody>
               <tr data-p="direct"><td class="mono">12D3…N2v <span class="mut" style="font-family:var(--sans)">Asus</span></td><td><span class="badge ok">direct</span></td><td class="num">1</td><td class="num">20 ms</td><td><span class="badge ok">1.00</span></td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>
               <tr data-p="mixed"><td class="mono">12D3…SXB</td><td><span class="badge secondary">mixed</span></td><td class="num">1</td><td class="num">140 ms</td><td><span class="badge ok">0.97</span></td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>
               <tr data-p="relay"><td class="mono">12D3…EL5</td><td><span class="badge warn">relay</span></td><td class="num">0</td><td class="num">310 ms</td><td><span class="badge ok">0.90</span></td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>
-            </tbody></table><div class="pager"><span>3 of 7 peers</span><span class="grow"></span><span class="btn ghost sm">Rows 20 <span class="icon" data-i="chev"></span></span></div></div>
+            </tbody></table><div class="pager"><span id="peercount" class="mut">0 peers</span><span class="grow"></span><span class="btn ghost sm" id="peermore" style="display:none">View more <span class="icon" data-i="chev"></span></span></div></div>
             <div class="mut" style="font-size:11.5px;margin-top:10px">Bootstrap nodes are network infrastructure — they don't appear in your peer list.</div>
           </div>
 
@@ -343,6 +343,8 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
               <div class="setpanel" data-p="appearance"><div class="sectitle">Appearance</div><div class="secsub" style="margin-bottom:16px">Theme and default layout.</div>
                 <div class="field"><label>Theme</label><div class="input select drop" data-opts="System|Light|Dark" data-act="theme"><span>System</span><span class="icon" data-i="chev"></span></div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Show advanced views</label><div class="desc">Peers (DHT · Swarm · Logs) and per-request params.</div></div><div class="switch" id="advsw"></div></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Verbose logs</label><div class="desc">Off keeps logs light (default). On raises detail for troubleshooting — restart Sharing to apply.</div></div><div class="switch" id="verboselogsw"></div></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Send logs to developer</label><div class="desc">Bundles recent agent logs (no chat content) into a file you can share for support.</div></div><button class="btn outline sm" id="sendlogsbtn">Export logs</button></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Guided tour</label><div class="desc">Replay the first-run walkthrough.</div></div><button class="btn outline sm" id="obreplay">Take the tour</button></div>
                 <button class="btn primary save">Save changes</button></div>
             </div>

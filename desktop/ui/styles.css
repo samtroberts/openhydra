@@ -196,7 +196,7 @@
   .field .desc{font-size:11px;color:hsl(var(--muted-foreground));margin-top:5px}
   .input{height:32px;border:1px solid hsl(var(--input));border-radius:8px;background:hsl(var(--background));padding:0 10px;
     font-size:13px;display:flex;align-items:center;color:hsl(var(--foreground));min-height:32px}
-  .input.area{min-height:34px;height:auto;padding:7px 10px}
+  .input.area{min-height:34px;height:auto;padding:7px 10px;align-items:flex-start}
   .select{cursor:pointer;justify-content:space-between;gap:8px}.select:hover{background:hsl(var(--accentbg))}
   .select .icon{color:hsl(var(--muted-foreground))}
   .range{height:6px;border-radius:6px;background:hsl(var(--muted));position:relative;cursor:pointer;margin:8px 0 2px}

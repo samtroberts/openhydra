@@ -158,6 +158,12 @@ struct Settings {
     /// the chat "web" toggle. Empty → the toggle is hidden. The operator brings their own
     /// search backend, same BYO philosophy as engines.
     search_url: String,
+    /// #4: verbose agent logging. Off by default (quiet `RUST_LOG=warn`) so the log ring stays
+    /// light; on raises the agent to info/debug for troubleshooting. The essential status lines
+    /// are `eprintln!` (not `RUST_LOG`-gated), so quiet mode never breaks the status views.
+    verbose_logs: bool,
+    /// #9: user-editable device name shown to peers / in the UI. Empty → derive from the OS.
+    device_name: String,
 }
 
 impl Default for Settings {
@@ -167,6 +173,8 @@ impl Default for Settings {
             gateway_port: 8080,
             engine_autostart: true,
             search_url: String::new(),
+            verbose_logs: false,
+            device_name: String::new(),
         }
     }
 }
@@ -194,6 +202,92 @@ fn store_settings(s: &Settings) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(settings_path(), serde_json::to_string_pretty(s).unwrap())
         .map_err(|e| e.to_string())
+}
+
+// ── #1: chat sessions persisted to disk (WebView localStorage isn't durable across restarts
+// on any platform). The UI owns the JSON shape; we just read/write the blob to a file. ──
+fn sessions_path() -> PathBuf {
+    openhydra_dir().join("sessions.json")
+}
+
+/// Read the persisted sessions blob (raw JSON string the UI wrote), or "" if none yet.
+#[tauri::command]
+fn load_sessions() -> String {
+    std::fs::read_to_string(sessions_path()).unwrap_or_default()
+}
+
+/// Persist the UI's sessions blob (verbatim JSON string).
+#[tauri::command]
+fn save_sessions(data: String) -> Result<(), String> {
+    let dir = openhydra_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(sessions_path(), data).map_err(|e| e.to_string())
+}
+
+// ── #9: OS device name, used as the default until the user edits it. ──
+fn hostname_cmd() -> Option<String> {
+    Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().trim_end_matches(".local").to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The system's device name (friendly name on macOS/Windows), for the Settings default.
+#[tauri::command]
+fn device_hostname() -> String {
+    #[cfg(windows)]
+    let name = std::env::var("COMPUTERNAME").ok();
+    #[cfg(target_os = "macos")]
+    let name = Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let name = hostname_cmd();
+    name.filter(|s: &String| !s.is_empty())
+        .or_else(hostname_cmd)
+        .unwrap_or_else(|| "This machine".into())
+}
+
+// ── #4: bundle the (bounded, in-memory) agent logs + environment into one file to send the
+// developer. The agent logs network/status events only — never prompt/response content — so
+// the bundle is prompt-free by construction. ──
+#[tauri::command]
+fn export_logs(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut buf = format!(
+        "OpenHydra desktop {} · {} {} · exported@{}\n(agent network/status logs only — no prompt content)\n\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        ts,
+    );
+    for (name, role) in [("provider", &state.provider), ("gateway", &state.gateway)] {
+        buf.push_str(&format!("──── {name} ────\n"));
+        if let Ok(r) = role.lock() {
+            buf.push_str(&format!(
+                "running={} pid={:?} peer_id={:?}\n",
+                r.status.running, r.status.pid, r.status.peer_id
+            ));
+            for line in &r.logs {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        buf.push('\n');
+    }
+    let dir = openhydra_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("openhydra-logs-{ts}.txt"));
+    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 // ── Role state (one per supervised child) ──
@@ -390,8 +484,12 @@ fn spawn_role(
         }
     }
     cmd.args(subcommand)
-        // info-level network events feed the relay/announce status lines.
-        .env("RUST_LOG", "openhydra_network=info,info")
+        // #4: quiet by default (essential status lines are eprintln!, not RUST_LOG-gated, so
+        // this never breaks the status views); verbose opt-in raises to info/debug.
+        .env(
+            "RUST_LOG",
+            if load_settings().verbose_logs { "openhydra_network=info,debug" } else { "warn" },
+        )
         .env("OPENHYDRA_STATUS_TOKEN", status_token())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -754,6 +852,10 @@ fn main() {
             web_search,
             status_snapshot,
             save_settings,
+            load_sessions,
+            save_sessions,
+            device_hostname,
+            export_logs,
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
