@@ -1,0 +1,43 @@
+name: R2 CORS
+
+# One-click (workflow_dispatch) job that applies the CORS policy to the download bucket so
+# the landing page can fetch dl.openhydra.co/latest.json cross-origin (from openhydra.co) and
+# auto-update its version label. Bucket-level + idempotent — safe to re-run. Uses the same R2
+# secrets + S3 endpoint as the publish-r2 job in release.yml.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  set-cors:
+    name: Apply CORS policy to the download bucket
+    runs-on: ubuntu-latest
+    steps:
+      - name: put-bucket-cors
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          cat > /tmp/r2-cors.json <<'JSON'
+          {
+            "CORSRules": [
+              {
+                "AllowedOrigins": ["https://openhydra.co", "https://www.openhydra.co"],
+                "AllowedMethods": ["GET", "HEAD"],
+                "AllowedHeaders": ["*"],
+                "ExposeHeaders": ["ETag"],
+                "MaxAgeSeconds": 3600
+              }
+            ]
+          }
+          JSON
+          echo "Applying CORS policy to bucket $R2_BUCKET ..."
+          aws s3api put-bucket-cors --bucket "$R2_BUCKET" --endpoint-url "$EP" \
+            --cors-configuration file:///tmp/r2-cors.json
+          echo "Applied. Current policy:"
+          aws s3api get-bucket-cors --bucket "$R2_BUCKET" --endpoint-url "$EP"
