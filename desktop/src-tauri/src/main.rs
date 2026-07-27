@@ -224,6 +224,28 @@ fn save_sessions(data: String) -> Result<(), String> {
     std::fs::write(sessions_path(), data).map_err(|e| e.to_string())
 }
 
+// ── #7/#10: lifetime served/consumed model stats + daily buckets, persisted to disk. The
+// agent's per-model counters reset to zero on every process restart, so the durable
+// lifetime totals + time-series live here (the desktop accumulates poll-to-poll deltas and
+// owns the JSON shape); this file just reads/writes the blob. ──
+fn stats_path() -> PathBuf {
+    openhydra_dir().join("stats.json")
+}
+
+/// Read the persisted model-stats blob (raw JSON string the UI wrote), or "" if none yet.
+#[tauri::command]
+fn load_stats() -> String {
+    std::fs::read_to_string(stats_path()).unwrap_or_default()
+}
+
+/// Persist the UI's model-stats blob (verbatim JSON string).
+#[tauri::command]
+fn save_stats(data: String) -> Result<(), String> {
+    let dir = openhydra_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(stats_path(), data).map_err(|e| e.to_string())
+}
+
 // ── #9: OS device name, used as the default until the user edits it. ──
 fn hostname_cmd() -> Option<String> {
     Command::new("hostname")
@@ -626,8 +648,14 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
         let base_port = if prov { PROVIDER_STATUS_PORT } else { GATEWAY_STATUS_PORT };
         let mut base = fetch_status(base_port, "/status")?;
         if prov && gw {
-            if let Some(gw_econ) = fetch_status(GATEWAY_STATUS_PORT, "/status/economy") {
-                merge_economy(&mut base, gw_econ);
+            // Provider base carries the served side (peers, served counters, `served` ledger
+            // rows); the gateway process holds the consumed side + `used` ledger rows. Pull the
+            // gateway's full status once and overlay both its economy and its transfers.
+            if let Some(gw) = fetch_status(GATEWAY_STATUS_PORT, "/status") {
+                merge_economy(&mut base, gw.get("economy").cloned().unwrap_or_default());
+                if let Some(gw_transfers) = gw.get("transfers").cloned() {
+                    merge_transfers(&mut base, gw_transfers);
+                }
             }
         }
         Some(base)
@@ -668,6 +696,34 @@ fn merge_economy(base: &mut serde_json::Value, gw_econ: serde_json::Value) {
         }
         econ["credit"] = serde_json::Value::Array(merged);
     }
+}
+
+/// Merge the gateway's transfer counters (the consumed side + `used` ledger rows) into the
+/// provider base snapshot's `transfers` block. The provider process only ever fills the served
+/// side, so consumed fields are taken wholesale from the gateway; the two roles' recent-ledger
+/// rings (provider = `served`, gateway = `used`) are concatenated and re-sorted newest-first.
+fn merge_transfers(base: &mut serde_json::Value, gw: serde_json::Value) {
+    let Some(t) = base.get_mut("transfers") else { return };
+    for key in ["requests_consumed", "tokens_consumed", "consumed_per_model"] {
+        if let Some(v) = gw.get(key).cloned() {
+            t[key] = v;
+        }
+    }
+    // Union the recent-ledger rings and sort by timestamp descending (newest first).
+    let mut rows: Vec<serde_json::Value> = t
+        .get("recent")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(gw_rows) = gw.get("recent").and_then(|r| r.as_array()) {
+        rows.extend(gw_rows.iter().cloned());
+    }
+    rows.sort_by(|a, b| {
+        let ta = a.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    t["recent"] = serde_json::Value::Array(rows);
 }
 
 /// Blocking loopback GET of the status endpoint. Zero-dep: the agent serves tiny
@@ -854,6 +910,8 @@ fn main() {
             save_settings,
             load_sessions,
             save_sessions,
+            load_stats,
+            save_stats,
             device_hostname,
             export_logs,
         ])

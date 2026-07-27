@@ -71,10 +71,10 @@
             <div class="card pad kpi"><div class="lbl">Give-to-get</div><div class="val num">1.9×</div><div class="sub">served ÷ used</div></div>
             <div class="card pad kpi"><div class="lbl">Reputation</div><div class="val num">1.00</div><div class="sub"><span class="dot ok"></span>top-tier · own pricing</div></div>
           </div>
-          <div class="card pad spark placeholder" style="margin-top:14px" data-tier="adv">Served vs used · last 30 days</div>
+          <div class="card pad" id="sharechart" data-tier="adv" style="margin-top:14px"></div>
 
           <div class="card" style="margin-top:14px">
-            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Models you serve</div><div class="grow"></div><span class="badge ok">1 announced</span><button class="btn outline sm" id="addmodel"><span class="icon" data-i="plus"></span>Add model</button></div>
+            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Models you serve</div><div class="grow"></div><button class="btn ghost sm" id="hideinactive">Hide inactive</button><span class="badge ok">1 announced</span><button class="btn outline sm" id="addmodel"><span class="icon" data-i="plus"></span>Add model</button></div>
             <table id="servetable"><thead><tr><th>Model</th><th>Engine</th><th>Requests</th><th>Tokens</th><th>Avg TPS</th><th>Status</th><th>Announce</th></tr></thead><tbody>
               <tr><td><b>tinyllama</b></td><td>ollama</td><td class="num">298</td><td class="num">176k</td><td class="num">74</td><td><span class="badge secondary">ready</span></td><td><div class="switch" data-sw title="Announce on the network"></div></td></tr>
               <tr><td><b>llama3</b> <span class="mut">· spills to CPU on 2GB</span></td><td>ollama</td><td class="num">14</td><td class="num">8.2k</td><td class="num">6</td><td><span class="badge warn">degraded</span></td><td><div class="switch" data-sw title="Not announced — you choose what to serve"></div></td></tr>
@@ -122,7 +122,7 @@
             <div class="card pad kpi"><div class="lbl">Net balance</div><div class="val num">+877</div><div class="sub">credits available</div></div>
             <div class="card pad kpi"><div class="lbl">Give-to-get</div><div class="val num">1.9×</div><div class="sub">served ÷ used</div></div>
           </div>
-          <div class="card pad spark placeholder" style="margin-top:14px" data-tier="adv">Served vs used · last 30 days</div>
+          <div class="card pad" id="actchart" data-tier="adv" style="margin-top:14px"></div>
           <div class="mut" style="font-size:11.5px;margin-top:12px">Full transaction history lives in Network › Ledger.</div>
         </section>
 

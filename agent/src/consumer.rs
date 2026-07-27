@@ -237,6 +237,10 @@ pub struct ConsumerNode {
     /// mutates it; cross-process unification merges on rehydrate — full live unification
     /// lands with the combined-role / enforcement work.)
     credit: Mutex<HashMap<String, CreditAccount>>,
+    /// Shared transfer counters (#7/#5): per-model **consumed** aggregates + recent `used`
+    /// ledger rows. `None` when no status endpoint is running. The symmetric half of the
+    /// provider's `TransferStats` served side; the desktop merges both processes' views.
+    stats: Option<Arc<crate::status::TransferStats>>,
 }
 
 impl ConsumerNode {
@@ -248,7 +252,15 @@ impl ConsumerNode {
             reputation: Mutex::new(HashMap::new()),
             store: None,
             credit: Mutex::new(HashMap::new()),
+            stats: None,
         }
+    }
+
+    /// Attach the shared transfer counters so completions record per-model consumed tokens
+    /// and `used` ledger rows (builder form; keeps `new`/`with_store` signatures unchanged).
+    pub fn with_stats(mut self, stats: Arc<crate::status::TransferStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// A consumer whose earned reputation (M2.2(a)) and give-side credit (M2.3) are
@@ -271,6 +283,7 @@ impl ConsumerNode {
             reputation: Mutex::new(reputation),
             store: Some(store),
             credit: Mutex::new(credit),
+            stats: None,
         }
     }
 
@@ -444,6 +457,13 @@ impl ConsumerNode {
                     // delivered; a failed/slow settlement must not fail the completion).
                     if summary.ok && summary.tokens > 0 {
                         self.settle_receipt(&provider, summary.tokens, nonce);
+                        // #7/#5: per-model consumed tracking + a `used` ledger row (counterparty
+                        // = the provider we used). Fires on every delivered completion, so it
+                        // also captures external OpenAI clients hitting the gateway.
+                        if let Some(stats) = &self.stats {
+                            stats.record_consume(model, summary.tokens);
+                            stats.record_ledger(now, "used", model, &provider.peer_id, summary.tokens);
+                        }
                     }
                     // M2.2(a): a clean served completion earns the provider reputation.
                     self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);

@@ -22,13 +22,18 @@
 //! request must carry `Authorization: Bearer <token>` (the desktop app sets a random
 //! one per launch so other local users/processes can't read peer data).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+
+/// How many recent ledger rows each role keeps in memory for the desktop's Ledger view.
+/// A small bounded ring: the view shows "recent" activity, not the durable receipt archive
+/// (which the provider persists to redb only when launched with `--db`).
+const LEDGER_RING_CAP: usize = 250;
 
 use openhydra_network::handle::StatusClient;
 
@@ -44,9 +49,28 @@ pub struct ModelStats {
     pub avg_native_tps: f64,
 }
 
+/// One recent transaction for the desktop's Ledger view (#5). A `served` row is minted
+/// when the provider co-signs a settlement receipt; a `used` row when the consumer finishes
+/// a completion. Bounded ring (newest-first) — not the durable archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerRow {
+    /// Unix ms when the row was recorded.
+    pub ts_ms: u64,
+    /// `"served"` (this node served a peer) or `"used"` (this node consumed from a peer).
+    pub kind: &'static str,
+    pub model: String,
+    /// The counterparty's short peer id (the consumer we served / the provider we used).
+    pub counterparty: String,
+    pub tokens: u64,
+}
+
 /// Agent-side transfer counters, shared between the serving role (writer) and the
 /// status server (reader). Cheap atomics for the totals; one small mutex for the
 /// per-model map (touched once per request, never per token).
+///
+/// Both roles share one instance: the **provider** writes the served side
+/// (`record_serve` + `served` ledger rows), the **consumer/gateway** the consumed side
+/// (`record_consume` + `used` ledger rows). The desktop merges the two processes' views.
 #[derive(Debug, Default)]
 pub struct TransferStats {
     pub requests_served: AtomicU64,
@@ -54,7 +78,14 @@ pub struct TransferStats {
     pub serve_errors: AtomicU64,
     pub aup_refusals: AtomicU64,
     pub receipts_ledgered: AtomicU64,
+    /// Consumer-side totals (mirror of the served ones), for the give-to-get "used" figures.
+    pub requests_consumed: AtomicU64,
+    pub tokens_consumed: AtomicU64,
     per_model: Mutex<HashMap<String, ModelStats>>,
+    /// Per-model consumed aggregates (consumer/gateway side). TPS is not meaningful here.
+    consumed_per_model: Mutex<HashMap<String, ModelStats>>,
+    /// Newest-first ring of recent ledger rows (both `served` and `used`), for the Ledger view.
+    recent: Mutex<VecDeque<LedgerRow>>,
 }
 
 impl TransferStats {
@@ -77,6 +108,38 @@ impl TransferStats {
         }
     }
 
+    /// Record one completed **consumption** (called by the consumer after a completion). The
+    /// symmetric half of `record_serve`: net-new per-model consumed tracking so the desktop's
+    /// give-to-get "used" figures and the served-vs-used timeline are correct — including
+    /// tokens consumed by external OpenAI clients (e.g. a coding agent) pointed at the gateway,
+    /// which the desktop's own chat counter never sees.
+    pub fn record_consume(&self, model: &str, tokens: u64) {
+        self.requests_consumed.fetch_add(1, Ordering::Relaxed);
+        self.tokens_consumed.fetch_add(tokens, Ordering::Relaxed);
+        if let Ok(mut map) = self.consumed_per_model.lock() {
+            let entry = map.entry(model.to_string()).or_default();
+            entry.requests += 1;
+            entry.tokens += tokens;
+        }
+    }
+
+    /// Push a recent ledger row (newest-first, bounded). `now_ms` is passed in so the caller
+    /// owns the clock (keeps this pure/testable).
+    pub fn record_ledger(&self, now_ms: u64, kind: &'static str, model: &str, counterparty: &str, tokens: u64) {
+        if let Ok(mut ring) = self.recent.lock() {
+            ring.push_front(LedgerRow {
+                ts_ms: now_ms,
+                kind,
+                model: model.to_string(),
+                counterparty: counterparty.to_string(),
+                tokens,
+            });
+            while ring.len() > LEDGER_RING_CAP {
+                ring.pop_back();
+            }
+        }
+    }
+
     fn snapshot(&self) -> TransfersView {
         TransfersView {
             requests_served: self.requests_served.load(Ordering::Relaxed),
@@ -84,7 +147,11 @@ impl TransferStats {
             serve_errors: self.serve_errors.load(Ordering::Relaxed),
             aup_refusals: self.aup_refusals.load(Ordering::Relaxed),
             receipts_ledgered: self.receipts_ledgered.load(Ordering::Relaxed),
+            requests_consumed: self.requests_consumed.load(Ordering::Relaxed),
+            tokens_consumed: self.tokens_consumed.load(Ordering::Relaxed),
             per_model: self.per_model.lock().map(|m| m.clone()).unwrap_or_default(),
+            consumed_per_model: self.consumed_per_model.lock().map(|m| m.clone()).unwrap_or_default(),
+            recent: self.recent.lock().map(|r| r.iter().cloned().collect()).unwrap_or_default(),
         }
     }
 }
@@ -96,7 +163,11 @@ struct TransfersView {
     serve_errors: u64,
     aup_refusals: u64,
     receipts_ledgered: u64,
+    requests_consumed: u64,
+    tokens_consumed: u64,
     per_model: HashMap<String, ModelStats>,
+    consumed_per_model: HashMap<String, ModelStats>,
+    recent: Vec<LedgerRow>,
 }
 
 /// One counterparty's earned reputation (consumer-side, keyed by **OpenHydra** peer id —
@@ -420,6 +491,29 @@ mod tests {
         assert_eq!(llama.tokens, 30);
         assert_eq!(llama.avg_native_tps, 100.0);
         assert_eq!(view.per_model["tinyllama"].avg_native_tps, 0.0);
+    }
+
+    #[test]
+    fn records_consumption_and_bounded_ledger_ring() {
+        let s = TransferStats::default();
+        s.record_consume("qwen2.5:7b", 100);
+        s.record_consume("qwen2.5:7b", 50);
+        s.record_ledger(1000, "used", "qwen2.5:7b", "12D3KooWpeer", 100);
+        s.record_ledger(2000, "served", "tinyllama", "12D3KooWother", 40);
+        let v = s.snapshot();
+        assert_eq!(v.tokens_consumed, 150);
+        assert_eq!(v.requests_consumed, 2);
+        assert_eq!(v.consumed_per_model["qwen2.5:7b"].tokens, 150);
+        assert_eq!(v.consumed_per_model["qwen2.5:7b"].requests, 2);
+        // Newest-first ordering.
+        assert_eq!(v.recent.len(), 2);
+        assert_eq!(v.recent[0].kind, "served");
+        assert_eq!(v.recent[1].kind, "used");
+        // The ring is bounded at LEDGER_RING_CAP.
+        for i in 0..(LEDGER_RING_CAP + 25) {
+            s.record_ledger(i as u64, "used", "m", "p", 1);
+        }
+        assert_eq!(s.snapshot().recent.len(), LEDGER_RING_CAP);
     }
 
     /// Full loop: live loopback swarm node → StatusClient → HTTP server → parsed JSON,

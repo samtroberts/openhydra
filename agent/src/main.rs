@@ -474,7 +474,7 @@ fn run() -> Result<(), String> {
 
     match cli.role {
         Role::Provide(args) => provide(net, stats, economy, args),
-        Role::Serve(args) => serve(net, economy, args),
+        Role::Serve(args) => serve(net, stats, economy, args),
     }
 }
 
@@ -757,6 +757,7 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
 /// Consumer role: run the HTTP/SSE gateway until the process exits.
 fn serve(
     net: NetworkHandle,
+    stats: std::sync::Arc<TransferStats>,
     economy: std::sync::Arc<EconomyStats>,
     args: ServeArgs,
 ) -> Result<(), String> {
@@ -808,6 +809,6 @@ fn serve(
     let trusted_proxy = args.rate_limit.trusted_proxy;
     let embeddings = args.byok.embedding_config();
     let byok = args.byok.clone().into_config();
-    serve_http(net, economy, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings)
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

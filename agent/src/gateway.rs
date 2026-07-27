@@ -838,6 +838,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
 pub fn router(
     net: NetworkHandle,
     economy: Arc<EconomyStats>,
+    stats: Arc<crate::status::TransferStats>,
     api_key: Option<String>,
     store: Option<Store>,
     aup: AupPolicy,
@@ -850,6 +851,9 @@ pub fn router(
         Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
         None => ConsumerNode::new(net),
     };
+    // #7/#5: completions record per-model consumed tokens + `used` ledger rows into the shared
+    // transfer counters the status endpoint serves.
+    let node = node.with_stats(stats);
     let node = Arc::new(node);
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
@@ -897,6 +901,7 @@ pub fn router(
 pub fn serve_http(
     net: NetworkHandle,
     economy: Arc<EconomyStats>,
+    stats: Arc<crate::status::TransferStats>,
     bind: &str,
     api_key: Option<String>,
     store: Option<Store>,
@@ -911,7 +916,7 @@ pub fn serve_http(
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, economy, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg)
+        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })

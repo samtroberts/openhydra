@@ -549,6 +549,15 @@ impl<A: EngineAdapter> Provider<A> {
                     self.record_consumption(receipt);
                     if let Some(stats) = &self.stats {
                         stats.receipts_ledgered.fetch_add(1, Ordering::Relaxed);
+                        // #5 Ledger: a co-signed receipt is an authoritative "served" transaction
+                        // (right model/tokens, counterparty = the consumer we served).
+                        stats.record_ledger(
+                            now_unix_ms(),
+                            "served",
+                            &receipt.payload.model_id,
+                            source_peer,
+                            receipt.payload.tokens,
+                        );
                     }
                 }
                 response

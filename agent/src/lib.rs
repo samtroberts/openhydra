@@ -67,7 +67,7 @@ pub use gateway::serve_http;
 pub use hardening::harden_process;
 pub use http::ReqwestClient;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
-pub use status::{CreditEntry, EconomyStats, EconomyView, RepEntry, StatusServer, TransferStats};
+pub use status::{CreditEntry, EconomyStats, EconomyView, LedgerRow, RepEntry, StatusServer, TransferStats};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};
 
 /// An Ollama adapter backed by the live reqwest transport, pointed at `base_url`

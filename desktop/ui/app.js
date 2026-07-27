@@ -46,14 +46,25 @@
           known_models: ["tinyllama:latest", "llama3:latest", "qwen2.5:7b"],
           known_providers: [
             { model_id: "tinyllama:latest", openhydra_peer_id: "oh_asus", libp2p_peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7" },
+            { model_id: "tinyllama:latest", openhydra_peer_id: "oh_mac2", libp2p_peer_id: "12D3KooWSecondTiny99xyz" },
             { model_id: "qwen2.5:7b", openhydra_peer_id: "oh_gpu3", libp2p_peer_id: "12D3KooWEzegXr4qcjEW3WT" },
           ],
           counters: { dcutr_successes: 1, dcutr_failures: 0, reversal_dials: 0, reversal_successes: 0, tier_connect_success: { direct_quic_v4: 2, relay: 1 } },
         },
-        transfers: { requests_served: 3, tokens_served: 1280, serve_errors: 0, aup_refusals: 0, receipts_ledgered: 3, per_model: { "tinyllama:latest": { requests: 3, tokens: 1280, avg_native_tps: 73.2 } } },
+        transfers: {
+          requests_served: 3, tokens_served: 1280, serve_errors: 0, aup_refusals: 0, receipts_ledgered: 3,
+          requests_consumed: 2, tokens_consumed: 722,
+          per_model: { "tinyllama:latest": { requests: 3, tokens: 1280, avg_native_tps: 73.2 } },
+          consumed_per_model: { "qwen2.5:7b": { requests: 2, tokens: 722, avg_native_tps: 0 } },
+          recent: [
+            { ts_ms: Date.now() - 120000, kind: "served", model: "tinyllama:latest", counterparty: "12D3KooWEzegXr4qcjEW3WT", tokens: 128 },
+            { ts_ms: Date.now() - 840000, kind: "used", model: "qwen2.5:7b", counterparty: "12D3KooWM2qsVg5WbR6Asusn2XN7", tokens: 512 },
+            { ts_ms: Date.now() - 1860000, kind: "served", model: "tinyllama:latest", counterparty: "12D3KooWaBcSXB", tokens: 64 },
+          ],
+        },
         economy: {
           role: "consumer",
-          reputation: [{ openhydra_peer_id: "oh_asus", score: 72.5 }, { openhydra_peer_id: "oh_gpu3", score: 58.0 }],
+          reputation: [{ openhydra_peer_id: "oh_asus", score: 72.5 }, { openhydra_peer_id: "oh_mac2", score: 64.0 }, { openhydra_peer_id: "oh_gpu3", score: 58.0 }],
           credit: [{ libp2p_peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7", balance: 5123.4, rate_cap: 1.0 }, { libp2p_peer_id: "12D3KooWEzegXr4qcjEW3WT", balance: 4880.1 }],
           avg_reputation: 65.3, total_credit: 10003.5,
         },
@@ -74,6 +85,22 @@
     if (cmd === "web_search") return [];
     if (cmd === "load_sessions") return "";                       // #1 (mock: nothing persisted)
     if (cmd === "save_sessions") return null;                     // #1
+    if (cmd === "load_stats") {                                   // #7/#10 seeded history for preview
+      const now = Date.now(), HR = 3600000, hk = (ms) => Math.floor(ms / HR), models = {};
+      const mk = (id, sDay, uDay, days) => {
+        const m = { firstServed: now - days * 86400000, firstUsed: now - days * 86400000, servedTotal: 0, usedTotal: 0, lastServed: 0, lastUsed: 0, buckets: {} };
+        for (let d = 0; d < days; d++) for (let h = 0; h < 24; h += 3) {
+          const k = hk(now - d * 86400000 - h * HR);
+          const s = Math.round(sDay / 8 * (0.4 + Math.random())), u = Math.round(uDay / 8 * (0.4 + Math.random()));
+          const b = (m.buckets[k] ||= { s: 0, u: 0 }); b.s += s; b.u += u; m.servedTotal += s; m.usedTotal += u;
+        }
+        models[id] = m;
+      };
+      mk("tinyllama:latest", 1800, 150, 9); mk("llama3.2:1b", 900, 500, 6); mk("qwen2.5:7b", 0, 1300, 5);
+      mk("phi3:mini", 600, 0, 12);   // previously served, no longer loaded → shows as "inactive"
+      return JSON.stringify({ models });
+    }
+    if (cmd === "save_stats") return null;                        // #7
     if (cmd === "device_hostname") return "Sam’s MacBook Air";    // #9
     if (cmd === "export_logs") return "~/.openhydra/openhydra-logs-1785200000.txt"; // #4
     return null;
@@ -155,6 +182,80 @@
   const ROLL_MAX = 30;
   function pushSample(arr, v, key) { if (v == null || !isFinite(v)) return; arr.push(v); while (arr.length > ROLL_MAX) arr.shift(); store.set(key, arr); }
   const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+
+  // ── #7/#10: lifetime served/consumed model stats + hourly time-series ────────────────────
+  // The agent's per-model counters reset to zero every process restart, so the DURABLE lifetime
+  // totals + timeline live here. On each poll we diff the agent's cumulative counters and fold
+  // the delta into hourly buckets (a Prometheus-style counter→rate), anchored at each model's
+  // first token. Persisted to ~/.openhydra/stats.json via the Tauri backend (localStorage isn't
+  // durable in the WebView). served = provider's `per_model`; used = gateway's `consumed_per_model`.
+  const HOUR_MS = 3600000, STATS_KEEP_HOURS = 24 * 31;   // ~31 days of hourly buckets
+  let statsDB = { models: {} };                          // hydrated on boot from load_stats
+  let statsDirty = false, statsSaveT = 0;
+  function hourKey(ms) { return Math.floor(ms / HOUR_MS); }
+  function statModel(id) {
+    return (statsDB.models[id] ||= { firstServed: null, firstUsed: null, servedTotal: 0, usedTotal: 0, lastServed: 0, lastUsed: 0, buckets: {} });
+  }
+  // Fold one cumulative counter reading into a per-model lifetime total + current-hour bucket.
+  // `raw` is the agent's since-boot counter; a value < the last reading means the agent restarted
+  // (counter reset to 0), so the whole `raw` is the fresh delta.
+  function foldCounter(m, raw, field, bucketField, now) {
+    raw = Math.max(0, Math.round(raw || 0));
+    const last = m[field];
+    const delta = raw >= last ? raw - last : raw;
+    m[field] = raw;
+    if (delta <= 0) return;
+    const totalField = field === "lastServed" ? "servedTotal" : "usedTotal";
+    const firstField = field === "lastServed" ? "firstServed" : "firstUsed";
+    m[totalField] += delta;
+    if (m[firstField] == null) m[firstField] = now;       // first-token anchor (no synthetic back-fill)
+    const b = (m.buckets[hourKey(now)] ||= { s: 0, u: 0 });
+    b[bucketField] += delta;
+  }
+  function accumulateStats() {
+    if (!snap?.transfers) return;
+    const now = Date.now(), t = snap.transfers;
+    for (const [id, pm] of Object.entries(t.per_model || {})) foldCounter(statModel(id), pm.tokens, "lastServed", "s", now);
+    for (const [id, pm] of Object.entries(t.consumed_per_model || {})) foldCounter(statModel(id), pm.tokens, "lastUsed", "u", now);
+    // Prune buckets older than the retention window (keeps stats.json bounded).
+    const floor = hourKey(now) - STATS_KEEP_HOURS;
+    for (const m of Object.values(statsDB.models)) for (const k in m.buckets) if (+k < floor) delete m.buckets[k];
+    statsDirty = true;
+    const nowT = Date.now();
+    if (nowT - statsSaveT > 8000) { statsSaveT = nowT; statsDirty = false; try { call("save_stats", { data: JSON.stringify(statsDB) }); } catch {} }
+  }
+  async function loadStats() {
+    try { const blob = await call("load_stats"); if (blob) { const d = JSON.parse(blob); if (d && d.models) statsDB = d; } } catch {}
+  }
+  const lifetimeServed = (id) => statsDB.models[id]?.servedTotal || 0;
+  const lifetimeUsed = (id) => statsDB.models[id]?.usedTotal || 0;
+  const statModels = () => Object.keys(statsDB.models);
+  // Durable lifetime totals across all models. Fall back to the agent's since-boot counter (or the
+  // legacy desktop-chat counter) until the accumulator has data — so a fresh install still shows
+  // something. `used` now derives from the gateway's per-model consumed tracking, so it counts
+  // tokens consumed by external OpenAI clients (e.g. a coding agent), not just in-app chats.
+  const totalServed = () => Object.values(statsDB.models).reduce((a, m) => a + (m.servedTotal || 0), 0) || (snap?.transfers?.tokens_served ?? 0);
+  const totalUsed = () => Object.values(statsDB.models).reduce((a, m) => a + (m.usedTotal || 0), 0) || (snap?.transfers?.tokens_consumed ?? usedTokens);
+  // Aggregate buckets for a range into ordered time-slots, each a per-model {s,u}. 24h → hourly
+  // (24 slots), 7d/30d → daily. Returns { slots:[{label,models:{id:{s,u}}}], models:Set }.
+  function statsSeries(range) {
+    const now = Date.now();
+    const spans = { "24h": { n: 24, ms: HOUR_MS }, "7d": { n: 7, ms: 86400000 }, "30d": { n: 30, ms: 86400000 } };
+    const sp = spans[range] || spans["24h"];
+    const slots = [], models = new Set();
+    for (let i = sp.n - 1; i >= 0; i--) {
+      const end = now - i * sp.ms, start = end - sp.ms;
+      const slot = { end, models: {} };
+      const kLo = hourKey(start), kHi = hourKey(end);
+      for (const [id, m] of Object.entries(statsDB.models)) {
+        let s = 0, u = 0;
+        for (let k = kLo; k < kHi; k++) { const b = m.buckets[k]; if (b) { s += b.s; u += b.u; } }
+        if (s || u) { slot.models[id] = { s, u }; models.add(id); }
+      }
+      slots.push(slot);
+    }
+    return { slots, models, span: sp };
+  }
 
   // ── economy (M2.2 reputation + M2.3 credit), surfaced by the agent status endpoint ──
   // reputation is keyed by OpenHydra peer id; credit by libp2p peer id. known_providers
@@ -419,6 +520,83 @@
     else if (activeView === "settings") renderSettings();
     else if (activeView === "chat") renderChat();
   }
+  // #7: hide previously-served-but-now-inactive models from the serve list.
+  let hideInactive = store.get("oh_hideinactive", false);
+  // #10: selected timeline range per chart host (persisted).
+  const chartRange = store.get("oh_chartrange", { share: "7d", activity: "7d" });
+  // Stable per-model hue for the timeline + legend.
+  function modelColor(id) { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 60% 55%)`; }
+  function fmtNum(n) { n = Math.round(n); return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n); }
+  // #10: inline-SVG served-vs-used timeline, stacked by model, with a 24h/7d/30d range selector.
+  // Self-contained (no chart lib — CSP-safe). `hostKey` = "share" | "activity".
+  function renderChart(hostSel, hostKey) {
+    const host = $(hostSel); if (!host) return;
+    const range = chartRange[hostKey] || "7d";
+    const { slots, models } = statsSeries(range);
+    // Rank models by lifetime volume in-window; keep top 6, fold the rest into "other".
+    const vol = {}; for (const s of slots) for (const [id, v] of Object.entries(s.models)) vol[id] = (vol[id] || 0) + v.s + v.u;
+    const top = Object.keys(vol).sort((a, b) => vol[b] - vol[a]).slice(0, 6);
+    const topSet = new Set(top);
+    const colorOf = (id) => topSet.has(id) ? modelColor(id) : "hsl(var(--muted-foreground))";
+    const hasData = Object.keys(vol).length > 0;
+    // Chart geometry (viewBox units; scales responsively).
+    const W = 640, H = 150, padL = 8, padR = 8, padB = 18, padT = 8, plotH = H - padB - padT;
+    const n = slots.length, groupW = (W - padL - padR) / n, barW = Math.min(14, groupW * 0.36);
+    let maxV = 1; for (const s of slots) { let sv = 0, uv = 0; for (const v of Object.values(s.models)) { sv += v.s; uv += v.u; } maxV = Math.max(maxV, sv, uv); }
+    const y = (v) => padT + plotH - (v / maxV) * plotH;
+    const rangeLabel = { "24h": "last 24 hours", "7d": "last 7 days", "30d": "last 30 days" }[range];
+    const xLabels = () => {
+      const step = range === "24h" ? 6 : range === "7d" ? 1 : 5, out = [];
+      for (let i = 0; i < n; i++) if (i % step === 0) {
+        const cx = padL + i * groupW + groupW / 2;
+        const end = slots[i].end, d = new Date(end);
+        const lbl = range === "24h" ? d.getHours() + "h" : (d.getMonth() + 1) + "/" + d.getDate();
+        out.push(`<text x="${cx.toFixed(1)}" y="${H - 5}" text-anchor="middle" font-size="9" fill="hsl(var(--muted-foreground))">${lbl}</text>`);
+      }
+      return out.join("");
+    };
+    let bars = "";
+    slots.forEach((s, i) => {
+      const gx = padL + i * groupW;
+      // served bar (left), used bar (right); each stacked by model.
+      const stack = (entries, x0, key) => {
+        let acc = 0, seg = "";
+        // stable order: top models first, then others
+        const ids = Object.keys(entries).sort((a, b) => (vol[b] || 0) - (vol[a] || 0));
+        for (const id of ids) {
+          const val = entries[id][key]; if (!val) continue;
+          const h = (val / maxV) * plotH, yTop = y(acc + val);
+          seg += `<rect x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, h).toFixed(1)}" fill="${colorOf(id)}" opacity="${key === "u" ? 0.55 : 1}"><title>${esc(id)} · ${key === "s" ? "served" : "used"} ${val}</title></rect>`;
+          acc += val;
+        }
+        return seg;
+      };
+      const gap = 2, cx = gx + groupW / 2;
+      bars += stack(s.models, cx - barW - gap / 2, "s");
+      bars += stack(s.models, cx + gap / 2, "u");
+    });
+    const legend = hasData
+      ? top.map((id) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:hsl(var(--muted-foreground))"><span style="width:9px;height:9px;border-radius:2px;background:${modelColor(id)}"></span>${esc(id)}</span>`).join("")
+        + (Object.keys(vol).length > 6 ? `<span style="font-size:11px;color:hsl(var(--muted-foreground))">+${Object.keys(vol).length - 6} more</span>` : "")
+      : "";
+    const chip = (r) => `<span class="btn ${range === r ? "outline" : "ghost"} sm chartrange" data-r="${r}" data-host="${hostKey}" style="padding:2px 8px;font-size:11px">${r}</span>`;
+    host.innerHTML = `
+      <div class="row" style="align-items:center;margin-bottom:6px"><div class="ctitle" style="font-size:13px">Served vs used · ${rangeLabel}</div><div class="grow"></div>${chip("24h")}${chip("7d")}${chip("30d")}</div>
+      ${hasData
+        ? `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="display:block">
+             <line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="hsl(var(--border))" stroke-width="1"/>
+             ${bars}${xLabels()}
+           </svg>
+           <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;align-items:center">
+             <span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:hsl(var(--muted-foreground))"><span style="width:9px;height:9px;border-radius:2px;background:hsl(var(--foreground))"></span>served (solid) · used (faded)</span>
+             ${legend}
+           </div>`
+        : `<div class="mut" style="padding:28px 0;text-align:center;font-size:12.5px">No served or used tokens in the ${rangeLabel} yet.<br/>Serve a model or run a chat — the timeline fills in from your node's activity.</div>`}
+    `;
+    $$(`${hostSel} .chartrange`).forEach((c) => c.onclick = () => { chartRange[hostKey] = c.dataset.r; store.set("oh_chartrange", chartRange); renderChart(hostSel, hostKey); });
+  }
+  const engineFor = (m) => { for (const e of engines) if (e.models.includes(m)) return e.label; return null; };
+
   function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
     const head = $("#v-share .row .ctitle").parentElement;
@@ -427,13 +605,14 @@
     const up = snap?.uptime_secs != null ? ` · up ${fmtUptime(snap.uptime_secs)}` : "";
     head.querySelector(".mut").textContent = `${running ? (p.announced ?? 0) : 0} models announced · gateway :8080${up}`;
     const k = $$("#v-share .g4 .kpi .val");
-    const served = t?.tokens_served ?? 0;
+    // #7: durable lifetime totals (survive restart; `used` counts external clients too).
+    const served = totalServed(), used = totalUsed();
     // #3 fix: "Credits earned" = net CONTRIBUTION (served − used), which RISES with serving and
     // falls with using — the earlier `economy.total_credit` summed counterparty balances and
     // moved the wrong way (provider's number dropped on serve). Contribution-based per decision.
-    const netCredits = served - usedTokens;
-    const ratio = usedTokens > 0 ? (served / usedTokens) : (served > 0 ? null : 0);
-    k[0].textContent = served;
+    const netCredits = served - used;
+    const ratio = used > 0 ? (served / used) : (served > 0 ? null : 0);
+    k[0].textContent = fmtNum(served);
     k[1].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[2].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     k[3].textContent = "—";   // own reputation is held by the peers we serve — not locally knowable
@@ -441,9 +620,30 @@
     $$("#v-share .g4 .kpi .sub")[1].textContent = "contribution · served − used (not money)";
     $$("#v-share .g4 .kpi .sub")[2].textContent = "served ÷ used";
     $$("#v-share .g4 .kpi .sub")[3].innerHTML = `<span class="mut">earned on the peers you serve</span>`;
-    const per = t?.per_model || {}, rows = [];
-    for (const e of engines) for (const m of e.models) { const pm = per[m] || {}; rows.push(`<tr><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(e.label)}</td><td class="num">${pm.requests ?? "—"}</td><td class="num">${pm.tokens ?? "—"}</td><td class="num">${pm.avg_native_tps ? Math.round(pm.avg_native_tps) : "—"}</td><td><span class="badge ${running ? "ok" : "secondary"}">${running ? "live" : "ready"}</span></td><td><div class="switch ${running ? "on" : ""}" data-announce></div></td></tr>`); }
+    // #7: LIFETIME served-models list. Active = a model an installed engine can serve right now;
+    // inactive = previously served (lifetime tokens on record) but not currently loaded — shown
+    // dimmed, hideable. Lifetime tokens come from the durable accumulator so they survive restart.
+    const per = t?.per_model || {};
+    const active = new Set(engines.flatMap((e) => e.models));
+    const lifetime = statModels().filter((id) => lifetimeServed(id) > 0);
+    const allModels = [...new Set([...engines.flatMap((e) => e.models), ...lifetime])]
+      .sort((a, b) => (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0));
+    const rows = [];
+    for (const m of allModels) {
+      const isActive = active.has(m);
+      if (!isActive && hideInactive) continue;
+      const pm = per[m] || {};
+      const tokens = lifetimeServed(m) || pm.tokens || 0;
+      const reqs = pm.requests ?? "—";
+      const tps = pm.avg_native_tps ? Math.round(pm.avg_native_tps) : "—";
+      const status = isActive ? `<span class="badge ${running ? "ok" : "secondary"}">${running ? "live" : "ready"}</span>` : `<span class="badge secondary">inactive</span>`;
+      const ann = isActive ? `<div class="switch ${running ? "on" : ""}" data-announce></div>` : `<span class="mut" style="font-size:11px">—</span>`;
+      rows.push(`<tr${isActive ? "" : ' style="opacity:.5"'}><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td>${ann}</td></tr>`);
+    }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
+    const hb = $("#hideinactive");
+    if (hb) { const anyInactive = allModels.some((m) => !active.has(m)); hb.style.display = anyInactive ? "" : "none"; hb.classList.toggle("outline", hideInactive); hb.classList.toggle("ghost", !hideInactive); hb.textContent = hideInactive ? "Show inactive" : "Hide inactive"; hb.onclick = () => { hideInactive = !hideInactive; store.set("oh_hideinactive", hideInactive); renderShare(); }; }
+    renderChart("#sharechart", "share");   // #10 timeline
     $("#v-share .badge.ok, #v-share .badge").parentElement && ($$("#v-share .card .row .badge")[0]);
     const ann = $("#v-share .card .row .badge.ok") || $("#servetable").closest(".card").querySelector(".badge");
     if (ann) { ann.textContent = `${running ? engines.reduce((n, e) => n + e.models.length, 0) : 0} announced`; ann.className = "badge " + (running && engines.length ? "ok" : "secondary"); }
@@ -455,6 +655,9 @@
     // wanted table — honest empty state until demand telemetry lands
     $("#wanttable tbody").innerHTML = `<tr><td colspan="4" class="mut">Fills in as network demand telemetry lands.</td></tr>`;
   }
+  // #11b: which model rows are expanded to show their per-provider breakdown. A Set so the
+  // 2.5s poll re-render doesn't collapse an open row (mirrors the peers-filter persistence rule).
+  const expandedProviders = new Set();
   function renderProviders() {
     const models = netModels();
     const local = new Set(state?.provider?.status?.running ? engines.flatMap((e) => e.models) : []);
@@ -466,15 +669,34 @@
     $("#provcount").textContent = models.length;
     const q = ($("#search").value || "").toLowerCase();
     const byOh = repByOpenhydra();
+    // Group the announced providers by model so a model served by several peers can expand (#11b).
+    const provsByModel = {};
+    for (const p of (snap?.network?.known_providers || [])) (provsByModel[p.model_id] ||= []).push(p);
     const rows = models.filter((m) => !q || m.toLowerCase().includes(q)).map((m) => {
+      const remote = provsByModel[m] || [];
       const cnt = (seenCount[m] || 0) + (local.has(m) ? 1 : 0);   // last-known count, sticky
       const tps = modelAvgTps(m);                                  // only for models we serve
       const rep = modelReputation(m, byOh);                        // earned rep of its providers
-      return `<tr class="prov" data-cat="${modelCat(m)}"><td>${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
+      const canExpand = remote.length > 1;                         // >1 provider → disclosure
+      const open = expandedProviders.has(m);
+      const caret = canExpand ? `<span class="prowtog" data-m="${esc(m)}" style="cursor:pointer;display:inline-block;width:14px;color:hsl(var(--muted-foreground));transition:transform .12s;transform:rotate(${open ? 90 : 0}deg)">▸</span>` : '<span style="display:inline-block;width:14px"></span>';
+      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"><td>${caret}${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
+      if (canExpand && open) {
+        html += remote.map((p) => {
+          const prep = byOh[p.openhydra_peer_id];
+          return `<tr class="provsub" data-cat="${modelCat(m)}" data-for="${esc(m)}"><td style="padding-left:34px"><span class="mono mut">${peerShort(p.libp2p_peer_id)}</span></td><td class="num mut">1</td><td class="num mut">—</td><td>${repBadge(prep)}</td><td class="num mut">—</td></tr>`;
+        }).join("");
+      }
+      return html;
     });
     $("#provtable tbody").innerHTML = rows.join("") || `<tr><td colspan="5" class="mut">${snap ? "No models discovered yet — they appear as peers announce." : "Connecting…"}</td></tr>`;
     const cat = $("#provchips .chip.on")?.dataset.cat || "all";
-    $$("#provtable .prov").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none");
+    $$("#provtable .prov, #provtable .provsub").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none");
+    $$("#provtable .prowtog").forEach((tog) => tog.onclick = (e) => {
+      e.stopPropagation(); const m = tog.dataset.m;
+      if (expandedProviders.has(m)) expandedProviders.delete(m); else expandedProviders.add(m);
+      renderProviders();
+    });
   }
   const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama-cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["Exo", "exo", "Shard big models across your devices."]];
   function renderEngines() {
@@ -495,11 +717,11 @@
   }
   function renderActivity() {
     const t = snap?.transfers, k = $$("#v-activity .g4 .kpi .val");
-    const served = t?.tokens_served ?? 0;
-    const netCredits = served - usedTokens;   // #3: net balance rises with serving, falls with using
-    const ratio = usedTokens > 0 ? (served / usedTokens) : (served > 0 ? null : 0);
-    k[0].textContent = served;
-    k[1].textContent = usedTokens;
+    const served = totalServed(), used = totalUsed();   // #7 durable lifetime totals
+    const netCredits = served - used;   // #3: net balance rises with serving, falls with using
+    const ratio = used > 0 ? (served / used) : (served > 0 ? null : 0);
+    k[0].textContent = fmtNum(served);
+    k[1].textContent = fmtNum(used);
     k[2].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[3].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     $$("#v-activity .g4 .kpi .sub")[0].innerHTML = `<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} receipts co-signed`;
@@ -517,11 +739,30 @@
       if (snap?.uptime_secs != null) parts.push(`node up ${fmtUptime(snap.uptime_secs)}`);
       note.textContent = (parts.length ? `Your recent chats: ${parts.join(" · ")}. ` : "") + "Full transaction history lives in Network › Ledger.";
     }
+    renderChart("#actchart", "activity");   // #10 timeline
   }
+  // Relative "Nm ago" timestamp for the ledger rows.
+  function relTime(ms) {
+    const s = Math.max(0, (Date.now() - ms) / 1000);
+    if (s < 60) return Math.round(s) + "s ago";
+    const m = s / 60; if (m < 60) return Math.round(m) + "m ago";
+    const h = m / 60; if (h < 24) return Math.round(h) + "h ago";
+    return Math.round(h / 24) + "d ago";
+  }
+  // #5: real ledger rows from the agent's recent-transaction ring (served rows from the provider
+  // process, used rows from the gateway; merged + newest-first by the desktop). The credit column
+  // is a signed contribution unit (served +, used −; "not money"), not a wallet balance.
   function renderLedger() {
-    const t = snap?.transfers;
-    $("#v-ledger .row .mut").textContent = `${t?.receipts_ledgered ?? 0} receipts · ${t?.tokens_served ?? 0} tokens served`;
-    $("#ledgertable tbody").innerHTML = `<tr><td colspan="6" class="mut">Receipts are co-signed and stored by the agent — the per-transaction view lands with the credit ledger.</td></tr>`;
+    const t = snap?.transfers, rows = t?.recent || [];
+    $("#v-ledger .row .mut").textContent = rows.length
+      ? `${rows.length} recent · ${t?.receipts_ledgered ?? 0} co-signed · ${t?.tokens_served ?? 0} served / ${t?.tokens_consumed ?? 0} used tokens`
+      : `${t?.receipts_ledgered ?? 0} receipts · ${t?.tokens_served ?? 0} tokens served`;
+    $("#ledgertable tbody").innerHTML = rows.length
+      ? rows.slice(0, 100).map((r) => {
+          const served = r.kind === "served", cr = (served ? "+" : "−") + (r.tokens / 100).toFixed(1);
+          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td>${modelIcon(r.model)}${esc(r.model)}</td><td class="mono">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
+        }).join("")
+      : `<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`;
   }
   function renderConnectors() {
     $("#v-connectors .cp") && $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied"); });
@@ -584,7 +825,7 @@
     if (state) { if (!anyOn) { dot = ""; label = "Ready — connecting…"; } else if (peers > 0) { dot = "ok pulse"; label = "Connected"; } else { dot = "warn pulse"; label = "Connecting to network…"; } }
     $("#netdot").className = "dot " + dot; $("#netlabel").textContent = label;
     $("#sbpeers").textContent = `${peers} peers`;
-    $("#sbserved").textContent = snap?.transfers?.tokens_served ?? 0; $("#sbused").textContent = usedTokens;
+    $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
     $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:8080/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
     $("#sharingsw").classList.toggle("on", !!p?.running);
     $("#sidepeer").textContent = `${deviceName} · ${shortPeer(p?.peer_id || g?.peer_id)}`;
@@ -602,7 +843,7 @@
   $("#logchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#logchips .chip").forEach((x) => x.classList.toggle("on", x === c)); logTab = c.dataset.log === "gateway" ? "gateway" : "provider"; renderLogs(); };
   $("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); } };
   $("#cmdk").onclick = (e) => { e.stopPropagation(); menu($("#cmdk"), Object.keys(titles).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); };
-  $("#traymark").onclick = (e) => { e.stopPropagation(); menu($("#traymark"), [{ label: "Launch OpenHydra", fn: () => {} }, { sep: 1 }, { label: "Sharing", on: !!state?.provider?.status?.running, fn: toggleSharing }, { label: "Model · " + (netModels()[0] || "—"), fn: () => {} }, { sep: 1 }, { label: `▲ ${snap?.transfers?.tokens_served ?? 0} served`, fn: () => {} }, { label: `▼ ${usedTokens} used`, fn: () => {} }, { sep: 1 }, { label: "Quit OpenHydra", fn: () => call("quit") }]); };
+  $("#traymark").onclick = (e) => { e.stopPropagation(); menu($("#traymark"), [{ label: "Launch OpenHydra", fn: () => {} }, { sep: 1 }, { label: "Sharing", on: !!state?.provider?.status?.running, fn: toggleSharing }, { label: "Model · " + (netModels()[0] || "—"), fn: () => {} }, { sep: 1 }, { label: `▲ ${fmtNum(totalServed())} served`, fn: () => {} }, { label: `▼ ${fmtNum(totalUsed())} used`, fn: () => {} }, { sep: 1 }, { label: "Quit OpenHydra", fn: () => call("quit") }]); };
   $("#addmodel") && ($("#addmodel").onclick = (e) => { e.stopPropagation(); const opts = engines.flatMap((e) => e.models.map((m) => ({ label: `${m} · ${e.label}`, fn: () => toggleSharing() }))); menu($("#addmodel"), opts.length ? opts : [{ label: "No engine models — start an engine", fn: () => go("engines") }]); });
 
   // ── settings ──
@@ -667,7 +908,7 @@
   // ── polling ──
   async function refresh() { try { state = await call("get_state"); } catch {} renderStatusbar(); if (["share", "settings", "connectors", "engines", "activity", "ledger"].includes(activeView)) renderView(); if (activeView === "peers") renderLogs(); }
   async function refreshEngines() { try { engines = await call("detect_engines_now"); } catch { engines = []; } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
-  async function refreshStatus() { try { snap = await call("status_snapshot"); } catch { snap = null; } noteSeen(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
+  async function refreshStatus() { try { snap = await call("status_snapshot"); } catch { snap = null; } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
   $$(".enginst, #refreshEngines").forEach(() => {});
 
   // ── boot ──
@@ -676,6 +917,7 @@
   (async () => {
     // #1: hydrate chat sessions from the durable backend file (localStorage is only a cache).
     try { const blob = await call("load_sessions"); if (blob) { const d = JSON.parse(blob); if (d.sessions) sessions = d.sessions; if (d.order) sessionOrder = d.order; if (d.device) deviceName = d.device; if (typeof d.used === "number") { usedTokens = d.used; store.set("oh_used", usedTokens); } } } catch {}
+    await loadStats();   // #7/#10: hydrate lifetime model stats + timeline buckets from disk
     // #9: default device name from the OS if the user hasn't set/restored one.
     if (!deviceName) { try { deviceName = await call("device_hostname"); } catch {} if (!deviceName) deviceName = /Mac/.test(navigator.platform) ? "This Mac" : "This machine"; store.set("oh_device", deviceName); }
     renderRecents(); renderStatusbar();
