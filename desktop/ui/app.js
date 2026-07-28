@@ -350,7 +350,14 @@
   // DHT provider records expire (~300s TTL) and re-propagate on their own schedule, so the raw
   // known_models snapshot flickers. Keep a model "sticky" for STICKY_MS after we last saw it so
   // the Providers list and model picker stay calm instead of blinking rows in and out.
-  const STICKY_MS = 90000;
+  // W2: hold a model listed up to 3 min after we last saw it. This rides transient gossip gaps /
+  // relay blips (a live provider that briefly drops out of known_models on a connection loss)
+  // WITHOUT ever exceeding the network's own ~300s record TTL — so the UI never claims a provider
+  // is alive longer than the network itself does. A provider that genuinely stops is dropped once
+  // it's been absent past STICKY_MS, and the real liveness gate is request-time discovery (a dead
+  // pick returns a clean "no provider", never a hang).
+  const STICKY_MS = 180000;
+  const IDLE_MS = 130000;  // seen within this = "live"; IDLE_MS..STICKY_MS = "idle" (dimmed).
   const seenModels = {};   // model -> last-seen ms
   const seenCount = {};    // model -> last-known provider count
   function noteSeen() {
@@ -359,6 +366,13 @@
     const provs = snap?.network?.known_providers || [];
     const c = {}; for (const p of provs) c[p.model_id] = (c[p.model_id] || 0) + 1;
     for (const m in c) seenCount[m] = c[m];
+  }
+  // A model still listed only because of stickiness (seen, but not within the last IDLE_MS) — shown
+  // dimmed/"idle", an honest "unconfirmed this instant" signal. Locally-served models are always live.
+  function modelIdle(m) {
+    if (state?.provider?.status?.running && engines.some((e) => e.models.includes(m))) return false;
+    const t = seenModels[m];
+    return t != null && (Date.now() - t) > IDLE_MS;
   }
   function netModels() {
     const now = Date.now();
@@ -680,7 +694,8 @@
       const canExpand = remote.length > 1;                         // >1 provider → disclosure
       const open = expandedProviders.has(m);
       const caret = canExpand ? `<span class="prowtog" data-m="${esc(m)}" style="cursor:pointer;display:inline-block;width:14px;color:hsl(var(--muted-foreground));transition:transform .12s;transform:rotate(${open ? 90 : 0}deg)">▸</span>` : '<span style="display:inline-block;width:14px"></span>';
-      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"><td>${caret}${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
+      const idle = modelIdle(m);   // W2: seen but quiet → dim, don't drop (rides gossip gaps)
+      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"${idle ? ' style="opacity:.5"' : ""}><td>${caret}${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : idle ? ' <span class="mut" style="font-size:10.5px">· idle</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
       if (canExpand && open) {
         html += remote.map((p) => {
           const prep = byOh[p.openhydra_peer_id];

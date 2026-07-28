@@ -2556,7 +2556,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openhydra-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "base64",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "openhydra-network"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "openhydra-protocol"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ed25519-dalek",
  "hex",
