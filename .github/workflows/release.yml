@@ -11,8 +11,10 @@
 # and a mutable  latest/  prefix (stable filenames), plus a  latest.json  manifest that
 # the landing page + install.sh read. Serve the bucket at https://dl.openhydra.co.
 #
-# Signing/notarization is intentionally NOT wired yet (needs the Apple Developer ID /
-# Windows cert secrets); bundles are unsigned.
+# macOS code-signing + notarization IS wired (see the "Build desktop app" step): set the
+# APPLE_* repo secrets to produce a signed + notarized .dmg (no Gatekeeper warning) — setup in
+# docs/MACOS_SIGNING.md. Without them the build is unsigned, as before. Windows signing (an
+# Authenticode/EV cert for SmartScreen) is still TODO.
 #
 # Secrets required for the publish-r2 job (repo → Settings → Secrets → Actions):
 #   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
@@ -94,15 +96,32 @@ jobs:
       - name: Build desktop app
         working-directory: desktop
         env:
+          # Tauri updater signatures (minisign) — the sibling `.sig` the auto-updater verifies.
+          # DISTINCT from Apple code-signing below.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple Developer ID code-signing + notarization (macOS only). Tauri reads these during
+          # `tauri build`: imports the .p12, signs the .app + sidecar with hardened runtime, and
+          # notarizes + staples the .dmg. Unset ⇒ an unsigned build (Gatekeeper warns), as before.
+          # Set these as repository secrets to turn signing on — see docs/MACOS_SIGNING.md.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           npm ci || npm install
+          if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "Apple Developer ID present → macOS build will be SIGNED + NOTARIZED"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            echo "::warning::No APPLE_SIGNING_IDENTITY → macOS build is UNSIGNED (Gatekeeper will warn)"
+          fi
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo "Signing key present → building signed updater artifacts"
+            echo "Updater signing key present → building signed updater artifacts"
             npm exec tauri build -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
           else
-            echo "No signing key → normal build (updater artifacts skipped)"
+            echo "No updater signing key → normal build (updater artifacts skipped)"
             npm exec tauri build
           fi
         shell: bash
