@@ -16,6 +16,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// An error from talking to, or interpreting, an engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,14 +103,75 @@ pub trait HttpClient {
 
 /// One chat message in an inference request. Serializable — it crosses the swarm as
 /// part of a serve request (see [`crate::serve`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `content` tolerates an explicit JSON `null` on deserialize (OpenAI sends
+/// `content: null` on an assistant turn that only made tool calls) → the empty string, so
+/// a coding-agent request never 400s on a well-formed tool-call turn.
+///
+/// `tool_calls` / `tool_call_id` / `name` carry a multi-turn tool exchange across the wire:
+/// an assistant turn that requested tools (`tool_calls`), and the `role:"tool"` result
+/// messages that answer them (`tool_call_id` + `content`). All three are absent on an
+/// ordinary user/assistant message and `skip_serializing_if`-elided, so a plain message
+/// serialises exactly as before (older providers see an unchanged shape).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default, deserialize_with = "de_string_or_null")]
     pub content: String,
+    /// Assistant turn: the tool calls the model previously requested (OpenAI `tool_calls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// `role:"tool"` message: which tool call this is the result of (OpenAI `tool_call_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional author / tool name (OpenAI `name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// A plain text message (no tool-call state) — the common case.
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: role.into(), content: content.into(), ..Default::default() }
+    }
+}
+
+/// Deserialize a string that a client may send as JSON `null` → `""`. `#[serde(default)]`
+/// alone only covers an *absent* key; this also maps a present-but-null value.
+fn de_string_or_null<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(de)?.unwrap_or_default())
+}
+
+/// One OpenAI tool call the model requested (`type: "function"`). `arguments` is the raw
+/// JSON *string* the model emitted (the OpenAI wire shape) — passed through verbatim so we
+/// never reshape or lose what the model produced. Terminal, structured data: it rides the
+/// [`ServeOutcome`] return value, not the text `on_delta` stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "tool_call_type_function")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+/// The `function` payload of a [`ToolCall`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// JSON-encoded argument object, kept as a string (OpenAI convention).
+    #[serde(default)]
+    pub arguments: String,
+}
+
+fn tool_call_type_function() -> String {
+    "function".to_string()
 }
 
 /// A request to serve a streaming chat completion from an engine.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct InferenceRequest {
     /// The engine's handle for the model (e.g. Ollama's `"qwen2.5:7b"`) — i.e.
     /// [`DetectedModel::engine_ref`].
@@ -118,6 +180,9 @@ pub struct InferenceRequest {
     /// Cap on generated tokens, if any.
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
+    /// OpenAI `tools` specs, forwarded opaquely to the engine (empty ⇒ no tools). Carried
+    /// as raw JSON so the adapter hands the engine exactly what the client sent.
+    pub tools: Vec<Value>,
 }
 
 /// Raw counters/timings the engine itself reports for one request — Ollama's
@@ -141,7 +206,7 @@ pub struct EngineMetrics {
 }
 
 /// The result of a served stream, after the last token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServeOutcome {
     /// Completion tokens generated — the engine's own count where it reports one (Ollama
     /// `eval_count`), else the number of non-empty content chunks emitted. Feeds the
@@ -151,6 +216,10 @@ pub struct ServeOutcome {
     pub done: bool,
     /// The engine's own per-request metrics (Ollama `eval_*`/`prompt_eval_*`/`load_*`).
     pub engine: EngineMetrics,
+    /// Tool calls the model requested this turn (OpenAI `tool_calls`), empty when none.
+    /// Terminal structured data — carried on the return value, not via `on_delta` (which is
+    /// text-only). The provider relays these back as a [`ServeChunk::ToolCalls`] frame.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// A model an engine currently serves, ready to advertise to the swarm.
@@ -206,4 +275,79 @@ pub struct EmbeddingResponse {
 pub trait EmbeddingAdapter {
     /// Embed each of `inputs` with `model`, returning one vector per input (in order).
     fn embed(&self, model: &str, inputs: &[String]) -> Result<EmbeddingResponse, AdapterError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_tolerates_explicit_null() {
+        // OpenAI sends `content: null` on an assistant turn that only made tool calls — that
+        // must deserialize (→ "") rather than 400 the request.
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        assert_eq!(m.content, "");
+        // An absent `content` key also defaults to empty.
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user"}"#).unwrap();
+        assert_eq!(m.content, "");
+        // A normal string is preserved unchanged.
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert_eq!(m.content, "hi");
+    }
+
+    #[test]
+    fn plain_message_serialises_without_tool_fields() {
+        // A plain user message must serialise exactly as before — no null tool_* keys — so
+        // older providers see an unchanged shape.
+        let v: Value = serde_json::to_value(ChatMessage::new("user", "hi")).unwrap();
+        assert_eq!(v, serde_json::json!({ "role": "user", "content": "hi" }));
+    }
+
+    #[test]
+    fn multi_turn_tool_message_round_trips() {
+        // An assistant tool-call turn + a role:"tool" result must round-trip across the wire.
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: ToolCallFunction { name: "get_weather".into(), arguments: r#"{"city":"SF"}"#.into() },
+            }]),
+            ..Default::default()
+        };
+        let tool = ChatMessage {
+            role: "tool".into(),
+            content: "72F".into(),
+            tool_call_id: Some("call_1".into()),
+            name: Some("get_weather".into()),
+            ..Default::default()
+        };
+        for m in [assistant, tool] {
+            let back: ChatMessage = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+            assert_eq!(back, m);
+        }
+    }
+
+    #[test]
+    fn tool_call_uses_the_openai_wire_shape() {
+        let tc = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "get_weather".into(),
+                arguments: r#"{"city":"SF"}"#.into(),
+            },
+        };
+        let v: Value = serde_json::from_str(&serde_json::to_string(&tc).unwrap()).unwrap();
+        assert_eq!(v["type"], "function"); // `kind` serializes back out as `type`
+        assert_eq!(v["function"]["name"], "get_weather");
+        // `arguments` stays a JSON *string*, not a parsed object (the OpenAI convention).
+        assert!(v["function"]["arguments"].is_string());
+
+        // A provider may omit `type` and `arguments`; both default sanely on the way in.
+        let back: ToolCall = serde_json::from_str(r#"{"id":"c","function":{"name":"f"}}"#).unwrap();
+        assert_eq!(back.kind, "function");
+        assert_eq!(back.function.arguments, "");
+    }
 }

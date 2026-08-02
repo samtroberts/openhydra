@@ -217,6 +217,7 @@ impl<H: HttpClient> EngineAdapter for AnthropicAdapter<H> {
             tokens,
             done,
             engine: EngineMetrics { prompt_eval_count: input, eval_count: output, ..EngineMetrics::default() },
+            tool_calls: Vec::new(),
         })
     }
 }
@@ -228,7 +229,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage { role: role.to_string(), content: content.to_string() }
+        ChatMessage { role: role.to_string(), content: content.to_string(), ..Default::default() }
     }
 
     /// Canned `/v1/models` + `/v1/messages` SSE; records the last POST body for assertions.
@@ -256,7 +257,7 @@ mod tests {
     }
 
     fn req(messages: Vec<ChatMessage>) -> InferenceRequest {
-        InferenceRequest { model_ref: "claude-3-5-sonnet".into(), messages, max_tokens: None, temperature: None }
+        InferenceRequest { model_ref: "claude-3-5-sonnet".into(), messages, max_tokens: None, temperature: None, tools: Vec::new() }
     }
 
     #[test]

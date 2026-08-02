@@ -30,6 +30,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+mod hostinfo;
+mod installer;
+
 // ── Child-pid registry (crash/kill safety) ──
 //
 // `RunEvent::Exit` covers a normal quit, but NOT a SIGTERM/SIGINT to the app (observed
@@ -745,6 +748,21 @@ fn fetch_status(port: u16, path: &str) -> Option<serde_json::Value> {
     serde_json::from_str(body).ok()
 }
 
+/// Probe the host's CPU / RAM / GPU(s) for the system panel (like LM Studio's). Runs stock
+/// system tools off the UI thread; never fails (unknown fields fall back gracefully).
+#[tauri::command]
+async fn system_info() -> hostinfo::SystemInfo {
+    tauri::async_runtime::spawn_blocking(hostinfo::probe).await.unwrap_or_else(|_| {
+        hostinfo::SystemInfo {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            cpu: "Unknown".into(),
+            ram_bytes: 0,
+            gpus: vec![],
+        }
+    })
+}
+
 /// Probe the local engines right now (the agent crate's own concurrent detection).
 #[tauri::command]
 async fn detect_engines_now() -> Vec<EngineView> {
@@ -760,6 +778,153 @@ async fn detect_engines_now() -> Vec<EngineView> {
     })
     .await
     .unwrap_or_default()
+}
+
+/// What an install *would* do — resolved without running, for the consent UI (B5).
+#[derive(Serialize)]
+struct InstallPlan {
+    engine: String,
+    /// False when there's no Tier-1 recipe for this engine/OS (UI shows "Guided install").
+    supported: bool,
+    /// One-line "what will run, from where" for the consent prompt.
+    summary: String,
+    /// True only where the exact commands are vendor-verified on this OS.
+    verified: bool,
+    /// Already answering on its port → Install is a no-op.
+    already_installed: bool,
+    /// A blocking prereq (e.g. missing Homebrew), with an actionable message.
+    blocker: Option<String>,
+    /// This engine also offers a headless CLI install on this OS → the UI shows an app/CLI toggle.
+    cli_available: bool,
+}
+
+/// Resolve (without executing) what installing `engine` (in flavour `variant`) would do — powers
+/// the consent modal. `variant` is None/"app"/"cli"; the app is the default where both exist.
+#[tauri::command]
+async fn install_plan(engine: String, accel: Option<String>, variant: Option<String>) -> InstallPlan {
+    let fallback = InstallPlan {
+        engine: engine.clone(),
+        supported: false,
+        summary: "install planning failed".into(),
+        verified: false,
+        already_installed: false,
+        blocker: Some("internal error".into()),
+        cli_available: false,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(os) = installer::Os::current() else {
+            return InstallPlan {
+                engine,
+                supported: false,
+                summary: "this OS isn't supported by the installer".into(),
+                verified: false,
+                already_installed: false,
+                blocker: Some("unsupported OS".into()),
+                cli_available: false,
+            };
+        };
+        let already_installed = installer::already_installed(&engine);
+        let accel = installer::Accel::from_str_opt(accel.as_deref());
+        let variant = installer::Variant::from_str_opt(variant.as_deref());
+        let cli_available = installer::has_cli_variant(&engine, os);
+        match installer::recipe_for_variant(&engine, os, accel, variant) {
+            Ok(r) => InstallPlan {
+                supported: true,
+                summary: r.summary,
+                verified: r.verified,
+                already_installed,
+                blocker: installer::prereq_blocker(&engine, os),
+                cli_available,
+                engine,
+            },
+            // The blocker carries the "can't install here" message; leaving summary empty avoids
+            // the UI rendering the same text twice (blocker + summary).
+            Err(e) => InstallPlan {
+                supported: false,
+                summary: String::new(),
+                verified: false,
+                already_installed,
+                blocker: Some(e),
+                cli_available,
+                engine,
+            },
+        }
+    })
+    .await
+    .unwrap_or(fallback)
+}
+
+/// Install a Tier-1 engine, streaming progress to the webview as `install://progress` events
+/// (`phase`/`log`/`done`/`error`). Idempotent (a detect-first hit returns immediately); refuses
+/// on a prereq blocker. The heavy work runs off the UI thread.
+#[tauri::command]
+async fn install_engine(app: tauri::AppHandle, engine: String, accel: Option<String>, variant: Option<String>) -> Result<(), String> {
+    let os = installer::Os::current().ok_or_else(|| "unsupported OS for the installer".to_string())?;
+    // EVERYTHING here runs inside spawn_blocking. `already_installed` builds an
+    // `openhydra_agent::ReqwestClient` (reqwest::blocking, which owns a tokio runtime); creating
+    // or dropping that in the async command context panics ("Cannot drop a runtime in a context
+    // where blocking is not allowed"). A blocking-pool thread has no runtime context, so it's safe.
+    // Every terminal path emits a `done`/`error` event so the UI overlay can never hang silently.
+    tauri::async_runtime::spawn_blocking(move || {
+        if installer::already_installed(&engine) {
+            installer::emit_done(&app, &engine, format!("{engine} is already installed"));
+            return Ok(());
+        }
+        if let Some(blocker) = installer::prereq_blocker(&engine, os) {
+            installer::emit_error(&app, &engine, blocker.clone());
+            return Err(blocker);
+        }
+        let accel = installer::Accel::from_str_opt(accel.as_deref());
+        let variant = installer::Variant::from_str_opt(variant.as_deref());
+        let recipe = match installer::recipe_for_variant(&engine, os, accel, variant) {
+            Ok(r) => r,
+            Err(e) => {
+                installer::emit_error(&app, &engine, e.clone());
+                return Err(e);
+            }
+        };
+        let default_model = recipe.default_model;
+        let done_msg = recipe.completion_message();
+        let eng = engine.clone();
+        let result = installer::run_recipe(&app, &recipe).and_then(|_| match default_model {
+            Some(m) => installer::pull_and_warm(&app, &eng, m),
+            None => {
+                installer::emit_done(&app, &eng, done_msg.clone());
+                Ok(())
+            }
+        });
+        if let Err(e) = &result {
+            installer::emit_error(&app, &eng, e.clone());
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Which engines are installed on disk (present, regardless of whether their server runs). Powers
+/// the "Run" CTA for installed-but-idle engines. `reqwest`-free, but cheap fs/PATH checks still run
+/// off the UI thread for consistency.
+#[tauri::command]
+async fn installed_engines() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        ["ollama", "lm-studio", "llama.cpp", "comfyui", "vllm", "exo"]
+            .into_iter()
+            .filter(|e| installer::installed_on_disk(e))
+            .map(String::from)
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Start an installed engine's local server (the "Run" CTA). Best-effort; errors for engines that
+/// need a model/cluster arg. `start_lm_studio_core` builds a reqwest client, so run off-thread.
+#[tauri::command]
+async fn run_engine(engine: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || installer::run_engine(&engine))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// One chat message from the UI (Chat/Code views).
@@ -903,6 +1068,11 @@ fn main() {
             stop_provider,
             stop_gateway,
             detect_engines_now,
+            system_info,
+            install_plan,
+            install_engine,
+            installed_engines,
+            run_engine,
             gateway_health,
             chat_completion,
             web_search,

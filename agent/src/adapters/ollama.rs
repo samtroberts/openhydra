@@ -26,6 +26,7 @@ use openhydra_protocol::model_id::{canonical_model_id, chat_template_hash, norma
 
 use crate::adapter::{
     AdapterError, DetectedModel, EngineAdapter, HttpClient, InferenceRequest, ServeOutcome,
+    ToolCall, ToolCallFunction,
 };
 
 /// Default local Ollama endpoint.
@@ -97,15 +98,60 @@ struct ChatStreamChunk {
 struct ChatStreamMessage {
     #[serde(default)]
     content: String,
+    /// Tool calls the model requested (recent Ollama; may arrive on any chunk, usually the
+    /// last). Ollama's shape differs from OpenAI's: no `id`, and `arguments` is a JSON
+    /// *object*, not a string — both are normalised in [`OllamaAdapter::serve_stream`].
+    #[serde(default)]
+    tool_calls: Vec<OllamaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OllamaToolCall {
+    /// Present on recent Ollama (≥0.31, live-verified against qwen2.5:7b); absent on older
+    /// builds — we use it when non-empty, else synthesise a stable id.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: OllamaToolCallFunction,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OllamaToolCallFunction {
+    #[serde(default)]
+    name: String,
+    /// Ollama returns the arguments as a structured JSON object (OpenAI uses a string).
+    #[serde(default)]
+    arguments: serde_json::Value,
 }
 
 /// Build the Ollama `/api/chat` request body (always streaming). `max_tokens`/
 /// `temperature` map to Ollama's `options.{num_predict,temperature}`; omitted when unset.
 fn build_chat_body(req: &InferenceRequest) -> String {
+    // Map each message, forwarding multi-turn tool state in Ollama's shape: an assistant's
+    // `tool_calls` carry `function.{name, arguments}` where **arguments is an object** (the
+    // inverse of the string we surface at the gateway — parse it back; fall back to the raw
+    // string if it isn't valid JSON), and a `role:"tool"` result carries `tool_name`.
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .map(|m| {
+            let mut msg = serde_json::json!({ "role": m.role, "content": m.content });
+            if let Some(tcs) = &m.tool_calls {
+                let calls: Vec<serde_json::Value> = tcs
+                    .iter()
+                    .map(|tc| {
+                        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
+                        serde_json::json!({ "function": { "name": tc.function.name, "arguments": args } })
+                    })
+                    .collect();
+                msg["tool_calls"] = serde_json::Value::Array(calls);
+            }
+            if let Some(name) = &m.name {
+                msg["tool_name"] = serde_json::json!(name);
+            }
+            msg
+        })
         .collect();
     let mut options = serde_json::Map::new();
     if let Some(n) = req.max_tokens {
@@ -121,6 +167,12 @@ fn build_chat_body(req: &InferenceRequest) -> String {
     });
     if !options.is_empty() {
         body["options"] = serde_json::Value::Object(options);
+    }
+    // Forward the caller's OpenAI-shaped `tools` verbatim — Ollama's `/api/chat` accepts the
+    // same schema and streams any resulting `message.tool_calls` back (recent Ollama supports
+    // tool calls with `stream: true`). Omitted when empty so a plain chat is byte-identical.
+    if !req.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(req.tools.clone());
     }
     body.to_string()
 }
@@ -234,18 +286,38 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         let mut engine = crate::adapter::EngineMetrics::default();
         let mut done = false;
         let mut first_token_at: Option<std::time::Instant> = None;
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
         for line in lines {
             let line = line?;
             if line.trim().is_empty() {
                 continue; // keep-alive / blank framing line
             }
-            let chunk = parse_chat_chunk(&line)?;
+            let mut chunk = parse_chat_chunk(&line)?;
             if !chunk.message.content.is_empty() {
                 if first_token_at.is_none() {
                     first_token_at = Some(std::time::Instant::now());
                 }
                 on_delta(&chunk.message.content);
                 chunk_tokens += 1;
+            }
+            // Tool calls can ride any chunk (usually the last). Normalise Ollama's shape to
+            // OpenAI's: synthesise a stable `id` (Ollama omits it — coding agents match tool
+            // results to calls by id) and render `arguments` as a JSON *string*.
+            for otc in std::mem::take(&mut chunk.message.tool_calls) {
+                let arguments = if otc.function.arguments.is_null() {
+                    String::new()
+                } else {
+                    otc.function.arguments.to_string()
+                };
+                let id = otc
+                    .id
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("call_{}", tool_calls.len() + 1));
+                tool_calls.push(ToolCall {
+                    id,
+                    kind: "function".to_string(),
+                    function: ToolCallFunction { name: otc.function.name, arguments },
+                });
             }
             // The metrics all arrive together on the final chunk.
             if chunk.eval_count.is_some() {
@@ -277,7 +349,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
                 engine.eval_count = tokens;
             }
         }
-        Ok(ServeOutcome { tokens, done, engine })
+        Ok(ServeOutcome { tokens, done, engine, tool_calls })
     }
 }
 
@@ -374,9 +446,10 @@ mod tests {
     fn user_req(prompt: &str) -> InferenceRequest {
         InferenceRequest {
             model_ref: "qwen2.5:7b".into(),
-            messages: vec![crate::adapter::ChatMessage { role: "user".into(), content: prompt.into() }],
+            messages: vec![crate::adapter::ChatMessage { role: "user".into(), content: prompt.into(), ..Default::default() }],
             max_tokens: Some(128),
             temperature: Some(0.7),
+            tools: Vec::new(),
         }
     }
 
@@ -451,6 +524,86 @@ mod tests {
         assert_eq!(v["messages"][0]["content"], "hi there");
         assert_eq!(v["options"]["num_predict"], 128);
         assert_eq!(v["options"]["temperature"], 0.7);
+        assert!(v.get("tools").is_none(), "no tools field on a plain chat");
+    }
+
+    #[test]
+    fn build_chat_body_forwards_tools_verbatim() {
+        let mut req = user_req("what's the weather?");
+        req.tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "parameters": { "type": "object" } }
+        })];
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req)).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn build_chat_body_forwards_multi_turn_tool_messages_in_ollama_shape() {
+        use crate::adapter::{ChatMessage, ToolCall, ToolCallFunction};
+        let mut req = user_req("weather?");
+        req.messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: ToolCallFunction { name: "get_weather".into(), arguments: r#"{"city":"SF"}"#.into() },
+                }]),
+                ..Default::default()
+            },
+            ChatMessage { role: "tool".into(), content: "72F".into(), name: Some("get_weather".into()), ..Default::default() },
+        ];
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req)).unwrap();
+        // Ollama wants arguments as an OBJECT (we parse our string back), and no id/type.
+        assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["arguments"]["city"], "SF");
+        assert!(v["messages"][0]["tool_calls"][0]["function"]["arguments"].is_object());
+        // Tool result carries tool_name (Ollama's field), not tool_call_id.
+        assert_eq!(v["messages"][1]["role"], "tool");
+        assert_eq!(v["messages"][1]["tool_name"], "get_weather");
+    }
+
+    #[test]
+    fn serve_stream_parses_tool_calls_into_openai_shape() {
+        // Ollama emits a tool call on the final chunk: no `id`, `arguments` as an object.
+        let lines = [
+            r#"{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"SF"}}}]},"done":true,"eval_count":9}"#,
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("weather in SF?"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert!(out.is_empty(), "a tool-call turn streams no text");
+        assert_eq!(outcome.tool_calls.len(), 1);
+        let tc = &outcome.tool_calls[0];
+        assert_eq!(tc.id, "call_1", "a stable id is synthesised (Ollama omits it)");
+        assert_eq!(tc.kind, "function");
+        assert_eq!(tc.function.name, "get_weather");
+        // arguments normalised to a JSON *string* (OpenAI convention).
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(args["city"], "SF");
+    }
+
+    #[test]
+    fn serve_stream_mixes_text_then_tool_call() {
+        // A model may narrate, then call a tool across two chunks; ids increment per call.
+        let lines = [
+            r#"{"message":{"content":"Let me check. "},"done":false}"#,
+            r#"{"message":{"content":"","tool_calls":[{"function":{"name":"a","arguments":{}}}]},"done":false}"#,
+            r#"{"message":{"content":"","tool_calls":[{"function":{"name":"b","arguments":{"x":1}}}]},"done":true,"eval_count":5}"#,
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("hi"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(out, "Let me check. ");
+        assert_eq!(outcome.tool_calls.len(), 2);
+        assert_eq!(outcome.tool_calls[0].id, "call_1");
+        assert_eq!(outcome.tool_calls[0].function.name, "a");
+        assert_eq!(outcome.tool_calls[1].id, "call_2");
+        assert_eq!(outcome.tool_calls[1].function.name, "b");
     }
 
     #[test]
@@ -554,9 +707,11 @@ mod tests {
             messages: vec![crate::adapter::ChatMessage {
                 role: "user".into(),
                 content: "Reply with one word.".into(),
+                ..Default::default()
             }],
             max_tokens: Some(16),
             temperature: Some(0.0),
+            tools: Vec::new(),
         };
         let mut out = String::new();
         let outcome = agent.serve_stream(&req, &mut |d| out.push_str(d)).unwrap();

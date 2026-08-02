@@ -28,7 +28,49 @@
       settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 8080, engine_autostart: true, search_url: "" },
       agent_found: true, gateway_url: "http://127.0.0.1:8080/v1",
     };
-    if (cmd === "detect_engines_now") return [{ label: "ollama", url: "http://127.0.0.1:11434", models: ["tinyllama:latest", "llama3.2:1b"] }];
+    if (cmd === "system_info") return { os: "macos", arch: "aarch64", cpu: "Apple M1", ram_bytes: 8589934592, gpus: [{ name: "Apple M1 (7-core GPU)", vram_bytes: 8589934592, unified: true }] };
+    if (cmd === "detect_engines_now") return (mk.runningEngines || mk.installedEngines || ["ollama"]).map((l) => ({ label: l, url: "http://127.0.0.1:11434", models: l === "ollama" ? ["tinyllama:latest", "llama3.2:1b"] : [] }));
+    if (cmd === "installed_engines") return mk.installedEngines || ["ollama"];
+    if (cmd === "run_engine") { mk.runningEngines = [...new Set([...(mk.runningEngines || ["ollama"]), args.engine])]; return null; }
+    if (cmd === "install_plan") {
+      const cli = args.variant === "cli";
+      // vLLM on this mock host (macOS) = the community vllm-metal plugin (MLX, prebuilt wheels).
+      if (args.engine === "vllm") return { engine: "vllm", supported: true, verified: false,
+        already_installed: (mk.installedEngines || ["ollama"]).includes("vllm"), cli_available: false,
+        summary: "Install vLLM for Apple Silicon via the community vllm-metal plugin (MLX backend, prebuilt wheels — no source compile). Runs install.sh into ~/.venv-vllm-metal.", blocker: null };
+      const supported = ["ollama", "llama.cpp", "lm-studio", "comfyui", "exo"].includes(args.engine);
+      const installed = (mk.installedEngines || ["ollama"]).includes(args.engine);
+      const cliAvailable = ["comfyui", "exo"].includes(args.engine); // macOS: app default + CLI option
+      const summaries = {
+        "ollama": "Install Ollama via the official method → serves on :11434 (pulls qwen2.5:7b)",
+        "llama.cpp": "Install llama.cpp via Homebrew (brew install llama.cpp) — installs llama-server; then point it at a GGUF model to serve on :8080.",
+        "lm-studio": "Download the official LM Studio installer (~570 MB .dmg, Apple Silicon) and install it to /Applications, then it auto-starts the local server on :1234.",
+        "comfyui": cli
+          ? "Headless CLI: install ComfyUI via comfy-cli (uv) → clones ComfyUI + the Metal PyTorch into ~/.openhydra/engines/comfyui. Run `comfy launch` (:8188)."
+          : "Download the official ComfyUI desktop app (signed .dmg, ~170 MB) → /Applications, like LM Studio. Then launch it and add a checkpoint model.",
+        "exo": cli
+          ? "Headless CLI: install Exo from source: git clone → uv venv (Python 3.13) → uv pip install. Then run `exo`."
+          : "Download the native EXO macOS app (signed .dmg) → /Applications, like LM Studio. Then launch EXO to serve + join the cluster.",
+      };
+      return { engine: args.engine, supported, verified: args.engine !== "llama.cpp", already_installed: installed, cli_available: cliAvailable,
+        summary: supported ? summaries[args.engine] : "No Tier-1 installer for this engine yet — use a guided install.", blocker: null };
+    }
+    if (cmd === "install_engine") {
+      const eng = args.engine;
+      const steps = eng === "comfyui"
+        ? [["phase", "running: uvx --from comfy-cli comfy --skip-prompt install"], ["log", "cloning ComfyUI…"], ["log", "detected Metal (Apple Silicon) → installing torch"], ["log", "installing ComfyUI-Manager"], ["done", "ComfyUI installed. Launch it (comfy launch, serves :8188) and add a checkpoint model; this card flips to running once it serves."]]
+        : eng === "exo"
+        ? [["phase", "running: git clone https://github.com/exo-explore/exo.git"], ["phase", "running: uv venv --python 3.12"], ["log", "installed Python 3.12"], ["phase", "running: uv pip install ."], ["log", "resolving dependencies…"], ["done", "Exo installed. Run exo to serve an OpenAI API + join the P2P cluster; this card flips to running once it serves."]]
+        : eng === "lm-studio"
+        ? [["phase", "downloading installer → ~/.openhydra/engines/lm-studio/LM-Studio.dmg (can take a minute)"], ["log", "downloaded 570 MB"], ["phase", "mounting the disk image"], ["phase", "copying LM Studio → /Applications"], ["log", "installed LM Studio to /Applications"], ["phase", "launching LM Studio"], ["done", "LM Studio installed to /Applications and launched. Enable Developer → Start Server (:1234); this card flips to running once it serves."]]
+        : eng === "llama.cpp"
+        ? [["phase", "running: brew install llama.cpp"], ["log", "==> Fetching llama.cpp"], ["log", "==> Pouring llama.cpp bottle"], ["phase", "confirming llama-server is installed"], ["done", "llama.cpp installed — ready to configure"]]
+        : [["phase", "running: ollama installer"], ["log", "downloading ollama…"], ["log", "installing to /usr/local/bin"], ["phase", "health-check http://127.0.0.1:11434/api/version"], ["phase", "pulling qwen2.5:7b (first time can take minutes)"], ["log", "pulling manifest"], ["log", "verifying sha256 digest"], ["done", "ollama ready — qwen2.5:7b pulled and warm"]];
+      let i = 0;
+      const tick = () => { if (i >= steps.length) { mk.installedEngines = [...new Set([...(mk.installedEngines || ["ollama"]), eng])]; return; } mockEmitInstall({ engine: eng, kind: steps[i][0], message: steps[i][1] }); i++; setTimeout(tick, 450); };
+      setTimeout(tick, 300);
+      return null;
+    }
     if (cmd === "status_snapshot") {
       if (!mk.provider && !mk.gateway) return null;
       return {
@@ -175,7 +217,7 @@
   }
 
   // ── live state ──
-  let state = null, engines = [], snap = null, activeView = "home", curChat = null, attachments = [];
+  let state = null, engines = [], installedEngines = [], snap = null, activeView = "home", curChat = null, attachments = [];
   // Rolling per-chat telemetry the agent only emits per-request (there's no aggregated RTT on
   // the status API) — we average the last N replies client-side for the Activity view.
   const rttSamples = store.get("oh_rtt", []), tpsSamples = store.get("oh_tps", []);
@@ -713,20 +755,141 @@
       renderProviders();
     });
   }
-  const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama-cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["Exo", "exo", "Shard big models across your devices."]];
+  // ── Tier-1 engine installer (B5): consent → stream install://progress → refresh ──
+  const tauriEvent = window.__TAURI__?.event;
+  const mockInstallCbs = [];
+  // Subscribe to install progress; returns an unlisten fn. Real Tauri event bus if present,
+  // else the in-page mock bus the browser-preview install driver feeds.
+  function onInstallProgress(cb) {
+    if (tauriEvent?.listen) {
+      let un = null, dead = false;
+      tauriEvent.listen("install://progress", (e) => cb(e.payload)).then((u) => { if (dead) u(); else un = u; });
+      return () => { dead = true; if (un) un(); };
+    }
+    mockInstallCbs.push(cb);
+    return () => { const i = mockInstallCbs.indexOf(cb); if (i >= 0) mockInstallCbs.splice(i, 1); };
+  }
+  function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(ev)); }
+
+  function installOverlay() {
+    let el = $("#installov");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "installov";
+      el.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:9999";
+      el.innerHTML = `<style>@keyframes instIndet{0%{transform:translateX(-100%)}100%{transform:translateX(280%)}} #instBarFill.indet{width:36%!important;animation:instIndet 1.15s ease-in-out infinite}</style>
+        <div class="card pad" style="width:min(560px,92vw);max-height:82vh;display:flex;flex-direction:column;gap:10px">
+        <div class="row"><b id="instTitle" style="font-size:14px">Install</b><button id="instX" class="btn outline sm" style="margin-left:auto">✕</button></div>
+        <div id="instBody" style="font-size:12.5px;line-height:1.5"></div>
+        <div id="instBar" style="display:none;height:8px;border-radius:6px;background:rgba(127,127,127,.15);overflow:hidden"><div id="instBarFill" style="height:100%;width:0%;background:var(--brand,#2f9e6f);transition:width .35s ease"></div></div>
+        <pre id="instLog" class="mono" style="display:none;background:rgba(127,127,127,.1);border-radius:8px;padding:10px;overflow:auto;max-height:42vh;font-size:11px;margin:0;white-space:pre-wrap"></pre>
+        <div class="row" id="instActions"></div></div>`;
+      document.body.appendChild(el);
+      el.querySelector("#instX").onclick = () => el.style.display = "none";
+      el.addEventListener("click", (e) => { if (e.target === el) el.style.display = "none"; });
+    }
+    return el;
+  }
+
+  async function startInstall(label, name) {
+    const ov = installOverlay();
+    const body = $("#instBody"), log = $("#instLog"), actions = $("#instActions");
+    $("#instTitle").textContent = `Install ${name}`;
+    log.style.display = "none"; log.textContent = ""; actions.innerHTML = ""; body.textContent = "Checking…"; ov.style.display = "flex";
+    const okBtn = (t, fn) => { actions.innerHTML = `<button class="btn brand sm" id="instOk" style="margin-left:auto">${t}</button>`; $("#instOk").onclick = fn || (() => ov.style.display = "none"); };
+    let variant = null; // null = platform default (desktop app where both exist)
+    // (Re)fetch + render the plan for the current variant — lets the app/CLI toggle swap the summary.
+    const render = async () => {
+      body.textContent = "Checking…"; actions.innerHTML = "";
+      let plan;
+      try { plan = await call("install_plan", { engine: label, accel: null, variant }); }
+      catch (e) { body.textContent = `Could not plan the install: ${e}`; okBtn("Close"); return; }
+      if (plan.already_installed) { body.textContent = `${name} is already installed. Nothing to do.`; okBtn("OK"); return; }
+      if (plan.blocker) { body.innerHTML = `<b>Can't install ${name} here</b><br><span class="mut">${esc(plan.blocker)}</span>${plan.summary ? `<br><br><span class="mut">${esc(plan.summary)}</span>` : ""}`; okBtn("OK"); return; }
+      if (!plan.supported) { body.innerHTML = `No one-click installer for ${name} yet.<br><span class="mut">${esc(plan.summary)}</span>`; okBtn("OK"); return; }
+      const warn = plan.verified ? "" : `<br><br><span class="badge warn">unverified on your OS</span> <span class="mut">This recipe isn't yet end-to-end tested here — it may take a few minutes and could fail.</span>`;
+      const cur = variant === "cli" ? "cli" : "app";
+      // App-vs-CLI toggle where both exist (ComfyUI / Exo on macOS: desktop app vs headless CLI).
+      const toggle = plan.cli_available
+        ? `<div class="row" style="gap:6px;margin-bottom:8px"><button class="btn ${cur === "app" ? "brand" : "outline"} sm" id="varApp">Desktop app</button><button class="btn ${cur === "cli" ? "brand" : "outline"} sm" id="varCli">Headless CLI</button></div>`
+        : "";
+      body.innerHTML = `${toggle}${esc(plan.summary)}${warn}`;
+      if (plan.cli_available) { $("#varApp").onclick = () => { variant = "app"; render(); }; $("#varCli").onclick = () => { variant = "cli"; render(); }; }
+      actions.innerHTML = `<button class="btn outline sm" id="instCancel">Cancel</button><button class="btn brand sm" id="instGo" style="margin-left:auto">Install ${name}${cur === "cli" ? " · CLI" : ""}</button>`;
+      $("#instCancel").onclick = () => ov.style.display = "none";
+      $("#instGo").onclick = () => runInstall(label, name, variant);
+    };
+    render();
+  }
+
+  async function runInstall(label, name, variant) {
+    const body = $("#instBody"), log = $("#instLog"), actions = $("#instActions");
+    const bar = $("#instBar"), fill = $("#instBarFill");
+    body.textContent = `Installing ${name}…`; log.style.display = "block"; log.textContent = ""; actions.innerHTML = "";
+    bar.style.display = "none"; fill.style.width = "0%";
+    const append = (s) => { log.textContent += s + "\n"; log.scrollTop = log.scrollHeight; };
+    // Bar states: determinate (we know %, our own downloads) vs indeterminate (vendor tool is
+    // working — brew/uv/git/pip manage their own download, so we show an animated "working" bar).
+    const setDet = (pct) => { bar.style.display = "block"; fill.classList.remove("indet"); fill.style.opacity = "1"; fill.style.width = pct + "%"; };
+    const setIndet = () => { bar.style.display = "block"; fill.classList.add("indet"); fill.style.opacity = "1"; fill.style.width = ""; };
+    const hideBar = () => { bar.style.display = "none"; fill.classList.remove("indet"); };
+    const un = onInstallProgress((ev) => {
+      if (ev.engine !== label) return;
+      if (ev.kind === "phase") { setIndet(); body.textContent = ev.message === "downloading" ? "Downloading…" : ev.message === "installing" ? "Installing…" : ev.message; append("▸ " + ev.message); }
+      else if (ev.kind === "download") { if (typeof ev.percent === "number") setDet(ev.percent); else setIndet(); body.textContent = "Downloading — " + ev.message; }
+      else if (ev.kind === "log") append(ev.message);
+      else if (ev.kind === "done") { un(); hideBar(); body.innerHTML = `<span class="badge ok">done</span> ${esc(ev.message)}`; append("✓ " + ev.message); actions.innerHTML = `<button class="btn brand sm" id="instFin" style="margin-left:auto">Done</button>`; $("#instFin").onclick = () => { $("#installov").style.display = "none"; refreshEngines(); }; refreshEngines(); }
+      else if (ev.kind === "error") { un(); hideBar(); body.innerHTML = `<span class="badge warn">failed</span> ${esc(ev.message)}`; append("✗ " + ev.message); actions.innerHTML = `<button class="btn outline sm" id="instFin" style="margin-left:auto">Close</button>`; $("#instFin").onclick = () => $("#installov").style.display = "none"; }
+    });
+    try { await call("install_engine", { engine: label, accel: null, variant: variant || null }); }
+    catch (e) { /* backend already emitted an error event; guard the mock/no-event path */ mockEmitInstall({ engine: label, kind: "error", message: String(e) }); }
+  }
+
+  // ── Host hardware panel (system_info) — shown in the Engines header, LM-Studio style ──
+  let sysInfo = null;
+  function fmtGB(bytes) { if (!bytes) return "—"; const gb = bytes / 1073741824; const s = gb >= 10 ? String(Math.round(gb)) : gb.toFixed(1).replace(/\.0$/, ""); return s + " GB"; }
+  function fmtSystem(s) {
+    if (!s || !s.cpu) return "";
+    const bits = [s.cpu, fmtGB(s.ram_bytes)];
+    if (s.gpus && s.gpus.length) {
+      const g = s.gpus[0];
+      if (g.unified) { const m = (g.name.match(/\((\d+-core GPU)\)/) || [])[1]; bits.push(m ? m + " · unified" : "unified memory"); }
+      else { bits.push(g.name + (g.vram_bytes ? " " + fmtGB(g.vram_bytes) : "")); }
+    }
+    return bits.join(" · ");
+  }
+  async function refreshSystem() { try { sysInfo = await call("system_info"); } catch { sysInfo = null; } const el = $("#syshw"); if (el) el.textContent = fmtSystem(sysInfo) || `${sysInfo?.os || ""} · ${sysInfo?.arch || ""}`.trim(); }
+
+  // Labels MUST match `detect_engines` (agent adapter `engine_name`) so the "running" badge
+  // resolves — e.g. `llama.cpp`, not `llama-cpp` (the latter silently never matched detection).
+  const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama.cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["Exo", "exo", "Shard big models across your devices."]];
+  // Engines OpenHydra can start on demand (self-serving; no model/cluster arg) → get a "Run" CTA.
+  const RUNNABLE = new Set(["ollama", "lm-studio"]);
   function renderEngines() {
     const det = Object.fromEntries(engines.map((e) => [e.label, e]));
     const cards = $$("#v-engines .grid.g3 .card");
     ENGINES.forEach(([name, label, desc], i) => {
-      const c = cards[i]; if (!c) return; const d = det[label], guided = ["comfyui", "vllm", "exo"].includes(label);
+      // All six engines now have real (probe-then-install) recipes → none is a plain "guided" toast.
+      const c = cards[i]; if (!c) return;
+      const d = det[label];                                // serving right now
+      const installed = installedEngines.includes(label);  // present on disk (may be idle)
+      const runnable = RUNNABLE.has(label);                // can self-serve (no model/cluster arg)
       c.querySelector("b").textContent = name;
-      const badge = c.querySelector(".badge"); badge.className = "badge " + (d ? "ok" : ""); badge.style.marginLeft = "auto"; badge.innerHTML = d ? '<span class="dot ok"></span>running' : "not installed";
+      const badge = c.querySelector(".badge"); badge.style.marginLeft = "auto";
+      badge.className = "badge " + (d ? "ok" : "");
+      badge.innerHTML = d ? '<span class="dot ok"></span>running' : installed ? "installed" : "not installed";
       c.querySelectorAll(".mut")[0].textContent = desc;
       const foot = c.querySelectorAll(".row")[1]; const btn = foot.querySelector(".enginst"); const def = foot.querySelector(".badge");
       if (def) def.style.display = d && label === "ollama" ? "" : "none";
-      btn.textContent = d ? "Manage" : guided ? "Guided install" : "Install"; btn.className = "btn " + (d || guided ? "outline" : "brand") + " sm enginst"; btn.style.marginLeft = "auto";
+      // Three-state CTA: running → Manage; installed-but-idle → Run (self-serving) or Installed
+      // (needs a model to serve); not installed → Install (drives the Tier-1 installer).
+      let txt, cls, act;
+      if (d) { txt = "Manage"; cls = "outline"; act = () => toast(`${name} is running — manage models from Share`); }
+      else if (installed && runnable) { txt = "Run"; cls = "brand"; act = () => runEngine(label, name); }
+      else if (installed) { txt = "Installed"; cls = "outline"; act = () => toast(`${name} is installed — start it with a model to serve`); }
+      else { txt = "Install"; cls = "brand"; act = () => startInstall(label, name); }
+      btn.textContent = txt; btn.className = "btn " + cls + " sm enginst"; btn.style.marginLeft = "auto"; btn.onclick = act;
     });
-    $$("#v-engines .enginst").forEach((b) => b.onclick = () => toast("One-click installs land with the engine store — start or install it manually for now"));
     // recommended: honest until a model store lands
     $("#rectable tbody").innerHTML = `<tr><td colspan="5" class="mut">One-click downloads land with the model store — for now, pull with your engine (e.g. <span class="mono">ollama pull</span>) and it appears in Share.</td></tr>`;
   }
@@ -922,7 +1085,14 @@
 
   // ── polling ──
   async function refresh() { try { state = await call("get_state"); } catch {} renderStatusbar(); if (["share", "settings", "connectors", "engines", "activity", "ledger"].includes(activeView)) renderView(); if (activeView === "peers") renderLogs(); }
-  async function refreshEngines() { try { engines = await call("detect_engines_now"); } catch { engines = []; } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
+  async function refreshEngines() { try { engines = await call("detect_engines_now"); } catch { engines = []; } try { installedEngines = await call("installed_engines"); } catch { installedEngines = []; } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
+  // Start an installed-but-idle engine's server, then refresh so the card flips to "running".
+  async function runEngine(label, name) {
+    toast(`Starting ${name}…`);
+    try { await call("run_engine", { engine: label }); toast(`${name} started`); }
+    catch (e) { toast(String(e)); }
+    await refreshEngines();
+  }
   async function refreshStatus() { try { snap = await call("status_snapshot"); } catch { snap = null; } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
   $$(".enginst, #refreshEngines").forEach(() => {});
 
@@ -936,7 +1106,7 @@
     // #9: default device name from the OS if the user hasn't set/restored one.
     if (!deviceName) { try { deviceName = await call("device_hostname"); } catch {} if (!deviceName) deviceName = /Mac/.test(navigator.platform) ? "This Mac" : "This machine"; store.set("oh_device", deviceName); }
     renderRecents(); renderStatusbar();
-    await refresh(); await refreshEngines();
+    await refresh(); await refreshEngines(); await refreshSystem();
     await ensureGateway();  // eager: warm discovery so the first chat isn't a cold 504
     await refreshStatus();
   })();

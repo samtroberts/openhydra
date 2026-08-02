@@ -294,9 +294,10 @@ mod tests {
             .serve_stream(
                 &InferenceRequest {
                     model_ref: "mlx-community/Llama-3.2-1B-Instruct-4bit".into(),
-                    messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                    messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
                     max_tokens: None,
                     temperature: None,
+                    tools: Vec::new(),
                 },
                 &mut |d| out.push_str(d),
             )

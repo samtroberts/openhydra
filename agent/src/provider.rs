@@ -664,7 +664,7 @@ mod tests {
         ) -> Result<ServeOutcome, AdapterError> {
             on_delta("Hello");
             on_delta(" world");
-            Ok(ServeOutcome { tokens: 5, done: true, engine: Default::default() })
+            Ok(ServeOutcome { tokens: 5, done: true, engine: Default::default(), tool_calls: Vec::new() })
         }
     }
 
@@ -675,6 +675,7 @@ mod tests {
             messages: vec![],
             max_tokens: None,
             temperature: None,
+            tools: Vec::new(),
             nonce: [0u8; 16],
         };
         let mut data = vec![SERVE_REQUEST];

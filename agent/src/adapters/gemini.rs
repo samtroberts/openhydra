@@ -210,6 +210,7 @@ impl<H: HttpClient> EngineAdapter for GeminiAdapter<H> {
             tokens,
             done,
             engine: EngineMetrics { prompt_eval_count: prompt, eval_count: output, ..EngineMetrics::default() },
+            tool_calls: Vec::new(),
         })
     }
 }
@@ -220,7 +221,7 @@ mod tests {
     use crate::adapter::ChatMessage;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage { role: role.to_string(), content: content.to_string() }
+        ChatMessage { role: role.to_string(), content: content.to_string(), ..Default::default() }
     }
 
     #[derive(Default)]
@@ -245,7 +246,7 @@ mod tests {
     }
 
     fn req(messages: Vec<ChatMessage>) -> InferenceRequest {
-        InferenceRequest { model_ref: "gemini-1.5-pro".into(), messages, max_tokens: Some(256), temperature: None }
+        InferenceRequest { model_ref: "gemini-1.5-pro".into(), messages, max_tokens: Some(256), temperature: None, tools: Vec::new() }
     }
 
     #[test]

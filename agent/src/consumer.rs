@@ -32,7 +32,9 @@ use openhydra_protocol::verify::{
     VerificationOutcome, NEUTRAL_REPUTATION,
 };
 
-use crate::adapter::{AdapterError, ChatMessage};
+use serde_json::Value;
+
+use crate::adapter::{AdapterError, ChatMessage, ToolCall};
 use crate::provider::SERVE_REQUEST;
 use crate::receipt::request_receipt;
 use crate::serve::{parse_response, ServeChunk, ServeRequest, ServeSummary};
@@ -194,9 +196,13 @@ pub fn request_completion(
 
     let response = transport(&framed)?;
 
+    // Tool calls arrive in their own terminal frame just before `Done`; hold them so the
+    // `Done` arm can attach them to the summary the gateway turns into the assistant turn.
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
     for chunk in parse_response(&response)? {
         match chunk {
             ServeChunk::Delta(text) => on_delta(&text),
+            ServeChunk::ToolCalls(tc) => tool_calls = tc,
             ServeChunk::Done { tokens, metrics } => {
                 return Ok(ServeSummary {
                     tokens,
@@ -204,6 +210,7 @@ pub fn request_completion(
                     metrics,
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
+                    tool_calls,
                 })
             }
             ServeChunk::Error(msg) => return Err(AdapterError::Http(msg)),
@@ -370,12 +377,14 @@ impl ConsumerNode {
             tokens = tracing::field::Empty,
         )
     )]
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         self: &Arc<Self>,
         model: &str,
         messages: Vec<ChatMessage>,
         max_tokens: Option<u32>,
         temperature: Option<f64>,
+        tools: Vec<Value>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
@@ -422,6 +431,7 @@ impl ConsumerNode {
                 messages: messages.clone(),
                 max_tokens,
                 temperature,
+                tools: tools.clone(),
                 nonce,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
@@ -634,6 +644,8 @@ impl ConsumerNode {
             // Redundant-execution comparison only holds for greedy decoding — a sampled
             // (temperature > 0) answer would legitimately differ between honest providers.
             temperature: Some(0.0),
+            // The audit is a plain-text probe — no tools.
+            tools: Vec::new(),
             // Audit serves are never settled into a receipt, but the field is required.
             nonce: rand::random::<[u8; 16]>(),
         };
@@ -741,6 +753,7 @@ pub fn default_challenge() -> (Vec<ChatMessage>, String) {
              Line 1: output exactly the token {nonce}. From line 2 onward: deterministically \
              continue this passage — \"A peer joins the distributed network by\""
         ),
+        ..Default::default()
     }];
     (messages, nonce)
 }
@@ -775,7 +788,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default() })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default(), tool_calls: Vec::new() })
         }
     }
 
@@ -783,9 +796,10 @@ mod tests {
         ServeRequest {
             reply_to: "12D3KooWConsumer".into(),
             model_ref: "qwen2.5:7b".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
             max_tokens: Some(64),
             temperature: None,
+            tools: Vec::new(),
             nonce: [0u8; 16],
         }
     }
@@ -804,6 +818,48 @@ mod tests {
         assert_eq!(out, "Hello world");
         assert_eq!(summary.tokens, 5);
         assert!(summary.ok);
+    }
+
+    #[test]
+    fn tool_calls_flow_back_through_the_provider_loop() {
+        // The full in-process loop for a tool-call turn: the provider's engine returns tool
+        // calls (no text), and the consumer surfaces them on the summary with an empty stream.
+        use crate::adapter::{ToolCall, ToolCallFunction};
+        struct ToolStub;
+        impl EngineAdapter for ToolStub {
+            fn engine_name(&self) -> &'static str {
+                "toolstub"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(
+                &self,
+                _req: &InferenceRequest,
+                _on_delta: &mut dyn FnMut(&str),
+            ) -> Result<ServeOutcome, AdapterError> {
+                Ok(ServeOutcome {
+                    tokens: 1,
+                    done: true,
+                    engine: Default::default(),
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        kind: "function".into(),
+                        function: ToolCallFunction { name: "search".into(), arguments: r#"{"q":"rust"}"#.into() },
+                    }],
+                })
+            }
+        }
+        let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            Ok(handle_serve_inbound(req, &ToolStub))
+        };
+        let mut text = String::new();
+        let summary =
+            request_completion(&mut transport, &request(), &mut |d| text.push_str(d)).unwrap();
+        assert!(text.is_empty(), "a tool-call turn streams no text");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.tool_calls[0].function.name, "search");
+        assert_eq!(summary.tool_calls[0].function.arguments, r#"{"q":"rust"}"#);
     }
 
     #[test]

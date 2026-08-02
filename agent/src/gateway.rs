@@ -94,6 +94,11 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f64>,
+    /// OpenAI `tools` — function specs the model may call. Forwarded opaquely to the engine;
+    /// any resulting `tool_calls` come back on the assistant turn. Empty ⇒ a plain completion.
+    /// (`tool_choice` is accepted but not yet forwarded — see A2b.)
+    #[serde(default)]
+    tools: Vec<Value>,
     /// OpenAI default is `false` → a single JSON object; `true` → an SSE stream.
     #[serde(default)]
     stream: bool,
@@ -252,7 +257,10 @@ fn stream_chunk(id: &str, model: &str, created: u64, delta: Value, finish: Optio
     .to_string()
 }
 
-/// The non-streaming `chat.completion` object.
+/// The non-streaming `chat.completion` object. When the model requested tool calls, the
+/// assistant message carries `tool_calls` with `content: null` and `finish_reason` is
+/// `"tool_calls"` (the OpenAI shape a coding agent expects); otherwise it carries the
+/// generated text and finishes `"stop"`.
 fn completion_object(
     id: &str,
     model: &str,
@@ -261,6 +269,14 @@ fn completion_object(
     summary: &ServeSummary,
     wall: std::time::Duration,
 ) -> Value {
+    let (message, finish) = if summary.tool_calls.is_empty() {
+        (json!({ "role": "assistant", "content": content }), "stop")
+    } else {
+        (
+            json!({ "role": "assistant", "content": Value::Null, "tool_calls": summary.tool_calls }),
+            "tool_calls",
+        )
+    };
     json!({
         "id": id,
         "object": "chat.completion",
@@ -268,8 +284,8 @@ fn completion_object(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish,
         }],
         "usage": usage_value(summary),
         "openhydra": openhydra_block(summary, wall),
@@ -280,12 +296,14 @@ fn completion_object(
 
 /// Spawn the blocking `complete` on a plain OS thread, returning the event channel and the
 /// start instant. The worker forwards each delta, then a terminal `Done`/`Error`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker(
     node: Arc<ConsumerNode>,
     model: String,
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
+    tools: Vec<Value>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
@@ -300,7 +318,7 @@ fn spawn_worker(
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
         };
-        match node.complete(&model, messages, max_tokens, temperature, &mut on_delta) {
+        match node.complete(&model, messages, max_tokens, temperature, tools, &mut on_delta) {
             Ok(summary) => {
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -382,6 +400,7 @@ async fn chat_completions(
             req.messages,
             req.max_tokens,
             req.temperature,
+            req.tools,
             gen_permit,
         )
     };
@@ -416,7 +435,15 @@ fn spawn_byok_worker(
     std::thread::spawn(move || {
         // Hold the global generation permit (G3b) for the worker's whole lifetime.
         let _gen_permit = gen_permit;
-        let request = InferenceRequest { model_ref: model, messages, max_tokens, temperature };
+        // BYOK tool-calling (forwarding `tools` to Anthropic/Gemini) is a separate follow-up;
+        // the hosted adapters ignore tools today, so a mapped model serves plain text.
+        let request = InferenceRequest {
+            model_ref: model,
+            messages,
+            max_tokens,
+            temperature,
+            tools: Vec::new(),
+        };
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
         };
@@ -437,6 +464,7 @@ fn spawn_byok_worker(
                     },
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
+                    tool_calls: outcome.tool_calls,
                 };
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -479,8 +507,17 @@ fn stream_response(
                     summary.discover_ns,
                     summary.proxy_roundtrip_ns,
                 );
+                // Tool calls (if any) ride the final chunk's delta with finish_reason
+                // "tool_calls"; a plain completion finishes "stop" with an empty delta.
+                // (Incremental per-argument streaming of tool_calls is a later refinement —
+                // delivered as one delta here, which OpenAI clients accumulate fine.)
+                let (delta, finish) = if summary.tool_calls.is_empty() {
+                    (json!({}), "stop")
+                } else {
+                    (json!({ "tool_calls": summary.tool_calls }), "tool_calls")
+                };
                 let mut chunk: Value =
-                    serde_json::from_str(&stream_chunk(&id_s, &model_s, created, json!({}), Some("stop")))
+                    serde_json::from_str(&stream_chunk(&id_s, &model_s, created, delta, Some(finish)))
                         .unwrap_or_else(|_| json!({}));
                 chunk["openhydra"] = openhydra_block(&summary, wall);
                 if want_usage {
@@ -782,7 +819,7 @@ async fn embeddings(
     // via max-messages, total size via max-prompt-chars, and applies deny-substrings).
     let aup_inputs: Vec<ChatMessage> = inputs
         .iter()
-        .map(|t| ChatMessage { role: "user".to_string(), content: t.clone() })
+        .map(|t| ChatMessage { role: "user".to_string(), content: t.clone(), ..Default::default() })
         .collect();
     if let AupDecision::Deny(reason) = state.aup.evaluate(&aup_inputs, None) {
         return openai_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error");
@@ -937,6 +974,7 @@ mod tests {
             },
             proxy_roundtrip_ns: 600_000_000,
             discover_ns: 1_000_000,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -949,11 +987,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_empty_model_and_messages() {
-        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into() }], max_tokens: None, temperature: None, stream: false, stream_options: None };
+        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, temperature: None, stream: false, stream_options: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into() }], max_tokens: None, temperature: None, stream: false, stream_options: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None };
         assert!(validate(&r).is_none());
     }
 
@@ -977,6 +1015,35 @@ mod tests {
         assert_eq!(v["usage"]["total_tokens"], 73);
         assert!(v["created"].is_u64());
         assert!(v["openhydra"]["tokens"] == 27);
+    }
+
+    #[test]
+    fn completion_object_emits_tool_calls_when_present() {
+        use crate::adapter::{ToolCall, ToolCallFunction};
+        let mut s = summary(0, 12);
+        s.tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "get_time".into(), arguments: "{}".into() },
+        }];
+        let v = completion_object("chatcmpl-1", "m", 1, "", &s, std::time::Duration::from_millis(10));
+        // The OpenAI shape a coding agent expects: content null, tool_calls set, finish_reason.
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(v["choices"][0]["message"]["content"], Value::Null);
+        assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["type"], "function");
+        assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn chat_request_parses_tools_and_ignores_unknown_fields() {
+        // A coding agent sends `tools` + `tool_choice`; we honour `tools`, and unknown fields
+        // (tool_choice, top_p, …) are silently ignored rather than 400-ing the request.
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":"auto","top_p":0.9}"#,
+        )
+        .unwrap();
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0]["function"]["name"], "f");
     }
 
     #[test]

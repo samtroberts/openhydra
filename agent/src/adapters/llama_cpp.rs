@@ -302,9 +302,10 @@ mod tests {
             .serve_stream(
                 &InferenceRequest {
                     model_ref: "Qwen2.5-7B-Instruct-Q4_K_M".into(),
-                    messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+                    messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
                     max_tokens: None,
                     temperature: None,
+                    tools: Vec::new(),
                 },
                 &mut |d| out.push_str(d),
             )

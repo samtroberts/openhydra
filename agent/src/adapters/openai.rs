@@ -26,8 +26,13 @@ use serde::Deserialize;
 
 use crate::adapter::{
     AdapterError, DetectedModel, EngineAdapter, EngineMetrics, HttpClient, InferenceRequest,
-    ServeOutcome,
+    ServeOutcome, ToolCall, ToolCallFunction,
 };
+
+/// Upper bound on distinct tool calls accumulated from one stream — a defensive cap so a
+/// buggy/hostile server can't drive an unbounded `index` into a huge allocation (mirrors the
+/// bounded-allocation discipline elsewhere in the serve path). Well above any real fan-out.
+const MAX_TOOL_CALLS: usize = 64;
 
 /// Default vLLM endpoint.
 pub const DEFAULT_VLLM_URL: &str = "http://127.0.0.1:8000";
@@ -78,6 +83,41 @@ struct Delta {
     /// servers — `Option<String>` accepts all three.
     #[serde(default)]
     content: Option<String>,
+    /// Tool-call fragments (OpenAI streams these incrementally: `id`/`name` on the first
+    /// fragment for an `index`, then `arguments` string pieces on following chunks).
+    #[serde(default)]
+    tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeltaToolCall {
+    /// Which tool call this fragment belongs to (stable across the stream).
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<DeltaToolCallFunction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeltaToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    /// A fragment of the JSON-string arguments — concatenated across chunks in order.
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Per-`index` accumulator that reassembles a streamed tool call from its fragments.
+#[derive(Default)]
+struct ToolAcc {
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -91,10 +131,26 @@ struct Usage {
 /// Build the `/v1/chat/completions` body (always streaming, usage requested).
 /// `max_tokens` / `temperature` map straight through; omitted when unset.
 fn build_chat_body(req: &InferenceRequest) -> String {
+    // Map each message, forwarding multi-turn tool state (assistant `tool_calls`, and a
+    // `role:"tool"` result's `tool_call_id`/`name`) verbatim — our `ToolCall` already
+    // serialises to the exact OpenAI shape (`type`, `function.{name,arguments-string}`), so a
+    // vLLM/LM Studio/llama.cpp/Exo backend can continue the tool loop.
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .map(|m| {
+            let mut msg = serde_json::json!({ "role": m.role, "content": m.content });
+            if let Some(tcs) = &m.tool_calls {
+                msg["tool_calls"] = serde_json::json!(tcs);
+            }
+            if let Some(id) = &m.tool_call_id {
+                msg["tool_call_id"] = serde_json::json!(id);
+            }
+            if let Some(name) = &m.name {
+                msg["name"] = serde_json::json!(name);
+            }
+            msg
+        })
         .collect();
     let mut body = serde_json::json!({
         "model": req.model_ref,
@@ -107,6 +163,12 @@ fn build_chat_body(req: &InferenceRequest) -> String {
     }
     if let Some(t) = req.temperature {
         body["temperature"] = serde_json::json!(t);
+    }
+    // Forward the caller's OpenAI-shaped `tools` verbatim — vLLM / LM Studio / llama.cpp /
+    // Exo all accept the OpenAI schema and stream `tool_calls` deltas back. Omitted when
+    // empty so a plain chat body is byte-identical to before.
+    if !req.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(req.tools.clone());
     }
     body.to_string()
 }
@@ -220,6 +282,7 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
     let mut chunk_tokens = 0u64;
     let mut usage: Option<Usage> = None;
     let mut done = false;
+    let mut tool_acc: Vec<ToolAcc> = Vec::new();
     // The OpenAI stream carries no timings; the engine is local, so measure them here —
     // start→first-token ≈ prefill, first-token→end ≈ decode.
     let mut first_token_at: Option<std::time::Instant> = None;
@@ -234,9 +297,10 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
         }
         let chunk = parse_chunk(payload)?;
         for choice in &chunk.choices {
-            // B-C4: once a finish_reason has been seen, stop emitting/counting content.
-            // Anything a (buggy or malicious) server sends after the finish must not
-            // inflate `chunk_tokens` — that count is the fallback that feeds the receipt.
+            // B-C4: once a finish_reason has been seen, stop emitting/counting content and
+            // stop accumulating tool-call fragments. Anything a (buggy or malicious) server
+            // sends after the finish must not inflate `chunk_tokens` (the receipt fallback)
+            // or graft extra tool calls onto the assistant turn.
             if !done {
                 if let Some(content) = &choice.delta.content {
                     if !content.is_empty() {
@@ -247,9 +311,13 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
                         chunk_tokens += 1;
                     }
                 }
+                if let Some(tcs) = &choice.delta.tool_calls {
+                    accumulate_tool_calls(&mut tool_acc, tcs);
+                }
             }
             if choice.finish_reason.is_some() {
-                // A clean stop; keep reading — the usage chunk may still follow.
+                // A clean stop (content, `tool_calls`, `length`, …); keep reading — the
+                // usage chunk may still follow.
                 done = true;
             }
         }
@@ -285,7 +353,56 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
         total_duration_ns,
         ..EngineMetrics::default()
     };
-    Ok(ServeOutcome { tokens, done, engine })
+    // Reassemble the accumulated fragments into finished OpenAI tool calls. A slot with no
+    // function name never got a real fragment (defensive) → dropped; a missing id/type is
+    // filled with a synthesised default so the assistant turn is always well-formed.
+    let tool_calls: Vec<ToolCall> = tool_acc
+        .into_iter()
+        .enumerate()
+        .filter(|(_, a)| !a.name.is_empty())
+        .map(|(i, a)| ToolCall {
+            id: if a.id.is_empty() { format!("call_{}", i + 1) } else { a.id },
+            kind: if a.kind.is_empty() { "function".to_string() } else { a.kind },
+            function: ToolCallFunction { name: a.name, arguments: a.arguments },
+        })
+        .collect();
+    Ok(ServeOutcome { tokens, done, engine, tool_calls })
+}
+
+/// Merge one chunk's streamed tool-call fragments into the per-`index` accumulators: set
+/// `id`/`type`/`name` from whichever fragment first carries them, and append each
+/// `arguments` piece in arrival order. Fragments past [`MAX_TOOL_CALLS`] are ignored (a
+/// bound against a hostile `index`).
+fn accumulate_tool_calls(acc: &mut Vec<ToolAcc>, fragments: &[DeltaToolCall]) {
+    for f in fragments {
+        if f.index >= MAX_TOOL_CALLS {
+            continue; // out-of-bound index — drop rather than grow the vec unboundedly
+        }
+        if f.index >= acc.len() {
+            acc.resize_with(f.index + 1, ToolAcc::default);
+        }
+        let slot = &mut acc[f.index];
+        if let Some(id) = &f.id {
+            if !id.is_empty() {
+                slot.id = id.clone();
+            }
+        }
+        if let Some(kind) = &f.kind {
+            if !kind.is_empty() {
+                slot.kind = kind.clone();
+            }
+        }
+        if let Some(func) = &f.function {
+            if let Some(name) = &func.name {
+                if !name.is_empty() {
+                    slot.name = name.clone();
+                }
+            }
+            if let Some(arguments) = &func.arguments {
+                slot.arguments.push_str(arguments);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,9 +451,10 @@ mod tests {
     fn req() -> InferenceRequest {
         InferenceRequest {
             model_ref: "Qwen/Qwen2.5-7B-Instruct".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
             max_tokens: Some(16),
             temperature: Some(0.0),
+            tools: Vec::new(),
         }
     }
 
@@ -410,6 +528,104 @@ mod tests {
         // Timings are measured provider-locally; these invariants hold regardless of clock.
         assert!(outcome.engine.total_duration_ns >= outcome.engine.eval_duration_ns);
         assert!(outcome.engine.total_duration_ns >= outcome.engine.prompt_eval_duration_ns);
+    }
+
+    #[test]
+    fn build_chat_body_forwards_tools_verbatim() {
+        let mut r = req();
+        r.tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "parameters": { "type": "object" } }
+        })];
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&r)).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], "get_weather");
+        // A plain request carries no tools field.
+        let plain: serde_json::Value = serde_json::from_str(&build_chat_body(&req())).unwrap();
+        assert!(plain.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_forwards_multi_turn_tool_messages() {
+        use crate::adapter::{ToolCall, ToolCallFunction};
+        let mut r = req();
+        r.messages = vec![
+            ChatMessage::new("user", "weather in SF?"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: ToolCallFunction { name: "get_weather".into(), arguments: r#"{"city":"SF"}"#.into() },
+                }]),
+                ..Default::default()
+            },
+            ChatMessage { role: "tool".into(), content: "72F".into(), tool_call_id: Some("call_1".into()), ..Default::default() },
+        ];
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&r)).unwrap();
+        // Assistant turn keeps OpenAI-shaped tool_calls (arguments stays a string).
+        assert_eq!(v["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(v["messages"][1]["tool_calls"][0]["type"], "function");
+        assert!(v["messages"][1]["tool_calls"][0]["function"]["arguments"].is_string());
+        // Tool result carries its tool_call_id.
+        assert_eq!(v["messages"][2]["role"], "tool");
+        assert_eq!(v["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn serve_stream_reassembles_streamed_tool_call_fragments() {
+        // vLLM/OpenAI stream a tool call as: id+name first, then argument string fragments,
+        // then a finish_reason:"tool_calls" chunk. The adapter must reassemble one call with
+        // the full argument string.
+        let (out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8}}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert!(out.is_empty(), "a tool-call turn streams no text content");
+        assert_eq!(outcome.tokens, 8);
+        assert_eq!(outcome.tool_calls.len(), 1);
+        let tc = &outcome.tool_calls[0];
+        assert_eq!(tc.id, "call_abc"); // real id preserved (not synthesised)
+        assert_eq!(tc.kind, "function");
+        assert_eq!(tc.function.name, "get_weather");
+        // arguments reassembled from the three fragments into valid JSON.
+        let args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap();
+        assert_eq!(args["city"], "SF");
+    }
+
+    #[test]
+    fn serve_stream_reassembles_two_parallel_tool_calls_by_index() {
+        let (_out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"f0","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"f1","arguments":"{\"x\":1}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(outcome.tool_calls.len(), 2);
+        assert_eq!(outcome.tool_calls[0].function.name, "f0");
+        assert_eq!(outcome.tool_calls[1].function.name, "f1");
+        assert_eq!(outcome.tool_calls[1].id, "b");
+    }
+
+    #[test]
+    fn tool_call_fragments_after_finish_are_ignored() {
+        // B-C4: a server injecting a tool call after finish_reason must not graft it on.
+        let (_out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"real","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"x","type":"function","function":{"name":"injected","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(outcome.tool_calls.len(), 1, "post-finish tool call dropped");
+        assert_eq!(outcome.tool_calls[0].function.name, "real");
     }
 
     #[test]

@@ -120,7 +120,7 @@ mod tests {
     use super::*;
 
     fn msg(content: &str) -> ChatMessage {
-        ChatMessage { role: "user".to_string(), content: content.to_string() }
+        ChatMessage { role: "user".to_string(), content: content.to_string(), ..Default::default() }
     }
 
     #[test]

@@ -225,7 +225,7 @@ mod tests {
             on_delta: &mut dyn FnMut(&str),
         ) -> Result<ServeOutcome, AdapterError> {
             on_delta(self.tag);
-            Ok(ServeOutcome { tokens: 1, done: true, engine: EngineMetrics::default() })
+            Ok(ServeOutcome { tokens: 1, done: true, engine: EngineMetrics::default(), tool_calls: Vec::new() })
         }
     }
 
@@ -252,9 +252,10 @@ mod tests {
     fn infer(model_ref: &str) -> InferenceRequest {
         InferenceRequest {
             model_ref: model_ref.into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
             max_tokens: None,
             temperature: None,
+            tools: Vec::new(),
         }
     }
 

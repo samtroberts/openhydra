@@ -256,6 +256,7 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
                 total_duration_ns: elapsed_ns,
                 ..EngineMetrics::default()
             },
+            tool_calls: Vec::new(), // image gen has no tool calls
         })
     }
 }
@@ -321,9 +322,10 @@ mod tests {
     fn request(prompt: &str) -> InferenceRequest {
         InferenceRequest {
             model_ref: "dreamshaper_8.safetensors".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: prompt.into() }],
+            messages: vec![ChatMessage { role: "user".into(), content: prompt.into(), ..Default::default() }],
             max_tokens: None,
             temperature: None,
+            tools: Vec::new(),
         }
     }
 

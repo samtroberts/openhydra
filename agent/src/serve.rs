@@ -23,8 +23,11 @@
 //!   utf8).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::adapter::{AdapterError, ChatMessage, EngineAdapter, EngineMetrics, InferenceRequest};
+use crate::adapter::{
+    AdapterError, ChatMessage, EngineAdapter, EngineMetrics, InferenceRequest, ToolCall,
+};
 
 /// Per-request metrics carried on the terminal `Done` frame: the engine's own numbers
 /// plus the provider's serve-side wall time (so the consumer can separate network RTT
@@ -51,6 +54,10 @@ pub struct ServeRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// OpenAI `tools` specs the consumer forwards for the provider's engine (empty ⇒ none).
+    /// `#[serde(default)]` so an older consumer that omits the field still deserializes.
+    #[serde(default)]
+    pub tools: Vec<Value>,
     /// The receipt nonce the consumer commits *before* the serve (B-S1). The provider
     /// records the tokens it serves under this nonce and later co-signs the settlement
     /// receipt only if the same nonce is presented with `tokens <= served`, the same model,
@@ -71,12 +78,17 @@ impl ServeRequest {
 const TAG_DELTA: u8 = 0x01;
 const TAG_DONE: u8 = 0x02;
 const TAG_ERROR: u8 = 0x03;
+const TAG_TOOLCALLS: u8 = 0x04;
 
 /// One frame the provider streams back to the consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeChunk {
     /// A text fragment of the completion.
     Delta(String),
+    /// The tool calls the model requested this turn (OpenAI `tool_calls`). Sent once,
+    /// terminal, just before `Done` — structured data that can't ride the text `Delta`
+    /// path. Absent when the model produced plain text.
+    ToolCalls(Vec<ToolCall>),
     /// End of stream + the completion token count (for the co-signed receipt) and the
     /// per-request [`ServeMetrics`] (engine numbers + provider serve time).
     Done { tokens: u64, metrics: ServeMetrics },
@@ -109,6 +121,15 @@ impl ServeChunk {
                 b.extend_from_slice(s.as_bytes());
                 b
             }
+            ServeChunk::ToolCalls(calls) => {
+                // tag · JSON(Vec<ToolCall>). One frame per request (terminal), so JSON is
+                // fine and keeps the tool-call shape extensible.
+                let json = serde_json::to_vec(calls).unwrap_or_default();
+                let mut b = Vec::with_capacity(1 + json.len());
+                b.push(TAG_TOOLCALLS);
+                b.extend_from_slice(&json);
+                b
+            }
         }
     }
 
@@ -126,13 +147,16 @@ impl ServeChunk {
             Some(&TAG_ERROR) => Ok(ServeChunk::Error(
                 String::from_utf8_lossy(&bytes[1..]).into_owned(),
             )),
+            Some(&TAG_TOOLCALLS) => serde_json::from_slice(&bytes[1..])
+                .map(ServeChunk::ToolCalls)
+                .map_err(|e| AdapterError::Parse(format!("serve chunk: bad tool_calls frame: {e}"))),
             _ => Err(AdapterError::Parse("serve chunk: bad/short frame".into())),
         }
     }
 }
 
 /// Outcome of serving one request (returned to the wiring layer for the receipt).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServeSummary {
     /// Completion tokens generated (0 on a failed request).
     pub tokens: u64,
@@ -145,6 +169,10 @@ pub struct ServeSummary {
     /// Consumer-side: the `proxy_forward` round-trip (ns) = network RTT + provider serve.
     /// Set by the consumer; 0 provider-side.
     pub proxy_roundtrip_ns: u64,
+    /// Tool calls the model requested (OpenAI `tool_calls`), from the `ToolCalls` frame;
+    /// empty for a plain-text completion. The gateway emits these as the assistant turn's
+    /// `tool_calls` with `finish_reason: "tool_calls"`.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -169,6 +197,7 @@ pub fn handle_serve_request(
                 metrics: ServeMetrics::default(),
                 discover_ns: 0,
                 proxy_roundtrip_ns: 0,
+                tool_calls: Vec::new(),
             };
         }
     };
@@ -188,6 +217,7 @@ pub fn handle_serve_request_parsed(
         messages: req.messages,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
+        tools: req.tools,
     };
 
     // Scope the delta sink so its &mut borrow of `send_chunk` ends before the terminal
@@ -203,8 +233,20 @@ pub fn handle_serve_request_parsed(
     match outcome {
         Ok(o) => {
             let metrics = ServeMetrics { engine: o.engine, provider_serve_ns };
+            // Tool calls (terminal, structured) go in their own frame just before `Done`, so
+            // the consumer sees text deltas → tool_calls → done in order.
+            if !o.tool_calls.is_empty() {
+                send_chunk(&ServeChunk::ToolCalls(o.tool_calls.clone()).encode());
+            }
             send_chunk(&ServeChunk::Done { tokens: o.tokens, metrics }.encode());
-            ServeSummary { tokens: o.tokens, ok: true, metrics, discover_ns: 0, proxy_roundtrip_ns: 0 }
+            ServeSummary {
+                tokens: o.tokens,
+                ok: true,
+                metrics,
+                discover_ns: 0,
+                proxy_roundtrip_ns: 0,
+                tool_calls: o.tool_calls,
+            }
         }
         Err(e) => {
             send_chunk(&ServeChunk::Error(e.to_string()).encode());
@@ -214,6 +256,7 @@ pub fn handle_serve_request_parsed(
                 metrics: ServeMetrics { provider_serve_ns, ..Default::default() },
                 discover_ns: 0,
                 proxy_roundtrip_ns: 0,
+                tool_calls: Vec::new(),
             }
         }
     }
@@ -254,15 +297,24 @@ pub fn parse_response(buffer: &[u8]) -> Result<Vec<ServeChunk>, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{DetectedModel, ServeOutcome};
+    use crate::adapter::{DetectedModel, ServeOutcome, ToolCallFunction};
+
+    fn tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: name.into(), arguments: "{}".into() },
+        }
+    }
 
     fn req(reply_to: &str) -> ServeRequest {
         ServeRequest {
             reply_to: reply_to.into(),
             model_ref: "qwen2.5:7b".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
             max_tokens: Some(64),
             temperature: None,
+            tools: Vec::new(),
             nonce: [0u8; 16],
         }
     }
@@ -292,7 +344,7 @@ mod tests {
             for d in &self.deltas {
                 on_delta(d);
             }
-            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default() })
+            Ok(ServeOutcome { tokens: self.tokens, done: true, engine: Default::default(), tool_calls: Vec::new() })
         }
     }
 
@@ -314,6 +366,7 @@ mod tests {
     fn serve_chunk_round_trips_each_variant() {
         for c in [
             ServeChunk::Delta("héllo".into()), // multi-byte utf8
+            ServeChunk::ToolCalls(vec![tool_call("get_weather"), tool_call("get_time")]),
             ServeChunk::Done {
                 tokens: 4096,
                 metrics: ServeMetrics {
@@ -343,6 +396,39 @@ mod tests {
         assert!(matches!(frames[3], ServeChunk::Done { tokens: 9, .. }));
         assert_eq!(summary.tokens, 9);
         assert!(summary.ok);
+    }
+
+    #[test]
+    fn serve_emits_a_tool_calls_frame_before_done() {
+        // An adapter that returns tool calls (no text) must produce exactly: ToolCalls → Done,
+        // and the summary must carry the calls for the gateway to shape into the assistant turn.
+        struct ToolStub;
+        impl EngineAdapter for ToolStub {
+            fn engine_name(&self) -> &'static str {
+                "toolstub"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(
+                &self,
+                _request: &InferenceRequest,
+                _on_delta: &mut dyn FnMut(&str),
+            ) -> Result<ServeOutcome, AdapterError> {
+                Ok(ServeOutcome {
+                    tokens: 2,
+                    done: true,
+                    engine: Default::default(),
+                    tool_calls: vec![tool_call("get_weather")],
+                })
+            }
+        }
+        let (frames, summary) = collect_chunks(&req("c").encode(), &ToolStub);
+        assert_eq!(frames.len(), 2, "no text deltas → just ToolCalls then Done");
+        assert!(matches!(&frames[0], ServeChunk::ToolCalls(tc) if tc.len() == 1));
+        assert!(matches!(frames[1], ServeChunk::Done { tokens: 2, .. }));
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.tool_calls[0].function.name, "get_weather");
     }
 
     #[test]
