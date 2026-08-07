@@ -275,6 +275,57 @@ pub fn frame_response(encoded_chunks: &[Vec<u8>]) -> Vec<u8> {
     buf
 }
 
+/// Reconnect-and-fetch (long-serve drop tolerance): a consumer whose serve connection was
+/// evicted during a long generation re-requests the buffered result **by nonce** on a fresh
+/// circuit, instead of losing the completed work. The provider keys the buffer on the same
+/// [`ServeRequest::nonce`] it already records for settlement, so no new correlation id is
+/// needed. See `RECONNECT_AND_FETCH_PLAN.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchResponse {
+    /// The buffered serve frames — byte-identical to what a fresh serve round-trip returns,
+    /// so the consumer decodes them with [`parse_response`] exactly as usual.
+    Ready(Vec<u8>),
+    /// The serve is still running (buffer holds a Generating marker); retry after a backoff.
+    Generating,
+    /// No buffered result under this nonce — the provider restarted or the buffer TTL expired.
+    /// The consumer re-serves from scratch (deterministic engines cache-hit).
+    NotFound,
+    /// The fetch's libp2p-authenticated sender is not the consumer that committed the nonce.
+    /// Guards against a peer that learns/guesses a nonce fetching another consumer's result.
+    Forbidden,
+}
+
+const FETCH_READY: u8 = 0x01;
+const FETCH_GENERATING: u8 = 0x02;
+const FETCH_NOTFOUND: u8 = 0x03;
+const FETCH_FORBIDDEN: u8 = 0x04;
+
+impl FetchResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            FetchResponse::Ready(framed) => {
+                let mut b = Vec::with_capacity(1 + framed.len());
+                b.push(FETCH_READY);
+                b.extend_from_slice(framed);
+                b
+            }
+            FetchResponse::Generating => vec![FETCH_GENERATING],
+            FetchResponse::NotFound => vec![FETCH_NOTFOUND],
+            FetchResponse::Forbidden => vec![FETCH_FORBIDDEN],
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, AdapterError> {
+        match bytes.first() {
+            Some(&FETCH_READY) => Ok(FetchResponse::Ready(bytes[1..].to_vec())),
+            Some(&FETCH_GENERATING) => Ok(FetchResponse::Generating),
+            Some(&FETCH_NOTFOUND) => Ok(FetchResponse::NotFound),
+            Some(&FETCH_FORBIDDEN) => Ok(FetchResponse::Forbidden),
+            _ => Err(AdapterError::Parse("fetch response: bad/empty frame".into())),
+        }
+    }
+}
+
 /// Parse a [`frame_response`] buffer back into chunks (consumer side).
 pub fn parse_response(buffer: &[u8]) -> Result<Vec<ServeChunk>, AdapterError> {
     let mut out = Vec::new();
@@ -470,5 +521,31 @@ mod tests {
         assert!(matches!(frames.last().unwrap(), ServeChunk::Error(_)));
         assert!(!summary.ok);
         assert_eq!(summary.tokens, 0);
+    }
+
+    #[test]
+    fn fetch_response_roundtrips_each_variant() {
+        // Ready carries the framed serve response verbatim, so the consumer parses it exactly
+        // like a first-try round-trip.
+        let framed = frame_response(&[
+            ServeChunk::Delta("hi".into()).encode(),
+            ServeChunk::Done { tokens: 3, metrics: ServeMetrics::default() }.encode(),
+        ]);
+        for r in [
+            FetchResponse::Ready(framed.clone()),
+            FetchResponse::Generating,
+            FetchResponse::NotFound,
+            FetchResponse::Forbidden,
+        ] {
+            assert_eq!(FetchResponse::decode(&r.encode()).unwrap(), r);
+        }
+        // The Ready payload really is the framed serve bytes.
+        if let FetchResponse::Ready(bytes) = FetchResponse::decode(&FetchResponse::Ready(framed.clone()).encode()).unwrap() {
+            assert_eq!(parse_response(&bytes).unwrap().len(), 2);
+        } else {
+            panic!("expected Ready");
+        }
+        // An empty frame is a decode error, not a silent misparse.
+        assert!(FetchResponse::decode(&[]).is_err());
     }
 }

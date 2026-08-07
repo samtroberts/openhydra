@@ -35,9 +35,9 @@ use openhydra_protocol::verify::{
 use serde_json::Value;
 
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
-use crate::provider::SERVE_REQUEST;
+use crate::provider::{FETCH_RESULT, SERVE_REQUEST};
 use crate::receipt::request_receipt;
-use crate::serve::{parse_response, ServeChunk, ServeRequest, ServeSummary};
+use crate::serve::{parse_response, FetchResponse, ServeChunk, ServeRequest, ServeSummary};
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -64,6 +64,16 @@ pub struct SelectedProvider {
 /// stale-but-advertised provider frees its slot for failover instead of hanging the
 /// request on libp2p's ~15s (or unbounded) request-response wait.
 const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Reconnect-and-fetch: per fetch-attempt timeout. A fetch is a cheap provider-side buffer
+/// lookup, so this is short — the cost is re-dialing over a (re-establishing) relay circuit.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Reconnect-and-fetch: backoff between fetch attempts, tuned to the ~10s relay re-establish
+/// window (a fetch that fails at the transport layer means the circuit isn't back yet).
+const FETCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
+/// Reconnect-and-fetch: overall budget to recover a dropped serve's buffered result before
+/// giving up — comfortably covers the 10–70s NAT/relay reconnect window plus a generation tail.
+const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Bound on the detached receipt-settlement round-trip (G5). Settlement runs off the response
 /// path, so this only caps how long a provider that black-holes the RECEIPT_REQUEST can park
@@ -441,16 +451,26 @@ impl ConsumerNode {
                 let rt = &mut proxy_roundtrip_ns;
                 let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
                     let t = std::time::Instant::now();
-                    let r = self
-                        .net
-                        .proxy_forward_timeout(
-                            provider_libp2p.clone(),
-                            framed.to_vec(),
-                            ATTEMPT_TIMEOUT,
-                        )
-                        .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")));
+                    let r = self.net.proxy_forward_timeout(
+                        provider_libp2p.clone(),
+                        framed.to_vec(),
+                        ATTEMPT_TIMEOUT,
+                    );
                     *rt = t.elapsed().as_nanos() as u64;
-                    r
+                    match r {
+                        Ok(bytes) => Ok(bytes),
+                        // The serve connection dropped (e.g. relay/NAT eviction during a long
+                        // generation). The response is single-shot, so nothing was delivered
+                        // yet — recover the completed work by fetching it by nonce on a fresh
+                        // circuit rather than failing. See RECONNECT_AND_FETCH_PLAN.md.
+                        Err(drop_err) => self
+                            .reconnect_and_fetch(&provider_libp2p, &nonce, framed)
+                            .map_err(|fe| {
+                                AdapterError::Http(format!(
+                                    "proxy_forward: {drop_err}; reconnect-fetch: {fe}"
+                                ))
+                            }),
+                    }
                 };
                 let mut guarded = |d: &str| {
                     delivered = true;
@@ -503,6 +523,62 @@ impl ConsumerNode {
         }
         Err(last_err
             .unwrap_or_else(|| AdapterError::Http(format!("all providers failed for '{model}'"))))
+    }
+
+    /// Reconnect-and-fetch (RECONNECT_AND_FETCH_PLAN.md): the serve connection to `provider`
+    /// dropped mid-request (e.g. the relay/NAT mapping was evicted during a long generation).
+    /// Poll the provider for the buffered result **by nonce** on fresh circuits — each
+    /// `proxy_forward` re-dials — backing off while the relay re-establishes or the provider
+    /// is still generating, until [`FETCH_DEADLINE`]. `NotFound` (provider restarted / buffer
+    /// TTL expired) → re-serve the original request once; deterministic engines cache-hit.
+    /// Returns the framed serve response for [`request_completion`] to parse, exactly as a
+    /// first-try round-trip would.
+    fn reconnect_and_fetch(
+        &self,
+        provider: &str,
+        nonce: &[u8; 16],
+        original_serve: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mut fetch_req = Vec::with_capacity(1 + nonce.len());
+        fetch_req.push(FETCH_RESULT);
+        fetch_req.extend_from_slice(nonce);
+        let deadline = std::time::Instant::now() + FETCH_DEADLINE;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("result not recovered before deadline".into());
+            }
+            match self.net.proxy_forward_timeout(
+                provider.to_string(),
+                fetch_req.clone(),
+                FETCH_TIMEOUT,
+            ) {
+                Ok(resp) => match FetchResponse::decode(&resp) {
+                    Ok(FetchResponse::Ready(framed)) => {
+                        tracing::debug!(provider = %provider, "reconnect-fetch recovered result");
+                        return Ok(framed);
+                    }
+                    // Still generating — wait out the compute, then re-fetch.
+                    Ok(FetchResponse::Generating) => std::thread::sleep(FETCH_BACKOFF),
+                    // Provider no longer holds it → re-serve once (idempotent for deterministic
+                    // engines; the ComfyUI /history cache makes the re-run instant).
+                    Ok(FetchResponse::NotFound) => {
+                        tracing::debug!(provider = %provider, "reconnect-fetch NotFound → re-serve");
+                        return self
+                            .net
+                            .proxy_forward_timeout(
+                                provider.to_string(),
+                                original_serve.to_vec(),
+                                ATTEMPT_TIMEOUT,
+                            )
+                            .map_err(|e| format!("re-serve: {e}"));
+                    }
+                    Ok(FetchResponse::Forbidden) => return Err("fetch forbidden".into()),
+                    Err(e) => return Err(format!("bad fetch response: {e}")),
+                },
+                // Transport still down (relay re-establishing) → back off and retry the fetch.
+                Err(_) => std::thread::sleep(FETCH_BACKOFF),
+            }
+        }
     }
 
     /// Fire the co-signed receipt for a completed request. Skips a provider that

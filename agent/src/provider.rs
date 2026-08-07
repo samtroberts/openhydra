@@ -35,7 +35,8 @@ use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{
-    frame_response, handle_serve_request, handle_serve_request_parsed, ServeChunk, ServeRequest,
+    frame_response, handle_serve_request, handle_serve_request_parsed, FetchResponse, ServeChunk,
+    ServeRequest,
 };
 use crate::status::TransferStats;
 use crate::workpool::WorkerPool;
@@ -55,6 +56,44 @@ fn now_unix_ms() -> u64 {
 /// libp2p proxy method byte for an inference serve request (consumer → provider). Sits
 /// alongside the existing peer method bytes (0x01 Forward … 0x07 Receipt).
 pub const SERVE_REQUEST: u8 = 0x10;
+
+/// libp2p proxy method byte for a **reconnect-and-fetch** request (consumer → provider):
+/// `0x11 ‖ nonce(16)`. A consumer whose serve connection dropped during a long generation
+/// re-requests the buffered result by the same nonce it committed for settlement, on a fresh
+/// circuit, instead of losing the completed work. See `RECONNECT_AND_FETCH_PLAN.md`.
+pub const FETCH_RESULT: u8 = 0x11;
+
+/// How long a completed (or in-flight) serve result stays fetchable. Must comfortably exceed
+/// the NAT/relay re-establishment window (~10–70s) so a reconnecting consumer still finds it.
+const RESULT_TTL_MS: u64 = 120_000;
+/// Hard cap on buffered results (count) — evict oldest-first past this.
+const MAX_RESULT_ENTRIES: usize = 256;
+/// Hard cap on total buffered result bytes (a single 4K video base64 is MBs) — evict
+/// oldest-first past this so the buffer can't become a memory DoS.
+const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+/// E-S8-style per-peer rate cap on fetch requests (cheap map lookups, but still bounded).
+const FETCH_RATE_RPS: f64 = 50.0;
+const FETCH_RATE_BURST: f64 = 100.0;
+const FETCH_RATE_MAX_TRACKED: usize = 4096;
+
+/// A buffered serve result, keyed by the consumer's committed nonce, so a reconnecting
+/// consumer can fetch it after the serve connection drops (reconnect-and-fetch).
+struct BufferedResult {
+    /// The consumer libp2p peer id allowed to fetch — the `reply_to` from the serve request.
+    /// A fetch from any other authenticated peer is `Forbidden`.
+    reply_to: String,
+    state: ResultState,
+    /// Encoded-frame byte size, for the total-bytes cap.
+    bytes: usize,
+    recorded_ms: u64,
+}
+
+/// Lifecycle of a buffered result: generating (in-flight; a fetch says "retry") → ready
+/// (the encoded [`ServeChunk`] frames, byte-identical to a fresh serve response).
+enum ResultState {
+    Generating,
+    Ready(Vec<Vec<u8>>),
+}
 
 /// Build the DHT record advertising one detected model.
 ///
@@ -180,6 +219,45 @@ fn validate_and_consume_commitment(
     Ok(())
 }
 
+/// Pure reconnect-and-fetch lookup, extracted so it is unit-testable without a live
+/// `Provider`. `source_peer` is the libp2p-authenticated fetcher; only the consumer that
+/// committed the nonce (`reply_to`) may retrieve the buffered result.
+fn fetch_from_buffer(
+    map: &HashMap<[u8; 16], BufferedResult>,
+    nonce: &[u8; 16],
+    source_peer: &str,
+) -> FetchResponse {
+    match map.get(nonce) {
+        None => FetchResponse::NotFound,
+        // Ownership binding: a fetch from anyone but the committing consumer is refused, so a
+        // peer that learns/guesses a nonce can't steal another consumer's result.
+        Some(r) if r.reply_to != source_peer => FetchResponse::Forbidden,
+        Some(r) => match &r.state {
+            ResultState::Generating => FetchResponse::Generating,
+            ResultState::Ready(frames) => FetchResponse::Ready(frame_response(frames)),
+        },
+    }
+}
+
+/// Evict oldest-first until the result buffer is within both the count and byte caps, so a
+/// flood of buffered results (or a few huge ones) can't grow provider memory without bound.
+/// O(n·evictions) but n ≤ [`MAX_RESULT_ENTRIES`], so trivial. Free fn (no `Self`) to keep it
+/// unit-testable without a live `Provider`.
+fn enforce_result_caps(map: &mut HashMap<[u8; 16], BufferedResult>) {
+    loop {
+        let total: usize = map.values().map(|r| r.bytes).sum();
+        if map.len() <= MAX_RESULT_ENTRIES && total <= MAX_RESULT_BYTES {
+            break;
+        }
+        match map.iter().min_by_key(|(_, r)| r.recorded_ms).map(|(k, _)| *k) {
+            Some(oldest) => {
+                map.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+}
+
 /// An engine joined to the swarm: advertises its models and serves inbound requests.
 pub struct Provider<A: EngineAdapter> {
     adapter: A,
@@ -210,6 +288,13 @@ pub struct Provider<A: EngineAdapter> {
     /// E-S8: global token-bucket cap on inbound receipt settlements — sheds a receipt flood
     /// *before* the Ed25519 verify+sign, so receipt crypto can't monopolize the worker pool.
     receipt_rl: Arc<RateLimiter>,
+    /// Reconnect-and-fetch: nonce → buffered serve result, so a consumer whose connection
+    /// dropped during a long generation can fetch the completed work on a fresh circuit
+    /// instead of losing it. Bound to the serve's `reply_to`, TTL-pruned + byte/count-capped.
+    results: Mutex<HashMap<[u8; 16], BufferedResult>>,
+    /// E-S8: per-peer rate cap on fetch requests (mirrors `receipt_rl`; a separate bucket so a
+    /// fetch flood can't shed receipts and vice-versa).
+    fetch_rl: Arc<RateLimiter>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -230,6 +315,13 @@ impl<A: EngineAdapter> Provider<A> {
                 burst: RECEIPT_RATE_BURST,
                 max_inflight: 0, // rate-only; concurrency is already bounded by the worker pool
                 max_tracked: RECEIPT_RATE_MAX_TRACKED, // per-peer buckets, bounded + idle-evicted
+            })),
+            results: Mutex::new(HashMap::new()),
+            fetch_rl: Arc::new(RateLimiter::new(RateLimitConfig {
+                rps: FETCH_RATE_RPS,
+                burst: FETCH_RATE_BURST,
+                max_inflight: 0,
+                max_tracked: FETCH_RATE_MAX_TRACKED,
             })),
         }
     }
@@ -283,6 +375,65 @@ impl<A: EngineAdapter> Provider<A> {
             return; // backstop — refuse to grow past the cap (stale entries already pruned)
         }
         map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now });
+    }
+
+    /// Reconnect-and-fetch: mark a serve in-flight under `nonce` so a fetch that arrives
+    /// while it's still generating gets `Generating` (retry) rather than `NotFound`
+    /// (re-serve) — which would double-run the same request.
+    fn mark_generating(&self, nonce: [u8; 16], reply_to: &str) {
+        let now = now_unix_ms();
+        let mut map = self.results.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
+        enforce_result_caps(&mut map);
+        map.insert(
+            nonce,
+            BufferedResult {
+                reply_to: reply_to.to_string(),
+                state: ResultState::Generating,
+                bytes: 0,
+                recorded_ms: now,
+            },
+        );
+    }
+
+    /// Reconnect-and-fetch: buffer the completed serve frames under `nonce`, bound to the
+    /// consumer's `reply_to`, so a reconnecting consumer can fetch them. Called right after
+    /// the serve completes (ok or error — the consumer gets whatever was produced).
+    fn store_result(&self, nonce: [u8; 16], reply_to: &str, frames: &[Vec<u8>]) {
+        let now = now_unix_ms();
+        let bytes: usize = frames.iter().map(|c| c.len()).sum();
+        let mut map = self.results.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
+        map.insert(
+            nonce,
+            BufferedResult {
+                reply_to: reply_to.to_string(),
+                state: ResultState::Ready(frames.to_vec()),
+                bytes,
+                recorded_ms: now,
+            },
+        );
+        enforce_result_caps(&mut map);
+    }
+
+    /// Handle a [`FETCH_RESULT`] request: return the buffered result for the nonce in
+    /// `payload` (`0x11 ‖ nonce(16)` → this is `payload` = the 16 nonce bytes). `source_peer`
+    /// is the libp2p-authenticated sender; only the consumer that committed the nonce
+    /// (`reply_to`) may fetch it.
+    fn handle_fetch(&self, source_peer: &str, payload: &[u8]) -> Vec<u8> {
+        // E-S8: shed a fetch flood, keyed on the authenticated sender. Throttled → "retry"
+        // (Generating), so an honest reconnecting consumer just backs off.
+        if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+            return FetchResponse::Generating.encode();
+        }
+        let nonce: [u8; 16] = match payload.try_into() {
+            Ok(n) => n,
+            Err(_) => return FetchResponse::NotFound.encode(),
+        };
+        let now = now_unix_ms();
+        let mut map = self.results.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
+        fetch_from_buffer(&map, &nonce, source_peer).encode()
     }
 
     /// B-S1/B-S7: validate a settlement receipt against the serve we recorded under its
@@ -569,14 +720,22 @@ impl<A: EngineAdapter> Provider<A> {
                 let summary = match parsed {
                     Some(req) => {
                         // Capture the small fields we still need after `req` is moved into
-                        // the serve (which consumes `messages`), for commitment + stats.
+                        // the serve (which consumes `messages`), for commitment + stats +
+                        // reconnect-and-fetch buffering.
                         let nonce = req.nonce;
                         let model_ref = req.model_ref.clone();
+                        let reply_to = req.reply_to.clone();
+                        // Reconnect-and-fetch: mark in-flight so a fetch racing this serve gets
+                        // Generating (retry), not NotFound (which would re-run the request).
+                        self.mark_generating(nonce, &reply_to);
                         let summary = handle_serve_request_parsed(
                             req,
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
                         );
+                        // Reconnect-and-fetch: buffer the produced frames under the nonce so a
+                        // consumer whose connection dropped can fetch them on a fresh circuit.
+                        self.store_result(nonce, &reply_to, &chunks);
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once).
                         if summary.ok && summary.tokens > 0 {
@@ -601,6 +760,8 @@ impl<A: EngineAdapter> Provider<A> {
                 let _ = summary;
                 frame_response(&chunks)
             }
+            // Reconnect-and-fetch: return the buffered result for a nonce (drop recovery).
+            Some(&FETCH_RESULT) => self.handle_fetch(source_peer, &data[1..]),
             // Unknown method byte → a framed Error from the serve handler.
             _ => handle_serve_inbound(data, &self.adapter),
         }
@@ -849,5 +1010,78 @@ mod tests {
             .unwrap_err()
             .contains("no serve commitment"));
         assert!(map2.is_empty(), "stale commitment should have been pruned");
+    }
+
+    // ── Reconnect-and-fetch ──────────────────────────────────────────────
+
+    fn ready_entry(reply_to: &str, frames: Vec<Vec<u8>>) -> BufferedResult {
+        let bytes = frames.iter().map(|c| c.len()).sum();
+        BufferedResult { reply_to: reply_to.into(), state: ResultState::Ready(frames), bytes, recorded_ms: 0 }
+    }
+
+    #[test]
+    fn fetch_returns_buffered_frames_to_the_owner_byte_identical() {
+        let frames = vec![
+            ServeChunk::Delta("![img](data:image/png;base64,AAAA)".into()).encode(),
+            ServeChunk::Done { tokens: 20, metrics: Default::default() }.encode(),
+        ];
+        let mut map = HashMap::new();
+        map.insert([7u8; 16], ready_entry("consumerA", frames.clone()));
+        match fetch_from_buffer(&map, &[7u8; 16], "consumerA") {
+            FetchResponse::Ready(framed) => {
+                // Byte-identical to a fresh serve round-trip → parses to the same chunks.
+                assert_eq!(framed, frame_response(&frames));
+                let chunks = parse_response(&framed).unwrap();
+                assert!(matches!(chunks[0], ServeChunk::Delta(_)));
+                assert!(matches!(chunks[1], ServeChunk::Done { tokens: 20, .. }));
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_binds_to_reply_to_and_reports_unknown_nonce() {
+        let mut map = HashMap::new();
+        map.insert(
+            [1u8; 16],
+            ready_entry("consumerA", vec![ServeChunk::Done { tokens: 1, metrics: Default::default() }.encode()]),
+        );
+        // A different authenticated peer cannot fetch someone else's result (ownership binding).
+        assert_eq!(fetch_from_buffer(&map, &[1u8; 16], "attackerB"), FetchResponse::Forbidden);
+        // An unknown nonce → NotFound (the consumer re-serves).
+        assert_eq!(fetch_from_buffer(&map, &[9u8; 16], "consumerA"), FetchResponse::NotFound);
+    }
+
+    #[test]
+    fn fetch_reports_generating_while_in_flight() {
+        let mut map = HashMap::new();
+        map.insert(
+            [2u8; 16],
+            BufferedResult { reply_to: "c".into(), state: ResultState::Generating, bytes: 0, recorded_ms: 0 },
+        );
+        // A fetch racing an in-flight serve gets Generating (retry), never NotFound (re-run).
+        assert_eq!(fetch_from_buffer(&map, &[2u8; 16], "c"), FetchResponse::Generating);
+    }
+
+    #[test]
+    fn result_caps_evict_oldest_first() {
+        // Distinct 16-byte keys (a u8 key would wrap past 256 and collide).
+        let key = |i: usize| {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        let mut map = HashMap::new();
+        for i in 0..(MAX_RESULT_ENTRIES + 5) {
+            let mut e = ready_entry("c", vec![vec![0u8; 8]]);
+            e.recorded_ms = i as u64; // ascending age: i=0 is the oldest
+            map.insert(key(i), e);
+        }
+        enforce_result_caps(&mut map);
+        assert_eq!(map.len(), MAX_RESULT_ENTRIES, "count cap enforced");
+        // The 5 oldest (recorded_ms 0..4) were evicted; the newest survive.
+        assert!(!map.contains_key(&key(0)));
+        assert!(!map.contains_key(&key(4)));
+        assert!(map.contains_key(&key(MAX_RESULT_ENTRIES + 4)));
     }
 }
