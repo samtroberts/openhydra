@@ -173,7 +173,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             bootstraps: Vec::new(),
-            gateway_port: 8080,
+            // #2: default off 8080 — that's llama.cpp's default, so a user running llama.cpp
+            // locally would collide with the OpenHydra gateway. 16527 avoids the common engine
+            // ports (llama.cpp 8080, vLLM/OpenAI 8000, LM Studio 1234, Ollama 11434, Exo 52415,
+            // ComfyUI 8188). Still user-overridable in Settings.
+            gateway_port: 16527,
             engine_autostart: true,
             search_url: String::new(),
             verbose_logs: false,
@@ -219,12 +223,22 @@ fn load_sessions() -> String {
     std::fs::read_to_string(sessions_path()).unwrap_or_default()
 }
 
-/// Persist the UI's sessions blob (verbatim JSON string).
+/// Persist the UI's sessions blob (verbatim JSON string). #1: written **atomically** (temp +
+/// rename) so a crash mid-write can never truncate/corrupt the chat-history file — the reader
+/// always sees either the previous complete file or the new complete one, never a partial write.
 #[tauri::command]
 fn save_sessions(data: String) -> Result<(), String> {
     let dir = openhydra_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(sessions_path(), data).map_err(|e| e.to_string())
+    write_atomic(&sessions_path(), &data)
+}
+
+/// Write `data` to `path` atomically: to a sibling temp file, then rename over `path`. Rename is
+/// atomic on the same filesystem, so `path` is never observed half-written.
+fn write_atomic(path: &std::path::Path, data: &str) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 // ── #7/#10: lifetime served/consumed model stats + daily buckets, persisted to disk. The
@@ -246,7 +260,7 @@ fn load_stats() -> String {
 fn save_stats(data: String) -> Result<(), String> {
     let dir = openhydra_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(stats_path(), data).map_err(|e| e.to_string())
+    write_atomic(&stats_path(), &data) // #1: atomic — never leave the durable stats file half-written
 }
 
 // ── #9: OS device name, used as the default until the user edits it. ──
@@ -596,14 +610,35 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     )
 }
 
+/// #7: the libp2p PeerId of this desktop's own provider identity. The gateway is told this so
+/// a self-serve (same machine provides *and* consumes) settles no receipt and moves no credit.
+/// Runs the agent's `peer-id` subcommand — stable, no swarm; the id is the same whether or not
+/// the provider is currently running. Best-effort: `None` (consumer-only) if it can't resolve.
+fn provider_peer_id() -> Option<String> {
+    let bin = agent_binary()?;
+    let key = openhydra_dir().join("desktop-provider.key");
+    let out = Command::new(&bin).arg("--identity").arg(&key).arg("peer-id").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
 #[tauri::command]
 fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
-    let sub = vec![
+    let mut sub = vec![
         "serve".to_string(),
         "--bind".into(),
         format!("127.0.0.1:{}", settings.gateway_port),
     ];
+    // #7: mark our own provider so the gateway never settles credit against itself on a
+    // self-serve. Computed from the provider identity key (stable across runs).
+    if let Some(id) = provider_peer_id() {
+        sub.push("--self-provider".into());
+        sub.push(id);
+    }
     spawn_role(
         &state.gateway,
         "desktop-consumer.key",
@@ -1159,11 +1194,11 @@ mod tests {
     #[test]
     fn settings_default_and_roundtrip() {
         let d = Settings::default();
-        assert_eq!(d.gateway_port, 8080);
+        assert_eq!(d.gateway_port, 16527);
         assert!(d.engine_autostart);
         let json = serde_json::to_string(&d).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.gateway_port, 8080);
+        assert_eq!(back.gateway_port, 16527);
         // Partial JSON (older config) still parses via serde(default).
         let partial: Settings = serde_json::from_str(r#"{"gateway_port": 9999}"#).unwrap();
         assert_eq!(partial.gateway_port, 9999);

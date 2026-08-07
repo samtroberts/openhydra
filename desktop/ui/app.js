@@ -24,9 +24,9 @@
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "get_state") return {
       provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: mk.provider ? 2 : 0, relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
-      gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:8080"] },
-      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 8080, engine_autostart: true, search_url: "" },
-      agent_found: true, gateway_url: "http://127.0.0.1:8080/v1",
+      gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
+      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "" },
+      agent_found: true, gateway_url: "http://127.0.0.1:16527/v1",
     };
     if (cmd === "system_info") return { os: "macos", arch: "aarch64", cpu: "Apple M1", ram_bytes: 8589934592, gpus: [{ name: "Apple M1 (7-core GPU)", vram_bytes: 8589934592, unified: true }] };
     if (cmd === "detect_engines_now") return (mk.runningEngines || mk.installedEngines || ["ollama"]).map((l) => ({ label: l, url: "http://127.0.0.1:11434", models: l === "ollama" ? ["tinyllama:latest", "llama3.2:1b"] : [] }));
@@ -433,8 +433,46 @@
     $("#sbmodels").textContent = models.length + " models";
   }
 
-  // reply rendering: fenced code cards + ComfyUI images + metadata line
-  const IMG_SRC = /^(data:image\/[a-z.+-]+;base64,[A-Za-z0-9+/=]+|https?:\/\/\S+\.(?:png|jpe?g|gif|webp))$/i;
+  // reply rendering: fenced code cards + inline media (image/video/audio) + metadata line
+  // #3/#4: classify a markdown media src as image | video | audio (data: URL or media-file URL),
+  // "" if it isn't media (a regular link stays as text). Drives which element we render.
+  function mediaKind(src) {
+    const s = (src || "").trim();
+    const dm = s.match(/^data:([a-z]+)\/[a-z0-9.+-]+/i);
+    let m = dm ? dm[1].toLowerCase() : "";
+    if (!m) { const ext = (s.match(/\.([a-z0-9]+)(?:[?#]|$)/i) || [, ""])[1].toLowerCase();
+      m = ["png","jpg","jpeg","gif","webp","svg"].includes(ext) ? "image"
+        : ["mp4","webm","mov","m4v"].includes(ext) ? "video"
+        : ["mp3","wav","flac","ogg","m4a"].includes(ext) ? "audio" : ""; }
+    return (m === "image" || m === "video" || m === "audio") ? m : "";
+  }
+  // #4: render inline media; #3: copy + download controls under it. Returns null for non-media.
+  function mediaEl(src, label) {
+    const kind = mediaKind(src); if (!kind) return null;
+    const wrap = document.createElement("div"); wrap.style.cssText = "margin:6px 0;max-width:100%";
+    const el = document.createElement(kind === "image" ? "img" : kind);
+    el.src = src; if (kind !== "image") el.controls = true;
+    el.style.cssText = "max-width:100%;border-radius:10px;border:1px solid hsl(var(--border));display:block;width:auto;height:auto";
+    wrap.appendChild(el);
+    const bar = document.createElement("div"); bar.style.cssText = "display:flex;gap:12px;margin-top:4px;font-size:12px";
+    const cp = document.createElement("button"); cp.textContent = "⎘ copy";
+    cp.style.cssText = "cursor:pointer;color:hsl(var(--muted));background:none;border:none;padding:0;font:inherit";
+    cp.onclick = async () => {
+      try { // copy the image itself to the clipboard when possible; else copy the src/data-URL
+        if (kind === "image" && src.startsWith("data:") && window.ClipboardItem) {
+          const blob = await (await fetch(src)).blob();
+          await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+        } else { await navigator.clipboard.writeText(src); }
+      } catch { try { await navigator.clipboard.writeText(src); } catch {} }
+      cp.textContent = "✓ copied"; setTimeout(() => cp.textContent = "⎘ copy", 1400);
+    };
+    const ext = kind === "image" ? "png" : kind === "video" ? "mp4" : "flac";
+    const dl = document.createElement("a"); dl.textContent = "⭳ download";
+    dl.href = src; dl.download = (label && label.trim()) || `openhydra-${kind}.${ext}`;
+    dl.style.cssText = "cursor:pointer;color:hsl(var(--muted));text-decoration:none";
+    bar.appendChild(cp); bar.appendChild(dl); wrap.appendChild(bar);
+    return wrap;
+  }
   const KW = new Set("fn let mut pub use impl struct enum trait match if else for while loop return async await move def class import from as with try except lambda yield pass raise function const var new typeof export default package func go defer chan interface map range type switch case break continue static void int float double char bool".split(" "));
   function hl(code) { let out = "", i = 0; const push = (c, s) => out += c ? `<span class="${c}">${esc(s)}</span>` : esc(s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return out; }
   function parseFences(t) { const p = [], re = /```([\w+-]*)\n([\s\S]*?)```/g; let last = 0, m; while ((m = re.exec(t))) { if (m.index > last) p.push({ prose: t.slice(last, m.index).trim() }); p.push({ lang: m[1] || "code", code: m[2] }); last = re.lastIndex; } if (last < t.length) p.push({ prose: t.slice(last).trim() }); return p.filter((x) => x.code != null || x.prose); }
@@ -445,8 +483,19 @@
   // real answer (or a clear note) instead of a blank bubble.
   function splitThink(raw) {
     raw = raw || ""; let reasoning = "";
+    // Well-formed <think>…</think> pairs.
     raw = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_, t) => { reasoning += t + "\n"; return ""; });
-    raw = raw.replace(/<think>([\s\S]*)$/i, (_, t) => { reasoning += t; return ""; }); // unclosed / still thinking
+    // Reasoning models (Qwen3, DeepSeek-R1, …) whose chat template PRE-FILLS the opening
+    // <think> in the prompt emit a completion that *starts* with the chain-of-thought and
+    // closes it with a lone </think> (no opening tag). If a </think> remains with no <think>
+    // before it, treat that leading block as reasoning — else it (and the stray tag) leak.
+    const close = raw.search(/<\/think>/i);
+    if (close !== -1 && !/<think>/i.test(raw.slice(0, close))) {
+      reasoning += raw.slice(0, close) + "\n";
+      raw = raw.slice(close).replace(/<\/think>/i, "");
+    }
+    // Unclosed <think>… (still thinking / truncated stream).
+    raw = raw.replace(/<think>([\s\S]*)$/i, (_, t) => { reasoning += t; return ""; });
     return { answer: raw.trim(), reasoning: reasoning.trim() };
   }
   function botEl(content, meta, reasoning) {
@@ -459,7 +508,7 @@
     if (content && content.trim()) {
       for (const part of parseFences(content)) {
         if (part.code != null) { const c = document.createElement("div"); c.className = "code-card"; c.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span><button class="code-copy">⎘ copy</button></div><pre>${hl(part.code)}</pre>`; c.querySelector(".code-copy").onclick = (ev) => { navigator.clipboard?.writeText(part.code); ev.target.textContent = "✓ copied"; setTimeout(() => ev.target.textContent = "⎘ copy", 1400); }; d.appendChild(c); }
-        else { const pr = document.createElement("div"); pr.style.whiteSpace = "pre-wrap"; const re = /!\[[^\]]*\]\(([^)]+)\)/g; let last = 0, m; while ((m = re.exec(part.prose))) { if (m.index > last) pr.appendChild(document.createTextNode(part.prose.slice(last, m.index))); const src = m[1].trim(); if (IMG_SRC.test(src)) { const img = document.createElement("img"); img.className = "micon-img"; img.style.cssText = "max-width:100%;border-radius:10px;border:1px solid hsl(var(--border));margin:6px 0;display:block;width:auto;height:auto"; img.src = src; pr.appendChild(img); } else pr.appendChild(document.createTextNode(m[0])); last = re.lastIndex; } if (last < part.prose.length) pr.appendChild(document.createTextNode(part.prose.slice(last))); d.appendChild(pr); }
+        else { const pr = document.createElement("div"); pr.style.whiteSpace = "pre-wrap"; const re = /!?\[([^\]]*)\]\(([^)]+)\)/g; let last = 0, m; while ((m = re.exec(part.prose))) { if (m.index > last) pr.appendChild(document.createTextNode(part.prose.slice(last, m.index))); const mel = mediaEl(m[2].trim(), m[1]); if (mel) pr.appendChild(mel); else pr.appendChild(document.createTextNode(m[0])); last = re.lastIndex; } if (last < part.prose.length) pr.appendChild(document.createTextNode(part.prose.slice(last))); d.appendChild(pr); }
       }
     } else {
       // No visible answer — reasoning-model / thinking-mode case. Say so instead of a blank bubble.
@@ -659,7 +708,7 @@
     head.querySelector(".badge").innerHTML = running ? '<span class="dot ok"></span>provider running' : '<span class="dot"></span>not sharing';
     head.querySelector(".badge").className = "badge " + (running ? "ok" : "secondary"); head.querySelector(".badge").style.marginLeft = "8px";
     const up = snap?.uptime_secs != null ? ` · up ${fmtUptime(snap.uptime_secs)}` : "";
-    head.querySelector(".mut").textContent = `${running ? (p.announced ?? 0) : 0} models announced · gateway :8080${up}`;
+    head.querySelector(".mut").textContent = `${running ? (p.announced ?? 0) : 0} models announced · gateway :16527${up}`;
     const k = $$("#v-share .g4 .kpi .val");
     // #7: durable lifetime totals (survive restart; `used` counts external clients too).
     const served = totalServed(), used = totalUsed();
@@ -1004,7 +1053,7 @@
     $("#netdot").className = "dot " + dot; $("#netlabel").textContent = label;
     $("#sbpeers").textContent = `${peers} peers`;
     $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
-    $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:8080/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
+    $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:16527/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
     $("#sharingsw").classList.toggle("on", !!p?.running);
     $("#sidepeer").textContent = `${deviceName} · ${shortPeer(p?.peer_id || g?.peer_id)}`;
     renderModels();
@@ -1012,7 +1061,7 @@
     $("#homeconnecting").style.display = connected ? "none" : "inline-flex";
     $("#homeready").style.display = connected ? "" : "none";
   }
-  $("#apiendpoint").onclick = async () => { if (!state?.gateway?.status?.running) { await ensureGateway(); toast("Local API started"); return; } navigator.clipboard?.writeText(state?.gateway_url || "http://127.0.0.1:8080/v1"); toast("Copied"); };
+  $("#apiendpoint").onclick = async () => { if (!state?.gateway?.status?.running) { await ensureGateway(); toast("Local API started"); return; } navigator.clipboard?.writeText(state?.gateway_url || "http://127.0.0.1:16527/v1"); toast("Copied"); };
 
   // ── chips ──
   $("#provchips").onclick = (e) => { const c = e.target.closest(".chip[data-cat]"); if (!c) return; $$("#provchips .chip[data-cat]").forEach((x) => x.classList.toggle("on", x === c)); const cat = c.dataset.cat; $$("#provtable .prov").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none"); };
@@ -1030,7 +1079,7 @@
   $$(".save").forEach((b) => b.onclick = async () => {
     deviceName = ($('.setpanel[data-p="identity"] [contenteditable]').textContent || deviceName).trim(); store.set("oh_device", deviceName);
     saveSessions();   // #9: persist the (edited) device name to the durable file too
-    const settings = { bootstraps: state?.settings?.bootstraps || [], gateway_port: state?.settings?.gateway_port || 8080, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
+    const settings = { bootstraps: state?.settings?.bootstraps || [], gateway_port: state?.settings?.gateway_port || 16527, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
     try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
   });
   $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
@@ -1047,6 +1096,7 @@
   $("#relaunch").style.display = "none";
   async function checkUpdates() { const u = window.__TAURI__?.updater; if (!u?.check) return; try { const up = await u.check(); if (up) { updateReady = up; $("#relaunchver").textContent = "v" + up.version; $("#relaunch").style.display = "flex"; } } catch (e) { console.warn("update check", e); } }
   setTimeout(checkUpdates, 3000);
+  setInterval(checkUpdates, 60 * 60 * 1000); // #13: re-check hourly so a running instance sees a new release without a relaunch
   $("#relaunch").onclick = async () => { if (!updateReady) return; try { await updateReady.downloadAndInstall(); await window.__TAURI__?.process?.relaunch?.(); } catch (e) { toast(`Update failed: ${e}`); } };
 
   // ── first-run coachmark tour (spotlight; first launch + after updates only) ──

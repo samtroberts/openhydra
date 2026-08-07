@@ -119,6 +119,10 @@ enum Role {
     Provide(ProvideArgs),
     /// Run the consumer HTTP/SSE gateway (the front door for OpenAI-compatible clients).
     Serve(ServeArgs),
+    /// Print the libp2p PeerId for the `--identity` key (creating it if absent) and exit —
+    /// no swarm. Used to wire `serve --self-provider <id>` when one machine both provides and
+    /// consumes (#7 self-serve credit skip).
+    PeerId,
 }
 
 /// Which local engine an agent proxies to. Selects the adapter; the `--engine` URL
@@ -361,8 +365,9 @@ struct ProvideArgs {
 
 #[derive(Args)]
 struct ServeArgs {
-    /// Address the HTTP/SSE gateway binds (loopback by default — no firewall prompt).
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    /// Address the HTTP/SSE gateway binds (loopback by default — no firewall prompt). #2:
+    /// default off 8080 (llama.cpp's default) to avoid colliding with a locally-run engine.
+    #[arg(long, default_value = "127.0.0.1:16527")]
     bind: String,
 
     /// Require this API key on `/v1/*` (`Authorization: Bearer <key>`). Omit — or set the
@@ -374,6 +379,13 @@ struct ServeArgs {
     /// Omit for an ephemeral, in-memory reputation.
     #[arg(long)]
     db: Option<PathBuf>,
+
+    /// #7: this gateway's own co-located provider libp2p PeerId. When a request is served by
+    /// this peer (the same machine provides *and* consumes), it's a self-serve — no receipt is
+    /// settled and no give/take credit moves. Get it from `openhydra-agent peer-id --identity
+    /// <provider-key>`. Omit on a consumer-only node.
+    #[arg(long = "self-provider")]
+    self_provider: Option<String>,
 
     #[command(flatten)]
     aup: AupArgs,
@@ -440,6 +452,15 @@ fn run() -> Result<(), String> {
     openhydra_agent::telemetry::init();
     start_profiler_if_requested();
     let cli = Cli::parse();
+    // #7: `peer-id` resolves the identity's libp2p PeerId without starting a swarm, so the
+    // desktop can compute its own provider id and pass it to `serve --self-provider`.
+    if let Role::PeerId = cli.role {
+        let config = cli.node.into_config();
+        let id = openhydra_network::identity::Identity::load_or_create(&config.identity_path)
+            .map_err(|e| format!("load identity: {e}"))?;
+        println!("{}", id.libp2p_peer_id);
+        return Ok(());
+    }
     let status_bind = cli.node.status_bind.clone();
     let config = cli.node.into_config();
     // Start the swarm first; both roles need the live node.
@@ -465,6 +486,7 @@ fn run() -> Result<(), String> {
         let role = match &cli.role {
             Role::Provide(_) => "provider",
             Role::Serve(_) => "gateway",
+            Role::PeerId => unreachable!("peer-id returns before the status server"),
         };
         let local = StatusServer {
             role,
@@ -484,6 +506,7 @@ fn run() -> Result<(), String> {
     match cli.role {
         Role::Provide(args) => provide(net, stats, economy, args),
         Role::Serve(args) => serve(net, stats, economy, args),
+        Role::PeerId => unreachable!("peer-id handled before the swarm starts"),
     }
 }
 
@@ -823,6 +846,6 @@ fn serve(
     let trusted_proxy = args.rate_limit.trusted_proxy;
     let embeddings = args.byok.embedding_config();
     let byok = args.byok.clone().into_config();
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings)
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone())
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

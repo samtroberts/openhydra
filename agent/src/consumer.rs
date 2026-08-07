@@ -258,6 +258,11 @@ pub struct ConsumerNode {
     /// ledger rows. `None` when no status endpoint is running. The symmetric half of the
     /// provider's `TransferStats` served side; the desktop merges both processes' views.
     stats: Option<Arc<crate::status::TransferStats>>,
+    /// #7: this node's own co-located provider libp2p PeerId, when it also serves (the desktop
+    /// runs provider + gateway as two identities on one machine). A serve routed to *self* is
+    /// not a real market transaction, so we skip receipt settlement, reputation, and give/take
+    /// credit for it — no self-earning or self-deduction. `None` = consumer-only node.
+    self_provider: Option<String>,
 }
 
 impl ConsumerNode {
@@ -270,6 +275,7 @@ impl ConsumerNode {
             store: None,
             credit: Mutex::new(HashMap::new()),
             stats: None,
+            self_provider: None,
         }
     }
 
@@ -278,6 +284,18 @@ impl ConsumerNode {
     pub fn with_stats(mut self, stats: Arc<crate::status::TransferStats>) -> Self {
         self.stats = Some(stats);
         self
+    }
+
+    /// #7: mark this node's own provider peer id, so a self-serve settles no receipt and moves
+    /// no credit (builder form). `None`/empty leaves it consumer-only.
+    pub fn with_self_provider(mut self, peer_id: Option<String>) -> Self {
+        self.self_provider = peer_id.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// #7: is `provider_libp2p` this node's own co-located provider?
+    fn is_self_serve(&self, provider_libp2p: &str) -> bool {
+        self.self_provider.as_deref() == Some(provider_libp2p)
     }
 
     /// A consumer whose earned reputation (M2.2(a)) and give-side credit (M2.3) are
@@ -301,6 +319,7 @@ impl ConsumerNode {
             store: Some(store),
             credit: Mutex::new(credit),
             stats: None,
+            self_provider: None,
         }
     }
 
@@ -483,25 +502,37 @@ impl ConsumerNode {
                     summary.discover_ns = discover_ns;
                     summary.proxy_roundtrip_ns = proxy_roundtrip_ns;
                     tracing::debug!(elapsed = ?t_serve.elapsed(), attempt = i + 1, "serve ok");
+                    // #7: a serve routed to our OWN co-located provider is not a market
+                    // transaction — skip receipt settlement, credit, reputation, and the audit
+                    // (auditing yourself is pointless). Still counts as usage below.
+                    let self_serve = self.is_self_serve(&provider_libp2p);
                     // Settle the co-signed receipt at EOS (best-effort — tokens already
                     // delivered; a failed/slow settlement must not fail the completion).
                     if summary.ok && summary.tokens > 0 {
-                        self.settle_receipt(&provider, summary.tokens, nonce);
-                        // #7/#5: per-model consumed tracking + a `used` ledger row (counterparty
-                        // = the provider we used). Fires on every delivered completion, so it
-                        // also captures external OpenAI clients hitting the gateway.
+                        if !self_serve {
+                            self.settle_receipt(&provider, summary.tokens, nonce);
+                        }
+                        // #7/#5: per-model consumed tracking (pure usage — kept for self too) + a
+                        // `used` give/take ledger row (only for a real counterparty, not self).
                         if let Some(stats) = &self.stats {
                             stats.record_consume(model, summary.tokens);
-                            stats.record_ledger(now, "used", model, &provider.peer_id, summary.tokens);
+                            if !self_serve {
+                                stats.record_ledger(now, "used", model, &provider.peer_id, summary.tokens);
+                            }
                         }
                     }
-                    // M2.2(a): a clean served completion earns the provider reputation.
-                    self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
+                    // M2.2(a): a clean served completion earns the provider reputation — but not
+                    // for a self-serve (no earning off yourself).
+                    if !self_serve {
+                        self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
+                    }
                     req_span.record("provider", provider.peer_id.as_str());
                     req_span.record("tokens", summary.tokens);
                     // M2.2(b): sampled background redundant-exec audit of this provider (off
                     // the response path — the caller already has its completion).
-                    self.maybe_audit(model, &provider.peer_id);
+                    if !self_serve {
+                        self.maybe_audit(model, &provider.peer_id);
+                    }
                     return Ok(summary);
                 }
                 Err(e) => {
@@ -511,7 +542,10 @@ impl ConsumerNode {
                     );
                     // M2.2(a): a failed/refused serve attempt costs the provider
                     // reputation, so a dead/erroring one is downranked on the next discover.
-                    self.record_outcome(&provider.peer_id, VerificationOutcome::Rejected, now);
+                    // #7: never ding our own provider's reputation on a self-serve.
+                    if !self.is_self_serve(&provider.libp2p_peer_id) {
+                        self.record_outcome(&provider.peer_id, VerificationOutcome::Rejected, now);
+                    }
                     if delivered {
                         // Already streamed part of a completion to the client — failing over
                         // would duplicate output. Surface the error instead.

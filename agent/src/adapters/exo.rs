@@ -153,13 +153,46 @@ impl<H: HttpClient> EngineAdapter for ExoAdapter<H> {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError> {
         // Exo serves placed instances over the OpenAI chat route — reuse the shared SSE serve.
-        serve_chat_completions(
-            &self.http,
-            &format!("{}/v1/chat/completions", self.base_url),
-            request,
-            on_delta,
-        )
+        // #6: right after startup a serve can race Exo still *placing/warming* a model's runners
+        // (detection only announces `RunnerReady` models, but readiness can lapse between the
+        // announce and the request), so Exo answers `404 "No instance found"`. That's why "send
+        // it again and it works". Retry that transient a few times with a short backoff so the
+        // first request waits out the cold start instead of erroring. Only retry while nothing
+        // has been streamed yet — a mid-stream failure can't be safely re-run.
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        const MAX_ATTEMPTS: u32 = 4;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(1500);
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut emitted = false;
+            let mut sink = |d: &str| {
+                emitted = true;
+                on_delta(d);
+            };
+            match serve_chat_completions(&self.http, &url, request, &mut sink) {
+                Ok(o) => return Ok(o),
+                Err(e) => {
+                    if is_cold_start(&e) && !emitted && attempt + 1 < MAX_ATTEMPTS {
+                        std::thread::sleep(BACKOFF);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        unreachable!("loop returns on the last attempt")
     }
+}
+
+/// #6: does this error look like Exo's cold-start "model not placed/ready yet" (a transient we
+/// should retry), versus a genuine failure (surface immediately)? Matches Exo's `404 "No
+/// instance found"` and the readiness-race phrasings, and nothing that would hide a real bug.
+fn is_cold_start(e: &AdapterError) -> bool {
+    let m = e.to_string().to_ascii_lowercase();
+    m.contains("no instance")
+        || m.contains("404")
+        || m.contains("not found")
+        || m.contains("not ready")
+        || m.contains("placing")
 }
 
 #[cfg(test)]
