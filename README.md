@@ -131,7 +131,7 @@ Run the OpenAI-compatible gateway on another machine (or the same one, second
 process):
 
 ```bash
-./target/release/openhydra-agent serve            # binds 127.0.0.1:8080
+./target/release/openhydra-agent serve            # binds 127.0.0.1:16527
 # optional: require a key on /v1/* —
 #   --api-key <key>   or   OPENHYDRA_API_KEY=<key>
 ```
@@ -139,7 +139,7 @@ process):
 Then point any OpenAI client at it:
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl http://127.0.0.1:16527/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "llama3.2",
