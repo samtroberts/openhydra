@@ -284,22 +284,22 @@ jobs:
           # Mutable "latest" pointers — do not cache (so a new release is instant).
           aws s3 cp "pub/latest/" "s3://${R2_BUCKET}/latest/" --recursive \
             --endpoint-url "$EP" --cache-control "no-store, max-age=0"
-          # The Linux .AppImage has no extension→MIME mapping, so the recursive copies above
-          # ship it with NO Content-Type. Browsers then try to sniff/preview ~87MB of binary
-          # and stall instead of downloading (curl is unaffected — it ignores the type). Re-copy
-          # it in place with an explicit octet-stream type + attachment disposition so every
-          # browser downloads it. Applied to both the immutable versioned and the "latest" copy.
-          AI="OpenHydra-linux-x64.AppImage"
-          aws s3 cp "s3://${R2_BUCKET}/v${VERSION}/${AI}" "s3://${R2_BUCKET}/v${VERSION}/${AI}" \
-            --endpoint-url "$EP" --metadata-directive REPLACE \
-            --content-type "application/octet-stream" \
-            --content-disposition "attachment; filename=\"${AI}\"" \
-            --cache-control "public, max-age=31536000, immutable"
-          aws s3 cp "s3://${R2_BUCKET}/latest/${AI}" "s3://${R2_BUCKET}/latest/${AI}" \
-            --endpoint-url "$EP" --metadata-directive REPLACE \
-            --content-type "application/octet-stream" \
-            --content-disposition "attachment; filename=\"${AI}\"" \
-            --cache-control "no-store, max-age=0"
+          # The Linux .AppImage has no extension→MIME mapping, so the recursive copy above ships
+          # it with NO Content-Type — browsers then sniff ~87MB of binary and stall instead of
+          # downloading (curl is unaffected). Re-upload the local /latest/ AppImage (the file the
+          # download page links to) with an explicit octet-stream type + attachment disposition so
+          # every browser downloads it. Guarded + non-fatal so it can never block the manifests below.
+          AI_LOCAL="pub/latest/OpenHydra-linux-x64.AppImage"
+          if [ -f "$AI_LOCAL" ]; then
+            aws s3 cp "$AI_LOCAL" "s3://${R2_BUCKET}/latest/OpenHydra-linux-x64.AppImage" \
+              --endpoint-url "$EP" \
+              --content-type "application/octet-stream" \
+              --content-disposition "attachment; filename=\"OpenHydra-linux-x64.AppImage\"" \
+              --cache-control "no-store, max-age=0" \
+              || echo "::warning::AppImage content-type re-upload failed (non-fatal)"
+          else
+            echo "::warning::pub/latest AppImage not found; skipping content-type fix"
+          fi
           aws s3 cp "pub/latest.json" "s3://${R2_BUCKET}/latest.json" \
             --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
             --content-type "application/json"
