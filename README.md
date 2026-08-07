@@ -161,7 +161,9 @@ The gateway also serves `GET /v1/models` (model ids discovered on the swarm) and
 | `vllm`          | vLLM (OpenAI `/v1/*`)          | 8000         | `/v1/models` |
 | `lm-studio`     | LM Studio (OpenAI `/v1/*`)     | 1234         | `/v1/models` |
 | `llama-cpp`     | `llama-server` (`/props`)      | 8080         | `/props` → GGUF canonical id |
-| `openai`        | Any OpenAI-compatible (Exo, LocalAI, …) | 8000 | `/v1/models` |
+| `exo`           | Exo MLX cluster                | 52415        | `/state` — only placed-and-ready models (not the full catalog) |
+| `openai`        | Any OpenAI-compatible (LocalAI, …) | 8000     | `/v1/models` |
+| `comfyui`       | ComfyUI (image / audio / video) | 8188        | `/object_info/CheckpointLoaderSimple` — SD checkpoints |
 
 ---
 
