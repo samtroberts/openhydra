@@ -64,7 +64,7 @@
 
         <!-- SHARE — your node: what you serve + what you earn (merges Dashboard · Serving · Tokens) -->
         <section class="view" id="v-share">
-          <div class="row" style="margin-bottom:10px"><div class="ctitle">Your node</div><span class="badge ok" style="margin-left:8px"><span class="dot ok"></span>provider running</span><span class="mut" style="margin-left:auto;font-size:11.5px">2 models announced · gateway :8080</span></div>
+          <div class="row" style="margin-bottom:10px"><div class="ctitle">Your node</div><span class="badge ok" style="margin-left:8px"><span class="dot ok"></span>provider running</span><span class="mut" style="margin-left:auto;font-size:11.5px">2 models announced · gateway :16527</span></div>
           <div class="grid g4">
             <div class="card pad kpi"><div class="lbl">Tokens served</div><div class="val num">184.2k</div><div class="sub up"><span class="icon" data-i="activity"></span>▲ 12% vs yesterday</div></div>
             <div class="card pad kpi"><div class="lbl">Credits earned</div><div class="val num">1,842</div><div class="sub">today · net +877</div></div>
@@ -253,31 +253,31 @@
 
         <!-- CONNECTORS -->
         <section class="view" id="v-connectors">
-          <div class="card pad" style="margin-bottom:14px;font-size:13px"><b>OpenHydra is an OpenAI-compatible endpoint</b> at <span class="mono">http://127.0.0.1:8080/v1</span>. Point any tool with a custom base URL at it. <span class="badge ok">direct</span> plugs in as-is · <span class="badge warn">shim</span> needs an Anthropic→OpenAI proxy.</div>
+          <div class="card pad" style="margin-bottom:14px;font-size:13px"><b>OpenHydra is an OpenAI-compatible endpoint</b> at <span class="mono">http://127.0.0.1:16527/v1</span>. Point any tool with a custom base URL at it. <span class="badge ok">direct</span> plugs in as-is · <span class="badge warn">shim</span> needs an Anthropic→OpenAI proxy.</div>
           <div class="conn">
-            <div class="conncard"><div class="hd"><b>OpenCode</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+            <div class="conncard"><div class="hd"><b>OpenCode</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">export OPENAI_BASE_URL=http://127.0.0.1:16527/v1
 export OPENAI_API_KEY=oh-local
 # model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>VS Code · Continue</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">provider: openai
-apiBase: http://127.0.0.1:8080/v1
+apiBase: http://127.0.0.1:16527/v1
 model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>Claude Code</b><span class="badge warn" style="margin-left:auto">shim</span></div><div class="snippet"># Anthropic API → run a translating proxy
 # (LiteLLM) in front of OpenHydra
 ANTHROPIC_BASE_URL=http://127.0.0.1:4000<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>OpenClaw</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">openclaw config set model.baseUrl \
-  http://127.0.0.1:8080/v1
+  http://127.0.0.1:16527/v1
 openclaw config set model.name openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>Neovim · codecompanion</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">adapter = "openai_compatible"
-url = "http://127.0.0.1:8080/v1"
+url = "http://127.0.0.1:16527/v1"
 model = "openhydra/auto"<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>Emacs · gptel</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">(gptel-make-openai "OpenHydra"
-  :host "127.0.0.1:8080" :protocol "http"
+  :host "127.0.0.1:16527" :protocol "http"
   :models '("openhydra/auto"))<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>Pi</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">pi config set api.baseUrl \
-  http://127.0.0.1:8080/v1
+  http://127.0.0.1:16527/v1
 pi config set api.model openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
             <div class="conncard"><div class="hd"><b>Hermes</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet"># Settings → Model provider → OpenAI-compatible
-base_url: http://127.0.0.1:8080/v1
+base_url: http://127.0.0.1:16527/v1
 model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
           </div>
         </section>
@@ -331,7 +331,7 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
                 <div class="field"><label>Key file</label><div class="input mono">~/.openhydra/identity.key</div></div>
                 <button class="btn primary save">Save changes</button></div>
               <div class="setpanel" data-p="network"><div class="sectitle">Network</div><div class="secsub" style="margin-bottom:16px">Bootstrap peers connect automatically — nothing to configure.</div>
-                <div class="field"><label>Gateway bind</label><div class="input mono">127.0.0.1:8080</div></div>
+                <div class="field"><label>Gateway bind</label><div class="input mono">127.0.0.1:16527</div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Act as a relay for other peers</label><div class="desc">Helps peers behind strict NATs. Uses a little bandwidth, earns reputation. Only activates when your node is publicly reachable.</div></div><div class="switch on" data-sw></div></div><button class="btn primary save">Save changes</button></div>
               <div class="setpanel" data-p="engine"><div class="sectitle">Engine</div><div class="secsub" style="margin-bottom:16px">Local inference engine wrapped by your provider.</div>
                 <div class="field"><label>Engine</label><div class="input select drop" data-opts="auto-detect|ollama|vLLM|LM Studio|llama.cpp|Exo|ComfyUI"><span>auto-detect</span><span class="icon" data-i="chev"></span></div></div>
@@ -359,7 +359,7 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
         <span class="sep"></span><span class="num" id="sbmodels">6 models</span>
         <span class="sep"></span><span class="num" title="Tokens served / tokens used"><span class="up">▲ <span id="sbserved">0</span></span> <span style="margin-left:4px">▼ <span id="sbused">0</span></span></span>
         <span class="sep"></span><span class="num" title="Give-to-get credits — lands with the credit ledger" id="sbcredits">— credits</span>
-        <span class="actions"><span class="mut mono" id="apiendpoint" style="font-size:11px;cursor:pointer" title="Local OpenAI-compatible endpoint — always on. Click to copy; see Connectors.">127.0.0.1:8080/v1</span></span>
+        <span class="actions"><span class="mut mono" id="apiendpoint" style="font-size:11px;cursor:pointer" title="Local OpenAI-compatible endpoint — always on. Click to copy; see Connectors.">127.0.0.1:16527/v1</span></span>
       </div>
     </div>
   </div>

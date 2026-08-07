@@ -600,6 +600,10 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if settings.engine_autostart {
         sub.push("--engine-autostart".into());
     }
+    // Persist the receipt ledger + take-side credit across restarts. Own redb file: redb is
+    // single-writer per process, so the gateway role uses a separate file (gateway-ledger.redb).
+    sub.push("--db".into());
+    sub.push(openhydra_dir().join("provider-ledger.redb").to_string_lossy().into_owned());
     spawn_role(
         &state.provider,
         "desktop-provider.key",
@@ -639,6 +643,10 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
         sub.push("--self-provider".into());
         sub.push(id);
     }
+    // Persist earned reputation + give-side credit across restarts (separate redb from the
+    // provider role — redb allows a single writer process per file).
+    sub.push("--db".into());
+    sub.push(openhydra_dir().join("gateway-ledger.redb").to_string_lossy().into_owned());
     spawn_role(
         &state.gateway,
         "desktop-consumer.key",

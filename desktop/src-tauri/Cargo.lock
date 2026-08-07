@@ -3922,7 +3922,7 @@ dependencies = [
 
 [[package]]
 name = "openhydra-desktop"
-version = "0.3.6"
+version = "0.3.61"
 dependencies = [
  "libc",
  "openhydra-agent",
