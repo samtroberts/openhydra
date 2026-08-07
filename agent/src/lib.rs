@@ -98,6 +98,17 @@ pub fn live_comfyui(base_url: &str) -> Result<ComfyUiAdapter<ReqwestClient>, Ada
     Ok(ComfyUiAdapter::new(base_url, ReqwestClient::new()?))
 }
 
+/// A ComfyUI adapter in **BYO-workflow** mode: load the provider's API-format workflow
+/// templates from `dir` (each `*.json` with a `%prompt%` marker becomes a model) and inject
+/// the prompt at serve time. Makes the adapter model-agnostic (Flux, SDXL, video, …).
+pub fn live_comfyui_with_workflows(
+    base_url: &str,
+    dir: &std::path::Path,
+) -> Result<ComfyUiAdapter<ReqwestClient>, AdapterError> {
+    let templates = crate::adapters::comfyui::load_workflow_templates(dir)?;
+    Ok(ComfyUiAdapter::with_templates(base_url, ReqwestClient::new()?, templates))
+}
+
 /// An Exo cluster adapter backed by the live reqwest transport, pointed at the head node's
 /// `base_url` (e.g. [`DEFAULT_EXO_URL`]). Detects only placed-and-ready models via `/state`.
 pub fn live_exo(base_url: &str) -> Result<ExoAdapter<ReqwestClient>, AdapterError> {

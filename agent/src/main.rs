@@ -27,7 +27,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 use openhydra_agent::{
-    live_comfyui, live_exo, live_llamacpp, live_ollama, live_openai, serve_http, AupPolicy,
+    live_comfyui, live_comfyui_with_workflows, live_exo, live_llamacpp, live_ollama, live_openai,
+    serve_http, AupPolicy,
     ByokConfig, EconomyStats, EmbeddingConfig, EngineAdapter, Provider, RateLimitConfig,
     StatusServer, TransferStats, DEFAULT_ANTHROPIC_URL, DEFAULT_COMFYUI_URL, DEFAULT_EXO_URL,
     DEFAULT_GEMINI_URL, DEFAULT_LLAMACPP_URL, DEFAULT_LM_STUDIO_URL, DEFAULT_OLLAMA_URL,
@@ -313,6 +314,14 @@ struct ProvideArgs {
     #[arg(long)]
     engine: Option<String>,
 
+    /// Directory of ComfyUI API-format workflow templates (BYO-workflow; `--engine-kind
+    /// comfyui` only). Each `*.json` with a `%prompt%` marker is advertised as a model by
+    /// filename, and the prompt/seed are injected at serve time — so any ComfyUI-supported
+    /// model (Flux, SDXL, video, upscale chains) works with no code change. Omit for the
+    /// built-in SD txt2img graph.
+    #[arg(long = "comfyui-workflow-dir")]
+    comfyui_workflow_dir: Option<PathBuf>,
+
     /// If the engine's server isn't already up, start it before announcing. Off by default.
     /// Only applies to engines OpenHydra can launch unattended — `ollama` (`ollama serve`)
     /// and `lm-studio` (`lms server start`, whose OpenAI server is a separate toggle from
@@ -537,7 +546,12 @@ fn provide(
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Comfyui => {
-            let a = live_comfyui(&url).map_err(|e| format!("engine {url}: {e}"))?;
+            // BYO-workflow when a template dir is given; else the built-in SD graph.
+            let a = match args.comfyui_workflow_dir.clone() {
+                Some(dir) => live_comfyui_with_workflows(&url, &dir)
+                    .map_err(|e| format!("engine {url}: {e}"))?,
+                None => live_comfyui(&url).map_err(|e| format!("engine {url}: {e}"))?,
+            };
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Openai => {

@@ -29,6 +29,7 @@
 //! Parsing is pure; HTTP is injected via [`HttpClient`](crate::adapter::HttpClient).
 
 use base64::Engine as _;
+use std::path::Path;
 
 use crate::adapter::{
     AdapterError, DetectedModel, EngineAdapter, EngineMetrics, HttpClient, InferenceRequest,
@@ -48,17 +49,112 @@ const HEIGHT: u32 = 512;
 const POLL_MS: u64 = 500;
 const POLL_MAX_SECS: u64 = 300;
 
+/// A provider-supplied ComfyUI workflow (API-format JSON) with `%prompt%` / `%seed%` /
+/// `%negative%` markers. The filename (sans `.json`) is the advertised model id. This is
+/// what makes the adapter model-agnostic: ComfyUI already speaks every model via a graph,
+/// so the operator brings the graph (BYO-workflow) and we just inject the prompt.
+#[derive(Clone, Debug)]
+pub struct WorkflowTemplate {
+    /// Advertised model id (the template filename without `.json`).
+    pub model_id: String,
+    /// Raw template text, markers intact.
+    pub json: String,
+    /// Steps parsed from the template (for step-as-tokens billing); [`STEPS`] if absent.
+    pub steps: u64,
+}
+
 /// Adapter for a local ComfyUI, generic over the injected HTTP transport.
 pub struct ComfyUiAdapter<H: HttpClient> {
     base_url: String,
     http: H,
+    /// Empty ⇒ built-in SD txt2img graph + checkpoint detection (back-compat). Non-empty ⇒
+    /// BYO-workflow mode: advertise these templates, inject the prompt, submit as-is.
+    templates: Vec<WorkflowTemplate>,
 }
 
 impl<H: HttpClient> ComfyUiAdapter<H> {
-    /// New adapter against `base_url`, e.g. [`DEFAULT_COMFYUI_URL`].
+    /// New adapter against `base_url`, e.g. [`DEFAULT_COMFYUI_URL`]. Built-in SD graph mode.
     pub fn new(base_url: impl Into<String>, http: H) -> Self {
-        Self { base_url: base_url.into().trim_end_matches('/').to_string(), http }
+        Self { base_url: base_url.into().trim_end_matches('/').to_string(), http, templates: Vec::new() }
     }
+
+    /// BYO-workflow mode: serve provider-supplied workflow templates instead of the built-in
+    /// SD graph. Any ComfyUI-supported model (Flux, SDXL, video, upscale chains) works with
+    /// zero code change — just drop a template file.
+    pub fn with_templates(
+        base_url: impl Into<String>,
+        http: H,
+        templates: Vec<WorkflowTemplate>,
+    ) -> Self {
+        Self { base_url: base_url.into().trim_end_matches('/').to_string(), http, templates }
+    }
+}
+
+/// Substitute the request tokens into a workflow template and parse the result. Pure.
+/// `"%seed%"` (a *quoted* placeholder) is de-quoted to the numeric seed; `%prompt%` /
+/// `%negative%` are JSON-escaped and spliced into their string values. Keying on the marker
+/// (not node type) is what makes this work for SD, Flux, or any other graph.
+fn inject_template(
+    tpl: &str,
+    prompt: &str,
+    negative: &str,
+    seed: u64,
+) -> Result<serde_json::Value, AdapterError> {
+    // JSON-escape without the surrounding quotes (the marker already sits inside a "…").
+    let esc = |s: &str| -> String {
+        let j = serde_json::Value::String(s.to_string()).to_string();
+        j[1..j.len() - 1].to_string()
+    };
+    let injected = tpl
+        .replace("\"%seed%\"", &seed.to_string())
+        .replace("%prompt%", &esc(prompt))
+        .replace("%negative%", &esc(negative));
+    serde_json::from_str(&injected)
+        .map_err(|e| AdapterError::Parse(format!("workflow invalid after injection: {e}")))
+}
+
+/// Best-effort step count from a raw template (first node input named `steps`), for
+/// step-as-tokens billing. Falls back to [`STEPS`]. Pure.
+fn parse_template_steps(tpl: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(tpl)
+        .ok()
+        .and_then(|v| {
+            v.as_object().and_then(|o| {
+                o.values().find_map(|n| {
+                    n.get("inputs").and_then(|i| i.get("steps")).and_then(|s| s.as_u64())
+                })
+            })
+        })
+        .unwrap_or(STEPS)
+}
+
+/// Load provider-supplied workflow templates from a directory (`*.json`). File I/O is kept
+/// out of the adapter (which stays HTTP-injected / unit-testable); the caller hands the
+/// result to [`ComfyUiAdapter::with_templates`]. Each file must contain a `%prompt%` marker.
+pub fn load_workflow_templates(dir: &Path) -> Result<Vec<WorkflowTemplate>, AdapterError> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| AdapterError::Http(format!("workflow dir {}: {e}", dir.display())))?;
+    for entry in entries {
+        let path = entry.map_err(|e| AdapterError::Http(e.to_string()))?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| AdapterError::Http(format!("read {}: {e}", path.display())))?;
+        if !json.contains("%prompt%") {
+            return Err(AdapterError::Parse(format!(
+                "workflow {} has no %prompt% marker",
+                path.display()
+            )));
+        }
+        let model_id =
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("workflow").to_string();
+        let steps = parse_template_steps(&json);
+        out.push(WorkflowTemplate { model_id, json, steps });
+    }
+    out.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+    Ok(out)
 }
 
 /// The minimal txt2img workflow graph, in ComfyUI's API format (`/prompt` body's
@@ -109,23 +205,48 @@ fn parse_checkpoints(json: &str) -> Result<Vec<String>, AdapterError> {
     Ok(names.iter().filter_map(|n| n.as_str().map(String::from)).collect())
 }
 
-/// Extract the first output image's `(filename, subfolder, type)` from a
-/// `/history/{id}` response, or `None` while the graph is still running. Pure.
-fn parse_history_image(json: &str, prompt_id: &str) -> Option<(String, String, String)> {
+/// Output keys ComfyUI uses across modalities: images (SaveImage), gifs/videos
+/// (VHS_VideoCombine / SaveVideo), audio (SaveAudio). Checked in this order per node.
+const MEDIA_KEYS: [&str; 4] = ["images", "gifs", "videos", "audio"];
+
+/// Extract the first output media file's `(filename, subfolder, type)` from a
+/// `/history/{id}` response — image, video, OR audio — or `None` while the graph is still
+/// running. Media-agnostic: keys on the output arrays, not the modality. Pure.
+fn parse_history_media(json: &str, prompt_id: &str) -> Option<(String, String, String)> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let outputs = &v[prompt_id]["outputs"];
     for (_node, out) in outputs.as_object()? {
-        if let Some(images) = out["images"].as_array() {
-            if let Some(img) = images.first() {
-                return Some((
-                    img["filename"].as_str()?.to_string(),
-                    img["subfolder"].as_str().unwrap_or("").to_string(),
-                    img["type"].as_str().unwrap_or("output").to_string(),
-                ));
+        for key in MEDIA_KEYS {
+            if let Some(arr) = out[key].as_array() {
+                if let Some(m) = arr.first() {
+                    return Some((
+                        m["filename"].as_str()?.to_string(),
+                        m["subfolder"].as_str().unwrap_or("").to_string(),
+                        m["type"].as_str().unwrap_or("output").to_string(),
+                    ));
+                }
             }
         }
     }
     None
+}
+
+/// MIME type from a ComfyUI output filename's extension, for the returned data-URL. Pure.
+fn mime_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Minimal query-string escaper for the /view params (filenames are engine-generated,
@@ -149,6 +270,24 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
     }
 
     fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+        // BYO-workflow: advertise the provider's templates by filename (no dependency on
+        // CheckpointLoaderSimple, so Flux — which isn't a single checkpoint — is detectable).
+        if !self.templates.is_empty() {
+            return Ok(self
+                .templates
+                .iter()
+                .map(|t| DetectedModel {
+                    engine_ref: t.model_id.clone(),
+                    // Distinct canonical id per template so multiple workflows on one
+                    // provider don't collide to the same DHT record (empty → collision).
+                    canonical_id: t.model_id.clone(),
+                    family: "comfyui-workflow".into(),
+                    params: String::new(),
+                    quant: String::new(),
+                    size_bytes: 0,
+                })
+                .collect());
+        }
         let json =
             self.http.get(&format!("{}/object_info/CheckpointLoaderSimple", self.base_url))?;
         Ok(parse_checkpoints(&json)?
@@ -184,7 +323,21 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
         }
 
         let started = std::time::Instant::now();
-        let workflow = build_workflow(&request.model_ref, prompt, seed_from_prompt(prompt));
+        let seed = seed_from_prompt(prompt);
+        // Pick the provider's workflow template for this model; else the built-in SD graph.
+        let (workflow, bill_steps) =
+            match self.templates.iter().find(|t| t.model_id == request.model_ref) {
+                Some(t) => (inject_template(&t.json, prompt, "", seed)?, t.steps),
+                None if self.templates.is_empty() => {
+                    (build_workflow(&request.model_ref, prompt, seed), STEPS)
+                }
+                None => {
+                    return Err(AdapterError::Http(format!(
+                        "no workflow template for model '{}'",
+                        request.model_ref
+                    )))
+                }
+            };
         let body = serde_json::json!({ "prompt": workflow, "client_id": "openhydra" });
         let resp = self.http.post_json(&format!("{}/prompt", self.base_url), &body.to_string())?;
         let resp: serde_json::Value =
@@ -206,7 +359,7 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
         const MAX_POLL_ERRORS: u32 = 10;
         let deadline = started + std::time::Duration::from_secs(POLL_MAX_SECS);
         let mut consecutive_errs: u32 = 0;
-        let image = loop {
+        let media = loop {
             if std::time::Instant::now() >= deadline {
                 return Err(AdapterError::Http(format!(
                     "comfyui generation timed out after {POLL_MAX_SECS}s (prompt {prompt_id})"
@@ -215,8 +368,8 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
             match self.http.get(&format!("{}/history/{prompt_id}", self.base_url)) {
                 Ok(hist) => {
                     consecutive_errs = 0;
-                    if let Some(img) = parse_history_image(&hist, &prompt_id) {
-                        break img;
+                    if let Some(m) = parse_history_media(&hist, &prompt_id) {
+                        break m;
                     }
                 }
                 Err(e) => {
@@ -232,8 +385,9 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         };
 
-        // Fetch the PNG and emit it as one markdown data-URL delta.
-        let (filename, subfolder, kind) = image;
+        // Fetch the media (any type) and emit it as one markdown data-URL delta with the
+        // right MIME: `![…]` for images (renders inline), a `[…]` link for audio/video.
+        let (filename, subfolder, kind) = media;
         let bytes = self.http.get_bytes(&format!(
             "{}/view?filename={}&subfolder={}&type={}",
             self.base_url,
@@ -242,16 +396,23 @@ impl<H: HttpClient> EngineAdapter for ComfyUiAdapter<H> {
             qs(&kind),
         ))?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        on_delta(&format!("![{}](data:image/png;base64,{b64})", qs(&filename)));
+        let mime = mime_for(&filename);
+        let delta = if mime.starts_with("image/") {
+            format!("![{}](data:{mime};base64,{b64})", qs(&filename))
+        } else {
+            format!("[{}](data:{mime};base64,{b64})", qs(&filename))
+        };
+        on_delta(&delta);
 
         let elapsed_ns = started.elapsed().as_nanos() as u64;
         Ok(ServeOutcome {
             // No tokens in image gen: bill sampler steps (compute-proportional, like
-            // tokens are for LLMs). Deterministic per request → receipt-stable.
-            tokens: STEPS,
+            // tokens are for LLMs). Deterministic per request → receipt-stable. In
+            // BYO-workflow mode `bill_steps` comes from the template; else the fixed STEPS.
+            tokens: bill_steps,
             done: true,
             engine: EngineMetrics {
-                eval_count: STEPS,
+                eval_count: bill_steps,
                 eval_duration_ns: elapsed_ns,
                 total_duration_ns: elapsed_ns,
                 ..EngineMetrics::default()
@@ -380,5 +541,60 @@ mod tests {
     fn seed_is_deterministic_per_prompt() {
         assert_eq!(seed_from_prompt("x"), seed_from_prompt("x"));
         assert_ne!(seed_from_prompt("x"), seed_from_prompt("y"));
+    }
+
+    // ---- BYO-workflow ----
+
+    #[test]
+    fn inject_substitutes_prompt_and_dequotes_seed_and_escapes() {
+        let tpl = r#"{"6":{"class_type":"CLIPTextEncode","inputs":{"text":"%prompt%"}},
+                      "3":{"class_type":"KSampler","inputs":{"seed":"%seed%","steps":25}}}"#;
+        let v = inject_template(tpl, "a \"quoted\" llama", "", 42).unwrap();
+        assert_eq!(v["6"]["inputs"]["text"], "a \"quoted\" llama"); // escaping round-trips
+        assert_eq!(v["3"]["inputs"]["seed"].as_u64().unwrap(), 42); // "%seed%" → int, not string
+    }
+
+    #[test]
+    fn parse_steps_reads_first_steps_or_defaults() {
+        assert_eq!(parse_template_steps(r#"{"3":{"inputs":{"steps":37}}}"#), 37);
+        assert_eq!(parse_template_steps(r#"{"3":{"inputs":{"cfg":7}}}"#), STEPS);
+    }
+
+    #[test]
+    fn byo_mode_detects_templates_not_checkpoints() {
+        let tpls = vec![WorkflowTemplate {
+            model_id: "flux2-klein".into(),
+            json: "{\"6\":{\"inputs\":{\"text\":\"%prompt%\"}}}".into(),
+            steps: 28,
+        }];
+        let a = ComfyUiAdapter::with_templates(
+            DEFAULT_COMFYUI_URL,
+            MockHttp { history_pending: RefCell::new(0), posted: RefCell::new(vec![]) },
+            tpls,
+        );
+        let models = a.detect_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].engine_ref, "flux2-klein");
+        assert_eq!(models[0].family, "comfyui-workflow");
+    }
+
+    // ---- media-agnostic output ----
+
+    #[test]
+    fn parse_media_finds_audio_and_video_not_just_images() {
+        let audio = r#"{"p":{"outputs":{"9":{"audio":[{"filename":"song.flac","subfolder":"","type":"output"}]}}}}"#;
+        assert_eq!(parse_history_media(audio, "p").unwrap().0, "song.flac");
+        let video = r#"{"p":{"outputs":{"9":{"gifs":[{"filename":"clip.mp4","subfolder":"vid","type":"output"}]}}}}"#;
+        let (f, sf, _) = parse_history_media(video, "p").unwrap();
+        assert_eq!((f.as_str(), sf.as_str()), ("clip.mp4", "vid"));
+    }
+
+    #[test]
+    fn mime_by_extension() {
+        assert_eq!(mime_for("x.png"), "image/png");
+        assert_eq!(mime_for("x.flac"), "audio/flac");
+        assert_eq!(mime_for("x.mp4"), "video/mp4");
+        assert_eq!(mime_for("x.webm"), "video/webm");
+        assert_eq!(mime_for("noext"), "application/octet-stream");
     }
 }
