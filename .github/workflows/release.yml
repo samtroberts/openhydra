@@ -153,13 +153,15 @@ jobs:
           name: openhydra-${{ matrix.triple }}
           path: dist/*
 
-      # Transition belt-and-suspenders: keep a draft GitHub Release on tag runs.
-      # Remove this step once R2 is the sole download origin and the repo is private.
-      - name: Upload to draft release
+      # Publish a GitHub Release on tag runs — auto-generated notes, marked latest.
+      # Downloads still come from R2; this is purely for GitHub-side visibility.
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          draft: true
+          draft: false
+          make_latest: true
+          generate_release_notes: true
           files: dist/*
 
   # Publish every platform's artifacts to Cloudflare R2 + write latest.json.
