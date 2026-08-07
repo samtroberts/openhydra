@@ -119,6 +119,12 @@ Start your engine, then point a provider at it. Ollama is the default:
 ./target/release/openhydra-agent provide --engine-kind lm-studio  --engine http://127.0.0.1:1234
 ./target/release/openhydra-agent provide --engine-kind llama-cpp  --engine http://127.0.0.1:8080
 ./target/release/openhydra-agent provide --engine-kind openai     --engine http://127.0.0.1:8000
+
+# Exo MLX cluster (port 52415)
+./target/release/openhydra-agent provide --engine-kind exo        --engine http://127.0.0.1:52415
+
+# ComfyUI for image / audio / video (port 8188); add --comfyui-workflow-dir <dir> for BYO workflows
+./target/release/openhydra-agent provide --engine-kind comfyui    --engine http://127.0.0.1:8188
 ```
 
 Useful flags: `--db <path>` persists the receipt ledger (redb) across restarts;
