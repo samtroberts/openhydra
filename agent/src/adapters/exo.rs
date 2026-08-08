@@ -62,16 +62,27 @@ struct ShardAssignments {
     runner_to_shard: HashMap<String, serde_json::Value>,
 }
 
-/// A runner is ready iff its state object is the `RunnerReady` variant.
+/// A runner is serveable iff it is **up** — either `RunnerReady` (loaded, idle) or
+/// `RunnerRunning` (loaded, actively serving a request). Both states can take work; only down
+/// states (`RunnerFailed`, `RunnerShuttingDown`, …) are excluded.
+///
+/// Counting *only* `RunnerReady` was a bug: Exo reports `RunnerRunning` while a runner is
+/// mid-request, so a model dropped out of detection **precisely while it was being served**.
+/// Combined with the provider's periodic (120s) route-table rebuild, the model flapped in and
+/// out of the route table and consumers hit `no local engine serves '<model>' (auto mode)`.
 fn runner_ready(
     runners: &HashMap<String, HashMap<String, serde_json::Value>>,
     runner_id: &str,
 ) -> bool {
-    runners.get(runner_id).map(|state| state.contains_key("RunnerReady")).unwrap_or(false)
+    runners
+        .get(runner_id)
+        .map(|state| state.contains_key("RunnerReady") || state.contains_key("RunnerRunning"))
+        .unwrap_or(false)
 }
 
 /// The model ids Exo can actually serve: a placed instance with a non-empty runner set whose
-/// **every** assigned runner is `RunnerReady`. De-duplicated (a model could be placed twice).
+/// **every** assigned runner is up (ready or running). De-duplicated (a model could be placed
+/// twice).
 fn serving_models(state: &State) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -280,6 +291,37 @@ mod tests {
     fn skips_instance_with_a_non_ready_runner() {
         // r2 failed → the instance can't serve → announce nothing (not the catalog).
         let state = state_fixture("some/model", &[("r1", true), ("r2", false)]);
+        assert!(detect(state).is_empty());
+    }
+
+    #[test]
+    fn announces_a_running_runner_as_serveable() {
+        // A runner actively serving reports `RunnerRunning`, not `RunnerReady`. It must still
+        // count as serveable — otherwise a model drops out of detection the moment it is used,
+        // and the provider's route table loses it until it next goes idle.
+        let state = serde_json::json!({
+            "instances": {
+                "inst-1": { "MlxRingInstance": { "shardAssignments": {
+                    "modelId": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+                    "runnerToShard": { "r1": {} } } } },
+            },
+            "runners": { "r1": { "RunnerRunning": {} } },
+        })
+        .to_string();
+        assert_eq!(detect(state), vec!["mlx-community/Llama-3.2-1B-Instruct-4bit"]);
+    }
+
+    #[test]
+    fn skips_a_shutting_down_assigned_runner() {
+        // A `RunnerShuttingDown` runner assigned to the instance is down → not serveable.
+        let state = serde_json::json!({
+            "instances": {
+                "inst-1": { "MlxRingInstance": { "shardAssignments": {
+                    "modelId": "m/x", "runnerToShard": { "r1": {} } } } },
+            },
+            "runners": { "r1": { "RunnerShuttingDown": {} } },
+        })
+        .to_string();
         assert!(detect(state).is_empty());
     }
 
