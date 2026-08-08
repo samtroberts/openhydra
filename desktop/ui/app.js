@@ -767,10 +767,11 @@
     const models = netModels();
     const local = new Set(state?.provider?.status?.running ? engines.flatMap((e) => e.models) : []);
     const strip = $("#v-providers .card.pad");
-    strip.querySelectorAll("b")[0].textContent = (snap?.transfers?.tokens_served ?? 0);
-    strip.querySelectorAll("b")[1].textContent = models.length;
-    strip.querySelectorAll("b")[2].textContent = snap?.network?.peers?.length ?? 0;
-    strip.querySelector(".mut").textContent = "from your node's view of the network";
+    strip.querySelectorAll("b")[0].textContent = (snap?.transfers?.tokens_served ?? 0);  // tokens
+    strip.querySelectorAll("b")[1].textContent = models.length;                          // models
+    strip.querySelectorAll("b")[2].textContent = snap?.network?.peers?.length ?? 0;       // peers
+    // Labels are now correct & honest in the template ("tokens served · models · peers · from your
+    // node") — these are all LOCAL counts, so no "network-wide" claim until Tier-C stats land.
     $("#provcount").textContent = models.length;
     const q = ($("#search").value || "").toLowerCase();
     const byOh = repByOpenhydra();
