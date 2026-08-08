@@ -198,10 +198,18 @@ fn settings_path() -> PathBuf {
 }
 
 fn load_settings() -> Settings {
-    std::fs::read_to_string(settings_path())
+    let mut s: Settings = std::fs::read_to_string(settings_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // C5 migration: the gateway port was never user-editable before v0.3.8, so a persisted
+    // 8080 (the pre-16527 default that collided with llama.cpp) is stale — bump it to the
+    // current default and re-save. Fresh installs already default to 16527.
+    if s.gateway_port == 8080 {
+        s.gateway_port = 16527;
+        let _ = store_settings(&s);
+    }
+    s
 }
 
 fn store_settings(s: &Settings) -> Result<(), String> {

@@ -136,6 +136,7 @@ jobs:
           B=desktop/src-tauri/target/release/bundle
           find "$B" -name "*.dmg" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.deb" -exec cp {} dist/ \; 2>/dev/null || true
+          find "$B" -name "*.rpm" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.AppImage" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.msi" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*setup*.exe" -exec cp {} dist/ \; 2>/dev/null || true
@@ -206,6 +207,7 @@ jobs:
             (re.compile(r'\.msi$'),                        'OpenHydra-windows-x64.msi'),
             (re.compile(r'\.AppImage$'),                   'OpenHydra-linux-x64.AppImage'),
             (re.compile(r'\.deb$'),                        'OpenHydra-linux-x64.deb'),
+            (re.compile(r'\.rpm$'),                        'OpenHydra-linux-x64.rpm'),
           ]
           for name in sorted(os.listdir(src)):
               p = os.path.join(src, name)

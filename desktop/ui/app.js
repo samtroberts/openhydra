@@ -1037,7 +1037,9 @@
     const id = $('.setpanel[data-p="identity"]'); const dn = id.querySelector('[contenteditable]');
     if (document.activeElement !== dn) dn.textContent = deviceName;
     id.querySelectorAll(".input")[1].childNodes[0].textContent = (p.provider.status.peer_id || p.gateway.status.peer_id || "—");
-    $('.setpanel[data-p="network"] .input.mono').textContent = `127.0.0.1:${p.settings.gateway_port}`;
+    const netp = $('.setpanel[data-p="network"]');
+    const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = p.settings.gateway_port;
+    const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
     const eng = $('.setpanel[data-p="engine"]'); eng.querySelectorAll(".input.mono")[0].textContent = engines[0]?.url || "http://127.0.0.1:11434";
     eng.querySelector('.switch').classList.toggle("on", !!p.settings.engine_autostart);
     $("#advsw").classList.toggle("on", app.hasAttribute("data-adv"));
@@ -1079,7 +1081,11 @@
   $$(".save").forEach((b) => b.onclick = async () => {
     deviceName = ($('.setpanel[data-p="identity"] [contenteditable]').textContent || deviceName).trim(); store.set("oh_device", deviceName);
     saveSessions();   // #9: persist the (edited) device name to the durable file too
-    const settings = { bootstraps: state?.settings?.bootstraps || [], gateway_port: state?.settings?.gateway_port || 16527, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
+    const netp = $('.setpanel[data-p="network"]');
+    let gwPort = parseInt((netp.querySelector('#gwport')?.textContent || "").trim(), 10);
+    if (!Number.isInteger(gwPort) || gwPort < 1024 || gwPort > 65535) gwPort = state?.settings?.gateway_port || 16527;
+    const bootstraps = (netp.querySelector('#bootstraps')?.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean);
+    const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
     try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
   });
   $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
