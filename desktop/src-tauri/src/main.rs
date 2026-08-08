@@ -998,13 +998,18 @@ async fn chat_completion(
     max_tokens: Option<u32>,
 ) -> Result<serde_json::Value, String> {
     let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
+    // Default when the UI doesn't supply one: a generous chat budget, NOT the engine's own
+    // default. LM Studio (and others) fall back to ~512 tokens when `max_tokens` is absent —
+    // far too small for a reasoning model, which spends that entirely on hidden chain-of-thought
+    // and never reaches the answer ("no visible text"). 4096 lets it finish thinking AND reply.
+    const DEFAULT_CHAT_MAX_TOKENS: u32 = 4096;
     let body = serde_json::json!({
         "model": model,
         "messages": messages
             .iter()
             .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
             .collect::<Vec<_>>(),
-        "max_tokens": max_tokens,
+        "max_tokens": max_tokens.unwrap_or(DEFAULT_CHAT_MAX_TOKENS),
     });
     tauri::async_runtime::spawn_blocking(move || {
         use openhydra_agent::adapter::HttpClient;

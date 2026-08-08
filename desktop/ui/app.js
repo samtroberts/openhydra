@@ -476,7 +476,7 @@
   const KW = new Set("fn let mut pub use impl struct enum trait match if else for while loop return async await move def class import from as with try except lambda yield pass raise function const var new typeof export default package func go defer chan interface map range type switch case break continue static void int float double char bool".split(" "));
   function hl(code) { let out = "", i = 0; const push = (c, s) => out += c ? `<span class="${c}">${esc(s)}</span>` : esc(s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return out; }
   function parseFences(t) { const p = [], re = /```([\w+-]*)\n([\s\S]*?)```/g; let last = 0, m; while ((m = re.exec(t))) { if (m.index > last) p.push({ prose: t.slice(last, m.index).trim() }); p.push({ lang: m[1] || "code", code: m[2] }); last = re.lastIndex; } if (last < t.length) p.push({ prose: t.slice(last).trim() }); return p.filter((x) => x.code != null || x.prose); }
-  function metaRow(m) { return `<div class="msgmeta"><span>${esc(m.model)}</span><span class="num">${m.tok} tok</span><span class="num" title="End-to-end throughput — engine TPS with network latency">${m.tps} t/s herd</span><span class="num">${m.rtt} ms RTT</span><span>${m.at}</span></div>`; }
+  function metaRow(m) { return `<div class="msgmeta"><span>${esc(m.model)}</span><span class="num">${m.tok} tok</span><span class="num" title="Engine generation speed — decode tokens per second, measured on the provider">${m.tps} tok/s</span><span class="num">${m.rtt} ms RTT</span><span>${m.at}</span></div>`; }
   // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
   // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand
   // back an EMPTY content. Split any inline thinking out of the answer so the chat shows the
@@ -567,7 +567,12 @@
     const messages = s.m.map((x) => ({ role: x[0] === "me" ? "user" : "assistant", content: x[1] }));
     const t0 = Date.now();
     try {
-      const resp = await call("chat_completion", { model, messages, maxTokens: +($("[data-label='tokk']")?.dataset.val) || 1024 });
+      // Tauri v2 maps camelCase JS args → snake_case Rust params, so `maxTokens` binds to the
+      // command's `max_tokens`. Send the slider's current value; if it's somehow missing, omit it
+      // and let the Rust command apply its generous default (a reasoning model needs well over the
+      // old 512 or it spends the whole budget on hidden thinking and returns nothing).
+      const tokLimit = Math.round(+($("[data-label='tokk']")?.dataset.val)) || undefined;
+      const resp = await call("chat_completion", { model, messages, maxTokens: tokLimit });
       wait.remove();
       const msg = resp?.choices?.[0]?.message || {};
       const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer

@@ -1935,7 +1935,7 @@ fn handle_announce(
                         warn!(model_id = %signed_record.model_id, "start_providing failed: {e:?}");
                     }
                     // Cache locally for fast resolve + discover cache hits
-                    state.known_peers.insert(signed_record.peer_id.clone(), signed_record.clone());
+                    state.known_peers.insert(known_peer_key(&signed_record), signed_record.clone());
                     info!(
                         model_id = %signed_record.model_id,
                         peer_id = %signed_record.peer_id,
@@ -2023,8 +2023,8 @@ fn handle_provider_pex(
         warn!(%source_str, %e, "provider_pex: rejected advert (failed authenticity)");
         return;
     }
-    let is_new = !state.known_peers.contains_key(&record.peer_id);
-    state.known_peers.insert(record.peer_id.clone(), record.clone());
+    let is_new = !state.known_peers.contains_key(&known_peer_key(&record));
+    state.known_peers.insert(known_peer_key(&record), record.clone());
     if is_new {
         info!(
             model_id = %record.model_id,
@@ -2133,8 +2133,10 @@ fn handle_resolve(
     peer_id: &str,
     reply: oneshot::Sender<Result<String, String>>,
 ) {
-    // Look up the peer in our known_peers cache.
-    if let Some(record) = state.known_peers.get(peer_id) {
+    // Look up the peer in our known_peers cache. `known_peers` is now keyed by (peer_id,
+    // model_id), and the reachability fields (relay_address/host/port) are node-level — identical
+    // across a node's models — so match by the record's peer_id and take any of its entries.
+    if let Some(record) = state.known_peers.values().find(|r| r.peer_id == peer_id) {
         if record.requires_relay && !record.relay_address.is_empty() {
             // Peer needs relay — return the relay circuit address.
             let _ = reply.send(Ok(record.relay_address.clone()));
@@ -3522,7 +3524,7 @@ fn handle_kad_event(
                                     if let Err(e) = dht::verify_peer_record(&record) {
                                         warn!(%pid_str, %e, "dht_record_rejected: provider-store verify failed");
                                     } else if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
-                                        state.known_peers.insert(record.peer_id.clone(), record.clone());
+                                        state.known_peers.insert(known_peer_key(&record), record.clone());
                                         pending.records.push(record);
                                     }
                                 }
@@ -3676,7 +3678,7 @@ fn handle_kad_event(
                                 // Cache the peer.
                                 state
                                     .known_peers
-                                    .insert(peer_record.peer_id.clone(), peer_record.clone());
+                                    .insert(known_peer_key(&peer_record), peer_record.clone());
                                 pending.records.push(peer_record);
                             }
                             Err(e) => {
@@ -3878,7 +3880,7 @@ fn accept_and_install_record(
             }
         }
     }
-    state.known_peers.insert(peer_record.peer_id.clone(), peer_record.clone());
+    state.known_peers.insert(known_peer_key(&peer_record), peer_record.clone());
     true
 }
 
@@ -3993,6 +3995,15 @@ fn finalize_discover_fetch(state: &mut LoopState, discover_id: kad::QueryId) {
         }
     }
     maybe_reply_discover(state, discover_id);
+}
+
+/// C7-flicker fix: the `known_peers` cache key. Keyed by **`(peer_id, model_id)`**, not `peer_id`
+/// alone — a single provider node announces one record PER model it serves (all sharing its node
+/// `peer_id`), so keying on `peer_id` made each model clobber the previous one and a multi-model
+/// provider could only ever surface ONE model at a time (it flickered between them). The unit
+/// separator can't appear in a hex peer id or a model handle, so the composite is unambiguous.
+fn known_peer_key(record: &PeerRecord) -> String {
+    format!("{}\u{1f}{}", record.peer_id, record.model_id)
 }
 
 /// Convert a PeerRecord into a DiscoveredPeer.
@@ -5516,6 +5527,33 @@ mod tests {
         let mut keys: Vec<String> = cache.keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn known_peer_key_keeps_every_model_of_a_multi_model_provider() {
+        // The flicker bug: a provider node serving N models announces N records that all share
+        // its node `peer_id`. Keyed by peer_id alone they clobbered each other (one model shown,
+        // flickering). Keyed by (peer_id, model_id) all coexist.
+        let rec = |model: &str| PeerRecord {
+            peer_id: "node-A".into(),
+            model_id: model.into(),
+            libp2p_peer_id: "12D3KooWnodeA".into(),
+            ..Default::default()
+        };
+        let mut known: HashMap<String, PeerRecord> = HashMap::new();
+        known.insert(known_peer_key(&rec("qwen3.5-4b-mlx")), rec("qwen3.5-4b-mlx"));
+        known.insert(known_peer_key(&rec("nomic-embed")), rec("nomic-embed"));
+        // Both survive — no clobber.
+        assert_eq!(known.len(), 2);
+        let mut models: Vec<String> = known.values().map(|r| r.model_id.clone()).collect();
+        models.sort();
+        assert_eq!(models, vec!["nomic-embed".to_string(), "qwen3.5-4b-mlx".to_string()]);
+        // Re-announcing the same (peer, model) refreshes in place, not a third row.
+        known.insert(known_peer_key(&rec("nomic-embed")), rec("nomic-embed"));
+        assert_eq!(known.len(), 2);
+        // A value-based evict (how disconnect/reap work) drops ALL of the node's models at once.
+        known.retain(|_, r| r.libp2p_peer_id != "12D3KooWnodeA");
+        assert!(known.is_empty());
     }
 
     #[test]

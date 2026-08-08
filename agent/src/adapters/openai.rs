@@ -83,6 +83,13 @@ struct Delta {
     /// servers — `Option<String>` accepts all three.
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning models (Qwen3, DeepSeek-R1, …) served over the OpenAI protocol stream their
+    /// chain-of-thought here, SEPARATE from `content` (which stays empty until the final
+    /// answer). Without reading this the reasoning is silently dropped and a model that spends
+    /// its whole budget thinking looks like it returned nothing. We capture it and re-emit it
+    /// wrapped in `<think>…</think>` (see the serve loop).
+    #[serde(default)]
+    reasoning_content: Option<String>,
     /// Tool-call fragments (OpenAI streams these incrementally: `id`/`name` on the first
     /// fragment for an `index`, then `arguments` string pieces on following chunks).
     #[serde(default)]
@@ -286,6 +293,13 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
     // The OpenAI stream carries no timings; the engine is local, so measure them here —
     // start→first-token ≈ prefill, first-token→end ≈ decode.
     let mut first_token_at: Option<std::time::Instant> = None;
+    // Reasoning models stream chain-of-thought in `delta.reasoning_content`. We wrap it in a
+    // single `<think>…</think>` block as it streams: open on the first reasoning fragment, close
+    // before the first answer token (or at end if the model only ever reasoned). This surfaces
+    // thinking that would otherwise be dropped, matches the inline-`<think>` convention other
+    // engines (Ollama) already use, and anchors the decode-TPS timer on the first REAL generated
+    // token — reasoning included — instead of a content token that may never arrive.
+    let mut reasoning_open = false;
     for line in lines {
         let line = line?;
         let Some(payload) = sse_payload(&line) else {
@@ -302,10 +316,28 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
             // sends after the finish must not inflate `chunk_tokens` (the receipt fallback)
             // or graft extra tool calls onto the assistant turn.
             if !done {
+                if let Some(reasoning) = &choice.delta.reasoning_content {
+                    if !reasoning.is_empty() {
+                        if first_token_at.is_none() {
+                            first_token_at = Some(std::time::Instant::now());
+                        }
+                        if !reasoning_open {
+                            on_delta("<think>");
+                            reasoning_open = true;
+                        }
+                        on_delta(reasoning);
+                        chunk_tokens += 1;
+                    }
+                }
                 if let Some(content) = &choice.delta.content {
                     if !content.is_empty() {
                         if first_token_at.is_none() {
                             first_token_at = Some(std::time::Instant::now());
+                        }
+                        // Close the reasoning block before the first answer token.
+                        if reasoning_open {
+                            on_delta("</think>\n\n");
+                            reasoning_open = false;
                         }
                         on_delta(content);
                         chunk_tokens += 1;
@@ -324,6 +356,11 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
         if chunk.usage.is_some() {
             usage = chunk.usage;
         }
+    }
+    // The model produced only reasoning (no answer — e.g. hit the token cap mid-thought): close
+    // the block so the consumer/UI renders the thinking instead of a blank bubble.
+    if reasoning_open {
+        on_delta("</think>");
     }
     let end = std::time::Instant::now();
 
@@ -512,6 +549,38 @@ mod tests {
         assert_eq!(out, "abc");
         assert_eq!(outcome.tokens, 3); // no usage reported → count content chunks
         assert!(outcome.done);
+    }
+
+    #[test]
+    fn serve_stream_wraps_reasoning_content_in_think_then_emits_answer() {
+        // Reasoning models (Qwen3/DeepSeek-R1 via LM Studio/vLLM) stream chain-of-thought in
+        // `reasoning_content`, keeping `content` empty until the final answer. Without capture it
+        // was silently dropped; now it must be wrapped in a single <think>…</think> block.
+        let (out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"think."},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Hi!"},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>Let me think.</think>\n\nHi!");
+        assert_eq!(outcome.tokens, 3);
+        assert!(outcome.done);
+    }
+
+    #[test]
+    fn serve_stream_closes_think_when_model_only_reasoned() {
+        // The failure the users hit: the model spent its whole token budget thinking and never
+        // emitted an answer. The <think> block must still be closed so the UI shows the thinking
+        // instead of a blank bubble (and the reasoning is no longer dropped entirely).
+        let (out, _outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"thinking forever"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>thinking forever</think>");
     }
 
     #[test]
