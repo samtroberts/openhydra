@@ -468,7 +468,7 @@ impl ConsumerNode {
         on_delta: &mut dyn FnMut(&str),
     ) -> AttemptOutcome {
         let t_discover = std::time::Instant::now();
-        let peers = {
+        let mut peers = {
             let _span = tracing::info_span!("discover", model = %model).entered();
             match self.net.discover(model) {
                 Ok(p) => p,
@@ -476,6 +476,23 @@ impl ConsumerNode {
                 Err(e) => return AttemptOutcome::Fatal(AdapterError::Http(format!("discover: {e}"))),
             }
         };
+        // C7: passive discovery (DHT get_providers + gossip PEX) can come up empty across NATs —
+        // the D-sized gossip mesh doesn't forward a provider's advert to this specific consumer
+        // and a NAT'd provider's DHT put_record times out. Fall back to asking a connected
+        // bootstrap's provider registry, which has retained the verified adverts it saw. This is
+        // a best-effort supplement: only when passive discovery found nothing, and a failed query
+        // (no bootstrap, transport error) just leaves `peers` empty for the normal Retryable path.
+        if peers.is_empty() {
+            let _span = tracing::info_span!("registry_query", model = %model).entered();
+            match self.net.query_registry(model) {
+                Ok(reg) if !reg.is_empty() => {
+                    tracing::info!(model, n = reg.len(), "C7: bootstrap registry supplied providers passive discovery missed");
+                    peers = reg;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(model, error = %e, "C7: registry query failed (best-effort)"),
+            }
+        }
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
         // a provider that has failed this consumer ranks below an untried one.

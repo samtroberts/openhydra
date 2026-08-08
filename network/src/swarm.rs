@@ -234,6 +234,11 @@ pub fn build_swarm(
 
     // gRPC proxy (cross-ISP tunneling through relay).
     let grpc_proxy = crate::proxy::proxy_behaviour();
+    // C7: registry query — this node only ever *asks* a bootstrap "who serves model X?", so it
+    // advertises Outbound support only (bootstraps run the Inbound responder).
+    let registry_query = crate::registry_proto::registry_behaviour(
+        libp2p::request_response::ProtocolSupport::Outbound,
+    );
 
     // PR-3 (B1) — Gossipsub over a single topic, signed with our Ed25519
     // identity so recipients can verify the message came from a real swarm
@@ -336,6 +341,7 @@ pub fn build_swarm(
         identify,
         mdns,
         grpc_proxy,
+        registry_query,
         gossipsub,
         ping,
         stream,

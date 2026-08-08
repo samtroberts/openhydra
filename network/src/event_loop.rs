@@ -22,6 +22,7 @@ use crate::forward_msg;
 use crate::ipc::IpcBridge;
 use crate::ipc_codec::IpcForwardHeader;
 use crate::proxy::{self, ProxyRequest, ProxyResponse};
+use crate::registry_proto::{RegistryQuery, RegistryReply};
 use crate::ring::{RingAction, RingConfig, RingHandle, RingManager};
 use crate::routing_cache;
 use crate::sampler_bridge::{SamplerBridge, SampleRequest};
@@ -269,6 +270,14 @@ pub enum SwarmCommand {
     InvalidateDiscover {
         model_id: String,
         reply: oneshot::Sender<()>,
+    },
+    /// C7: ask a connected bootstrap's provider registry "who serves this model?". A best-effort
+    /// supplementary discovery source for the cross-NAT case where DHT `get_providers` and gossip
+    /// PEX both come up empty. Records are re-verified before use; a `Vec` (possibly empty) is
+    /// returned, never an error for "no connected bootstrap" — the caller treats it as a fallback.
+    QueryRegistry {
+        model_id: String,
+        reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
     },
     /// Get current NAT status.
     NatStatus {
@@ -568,6 +577,9 @@ struct LoopState {
     relay_addrs: Vec<Multiaddr>,
     /// Pending proxy forward requests: request_id → reply channel.
     pending_proxy: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// C7: pending registry queries: outbound request_id → reply channel. The reply is completed
+    /// when the bootstrap's `RegistryReply` (or an outbound failure) arrives.
+    pending_registry: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>>,
     /// Local gRPC port for inbound proxy requests.
     local_grpc_port: u16,
     /// Pending inbound proxy responses: request_id → (libp2p ResponseChannel, proxy_respond_tx sender)
@@ -742,7 +754,7 @@ const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 /// Rust (verify + author-check + cache into `known_peers`) so discovery keeps
 /// working even when the Kademlia DHT is fully degraded — BitTorrent's PEX
 /// property. Travels on the same single topic as the other control events.
-const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
+pub const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
 
 /// R-DHT-1 audit fix: how long a `known_peers` entry we are NOT connected to may
 /// survive in the reaper. A PEX-learned provider is, by definition, one we have
@@ -808,6 +820,7 @@ impl LoopState {
             kad_server_mode: false, // nodes start as Kad clients (R-DHT-2)
             relay_addrs: Vec::new(),
             pending_proxy: HashMap::new(),
+            pending_registry: HashMap::new(),
             local_grpc_port: 50051,
             inbound_proxy_channels: HashMap::new(),
             inbound_proxy_counter: 0,
@@ -1160,6 +1173,9 @@ pub async fn run_event_loop(
                         // re-queries get_providers instead of early-replying from a stale seed.
                         state.discover_cache.remove(&model_id);
                         let _ = reply.send(());
+                    }
+                    Some(SwarmCommand::QueryRegistry { model_id, reply }) => {
+                        handle_query_registry(&mut swarm, &model_id, reply, &mut state);
                     }
                     Some(SwarmCommand::NatStatus { reply }) => {
                         let _ = reply.send(state.nat_info.clone());
@@ -2925,6 +2941,11 @@ fn handle_swarm_event(
             handle_grpc_proxy_event(proxy_event, swarm, state, proxy_queue);
         }
 
+        // ── C7 Registry query (consumer side) ──
+        SwarmEvent::Behaviour(OpenHydraBehaviourEvent::RegistryQuery(reg_event)) => {
+            handle_registry_query_event(reg_event, swarm, state);
+        }
+
         // ── Gossipsub (PR-3 / B1) ──
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Gossipsub(gossip_event)) => {
             if let libp2p::gossipsub::Event::Message {
@@ -3810,15 +3831,38 @@ fn ingest_discovered_record(
             return;
         }
     };
-    // H1: reject unverified records before trusting any field (DHT poisoning).
-    if let Err(e) = dht::verify_peer_record(&peer_record) {
-        warn!(%e, "dht_record_rejected: fetched record verify failed");
+    if !accept_and_install_record(swarm, state, &peer_record) {
         return;
     }
-    // Install the relay-circuit address so the peer is dialable (mirrors the legacy
-    // GetRecord path; without it, discover returns a record but the address book is empty).
-    // D-S5: gate the self-declared address through safe_injectable_circuit_addr so a
-    // signed-but-dishonest address can't seed the routing table with a victim host.
+    let pid_str = peer_record.libp2p_peer_id.clone();
+    if let Some(pending) = state.pending_discovers.get_mut(&discover_id) {
+        if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
+            pending.records.push(peer_record);
+        }
+    }
+}
+
+/// Verify a freshly-learned provider record and make it usable, returning whether it was
+/// accepted. Shared by the DHT record-fetch path ([`ingest_discovered_record`]) and the C7
+/// registry-query path so every newly-learned record goes through the identical trust +
+/// dialability steps — there is exactly one place that decides "is this record safe to use?":
+///
+/// * H1 — reject records that fail `verify_peer_record` before trusting any field (DHT/registry
+///   poisoning: an unverified record's multiaddr must never reach the routing table).
+/// * D-S5 — install the peer's relay-circuit address into Kademlia only if it is safely
+///   injectable (names this peer, via a trusted relay), so a signed-but-dishonest address can't
+///   seed the routing table with a victim host. Without an installed address `proxy_forward`
+///   fails with "no addresses for peer".
+/// * Cache the verified record in `known_peers` (feeds the C11 seed / passive discovery).
+fn accept_and_install_record(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+    peer_record: &PeerRecord,
+) -> bool {
+    if let Err(e) = dht::verify_peer_record(peer_record) {
+        warn!(%e, "record_rejected: verify failed");
+        return false;
+    }
     if !peer_record.relay_address.is_empty() && !peer_record.libp2p_peer_id.is_empty() {
         if let Ok(pid) = peer_record.libp2p_peer_id.parse::<PeerId>() {
             let trusted = trusted_relay_pids(state);
@@ -3829,17 +3873,85 @@ fn ingest_discovered_record(
                 }
                 None => {
                     warn!(%pid, addr = %peer_record.relay_address,
-                          "ingest: rejected non-injectable relay_address (D-S5)");
+                          "record: rejected non-injectable relay_address (D-S5)");
                 }
             }
         }
     }
-    let pid_str = peer_record.libp2p_peer_id.clone();
     state.known_peers.insert(peer_record.peer_id.clone(), peer_record.clone());
-    if let Some(pending) = state.pending_discovers.get_mut(&discover_id) {
-        if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
-            pending.records.push(peer_record);
+    true
+}
+
+/// C7 command handler: ask a connected bootstrap "who serves `model_id`?". Picks the first
+/// bootstrap we currently have a live connection to (bootstraps run the Inbound registry
+/// responder and the query rides that existing connection), sends the request, and parks the
+/// reply until the response/failure event lands. If no bootstrap is connected there is nothing
+/// to ask — reply with an empty `Vec` (best-effort: the caller falls back to whatever passive
+/// discovery already returned), not an error.
+fn handle_query_registry(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    model_id: &str,
+    reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
+    state: &mut LoopState,
+) {
+    let target = state
+        .bootstrap_peers
+        .iter()
+        .map(|(pid, _)| *pid)
+        .find(|pid| swarm.is_connected(pid));
+    let Some(pid) = target else {
+        debug!(model_id, "registry: no connected bootstrap to query — returning empty");
+        let _ = reply.send(Ok(Vec::new()));
+        return;
+    };
+    let req_id = swarm
+        .behaviour_mut()
+        .registry_query
+        .send_request(&pid, RegistryQuery { model_id: model_id.to_string() });
+    state.pending_registry.insert(req_id, reply);
+    debug!(%pid, model_id, "registry: querying bootstrap");
+}
+
+/// C7 event handler (consumer side): route registry request/response events. Responses carry the
+/// bootstrap's self-signed provider records — each is re-verified and made dialable via
+/// [`accept_and_install_record`] (the bootstrap is not a trust anchor) before being surfaced.
+fn handle_registry_query_event(
+    event: request_response::Event<RegistryQuery, RegistryReply>,
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    state: &mut LoopState,
+) {
+    match event {
+        request_response::Event::Message { peer, message } => match message {
+            // This node advertises Outbound support only, so it should never receive an inbound
+            // query. If a peer sends one anyway, answer empty rather than leave the stream hung.
+            request_response::Message::Request { request, channel, .. } => {
+                debug!(%peer, model = %request.model_id, "registry: unexpected inbound query — answering empty");
+                let _ = swarm
+                    .behaviour_mut()
+                    .registry_query
+                    .send_response(channel, RegistryReply::default());
+            }
+            request_response::Message::Response { request_id, response } => {
+                if let Some(reply) = state.pending_registry.remove(&request_id) {
+                    let mut verified: Vec<PeerRecord> = Vec::new();
+                    for rec in response.records {
+                        if accept_and_install_record(swarm, state, &rec) {
+                            verified.push(rec);
+                        }
+                    }
+                    debug!(%peer, returned = verified.len(), "registry: query answered");
+                    let peers = discovered_from_records(state, &verified);
+                    let _ = reply.send(Ok(peers));
+                }
+            }
+        },
+        request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+            if let Some(reply) = state.pending_registry.remove(&request_id) {
+                let _ = reply.send(Err(format!("registry query to {peer} failed: {error}")));
+            }
         }
+        request_response::Event::InboundFailure { .. }
+        | request_response::Event::ResponseSent { .. } => {}
     }
 }
 

@@ -19,8 +19,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::swarm::Config as SwarmConfig;
-use libp2p::{autonat, gossipsub, identify, kad, ping, relay, Multiaddr, Swarm, Transport};
+use libp2p::{autonat, gossipsub, identify, kad, ping, relay, request_response, Multiaddr, Swarm, Transport};
 use tracing::{debug, info, warn};
+
+use openhydra_network::registry_proto::{RegistryCodec, RegistryReply};
 
 // Re-use crate modules for identity and transport.
 // Note: since this is a [[bin]], we import the library crate.
@@ -58,6 +60,24 @@ struct BootstrapBehaviour {
     /// Phase 5.6: Ping detects stale connections — without it, dead
     /// connections persist for the full idle_connection_timeout (600s).
     ping: ping::Behaviour,
+    /// C7: `/openhydra/registry/1.0.0` responder. Answers a consumer's "who serves model X?"
+    /// query from the `ProviderRegistry` this bootstrap has retained. Inbound-only — a bootstrap
+    /// answers registry queries but never issues them.
+    registry_query: request_response::Behaviour<RegistryCodec>,
+}
+
+/// C7: registry entry TTL — a provider that stops re-announcing ages out. Matches the DHT
+/// record TTL (~300 s); healthy providers re-announce well within this.
+const REGISTRY_TTL_MS: u64 = 300_000;
+/// How often to sweep expired registry entries.
+const REGISTRY_REAP_SECS: u64 = 60;
+
+/// Current Unix time in milliseconds (0 if the clock is before the epoch — never in practice).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -259,6 +279,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reachability verdicts.
     let autonat_v2_server = autonat::v2::server::Behaviour::default();
 
+    // C7: registry responder — Inbound-only (this bootstrap answers "who serves model X?"
+    // queries from the registry it retains; it never issues such queries itself).
+    let registry_query = openhydra_network::registry_proto::registry_behaviour(
+        request_response::ProtocolSupport::Inbound,
+    );
+
     let behaviour = BootstrapBehaviour {
         kademlia,
         relay_server,
@@ -267,6 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dcutr,
         gossipsub,
         ping,
+        registry_query,
     };
 
     // Phase 5.6: Reduced from 600s to 300s to match peer nodes and
@@ -292,6 +319,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut metrics_ticker = tokio::time::interval(Duration::from_secs(300));
     metrics_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // C7: retain the verified PROVIDER_ANNOUNCE records we see (this bootstrap subscribes to the
+    // swarm topic, so it receives every announce from its connected providers) so we can answer
+    // "who serves model X?" authoritatively — instead of relying on the D-sized gossip mesh to
+    // forward the advert to the right consumer, which it does not do reliably across NATs.
+    let mut registry = openhydra_network::registry::ProviderRegistry::new(REGISTRY_TTL_MS);
+    let mut registry_reaper = tokio::time::interval(Duration::from_secs(REGISTRY_REAP_SECS));
+    registry_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Event loop — Phase 4.4: graceful shutdown via signal handling.
     loop {
         tokio::select! {
@@ -307,8 +342,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     total_circuits,
                     denied_circuits,
                     connected_peers = peers,
+                    registry_models = registry.model_count(),
+                    registry_providers = registry.len(),
                     "relay_metrics"
                 );
+            }
+            _ = registry_reaper.tick() => {
+                let removed = registry.reap(now_ms());
+                if removed > 0 {
+                    debug!(removed, remaining = registry.len(), "C7 registry: reaped stale providers");
+                }
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -438,6 +481,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     len = message.data.len(),
                                     "gossipsub: message received/forwarded"
                                 );
+                                // C7: retain verified PROVIDER_ANNOUNCE records into the registry.
+                                // `message.source` is the strict-signed ORIGINAL author (not the
+                                // relay hop `propagation_source`), so it is the right trust anchor
+                                // for `pex_record_is_authentic` — which checks the embedded signed
+                                // record AND that this author owns it. Forged/unsigned adverts are
+                                // rejected; the store only ever conveys self-signed records.
+                                if let (Some(author), Ok(parsed)) = (
+                                    message.source,
+                                    serde_json::from_slice::<serde_json::Value>(&message.data),
+                                ) {
+                                    if parsed.get("type").and_then(|v| v.as_str())
+                                        == Some(openhydra_network::event_loop::PROVIDER_ANNOUNCE_TYPE)
+                                    {
+                                        if let Some(rec) = parsed
+                                            .get("record")
+                                            .and_then(|v| serde_json::from_value::<openhydra_network::types::PeerRecord>(v.clone()).ok())
+                                        {
+                                            let author_str = author.to_base58();
+                                            match openhydra_network::dht::pex_record_is_authentic(&rec, &author_str) {
+                                                Ok(()) => registry.insert(rec, now_ms()),
+                                                Err(e) => debug!(%author_str, %e, "C7 registry: rejected unauthentic advert"),
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             BootstrapBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
                                 peer_id, topic,
@@ -509,6 +577,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         warn!(%peer, %error, "ping: failure");
                                     }
                                 }
+                            }
+
+                            // C7: answer a consumer's registry query from the retained store. The
+                            // records are the providers' own self-signed PeerRecords (verified on
+                            // ingest); the consumer re-verifies before dialing. Inbound-only, so
+                            // only Request/InboundFailure ever occur — other variants are ignored.
+                            BootstrapBehaviourEvent::RegistryQuery(request_response::Event::Message {
+                                peer, message: request_response::Message::Request { request, channel, .. },
+                            }) => {
+                                let records = registry.providers_for(&request.model_id, now_ms());
+                                debug!(%peer, model = %request.model_id, n = records.len(), "C7 registry: answering query");
+                                if swarm
+                                    .behaviour_mut()
+                                    .registry_query
+                                    .send_response(channel, RegistryReply { records })
+                                    .is_err()
+                                {
+                                    debug!(%peer, "C7 registry: response channel closed before send");
+                                }
+                            }
+                            BootstrapBehaviourEvent::RegistryQuery(other) => {
+                                debug!(?other, "C7 registry: non-request event");
                             }
                         }
                     }

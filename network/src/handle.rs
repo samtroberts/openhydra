@@ -170,6 +170,17 @@ impl NetworkHandle {
         })
     }
 
+    /// C7: ask a connected bootstrap's provider registry "who serves `model_id`?". A best-effort
+    /// supplementary discovery source for the cross-NAT case where DHT `get_providers` and gossip
+    /// PEX both return nothing. Returned records are already re-verified + made dialable; an empty
+    /// `Vec` means "no connected bootstrap / registry had nothing" (not an error to escalate).
+    pub fn query_registry(&self, model_id: impl Into<String>) -> Result<Vec<DiscoveredPeer>, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::QueryRegistry {
+            model_id: model_id.into(),
+            reply,
+        })?
+    }
+
     /// The distinct model ids this node currently knows about (PEX-learned / discovered
     /// providers). Empty until gossip/discovery has populated the cache. Powers the
     /// gateway's `GET /v1/models`.
