@@ -265,6 +265,20 @@ pub struct ConsumerNode {
     self_provider: Option<String>,
 }
 
+/// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
+/// to decide whether to bypass the C11 discovery cache and retry.
+enum AttemptOutcome {
+    /// Served successfully — return this summary.
+    Served(ServeSummary),
+    /// No usable provider this pass (empty discovery, or every candidate failed with **nothing
+    /// streamed** yet). Safe to invalidate the discovery cache and retry once — a stale cache
+    /// hit (provider moved/died, replacement not yet cached) shouldn't strand the request.
+    Retryable(AdapterError),
+    /// Must propagate as-is — e.g. output was already streamed to the client (a retry would
+    /// duplicate it), or a discovery-transport error a cache bypass can't fix.
+    Fatal(AdapterError),
+}
+
 impl ConsumerNode {
     /// An in-memory consumer (reputation and credit are not persisted across restarts).
     pub fn new(net: NetworkHandle) -> Self {
@@ -419,12 +433,48 @@ impl ConsumerNode {
         let now = now_unix_ms();
         // The `complete` span (from #[instrument]); we fill in `provider`/`tokens` on success.
         let req_span = tracing::Span::current();
+        // First pass may discover from the C11 cache. On a "no usable provider" outcome — empty
+        // discovery, or every candidate failed with nothing streamed — the cached set may be
+        // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
+        // model's discovery cache and retry once with a cold get_providers lookup. The retry is
+        // only reached when nothing was streamed, so it can never duplicate delivered output.
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, now, &req_span, on_delta) {
+            AttemptOutcome::Served(summary) => return Ok(summary),
+            AttemptOutcome::Fatal(e) => return Err(e),
+            AttemptOutcome::Retryable(_) => {}
+        }
+        tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
+        let _ = self.net.invalidate_discover(model);
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, now, &req_span, on_delta) {
+            AttemptOutcome::Served(summary) => Ok(summary),
+            AttemptOutcome::Retryable(e) | AttemptOutcome::Fatal(e) => Err(e),
+        }
+    }
+
+    /// One serve pass: discover (which may early-reply from the C11 cache) → rank → try
+    /// providers in preference order with failover. Returns [`AttemptOutcome`] so
+    /// [`complete`](Self::complete) can bypass the discovery cache and retry once on a
+    /// `Retryable` result. `Retryable` is only returned when nothing has been streamed.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_once(
+        self: &Arc<Self>,
+        model: &str,
+        messages: &[ChatMessage],
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        tools: &[Value],
+        now: u64,
+        req_span: &tracing::Span,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> AttemptOutcome {
         let t_discover = std::time::Instant::now();
         let peers = {
             let _span = tracing::info_span!("discover", model = %model).entered();
-            self.net
-                .discover(model)
-                .map_err(|e| AdapterError::Http(format!("discover: {e}")))?
+            match self.net.discover(model) {
+                Ok(p) => p,
+                // A discovery-transport error won't be fixed by a cache bypass → fatal.
+                Err(e) => return AttemptOutcome::Fatal(AdapterError::Http(format!("discover: {e}"))),
+            }
         };
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
@@ -435,7 +485,9 @@ impl ConsumerNode {
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
-            return Err(AdapterError::Http(format!("no provider for model '{model}'")));
+            return AttemptOutcome::Retryable(AdapterError::Http(format!(
+                "no provider for model '{model}'"
+            )));
         }
         let total = candidates.len();
 
@@ -457,10 +509,10 @@ impl ConsumerNode {
             let request = ServeRequest {
                 reply_to: self.net.libp2p_peer_id().to_string(),
                 model_ref: provider.model_id.clone(),
-                messages: messages.clone(),
+                messages: messages.to_vec(),
                 max_tokens,
                 temperature,
-                tools: tools.clone(),
+                tools: tools.to_vec(),
                 nonce,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
@@ -533,7 +585,7 @@ impl ConsumerNode {
                     if !self_serve {
                         self.maybe_audit(model, &provider.peer_id);
                     }
-                    return Ok(summary);
+                    return AttemptOutcome::Served(summary);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -548,15 +600,18 @@ impl ConsumerNode {
                     }
                     if delivered {
                         // Already streamed part of a completion to the client — failing over
-                        // would duplicate output. Surface the error instead.
-                        return Err(e);
+                        // (or a cache-bypass retry) would duplicate output. Surface it as fatal.
+                        return AttemptOutcome::Fatal(e);
                     }
                     last_err = Some(e);
                 }
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| AdapterError::Http(format!("all providers failed for '{model}'"))))
+        // Every candidate failed, but nothing was streamed → safe for the caller to bypass the
+        // discovery cache and retry once.
+        AttemptOutcome::Retryable(
+            last_err.unwrap_or_else(|| AdapterError::Http(format!("all providers failed for '{model}'"))),
+        )
     }
 
     /// Reconnect-and-fetch (RECONNECT_AND_FETCH_PLAN.md): the serve connection to `provider`

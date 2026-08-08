@@ -263,6 +263,13 @@ pub enum SwarmCommand {
         model_id: String,
         reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
     },
+    /// C11: drop this model's discover-cache entry so the next `Discover` does a fresh
+    /// `get_providers` lookup. The consumer sends this when every candidate from a
+    /// (possibly cached) discovery failed, so a stale cache hit can't strand the request.
+    InvalidateDiscover {
+        model_id: String,
+        reply: oneshot::Sender<()>,
+    },
     /// Get current NAT status.
     NatStatus {
         reply: oneshot::Sender<NatInfo>,
@@ -528,6 +535,11 @@ struct LoopState {
     ipv6_capable: bool,
     /// Known peers from Kademlia queries, keyed by OpenHydra peer_id.
     known_peers: HashMap<String, PeerRecord>,
+    /// C11: model_id → (unix_ms of our last *completed* discover, net_generation then). A
+    /// fresh entry lets `handle_discover` answer from `known_peers` without a fresh
+    /// `get_providers` round-trip. Invalidated by `DISCOVER_CACHE_TTL_MS` and by a
+    /// net-generation change (roam/wake) — so we never serve a stale relay path after moving.
+    discover_cache: HashMap<String, (u64, u64)>,
     /// Pending Kademlia GET queries: query_id → reply channel.
     pending_discovers: HashMap<kad::QueryId, PendingDiscover>,
     /// Chained `get_record` fetches spawned by a `get_providers` discover, mapping the
@@ -741,6 +753,14 @@ const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
 /// ages out, while a live one is kept refreshed by each gossip.
 const KNOWN_PEER_TTL_MS: u64 = 300_000;
 
+/// C11: how long a *completed* `discover` for a model stays fresh enough to answer from the
+/// `known_peers` cache without a new `get_providers` round-trip. Coalesces a request burst (a
+/// chat session / an agent loop) so only ~1 request per window pays the DHT lookup — which
+/// cross-NAT is the ~1.2 s `discover` hop (gossip PEX can't populate the cache across separate
+/// networks). Kept low so a moved/departed provider is re-resolved promptly; failover + the
+/// reaper cover a stale hit, and a net-generation change invalidates it outright.
+const DISCOVER_CACHE_TTL_MS: u64 = 30_000;
+
 /// Current wall-clock time in Unix milliseconds (0 if the clock is before the
 /// epoch, which never happens in practice).
 fn now_unix_ms() -> u64 {
@@ -779,6 +799,7 @@ impl LoopState {
             },
             ipv6_capable: probe_ipv6_capable(),
             known_peers: HashMap::new(),
+            discover_cache: HashMap::new(),
             pending_discovers: HashMap::new(),
             pending_record_fetches: HashMap::new(),
             external_addrs: Vec::new(),
@@ -1133,6 +1154,12 @@ pub async fn run_event_loop(
                     }
                     Some(SwarmCommand::Discover { model_id, reply }) => {
                         handle_discover(&mut swarm, &model_id, reply, &mut state);
+                    }
+                    Some(SwarmCommand::InvalidateDiscover { model_id, reply }) => {
+                        // C11 bypass: forget this model's cached discovery so the next Discover
+                        // re-queries get_providers instead of early-replying from a stale seed.
+                        state.discover_cache.remove(&model_id);
+                        let _ = reply.send(());
                     }
                     Some(SwarmCommand::NatStatus { reply }) => {
                         let _ = reply.send(state.nat_info.clone());
@@ -1634,6 +1661,14 @@ pub async fn run_event_loop(
                 if removed > 0 {
                     info!(removed, remaining = state.known_peers.len(), "known_peers reaper sweep");
                 }
+                // C11: prune the discover cache on the same tick so it stays bounded — drops
+                // entries past DISCOVER_CACHE_TTL_MS or from a superseded net-generation.
+                prune_discover_cache(
+                    &mut state.discover_cache,
+                    now_ms,
+                    state.net_generation.load(std::sync::atomic::Ordering::Relaxed),
+                    DISCOVER_CACHE_TTL_MS,
+                );
                 // Phase 2.4: TTL-sweep leaked inbound proxy response channels.
                 // Normally a channel is removed when the Python responder replies
                 // (~lines 814/1022). If the responder crashes/drops, the channel
@@ -1986,6 +2021,40 @@ fn handle_provider_pex(
     }
 }
 
+/// C11: is our last completed discover for `model` still within `ttl_ms` and the same
+/// net-generation? Pure, so the cache-freshness policy is unit-testable without a swarm.
+fn discover_cache_fresh(
+    cache: &HashMap<String, (u64, u64)>,
+    model: &str,
+    now_ms: u64,
+    cur_gen: u64,
+    ttl_ms: u64,
+) -> bool {
+    matches!(cache.get(model), Some(&(at_ms, at_gen)) if at_gen == cur_gen && now_ms.saturating_sub(at_ms) < ttl_ms)
+}
+
+/// C11: drop discover-cache entries past `ttl_ms` or from a superseded net-generation, so the
+/// map stays bounded to models discovered in the last TTL under the current generation — it
+/// can't grow unbounded across distinct (client-supplied) model_ids, nor accumulate dead
+/// entries after each roam/wake bumps the generation. Keep-condition mirrors
+/// [`discover_cache_fresh`]. Run on the periodic reaper tick.
+fn prune_discover_cache(cache: &mut HashMap<String, (u64, u64)>, now_ms: u64, cur_gen: u64, ttl_ms: u64) {
+    cache.retain(|_model, &mut (at_ms, at_gen)| at_gen == cur_gen && now_ms.saturating_sub(at_ms) < ttl_ms);
+}
+
+/// Build `DiscoveredPeer`s from records, stamping the R-DHT-8 liveness hint (is there a live
+/// libp2p connection to each provider right now). Shared by the C11 cache-hit early-reply and
+/// the query-completion reply path so both surface the same connected/failover signal.
+fn discovered_from_records(state: &LoopState, records: &[PeerRecord]) -> Vec<DiscoveredPeer> {
+    let mut peers: Vec<DiscoveredPeer> = records.iter().map(record_to_discovered).collect();
+    for p in &mut peers {
+        if let Ok(pid) = p.libp2p_peer_id.parse::<PeerId>() {
+            p.connected = state.peer_connections.contains_key(&pid);
+        }
+    }
+    peers
+}
+
 /// Handle a discover command: find providers for the model via Kademlia
 /// provider API (Task 2.1: Option C).
 fn handle_discover(
@@ -2008,6 +2077,22 @@ fn handle_discover(
         .filter(|r| r.model_id == model_id && r.libp2p_peer_id != local_id)
         .cloned()
         .collect();
+
+    // C11: if we completed a discover for this model recently (and haven't changed networks
+    // since), answer straight from the cache seed — skipping the ~1.2 s get_providers
+    // round-trip. The cold path below still runs (and refreshes the cache) once the entry
+    // ages past DISCOVER_CACHE_TTL_MS or a net-generation change invalidates it. A stale hit
+    // is bounded by the TTL and covered by the consumer's failover + the known_peers reaper.
+    let now_ms = now_unix_ms();
+    let cur_gen = state.net_generation.load(std::sync::atomic::Ordering::Relaxed);
+    if !seed.is_empty()
+        && discover_cache_fresh(&state.discover_cache, model_id, now_ms, cur_gen, DISCOVER_CACHE_TTL_MS)
+    {
+        let peers = discovered_from_records(state, &seed);
+        debug!(model_id, n = peers.len(), "discover: C11 cache hit — skipped get_providers");
+        let _ = reply.send(Ok(peers));
+        return;
+    }
     if !seed.is_empty() {
         debug!(model_id, seeded = seed.len(), "discover: pre-seeded from PEX/DHT cache");
     }
@@ -3582,11 +3667,14 @@ fn handle_kad_event(
                 Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
                     // Query complete — send results back.
                     if let Some(pending) = state.pending_discovers.remove(&id) {
-                        let peers = pending
-                            .records
-                            .into_iter()
-                            .map(|r| record_to_discovered(&r))
-                            .collect();
+                        let peers = discovered_from_records(state, &pending.records);
+                        // C11: cache a non-empty result so repeat requests skip get_providers.
+                        if !peers.is_empty() {
+                            state.discover_cache.insert(
+                                pending.model_id.clone(),
+                                (now_unix_ms(), state.net_generation.load(std::sync::atomic::Ordering::Relaxed)),
+                            );
+                        }
                         let _ = pending.reply.send(Ok(peers));
                     }
                 }
@@ -3767,16 +3855,18 @@ fn maybe_reply_discover(state: &mut LoopState, discover_id: kad::QueryId) {
     };
     if ready {
         let pending = state.pending_discovers.remove(&discover_id).expect("present");
-        let mut peers: Vec<DiscoveredPeer> =
-            pending.records.iter().map(record_to_discovered).collect();
-        // R-DHT-8: stamp the liveness hint — is there a live libp2p connection to
-        // this provider right now? The consumer prefers connected providers so the
-        // failover path becomes the exception, not the rule. All records here are
-        // already H1/PEX-verified, so we never surface an unverified candidate.
-        for p in &mut peers {
-            if let Ok(pid) = p.libp2p_peer_id.parse::<PeerId>() {
-                p.connected = state.peer_connections.contains_key(&pid);
-            }
+        // R-DHT-8: `discovered_from_records` stamps the liveness hint (live libp2p connection?)
+        // so the consumer prefers connected providers and failover is the exception. All
+        // records here are already H1/PEX-verified, so we never surface an unverified candidate.
+        let peers = discovered_from_records(state, &pending.records);
+        // C11: remember this successful discover so the next request for the same model can
+        // answer from `known_peers` without a fresh get_providers round-trip. Only cache a
+        // non-empty result — an empty one has nothing to serve and should re-query.
+        if !peers.is_empty() {
+            state.discover_cache.insert(
+                pending.model_id.clone(),
+                (now_unix_ms(), state.net_generation.load(std::sync::atomic::Ordering::Relaxed)),
+            );
         }
         let _ = pending.reply.send(Ok(peers));
     }
@@ -5276,6 +5366,45 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c11_discover_cache_fresh_policy() {
+        let ttl = DISCOVER_CACHE_TTL_MS;
+        let mut cache: HashMap<String, (u64, u64)> = HashMap::new();
+        // model "m" discovered at t=1_000_000 under net-generation 7.
+        cache.insert("m".into(), (1_000_000, 7));
+
+        // Within TTL, same generation → fresh (early-reply eligible).
+        assert!(discover_cache_fresh(&cache, "m", 1_000_000 + ttl - 1, 7, ttl));
+        assert!(discover_cache_fresh(&cache, "m", 1_000_000, 7, ttl));
+
+        // Past TTL → stale (re-query).
+        assert!(!discover_cache_fresh(&cache, "m", 1_000_000 + ttl, 7, ttl));
+        assert!(!discover_cache_fresh(&cache, "m", 2_000_000, 7, ttl));
+
+        // Net-generation changed (roam/wake) → invalidated even if within TTL.
+        assert!(!discover_cache_fresh(&cache, "m", 1_000_000 + 1, 8, ttl));
+
+        // Unknown model → not fresh.
+        assert!(!discover_cache_fresh(&cache, "other", 1_000_000, 7, ttl));
+
+        // Clock skew (now < stored) must not underflow into a false "fresh".
+        assert!(discover_cache_fresh(&cache, "m", 999_999, 7, ttl)); // saturating_sub → 0 < ttl
+    }
+
+    #[test]
+    fn c11_prune_discover_cache_bounds_the_map() {
+        let ttl = DISCOVER_CACHE_TTL_MS;
+        let now = 1_000_000u64;
+        let mut cache: HashMap<String, (u64, u64)> = HashMap::new();
+        cache.insert("fresh".into(), (now - 1, 5)); // within TTL, current gen → keep
+        cache.insert("stale".into(), (now - ttl - 1, 5)); // past TTL → drop
+        cache.insert("oldgen".into(), (now - 1, 4)); // superseded net-generation → drop
+        prune_discover_cache(&mut cache, now, 5, ttl);
+        let mut keys: Vec<String> = cache.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["fresh".to_string()]);
+    }
 
     #[test]
     fn test_globally_reachable_addr_gate() {

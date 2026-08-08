@@ -159,6 +159,17 @@ impl NetworkHandle {
         })?
     }
 
+    /// C11: drop `model_id` from the discover cache so the next [`discover`](Self::discover)
+    /// does a fresh `get_providers` lookup. The consumer calls this after every candidate from
+    /// a (possibly cached) discovery failed, then retries discover once. Best-effort: an error
+    /// here (event loop gone) just means the retry falls back to whatever discover returns.
+    pub fn invalidate_discover(&self, model_id: impl Into<String>) -> Result<(), String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::InvalidateDiscover {
+            model_id: model_id.into(),
+            reply,
+        })
+    }
+
     /// The distinct model ids this node currently knows about (PEX-learned / discovered
     /// providers). Empty until gossip/discovery has populated the cache. Powers the
     /// gateway's `GET /v1/models`.
