@@ -42,10 +42,17 @@ jobs:
         with:
           workspaces: network
       - name: Build bootstrap binary
+        # Run from the workspace root: `network` is a root-workspace member (members =
+        # ["network","protocol","agent"]), so the binary lands in the workspace-root
+        # `target/release/`, NOT `network/target/`. The job default working-directory is
+        # `network`, which is why the old `ls target/release/...` looked in the wrong place
+        # and exited 2 even though the build succeeded.
+        working-directory: .
         run: |
           cargo build --release --bin openhydra-bootstrap
           ls -lh target/release/openhydra-bootstrap
       - uses: actions/upload-artifact@v4
         with:
           name: openhydra-bootstrap-linux-x86_64
-          path: network/target/release/openhydra-bootstrap
+          # upload-artifact paths are repo-root-relative (working-directory doesn't apply).
+          path: target/release/openhydra-bootstrap
