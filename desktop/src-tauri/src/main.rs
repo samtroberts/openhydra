@@ -167,6 +167,11 @@ struct Settings {
     verbose_logs: bool,
     /// #9: user-editable device name shown to peers / in the UI. Empty → derive from the OS.
     device_name: String,
+    /// Per-model share allowlist (engine handles). Empty → share every model the engine exposes
+    /// (the default). Non-empty → pass each as `--share-models` so the provider announces and
+    /// serves only these. Restart Sharing to apply a change.
+    #[serde(default)]
+    shared_models: Vec<String>,
 }
 
 impl Default for Settings {
@@ -182,6 +187,7 @@ impl Default for Settings {
             search_url: String::new(),
             verbose_logs: false,
             device_name: String::new(),
+            shared_models: Vec::new(), // empty ⇒ share every detected model (the default)
         }
     }
 }
@@ -298,6 +304,98 @@ fn device_hostname() -> String {
     name.filter(|s: &String| !s.is_empty())
         .or_else(hostname_cmd)
         .unwrap_or_else(|| "This machine".into())
+}
+
+/// The desktop bundle's version (from this crate's Cargo.toml, kept in lockstep with
+/// tauri.conf.json). This is the authoritative "what am I running" string the UI shows — unlike
+/// the agent crate's `CARGO_PKG_VERSION` surfaced by `/status`, which can lag the bundle.
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+// ── AppImage desktop integration ──
+// An AppImage is a portable single file: double-clickable, but it does NOT add itself to the
+// applications menu. When we detect we're running from one (the AppImage runtime exports the
+// `APPIMAGE` env var → the .AppImage path, and `APPDIR` → its mount), we offer a first-run
+// "Add to Applications" step that drops a `.desktop` launcher pointing back at the AppImage, so
+// it appears in the menu like an installed app. No-op on macOS / Windows / a non-AppImage Linux
+// build (where `APPIMAGE` is unset), so the UI prompt simply never shows.
+
+/// The path to the running `.AppImage`, or `None` when not running as one.
+fn appimage_path() -> Option<String> {
+    std::env::var("APPIMAGE").ok().filter(|s| !s.is_empty())
+}
+
+/// `~/.local/share/applications/openhydra.desktop`.
+fn desktop_entry_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".local/share/applications/openhydra.desktop"))
+}
+
+/// The `.desktop` launcher body pointing at this AppImage. Pure (no I/O) so it's unit-testable.
+/// `Exec` is double-quoted because an AppImage path can contain spaces.
+fn desktop_entry(appimage: &str, icon: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=OpenHydra\n\
+         Comment=Share your machine's inference engines and use the OpenHydra network.\n\
+         Exec=\"{appimage}\" %U\n\
+         Icon={icon}\n\
+         Categories=Utility;Network;\n\
+         Terminal=false\n\
+         StartupWMClass=OpenHydra\n"
+    )
+}
+
+#[derive(Serialize)]
+struct AppImageStatus {
+    /// True when running from an AppImage (the "Add to Applications" prompt only applies then).
+    is_appimage: bool,
+    /// True once a launcher entry already exists (don't offer to add it again).
+    integrated: bool,
+}
+
+/// Whether we're an AppImage and whether a launcher entry already exists — the UI uses this to
+/// decide whether to show the first-run "Add to Applications" prompt.
+#[tauri::command]
+fn appimage_status() -> AppImageStatus {
+    AppImageStatus {
+        is_appimage: appimage_path().is_some(),
+        integrated: desktop_entry_path().map(|p| p.exists()).unwrap_or(false),
+    }
+}
+
+/// Write a `.desktop` launcher (and best-effort copy the AppImage's icon into the hicolor theme)
+/// so OpenHydra shows up in the applications menu. Idempotent; errors are surfaced to the UI.
+#[tauri::command]
+fn integrate_appimage() -> Result<(), String> {
+    let appimage = appimage_path().ok_or("not running as an AppImage")?;
+    let home = std::env::var("HOME").map_err(|_| "no HOME set".to_string())?;
+    let apps_dir = PathBuf::from(&home).join(".local/share/applications");
+    std::fs::create_dir_all(&apps_dir).map_err(|e| e.to_string())?;
+
+    // Prefer the AppImage's own icon (`$APPDIR/.DirIcon`, the standard AppImage icon) copied into
+    // the user's icon theme so the launcher shows the real logo; fall back to the app id.
+    let mut icon = "co.openhydra.desktop".to_string();
+    if let Ok(appdir) = std::env::var("APPDIR") {
+        let diricon = PathBuf::from(&appdir).join(".DirIcon");
+        let icons_dir = PathBuf::from(&home).join(".local/share/icons/hicolor/256x256/apps");
+        if diricon.exists()
+            && std::fs::create_dir_all(&icons_dir).is_ok()
+            && std::fs::copy(&diricon, icons_dir.join("openhydra.png")).is_ok()
+        {
+            icon = "openhydra".to_string();
+        }
+    }
+
+    let path = apps_dir.join("openhydra.desktop");
+    std::fs::write(&path, desktop_entry(&appimage, &icon)).map_err(|e| e.to_string())?;
+    // Best-effort refresh of the menu database (harmless if the tool is absent).
+    let _ = Command::new("update-desktop-database").arg(&apps_dir).status();
+    Ok(())
 }
 
 // ── #4: bundle the (bounded, in-memory) agent logs + environment into one file to send the
@@ -612,6 +710,14 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // single-writer per process, so the gateway role uses a separate file (gateway-ledger.redb).
     sub.push("--db".into());
     sub.push(openhydra_dir().join("provider-ledger.redb").to_string_lossy().into_owned());
+    // Per-model share allowlist: pass each selected model as its own --share-models flag. Empty
+    // list ⇒ no flag ⇒ the agent shares every detected model (the default).
+    for model in &settings.shared_models {
+        if !model.trim().is_empty() {
+            sub.push("--share-models".into());
+            sub.push(model.clone());
+        }
+    }
     spawn_role(
         &state.provider,
         "desktop-provider.key",
@@ -1139,6 +1245,9 @@ fn main() {
             load_stats,
             save_stats,
             device_hostname,
+            app_version,
+            appimage_status,
+            integrate_appimage,
             export_logs,
         ])
         .setup(|app| {
@@ -1193,6 +1302,18 @@ mod tests {
     fn strips_ansi_sgr_sequences() {
         let colored = "\u{1b}[2m2026-07-02\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m announced";
         assert_eq!(strip_ansi(colored), "2026-07-02  INFO announced");
+    }
+
+    #[test]
+    fn desktop_entry_quotes_exec_and_sets_fields() {
+        // An AppImage path can contain spaces, so Exec must be quoted or the launcher breaks.
+        let d = desktop_entry("/home/me/My Apps/OpenHydra.AppImage", "openhydra");
+        assert!(d.contains("Exec=\"/home/me/My Apps/OpenHydra.AppImage\" %U"));
+        assert!(d.contains("Name=OpenHydra"));
+        assert!(d.contains("Icon=openhydra"));
+        assert!(d.contains("Type=Application"));
+        assert!(d.contains("Categories=Utility;Network;"));
+        assert!(d.starts_with("[Desktop Entry]"));
     }
 
     #[test]

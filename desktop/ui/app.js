@@ -20,12 +20,12 @@
     if (cmd === "stop_provider") { mk.provider = false; return null; }
     if (cmd === "start_gateway") { mk.gateway = true; return null; }
     if (cmd === "stop_gateway") { mk.gateway = false; return null; }
-    if (cmd === "save_settings") return null;
+    if (cmd === "save_settings") { if (args?.settings) mk.sharedModels = args.settings.shared_models || []; return null; }
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "get_state") return {
       provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: mk.provider ? 2 : 0, relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
-      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "" },
+      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "", shared_models: mk.sharedModels || [] },
       agent_found: true, gateway_url: "http://127.0.0.1:16527/v1",
     };
     if (cmd === "system_info") return { os: "macos", arch: "aarch64", cpu: "Apple M1", ram_bytes: 8589934592, gpus: [{ name: "Apple M1 (7-core GPU)", vram_bytes: 8589934592, unified: true }] };
@@ -144,6 +144,9 @@
     }
     if (cmd === "save_stats") return null;                        // #7
     if (cmd === "device_hostname") return "Sam’s MacBook Air";    // #9
+    if (cmd === "app_version") return "0.3.10";                   // mock bundle version
+    if (cmd === "appimage_status") return { is_appimage: localStorage.getItem("oh_mock_appimage") === "1", integrated: mk.integrated || false };
+    if (cmd === "integrate_appimage") { mk.integrated = true; return null; }
     if (cmd === "export_logs") return "~/.openhydra/openhydra-logs-1785200000.txt"; // #4
     return null;
   }
@@ -204,12 +207,40 @@
 
   // ── persistence ──
   const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
-  let sessions = store.get("oh_sessions", {}), sessionOrder = store.get("oh_order", []);
+  // Coerce persisted sessions into the canonical `{ id: {t, m} }` object. A legacy build stored
+  // them as an ARRAY of `{ id, name, history, preset }`; if that array reaches `sessions`, every
+  // new chat added under a string key is silently dropped by JSON.stringify on save (arrays only
+  // serialize numeric indices) — so no chat ever persists across relaunch. Normalizing here fixes
+  // it and migrates the old shape (name→t, history→m) in passing.
+  function coerceSessions(raw) {
+    if (Array.isArray(raw)) {
+      const obj = {};
+      raw.forEach((s, i) => {
+        if (!s) return;
+        const id = s.id || ("mig" + i);               // synthesize an id rather than DROP the chat
+        const src = Array.isArray(s.m) ? s.m : Array.isArray(s.history) ? s.history : [];
+        const msgs = src.map((h) => {
+          if (Array.isArray(h)) return h;             // already [role, content, …] — keep verbatim
+          if (typeof h === "string") return ["me", h]; // bare-string message
+          if (h && typeof h === "object") {
+            const text = typeof h.content === "string" ? h.content : (h.text ?? (h.content != null ? JSON.stringify(h.content) : ""));
+            return [h.role === "assistant" || h.role === "ai" ? "ai" : "me", text];
+          }
+          return ["me", String(h ?? "")];
+        });
+        obj[id] = { t: s.t || s.name || "New chat", m: msgs };
+      });
+      return obj;
+    }
+    return raw && typeof raw === "object" ? raw : {};
+  }
+  let sessions = coerceSessions(store.get("oh_sessions", {})), sessionOrder = store.get("oh_order", []);
   let deviceName = store.get("oh_device", "");   // #9: derived from the OS on boot if unset
   let usedTokens = store.get("oh_used", 0);
   root.dataset.theme = store.get("oh_theme", "light");
   if (store.get("oh_adv", false)) app.setAttribute("data-adv", "");
   function saveSessions() {
+    if (Array.isArray(sessions)) sessions = coerceSessions(sessions); // never persist an array (see coerceSessions)
     store.set("oh_sessions", sessions); store.set("oh_order", sessionOrder);
     // #1: durable write-through to the Tauri backend file (WebView localStorage isn't durable
     // across restarts on any platform). Fire-and-forget; localStorage stays as a fast cache.
@@ -707,6 +738,38 @@
   }
   const engineFor = (m) => { for (const e of engines) if (e.models.includes(m)) return e.label; return null; };
 
+  // ── per-model share allowlist (Share view toggles) ──
+  // settings.shared_models empty ⇒ share ALL detected models (the default). Non-empty ⇒ only those.
+  // A per-model toggle edits this list; the provider announces AND serves only shared models (the
+  // gate is enforced agent-side). The list is read at provider start, so a change applies on the
+  // next Sharing restart — we don't auto-restart a running provider mid-serve.
+  function shareActiveModels() { return [...new Set(engines.flatMap((e) => e.models))]; }
+  function isModelShared(m) { const s = state?.settings?.shared_models || []; return s.length === 0 || s.includes(m); }
+  async function saveSharedModels(next) {
+    const settings = Object.assign({}, state?.settings || {}, { shared_models: next });
+    if (state?.settings) state.settings.shared_models = next; // optimistic local update
+    try { await call("save_settings", { settings }); } catch (e) { toast(`Save failed: ${e}`); return; }
+    toast(state?.provider?.status?.running ? "Saved — restart Sharing to apply" : "Saved");
+    renderShare();
+  }
+  async function toggleShareModel(m) {
+    const all = shareActiveModels();
+    // Empty selection means "share all" in the data model, so an empty allowlist can't represent
+    // "share none". Refuse to de-select the LAST enabled model — otherwise turning everything off
+    // (or the only model of a single-model provider) silently flips back to sharing everything. To
+    // stop sharing entirely, use the Sharing toggle.
+    if (isModelShared(m) && all.filter(isModelShared).length <= 1) {
+      toast("Turn off Sharing (top bar) to stop sharing entirely");
+      return;
+    }
+    let list = (state?.settings?.shared_models || []).slice();
+    const wasShared = list.length === 0 || list.includes(m);
+    if (list.length === 0) list = all.slice();        // materialize "share all" before removing one
+    if (wasShared) list = list.filter((x) => x !== m);
+    else if (!list.includes(m)) list.push(m);
+    if (all.length && all.every((x) => list.includes(x))) list = []; // re-enabled all ⇒ back to default
+    await saveSharedModels(list);
+  }
   function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
     const head = $("#v-share .row .ctitle").parentElement;
@@ -747,7 +810,7 @@
       const reqs = pm.requests ?? "—";
       const tps = pm.avg_native_tps ? Math.round(pm.avg_native_tps) : "—";
       const status = isActive ? `<span class="badge ${running ? "ok" : "secondary"}">${running ? "live" : "ready"}</span>` : `<span class="badge secondary">inactive</span>`;
-      const ann = isActive ? `<div class="switch ${running ? "on" : ""}" data-announce></div>` : `<span class="mut" style="font-size:11px">—</span>`;
+      const ann = isActive ? `<div class="switch ${isModelShared(m) ? "on" : ""}" data-share="${esc(m)}" title="Share this model on the network"></div>` : `<span class="mut" style="font-size:11px">—</span>`;
       rows.push(`<tr${isActive ? "" : ' style="opacity:.5"'}><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td>${ann}</td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
@@ -757,7 +820,7 @@
     $("#v-share .badge.ok, #v-share .badge").parentElement && ($$("#v-share .card .row .badge")[0]);
     const ann = $("#v-share .card .row .badge.ok") || $("#servetable").closest(".card").querySelector(".badge");
     if (ann) { ann.textContent = `${running ? engines.reduce((n, e) => n + e.models.length, 0) : 0} announced`; ann.className = "badge " + (running && engines.length ? "ok" : "secondary"); }
-    $$("#servetable [data-announce]").forEach((sw) => sw.onclick = toggleSharing);
+    $$("#servetable [data-share]").forEach((sw) => sw.onclick = () => toggleShareModel(sw.dataset.share));
     // incoming strip
     const inflight = t?.requests_served != null ? "" : "";
     const inc = $("#v-share .card.pad .mut");
@@ -1091,7 +1154,7 @@
     let gwPort = parseInt((netp.querySelector('#gwport')?.textContent || "").trim(), 10);
     if (!Number.isInteger(gwPort) || gwPort < 1024 || gwPort > 65535) gwPort = state?.settings?.gateway_port || 16527;
     const bootstraps = (netp.querySelector('#bootstraps')?.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean);
-    const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
+    const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName, shared_models: state?.settings?.shared_models || [] };
     try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
   });
   $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
@@ -1103,13 +1166,58 @@
   // ── connectors copy (wireframe .cp) ──
   $$(".cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied to clipboard"); });
 
-  // ── updater → relaunch card ──
-  let updateReady = null;
+  // ── updater → silent download, apply on next restart ──
+  // Policy: auto-check (hourly), then silently download + stage a signed update in the
+  // BACKGROUND. We deliberately do NOT relaunch — on macOS the new bundle is swapped in place
+  // without touching the running process or its sidecar agents, so an active provider keeps
+  // serving and the update takes effect the next time the app is restarted ("apply on quit").
+  // The card becomes an optional "restart now" accelerator, not a forced interruption.
+  let updateReady = null;   // the checked Update handle
+  let updateStaged = false; // true once bytes are downloaded + installed on disk (pending restart)
   $("#relaunch").style.display = "none";
-  async function checkUpdates() { const u = window.__TAURI__?.updater; if (!u?.check) return; try { const up = await u.check(); if (up) { updateReady = up; $("#relaunchver").textContent = "v" + up.version; $("#relaunch").style.display = "flex"; } } catch (e) { console.warn("update check", e); } }
+  async function checkUpdates() {
+    const u = window.__TAURI__?.updater; if (!u?.check) return;
+    if (updateStaged) return; // already downloaded + staged this session; waiting on a restart
+    try {
+      const up = await u.check();
+      if (!up) return;
+      updateReady = up;
+      // Silent staging is a clean in-place swap on macOS (.app) and Linux (AppImage): the running
+      // process is untouched and the update applies on next restart. On Windows the update is an
+      // NSIS installer that CLOSES the app to replace the binary — auto-installing would interrupt
+      // an active serve — so there we fall back to the one-click card and let the user pick when.
+      // Fail SAFE: only silent-stage when we've CONFIRMED a non-Windows OS. If sysInfo hasn't
+      // loaded yet (cold-start can delay it past this check) OR the OS is Windows, fall back to the
+      // manual card — so an unknown OS never triggers the NSIS installer that closes the app.
+      const canSilentStage = !!sysInfo && (sysInfo.os || "").toLowerCase() !== "windows";
+      if (canSilentStage) {
+        try {
+          await up.downloadAndInstall();   // download + stage; no relaunch → applies on next restart
+          updateStaged = true;
+          $("#relaunchver").textContent = "v" + up.version + " · restart to apply";
+        } catch (e) {
+          // Staging failed (e.g. offline mid-download) — fall back to a manual one-click apply.
+          console.warn("update staging failed", e);
+          $("#relaunchver").textContent = "v" + up.version;
+        }
+      } else {
+        $("#relaunchver").textContent = "v" + up.version; // Windows: manual apply via the card
+      }
+      $("#relaunch").style.display = "flex";
+    } catch (e) { console.warn("update check", e); }
+  }
   setTimeout(checkUpdates, 3000);
-  setInterval(checkUpdates, 60 * 60 * 1000); // #13: re-check hourly so a running instance sees a new release without a relaunch
-  $("#relaunch").onclick = async () => { if (!updateReady) return; try { await updateReady.downloadAndInstall(); await window.__TAURI__?.process?.relaunch?.(); } catch (e) { toast(`Update failed: ${e}`); } };
+  setInterval(checkUpdates, 60 * 60 * 1000); // #13: re-check hourly so a running instance stages a new release in the background
+  let relaunchBusy = false;
+  $("#relaunch").onclick = async () => {
+    if (relaunchBusy) return; // guard against a double-click firing two downloadAndInstall calls
+    relaunchBusy = true;
+    try {
+      // Staged already → just relaunch into it. Not staged (fallback) → download+install first.
+      if (!updateStaged && updateReady) await updateReady.downloadAndInstall();
+      await window.__TAURI__?.process?.relaunch?.();
+    } catch (e) { relaunchBusy = false; toast(`Update failed: ${e}`); }
+  };
 
   // ── first-run coachmark tour (spotlight; first launch + after updates only) ──
   const COACH = [
@@ -1163,10 +1271,51 @@
   $("#homelogo").src = "logo.png";
   (async () => {
     // #1: hydrate chat sessions from the durable backend file (localStorage is only a cache).
-    try { const blob = await call("load_sessions"); if (blob) { const d = JSON.parse(blob); if (d.sessions) sessions = d.sessions; if (d.order) sessionOrder = d.order; if (d.device) deviceName = d.device; if (typeof d.used === "number") { usedTokens = d.used; store.set("oh_used", usedTokens); } } } catch {}
+    // `loadOk` gates the clean-shape rewrite below: on a transient load failure we must NOT write
+    // the (possibly stale) localStorage cache back over the durable file — that would delete chats
+    // the file holds but the cache lost. `migrated` = the on-disk shape actually needed fixing.
+    let loadOk = false, migrated = false;
+    try {
+      const blob = await call("load_sessions");
+      loadOk = true;
+      if (blob) {
+        const d = JSON.parse(blob);
+        if (d.sessions) { const co = coerceSessions(d.sessions); migrated = co !== d.sessions; sessions = co; }
+        if (Array.isArray(d.order)) sessionOrder = d.order;
+        if (d.device) deviceName = d.device;
+        if (typeof d.used === "number") { usedTokens = d.used; store.set("oh_used", usedTokens); }
+      }
+    } catch { loadOk = false; }
+    // Repair order/sessions drift: drop order ids with no session, and append any session missing
+    // from order — otherwise legacy orphaned ids render nothing and recovered chats stay hidden.
+    const orderBefore = sessionOrder.join("");
+    sessionOrder = sessionOrder.filter((id) => sessions[id]);
+    for (const id in sessions) if (!sessionOrder.includes(id)) sessionOrder.push(id);
+    const orderRepaired = sessionOrder.join("") !== orderBefore;
+    // Rewrite the durable file ONLY when the load succeeded AND coercion/repair actually changed the
+    // shape — never overwrite it with stale cache after a failed/empty load.
+    if (loadOk && (migrated || orderRepaired) && Object.keys(sessions).length) saveSessions();
     await loadStats();   // #7/#10: hydrate lifetime model stats + timeline buckets from disk
     // #9: default device name from the OS if the user hasn't set/restored one.
     if (!deviceName) { try { deviceName = await call("device_hostname"); } catch {} if (!deviceName) deviceName = /Mac/.test(navigator.platform) ? "This Mac" : "This machine"; store.set("oh_device", deviceName); }
+    // Show the running OpenHydra version (authoritative bundle version, not a guess) in the
+    // statusbar + Settings › About.
+    try { const v = await call("app_version"); if (v) { const sv = $("#sbver"); if (sv) sv.textContent = "v" + v; const av = $("#aboutver"); if (av) av.textContent = "OpenHydra v" + v; } } catch {}
+    // First-run "Add to Applications" — only when running from a Linux AppImage that hasn't been
+    // integrated yet (an AppImage is double-clickable but doesn't add itself to the app menu).
+    try {
+      const st = await call("appimage_status");
+      if (st?.is_appimage && !st.integrated && !store.get("oh_appimage_dismissed", false)) {
+        const card = $("#appimageintegrate");
+        card.style.display = "block";
+        $("#appimageadd").onclick = async () => {
+          try { await call("integrate_appimage"); toast("Added to Applications ✓"); }
+          catch (e) { toast(`Couldn't add: ${e}`); }
+          card.style.display = "none";
+        };
+        $("#appimagedismiss").onclick = () => { store.set("oh_appimage_dismissed", true); card.style.display = "none"; };
+      }
+    } catch {}
     renderRecents(); renderStatusbar();
     await refresh(); await refreshEngines(); await refreshSystem();
     await ensureGateway();  // eager: warm discovery so the first chat isn't a cold 504

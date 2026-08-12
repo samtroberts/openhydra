@@ -41,9 +41,16 @@
         <div class="nav recent" data-chat="rust"><span class="icon" data-i="chat"></span>Rust borrow error</div>
         <div class="nav recent" data-chat="poster"><span class="icon" data-i="chat"></span>Poster concepts</div>
       </div>
+      <div class="card" id="appimageintegrate" style="display:none;margin-top:auto;padding:10px 12px;gap:8px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="icon" data-i="zap" style="color:hsl(var(--muted-foreground))"></span>
+          <div style="min-width:0"><div style="font-weight:600;font-size:12.5px">Add to Applications</div><div class="mut" style="font-size:11px">Show OpenHydra in your app menu.</div></div>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:2px"><button class="btn brand sm" id="appimageadd" style="flex:1">Add</button><button class="btn ghost sm" id="appimagedismiss">Not now</button></div>
+      </div>
       <div class="card click" id="relaunch" style="display:none;margin-top:auto;padding:10px 12px;display:flex;align-items:center;gap:10px">
         <span class="icon" data-i="refresh" style="color:hsl(var(--muted-foreground))"></span>
-        <div style="min-width:0"><div style="font-weight:600;font-size:12.5px">Relaunch to update</div><div class="mut mono" style="font-size:11px" id="relaunchver">—</div></div>
+        <div style="min-width:0"><div style="font-weight:600;font-size:12.5px">Update ready</div><div class="mut mono" style="font-size:11px" id="relaunchver">—</div></div>
         <span class="icon" data-i="chevr" style="margin-left:auto;color:hsl(var(--muted-foreground))"></span>
       </div>
       <div class="sidefoot" id="gosettings" style="cursor:pointer;margin-top:8px" title="Settings">
@@ -347,6 +354,7 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Verbose logs</label><div class="desc">Off keeps logs light (default). On raises detail for troubleshooting — restart Sharing to apply.</div></div><div class="switch" id="verboselogsw"></div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Send logs to developer</label><div class="desc">Bundles recent agent logs (no chat content) into a file you can share for support.</div></div><button class="btn outline sm" id="sendlogsbtn">Export logs</button></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Guided tour</label><div class="desc">Replay the first-run walkthrough.</div></div><button class="btn outline sm" id="obreplay">Take the tour</button></div>
+                <div class="field row" style="justify-content:space-between"><div><label style="margin:0">About</label><div class="desc">The version of OpenHydra you're running.</div></div><div class="mut mono" id="aboutver">OpenHydra v—</div></div>
                 <button class="btn primary save">Save changes</button></div>
             </div>
           </div>
@@ -360,7 +368,7 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
         <span class="sep"></span><span class="num" id="sbmodels">6 models</span>
         <span class="sep"></span><span class="num" title="Tokens served / tokens used"><span class="up">▲ <span id="sbserved">0</span></span> <span style="margin-left:4px">▼ <span id="sbused">0</span></span></span>
         <span class="sep"></span><span class="num" title="Give-to-get credits — lands with the credit ledger" id="sbcredits">— credits</span>
-        <span class="actions"><span class="mut mono" id="apiendpoint" style="font-size:11px;cursor:pointer" title="Local OpenAI-compatible endpoint — always on. Click to copy; see Connectors.">127.0.0.1:16527/v1</span></span>
+        <span class="actions"><span class="mut mono" id="sbver" title="OpenHydra version">v—</span><span class="mut mono" id="apiendpoint" style="font-size:11px;cursor:pointer;margin-left:10px" title="Local OpenAI-compatible endpoint — always on. Click to copy; see Connectors.">127.0.0.1:16527/v1</span></span>
       </div>
     </div>
   </div>
