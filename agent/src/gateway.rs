@@ -886,7 +886,15 @@ pub fn router(
     self_provider: Option<String>,
 ) -> Router {
     let node = match store {
-        Some(s) => ConsumerNode::with_store(net, s), // M2.2(a): persisted reputation
+        Some(s) => {
+            // Rehydrate the durable Ledger (recent `used` rows + lifetime totals) so the desktop
+            // Ledger view survives a restart instead of resetting. Read before `s` moves into the
+            // node. 250 = the status ring cap.
+            if let (Ok(rows), Ok((served, used, n))) = (s.recent_ledger_rows(250), s.ledger_totals()) {
+                stats.rehydrate_ledger(&rows, served, used, n);
+            }
+            ConsumerNode::with_store(net, s) // M2.2(a): persisted reputation
+        }
         None => ConsumerNode::new(net),
     };
     // #7/#5: completions record per-model consumed tokens + `used` ledger rows into the shared

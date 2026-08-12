@@ -589,6 +589,19 @@ impl ConsumerNode {
                                 stats.record_ledger(now, "used", model, &provider.peer_id, summary.tokens);
                             }
                         }
+                        // Durable Ledger row (consumer's `used` side — not a receipt, so it lives
+                        // only here) so the view + totals survive a restart. Best-effort.
+                        if !self_serve {
+                            if let Some(store) = &self.store {
+                                let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
+                                    ts_ms: now,
+                                    kind: "used".to_string(),
+                                    model: model.to_string(),
+                                    counterparty: provider.peer_id.clone(),
+                                    tokens: summary.tokens,
+                                });
+                            }
+                        }
                     }
                     // M2.2(a): a clean served completion earns the provider reputation — but not
                     // for a self-serve (no earning off yourself).

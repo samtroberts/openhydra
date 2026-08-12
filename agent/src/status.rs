@@ -140,6 +140,38 @@ impl TransferStats {
         }
     }
 
+    /// Rehydrate the recent ring + lifetime totals from the durable ledger on boot, so the
+    /// desktop Ledger view and its counters survive a restart (the in-memory ring is otherwise
+    /// zeroed each launch). `rows` are newest-first (as [`Store::recent_ledger_rows`] returns);
+    /// the totals are the all-time aggregates from [`Store::ledger_totals`]. Called once at
+    /// startup, before serving begins.
+    ///
+    /// [`Store::recent_ledger_rows`]: openhydra_protocol::store::Store::recent_ledger_rows
+    /// [`Store::ledger_totals`]: openhydra_protocol::store::Store::ledger_totals
+    pub fn rehydrate_ledger(
+        &self,
+        rows: &[openhydra_protocol::store::LedgerEntry],
+        served_tokens: u64,
+        used_tokens: u64,
+        served_count: u64,
+    ) {
+        if let Ok(mut ring) = self.recent.lock() {
+            ring.clear();
+            for e in rows.iter().take(LEDGER_RING_CAP) {
+                ring.push_back(LedgerRow {
+                    ts_ms: e.ts_ms,
+                    kind: if e.kind == "served" { "served" } else { "used" },
+                    model: e.model.clone(),
+                    counterparty: e.counterparty.clone(),
+                    tokens: e.tokens,
+                });
+            }
+        }
+        self.tokens_served.store(served_tokens, Ordering::Relaxed);
+        self.tokens_consumed.store(used_tokens, Ordering::Relaxed);
+        self.receipts_ledgered.store(served_count, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> TransfersView {
         TransfersView {
             requests_served: self.requests_served.load(Ordering::Relaxed),
@@ -514,6 +546,30 @@ mod tests {
             s.record_ledger(i as u64, "used", "m", "p", 1);
         }
         assert_eq!(s.snapshot().recent.len(), LEDGER_RING_CAP);
+    }
+
+    #[test]
+    fn rehydrate_ledger_restores_ring_newest_first_and_totals() {
+        use openhydra_protocol::store::LedgerEntry;
+        let s = TransferStats::default();
+        // Store returns rows NEWEST-FIRST; rehydrate must preserve that in the ring and set the
+        // lifetime totals — the whole point of surviving a restart.
+        let rows = vec![
+            LedgerEntry { ts_ms: 30, kind: "served".into(), model: "m2".into(), counterparty: "peerC".into(), tokens: 7 },
+            LedgerEntry { ts_ms: 20, kind: "served".into(), model: "m2".into(), counterparty: "peerB".into(), tokens: 30 },
+            LedgerEntry { ts_ms: 10, kind: "used".into(), model: "m1".into(), counterparty: "peerA".into(), tokens: 5 },
+        ];
+        s.rehydrate_ledger(&rows, 37, 5, 2);
+        let v = s.snapshot();
+        assert_eq!(v.recent.len(), 3);
+        assert_eq!(v.recent[0].counterparty, "peerC"); // newest first
+        assert_eq!(v.recent[2].counterparty, "peerA"); // oldest last
+        assert_eq!(v.tokens_served, 37);
+        assert_eq!(v.tokens_consumed, 5);
+        assert_eq!(v.receipts_ledgered, 2);
+        // A subsequent live row still lands at the front (newest), atop the rehydrated history.
+        s.record_ledger(40, "served", "m3", "peerD", 3);
+        assert_eq!(s.snapshot().recent[0].counterparty, "peerD");
     }
 
     /// Full loop: live loopback swarm node → StatusClient → HTTP server → parsed JSON,

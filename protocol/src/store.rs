@@ -40,6 +40,87 @@ const PEER_REPUTATION: TableDefinition<&str, &[u8]> = TableDefinition::new("peer
 const PEER_CREDIT: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_credit");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
+/// Durable ledger rows for the desktop Ledger view, keyed by a monotonic sequence → a compact
+/// [`LedgerEntry`] blob. Distinct from [`RECEIPTS`]: it records BOTH the provider's `served` side
+/// and the consumer's `used` side (the latter are not receipts at all), so the view and its
+/// lifetime totals survive a restart. Append-only + pruned to [`LEDGER_ROWS_CAP`].
+const LEDGER_ROWS: TableDefinition<u64, &[u8]> = TableDefinition::new("ledger_rows");
+/// Single-row counters for the ledger (next sequence). Keyed by a static tag.
+const LEDGER_META: TableDefinition<&str, u64> = TableDefinition::new("ledger_meta");
+/// Meta key holding the next `LEDGER_ROWS` sequence number.
+const LEDGER_SEQ_KEY: &str = "seq";
+/// Meta keys holding **monotonic lifetime aggregates** — incremented on every append and NEVER
+/// pruned, so totals stay true even after old rows age out of `LEDGER_ROWS`. (Summing the rows
+/// table would undercount once pruning kicks in, and since the counters are overwritten from these
+/// on each restart, the displayed lifetime figures would shrink — so keep them here, not derived.)
+const LEDGER_SERVED_TOKENS_KEY: &str = "served_tokens";
+const LEDGER_USED_TOKENS_KEY: &str = "used_tokens";
+const LEDGER_SERVED_COUNT_KEY: &str = "served_count";
+/// Max durable ledger rows retained; the oldest are pruned past this. Bounds growth on a
+/// long-lived node while comfortably covering the desktop's 250-row view + lifetime totals.
+const LEDGER_ROWS_CAP: u64 = 5000;
+
+/// One durable ledger transaction row for the desktop Ledger view. A compact, self-describing
+/// blob — NOT a cryptographic receipt — capturing a `served` (provider) or `used` (consumer)
+/// transfer so the Ledger view and lifetime token totals persist across restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntry {
+    /// Unix-ms when recorded.
+    pub ts_ms: u64,
+    /// `"served"` (this node served a peer) or `"used"` (this node consumed from a peer).
+    pub kind: String,
+    /// Canonical model id transacted.
+    pub model: String,
+    /// Counterparty short peer id.
+    pub counterparty: String,
+    /// Tokens transferred.
+    pub tokens: u64,
+}
+
+impl LedgerEntry {
+    /// Compact little-endian wire form: `ts_ms(8) ‖ tokens(8) ‖ kind_len(1) ‖ kind ‖
+    /// model_len(2) ‖ model ‖ cp_len(2) ‖ counterparty`. Strings are clamped to their
+    /// length-prefix's max (a 255-byte kind / 64 KiB model or peer id is never reached in
+    /// practice).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        fn push_str(b: &mut Vec<u8>, s: &str, max: usize, len_bytes: usize) {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(max);
+            match len_bytes {
+                1 => b.push(n as u8),
+                _ => b.extend_from_slice(&(n as u16).to_le_bytes()),
+            }
+            b.extend_from_slice(&bytes[..n]);
+        }
+        let mut b = Vec::with_capacity(24 + self.kind.len() + self.model.len() + self.counterparty.len());
+        b.extend_from_slice(&self.ts_ms.to_le_bytes());
+        b.extend_from_slice(&self.tokens.to_le_bytes());
+        push_str(&mut b, &self.kind, u8::MAX as usize, 1);
+        push_str(&mut b, &self.model, u16::MAX as usize, 2);
+        push_str(&mut b, &self.counterparty, u16::MAX as usize, 2);
+        b
+    }
+
+    /// Parse [`to_bytes`]; `None` on any truncation/format error so one corrupt row is skipped
+    /// rather than poisoning the whole view.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        let mut p = 0usize;
+        fn take<'a>(data: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
+            let s = data.get(*p..*p + n)?;
+            *p += n;
+            Some(s)
+        }
+        let ts_ms = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().ok()?);
+        let tokens = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().ok()?);
+        let kl = *take(data, &mut p, 1)?.first()? as usize;
+        let kind = std::str::from_utf8(take(data, &mut p, kl)?).ok()?.to_string();
+        let ml = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().ok()?) as usize;
+        let model = std::str::from_utf8(take(data, &mut p, ml)?).ok()?.to_string();
+        let cl = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().ok()?) as usize;
+        let counterparty = std::str::from_utf8(take(data, &mut p, cl)?).ok()?.to_string();
+        Some(Self { ts_ms, kind, model, counterparty, tokens })
+    }
+}
 
 /// An error from the persistent store. Wraps the underlying `redb` failure as a string
 /// so callers (and the future FFI surface) get one error type without leaking redb's.
@@ -101,6 +182,8 @@ impl Store {
             wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
             wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
+            wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
+            wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
         }
         wtx.commit().map_err(StoreError::from)?;
         Ok(())
@@ -133,6 +216,97 @@ impl Store {
         let rtx = self.db.begin_read().map_err(StoreError::from)?;
         let t = rtx.open_table(RECEIPTS).map_err(StoreError::from)?;
         t.len().map_err(StoreError::from)
+    }
+
+    // ── LEDGER_ROWS (desktop Ledger view — durable transaction rows) ──
+
+    /// Append one durable ledger row (a `served`/`used` transaction) and prune the oldest rows
+    /// past [`LEDGER_ROWS_CAP`]. Best-effort ordering via a monotonic sequence; the caller
+    /// treats a failure as non-fatal (the swarm keeps working, the node just keeps a thinner
+    /// local history).
+    pub fn append_ledger_row(&self, entry: &LedgerEntry) -> Result<(), StoreError> {
+        let blob = entry.to_bytes();
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut meta = wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
+            let seq = meta
+                .get(LEDGER_SEQ_KEY)
+                .map_err(StoreError::from)?
+                .map(|v| v.value())
+                .unwrap_or(0);
+            {
+                let mut rows = wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
+                rows.insert(seq, blob.as_slice()).map_err(StoreError::from)?;
+                let len = rows.len().map_err(StoreError::from)?;
+                if len > LEDGER_ROWS_CAP {
+                    // Prune the oldest (smallest-key) rows back down to the cap.
+                    let excess = (len - LEDGER_ROWS_CAP) as usize;
+                    let mut oldest: Vec<u64> = Vec::with_capacity(excess);
+                    for item in rows.iter().map_err(StoreError::from)?.take(excess) {
+                        let (k, _) = item.map_err(StoreError::from)?;
+                        oldest.push(k.value());
+                    }
+                    for k in oldest {
+                        rows.remove(k).map_err(StoreError::from)?;
+                    }
+                }
+            }
+            meta.insert(LEDGER_SEQ_KEY, seq.wrapping_add(1)).map_err(StoreError::from)?;
+            // Bump the monotonic lifetime aggregates (never pruned) so totals stay true even after
+            // old rows age out of LEDGER_ROWS. The `.get(...).map(value)` guard drops before the
+            // `.insert`, mirroring the seq read above.
+            let (tok_key, count_key) = if entry.kind == "served" {
+                (LEDGER_SERVED_TOKENS_KEY, Some(LEDGER_SERVED_COUNT_KEY))
+            } else {
+                (LEDGER_USED_TOKENS_KEY, None)
+            };
+            let cur = meta.get(tok_key).map_err(StoreError::from)?.map(|v| v.value()).unwrap_or(0);
+            meta.insert(tok_key, cur.saturating_add(entry.tokens)).map_err(StoreError::from)?;
+            if let Some(ck) = count_key {
+                let c = meta.get(ck).map_err(StoreError::from)?.map(|v| v.value()).unwrap_or(0);
+                meta.insert(ck, c.saturating_add(1)).map_err(StoreError::from)?;
+            }
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// The most recent `limit` ledger rows, **newest-first** (matches the desktop's ring order).
+    /// Corrupt rows are skipped, not fatal.
+    pub fn recent_ledger_rows(&self, limit: usize) -> Result<Vec<LedgerEntry>, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let rows = rtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
+        let mut out = Vec::new();
+        for item in rows.iter().map_err(StoreError::from)?.rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let (_, v) = item.map_err(StoreError::from)?;
+            if let Some(e) = LedgerEntry::from_bytes(v.value()) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Lifetime aggregates: `(served_tokens, used_tokens, served_count)`. Read from the monotonic
+    /// `LEDGER_META` counters — NOT by summing `LEDGER_ROWS`, which is pruned to a rolling window —
+    /// so these stay true lifetime figures across restarts and past the prune cap. The served
+    /// count is the co-signed-receipt tally the Ledger view shows.
+    pub fn ledger_totals(&self) -> Result<(u64, u64, u64), StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let meta = match rtx.open_table(LEDGER_META) {
+            Ok(t) => t,
+            Err(_) => return Ok((0, 0, 0)), // table absent on a brand-new/empty ledger
+        };
+        let get = |k: &str| -> Result<u64, StoreError> {
+            Ok(meta.get(k).map_err(StoreError::from)?.map(|v| v.value()).unwrap_or(0))
+        };
+        Ok((
+            get(LEDGER_SERVED_TOKENS_KEY)?,
+            get(LEDGER_USED_TOKENS_KEY)?,
+            get(LEDGER_SERVED_COUNT_KEY)?,
+        ))
     }
 
     // ── PEER_REPUTATION ──
@@ -330,6 +504,75 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.redb");
         (dir, path)
+    }
+
+    fn entry(ts: u64, kind: &str, model: &str, cp: &str, tokens: u64) -> LedgerEntry {
+        LedgerEntry { ts_ms: ts, kind: kind.into(), model: model.into(), counterparty: cp.into(), tokens }
+    }
+
+    #[test]
+    fn ledger_entry_bytes_roundtrip() {
+        let e = entry(1_700_000_000_123, "served", "qwen3-vl:30b", "12D3KooWabc", 256);
+        assert_eq!(LedgerEntry::from_bytes(&e.to_bytes()), Some(e));
+        // A truncated blob decodes to None instead of panicking.
+        assert_eq!(LedgerEntry::from_bytes(&[0u8; 4]), None);
+        // Unicode model id survives.
+        let u = entry(1, "used", "modèle/7b", "peer", 1);
+        assert_eq!(LedgerEntry::from_bytes(&u.to_bytes()), Some(u));
+    }
+
+    #[test]
+    fn ledger_rows_persist_across_reopen_newest_first() {
+        let (_dir, path) = temp_db();
+        {
+            let store = Store::open(&path).unwrap();
+            store.append_ledger_row(&entry(10, "used", "m1", "peerA", 5)).unwrap();
+            store.append_ledger_row(&entry(20, "served", "m2", "peerB", 30)).unwrap();
+            store.append_ledger_row(&entry(30, "served", "m2", "peerC", 7)).unwrap();
+        }
+        // Reopen the SAME file — the whole point: rows survive a restart.
+        let store = Store::open(&path).unwrap();
+        let recent = store.recent_ledger_rows(10).unwrap();
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].counterparty, "peerC"); // newest first
+        assert_eq!(recent[2].counterparty, "peerA"); // oldest last
+        // Totals: served 30+7=37 over 2 rows; used 5.
+        assert_eq!(store.ledger_totals().unwrap(), (37, 5, 2));
+    }
+
+    #[test]
+    fn recent_ledger_rows_respects_limit() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..10 {
+            store.append_ledger_row(&entry(i, "served", "m", "p", 1)).unwrap();
+        }
+        assert_eq!(store.recent_ledger_rows(3).unwrap().len(), 3);
+        assert_eq!(store.recent_ledger_rows(100).unwrap().len(), 10);
+        // Totals count every row, not just the windowed view.
+        assert_eq!(store.ledger_totals().unwrap(), (10, 0, 10));
+    }
+
+    #[test]
+    fn empty_ledger_totals_are_zero() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.ledger_totals().unwrap(), (0, 0, 0));
+        assert!(store.recent_ledger_rows(5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lifetime_totals_survive_pruning() {
+        // Regression guard: totals must NOT shrink when old rows are pruned past LEDGER_ROWS_CAP.
+        // The rows table is a rolling window; the lifetime aggregates live in LEDGER_META and count
+        // every append. (Earlier, ledger_totals summed the prunable rows and undercounted.)
+        let store = Store::open_in_memory().unwrap();
+        let n = LEDGER_ROWS_CAP + 5;
+        for i in 0..n {
+            store.append_ledger_row(&entry(i, "served", "m", "p", 2)).unwrap();
+        }
+        // Rows are a capped rolling window…
+        assert_eq!(store.recent_ledger_rows(usize::MAX).unwrap().len() as u64, LEDGER_ROWS_CAP);
+        // …but lifetime totals reflect ALL appends, not just the retained window.
+        assert_eq!(store.ledger_totals().unwrap(), (n * 2, 0, n));
     }
 
     #[test]

@@ -334,6 +334,13 @@ struct ProvideArgs {
     #[arg(long)]
     engine_autostart: bool,
 
+    /// Restrict which models to share, by engine handle (repeat, or comma-separate). Omit to
+    /// share every model the engine exposes (the default). A model not in this list is neither
+    /// announced nor served — a request for it is refused. E.g. `--share-models tinyllama:latest
+    /// --share-models qwen3-vl:4b`.
+    #[arg(long = "share-models", value_delimiter = ',')]
+    share_models: Vec<String>,
+
     /// Advisory host advertised in records (routing is by libp2p peer id regardless).
     #[arg(long, default_value = "")]
     host: String,
@@ -749,12 +756,26 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         }
     };
 
+    // Rehydrate the durable Ledger (recent rows + lifetime served/used totals) so the desktop
+    // Ledger view and its counters survive a restart instead of resetting to zero. 250 = the
+    // status ring cap. Read from the store before it's moved into the provider below.
+    if let (Ok(rows), Ok((served, used, n))) = (store.recent_ledger_rows(250), store.ledger_totals()) {
+        stats.rehydrate_ledger(&rows, served, used, n);
+    }
     let aup = args.aup.clone().into_policy();
     let provider = Provider::new(adapter, net)
         .with_address(args.host, args.port)
         .with_store(store)
         .with_aup(aup)
+        .with_shared_models(args.share_models.clone())
         .with_stats(stats);
+    if !args.share_models.is_empty() {
+        eprintln!(
+            "openhydra-agent: sharing only {} selected model(s): {}",
+            args.share_models.len(),
+            args.share_models.join(", ")
+        );
+    }
 
     let announced = provider
         .announce_models()

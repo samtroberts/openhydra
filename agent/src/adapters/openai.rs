@@ -90,6 +90,12 @@ struct Delta {
     /// wrapped in `<think>…</think>` (see the serve loop).
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Same chain-of-thought, but under the engine's native `thinking` key. Ollama's `/v1`
+    /// stream emits reasoning here (not `reasoning_content`) on some builds/models, so a thinking
+    /// model served through Ollama would otherwise return an empty `content` with its whole token
+    /// budget spent invisibly. Treated identically to [`reasoning_content`] in the serve loop.
+    #[serde(default)]
+    thinking: Option<String>,
     /// Tool-call fragments (OpenAI streams these incrementally: `id`/`name` on the first
     /// fragment for an `index`, then `arguments` string pieces on following chunks).
     #[serde(default)]
@@ -316,7 +322,17 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
             // sends after the finish must not inflate `chunk_tokens` (the receipt fallback)
             // or graft extra tool calls onto the assistant turn.
             if !done {
-                if let Some(reasoning) = &choice.delta.reasoning_content {
+                // Reasoning arrives as `reasoning_content` (vLLM / LM Studio / OpenAI-compat
+                // convention) or, on some Ollama `/v1` builds, under the engine's native
+                // `thinking` key. Accept whichever is present so the chain-of-thought is never
+                // dropped — both feed the same single `<think>…</think>` block.
+                if let Some(reasoning) = choice
+                    .delta
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or(choice.delta.thinking.as_deref().filter(|s| !s.is_empty()))
+                {
                     if !reasoning.is_empty() {
                         if first_token_at.is_none() {
                             first_token_at = Some(std::time::Instant::now());
@@ -581,6 +597,52 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(out, "<think>thinking forever</think>");
+    }
+
+    #[test]
+    fn serve_stream_wraps_ollama_thinking_key_like_reasoning_content() {
+        // Ollama's /v1 stream emits chain-of-thought under the native `thinking` key rather than
+        // `reasoning_content`. It must be wrapped identically so it isn't dropped — same output as
+        // the `reasoning_content` case.
+        let (out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"thinking":"Let me "},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"thinking":"think."},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Hi!"},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>Let me think.</think>\n\nHi!");
+        assert_eq!(outcome.tokens, 3);
+        assert!(outcome.done);
+    }
+
+    #[test]
+    fn serve_stream_empty_reasoning_content_does_not_shadow_thinking() {
+        // A proxy may stamp an empty `reasoning_content:""` while passing Ollama's native `thinking`
+        // through. The empty string must NOT shadow the real thinking — filter empties before the
+        // `.or()`, otherwise `Some("")` wins and the chain-of-thought is dropped.
+        let (out, _outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"","thinking":"real cot"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Answer"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>real cot</think>\n\nAnswer");
+    }
+
+    #[test]
+    fn serve_stream_surfaces_thinking_only_ollama_response() {
+        // The exact live failure: a thinking-heavy model served through Ollama's /v1 spent its
+        // whole budget in `thinking` and returned an empty `content` — so the consumer saw a blank
+        // answer. The thinking must now be surfaced, wrapped and closed, instead of dropped.
+        let (out, _outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"thinking":"still reasoning"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>still reasoning</think>");
     }
 
     #[test]
