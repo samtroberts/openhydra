@@ -12,9 +12,9 @@
     <button class="iconbtn" id="navtoggle" title="Collapse sidebar"><span class="icon" data-i="panelleft"></span></button>
     <button class="iconbtn dis" id="navback" title="Back"><span class="icon" data-i="chevl"></span></button>
     <button class="iconbtn dis" id="navfwd" title="Forward"><span class="icon" data-i="chevr"></span></button>
-    <div class="brandmark" id="traymark" style="cursor:pointer" title="System-tray menu (preview)"><img class="brandlogo" src="logo.png" alt="OpenHydra"/>OpenHydra</div>
+    <div class="brandmark" id="traymark" style="cursor:pointer" title="System-tray menu (preview)"><img class="brandlogo" src="logo-mark.png" alt="OpenHydra"/>OpenHydra</div>
     <div class="grow"></div>
-    <div class="row" style="gap:8px"><span class="mut" style="font-size:12.5px;font-weight:500">Sharing</span><div class="switch" id="sharingsw" title="Serve your models to the network — you're always connected; sharing is your choice"></div></div>
+    <button class="btn brand sm" id="sharecta" title="Share your machine's models to the network">Share your models</button>
     <button class="kbd" id="cmdk"><span class="icon" data-i="command"></span>K</button>
     <button class="iconbtn" id="theme" title="Toggle theme"><span class="icon" data-i="theme"></span></button>
   </div>
@@ -28,7 +28,7 @@
       <div class="nav on" data-v="home" data-m="home"><span class="icon" data-i="plus"></span>New</div>
       <div class="nav" data-v="activity" data-m="home"><span class="icon" data-i="activity"></span>Activity</div>
       <div class="nav" data-v="connectors" data-m="home"><span class="icon" data-i="plug"></span>Connectors</div>
-      <div class="nav" data-v="providers" data-m="network"><span class="icon" data-i="package"></span>Providers</div>
+      <div class="nav" data-v="providers" data-m="network"><span class="icon" data-i="package"></span>Models</div>
       <div class="nav" data-v="share" data-m="network"><span class="icon" data-i="zap"></span>Share</div>
       <div class="nav" data-v="engines" data-m="network"><span class="icon" data-i="monitor"></span>Engines</div>
       <div class="nav" data-v="ledger" data-m="network"><span class="icon" data-i="list"></span>Ledger</div>
@@ -71,15 +71,7 @@
 
         <!-- SHARE — your node: what you serve + what you earn (merges Dashboard · Serving · Tokens) -->
         <section class="view" id="v-share">
-          <div class="row" style="margin-bottom:10px"><div class="ctitle">Your node</div><span class="badge ok" style="margin-left:8px"><span class="dot ok"></span>provider running</span><span class="mut" style="margin-left:auto;font-size:11.5px">2 models announced · gateway :16527</span></div>
-          <div class="grid g4">
-            <div class="card pad kpi"><div class="lbl">Tokens served</div><div class="val num">184.2k</div><div class="sub up"><span class="icon" data-i="activity"></span>▲ 12% vs yesterday</div></div>
-            <div class="card pad kpi"><div class="lbl">Credits earned</div><div class="val num">1,842</div><div class="sub">today · net +877</div></div>
-            <div class="card pad kpi"><div class="lbl">Give-to-get</div><div class="val num">1.9×</div><div class="sub">served ÷ used</div></div>
-            <div class="card pad kpi"><div class="lbl">Reputation</div><div class="val num">1.00</div><div class="sub"><span class="dot ok"></span>top-tier · own pricing</div></div>
-          </div>
-          <div class="card pad" id="sharechart" data-tier="adv" style="margin-top:14px"></div>
-
+          <div class="row" style="margin-bottom:10px"><div class="ctitle">Your node</div><span class="badge ok" style="margin-left:8px"><span class="dot ok"></span>provider running</span><span class="mut" style="margin-left:auto;font-size:11.5px">2 models announced · gateway :16527</span><button class="btn sm brand" id="sharetoggle" style="margin-left:12px">Start sharing</button></div>
           <div class="card" style="margin-top:14px">
             <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Models you serve</div><div class="grow"></div><button class="btn ghost sm" id="hideinactive">Hide inactive</button><span class="badge ok">1 announced</span><button class="btn outline sm" id="addmodel"><span class="icon" data-i="plus"></span>Add model</button></div>
             <table id="servetable"><thead><tr><th>Model</th><th>Engine</th><th>Requests</th><th>Tokens</th><th>Avg TPS</th><th>Status</th><th>Announce</th></tr></thead><tbody>
@@ -89,7 +81,15 @@
             <div class="pager" style="justify-content:flex-start"><span class="mut">Toggle a model off to stop announcing it. You choose what to serve.</span></div>
           </div>
 
-          <div class="card pad" style="margin-top:14px;display:flex;align-items:center;gap:12px"><span class="live"><span class="dot ok pulse"></span>Incoming</span><span class="mut" style="font-size:12.5px">2 requests in flight · 512-token budget · from 12D3…m2, 12D3…kx</span></div>
+          <div class="grid g4" style="margin-top:14px">
+            <div class="card pad kpi"><div class="lbl">Tokens served</div><div class="val num">184.2k</div><div class="sub up"><span class="icon" data-i="activity"></span>▲ 12% vs yesterday</div></div>
+            <div class="card pad kpi"><div class="lbl">Credits earned</div><div class="val num">1,842</div><div class="sub">today · net +877</div></div>
+            <div class="card pad kpi"><div class="lbl">Give-to-get</div><div class="val num">1.9×</div><div class="sub">served ÷ used</div></div>
+            <div class="card pad kpi"><div class="lbl">Reputation</div><div class="val num">1.00</div><div class="sub"><span class="dot ok"></span>top-tier · own pricing</div></div>
+          </div>
+          <div class="card pad" id="sharechart" data-tier="adv" style="margin-top:14px"></div>
+
+          <div class="card pad" id="incomingcard" style="margin-top:14px;display:none;align-items:center;gap:12px"><span class="live"><span class="dot ok pulse"></span>Incoming</span><span class="mut" id="incomingtext" style="font-size:12.5px"></span></div>
 
           <div class="card" style="margin-top:14px">
             <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Wanted on the network</div><span class="mut" style="margin-left:auto;font-size:12px">high demand · few providers</span></div>
@@ -103,7 +103,7 @@
         <!-- HOME — landing: greeting + prompt box. Sending starts a chat in Recents. -->
         <section class="view on" id="v-home">
           <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:460px;gap:20px">
-            <div style="display:flex;align-items:center;gap:13px"><img id="homelogo" src="logo.png" alt="" style="width:36px;height:36px;border-radius:9px"/><span style="font-size:27px;font-weight:600;letter-spacing:-.02em">Welcome to OpenHydra</span></div>
+            <div style="display:flex;align-items:center;gap:13px"><img id="homelogo" src="logo-mark.png" alt="" style="width:38px;height:38px;object-fit:contain"/><span style="font-size:27px;font-weight:600;letter-spacing:-.02em">Welcome to OpenHydra</span></div>
             <div class="card" id="homecard" style="width:min(640px,94%);padding:12px 12px 10px">
               <div class="input area" id="homeprompt" contenteditable="true" data-ph="How can I help you today?" style="border:0;min-height:54px;padding:6px 4px"></div>
               <div class="row" style="gap:8px;margin-top:4px">
@@ -342,8 +342,8 @@ model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
                 <div class="field"><label>Bootstrap peers</label><div class="input mono" contenteditable="true" id="bootstraps" style="min-height:54px;align-items:flex-start;white-space:pre-wrap;line-height:1.5"></div><div class="desc">Advanced — extra bootstrap multiaddrs, one per line. Leave blank to use the built-in default.</div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Act as a relay for other peers</label><div class="desc">Helps peers behind strict NATs. Uses a little bandwidth, earns reputation. Only activates when your node is publicly reachable.</div></div><div class="switch on" data-sw></div></div><button class="btn primary save">Save changes</button></div>
               <div class="setpanel" data-p="engine"><div class="sectitle">Engine</div><div class="secsub" style="margin-bottom:16px">Local inference engine wrapped by your provider.</div>
-                <div class="field"><label>Engine</label><div class="input select drop" data-opts="auto-detect|ollama|vLLM|LM Studio|llama.cpp|Exo|ComfyUI"><span>auto-detect</span><span class="icon" data-i="chev"></span></div></div>
-                <div class="field"><label>Endpoint</label><div class="input mono">http://127.0.0.1:11434</div></div>
+                <div class="field"><label>Engine</label><div class="input select drop" id="enginedrop" data-opts="auto-detect|ollama|vLLM|LM Studio|llama.cpp|Exo|ComfyUI"><span>auto-detect</span><span class="icon" data-i="chev"></span></div></div>
+                <div class="field"><label>Endpoint</label><div class="input mono" id="engineendpoint">http://127.0.0.1:11434</div></div>
                 <div class="field row" style="justify-content:space-between"><div><label style="margin:0">Start engine automatically if it's down</label><div class="desc">Autostarts your default engine when OpenHydra launches.</div></div><div class="switch on" data-sw></div></div><button class="btn primary save">Save changes</button></div>
               <div class="setpanel" data-p="byok"><div class="sectitle">Bring your own keys</div><div class="secsub" style="margin-bottom:16px">Route to hosted frontier models with your keys.</div>
                 <div class="field"><label>Anthropic key</label><div class="input mono">••••••••••••</div></div>

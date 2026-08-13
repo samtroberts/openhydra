@@ -70,7 +70,7 @@
   .brandmark{display:flex;align-items:center;gap:7px;font-weight:600;letter-spacing:-.01em}
   .brandmark .zap{width:20px;height:20px;border-radius:6px;background:hsl(var(--brand));color:hsl(var(--brand-fg));
     display:flex;align-items:center;justify-content:center}.brandmark .zap svg{width:13px;height:13px}
-  .brandmark .brandlogo{width:22px;height:22px;object-fit:contain;border-radius:5px;flex:none}
+  .brandmark .brandlogo{width:26px;height:26px;object-fit:contain;flex:none;transform:scale(1.08)}
   .grow{flex:1}
   /* collapsible sidebar */
   .sidebar{transition:width .16s ease}

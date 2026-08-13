@@ -351,7 +351,7 @@
   function repBadge(v) { if (v == null) return '<span class="mut">—</span>'; v = Math.round(v); const cls = v >= 66 ? "ok" : v >= 40 ? "warn" : "secondary"; return `<span class="badge ${cls}">${v}</span>`; }
 
   // ── nav / workspace switcher / history (wireframe verbatim + header-hide + renderView) ──
-  const titles = { home: "Home", chat: "Chat", activity: "Activity", connectors: "Connectors", providers: "Providers", share: "Share", engines: "Engines", ledger: "Ledger", peers: "Diagnostics and Stats", settings: "Settings" };
+  const titles = { home: "Home", chat: "Chat", activity: "Activity", connectors: "Connectors", providers: "Models", share: "Share", engines: "Engines", ledger: "Ledger", peers: "Diagnostics and Stats", settings: "Settings" };
   const searchable = { providers: 1, peers: 1 };
   const VIEWMODE = { home: "home", chat: "home", activity: "home", connectors: "home", providers: "network", share: "network", engines: "network", ledger: "network", peers: "network" };
   function setMode(m) { app.dataset.mode = m; $$("#modeswitch button").forEach((b) => b.toggleAttribute("data-on", b.dataset.m === m)); }
@@ -386,8 +386,21 @@
     e.stopPropagation();
     const opts = (d.dataset.opts || "").split("|").filter(Boolean);
     const cur = d.querySelector("span").textContent;
-    menu(d, opts.length ? opts.map((o) => ({ label: o, on: o === cur, fn: () => { d.querySelector("span").textContent = o; if (d.dataset.act === "theme") setTheme(o); if (d.id === "modeldrop" || d.id === "homedrop") { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) other.querySelector("span").textContent = o; } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
+    menu(d, opts.length ? opts.map((o) => ({ label: o, on: o === cur, fn: () => { d.querySelector("span").textContent = o; if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") updateEngineEndpoint(); if (d.id === "modeldrop" || d.id === "homedrop") { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) other.querySelector("span").textContent = o; } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
   });
+  // #3: the Settings › Engine endpoint follows the selected engine (was pinned to engines[0]).
+  const ENGINE_ENDPOINTS = { "auto-detect": "", ollama: "http://127.0.0.1:11434", "vLLM": "http://127.0.0.1:8000", "LM Studio": "http://127.0.0.1:1234", "llama.cpp": "http://127.0.0.1:8080", "Exo": "http://127.0.0.1:52415", "ComfyUI": "http://127.0.0.1:8188" };
+  function updateEngineEndpoint() {
+    const drop = $("#enginedrop"), field = $("#engineendpoint"); if (!drop || !field) return;
+    const sel = (drop.querySelector("span")?.textContent || "auto-detect").trim();
+    // auto-detect → the first detected engine's live URL; a specific pick → that engine's live URL
+    // if it's currently running, else its standard endpoint.
+    const live = engines.find((e) => (e.label || "").toLowerCase() === sel.toLowerCase());
+    const url = sel === "auto-detect"
+      ? (engines[0]?.url || "http://127.0.0.1:11434")
+      : (live?.url || ENGINE_ENDPOINTS[sel] || "http://127.0.0.1:11434");
+    field.textContent = url;
+  }
 
   // ── inference range sliders (wireframe verbatim) ──
   $$(".range").forEach((rg) => {
@@ -562,16 +575,22 @@
 
   // ── sharing = provider role; announce switches reflect + drive it ──
   let sharingBusy = false;
-  async function toggleSharing() {
+  async function setSharing(on) {
     if (sharingBusy) return; sharingBusy = true;
-    const running = state?.provider?.status?.running;
     try {
-      if (running) await call("stop_provider");
-      else { if (!engines.some((e) => e.models.length)) { go("engines"); toast("No local models found — start or install an engine to share"); sharingBusy = false; return; } await call("start_provider"); }
-    } catch (e) { toast(`${running ? "stop" : "start"} failed: ${e}`); }
-    await refresh(); sharingBusy = false;
+      if (on) {
+        if (!engines.some((e) => e.models.length)) { go("engines"); toast("No local models found — start or install an engine to share"); return; }
+        await call("start_provider");
+      } else {
+        await call("stop_provider");
+      }
+      await refresh();
+    } catch (e) { toast(`${on ? "start" : "stop"} sharing failed: ${e}`); }
+    finally { sharingBusy = false; }
   }
-  $("#sharingsw").onclick = toggleSharing;
+  async function toggleSharing() { await setSharing(!state?.provider?.status?.running); }
+  $("#sharecta").onclick = () => go("share");   // #1: title-bar CTA routes to the Share tab
+  $("#sharetoggle").onclick = toggleSharing;    // start/stop sharing now lives in the Share view
 
   // ── gateway lifecycle (Local API) ──
   async function ensureGateway() {
@@ -754,27 +773,38 @@
   }
   async function toggleShareModel(m) {
     const all = shareActiveModels();
-    // Empty selection means "share all" in the data model, so an empty allowlist can't represent
-    // "share none". Refuse to de-select the LAST enabled model — otherwise turning everything off
-    // (or the only model of a single-model provider) silently flips back to sharing everything. To
-    // stop sharing entirely, use the Sharing toggle.
-    if (isModelShared(m) && all.filter(isModelShared).length <= 1) {
-      toast("Turn off Sharing (top bar) to stop sharing entirely");
-      return;
+    const running = !!state?.provider?.status?.running;
+    // The switch means "serving this model right now" = sharing is on AND m is in the share set.
+    const servingNow = running && isModelShared(m);
+    if (servingNow) {
+      // Turning a served model OFF. If it's the LAST one still served, the intent is "share
+      // nothing" — which the allowlist can't encode (empty = share all), so stop sharing entirely.
+      const othersServed = all.filter((x) => x !== m && isModelShared(x)).length;
+      if (othersServed === 0) { await setSharing(false); return; }
+      // Otherwise just narrow the allowlist (applies on the next Sharing restart).
+      let list = (state?.settings?.shared_models || []).slice();
+      if (list.length === 0) list = all.slice();               // materialize "share all" first
+      list = list.filter((x) => x !== m);
+      if (all.length && all.every((x) => list.includes(x))) list = []; // all ⇒ default
+      await saveSharedModels(list);
+    } else {
+      // Turning a model ON.
+      let list = (state?.settings?.shared_models || []).slice();
+      if (!running && list.length === 0) list = [m];           // from a stopped/default state, share just this one
+      else if (!list.includes(m)) list.push(m);
+      if (all.length && all.every((x) => list.includes(x))) list = []; // all ⇒ default
+      await saveSharedModels(list);
+      if (!running) await setSharing(true);                    // begin serving
     }
-    let list = (state?.settings?.shared_models || []).slice();
-    const wasShared = list.length === 0 || list.includes(m);
-    if (list.length === 0) list = all.slice();        // materialize "share all" before removing one
-    if (wasShared) list = list.filter((x) => x !== m);
-    else if (!list.includes(m)) list.push(m);
-    if (all.length && all.every((x) => list.includes(x))) list = []; // re-enabled all ⇒ back to default
-    await saveSharedModels(list);
   }
   function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
     const head = $("#v-share .row .ctitle").parentElement;
     head.querySelector(".badge").innerHTML = running ? '<span class="dot ok"></span>provider running' : '<span class="dot"></span>not sharing';
     head.querySelector(".badge").className = "badge " + (running ? "ok" : "secondary"); head.querySelector(".badge").style.marginLeft = "8px";
+    // #1: start/stop lives here now (the title-bar control became a CTA that routes here).
+    const stb = $("#sharetoggle");
+    if (stb) { stb.textContent = running ? "Stop sharing" : "Start sharing"; stb.className = "btn sm " + (running ? "outline" : "brand"); stb.style.marginLeft = "12px"; }
     const up = snap?.uptime_secs != null ? ` · up ${fmtUptime(snap.uptime_secs)}` : "";
     head.querySelector(".mut").textContent = `${running ? (p.announced ?? 0) : 0} models announced · gateway :16527${up}`;
     const k = $$("#v-share .g4 .kpi .val");
@@ -810,7 +840,7 @@
       const reqs = pm.requests ?? "—";
       const tps = pm.avg_native_tps ? Math.round(pm.avg_native_tps) : "—";
       const status = isActive ? `<span class="badge ${running ? "ok" : "secondary"}">${running ? "live" : "ready"}</span>` : `<span class="badge secondary">inactive</span>`;
-      const ann = isActive ? `<div class="switch ${isModelShared(m) ? "on" : ""}" data-share="${esc(m)}" title="Share this model on the network"></div>` : `<span class="mut" style="font-size:11px">—</span>`;
+      const ann = isActive ? `<div class="switch ${running && isModelShared(m) ? "on" : ""}" data-share="${esc(m)}" title="${running ? "Serve this model on the network" : "Start sharing to serve this model"}"></div>` : `<span class="mut" style="font-size:11px">—</span>`;
       rows.push(`<tr${isActive ? "" : ' style="opacity:.5"'}><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td>${ann}</td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
@@ -822,9 +852,21 @@
     if (ann) { ann.textContent = `${running ? engines.reduce((n, e) => n + e.models.length, 0) : 0} announced`; ann.className = "badge " + (running && engines.length ? "ok" : "secondary"); }
     $$("#servetable [data-share]").forEach((sw) => sw.onclick = () => toggleShareModel(sw.dataset.share));
     // incoming strip
-    const inflight = t?.requests_served != null ? "" : "";
-    const inc = $("#v-share .card.pad .mut");
-    if (inc) inc.textContent = running ? `Serving live · ${t?.requests_served ?? 0} requests, ${t?.tokens_served ?? 0} tokens so far` : "Turn on Sharing (title bar) to start serving.";
+    // Honest "Incoming" strip: real cumulative serve activity while sharing; hidden when idle.
+    // There is no live concurrent-in-flight telemetry, so we don't fabricate one (the old card
+    // showed a hardcoded "2 requests in flight from 12D3…" mockup).
+    const incCard = $("#incomingcard"), incText = $("#incomingtext");
+    if (incCard && incText) {
+      if (running) {
+        const r = t?.requests_served ?? 0;
+        incText.textContent = r > 0
+          ? `${r} request${r === 1 ? "" : "s"} served · ${fmtNum(t?.tokens_served ?? 0)} tokens so far`
+          : "Waiting for requests…";
+        incCard.style.display = "flex";
+      } else {
+        incCard.style.display = "none";
+      }
+    }
     // wanted table — honest empty state until demand telemetry lands
     $("#wanttable tbody").innerHTML = `<tr><td colspan="4" class="mut">Fills in as network demand telemetry lands.</td></tr>`;
   }
@@ -1109,7 +1151,8 @@
     const netp = $('.setpanel[data-p="network"]');
     const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = p.settings.gateway_port;
     const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
-    const eng = $('.setpanel[data-p="engine"]'); eng.querySelectorAll(".input.mono")[0].textContent = engines[0]?.url || "http://127.0.0.1:11434";
+    const eng = $('.setpanel[data-p="engine"]');
+    updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
     eng.querySelector('.switch').classList.toggle("on", !!p.settings.engine_autostart);
     $("#advsw").classList.toggle("on", app.hasAttribute("data-adv"));
     $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4
@@ -1125,7 +1168,21 @@
     $("#sbpeers").textContent = `${peers} peers`;
     $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
     $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:16527/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
-    $("#sharingsw").classList.toggle("on", !!p?.running);
+    // #1: the title-bar CTA reflects state. Off = a brand-filled call-to-action ("Share your
+    // models"). Live = a calm green "active" chip with a pulsing dot ("Sharing N models") — it reads
+    // as status, not an unclicked CTA. Reuses the app's shared `.btn.on` active treatment.
+    const shb = $("#sharecta");
+    if (shb) {
+      const n = p?.announced ?? 0, live = !!p?.running;
+      shb.classList.toggle("brand", !live);
+      shb.classList.toggle("on", live);
+      shb.title = live
+        ? `Sharing ${n} model${n === 1 ? "" : "s"} to the network — click to manage`
+        : "Share your machine's models to the network";
+      shb.innerHTML = live
+        ? `<span class="dot ok pulse"></span>${n > 0 ? `Sharing ${n} model${n === 1 ? "" : "s"}` : "Sharing…"}`
+        : "Share your models";
+    }
     $("#sidepeer").textContent = `${deviceName} · ${shortPeer(p?.peer_id || g?.peer_id)}`;
     renderModels();
     const connected = anyOn && (peers > 0 || netModels().length > 0);
@@ -1222,9 +1279,9 @@
   // ── first-run coachmark tour (spotlight; first launch + after updates only) ──
   const COACH = [
     { v: "home", a: "#homecard", t: "Chat with the network", d: "Ask anything — requests route to models served by peers. The first connection takes a few seconds; watch the status bar fill in." },
-    { v: "providers", a: "#modeswitch", t: "Two sides of the app", d: "Home is where you use AI. Network is where you browse providers, share your models, and manage engines." },
+    { v: "providers", a: "#modeswitch", t: "Two sides of the app", d: "Home is where you use AI. Network is where you browse models, share your machine, and manage engines." },
     { v: "engines", a: '.nav[data-v="engines"]', t: "Engines & models", d: "OpenHydra wraps any engine already on your machine — whatever it can run, you can share." },
-    { v: "share", a: "#sharingsw", t: "Share when you're ready", d: "Flip Sharing to announce your models and earn your place. Off means connected, not serving." },
+    { v: "share", a: "#sharecta", t: "Share when you're ready", d: "Click ‘Share your models’ to open the Share tab and pick what to serve. You're always connected; sharing is your choice." },
   ];
   const TOUR_KEY = "oh_tour_v2";
   let coachEl = null, coachRing = null, coachOv = [];
@@ -1268,7 +1325,7 @@
 
   // ── boot ──
   $(".header").style.display = "none"; // Home landing has no header
-  $("#homelogo").src = "logo.png";
+  $("#homelogo").src = "logo-mark.png";
   (async () => {
     // #1: hydrate chat sessions from the durable backend file (localStorage is only a cache).
     // `loadOk` gates the clean-shape rewrite below: on a transient load failure we must NOT write

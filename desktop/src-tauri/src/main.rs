@@ -1203,6 +1203,119 @@ fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Resul
     Ok(())
 }
 
+// ── Menubar/tray menu ──
+// Mirrors the in-app tray preview: Open · Sharing (checkable) · Model · ▲ served · ▼ used · Quit.
+// macOS auto-shows a tray menu on left-click, so there's no just-in-time hook to refresh it first —
+// instead a lightweight background thread rebuilds the menu every few seconds (and the Sharing
+// handler rebuilds it immediately) so it's already current when the user clicks.
+
+/// What the tray menu displays. `sharing` = the provider role is running; the counters + model come
+/// from the same `--status-bind` snapshot the UI polls (a loopback GET, no extra deps).
+struct TrayStats {
+    sharing: bool,
+    model: String,
+    served: u64,
+    used: u64,
+}
+
+fn tray_stats(state: &AppState) -> TrayStats {
+    let sharing = state.provider.lock().map(|r| r.status.running).unwrap_or(false);
+    let gw = state.gateway.lock().map(|r| r.status.running).unwrap_or(false);
+    let (mut model, mut served, mut used) = (String::new(), 0u64, 0u64);
+    if sharing || gw {
+        let base_port = if sharing { PROVIDER_STATUS_PORT } else { GATEWAY_STATUS_PORT };
+        if let Some(mut snap) = fetch_status(base_port, "/status") {
+            if sharing && gw {
+                if let Some(g) = fetch_status(GATEWAY_STATUS_PORT, "/status") {
+                    merge_transfers(&mut snap, g.get("transfers").cloned().unwrap_or_default());
+                }
+            }
+            let t = snap.get("transfers");
+            served = t.and_then(|t| t.get("tokens_served")).and_then(|v| v.as_u64()).unwrap_or(0);
+            used = t.and_then(|t| t.get("tokens_consumed")).and_then(|v| v.as_u64()).unwrap_or(0);
+            // Prefer a model THIS node serves; else the first model seen on the network.
+            if sharing {
+                if let Some(k) = t
+                    .and_then(|t| t.get("per_model"))
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.keys().next())
+                {
+                    model = k.clone();
+                }
+            }
+            if model.is_empty() {
+                if let Some(first) = snap
+                    .get("network")
+                    .and_then(|n| n.get("known_models"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.iter().find_map(|v| v.as_str()))
+                {
+                    model = first.to_string();
+                }
+            }
+        }
+    }
+    TrayStats { sharing, model, served, used }
+}
+
+/// Compact human count for the menu (1280 → "1k", 2_400_000 → "2.4M").
+fn fmt_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{}k", ((n as f64) / 1_000.0).round() as u64)
+    } else {
+        format!("{:.1}M", (n as f64) / 1_000_000.0)
+    }
+}
+
+/// Build the tray menu for a given snapshot. Actionable: Open, Sharing (checkable), Quit. The
+/// Model/served/used rows are disabled — glanceable info, matching the in-app preview.
+fn build_tray_menu<R: tauri::Runtime, M: tauri::Manager<R>>(
+    m: &M,
+    s: &TrayStats,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+    let open = MenuItem::with_id(m, "open", "Open OpenHydra", true, None::<&str>)?;
+    let sharing = CheckMenuItem::with_id(m, "sharing", "Sharing", true, s.sharing, None::<&str>)?;
+    let model = MenuItem::with_id(
+        m,
+        "model",
+        format!("Model · {}", if s.model.is_empty() { "—" } else { &s.model }),
+        false,
+        None::<&str>,
+    )?;
+    let served =
+        MenuItem::with_id(m, "served", format!("▲ {} served", fmt_count(s.served)), false, None::<&str>)?;
+    let used =
+        MenuItem::with_id(m, "used", format!("▼ {} used", fmt_count(s.used)), false, None::<&str>)?;
+    let quit = MenuItem::with_id(m, "quit", "Quit OpenHydra", true, None::<&str>)?;
+    Menu::with_items(
+        m,
+        &[
+            &open,
+            &PredefinedMenuItem::separator(m)?,
+            &sharing,
+            &model,
+            &PredefinedMenuItem::separator(m)?,
+            &served,
+            &used,
+            &PredefinedMenuItem::separator(m)?,
+            &quit,
+        ],
+    )
+}
+
+/// Rebuild + install a fresh tray menu (call on the main thread — menu events already run there).
+fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let s = tray_stats(&app.state::<AppState>());
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Ok(menu) = build_tray_menu(app, &s) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
 // ── App wiring: tray, hide-on-close, kill children on exit ──
 
 fn kill_all(state: &AppState) {
@@ -1251,11 +1364,8 @@ fn main() {
             export_logs,
         ])
         .setup(|app| {
-            use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
-            let open = MenuItem::with_id(app, "open", "Open OpenHydra", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit OpenHydra", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let menu = build_tray_menu(app, &tray_stats(&app.state::<AppState>()))?;
             let mut tray = TrayIconBuilder::with_id("main")
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -1266,16 +1376,64 @@ fn main() {
                             let _ = w.set_focus();
                         }
                     }
+                    // Sharing = start/stop the provider role, same as the in-app toggle. Rebuild the
+                    // menu right away so the checkmark reflects the new state.
+                    "sharing" => {
+                        let running = app
+                            .state::<AppState>()
+                            .provider
+                            .lock()
+                            .map(|r| r.status.running)
+                            .unwrap_or(false);
+                        if running {
+                            stop_provider(app.state());
+                        } else if let Err(e) = start_provider(app.state()) {
+                            eprintln!("tray: start provider failed: {e}");
+                        }
+                        refresh_tray_menu(app);
+                    }
                     "quit" => {
                         kill_all(&app.state::<AppState>());
                         app.exit(0);
                     }
                     _ => {}
                 });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
+            // Menubar/tray icon: a background-less mark, not the cream-tiled app icon. On macOS it's
+            // a *template* image (alpha-only silhouette) so it auto-inverts for light/dark menubars —
+            // the brand mark is light, so a colored copy would vanish on a light menubar. Elsewhere
+            // fall back to the window icon.
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!(
+                    "../icons/trayTemplate.png"
+                )) {
+                    tray = tray.icon(icon).icon_as_template(true);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
             }
             tray.build(app)?;
+
+            // Keep the menu current (sharing check, model, served/used) so it's fresh on click.
+            // The status fetch is blocking, so it runs on this worker thread; the actual menu swap
+            // is marshalled back to the main thread (required for menu/tray mutation on macOS).
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let s = tray_stats(&handle.state::<AppState>());
+                let h = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    if let Some(tray) = h.tray_by_id("main") {
+                        if let Ok(menu) = build_tray_menu(&h, &s) {
+                            let _ = tray.set_menu(Some(menu));
+                        }
+                    }
+                });
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

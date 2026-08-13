@@ -7,7 +7,7 @@
 # of the CLI binary (bundled as a sidecar), which stays the single source of truth.
 [package]
 name = "openhydra-desktop"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2021"
 description = "OpenHydra desktop app — share your machine's inference engines and use the network"
 license = "Apache-2.0"

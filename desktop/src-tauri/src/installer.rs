@@ -681,11 +681,12 @@ fn exo_plan(_os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> {
 
 // ── Prereq gate (B3) ──
 
-/// Is `program` on PATH? Used to gate recipes that need a package manager (macOS `brew`).
-/// Falls back to common absolute install dirs because a GUI-launched macOS app inherits a minimal
-/// PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) that excludes Homebrew — without this, `llama-server`,
-/// `ollama`, `uv`, etc. installed via brew read as missing in the packaged app.
-pub fn has_program(program: &str) -> bool {
+/// Resolve `program` to a runnable path. Returns the bare name when it's on `PATH`, else the first
+/// matching absolute install dir. A GUI-launched macOS app inherits a minimal PATH
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) that excludes Homebrew — so `Command::new("ollama")` fails with
+/// `No such file or directory (os error 2)` even when Ollama is installed. Spawning the returned
+/// absolute path sidesteps that. On Windows we only trust `where` (no fixed install dir).
+pub fn resolve_program(program: &str) -> Option<PathBuf> {
     let probe = if cfg!(windows) { "where" } else { "which" };
     let on_path = Command::new(probe)
         .arg(program)
@@ -695,22 +696,30 @@ pub fn has_program(program: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false);
     if on_path {
-        return true;
+        return Some(PathBuf::from(program));
     }
     #[cfg(not(windows))]
     {
         for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
-            if Path::new(dir).join(program).exists() {
-                return true;
+            let cand = Path::new(dir).join(program);
+            if cand.exists() {
+                return Some(cand);
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            if Path::new(&home).join(".lmstudio/bin").join(program).exists() {
-                return true;
+            let cand = Path::new(&home).join(".lmstudio/bin").join(program);
+            if cand.exists() {
+                return Some(cand);
             }
         }
     }
-    false
+    None
+}
+
+/// Is `program` on PATH (or in a common absolute install dir)? Used to gate recipes that need a
+/// package manager (macOS `brew`). See [`resolve_program`] for the GUI-PATH rationale.
+pub fn has_program(program: &str) -> bool {
+    resolve_program(program).is_some()
 }
 
 /// The prereqs a recipe needs, checked before any step runs. Returns the first blocking
@@ -1191,14 +1200,22 @@ pub fn is_runnable(engine: &str) -> bool {
 pub fn run_engine(engine: &str) -> Result<(), String> {
     match normalize_engine(engine) {
         "ollama" => {
+            // Resolve to an absolute path first: a GUI-launched macOS app has a minimal PATH that
+            // excludes Homebrew/`/usr/local/bin`, so a bare `ollama` spawns `os error 2` even when
+            // it's installed. See `resolve_program`.
+            let bin = resolve_program("ollama").ok_or_else(|| {
+                "Ollama isn't on this app's PATH. Open Ollama once from Applications, or install it \
+                 from ollama.com, then try Run again."
+                    .to_string()
+            })?;
             // Idempotent: if the launch agent already serves :11434 this exits fast; harmless.
-            Command::new("ollama")
+            Command::new(&bin)
                 .arg("serve")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .map_err(|e| format!("start ollama: {e}"))?;
+                .map_err(|e| format!("start ollama ({}): {e}", bin.display()))?;
             Ok(())
         }
         "lm-studio" => start_lm_studio_core(3),
