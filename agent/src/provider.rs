@@ -343,9 +343,31 @@ struct StreamBuffer {
     recorded_ms: u64,
 }
 
+/// F1: whether a serve request's `reply_to` is allowed, i.e. equals the libp2p-authenticated
+/// sender. A legitimate consumer always sets `reply_to = its own peer id`, which is the
+/// authenticated `source_peer` on every path; a mismatch means a peer is trying to attribute a
+/// stream to someone else (spoofing the fairness-cap bucket / delivery target). The env
+/// kill-switch `OPENHYDRA_DISABLE_REPLYTO_BIND=1` reverts to accept-all at runtime (no rebuild)
+/// as an ops escape hatch if enforcement ever misfires on a legitimate path.
+fn reply_to_authorized(reply_to: &str, source_peer: &str) -> bool {
+    if std::env::var("OPENHYDRA_DISABLE_REPLYTO_BIND").as_deref() == Ok("1") {
+        return true;
+    }
+    reply_to_matches(reply_to, source_peer)
+}
+
+/// The pure binding rule (no env): a `reply_to` is authentic iff it is the authenticated sender.
+/// Split out so the core rule is unit-tested without touching the process-global kill-switch env
+/// var (which would race the parallel test runner).
+fn reply_to_matches(reply_to: &str, source_peer: &str) -> bool {
+    reply_to == source_peer
+}
+
 /// Admit a new stream under `nonce`: prune expired buffers, enforce the per-peer fairness cap
-/// (evicting only *this* peer's oldest), enforce the global byte/count backstops, then insert an
-/// empty `done=false` buffer. Free fn (no `Self`) so the buffer mechanics are unit-testable
+/// (evicting only *this* peer's oldest — and since `reply_to` is bound to the authenticated
+/// sender at `SERVE_STREAM` time (F1), that "peer" is the real sender, so one peer genuinely
+/// cannot evict another's active stream), enforce the global byte/count backstops, then insert
+/// an empty `done=false` buffer. Free fn (no `Self`) so the buffer mechanics are unit-testable
 /// without a live `Provider`.
 fn stream_begin_in(
     map: &mut HashMap<[u8; 16], StreamBuffer>,
@@ -705,7 +727,13 @@ impl<A: EngineAdapter> Provider<A> {
     /// stream into the buffer for the consumer's `FETCH_CHUNKS` polls. Held on one pool worker for
     /// the generation's duration, so concurrent generations stay bounded by the pool (engine
     /// capacity), same as the buffered path.
-    fn run_stream_job(self: Arc<Self>, request_id: String, data: Vec<u8>, max_concurrency: usize) {
+    fn run_stream_job(
+        self: Arc<Self>,
+        request_id: String,
+        source_peer: String,
+        data: Vec<u8>,
+        max_concurrency: usize,
+    ) {
         // A stream reply is always a `FetchChunksResponse`. A refusal (bad request / AUP / not
         // shared) is delivered as a *complete* stream: an ack carrying the framed `Error` with
         // `done=true`, so the consumer's poll loop sees the error and stops without a second poll.
@@ -722,6 +750,23 @@ impl<A: EngineAdapter> Provider<A> {
                 return;
             }
         };
+        // F1: `reply_to` is where the result is delivered and the key the per-peer stream-fairness
+        // cap is bucketed on. It MUST be the libp2p-authenticated sender — otherwise a peer could
+        // open streams with `reply_to = <victim>`, filling the victim's fair-share and evicting the
+        // victim's real streams (a targeted griefing DoS). A legitimate consumer always sets
+        // `reply_to = its own peer id`, which equals `source_peer` on every path (direct, relayed,
+        // reversal, local self-serve). Reject a mismatch as a done-error stream (no buffer created).
+        if !reply_to_authorized(&req.reply_to, &source_peer) {
+            tracing::warn!(
+                reply_to = %req.reply_to, source = %source_peer,
+                "serve_stream: reply_to does not match the authenticated sender — rejecting"
+            );
+            let framed = frame_response(&[
+                ServeChunk::Error("reply_to must equal the authenticated sender".into()).encode(),
+            ]);
+            respond_done(framed, 1);
+            return;
+        }
         // M2.3: throttle a leecher first (off the poll thread, budget-capped). Contributors pass.
         self.maybe_throttle(Some(&req), max_concurrency);
         // AUP floor: a policy-violating request is refused without touching the engine.
@@ -962,8 +1007,12 @@ impl<A: EngineAdapter> Provider<A> {
                 if data.first() == Some(&SERVE_STREAM) {
                     let provider = Arc::clone(&self);
                     let shed_id = request_id.clone();
+                    // F1: `source_peer` is the libp2p-authenticated sender — bound against the
+                    // request's `reply_to` inside the job so a peer can't attribute streams to
+                    // (and evict) a victim via a spoofed `reply_to`.
+                    let src = source_peer.clone();
                     let accepted = pool.submit(move || {
-                        provider.run_stream_job(request_id, data, max_concurrency);
+                        provider.run_stream_job(request_id, src, data, max_concurrency);
                     });
                     if !accepted {
                         // A3: pool full → shed at submit. No buffer was created (begin runs inside
@@ -1746,6 +1795,27 @@ mod tests {
         assert_eq!(tokens, 5);
         // Prune-on-ack held: after fully draining, the live buffer keeps only the un-acked tail.
         assert!(map[&nonce].base_offset > 0, "prefix was pruned as the consumer acked it");
+    }
+
+    #[test]
+    fn reply_to_bind_accepts_the_authenticated_sender_and_rejects_a_spoof() {
+        // F1 core rule (env-free, so it never races the kill-switch test): a legitimate consumer
+        // sets reply_to = its own peer id = the authenticated sender.
+        assert!(reply_to_matches("12D3KooWConsumer", "12D3KooWConsumer"));
+        // A peer attributing a stream to a *victim* (reply_to != sender) is rejected → run_stream_job
+        // returns before stream_begin, so no buffer is created in the victim's fairness bucket.
+        assert!(!reply_to_matches("12D3KooWVictim", "12D3KooWAttacker"));
+        assert!(!reply_to_matches("", "12D3KooWAttacker"));
+    }
+
+    #[test]
+    fn reply_to_bind_kill_switch_reverts_to_accept_all() {
+        // The ONLY test that touches the process-global kill-switch env var; no other test reads
+        // it (the core rule is tested via `reply_to_matches`), so there is no cross-test race.
+        std::env::set_var("OPENHYDRA_DISABLE_REPLYTO_BIND", "1");
+        assert!(reply_to_authorized("a", "b"), "kill-switch must accept a mismatch");
+        std::env::remove_var("OPENHYDRA_DISABLE_REPLYTO_BIND");
+        assert!(!reply_to_authorized("a", "b"), "enforcement restored once the var is cleared");
     }
 
     #[test]
