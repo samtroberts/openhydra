@@ -59,11 +59,34 @@ pub struct SelectedProvider {
     pub model_id: String,
 }
 
-/// Per-provider attempt budget for the serve round-trip. Generous enough for a real
-/// generation (including a cold model load on the provider), but bounded so a dead /
-/// stale-but-advertised provider frees its slot for failover instead of hanging the
-/// request on libp2p's ~15s (or unbounded) request-response wait.
-const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+// Per-provider attempt budget for the (buffered) serve round-trip — see [`attempt_timeout`].
+// A cold model load + prefill on a big agentic system prompt + generating `max_tokens` on a slow
+// remote model over a relay can take minutes; the old fixed 45s cap abandoned long agentic serves
+// mid-generation (live-diagnosed 2026-08-14: `proxy_forward timed out after 45s`). We scale the
+// budget by the request's `max_tokens` so a small request still fails over fast from a dead
+// provider while a big one gets room to finish. This only WIDENS the buffered window — the durable
+// fix is end-to-end streaming (a stall timeout instead of a total cap); see STREAMING_SERVE_PLAN.
+const ATTEMPT_TIMEOUT_BASE_SECS: u64 = 45; // discovery jitter + a cold model load
+const ATTEMPT_TIMEOUT_MS_PER_TOKEN: u64 = 40; // generation + prefill headroom on a slow remote model
+const ATTEMPT_TIMEOUT_MIN_SECS: u64 = 45;
+const ATTEMPT_TIMEOUT_MAX_SECS: u64 = 240; // bound so a dead provider still frees its slot for failover
+/// Assumed output length when a request omits `max_tokens`, for budgeting only.
+const ATTEMPT_TIMEOUT_DEFAULT_TOKENS: u64 = 1024;
+
+/// The per-attempt serve budget for a request of `max_tokens`. Honors an
+/// `OPENHYDRA_ATTEMPT_TIMEOUT_SECS` ops override (fixed seconds); otherwise
+/// `base + max_tokens · per_token`, clamped to `[MIN, MAX]`.
+fn attempt_timeout(max_tokens: Option<u32>) -> std::time::Duration {
+    if let Some(secs) = std::env::var("OPENHYDRA_ATTEMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(secs.clamp(ATTEMPT_TIMEOUT_MIN_SECS, ATTEMPT_TIMEOUT_MAX_SECS));
+    }
+    let tokens = max_tokens.map(u64::from).unwrap_or(ATTEMPT_TIMEOUT_DEFAULT_TOKENS);
+    let secs = ATTEMPT_TIMEOUT_BASE_SECS + tokens.saturating_mul(ATTEMPT_TIMEOUT_MS_PER_TOKEN) / 1000;
+    std::time::Duration::from_secs(secs.clamp(ATTEMPT_TIMEOUT_MIN_SECS, ATTEMPT_TIMEOUT_MAX_SECS))
+}
 
 /// Reconnect-and-fetch: per fetch-attempt timeout. A fetch is a cheap provider-side buffer
 /// lookup, so this is short — the cost is re-dialing over a (re-establishing) relay circuit.
@@ -71,13 +94,15 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Reconnect-and-fetch: backoff between fetch attempts, tuned to the ~10s relay re-establish
 /// window (a fetch that fails at the transport layer means the circuit isn't back yet).
 const FETCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
-/// Reconnect-and-fetch: overall budget to recover a dropped serve's buffered result before
-/// giving up — comfortably covers the 10–70s NAT/relay reconnect window plus a generation tail.
-const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+/// Reconnect-and-fetch: extra window (beyond the serve budget) to keep re-polling for the buffered
+/// result across relay reconnects before giving up. The overall recovery deadline is
+/// `attempt_timeout(max_tokens) + this`, so a long generation the consumer reconnected into can
+/// still finish and be fetched.
+const FETCH_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Bound on the detached receipt-settlement round-trip (G5). Settlement runs off the response
 /// path, so this only caps how long a provider that black-holes the RECEIPT_REQUEST can park
-/// the detached settlement thread — kept well below [`ATTEMPT_TIMEOUT`] since credit is
+/// the detached settlement thread — kept well below the serve budget ([`attempt_timeout`]) since credit is
 /// advisory and a dropped settlement never affects the delivered completion.
 const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -533,6 +558,9 @@ impl ConsumerNode {
                 nonce,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
+            // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
+            // agentic completion on a slow remote model isn't abandoned mid-generation.
+            let serve_to = attempt_timeout(max_tokens);
             let t_serve = std::time::Instant::now();
             let mut proxy_roundtrip_ns = 0u64;
             let result = {
@@ -542,7 +570,7 @@ impl ConsumerNode {
                     let r = self.net.proxy_forward_timeout(
                         provider_libp2p.clone(),
                         framed.to_vec(),
-                        ATTEMPT_TIMEOUT,
+                        serve_to,
                     );
                     *rt = t.elapsed().as_nanos() as u64;
                     match r {
@@ -552,7 +580,7 @@ impl ConsumerNode {
                         // yet — recover the completed work by fetching it by nonce on a fresh
                         // circuit rather than failing. See RECONNECT_AND_FETCH_PLAN.md.
                         Err(drop_err) => self
-                            .reconnect_and_fetch(&provider_libp2p, &nonce, framed)
+                            .reconnect_and_fetch(&provider_libp2p, &nonce, framed, serve_to)
                             .map_err(|fe| {
                                 AdapterError::Http(format!(
                                     "proxy_forward: {drop_err}; reconnect-fetch: {fe}"
@@ -648,7 +676,8 @@ impl ConsumerNode {
     /// dropped mid-request (e.g. the relay/NAT mapping was evicted during a long generation).
     /// Poll the provider for the buffered result **by nonce** on fresh circuits — each
     /// `proxy_forward` re-dials — backing off while the relay re-establishes or the provider
-    /// is still generating, until [`FETCH_DEADLINE`]. `NotFound` (provider restarted / buffer
+    /// is still generating, until the recovery deadline (`serve_timeout + FETCH_RECONNECT_GRACE`).
+    /// `NotFound` (provider restarted / buffer
     /// TTL expired) → re-serve the original request once; deterministic engines cache-hit.
     /// Returns the framed serve response for [`request_completion`] to parse, exactly as a
     /// first-try round-trip would.
@@ -657,11 +686,14 @@ impl ConsumerNode {
         provider: &str,
         nonce: &[u8; 16],
         original_serve: &[u8],
+        serve_timeout: std::time::Duration,
     ) -> Result<Vec<u8>, String> {
         let mut fetch_req = Vec::with_capacity(1 + nonce.len());
         fetch_req.push(FETCH_RESULT);
         fetch_req.extend_from_slice(nonce);
-        let deadline = std::time::Instant::now() + FETCH_DEADLINE;
+        // Keep re-polling for the buffered result long enough for a generation the consumer
+        // reconnected into to finish (`serve_timeout`) plus the relay reconnect window.
+        let deadline = std::time::Instant::now() + serve_timeout + FETCH_RECONNECT_GRACE;
         loop {
             if std::time::Instant::now() >= deadline {
                 return Err("result not recovered before deadline".into());
@@ -687,7 +719,7 @@ impl ConsumerNode {
                             .proxy_forward_timeout(
                                 provider.to_string(),
                                 original_serve.to_vec(),
-                                ATTEMPT_TIMEOUT,
+                                serve_timeout,
                             )
                             .map_err(|e| format!("re-serve: {e}"));
                     }
@@ -824,8 +856,8 @@ impl ConsumerNode {
 
     /// Dispatch `challenge` to one specific `provider` deterministically (`temperature = 0`)
     /// and return its **full** completion text (the audit compares whole outputs, not a
-    /// streamed view). Bounded by [`ATTEMPT_TIMEOUT`] so a dead provider can't stall the
-    /// audit.
+    /// streamed view). Bounded by [`attempt_timeout`] (short — the audit is a 64-token probe)
+    /// so a dead provider can't stall the audit.
     fn dispatch_full(
         &self,
         provider: &SelectedProvider,
@@ -847,7 +879,7 @@ impl ConsumerNode {
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
             self.net
-                .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), ATTEMPT_TIMEOUT)
+                .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), attempt_timeout(Some(AUDIT_MAX_TOKENS)))
                 .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
         };
         let mut output = String::new();
@@ -997,6 +1029,25 @@ mod tests {
             tools: Vec::new(),
             nonce: [0u8; 16],
         }
+    }
+
+    #[test]
+    fn attempt_timeout_scales_with_max_tokens_and_clamps() {
+        // A tiny request stays at the floor (fast failover from a dead provider).
+        assert_eq!(attempt_timeout(Some(10)).as_secs(), ATTEMPT_TIMEOUT_MIN_SECS);
+        // A small request is just above the floor: 45 + 64·40/1000 = 47s.
+        assert_eq!(attempt_timeout(Some(64)).as_secs(), 47);
+        // A mid request gets room: 45 + 4096·40/1000 = 208s.
+        assert_eq!(attempt_timeout(Some(4096)).as_secs(), 208);
+        // A huge request clamps to the ceiling, not unbounded.
+        assert_eq!(attempt_timeout(Some(1_000_000)).as_secs(), ATTEMPT_TIMEOUT_MAX_SECS);
+        // No max_tokens → the default-estimate budget, still within bounds.
+        let d = attempt_timeout(None).as_secs();
+        assert!((ATTEMPT_TIMEOUT_MIN_SECS..=ATTEMPT_TIMEOUT_MAX_SECS).contains(&d));
+        // The env override wins and is itself clamped. (Test-local; safe — single-threaded.)
+        std::env::set_var("OPENHYDRA_ATTEMPT_TIMEOUT_SECS", "9999");
+        assert_eq!(attempt_timeout(Some(64)).as_secs(), ATTEMPT_TIMEOUT_MAX_SECS);
+        std::env::remove_var("OPENHYDRA_ATTEMPT_TIMEOUT_SECS");
     }
 
     #[test]

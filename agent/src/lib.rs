@@ -39,6 +39,7 @@ pub mod provider;
 pub mod ratelimit;
 pub mod receipt;
 pub mod serve;
+pub mod slash;
 /// P0 introspection: the `--status-bind` endpoint (network snapshot + transfer counters).
 pub mod status;
 pub mod telemetry;

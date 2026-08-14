@@ -136,13 +136,39 @@ impl ChatMessage {
     }
 }
 
-/// Deserialize a string that a client may send as JSON `null` → `""`. `#[serde(default)]`
-/// alone only covers an *absent* key; this also maps a present-but-null value.
+/// Deserialize an OpenAI message `content` into a plain string, accepting every shape a client
+/// may send it as:
+/// - a string (the common case),
+/// - JSON `null` (an assistant tool-call turn) → `""`,
+/// - an **array of content parts** (`[{ "type": "text", "text": "…" }, …]`) → the text parts
+///   concatenated. This is valid OpenAI spec — modern clients (e.g. Pi) send even plain text this
+///   way — and the gateway would otherwise 400 with "invalid type: sequence, expected a string".
+///   Non-text parts (image_url, etc.) are dropped: the downstream text engines can't consume them.
+///
+/// `#[serde(default)]` alone only covers an *absent* key; this also maps present null/array values.
 fn de_string_or_null<'de, D>(de: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(de)?.unwrap_or_default())
+    Ok(flatten_content(&serde_json::Value::deserialize(de)?))
+}
+
+/// Flatten an OpenAI `content` value (string | null | content-parts array) to a plain string.
+fn flatten_content(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                // A content part is `{ "type": "text", "text": "…" }`; keep its text. Some clients
+                // send bare strings in the array — keep those too. Anything else (image_url, …) drops.
+                p.get("text").and_then(|t| t.as_str()).or_else(|| p.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        // null (and any other unexpected shape) → empty.
+        _ => String::new(),
+    }
 }
 
 /// One OpenAI tool call the model requested (`type: "function"`). `arguments` is the raw
@@ -293,6 +319,26 @@ mod tests {
         // A normal string is preserved unchanged.
         let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
         assert_eq!(m.content, "hi");
+    }
+
+    #[test]
+    fn content_accepts_openai_content_parts_array() {
+        // Modern OpenAI clients (e.g. Pi) send even plain text as a content-parts array. The
+        // gateway must flatten the text parts instead of 400ing "invalid type: sequence".
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "hello world");
+        // Non-text parts (image_url, …) are dropped; text is kept.
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:…"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "describe");
+        // An empty parts array → empty string (not an error).
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":[]}"#).unwrap();
+        assert_eq!(m.content, "");
     }
 
     #[test]

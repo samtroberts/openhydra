@@ -55,6 +55,9 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// discovery + prefill), so a client's first-byte timeout survives a slow start without us
 /// fabricating a message envelope.
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a model lingers in the browse catalog (`/v1/models`, `/models`) after it was last seen
+/// live — smooths transient discovery churn. Matches the desktop W2 sticky-TTL.
+const MODEL_STICKY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 use crate::adapter::{ChatMessage, EmbeddingAdapter, EngineAdapter, InferenceRequest, ToolCall, ToolCallFunction};
 use crate::aup::{AupDecision, AupPolicy};
@@ -63,6 +66,7 @@ use crate::consumer::ConsumerNode;
 use crate::metrics::Metrics;
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::serve::ServeMetrics;
+use crate::slash::{self, SessionModels, SlashCommand};
 use openhydra_protocol::store::Store;
 use crate::serve::ServeSummary;
 
@@ -89,6 +93,12 @@ struct AppState {
     byok: Arc<ByokConfig>,
     /// BYOK embeddings routing (#34): `/v1/embeddings` for configured models. Empty by default.
     embeddings: Arc<EmbeddingConfig>,
+    /// Per-session sticky model selection set via the `/model <id>` slash-command (keyed by the
+    /// caller's API-key identity; in-memory, TTL'd, never persisted).
+    sessions: Arc<SessionModels>,
+    /// Sticky browse-list cache smoothing catalog churn for `/v1/models` + `/models` (routing is
+    /// unaffected — it uses the live set).
+    model_cache: Arc<ModelStickyCache>,
 }
 
 /// The OpenAI chat-completions request fields we honour (others ignored).
@@ -234,6 +244,7 @@ async fn resolve_model(
     state: &AppState,
     requested: &str,
     fallback_unservable: bool,
+    session_override: Option<&str>,
 ) -> Result<String, String> {
     let auto = is_auto_model(requested);
     // A concrete BYOK-mapped model is served directly (never announced on the swarm) — pass it
@@ -242,6 +253,7 @@ async fn resolve_model(
         return Ok(requested.to_string());
     }
     // Fast path: a concrete model on the strict (OpenAI) surface needs no discovery query.
+    // An explicit concrete model in the request always wins over any `/model` session pin.
     if !auto && !fallback_unservable {
         return Ok(requested.to_string());
     }
@@ -250,17 +262,225 @@ async fn resolve_model(
         .await
         .map_err(|_| "model resolution failed".to_string())?
         .map_err(|e| e)?;
-    // A concrete model that's actually served is used as-is.
+    // A concrete model that's actually served is used as-is (also wins over a session pin).
     if !auto && known.iter().any(|m| m == requested) {
         return Ok(requested.to_string());
     }
-    // `auto`, or an unservable id on the Anthropic surface → pick a live model.
+    // Now we're picking (request said `auto`, or an unservable id on the Anthropic surface):
+    // a `/model <id>` session pin wins next — but only if it's a concrete model currently served
+    // (a stale/typo'd pin falls through to the auto default rather than erroring).
+    if let Some(sel) = session_override.map(str::trim).filter(|s| !s.is_empty()) {
+        if !is_auto_model(sel) && known.iter().any(|m| m == sel) {
+            return Ok(sel.to_string());
+        }
+    }
+    // …else the auto default: an operator-preferred model if served, else the alphabetically-first.
     let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
     pick_auto_model(&known, preferred.as_deref()).ok_or_else(|| {
         "no models available on the network yet — try again once a provider announces, or request \
          a specific model"
             .to_string()
     })
+}
+
+// ── Slash-commands (`/models`, `/model <id>`, `/help`) ───────────────────────
+//
+// Handled by the gateway before dispatch so they work inside every connected coding tool
+// (OpenCode/Continue/Claude Code) — none of which offer a model picker natively. The parser
+// and reply-rendering are pure (in `crate::slash`); this layer extracts the latest user turn,
+// runs the (blocking) model query only when a command needs it, applies the session pin, and
+// shapes the reply into the OpenAI or Anthropic wire form. Commands cost no inference and
+// settle no receipt.
+
+/// The session identity a `/model` pin is stored under: the caller's API key (Bearer or the
+/// Anthropic `x-api-key`), else a single shared `local` session for the open loopback default.
+/// Matches how a coding-tool session behaves (one fixed key ⇒ one selection).
+fn session_key(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .map(|k| format!("key:{k}"))
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// The plain text of the latest user turn, iff it's an ordinary user message (not a tool result
+/// or an assistant/tool-call turn) — the only shape a slash-command may live in. `None` leaves
+/// the request to route to inference untouched.
+fn latest_user_text(messages: &[ChatMessage]) -> Option<&str> {
+    let last = messages.last()?;
+    if last.role != "user" || last.tool_calls.is_some() || last.tool_call_id.is_some() {
+        return None;
+    }
+    let t = last.content.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(last.content.as_str())
+    }
+}
+
+/// The plain text of the latest Anthropic user turn, iff it's an ordinary text message (bare
+/// string or text-only blocks). A turn carrying any `tool_result` / `tool_use` / non-text block
+/// is not a command and returns `None`.
+fn latest_ant_user_text(messages: &[AntMessage]) -> Option<String> {
+    let last = messages.last()?;
+    if last.role != "user" {
+        return None;
+    }
+    let text = match &last.content {
+        AntContent::Text(s) => s.clone(),
+        AntContent::Blocks(blocks) => {
+            let mut out = String::new();
+            for b in blocks {
+                match b {
+                    AntBlock::Text { text } => out.push_str(text),
+                    _ => return None, // tool_result / tool_use / image / … ⇒ not a plain command turn
+                }
+            }
+            out
+        }
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Query the currently-served models on a blocking thread (empty on error) — the **live** set,
+/// used for routing/`auto` resolution (never route to a model no provider currently serves).
+async fn known_models_async(state: &AppState) -> Vec<String> {
+    let node = state.node.clone();
+    tokio::task::spawn_blocking(move || node.known_models())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
+
+/// The **browse** set for `/v1/models` and the `/models` command: the live set, smoothed by the
+/// sticky cache so a provider that briefly drops off the network (a flaky-NAT node aging out of
+/// `known_peers`) doesn't flicker out of the catalog mid-session. Routing/`auto` still use the
+/// live set (`known_models_async`), so a sticky-but-currently-unserved model resolves on-demand
+/// or falls back — never routes to a dead peer.
+async fn browse_models(state: &AppState) -> Vec<String> {
+    let live = known_models_async(state).await;
+    state.model_cache.merge(live)
+}
+
+/// Sticky browse-list cache: a model stays listed for `ttl` after it was last seen live. Decoupled
+/// from routing; mirrors the desktop W2 sticky-TTL for the app's provider list. Smooths transient
+/// discovery churn (e.g. a CGNAT provider whose adverts briefly lapse) without ever claiming a
+/// model is *serveable* — the catalog is a hint, and on-demand resolution is the source of truth.
+struct ModelStickyCache {
+    seen: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    ttl: Duration,
+}
+
+impl ModelStickyCache {
+    fn new(ttl: Duration) -> Self {
+        Self { seen: std::sync::Mutex::new(std::collections::HashMap::new()), ttl }
+    }
+
+    /// Stamp each currently-live model as seen now, evict entries older than `ttl`, and return the
+    /// sorted union of live + still-fresh models.
+    fn merge(&self, live: Vec<String>) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let mut seen = self.seen.lock().unwrap();
+        for m in live {
+            seen.insert(m, now);
+        }
+        seen.retain(|_, t| now.duration_since(*t) <= self.ttl);
+        let mut out: Vec<String> = seen.keys().cloned().collect();
+        out.sort();
+        out
+    }
+}
+
+/// Handle a parsed command: fetch the live model set (only when the command needs it), render
+/// the reply, and apply any new session pin. Returns the assistant reply text.
+async fn handle_slash(state: &AppState, skey: &str, cmd: SlashCommand) -> String {
+    let known = match cmd {
+        // Browse/validate against the sticky catalog so a momentary churn dip doesn't make `/models`
+        // drop a live provider or `/model <id>` reject a just-flickered model.
+        SlashCommand::Models(_) | SlashCommand::ModelSet(_) => browse_models(state).await,
+        SlashCommand::ModelShow | SlashCommand::Help => Vec::new(),
+    };
+    let current = state.sessions.get(skey);
+    let result = slash::render(&cmd, &known, current.as_deref());
+    if let Some(model) = result.set_model {
+        state.sessions.set(skey, model);
+    }
+    result.reply
+}
+
+/// A gateway-authored assistant completion (a slash-command reply) in the OpenAI shape: a
+/// buffered `chat.completion`, or a minimal SSE stream (role → content → stop → `[DONE]`) when
+/// the client asked to stream. Zero `usage`; no `openhydra` telemetry block (no inference ran).
+fn command_response_openai(id: &str, model: &str, created: u64, text: String, stream: bool) -> Response {
+    if !stream {
+        return Json(json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": text },
+                "finish_reason": "stop",
+            }],
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
+        }))
+        .into_response();
+    }
+    let frames = vec![
+        stream_chunk(id, model, created, json!({ "role": "assistant" }), None),
+        stream_chunk(id, model, created, json!({ "content": text }), None),
+        stream_chunk(id, model, created, json!({}), Some("stop")),
+        "[DONE]".to_string(),
+    ];
+    let body = tokio_stream::iter(
+        frames
+            .into_iter()
+            .map(|d| Ok::<Event, std::convert::Infallible>(Event::default().data(d))),
+    );
+    Sse::new(body).into_response()
+}
+
+/// A gateway-authored assistant message (a slash-command reply) in the Anthropic Messages shape:
+/// a buffered `message`, or the full SSE event sequence when the client asked to stream. The
+/// streamed form keeps the canonical `message_start` → … → `message_stop` order (SDK-safe — no
+/// `ping` before `message_start`). Zero `usage`.
+fn command_response_anthropic(id: &str, model: &str, text: String, stream: bool) -> Response {
+    if !stream {
+        return Json(json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{ "type": "text", "text": text }],
+            "stop_reason": "end_turn",
+            "stop_sequence": Value::Null,
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
+        }))
+        .into_response();
+    }
+    let frames: Vec<(&'static str, Value)> = vec![
+        ("message_start", json!({ "type": "message_start", "message": { "id": id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null, "usage": { "input_tokens": 0, "output_tokens": 0 } } })),
+        ("content_block_start", json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } })),
+        ("content_block_delta", json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } })),
+        ("content_block_stop", json!({ "type": "content_block_stop", "index": 0 })),
+        ("message_delta", json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": Value::Null }, "usage": { "output_tokens": 0 } })),
+        ("message_stop", json!({ "type": "message_stop" })),
+    ];
+    let body = tokio_stream::iter(
+        frames
+            .into_iter()
+            .map(|(n, d)| Ok::<Event, std::convert::Infallible>(ant_sse(n, d))),
+    );
+    Sse::new(body).into_response()
 }
 
 // ── Response builders (pure) ─────────────────────────────────────────────────
@@ -428,14 +648,24 @@ async fn chat_completions(
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let stream = req.stream;
+    let skey = session_key(&headers);
+    // Gateway `/`-commands (`/models`, `/model <id>`, `/help`): handled here (before AUP/dispatch)
+    // and answered as an ordinary assistant message — no inference, no receipt. Only a plain user
+    // turn whose whole text is a recognized command is intercepted; anything else routes normally.
+    if let Some(cmd) = latest_user_text(&req.messages).and_then(slash::parse) {
+        let reply = handle_slash(&state, &skey, cmd).await;
+        return command_response_openai(&id, &req.model, created, reply, stream);
+    }
     // AUP → generation slot → model resolution (`openhydra/auto`; OpenAI stays strict) → BYOK/swarm
-    // dispatch, all inside spawn_dispatch so the backstop bounds the discovery query too. The
-    // resolved concrete model is echoed back.
+    // dispatch, all inside spawn_dispatch so the backstop bounds the discovery query too. A `/model`
+    // session pin steers the `auto`/default case; the resolved concrete model is echoed back.
+    let session_pin = state.sessions.get(&skey);
     let (model, rx, started) = match spawn_dispatch(
         &state,
         &headers,
         &req.model,
         false,
+        session_pin.as_deref(),
         req.messages,
         req.max_tokens,
         req.temperature,
@@ -477,6 +707,7 @@ async fn spawn_dispatch(
     headers: &axum::http::HeaderMap,
     requested_model: &str,
     fallback_unservable: bool,
+    session_override: Option<&str>,
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
@@ -498,7 +729,7 @@ async fn spawn_dispatch(
     };
     // Resolve `openhydra/auto` (and, on the Anthropic surface, an unservable id) to a concrete
     // model. BYOK-mapped ids are recognised inside `resolve_model` so they're never rewritten.
-    let model = resolve_model(state, requested_model, fallback_unservable)
+    let model = resolve_model(state, requested_model, fallback_unservable, session_override)
         .await
         .map_err(DispatchErr::NoModels)?;
     // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
@@ -1016,19 +1247,28 @@ async fn messages(
         return anthropic_error(StatusCode::BAD_REQUEST, "missing or empty field: messages", "invalid_request_error");
     }
 
-    let messages = to_chat_messages(req.system.as_ref(), &req.messages);
-    let tools = to_openai_tools(&req.tools);
     let id = next_msg_id();
     let stream = req.stream;
+    let skey = session_key(&headers);
+    // Gateway `/`-commands work through Claude Code too (before dispatch; answered as an assistant
+    // message). Only a plain-text user turn whose whole content is a command is intercepted.
+    if let Some(cmd) = latest_ant_user_text(&req.messages).and_then(|t| slash::parse(&t)) {
+        let reply = handle_slash(&state, &skey, cmd).await;
+        return command_response_anthropic(&id, &req.model, reply, stream);
+    }
+    let messages = to_chat_messages(req.system.as_ref(), &req.messages);
+    let tools = to_openai_tools(&req.tools);
     // Bridge Claude Code: on this Anthropic surface an unservable id (e.g. the `claude-*` id Claude
     // Code insists on) routes to a live model; `openhydra/auto`, served, and BYOK models resolve as
-    // usual. All inside spawn_dispatch (the permit bounds the discovery query). Resolved model
-    // echoed back in the response.
+    // usual. A `/model` session pin steers that bridged/`auto` case. All inside spawn_dispatch (the
+    // permit bounds the discovery query). Resolved model echoed back in the response.
+    let session_pin = state.sessions.get(&skey);
     let (model, rx, started) = match spawn_dispatch(
         &state,
         &headers,
         &req.model,
         true,
+        session_pin.as_deref(),
         messages,
         req.max_tokens,
         req.temperature,
@@ -1219,33 +1459,21 @@ async fn anthropic_stream_worker(
 /// as `complete` — `blocking_send` needs a non-tokio context).
 async fn list_models(State(state): State<AppState>) -> Response {
     state.metrics.incr_models();
-    let node = state.node.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(node.known_models());
-    });
-    match rx.await {
-        Ok(Ok(models)) => {
-            let mut data: Vec<Value> = Vec::new();
-            // Advertise the `openhydra/auto` meta-model first, but only when at least one concrete
-            // model can currently back it (else clients would pick a model that can't route).
-            if !models.is_empty() {
-                data.push(json!({ "id": AUTO_MODEL_ID, "object": "model", "created": 0, "owned_by": "openhydra" }));
-            }
-            data.extend(
-                models
-                    .iter()
-                    .map(|m| json!({ "id": m, "object": "model", "created": 0, "owned_by": "openhydra" })),
-            );
-            Json(json!({ "object": "list", "data": data })).into_response()
-        }
-        Ok(Err(e)) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
-        Err(_) => openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "models query failed",
-            "internal_error",
-        ),
+    // The sticky browse set (live models, smoothed over transient churn). Routing stays on the live
+    // set elsewhere — a listed-but-currently-unserved model resolves on-demand or falls back.
+    let models = browse_models(&state).await;
+    let mut data: Vec<Value> = Vec::new();
+    // Advertise the `openhydra/auto` meta-model first, but only when at least one concrete
+    // model can currently back it (else clients would pick a model that can't route).
+    if !models.is_empty() {
+        data.push(json!({ "id": AUTO_MODEL_ID, "object": "model", "created": 0, "owned_by": "openhydra" }));
     }
+    data.extend(
+        models
+            .iter()
+            .map(|m| json!({ "id": m, "object": "model", "created": 0, "owned_by": "openhydra" })),
+    );
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 /// Constant-time byte comparison — avoids leaking the API key length/prefix via timing.
@@ -1541,6 +1769,8 @@ pub fn router(
         trusted_proxy,
         byok: Arc::new(byok),
         embeddings: Arc::new(embeddings_cfg),
+        sessions: Arc::new(SessionModels::new(slash::DEFAULT_SESSION_TTL)),
+        model_cache: Arc::new(ModelStickyCache::new(MODEL_STICKY_TTL)),
     };
     // The `/v1/*` routes are auth-gated then rate-limited; `/health` and `/metrics` stay open
     // for liveness probes and Prometheus scraping. `route_layer`s run outermost-last, so
@@ -1914,5 +2144,99 @@ mod tests {
         assert!(!constant_time_eq("sk-secret-123", "sk-secret-124"));
         assert!(!constant_time_eq("sk-secret", "sk-secret-123")); // length mismatch
         assert!(!constant_time_eq("", "x"));
+    }
+
+    // ── Slash-command wiring (extraction / session key / reply shape) ──
+
+    #[test]
+    fn latest_user_text_only_a_plain_user_turn() {
+        // The last message is a plain user turn → its text.
+        let msgs = vec![ChatMessage::new("system", "s"), ChatMessage::new("user", "/models")];
+        assert_eq!(latest_user_text(&msgs), Some("/models"));
+        // An assistant turn last → not a command site.
+        let msgs = vec![ChatMessage::new("user", "hi"), ChatMessage::new("assistant", "/models")];
+        assert_eq!(latest_user_text(&msgs), None);
+        // A `role:"tool"` result turn (has tool_call_id) → None.
+        let mut tool = ChatMessage::new("tool", "72F");
+        tool.tool_call_id = Some("t1".into());
+        assert_eq!(latest_user_text(std::slice::from_ref(&tool)), None);
+        // Blank content → None.
+        assert_eq!(latest_user_text(&[ChatMessage::new("user", "   ")]), None);
+        assert_eq!(latest_user_text(&[]), None);
+    }
+
+    #[test]
+    fn latest_ant_user_text_flattens_text_blocks_only() {
+        let bare: MessagesRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{ "role": "user", "content": "/model qwen" }]
+        }))
+        .unwrap();
+        assert_eq!(latest_ant_user_text(&bare.messages).as_deref(), Some("/model qwen"));
+
+        let blocks: MessagesRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{ "role": "user", "content": [{ "type": "text", "text": "/models" }] }]
+        }))
+        .unwrap();
+        assert_eq!(latest_ant_user_text(&blocks.messages).as_deref(), Some("/models"));
+
+        // A tool_result turn is never a command.
+        let tr: MessagesRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t", "content": "x" }] }]
+        }))
+        .unwrap();
+        assert_eq!(latest_ant_user_text(&tr.messages), None);
+    }
+
+    #[test]
+    fn session_key_prefers_api_key_else_local() {
+        use axum::http::HeaderMap;
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::AUTHORIZATION, "Bearer abc".parse().unwrap());
+        assert_eq!(session_key(&h), "key:abc");
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "xyz".parse().unwrap());
+        assert_eq!(session_key(&h), "key:xyz");
+        assert_eq!(session_key(&HeaderMap::new()), "local");
+    }
+
+    #[tokio::test]
+    async fn command_response_openai_buffered_shape() {
+        let resp = command_response_openai("id1", "openhydra/auto", 123, "hello".into(), false);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["content"], "hello");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn model_sticky_cache_smooths_churn() {
+        let c = ModelStickyCache::new(Duration::from_secs(300));
+        // Two live models.
+        assert_eq!(c.merge(vec!["m1".into(), "m2".into()]), vec!["m1".to_string(), "m2".to_string()]);
+        // m2 momentarily gone from the live set → still listed (within TTL).
+        assert_eq!(c.merge(vec!["m1".into()]), vec!["m1".to_string(), "m2".to_string()]);
+        // A new model appears and joins.
+        assert_eq!(
+            c.merge(vec!["m1".into(), "m3".into()]),
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+        );
+        // ttl = 0 → a model absent from the next live set drops immediately (no stickiness).
+        let z = ModelStickyCache::new(Duration::ZERO);
+        z.merge(vec!["x".into(), "y".into()]);
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(z.merge(vec!["x".into()]), vec!["x".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn command_response_anthropic_buffered_shape() {
+        let resp = command_response_anthropic("msg1", "claude-x", "hi".into(), false);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "hi");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["usage"]["output_tokens"], 0);
     }
 }
