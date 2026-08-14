@@ -562,12 +562,9 @@ struct LoopState {
     /// ``GOSSIP_INBOUND_QUEUE_MAX`` to prevent unbounded memory growth
     /// when Python is slow to poll.
     gossip_inbound_queue: std::collections::VecDeque<(String, Vec<u8>)>,
-    /// B2: Per-peer relay dial retry state: (attempt_count, last_attempt).
-    relay_dial_retries: HashMap<PeerId, (u32, tokio::time::Instant)>,
     /// F-5: Per-relay-circuit RESERVATION retry state, keyed by the
     /// ``/p2p-circuit`` listen multiaddr string: (attempt_count,
-    /// next_attempt_at). Distinct from ``relay_dial_retries`` (which retries
-    /// *dialing a remote peer* via relay) — this retries OUR OWN reservation
+    /// next_attempt_at). Retries OUR OWN reservation
     /// (``listen_on`` a circuit) so we stay reachable when a relay rejects or
     /// drops the reservation. Without backoff a flapping relay caused either a
     /// tight re-listen loop or (on a hard listen_on error) a permanent strand
@@ -717,7 +714,6 @@ impl LoopState {
             dcutr_event_queue: VecDeque::new(),
             tunnel_close_queue: VecDeque::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
-            relay_dial_retries: HashMap::new(),
             relay_reservation_retries: HashMap::new(),
             // #42: set to the shared handle in run_event_loop; a real interface
             // change or watchdog rebuild bumps it.
@@ -741,7 +737,6 @@ pub async fn run_event_loop(
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
-    _stream_control: libp2p_stream::Control,
     keypair: libp2p::identity::Keypair,
     // WS-F F-4: shared leech table for the peer-relay server (None unless this
     // node opted into peer-relay mode). The RelayServer event handler records
@@ -888,10 +883,9 @@ pub async fn run_event_loop(
     // ListenerClosed handlers below re-listen if a reservation actually drops —
     // so the periodic re-listen was redundant and leaky.
 
-    // F3: Relay-dial retry driver — fires often enough to honour the
-    // 500ms–8s exponential backoff scheduled in relay_dial_retries. The
-    // dial itself is gated on each entry's next_attempt_at, so this ticker
-    // is cheap (it only acts on peers with a due, scheduled retry).
+    // F-5: relay-RESERVATION retry driver — fires often enough to honour the
+    // reservation-retry backoff. Each circuit's retry is gated on its own
+    // next_attempt_at, so this ticker is cheap (it only acts on due entries).
     let mut relay_retry_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
     relay_retry_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1529,20 +1523,9 @@ pub async fn run_event_loop(
             // F6: B5 periodic relay-renewal removed (see comment at ticker
             // decl). Reservation renewal is handled by libp2p auto-renewal +
             // the reactive ExpiredListenAddr / ListenerClosed handlers.
-            // F3: Drive any due relay-dial retries (scheduled with backoff).
+            // F-5: drive any due relay-RESERVATION retries (re-listen on
+            // circuits whose reservation was lost).
             _ = relay_retry_ticker.tick() => {
-                let now = tokio::time::Instant::now();
-                let due: Vec<PeerId> = state
-                    .relay_dial_retries
-                    .iter()
-                    .filter(|(_, (_, next_at))| now >= *next_at)
-                    .map(|(pid, _)| *pid)
-                    .collect();
-                for pid in due {
-                    drive_relay_retry(&mut swarm, &mut state, pid);
-                }
-                // F-5: drive any due relay-RESERVATION retries on the same
-                // ticker (re-listen on circuits whose reservation was lost).
                 drive_reservation_retries(&mut swarm, &mut state);
             }
             // #42: connectivity watchdog + debounced reactive rebootstrap.
@@ -1822,27 +1805,19 @@ fn handle_resolve(
 }
 
 /// Process a swarm event.
-/// F3: advance the relay-dial retry state machine for one peer.
-///
-/// Called both from `OutgoingConnectionError` (on failure) and from the
-/// `relay_retry_ticker` (to drive scheduled attempts). A retry is only
-/// dialed when `now >= next_attempt_at`, so failures that arrive faster than
-/// the backoff window are coalesced into a single spaced attempt instead of
-/// burning all five retries in milliseconds. After 5 spaced attempts
-/// (~500ms,1s,2s,4s,8s) the peer is evicted and its ring sessions aborted.
-fn drive_relay_retry(
+/// Evict a peer that failed an outgoing dial: drop it from the Kademlia routing
+/// table and the known-peers cache so routing stops preferring a dead path. A
+/// later serve re-discovers the peer on demand, so eviction is safe and cheap.
+/// (No-op if the peer is in fact still connected.)
+fn evict_unreachable_peer(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     state: &mut LoopState,
     pid: PeerId,
 ) {
     if swarm.is_connected(&pid) {
-        state.relay_dial_retries.remove(&pid);
         return;
     }
     let pid_str = pid.to_string();
-
-    // Serve-protocol path: a peer that fails to redial is evicted immediately.
-    state.relay_dial_retries.remove(&pid);
     swarm.behaviour_mut().kademlia.remove_peer(&pid);
     state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
     info!(%pid, "evicted unreachable peer after dial failure");
@@ -2689,9 +2664,6 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
-            // B2: Clear relay dial retry state on successful reconnection.
-            state.relay_dial_retries.remove(&peer_id);
-
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
@@ -2954,18 +2926,14 @@ fn handle_swarm_event(
                 );
             }
         }
-        // Phase 1.3 + B2: Failed dials with relay-aware retry for active
-        // ring sessions, immediate eviction otherwise.
+        // A failed outgoing dial to a peer we hold no live connection to →
+        // evict it so routing stops preferring the dead path (re-discovered
+        // on the next serve).
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             warn!(?peer_id, %error, "outgoing_connection_error");
             if let Some(pid) = peer_id {
                 if !swarm.is_connected(&pid) {
-                    // F3: route through the scheduled-retry helper. The first
-                    // failure dials immediately; subsequent failures within
-                    // the backoff window are no-ops (the relay_retry_ticker
-                    // drives the next spaced attempt), so a fast-failing relay
-                    // no longer burns all 5 attempts in milliseconds.
-                    drive_relay_retry(swarm, state, pid);
+                    evict_unreachable_peer(swarm, state, pid);
                 }
             }
         }

@@ -164,9 +164,9 @@ pub fn start_node(
 
                 let keypair_for_loop = identity.keypair.clone();
                 match swarm::build_swarm(&identity, opts) {
-                    Ok((swarm, stream_control, peer_relay_leech)) => {
+                    Ok((swarm, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, stream_control, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));

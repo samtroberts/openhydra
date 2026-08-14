@@ -58,8 +58,6 @@ pub struct OpenHydraBehaviour {
     /// mobile hotspot NAT drops TCP mappings during the 1-3 s inference
     /// silence, killing the relay circuit between tokens.
     pub ping: ping::Behaviour,
-    /// libp2p-stream — persistent bidirectional streams for tensor transfer (Fix 1).
-    pub stream: libp2p_stream::Behaviour,
     /// R-DHT-4: UPnP/NAT-PMP port mapping. On a home router that supports IGD,
     /// this maps our listen port and, on success, emits
     /// ``ToSwarm::ExternalAddrConfirmed`` for the mapped public address — which

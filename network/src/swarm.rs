@@ -60,7 +60,6 @@ pub fn build_swarm(
 ) -> Result<
     (
         Swarm<OpenHydraBehaviour>,
-        libp2p_stream::Control,
         // WS-F F-4: the peer-relay's leech table (None unless opted in), so the
         // event loop can record byte-cap cap-outs into it.
         Option<Arc<Mutex<LeechTable>>>,
@@ -292,10 +291,6 @@ pub fn build_swarm(
             .with_interval(Duration::from_secs(15)),
     );
 
-    // libp2p-stream behaviour for persistent tensor streams (Fix 1).
-    let stream = libp2p_stream::Behaviour::new();
-    let stream_control = stream.new_control();
-
     // R-DHT-4: UPnP/NAT-PMP. Default behaviour searches for an IGD gateway on
     // first poll and maps each listen port; on success it confirms the mapped
     // external address with the swarm (→ Kad server promotion via R-DHT-2). A
@@ -344,7 +339,6 @@ pub fn build_swarm(
         registry_query,
         gossipsub,
         ping,
-        stream,
         upnp,
     };
 
@@ -373,5 +367,5 @@ pub fn build_swarm(
         swarm.listen_on(addr.clone())?;
     }
 
-    Ok((swarm, stream_control, peer_relay_leech))
+    Ok((swarm, peer_relay_leech))
 }

@@ -75,13 +75,8 @@ pub struct PeerRecord {
     #[serde(default)]
     pub reputation_score: f64,
 
-    // Expert specialization
-    #[serde(default)]
-    pub expert_tags: Vec<String>,
-    #[serde(default)]
-    pub expert_layer_indices: Vec<u32>,
-
-    // Layer sharding
+    // Layer sharding (legacy: signed + carried, but no longer routed on — kept
+    // for record signature compatibility with the existing fleet).
     #[serde(default)]
     pub layer_start: u32,
     #[serde(default)]
@@ -337,8 +332,6 @@ impl Default for PeerRecord {
             hardware_class: String::new(),
             privacy_noise_variance: 0.0,
             reputation_score: 0.0,
-            expert_tags: Vec::new(),
-            expert_layer_indices: Vec::new(),
             layer_start: 0,
             layer_end: 0,
             total_layers: 0,
