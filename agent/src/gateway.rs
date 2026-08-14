@@ -48,7 +48,7 @@ use openhydra_network::handle::NetworkHandle;
 /// threads. Set high so it only ever trips under genuine overload.
 const MAX_CONCURRENT_GENERATIONS: usize = 512;
 
-use crate::adapter::{ChatMessage, EmbeddingAdapter, EngineAdapter, InferenceRequest};
+use crate::adapter::{ChatMessage, EmbeddingAdapter, EngineAdapter, InferenceRequest, ToolCall, ToolCallFunction};
 use crate::aup::{AupDecision, AupPolicy};
 use crate::byok::{ByokConfig, ByokProvider, EmbeddingConfig};
 use crate::consumer::ConsumerNode;
@@ -346,69 +346,107 @@ async fn chat_completions(
     if let Some(resp) = validate(&req) {
         return resp;
     }
-    // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
-    if let AupDecision::Deny(reason) = state.aup.evaluate(&req.messages, req.max_tokens) {
-        return openai_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error");
-    }
-
-    // G3b: acquire a slot in the global generation backstop before spawning a worker thread.
-    // Shed with 503 (not 429 — this is server capacity, not a per-caller limit) when full.
-    let gen_permit = match state.gen_limiter.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            state.metrics.record_rate_limited();
-            return openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server at generation capacity, retry shortly",
-                "server_overloaded",
-            );
-        }
-    };
 
     let id = next_id();
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
+    let (model, stream) = (req.model.clone(), req.stream);
 
-    // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing
-    // the swarm. The key is the caller's `X-Provider-Api-Key` if present, else the operator's.
-    let (rx, started) = if let Some(provider) = state.byok.provider_for(&req.model) {
+    let (rx, started) = match spawn_dispatch(
+        &state,
+        &headers,
+        &req.model,
+        req.messages,
+        req.max_tokens,
+        req.temperature,
+        req.tools,
+    ) {
+        Ok(v) => v,
+        Err(e) => return dispatch_err_openai(e),
+    };
+
+    if stream {
+        stream_response(id, model, created, want_usage, rx, started, state.metrics.clone())
+    } else {
+        buffered_response(id, model, created, rx, started, state.metrics.clone()).await
+    }
+}
+
+/// A dispatch failure that each API surface renders in its own error shape (OpenAI vs Anthropic).
+enum DispatchErr {
+    /// AUP floor rejected the request.
+    Aup(String),
+    /// The global generation backstop (G3b) is full.
+    Overloaded,
+    /// A BYOK-mapped model has no resolvable API key.
+    ByokKeyMissing(String),
+}
+
+/// Shared route/dispatch used by both `/v1/chat/completions` and `/v1/messages`: apply the AUP
+/// floor, acquire a generation slot, then spawn the swarm (or BYOK) worker. Returns the event
+/// channel + start instant, or a typed error the caller formats for its API shape.
+#[allow(clippy::too_many_arguments)]
+fn spawn_dispatch(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+    tools: Vec<Value>,
+) -> Result<(tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>, std::time::Instant), DispatchErr> {
+    // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
+    if let AupDecision::Deny(reason) = state.aup.evaluate(&messages, max_tokens) {
+        return Err(DispatchErr::Aup(reason));
+    }
+    // G3b: acquire a slot in the global generation backstop before spawning a worker thread.
+    let gen_permit = match state.gen_limiter.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            state.metrics.record_rate_limited();
+            return Err(DispatchErr::Overloaded);
+        }
+    };
+    // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
+    // swarm. The key is the caller's `X-Provider-Api-Key` if present, else the operator's.
+    let out = if let Some(provider) = state.byok.provider_for(model) {
         let caller_key = headers.get("x-provider-api-key").and_then(|v| v.to_str().ok());
         let key = match state.byok.resolve_key(provider, caller_key) {
             Some(k) => k,
-            None => {
-                return openai_error(
-                    StatusCode::BAD_REQUEST,
-                    &format!("no API key available for BYOK model '{}'", req.model),
-                    "invalid_request_error",
-                )
-            }
+            None => return Err(DispatchErr::ByokKeyMissing(model.to_string())),
         };
         spawn_byok_worker(
             provider,
             state.byok.base_url(provider).to_string(),
             key,
-            req.model.clone(),
-            req.messages,
-            req.max_tokens,
-            req.temperature,
+            model.to_string(),
+            messages,
+            max_tokens,
+            temperature,
             gen_permit,
         )
     } else {
-        spawn_worker(
-            state.node.clone(),
-            req.model.clone(),
-            req.messages,
-            req.max_tokens,
-            req.temperature,
-            req.tools,
-            gen_permit,
-        )
+        spawn_worker(state.node.clone(), model.to_string(), messages, max_tokens, temperature, tools, gen_permit)
     };
+    Ok(out)
+}
 
-    if req.stream {
-        stream_response(id, req.model, created, want_usage, rx, started, state.metrics.clone())
-    } else {
-        buffered_response(id, req.model, created, rx, started, state.metrics.clone()).await
+/// Render a [`DispatchErr`] as an OpenAI-shaped error response.
+fn dispatch_err_openai(e: DispatchErr) -> Response {
+    match e {
+        DispatchErr::Aup(reason) => {
+            openai_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error")
+        }
+        DispatchErr::Overloaded => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server at generation capacity, retry shortly",
+            "server_overloaded",
+        ),
+        DispatchErr::ByokKeyMissing(m) => openai_error(
+            StatusCode::BAD_REQUEST,
+            &format!("no API key available for BYOK model '{m}'"),
+            "invalid_request_error",
+        ),
     }
 }
 
@@ -605,6 +643,425 @@ fn log_completion(summary: &ServeSummary, wall: std::time::Duration) {
     );
 }
 
+// ── Anthropic Messages API (`POST /v1/messages`) ─────────────────────────────
+//
+// A native inbound translation of Anthropic's Messages API onto the same swarm route as
+// `/v1/chat/completions`, so Anthropic-SDK tools (Claude Code, etc.) plug in with only a
+// `base_url` change — no LiteLLM shim. Requests are converted to the internal OpenAI-shaped
+// `ChatMessage` list (system prompt, text, and full tool-use round-trip), routed via
+// `spawn_dispatch`, then the response is re-shaped into Anthropic's Messages JSON (buffered)
+// or its SSE event sequence (streaming).
+
+/// Anthropic `POST /v1/messages` request fields we honour (others ignored).
+#[derive(Debug, Deserialize)]
+struct MessagesRequest {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    messages: Vec<AntMessage>,
+    /// A system prompt — a bare string or an array of text blocks.
+    #[serde(default)]
+    system: Option<AntSystem>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    stream: bool,
+    /// Anthropic tool definitions (`name` / `description` / `input_schema`).
+    #[serde(default)]
+    tools: Vec<AntTool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AntMessage {
+    role: String,
+    content: AntContent,
+}
+
+/// A message's content: either a bare string or a list of typed blocks.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AntContent {
+    Text(String),
+    Blocks(Vec<AntBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum AntBlock {
+    #[serde(rename = "text")]
+    Text { #[serde(default)] text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: AntToolResultContent,
+    },
+    /// Any other block kind (image, document, …) — carried so deserialization doesn't fail,
+    /// but dropped in conversion (text engines can't consume it).
+    #[serde(other)]
+    Other,
+}
+
+/// A `tool_result` block's payload — a string, or blocks we flatten to their text.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AntToolResultContent {
+    Text(String),
+    Blocks(Vec<Value>),
+}
+impl Default for AntToolResultContent {
+    fn default() -> Self {
+        AntToolResultContent::Text(String::new())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AntSystem {
+    Text(String),
+    Blocks(Vec<Value>),
+}
+
+#[derive(Debug, Deserialize)]
+struct AntTool {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    input_schema: Value,
+}
+
+/// Flatten an Anthropic system prompt (string or text blocks) to a single string.
+fn ant_system_text(sys: &AntSystem) -> String {
+    match sys {
+        AntSystem::Text(s) => s.clone(),
+        AntSystem::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+/// Flatten a `tool_result` payload to a string (OpenAI `role:"tool"` content is text).
+fn ant_tool_result_text(content: &AntToolResultContent) -> String {
+    match content {
+        AntToolResultContent::Text(s) => s.clone(),
+        AntToolResultContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+/// Convert an Anthropic (system, messages) pair into the internal OpenAI-shaped `ChatMessage`
+/// list: the system prompt becomes a leading `system` turn; assistant `tool_use` blocks become
+/// `tool_calls`; user `tool_result` blocks become `role:"tool"` messages keyed by id.
+fn to_chat_messages(system: Option<&AntSystem>, messages: &[AntMessage]) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    if let Some(sys) = system {
+        let s = ant_system_text(sys);
+        if !s.is_empty() {
+            out.push(ChatMessage::new("system", s));
+        }
+    }
+    for m in messages {
+        match &m.content {
+            AntContent::Text(s) => out.push(ChatMessage::new(&m.role, s.clone())),
+            AntContent::Blocks(blocks) if m.role == "assistant" => {
+                let mut text = String::new();
+                let mut tool_calls = Vec::new();
+                for b in blocks {
+                    match b {
+                        AntBlock::Text { text: t } => text.push_str(t),
+                        AntBlock::ToolUse { id, name, input } => tool_calls.push(ToolCall {
+                            id: id.clone(),
+                            kind: "function".to_string(),
+                            function: ToolCallFunction { name: name.clone(), arguments: input.to_string() },
+                        }),
+                        _ => {}
+                    }
+                }
+                out.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: text,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            // user (or any non-assistant) turn with blocks: tool_result → `role:"tool"` messages,
+            // text → a trailing user message (matching OpenAI's assistant→tool→user ordering).
+            AntContent::Blocks(blocks) => {
+                let mut text = String::new();
+                for b in blocks {
+                    match b {
+                        AntBlock::Text { text: t } => text.push_str(t),
+                        AntBlock::ToolResult { tool_use_id, content } => out.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: ant_tool_result_text(content),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_use_id.clone()),
+                            name: None,
+                        }),
+                        _ => {}
+                    }
+                }
+                if !text.is_empty() {
+                    out.push(ChatMessage::new("user", text));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Anthropic tool defs → OpenAI `tools` (the shape the engine already forwards).
+fn to_openai_tools(tools: &[AntTool]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description.clone().unwrap_or_default(),
+                    "parameters": t.input_schema,
+                }
+            })
+        })
+        .collect()
+}
+
+static MSG_COUNTER: AtomicU64 = AtomicU64::new(1);
+fn next_msg_id() -> String {
+    format!("msg_{}", MSG_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// An Anthropic-shaped error response: `{ "type":"error", "error": { type, message } }`.
+fn anthropic_error(status: StatusCode, message: &str, etype: &str) -> Response {
+    (status, Json(json!({ "type": "error", "error": { "type": etype, "message": message } })))
+        .into_response()
+}
+
+fn dispatch_err_anthropic(e: DispatchErr) -> Response {
+    match e {
+        DispatchErr::Aup(reason) => anthropic_error(StatusCode::BAD_REQUEST, &reason, "invalid_request_error"),
+        DispatchErr::Overloaded => anthropic_error(
+            StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            "server at generation capacity, retry shortly",
+            "overloaded_error",
+        ),
+        DispatchErr::ByokKeyMissing(m) => anthropic_error(
+            StatusCode::BAD_REQUEST,
+            &format!("no API key available for BYOK model '{m}'"),
+            "invalid_request_error",
+        ),
+    }
+}
+
+/// The final Anthropic `message` object: text block + one `tool_use` block per tool call.
+fn anthropic_message_object(id: &str, model: &str, content: &str, summary: &ServeSummary) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+    if !content.is_empty() {
+        blocks.push(json!({ "type": "text", "text": content }));
+    }
+    for tc in &summary.tool_calls {
+        let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
+        blocks.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": input }));
+    }
+    let stop_reason = if summary.tool_calls.is_empty() { "end_turn" } else { "tool_use" };
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": summary.metrics.engine.prompt_eval_count,
+            "output_tokens": summary.tokens,
+        },
+    })
+}
+
+async fn messages(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<MessagesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(rej) => {
+            return anthropic_error(StatusCode::BAD_REQUEST, &rej.body_text(), "invalid_request_error")
+        }
+    };
+    state.metrics.incr_chat();
+    if req.model.trim().is_empty() {
+        return anthropic_error(StatusCode::BAD_REQUEST, "missing required field: model", "invalid_request_error");
+    }
+    if req.messages.is_empty() {
+        return anthropic_error(StatusCode::BAD_REQUEST, "missing or empty field: messages", "invalid_request_error");
+    }
+
+    let messages = to_chat_messages(req.system.as_ref(), &req.messages);
+    let tools = to_openai_tools(&req.tools);
+    let id = next_msg_id();
+    let (model, stream) = (req.model.clone(), req.stream);
+
+    let (rx, started) = match spawn_dispatch(
+        &state,
+        &headers,
+        &req.model,
+        messages,
+        req.max_tokens,
+        req.temperature,
+        tools,
+    ) {
+        Ok(v) => v,
+        Err(e) => return dispatch_err_anthropic(e),
+    };
+
+    if stream {
+        anthropic_stream_response(id, model, rx, started, state.metrics.clone())
+    } else {
+        anthropic_buffered_response(id, model, rx, started, state.metrics.clone()).await
+    }
+}
+
+async fn anthropic_buffered_response(
+    id: String,
+    model: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    started: std::time::Instant,
+    metrics: Arc<Metrics>,
+) -> Response {
+    let mut content = String::new();
+    let mut outcome: Option<Result<Box<ServeSummary>, String>> = None;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            GatewayEvent::Delta(t) => content.push_str(&t),
+            GatewayEvent::Done(s) => outcome = Some(Ok(s)),
+            GatewayEvent::Error(m) => outcome = Some(Err(m)),
+        }
+    }
+    match outcome {
+        Some(Ok(summary)) => {
+            let wall = started.elapsed();
+            log_completion(&summary, wall);
+            metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
+            Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
+        }
+        Some(Err(m)) => {
+            metrics.record_error();
+            let (status, _) = classify_error(&m);
+            anthropic_error(status, &m, "api_error")
+        }
+        None => anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "gateway worker produced no result",
+            "api_error",
+        ),
+    }
+}
+
+/// One named Anthropic SSE event.
+fn ant_sse(name: &str, data: Value) -> Event {
+    Event::default().event(name).data(data.to_string())
+}
+
+/// Translate the internal `GatewayEvent` stream into Anthropic's SSE event sequence
+/// (`message_start` → `content_block_start` → `content_block_delta`* → `content_block_stop`
+/// → `message_delta` → `message_stop`). A worker task fans one `Done` out into the several
+/// terminal events Anthropic expects; tool calls become extra `tool_use` blocks.
+fn anthropic_stream_response(
+    id: String,
+    model: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    started: std::time::Instant,
+    metrics: Arc<Metrics>,
+) -> Response {
+    let (etx, erx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    tokio::spawn(async move {
+        let _ = etx.send(ant_sse(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": id, "type": "message", "role": "assistant", "model": model,
+                    "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": 0, "output_tokens": 0 },
+                }
+            }),
+        ));
+        let _ = etx.send(ant_sse(
+            "content_block_start",
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        ));
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                GatewayEvent::Delta(t) => {
+                    let _ = etx.send(ant_sse(
+                        "content_block_delta",
+                        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } }),
+                    ));
+                }
+                GatewayEvent::Done(summary) => {
+                    let wall = started.elapsed();
+                    log_completion(&summary, wall);
+                    metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
+                    let _ = etx.send(ant_sse(
+                        "content_block_stop",
+                        json!({ "type": "content_block_stop", "index": 0 }),
+                    ));
+                    // Each tool call → a `tool_use` block whose arguments stream as one
+                    // `input_json_delta` (clients accumulate + parse it).
+                    for (i, tc) in summary.tool_calls.iter().enumerate() {
+                        let idx = i + 1;
+                        let _ = etx.send(ant_sse(
+                            "content_block_start",
+                            json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": {} } }),
+                        ));
+                        let _ = etx.send(ant_sse(
+                            "content_block_delta",
+                            json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "input_json_delta", "partial_json": tc.function.arguments } }),
+                        ));
+                        let _ = etx.send(ant_sse(
+                            "content_block_stop",
+                            json!({ "type": "content_block_stop", "index": idx }),
+                        ));
+                    }
+                    let stop_reason = if summary.tool_calls.is_empty() { "end_turn" } else { "tool_use" };
+                    let _ = etx.send(ant_sse(
+                        "message_delta",
+                        json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens } }),
+                    ));
+                    let _ = etx.send(ant_sse("message_stop", json!({ "type": "message_stop" })));
+                }
+                GatewayEvent::Error(m) => {
+                    metrics.record_error();
+                    let _ = etx.send(ant_sse(
+                        "error",
+                        json!({ "type": "error", "error": { "type": "api_error", "message": m } }),
+                    ));
+                }
+            }
+        }
+    });
+    Sse::new(UnboundedReceiverStream::new(erx).map(Ok::<Event, std::convert::Infallible>)).into_response()
+}
+
 /// `GET /v1/models` — the models this gateway currently knows a provider for (PEX-learned
 /// / discovered). Dynamic in a decentralized swarm: empty until gossip arrives, then grows
 /// as providers announce. The blocking swarm query runs on a plain OS thread (same reason
@@ -650,11 +1107,14 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// `Authorization: Bearer <key>`; otherwise pass through (open, for loopback).
 async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if let Some(key) = &state.api_key {
+        // Accept OpenAI-style `Authorization: Bearer <key>` and Anthropic-style `x-api-key: <key>`
+        // (so `/v1/messages` clients like Claude Code authenticate with their native header).
         let presented = req
             .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .or_else(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()));
         let ok = presented.is_some_and(|t| constant_time_eq(t, key));
         if !ok {
             return openai_error(
@@ -930,6 +1390,7 @@ pub fn router(
     // limiter — the limiter can then key off the validated API key.
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
@@ -987,6 +1448,85 @@ mod tests {
             discover_ns: 1_000_000,
             tool_calls: Vec::new(),
         }
+    }
+
+    // ── Anthropic `/v1/messages` translation ──
+
+    #[test]
+    fn ant_string_content_and_system_convert() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 16,
+            "system": "be brief",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .unwrap();
+        let msgs = to_chat_messages(req.system.as_ref(), &req.messages);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!((msgs[0].role.as_str(), msgs[0].content.as_str()), ("system", "be brief"));
+        assert_eq!((msgs[1].role.as_str(), msgs[1].content.as_str()), ("user", "hi"));
+    }
+
+    #[test]
+    fn ant_tool_roundtrip_converts_to_openai_shapes() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "weather?" }] },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "checking" },
+                    { "type": "tool_use", "id": "tu_1", "name": "get_weather", "input": { "city": "SF" } }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "72F" }
+                ] }
+            ]
+        }))
+        .unwrap();
+        let msgs = to_chat_messages(req.system.as_ref(), &req.messages);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        let tc = msgs[1].tool_calls.as_ref().expect("assistant tool_calls");
+        assert_eq!((tc[0].id.as_str(), tc[0].function.name.as_str()), ("tu_1", "get_weather"));
+        assert!(tc[0].function.arguments.contains("SF"));
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tu_1"));
+        assert_eq!(msgs[2].content, "72F");
+    }
+
+    #[test]
+    fn anthropic_message_object_text_then_tool_use() {
+        let mut s = summary(5, 3);
+        let obj = anthropic_message_object("msg_1", "m", "hello", &s);
+        assert_eq!(obj["type"], "message");
+        assert_eq!(obj["content"][0]["type"], "text");
+        assert_eq!(obj["content"][0]["text"], "hello");
+        assert_eq!(obj["stop_reason"], "end_turn");
+        assert_eq!(obj["usage"]["input_tokens"], 3);
+        assert_eq!(obj["usage"]["output_tokens"], 5);
+
+        s.tool_calls = vec![ToolCall {
+            id: "tu_9".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "f".into(), arguments: "{\"x\":1}".into() },
+        }];
+        let obj = anthropic_message_object("msg_2", "m", "", &s);
+        assert_eq!(obj["stop_reason"], "tool_use");
+        assert_eq!(obj["content"][0]["type"], "tool_use");
+        assert_eq!(obj["content"][0]["id"], "tu_9");
+        assert_eq!(obj["content"][0]["input"]["x"], 1);
+    }
+
+    #[test]
+    fn ant_tools_map_to_openai_functions() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "f", "description": "d", "input_schema": { "type": "object" } }]
+        }))
+        .unwrap();
+        let t = to_openai_tools(&req.tools);
+        assert_eq!(t[0]["type"], "function");
+        assert_eq!(t[0]["function"]["name"], "f");
+        assert_eq!(t[0]["function"]["parameters"]["type"], "object");
     }
 
     #[test]
