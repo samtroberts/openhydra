@@ -165,76 +165,9 @@ pub async fn start_proxy_listener() -> io::Result<(TcpListener, String)> {
     Ok((listener, addr))
 }
 
-// ── CP-1: Wire format negotiation ──────────────────────────────────────
-
-/// Detected wire format of an inbound proxy message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireFormat {
-    /// New ForwardMsg binary format (magic 0x4F485632 "OHV2").
-    ForwardMsg,
-    /// Legacy protobuf (anything that doesn't start with OHV2 magic).
-    LegacyProtobuf,
-}
-
-/// Detect the wire format of an inbound proxy message by inspecting
-/// the first 4 bytes.
-///
-/// This is the sole format-negotiation point: all inbound proxy
-/// messages pass through this check before dispatch.
-#[inline]
-pub fn detect_wire_format(data: &[u8]) -> WireFormat {
-    if crate::forward_msg::is_forward_msg(data) {
-        WireFormat::ForwardMsg
-    } else {
-        WireFormat::LegacyProtobuf
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_detect_forward_msg() {
-        // Build a minimal ForwardMsg.
-        let header = crate::ipc_codec::IpcForwardHeader {
-            request_id: "x".into(),
-            ..Default::default()
-        };
-        let wire = crate::forward_msg::encode(
-            crate::forward_msg::MsgType::Forward,
-            &header,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(detect_wire_format(&wire), WireFormat::ForwardMsg);
-    }
-
-    #[test]
-    fn test_detect_legacy_protobuf() {
-        // Protobuf messages start with field tags, not OHV2.
-        let protobuf = vec![0x0A, 0x10, 0x08, 0x01, 0x12, 0x04];
-        assert_eq!(detect_wire_format(&protobuf), WireFormat::LegacyProtobuf);
-    }
-
-    #[test]
-    fn test_detect_empty_is_legacy() {
-        assert_eq!(detect_wire_format(&[]), WireFormat::LegacyProtobuf);
-    }
-
-    #[test]
-    fn test_detect_method_prefix_is_legacy() {
-        // Method prefix bytes (0x01–0x06) used by Python proxy handler.
-        for prefix in 1u8..=6u8 {
-            let msg = vec![prefix, 0x0A, 0x10, 0x08];
-            assert_eq!(
-                detect_wire_format(&msg),
-                WireFormat::LegacyProtobuf,
-                "prefix 0x{:02X} should be legacy",
-                prefix
-            );
-        }
-    }
 
     // ── E-S6: framed read bounds the pre-auth allocation ───────────────────
 
