@@ -260,32 +260,32 @@
 
         <!-- CONNECTORS -->
         <section class="view" id="v-connectors">
-          <div class="card pad" style="margin-bottom:14px;font-size:13px"><b>OpenHydra is an OpenAI-compatible endpoint</b> at <span class="mono">http://127.0.0.1:16527/v1</span>. Point any tool with a custom base URL at it. <span class="badge ok">direct</span> plugs in as-is · <span class="badge warn">shim</span> needs an Anthropic→OpenAI proxy.</div>
+          <div class="card pad" style="margin-bottom:14px;font-size:13px"><b>OpenHydra is a drop-in endpoint for coding tools</b> — OpenAI-compatible at <span class="mono">http://127.0.0.1:16527/v1</span> and native Anthropic at <span class="mono">http://127.0.0.1:16527</span>. <b>Connect</b> wires a supported tool in one click; <b>Test</b> sends a live 1-token check. Others: copy the snippet.</div>
           <div class="conn">
-            <div class="conncard"><div class="hd"><b>OpenCode</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">export OPENAI_BASE_URL=http://127.0.0.1:16527/v1
+            <div class="conncard" data-key="opencode"><div class="hd"><span class="clogo" style="--lc:#111"><svg viewBox="0 0 24 24"><path d="M22 24H2V0h20zM17 4.8H7v14.4h10z"/></svg></span><b>OpenCode</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">export OPENAI_BASE_URL=http://127.0.0.1:16527/v1
 export OPENAI_API_KEY=oh-local
-# model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>VS Code · Continue</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">provider: openai
+# model: openhydra/auto</div><div class="connact"><span class="cstat off">●</span><span class="cstat-t">…</span><button class="btn ghost sm cp" style="margin-left:auto">Copy</button><button class="btn ghost sm ctest">Test</button><button class="btn sm cconnect">Connect</button></div></div>
+            <div class="conncard" data-key="continue"><div class="hd"><span class="clogo" style="--lc:#2f74c0">VS</span><b>VS Code · Continue</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">provider: openai
 apiBase: http://127.0.0.1:16527/v1
-model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>Claude Code</b><span class="badge warn" style="margin-left:auto">shim</span></div><div class="snippet"># Anthropic API → run a translating proxy
-# (LiteLLM) in front of OpenHydra
-ANTHROPIC_BASE_URL=http://127.0.0.1:4000<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>OpenClaw</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">openclaw config set model.baseUrl \
-  http://127.0.0.1:16527/v1
-openclaw config set model.name openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>Neovim · codecompanion</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">adapter = "openai_compatible"
+model: openhydra/auto</div><div class="connact"><span class="cstat off">●</span><span class="cstat-t">…</span><button class="btn ghost sm cp" style="margin-left:auto">Copy</button><button class="btn ghost sm ctest">Test</button><button class="btn sm cconnect">Connect</button></div></div>
+            <div class="conncard" data-key="claude"><div class="hd"><span class="clogo" style="--lc:#d97757"><svg viewBox="0 0 24 24"><path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z"/></svg></span><b>Claude Code</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet"># Native Anthropic /v1/messages — no proxy needed
+export ANTHROPIC_BASE_URL=http://127.0.0.1:16527
+export ANTHROPIC_API_KEY=oh-local</div><div class="connact"><span class="cstat off">●</span><span class="cstat-t">…</span><button class="btn ghost sm cp" style="margin-left:auto">Copy</button><button class="btn ghost sm ctest">Test</button><button class="btn sm cconnect">Connect</button></div></div>
+            <div class="conncard"><div class="hd"><span class="clogo" style="--lc:#8b5cf6">π</span><b>Pi</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet"># ~/.pi/agent/models.json → provider "openhydra"
+#   baseUrl http://127.0.0.1:16527/v1 · api openai-completions
+pi -p --provider openhydra --model openhydra/auto</div><div class="connact"><button class="btn ghost sm cp" style="margin-left:auto">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><span class="clogo" style="--lc:#b0895b">H</span><b>Hermes</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">hermes config set model.provider custom
+hermes config set model.base_url http://127.0.0.1:16527/v1
+hermes config set model.name openhydra/auto</div><div class="connact"><button class="btn ghost sm cp" style="margin-left:auto">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><span class="clogo" style="--lc:#57a143"><svg viewBox="0 0 24 24"><path d="M2.214 4.954v13.615L7.655 24V10.314L3.312 3.845 2.214 4.954zm4.999 17.98l-4.557-4.548V5.136l.59-.596 3.967 5.908v12.485zm14.573-4.457l-.862.937-4.24-6.376V0l5.068 5.092.034 13.385zM7.431.001l12.998 19.835-3.637 3.637L3.787 3.683 7.43 0z"/></svg></span><b>Neovim · codecompanion</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">adapter = "openai_compatible"
 url = "http://127.0.0.1:16527/v1"
-model = "openhydra/auto"<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>Emacs · gptel</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">(gptel-make-openai "OpenHydra"
+model = "openhydra/auto"</div><div class="connact"><button class="btn ghost sm cp" style="margin-left:auto">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><span class="clogo" style="--lc:#7f5ab6"><svg viewBox="0 0 24 24"><path d="M12,24C5.448,24,0.118,18.617,0.118,12S5.448,0,12,0c6.552,0,11.882,5.383,11.882,12S18.552,24,12,24z M12,0.661 C5.813,0.661,0.779,5.748,0.779,12S5.813,23.339,12,23.339c6.187,0,11.221-5.086,11.221-11.339S18.187,0.661,12,0.661z M8.03,20.197 c0,0,0.978,0.069,2.236-0.042c0.51-0.045,2.444-0.235,3.891-0.552c0,0,1.764-0.377,2.707-0.725c0.987-0.364,1.524-0.673,1.766-1.11 c-0.011-0.09,0.074-0.408-0.381-0.599c-1.164-0.488-2.514-0.4-5.185-0.457c-2.962-0.102-3.948-0.598-4.472-0.997 c-0.503-0.405-0.25-1.526,1.907-2.513c1.086-0.526,5.345-1.496,5.345-1.496c-1.434-0.709-4.109-1.955-4.659-2.224 c-0.482-0.236-1.254-0.591-1.421-1.021c-0.19-0.413,0.448-0.768,0.804-0.87c1.147-0.331,2.766-0.536,4.24-0.56 c0.741-0.012,0.861-0.059,0.861-0.059c1.022-0.17,1.695-0.869,1.414-1.976c-0.252-1.13-1.579-1.795-2.84-1.565 c-1.188,0.217-4.05,1.048-4.05,1.048c3.539-0.031,4.131,0.028,4.395,0.398c0.156,0.218-0.071,0.518-1.015,0.672 c-1.027,0.168-3.163,0.37-3.163,0.37c-2.049,0.122-3.492,0.13-3.925,1.046C6.202,7.564,6.787,8.094,7.043,8.425 c1.082,1.204,2.646,1.853,3.652,2.331c0.379,0.18,1.49,0.52,1.49,0.52c-3.265-0.18-5.619,0.823-7.001,1.977 c-1.562,1.445-0.871,3.168,2.33,4.228c1.891,0.626,2.828,0.921,5.648,0.667c1.661-0.09,1.923-0.036,1.939,0.1 c0.023,0.192-1.845,0.669-2.355,0.816C11.448,19.438,8.047,20.193,8.03,20.197z"/></svg></span><b>Emacs · gptel</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">(gptel-make-openai "OpenHydra"
   :host "127.0.0.1:16527" :protocol "http"
-  :models '("openhydra/auto"))<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>Pi</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">pi config set api.baseUrl \
+  :models '("openhydra/auto"))</div><div class="connact"><button class="btn ghost sm cp" style="margin-left:auto">Copy</button></div></div>
+            <div class="conncard"><div class="hd"><span class="clogo" style="--lc:#6366f1">Cw</span><b>OpenClaw</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet">openclaw config set model.baseUrl \
   http://127.0.0.1:16527/v1
-pi config set api.model openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
-            <div class="conncard"><div class="hd"><b>Hermes</b><span class="badge ok" style="margin-left:auto">direct</span></div><div class="snippet"># Settings → Model provider → OpenAI-compatible
-base_url: http://127.0.0.1:16527/v1
-model: openhydra/auto<button class="btn ghost sm cp">Copy</button></div></div>
+openclaw config set model.name openhydra/auto</div><div class="connact"><button class="btn ghost sm cp" style="margin-left:auto">Copy</button></div></div>
           </div>
         </section>
 

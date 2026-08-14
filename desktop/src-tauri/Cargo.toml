@@ -28,6 +28,10 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Connectors: merge the OpenHydra provider block into a tool's own config file. OpenCode is JSON
+# (serde_json), Continue is YAML. serde_yaml is archived-but-stable; it only ever touches a config
+# the user explicitly clicks "Connect" on (always backed up first).
+serde_yaml = "0.9"
 # Engine detection (detect_engines / MultiAdapter's probe) + the blocking HTTP client
 # used for the gateway health check. The GUI never runs the swarm in-process.
 openhydra-agent = { path = "../../agent" }

@@ -225,6 +225,23 @@
   .snippet{font-family:var(--mono);font-size:11.5px;line-height:1.55;background:hsl(var(--muted)/.6);border:1px solid hsl(var(--border));
     border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-word;position:relative;color:hsl(var(--foreground))}
   .snippet .cp{position:absolute;top:7px;right:7px}
+  .clogo{width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center;
+    font-size:11px;font-weight:700;color:#fff;background:var(--lc,#64748b);flex:0 0 auto}
+  .clogo svg{width:15px;height:15px;fill:#fff}
+  .connact{display:flex;align-items:center;gap:7px;margin-top:2px}
+  .connact .cstat{font-size:9px;line-height:1}.connact .cstat.on{color:hsl(var(--success))}.connact .cstat.off{color:hsl(var(--muted-foreground))}
+  .connact .cstat-t{font-size:11.5px;color:hsl(var(--muted-foreground))}
+  .cmodal-back{position:fixed;inset:0;background:hsl(240 10% 3.9% /.5);display:flex;align-items:center;justify-content:center;z-index:100;padding:24px}
+  .cmodal{width:min(560px,100%);max-height:80vh;display:flex;flex-direction:column;border:1px solid hsl(var(--border));border-radius:12px;
+    background:hsl(var(--popover));box-shadow:0 10px 40px hsl(240 10% 3.9% /.25);overflow:hidden}
+  .cmodal-h{padding:13px 16px;border-bottom:1px solid hsl(var(--border));font-size:13px}
+  .cmodal-b{padding:14px 16px;overflow:auto}
+  .cmodal-path{font-size:12.5px;color:hsl(var(--muted-foreground));margin-bottom:9px}.cmodal-path code{font-family:var(--mono);color:hsl(var(--foreground))}
+  .cmodal-warn{font-size:12px;color:hsl(var(--warning));background:hsl(var(--warning)/.1);border:1px solid hsl(var(--warning)/.35);
+    border-radius:8px;padding:7px 10px;margin-bottom:10px}
+  .cmodal-pre{font-family:var(--mono);font-size:11px;line-height:1.5;background:hsl(var(--muted)/.6);border:1px solid hsl(var(--border));
+    border-radius:8px;padding:10px;max-height:38vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .cmodal-f{padding:11px 16px;border-top:1px solid hsl(var(--border));display:flex;justify-content:flex-end;gap:8px}
 
   .statusbar{height:40px;flex:none;border-top:1px solid hsl(var(--border));background:hsl(var(--sidebar));
     display:flex;align-items:center;gap:14px;padding:0 16px;font-size:12px;color:hsl(var(--muted-foreground))}

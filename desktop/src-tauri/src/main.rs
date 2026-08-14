@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 mod hostinfo;
+mod connectors;
 mod installer;
 
 // ── Child-pid registry (crash/kill safety) ──
@@ -1129,6 +1130,62 @@ async fn chat_completion(
     .map_err(|e| e.to_string())?
 }
 
+// ── Connectors: detect installed coding tools + one-click wire them to the gateway ──
+
+/// Detection status for every known connector (installed? where?). Read-only.
+#[tauri::command]
+fn connector_status() -> Vec<connectors::ConnectorStatus> {
+    connectors::statuses()
+}
+
+/// The gateway origin the connectors point tools at (`http://127.0.0.1:<port>`).
+fn gateway_origin(state: &tauri::State<'_, AppState>) -> Result<String, String> {
+    let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+/// Preview (no write) what Connect would do for `key` — path, create/update, the full new content,
+/// and any caveat. The UI shows this for confirmation before Apply.
+#[tauri::command]
+fn connector_preview(state: tauri::State<'_, AppState>, key: String) -> Result<connectors::ConnectPreview, String> {
+    let origin = gateway_origin(&state)?;
+    connectors::preview(&key, &origin)
+}
+
+/// Write the OpenHydra block into `key`'s config (backs up any existing file first). Called only
+/// after the user confirms the preview.
+#[tauri::command]
+fn connector_apply(state: tauri::State<'_, AppState>, key: String) -> Result<connectors::ConnectReport, String> {
+    let origin = gateway_origin(&state)?;
+    connectors::apply(&key, &origin)
+}
+
+/// "Test" button: a bounded 1-token `openhydra/auto` completion through the local gateway; returns
+/// the model that served it, or an actionable error (gateway down / no provider).
+#[tauri::command]
+async fn connector_test(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
+    let body = serde_json::json!({
+        "model": "openhydra/auto",
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        use openhydra_agent::adapter::HttpClient;
+        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let resp = client
+            .post_json(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
+            .map_err(|e| format!("gateway unreachable on :{port} — is OpenHydra sharing/serving? ({e})"))?;
+        let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
+        if let Some(err) = v.get("error") {
+            return Err(err.get("message").and_then(|m| m.as_str()).unwrap_or("gateway error").to_string());
+        }
+        Ok(v.get("model").and_then(|m| m.as_str()).unwrap_or("ok").to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// One web-search hit handed to the UI.
 #[derive(Serialize)]
 struct SearchHit {
@@ -1362,6 +1419,10 @@ fn main() {
             appimage_status,
             integrate_appimage,
             export_logs,
+            connector_status,
+            connector_preview,
+            connector_apply,
+            connector_test,
         ])
         .setup(|app| {
             use tauri::tray::TrayIconBuilder;

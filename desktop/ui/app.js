@@ -22,6 +22,23 @@
     if (cmd === "stop_gateway") { mk.gateway = false; return null; }
     if (cmd === "save_settings") { if (args?.settings) mk.sharedModels = args.settings.shared_models || []; return null; }
     if (cmd === "gateway_health") return mk.gateway;
+    if (cmd === "connector_status") return [
+      { key: "opencode", label: "OpenCode", kind: "opencode", installed: true, detail: "/usr/local/bin/opencode" },
+      { key: "claude", label: "Claude Code", kind: "claude", installed: true, detail: "/usr/local/bin/claude" },
+      { key: "continue", label: "Continue", kind: "continue", installed: false, detail: null },
+    ];
+    if (cmd === "connector_preview") {
+      const key = args?.key;
+      const paths = { opencode: "~/.config/opencode/opencode.json", claude: "~/.claude/settings.json", continue: "~/.continue/config.yaml" };
+      const previews = {
+        opencode: '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {\n    "openhydra": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "OpenHydra",\n      "options": { "baseURL": "http://127.0.0.1:16527/v1", "apiKey": "oh-local" },\n      "models": { "openhydra/auto": { "name": "OpenHydra Auto" } }\n    }\n  },\n  "model": "openhydra/openhydra/auto"\n}',
+        claude: '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:16527",\n    "ANTHROPIC_API_KEY": "oh-local"\n  }\n}',
+        continue: "models:\n- name: OpenHydra\n  provider: openai\n  model: openhydra/auto\n  apiBase: http://127.0.0.1:16527/v1\n  apiKey: oh-local\n  roles:\n  - chat\n  - edit\n  - apply\n",
+      };
+      return { key, kind: key, path: paths[key], action: "create", preview: previews[key] || "{}", warning: key === "continue" ? "Continue's config.yaml will be reformatted (comments/spacing are not preserved). The original is backed up." : null };
+    }
+    if (cmd === "connector_apply") return { key: args?.key, path: "~/(config)", backup: null, action: "added" };
+    if (cmd === "connector_test") return mk.gateway ? "granite4.1:3b" : Promise.reject("gateway unreachable on :16527 — is OpenHydra sharing/serving?");
     if (cmd === "get_state") return {
       provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: mk.provider ? 2 : 0, relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
@@ -1103,7 +1120,64 @@
       : `<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`;
   }
   function renderConnectors() {
-    $("#v-connectors .cp") && $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied"); });
+    $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const sn = b.closest(".conncard")?.querySelector(".snippet"); navigator.clipboard?.writeText((sn?.textContent || "").trim()); toast("Copied"); });
+    wireConnectors();
+  }
+
+  // Detect installed tools + wire Connect/Test on the actionable connector cards.
+  async function wireConnectors() {
+    let statuses = [];
+    try { statuses = await call("connector_status"); } catch {}
+    const byKey = {}; statuses.forEach((s) => (byKey[s.key] = s));
+    $$("#v-connectors .conncard[data-key]").forEach((card) => {
+      const key = card.dataset.key;
+      const st = byKey[key];
+      const dot = $(".cstat", card), lbl = $(".cstat-t", card);
+      if (dot) { dot.textContent = "●"; dot.className = "cstat " + (st?.installed ? "on" : "off"); }
+      if (lbl) lbl.textContent = st?.installed ? "installed" : "not detected";
+      const connectBtn = $(".cconnect", card), testBtn = $(".ctest", card);
+      if (connectBtn) connectBtn.onclick = () => connectTool(key);
+      if (testBtn) testBtn.onclick = () => testGateway(testBtn);
+    });
+  }
+
+  async function connectTool(key) {
+    let pv;
+    try { pv = await call("connector_preview", { key }); }
+    catch (e) { toast("Preview failed: " + e); return; }
+    if (!(await confirmConnect(pv))) return;
+    try {
+      const rep = await call("connector_apply", { key });
+      toast(`Connected — ${rep.action} config` + (rep.backup ? " (original backed up)" : ""));
+    } catch (e) { toast("Connect failed: " + e); }
+  }
+
+  async function testGateway(btn) {
+    const prev = btn.textContent; btn.textContent = "Testing…"; btn.disabled = true;
+    try { const model = await call("connector_test"); toast("Gateway OK → " + model); }
+    catch (e) { toast("Test failed: " + e); }
+    finally { btn.textContent = prev; btn.disabled = false; }
+  }
+
+  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+  // A self-contained confirm dialog showing exactly what Connect will write. Resolves true/false.
+  function confirmConnect(pv) {
+    return new Promise((resolve) => {
+      const back = document.createElement("div");
+      back.className = "cmodal-back";
+      back.innerHTML =
+        `<div class="cmodal"><div class="cmodal-h"><b>Connect ${escapeHtml(pv.key)} to OpenHydra</b></div>` +
+        `<div class="cmodal-b"><div class="cmodal-path">${pv.action === "create" ? "Create" : "Update"} <code>${escapeHtml(pv.path)}</code></div>` +
+        (pv.warning ? `<div class="cmodal-warn">⚠ ${escapeHtml(pv.warning)}</div>` : "") +
+        `<pre class="cmodal-pre">${escapeHtml(pv.preview)}</pre></div>` +
+        `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm cok">Write config</button></div></div>`;
+      document.body.appendChild(back);
+      const done = (v) => { back.remove(); resolve(v); };
+      $(".cx", back).onclick = () => done(false);
+      $(".cok", back).onclick = () => done(true);
+      back.onclick = (e) => { if (e.target === back) done(false); };
+    });
   }
   // libp2p ids of the infrastructure we're connected to (bootstraps + circuit relays) — these
   // aren't "peers" a user cares about, so we hide them from the Peers list.
