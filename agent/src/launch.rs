@@ -112,15 +112,17 @@ fn spec_for(tool: &str) -> Option<&'static ToolSpec> {
 fn resolve_tool_bin(bins: &[&str]) -> Option<PathBuf> {
     let probe = if cfg!(windows) { "where" } else { "which" };
     for b in bins {
-        let on_path = Command::new(probe)
-            .arg(b)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if on_path {
-            return Some(PathBuf::from(*b));
+        // Capture the *full resolved path* (with extension on Windows, e.g. `…\claude.cmd`) — a bare
+        // name won't run on Windows, and the full path is what `exec_tool` needs to detect a shim.
+        if let Ok(out) = Command::new(probe).arg(b).stderr(Stdio::null()).output() {
+            if out.status.success() {
+                if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
+                    let p = line.trim();
+                    if !p.is_empty() {
+                        return Some(PathBuf::from(p));
+                    }
+                }
+            }
         }
         #[cfg(not(windows))]
         {
@@ -157,13 +159,13 @@ fn gateway_reachable(origin: &str) -> bool {
     if !hostport.contains(':') {
         return true;
     }
+    // Try EVERY resolved address (a dual-stack host like `localhost` often yields `::1` first while
+    // the gateway listens only on IPv4 — probing just the first would falsely warn). A refused
+    // connection returns immediately, so this stays fast; `.any` short-circuits on the first hit.
     match hostport.to_socket_addrs() {
-        Ok(mut addrs) => addrs
-            .next()
-            .map(|a| {
-                std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(800)).is_ok()
-            })
-            .unwrap_or(false),
+        Ok(addrs) => addrs.into_iter().any(|a| {
+            std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(500)).is_ok()
+        }),
         Err(_) => true,
     }
 }
@@ -239,23 +241,45 @@ pub fn run(args: LaunchArgs) -> Result<(), String> {
     };
     eprintln!("openhydra launch: starting {tool} → {origin} ({model_note})");
 
-    let mut cmd = Command::new(&bin);
-    cmd.args(&args.args);
-    for (k, v) in &env {
-        cmd.env(k, v);
-    }
-    exec_tool(cmd)
+    exec_tool(&bin, &args.args, &env)
 }
 
 #[cfg(unix)]
-fn exec_tool(mut cmd: Command) -> Result<(), String> {
+fn exec_tool(bin: &Path, args: &[String], env: &[(String, String)]) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     // exec replaces this process; it only returns on failure.
     Err(format!("failed to launch: {}", cmd.exec()))
 }
 
 #[cfg(windows)]
-fn exec_tool(mut cmd: Command) -> Result<(), String> {
+fn exec_tool(bin: &Path, args: &[String], env: &[(String, String)]) -> Result<(), String> {
+    // npm/yarn/bun global installs create `.cmd`/`.bat` shims that CreateProcess can't execute
+    // directly — those must go through `cmd /C`. A real `.exe` is launched directly.
+    let is_shim = bin
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            e == "cmd" || e == "bat"
+        })
+        .unwrap_or(false);
+    let mut cmd = if is_shim {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(bin).args(args);
+        c
+    } else {
+        let mut c = Command::new(bin);
+        c.args(args);
+        c
+    };
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     match cmd.status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(0)),
         Err(e) => Err(format!("failed to launch: {e}")),

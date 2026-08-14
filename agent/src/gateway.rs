@@ -228,6 +228,11 @@ async fn resolve_model(
     fallback_unservable: bool,
 ) -> Result<String, String> {
     let auto = is_auto_model(requested);
+    // A concrete BYOK-mapped model is served directly (never announced on the swarm) — pass it
+    // through untouched, and skip the discovery query entirely.
+    if !auto && state.byok.provider_for(requested).is_some() {
+        return Ok(requested.to_string());
+    }
     // Fast path: a concrete model on the strict (OpenAI) surface needs no discovery query.
     if !auto && !fallback_unservable {
         return Ok(requested.to_string());
@@ -415,22 +420,21 @@ async fn chat_completions(
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let stream = req.stream;
-    // Resolve `openhydra/auto` → a concrete live model before routing (and echo it back). Strict:
-    // a concrete OpenAI model is passed through (a real "no provider" if nobody serves it).
-    let model = match resolve_model(&state, &req.model, false).await {
-        Ok(m) => m,
-        Err(e) => return openai_error(StatusCode::SERVICE_UNAVAILABLE, &e, "no_provider"),
-    };
-
-    let (rx, started) = match spawn_dispatch(
+    // AUP → generation slot → model resolution (`openhydra/auto`; OpenAI stays strict) → BYOK/swarm
+    // dispatch, all inside spawn_dispatch so the backstop bounds the discovery query too. The
+    // resolved concrete model is echoed back.
+    let (model, rx, started) = match spawn_dispatch(
         &state,
         &headers,
-        &model,
+        &req.model,
+        false,
         req.messages,
         req.max_tokens,
         req.temperature,
         req.tools,
-    ) {
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => return dispatch_err_openai(e),
     };
@@ -450,26 +454,33 @@ enum DispatchErr {
     Overloaded,
     /// A BYOK-mapped model has no resolvable API key.
     ByokKeyMissing(String),
+    /// Model resolution found nothing to serve (e.g. `auto` with no live models).
+    NoModels(String),
 }
 
 /// Shared route/dispatch used by both `/v1/chat/completions` and `/v1/messages`: apply the AUP
-/// floor, acquire a generation slot, then spawn the swarm (or BYOK) worker. Returns the event
-/// channel + start instant, or a typed error the caller formats for its API shape.
+/// floor, acquire a generation slot, **then** resolve the model and spawn the swarm (or BYOK)
+/// worker. Resolution runs after the permit so the backstop bounds its (blocking) discovery query,
+/// and recognises BYOK models before any swarm fallback. Returns the *resolved* model (for the
+/// response echo) + the event channel + start instant, or a typed error the caller shapes.
 #[allow(clippy::too_many_arguments)]
-fn spawn_dispatch(
+async fn spawn_dispatch(
     state: &AppState,
     headers: &axum::http::HeaderMap,
-    model: &str,
+    requested_model: &str,
+    fallback_unservable: bool,
     messages: Vec<ChatMessage>,
     max_tokens: Option<u32>,
     temperature: Option<f64>,
     tools: Vec<Value>,
-) -> Result<(tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>, std::time::Instant), DispatchErr> {
+) -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>, std::time::Instant), DispatchErr>
+{
     // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
     if let AupDecision::Deny(reason) = state.aup.evaluate(&messages, max_tokens) {
         return Err(DispatchErr::Aup(reason));
     }
-    // G3b: acquire a slot in the global generation backstop before spawning a worker thread.
+    // G3b: acquire the global generation slot BEFORE any (blocking) discovery work, so the backstop
+    // bounds resolution too.
     let gen_permit = match state.gen_limiter.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -477,28 +488,33 @@ fn spawn_dispatch(
             return Err(DispatchErr::Overloaded);
         }
     };
+    // Resolve `openhydra/auto` (and, on the Anthropic surface, an unservable id) to a concrete
+    // model. BYOK-mapped ids are recognised inside `resolve_model` so they're never rewritten.
+    let model = resolve_model(state, requested_model, fallback_unservable)
+        .await
+        .map_err(DispatchErr::NoModels)?;
     // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
     // swarm. The key is the caller's `X-Provider-Api-Key` if present, else the operator's.
-    let out = if let Some(provider) = state.byok.provider_for(model) {
+    let (rx, started) = if let Some(provider) = state.byok.provider_for(&model) {
         let caller_key = headers.get("x-provider-api-key").and_then(|v| v.to_str().ok());
         let key = match state.byok.resolve_key(provider, caller_key) {
             Some(k) => k,
-            None => return Err(DispatchErr::ByokKeyMissing(model.to_string())),
+            None => return Err(DispatchErr::ByokKeyMissing(model)),
         };
         spawn_byok_worker(
             provider,
             state.byok.base_url(provider).to_string(),
             key,
-            model.to_string(),
+            model.clone(),
             messages,
             max_tokens,
             temperature,
             gen_permit,
         )
     } else {
-        spawn_worker(state.node.clone(), model.to_string(), messages, max_tokens, temperature, tools, gen_permit)
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, gen_permit)
     };
-    Ok(out)
+    Ok((model, rx, started))
 }
 
 /// Render a [`DispatchErr`] as an OpenAI-shaped error response.
@@ -517,6 +533,7 @@ fn dispatch_err_openai(e: DispatchErr) -> Response {
             &format!("no API key available for BYOK model '{m}'"),
             "invalid_request_error",
         ),
+        DispatchErr::NoModels(m) => openai_error(StatusCode::SERVICE_UNAVAILABLE, &m, "no_provider"),
     }
 }
 
@@ -937,6 +954,7 @@ fn dispatch_err_anthropic(e: DispatchErr) -> Response {
             &format!("no API key available for BYOK model '{m}'"),
             "invalid_request_error",
         ),
+        DispatchErr::NoModels(m) => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, &m, "api_error"),
     }
 }
 
@@ -989,23 +1007,22 @@ async fn messages(
     let tools = to_openai_tools(&req.tools);
     let id = next_msg_id();
     let stream = req.stream;
-    // Resolve the model, bridging Claude Code: `openhydra/auto` and any model OpenHydra doesn't
-    // serve (e.g. the `claude-*` id Claude Code insists on) route to a live model; a served model
-    // is used as-is. Echoed back in the response.
-    let model = match resolve_model(&state, &req.model, true).await {
-        Ok(m) => m,
-        Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, &e, "api_error"),
-    };
-
-    let (rx, started) = match spawn_dispatch(
+    // Bridge Claude Code: on this Anthropic surface an unservable id (e.g. the `claude-*` id Claude
+    // Code insists on) routes to a live model; `openhydra/auto`, served, and BYOK models resolve as
+    // usual. All inside spawn_dispatch (the permit bounds the discovery query). Resolved model
+    // echoed back in the response.
+    let (model, rx, started) = match spawn_dispatch(
         &state,
         &headers,
-        &model,
+        &req.model,
+        true,
         messages,
         req.max_tokens,
         req.temperature,
         tools,
-    ) {
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => return dispatch_err_anthropic(e),
     };
