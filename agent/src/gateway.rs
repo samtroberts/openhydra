@@ -27,7 +27,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{extract::State, Json, Router};
@@ -47,6 +47,14 @@ use openhydra_network::handle::NetworkHandle;
 /// worker's lifetime; when none is free the gateway sheds with `503` rather than pile up
 /// threads. Set high so it only ever trips under genuine overload.
 const MAX_CONCURRENT_GENERATIONS: usize = 512;
+
+/// SSE keep-alive comment interval — keeps a streaming connection warm through any stall so a
+/// client read-timeout can't trip during a cold-model load / prefill / slow provider.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How often the Anthropic streamer emits a native `ping` while awaiting the first frame (during
+/// discovery + prefill), so a client's first-byte timeout survives a slow start without us
+/// fabricating a message envelope.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 use crate::adapter::{ChatMessage, EmbeddingAdapter, EngineAdapter, InferenceRequest, ToolCall, ToolCallFunction};
 use crate::aup::{AupDecision, AupPolicy};
@@ -664,7 +672,12 @@ fn stream_response(
         Ok::<Event, std::convert::Infallible>(Event::default().data(data))
     });
     let done = tokio_stream::once(Ok(Event::default().data("[DONE]")));
-    Sse::new(role.chain(body).chain(done)).into_response()
+    // Keep-alive comments (`:`) during any stall (cold-model load / prefill / a slow provider)
+    // keep the connection warm so a client read-timeout can't trip mid-stream; SSE parsers ignore
+    // comment lines.
+    Sse::new(role.chain(body).chain(done))
+        .keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL))
+        .into_response()
 }
 
 /// `stream: false` (the OpenAI default) → collect the whole completion and return a single
@@ -1092,7 +1105,9 @@ fn anthropic_stream_response(
     tokio::spawn(anthropic_stream_worker(id, model, rx, started, metrics, etx));
     let body = UnboundedReceiverStream::new(erx)
         .map(|(name, data)| Ok::<Event, std::convert::Infallible>(ant_sse(name, data)));
-    Sse::new(body).into_response()
+    Sse::new(body)
+        .keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL))
+        .into_response()
 }
 
 /// Translate the internal `GatewayEvent` stream into ordered Anthropic SSE frames sent to `out`.
@@ -1107,9 +1122,21 @@ async fn anthropic_stream_worker(
     metrics: Arc<Metrics>,
     out: tokio::sync::mpsc::UnboundedSender<(&'static str, Value)>,
 ) {
-    // Wait for the first frame before committing to a message envelope. If the generation errors
-    // before producing anything (e.g. "no provider"), emit ONLY a clean `error` frame.
-    let first = match rx.recv().await {
+    // Wait for the first frame before committing to a message envelope. While waiting, emit a native
+    // `ping` every PING_INTERVAL so a slow discovery / cold-model load / prefill (no bytes for tens
+    // of seconds) can't trip a client's first-byte timeout — WITHOUT fabricating a message envelope
+    // (a `ping` is an explicit keep-alive, so the clean immediate-error contract holds). `biased`
+    // makes a ready frame always win the race, so pings never appear once real data is available.
+    let first = loop {
+        tokio::select! {
+            biased;
+            frame = rx.recv() => break frame,
+            _ = tokio::time::sleep(PING_INTERVAL) => {
+                let _ = out.send(("ping", json!({ "type": "ping" })));
+            }
+        }
+    };
+    let first = match first {
         Some(GatewayEvent::Error(m)) => {
             metrics.record_error();
             let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
@@ -1758,6 +1785,37 @@ mod tests {
                 "message_stop",
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_pings_while_awaiting_the_first_frame() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(anthropic_stream_worker(
+            "id".into(),
+            "m".into(),
+            rx,
+            std::time::Instant::now(),
+            Arc::new(Metrics::new()),
+            otx,
+        ));
+        tokio::task::yield_now().await; // let the worker reach its first select
+        // No frame yet → advance past two ping intervals; native pings should be emitted.
+        tokio::time::advance(std::time::Duration::from_secs(25)).await;
+        tokio::task::yield_now().await;
+        // Now deliver the (only) frame and close the stream.
+        tx.send(GatewayEvent::Done(Box::new(summary(0, 0)))).unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        let mut names = Vec::new();
+        while let Ok((n, _)) = orx.try_recv() {
+            names.push(n);
+        }
+        assert!(names.iter().any(|&n| n == "ping"), "expected pings during the wait, got {names:?}");
+        // Pings appear only BEFORE the message envelope; the message still completes cleanly.
+        let start = names.iter().position(|&n| n == "message_start").expect("message_start");
+        assert!(names[..start].iter().all(|&n| n == "ping"));
+        assert!(names.contains(&"message_stop"));
     }
 
     #[test]

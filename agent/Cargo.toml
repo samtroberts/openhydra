@@ -59,6 +59,9 @@ libc = "0.2"
 [dev-dependencies]
 # Isolated identity dirs for the status-endpoint tests (mirrors network's dev-deps).
 tempfile = "3"
+# `test-util` (paused time: `start_paused`, `advance`) for deterministic timing tests — the
+# feature unions with the main tokio deps only in test builds.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = ["engine-autostart"]
