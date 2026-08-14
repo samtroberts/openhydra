@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::DiscoveredPeer;
@@ -35,9 +36,11 @@ use openhydra_protocol::verify::{
 use serde_json::Value;
 
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
-use crate::provider::{FETCH_RESULT, SERVE_REQUEST};
+use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
 use crate::receipt::request_receipt;
-use crate::serve::{parse_response, FetchResponse, ServeChunk, ServeRequest, ServeSummary};
+use crate::serve::{
+    parse_response, FetchChunksResponse, FetchResponse, ServeChunk, ServeRequest, ServeSummary,
+};
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -256,6 +259,199 @@ pub fn request_completion(
     ))
 }
 
+// ── P1c: streaming serve client ─────────────────────────────────────────────────────────
+//
+// The buffered `request_completion` above is one round-trip: the whole completion returns in a
+// single blob under a total-time cap, so a token doesn't reach the client until the last token is
+// generated. The streaming client opens a stream (`SERVE_STREAM 0x13`), then polls
+// (`FETCH_CHUNKS 0x14`) with an adaptive interval, delivering each delta the instant it lands —
+// turning the total-time cap into a *stall* cap (reset on every new token) and making drop-resume
+// (re-poll the same offset) the steady state. A legacy provider that doesn't know `0x13` answers
+// with a blob that fails to decode as a `FetchChunksResponse`, which the caller detects and falls
+// back to `request_completion`. See `STREAMING_SERVE_P1_PLAN.md`.
+
+/// Poll cadence: tight while tokens flow (`POLL_MIN`), backed off on idle (`POLL_MAX`). Bounds
+/// relay poll traffic without adding much token latency on an active stream.
+const POLL_MIN: Duration = Duration::from_millis(50);
+const POLL_MAX: Duration = Duration::from_millis(750);
+/// Give up if no new chunk arrives for this much *accumulated idle time* — the "provider wedged"
+/// signal. Reset on every progress, so total generation is unbounded as long as tokens flow.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bounded consecutive transport-drop retries at the same offset before giving up (drop-resume).
+const STREAM_DROP_RETRIES: u32 = 5;
+/// Backoff between drop-resume re-polls, tuned to the ~10s relay re-establish window.
+const STREAM_DROP_BACKOFF: Duration = Duration::from_secs(2);
+/// Per-round-trip timeout for a streaming call (the open ack or one poll). Each is a quick
+/// provider-side buffer op (the provider acks the open *before* generating), so this is short —
+/// a dead provider fails over fast, while a live stream's long generation is governed by the
+/// per-token stall clock, not this. (The buffered fallback still uses the `max_tokens`-scaled
+/// [`attempt_timeout`].)
+const STREAM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a streaming attempt didn't complete.
+enum StreamFail {
+    /// The provider answered `SERVE_STREAM` with a non-streaming (legacy) reply — the caller
+    /// retries the request over the buffered `request_completion` path and remembers this peer.
+    Legacy,
+    /// A real failure: a provider `Error` frame, a shed (`Overloaded`), a stall, or a dropped
+    /// transport past the retry budget. Carries the error for the caller's failover logic.
+    Error(AdapterError),
+}
+
+/// Dispatch one incremental slice of serve frames: text deltas → `on_delta`, tool calls held for
+/// the summary, `Done` → return the summary, `Error` → fail. `None` means "slice consumed, keep
+/// polling". Shared by the open-ack and the poll loop.
+fn dispatch_stream_slice(
+    framed: &[u8],
+    tool_calls: &mut Vec<ToolCall>,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<Option<ServeSummary>, StreamFail> {
+    let chunks = parse_response(framed)
+        .map_err(|e| StreamFail::Error(AdapterError::Parse(e.to_string())))?;
+    for chunk in chunks {
+        match chunk {
+            ServeChunk::Delta(text) => on_delta(&text),
+            ServeChunk::ToolCalls(tc) => *tool_calls = tc,
+            ServeChunk::Done { tokens, metrics } => {
+                return Ok(Some(ServeSummary {
+                    tokens,
+                    ok: true,
+                    metrics,
+                    discover_ns: 0,
+                    proxy_roundtrip_ns: 0,
+                    tool_calls: std::mem::take(tool_calls),
+                }))
+            }
+            ServeChunk::Error(msg) => return Err(StreamFail::Error(AdapterError::Http(msg))),
+        }
+    }
+    Ok(None)
+}
+
+/// Open a stream to a provider and drive the poll loop, delivering each delta to `on_delta`.
+///
+/// `transport(framed) -> response` is a **single, raw** `proxy_forward` round-trip (no `0x11`
+/// reconnect-fetch — streaming does its own drop-resume). `sleep(dur)` is injected so the poll
+/// cadence and the stall/backoff clock are deterministic in tests (accumulated idle time is summed
+/// from the sleeps, not read from a wall clock). Returns the [`ServeSummary`] on a clean `Done`, or
+/// [`StreamFail::Legacy`] when the provider doesn't speak streaming (→ caller falls back).
+fn request_completion_streaming(
+    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
+    sleep: &mut dyn FnMut(Duration),
+    request: &ServeRequest,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ServeSummary, StreamFail> {
+    // ── Open / capability probe ──
+    let mut open = Vec::with_capacity(1 + request.messages.len() * 32);
+    open.push(SERVE_STREAM);
+    open.extend_from_slice(&request.encode());
+    let ack = transport(&open).map_err(StreamFail::Error)?;
+    // A reply that doesn't decode as a FetchChunksResponse is a legacy provider's blob → fall back.
+    let ack = FetchChunksResponse::decode(&ack).map_err(|_| StreamFail::Legacy)?;
+
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut offset: u32 = 0;
+    match ack {
+        FetchChunksResponse::Overloaded => {
+            return Err(StreamFail::Error(AdapterError::Http(
+                "provider overloaded (stream shed at open)".into(),
+            )))
+        }
+        FetchChunksResponse::Forbidden => {
+            return Err(StreamFail::Error(AdapterError::Http("stream open forbidden".into())))
+        }
+        FetchChunksResponse::NotFound => {
+            return Err(StreamFail::Error(AdapterError::Http("stream missing at open".into())))
+        }
+        // The open ack may already carry frames — e.g. a refusal delivered as a complete
+        // (done=true) stream, or an eager first slice.
+        FetchChunksResponse::Chunks { framed, next_offset, done } => {
+            if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, on_delta)? {
+                return Ok(summary);
+            }
+            offset = next_offset.max(offset);
+            let _ = done; // done=true with no terminal frame can't happen; a real Done returns above
+        }
+    }
+
+    // ── Poll loop ──
+    let mut interval = POLL_MIN;
+    let mut idle = Duration::ZERO;
+    loop {
+        let mut poll = Vec::with_capacity(1 + 16 + 4);
+        poll.push(FETCH_CHUNKS);
+        poll.extend_from_slice(&request.nonce);
+        poll.extend_from_slice(&offset.to_be_bytes());
+
+        // Drop-resume: a transport error re-polls the SAME offset (the provider still holds the
+        // un-fetched tail), bounded by the retry budget + the stall clock.
+        let resp = {
+            let mut attempt = 0u32;
+            loop {
+                match transport(&poll) {
+                    Ok(bytes) => break bytes,
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt > STREAM_DROP_RETRIES {
+                            return Err(StreamFail::Error(AdapterError::Http(format!(
+                                "stream poll dropped past retry budget: {e}"
+                            ))));
+                        }
+                        sleep(STREAM_DROP_BACKOFF);
+                        idle += STREAM_DROP_BACKOFF;
+                        if idle >= STREAM_STALL_TIMEOUT {
+                            return Err(StreamFail::Error(AdapterError::Http(
+                                "stream stalled (no progress before deadline)".into(),
+                            )));
+                        }
+                    }
+                }
+            }
+        };
+
+        match FetchChunksResponse::decode(&resp) {
+            Ok(FetchChunksResponse::Chunks { framed, next_offset, done }) => {
+                let progressed = next_offset > offset;
+                if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, on_delta)? {
+                    return Ok(summary);
+                }
+                let _ = done; // a true `done` always carries a terminal frame → returned above
+                offset = next_offset.max(offset);
+                if progressed {
+                    interval = POLL_MIN;
+                    idle = Duration::ZERO;
+                } else {
+                    interval = (interval * 2).min(POLL_MAX);
+                    idle += interval;
+                    if idle >= STREAM_STALL_TIMEOUT {
+                        return Err(StreamFail::Error(AdapterError::Http(
+                            "stream stalled (no progress before deadline)".into(),
+                        )));
+                    }
+                }
+                sleep(interval);
+            }
+            // Buffer gone (provider restarted / TTL expired) — the caller re-serves from scratch.
+            Ok(FetchChunksResponse::NotFound) => {
+                return Err(StreamFail::Error(AdapterError::Http(
+                    "stream result not found (provider restarted)".into(),
+                )))
+            }
+            Ok(FetchChunksResponse::Forbidden) => {
+                return Err(StreamFail::Error(AdapterError::Http("stream poll forbidden".into())))
+            }
+            Ok(FetchChunksResponse::Overloaded) => {
+                return Err(StreamFail::Error(AdapterError::Http("stream overloaded mid-poll".into())))
+            }
+            Err(e) => {
+                return Err(StreamFail::Error(AdapterError::Parse(format!(
+                    "bad stream poll reply: {e}"
+                ))))
+            }
+        }
+    }
+}
+
 /// A consumer node: discovers providers and serves completions over the swarm — the
 /// **synchronous core** the HTTP/SSE gateway wraps (`complete` blocks; the gateway calls
 /// it from a `spawn_blocking` task and streams the deltas).
@@ -288,6 +484,11 @@ pub struct ConsumerNode {
     /// not a real market transaction, so we skip receipt settlement, reputation, and give/take
     /// credit for it — no self-earning or self-deduction. `None` = consumer-only node.
     self_provider: Option<String>,
+    /// P1c streaming: providers observed to answer `SERVE_STREAM` with a legacy (non-streaming)
+    /// reply, keyed by libp2p id. We skip re-probing these and go straight to the buffered path.
+    /// Best-effort/advisory — a wrong entry only forfeits the streaming benefit, never correctness
+    /// (a re-probe would just re-learn it). Never persisted; a fresh process re-learns on first use.
+    buffered_only: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -315,6 +516,7 @@ impl ConsumerNode {
             credit: Mutex::new(HashMap::new()),
             stats: None,
             self_provider: None,
+            buffered_only: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -359,6 +561,20 @@ impl ConsumerNode {
             credit: Mutex::new(credit),
             stats: None,
             self_provider: None,
+            buffered_only: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// P1c: has `libp2p_id` been observed to speak only the buffered (non-streaming) serve path?
+    fn is_buffered_only(&self, libp2p_id: &str) -> bool {
+        self.buffered_only.lock().map(|s| s.contains(libp2p_id)).unwrap_or(false)
+    }
+
+    /// P1c: remember that `libp2p_id` answered `SERVE_STREAM` with a legacy reply, so the next
+    /// serve to it skips the probe and goes straight to buffered.
+    fn mark_buffered_only(&self, libp2p_id: &str) {
+        if let Ok(mut s) = self.buffered_only.lock() {
+            s.insert(libp2p_id.to_string());
         }
     }
 
@@ -562,17 +778,25 @@ impl ConsumerNode {
             // agentic completion on a slow remote model isn't abandoned mid-generation.
             let serve_to = attempt_timeout(max_tokens);
             let t_serve = std::time::Instant::now();
-            let mut proxy_roundtrip_ns = 0u64;
+            // Shared across the (sequential) buffered + streaming transports via a Cell so both
+            // can record it without a mutable-borrow conflict. Holds the first-ack / round-trip RTT.
+            let proxy_rt = std::cell::Cell::new(0u64);
             let result = {
-                let rt = &mut proxy_roundtrip_ns;
-                let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                let mut guarded = |d: &str| {
+                    delivered = true;
+                    on_delta(d);
+                };
+                // Buffered (0x10) round-trip with 0x11 reconnect-fetch drop recovery — the proven
+                // path, used directly when a provider is known buffered-only and as the fallback
+                // when a streaming probe reveals a legacy provider.
+                let mut buffered = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
                     let t = std::time::Instant::now();
                     let r = self.net.proxy_forward_timeout(
                         provider_libp2p.clone(),
                         framed.to_vec(),
                         serve_to,
                     );
-                    *rt = t.elapsed().as_nanos() as u64;
+                    proxy_rt.set(t.elapsed().as_nanos() as u64);
                     match r {
                         Ok(bytes) => Ok(bytes),
                         // The serve connection dropped (e.g. relay/NAT eviction during a long
@@ -588,12 +812,50 @@ impl ConsumerNode {
                             }),
                     }
                 };
-                let mut guarded = |d: &str| {
-                    delivered = true;
-                    on_delta(d);
-                };
-                request_completion(&mut transport, &request, &mut guarded)
+                if self.is_buffered_only(&provider_libp2p) {
+                    request_completion(&mut buffered, &request, &mut guarded)
+                } else {
+                    // P1c: try streaming first. A raw round-trip (no 0x11 — streaming re-polls the
+                    // same offset itself for drop-resume); the first-ack RTT is recorded as
+                    // proxy_roundtrip_ns. Real thread::sleep paces the poll loop live.
+                    let stream_out = {
+                        let mut stream_transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                            let t = std::time::Instant::now();
+                            let r = self.net.proxy_forward_timeout(
+                                provider_libp2p.clone(),
+                                framed.to_vec(),
+                                STREAM_CALL_TIMEOUT,
+                            );
+                            if proxy_rt.get() == 0 {
+                                proxy_rt.set(t.elapsed().as_nanos() as u64); // first-ack RTT
+                            }
+                            r.map_err(AdapterError::Http)
+                        };
+                        let mut sleeper = |d: Duration| std::thread::sleep(d);
+                        request_completion_streaming(
+                            &mut stream_transport,
+                            &mut sleeper,
+                            &request,
+                            &mut guarded,
+                        )
+                    };
+                    match stream_out {
+                        Ok(s) => Ok(s),
+                        Err(StreamFail::Error(e)) => Err(e),
+                        // A legacy provider — remember it and fall back to buffered this same
+                        // attempt (the probe ran no generation, so no work is wasted).
+                        Err(StreamFail::Legacy) => {
+                            self.mark_buffered_only(&provider_libp2p);
+                            tracing::debug!(
+                                provider = %provider_libp2p,
+                                "provider is buffered-only; falling back to SERVE_REQUEST"
+                            );
+                            request_completion(&mut buffered, &request, &mut guarded)
+                        }
+                    }
+                }
             };
+            let proxy_roundtrip_ns = proxy_rt.get();
             match result {
                 Ok(mut summary) => {
                     summary.discover_ns = discover_ns;
@@ -1132,6 +1394,271 @@ mod tests {
         };
         let err = request_completion(&mut transport, &request(), &mut |_| {}).unwrap_err();
         assert!(matches!(err, AdapterError::Parse(_)));
+    }
+
+    // ── P1c: streaming serve client ─────────────────────────────────────────
+
+    /// Encode a `FetchChunksResponse::Chunks` reply from a set of encoded frames.
+    fn chunks_reply(frames: &[Vec<u8>], next_offset: u32, done: bool) -> Vec<u8> {
+        FetchChunksResponse::Chunks { framed: crate::serve::frame_response(frames), next_offset, done }
+            .encode()
+    }
+
+    /// The full encoded serve frames an adapter would emit for `req` (what the streaming provider
+    /// reveals incrementally, and what the buffered provider returns whole).
+    fn serve_frames(adapter: &dyn EngineAdapter, req: &ServeRequest) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        crate::serve::handle_serve_request(&req.encode(), adapter, &mut |c| frames.push(c.to_vec()));
+        frames
+    }
+
+    /// A faithful in-test streaming provider: reveals `reveal_per_poll` more frames on each poll
+    /// (simulating tokens arriving between polls) and serves the incremental slice from the polled
+    /// offset, pruning the acknowledged prefix exactly like the real provider buffer.
+    struct MockStreamProvider {
+        pending: std::collections::VecDeque<Vec<u8>>,
+        buf: Vec<Vec<u8>>,
+        base: u32,
+        accept: bool,
+        reveal_per_poll: usize,
+    }
+    impl MockStreamProvider {
+        fn new(frames: Vec<Vec<u8>>, accept: bool, reveal_per_poll: usize) -> Self {
+            Self { pending: frames.into(), buf: Vec::new(), base: 0, accept, reveal_per_poll }
+        }
+        fn respond(&mut self, framed: &[u8]) -> Result<Vec<u8>, AdapterError> {
+            match framed.first() {
+                Some(&SERVE_STREAM) if self.accept => Ok(chunks_reply(&[], 0, false)),
+                // A legacy provider answers the unknown method byte with an error blob.
+                Some(&SERVE_STREAM) => Ok(crate::serve::frame_response(&[
+                    ServeChunk::Error("unsupported method".into()).encode()
+                ])),
+                Some(&FETCH_CHUNKS) => {
+                    let off = u32::from_be_bytes(framed[17..21].try_into().unwrap());
+                    for _ in 0..self.reveal_per_poll {
+                        if let Some(f) = self.pending.pop_front() {
+                            self.buf.push(f);
+                        }
+                    }
+                    let have_hi = self.base + self.buf.len() as u32;
+                    let start_abs = off.clamp(self.base, have_hi);
+                    let li = (start_abs - self.base) as usize;
+                    let out = crate::serve::frame_response(&self.buf[li..]);
+                    let done = self.buf.last().map(|f| ServeChunk::frame_is_terminal(f)).unwrap_or(false);
+                    if li > 0 {
+                        self.buf.drain(0..li);
+                        self.base = start_abs;
+                    }
+                    Ok(chunks_reply_raw(out, have_hi, done))
+                }
+                _ => Ok(crate::serve::frame_response(&[ServeChunk::Error("unsupported".into()).encode()])),
+            }
+        }
+    }
+    fn chunks_reply_raw(framed: Vec<u8>, next_offset: u32, done: bool) -> Vec<u8> {
+        FetchChunksResponse::Chunks { framed, next_offset, done }.encode()
+    }
+
+    #[test]
+    fn streaming_delivers_incrementally_and_matches_the_buffered_result() {
+        let adapter = StubAdapter { deltas: vec!["Hello", ", ", "world"], tokens: 7, fail: None };
+        // Buffered reference: the whole completion in one blob.
+        let mut buffered_text = String::new();
+        let mut buf_tp = |req: &[u8]| Ok(handle_serve_inbound(req, &adapter));
+        let buf_summary =
+            request_completion(&mut buf_tp, &request(), &mut |d| buffered_text.push_str(d)).unwrap();
+
+        // Streaming: the same frames revealed one-per-poll.
+        let frames = serve_frames(&adapter, &request());
+        let mut mock = MockStreamProvider::new(frames, true, 1);
+        let mut transport = |f: &[u8]| mock.respond(f);
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleeper = |d: Duration| sleeps.push(d);
+        let mut stream_text = String::new();
+        let stream_summary = request_completion_streaming(
+            &mut transport,
+            &mut sleeper,
+            &request(),
+            &mut |d| stream_text.push_str(d),
+        )
+        .unwrap_or_else(|_| panic!("streaming should complete"));
+
+        assert_eq!(stream_text, buffered_text, "streamed text must equal the buffered text");
+        assert_eq!(stream_text, "Hello, world");
+        assert_eq!(stream_summary.tokens, buf_summary.tokens);
+        // Multiple polls happened → it really streamed rather than returning one blob.
+        assert!(sleeps.len() >= 2, "expected several polls, got {}", sleeps.len());
+    }
+
+    #[test]
+    fn streaming_falls_back_to_buffered_on_a_legacy_provider() {
+        // A provider that doesn't speak streaming answers the open with a legacy error blob; the
+        // client reports Legacy so serve_once retries over the buffered path.
+        let frames = serve_frames(&StubAdapter { deltas: vec!["x"], tokens: 1, fail: None }, &request());
+        let mut mock = MockStreamProvider::new(frames, /*accept=*/ false, 1);
+        let mut transport = |f: &[u8]| mock.respond(f);
+        let mut sleeper = |_: Duration| {};
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Legacy)));
+    }
+
+    #[test]
+    fn streaming_overloaded_open_ack_is_a_failover_error() {
+        // A pool-shed at open → Overloaded → a real error (serve_once fails over to another peer).
+        let mut transport = |_: &[u8]| Ok(FetchChunksResponse::Overloaded.encode());
+        let mut sleeper = |_: Duration| {};
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("overloaded")));
+    }
+
+    #[test]
+    fn streaming_interval_tightens_on_progress_and_backs_off_on_idle() {
+        // progress → idle → progress → idle → done. The sleeps prove the interval resets to
+        // POLL_MIN on each progress and doubles on each idle.
+        let script = vec![
+            chunks_reply(&[ServeChunk::Delta("a".into()).encode()], 1, false), // progress
+            chunks_reply(&[], 1, false),                                        // idle
+            chunks_reply(&[ServeChunk::Delta("b".into()).encode()], 2, false), // progress (reset)
+            chunks_reply(&[], 2, false),                                        // idle
+            chunks_reply(&[ServeChunk::Done { tokens: 2, metrics: Default::default() }.encode()], 3, true),
+        ];
+        let mut idx = 0usize;
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                let r = script[idx].clone();
+                idx += 1;
+                Ok(r)
+            }
+        };
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleeper = |d: Duration| sleeps.push(d);
+        let mut text = String::new();
+        let summary =
+            request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |d| text.push_str(d))
+                .unwrap_or_else(|_| panic!("should complete"));
+        assert_eq!(text, "ab");
+        assert_eq!(summary.tokens, 2);
+        // sleeps: [after progress = MIN, after idle = 2·MIN, after progress = MIN (reset), after idle = 2·MIN]
+        assert_eq!(sleeps.len(), 4);
+        assert_eq!(sleeps[0], POLL_MIN, "tight after first progress");
+        assert!(sleeps[1] > sleeps[0], "backs off on idle");
+        assert_eq!(sleeps[2], POLL_MIN, "resets to tight after the next progress");
+        assert!(sleeps[3] > sleeps[2], "backs off again on idle");
+    }
+
+    #[test]
+    fn streaming_backoff_is_capped_at_poll_max() {
+        // A permanently-idle stream: the interval doubles but never exceeds POLL_MAX, and the run
+        // is bounded by the stall deadline (no real sleeping — the clock sums injected sleeps).
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                Ok(chunks_reply(&[], 0, false)) // never any progress
+            }
+        };
+        let mut sleeps: Vec<Duration> = Vec::new();
+        let mut sleeper = |d: Duration| sleeps.push(d);
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(_))), "all-idle stream must stall out");
+        assert!(sleeps.iter().all(|d| *d <= POLL_MAX), "interval must never exceed POLL_MAX");
+        assert!(sleeps.iter().any(|d| *d == POLL_MAX), "long idle should reach the POLL_MAX cap");
+    }
+
+    #[test]
+    fn streaming_stalls_out_when_no_progress_before_the_deadline() {
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                Ok(chunks_reply(&[], 0, false)) // never any progress
+            }
+        };
+        let mut sleeper = |_: Duration| {}; // no real time; the stall clock sums injected sleeps
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("stall")));
+    }
+
+    #[test]
+    fn streaming_drop_resume_repolls_the_same_offset_and_completes() {
+        // The first two polls fail at the transport (relay dropped); drop-resume re-polls the same
+        // offset and the stream still completes with the full, correct output — no duplication.
+        let adapter = StubAdapter { deltas: vec!["re", "sume"], tokens: 3, fail: None };
+        let frames = serve_frames(&adapter, &request());
+        let mut mock = MockStreamProvider::new(frames, true, 1);
+        let mut fail_budget = 2u32;
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&FETCH_CHUNKS) && fail_budget > 0 {
+                fail_budget -= 1;
+                return Err(AdapterError::Http("relay dropped".into()));
+            }
+            mock.respond(f)
+        };
+        let mut sleeper = |_: Duration| {};
+        let mut text = String::new();
+        let summary =
+            request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |d| text.push_str(d))
+                .unwrap_or_else(|_| panic!("drop-resume should recover"));
+        assert_eq!(text, "resume");
+        assert_eq!(summary.tokens, 3);
+    }
+
+    #[test]
+    fn streaming_gives_up_when_drops_exceed_the_retry_budget() {
+        // The transport is permanently dead: every poll errors. Past the bounded retry budget the
+        // client surfaces an error (serve_once then fails over / retries).
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                Err(AdapterError::Http("dead".into()))
+            }
+        };
+        let mut sleeper = |_: Duration| {};
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("dropped")));
+    }
+
+    #[test]
+    fn streaming_provider_error_frame_becomes_an_error() {
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                Ok(chunks_reply(&[ServeChunk::Error("engine exploded".into()).encode()], 1, true))
+            }
+        };
+        let mut sleeper = |_: Duration| {};
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("engine exploded")));
+    }
+
+    #[test]
+    fn streaming_carries_tool_calls_through_to_the_summary() {
+        use crate::adapter::{ToolCall, ToolCallFunction};
+        let tc = ServeChunk::ToolCalls(vec![ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "search".into(), arguments: r#"{"q":"rust"}"#.into() },
+        }])
+        .encode();
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                Ok(chunks_reply(&[tc.clone(), ServeChunk::Done { tokens: 1, metrics: Default::default() }.encode()], 2, true))
+            }
+        };
+        let mut sleeper = |_: Duration| {};
+        let mut text = String::new();
+        let summary =
+            request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |d| text.push_str(d))
+                .unwrap_or_else(|_| panic!("should complete"));
+        assert!(text.is_empty(), "a tool-call turn streams no text");
+        assert_eq!(summary.tool_calls.len(), 1);
+        assert_eq!(summary.tool_calls[0].function.name, "search");
     }
 
     // ── provider selection ──

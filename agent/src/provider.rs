@@ -35,8 +35,8 @@ use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{
-    frame_response, handle_serve_request, handle_serve_request_parsed, FetchResponse, ServeChunk,
-    ServeRequest,
+    frame_response, handle_serve_request, handle_serve_request_parsed, FetchChunksResponse,
+    FetchResponse, ServeChunk, ServeRequest,
 };
 use crate::status::TransferStats;
 use crate::workpool::WorkerPool;
@@ -62,6 +62,23 @@ pub const SERVE_REQUEST: u8 = 0x10;
 /// re-requests the buffered result by the same nonce it committed for settlement, on a fresh
 /// circuit, instead of losing the completed work. See `RECONNECT_AND_FETCH_PLAN.md`.
 pub const FETCH_RESULT: u8 = 0x11;
+
+/// libp2p proxy method byte for a streaming **chunk poll** (consumer → provider):
+/// `0x14 ‖ nonce(16) ‖ offset(4, big-endian)`. The consumer polls for the serve frames at or
+/// after `offset`; the provider replies with a [`FetchChunksResponse`] carrying the incremental
+/// slice, prunes the acknowledged prefix, and reports `done` when the terminal frame is included.
+/// (`0x12` is [`RECEIPT_REQUEST`](crate::receipt::RECEIPT_REQUEST); `0x13` is [`SERVE_STREAM`].)
+/// See `STREAMING_SERVE_P1_PLAN.md`.
+pub const FETCH_CHUNKS: u8 = 0x14;
+
+/// libp2p proxy method byte to **open a stream** (consumer → provider): `0x13 ‖ ServeRequest`.
+/// Same request body as [`SERVE_REQUEST`], but instead of buffering the whole completion and
+/// returning it in one blob, the provider submits the generation to the worker pool, replies
+/// with an immediate [`FetchChunksResponse`] ack, and streams the frames incrementally to
+/// [`FETCH_CHUNKS`] polls. A legacy provider that doesn't know this byte answers with a framed
+/// `Error` blob, which the consumer detects (it fails to decode as a `FetchChunksResponse`) and
+/// falls back to [`SERVE_REQUEST`].
+pub const SERVE_STREAM: u8 = 0x13;
 
 /// How long a completed (or in-flight) serve result stays fetchable. Must comfortably exceed
 /// the NAT/relay re-establishment window (~10–70s) so a reconnecting consumer still finds it.
@@ -280,6 +297,157 @@ fn enforce_result_caps(map: &mut HashMap<[u8; 16], BufferedResult>) {
     }
 }
 
+// ── P1 streaming: trimmable-log stream buffer ──────────────────────────────────────────
+//
+// The reconnect-fetch buffer above ([`BufferedResult`], whole-result-until-TTL) does not
+// survive thousands of concurrent streams: it holds every completed result whole until the
+// TTL and evicts oldest-first, so active streams evict each other under load. The streaming
+// path instead keys each nonce to a [`StreamBuffer`] — an append-only log with a *trimmable
+// prefix*. A poll for absolute chunk `offset` proves the consumer holds `[0..offset)`, so the
+// provider drops that prefix; per-stream memory is the un-fetched tail only (a few KB),
+// independent of total generation size. See `STREAMING_SERVE_P1_PLAN.md`.
+//
+// This is a **separate map** from `results` (0x10/0x11 stays byte-for-byte unchanged); a given
+// nonce is created by *either* a buffered serve *or* a streaming serve, never both, so the two
+// buffers never alias.
+
+/// How long a stream buffer stays fetchable after its last activity (append or poll). Matches
+/// [`RESULT_TTL_MS`] so a consumer whose relay dropped mid-stream has the same reconnect window.
+const STREAM_TTL_MS: u64 = RESULT_TTL_MS;
+/// Global cap on live stream buffers. Streams are tiny (prune-on-ack keeps only the un-fetched
+/// tail), so this is generous; the real bound on *generating* streams is the worker pool.
+const MAX_STREAM_ENTRIES: usize = 512;
+/// Per-peer fairness cap: one consumer can hold at most this many live streams. Admission
+/// evicts **that peer's own** oldest stream first, so one peer opening many streams can never
+/// evict another peer's active stream (the property the scale scenario demands).
+const MAX_STREAMS_PER_PEER: usize = 128;
+/// Global byte backstop across all live stream tails — a last-resort guard (deltas are small and
+/// pruned, so this rarely bites), evicting the globally-oldest stream if somehow exceeded.
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+/// A per-nonce append-only log of encoded [`ServeChunk`] frames with a trimmable prefix (P1
+/// streaming). See the module note above.
+struct StreamBuffer {
+    /// Peer-bound: only the consumer that committed the nonce (its `reply_to`) may poll.
+    reply_to: String,
+    /// Absolute chunk index of `chunks[0]`; advances as the acknowledged prefix is pruned.
+    base_offset: u32,
+    /// Encoded [`ServeChunk`] frames covering absolute indices `[base_offset, base_offset+len)`.
+    chunks: Vec<Vec<u8>>,
+    /// A terminal `Done`/`Error` frame has been appended (end of stream). Set atomically with
+    /// the terminal append so a poll never sees `done` without the terminal chunk in the log.
+    done: bool,
+    /// Live (un-pruned) byte size, for the byte backstop.
+    bytes: usize,
+    /// TTL + last-activity stamp (append or poll refreshes it).
+    recorded_ms: u64,
+}
+
+/// Admit a new stream under `nonce`: prune expired buffers, enforce the per-peer fairness cap
+/// (evicting only *this* peer's oldest), enforce the global byte/count backstops, then insert an
+/// empty `done=false` buffer. Free fn (no `Self`) so the buffer mechanics are unit-testable
+/// without a live `Provider`.
+fn stream_begin_in(
+    map: &mut HashMap<[u8; 16], StreamBuffer>,
+    nonce: [u8; 16],
+    reply_to: &str,
+    now: u64,
+) {
+    map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
+    // Per-peer fairness: while this peer already holds the cap, drop its own oldest. Only ever
+    // touches `reply_to`'s streams, so it cannot evict another peer's active stream.
+    loop {
+        let mine = map.values().filter(|b| b.reply_to == reply_to).count();
+        if mine < MAX_STREAMS_PER_PEER {
+            break;
+        }
+        match map
+            .iter()
+            .filter(|(_, b)| b.reply_to == reply_to)
+            .min_by_key(|(_, b)| b.recorded_ms)
+            .map(|(k, _)| *k)
+        {
+            Some(oldest) => {
+                map.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+    // Global backstops: evict the globally-oldest until within the count + byte caps.
+    loop {
+        let total: usize = map.values().map(|b| b.bytes).sum();
+        if map.len() < MAX_STREAM_ENTRIES && total <= MAX_STREAM_BYTES {
+            break;
+        }
+        match map.iter().min_by_key(|(_, b)| b.recorded_ms).map(|(k, _)| *k) {
+            Some(oldest) => {
+                map.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+    map.insert(
+        nonce,
+        StreamBuffer { reply_to: reply_to.to_string(), base_offset: 0, chunks: Vec::new(), done: false, bytes: 0, recorded_ms: now },
+    );
+}
+
+/// Append one encoded frame to the stream under `nonce` (no-op if the buffer was already reaped).
+/// A terminal (`Done`/`Error`) frame sets `done` **in the same lock op** as the append, so a
+/// concurrent poll can never observe `done=true` without the terminal chunk being fetchable.
+fn stream_append_in(
+    map: &mut HashMap<[u8; 16], StreamBuffer>,
+    nonce: &[u8; 16],
+    encoded: &[u8],
+    now: u64,
+) {
+    if let Some(buf) = map.get_mut(nonce) {
+        buf.bytes += encoded.len();
+        buf.chunks.push(encoded.to_vec());
+        buf.recorded_ms = now;
+        if ServeChunk::frame_is_terminal(encoded) {
+            buf.done = true;
+        }
+    }
+}
+
+/// Serve a `FETCH_CHUNKS` poll from the buffer: peer-bind, return the incremental slice
+/// `[offset..]`, prune the acknowledged prefix `[base_offset..offset)`, and report `done`. Pure
+/// (operates on `&mut map`) so it is unit-testable without a live `Provider`; TTL pruning + the
+/// per-peer rate-limit stay in the [`Provider::handle_fetch_chunks`] wrapper.
+fn fetch_chunks_from(
+    map: &mut HashMap<[u8; 16], StreamBuffer>,
+    nonce: &[u8; 16],
+    source_peer: &str,
+    offset: u32,
+    now: u64,
+) -> FetchChunksResponse {
+    let buf = match map.get_mut(nonce) {
+        None => return FetchChunksResponse::NotFound,
+        // Ownership binding: a poll from anyone but the committing consumer is refused.
+        Some(b) if b.reply_to != source_peer => return FetchChunksResponse::Forbidden,
+        Some(b) => b,
+    };
+    let have_hi = buf.base_offset + buf.chunks.len() as u32;
+    // Clamp the request into the live window: a stale/duplicate poll below base (already pruned)
+    // resumes at base; a poll past the end yields an empty slice.
+    let start_abs = offset.clamp(buf.base_offset, have_hi);
+    let li = (start_abs - buf.base_offset) as usize;
+    // Copy the slice to return BEFORE pruning (frame_response copies, so the drain below is safe).
+    let framed = frame_response(&buf.chunks[li..]);
+    let done = buf.done;
+    // Prune-on-ack: the poll for `offset` proves `[0..offset)` was received, so drop
+    // `[base_offset..start_abs)`. We keep `[start_abs..]` (the data just returned) so a transport
+    // drop before the consumer processes it re-polls the same offset and gets it again.
+    if li > 0 {
+        buf.chunks.drain(0..li);
+        buf.base_offset = start_abs;
+        buf.bytes = buf.chunks.iter().map(|c| c.len()).sum();
+    }
+    buf.recorded_ms = now;
+    FetchChunksResponse::Chunks { framed, next_offset: have_hi, done }
+}
+
 /// An engine joined to the swarm: advertises its models and serves inbound requests.
 pub struct Provider<A: EngineAdapter> {
     adapter: A,
@@ -315,8 +483,13 @@ pub struct Provider<A: EngineAdapter> {
     /// instead of losing it. Bound to the serve's `reply_to`, TTL-pruned + byte/count-capped.
     results: Mutex<HashMap<[u8; 16], BufferedResult>>,
     /// E-S8: per-peer rate cap on fetch requests (mirrors `receipt_rl`; a separate bucket so a
-    /// fetch flood can't shed receipts and vice-versa).
+    /// fetch flood can't shed receipts and vice-versa). Shared by `FETCH_RESULT` + `FETCH_CHUNKS`.
     fetch_rl: Arc<RateLimiter>,
+    /// P1 streaming: nonce → trimmable-log [`StreamBuffer`], populated by `SERVE_STREAM` and
+    /// polled/pruned by `FETCH_CHUNKS`. Separate from `results` (0x10/0x11 buffered path) so the
+    /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
+    /// the un-fetched tail so thousands of concurrent streams don't evict one another.
+    streams: Mutex<HashMap<[u8; 16], StreamBuffer>>,
     /// Per-model share allowlist, keyed on the engine handle (`DetectedModel::engine_ref`, the
     /// same string a consumer sends as `ServeRequest.model_ref`). `None` → share every detected
     /// model (the default). `Some(set)` → announce and serve **only** these; a request for any
@@ -350,6 +523,7 @@ impl<A: EngineAdapter> Provider<A> {
                 max_inflight: 0,
                 max_tracked: FETCH_RATE_MAX_TRACKED,
             })),
+            streams: Mutex::new(HashMap::new()),
             shared_models: None,
         }
     }
@@ -481,6 +655,123 @@ impl<A: EngineAdapter> Provider<A> {
         let mut map = self.results.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
         fetch_from_buffer(&map, &nonce, source_peer).encode()
+    }
+
+    /// P1 streaming: admit a new stream under `nonce` (empty, `done=false`). Called at the start
+    /// of an accepted `SERVE_STREAM` generation job, so the buffer exists before the ack is sent
+    /// and never lingers without a producer (a shed submit never reaches this).
+    fn stream_begin(&self, nonce: [u8; 16], reply_to: &str) {
+        let now = now_unix_ms();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        stream_begin_in(&mut map, nonce, reply_to, now);
+    }
+
+    /// P1 streaming: append one encoded frame to the stream (a delta, or the terminal frame which
+    /// also flips `done`). No-op if the buffer was reaped meanwhile — the consumer re-serves on
+    /// the resulting `NotFound`.
+    fn stream_append(&self, nonce: [u8; 16], encoded: &[u8]) {
+        let now = now_unix_ms();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        stream_append_in(&mut map, &nonce, encoded, now);
+    }
+
+    /// Handle a [`FETCH_CHUNKS`] poll: `payload` = `nonce(16) ‖ offset(4, big-endian)`. Returns
+    /// the incremental slice from `offset`, pruning the acknowledged prefix. `source_peer` is the
+    /// libp2p-authenticated sender; only the committing consumer (`reply_to`) may poll. Fast and
+    /// **non-blocking** — never long-polls; the consumer paces itself.
+    fn handle_fetch_chunks(&self, source_peer: &str, payload: &[u8]) -> Vec<u8> {
+        // Parse `nonce ‖ offset`. A malformed poll → NotFound (the consumer re-serves).
+        if payload.len() != 20 {
+            return FetchChunksResponse::NotFound.encode();
+        }
+        let nonce: [u8; 16] = payload[0..16].try_into().unwrap();
+        let offset = u32::from_be_bytes(payload[16..20].try_into().unwrap());
+        // E-S8: shed a poll flood, keyed on the authenticated sender. A shed poll returns
+        // "no progress at your offset" so an honest consumer simply backs off and re-polls the
+        // same offset — it never re-serves or fails over on a transient rate-limit.
+        if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+            return FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: offset, done: false }
+                .encode();
+        }
+        let now = now_unix_ms();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
+        fetch_chunks_from(&mut map, &nonce, source_peer, offset, now).encode()
+    }
+
+    /// P1 streaming: the single pool job for a `SERVE_STREAM`. It gates (throttle/AUP/share)
+    /// exactly like the buffered path, then **responds with the immediate ack early** and keeps
+    /// running to generate — so the one inbound request is answered at once while the tokens
+    /// stream into the buffer for the consumer's `FETCH_CHUNKS` polls. Held on one pool worker for
+    /// the generation's duration, so concurrent generations stay bounded by the pool (engine
+    /// capacity), same as the buffered path.
+    fn run_stream_job(self: Arc<Self>, request_id: String, data: Vec<u8>, max_concurrency: usize) {
+        // A stream reply is always a `FetchChunksResponse`. A refusal (bad request / AUP / not
+        // shared) is delivered as a *complete* stream: an ack carrying the framed `Error` with
+        // `done=true`, so the consumer's poll loop sees the error and stops without a second poll.
+        let respond_done = |framed: Vec<u8>, next_offset: u32| {
+            let _ = self
+                .net
+                .respond(request_id.clone(), FetchChunksResponse::Chunks { framed, next_offset, done: true }.encode());
+        };
+        let req = match ServeRequest::decode(&data[1..]) {
+            Ok(r) => r,
+            Err(e) => {
+                let framed = frame_response(&[ServeChunk::Error(format!("bad serve request: {e}")).encode()]);
+                respond_done(framed, 1);
+                return;
+            }
+        };
+        // M2.3: throttle a leecher first (off the poll thread, budget-capped). Contributors pass.
+        self.maybe_throttle(Some(&req), max_concurrency);
+        // AUP floor: a policy-violating request is refused without touching the engine.
+        if let Some(refusal) = self.aup_refusal(Some(&req)) {
+            if let Some(stats) = &self.stats {
+                stats.aup_refusals.fetch_add(1, Ordering::Relaxed);
+            }
+            respond_done(refusal, 1);
+            return;
+        }
+        // Per-model share gate: the real enforcement point (a consumer could learn the id via
+        // cache/PEX/guess), refused before the engine.
+        if !self.model_shared(&req.model_ref) {
+            let framed = frame_response(&[ServeChunk::Error(format!(
+                "model '{}' is not shared by this provider",
+                req.model_ref
+            ))
+            .encode()]);
+            respond_done(framed, 1);
+            return;
+        }
+        // Capture the small fields needed after `req` is moved into the serve (which consumes
+        // `messages`), for the ack, buffer, commitment, and stats.
+        let nonce = req.nonce;
+        let model_ref = req.model_ref.clone();
+        let reply_to = req.reply_to.clone();
+        // Create the buffer, then ack immediately (before generating), so the consumer starts
+        // polling right away and never races an absent buffer (begin happens before the ack).
+        self.stream_begin(nonce, &reply_to);
+        let _ = self.net.respond(
+            request_id,
+            FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode(),
+        );
+        // Generate, appending each frame (deltas, then the terminal Done/Error which flips `done`).
+        let summary =
+            handle_serve_request_parsed(req, &self.adapter, &mut |c| self.stream_append(nonce, c));
+        // B-S1: record what we served under the committed nonce so its settlement receipt can be
+        // validated (right tokens/model, once) — identical to the buffered path.
+        if summary.ok && summary.tokens > 0 {
+            self.record_commitment(nonce, model_ref.clone(), summary.tokens);
+        }
+        if let Some(stats) = &self.stats {
+            let e = &summary.metrics.engine;
+            let native_tps = if e.eval_duration_ns > 0 {
+                e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
+            } else {
+                0.0
+            };
+            stats.record_serve(&model_ref, summary.tokens, native_tps, summary.ok);
+        }
     }
 
     /// B-S1/B-S7: validate a settlement receipt against the serve we recorded under its
@@ -664,6 +955,24 @@ impl<A: EngineAdapter> Provider<A> {
         let mut last_generation = self.net.network_generation();
         loop {
             if let Some((request_id, source_peer, data)) = self.net.poll_inbound(poll_timeout) {
+                // P1 streaming: a SERVE_STREAM job acks early then keeps running to generate, so
+                // it needs its own body (it responds itself, mid-job, rather than returning one
+                // buffered blob). Everything else (SERVE_REQUEST / FETCH_RESULT / FETCH_CHUNKS /
+                // receipts) takes the generic dispatch path below.
+                if data.first() == Some(&SERVE_STREAM) {
+                    let provider = Arc::clone(&self);
+                    let shed_id = request_id.clone();
+                    let accepted = pool.submit(move || {
+                        provider.run_stream_job(request_id, data, max_concurrency);
+                    });
+                    if !accepted {
+                        // A3: pool full → shed at submit. No buffer was created (begin runs inside
+                        // the job), so there's no orphan `Generating` stream. The consumer fails
+                        // over to another provider on the explicit `Overloaded` ack.
+                        let _ = self.net.respond(shed_id, FetchChunksResponse::Overloaded.encode());
+                    }
+                    continue;
+                }
                 // Serve off the poll thread so the loop can keep accepting requests and a
                 // slow one doesn't head-of-line-block the rest.
                 let provider = Arc::clone(&self);
@@ -839,6 +1148,10 @@ impl<A: EngineAdapter> Provider<A> {
             }
             // Reconnect-and-fetch: return the buffered result for a nonce (drop recovery).
             Some(&FETCH_RESULT) => self.handle_fetch(source_peer, &data[1..]),
+            // P1 streaming: an incremental chunk poll (short, non-blocking). `SERVE_STREAM` is
+            // handled earlier in `run_inbound` (it acks early then keeps generating); only the
+            // poll reaches `dispatch`.
+            Some(&FETCH_CHUNKS) => self.handle_fetch_chunks(source_peer, &data[1..]),
             // Unknown method byte → a framed Error from the serve handler.
             _ => handle_serve_inbound(data, &self.adapter),
         }
@@ -1176,6 +1489,273 @@ mod tests {
         );
         // A fetch racing an in-flight serve gets Generating (retry), never NotFound (re-run).
         assert_eq!(fetch_from_buffer(&map, &[2u8; 16], "c"), FetchResponse::Generating);
+    }
+
+    // ── P1 streaming: trimmable-log buffer ───────────────────────────────
+
+    fn delta(s: &str) -> Vec<u8> {
+        ServeChunk::Delta(s.into()).encode()
+    }
+    fn done(tokens: u64) -> Vec<u8> {
+        ServeChunk::Done { tokens, metrics: Default::default() }.encode()
+    }
+
+    #[test]
+    fn stream_poll_returns_incremental_slice_and_prunes_the_acked_prefix() {
+        let mut map = HashMap::new();
+        let n = [1u8; 16];
+        stream_begin_in(&mut map, n, "consumerA", 0);
+        for (i, s) in ["a", "b", "c"].iter().enumerate() {
+            stream_append_in(&mut map, &n, &delta(s), 1 + i as u64);
+        }
+        // Poll from 0: gets all 3, next_offset=3, nothing pruned yet (offset 0 acks nothing).
+        match fetch_chunks_from(&mut map, &n, "consumerA", 0, 10) {
+            FetchChunksResponse::Chunks { framed, next_offset, done } => {
+                assert_eq!((next_offset, done), (3, false));
+                assert_eq!(parse_response(&framed).unwrap().len(), 3);
+            }
+            o => panic!("expected Chunks, got {o:?}"),
+        }
+        assert_eq!(map[&n].base_offset, 0);
+        assert_eq!(map[&n].chunks.len(), 3);
+
+        // Two more frames, then poll @3: gets only the new slice, prunes [0..3), base → 3.
+        stream_append_in(&mut map, &n, &delta("d"), 11);
+        stream_append_in(&mut map, &n, &delta("e"), 11);
+        match fetch_chunks_from(&mut map, &n, "consumerA", 3, 12) {
+            FetchChunksResponse::Chunks { framed, next_offset, done } => {
+                assert_eq!((next_offset, done), (5, false));
+                let chunks = parse_response(&framed).unwrap();
+                assert_eq!(chunks, vec![ServeChunk::Delta("d".into()), ServeChunk::Delta("e".into())]);
+            }
+            o => panic!("expected Chunks, got {o:?}"),
+        }
+        // Prune-on-ack: absolute offsets survive — base advanced to 3, only the tail remains.
+        assert_eq!(map[&n].base_offset, 3);
+        assert_eq!(map[&n].chunks.len(), 2);
+
+        // Drop-resume: re-poll the SAME offset returns the same tail; the just-returned data is
+        // not pruned until acked by a higher poll, so a transport drop loses nothing.
+        match fetch_chunks_from(&mut map, &n, "consumerA", 3, 13) {
+            FetchChunksResponse::Chunks { framed, next_offset, .. } => {
+                assert_eq!(next_offset, 5);
+                assert_eq!(parse_response(&framed).unwrap().len(), 2);
+            }
+            o => panic!("expected Chunks, got {o:?}"),
+        }
+        assert_eq!(map[&n].base_offset, 3, "re-poll at the same offset must not advance base");
+    }
+
+    #[test]
+    fn terminal_frame_flips_done_atomically_and_survives_until_acked() {
+        let mut map = HashMap::new();
+        let n = [2u8; 16];
+        stream_begin_in(&mut map, n, "c", 0);
+        stream_append_in(&mut map, &n, &delta("hi"), 1);
+        assert!(!map[&n].done, "a delta does not end the stream");
+        // The terminal append sets `done` in the same op — a poll never sees done without it.
+        stream_append_in(&mut map, &n, &done(1), 1);
+        assert!(map[&n].done);
+        // Poll @0 delivers delta + Done together with done=true.
+        match fetch_chunks_from(&mut map, &n, "c", 0, 2) {
+            FetchChunksResponse::Chunks { framed, next_offset, done } => {
+                assert_eq!((next_offset, done), (2, true));
+                let chunks = parse_response(&framed).unwrap();
+                assert!(matches!(chunks.last().unwrap(), ServeChunk::Done { .. }));
+            }
+            o => panic!("expected Chunks, got {o:?}"),
+        }
+        // A poll at offset 0 prunes nothing (li=0), so a drop-resume re-poll@0 re-delivers the
+        // terminal — it is never dropped before the consumer acks past it.
+        match fetch_chunks_from(&mut map, &n, "c", 0, 3) {
+            FetchChunksResponse::Chunks { framed, done, .. } => {
+                assert!(done);
+                assert_eq!(parse_response(&framed).unwrap().len(), 2, "terminal re-delivered on resume");
+            }
+            o => panic!("expected Chunks, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_fetch_binds_to_reply_to_and_reports_unknown_nonce() {
+        let mut map = HashMap::new();
+        let n = [3u8; 16];
+        stream_begin_in(&mut map, n, "consumerA", 0);
+        stream_append_in(&mut map, &n, &delta("x"), 1);
+        // A different authenticated peer cannot poll someone else's stream.
+        assert_eq!(fetch_chunks_from(&mut map, &n, "attackerB", 0, 2), FetchChunksResponse::Forbidden);
+        // An unknown nonce → NotFound (the consumer re-serves).
+        assert_eq!(fetch_chunks_from(&mut map, &[9u8; 16], "consumerA", 0, 2), FetchChunksResponse::NotFound);
+    }
+
+    #[test]
+    fn stale_low_poll_resumes_at_base_without_re_pruning() {
+        let mut map = HashMap::new();
+        let n = [4u8; 16];
+        stream_begin_in(&mut map, n, "c", 0);
+        for s in ["a", "b", "c", "d"] {
+            stream_append_in(&mut map, &n, &delta(s), 1);
+        }
+        // Advance: poll @2 prunes [0..2), base → 2.
+        let _ = fetch_chunks_from(&mut map, &n, "c", 2, 2);
+        assert_eq!(map[&n].base_offset, 2);
+        // A stale/duplicate poll below base clamps to base and returns the live tail, no re-prune.
+        match fetch_chunks_from(&mut map, &n, "c", 0, 3) {
+            FetchChunksResponse::Chunks { next_offset, framed, .. } => {
+                assert_eq!(next_offset, 4);
+                assert_eq!(parse_response(&framed).unwrap().len(), 2); // [2..4)
+            }
+            o => panic!("expected Chunks, got {o:?}"),
+        }
+        assert_eq!(map[&n].base_offset, 2, "a below-base poll must not move base");
+    }
+
+    #[test]
+    fn per_peer_cap_evicts_only_the_same_peers_streams() {
+        let mut map = HashMap::new();
+        // Peer B holds one active stream.
+        let bkey = [200u8; 16];
+        stream_begin_in(&mut map, bkey, "peerB", 0);
+        // Peer A floods well past its per-peer cap.
+        let akey = |i: usize| {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        for i in 0..(MAX_STREAMS_PER_PEER + 20) {
+            stream_begin_in(&mut map, akey(i), "peerA", i as u64);
+        }
+        // Peer A's admissions only ever evict peer A's own oldest — B's active stream survives.
+        assert!(map.contains_key(&bkey), "peer A's flood must not evict peer B's active stream");
+        let a_count = map.values().filter(|b| b.reply_to == "peerA").count();
+        assert!(a_count <= MAX_STREAMS_PER_PEER, "peer A bounded to its fair share, got {a_count}");
+    }
+
+    #[test]
+    fn scale_sim_thousands_of_streams_no_active_eviction_under_fair_share() {
+        // Many honest peers each holding one actively-polled stream, plus one greedy peer opening
+        // far more than its share. Assert: (a) every honest stream survives and still returns its
+        // data (prune + fairness hold — the greedy peer only evicts its own), (b) the greedy peer
+        // is bounded to its per-peer cap, (c) the total stays within the global backstop.
+        let mut map = HashMap::new();
+        const HONEST: usize = 300; // < MAX_STREAM_ENTRIES so the global backstop never fires here
+        let hkey = |i: usize| {
+            let mut k = [0u8; 16];
+            k[0] = 0xAA;
+            k[8..].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        for i in 0..HONEST {
+            stream_begin_in(&mut map, hkey(i), &format!("honest-{i}"), i as u64);
+            stream_append_in(&mut map, &hkey(i), &delta("tok"), i as u64);
+        }
+        // Greedy peer opens 1000 streams (all under one reply_to → its per-peer cap bites).
+        let gkey = |i: usize| {
+            let mut k = [0u8; 16];
+            k[0] = 0xBB;
+            k[8..].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            k
+        };
+        for i in 0..1000 {
+            stream_begin_in(&mut map, gkey(i), "greedy", 1000 + i as u64);
+        }
+        // (a) every honest stream survives with its data intact.
+        for i in 0..HONEST {
+            match fetch_chunks_from(&mut map, &hkey(i), &format!("honest-{i}"), 0, 5000) {
+                FetchChunksResponse::Chunks { framed, next_offset, .. } => {
+                    assert_eq!(next_offset, 1);
+                    assert_eq!(parse_response(&framed).unwrap(), vec![ServeChunk::Delta("tok".into())]);
+                }
+                o => panic!("honest stream {i} evicted or corrupted: {o:?}"),
+            }
+        }
+        // (b) the greedy peer is capped to its fair share.
+        let greedy = map.values().filter(|b| b.reply_to == "greedy").count();
+        assert!(greedy <= MAX_STREAMS_PER_PEER, "greedy peer bounded, got {greedy}");
+        // (c) total within the global backstop.
+        assert!(map.len() <= MAX_STREAM_ENTRIES, "global entry cap held, got {}", map.len());
+    }
+
+    #[test]
+    fn stream_wire_loop_provider_buffer_to_consumer_decode_matches_buffered() {
+        // End-to-end wire check WITHOUT libp2p: drive the real provider buffer (append via the
+        // same free fns run_stream_job uses) → encode each poll reply on the wire → decode +
+        // reassemble exactly as the consumer does. Proves the provider's bytes and the consumer's
+        // decode agree, and that incremental prune-on-ack reassembles the buffered result.
+        let adapter = StubAdapter; // emits "Hello" + " world", tokens 5
+        let nonce = [42u8; 16];
+        let req = ServeRequest {
+            reply_to: "consumerZ".into(),
+            model_ref: "qwen2.5:7b".into(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+            nonce,
+        };
+
+        // Collect the frames the engine produces (the buffered result), then reveal them into the
+        // stream buffer one-per-poll to simulate tokens arriving between polls (the real case).
+        let mut buffered_frames: Vec<Vec<u8>> = Vec::new();
+        crate::serve::handle_serve_request_parsed(req, &adapter, &mut |c| buffered_frames.push(c.to_vec()));
+        let mut pending: std::collections::VecDeque<Vec<u8>> = buffered_frames.iter().cloned().collect();
+
+        let mut map = HashMap::new();
+        stream_begin_in(&mut map, nonce, "consumerZ", 0);
+
+        // Consumer: poll loop over the wire — encode the provider reply, decode as the consumer
+        // would, parse_response the slice, accumulate, advance offset, prune-on-ack, until done.
+        let mut text = String::new();
+        let mut offset: u32 = 0;
+        let mut tokens = 0u64;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 100, "poll loop should terminate");
+            // A token "arrives" between polls: reveal one more frame into the provider buffer.
+            if let Some(frame) = pending.pop_front() {
+                stream_append_in(&mut map, &nonce, &frame, guard as u64);
+            }
+            let reply_bytes = fetch_chunks_from(&mut map, &nonce, "consumerZ", offset, 2 + guard as u64).encode();
+            match crate::serve::FetchChunksResponse::decode(&reply_bytes).unwrap() {
+                crate::serve::FetchChunksResponse::Chunks { framed, next_offset, done } => {
+                    for chunk in parse_response(&framed).unwrap() {
+                        match chunk {
+                            ServeChunk::Delta(t) => text.push_str(&t),
+                            ServeChunk::Done { tokens: n, .. } => tokens = n,
+                            _ => {}
+                        }
+                    }
+                    offset = next_offset;
+                    if done {
+                        break;
+                    }
+                }
+                other => panic!("unexpected reply: {other:?}"),
+            }
+        }
+
+        // Reassembled streamed output equals the buffered result, byte-for-byte.
+        let buffered_text: String = parse_response(&frame_response(&buffered_frames))
+            .unwrap()
+            .into_iter()
+            .filter_map(|c| if let ServeChunk::Delta(t) = c { Some(t) } else { None })
+            .collect();
+        assert_eq!(text, buffered_text);
+        assert_eq!(text, "Hello world");
+        assert_eq!(tokens, 5);
+        // Prune-on-ack held: after fully draining, the live buffer keeps only the un-acked tail.
+        assert!(map[&nonce].base_offset > 0, "prefix was pruned as the consumer acked it");
+    }
+
+    #[test]
+    fn stream_begin_ttl_prunes_expired_buffers() {
+        let mut map = HashMap::new();
+        stream_begin_in(&mut map, [1u8; 16], "c", 0); // recorded at t=0
+        // A begin far past the TTL prunes the stale buffer as a side effect.
+        stream_begin_in(&mut map, [2u8; 16], "c", STREAM_TTL_MS + 1);
+        assert!(!map.contains_key(&[1u8; 16]), "expired stream pruned on the next begin");
+        assert!(map.contains_key(&[2u8; 16]));
     }
 
     #[test]

@@ -501,7 +501,12 @@ fn usage_value(summary: &ServeSummary) -> Value {
 
 /// The `openhydra` telemetry block: three views of one request (engine ground-truth,
 /// pipeline end-to-end, and where the wall-clock went hop-by-hop).
-fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration) -> Value {
+///
+/// `ttft` is the measured time to the **first delta** reaching the responder (P1 streaming): on a
+/// streaming serve it's a small fraction of `wall` (the first token arrives while the rest
+/// generate); on a buffered serve / legacy-fallback the whole completion lands at once, so it
+/// equals `wall`. So `ttft_ms ≪ wall_ms` is also the signal that streaming actually engaged.
+fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std::time::Duration) -> Value {
     let e = &summary.metrics.engine;
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let ms = |ns: u64| ns / 1_000_000;
@@ -530,7 +535,8 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration) -> Value {
             "pipeline_tps": r1(pipeline_tps),
             "wall_ms": ms(wall_ns),
             "overhead_ms": ms(wall_ns.saturating_sub(e.total_duration_ns)),
-            "ttft_ms": ms(wall_ns), // buffered transport: no token reaches the client until done
+            // P1 streaming: the real time to the first delta (≪ wall when streaming engaged).
+            "ttft_ms": ms((ttft.as_nanos() as u64).min(wall_ns)),
         },
         "hops_ms": {
             "discover": ms(summary.discover_ns),
@@ -565,6 +571,7 @@ fn completion_object(
     content: &str,
     summary: &ServeSummary,
     wall: std::time::Duration,
+    ttft: std::time::Duration,
 ) -> Value {
     let (message, finish) = if summary.tool_calls.is_empty() {
         (json!({ "role": "assistant", "content": content }), "stop")
@@ -585,7 +592,7 @@ fn completion_object(
             "finish_reason": finish,
         }],
         "usage": usage_value(summary),
-        "openhydra": openhydra_block(summary, wall),
+        "openhydra": openhydra_block(summary, wall, ttft),
     })
 }
 
@@ -857,9 +864,13 @@ fn stream_response(
         tokio_stream::once(Ok::<Event, std::convert::Infallible>(Event::default().data(data)))
     };
     let (id_s, model_s) = (id.clone(), model.clone());
+    // P1 streaming: stamp the first delta so `ttft_ms` reflects real time-to-first-token — the
+    // whole point of streaming is that this lands far ahead of `wall`.
+    let mut ttft: Option<std::time::Duration> = None;
     let body = UnboundedReceiverStream::new(rx).map(move |ev| {
         let data = match ev {
             GatewayEvent::Delta(t) => {
+                ttft.get_or_insert_with(|| started.elapsed());
                 stream_chunk(&id_s, &model_s, created, json!({ "content": t }), None)
             }
             GatewayEvent::Done(summary) => {
@@ -883,7 +894,8 @@ fn stream_response(
                 let mut chunk: Value =
                     serde_json::from_str(&stream_chunk(&id_s, &model_s, created, delta, Some(finish)))
                         .unwrap_or_else(|_| json!({}));
-                chunk["openhydra"] = openhydra_block(&summary, wall);
+                // No delta (tool-call-only turn) → first "token" is effectively at completion.
+                chunk["openhydra"] = openhydra_block(&summary, wall, ttft.unwrap_or(wall));
                 if want_usage {
                     chunk["usage"] = usage_value(&summary);
                 }
@@ -923,9 +935,15 @@ async fn buffered_response(
 ) -> Response {
     let mut content = String::new();
     let mut outcome: Option<Result<Box<ServeSummary>, String>> = None;
+    // Time the first delta even though the HTTP body is buffered: with P1 streaming the tokens
+    // arrive incrementally over the channel, so this is the real generation time-to-first-token.
+    let mut ttft: Option<std::time::Duration> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
-            GatewayEvent::Delta(t) => content.push_str(&t),
+            GatewayEvent::Delta(t) => {
+                ttft.get_or_insert_with(|| started.elapsed());
+                content.push_str(&t);
+            }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
             GatewayEvent::Error(m) => outcome = Some(Err(m)),
         }
@@ -940,7 +958,8 @@ async fn buffered_response(
                 summary.discover_ns,
                 summary.proxy_roundtrip_ns,
             );
-            Json(completion_object(&id, &model, created, &content, &summary, wall)).into_response()
+            Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
+                .into_response()
         }
         Some(Err(m)) => {
             metrics.record_error();
@@ -2080,7 +2099,7 @@ mod tests {
     #[test]
     fn completion_object_is_openai_shaped() {
         let s = summary(27, 46);
-        let v = completion_object("chatcmpl-1", "unsloth/Llama-3.2-1B-Instruct", 1_700_000_000, "hello world", &s, std::time::Duration::from_millis(500));
+        let v = completion_object("chatcmpl-1", "unsloth/Llama-3.2-1B-Instruct", 1_700_000_000, "hello world", &s, std::time::Duration::from_millis(500), std::time::Duration::from_millis(80));
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["role"], "assistant");
         assert_eq!(v["choices"][0]["message"]["content"], "hello world");
@@ -2101,7 +2120,7 @@ mod tests {
             kind: "function".into(),
             function: ToolCallFunction { name: "get_time".into(), arguments: "{}".into() },
         }];
-        let v = completion_object("chatcmpl-1", "m", 1, "", &s, std::time::Duration::from_millis(10));
+        let v = completion_object("chatcmpl-1", "m", 1, "", &s, std::time::Duration::from_millis(10), std::time::Duration::from_millis(10));
         // The OpenAI shape a coding agent expects: content null, tool_calls set, finish_reason.
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(v["choices"][0]["message"]["content"], Value::Null);

@@ -133,6 +133,13 @@ impl ServeChunk {
         }
     }
 
+    /// Whether an encoded frame is a **terminal** (`Done`/`Error`) chunk — the last frame of
+    /// a stream. The provider's streaming buffer sets its `done` flag atomically with appending
+    /// such a frame, so a poll never observes `done` without the terminal chunk being fetchable.
+    pub fn frame_is_terminal(encoded: &[u8]) -> bool {
+        matches!(encoded.first(), Some(&TAG_DONE) | Some(&TAG_ERROR))
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, AdapterError> {
         match bytes.first() {
             Some(&TAG_DELTA) => Ok(ServeChunk::Delta(
@@ -322,6 +329,77 @@ impl FetchResponse {
             Some(&FETCH_NOTFOUND) => Ok(FetchResponse::NotFound),
             Some(&FETCH_FORBIDDEN) => Ok(FetchResponse::Forbidden),
             _ => Err(AdapterError::Parse("fetch response: bad/empty frame".into())),
+        }
+    }
+}
+
+/// Response to a `FETCH_CHUNKS` poll (streaming serve, P1): the newly-produced serve frames at
+/// or after the requested chunk offset, the offset to poll from next, and whether the stream is
+/// complete (a terminal `Done`/`Error` chunk is included). `NotFound`/`Forbidden` mirror
+/// [`FetchResponse`]. Unlike the buffered `FetchResponse::Ready` (the *whole* result), this
+/// carries only the incremental slice `[offset..]`, so a long generation streams in bounded polls
+/// instead of one blob under a total-time cap.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FetchChunksResponse {
+    /// `framed` = [`frame_response`] of the chunks `[offset..]` — decode with [`parse_response`].
+    /// `next_offset` is the chunk index to request next; `done` marks end-of-stream.
+    Chunks { framed: Vec<u8>, next_offset: u32, done: bool },
+    /// No buffer under this nonce (provider restarted / TTL expired) — the consumer re-serves.
+    NotFound,
+    /// The poll's authenticated sender is not the consumer that committed the nonce.
+    Forbidden,
+    /// The provider shed the `SERVE_STREAM` at submit (worker pool full) — no buffer was
+    /// created. Only ever returned as the immediate ack to a `SERVE_STREAM`; the consumer
+    /// fails over to another provider (or retries) rather than polling a stream that will
+    /// never exist.
+    Overloaded,
+}
+
+// High, unambiguous discriminator bytes so a streaming consumer can tell a real
+// `FetchChunksResponse` from a legacy provider's reply by structural decode alone. A legacy
+// provider that doesn't know the `SERVE_STREAM` method byte answers it with a *fixed*
+// `frame_response([Error("unsupported method")])`, which begins with that frame's little-endian
+// `u32` length prefix (low byte `0x13` = 19, the frame's byte length) — far below `0xF1`. So a
+// reply whose first byte is `0xF1..=0xF4` is unambiguously a real streaming reply, and the
+// legacy error blob decodes cleanly to a decode error (→ the consumer falls back to the buffered
+// `SERVE_REQUEST`). The bytes are kept in the high range as defense-in-depth against any other
+// small `frame_response` blob a consumer might mis-probe.
+const FC_CHUNKS: u8 = 0xF1;
+const FC_NOTFOUND: u8 = 0xF2;
+const FC_FORBIDDEN: u8 = 0xF3;
+const FC_OVERLOADED: u8 = 0xF4;
+
+impl FetchChunksResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            FetchChunksResponse::Chunks { framed, next_offset, done } => {
+                let mut b = Vec::with_capacity(6 + framed.len());
+                b.push(FC_CHUNKS);
+                b.extend_from_slice(&next_offset.to_be_bytes());
+                b.push(u8::from(*done));
+                b.extend_from_slice(framed);
+                b
+            }
+            FetchChunksResponse::NotFound => vec![FC_NOTFOUND],
+            FetchChunksResponse::Forbidden => vec![FC_FORBIDDEN],
+            FetchChunksResponse::Overloaded => vec![FC_OVERLOADED],
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, AdapterError> {
+        match bytes.first() {
+            Some(&FC_CHUNKS) => {
+                if bytes.len() < 6 {
+                    return Err(AdapterError::Parse("fetch-chunks: short header".into()));
+                }
+                let next_offset = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                let done = bytes[5] != 0;
+                Ok(FetchChunksResponse::Chunks { framed: bytes[6..].to_vec(), next_offset, done })
+            }
+            Some(&FC_NOTFOUND) => Ok(FetchChunksResponse::NotFound),
+            Some(&FC_FORBIDDEN) => Ok(FetchChunksResponse::Forbidden),
+            Some(&FC_OVERLOADED) => Ok(FetchChunksResponse::Overloaded),
+            _ => Err(AdapterError::Parse("fetch-chunks: bad/empty frame".into())),
         }
     }
 }
@@ -547,5 +625,61 @@ mod tests {
         }
         // An empty frame is a decode error, not a silent misparse.
         assert!(FetchResponse::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn fetch_chunks_response_round_trips() {
+        // Frame two deltas as the incremental slice; carry next_offset + done.
+        let framed = frame_response(&[
+            ServeChunk::Delta("he".into()).encode(),
+            ServeChunk::Delta("llo".into()).encode(),
+        ]);
+        let r = FetchChunksResponse::Chunks { framed: framed.clone(), next_offset: 2, done: false };
+        let back = FetchChunksResponse::decode(&r.encode()).unwrap();
+        assert_eq!(back, r);
+        // The carried `framed` decodes with the normal serve parser.
+        if let FetchChunksResponse::Chunks { framed, next_offset, done } = back {
+            assert_eq!((next_offset, done), (2, false));
+            let chunks = parse_response(&framed).unwrap();
+            assert_eq!(chunks.len(), 2);
+        } else {
+            panic!("expected Chunks");
+        }
+        // A terminal slice (done=true) + the sentinels round-trip.
+        for r in [
+            FetchChunksResponse::Chunks { framed: frame_response(&[ServeChunk::Done { tokens: 5, metrics: Default::default() }.encode()]), next_offset: 3, done: true },
+            FetchChunksResponse::NotFound,
+            FetchChunksResponse::Forbidden,
+            FetchChunksResponse::Overloaded,
+        ] {
+            assert_eq!(FetchChunksResponse::decode(&r.encode()).unwrap(), r);
+        }
+        assert!(FetchChunksResponse::decode(&[]).is_err());
+        assert!(FetchChunksResponse::decode(&[FC_CHUNKS, 0, 0]).is_err()); // short header
+    }
+
+    #[test]
+    fn fetch_chunks_discriminator_cannot_collide_with_a_legacy_error_blob() {
+        // A legacy provider answers the unknown SERVE_STREAM method byte with the fixed
+        // `frame_response([Error("unsupported method")])`. That blob begins with the frame's
+        // little-endian u32 length prefix — low byte 0x13 (= the 19-byte frame length), which is
+        // far below the 0xF1..=0xF4 streaming discriminators. So the consumer can tell a real
+        // streaming reply from that blob by structural decode alone.
+        let legacy = frame_response(&[ServeChunk::Error("unsupported method".into()).encode()]);
+        let lead = legacy.first().copied().unwrap();
+        assert!(lead < 0xF1, "legacy blob leads with a length byte ({lead:#x}) below the discriminators");
+        assert!(FetchChunksResponse::decode(&legacy).is_err(), "must not misdecode as a streaming reply");
+        for tag in [FC_CHUNKS, FC_NOTFOUND, FC_FORBIDDEN, FC_OVERLOADED] {
+            assert!(tag >= 0xF1);
+        }
+    }
+
+    #[test]
+    fn frame_is_terminal_flags_done_and_error_only() {
+        assert!(ServeChunk::frame_is_terminal(&ServeChunk::Done { tokens: 1, metrics: Default::default() }.encode()));
+        assert!(ServeChunk::frame_is_terminal(&ServeChunk::Error("x".into()).encode()));
+        assert!(!ServeChunk::frame_is_terminal(&ServeChunk::Delta("hi".into()).encode()));
+        assert!(!ServeChunk::frame_is_terminal(&ServeChunk::ToolCalls(vec![tool_call("f")]).encode()));
+        assert!(!ServeChunk::frame_is_terminal(&[]));
     }
 }
