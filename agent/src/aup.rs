@@ -77,7 +77,7 @@ impl AupPolicy {
         }
 
         if self.max_prompt_chars > 0 {
-            let total: usize = messages.iter().map(|m| m.content.chars().count()).sum();
+            let total: usize = messages.iter().map(message_text_len).sum();
             if total > self.max_prompt_chars {
                 return AupDecision::Deny(format!(
                     "prompt too large ({total} chars > limit {})",
@@ -99,7 +99,7 @@ impl AupPolicy {
 
         if !self.denied_substrings.is_empty() {
             for msg in messages {
-                let haystack = msg.content.to_lowercase();
+                let haystack = message_haystack(msg);
                 if self
                     .denied_substrings
                     .iter()
@@ -113,6 +113,33 @@ impl AupPolicy {
 
         AupDecision::Allow
     }
+}
+
+/// The char count of ALL engine-bound text in a message: its `content` plus any tool-call
+/// name/arguments. Content smuggled through `tool_calls` still reaches the engine, so AUP sizes it.
+fn message_text_len(m: &ChatMessage) -> usize {
+    let mut n = m.content.chars().count();
+    if let Some(calls) = &m.tool_calls {
+        for c in calls {
+            n += c.function.name.chars().count() + c.function.arguments.chars().count();
+        }
+    }
+    n
+}
+
+/// A lowercased haystack of ALL engine-bound text in a message (content + tool-call name/arguments),
+/// so `denied_substrings` scans everything the engine will see — not just `content`.
+fn message_haystack(m: &ChatMessage) -> String {
+    let mut s = m.content.to_lowercase();
+    if let Some(calls) = &m.tool_calls {
+        for c in calls {
+            s.push('\n');
+            s.push_str(&c.function.name.to_lowercase());
+            s.push('\n');
+            s.push_str(&c.function.arguments.to_lowercase());
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -143,6 +170,41 @@ mod tests {
         assert_eq!(p.evaluate(&[msg("hello")], None), AupDecision::Allow); // 5 chars
         // 6 + 6 = 12 > 10, summed across messages.
         assert!(matches!(p.evaluate(&[msg("abcdef"), msg("ghijkl")], None), AupDecision::Deny(_)));
+    }
+
+    fn msg_with_tool(name: &str, args: &str) -> ChatMessage {
+        use crate::adapter::{ToolCall, ToolCallFunction};
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "t1".to_string(),
+                kind: "function".to_string(),
+                function: ToolCallFunction { name: name.to_string(), arguments: args.to_string() },
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn denied_substring_in_tool_call_arguments_is_caught() {
+        let p = AupPolicy { denied_substrings: vec!["forbidden".to_string()], ..Default::default() };
+        // content is empty, but the denied word rides in the tool-call arguments → still denied.
+        let m = msg_with_tool("lookup", r#"{"q":"how to make FORBIDDEN things"}"#);
+        assert!(matches!(p.evaluate(&[m], None), AupDecision::Deny(_)));
+        // a clean tool call passes.
+        assert_eq!(
+            p.evaluate(&[msg_with_tool("lookup", r#"{"q":"weather"}"#)], None),
+            AupDecision::Allow
+        );
+    }
+
+    #[test]
+    fn prompt_size_counts_tool_call_arguments() {
+        let p = AupPolicy { max_prompt_chars: 10, ..Default::default() };
+        // empty content but 20-char arguments → over the 10-char limit.
+        let m = msg_with_tool("f", "01234567890123456789");
+        assert!(matches!(p.evaluate(&[m], None), AupDecision::Deny(_)));
     }
 
     #[test]

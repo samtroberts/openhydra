@@ -1082,102 +1082,106 @@ fn ant_sse(name: &str, data: Value) -> Event {
 fn anthropic_stream_response(
     id: String,
     model: String,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
-    let (etx, erx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    tokio::spawn(async move {
-        // Wait for the first frame before committing to a message envelope. If the generation
-        // errors before producing anything (e.g. "no provider"), emit ONLY a clean `error` event —
-        // don't fabricate a `message_start`/`content_block_start` for a message that never began.
-        let first = match rx.recv().await {
-            Some(GatewayEvent::Error(m)) => {
-                metrics.record_error();
-                let _ = etx.send(ant_sse(
-                    "error",
-                    json!({ "type": "error", "error": { "type": "api_error", "message": m } }),
-                ));
-                return;
+    // The worker emits `(event_name, json)` frames; convert to axum SSE `Event` only at the boundary
+    // so the translation logic stays unit-testable without axum.
+    let (etx, erx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, Value)>();
+    tokio::spawn(anthropic_stream_worker(id, model, rx, started, metrics, etx));
+    let body = UnboundedReceiverStream::new(erx)
+        .map(|(name, data)| Ok::<Event, std::convert::Infallible>(ant_sse(name, data)));
+    Sse::new(body).into_response()
+}
+
+/// Translate the internal `GatewayEvent` stream into ordered Anthropic SSE frames sent to `out`.
+/// Peeks the first frame: an immediate error yields a single `error` frame with no message
+/// envelope; otherwise `message_start` → `content_block_start` → deltas → `content_block_stop`
+/// → (tool blocks) → `message_delta` → `message_stop`. Factored out so it's testable without axum.
+async fn anthropic_stream_worker(
+    id: String,
+    model: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    started: std::time::Instant,
+    metrics: Arc<Metrics>,
+    out: tokio::sync::mpsc::UnboundedSender<(&'static str, Value)>,
+) {
+    // Wait for the first frame before committing to a message envelope. If the generation errors
+    // before producing anything (e.g. "no provider"), emit ONLY a clean `error` frame.
+    let first = match rx.recv().await {
+        Some(GatewayEvent::Error(m)) => {
+            metrics.record_error();
+            let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
+            return;
+        }
+        Some(ev) => ev, // a Delta or Done — the message really started
+        None => return, // stream closed with nothing
+    };
+    let _ = out.send((
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": id, "type": "message", "role": "assistant", "model": model,
+                "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 },
             }
-            Some(ev) => ev, // a Delta or Done — the message really started
-            None => return, // stream closed with nothing
-        };
-        let _ = etx.send(ant_sse(
-            "message_start",
-            json!({
-                "type": "message_start",
-                "message": {
-                    "id": id, "type": "message", "role": "assistant", "model": model,
-                    "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
-                    "usage": { "input_tokens": 0, "output_tokens": 0 },
-                }
-            }),
-        ));
-        let _ = etx.send(ant_sse(
-            "content_block_start",
-            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
-        ));
-        // Process the first frame, then drain the rest.
-        let mut pending = Some(first);
-        loop {
-            let ev = match pending.take() {
+        }),
+    ));
+    let _ = out.send((
+        "content_block_start",
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+    ));
+    // Process the first frame, then drain the rest.
+    let mut pending = Some(first);
+    loop {
+        let ev = match pending.take() {
+            Some(e) => e,
+            None => match rx.recv().await {
                 Some(e) => e,
-                None => match rx.recv().await {
-                    Some(e) => e,
-                    None => break,
-                },
-            };
-            match ev {
-                GatewayEvent::Delta(t) => {
-                    let _ = etx.send(ant_sse(
+                None => break,
+            },
+        };
+        match ev {
+            GatewayEvent::Delta(t) => {
+                let _ = out.send((
+                    "content_block_delta",
+                    json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } }),
+                ));
+            }
+            GatewayEvent::Done(summary) => {
+                let wall = started.elapsed();
+                log_completion(&summary, wall);
+                metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
+                let _ = out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 })));
+                // Each tool call → a `tool_use` block whose arguments stream as one
+                // `input_json_delta` (clients accumulate + parse it).
+                for (i, tc) in summary.tool_calls.iter().enumerate() {
+                    let idx = i + 1;
+                    let _ = out.send((
+                        "content_block_start",
+                        json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": {} } }),
+                    ));
+                    let _ = out.send((
                         "content_block_delta",
-                        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } }),
+                        json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "input_json_delta", "partial_json": tc.function.arguments } }),
                     ));
+                    let _ = out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": idx })));
                 }
-                GatewayEvent::Done(summary) => {
-                    let wall = started.elapsed();
-                    log_completion(&summary, wall);
-                    metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
-                    let _ = etx.send(ant_sse(
-                        "content_block_stop",
-                        json!({ "type": "content_block_stop", "index": 0 }),
-                    ));
-                    // Each tool call → a `tool_use` block whose arguments stream as one
-                    // `input_json_delta` (clients accumulate + parse it).
-                    for (i, tc) in summary.tool_calls.iter().enumerate() {
-                        let idx = i + 1;
-                        let _ = etx.send(ant_sse(
-                            "content_block_start",
-                            json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": {} } }),
-                        ));
-                        let _ = etx.send(ant_sse(
-                            "content_block_delta",
-                            json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "input_json_delta", "partial_json": tc.function.arguments } }),
-                        ));
-                        let _ = etx.send(ant_sse(
-                            "content_block_stop",
-                            json!({ "type": "content_block_stop", "index": idx }),
-                        ));
-                    }
-                    let stop_reason = if summary.tool_calls.is_empty() { "end_turn" } else { "tool_use" };
-                    let _ = etx.send(ant_sse(
-                        "message_delta",
-                        json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens } }),
-                    ));
-                    let _ = etx.send(ant_sse("message_stop", json!({ "type": "message_stop" })));
-                }
-                GatewayEvent::Error(m) => {
-                    metrics.record_error();
-                    let _ = etx.send(ant_sse(
-                        "error",
-                        json!({ "type": "error", "error": { "type": "api_error", "message": m } }),
-                    ));
-                }
+                let stop_reason = if summary.tool_calls.is_empty() { "end_turn" } else { "tool_use" };
+                let _ = out.send((
+                    "message_delta",
+                    json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens } }),
+                ));
+                let _ = out.send(("message_stop", json!({ "type": "message_stop" })));
+            }
+            GatewayEvent::Error(m) => {
+                metrics.record_error();
+                let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
             }
         }
-    });
-    Sse::new(UnboundedReceiverStream::new(erx).map(Ok::<Event, std::convert::Infallible>)).into_response()
+    }
 }
 
 /// `GET /v1/models` — the models this gateway currently knows a provider for (PEX-learned
@@ -1676,6 +1680,84 @@ mod tests {
         assert_eq!(t[0]["type"], "function");
         assert_eq!(t[0]["function"]["name"], "f");
         assert_eq!(t[0]["function"]["parameters"]["type"], "object");
+    }
+
+    // ── Anthropic streaming translation (the immediate-error branch, deterministically) ──
+
+    /// Drive `anthropic_stream_worker` with a fixed event sequence and return the ordered SSE event
+    /// names it emits.
+    async fn stream_names(events: Vec<GatewayEvent>) -> Vec<&'static str> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for e in events {
+            tx.send(e).unwrap();
+        }
+        drop(tx); // close so the worker's drain loop ends
+        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        anthropic_stream_worker(
+            "msg_x".into(),
+            "m".into(),
+            rx,
+            std::time::Instant::now(),
+            Arc::new(Metrics::new()),
+            otx,
+        )
+        .await;
+        let mut names = Vec::new();
+        while let Ok((name, _)) = orx.try_recv() {
+            names.push(name);
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn stream_immediate_error_has_no_message_envelope() {
+        // An error as the FIRST frame → a single `error` frame, never a `message_start`.
+        let names = stream_names(vec![GatewayEvent::Error("no provider".into())]).await;
+        assert_eq!(names, vec!["error"]);
+    }
+
+    #[tokio::test]
+    async fn stream_happy_path_is_a_full_message_envelope() {
+        let names = stream_names(vec![
+            GatewayEvent::Delta("hi".into()),
+            GatewayEvent::Done(Box::new(summary(1, 2))),
+        ])
+        .await;
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_done_with_tool_call_emits_tool_use_block() {
+        let mut s = summary(3, 2);
+        s.tool_calls = vec![ToolCall {
+            id: "tu".into(),
+            kind: "function".into(),
+            function: ToolCallFunction { name: "f".into(), arguments: "{}".into() },
+        }];
+        let names = stream_names(vec![GatewayEvent::Done(Box::new(s))]).await;
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",  // text block (index 0)
+                "content_block_stop",
+                "content_block_start",  // tool_use block (index 1)
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
     }
 
     #[test]
