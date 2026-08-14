@@ -38,6 +38,8 @@ use openhydra_network::handle::NetworkHandle;
 use openhydra_network::node::NodeConfig;
 use openhydra_protocol::store::Store;
 
+mod launch;
+
 /// OpenHydra agent — a gateway in front of whatever inference engine you already run.
 #[derive(Parser)]
 #[command(name = "openhydra-agent", version, about)]
@@ -123,6 +125,10 @@ enum Role {
     /// no swarm. Used to wire `serve --self-provider <id>` when one machine both provides and
     /// consumes (#7 self-serve credit skip).
     PeerId,
+    /// Launch a coding tool (Claude Code, OpenCode, …) wired to the local OpenHydra gateway:
+    /// sets its endpoint env, defaults the model to `openhydra/auto`, then execs it. No swarm.
+    /// See `openhydra launch --list`.
+    Launch(launch::LaunchArgs),
 }
 
 /// Which local engine an agent proxies to. Selects the adapter; the `--engine` URL
@@ -459,15 +465,21 @@ fn run() -> Result<(), String> {
     openhydra_agent::telemetry::init();
     start_profiler_if_requested();
     let cli = Cli::parse();
-    // #7: `peer-id` resolves the identity's libp2p PeerId without starting a swarm, so the
-    // desktop can compute its own provider id and pass it to `serve --self-provider`.
-    if let Role::PeerId = cli.role {
-        let config = cli.node.into_config();
-        let id = openhydra_network::identity::Identity::load_or_create(&config.identity_path)
-            .map_err(|e| format!("load identity: {e}"))?;
-        println!("{}", id.libp2p_peer_id);
-        return Ok(());
-    }
+    // Roles that need no swarm are handled (and returned) before starting the network:
+    //  • `peer-id` (#7) resolves the identity's libp2p PeerId so the desktop can wire
+    //    `serve --self-provider <id>` for the self-serve credit skip.
+    //  • `launch` just execs a coding tool wired to the local gateway.
+    let role = match cli.role {
+        Role::PeerId => {
+            let config = cli.node.into_config();
+            let id = openhydra_network::identity::Identity::load_or_create(&config.identity_path)
+                .map_err(|e| format!("load identity: {e}"))?;
+            println!("{}", id.libp2p_peer_id);
+            return Ok(());
+        }
+        Role::Launch(args) => return launch::run(args),
+        other => other, // Provide | Serve — need the swarm
+    };
     let status_bind = cli.node.status_bind.clone();
     let config = cli.node.into_config();
     // Start the swarm first; both roles need the live node.
@@ -490,13 +502,13 @@ fn run() -> Result<(), String> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     if let Some(bind) = status_bind {
-        let role = match &cli.role {
+        let role_str = match &role {
             Role::Provide(_) => "provider",
             Role::Serve(_) => "gateway",
-            Role::PeerId => unreachable!("peer-id returns before the status server"),
+            _ => unreachable!("no-swarm roles return before the status server"),
         };
         let local = StatusServer {
-            role,
+            role: role_str,
             agent_version: env!("CARGO_PKG_VERSION"),
             libp2p_peer_id: net.libp2p_peer_id().to_string(),
             openhydra_peer_id: net.openhydra_peer_id().to_string(),
@@ -510,10 +522,10 @@ fn run() -> Result<(), String> {
         eprintln!("openhydra-agent: status endpoint at http://{local}/status");
     }
 
-    match cli.role {
+    match role {
         Role::Provide(args) => provide(net, stats, economy, args),
         Role::Serve(args) => serve(net, stats, economy, args),
-        Role::PeerId => unreachable!("peer-id handled before the swarm starts"),
+        _ => unreachable!("no-swarm roles handled before the swarm starts"),
     }
 }
 
