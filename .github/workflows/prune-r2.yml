@@ -19,6 +19,17 @@ on:
         description: "Dry run — only report, delete nothing. Set false to actually delete."
         type: boolean
         default: true
+  # Reusable: release.yml calls this after publishing so the bucket self-trims to `keep`.
+  workflow_call:
+    inputs:
+      keep:
+        type: string
+        default: "5"
+        required: false
+      dry_run:
+        type: boolean
+        default: false
+        required: false
 
 jobs:
   prune:

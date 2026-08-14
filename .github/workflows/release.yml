@@ -317,3 +317,15 @@ jobs:
               --content-type "application/json"
           fi
           echo "Published v${VERSION} to R2 → ${DIST_HOST}"
+
+  # Auto-trim the R2 bucket to the newest 5 releases after a successful publish.
+  # Tag runs only (not manual workflow_dispatch re-publishes, which may target an
+  # arbitrary version). Reuses the standalone prune workflow with dry_run=false.
+  prune:
+    needs: publish-r2
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/prune-r2.yml
+    with:
+      keep: "5"
+      dry_run: false
+    secrets: inherit
