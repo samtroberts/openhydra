@@ -1,0 +1,81 @@
+# Prune old release artifacts from the Cloudflare R2 download bucket, keeping only the N most
+# recent versioned releases. Runs in CI so it uses the same R2_* secrets the release job uses.
+#
+# Deletes ONLY the immutable per-release prefixes:  v<semver>/  and  updater/v<semver>/
+# NEVER touches the mutable pointers:  latest/ , latest.json , updater/latest.json
+#
+# SAFE BY DEFAULT: `dry_run` defaults to true — the run only *reports* what it would delete.
+# Re-run with dry_run=false to actually delete. Manual trigger only (workflow_dispatch).
+name: Prune R2 releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "How many most-recent versioned releases to keep"
+        default: "5"
+        required: true
+      dry_run:
+        description: "Dry run — only report, delete nothing. Set false to actually delete."
+        type: boolean
+        default: true
+
+jobs:
+  prune:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Prune v*/ and updater/v*/ beyond the newest N
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          KEEP: ${{ inputs.keep }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          # Preflight: fail loudly on a credential/bucket problem instead of silently pruning nothing.
+          if ! aws s3 ls "s3://${R2_BUCKET}/" --endpoint-url "$EP" >/dev/null; then
+            echo "::error::cannot list s3://${R2_BUCKET}/ — check R2_* secrets"; exit 1
+          fi
+
+          # Enumerate top-level "v<semver>/" prefixes, newest first.
+          mapfile -t VERSIONS < <(
+            aws s3 ls "s3://${R2_BUCKET}/" --endpoint-url "$EP" \
+              | awk '$1=="PRE" && $2 ~ /^v[0-9]+\.[0-9]+\.[0-9]+\/$/ { sub(/\/$/,"",$2); print $2 }' \
+              | sort -Vr
+          )
+
+          echo "Keep newest: ${KEEP}   |   dry_run: ${DRY_RUN}"
+          echo "Found ${#VERSIONS[@]} versioned releases (newest first): ${VERSIONS[*]:-<none>}"
+
+          if [ "${#VERSIONS[@]}" -le "$KEEP" ]; then
+            echo "≤ ${KEEP} releases present — nothing to prune."
+            exit 0
+          fi
+
+          KEEP_LIST=("${VERSIONS[@]:0:$KEEP}")
+          PRUNE_LIST=("${VERSIONS[@]:$KEEP}")
+          echo "==> KEEP  (${#KEEP_LIST[@]}): ${KEEP_LIST[*]}"
+          echo "==> PRUNE (${#PRUNE_LIST[@]}): ${PRUNE_LIST[*]}"
+
+          for v in "${PRUNE_LIST[@]}"; do
+            for prefix in "${v}/" "updater/${v}/"; do
+              echo "---- ${prefix} ----"
+              if [ "$DRY_RUN" = "true" ]; then
+                aws s3 ls "s3://${R2_BUCKET}/${prefix}" --recursive --endpoint-url "$EP" \
+                  | sed 's/^/  [dry-run WOULD DELETE] /' || echo "  (empty)"
+              else
+                aws s3 rm "s3://${R2_BUCKET}/${prefix}" --recursive --endpoint-url "$EP" || true
+              fi
+            done
+          done
+
+          echo "Done. Preserved: latest/, latest.json, updater/latest.json, and the newest ${KEEP} versions."
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::DRY RUN — nothing deleted. Re-run with dry_run=false to apply."
+          fi
