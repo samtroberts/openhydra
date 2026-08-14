@@ -5,15 +5,8 @@
 //! Drives the swarm through a synchronous [`handle::NetworkHandle`] for the
 //! `openhydra-agent` host (and the `openhydra-bootstrap` binary).
 
-pub mod batcher;
 pub mod behaviour;
-pub mod dispatcher;
-pub mod forward_msg;
-pub mod ipc;
-pub mod ipc_codec;
 pub mod proxy;
-pub mod ring;
-pub mod sampler_bridge;
 
 /// Prost-generated types from peer.proto.
 pub mod proto {
@@ -31,7 +24,6 @@ pub mod registry_proto;
 pub mod relay;
 pub mod routing_cache;
 pub mod swarm;
-pub mod tensor_stream;
 pub mod transport;
 pub mod types;
 
