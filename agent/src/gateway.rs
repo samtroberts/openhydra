@@ -1122,21 +1122,12 @@ async fn anthropic_stream_worker(
     metrics: Arc<Metrics>,
     out: tokio::sync::mpsc::UnboundedSender<(&'static str, Value)>,
 ) {
-    // Wait for the first frame before committing to a message envelope. While waiting, emit a native
-    // `ping` every PING_INTERVAL so a slow discovery / cold-model load / prefill (no bytes for tens
-    // of seconds) can't trip a client's first-byte timeout — WITHOUT fabricating a message envelope
-    // (a `ping` is an explicit keep-alive, so the clean immediate-error contract holds). `biased`
-    // makes a ready frame always win the race, so pings never appear once real data is available.
-    let first = loop {
-        tokio::select! {
-            biased;
-            frame = rx.recv() => break frame,
-            _ = tokio::time::sleep(PING_INTERVAL) => {
-                let _ = out.send(("ping", json!({ "type": "ping" })));
-            }
-        }
-    };
-    let first = match first {
+    // Wait for the first frame before committing to a message envelope. If the generation errors
+    // before producing anything, emit ONLY a clean `error` frame. The pre-first-frame gap is kept
+    // warm by the SSE comment keep-alive on the response — NO native `ping` here, because a `ping`
+    // before `message_start` makes the official Anthropic SDK `.stream()` accumulator raise
+    // "Unexpected event order, got ping before message_start" and abort.
+    let first = match rx.recv().await {
         Some(GatewayEvent::Error(m)) => {
             metrics.record_error();
             let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
@@ -1160,16 +1151,11 @@ async fn anthropic_stream_worker(
         "content_block_start",
         json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
     ));
-    // Process the first frame, then drain the rest.
-    let mut pending = Some(first);
-    loop {
-        let ev = match pending.take() {
-            Some(e) => e,
-            None => match rx.recv().await {
-                Some(e) => e,
-                None => break,
-            },
-        };
+    // Process the first frame, then drain the rest. A native `ping` is emitted only on a mid-content
+    // stall — i.e. AFTER `message_start` (canonical + SDK-safe); `biased` makes a ready frame win, so
+    // pings never appear once tokens are flowing.
+    let mut ev = first;
+    'drain: loop {
         match ev {
             GatewayEvent::Delta(t) => {
                 let _ = out.send((
@@ -1202,12 +1188,28 @@ async fn anthropic_stream_worker(
                     json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens } }),
                 ));
                 let _ = out.send(("message_stop", json!({ "type": "message_stop" })));
+                break 'drain;
             }
             GatewayEvent::Error(m) => {
                 metrics.record_error();
                 let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
+                break 'drain;
             }
         }
+        // Await the next frame; emit a `ping` on a mid-content stall (biased → a ready frame wins,
+        // so no ping once tokens are flowing). Only reached after a `Delta` (Done/Error broke).
+        ev = loop {
+            tokio::select! {
+                biased;
+                f = rx.recv() => match f {
+                    Some(e) => break e,
+                    None => break 'drain, // channel closed without a terminal frame (defensive)
+                },
+                _ = tokio::time::sleep(PING_INTERVAL) => {
+                    let _ = out.send(("ping", json!({ "type": "ping" })));
+                }
+            }
+        };
     }
 }
 
@@ -1788,7 +1790,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stream_pings_while_awaiting_the_first_frame() {
+    async fn stream_pings_during_a_mid_content_stall_never_before_message_start() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
         let worker = tokio::spawn(anthropic_stream_worker(
@@ -1799,22 +1801,25 @@ mod tests {
             Arc::new(Metrics::new()),
             otx,
         ));
-        tokio::task::yield_now().await; // let the worker reach its first select
-        // No frame yet → advance past two ping intervals; native pings should be emitted.
+        // First token opens the message envelope.
+        tx.send(GatewayEvent::Delta("hi".into())).unwrap();
+        tokio::task::yield_now().await;
+        // Then the model stalls: advance past two ping intervals → native pings fire, AFTER
+        // message_start (where the Anthropic protocol allows them).
         tokio::time::advance(std::time::Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
-        // Now deliver the (only) frame and close the stream.
-        tx.send(GatewayEvent::Done(Box::new(summary(0, 0)))).unwrap();
+        tx.send(GatewayEvent::Done(Box::new(summary(1, 1)))).unwrap();
         drop(tx);
         worker.await.unwrap();
         let mut names = Vec::new();
         while let Ok((n, _)) = orx.try_recv() {
             names.push(n);
         }
-        assert!(names.iter().any(|&n| n == "ping"), "expected pings during the wait, got {names:?}");
-        // Pings appear only BEFORE the message envelope; the message still completes cleanly.
-        let start = names.iter().position(|&n| n == "message_start").expect("message_start");
-        assert!(names[..start].iter().all(|&n| n == "ping"));
+        // The stream must OPEN with message_start — never a ping before it (that breaks the SDK).
+        assert_eq!(names.first(), Some(&"message_start"), "{names:?}");
+        let start = names.iter().position(|&n| n == "message_start").unwrap();
+        let ping = names.iter().position(|&n| n == "ping").expect("expected mid-content pings");
+        assert!(ping > start, "ping must come after message_start: {names:?}");
         assert!(names.contains(&"message_stop"));
     }
 
