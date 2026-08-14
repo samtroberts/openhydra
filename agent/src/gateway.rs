@@ -186,6 +186,53 @@ fn validate(req: &ChatRequest) -> Option<Response> {
     None
 }
 
+// ── `openhydra/auto` meta-model ──────────────────────────────────────────────
+//
+// Connector snippets advertise `model: openhydra/auto`, but the router resolves a *literal*
+// model id — so `auto` must be turned into a concrete model that actually has a provider
+// before dispatch. Resolution: an operator override (`OPENHYDRA_AUTO_MODEL`) if it's live,
+// else a deterministic pick from the currently-known set; empty set ⇒ a clear "no models yet".
+
+/// The canonical meta-model id the connectors advertise.
+const AUTO_MODEL_ID: &str = "openhydra/auto";
+
+/// Is `model` the auto meta-model (`auto` or `openhydra/auto`, case/space-insensitive)?
+fn is_auto_model(model: &str) -> bool {
+    let m = model.trim();
+    m.eq_ignore_ascii_case("auto") || m.eq_ignore_ascii_case(AUTO_MODEL_ID)
+}
+
+/// Pure selection: an operator-preferred model wins *iff* it's currently served; otherwise the
+/// alphabetically-first known model (stable/deterministic). `None` when nothing is served.
+fn pick_auto_model(known: &[String], preferred: Option<&str>) -> Option<String> {
+    if let Some(p) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
+        if known.iter().any(|m| m == p) {
+            return Some(p.to_string());
+        }
+    }
+    known.iter().min().cloned()
+}
+
+/// Resolve the request's `model` to a concrete one: a no-op for a normal model, or (for
+/// `openhydra/auto`) a live model chosen by [`pick_auto_model`]. `known_models` is a blocking
+/// swarm read, so it runs on a blocking thread. Returns the concrete model, or an error reason.
+async fn resolve_auto_model(state: &AppState, requested: &str) -> Result<String, String> {
+    if !is_auto_model(requested) {
+        return Ok(requested.to_string());
+    }
+    let node = state.node.clone();
+    let known = tokio::task::spawn_blocking(move || node.known_models())
+        .await
+        .map_err(|_| "auto-model resolution failed".to_string())?
+        .map_err(|e| e)?;
+    let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
+    pick_auto_model(&known, preferred.as_deref()).ok_or_else(|| {
+        "no models available on the network yet — try again once a provider announces, or request \
+         a specific model"
+            .to_string()
+    })
+}
+
 // ── Response builders (pure) ─────────────────────────────────────────────────
 
 /// `usage` object: prompt tokens are the engine's count (0 if it reports none),
@@ -350,12 +397,17 @@ async fn chat_completions(
     let id = next_id();
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
-    let (model, stream) = (req.model.clone(), req.stream);
+    let stream = req.stream;
+    // Resolve `openhydra/auto` → a concrete live model before routing (and echo it back).
+    let model = match resolve_auto_model(&state, &req.model).await {
+        Ok(m) => m,
+        Err(e) => return openai_error(StatusCode::SERVICE_UNAVAILABLE, &e, "no_provider"),
+    };
 
     let (rx, started) = match spawn_dispatch(
         &state,
         &headers,
-        &req.model,
+        &model,
         req.messages,
         req.max_tokens,
         req.temperature,
@@ -918,12 +970,17 @@ async fn messages(
     let messages = to_chat_messages(req.system.as_ref(), &req.messages);
     let tools = to_openai_tools(&req.tools);
     let id = next_msg_id();
-    let (model, stream) = (req.model.clone(), req.stream);
+    let stream = req.stream;
+    // Resolve `openhydra/auto` → a concrete live model before routing (and echo it back).
+    let model = match resolve_auto_model(&state, &req.model).await {
+        Ok(m) => m,
+        Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, &e, "api_error"),
+    };
 
     let (rx, started) = match spawn_dispatch(
         &state,
         &headers,
-        &req.model,
+        &model,
         messages,
         req.max_tokens,
         req.temperature,
@@ -1075,10 +1132,17 @@ async fn list_models(State(state): State<AppState>) -> Response {
     });
     match rx.await {
         Ok(Ok(models)) => {
-            let data: Vec<Value> = models
-                .iter()
-                .map(|m| json!({ "id": m, "object": "model", "created": 0, "owned_by": "openhydra" }))
-                .collect();
+            let mut data: Vec<Value> = Vec::new();
+            // Advertise the `openhydra/auto` meta-model first, but only when at least one concrete
+            // model can currently back it (else clients would pick a model that can't route).
+            if !models.is_empty() {
+                data.push(json!({ "id": AUTO_MODEL_ID, "object": "model", "created": 0, "owned_by": "openhydra" }));
+            }
+            data.extend(
+                models
+                    .iter()
+                    .map(|m| json!({ "id": m, "object": "model", "created": 0, "owned_by": "openhydra" })),
+            );
             Json(json!({ "object": "list", "data": data })).into_response()
         }
         Ok(Err(e)) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
@@ -1448,6 +1512,30 @@ mod tests {
             discover_ns: 1_000_000,
             tool_calls: Vec::new(),
         }
+    }
+
+    // ── `openhydra/auto` meta-model ──
+
+    #[test]
+    fn is_auto_model_matches_aliases() {
+        assert!(is_auto_model("auto"));
+        assert!(is_auto_model("openhydra/auto"));
+        assert!(is_auto_model("  OpenHydra/Auto  "));
+        assert!(!is_auto_model("qwen2.5:7b"));
+        assert!(!is_auto_model("openhydra/qwen2.5:7b"));
+    }
+
+    #[test]
+    fn pick_auto_prefers_available_override_else_first() {
+        let known = vec!["qwen2.5:7b".to_string(), "llama3.2:1b".to_string()];
+        // operator override wins when it's actually served
+        assert_eq!(pick_auto_model(&known, Some("qwen2.5:7b")).as_deref(), Some("qwen2.5:7b"));
+        // override that isn't served → fall back to the deterministic (alphabetical) pick
+        assert_eq!(pick_auto_model(&known, Some("not-served")).as_deref(), Some("llama3.2:1b"));
+        // no override → deterministic pick
+        assert_eq!(pick_auto_model(&known, None).as_deref(), Some("llama3.2:1b"));
+        // nothing served → nothing to pick
+        assert_eq!(pick_auto_model(&[], Some("x")), None);
     }
 
     // ── Anthropic `/v1/messages` translation ──
