@@ -62,10 +62,13 @@ struct ToolSpec {
 /// contract, so only add a tool once its wiring is verified.
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
+        // Claude Code validates the model id client-side and rejects non-`claude-*` names, so we
+        // do NOT pin ANTHROPIC_MODEL — it uses its own default id, which the gateway's
+        // `/v1/messages` bridges to a live OpenHydra model. Pin one with OPENHYDRA_AUTO_MODEL.
         key: "claude",
         bins: &["claude"],
         api: Api::Anthropic,
-        sets_model: true,
+        sets_model: false,
         install_hint: "npm install -g @anthropic-ai/claude-code",
     },
     ToolSpec {
@@ -218,9 +221,23 @@ pub fn run(args: LaunchArgs) -> Result<(), String> {
         );
     }
     if !spec.sets_model {
-        eprintln!("openhydra launch: set {tool}'s model to '{}' to route through OpenHydra.", args.model);
+        match spec.api {
+            Api::OpenAi => eprintln!(
+                "openhydra launch: set {tool}'s model to '{}' in its config to route through OpenHydra.",
+                args.model
+            ),
+            Api::Anthropic => eprintln!(
+                "openhydra launch: {tool} sends its own model id; OpenHydra routes it to a live model \
+                 (set OPENHYDRA_AUTO_MODEL on the gateway to pin one)."
+            ),
+        }
     }
-    eprintln!("openhydra launch: starting {tool} → {origin} (model {})", args.model);
+    let model_note = if spec.sets_model {
+        format!("model {}", args.model)
+    } else {
+        "model: OpenHydra-routed".to_string()
+    };
+    eprintln!("openhydra launch: starting {tool} → {origin} ({model_note})");
 
     let mut cmd = Command::new(&bin);
     cmd.args(&args.args);
@@ -257,12 +274,14 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_env_points_at_origin_and_pins_model() {
+    fn anthropic_env_points_at_origin_without_pinning_model() {
+        // Claude Code rejects non-`claude-*` model ids client-side, so we set only the endpoint +
+        // key and let the gateway bridge whatever id Claude Code sends. No ANTHROPIC_MODEL.
         let s = spec_for("claude").unwrap();
         let e = tool_env(s, "http://127.0.0.1:16527", "openhydra/auto", "k");
         assert!(e.contains(&("ANTHROPIC_BASE_URL".into(), "http://127.0.0.1:16527".into())));
         assert!(e.contains(&("ANTHROPIC_API_KEY".into(), "k".into())));
-        assert!(e.contains(&("ANTHROPIC_MODEL".into(), "openhydra/auto".into())));
+        assert!(!e.iter().any(|(k, _)| k == "ANTHROPIC_MODEL"));
     }
 
     #[test]

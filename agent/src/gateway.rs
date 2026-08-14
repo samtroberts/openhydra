@@ -213,18 +213,35 @@ fn pick_auto_model(known: &[String], preferred: Option<&str>) -> Option<String> 
     known.iter().min().cloned()
 }
 
-/// Resolve the request's `model` to a concrete one: a no-op for a normal model, or (for
-/// `openhydra/auto`) a live model chosen by [`pick_auto_model`]. `known_models` is a blocking
-/// swarm read, so it runs on a blocking thread. Returns the concrete model, or an error reason.
-async fn resolve_auto_model(state: &AppState, requested: &str) -> Result<String, String> {
-    if !is_auto_model(requested) {
+/// Resolve the request's `model` to a concrete, served one. `known_models` is a blocking swarm
+/// read, so it runs on a blocking thread.
+///
+/// - `auto` / `openhydra/auto` → a live model via [`pick_auto_model`].
+/// - a concrete model that **is** served → itself.
+/// - a concrete model that is **not** served → falls back to `auto` iff `fallback_unservable`.
+///   The Anthropic `/v1/messages` path sets this: Claude Code can only send `claude-*` ids it
+///   validates client-side, so an id OpenHydra doesn't serve means "route with OpenHydra's
+///   models." The OpenAI path leaves it `false` (stays strict → a real "no provider" error).
+async fn resolve_model(
+    state: &AppState,
+    requested: &str,
+    fallback_unservable: bool,
+) -> Result<String, String> {
+    let auto = is_auto_model(requested);
+    // Fast path: a concrete model on the strict (OpenAI) surface needs no discovery query.
+    if !auto && !fallback_unservable {
         return Ok(requested.to_string());
     }
     let node = state.node.clone();
     let known = tokio::task::spawn_blocking(move || node.known_models())
         .await
-        .map_err(|_| "auto-model resolution failed".to_string())?
+        .map_err(|_| "model resolution failed".to_string())?
         .map_err(|e| e)?;
+    // A concrete model that's actually served is used as-is.
+    if !auto && known.iter().any(|m| m == requested) {
+        return Ok(requested.to_string());
+    }
+    // `auto`, or an unservable id on the Anthropic surface → pick a live model.
     let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
     pick_auto_model(&known, preferred.as_deref()).ok_or_else(|| {
         "no models available on the network yet — try again once a provider announces, or request \
@@ -398,8 +415,9 @@ async fn chat_completions(
     let created = unix_now();
     let want_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let stream = req.stream;
-    // Resolve `openhydra/auto` → a concrete live model before routing (and echo it back).
-    let model = match resolve_auto_model(&state, &req.model).await {
+    // Resolve `openhydra/auto` → a concrete live model before routing (and echo it back). Strict:
+    // a concrete OpenAI model is passed through (a real "no provider" if nobody serves it).
+    let model = match resolve_model(&state, &req.model, false).await {
         Ok(m) => m,
         Err(e) => return openai_error(StatusCode::SERVICE_UNAVAILABLE, &e, "no_provider"),
     };
@@ -971,8 +989,10 @@ async fn messages(
     let tools = to_openai_tools(&req.tools);
     let id = next_msg_id();
     let stream = req.stream;
-    // Resolve `openhydra/auto` → a concrete live model before routing (and echo it back).
-    let model = match resolve_auto_model(&state, &req.model).await {
+    // Resolve the model, bridging Claude Code: `openhydra/auto` and any model OpenHydra doesn't
+    // serve (e.g. the `claude-*` id Claude Code insists on) route to a live model; a served model
+    // is used as-is. Echoed back in the response.
+    let model = match resolve_model(&state, &req.model, true).await {
         Ok(m) => m,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, &e, "api_error"),
     };
