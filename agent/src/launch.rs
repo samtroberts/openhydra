@@ -116,11 +116,25 @@ fn resolve_tool_bin(bins: &[&str]) -> Option<PathBuf> {
         // name won't run on Windows, and the full path is what `exec_tool` needs to detect a shim.
         if let Ok(out) = Command::new(probe).arg(b).stderr(Stdio::null()).output() {
             if out.status.success() {
-                if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
-                    let p = line.trim();
-                    if !p.is_empty() {
-                        return Some(PathBuf::from(p));
-                    }
+                let text = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                // On Windows `where` may list an extensionless bash shim before the runnable
+                // `.cmd`/`.exe`; prefer a directly-runnable extension. Elsewhere the one `which`
+                // line is the answer.
+                let picked = if cfg!(windows) {
+                    lines
+                        .iter()
+                        .find(|l| {
+                            let low = l.to_ascii_lowercase();
+                            low.ends_with(".exe") || low.ends_with(".cmd") || low.ends_with(".bat")
+                        })
+                        .or_else(|| lines.first())
+                        .copied()
+                } else {
+                    lines.first().copied()
+                };
+                if let Some(p) = picked {
+                    return Some(PathBuf::from(p));
                 }
             }
         }
@@ -258,25 +272,11 @@ fn exec_tool(bin: &Path, args: &[String], env: &[(String, String)]) -> Result<()
 
 #[cfg(windows)]
 fn exec_tool(bin: &Path, args: &[String], env: &[(String, String)]) -> Result<(), String> {
-    // npm/yarn/bun global installs create `.cmd`/`.bat` shims that CreateProcess can't execute
-    // directly — those must go through `cmd /C`. A real `.exe` is launched directly.
-    let is_shim = bin
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_ascii_lowercase();
-            e == "cmd" || e == "bat"
-        })
-        .unwrap_or(false);
-    let mut cmd = if is_shim {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(bin).args(args);
-        c
-    } else {
-        let mut c = Command::new(bin);
-        c.args(args);
-        c
-    };
+    // Rust's std runs `.cmd`/`.bat` shims correctly (with batch-safe arg escaping) since 1.77.2, so
+    // invoke the resolved path directly. A manual `cmd /C` would mis-escape spaced npm paths and let
+    // cmd interpret metacharacters in the forwarded args — worse, not better.
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
     for (k, v) in env {
         cmd.env(k, v);
     }
