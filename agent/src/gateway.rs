@@ -1088,6 +1088,21 @@ fn anthropic_stream_response(
 ) -> Response {
     let (etx, erx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     tokio::spawn(async move {
+        // Wait for the first frame before committing to a message envelope. If the generation
+        // errors before producing anything (e.g. "no provider"), emit ONLY a clean `error` event —
+        // don't fabricate a `message_start`/`content_block_start` for a message that never began.
+        let first = match rx.recv().await {
+            Some(GatewayEvent::Error(m)) => {
+                metrics.record_error();
+                let _ = etx.send(ant_sse(
+                    "error",
+                    json!({ "type": "error", "error": { "type": "api_error", "message": m } }),
+                ));
+                return;
+            }
+            Some(ev) => ev, // a Delta or Done — the message really started
+            None => return, // stream closed with nothing
+        };
         let _ = etx.send(ant_sse(
             "message_start",
             json!({
@@ -1103,7 +1118,16 @@ fn anthropic_stream_response(
             "content_block_start",
             json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
         ));
-        while let Some(ev) = rx.recv().await {
+        // Process the first frame, then drain the rest.
+        let mut pending = Some(first);
+        loop {
+            let ev = match pending.take() {
+                Some(e) => e,
+                None => match rx.recv().await {
+                    Some(e) => e,
+                    None => break,
+                },
+            };
             match ev {
                 GatewayEvent::Delta(t) => {
                     let _ = etx.send(ant_sse(
