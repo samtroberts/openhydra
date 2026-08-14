@@ -2,8 +2,7 @@ CARGO ?= cargo
 
 .PHONY: build release test clippy fmt provide serve clean
 
-# Build the agent (debug). The agent links no Python — openhydra-network is
-# pulled with default-features = false, dropping the pyo3 feature.
+# Build the agent (debug). The agent links no Python.
 build:
 	$(CARGO) build -p openhydra-agent
 

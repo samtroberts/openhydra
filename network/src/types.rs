@@ -1,8 +1,7 @@
 //! Shared data types for the OpenHydra P2P networking layer.
 //!
-//! These mirror the Python `Announcement` dataclass (40+ fields) and
-//! `PeerEndpoint` dataclass, serializable to both CBOR (for Kademlia
-//! records) and Python dicts (via serde_json → PyO3).
+//! The peer-record types (`Announcement`/`PeerEndpoint`-shaped, 40+ fields),
+//! serializable to CBOR for Kademlia records and JSON for the introspection API.
 
 use openhydra_protocol::crypto_agility::SigAlg;
 use serde::{Deserialize, Serialize};

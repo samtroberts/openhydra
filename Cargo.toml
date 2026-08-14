@@ -1,8 +1,8 @@
 # OpenHydra Rust workspace.
 #
 # - `protocol` — pure, synchronous core (canonical model id, routing math, co-signed
-#   receipts, verification policy, persistent ledger). No async / libp2p / pyo3.
-# - `network`  — rust-libp2p + Kademlia + the PyO3 FFI; depends on `protocol`.
+#   receipts, verification policy, persistent ledger). No async / libp2p.
+# - `network`  — rust-libp2p + Kademlia (the async/transport shell); depends on `protocol`.
 # - `agent`    — the pure-protocol agent (M3.1+): BYO-engine adapters (Ollama/vLLM/…)
 #   and the eventual HTTP/SSE gateway. It proxies inference to *external* engines and
 #   never runs a model. Depends on `protocol`.
