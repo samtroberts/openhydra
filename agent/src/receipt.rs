@@ -274,4 +274,65 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AdapterError::Http(m) if m.contains("provider rejected")));
     }
+
+    /// Audit F3 (receipt-decoder coverage): the receipt request decoder runs on RAW, UNTRUSTED
+    /// bytes — the network layer hands any inbound `request_response` body (method byte `0x12`)
+    /// straight to `handle_receipt_inbound` → `decode_request`, which slices a fixed 162-byte
+    /// header and then a sender-declared `model_len` region. Those slices MUST be length-guarded
+    /// so adversarial input returns `Err`, never panics. This is the receipt-path twin of
+    /// `serve::tests::serve_decoders_never_panic_on_malformed_input`; it pins the guarantee against
+    /// a future edit that reorders a check or adds an unchecked slice. Passing = no unwind escapes.
+    #[test]
+    fn receipt_decoder_never_panics_on_malformed_input() {
+        // Hostile shapes tuned to the layout (REQ_FIXED = 162, then u16 model_len at [160..162],
+        // then `model_len` model bytes): empty, single bytes, truncated below the fixed header,
+        // exact-header with a nonzero declared model_len (length-mismatch path), a huge declared
+        // model_len over a short body, invalid-utf8 model bytes, and pseudo-random blobs.
+        let mut corpus: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x00],
+            vec![RECEIPT_REQUEST],            // method byte only, no payload
+            vec![0xFF; 1],
+            vec![0u8; 80],                    // truncated mid fixed-header
+            vec![0u8; REQ_FIXED - 2],         // one field short of the fixed header
+            vec![0u8; REQ_FIXED - 1],
+            vec![7u8; REQ_FIXED],             // full header, model_len from [160..162] = 0x0707 → len mismatch
+            {
+                // Exact fixed header, model_len declared huge, but no model body → length mismatch.
+                let mut v = vec![0u8; REQ_FIXED];
+                v[160] = 0xFF;
+                v[161] = 0xFF; // model_len = 65535, but data.len() == REQ_FIXED → Err, no slice
+                v
+            },
+            {
+                // Header + a small model region that is invalid UTF-8 → from_utf8 Err, not a panic.
+                let mut v = vec![0u8; REQ_FIXED + 3];
+                v[160] = 3; // model_len = 3
+                v[161] = 0;
+                let n = v.len();
+                v[n - 3..].copy_from_slice(&[0xff, 0xfe, 0x80]);
+                v
+            },
+        ];
+        // Deterministic pseudo-random blobs (no rng in the test path), spanning both sides of
+        // REQ_FIXED so the length checks and the variable slice are all exercised.
+        for seed in 0u16..96 {
+            let n = (seed as usize * 7) % (REQ_FIXED + 40);
+            corpus.push((0..n).map(|i| (seed.wrapping_mul(31).wrapping_add(i as u16)) as u8).collect());
+        }
+
+        let provider = signer(9);
+        let psign = sign_with(&provider);
+        let ppub = pubkey(&provider);
+        for bytes in &corpus {
+            // Core decoder on the payload (post method-byte), where the slicing risk lives.
+            let _ = decode_request(bytes);
+            // Full inbound path incl. the `data.first()` method-byte strip — results ignored,
+            // the point is "no panic". Feed both the raw bytes and a 0x12-prefixed variant.
+            let _ = handle_receipt_inbound(bytes, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), String>(()));
+            let mut framed = vec![RECEIPT_REQUEST];
+            framed.extend_from_slice(bytes);
+            let _ = handle_receipt_inbound(&framed, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), String>(()));
+        }
+    }
 }
