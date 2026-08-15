@@ -3799,8 +3799,16 @@ fn handle_grpc_proxy_event(
                     // poll_inbound, which decodes the 1-byte method and replies. The agent's serve
                     // decode is length-guarded / Err-not-panic, so raw untrusted bodies are handled
                     // safely at that layer (the pre-pivot dispatcher/forward_msg parsers are gone).
+                    //
+                    // F4 (audit): the removed dispatcher used to answer two method bytes inline —
+                    // METHOD_PING (0x05) and METHOD_GET_STATUS (0x06). Those now fall through to
+                    // the agent, whose dispatch returns a framed "unsupported method" Error. No
+                    // in-tree peer sends them (libp2p's own ping handles liveness); if a future
+                    // need arises, add the inline responder in the agent's dispatch `_` arm.
                     state.inbound_proxy_counter += 1;
                     let req_id = format!("proxy-{}", state.inbound_proxy_counter);
+                    // F6b: trace (not info — this fires for EVERY inbound request) for debugging.
+                    trace!(%peer, id = %req_id, bytes = request.0.len(), "proxy request queued for the agent");
                     proxy_queue.push((req_id.clone(), peer.to_string(), request.0));
                     state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
                 }

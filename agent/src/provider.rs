@@ -36,7 +36,7 @@ use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
 use crate::serve::{
     frame_response, handle_serve_request, handle_serve_request_parsed, FetchChunksResponse,
-    FetchResponse, ServeChunk, ServeRequest,
+    FetchResponse, ServeChunk, ServeRequest, ServeSummary,
 };
 use crate::status::TransferStats;
 use crate::workpool::WorkerPool;
@@ -361,6 +361,29 @@ fn reply_to_authorized(reply_to: &str, source_peer: &str) -> bool {
 /// var (which would race the parallel test runner).
 fn reply_to_matches(reply_to: &str, source_peer: &str) -> bool {
     reply_to == source_peer
+}
+
+/// F5: run a streaming generation, catching a panic in the adapter/engine and turning it into a
+/// terminal `Error` chunk so the stream buffer never lingers `done=false` after a bug (which would
+/// stall the consumer for the full stall deadline). On a normal `Ok`/`Err` outcome the underlying
+/// [`handle_serve_request_parsed`] already emits the terminal `Done`/`Error`, so those paths are
+/// byte-for-byte unchanged; only the panic branch is new. Free fn (no `Self`) so it is unit-testable
+/// with a panicking stub adapter. `AssertUnwindSafe` is sound here — the injected `on_chunk`
+/// appender takes+releases its lock per call, so a panic between appends holds nothing locked.
+fn generate_stream_guarded(
+    req: ServeRequest,
+    adapter: &dyn EngineAdapter,
+    on_chunk: &mut dyn FnMut(&[u8]),
+) -> ServeSummary {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_serve_request_parsed(req, adapter, on_chunk)
+    })) {
+        Ok(summary) => summary,
+        Err(_) => {
+            on_chunk(&ServeChunk::Error("provider generation failed".into()).encode());
+            ServeSummary { ok: false, ..Default::default() } // tokens 0 → no commitment recorded
+        }
+    }
 }
 
 /// Admit a new stream under `nonce`: prune expired buffers, enforce the per-peer fairness cap
@@ -801,8 +824,11 @@ impl<A: EngineAdapter> Provider<A> {
             FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode(),
         );
         // Generate, appending each frame (deltas, then the terminal Done/Error which flips `done`).
+        // F5: `generate_stream_guarded` catches a panic in the adapter/engine and appends a
+        // synthetic terminal Error, so a bug can't leave this buffer `done=false` forever (which
+        // would stall the consumer ~120s before it re-serves).
         let summary =
-            handle_serve_request_parsed(req, &self.adapter, &mut |c| self.stream_append(nonce, c));
+            generate_stream_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c));
         // B-S1: record what we served under the committed nonce so its settlement receipt can be
         // validated (right tokens/model, once) — identical to the buffered path.
         if summary.ok && summary.tokens > 0 {
@@ -1816,6 +1842,36 @@ mod tests {
         assert!(reply_to_authorized("a", "b"), "kill-switch must accept a mismatch");
         std::env::remove_var("OPENHYDRA_DISABLE_REPLYTO_BIND");
         assert!(!reply_to_authorized("a", "b"), "enforcement restored once the var is cleared");
+    }
+
+    #[test]
+    fn generate_stream_guarded_turns_a_panic_into_a_terminal_error() {
+        // F5: a panicking engine must not leave the stream `done=false` (→ 120s consumer stall);
+        // the guard catches it and appends a terminal Error so the consumer ends fast.
+        struct PanicAdapter;
+        impl EngineAdapter for PanicAdapter {
+            fn engine_name(&self) -> &'static str { "panic" }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> { Ok(vec![]) }
+            fn serve_stream(
+                &self,
+                _req: &InferenceRequest,
+                _on_delta: &mut dyn FnMut(&str),
+            ) -> Result<ServeOutcome, AdapterError> {
+                panic!("engine exploded");
+            }
+        }
+        let req = ServeRequest {
+            reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
+            max_tokens: None, temperature: None, tools: Vec::new(), nonce: [0u8; 16],
+        };
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        // Must NOT propagate the panic; returns a failed summary.
+        let summary = generate_stream_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()));
+        assert!(!summary.ok);
+        assert_eq!(summary.tokens, 0, "no tokens → no commitment recorded");
+        let last = frames.last().expect("a terminal frame was appended");
+        assert!(matches!(ServeChunk::decode(last).unwrap(), ServeChunk::Error(_)));
+        assert!(ServeChunk::frame_is_terminal(last), "the appended frame ends the stream");
     }
 
     #[test]
