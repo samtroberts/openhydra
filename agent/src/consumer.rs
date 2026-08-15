@@ -305,16 +305,40 @@ const STREAM_TOTAL_CEILING: Duration = Duration::from_secs(6 * 60 * 60);
 const STREAM_TOTAL_DEFAULT_TOKENS: u64 = 1024;
 
 /// The absolute total-time ceiling for a streaming attempt of `max_tokens`. Honors an
-/// `OPENHYDRA_STREAM_MAX_TOTAL_SECS` ops override; otherwise `BASE + max_tokens · per_token`,
-/// clamped to `[FLOOR, CEILING]`. Deliberately generous — it is a DoS backstop, not a latency SLA.
+/// `OPENHYDRA_STREAM_MAX_TOTAL_SECS` ops override (floored — see [`stream_total_cap_override`]);
+/// otherwise `BASE + max_tokens · per_token`, clamped to `[FLOOR, CEILING]`. Deliberately
+/// generous — it is a DoS backstop, not a latency SLA.
 fn stream_total_cap(max_tokens: Option<u32>) -> Duration {
     if let Some(secs) = std::env::var("OPENHYDRA_STREAM_MAX_TOTAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
-        return Duration::from_secs(secs);
+        return stream_total_cap_override(secs);
     }
     stream_total_cap_scaled(max_tokens)
+}
+
+/// Turn the raw `OPENHYDRA_STREAM_MAX_TOTAL_SECS` seconds into a usable cap. The override exists so
+/// an operator can bound the DoS window *tighter* than the 30-min scaled floor, but a value below
+/// the idle-stall ([`STREAM_STALL_TIMEOUT`]) is nonsensical — the total cap would fire before even
+/// one stall window elapses, aborting every legitimate stream (a fat-fingered `=0` kills all
+/// serving outright). So floor it at the stall timeout and warn when the raw value had to be
+/// raised, keeping the knob useful without the silent all-streams-down footgun. Pure (no env read)
+/// so the flooring is unit-tested directly.
+fn stream_total_cap_override(secs: u64) -> Duration {
+    let floor = STREAM_STALL_TIMEOUT;
+    let requested = Duration::from_secs(secs);
+    if requested < floor {
+        tracing::warn!(
+            requested_secs = secs,
+            floored_secs = floor.as_secs(),
+            "OPENHYDRA_STREAM_MAX_TOTAL_SECS below the idle-stall floor — raising it (a cap under \
+             the stall window would abort every stream)"
+        );
+        floor
+    } else {
+        requested
+    }
 }
 
 /// The pure `max_tokens`-scaled cap (no env), split out so the scaling/clamp math is unit-tested
@@ -1729,11 +1753,23 @@ mod tests {
     }
 
     #[test]
+    fn stream_total_cap_override_floors_a_nonsensical_value() {
+        // Pure (env-free) flooring rule: an override at/above the idle-stall is honored verbatim;
+        // one below it (incl. a fat-fingered 0) is raised to the stall floor so it can never abort
+        // every stream. Tested here rather than via env so it never races the parallel runner.
+        assert_eq!(stream_total_cap_override(600), Duration::from_secs(600), "honored as-is");
+        assert_eq!(stream_total_cap_override(STREAM_STALL_TIMEOUT.as_secs()), STREAM_STALL_TIMEOUT);
+        assert_eq!(stream_total_cap_override(0), STREAM_STALL_TIMEOUT, "0 floored, not instant-abort");
+        assert_eq!(stream_total_cap_override(7), STREAM_STALL_TIMEOUT, "below-floor raised");
+    }
+
+    #[test]
     fn stream_total_cap_env_override_wins() {
-        // The ONLY test that touches the process-global override env var (the scaling math is
-        // tested via `stream_total_cap_scaled`, which never reads env), so no cross-test race.
-        std::env::set_var("OPENHYDRA_STREAM_MAX_TOTAL_SECS", "7");
-        assert_eq!(stream_total_cap(Some(64)), Duration::from_secs(7));
+        // The ONLY test that touches the process-global override env var (the scaling + flooring
+        // math is tested via `stream_total_cap_scaled` / `stream_total_cap_override`, which never
+        // read env), so no cross-test race. A value above the floor rides through unchanged.
+        std::env::set_var("OPENHYDRA_STREAM_MAX_TOTAL_SECS", "600");
+        assert_eq!(stream_total_cap(Some(64)), Duration::from_secs(600));
         std::env::remove_var("OPENHYDRA_STREAM_MAX_TOTAL_SECS");
         assert_eq!(stream_total_cap(Some(64)), STREAM_TOTAL_FLOOR, "reverts to the scaled cap");
     }
