@@ -1804,23 +1804,23 @@ fn handle_resolve(
     }
 }
 
-/// Process a swarm event.
-/// Evict a peer that failed an outgoing dial: drop it from the Kademlia routing
-/// table and the known-peers cache so routing stops preferring a dead path. A
-/// later serve re-discovers the peer on demand, so eviction is safe and cheap.
-/// (No-op if the peer is in fact still connected.)
-fn evict_unreachable_peer(
-    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
-    state: &mut LoopState,
-    pid: PeerId,
-) {
+/// A peer we hold no live connection to failed an outgoing dial: drop it from the Kademlia
+/// routing table so routing stops preferring that dead path (a later serve re-discovers it on
+/// demand). (No-op if the peer is in fact still connected.)
+///
+/// It deliberately does **NOT** touch `known_peers`. An outgoing dial to a NAT'd / relayed
+/// provider fails routinely (DCUtR attempts, relay churn, transient direct-dial failures), and
+/// wiping the cache here dropped the provider's *entire* model set on every such hiccup — so a
+/// multi-model provider collapsed to ~1 model in the browse list / desktop Models view (regression
+/// vs v0.3.13, which only evicted after a 5-dial retry ladder). `known_peers` has its own liveness
+/// reaper (retain-if-connected-or-fresh, `KNOWN_PEER_TTL_MS`) kept warm by PEX, so a genuinely
+/// departed peer still ages out within the TTL while a transiently-unreachable one survives.
+fn evict_unreachable_peer(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, pid: PeerId) {
     if swarm.is_connected(&pid) {
         return;
     }
-    let pid_str = pid.to_string();
     swarm.behaviour_mut().kademlia.remove_peer(&pid);
-    state.known_peers.retain(|_, r| r.libp2p_peer_id != pid_str);
-    info!(%pid, "evicted unreachable peer after dial failure");
+    debug!(%pid, "removed unreachable peer from the routing table (known_peers left to the TTL reaper)");
 }
 
 /// F-5: backoff schedule (in ms) for relay-RESERVATION retries.
@@ -2404,14 +2404,10 @@ fn handle_swarm_event(
                 libp2p::mdns::Event::Expired(peers) => {
                     for (peer_id, _) in peers {
                         info!(%peer_id, "mDNS peer expired");
-                        if !swarm.is_connected(&peer_id) {
-                            swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
-                            let libp2p_id_str = peer_id.to_string();
-                            state.known_peers.retain(|_, record| {
-                                record.libp2p_peer_id != libp2p_id_str
-                            });
-                            debug!(%peer_id, "evicted expired mDNS peer");
-                        }
+                        // Drop the dead LAN route but keep `known_peers` — the TTL reaper owns
+                        // cache lifecycle. Wiping here collapsed multi-model providers on transient
+                        // mDNS churn. (No-op if still connected.)
+                        evict_unreachable_peer(swarm, peer_id);
                     }
                 }
             }
@@ -2584,14 +2580,10 @@ fn handle_swarm_event(
             if let Err(ref e) = ping_event.result {
                 let peer = ping_event.peer;
                 warn!(%peer, error = %e, "ping failed");
-                if !swarm.is_connected(&peer) {
-                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
-                    let libp2p_id_str = peer.to_string();
-                    state.known_peers.retain(|_, record| {
-                        record.libp2p_peer_id != libp2p_id_str
-                    });
-                    info!(%peer, "evicted peer after ping failure");
-                }
+                // Drop the dead route but keep `known_peers`: a ping failure to a relayed/NAT'd
+                // peer is transient, and wiping the cache here collapsed multi-model providers.
+                // The TTL reaper (fresh-or-connected) ages out a genuinely gone peer.
+                evict_unreachable_peer(swarm, peer);
             }
         }
 
@@ -2926,14 +2918,15 @@ fn handle_swarm_event(
                 );
             }
         }
-        // A failed outgoing dial to a peer we hold no live connection to →
-        // evict it so routing stops preferring the dead path (re-discovered
-        // on the next serve).
+        // A failed outgoing dial to a peer we hold no live connection to → drop it from the
+        // routing table (dead path). Do NOT wipe `known_peers` here — that collapsed multi-model
+        // providers on transient dial failures; the TTL reaper owns cache lifecycle. See
+        // [`evict_unreachable_peer`].
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             warn!(?peer_id, %error, "outgoing_connection_error");
             if let Some(pid) = peer_id {
                 if !swarm.is_connected(&pid) {
-                    evict_unreachable_peer(swarm, state, pid);
+                    evict_unreachable_peer(swarm, pid);
                 }
             }
         }
@@ -3252,12 +3245,10 @@ fn handle_kad_event(
         // Phase 1.2: UnroutablePeer is the strongest signal that a peer
         // should be evicted — Kademlia itself declares it unreachable.
         kad::Event::UnroutablePeer { peer } => {
-            warn!(%peer, "kademlia reports peer unroutable, evicting");
-            swarm.behaviour_mut().kademlia.remove_peer(&peer);
-            let libp2p_id_str = peer.to_string();
-            state.known_peers.retain(|_, record| {
-                record.libp2p_peer_id != libp2p_id_str
-            });
+            warn!(%peer, "kademlia reports peer unroutable — dropping route, keeping cache");
+            // Routing-only: keep `known_peers` (TTL reaper owns lifecycle). Wiping here collapsed
+            // multi-model providers whenever Kademlia transiently declared a relayed peer unroutable.
+            evict_unreachable_peer(swarm, peer);
         }
         _ => {
             debug!(?event, "unhandled kademlia event");
