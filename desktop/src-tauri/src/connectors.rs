@@ -339,6 +339,56 @@ pub fn apply(key: &str, origin: &str) -> Result<ConnectReport, String> {
 mod tests {
     use super::*;
 
+    /// Real-app file-write validation (the "Connect" button → `connector_apply` → [`apply`]):
+    /// drives the ACTUAL filesystem write/backup path against a sandbox `HOME`, so it exercises
+    /// what the mock-bridge UI test couldn't (the real Rust write) without touching real dotfiles.
+    /// The only thing a literal in-window click adds on top is the JS→`invoke` dispatch.
+    #[test]
+    fn apply_writes_backs_up_and_is_idempotent_on_the_real_fs() {
+        let sandbox = std::env::temp_dir().join(format!("oh-connect-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        // Redirect every tool's config root into the sandbox (home() reads $HOME / $XDG_CONFIG_HOME).
+        std::env::set_var("HOME", &sandbox);
+        std::env::set_var("XDG_CONFIG_HOME", sandbox.join(".config"));
+        let origin = "http://127.0.0.1:16527";
+
+        // 1) Fresh create for all three tools: file written to the real fs, no backup, block present.
+        for key in ["opencode", "claude", "continue"] {
+            let rep = apply(key, origin).unwrap();
+            assert_eq!(rep.action, "added", "{key}: first apply adds the block");
+            assert!(rep.backup.is_none(), "{key}: a fresh create has nothing to back up");
+            let written = std::fs::read_to_string(&rep.path).unwrap();
+            assert!(written.contains("16527"), "{key}: written config points at the gateway");
+        }
+
+        // 2) Seed a REAL pre-existing user file → apply → the original is backed up verbatim and the
+        //    user's own keys survive the merge (the non-clobber guarantee, on the real fs).
+        let claude_path = sandbox.join(".claude/settings.json");
+        let user_json = r#"{"model":"opus","permissions":{"allow":["Bash"]}}"#;
+        std::fs::write(&claude_path, user_json).unwrap();
+        let rep = apply("claude", origin).unwrap();
+        let bak1 = rep.backup.expect("a non-empty existing file must be backed up");
+        assert_eq!(std::fs::read_to_string(&bak1).unwrap(), user_json, "backup holds the ORIGINAL bytes");
+        let merged: Value = serde_json::from_str(&std::fs::read_to_string(&claude_path).unwrap()).unwrap();
+        assert_eq!(merged["model"], "opus", "user's model preserved");
+        assert_eq!(merged["permissions"]["allow"][0], "Bash", "user's permissions preserved");
+        assert_eq!(merged["env"]["ANTHROPIC_BASE_URL"], origin, "OpenHydra env block added");
+
+        // 3) Idempotency + backup non-clobber: apply again → "updated", a SECOND, distinct backup.
+        let rep2 = apply("claude", origin).unwrap();
+        assert_eq!(rep2.action, "updated", "second apply updates the existing block in place");
+        let bak2 = rep2.backup.expect("second apply backs up again");
+        assert_ne!(bak2, bak1, "the second backup does not clobber the first");
+
+        // 4) preview() reports an update without writing (the opencode file exists from step 1).
+        assert_eq!(preview("opencode", origin).unwrap().action, "update");
+
+        std::env::remove_var("HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
     #[test]
     fn opencode_merge_adds_provider_and_default_model() {
         let (out, action) = merge_opencode_json("", "http://127.0.0.1:16527/v1").unwrap();
