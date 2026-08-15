@@ -288,6 +288,43 @@ const STREAM_DROP_BACKOFF: Duration = Duration::from_secs(2);
 /// [`attempt_timeout`].)
 const STREAM_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+// F2: absolute total-time ceiling on a streaming attempt — a defense-in-depth backstop against a
+// malicious/degenerate provider that dribbles one token just under the stall deadline forever,
+// pinning the gateway's blocking thread indefinitely (thousands → tokio blocking-pool exhaustion).
+// The 120s idle-stall (above) is the primary bound; this only ever bites the pathological
+// slow-but-never-idle dribble. Sized to be **provably larger than any legitimate serve** so it can
+// never abort real work: scaled by `max_tokens` (a large output on a slow remote model is legit and
+// can run for a long time). Uses a real wall clock (not the accumulated-sleep stall clock, which
+// under-counts slow round-trips); test-safe because the deterministic tests finish in microseconds.
+const STREAM_TOTAL_BASE: Duration = Duration::from_secs(300);
+/// Worst-case seconds-per-token allowance (~0.5 tok/s — far slower than any real provider).
+const STREAM_TOTAL_PER_TOKEN_SECS: u64 = 2;
+const STREAM_TOTAL_FLOOR: Duration = Duration::from_secs(30 * 60);
+const STREAM_TOTAL_CEILING: Duration = Duration::from_secs(6 * 60 * 60);
+/// Assumed output length when a request omits `max_tokens` (budgeting only).
+const STREAM_TOTAL_DEFAULT_TOKENS: u64 = 1024;
+
+/// The absolute total-time ceiling for a streaming attempt of `max_tokens`. Honors an
+/// `OPENHYDRA_STREAM_MAX_TOTAL_SECS` ops override; otherwise `BASE + max_tokens · per_token`,
+/// clamped to `[FLOOR, CEILING]`. Deliberately generous — it is a DoS backstop, not a latency SLA.
+fn stream_total_cap(max_tokens: Option<u32>) -> Duration {
+    if let Some(secs) = std::env::var("OPENHYDRA_STREAM_MAX_TOTAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs);
+    }
+    stream_total_cap_scaled(max_tokens)
+}
+
+/// The pure `max_tokens`-scaled cap (no env), split out so the scaling/clamp math is unit-tested
+/// without touching the process-global override env var (which would race the parallel test runner).
+fn stream_total_cap_scaled(max_tokens: Option<u32>) -> Duration {
+    let tokens = max_tokens.map(u64::from).unwrap_or(STREAM_TOTAL_DEFAULT_TOKENS);
+    let scaled = STREAM_TOTAL_BASE + Duration::from_secs(tokens.saturating_mul(STREAM_TOTAL_PER_TOKEN_SECS));
+    scaled.clamp(STREAM_TOTAL_FLOOR, STREAM_TOTAL_CEILING)
+}
+
 /// Why a streaming attempt didn't complete.
 enum StreamFail {
     /// The provider answered `SERVE_STREAM` with a non-streaming (legacy) reply — the caller
@@ -341,6 +378,11 @@ fn request_completion_streaming(
     request: &ServeRequest,
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<ServeSummary, StreamFail> {
+    // F2: absolute total-time backstop (real wall clock), generous + `max_tokens`-scaled so it
+    // never aborts a legitimate long serve — only the pathological never-idle dribble.
+    let started = std::time::Instant::now();
+    let total_cap = stream_total_cap(request.max_tokens);
+
     // ── Open / capability probe ──
     let mut open = Vec::with_capacity(1 + request.messages.len() * 32);
     open.push(SERVE_STREAM);
@@ -378,6 +420,12 @@ fn request_completion_streaming(
     let mut interval = POLL_MIN;
     let mut idle = Duration::ZERO;
     loop {
+        // F2: absolute backstop — bail if the whole attempt has outrun its (generous) total cap.
+        if started.elapsed() > total_cap {
+            return Err(StreamFail::Error(AdapterError::Http(
+                "stream exceeded max total time".into(),
+            )));
+        }
         let mut poll = Vec::with_capacity(1 + 16 + 4);
         poll.push(FETCH_CHUNKS);
         poll.extend_from_slice(&request.nonce);
@@ -1659,6 +1707,35 @@ mod tests {
         assert!(text.is_empty(), "a tool-call turn streams no text");
         assert_eq!(summary.tool_calls.len(), 1);
         assert_eq!(summary.tool_calls[0].function.name, "search");
+    }
+
+    #[test]
+    fn stream_total_cap_scales_and_never_cuts_a_legit_serve() {
+        // F2 no-regression guard: the cap is provably larger than any real serve.
+        // Small requests clamp to the 30-min FLOOR (never abort quick work).
+        assert_eq!(stream_total_cap_scaled(Some(64)), STREAM_TOTAL_FLOOR);
+        assert_eq!(stream_total_cap_scaled(Some(700)), STREAM_TOTAL_FLOOR); // 300+1400=1700 < 1800 floor
+        assert!(stream_total_cap_scaled(None) >= STREAM_TOTAL_FLOOR);
+        // A big legit output scales UP (8k tokens → 300 + 16000 = 16300s ≈ 4.5h), well above realistic.
+        let big = stream_total_cap_scaled(Some(8000));
+        assert!(big > STREAM_TOTAL_FLOOR && big < STREAM_TOTAL_CEILING, "got {big:?}");
+        assert_eq!(big, Duration::from_secs(300 + 8000 * 2));
+        // A pathological max_tokens clamps to the 6-h CEILING (still bounds the dribble DoS).
+        assert_eq!(stream_total_cap_scaled(Some(u32::MAX)), STREAM_TOTAL_CEILING);
+        // Every possible value is at least the floor — no legit serve is ever cut below 30 min.
+        for t in [0u32, 1, 100, 750, 5000, 100_000, u32::MAX] {
+            assert!(stream_total_cap_scaled(Some(t)) >= STREAM_TOTAL_FLOOR);
+        }
+    }
+
+    #[test]
+    fn stream_total_cap_env_override_wins() {
+        // The ONLY test that touches the process-global override env var (the scaling math is
+        // tested via `stream_total_cap_scaled`, which never reads env), so no cross-test race.
+        std::env::set_var("OPENHYDRA_STREAM_MAX_TOTAL_SECS", "7");
+        assert_eq!(stream_total_cap(Some(64)), Duration::from_secs(7));
+        std::env::remove_var("OPENHYDRA_STREAM_MAX_TOTAL_SECS");
+        assert_eq!(stream_total_cap(Some(64)), STREAM_TOTAL_FLOOR, "reverts to the scaled cap");
     }
 
     // ── provider selection ──
