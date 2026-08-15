@@ -1,6 +1,6 @@
 [package]
 name = "openhydra-agent"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2021"
 rust-version = "1.75"
 description = "OpenHydra agent — BYO-engine adapters + the HTTP/SSE gateway. Proxies inference to external engines (Ollama/vLLM/…); never runs a model."

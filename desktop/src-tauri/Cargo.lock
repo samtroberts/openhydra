@@ -3126,21 +3126,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libp2p-stream"
-version = "0.2.0-alpha"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d454f6647bc9054e7fede2dc86e625786c4d1304bff7afc995285f53ef9091f0"
-dependencies = [
- "futures",
- "libp2p-core",
- "libp2p-identity",
- "libp2p-swarm",
- "rand 0.8.6",
- "tracing",
- "void",
-]
-
-[[package]]
 name = "libp2p-swarm"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3900,7 +3885,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openhydra-agent"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3922,7 +3907,7 @@ dependencies = [
 
 [[package]]
 name = "openhydra-desktop"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "libc",
  "openhydra-agent",
@@ -3947,7 +3932,6 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
- "libp2p-stream",
  "openhydra-protocol",
  "prost 0.13.5",
  "prost-build",
