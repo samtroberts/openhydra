@@ -682,4 +682,51 @@ mod tests {
         assert!(!ServeChunk::frame_is_terminal(&ServeChunk::ToolCalls(vec![tool_call("f")]).encode()));
         assert!(!ServeChunk::frame_is_terminal(&[]));
     }
+
+    /// F3 (audit): the serve decoders run on RAW, UNTRUSTED bytes — the network layer hands any
+    /// inbound `request_response` body straight to the agent, which decodes it with these. They
+    /// MUST return `Err`, never panic, on adversarial input. Restores the guarantee the deleted
+    /// `network/tests/adversarial.rs::decoders_never_panic_on_malformed_input` gave the (removed)
+    /// sharding parsers, for the surface that replaced them. Passing = no unwind escapes the loop.
+    #[test]
+    fn serve_decoders_never_panic_on_malformed_input() {
+        // A corpus of hostile shapes: empty, every single-byte tag, truncated/oversized length
+        // prefixes, valid-tag-then-truncated-body, short headers, and a few pseudo-random blobs.
+        let mut corpus: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x00],
+            vec![0x01],
+            vec![0x02],           // TAG_DONE with no u64 tokens
+            vec![0x02, 1, 2, 3],  // TAG_DONE, truncated (<9)
+            vec![0x04],           // TAG_TOOLCALLS with no JSON
+            vec![0x04, b'{'],     // TAG_TOOLCALLS, truncated JSON
+            vec![0xFF],
+            vec![0xF1],           // FC_CHUNKS, no header
+            vec![0xF1, 0, 0],     // FC_CHUNKS, short header (<6)
+            vec![0xF1, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF], // FC_CHUNKS ok header + truncated framed
+            vec![0xF2],
+            vec![0xF4, 9, 9, 9],  // FC_OVERLOADED with trailing garbage
+            vec![0xFF, 0xFF, 0xFF, 0xFF],             // parse_response: claims a 4GB chunk
+            vec![0x01, 0x00, 0x00, 0x00],             // parse_response: len=1, no body
+            vec![0x00, 0x00, 0x00],                   // parse_response: truncated length prefix
+            b"not json at all".to_vec(),
+            b"{".to_vec(),
+            vec![0x7b, 0xff, 0xfe, 0x00, 0x80],       // invalid utf8 tail
+        ];
+        // A handful of deterministic pseudo-random blobs (no rng in the test path).
+        for seed in 0u16..64 {
+            let n = (seed % 37) as usize;
+            corpus.push((0..n).map(|i| (seed.wrapping_mul(31).wrapping_add(i as u16)) as u8).collect());
+        }
+
+        for bytes in &corpus {
+            // Every decoder on every input — results ignored; the point is "no panic".
+            let _ = ServeRequest::decode(bytes);
+            let _ = ServeChunk::decode(bytes);
+            let _ = FetchResponse::decode(bytes);
+            let _ = FetchChunksResponse::decode(bytes);
+            let _ = parse_response(bytes);
+            let _ = ServeChunk::frame_is_terminal(bytes);
+        }
+    }
 }
