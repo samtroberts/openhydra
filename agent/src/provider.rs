@@ -363,14 +363,21 @@ fn reply_to_matches(reply_to: &str, source_peer: &str) -> bool {
     reply_to == source_peer
 }
 
-/// F5: run a streaming generation, catching a panic in the adapter/engine and turning it into a
-/// terminal `Error` chunk so the stream buffer never lingers `done=false` after a bug (which would
-/// stall the consumer for the full stall deadline). On a normal `Ok`/`Err` outcome the underlying
-/// [`handle_serve_request_parsed`] already emits the terminal `Done`/`Error`, so those paths are
-/// byte-for-byte unchanged; only the panic branch is new. Free fn (no `Self`) so it is unit-testable
-/// with a panicking stub adapter. `AssertUnwindSafe` is sound here — the injected `on_chunk`
-/// appender takes+releases its lock per call, so a panic between appends holds nothing locked.
-fn generate_stream_guarded(
+/// F5: run a generation, catching a panic in the adapter/engine and turning it into a terminal
+/// `Error` chunk so a bug can't strand the consumer. Used by **both** serve transports:
+/// - streaming (`SERVE_STREAM`) — the appended terminal flips the stream buffer's `done`, so it
+///   never lingers `done=false` (which would stall the consumer for the full ~120s stall deadline);
+/// - buffered (`SERVE_REQUEST`) — the terminal is pushed into the response frames and stored under
+///   the nonce, so a panic yields an immediate framed error instead of an unsent reply that leaves
+///   the nonce stuck `Generating` until the consumer's serve timeout + reconnect-fetch deadline.
+///
+/// On a normal `Ok`/`Err` outcome the underlying [`handle_serve_request_parsed`] already emits the
+/// terminal `Done`/`Error`, so those paths are byte-for-byte unchanged; only the panic branch is
+/// new. Free fn (no `Self`) so it is unit-testable with a panicking stub adapter. `AssertUnwindSafe`
+/// is sound here — the injected `on_chunk` sink (a `Mutex`-guarded append for the stream path, a
+/// local `Vec::push` for the buffered path) holds nothing locked across calls, so a panic between
+/// chunks leaves no poisoned state the terminal append can't recover.
+fn generate_guarded(
     req: ServeRequest,
     adapter: &dyn EngineAdapter,
     on_chunk: &mut dyn FnMut(&[u8]),
@@ -824,11 +831,11 @@ impl<A: EngineAdapter> Provider<A> {
             FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode(),
         );
         // Generate, appending each frame (deltas, then the terminal Done/Error which flips `done`).
-        // F5: `generate_stream_guarded` catches a panic in the adapter/engine and appends a
-        // synthetic terminal Error, so a bug can't leave this buffer `done=false` forever (which
-        // would stall the consumer ~120s before it re-serves).
+        // F5: `generate_guarded` catches a panic in the adapter/engine and appends a synthetic
+        // terminal Error, so a bug can't leave this buffer `done=false` forever (which would stall
+        // the consumer ~120s before it re-serves).
         let summary =
-            generate_stream_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c));
+            generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c));
         // B-S1: record what we served under the committed nonce so its settlement receipt can be
         // validated (right tokens/model, once) — identical to the buffered path.
         if summary.ok && summary.tokens > 0 {
@@ -1189,7 +1196,12 @@ impl<A: EngineAdapter> Provider<A> {
                         // Reconnect-and-fetch: mark in-flight so a fetch racing this serve gets
                         // Generating (retry), not NotFound (which would re-run the request).
                         self.mark_generating(nonce, &reply_to);
-                        let summary = handle_serve_request_parsed(
+                        // F5 (buffered twin): guard the generation so a panic in the adapter/engine
+                        // becomes a terminal Error frame instead of unwinding out of `dispatch`
+                        // (which would skip `respond` + `store_result`, leaving no reply and the
+                        // nonce stuck `Generating` until the consumer's serve timeout). The panic
+                        // path pushes the terminal into `chunks`, which is stored + returned below.
+                        let summary = generate_guarded(
                             req,
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
@@ -1845,9 +1857,13 @@ mod tests {
     }
 
     #[test]
-    fn generate_stream_guarded_turns_a_panic_into_a_terminal_error() {
-        // F5: a panicking engine must not leave the stream `done=false` (→ 120s consumer stall);
-        // the guard catches it and appends a terminal Error so the consumer ends fast.
+    fn generate_guarded_turns_a_panic_into_a_terminal_error() {
+        // F5: a panicking engine must not propagate out of generation — for streaming it would
+        // leave the buffer `done=false` (→ 120s consumer stall); for the buffered path it would
+        // unwind out of `dispatch` and skip `respond`/`store_result` (→ no reply, nonce stuck
+        // `Generating`). The guard catches it and emits a terminal Error via the sink so the
+        // consumer ends fast on either transport. The `Vec` sink here is the buffered path's exact
+        // usage (`chunks.push`); the stream path feeds the same guard a `stream_append` sink.
         struct PanicAdapter;
         impl EngineAdapter for PanicAdapter {
             fn engine_name(&self) -> &'static str { "panic" }
@@ -1866,7 +1882,7 @@ mod tests {
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
-        let summary = generate_stream_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()));
+        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()));
         assert!(!summary.ok);
         assert_eq!(summary.tokens, 0, "no tokens → no commitment recorded");
         let last = frames.last().expect("a terminal frame was appended");
