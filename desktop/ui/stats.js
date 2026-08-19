@@ -44,7 +44,6 @@ import { call } from "./bridge";
     try { const blob = await call("load_stats"); if (blob) { const d = JSON.parse(blob); if (d && d.models) statsDB = d; } } catch {}
   }
   export const lifetimeServed = (id) => statsDB.models[id]?.servedTotal || 0;
-  export const lifetimeUsed = (id) => statsDB.models[id]?.usedTotal || 0;
   export const statModels = () => Object.keys(statsDB.models);
   // Durable lifetime totals across all models. Fall back to the agent's since-boot counter (or the
   // legacy desktop-chat counter) until the accumulator has data — so a fresh install still shows

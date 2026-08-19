@@ -1,7 +1,7 @@
 // Lucide-style inline SVG icon set (wireframe verbatim) + the injector that fills [data-i] hosts.
 import { $$ } from "./dom";
 
-export const ICONS = {
+const ICONS = {
   zap:'<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
   command:'<path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/>',
   theme:'<path d="M12 8a2.83 2.83 0 0 0 4 4 4 4 0 1 1-4-4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.9 4.9 1.4 1.4"/><path d="m17.7 17.7 1.4 1.4"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.3 17.7-1.4 1.4"/><path d="m19.1 4.9-1.4 1.4"/>',

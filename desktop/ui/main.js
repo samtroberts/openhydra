@@ -4,14 +4,13 @@
 import { $, $$, esc, shortPeer } from "./dom";
 import { injectIcons } from "./icons";
 import { store } from "./storage";
-import { modelIcon, fmtUptime, fmtNum, fmtGB } from "./format";
-import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text";
+import { fmtNum, fmtGB } from "./format";
+import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
 import { toast, menu, closeMenus } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed } from "./stats";
 import { noteSeen, netModels, curModel, renderModels } from "./models";
 import { renderConnectors } from "./connectors";
-import { renderChart } from "./chart";
 import { renderProviders } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
 import { renderEngines } from "./installer";
@@ -22,7 +21,7 @@ import { renderSettings, updateEngineEndpoint } from "./settings";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on } from "./bus";
 import {
-  state, snap, engines, installedEngines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
+  state, snap, engines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
   setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
 } from "./state";
 

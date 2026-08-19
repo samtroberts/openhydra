@@ -1,7 +1,7 @@
 // Settings view + the Engine-endpoint helper (#3: the endpoint follows the selected engine). The
 // device-name / gateway-port / bootstraps fields are not clobbered while focused (the poll re-renders
 // Settings). updateEngineEndpoint is also called by the engine dropdown in the controller.
-import { $, $$ } from "./dom";
+import { $ } from "./dom";
 import { state, engines, deviceName } from "./state";
 
   // #3: the Settings › Engine endpoint follows the selected engine (was pinned to engines[0]).
@@ -28,7 +28,6 @@ import { state, engines, deviceName } from "./state";
     const netp = $('.setpanel[data-p="network"]');
     const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = p.settings.gateway_port;
     const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
-    const eng = $('.setpanel[data-p="engine"]');
     updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
     $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
     $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);

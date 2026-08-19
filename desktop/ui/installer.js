@@ -41,7 +41,7 @@ import { emit } from "./bus";
     return el;
   }
 
-  export async function startInstall(label, name) {
+  async function startInstall(label, name) {
     const ov = installOverlay();
     const body = $("#instBody"), log = $("#instLog"), actions = $("#instActions");
     $("#instTitle").textContent = `Install ${name}`;
