@@ -7,6 +7,8 @@ import { store } from "./storage";
 import { modelIcon, modelCat, fmtUptime, repBadge, fmtNum, modelColor, relTime, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text";
 import { call, mockEmitInstall, mockInstallCbs } from "./bridge";
+import { toast, menu, closeMenus } from "./chrome";
+import { accumulateStats, loadStats, totalServed, totalUsed, statsSeries, lifetimeServed, statModels } from "./stats";
 import {
   state, snap, engines, installedEngines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
   setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
@@ -22,19 +24,7 @@ import {
 
   injectIcons();
 
-  // ── toast + popover menu (wireframe verbatim) ──
-  let toastEl, toastT;
-  function toast(m) { if (!toastEl) { toastEl = document.createElement("div"); toastEl.className = "toast"; document.body.appendChild(toastEl); } toastEl.textContent = m; toastEl.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove("show"), 1600); }
-  let menuFor = null;
-  function closeMenus() { $$(".menu").forEach((m) => m.remove()); menuFor = null; }
-  function menu(anchor, items) {
-    if (menuFor === anchor) { closeMenus(); return; }
-    closeMenus(); menuFor = anchor;
-    const m = document.createElement("div"); m.className = "menu";
-    items.forEach((it) => { if (it.sep) { const s = document.createElement("div"); s.className = "msep"; m.appendChild(s); return; } const mi = document.createElement("div"); mi.className = "mi"; mi.innerHTML = `<span class="ck">${it.on ? "✓" : ""}</span>${esc(it.label)}`; mi.onclick = (e) => { e.stopPropagation(); closeMenus(); it.fn && it.fn(); }; m.appendChild(mi); });
-    document.body.appendChild(m);
-    const r = anchor.getBoundingClientRect(); m.style.left = Math.min(r.left, innerWidth - m.offsetWidth - 10) + "px"; let t = r.bottom + 5; if (t + m.offsetHeight > innerHeight - 8) t = r.top - m.offsetHeight - 5; m.style.top = Math.max(8, t) + "px";
-  }
+  // toast + popover menu live in chrome.js; dismiss-open-menus on any click / resize stays wired here:
   document.addEventListener("click", closeMenus); addEventListener("resize", closeMenus);
 
   // ── model family badge ──
@@ -89,79 +79,6 @@ import {
   function pushSample(arr, v, key) { if (v == null || !isFinite(v)) return; arr.push(v); while (arr.length > ROLL_MAX) arr.shift(); store.set(key, arr); }
   const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
 
-  // ── #7/#10: lifetime served/consumed model stats + hourly time-series ────────────────────
-  // The agent's per-model counters reset to zero every process restart, so the DURABLE lifetime
-  // totals + timeline live here. On each poll we diff the agent's cumulative counters and fold
-  // the delta into hourly buckets (a Prometheus-style counter→rate), anchored at each model's
-  // first token. Persisted to ~/.openhydra/stats.json via the Tauri backend (localStorage isn't
-  // durable in the WebView). served = provider's `per_model`; used = gateway's `consumed_per_model`.
-  const HOUR_MS = 3600000, STATS_KEEP_HOURS = 24 * 31;   // ~31 days of hourly buckets
-  let statsDB = { models: {} };                          // hydrated on boot from load_stats
-  let statsDirty = false, statsSaveT = 0;
-  function hourKey(ms) { return Math.floor(ms / HOUR_MS); }
-  function statModel(id) {
-    return (statsDB.models[id] ||= { firstServed: null, firstUsed: null, servedTotal: 0, usedTotal: 0, lastServed: 0, lastUsed: 0, buckets: {} });
-  }
-  // Fold one cumulative counter reading into a per-model lifetime total + current-hour bucket.
-  // `raw` is the agent's since-boot counter; a value < the last reading means the agent restarted
-  // (counter reset to 0), so the whole `raw` is the fresh delta.
-  function foldCounter(m, raw, field, bucketField, now) {
-    raw = Math.max(0, Math.round(raw || 0));
-    const last = m[field];
-    const delta = raw >= last ? raw - last : raw;
-    m[field] = raw;
-    if (delta <= 0) return;
-    const totalField = field === "lastServed" ? "servedTotal" : "usedTotal";
-    const firstField = field === "lastServed" ? "firstServed" : "firstUsed";
-    m[totalField] += delta;
-    if (m[firstField] == null) m[firstField] = now;       // first-token anchor (no synthetic back-fill)
-    const b = (m.buckets[hourKey(now)] ||= { s: 0, u: 0 });
-    b[bucketField] += delta;
-  }
-  function accumulateStats() {
-    if (!snap?.transfers) return;
-    const now = Date.now(), t = snap.transfers;
-    for (const [id, pm] of Object.entries(t.per_model || {})) foldCounter(statModel(id), pm.tokens, "lastServed", "s", now);
-    for (const [id, pm] of Object.entries(t.consumed_per_model || {})) foldCounter(statModel(id), pm.tokens, "lastUsed", "u", now);
-    // Prune buckets older than the retention window (keeps stats.json bounded).
-    const floor = hourKey(now) - STATS_KEEP_HOURS;
-    for (const m of Object.values(statsDB.models)) for (const k in m.buckets) if (+k < floor) delete m.buckets[k];
-    statsDirty = true;
-    const nowT = Date.now();
-    if (nowT - statsSaveT > 8000) { statsSaveT = nowT; statsDirty = false; try { call("save_stats", { data: JSON.stringify(statsDB) }); } catch {} }
-  }
-  async function loadStats() {
-    try { const blob = await call("load_stats"); if (blob) { const d = JSON.parse(blob); if (d && d.models) statsDB = d; } } catch {}
-  }
-  const lifetimeServed = (id) => statsDB.models[id]?.servedTotal || 0;
-  const lifetimeUsed = (id) => statsDB.models[id]?.usedTotal || 0;
-  const statModels = () => Object.keys(statsDB.models);
-  // Durable lifetime totals across all models. Fall back to the agent's since-boot counter (or the
-  // legacy desktop-chat counter) until the accumulator has data — so a fresh install still shows
-  // something. `used` now derives from the gateway's per-model consumed tracking, so it counts
-  // tokens consumed by external OpenAI clients (e.g. a coding agent), not just in-app chats.
-  const totalServed = () => Object.values(statsDB.models).reduce((a, m) => a + (m.servedTotal || 0), 0) || (snap?.transfers?.tokens_served ?? 0);
-  const totalUsed = () => Object.values(statsDB.models).reduce((a, m) => a + (m.usedTotal || 0), 0) || (snap?.transfers?.tokens_consumed ?? usedTokens);
-  // Aggregate buckets for a range into ordered time-slots, each a per-model {s,u}. 24h → hourly
-  // (24 slots), 7d/30d → daily. Returns { slots:[{label,models:{id:{s,u}}}], models:Set }.
-  function statsSeries(range) {
-    const now = Date.now();
-    const spans = { "24h": { n: 24, ms: HOUR_MS }, "7d": { n: 7, ms: 86400000 }, "30d": { n: 30, ms: 86400000 } };
-    const sp = spans[range] || spans["24h"];
-    const slots = [], models = new Set();
-    for (let i = sp.n - 1; i >= 0; i--) {
-      const end = now - i * sp.ms, start = end - sp.ms;
-      const slot = { end, models: {} };
-      const kLo = hourKey(start), kHi = hourKey(end);
-      for (const [id, m] of Object.entries(statsDB.models)) {
-        let s = 0, u = 0;
-        for (let k = kLo; k < kHi; k++) { const b = m.buckets[k]; if (b) { s += b.s; u += b.u; } }
-        if (s || u) { slot.models[id] = { s, u }; models.add(id); }
-      }
-      slots.push(slot);
-    }
-    return { slots, models, span: sp };
-  }
 
   // ── economy (M2.2 reputation + M2.3 credit), surfaced by the agent status endpoint ──
   // reputation is keyed by OpenHydra peer id; credit by libp2p peer id. known_providers
