@@ -1,18 +1,19 @@
 // OpenHydra Desktop — the shadcn wireframe (docs/openhydra_wireframe_shadcn.html) wired to the
 // Rust backend via Tauri IPC. The DOM + CSS are the wireframe verbatim; this file swaps the
 // wireframe's demo data for live network state. In a plain browser it renders a demo mock.
-import { $, $$, esc, shortPeer, peerShort } from "./dom";
+import { $, $$, esc, shortPeer } from "./dom";
 import { injectIcons } from "./icons";
 import { store } from "./storage";
-import { modelIcon, modelCat, fmtUptime, repBadge, fmtNum, modelColor, relTime, fmtGB } from "./format";
+import { modelIcon, fmtUptime, fmtNum, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text";
 import { call, mockEmitInstall, mockInstallCbs } from "./bridge";
 import { toast, menu, closeMenus } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, statsSeries, lifetimeServed, statModels } from "./stats";
-import { repByOpenhydra, repByLibp2p, modelReputation, modelAvgTps } from "./econ";
-import { noteSeen, modelIdle, netModels, curModel, renderModels, seenCount } from "./models";
+import { noteSeen, netModels, curModel, renderModels } from "./models";
 import { renderConnectors } from "./connectors";
 import { renderChart } from "./chart";
+import { renderProviders } from "./providers";
+import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
 import {
   state, snap, engines, installedEngines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
   setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
@@ -433,49 +434,6 @@ import {
   }
   // #11b: which model rows are expanded to show their per-provider breakdown. A Set so the
   // 2.5s poll re-render doesn't collapse an open row (mirrors the peers-filter persistence rule).
-  const expandedProviders = new Set();
-  function renderProviders() {
-    const models = netModels();
-    const local = new Set(state?.provider?.status?.running ? engines.flatMap((e) => e.models) : []);
-    const strip = $("#v-providers .card.pad");
-    strip.querySelectorAll("b")[0].textContent = (snap?.transfers?.tokens_served ?? 0);  // tokens
-    strip.querySelectorAll("b")[1].textContent = models.length;                          // models
-    strip.querySelectorAll("b")[2].textContent = snap?.network?.peers?.length ?? 0;       // peers
-    // Labels are now correct & honest in the template ("tokens served · models · peers · from your
-    // node") — these are all LOCAL counts, so no "network-wide" claim until Tier-C stats land.
-    $("#provcount").textContent = models.length;
-    const q = ($("#search").value || "").toLowerCase();
-    const byOh = repByOpenhydra();
-    // Group the announced providers by model so a model served by several peers can expand (#11b).
-    const provsByModel = {};
-    for (const p of (snap?.network?.known_providers || [])) (provsByModel[p.model_id] ||= []).push(p);
-    const rows = models.filter((m) => !q || m.toLowerCase().includes(q)).map((m) => {
-      const remote = provsByModel[m] || [];
-      const cnt = (seenCount[m] || 0) + (local.has(m) ? 1 : 0);   // last-known count, sticky
-      const tps = modelAvgTps(m);                                  // only for models we serve
-      const rep = modelReputation(m, byOh);                        // earned rep of its providers
-      const canExpand = remote.length > 1;                         // >1 provider → disclosure
-      const open = expandedProviders.has(m);
-      const caret = canExpand ? `<span class="prowtog" data-m="${esc(m)}" style="cursor:pointer;display:inline-block;width:14px;color:hsl(var(--muted-foreground));transition:transform .12s;transform:rotate(${open ? 90 : 0}deg)">▸</span>` : '<span style="display:inline-block;width:14px"></span>';
-      const idle = modelIdle(m);   // W2: seen but quiet → dim, don't drop (rides gossip gaps)
-      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"${idle ? ' style="opacity:.5"' : ""}><td>${caret}${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : idle ? ' <span class="mut" style="font-size:10.5px">· idle</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
-      if (canExpand && open) {
-        html += remote.map((p) => {
-          const prep = byOh[p.openhydra_peer_id];
-          return `<tr class="provsub" data-cat="${modelCat(m)}" data-for="${esc(m)}"><td style="padding-left:34px"><span class="mono mut">${peerShort(p.libp2p_peer_id)}</span></td><td class="num mut">1</td><td class="num mut">—</td><td>${repBadge(prep)}</td><td class="num mut">—</td></tr>`;
-        }).join("");
-      }
-      return html;
-    });
-    $("#provtable tbody").innerHTML = rows.join("") || `<tr><td colspan="5" class="mut">${snap ? "No models discovered yet — they appear as peers announce." : "Connecting…"}</td></tr>`;
-    const cat = $("#provchips .chip.on")?.dataset.cat || "all";
-    $$("#provtable .prov, #provtable .provsub").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none");
-    $$("#provtable .prowtog").forEach((tog) => tog.onclick = (e) => {
-      e.stopPropagation(); const m = tog.dataset.m;
-      if (expandedProviders.has(m)) expandedProviders.delete(m); else expandedProviders.add(m);
-      renderProviders();
-    });
-  }
   // ── Tier-1 engine installer (B5): consent → stream install://progress → refresh ──
   const tauriEvent = window.__TAURI__?.event;
   // Subscribe to install progress; returns an unlisten fn. Real Tauri event bus if present,
@@ -637,59 +595,6 @@ import {
     }
     renderChart("#actchart", "activity");   // #10 timeline
   }
-  // Relative "Nm ago" timestamp for the ledger rows.
-  // #5: real ledger rows from the agent's recent-transaction ring (served rows from the provider
-  // process, used rows from the gateway; merged + newest-first by the desktop). The credit column
-  // is a signed contribution unit (served +, used −; "not money"), not a wallet balance.
-  function renderLedger() {
-    const t = snap?.transfers, rows = t?.recent || [];
-    $("#v-ledger .row .mut").textContent = rows.length
-      ? `${rows.length} recent · ${t?.receipts_ledgered ?? 0} co-signed · ${t?.tokens_served ?? 0} served / ${t?.tokens_consumed ?? 0} used tokens`
-      : `${t?.receipts_ledgered ?? 0} receipts · ${t?.tokens_served ?? 0} tokens served`;
-    $("#ledgertable tbody").innerHTML = rows.length
-      ? rows.slice(0, 100).map((r) => {
-          const served = r.kind === "served", cr = (served ? "+" : "−") + (r.tokens / 100).toFixed(1);
-          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td>${modelIcon(r.model)}${esc(r.model)}</td><td class="mono">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
-        }).join("")
-      : `<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`;
-  }
-
-  // libp2p ids of the infrastructure we're connected to (bootstraps + circuit relays) — these
-  // aren't "peers" a user cares about, so we hide them from the Peers list.
-  function infraPeerIds() {
-    const s = new Set();
-    (snap?.network?.relay_reservations || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)\/p2p-circuit/); if (m) s.add(m[1]); });
-    (state?.settings?.bootstraps || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)/); if (m) s.add(m[1]); });
-    return s;
-  }
-  let peerLimit = 10;   // "View more" bumps this
-  function renderPeers() {
-    if (!snap) { $("#peertable tbody").innerHTML = `<tr><td colspan="5" class="mut">Turn on Sharing or chat to connect, then peers appear here.</td></tr>`; const pc = $("#peercount"); if (pc) pc.textContent = "0 peers"; const pm = $("#peermore"); if (pm) pm.style.display = "none"; return; }
-    const n = snap.network;
-    const infra = infraPeerIds();
-    const peers = (n.peers || []).filter((p) => !infra.has(p.peer_id));   // hide bootstraps/relays
-    const repL = repByLibp2p();
-    const shown = peers.slice(0, peerLimit);
-    $("#peertable tbody").innerHTML = shown.length ? shown.map((p) => `<tr data-p="${p.path}"><td class="mono">${peerShort(p.peer_id)}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${p.path}</span></td><td class="num">${p.quic_direct_v6}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>`).join("") : `<tr><td colspan="5" class="mut">${n.peers.length ? "Only infrastructure connected — waiting for network peers." : "No peers connected yet — connecting."}</td></tr>`;
-    injectIcons($("#peertable"));
-    // dynamic count + View more
-    const pc = $("#peercount"); if (pc) pc.textContent = peers.length <= peerLimit ? `${peers.length} peer${peers.length === 1 ? "" : "s"}` : `${shown.length} of ${peers.length} peers`;
-    const pm = $("#peermore"); if (pm) { pm.style.display = peers.length > peerLimit ? "" : "none"; pm.onclick = () => { peerLimit += 10; renderPeers(); }; }
-    // re-apply the active Direct/Relay/Mixed chip so the 2.5s poll doesn't reset it to All
-    const pp = $("#peerchips .chip.on")?.dataset.p || "all";
-    $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) ? "" : "none");
-    $("#actchips .chip .num") && ($("#actchips .chip .num").textContent = peers.length);
-    $$("#peertable .rowmenu").forEach((cell) => cell.onclick = (e) => { e.stopPropagation(); menu(cell, [{ label: "Copy peer id", fn: () => toast("Copied") }, { sep: 1 }, { label: "Drop connection", fn: () => toast("Dropped") }]); });
-    // DHT
-    $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono">/oh/model/${esc(m)}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td><td class="num">—</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No records yet.</td></tr>`;
-    $$("#v-peers .acttab")[1].querySelector(".card.pad").innerHTML = `kad_routing_peers: <span class="num">${n.kad_routing_peers}</span> · server mode: ${n.kad_server_mode ? "yes" : "no"}`;
-    // Swarm
-    const sw = $$("#v-peers .acttab")[2].querySelectorAll(".kpi .val"); sw[0].textContent = n.listen_addrs.length; sw[1].textContent = n.relay_reservations.length; sw[2].textContent = n.counters.dcutr_successes; sw[3].textContent = n.autonat_private ? "private" : "public";
-    // Logs
-    renderLogs();
-  }
-  let logTab = "provider";
-  function renderLogs() { const logs = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || []; $("#logbody").innerHTML = logs.length ? logs.map(esc).join("<br>") : "—"; }
   function renderSettings() {
     const p = state; if (!p) return;
     // #9: don't clobber the device-name field while the user is editing it (the 2.5s poll
@@ -745,7 +650,7 @@ import {
   $("#provchips").onclick = (e) => { const c = e.target.closest(".chip[data-cat]"); if (!c) return; $$("#provchips .chip[data-cat]").forEach((x) => x.classList.toggle("on", x === c)); const cat = c.dataset.cat; $$("#provtable .prov").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none"); };
   $("#actchips").onclick = (e) => { const c = e.target.closest(".chip[data-act]"); if (!c) return; $$("#actchips .chip").forEach((x) => x.classList.toggle("on", x === c)); $$("#v-peers .acttab").forEach((t) => t.classList.toggle("on", t.dataset.act === c.dataset.act)); };
   $("#peerchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#peerchips .chip").forEach((x) => x.classList.toggle("on", x === c)); const pp = c.dataset.p; $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) ? "" : "none"); };
-  $("#logchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#logchips .chip").forEach((x) => x.classList.toggle("on", x === c)); logTab = c.dataset.log === "gateway" ? "gateway" : "provider"; renderLogs(); };
+  $("#logchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#logchips .chip").forEach((x) => x.classList.toggle("on", x === c)); setLogTab(c.dataset.log === "gateway" ? "gateway" : "provider"); renderLogs(); };
   $("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); } };
   $("#cmdk").onclick = (e) => { e.stopPropagation(); menu($("#cmdk"), Object.keys(titles).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); };
   $("#traymark").onclick = (e) => { e.stopPropagation(); menu($("#traymark"), [{ label: "Launch OpenHydra", fn: () => {} }, { sep: 1 }, { label: "Sharing", on: !!state?.provider?.status?.running, fn: toggleSharing }, { label: "Model · " + (netModels()[0] || "—"), fn: () => {} }, { sep: 1 }, { label: `▲ ${fmtNum(totalServed())} served`, fn: () => {} }, { label: `▼ ${fmtNum(totalUsed())} used`, fn: () => {} }, { sep: 1 }, { label: "Quit OpenHydra", fn: () => call("quit") }]); };
