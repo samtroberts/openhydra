@@ -192,6 +192,19 @@
   .msg.ai{margin-right:0;padding:4px 2px}
   .msgmeta{display:flex;flex-wrap:wrap;gap:5px 12px;align-items:center;font-size:10.5px;color:hsl(var(--muted-foreground));margin-top:8px}
   .msgmeta .num{font-family:var(--mono)}
+  /* fenced code blocks in chat replies (parseFences + hl() in text.js) */
+  .code-card{margin:8px 0;border:1px solid hsl(var(--border));border-radius:8px;background:hsl(var(--muted)/.5);overflow:hidden}
+  .code-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 6px 5px 11px;border-bottom:1px solid hsl(var(--border));background:hsl(var(--muted)/.55)}
+  .code-card-head span{font-family:var(--mono);font-size:11px;color:hsl(var(--muted-foreground));letter-spacing:.02em}
+  .code-copy{font:inherit;font-size:11px;color:hsl(var(--muted-foreground));background:none;border:none;cursor:pointer;padding:2px 7px;border-radius:5px;flex:0 0 auto}
+  .code-copy:hover{background:hsl(var(--muted));color:hsl(var(--foreground))}
+  .code-card pre{margin:0;padding:10px 11px;overflow-x:auto;font-family:var(--mono);font-size:12px;line-height:1.55;color:hsl(var(--foreground))}
+  /* syntax highlight tokens */
+  .tk-com{color:hsl(var(--muted-foreground));font-style:italic}
+  .tk-str{color:hsl(var(--success))}
+  .tk-num{color:hsl(var(--warning))}
+  .tk-kw{color:hsl(var(--brand));font-weight:600}
+  .tk-fn{color:hsl(210 90% 56%)}
   .field{margin-bottom:14px}.field label{display:block;font-size:12px;font-weight:500;margin-bottom:6px}
   .field .desc{font-size:11px;color:hsl(var(--muted-foreground));margin-top:5px}
   .input{height:32px;border:1px solid hsl(var(--input));border-radius:8px;background:hsl(var(--background));padding:0 10px;
