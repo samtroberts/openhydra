@@ -30,6 +30,7 @@ pub mod aup;
 /// Engine auto-detection (`--engine-kind auto`) + the multi-engine union adapter.
 pub mod detect;
 pub mod byok;
+pub mod connect;
 pub mod consumer;
 pub mod gateway;
 pub mod hardening;

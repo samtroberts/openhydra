@@ -173,6 +173,23 @@ struct Settings {
     /// serves only these. Restart Sharing to apply a change.
     #[serde(default)]
     shared_models: Vec<String>,
+    /// Persisted sharing INTENT — was the provider role running when we last toggled it? The provider
+    /// is a child process killed on quit/update (`kill_all` on exit), so without this every restart
+    /// silently stopped sharing. Set by start/stop_provider; read on launch to resume.
+    sharing_enabled: bool,
+    /// Resume sharing automatically on launch when `sharing_enabled` is set (informed opt-out — the UI
+    /// can clear it). Default on.
+    resume_on_launch: bool,
+    /// Persisted-settings schema version, for future migrations (see `load_settings`). Files written
+    /// before versioning (field absent) parse as 1; fresh installs + re-saves write the current one.
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+}
+
+/// Current settings schema version. Bump when a field's meaning/shape changes and add a migration arm.
+const SCHEMA_VERSION: u32 = 2;
+fn default_schema_version() -> u32 {
+    1
 }
 
 impl Default for Settings {
@@ -189,6 +206,9 @@ impl Default for Settings {
             verbose_logs: false,
             device_name: String::new(),
             shared_models: Vec::new(), // empty ⇒ share every detected model (the default)
+            sharing_enabled: false,
+            resume_on_launch: true,
+            schema_version: SCHEMA_VERSION,
         }
     }
 }
@@ -205,15 +225,34 @@ fn settings_path() -> PathBuf {
 }
 
 fn load_settings() -> Settings {
-    let mut s: Settings = std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    // C5 migration: the gateway port was never user-editable before v0.3.8, so a persisted
-    // 8080 (the pre-16527 default that collided with llama.cpp) is stale — bump it to the
-    // current default and re-save. Fresh installs already default to 16527.
+    let path = settings_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(_) => return Settings::default(), // no file yet — fresh install
+    };
+    // Container `#[serde(default)]` fills any missing field, so adding fields across an update is
+    // safe. A hard parse failure (e.g. a field's TYPE changed) must NOT silently wipe the user's
+    // settings — preserve the original beside the file, then default, so nothing is lost.
+    let mut s: Settings = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("openhydra: {} failed to parse ({e}); backing it up → .corrupt.bak, using defaults", path.display());
+            let _ = std::fs::write(path.with_extension("json.corrupt.bak"), &raw);
+            Settings::default()
+        }
+    };
+    let mut migrated = false;
+    // C5 migration: the gateway port was never user-editable before v0.3.8, so a persisted 8080 (the
+    // pre-16527 default that collided with llama.cpp) is stale — bump it. Fresh installs use 16527.
     if s.gateway_port == 8080 {
         s.gateway_port = 16527;
+        migrated = true;
+    }
+    if s.schema_version < SCHEMA_VERSION {
+        s.schema_version = SCHEMA_VERSION;
+        migrated = true;
+    }
+    if migrated {
         let _ = store_settings(&s);
     }
     s
@@ -495,6 +534,9 @@ struct AppState {
     provider: Arc<Mutex<Role>>,
     gateway: Arc<Mutex<Role>>,
     settings: Mutex<Settings>,
+    /// Set true when this launch auto-resumed sharing — drives the one-time "Resuming your shared
+    /// models…" notice (with a "Don't resume" opt-out) in the UI. Transient, not persisted.
+    resumed_on_launch: std::sync::atomic::AtomicBool,
 }
 
 // ── Log ingestion: strip ANSI, ring-buffer, parse status out of known lines ──
@@ -676,6 +718,8 @@ struct FullState {
     settings: Settings,
     agent_found: bool,
     gateway_url: String,
+    /// True on the launch that auto-resumed sharing — the UI shows a one-time "Resuming…" notice.
+    resumed_on_launch: bool,
 }
 
 fn view(role: &Arc<Mutex<Role>>) -> RoleView {
@@ -697,6 +741,18 @@ fn get_state(state: tauri::State<'_, AppState>) -> FullState {
         settings,
         agent_found: agent_binary().is_some(),
         gateway_url,
+        resumed_on_launch: state.resumed_on_launch.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Persist whether the user is sharing, so a restart can resume it (the provider is a child process
+/// killed on quit/update, so intent must live in settings, not just the process). No-op if unchanged.
+fn set_sharing_enabled(state: &tauri::State<'_, AppState>, on: bool) {
+    if let Ok(mut s) = state.settings.lock() {
+        if s.sharing_enabled != on {
+            s.sharing_enabled = on;
+            let _ = store_settings(&s);
+        }
     }
 }
 
@@ -726,7 +782,9 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
         PROVIDER_STATUS_PORT,
         &settings.bootstraps,
         &sub,
-    )
+    )?;
+    set_sharing_enabled(&state, true); // remember intent so a restart resumes sharing
+    Ok(())
 }
 
 /// #7: the libp2p PeerId of this desktop's own provider identity. The gateway is told this so
@@ -775,6 +833,7 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn stop_provider(state: tauri::State<'_, AppState>) {
     state.provider.lock().expect("role lock").kill();
+    set_sharing_enabled(&state, false); // user turned sharing off — don't resume on next launch
 }
 
 #[tauri::command]
@@ -1153,11 +1212,62 @@ fn connector_preview(state: tauri::State<'_, AppState>, key: String) -> Result<c
 }
 
 /// Write the OpenHydra block into `key`'s config (backs up any existing file first). Called only
-/// after the user confirms the preview.
+/// after the user confirms the preview. `models` declares specific network model ids in the tool's
+/// own picker (opencode/pi/continue only); omit/empty ⇒ just `openhydra/auto`.
 #[tauri::command]
-fn connector_apply(state: tauri::State<'_, AppState>, key: String) -> Result<connectors::ConnectReport, String> {
+fn connector_apply(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    models: Option<Vec<String>>,
+) -> Result<connectors::ConnectReport, String> {
     let origin = gateway_origin(&state)?;
-    connectors::apply(&key, &origin)
+    connectors::apply_with_models(&key, &origin, &models.unwrap_or_default())
+}
+
+/// Un-wire `key`: restore the pristine pre-OpenHydra config from its backup, or delete a file we
+/// created. The inverse of `connector_apply` (the Disconnect button).
+#[tauri::command]
+fn connector_disconnect(key: String) -> Result<connectors::DisconnectReport, String> {
+    connectors::disconnect(&key)
+}
+
+/// Open a tool's GUI (the App/Editor "Connect & Open" action): the OpenCode/Hermes desktop app or the
+/// Continue/Claude editor, via the tool's `gui_target`. Best-effort — an Err leaves the (already
+/// written) config in place and the UI toasts a manual-open fallback.
+#[tauri::command]
+fn open_gui(key: String) -> Result<(), String> {
+    use openhydra_agent::connect::spec;
+    use std::process::Command;
+    let spec = spec(&key).ok_or_else(|| format!("unknown connector '{key}'"))?;
+    let app = spec.gui_target.ok_or_else(|| format!("{key} has no GUI to open"))?;
+    // Run + WAIT for the launcher to exit so we report real success. `open`/`code` return promptly
+    // after handing off to LaunchServices, but `open -a` exits non-zero when the app is missing — a
+    // bare spawn would mask that as success and the UI would falsely toast "opening…".
+    let run = |mut cmd: Command, what: String| -> Result<(), String> {
+        match cmd.status() {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(format!("{what} failed ({s})")),
+            Err(e) => Err(format!("{what}: {e}")),
+        }
+    };
+    // Editor tools: prefer the `code` CLI (via the GUI-PATH resolver) so an open workspace is reused;
+    // fall back to macOS `open -a <app>`. App tools: `open -a <app>`.
+    if matches!(spec.kind, openhydra_agent::connect::Kind::ContinueYaml | openhydra_agent::connect::Kind::ClaudeSettings) {
+        if let Some(code) = crate::installer::resolve_program("code") {
+            return run(Command::new(code), "launch VS Code".into());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut c = Command::new("open");
+        c.args(["-a", app]);
+        run(c, format!("open {app}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err(format!("opening {key}'s GUI is only wired for macOS so far; open {app} manually"))
+    }
 }
 
 /// "Test" button: a bounded 1-token `openhydra/auto` completion through the local gateway; returns
@@ -1254,9 +1364,16 @@ async fn gateway_health(state: tauri::State<'_, AppState>) -> Result<bool, ()> {
 }
 
 #[tauri::command]
-fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
+fn save_settings(state: tauri::State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
+    let mut cur = state.settings.lock().map_err(|e| e.to_string())?;
+    // Preserve fields the settings FORM doesn't own — taking the payload verbatim would reset them.
+    // `sharing_enabled` is managed by start/stop_provider (a save must not clear a live sharing intent
+    // → it would break resume-on-launch); `schema_version` is managed by load_settings' migration.
+    // `resume_on_launch` IS surfaced by the settings toggle now, so its payload value is honoured.
+    settings.sharing_enabled = cur.sharing_enabled;
+    settings.schema_version = cur.schema_version;
     store_settings(&settings)?;
-    *state.settings.lock().map_err(|e| e.to_string())? = settings;
+    *cur = settings;
     Ok(())
 }
 
@@ -1392,6 +1509,7 @@ fn main() {
             provider: Arc::new(Mutex::new(Role::new(&PROVIDER_PID))),
             gateway: Arc::new(Mutex::new(Role::new(&GATEWAY_PID))),
             settings: Mutex::new(load_settings()),
+            resumed_on_launch: std::sync::atomic::AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -1422,9 +1540,34 @@ fn main() {
             connector_status,
             connector_preview,
             connector_apply,
+            connector_disconnect,
+            open_gui,
             connector_test,
         ])
         .setup(|app| {
+            // Resume sharing if the user was sharing when they last quit (informed opt-out via
+            // `resume_on_launch`). The provider is a child process killed on exit, so without this
+            // every restart/update silently stopped sharing. The agent re-announces only models the
+            // engine actually serves (re-probing each tick), so a not-yet-ready engine resolves itself.
+            {
+                let (enabled, resume) = app
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .map(|s| (s.sharing_enabled, s.resume_on_launch))
+                    .unwrap_or((false, true));
+                if enabled && resume {
+                    match start_provider(app.state()) {
+                        Ok(()) => {
+                            app.state::<AppState>()
+                                .resumed_on_launch
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("openhydra: resumed sharing on launch (was sharing at last quit)");
+                        }
+                        Err(e) => eprintln!("openhydra: resume sharing on launch failed: {e}"),
+                    }
+                }
+            }
             use tauri::tray::TrayIconBuilder;
             let menu = build_tray_menu(app, &tray_stats(&app.state::<AppState>()))?;
             let mut tray = TrayIconBuilder::with_id("main")
@@ -1564,5 +1707,37 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"gateway_port": 9999}"#).unwrap();
         assert_eq!(partial.gateway_port, 9999);
         assert!(partial.bootstraps.is_empty());
+    }
+
+    /// The actual "an update stopped my sharing" guard: a settings.json written by an OLD version
+    /// (no sharing/resume/version fields) must parse WITHOUT losing the fields it does have, and the
+    /// new fields must default sanely — never a wipe.
+    #[test]
+    fn old_settings_json_migrates_without_losing_state() {
+        let old = r#"{"bootstraps":["/dns4/x/tcp/4001"],"gateway_port":16527,"engine_autostart":true,
+            "search_url":"","verbose_logs":false,"device_name":"Asus",
+            "shared_models":["qwen3-coder:30b-a3b-q8_0"]}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        // present fields survive the schema bump
+        assert_eq!(s.shared_models, vec!["qwen3-coder:30b-a3b-q8_0"]);
+        assert_eq!(s.device_name, "Asus");
+        assert!(s.engine_autostart);
+        // new fields default sanely (unknown at old-schema time)
+        assert!(!s.sharing_enabled, "unknown sharing intent defaults off, not a spurious on");
+        assert!(s.resume_on_launch, "resume defaults on");
+        assert_eq!(s.schema_version, 1, "a pre-versioning file reads as v1 → load_settings migrates it up");
+    }
+
+    /// Sharing intent round-trips: once set, it persists so a restart can resume it.
+    #[test]
+    fn sharing_intent_round_trips() {
+        let mut s = Settings::default();
+        assert!(!s.sharing_enabled);
+        assert_eq!(s.schema_version, SCHEMA_VERSION); // a fresh install writes the current version
+        s.sharing_enabled = true;
+        s.shared_models = vec!["llama3.1:8b".into()];
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.sharing_enabled, "sharing intent survives a save/load");
+        assert_eq!(back.shared_models, vec!["llama3.1:8b"]);
     }
 }

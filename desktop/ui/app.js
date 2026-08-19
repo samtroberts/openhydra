@@ -22,28 +22,37 @@
     if (cmd === "stop_gateway") { mk.gateway = false; return null; }
     if (cmd === "save_settings") { if (args?.settings) mk.sharedModels = args.settings.shared_models || []; return null; }
     if (cmd === "gateway_health") return mk.gateway;
-    if (cmd === "connector_status") return [
-      { key: "opencode", label: "OpenCode", kind: "opencode", installed: true, detail: "/usr/local/bin/opencode" },
-      { key: "claude", label: "Claude Code", kind: "claude", installed: true, detail: "/usr/local/bin/claude" },
-      { key: "continue", label: "Continue", kind: "continue", installed: false, detail: null },
-    ];
+    if (cmd === "connector_status") {
+      const c = (o) => ({ declared_models: [], ...o, connected: !!(mk.connected && mk.connected[o.key]) });
+      return [
+        c({ key: "opencode", label: "OpenCode", kind: "opencode", installed: true, detail: "/usr/local/bin/opencode", surfaces: ["terminal", "app"], declares_models: true, has_gui: true, natural_verb: "launch", declared_models: ["qwen2.5:7b"] }),
+        c({ key: "claude", label: "Claude Code", kind: "claude", installed: true, detail: "/usr/local/bin/claude", surfaces: ["terminal", "editor"], declares_models: false, has_gui: true, natural_verb: "launch" }),
+        c({ key: "continue", label: "Continue", kind: "continue", installed: false, detail: null, surfaces: ["editor"], declares_models: true, has_gui: true, natural_verb: "connect" }),
+        c({ key: "pi", label: "Pi", kind: "pi", installed: true, detail: "~/.pi/agent", surfaces: ["terminal"], declares_models: true, has_gui: false, natural_verb: "launch" }),
+        c({ key: "hermes", label: "Hermes", kind: "hermes", installed: false, detail: null, surfaces: ["terminal", "app"], declares_models: false, has_gui: true, natural_verb: "launch" }),
+      ];
+    }
     if (cmd === "connector_preview") {
       const key = args?.key;
-      const paths = { opencode: "~/.config/opencode/opencode.json", claude: "~/.claude/settings.json", continue: "~/.continue/config.yaml" };
+      const paths = { opencode: "~/.config/opencode/opencode.json", claude: "~/.claude/settings.json", continue: "~/.continue/config.yaml", pi: "~/.pi/agent/models.json", hermes: "~/.hermes/config.yaml" };
       const previews = {
         opencode: '{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {\n    "openhydra": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "OpenHydra",\n      "options": { "baseURL": "http://127.0.0.1:16527/v1", "apiKey": "oh-local" },\n      "models": { "openhydra/auto": { "name": "OpenHydra Auto" } }\n    }\n  },\n  "model": "openhydra/openhydra/auto"\n}',
         claude: '{\n  "env": {\n    "ANTHROPIC_BASE_URL": "http://127.0.0.1:16527",\n    "ANTHROPIC_API_KEY": "oh-local"\n  }\n}',
         continue: "models:\n- name: OpenHydra\n  provider: openai\n  model: openhydra/auto\n  apiBase: http://127.0.0.1:16527/v1\n  apiKey: oh-local\n  roles:\n  - chat\n  - edit\n  - apply\n",
+        pi: '{\n  "providers": {\n    "openhydra": {\n      "baseUrl": "http://127.0.0.1:16527/v1",\n      "apiKey": "oh-local",\n      "api": "openai-completions",\n      "models": [{ "id": "openhydra/auto", "name": "OpenHydra Auto" }]\n    }\n  }\n}',
+        hermes: "model:\n  provider: custom\n  base_url: http://127.0.0.1:16527/v1\n  api_key: oh-local\n  name: openhydra/auto\n",
       };
-      return { key, kind: key, path: paths[key], action: "create", preview: previews[key] || "{}", warning: key === "continue" ? "Continue's config.yaml will be reformatted (comments/spacing are not preserved). The original is backed up." : null };
+      return { key, kind: key, path: paths[key], action: "create", preview: previews[key] || "{}", warning: key === "continue" ? "Continue's config.yaml will be reformatted (comments/spacing are not preserved). The original is backed up." : (key === "hermes" ? "Hermes' config.yaml will be reformatted (comments/spacing are not preserved). The original is backed up." : null) };
     }
-    if (cmd === "connector_apply") return { key: args?.key, path: "~/(config)", backup: null, action: "added" };
+    if (cmd === "connector_apply") { (mk.connected || (mk.connected = {}))[args?.key] = true; return { key: args?.key, path: "~/(config)", backup: null, action: "added" }; }
+    if (cmd === "connector_disconnect") { if (mk.connected) mk.connected[args?.key] = false; return { key: args?.key, path: "~/(config)", action: "restored" }; }
+    if (cmd === "open_gui") return null;
     if (cmd === "connector_test") return mk.gateway ? "granite4.1:3b" : Promise.reject("gateway unreachable on :16527 — is OpenHydra sharing/serving?");
     if (cmd === "get_state") return {
       provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: mk.provider ? 2 : 0, relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
-      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "", shared_models: mk.sharedModels || [] },
-      agent_found: true, gateway_url: "http://127.0.0.1:16527/v1",
+      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, schema_version: 2 },
+      agent_found: true, gateway_url: "http://127.0.0.1:16527/v1", resumed_on_launch: !!mk.resumedOnLaunch,
     };
     if (cmd === "system_info") return { os: "macos", arch: "aarch64", cpu: "Apple M1", ram_bytes: 8589934592, gpus: [{ name: "Apple M1 (7-core GPU)", vram_bytes: 8589934592, unified: true }] };
     if (cmd === "detect_engines_now") return (mk.runningEngines || mk.installedEngines || ["ollama"]).map((l) => ({ label: l, url: "http://127.0.0.1:11434", models: l === "ollama" ? ["tinyllama:latest", "llama3.2:1b"] : [] }));
@@ -1124,32 +1133,171 @@
     wireConnectors();
   }
 
-  // Detect installed tools + wire Connect/Test on the actionable connector cards.
+  const AUTO_MODEL = "openhydra/auto";
+  function surfLabel(s) { return s === "terminal" ? "Terminal" : s === "editor" ? "Editor" : "App"; }
+  // Live network model ids for the selector (sticky-smoothed; may be empty before the first snapshot).
+  function liveModels() {
+    return [...new Set([...(snap?.network?.known_models || []), ...Object.keys(seenModels || {})])]
+      .filter(Boolean).sort();
+  }
+
+  // Detect installed tools + render the surface switcher, live snippet, model selector, and
+  // state-driven actions on the actionable connector cards.
   async function wireConnectors() {
     let statuses = [];
     try { statuses = await call("connector_status"); } catch {}
     const byKey = {}; statuses.forEach((s) => (byKey[s.key] = s));
     $$("#v-connectors .conncard[data-key]").forEach((card) => {
-      const key = card.dataset.key;
-      const st = byKey[key];
-      const dot = $(".cstat", card), lbl = $(".cstat-t", card);
-      if (dot) { dot.textContent = "●"; dot.className = "cstat " + (st?.installed ? "on" : "off"); }
-      if (lbl) lbl.textContent = st?.installed ? "installed" : "not detected";
-      const connectBtn = $(".cconnect", card), testBtn = $(".ctest", card);
-      if (connectBtn) connectBtn.onclick = () => connectTool(key);
-      if (testBtn) testBtn.onclick = () => testGateway(testBtn);
+      const st = byKey[card.dataset.key];
+      if (!st) return;
+      if (!card.dataset.surface || !(st.surfaces || []).includes(card.dataset.surface)) {
+        card.dataset.surface = (st.surfaces && st.surfaces[0]) || "terminal";
+      }
+      renderSurfaceSwitcher(card, st);
+      renderModelSelector(card, st);
+      renderSnippet(card, st);
+      renderActions(card, st);
     });
   }
 
-  async function connectTool(key) {
-    let pv;
-    try { pv = await call("connector_preview", { key }); }
-    catch (e) { toast("Preview failed: " + e); return; }
-    if (!(await confirmConnect(pv))) return;
-    try {
-      const rep = await call("connector_apply", { key });
+  // The repurposed "direct" slot: a segmented switcher for dual-surface tools, a static chip otherwise.
+  function renderSurfaceSwitcher(card, st) {
+    const slot = $(".csurf", card); if (!slot) return;
+    const surfaces = st.surfaces && st.surfaces.length ? st.surfaces : ["terminal"];
+    if (surfaces.length < 2) { slot.innerHTML = `<span class="solo">${surfLabel(surfaces[0])}</span>`; return; }
+    slot.innerHTML = surfaces.map((s) => `<button data-s="${s}"${s === card.dataset.surface ? ' class="on"' : ""}>${surfLabel(s)}</button>`).join("");
+    $$("button", slot).forEach((b) => b.onclick = () => {
+      card.dataset.surface = b.dataset.s;
+      renderSurfaceSwitcher(card, st); renderSnippet(card, st); renderActions(card, st);
+    });
+  }
+
+  // Model selector (picker tools only: opencode/pi/continue) — injected once, before the actions row.
+  // Searchable multi-select: type-to-filter dropdown of all network model ids (or a custom typed id),
+  // selections become removable chips. `openhydra/auto` is a permanent chip. Selection lives on
+  // `card._models` (a Set) so it survives the periodic refresh() re-render.
+  function renderModelSelector(card, st) {
+    let box = $(".cmodels", card);
+    if (!st.declares_models) { if (box) box.remove(); return; }
+    // Build ONCE — rebuilding the whole selector every 2.5s (refresh) collapsed the open dropdown and
+    // wiped focus/typed text. On later renders, only live-refresh the OPEN dropdown's option list.
+    if (box) { if (box._liveRefresh) box._liveRefresh(); return; }
+    // Seed from models ALREADY declared in the tool's config, so a re-Connect keeps them (the writers
+    // replace the declared set, and this Set is what Connect sends).
+    if (!card._models) card._models = new Set(st.declared_models || []);
+    box = document.createElement("details"); box.className = "cmodels";
+    card.insertBefore(box, $(".connact", card));
+    box.innerHTML = `<summary>Models to declare in ${esc(st.label)} ▾</summary>`
+      + `<div class="mchips"></div>`
+      + `<div class="mcombo"><input class="mfilter" type="text" placeholder="add a model — scroll or type to filter…"><div class="mopts" hidden></div></div>`;
+    const chipsEl = $(".mchips", box), input = $(".mfilter", box), opts = $(".mopts", box);
+
+    const renderChips = () => {
+      chipsEl.innerHTML = `<span class="mchip auto">${AUTO_MODEL} <span class="mut">· always</span></span>`
+        + [...card._models].map((m) => `<span class="mchip">${esc(m)} <button class="mrm" data-v="${esc(m)}" title="Remove">×</button></span>`).join("");
+      $$(".mrm", chipsEl).forEach((b) => b.onclick = () => { card._models.delete(b.dataset.v); renderChips(); renderSnippet(card, st); if (!opts.hidden) renderOpts(); });
+    };
+    const add = (v) => { v = (v || "").trim(); if (!v || v === AUTO_MODEL) return; card._models.add(v); input.value = ""; renderChips(); renderOpts(); renderSnippet(card, st); };
+    const renderOpts = () => {
+      const q = input.value.trim().toLowerCase();
+      const avail = liveModels().filter((m) => !card._models.has(m) && m.toLowerCase().includes(q));
+      let html = avail.map((m) => `<div class="mopt" data-v="${esc(m)}">${esc(m)}</div>`).join("");
+      const typed = input.value.trim();
+      if (typed && !liveModels().some((m) => m.toLowerCase() === typed.toLowerCase()) && !card._models.has(typed)) {
+        html += `<div class="mopt add" data-v="${esc(typed)}">+ Add “${esc(typed)}”</div>`;
+      }
+      opts.innerHTML = html || `<div class="mopt mut">No matching models on the network</div>`;
+      // mousedown (not click) + preventDefault so the option registers before the input's blur hides it.
+      $$(".mopt[data-v]", opts).forEach((o) => o.onmousedown = (e) => { e.preventDefault(); add(o.dataset.v); });
+      box._lastSig = liveModels().join(""); // remember the network's model set at this render
+    };
+    input.onfocus = () => { opts.hidden = false; renderOpts(); };
+    input.oninput = () => { opts.hidden = false; renderOpts(); };
+    input.onblur = () => setTimeout(() => { opts.hidden = true; }, 150);
+    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); add(input.value); } };
+    // Called on each 2.5s poll (via the build-once early-return): if the dropdown is OPEN and the
+    // network's model set changed since the last render, refresh just the option list — preserving the
+    // input's focus + typed text. Unchanged ⇒ skip, so an idle open list never reshuffles or loses scroll.
+    box._liveRefresh = () => { if (!opts.hidden && liveModels().join("") !== box._lastSig) renderOpts(); };
+    renderChips();
+  }
+
+  function selectedModels(card) { return card._models ? [...card._models] : []; }
+
+  // The Terminal snippet is the live `openhydra <verb> …` command (reflecting the model selection);
+  // the App/Editor snippet is a short instruction, since there's no command to copy.
+  function renderSnippet(card, st) {
+    const sn = $(".snippet", card); if (!sn) return;
+    const models = selectedModels(card);
+    if (card.dataset.surface === "terminal") {
+      const lines = [];
+      if (models.length) lines.push(`openhydra connect ${st.key}` + models.map((m) => ` --model ${m}`).join(""));
+      lines.push(`openhydra ${st.natural_verb} ${st.key}`);
+      sn.textContent = lines.join("\n");
+    } else {
+      const where = card.dataset.surface === "editor" ? "your editor" : "the app";
+      const declare = models.length ? `\n# picker models: ${models.join(", ")}` : "";
+      sn.textContent = `# Connect writes ${st.kind}'s config, then open ${where} — it reads it.${declare}\n# model: ${AUTO_MODEL}`;
+    }
+  }
+
+  function renderActions(card, st) {
+    const act = $(".connact", card); if (!act) return;
+    const isTerminal = card.dataset.surface === "terminal";
+    // Skip the rebuild when nothing that affects the buttons changed — otherwise the 2.5s refresh
+    // would destroy the button DOM mid-interaction (e.g. clobbering a Test's "Testing…" state and
+    // re-enabling it while the request is still in flight).
+    const sig = `${st.installed}|${st.connected}|${isTerminal}`;
+    if (act._sig === sig) return;
+    act._sig = sig;
+    const runLabel = st.connected ? (isTerminal ? "Run" : "Open") : (isTerminal ? "Connect &amp; Run" : "Connect &amp; Open");
+    const statusHtml = st.connected
+      ? `<span class="cconnected">● Connected</span>`
+      : `<span class="cstat ${st.installed ? "on" : "off"}">●</span><span class="cstat-t">${st.installed ? "installed" : "not detected"}</span>`;
+    act.innerHTML = statusHtml
+      + (isTerminal ? `<button class="btn ghost sm ccopy" style="margin-left:auto">Copy</button>` : `<span style="margin-left:auto"></span>`)
+      + `<button class="btn ghost sm ctest">Test</button>`
+      + (st.connected ? `<button class="btn ghost sm cdisc">Disconnect</button>` : `<button class="btn ghost sm cwire">Connect</button>`)
+      + `<button class="btn sm crun">${runLabel}</button>`;
+    const on = (sel, fn) => { const b = $(sel, act); if (b) b.onclick = fn; };
+    on(".ccopy", () => { navigator.clipboard?.writeText(($(".snippet", card)?.textContent || "").trim()); toast("Copied"); });
+    on(".ctest", (e) => testGateway(e.target));
+    on(".cwire", () => connectTool(card, st, false));
+    on(".crun", () => connectTool(card, st, true));
+    on(".cdisc", () => disconnectTool(card, st));
+  }
+
+  // Wire the tool (persist config via apply, declaring any selected models), then optionally run it:
+  // Terminal → copy `openhydra launch <tool>`; App/Editor → open the GUI. `apply` backs up the original.
+  async function connectTool(card, st, run) {
+    const models = selectedModels(card), surf = card.dataset.surface;
+    let rep;
+    try { rep = await call("connector_apply", { key: st.key, models }); }
+    catch (e) { toast("Connect failed: " + e); return; }
+    if (!run) {
       toast(`Connected — ${rep.action} config` + (rep.backup ? " (original backed up)" : ""));
-    } catch (e) { toast("Connect failed: " + e); }
+      wireConnectors(); return;
+    }
+    if (surf === "terminal") {
+      const cmd = `openhydra launch ${st.key}`;
+      try { await navigator.clipboard.writeText(cmd); toast(`Wired ✓ — copied "${cmd}". Paste in your terminal to run.`); }
+      catch { toast(`Wired ✓ — run: ${cmd}`); }
+    } else {
+      try { await call("open_gui", { key: st.key }); toast(`Wired ✓ — opening ${surfLabel(surf)}…`); }
+      catch (e) { toast(`Wired ✓ — couldn't open ${surfLabel(surf)} (${e}). Open it manually; it reads the config.`); }
+    }
+    wireConnectors();
+  }
+
+  async function disconnectTool(card, st) {
+    if (!(await confirmModal(`Disconnect ${st.label}`, `Restores ${st.label}'s original config (removes the OpenHydra block).`, "Disconnect"))) return;
+    try {
+      const rep = await call("connector_disconnect", { key: st.key });
+      const label = { restored: "original restored", stripped: "removed our block, kept your config", removed: "removed our config", "not-connected": "nothing to undo" }[rep.action] || rep.action;
+      toast("Disconnected — " + label);
+    }
+    catch (e) { toast("Disconnect failed: " + e); return; }
+    wireConnectors();
   }
 
   async function testGateway(btn) {
@@ -1161,17 +1309,16 @@
 
   function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
-  // A self-contained confirm dialog showing exactly what Connect will write. Resolves true/false.
-  function confirmConnect(pv) {
+  // Generic in-app confirm — window.confirm() is a no-op in the Tauri webview, so we can't gate on it.
+  // Resolves true/false.
+  function confirmModal(title, body, okLabel) {
     return new Promise((resolve) => {
       const back = document.createElement("div");
       back.className = "cmodal-back";
       back.innerHTML =
-        `<div class="cmodal"><div class="cmodal-h"><b>Connect ${escapeHtml(pv.key)} to OpenHydra</b></div>` +
-        `<div class="cmodal-b"><div class="cmodal-path">${pv.action === "create" ? "Create" : "Update"} <code>${escapeHtml(pv.path)}</code></div>` +
-        (pv.warning ? `<div class="cmodal-warn">⚠ ${escapeHtml(pv.warning)}</div>` : "") +
-        `<pre class="cmodal-pre">${escapeHtml(pv.preview)}</pre></div>` +
-        `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm cok">Write config</button></div></div>`;
+        `<div class="cmodal"><div class="cmodal-h"><b>${escapeHtml(title)}</b></div>` +
+        `<div class="cmodal-b"><div class="cmodal-path">${escapeHtml(body)}</div></div>` +
+        `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm cok">${escapeHtml(okLabel || "OK")}</button></div></div>`;
       document.body.appendChild(back);
       const done = (v) => { back.remove(); resolve(v); };
       $(".cx", back).onclick = () => done(false);
@@ -1179,6 +1326,7 @@
       back.onclick = (e) => { if (e.target === back) done(false); };
     });
   }
+
   // libp2p ids of the infrastructure we're connected to (bootstraps + circuit relays) — these
   // aren't "peers" a user cares about, so we hide them from the Peers list.
   function infraPeerIds() {
@@ -1227,7 +1375,8 @@
     const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
     const eng = $('.setpanel[data-p="engine"]');
     updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
-    eng.querySelector('.switch').classList.toggle("on", !!p.settings.engine_autostart);
+    $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
+    $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);
     $("#advsw").classList.toggle("on", app.hasAttribute("data-adv"));
     $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4
   }
@@ -1285,7 +1434,7 @@
     let gwPort = parseInt((netp.querySelector('#gwport')?.textContent || "").trim(), 10);
     if (!Number.isInteger(gwPort) || gwPort < 1024 || gwPort > 65535) gwPort = state?.settings?.gateway_port || 16527;
     const bootstraps = (netp.querySelector('#bootstraps')?.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean);
-    const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $('.setpanel[data-p="engine"] .switch').classList.contains("on"), search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName, shared_models: state?.settings?.shared_models || [] };
+    const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $("#engineautostartsw").classList.contains("on"), resume_on_launch: $("#resumelaunchsw") ? $("#resumelaunchsw").classList.contains("on") : true, search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName, shared_models: state?.settings?.shared_models || [] };
     try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
   });
   $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
@@ -1385,7 +1534,33 @@
   $("#obreplay").onclick = () => coachShow(0);
 
   // ── polling ──
-  async function refresh() { try { state = await call("get_state"); } catch {} renderStatusbar(); if (["share", "settings", "connectors", "engines", "activity", "ledger"].includes(activeView)) renderView(); if (activeView === "peers") renderLogs(); }
+  async function refresh() {
+    try { state = await call("get_state"); } catch {}
+    // Informed opt-out: while this launch's auto-resume is flagged, keep a non-blocking notice up.
+    if (state?.resumed_on_launch) ensureResumeNotice();
+    renderStatusbar();
+    if (["share", "settings", "connectors", "engines", "activity", "ledger"].includes(activeView)) renderView();
+    if (activeView === "peers") renderLogs();
+  }
+
+  // Non-blocking "Resuming your shared models…" banner (informed opt-out). RE-ASSERTED each refresh so a
+  // first-run / after-update coachmark DOM rebuild can't kill it (that's exactly the update case where
+  // this matters). Clears on "Don't resume", ×, or after a short show-window.
+  let resumeNoticeDismissed = false, resumeNoticeDeadline = 0;
+  function ensureResumeNotice() {
+    if (resumeNoticeDismissed) return;
+    if (!resumeNoticeDeadline) resumeNoticeDeadline = Date.now() + 18000;
+    if (Date.now() > resumeNoticeDeadline) { resumeNoticeDismissed = true; document.getElementById("resumenotice")?.remove(); return; }
+    if (document.getElementById("resumenotice")) return;
+    const el = document.createElement("div");
+    el.id = "resumenotice"; el.className = "resumenotice";
+    el.innerHTML = `<span class="rn-dot">●</span><span>Resuming your shared models…</span>`
+      + `<button class="btn ghost sm rn-stop">Don't resume</button><button class="rn-x" title="Dismiss">×</button>`;
+    document.body.appendChild(el);
+    const dismiss = () => { resumeNoticeDismissed = true; el.remove(); };
+    el.querySelector(".rn-stop").onclick = async () => { dismiss(); try { await setSharing(false); toast("Sharing stopped"); } catch (e) { toast("Couldn't stop: " + e); } };
+    el.querySelector(".rn-x").onclick = dismiss;
+  }
   async function refreshEngines() { try { engines = await call("detect_engines_now"); } catch { engines = []; } try { installedEngines = await call("installed_engines"); } catch { installedEngines = []; } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
   // Start an installed-but-idle engine's server, then refresh so the card flips to "running".
   async function runEngine(label, name) {

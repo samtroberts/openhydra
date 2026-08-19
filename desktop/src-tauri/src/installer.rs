@@ -707,9 +707,14 @@ pub fn resolve_program(program: &str) -> Option<PathBuf> {
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            let cand = Path::new(&home).join(".lmstudio/bin").join(program);
-            if cand.exists() {
-                return Some(cand);
+            // A Finder-launched GUI app gets a minimal PATH, so `which` misses tools installed
+            // under $HOME. `~/.local/bin` is where npm-user / curl-installers land (pi, hermes,
+            // claude, …); `~/.lmstudio/bin` is LM Studio's CLI.
+            for sub in [".local/bin", ".lmstudio/bin"] {
+                let cand = Path::new(&home).join(sub).join(program);
+                if cand.exists() {
+                    return Some(cand);
+                }
             }
         }
     }

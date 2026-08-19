@@ -658,8 +658,14 @@ impl ConsumerNode {
 
     /// Snapshot the consumer's give-to-get economy for the status endpoint: earned
     /// reputation per provider (OpenHydra-keyed) and give-side credit balance per provider
-    /// (libp2p-keyed). Decayed to `now`. Pure reads of both maps; safe to call from a
-    /// background publisher thread.
+    /// (libp2p-keyed). Pure reads of both maps; safe to call from a background publisher thread.
+    ///
+    /// Reputation reports the **standing (raw) score** — the value as of the last verification
+    /// outcome — NOT the time-decayed `score_at(now)`. The decayed value drifts toward neutral on
+    /// every poll, which made the desktop's reputation flicker and appear to "reset" on a bare
+    /// re-announce (which produces no outcome, so decay is all that changed). The router still
+    /// reads the decayed `score_at` directly from the tracker for ranking; only the human-facing
+    /// display uses the stable standing score, which persists across re-announce and restart.
     pub fn economy_snapshot(&self) -> (Vec<crate::status::RepEntry>, Vec<crate::status::CreditEntry>) {
         let now = now_unix_ms();
         let reputation = self
@@ -669,7 +675,7 @@ impl ConsumerNode {
                 m.iter()
                     .map(|(id, t)| crate::status::RepEntry {
                         openhydra_peer_id: id.clone(),
-                        score: (t.score_at(now) * 10.0).round() / 10.0,
+                        score: (t.raw_score() * 10.0).round() / 10.0,
                     })
                     .collect()
             })

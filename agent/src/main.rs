@@ -39,6 +39,7 @@ use openhydra_network::node::NodeConfig;
 use openhydra_protocol::store::Store;
 
 mod launch;
+mod connect_cli;
 
 /// OpenHydra agent — a gateway in front of whatever inference engine you already run.
 #[derive(Parser)]
@@ -129,6 +130,13 @@ enum Role {
     /// sets its endpoint env, defaults the model to `openhydra/auto`, then execs it. No swarm.
     /// See `openhydra launch --list`.
     Launch(launch::LaunchArgs),
+    /// Persistently wire a coding tool to the local gateway by writing an OpenHydra block into its
+    /// own config file (Claude Code, OpenCode, Continue, Hermes, Pi) — the CLI twin of the desktop
+    /// "Connect" button. Backs up any existing config first. No swarm. See `openhydra connect --list`.
+    Connect(connect_cli::ConnectArgs),
+    /// Un-wire a coding tool: restore the pristine pre-OpenHydra config from its backup (or delete a
+    /// file we created). The inverse of `connect`, and the CLI twin of the desktop "Disconnect" button.
+    Disconnect(connect_cli::DisconnectArgs),
 }
 
 /// Which local engine an agent proxies to. Selects the adapter; the `--engine` URL
@@ -469,6 +477,7 @@ fn run() -> Result<(), String> {
     //  • `peer-id` (#7) resolves the identity's libp2p PeerId so the desktop can wire
     //    `serve --self-provider <id>` for the self-serve credit skip.
     //  • `launch` just execs a coding tool wired to the local gateway.
+    //  • `connect` writes an OpenHydra block into a coding tool's config file and exits.
     let role = match cli.role {
         Role::PeerId => {
             let config = cli.node.into_config();
@@ -478,6 +487,8 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Role::Launch(args) => return launch::run(args),
+        Role::Connect(args) => return connect_cli::run(args),
+        Role::Disconnect(args) => return connect_cli::run_disconnect(args),
         other => other, // Provide | Serve — need the swarm
     };
     let status_bind = cli.node.status_bind.clone();

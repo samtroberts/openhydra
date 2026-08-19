@@ -504,6 +504,21 @@ mod tests {
     }
 
     #[test]
+    fn raw_score_is_time_stable_while_score_at_decays() {
+        // The desktop reputation display uses raw_score() (standing) precisely because it does NOT
+        // drift between verification outcomes, unlike score_at() which decays toward neutral on every
+        // poll — that decay was the flickering the UI showed (economy_snapshot fix depends on this).
+        let mut t = ReputationTracker::with_half_life(1_000, DAY_MS);
+        t.record(VerificationOutcome::Honored, 1_000); // push above neutral
+        let standing = t.raw_score();
+        assert!(standing > NEUTRAL_REPUTATION);
+        // A day later: the standing score is unchanged, but score_at has decayed toward neutral.
+        assert_eq!(t.raw_score(), standing, "standing score does not drift with time (stable display)");
+        let decayed = t.score_at(1_000 + DAY_MS);
+        assert!(decayed < standing && decayed > NEUTRAL_REPUTATION, "score_at decays toward neutral");
+    }
+
+    #[test]
     fn tracker_bytes_roundtrip_preserves_decay() {
         // A snapshot survives serialization with its exact state, so a rehydrated
         // tracker decays to the same value as the original.

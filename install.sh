@@ -1,5 +1,7 @@
 #!/bin/sh
-# OpenHydra CLI installer — downloads the latest `openhydra-agent` for your platform.
+# OpenHydra CLI installer — installs the `openhydra` command for your platform (the binary is
+# distributed as `openhydra-agent-<target>`; it's installed as `openhydra`, with an `openhydra-agent`
+# compatibility symlink).
 #
 # Usage:
 #   curl -fsSL https://openhydra.co/install.sh | sh
@@ -18,7 +20,9 @@ set -eu
 
 REPO="${OPENHYDRA_REPO:-samtroberts/openhydra}"
 VERSION="${OPENHYDRA_VERSION:-latest}"
-BIN_NAME="openhydra-agent"
+# The command users type is `openhydra`. The release artifact is still named `openhydra-agent-<target>`
+# (see $asset below); it's installed as `openhydra`, plus an `openhydra-agent` compat symlink.
+BIN_NAME="openhydra"
 
 info() { printf '  %s\n' "$*"; }
 err()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -95,6 +99,13 @@ target="$bindir/$BIN_NAME"
 mv "$tmp" "$target" 2>/dev/null || err "cannot write '$target'. Retry with a writable dir, e.g.: OPENHYDRA_BIN_DIR=\"\$HOME/.local/bin\" sh install.sh"
 trap - EXIT INT TERM
 
+# Compatibility: some scripts/docs invoke the binary as `openhydra-agent` (the desktop sidecar's
+# name). Expose that alias next to the primary `openhydra` command — but NEVER clobber a real
+# `openhydra-agent` binary the user already has (only create/refresh it when absent or already a symlink).
+if [ ! -e "$bindir/openhydra-agent" ] || [ -L "$bindir/openhydra-agent" ]; then
+  ln -sf "$BIN_NAME" "$bindir/openhydra-agent" 2>/dev/null || true
+fi
+
 # macOS: clear any quarantine flag so Gatekeeper won't block the unsigned binary.
 if [ "$os" = "Darwin" ]; then
   xattr -d com.apple.quarantine "$target" >/dev/null 2>&1 || true
@@ -123,7 +134,10 @@ OpenHydra CLI is ready. Next:
   $BIN_NAME provide --engine-kind ollama
 
   # …or run the OpenAI-compatible gateway to consume from the network:
-  $BIN_NAME serve            # → http://127.0.0.1:8080
+  $BIN_NAME serve            # → http://127.0.0.1:16527
+
+  # …or wire a coding tool (Claude Code, OpenCode, Hermes, Pi) to the gateway and run it:
+  $BIN_NAME launch claude
 
 Docs: https://github.com/$REPO#quick-start
 EOF

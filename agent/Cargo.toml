@@ -1,6 +1,6 @@
 [package]
 name = "openhydra-agent"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
 rust-version = "1.75"
 description = "OpenHydra agent — BYO-engine adapters + the HTTP/SSE gateway. Proxies inference to external engines (Ollama/vLLM/…); never runs a model."
@@ -24,6 +24,9 @@ base64 = "0.22" # ComfyUI adapter: image bytes -> data-URL in the completion str
 # Parse engine HTTP responses (Ollama /api/tags, /api/show, …).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `connect` subcommand: Continue/Hermes tool configs are YAML. serde_yaml is archived-but-stable and
+# only ever touches a small config file. Shared with the desktop's Connect writers.
+serde_yaml = "0.9"
 # Live HTTP transport to the local engine. Blocking client (matches the sync HttpClient
 # trait; the async gateway will call it via spawn_blocking). rustls-tls (not native-tls)
 # keeps the eventual single static binary free of a system OpenSSL dependency.

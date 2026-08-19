@@ -6,20 +6,27 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 //! `openhydra launch <tool>` — run a coding tool wired to the local OpenHydra gateway,
-//! ollama-run style. It sets the tool's endpoint env vars so the tool's requests hit
-//! OpenHydra's OpenAI-/Anthropic-compatible gateway, then execs the tool. The model defaults
-//! to `openhydra/auto` (the gateway resolves it to a live model).
+//! ollama-run style. **`launch` = `connect` + run:** it ALWAYS persists the OpenHydra block into the
+//! tool's config file via the shared [`openhydra_agent::connect`] writers (idempotent, backed up) —
+//! so the tool stays wired across future sessions, not just this one — then execs the tool.
+//!   • Env tools (Claude Code, OpenCode) additionally get an endpoint env var set on the spawned
+//!     process: a redundant, immediate guarantee independent of when the tool re-reads its config.
+//!   • Config tools (Hermes, Pi) are steered by the written file (plus selecting the OpenHydra
+//!     provider on the CLI where needed, e.g. Pi's `--provider openhydra`).
+//! The model defaults to `openhydra/auto` (the gateway resolves it to a live model).
 //!
-//! Adding a tool is one `TOOLS` entry + (if its env differs) one arm in [`tool_env`].
+//! Adding a tool is one `TOOLS` entry (+ an env arm in [`tool_env`] only if it's an env tool).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use clap::Args;
 
+use openhydra_agent::connect;
+
 #[derive(Debug, Args)]
 pub struct LaunchArgs {
-    /// The coding tool to launch (e.g. `claude`, `opencode`). Omit only with `--list`.
+    /// The coding tool to launch (claude, opencode, hermes, pi). Omit only with `--list`.
     pub tool: Option<String>,
     /// List supported tools (and whether each is installed) and exit.
     #[arg(long)]
@@ -34,7 +41,7 @@ pub struct LaunchArgs {
     /// still satisfies tools that refuse to start without the var set.
     #[arg(long, default_value = "openhydra-local")]
     pub api_key: String,
-    /// Print the env it would set (shell-eval'able) and exit — don't launch.
+    /// Print the wiring it would apply (env / config target) and exit — don't launch or write.
     #[arg(long)]
     pub print_env: bool,
     /// Arguments after `--` are forwarded verbatim to the tool.
@@ -48,17 +55,29 @@ enum Api {
     Anthropic,
 }
 
+/// How `launch` wires a tool to the gateway before exec.
+#[derive(Clone, Copy)]
+enum Wiring {
+    /// The tool reads an endpoint env var (OPENAI_/ANTHROPIC_BASE_URL): set it, then exec. Ephemeral.
+    Env(Api),
+    /// The tool is configured by a file, not env: persist the OpenHydra block via `connect`
+    /// (idempotent, backs up), then exec. Used for config-only tools (Hermes, Pi).
+    Config,
+}
+
 struct ToolSpec {
     key: &'static str,
     bins: &'static [&'static str],
-    api: Api,
-    /// Whether the tool takes the model via env (so `--model` actually pins it). When false we
-    /// can only set the endpoint; the user picks the model in the tool's own config.
+    wiring: Wiring,
+    /// Whether the tool takes the model via env (so `--model` actually pins it). Env tools only.
     sets_model: bool,
+    /// Args prepended before the user's forwarded `--` args; a `{model}` token is replaced with the
+    /// `--model` value. Lets a config tool select the OpenHydra provider on the CLI (Pi).
+    default_args: &'static [&'static str],
     install_hint: &'static str,
 }
 
-/// The supported tools. Kept deliberately small + accurate — an entry asserts a real env
+/// The supported tools. Kept deliberately small + accurate — an entry asserts a real wiring
 /// contract, so only add a tool once its wiring is verified.
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
@@ -67,24 +86,46 @@ const TOOLS: &[ToolSpec] = &[
         // `/v1/messages` bridges to a live OpenHydra model. Pin one with OPENHYDRA_AUTO_MODEL.
         key: "claude",
         bins: &["claude"],
-        api: Api::Anthropic,
+        wiring: Wiring::Env(Api::Anthropic),
         sets_model: false,
+        default_args: &[],
         install_hint: "npm install -g @anthropic-ai/claude-code",
     },
     ToolSpec {
         key: "opencode",
         bins: &["opencode"],
-        api: Api::OpenAi,
+        wiring: Wiring::Env(Api::OpenAi),
         sets_model: false,
+        default_args: &[],
         install_hint: "see https://opencode.ai",
+    },
+    ToolSpec {
+        // Hermes reads ~/.hermes/config.yaml (no endpoint env var); `connect` writes the OpenHydra
+        // `model:` block, which becomes Hermes' active model — so a bare `hermes` routes through us.
+        key: "hermes",
+        bins: &["hermes", "hermes-agent"],
+        wiring: Wiring::Config,
+        sets_model: false,
+        default_args: &[],
+        install_hint: "see https://github.com/NousResearch/hermes",
+    },
+    ToolSpec {
+        // Pi reads ~/.pi/agent/models.json; `connect` writes the `openhydra` provider, then we select
+        // it on the CLI (`--provider openhydra --model <model>`).
+        key: "pi",
+        bins: &["pi"],
+        wiring: Wiring::Config,
+        sets_model: false,
+        default_args: &["--provider", "openhydra", "--model", "{model}"],
+        install_hint: "curl -fsSL https://pi.dev/install.sh | sh",
     },
 ];
 
 /// The env a tool needs to route through OpenHydra. Anthropic tools point at the origin (they
-/// append `/v1/messages`); OpenAI tools point at `<origin>/v1`.
+/// append `/v1/messages`); OpenAI tools point at `<origin>/v1`. Config tools take no env.
 fn tool_env(spec: &ToolSpec, origin: &str, model: &str, key: &str) -> Vec<(String, String)> {
-    match spec.api {
-        Api::Anthropic => {
+    match spec.wiring {
+        Wiring::Env(Api::Anthropic) => {
             let mut e = vec![
                 ("ANTHROPIC_BASE_URL".to_string(), origin.to_string()),
                 ("ANTHROPIC_API_KEY".to_string(), key.to_string()),
@@ -94,11 +135,34 @@ fn tool_env(spec: &ToolSpec, origin: &str, model: &str, key: &str) -> Vec<(Strin
             }
             e
         }
-        Api::OpenAi => vec![
+        Wiring::Env(Api::OpenAi) => vec![
             ("OPENAI_BASE_URL".to_string(), format!("{origin}/v1")),
             ("OPENAI_API_KEY".to_string(), key.to_string()),
         ],
+        Wiring::Config => vec![],
     }
+}
+
+/// Prepend a tool's `default_args` (with `{model}` substituted) to the user's forwarded args.
+fn build_argv(spec: &ToolSpec, model: &str, user_args: &[String]) -> Vec<String> {
+    // If the user forwards their own `--model`, don't ALSO inject ours — two `--model` flags confuse
+    // the tool. Drop the injected `--model {model}` pair (keep the rest, e.g. Pi's `--provider`).
+    let user_sets_model = user_args.iter().any(|a| a == "--model");
+    let mut argv: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    for a in spec.default_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if user_sets_model && *a == "--model" {
+            skip_next = true; // also skip the following `{model}`
+            continue;
+        }
+        argv.push(if *a == "{model}" { model.to_string() } else { a.to_string() });
+    }
+    argv.extend(user_args.iter().cloned());
+    argv
 }
 
 fn spec_for(tool: &str) -> Option<&'static ToolSpec> {
@@ -148,7 +212,9 @@ fn resolve_tool_bin(bins: &[&str]) -> Option<PathBuf> {
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            for rel in [".npm-global/bin", ".local/bin", ".bun/bin"] {
+            // `.opencode/bin` = OpenCode's official installer; `.local/bin` = npm-user / curl
+            // installers (pi, hermes); `.bun/bin`, `.npm-global/bin` = other JS toolchains.
+            for rel in [".opencode/bin", ".npm-global/bin", ".local/bin", ".bun/bin"] {
                 let c = Path::new(&home).join(rel).join(b);
                 if c.exists() {
                     return Some(c);
@@ -188,15 +254,19 @@ fn shell_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "'\\''"))
 }
 
+fn wiring_label(w: Wiring) -> &'static str {
+    match w {
+        Wiring::Env(Api::OpenAi) => "OpenAI (env)",
+        Wiring::Env(Api::Anthropic) => "Anthropic (env)",
+        Wiring::Config => "config file",
+    }
+}
+
 fn print_tools() {
     println!("Supported tools (openhydra launch <tool>):");
     for s in TOOLS {
         let found = if resolve_tool_bin(s.bins).is_some() { "installed" } else { "not found" };
-        let api = match s.api {
-            Api::OpenAi => "OpenAI",
-            Api::Anthropic => "Anthropic",
-        };
-        println!("  {:10} {:9} {}", s.key, api, found);
+        println!("  {:10} {:16} {}", s.key, wiring_label(s.wiring), found);
     }
 }
 
@@ -217,12 +287,30 @@ pub fn run(args: LaunchArgs) -> Result<(), String> {
     let origin = args.gateway.trim_end_matches('/').to_string();
     let env = tool_env(spec, &origin, &args.model, &args.api_key);
 
-    // `--print-env` is a dry run — show the wiring without needing the tool installed or a gateway up.
+    // `--print-env` is a dry run — show the wiring without needing the tool installed, a gateway up,
+    // or (for config tools) touching any file.
     if args.print_env {
-        for (k, v) in &env {
-            println!("export {k}={}", shell_quote(v));
+        match spec.wiring {
+            Wiring::Env(_) => {
+                for (k, v) in &env {
+                    println!("export {k}={}", shell_quote(v));
+                }
+                let path = connect::spec(spec.key)
+                    .and_then(|s| connect::config_path(s.kind))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<config file>".into());
+                println!("# launch also persists {tool}'s config so it stays wired: {path}");
+                println!("# then run: {}", spec.bins[0]);
+            }
+            Wiring::Config => {
+                let path = connect::spec(spec.key)
+                    .and_then(|s| connect::config_path(s.kind))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<config file>".into());
+                println!("# {tool} is wired via its config file (no env): {path}");
+                println!("# `openhydra launch {tool}` writes the OpenHydra block there, then runs it.");
+            }
         }
-        println!("# then run: {}", spec.bins[0]);
         return Ok(());
     }
 
@@ -236,26 +324,35 @@ pub fn run(args: LaunchArgs) -> Result<(), String> {
              or run `openhydra serve --bind 127.0.0.1:16527`. Launching {tool} anyway."
         );
     }
-    if !spec.sets_model {
-        match spec.api {
-            Api::OpenAi => eprintln!(
-                "openhydra launch: set {tool}'s model to '{}' in its config to route through OpenHydra.",
-                args.model
-            ),
-            Api::Anthropic => eprintln!(
-                "openhydra launch: {tool} sends its own model id; OpenHydra routes it to a live model \
-                 (set OPENHYDRA_AUTO_MODEL on the gateway to pin one)."
-            ),
-        }
+
+    // Wire the tool: launch = connect + run. ALWAYS persist the OpenHydra block into the tool's config
+    // (idempotent, backed up) via the SAME writers as `openhydra connect` / the desktop button — so the
+    // tool stays wired across future sessions, not just this one. Env tools ADDITIONALLY get endpoint
+    // env vars on the spawned process (see `env`): a redundant, immediate guarantee independent of when
+    // the tool re-reads its config.
+    let rep = connect::apply(spec.key, &origin)?;
+    let backup = rep
+        .backup
+        .as_ref()
+        .map(|b| format!(" (original backed up → {b})"))
+        .unwrap_or_default();
+    eprintln!("openhydra launch: wired {tool} config → {}{}", rep.path, backup);
+    if matches!(spec.wiring, Wiring::Env(Api::Anthropic)) && !spec.sets_model {
+        eprintln!(
+            "openhydra launch: {tool} sends its own model id; OpenHydra routes it to a live model \
+             (set OPENHYDRA_AUTO_MODEL on the gateway to pin one)."
+        );
     }
-    let model_note = if spec.sets_model {
-        format!("model {}", args.model)
-    } else {
-        "model: OpenHydra-routed".to_string()
+
+    let model_note = match spec.wiring {
+        Wiring::Config => "model: openhydra/auto (via config)".to_string(),
+        _ if spec.sets_model => format!("model {}", args.model),
+        _ => "model: OpenHydra-routed".to_string(),
     };
     eprintln!("openhydra launch: starting {tool} → {origin} ({model_note})");
 
-    exec_tool(&bin, &args.args, &env)
+    let argv = build_argv(spec, &args.model, &args.args);
+    exec_tool(&bin, &argv, &env)
 }
 
 #[cfg(unix)]
@@ -294,7 +391,23 @@ mod tests {
     fn spec_lookup_is_case_insensitive() {
         assert!(spec_for("claude").is_some());
         assert!(spec_for("OpenCode").is_some());
+        assert!(spec_for("Hermes").is_some());
+        assert!(spec_for("pi").is_some());
         assert!(spec_for("nope").is_none());
+    }
+
+    #[test]
+    fn every_launch_tool_has_a_connect_writer_so_launch_persists() {
+        // launch = connect + run: EVERY launchable tool (env tools included) must be wireable by the
+        // shared connect module, or `connect::apply` in run() would fail. This is the precondition
+        // that makes the "always persist config" redefinition sound.
+        for s in TOOLS {
+            assert!(
+                connect::spec(s.key).is_some(),
+                "{} has no connect writer — launch can't persist its config",
+                s.key
+            );
+        }
     }
 
     #[test]
@@ -315,6 +428,42 @@ mod tests {
         assert!(e.contains(&("OPENAI_BASE_URL".into(), "http://127.0.0.1:16527/v1".into())));
         assert!(e.contains(&("OPENAI_API_KEY".into(), "k".into())));
         assert!(!e.iter().any(|(k, _)| k.contains("MODEL")));
+    }
+
+    #[test]
+    fn config_tools_take_no_env() {
+        // Hermes + Pi are wired by their config file, not env — `launch` writes that via `connect`.
+        for key in ["hermes", "pi"] {
+            let s = spec_for(key).unwrap();
+            assert!(matches!(s.wiring, Wiring::Config), "{key} is a config tool");
+            assert!(tool_env(s, "http://h", "m", "k").is_empty(), "{key} sets no env");
+        }
+    }
+
+    #[test]
+    fn pi_selects_the_openhydra_provider_on_the_cli_with_the_model_substituted() {
+        let s = spec_for("pi").unwrap();
+        let argv = build_argv(s, "openhydra/auto", &["-p".into(), "hi".into()]);
+        // default_args (with {model} → openhydra/auto) come first, then the user's forwarded args.
+        assert_eq!(
+            argv,
+            vec!["--provider", "openhydra", "--model", "openhydra/auto", "-p", "hi"]
+        );
+    }
+
+    #[test]
+    fn a_user_provided_model_flag_suppresses_the_injected_one() {
+        let s = spec_for("pi").unwrap();
+        // User forwards their own --model: keep --provider, drop our injected --model {model}.
+        let argv = build_argv(s, "openhydra/auto", &["--model".into(), "qwen3-coder".into(), "-p".into(), "hi".into()]);
+        assert_eq!(argv, vec!["--provider", "openhydra", "--model", "qwen3-coder", "-p", "hi"]);
+        assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1, "exactly one --model");
+    }
+
+    #[test]
+    fn hermes_needs_no_extra_args() {
+        let s = spec_for("hermes").unwrap();
+        assert_eq!(build_argv(s, "openhydra/auto", &["-z".into()]), vec!["-z"]);
     }
 
     #[test]
