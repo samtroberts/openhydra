@@ -6,6 +6,10 @@ import { injectIcons } from "./icons";
 import { store } from "./storage";
 import { modelIcon, modelCat, fmtUptime, repBadge, fmtNum, modelColor, relTime, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text";
+import {
+  state, snap, engines, installedEngines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
+  setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
+} from "./state";
 
 (function () {
   const app = $("#app"), root = document.documentElement;
@@ -229,13 +233,13 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
     }
     return raw && typeof raw === "object" ? raw : {};
   }
-  let sessions = coerceSessions(store.get("oh_sessions", {})), sessionOrder = store.get("oh_order", []);
-  let deviceName = store.get("oh_device", "");   // #9: derived from the OS on boot if unset
-  let usedTokens = store.get("oh_used", 0);
+  setSessions(coerceSessions(store.get("oh_sessions", {}))); setSessionOrder(store.get("oh_order", []));
+  setDeviceName(store.get("oh_device", ""));   // #9: derived from the OS on boot if unset
+  setUsedTokens(store.get("oh_used", 0));
   root.dataset.theme = store.get("oh_theme", "light");
   if (store.get("oh_adv", false)) app.setAttribute("data-adv", "");
   function saveSessions() {
-    if (Array.isArray(sessions)) sessions = coerceSessions(sessions); // never persist an array (see coerceSessions)
+    if (Array.isArray(sessions)) setSessions(coerceSessions(sessions)); // never persist an array (see coerceSessions)
     store.set("oh_sessions", sessions); store.set("oh_order", sessionOrder);
     // #1: durable write-through to the Tauri backend file (WebView localStorage isn't durable
     // across restarts on any platform). Fire-and-forget; localStorage stays as a fast cache.
@@ -243,7 +247,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
   }
 
   // ── live state ──
-  let state = null, engines = [], installedEngines = [], snap = null, activeView = "home", curChat = null, attachments = [];
+  let attachments = [];   // chat-local: file attachments queued for the next message
   // Rolling per-chat telemetry the agent only emits per-request (there's no aggregated RTT on
   // the status API) — we average the last N replies client-side for the Activity view.
   const rttSamples = store.get("oh_rtt", []), tpsSamples = store.get("oh_tps", []);
@@ -351,7 +355,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
   let hist = ["home"], hi = 0;
   function updNavBtns() { $("#navback").classList.toggle("dis", hi <= 0); $("#navfwd").classList.toggle("dis", hi >= hist.length - 1); }
   function go(v, noHist) {
-    activeView = v; const vm = VIEWMODE[v]; if (vm) setMode(vm);
+    setActiveView(v); const vm = VIEWMODE[v]; if (vm) setMode(vm);
     $$(".nav").forEach((x) => x.classList.toggle("on", x.dataset.v === v || (v === "chat" && x.dataset.chat === curChat)));
     $$(".view").forEach((x) => x.classList.toggle("on", x.id === "v-" + v));
     $("#htitle").textContent = titles[v];
@@ -423,7 +427,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
   $("#recents").onclick = (e) => { const r = e.target.closest(".recent"); if (r) openChat(r.dataset.chat); };
   $("#recfilter").oninput = renderRecents;
   function newSession(title) { const id = "c" + Date.now().toString(36); sessions[id] = { t: title || "New chat", m: [] }; sessionOrder.unshift(id); saveSessions(); return id; }
-  function openChat(id) { curChat = id; renderChat(); go("chat"); renderRecents(); }
+  function openChat(id) { setCurChat(id); renderChat(); go("chat"); renderRecents(); }
 
   // ── chat: model list = network-routable models (fixes the 504: can't pick an unservable model) ──
   // DHT provider records expire (~300s TTL) and re-propagate on their own schedule, so the raw
@@ -541,7 +545,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
     const model = curModel();
     if (!text) return;
     if (!model) { toast("No routable model yet — connecting to the network…"); return; }
-    if (fromHome || !curChat) { curChat = newSession(text.slice(0, 34)); }
+    if (fromHome || !curChat) { setCurChat(newSession(text.slice(0, 34))); }
     const s = sessions[curChat];
     let content = text;
     if (attachments.length) { content = attachments.map((a) => `--- file: ${a.name} ---\n${a.text}`).join("\n\n") + `\n\n${text}`; attachments = []; }
@@ -569,7 +573,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
       pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
       pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
       s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();
-      if (resp?.usage?.completion_tokens) { usedTokens += resp.usage.completion_tokens; store.set("oh_used", usedTokens); renderStatusbar(); }
+      if (resp?.usage?.completion_tokens) { setUsedTokens(usedTokens + resp.usage.completion_tokens); store.set("oh_used", usedTokens); renderStatusbar(); }
     } catch (e) {
       wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
       const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
@@ -1327,7 +1331,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
   $("#setnav").onclick = (e) => { const s = e.target.closest(".s"); if (!s) return; $$("#setnav .s").forEach((x) => x.classList.toggle("on", x === s)); $$(".setpanel").forEach((pnl) => pnl.classList.toggle("on", pnl.dataset.p === s.dataset.p)); };
   $$("[data-sw]").forEach((sw) => { if (sw.closest("#servetable")) return; sw.onclick = () => sw.classList.toggle("on"); });
   $$(".save").forEach((b) => b.onclick = async () => {
-    deviceName = ($('.setpanel[data-p="identity"] [contenteditable]').textContent || deviceName).trim(); store.set("oh_device", deviceName);
+    setDeviceName(($('.setpanel[data-p="identity"] [contenteditable]').textContent || deviceName).trim()); store.set("oh_device", deviceName);
     saveSessions();   // #9: persist the (edited) device name to the durable file too
     const netp = $('.setpanel[data-p="network"]');
     let gwPort = parseInt((netp.querySelector('#gwport')?.textContent || "").trim(), 10);
@@ -1434,7 +1438,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
 
   // ── polling ──
   async function refresh() {
-    try { state = await call("get_state"); } catch {}
+    try { setState(await call("get_state")); } catch {}
     // Informed opt-out: while this launch's auto-resume is flagged, keep a non-blocking notice up.
     if (state?.resumed_on_launch) ensureResumeNotice();
     renderStatusbar();
@@ -1460,7 +1464,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
     el.querySelector(".rn-stop").onclick = async () => { dismiss(); try { await setSharing(false); toast("Sharing stopped"); } catch (e) { toast("Couldn't stop: " + e); } };
     el.querySelector(".rn-x").onclick = dismiss;
   }
-  async function refreshEngines() { try { engines = await call("detect_engines_now"); } catch { engines = []; } try { installedEngines = await call("installed_engines"); } catch { installedEngines = []; } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
+  async function refreshEngines() { try { setEngines(await call("detect_engines_now")); } catch { setEngines([]); } try { setInstalledEngines(await call("installed_engines")); } catch { setInstalledEngines([]); } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
   // Start an installed-but-idle engine's server, then refresh so the card flips to "running".
   async function runEngine(label, name) {
     toast(`Starting ${name}…`);
@@ -1468,7 +1472,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
     catch (e) { toast(String(e)); }
     await refreshEngines();
   }
-  async function refreshStatus() { try { snap = await call("status_snapshot"); } catch { snap = null; } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
+  async function refreshStatus() { try { setSnap(await call("status_snapshot")); } catch { setSnap(null); } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
   $$(".enginst, #refreshEngines").forEach(() => {});
 
   // ── boot ──
@@ -1485,16 +1489,16 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
       loadOk = true;
       if (blob) {
         const d = JSON.parse(blob);
-        if (d.sessions) { const co = coerceSessions(d.sessions); migrated = co !== d.sessions; sessions = co; }
-        if (Array.isArray(d.order)) sessionOrder = d.order;
-        if (d.device) deviceName = d.device;
-        if (typeof d.used === "number") { usedTokens = d.used; store.set("oh_used", usedTokens); }
+        if (d.sessions) { const co = coerceSessions(d.sessions); migrated = co !== d.sessions; setSessions(co); }
+        if (Array.isArray(d.order)) setSessionOrder(d.order);
+        if (d.device) setDeviceName(d.device);
+        if (typeof d.used === "number") { setUsedTokens(d.used); store.set("oh_used", usedTokens); }
       }
     } catch { loadOk = false; }
     // Repair order/sessions drift: drop order ids with no session, and append any session missing
     // from order — otherwise legacy orphaned ids render nothing and recovered chats stay hidden.
     const orderBefore = sessionOrder.join("");
-    sessionOrder = sessionOrder.filter((id) => sessions[id]);
+    setSessionOrder(sessionOrder.filter((id) => sessions[id]));
     for (const id in sessions) if (!sessionOrder.includes(id)) sessionOrder.push(id);
     const orderRepaired = sessionOrder.join("") !== orderBefore;
     // Rewrite the durable file ONLY when the load succeeded AND coercion/repair actually changed the
@@ -1502,7 +1506,7 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
     if (loadOk && (migrated || orderRepaired) && Object.keys(sessions).length) saveSessions();
     await loadStats();   // #7/#10: hydrate lifetime model stats + timeline buckets from disk
     // #9: default device name from the OS if the user hasn't set/restored one.
-    if (!deviceName) { try { deviceName = await call("device_hostname"); } catch {} if (!deviceName) deviceName = /Mac/.test(navigator.platform) ? "This Mac" : "This machine"; store.set("oh_device", deviceName); }
+    if (!deviceName) { try { setDeviceName(await call("device_hostname")); } catch {} if (!deviceName) setDeviceName(/Mac/.test(navigator.platform) ? "This Mac" : "This machine"); store.set("oh_device", deviceName); }
     // Show the running OpenHydra version (authoritative bundle version, not a guess) in the
     // statusbar + Settings › About.
     try { const v = await call("app_version"); if (v) { const sv = $("#sbver"); if (sv) sv.textContent = "v" + v; const av = $("#aboutver"); if (av) av.textContent = "OpenHydra v" + v; } } catch {}
