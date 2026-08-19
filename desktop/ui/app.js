@@ -1,8 +1,13 @@
 // OpenHydra Desktop — the shadcn wireframe (docs/openhydra_wireframe_shadcn.html) wired to the
 // Rust backend via Tauri IPC. The DOM + CSS are the wireframe verbatim; this file swaps the
 // wireframe's demo data for live network state. In a plain browser it renders a demo mock.
+import { $, $$, esc, escapeHtml, shortPeer, peerShort } from "./dom";
+import { injectIcons } from "./icons";
+import { store } from "./storage";
+import { modelIcon, modelCat, fmtUptime, repBadge, fmtNum, modelColor, relTime, fmtGB } from "./format";
+import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text";
+
 (function () {
-  const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const app = $("#app"), root = document.documentElement;
   if (/Mac/.test(navigator.platform)) document.body.classList.add("is-mac");
   document.addEventListener("contextmenu", (e) => {
@@ -177,34 +182,6 @@
     return null;
   }
 
-  // ── icons (wireframe verbatim) ──
-  const S = {
-    zap:'<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
-    command:'<path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/>',
-    theme:'<path d="M12 8a2.83 2.83 0 0 0 4 4 4 4 0 1 1-4-4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.9 4.9 1.4 1.4"/><path d="m17.7 17.7 1.4 1.4"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.3 17.7-1.4 1.4"/><path d="m19.1 4.9-1.4 1.4"/>',
-    users:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
-    network:'<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',
-    activity:'<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
-    list:'<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
-    chat:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
-    monitor:'<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>',
-    package:'<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M3.3 7 12 12l8.7-5"/><path d="M12 22V12"/>',
-    plug:'<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
-    settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>',
-    search:'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
-    send:'<path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/>',
-    plus:'<path d="M5 12h14"/><path d="M12 5v14"/>',
-    chev:'<path d="m6 9 6 6 6-6"/>', chevl:'<path d="m15 18-6-6 6-6"/>', chevr:'<path d="m9 18 6-6-6-6"/>',
-    homeic:'<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
-    refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/>',
-    sliders:'<line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/>',
-    x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
-    more:'<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
-    paperclip:'<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
-    mic:'<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>',
-    panelleft:'<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
-  };
-  function injectIcons(rt = document) { $$("[data-i]", rt).forEach((e) => { const n = e.dataset.i; if (S[n]) e.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${S[n]}</svg>`; }); }
   injectIcons();
 
   // ── toast + popover menu (wireframe verbatim) ──
@@ -221,18 +198,10 @@
     const r = anchor.getBoundingClientRect(); m.style.left = Math.min(r.left, innerWidth - m.offsetWidth - 10) + "px"; let t = r.bottom + 5; if (t + m.offsetHeight > innerHeight - 8) t = r.top - m.offsetHeight - 5; m.style.top = Math.max(8, t) + "px";
   }
   document.addEventListener("click", closeMenus); addEventListener("resize", closeMenus);
-  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-  function shortPeer(p) { return p && p.length > 20 ? `${p.slice(0, 10)}…${p.slice(-6)}` : p || "—"; }
-  function peerShort(p) { return p && p.length > 18 ? `${p.slice(0, 12)}…${p.slice(-4)}` : p || "—"; }
 
   // ── model family badge ──
-  const FAMILY = [[/qwen/i, "qwen"], [/llama|tinyllama/i, "llama"], [/gemma/i, "gemma"], [/mi(s|x)tral/i, "mistral"], [/phi/i, "phi"], [/deepseek/i, "deepseek"], [/flux|sdxl|stable/i, "flux"], [/nomic|embed/i, "nomic"]];
-  const FAMSTYLE = { qwen: ["Q", "#6d49c4"], llama: ["L", "#0866ff"], gemma: ["G", "#1a73e8"], mistral: ["M", "#fa5210"], phi: ["φ", "#12a3a6"], deepseek: ["DS", "#4d6bfe"], flux: ["F", "#111418"], nomic: ["N", "#127a6b"] };
-  function modelIcon(id) { const k = (FAMILY.find(([rx]) => rx.test(id || "")) || [])[1]; const s = k && FAMSTYLE[k]; if (s) return `<span class="micon" style="background:${s[1]}">${s[0]}</span>`; const hues = ["#64748b", "#0891b2", "#7c3aed", "#db2777", "#ca8a04", "#059669"]; return `<span class="micon" style="background:${hues[(String(id).charCodeAt(0) || 0) % hues.length]}">${esc((String(id)[0] || "?").toUpperCase())}</span>`; }
-  const modelCat = (m) => /coder|code/i.test(m) ? "code" : /flux|sdxl|stable|image/i.test(m) ? "image" : /embed|nomic/i.test(m) ? "embeddings" : "chat";
 
   // ── persistence ──
-  const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
   // Coerce persisted sessions into the canonical `{ id: {t, m} }` object. A legacy build stored
   // them as an ARRAY of `{ id, name, history, preset }`; if that array reaches `sessions`, every
   // new chat added under a string key is silently dropped by JSON.stringify on save (arrays only
@@ -373,8 +342,6 @@
   function modelReputation(model, byOh) { const s = providersForModel(model).map((p) => byOh[p.openhydra_peer_id]).filter((x) => x != null); return s.length ? Math.round(s.reduce((a, b) => a + b, 0) / s.length) : null; }
   // provider role publishes per-model serve TPS; only present for models THIS node serves.
   function modelAvgTps(model) { const pm = snap?.transfers?.per_model?.[model]; return pm && pm.avg_native_tps > 0 ? Math.round(pm.avg_native_tps) : null; }
-  function fmtUptime(s) { if (s == null) return "—"; s = Math.floor(s); if (s < 60) return s + "s"; const m = Math.floor(s / 60); if (m < 60) return m + "m"; const h = Math.floor(m / 60); if (h < 24) return `${h}h ${m % 60}m`; const d = Math.floor(h / 24); return `${d}d ${h % 24}h`; }
-  function repBadge(v) { if (v == null) return '<span class="mut">—</span>'; v = Math.round(v); const cls = v >= 66 ? "ok" : v >= 40 ? "warn" : "secondary"; return `<span class="badge ${cls}">${v}</span>`; }
 
   // ── nav / workspace switcher / history (wireframe verbatim + header-hide + renderView) ──
   const titles = { home: "Home", chat: "Chat", activity: "Activity", connectors: "Connectors", providers: "Models", share: "Share", engines: "Engines", ledger: "Ledger", peers: "Diagnostics and Stats", settings: "Settings" };
@@ -506,68 +473,11 @@
   // reply rendering: fenced code cards + inline media (image/video/audio) + metadata line
   // #3/#4: classify a markdown media src as image | video | audio (data: URL or media-file URL),
   // "" if it isn't media (a regular link stays as text). Drives which element we render.
-  function mediaKind(src) {
-    const s = (src || "").trim();
-    const dm = s.match(/^data:([a-z]+)\/[a-z0-9.+-]+/i);
-    let m = dm ? dm[1].toLowerCase() : "";
-    if (!m) { const ext = (s.match(/\.([a-z0-9]+)(?:[?#]|$)/i) || [, ""])[1].toLowerCase();
-      m = ["png","jpg","jpeg","gif","webp","svg"].includes(ext) ? "image"
-        : ["mp4","webm","mov","m4v"].includes(ext) ? "video"
-        : ["mp3","wav","flac","ogg","m4a"].includes(ext) ? "audio" : ""; }
-    return (m === "image" || m === "video" || m === "audio") ? m : "";
-  }
   // #4: render inline media; #3: copy + download controls under it. Returns null for non-media.
-  function mediaEl(src, label) {
-    const kind = mediaKind(src); if (!kind) return null;
-    const wrap = document.createElement("div"); wrap.style.cssText = "margin:6px 0;max-width:100%";
-    const el = document.createElement(kind === "image" ? "img" : kind);
-    el.src = src; if (kind !== "image") el.controls = true;
-    el.style.cssText = "max-width:100%;border-radius:10px;border:1px solid hsl(var(--border));display:block;width:auto;height:auto";
-    wrap.appendChild(el);
-    const bar = document.createElement("div"); bar.style.cssText = "display:flex;gap:12px;margin-top:4px;font-size:12px";
-    const cp = document.createElement("button"); cp.textContent = "⎘ copy";
-    cp.style.cssText = "cursor:pointer;color:hsl(var(--muted));background:none;border:none;padding:0;font:inherit";
-    cp.onclick = async () => {
-      try { // copy the image itself to the clipboard when possible; else copy the src/data-URL
-        if (kind === "image" && src.startsWith("data:") && window.ClipboardItem) {
-          const blob = await (await fetch(src)).blob();
-          await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-        } else { await navigator.clipboard.writeText(src); }
-      } catch { try { await navigator.clipboard.writeText(src); } catch {} }
-      cp.textContent = "✓ copied"; setTimeout(() => cp.textContent = "⎘ copy", 1400);
-    };
-    const ext = kind === "image" ? "png" : kind === "video" ? "mp4" : "flac";
-    const dl = document.createElement("a"); dl.textContent = "⭳ download";
-    dl.href = src; dl.download = (label && label.trim()) || `openhydra-${kind}.${ext}`;
-    dl.style.cssText = "cursor:pointer;color:hsl(var(--muted));text-decoration:none";
-    bar.appendChild(cp); bar.appendChild(dl); wrap.appendChild(bar);
-    return wrap;
-  }
-  const KW = new Set("fn let mut pub use impl struct enum trait match if else for while loop return async await move def class import from as with try except lambda yield pass raise function const var new typeof export default package func go defer chan interface map range type switch case break continue static void int float double char bool".split(" "));
-  function hl(code) { let out = "", i = 0; const push = (c, s) => out += c ? `<span class="${c}">${esc(s)}</span>` : esc(s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return out; }
-  function parseFences(t) { const p = [], re = /```([\w+-]*)\n([\s\S]*?)```/g; let last = 0, m; while ((m = re.exec(t))) { if (m.index > last) p.push({ prose: t.slice(last, m.index).trim() }); p.push({ lang: m[1] || "code", code: m[2] }); last = re.lastIndex; } if (last < t.length) p.push({ prose: t.slice(last).trim() }); return p.filter((x) => x.code != null || x.prose); }
-  function metaRow(m) { return `<div class="msgmeta"><span>${esc(m.model)}</span><span class="num">${m.tok} tok</span><span class="num" title="Engine generation speed — decode tokens per second, measured on the provider">${m.tps} tok/s</span><span class="num">${m.rtt} ms RTT</span><span>${m.at}</span></div>`; }
   // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
   // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand
   // back an EMPTY content. Split any inline thinking out of the answer so the chat shows the
   // real answer (or a clear note) instead of a blank bubble.
-  function splitThink(raw) {
-    raw = raw || ""; let reasoning = "";
-    // Well-formed <think>…</think> pairs.
-    raw = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_, t) => { reasoning += t + "\n"; return ""; });
-    // Reasoning models (Qwen3, DeepSeek-R1, …) whose chat template PRE-FILLS the opening
-    // <think> in the prompt emit a completion that *starts* with the chain-of-thought and
-    // closes it with a lone </think> (no opening tag). If a </think> remains with no <think>
-    // before it, treat that leading block as reasoning — else it (and the stray tag) leak.
-    const close = raw.search(/<\/think>/i);
-    if (close !== -1 && !/<think>/i.test(raw.slice(0, close))) {
-      reasoning += raw.slice(0, close) + "\n";
-      raw = raw.slice(close).replace(/<\/think>/i, "");
-    }
-    // Unclosed <think>… (still thinking / truncated stream).
-    raw = raw.replace(/<think>([\s\S]*)$/i, (_, t) => { reasoning += t; return ""; });
-    return { answer: raw.trim(), reasoning: reasoning.trim() };
-  }
   function botEl(content, meta, reasoning) {
     const d = document.createElement("div"); d.className = "msg ai";
     if (reasoning) {
@@ -711,8 +621,6 @@
   // #10: selected timeline range per chart host (persisted).
   const chartRange = store.get("oh_chartrange", { share: "7d", activity: "7d" });
   // Stable per-model hue for the timeline + legend.
-  function modelColor(id) { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 60% 55%)`; }
-  function fmtNum(n) { n = Math.round(n); return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n); }
   // #10: inline-SVG served-vs-used timeline, stacked by model, with a 24h/7d/30d range selector.
   // Self-contained (no chart lib — CSP-safe). `hostKey` = "share" | "activity".
   function renderChart(hostSel, hostKey) {
@@ -1033,7 +941,6 @@
 
   // ── Host hardware panel (system_info) — shown in the Engines header, LM-Studio style ──
   let sysInfo = null;
-  function fmtGB(bytes) { if (!bytes) return "—"; const gb = bytes / 1073741824; const s = gb >= 10 ? String(Math.round(gb)) : gb.toFixed(1).replace(/\.0$/, ""); return s + " GB"; }
   function fmtSystem(s) {
     if (!s || !s.cpu) return "";
     const bits = [s.cpu, fmtGB(s.ram_bytes)];
@@ -1106,13 +1013,6 @@
     renderChart("#actchart", "activity");   // #10 timeline
   }
   // Relative "Nm ago" timestamp for the ledger rows.
-  function relTime(ms) {
-    const s = Math.max(0, (Date.now() - ms) / 1000);
-    if (s < 60) return Math.round(s) + "s ago";
-    const m = s / 60; if (m < 60) return Math.round(m) + "m ago";
-    const h = m / 60; if (h < 24) return Math.round(h) + "h ago";
-    return Math.round(h / 24) + "d ago";
-  }
   // #5: real ledger rows from the agent's recent-transaction ring (served rows from the provider
   // process, used rows from the gateway; merged + newest-first by the desktop). The credit column
   // is a signed contribution unit (served +, used −; "not money"), not a wallet balance.
@@ -1307,7 +1207,6 @@
     finally { btn.textContent = prev; btn.disabled = false; }
   }
 
-  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
   // Generic in-app confirm — window.confirm() is a no-op in the Tauri webview, so we can't gate on it.
   // Resolves true/false.
