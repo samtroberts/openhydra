@@ -5,9 +5,12 @@
   "scripts": {
     "tauri": "tauri",
     "sidecar": "cargo build --release -p openhydra-agent --manifest-path ../Cargo.toml && mkdir -p src-tauri/target/release && cp ../target/release/openhydra-agent src-tauri/target/release/openhydra-agent && echo \"sidecar refreshed: $(ls -la src-tauri/target/release/openhydra-agent | awk '{print $6,$7,$8}')\"",
+    "dev:vite": "vite",
+    "build": "vite build",
     "dev": "npm run sidecar && tauri dev --release"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "vite": "^6"
   }
 }

@@ -12,7 +12,7 @@
     <button class="iconbtn" id="navtoggle" title="Collapse sidebar"><span class="icon" data-i="panelleft"></span></button>
     <button class="iconbtn dis" id="navback" title="Back"><span class="icon" data-i="chevl"></span></button>
     <button class="iconbtn dis" id="navfwd" title="Forward"><span class="icon" data-i="chevr"></span></button>
-    <div class="brandmark" id="traymark" style="cursor:pointer" title="System-tray menu (preview)"><img class="brandlogo" src="logo-mark.png" alt="OpenHydra"/>OpenHydra</div>
+    <div class="brandmark" id="traymark" style="cursor:pointer" title="System-tray menu (preview)"><img class="brandlogo" src="/logo-mark.png" alt="OpenHydra"/>OpenHydra</div>
     <div class="grow"></div>
     <button class="btn brand sm" id="sharecta" title="Share your machine's models to the network">Share your models</button>
     <button class="kbd" id="cmdk"><span class="icon" data-i="command"></span>K</button>
@@ -103,7 +103,7 @@
         <!-- HOME — landing: greeting + prompt box. Sending starts a chat in Recents. -->
         <section class="view on" id="v-home">
           <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:460px;gap:20px">
-            <div style="display:flex;align-items:center;gap:13px"><img id="homelogo" src="logo-mark.png" alt="" style="width:38px;height:38px;object-fit:contain"/><span style="font-size:27px;font-weight:600;letter-spacing:-.02em">Welcome to OpenHydra</span></div>
+            <div style="display:flex;align-items:center;gap:13px"><img id="homelogo" src="/logo-mark.png" alt="" style="width:38px;height:38px;object-fit:contain"/><span style="font-size:27px;font-weight:600;letter-spacing:-.02em">Welcome to OpenHydra</span></div>
             <div class="card" id="homecard" style="width:min(640px,94%);padding:12px 12px 10px">
               <div class="input area" id="homeprompt" contenteditable="true" data-ph="How can I help you today?" style="border:0;min-height:54px;padding:6px 4px"></div>
               <div class="row" style="gap:8px;margin-top:4px">
@@ -383,6 +383,6 @@ openclaw config set model.name openhydra/auto</div><div class="connact"><button 
   </div>
 </div>
 <input type="file" id="attachfile" multiple class="hidden" style="display:none" accept=".txt,.md,.rs,.py,.js,.ts,.json,.toml,.yaml,.yml,.csv,.html,.css,.sh,.c,.h,.cpp,.go"/>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

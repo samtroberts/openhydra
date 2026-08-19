@@ -1574,7 +1574,7 @@
 
   // ── boot ──
   $(".header").style.display = "none"; // Home landing has no header
-  $("#homelogo").src = "logo-mark.png";
+  $("#homelogo").src = "/logo-mark.png";
   (async () => {
     // #1: hydrate chat sessions from the durable backend file (localStorage is only a cache).
     // `loadOk` gates the clean-shape rewrite below: on a transient load failure we must NOT write
