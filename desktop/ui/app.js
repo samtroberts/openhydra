@@ -14,9 +14,12 @@ import { renderConnectors } from "./connectors";
 import { renderChart } from "./chart";
 import { renderProviders } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
-import { startInstall } from "./installer";
+import { renderEngines } from "./installer";
 import { renderShare, setSharing, toggleSharing, ensureGateway } from "./share";
 import { coachShow, maybeStartTour } from "./coach";
+import { renderActivity } from "./activity";
+import { renderSettings, updateEngineEndpoint } from "./settings";
+import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on } from "./bus";
 import {
   state, snap, engines, installedEngines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
@@ -83,10 +86,6 @@ import {
   let attachments = [];   // chat-local: file attachments queued for the next message
   // Rolling per-chat telemetry the agent only emits per-request (there's no aggregated RTT on
   // the status API) — we average the last N replies client-side for the Activity view.
-  const rttSamples = store.get("oh_rtt", []), tpsSamples = store.get("oh_tps", []);
-  const ROLL_MAX = 30;
-  function pushSample(arr, v, key) { if (v == null || !isFinite(v)) return; arr.push(v); while (arr.length > ROLL_MAX) arr.shift(); store.set(key, arr); }
-  const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
 
 
 
@@ -128,19 +127,6 @@ import {
     const cur = d.querySelector("span").textContent;
     menu(d, opts.length ? opts.map((o) => ({ label: o, on: o === cur, fn: () => { d.querySelector("span").textContent = o; if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") updateEngineEndpoint(); if (d.id === "modeldrop" || d.id === "homedrop") { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) other.querySelector("span").textContent = o; } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
   });
-  // #3: the Settings › Engine endpoint follows the selected engine (was pinned to engines[0]).
-  const ENGINE_ENDPOINTS = { "auto-detect": "", ollama: "http://127.0.0.1:11434", "vLLM": "http://127.0.0.1:8000", "LM Studio": "http://127.0.0.1:1234", "llama.cpp": "http://127.0.0.1:8080", "Exo": "http://127.0.0.1:52415", "ComfyUI": "http://127.0.0.1:8188" };
-  function updateEngineEndpoint() {
-    const drop = $("#enginedrop"), field = $("#engineendpoint"); if (!drop || !field) return;
-    const sel = (drop.querySelector("span")?.textContent || "auto-detect").trim();
-    // auto-detect → the first detected engine's live URL; a specific pick → that engine's live URL
-    // if it's currently running, else its standard endpoint.
-    const live = engines.find((e) => (e.label || "").toLowerCase() === sel.toLowerCase());
-    const url = sel === "auto-detect"
-      ? (engines[0]?.url || "http://127.0.0.1:11434")
-      : (live?.url || ENGINE_ENDPOINTS[sel] || "http://127.0.0.1:11434");
-    field.textContent = url;
-  }
 
   // ── inference range sliders (wireframe verbatim) ──
   $$(".range").forEach((rg) => {
@@ -313,80 +299,6 @@ import {
 
   // Labels MUST match `detect_engines` (agent adapter `engine_name`) so the "running" badge
   // resolves — e.g. `llama.cpp`, not `llama-cpp` (the latter silently never matched detection).
-  const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama.cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["Exo", "exo", "Shard big models across your devices."]];
-  // Engines OpenHydra can start on demand (self-serving; no model/cluster arg) → get a "Run" CTA.
-  const RUNNABLE = new Set(["ollama", "lm-studio"]);
-  function renderEngines() {
-    const det = Object.fromEntries(engines.map((e) => [e.label, e]));
-    const cards = $$("#v-engines .grid.g3 .card");
-    ENGINES.forEach(([name, label, desc], i) => {
-      // All six engines now have real (probe-then-install) recipes → none is a plain "guided" toast.
-      const c = cards[i]; if (!c) return;
-      const d = det[label];                                // serving right now
-      const installed = installedEngines.includes(label);  // present on disk (may be idle)
-      const runnable = RUNNABLE.has(label);                // can self-serve (no model/cluster arg)
-      c.querySelector("b").textContent = name;
-      const badge = c.querySelector(".badge"); badge.style.marginLeft = "auto";
-      badge.className = "badge " + (d ? "ok" : "");
-      badge.innerHTML = d ? '<span class="dot ok"></span>running' : installed ? "installed" : "not installed";
-      c.querySelectorAll(".mut")[0].textContent = desc;
-      const foot = c.querySelectorAll(".row")[1]; const btn = foot.querySelector(".enginst"); const def = foot.querySelector(".badge");
-      if (def) def.style.display = d && label === "ollama" ? "" : "none";
-      // Three-state CTA: running → Manage; installed-but-idle → Run (self-serving) or Installed
-      // (needs a model to serve); not installed → Install (drives the Tier-1 installer).
-      let txt, cls, act;
-      if (d) { txt = "Manage"; cls = "outline"; act = () => toast(`${name} is running — manage models from Share`); }
-      else if (installed && runnable) { txt = "Run"; cls = "brand"; act = () => runEngine(label, name); }
-      else if (installed) { txt = "Installed"; cls = "outline"; act = () => toast(`${name} is installed — start it with a model to serve`); }
-      else { txt = "Install"; cls = "brand"; act = () => startInstall(label, name); }
-      btn.textContent = txt; btn.className = "btn " + cls + " sm enginst"; btn.style.marginLeft = "auto"; btn.onclick = act;
-    });
-    // recommended: honest until a model store lands
-    $("#rectable tbody").innerHTML = `<tr><td colspan="5" class="mut">One-click downloads land with the model store — for now, pull with your engine (e.g. <span class="mono">ollama pull</span>) and it appears in Share.</td></tr>`;
-  }
-  function renderActivity() {
-    const t = snap?.transfers, k = $$("#v-activity .g4 .kpi .val");
-    const served = totalServed(), used = totalUsed();   // #7 durable lifetime totals
-    const netCredits = served - used;   // #3: net balance rises with serving, falls with using
-    const ratio = used > 0 ? (served / used) : (served > 0 ? null : 0);
-    k[0].textContent = fmtNum(served);
-    k[1].textContent = fmtNum(used);
-    k[2].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
-    k[3].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
-    $$("#v-activity .g4 .kpi .sub")[0].innerHTML = `<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} receipts co-signed`;
-    $$("#v-activity .g4 .kpi .sub")[1].textContent = "this device";
-    $$("#v-activity .g4 .kpi .sub")[2].textContent = "net contribution · served − used";
-    $$("#v-activity .g4 .kpi .sub")[3].textContent = "served ÷ used";
-    // Rolling per-chat throughput/latency — the only place an aggregated TPS/RTT is honest,
-    // since the agent emits these per-request. Uptime rounds out the "your node" picture.
-    const note = $("#v-activity .mut");
-    if (note) {
-      const at = mean(tpsSamples), ar = mean(rttSamples);
-      const parts = [];
-      if (at != null) parts.push(`avg ${Math.round(at)} t/s`);
-      if (ar != null) parts.push(`${Math.round(ar)} ms RTT`);
-      if (snap?.uptime_secs != null) parts.push(`node up ${fmtUptime(snap.uptime_secs)}`);
-      note.textContent = (parts.length ? `Your recent chats: ${parts.join(" · ")}. ` : "") + "Full transaction history lives in Network › Ledger.";
-    }
-    renderChart("#actchart", "activity");   // #10 timeline
-  }
-  function renderSettings() {
-    const p = state; if (!p) return;
-    // #9: don't clobber the device-name field while the user is editing it (the 2.5s poll
-    // re-renders Settings; overwriting a focused field was why it "couldn't be changed").
-    const id = $('.setpanel[data-p="identity"]'); const dn = id.querySelector('[contenteditable]');
-    if (document.activeElement !== dn) dn.textContent = deviceName;
-    id.querySelectorAll(".input")[1].childNodes[0].textContent = (p.provider.status.peer_id || p.gateway.status.peer_id || "—");
-    const netp = $('.setpanel[data-p="network"]');
-    const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = p.settings.gateway_port;
-    const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
-    const eng = $('.setpanel[data-p="engine"]');
-    updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
-    $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
-    $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);
-    $("#advsw").classList.toggle("on", app.hasAttribute("data-adv"));
-    $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4
-  }
 
   // ── status bar + lifecycle ──
   function renderStatusbar() {
@@ -541,13 +453,6 @@ import {
   on("refresh-engines", refreshEngines);   // installer.js fires this after an install completes
   on("nav", (v) => go(v));                  // feature modules request navigation via the bus
   on("refresh", () => refresh());           // …and a full state refresh
-  // Start an installed-but-idle engine's server, then refresh so the card flips to "running".
-  async function runEngine(label, name) {
-    toast(`Starting ${name}…`);
-    try { await call("run_engine", { engine: label }); toast(`${name} started`); }
-    catch (e) { toast(String(e)); }
-    await refreshEngines();
-  }
   async function refreshStatus() { try { setSnap(await call("status_snapshot")); } catch { setSnap(null); } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
   $$(".enginst, #refreshEngines").forEach(() => {});
 

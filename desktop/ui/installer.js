@@ -1,7 +1,8 @@
 // Tier-1 engine installer (B5): consent -> stream install://progress -> refresh. Self-contained
 // modal overlay; on completion it fires the "refresh-engines" bus signal (the controller re-detects
 // engines) rather than importing the controller's refreshEngines (which would cycle).
-import { $, esc } from "./dom";
+import { $, $$, esc } from "./dom";
+import { engines, installedEngines } from "./state";
 import { call, mockEmitInstall, mockInstallCbs } from "./bridge";
 import { toast } from "./chrome";
 import { emit } from "./bus";
@@ -94,3 +95,43 @@ import { emit } from "./bus";
     catch (e) { /* backend already emitted an error event; guard the mock/no-event path */ mockEmitInstall({ engine: label, kind: "error", message: String(e) }); }
   }
 
+
+  const ENGINES = [["Ollama", "ollama", "General-purpose local LLMs."], ["LM Studio", "lm-studio", "MLX-optimised models on Apple silicon."], ["llama.cpp", "llama.cpp", "Lightweight GGUF runtime."], ["ComfyUI", "comfyui", "Image generation — Stable Diffusion, Flux."], ["vLLM", "vllm", "High-throughput serving. Needs Python + GPU."], ["Exo", "exo", "Shard big models across your devices."]];
+  // Engines OpenHydra can start on demand (self-serving; no model/cluster arg) → get a "Run" CTA.
+  const RUNNABLE = new Set(["ollama", "lm-studio"]);
+  export function renderEngines() {
+    const det = Object.fromEntries(engines.map((e) => [e.label, e]));
+    const cards = $$("#v-engines .grid.g3 .card");
+    ENGINES.forEach(([name, label, desc], i) => {
+      // All six engines now have real (probe-then-install) recipes → none is a plain "guided" toast.
+      const c = cards[i]; if (!c) return;
+      const d = det[label];                                // serving right now
+      const installed = installedEngines.includes(label);  // present on disk (may be idle)
+      const runnable = RUNNABLE.has(label);                // can self-serve (no model/cluster arg)
+      c.querySelector("b").textContent = name;
+      const badge = c.querySelector(".badge"); badge.style.marginLeft = "auto";
+      badge.className = "badge " + (d ? "ok" : "");
+      badge.innerHTML = d ? '<span class="dot ok"></span>running' : installed ? "installed" : "not installed";
+      c.querySelectorAll(".mut")[0].textContent = desc;
+      const foot = c.querySelectorAll(".row")[1]; const btn = foot.querySelector(".enginst"); const def = foot.querySelector(".badge");
+      if (def) def.style.display = d && label === "ollama" ? "" : "none";
+      // Three-state CTA: running → Manage; installed-but-idle → Run (self-serving) or Installed
+      // (needs a model to serve); not installed → Install (drives the Tier-1 installer).
+      let txt, cls, act;
+      if (d) { txt = "Manage"; cls = "outline"; act = () => toast(`${name} is running — manage models from Share`); }
+      else if (installed && runnable) { txt = "Run"; cls = "brand"; act = () => runEngine(label, name); }
+      else if (installed) { txt = "Installed"; cls = "outline"; act = () => toast(`${name} is installed — start it with a model to serve`); }
+      else { txt = "Install"; cls = "brand"; act = () => startInstall(label, name); }
+      btn.textContent = txt; btn.className = "btn " + cls + " sm enginst"; btn.style.marginLeft = "auto"; btn.onclick = act;
+    });
+    // recommended: honest until a model store lands
+    $("#rectable tbody").innerHTML = `<tr><td colspan="5" class="mut">One-click downloads land with the model store — for now, pull with your engine (e.g. <span class="mono">ollama pull</span>) and it appears in Share.</td></tr>`;
+  }
+
+  // Start an installed-but-idle engine's server, then refresh so the card flips to "running".
+  async function runEngine(label, name) {
+    toast(`Starting ${name}…`);
+    try { await call("run_engine", { engine: label }); toast(`${name} started`); }
+    catch (e) { toast(String(e)); }
+    emit("refresh-engines");
+  }
