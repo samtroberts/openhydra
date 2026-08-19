@@ -9,6 +9,8 @@ import { hl, parseFences, splitThink, metaRow, mediaKind, mediaEl } from "./text
 import { call, mockEmitInstall, mockInstallCbs } from "./bridge";
 import { toast, menu, closeMenus } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, statsSeries, lifetimeServed, statModels } from "./stats";
+import { repByOpenhydra, repByLibp2p, modelReputation, modelAvgTps } from "./econ";
+import { noteSeen, modelIdle, netModels, curModel, renderModels, liveModels, seenCount } from "./models";
 import {
   state, snap, engines, installedEngines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
   setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
@@ -80,23 +82,6 @@ import {
   const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
 
 
-  // ── economy (M2.2 reputation + M2.3 credit), surfaced by the agent status endpoint ──
-  // reputation is keyed by OpenHydra peer id; credit by libp2p peer id. known_providers
-  // carries both, so we can join either back to a model row or a peer row.
-  function econ() { return snap?.economy || {}; }
-  function repByOpenhydra() { const m = {}; (econ().reputation || []).forEach((r) => m[r.openhydra_peer_id] = r.score); return m; }
-  function creditByLibp2p() { const m = {}; (econ().credit || []).forEach((c) => m[c.libp2p_peer_id] = c); return m; }
-  // libp2p peer id → earned reputation, resolved through the provider directory.
-  function repByLibp2p() {
-    const byOh = repByOpenhydra(), out = {};
-    (snap?.network?.known_providers || []).forEach((p) => { if (p.openhydra_peer_id in byOh) out[p.libp2p_peer_id] = byOh[p.openhydra_peer_id]; });
-    return out;
-  }
-  function providersForModel(model) { return (snap?.network?.known_providers || []).filter((p) => p.model_id === model); }
-  // mean earned reputation across the providers serving `model` (null if none rated yet).
-  function modelReputation(model, byOh) { const s = providersForModel(model).map((p) => byOh[p.openhydra_peer_id]).filter((x) => x != null); return s.length ? Math.round(s.reduce((a, b) => a + b, 0) / s.length) : null; }
-  // provider role publishes per-model serve TPS; only present for models THIS node serves.
-  function modelAvgTps(model) { const pm = snap?.transfers?.per_model?.[model]; return pm && pm.avg_native_tps > 0 ? Math.round(pm.avg_native_tps) : null; }
 
   // ── nav / workspace switcher / history (wireframe verbatim + header-hide + renderView) ──
   const titles = { home: "Home", chat: "Chat", activity: "Activity", connectors: "Connectors", providers: "Models", share: "Share", engines: "Engines", ledger: "Ledger", peers: "Diagnostics and Stats", settings: "Settings" };
@@ -180,50 +165,6 @@ import {
   function newSession(title) { const id = "c" + Date.now().toString(36); sessions[id] = { t: title || "New chat", m: [] }; sessionOrder.unshift(id); saveSessions(); return id; }
   function openChat(id) { setCurChat(id); renderChat(); go("chat"); renderRecents(); }
 
-  // ── chat: model list = network-routable models (fixes the 504: can't pick an unservable model) ──
-  // DHT provider records expire (~300s TTL) and re-propagate on their own schedule, so the raw
-  // known_models snapshot flickers. Keep a model "sticky" for STICKY_MS after we last saw it so
-  // the Providers list and model picker stay calm instead of blinking rows in and out.
-  // W2: hold a model listed up to 3 min after we last saw it. This rides transient gossip gaps /
-  // relay blips (a live provider that briefly drops out of known_models on a connection loss)
-  // WITHOUT ever exceeding the network's own ~300s record TTL — so the UI never claims a provider
-  // is alive longer than the network itself does. A provider that genuinely stops is dropped once
-  // it's been absent past STICKY_MS, and the real liveness gate is request-time discovery (a dead
-  // pick returns a clean "no provider", never a hang).
-  const STICKY_MS = 180000;
-  const IDLE_MS = 130000;  // seen within this = "live"; IDLE_MS..STICKY_MS = "idle" (dimmed).
-  const seenModels = {};   // model -> last-seen ms
-  const seenCount = {};    // model -> last-known provider count
-  function noteSeen() {
-    const now = Date.now();
-    (snap?.network?.known_models || []).forEach((m) => seenModels[m] = now);
-    const provs = snap?.network?.known_providers || [];
-    const c = {}; for (const p of provs) c[p.model_id] = (c[p.model_id] || 0) + 1;
-    for (const m in c) seenCount[m] = c[m];
-  }
-  // A model still listed only because of stickiness (seen, but not within the last IDLE_MS) — shown
-  // dimmed/"idle", an honest "unconfirmed this instant" signal. Locally-served models are always live.
-  function modelIdle(m) {
-    if (state?.provider?.status?.running && engines.some((e) => e.models.includes(m))) return false;
-    const t = seenModels[m];
-    return t != null && (Date.now() - t) > IDLE_MS;
-  }
-  function netModels() {
-    const now = Date.now();
-    const net = Object.keys(seenModels).filter((m) => now - seenModels[m] < STICKY_MS);
-    const sharingLocal = state?.provider?.status?.running ? engines.flatMap((e) => e.models) : [];
-    return [...new Set([...net, ...sharingLocal])].sort();
-  }
-  function curModel() { const m = $("#modeldrop span").textContent; return m && m !== "—" && !/no models/i.test(m) ? m : ""; }
-  function renderModels() {
-    const models = netModels(); const opts = models.join("|");
-    $("#homedrop").dataset.opts = opts; $("#modeldrop").dataset.opts = opts;
-    const label = models[0] || "— no models yet";
-    for (const d of ["#homedrop", "#modeldrop"]) { const sp = $(d + " span"); const cur = sp.textContent; if (!models.includes(cur)) sp.textContent = label; }
-    $("#mcount").textContent = models.length; $("#homelive").textContent = models.length;
-    $("#provcount") && ($("#provcount").textContent = models.length);
-    $("#sbmodels").textContent = models.length + " models";
-  }
 
   // reply rendering: fenced code cards + inline media (image/video/audio) + metadata line
   // #3/#4: classify a markdown media src as image | video | audio (data: URL or media-file URL),
@@ -788,11 +729,6 @@ import {
 
   const AUTO_MODEL = "openhydra/auto";
   function surfLabel(s) { return s === "terminal" ? "Terminal" : s === "editor" ? "Editor" : "App"; }
-  // Live network model ids for the selector (sticky-smoothed; may be empty before the first snapshot).
-  function liveModels() {
-    return [...new Set([...(snap?.network?.known_models || []), ...Object.keys(seenModels || {})])]
-      .filter(Boolean).sort();
-  }
 
   // Detect installed tools + render the surface switcher, live snippet, model selector, and
   // state-driven actions on the actionable connector cards.
