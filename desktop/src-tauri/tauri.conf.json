@@ -38,7 +38,22 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/openhydra-agent"]
+    "externalBin": ["binaries/openhydra-agent"],
+    "linux": {
+      "deb": {
+        "postInstallScript": "scripts/linux-postinstall.sh",
+        "preRemoveScript": "scripts/linux-preremove.sh"
+      },
+      "rpm": {
+        "postInstallScript": "scripts/linux-postinstall.sh",
+        "preRemoveScript": "scripts/linux-preremove.sh"
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "scripts/windows-installer-hooks.nsh"
+      }
+    }
   },
   "plugins": {
     "updater": {
