@@ -78,9 +78,29 @@ fn windows_bin_dir() -> PathBuf {
     Path::new(&base).join("OpenHydra").join("bin")
 }
 
+/// Resolve the FULL path `openhydra` runs from (for display). `resolve_program` returns just the bare
+/// name on its `which`-success path, so ask the shell's resolver directly to capture the real path;
+/// fall back to `resolve_program`'s common-dir hits (already absolute).
+fn resolved_path() -> Option<PathBuf> {
+    let probe = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(out) = std::process::Command::new(probe).arg(CLI_NAME).output() {
+        if out.status.success() {
+            if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
+                let p = line.trim();
+                if !p.is_empty() {
+                    return Some(PathBuf::from(p));
+                }
+            }
+        }
+    }
+    // A Finder-launched app has a minimal PATH, so `which` can miss a tool that IS installed under a
+    // known dir — fall back to those (they return absolute paths).
+    crate::installer::resolve_program(CLI_NAME).filter(|p| p.is_absolute())
+}
+
 /// Detection: is `openhydra` runnable, where from, and where would we install it?
 pub fn status() -> CliStatus {
-    let resolved = crate::installer::resolve_program(CLI_NAME);
+    let resolved = resolved_path();
     let target = default_target();
     // A dangling managed link: our target path exists as a symlink but its destination is gone.
     let managed_broken = {

@@ -9,6 +9,35 @@ import { liveModels } from "./models";
   export function renderConnectors() {
     $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const sn = b.closest(".conncard")?.querySelector(".snippet"); navigator.clipboard?.writeText((sn?.textContent || "").trim()); toast("Copied"); });
     wireConnectors();
+    renderCliBanner();
+  }
+
+  // Layer 2: the terminal snippets/`openhydra launch` only work once the `openhydra` CLI is on PATH.
+  // When it isn't, show a banner offering the one-click install (Layer 1's install_cli) instead of
+  // letting the user copy a command that fails with command-not-found. Status is cached (spawns
+  // `which`) so the 2.5s connectors re-render doesn't re-probe.
+  let _cliStatus = null;
+  async function cliStatus(force) {
+    if (_cliStatus === null || force) { try { _cliStatus = await call("cli_status"); } catch { _cliStatus = { on_path: true }; } }
+    return _cliStatus;
+  }
+  async function renderCliBanner() {
+    const b = $("#cliinstallbanner"); if (!b) return;
+    const s = await cliStatus();
+    if (s.on_path && !s.managed_broken) { b.style.display = "none"; b.innerHTML = ""; return; }
+    const broken = s.managed_broken;
+    b.style.display = "flex";
+    b.innerHTML = `<span class="clib-ic">⌨</span><span class="clib-t">${broken
+        ? `The <span class="mono">openhydra</span> command is installed but broken (the app moved) — repair it so the terminal commands below work.`
+        : `The <span class="mono">openhydra</span> command isn't on your PATH yet — the terminal snippets below (and <span class="mono">openhydra launch</span>) won't run until it's installed.`
+      }</span><button class="btn brand sm clib-go">${broken ? "Repair" : "Install the CLI"}</button>`;
+    const go = $(".clib-go", b);
+    if (go) go.onclick = async () => {
+      const prev = go.textContent; go.textContent = "Installing…"; go.disabled = true;
+      try { const r = await call("install_cli"); toast(r.note ? `openhydra installed → ${r.path}. ${r.note}` : `openhydra installed → ${r.path}`); }
+      catch (e) { toast(/cancel/i.test(String(e)) ? "CLI install cancelled" : `Install failed: ${e}`); go.textContent = prev; go.disabled = false; return; }
+      await cliStatus(true); renderCliBanner();
+    };
   }
 
   const AUTO_MODEL = "openhydra/auto";
