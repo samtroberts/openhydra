@@ -359,6 +359,22 @@ $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.togg
 // #4: verbose-logs toggle (persist on Save) + Send-logs export
 $("#verboselogsw") && ($("#verboselogsw").onclick = () => $("#verboselogsw").classList.toggle("on"));
 $("#sendlogsbtn") && ($("#sendlogsbtn").onclick = async () => { try { const path = await call("export_logs"); toast(path ? `Logs saved: ${path}` : "No logs yet"); } catch (e) { toast(`Export failed: ${e}`); } });
+// CLI-on-PATH (Layer 1): install the bundled `openhydra` command so terminal snippets + `openhydra
+// launch` work in the user's shell. Status is checked once (spawns `which`), not on every poll.
+async function refreshCli() {
+  const btn = $("#clibtn"), st = $("#clistatus"); if (!btn) return;
+  let s; try { s = await call("cli_status"); } catch { return; }
+  if (s.on_path) { btn.textContent = "Reinstall"; if (st) st.textContent = `✓ installed — ${s.resolved || "openhydra"}`; }
+  else if (s.managed_broken) { btn.textContent = "Repair"; if (st) st.textContent = "installed but broken (the app moved) — click Repair"; }
+  else { btn.textContent = "Install"; if (st) st.textContent = "not installed"; }
+}
+$("#clibtn") && ($("#clibtn").onclick = async () => {
+  const btn = $("#clibtn"), prev = btn.textContent; btn.textContent = "Installing…"; btn.disabled = true;
+  try { const r = await call("install_cli"); toast(r.note ? `openhydra installed → ${r.path}. ${r.note}` : `openhydra installed → ${r.path}`); }
+  catch (e) { toast(/cancel/i.test(String(e)) ? "CLI install cancelled" : `Install failed: ${e}`); btn.textContent = prev; }
+  finally { btn.disabled = false; await refreshCli(); }
+});
+refreshCli();
 
 // ── connectors copy (wireframe .cp) ──
 $$(".cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied to clipboard"); });

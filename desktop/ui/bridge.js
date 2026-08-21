@@ -167,5 +167,8 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "appimage_status") return { is_appimage: localStorage.getItem("oh_mock_appimage") === "1", integrated: mk.integrated || false };
     if (cmd === "integrate_appimage") { mk.integrated = true; return null; }
     if (cmd === "export_logs") return "~/.openhydra/openhydra-logs-1785200000.txt"; // #4
+    if (cmd === "cli_status") return { on_path: !!mk.cliInstalled, resolved: mk.cliInstalled ? "/usr/local/bin/openhydra" : null, source: "/Applications/OpenHydra.app/Contents/MacOS/openhydra-agent", target: "/usr/local/bin/openhydra", managed_broken: false };
+    if (cmd === "install_cli") { mk.cliInstalled = true; return { path: "/usr/local/bin/openhydra", method: "symlink", on_path: true, note: null }; }
+    if (cmd === "uninstall_cli") { mk.cliInstalled = false; return null; }
     return null;
   }

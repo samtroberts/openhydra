@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+mod cli;
 mod hostinfo;
 mod connectors;
 mod installer;
@@ -1231,6 +1232,34 @@ fn connector_disconnect(key: String) -> Result<connectors::DisconnectReport, Str
     connectors::disconnect(&key)
 }
 
+// ── `openhydra` CLI-on-PATH (Layer 1) ──────────────────────────────────────────
+// The bundled agent sidecar is the full CLI but isn't on PATH for app installs, so the Connectors
+// "Terminal" snippets + `openhydra launch` fail with command-not-found. These expose an in-app
+// "Install command-line tool" action (the VS Code model). See docs/CLI_ON_PATH_PLAN_v1.md.
+
+/// Is `openhydra` runnable from a terminal, where from, and where would we install it? Read-only.
+#[tauri::command]
+fn cli_status() -> cli::CliStatus {
+    cli::status()
+}
+
+/// Link/copy the bundled sidecar onto PATH as `openhydra`. On macOS this shows one admin prompt
+/// (osascript) — run off the UI thread so the prompt doesn't freeze the window.
+#[tauri::command]
+async fn install_cli() -> Result<cli::InstallReport, String> {
+    tauri::async_runtime::spawn_blocking(cli::install)
+        .await
+        .map_err(|e| format!("install task failed: {e}"))?
+}
+
+/// Remove the managed `openhydra` command.
+#[tauri::command]
+async fn uninstall_cli() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(cli::uninstall)
+        .await
+        .map_err(|e| format!("uninstall task failed: {e}"))?
+}
+
 /// Open a tool's GUI (the App/Editor "Connect & Open" action): the OpenCode/Hermes desktop app or the
 /// Continue/Claude editor, via the tool's `gui_target`. Best-effort — an Err leaves the (already
 /// written) config in place and the UI toasts a manual-open fallback.
@@ -1543,6 +1572,9 @@ fn main() {
             connector_disconnect,
             open_gui,
             connector_test,
+            cli_status,
+            install_cli,
+            uninstall_cli,
         ])
         .setup(|app| {
             // Resume sharing if the user was sharing when they last quit (informed opt-out via
