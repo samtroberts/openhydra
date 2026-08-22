@@ -20,6 +20,7 @@ import { renderActivity } from "./activity";
 import { renderSettings, updateEngineEndpoint } from "./settings";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on } from "./bus";
+import { cliState, refreshCliStatus, installCli } from "./cliui";
 import {
   state, snap, engines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
   setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
@@ -359,22 +360,24 @@ $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.togg
 // #4: verbose-logs toggle (persist on Save) + Send-logs export
 $("#verboselogsw") && ($("#verboselogsw").onclick = () => $("#verboselogsw").classList.toggle("on"));
 $("#sendlogsbtn") && ($("#sendlogsbtn").onclick = async () => { try { const path = await call("export_logs"); toast(path ? `Logs saved: ${path}` : "No logs yet"); } catch (e) { toast(`Export failed: ${e}`); } });
-// CLI-on-PATH (Layer 1): install the bundled `openhydra` command so terminal snippets + `openhydra
-// launch` work in the user's shell. Status is checked once (spawns `which`), not on every poll.
-async function refreshCli() {
+// CLI-on-PATH (Layer 1): the Settings "Command-line tool" row. Status comes from the shared cliui
+// source, so an install here — or from the Connectors banner — keeps both in sync via "cli-status".
+function renderCliRow() {
   const btn = $("#clibtn"), st = $("#clistatus"); if (!btn) return;
-  let s; try { s = await call("cli_status"); } catch { return; }
+  const s = cliState();
+  if (!s) { if (st) st.textContent = ""; return; }                                   // not fetched yet
+  if (s.error) { btn.textContent = "Install"; if (st) st.textContent = "couldn't check status"; return; }
   if (s.on_path) { btn.textContent = "Reinstall"; if (st) st.textContent = `✓ installed — ${s.resolved || "openhydra"}`; }
-  else if (s.managed_broken) { btn.textContent = "Repair"; if (st) st.textContent = "installed but broken (the app moved) — click Repair"; }
+  else if (s.managed_broken) { btn.textContent = "Repair"; if (st) st.textContent = "installed but broken — click Repair"; }
   else { btn.textContent = "Install"; if (st) st.textContent = "not installed"; }
 }
+on("cli-status", renderCliRow);
 $("#clibtn") && ($("#clibtn").onclick = async () => {
-  const btn = $("#clibtn"), prev = btn.textContent; btn.textContent = "Installing…"; btn.disabled = true;
-  try { const r = await call("install_cli"); toast(r.note ? `openhydra installed → ${r.path}. ${r.note}` : `openhydra installed → ${r.path}`); }
-  catch (e) { toast(/cancel/i.test(String(e)) ? "CLI install cancelled" : `Install failed: ${e}`); btn.textContent = prev; }
-  finally { btn.disabled = false; await refreshCli(); }
+  const btn = $("#clibtn"); btn.disabled = true; btn.textContent = "Installing…";
+  await installCli();   // toasts + refreshes; the "cli-status" handler re-renders the row
+  btn.disabled = false;
 });
-refreshCli();
+refreshCliStatus();     // initial fetch (broadcasts to both surfaces)
 
 // ── connectors copy (wireframe .cp) ──
 $$(".cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.clipboard?.writeText(b.parentElement.textContent.replace(/Copy$/, "").trim()); toast("Copied to clipboard"); });

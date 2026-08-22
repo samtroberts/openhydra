@@ -5,26 +5,28 @@ import { $, $$, esc, escapeHtml } from "./dom";
 import { call } from "./bridge";
 import { toast } from "./chrome";
 import { liveModels } from "./models";
+import { on } from "./bus";
+import { cliState, refreshCliStatus, installCli } from "./cliui";
 
   export function renderConnectors() {
     $$("#v-connectors .cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); const sn = b.closest(".conncard")?.querySelector(".snippet"); navigator.clipboard?.writeText((sn?.textContent || "").trim()); toast("Copied"); });
     wireConnectors();
+    if (cliState() === null) refreshCliStatus();   // lazy first fetch if boot hasn't run it yet
     renderCliBanner();
   }
 
   // Layer 2: the terminal snippets/`openhydra launch` only work once the `openhydra` CLI is on PATH.
-  // When it isn't, show a banner offering the one-click install (Layer 1's install_cli) instead of
-  // letting the user copy a command that fails with command-not-found. Status is cached (spawns
-  // `which`) so the 2.5s connectors re-render doesn't re-probe.
-  let _cliStatus = null;
-  async function cliStatus(force) {
-    if (_cliStatus === null || force) { try { _cliStatus = await call("cli_status"); } catch { _cliStatus = { on_path: true }; } }
-    return _cliStatus;
-  }
-  async function renderCliBanner() {
+  // When it isn't, show a banner offering the one-click install instead of letting the user copy a
+  // command that fails with command-not-found. Status comes from the shared cliui source (one probe,
+  // broadcast via "cli-status"), so an install here OR from the Settings row updates both surfaces.
+  on("cli-status", renderCliBanner);
+  function renderCliBanner() {
     const b = $("#cliinstallbanner"); if (!b) return;
-    const s = await cliStatus();
-    if (s.on_path && !s.managed_broken) { b.style.display = "none"; b.innerHTML = ""; return; }
+    const s = cliState();
+    // Show ONLY when we've CONFIRMED the CLI is missing/broken — never on error/unknown. A failed check
+    // doesn't nag here (the always-present Settings row is the reliable install path).
+    const show = s && !s.error && (!s.on_path || s.managed_broken);
+    if (!show) { b.style.display = "none"; b.innerHTML = ""; return; }
     const broken = s.managed_broken;
     b.style.display = "flex";
     b.innerHTML = `<span class="clib-ic">⌨</span><span class="clib-t">${broken
@@ -33,10 +35,8 @@ import { liveModels } from "./models";
       }</span><button class="btn brand sm clib-go">${broken ? "Repair" : "Install the CLI"}</button>`;
     const go = $(".clib-go", b);
     if (go) go.onclick = async () => {
-      const prev = go.textContent; go.textContent = "Installing…"; go.disabled = true;
-      try { const r = await call("install_cli"); toast(r.note ? `openhydra installed → ${r.path}. ${r.note}` : `openhydra installed → ${r.path}`); }
-      catch (e) { toast(/cancel/i.test(String(e)) ? "CLI install cancelled" : `Install failed: ${e}`); go.textContent = prev; go.disabled = false; return; }
-      await cliStatus(true); renderCliBanner();
+      go.disabled = true; go.textContent = "Installing…";
+      await installCli();   // toasts + refreshes; the "cli-status" handler re-renders (hides on success)
     };
   }
 
