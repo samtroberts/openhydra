@@ -108,9 +108,7 @@ pub fn status() -> CliStatus {
     let mut broken_candidates = vec![target.clone()];
     #[cfg(unix)]
     broken_candidates.push(user_local_bin().join(CLI_NAME));
-    let managed_broken = broken_candidates
-        .iter()
-        .any(|p| std::fs::symlink_metadata(p).is_ok() && std::fs::metadata(p).is_err());
+    let managed_broken = broken_candidates.iter().any(|p| is_dangling_symlink(p));
     CliStatus {
         on_path: resolved.is_some(),
         resolved: resolved.map(|p| p.display().to_string()),
@@ -118,6 +116,12 @@ pub fn status() -> CliStatus {
         target: target.display().to_string(),
         managed_broken,
     }
+}
+
+/// A symlink whose destination is gone: symlink_metadata succeeds for the link itself, metadata
+/// (which follows it) fails. False for a regular file, a live symlink, or a missing path.
+fn is_dangling_symlink(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok() && std::fs::metadata(p).is_err()
 }
 
 /// Install the `openhydra` command onto PATH. Per-platform mechanics (see the plan doc).
@@ -155,10 +159,7 @@ pub fn uninstall() -> Result<(), String> {
         let _ = std::fs::remove_file(&user);
         if std::fs::symlink_metadata(&target).is_ok() {
             // `target` is a constant today, but quote it safely regardless (defense-in-depth — this runs as root).
-            let script = format!(
-                "do shell script \"rm -f \" & quoted form of {} with administrator privileges",
-                as_applescript_str(&target.display().to_string())
-            );
+            let script = build_uninstall_script(&target.display().to_string());
             run_osascript(&script)?;
         }
         Ok(())
@@ -170,12 +171,39 @@ pub fn uninstall() -> Result<(), String> {
 }
 
 // ── macOS ─────────────────────────────────────────────────────────────────────
-/// Escape a string as an AppleScript double-quoted string LITERAL (the `\` / `"` layer). The SHELL
-/// layer is handled separately by AppleScript's `quoted form of`, so paths never reach the shell
-/// un-quoted.
+/// Escape a string as an AppleScript double-quoted string LITERAL (the `\` / `"` layer).
 #[cfg(target_os = "macos")]
 fn as_applescript_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// An AppleScript expression yielding the SHELL-safe form of `s`: escaped for the AppleScript literal,
+/// then `quoted form of` for the shell — so a path never reaches the shell parser un-quoted.
+#[cfg(target_os = "macos")]
+fn as_quoted_shell_arg(s: &str) -> String {
+    format!("quoted form of {}", as_applescript_str(s))
+}
+
+/// Build the (root) install AppleScript. Pure — separated from `run_osascript` so the quoting is
+/// unit-testable without side effects. The command is assembled in a variable so `with administrator
+/// privileges` binds to the whole concatenation.
+#[cfg(target_os = "macos")]
+fn build_install_script(source: &str, target: &str) -> String {
+    format!(
+        "set cmd to \"mkdir -p /usr/local/bin && ln -sf \" & {} & \" \" & {}\n\
+         do shell script cmd with administrator privileges",
+        as_quoted_shell_arg(source),
+        as_quoted_shell_arg(target),
+    )
+}
+
+/// Build the (root) uninstall AppleScript. Pure, same quoting discipline.
+#[cfg(target_os = "macos")]
+fn build_uninstall_script(target: &str) -> String {
+    format!(
+        "do shell script \"rm -f \" & {} with administrator privileges",
+        as_quoted_shell_arg(target)
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -184,15 +212,9 @@ fn install_macos(source: &Path) -> Result<InstallReport, String> {
     // VS Code's "Install 'code' command in PATH". Survives app updates (the .app path is stable).
     //
     // SECURITY: this runs as ROOT, and `source` is the folder the app runs from — which can contain
-    // quotes / `;` / `$` (e.g. "~/Downloads/Sam's Apps/OpenHydra.app"). NEVER interpolate it into the
-    // shell string. Escape it for the AppleScript literal, then let `quoted form of` do the shell
-    // quoting, and build the command in a variable so precedence is unambiguous.
-    let src = as_applescript_str(&source.display().to_string());
-    let tgt = as_applescript_str("/usr/local/bin/openhydra");
-    let script = format!(
-        "set cmd to \"mkdir -p /usr/local/bin && ln -sf \" & quoted form of {src} & \" \" & quoted form of {tgt}\n\
-         do shell script cmd with administrator privileges"
-    );
+    // quotes / `;` / `$` (e.g. "~/Downloads/Sam's Apps/OpenHydra.app"). build_install_script quotes it
+    // (AppleScript-literal escaping + `quoted form of`); it is never raw-interpolated into the shell.
+    let script = build_install_script(&source.display().to_string(), "/usr/local/bin/openhydra");
     match run_osascript(&script) {
         Ok(()) => Ok(InstallReport {
             path: "/usr/local/bin/openhydra".into(),
@@ -275,6 +297,20 @@ fn install_linux(source: &Path) -> Result<InstallReport, String> {
 }
 
 // ── Windows ───────────────────────────────────────────────────────────────────
+/// Build the PowerShell one-liner that adds `dir` to the USER Path. Pure (unit-testable off-Windows —
+/// only the invocation in install_windows is Windows-gated). Doubles single quotes (usernames may
+/// contain `'`), guards a $null Path, and matches an EXACT `;`-segment (not a `-like` wildcard, which
+/// mishandles `[ ] * ?` and substring collisions). Idempotent — appends only when absent.
+#[allow(dead_code)] // used only by install_windows (cfg windows) + the tests
+fn build_win_path_add(dir: &str) -> String {
+    let dir_lit = dir.replace('\'', "''");
+    format!(
+        "$d = '{dir_lit}'; $p = [Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p = '' }}; \
+         if (($p -split ';') -notcontains $d) {{ if ($p) {{ $p = $p.TrimEnd(';') + ';' + $d }} else {{ $p = $d }}; \
+         [Environment]::SetEnvironmentVariable('Path', $p, 'User') }}"
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn install_windows(source: &Path) -> Result<InstallReport, String> {
     let bindir = windows_bin_dir();
@@ -283,14 +319,7 @@ fn install_windows(source: &Path) -> Result<InstallReport, String> {
     std::fs::copy(source, &target).map_err(|e| format!("copy: {e}"))?;
     // Add the bin dir to the USER PATH (no admin) via PowerShell's Environment API, then broadcast so
     // new shells pick it up. Idempotent — only appends when absent.
-    let dir_lit = bindir.display().to_string().replace('\'', "''"); // PowerShell single-quote escaping
-    // Guard $null (many users have no user-level Path) and match an EXACT ';'-segment (not a -like
-    // wildcard, which mishandles [ ] * ? and substring collisions). Idempotent — appends only if absent.
-    let ps = format!(
-        "$d = '{dir_lit}'; $p = [Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p = '' }}; \
-         if (($p -split ';') -notcontains $d) {{ if ($p) {{ $p = $p.TrimEnd(';') + ';' + $d }} else {{ $p = $d }}; \
-         [Environment]::SetEnvironmentVariable('Path', $p, 'User') }}"
-    );
+    let ps = build_win_path_add(&bindir.display().to_string());
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
         .status()
@@ -304,8 +333,23 @@ fn install_windows(source: &Path) -> Result<InstallReport, String> {
     })
 }
 
-/// Ensure `~/.local/bin` is on PATH by appending an export to the login shell's rc file (idempotent).
-/// Returns a user-facing note. macOS/Linux only (that dir isn't on the stock macOS PATH).
+/// The rc files an interactive shell of `shell` (a $SHELL path) ACTUALLY sources. zsh sources
+/// ~/.zshrc for both login and interactive; bash needs ~/.bashrc (interactive, most Linux terminals)
+/// AND ~/.bash_profile (login, e.g. macOS Terminal). A login-only file like ~/.zprofile silently
+/// misses non-login shells. Pure — unit-tested.
+#[cfg(unix)]
+fn rc_files_for_shell(shell: &str) -> &'static [&'static str] {
+    if shell.ends_with("zsh") {
+        &[".zshrc"]
+    } else if shell.ends_with("bash") {
+        &[".bashrc", ".bash_profile"]
+    } else {
+        &[".profile"]
+    }
+}
+
+/// Ensure `~/.local/bin` is on PATH by appending an export to the shell rc files interactive shells
+/// source (idempotent, gated on our own marker). Returns a user-facing note. macOS/Linux only.
 #[cfg(unix)]
 fn ensure_local_bin_on_path() -> Option<String> {
     // Already resolvable → nothing to do.
@@ -314,16 +358,7 @@ fn ensure_local_bin_on_path() -> Option<String> {
     }
     let home = std::env::var("HOME").ok()?;
     let shell = std::env::var("SHELL").unwrap_or_default();
-    // Write the rc files interactive shells ACTUALLY source. zsh sources ~/.zshrc for both login and
-    // interactive; bash needs ~/.bashrc (interactive, e.g. most Linux terminals) AND ~/.bash_profile
-    // (login, e.g. macOS Terminal). A login-only file like ~/.zprofile silently misses non-login shells.
-    let rc_files: &[&str] = if shell.ends_with("zsh") {
-        &[".zshrc"]
-    } else if shell.ends_with("bash") {
-        &[".bashrc", ".bash_profile"]
-    } else {
-        &[".profile"]
-    };
+    let rc_files = rc_files_for_shell(&shell);
     const MARKER: &str = "# added by OpenHydra — put the openhydra CLI on PATH";
     let line = "export PATH=\"$HOME/.local/bin:$PATH\"";
     let mut wrote = Vec::new();
@@ -358,5 +393,100 @@ fn ensure_local_bin_on_path() -> Option<String> {
             "Added ~/.local/bin to your PATH in {} — open a new terminal to use `openhydra`.",
             wrote.join(" and ")
         ))
+    }
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── macOS AppleScript quoting (the root-injection regression guard) ──
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn applescript_literal_escapes_backslash_and_quote() {
+        assert_eq!(as_applescript_str("plain"), "\"plain\"");
+        assert_eq!(as_applescript_str("a\"b"), "\"a\\\"b\"");   // " -> \"
+        assert_eq!(as_applescript_str("a\\b"), "\"a\\\\b\"");   // \ -> \\
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_script_quotes_and_never_raw_interpolates() {
+        let malicious = "/tmp/x'; touch /tmp/pwned; :";
+        let s = build_install_script(malicious, "/usr/local/bin/openhydra");
+        assert!(s.contains("quoted form of"), "must use `quoted form of` for the shell layer");
+        assert!(s.contains("with administrator privileges"));
+        // the path must NOT sit inside a shell-active single-quoted literal (the old vulnerable shape)
+        assert!(!s.contains("ln -sf '/tmp/x'"), "path must not be raw-interpolated into the shell");
+    }
+
+    // The real proof: build the SAME quoting the installer uses and let osascript evaluate it (with
+    // `echo` in place of the root `ln`). A crafted path must be treated as DATA, not commands.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn osascript_quoting_blocks_command_injection() {
+        // Unambiguous proof via a SIDE EFFECT: the payload tries to `touch` a marker file. If the path
+        // were injected the file would be created; safe quoting echoes it as literal data and it isn't.
+        let marker = std::env::temp_dir().join(format!("oh-inj-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let payload = format!("/tmp/x'; touch {}; echo '", marker.display());
+        let script = format!("set cmd to \"echo \" & {}\ndo shell script cmd", as_quoted_shell_arg(&payload));
+        let out = std::process::Command::new("osascript").arg("-e").arg(&script).output().unwrap();
+        assert!(out.status.success(), "osascript failed: {}", String::from_utf8_lossy(&out.stderr));
+        // And the whole payload should come back echoed as one literal line.
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), payload, "path must be echoed literally");
+        let injected = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!injected, "the `touch` payload must NOT have executed — that would be root injection");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uninstall_script_is_quoted() {
+        let s = build_uninstall_script("/usr/local/bin/openhydra");
+        assert!(s.contains("quoted form of") && s.contains("rm -f") && s.contains("with administrator privileges"));
+    }
+
+    // ── Windows PowerShell PATH builder (pure — runs on any host) ──
+    #[test]
+    fn win_path_add_escapes_quotes_and_matches_exact_segment() {
+        let ps = build_win_path_add(r"C:\Users\O'Brien\AppData\Local\OpenHydra\bin");
+        assert!(ps.contains("O''Brien"), "single quote must be doubled: {ps}");
+        assert!(ps.contains("-split ';'") && ps.contains("-notcontains"), "exact-segment match, not -like");
+        assert!(ps.contains("if (-not $p)"), "must guard a $null user Path");
+        assert!(!ps.contains("-like"), "must not use a -like wildcard test");
+    }
+
+    // ── rc-file selection (#4) ──
+    #[cfg(unix)]
+    #[test]
+    fn rc_files_target_interactive_shells() {
+        assert_eq!(rc_files_for_shell("/bin/zsh").to_vec(), vec![".zshrc"]);
+        assert_eq!(rc_files_for_shell("/usr/bin/bash").to_vec(), vec![".bashrc", ".bash_profile"]);
+        assert_eq!(rc_files_for_shell("/usr/bin/fish").to_vec(), vec![".profile"]);
+        assert_eq!(rc_files_for_shell("").to_vec(), vec![".profile"]);
+    }
+
+    // ── dangling-symlink detection (#8) ──
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_detection() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("oh-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real");
+        std::fs::write(&real, b"x").unwrap();
+        let live = dir.join("live");
+        symlink(&real, &live).unwrap();
+        let dangling = dir.join("dangling");
+        symlink(dir.join("gone"), &dangling).unwrap();
+
+        assert!(!is_dangling_symlink(&live), "a live symlink is not dangling");
+        assert!(is_dangling_symlink(&dangling), "a symlink to a missing target is dangling");
+        assert!(!is_dangling_symlink(&real), "a regular file is not a dangling symlink");
+        assert!(!is_dangling_symlink(&dir.join("nope")), "a missing path is not a dangling symlink");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
