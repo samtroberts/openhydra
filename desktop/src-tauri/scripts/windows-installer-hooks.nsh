@@ -10,6 +10,10 @@
 !include "LogicLib.nsh"
 !include "WinMessages.nsh"
 !include "WordFunc.nsh"
+; WordFunc.nsh only DEFINES these; they must be instantiated before ${WordAdd}/${un.WordAdd} exist
+; (installer + uninstaller are separate contexts, hence the un. variant). Without these it won't compile.
+!insertmacro WordAdd
+!insertmacro un.WordAdd
 
 !macro NSIS_HOOK_POSTINSTALL
   ; 1) The CLI is subcommand-dispatched, so a copy named openhydra.exe IS the full CLI.
@@ -27,7 +31,7 @@
   Delete "$INSTDIR\openhydra.exe"
   ; Remove our install dir from the user PATH (${UnWordAdd} "-word" removes it if present).
   ReadRegStr $0 HKCU "Environment" "Path"
-  ${UnWordAdd} "$0" ";" "-$INSTDIR" $1
+  ${un.WordAdd} "$0" ";" "-$INSTDIR" $1
   WriteRegExpandStr HKCU "Environment" "Path" "$1"
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 !macroend

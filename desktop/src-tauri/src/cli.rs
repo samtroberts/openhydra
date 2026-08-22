@@ -102,12 +102,15 @@ fn resolved_path() -> Option<PathBuf> {
 pub fn status() -> CliStatus {
     let resolved = resolved_path();
     let target = default_target();
-    // A dangling managed link: our target path exists as a symlink but its destination is gone.
-    let managed_broken = {
-        let p = &target;
-        // symlink_metadata succeeds for a dangling link; metadata (follows) fails.
-        std::fs::symlink_metadata(p).is_ok() && std::fs::metadata(p).is_err()
-    };
+    // A dangling managed link: a symlink whose destination is gone (symlink_metadata succeeds for a
+    // dangling link; metadata, which follows, fails). Check the primary target AND the ~/.local/bin
+    // fallback, since an admin-declined macOS install (or any unix install) lands there.
+    let mut broken_candidates = vec![target.clone()];
+    #[cfg(unix)]
+    broken_candidates.push(user_local_bin().join(CLI_NAME));
+    let managed_broken = broken_candidates
+        .iter()
+        .any(|p| std::fs::symlink_metadata(p).is_ok() && std::fs::metadata(p).is_err());
     CliStatus {
         on_path: resolved.is_some(),
         resolved: resolved.map(|p| p.display().to_string()),
@@ -151,9 +154,10 @@ pub fn uninstall() -> Result<(), String> {
         let user = user_local_bin().join(CLI_NAME);
         let _ = std::fs::remove_file(&user);
         if std::fs::symlink_metadata(&target).is_ok() {
+            // `target` is a constant today, but quote it safely regardless (defense-in-depth — this runs as root).
             let script = format!(
-                "do shell script \"rm -f '{}'\" with administrator privileges",
-                target.display()
+                "do shell script \"rm -f \" & quoted form of {} with administrator privileges",
+                as_applescript_str(&target.display().to_string())
             );
             run_osascript(&script)?;
         }
@@ -166,30 +170,45 @@ pub fn uninstall() -> Result<(), String> {
 }
 
 // ── macOS ─────────────────────────────────────────────────────────────────────
+/// Escape a string as an AppleScript double-quoted string LITERAL (the `\` / `"` layer). The SHELL
+/// layer is handled separately by AppleScript's `quoted form of`, so paths never reach the shell
+/// un-quoted.
+#[cfg(target_os = "macos")]
+fn as_applescript_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(target_os = "macos")]
 fn install_macos(source: &Path) -> Result<InstallReport, String> {
-    let target = "/usr/local/bin/openhydra";
     // Primary: symlink into /usr/local/bin (on the default macOS PATH) with one admin prompt — exactly
     // VS Code's "Install 'code' command in PATH". Survives app updates (the .app path is stable).
+    //
+    // SECURITY: this runs as ROOT, and `source` is the folder the app runs from — which can contain
+    // quotes / `;` / `$` (e.g. "~/Downloads/Sam's Apps/OpenHydra.app"). NEVER interpolate it into the
+    // shell string. Escape it for the AppleScript literal, then let `quoted form of` do the shell
+    // quoting, and build the command in a variable so precedence is unambiguous.
+    let src = as_applescript_str(&source.display().to_string());
+    let tgt = as_applescript_str("/usr/local/bin/openhydra");
     let script = format!(
-        "do shell script \"mkdir -p /usr/local/bin && ln -sf '{}' '{}'\" with administrator privileges",
-        source.display(),
-        target
+        "set cmd to \"mkdir -p /usr/local/bin && ln -sf \" & quoted form of {src} & \" \" & quoted form of {tgt}\n\
+         do shell script cmd with administrator privileges"
     );
     match run_osascript(&script) {
         Ok(()) => Ok(InstallReport {
-            path: target.into(),
+            path: "/usr/local/bin/openhydra".into(),
             method: "symlink".into(),
             on_path: true,
             note: None,
         }),
-        // -128 = the user cancelled the admin prompt; anything else (not writable, etc.) → fall back
-        // to a no-admin ~/.local/bin install.
+        // The user CANCELLED the privilege prompt → do nothing and report it. We must NOT silently
+        // fall back to writing ~/.local/bin + editing their shell rc behind a "success" toast.
+        Err(e) if e == "cancelled" => Err("cancelled".into()),
+        // A genuine failure (dir not writable, etc.) → fall back to the no-admin ~/.local/bin install.
         Err(e) => {
             let mut r = install_user_local(source)?;
             r.note = Some(match r.note.take() {
-                Some(n) => format!("Used ~/.local/bin (admin install skipped: {e}). {n}"),
-                None => format!("Used ~/.local/bin (admin install skipped: {e})."),
+                Some(n) => format!("Used ~/.local/bin (admin install failed: {e}). {n}"),
+                None => format!("Used ~/.local/bin (admin install failed: {e})."),
             });
             Ok(r)
         }
@@ -264,10 +283,13 @@ fn install_windows(source: &Path) -> Result<InstallReport, String> {
     std::fs::copy(source, &target).map_err(|e| format!("copy: {e}"))?;
     // Add the bin dir to the USER PATH (no admin) via PowerShell's Environment API, then broadcast so
     // new shells pick it up. Idempotent — only appends when absent.
-    let dir = bindir.display().to_string();
+    let dir_lit = bindir.display().to_string().replace('\'', "''"); // PowerShell single-quote escaping
+    // Guard $null (many users have no user-level Path) and match an EXACT ';'-segment (not a -like
+    // wildcard, which mishandles [ ] * ? and substring collisions). Idempotent — appends only if absent.
     let ps = format!(
-        "$d='{dir}'; $p=[Environment]::GetEnvironmentVariable('Path','User'); \
-         if ($p -notlike \"*$d*\") {{ [Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $d), 'User') }}"
+        "$d = '{dir_lit}'; $p = [Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p = '' }}; \
+         if (($p -split ';') -notcontains $d) {{ if ($p) {{ $p = $p.TrimEnd(';') + ';' + $d }} else {{ $p = $d }}; \
+         [Environment]::SetEnvironmentVariable('Path', $p, 'User') }}"
     );
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
@@ -292,31 +314,49 @@ fn ensure_local_bin_on_path() -> Option<String> {
     }
     let home = std::env::var("HOME").ok()?;
     let shell = std::env::var("SHELL").unwrap_or_default();
-    let rc = if shell.ends_with("zsh") {
-        ".zprofile"
+    // Write the rc files interactive shells ACTUALLY source. zsh sources ~/.zshrc for both login and
+    // interactive; bash needs ~/.bashrc (interactive, e.g. most Linux terminals) AND ~/.bash_profile
+    // (login, e.g. macOS Terminal). A login-only file like ~/.zprofile silently misses non-login shells.
+    let rc_files: &[&str] = if shell.ends_with("zsh") {
+        &[".zshrc"]
     } else if shell.ends_with("bash") {
-        ".bash_profile"
+        &[".bashrc", ".bash_profile"]
     } else {
-        ".profile"
+        &[".profile"]
     };
-    let rc_path = Path::new(&home).join(rc);
+    const MARKER: &str = "# added by OpenHydra — put the openhydra CLI on PATH";
     let line = "export PATH=\"$HOME/.local/bin:$PATH\"";
-    let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
-    if !existing.contains(".local/bin") {
+    let mut wrote = Vec::new();
+    for rc in rc_files {
+        let rc_path = Path::new(&home).join(rc);
+        let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+        // Idempotent on OUR marker (not a generic ".local/bin" substring, which false-skips on a
+        // comment or an unrelated line and leaves PATH unfixed).
+        if existing.contains(MARKER) {
+            continue;
+        }
         let mut block = String::new();
         if !existing.is_empty() && !existing.ends_with('\n') {
             block.push('\n');
         }
-        block.push_str("\n# added by OpenHydra — put the openhydra CLI on PATH\n");
+        block.push('\n');
+        block.push_str(MARKER);
+        block.push('\n');
         block.push_str(line);
         block.push('\n');
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&rc_path) {
             use std::io::Write;
-            let _ = f.write_all(block.as_bytes());
+            if f.write_all(block.as_bytes()).is_ok() {
+                wrote.push(format!("~/{rc}"));
+            }
         }
-        return Some(format!(
-            "Added ~/.local/bin to your PATH in ~/{rc} — open a new terminal (or run `source ~/{rc}`) to use `openhydra`."
-        ));
     }
-    Some("Open a new terminal to use `openhydra`.".into())
+    if wrote.is_empty() {
+        Some("Open a new terminal to use `openhydra`.".into())
+    } else {
+        Some(format!(
+            "Added ~/.local/bin to your PATH in {} — open a new terminal to use `openhydra`.",
+            wrote.join(" and ")
+        ))
+    }
 }

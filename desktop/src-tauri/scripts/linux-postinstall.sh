@@ -16,7 +16,10 @@ if [ -z "$AGENT" ]; then
 fi
 
 if [ -n "$AGENT" ]; then
-  ln -sf "$AGENT" /usr/bin/openhydra
+  # Only create/refresh a symlink — never clobber a user's own regular /usr/bin/openhydra binary.
+  if [ ! -e /usr/bin/openhydra ] || [ -L /usr/bin/openhydra ]; then
+    ln -sf "$AGENT" /usr/bin/openhydra
+  fi
 fi
 
 exit 0
