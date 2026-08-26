@@ -355,6 +355,13 @@ struct ProvideArgs {
     #[arg(long = "share-models", value_delimiter = ',')]
     share_models: Vec<String>,
 
+    /// Path to a JSON share-policy file (see `openhydra_agent::SharePolicy`), **hot-reloaded** while
+    /// running: the desktop rewrites it when the user toggles a model, and the node applies the
+    /// change within one poll slice (no restart). Takes precedence over `--share-models`. Omit for
+    /// the static `--share-models` behavior.
+    #[arg(long = "share-policy-file")]
+    share_policy_file: Option<std::path::PathBuf>,
+
     /// Advisory host advertised in records (routing is by libp2p peer id regardless).
     #[arg(long, default_value = "")]
     host: String,
@@ -786,18 +793,28 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         stats.rehydrate_ledger(&rows, served, used, n);
     }
     let aup = args.aup.clone().into_policy();
-    let provider = Provider::new(adapter, net)
+    let mut provider = Provider::new(adapter, net)
         .with_address(args.host, args.port)
         .with_store(store)
         .with_aup(aup)
-        .with_shared_models(args.share_models.clone())
         .with_stats(stats);
-    if !args.share_models.is_empty() {
+    // A hot-reloadable policy file (the desktop path) takes precedence over the static
+    // `--share-models` list. Only one governs sharing, so we never mix the two.
+    if let Some(path) = args.share_policy_file.clone() {
         eprintln!(
-            "openhydra-agent: sharing only {} selected model(s): {}",
-            args.share_models.len(),
-            args.share_models.join(", ")
+            "openhydra-agent: share policy from {} (hot-reloaded on change)",
+            path.display()
         );
+        provider = provider.with_share_policy_file(path);
+    } else {
+        provider = provider.with_shared_models(args.share_models.clone());
+        if !args.share_models.is_empty() {
+            eprintln!(
+                "openhydra-agent: sharing only {} selected model(s): {}",
+                args.share_models.len(),
+                args.share_models.join(", ")
+            );
+        }
     }
 
     let announced = provider

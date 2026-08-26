@@ -20,9 +20,12 @@
 //! the loop itself is thin glue over the live swarm.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::share_policy::{PolicyWatcher, SharePolicy};
 
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
@@ -110,28 +113,6 @@ struct BufferedResult {
 enum ResultState {
     Generating,
     Ready(Vec<Vec<u8>>),
-}
-
-/// Normalize an operator-supplied share list into the internal allowlist: an empty list means
-/// "share everything" (`None`), a non-empty list becomes the set to restrict to. Deduplicates.
-fn normalize_shared_models<I, S>(models: I) -> Option<std::collections::HashSet<String>>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let set: std::collections::HashSet<String> = models.into_iter().map(Into::into).collect();
-    if set.is_empty() {
-        None
-    } else {
-        Some(set)
-    }
-}
-
-/// Whether `model_ref` (an engine handle) is shared, given an optional allowlist. `None` (no
-/// allowlist configured) shares everything; `Some(set)` shares only members of the set. This is
-/// the single decision both the announce filter and the serve gate consult.
-fn model_is_shared(allow: &Option<std::collections::HashSet<String>>, model_ref: &str) -> bool {
-    allow.as_ref().is_none_or(|set| set.contains(model_ref))
 }
 
 /// Build the DHT record advertising one detected model.
@@ -542,11 +523,16 @@ pub struct Provider<A: EngineAdapter> {
     /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
     /// the un-fetched tail so thousands of concurrent streams don't evict one another.
     streams: Mutex<HashMap<[u8; 16], StreamBuffer>>,
-    /// Per-model share allowlist, keyed on the engine handle (`DetectedModel::engine_ref`, the
-    /// same string a consumer sends as `ServeRequest.model_ref`). `None` → share every detected
-    /// model (the default). `Some(set)` → announce and serve **only** these; a request for any
-    /// other model is refused, so the toggle gates serving, not just discovery.
-    shared_models: Option<std::collections::HashSet<String>>,
+    /// Which models this provider shares (announces + serves), keyed on the engine handle
+    /// (`DetectedModel::engine_ref`, the same string a consumer sends as `ServeRequest.model_ref`).
+    /// A [`PolicyWatcher`] so the policy can be **hot-reloaded at runtime** — the user can toggle
+    /// sharing in the desktop without restarting the node. Both the announce filter and the serve
+    /// gate consult it, so a de-selected model is genuinely off (not merely hidden).
+    policy: PolicyWatcher,
+    /// The engine handles published by the most recent [`Self::announce_models`] pass (the set that
+    /// passed the share filter). Read by the status API so the UI can show the provider's *real*
+    /// advertised set rather than an optimistic guess.
+    announced_models: Mutex<Vec<String>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -576,27 +562,44 @@ impl<A: EngineAdapter> Provider<A> {
                 max_tracked: FETCH_RATE_MAX_TRACKED,
             })),
             streams: Mutex::new(HashMap::new()),
-            shared_models: None,
+            policy: PolicyWatcher::r#static(SharePolicy::share_all()),
+            announced_models: Mutex::new(Vec::new()),
         }
     }
 
-    /// Restrict which models this provider shares (announces + serves), keyed on the engine
-    /// handle. An empty list means "share everything" (the default) — the operator hasn't
-    /// narrowed it. A non-empty list shares only those models; requests for any other model are
-    /// refused at serve time, so a de-selected model is genuinely off, not merely hidden.
+    /// Restrict which models this provider shares (announces + serves) via a **static** legacy
+    /// list (the CLI `--share-models` path). An empty list means "share everything"; a non-empty
+    /// list shares only those models. This path does not hot-reload — use
+    /// [`with_share_policy_file`](Self::with_share_policy_file) for the runtime-toggleable policy.
     pub fn with_shared_models<I, S>(mut self, models: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.shared_models = normalize_shared_models(models);
+        self.policy = PolicyWatcher::from_legacy_list(models);
         self
     }
 
-    /// Whether `model_ref` (an engine handle) is shared by this provider. Always true when no
-    /// allowlist is configured (share-all default).
+    /// Back this provider's share policy with a JSON file at `path`, hot-reloaded whenever the file
+    /// changes (the desktop rewrites it when the user toggles a model). Loads the current contents
+    /// now; a missing or malformed file falls back to share-everything with a warning, so the node
+    /// never silently shares nothing on a first-run/parse hiccup — the desktop writes a valid file
+    /// before launch in the normal flow.
+    pub fn with_share_policy_file(mut self, path: PathBuf) -> Self {
+        self.policy = PolicyWatcher::from_file(path);
+        self
+    }
+
+    /// Whether `model_ref` (an engine handle) is shared under the current (possibly hot-reloaded)
+    /// policy. Fail-closed (share-nothing) on a poisoned lock — matters for the serve gate.
     fn model_shared(&self, model_ref: &str) -> bool {
-        model_is_shared(&self.shared_models, model_ref)
+        self.policy.is_shared(model_ref)
+    }
+
+    /// The engine handles published by the most recent [`announce_models`](Self::announce_models)
+    /// pass — the provider's *real* advertised set (used by the status API).
+    pub fn announced_models(&self) -> Vec<String> {
+        self.announced_models.lock().map(|m| m.clone()).unwrap_or_default()
     }
 
     /// Attach shared transfer counters (P0 introspection — the `--status-bind` server
@@ -977,11 +980,10 @@ impl<A: EngineAdapter> Provider<A> {
     /// announced.
     pub fn announce_models(&self) -> Result<usize, AdapterError> {
         let models = self.adapter.detect_models()?;
-        let mut announced = 0usize;
+        let mut announced: Vec<String> = Vec::new();
         for model in &models {
-            // Per-model share allowlist: skip models the operator hasn't opted to share. The
-            // serve path enforces the same gate, so this is discovery hygiene, not the security
-            // boundary.
+            // Per-model share policy: skip models the operator hasn't opted to share. The serve
+            // path enforces the same gate, so this is discovery hygiene, not the security boundary.
             if !self.model_shared(&model.engine_ref) {
                 continue;
             }
@@ -996,9 +998,16 @@ impl<A: EngineAdapter> Provider<A> {
             self.net
                 .announce(record)
                 .map_err(|e| AdapterError::Http(format!("announce: {e}")))?;
-            announced += 1;
+            announced.push(model.engine_ref.clone());
         }
-        Ok(announced)
+        // Record the real advertised set for the status API (the UI reads this, not an optimistic
+        // guess). Only overwritten on a fully-successful pass — a mid-pass announce error returns
+        // above with the previous set intact.
+        let count = announced.len();
+        if let Ok(mut guard) = self.announced_models.lock() {
+            *guard = announced;
+        }
+        Ok(count)
     }
 
     /// Blocking serve loop: poll inbound requests, serve them, reply, and **periodically
@@ -1097,6 +1106,14 @@ impl<A: EngineAdapter> Provider<A> {
                     let _ = self.net.respond(shed_id, busy);
                 }
             }
+            // Hot-reload the share policy if the desktop rewrote it → re-announce now so a toggled-on
+            // model is advertised within one poll slice (<1s), and a toggled-off one stops being
+            // refreshed (its record ages out within the provider-record TTL; the serve gate refuses
+            // it immediately). Cheap: one `stat` per poll, parse+swap only on an actual change.
+            let policy_changed = self.policy.reload_if_changed();
+            if policy_changed {
+                eprintln!("openhydra-agent: share policy changed — re-announcing");
+            }
             // #42: a network change → re-announce now (not on the slow interval).
             let generation = self.net.network_generation();
             let network_changed = generation != last_generation;
@@ -1106,7 +1123,7 @@ impl<A: EngineAdapter> Provider<A> {
                     "openhydra-agent: network change (generation {generation}) — re-announcing"
                 );
             }
-            if network_changed || last_announce.elapsed() >= reannounce_every {
+            if policy_changed || network_changed || last_announce.elapsed() >= reannounce_every {
                 match self.announce_models() {
                     Ok(n) => eprintln!("openhydra-agent: re-announced {n} model(s)"),
                     Err(e) => eprintln!("openhydra-agent: re-announce failed: {e}"),
@@ -1287,42 +1304,18 @@ mod tests {
         assert_eq!(r.canonical_model_id, "");
     }
 
-    // ── per-model share allowlist ──
+    // ── per-model share policy ──
+    // The policy logic (modes, migration, load/save, hot-reload semantics) is covered in
+    // `crate::share_policy`. This test pins the provider-specific invariant: the string the policy
+    // gates on is the *same* string that gets announced as the record's `model_id` — so an
+    // allowlisted model is announced+servable and a de-selected sibling on the same node is not.
 
     #[test]
-    fn empty_share_list_means_share_everything() {
-        // The default: no allowlist configured → every model is shared (None, not an empty set,
-        // which would share nothing).
-        let allow = normalize_shared_models(Vec::<String>::new());
-        assert!(allow.is_none());
-        assert!(model_is_shared(&allow, "tinyllama:latest"));
-        assert!(model_is_shared(&allow, "anything:at-all"));
-    }
-
-    #[test]
-    fn non_empty_share_list_restricts_to_its_members() {
-        let allow = normalize_shared_models(["tinyllama:latest", "qwen3-vl:4b"]);
-        assert!(allow.is_some());
-        assert!(model_is_shared(&allow, "tinyllama:latest")); // listed → shared
-        assert!(model_is_shared(&allow, "qwen3-vl:4b")); // listed → shared
-        assert!(!model_is_shared(&allow, "qwen3-vl:30b")); // NOT listed → refused (announce + serve)
-        assert!(!model_is_shared(&allow, "")); // empty ref never accidentally matches
-    }
-
-    #[test]
-    fn share_list_deduplicates() {
-        let allow = normalize_shared_models(["a", "a", "b"]).unwrap();
-        assert_eq!(allow.len(), 2);
-    }
-
-    #[test]
-    fn share_gate_matches_the_engine_handle_the_consumer_sends() {
-        // The gate keys on the engine handle — the exact `model_id`/`model_ref` string — so an
-        // allowlisted model is servable and a de-selected sibling on the same node is not.
-        let allow = normalize_shared_models(["qwen2.5:7b"]);
+    fn share_gate_key_equals_the_announced_model_id() {
+        let policy = SharePolicy::share_list(["qwen2.5:7b"]);
         let served = build_peer_record(&detected("q/7b/x/y"), "oh", "lib", "pk", "", 0);
-        assert!(model_is_shared(&allow, &served.model_id)); // announced id == gate key
-        assert!(!model_is_shared(&allow, "qwen2.5:0.5b")); // a different handle on the same node
+        assert!(policy.is_shared(&served.model_id)); // announced id == gate key → shared
+        assert!(!policy.is_shared("qwen2.5:0.5b")); // a different handle on the same node → refused
     }
 
     struct StubAdapter;

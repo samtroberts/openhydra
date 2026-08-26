@@ -40,6 +40,7 @@ pub mod provider;
 pub mod ratelimit;
 pub mod receipt;
 pub mod serve;
+pub mod share_policy;
 pub mod slash;
 /// P0 introspection: the `--status-bind` endpoint (network snapshot + transfer counters).
 pub mod status;
@@ -69,6 +70,7 @@ pub use gateway::serve_http;
 pub use hardening::harden_process;
 pub use http::ReqwestClient;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
+pub use share_policy::{SharePolicy, ShareMode};
 pub use status::{CreditEntry, EconomyStats, EconomyView, LedgerRow, RepEntry, StatusServer, TransferStats};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};
 
