@@ -4,6 +4,7 @@
 import { $, $$, esc, peerShort } from "./dom";
 import { state, snap } from "./state";
 import { repByLibp2p } from "./econ";
+import { displayModelName } from "./models";
 import { modelIcon, relTime, repBadge } from "./format";
 import { injectIcons } from "./icons";
 import { menu, toast } from "./chrome";
@@ -19,7 +20,7 @@ import { menu, toast } from "./chrome";
     $("#ledgertable tbody").innerHTML = rows.length
       ? rows.slice(0, 100).map((r) => {
           const served = r.kind === "served", cr = (served ? "+" : "−") + (r.tokens / 100).toFixed(1);
-          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td>${modelIcon(r.model)}${esc(r.model)}</td><td class="mono">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
+          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td title="${esc(r.model)}">${modelIcon(r.model)}${esc(displayModelName(r.model))}</td><td class="mono">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
         }).join("")
       : `<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`;
   }
@@ -51,7 +52,7 @@ import { menu, toast } from "./chrome";
     $("#actchips .chip .num") && ($("#actchips .chip .num").textContent = peers.length);
     $$("#peertable .rowmenu").forEach((cell) => cell.onclick = (e) => { e.stopPropagation(); menu(cell, [{ label: "Copy peer id", fn: () => toast("Copied") }, { sep: 1 }, { label: "Drop connection", fn: () => toast("Dropped") }]); });
     // DHT
-    $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono">/oh/model/${esc(m)}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td><td class="num">—</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No records yet.</td></tr>`;
+    $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono" title="${esc(m)}">/oh/model/${esc(displayModelName(m))}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td><td class="num">—</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No records yet.</td></tr>`;
     $$("#v-peers .acttab")[1].querySelector(".card.pad").innerHTML = `kad_routing_peers: <span class="num">${n.kad_routing_peers}</span> · server mode: ${n.kad_server_mode ? "yes" : "no"}`;
     // Swarm
     const sw = $$("#v-peers .acttab")[2].querySelectorAll(".kpi .val"); sw[0].textContent = n.listen_addrs.length; sw[1].textContent = n.relay_reservations.length; sw[2].textContent = n.counters.dcutr_successes; sw[3].textContent = n.autonat_private ? "private" : "public";

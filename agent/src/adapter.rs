@@ -267,6 +267,36 @@ pub struct DetectedModel {
     pub size_bytes: u64,
 }
 
+/// Does `s` end in a `.gguf` extension, case-insensitively? Byte-based so it never panics on a
+/// non-char boundary — the last 5 bytes of a `.gguf` suffix are ASCII, so slicing at `len-5` is safe.
+fn ends_with_gguf(s: &str) -> bool {
+    s.len() >= 5 && s.as_bytes()[s.len() - 5..].eq_ignore_ascii_case(b".gguf")
+}
+
+/// Normalise an engine handle into a clean, path-free id to advertise (and to key the share policy
+/// on). `llama-server` reports the model id as whatever it was launched with — frequently the
+/// absolute `-m` path (`/home/alice/models/Qwen3.5-9B-Q4_K_M.gguf`), which would leak the operator's
+/// home dir + OS username onto the network and read as an unreadable name. Reduce a genuine
+/// filesystem path (a `.gguf` file, or an absolute / home / drive path) to its GGUF basename without
+/// the extension; a namespaced logical id (an Ollama tag `llama3.2:1b`, an HF `Qwen/Qwen2.5-7B`) has
+/// no such marker and passes through untouched. Idempotent: a clean id normalises to itself.
+pub fn normalize_engine_ref(id: &str) -> String {
+    let bytes = id.as_bytes();
+    let is_windows_drive =
+        bytes.get(1) == Some(&b':') && matches!(bytes.get(2), Some(b'/') | Some(b'\\'));
+    let looks_like_path =
+        ends_with_gguf(id) || id.starts_with('/') || id.starts_with('~') || is_windows_drive;
+    if !looks_like_path {
+        return id.to_string();
+    }
+    let base = id.rsplit(['/', '\\']).next().unwrap_or(id);
+    if ends_with_gguf(base) {
+        base[..base.len() - 5].to_string()
+    } else {
+        base.to_string()
+    }
+}
+
 /// A wrapper around one local inference engine.
 pub trait EngineAdapter {
     /// Short engine name, e.g. `"ollama"`.

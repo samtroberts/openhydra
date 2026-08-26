@@ -4,7 +4,7 @@
 import { $, $$, esc, escapeHtml } from "./dom";
 import { call } from "./bridge";
 import { toast } from "./chrome";
-import { liveModels } from "./models";
+import { liveModels, displayModelName } from "./models";
 import { on } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
 
@@ -96,14 +96,14 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
 
     const renderChips = () => {
       chipsEl.innerHTML = `<span class="mchip auto">${AUTO_MODEL} <span class="mut">· always</span></span>`
-        + [...card._models].map((m) => `<span class="mchip">${esc(m)} <button class="mrm" data-v="${esc(m)}" title="Remove">×</button></span>`).join("");
+        + [...card._models].map((m) => `<span class="mchip" title="${esc(m)}">${esc(displayModelName(m))} <button class="mrm" data-v="${esc(m)}" title="Remove">×</button></span>`).join("");
       $$(".mrm", chipsEl).forEach((b) => b.onclick = () => { card._models.delete(b.dataset.v); renderChips(); renderSnippet(card, st); if (!opts.hidden) renderOpts(); });
     };
     const add = (v) => { v = (v || "").trim(); if (!v || v === AUTO_MODEL) return; card._models.add(v); input.value = ""; renderChips(); renderOpts(); renderSnippet(card, st); };
     const renderOpts = () => {
       const q = input.value.trim().toLowerCase();
       const avail = liveModels().filter((m) => !card._models.has(m) && m.toLowerCase().includes(q));
-      let html = avail.map((m) => `<div class="mopt" data-v="${esc(m)}">${esc(m)}</div>`).join("");
+      let html = avail.map((m) => `<div class="mopt" data-v="${esc(m)}" title="${esc(m)}">${esc(displayModelName(m))}</div>`).join("");
       const typed = input.value.trim();
       if (typed && !liveModels().some((m) => m.toLowerCase() === typed.toLowerCase()) && !card._models.has(typed)) {
         html += `<div class="mopt add" data-v="${esc(typed)}">+ Add “${esc(typed)}”</div>`;

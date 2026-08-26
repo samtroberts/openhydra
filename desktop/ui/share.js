@@ -10,6 +10,7 @@ import { store } from "./storage";
 import { totalServed, totalUsed, lifetimeServed, statModels } from "./stats";
 import { renderChart } from "./chart";
 import { fmtNum, fmtUptime, modelIcon } from "./format";
+import { displayModelName } from "./models";
 
   let sharingBusy = false;
   export async function setSharing(on) {
@@ -183,7 +184,7 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
       else status = `<span class="badge secondary">off</span>`;
       const swTitle = !running ? "Share this model when you start sharing"
         : sharedIntent ? "Sharing on the network — toggle off to stop" : "Toggle on to share this model";
-      rows.push(`<tr><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td><div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div></td></tr>`);
+      rows.push(`<tr><td>${modelIcon(m)}<b title="${esc(m)}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td><div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div></td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
     // "Previously served" — lifetime tokens on record but NOT currently detected.
@@ -193,7 +194,7 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
     if (pastCard) {
       pastCard.style.display = pastModels.length ? "" : "none";
       $("#pasttable tbody").innerHTML = pastModels.map((m) =>
-        `<tr><td>${modelIcon(m)}<b>${esc(m)}</b></td><td class="num">${fmtNum(lifetimeServed(m))}</td><td><span class="badge secondary">not on device</span></td></tr>`
+        `<tr><td>${modelIcon(m)}<b title="${esc(m)}">${esc(displayModelName(m))}</b></td><td class="num">${fmtNum(lifetimeServed(m))}</td><td><span class="badge secondary">not on device</span></td></tr>`
       ).join("");
       const tbl = $("#pasttable"), foot = pastCard.querySelector(".pager");
       if (tbl) tbl.style.display = hidePast ? "none" : "";

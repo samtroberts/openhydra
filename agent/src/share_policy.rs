@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
+use crate::adapter::normalize_engine_ref;
+
 /// How a provider decides which detected models to share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,11 +102,25 @@ impl SharePolicy {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let set: BTreeSet<String> = models.into_iter().map(Into::into).collect();
+        // Normalise here too: a legacy `settings.shared_models` may key a llama.cpp model by its
+        // absolute `-m` path, which no longer matches the clean handle the adapter now advertises.
+        let set: BTreeSet<String> =
+            models.into_iter().map(|m| normalize_engine_ref(&m.into())).collect();
         if set.is_empty() {
             Self::share_all()
         } else {
             Self { version: default_version(), mode: ShareMode::List, models: set }
+        }
+    }
+
+    /// Migrate the `models` set to clean engine handles (see [`normalize_engine_ref`]). Older policy
+    /// files — and legacy `settings.shared_models` — may key a llama.cpp model by its absolute `-m`
+    /// path (`/home/user/models/X.gguf`); the adapter now advertises the clean handle (`X`), so
+    /// without this a previously-shared model would silently stop matching and un-share until the
+    /// user re-toggled it. Idempotent for already-clean ids; a no-op in `all` mode.
+    fn normalize_models(&mut self) {
+        if self.mode == ShareMode::List {
+            self.models = self.models.iter().map(|m| normalize_engine_ref(m)).collect();
         }
     }
 
@@ -127,7 +143,12 @@ impl SharePolicy {
     /// in-memory policy, so a bad write never silently opens up or shuts down sharing).
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let mut policy: Self = serde_json::from_str(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // F5 migration: fold legacy path-keyed entries to clean handles so a model shared under an
+        // old build's absolute-path id stays shared against the now-clean advertised handle.
+        policy.normalize_models();
+        Ok(policy)
     }
 
     /// Write the policy to `path` **atomically** (temp file + rename), so a crash or a concurrent
@@ -325,6 +346,35 @@ mod tests {
         assert!(p.is_shared("qwen3.8:27b-q8_0")); // listed → shared (dotted family is opaque)
         assert!(!p.is_shared("qwen3-vl:30b")); // not listed → refused (announce + serve)
         assert!(!p.is_shared("")); // empty ref never matches a list entry
+    }
+
+    #[test]
+    fn f5_legacy_path_entry_migrates_to_clean_handle() {
+        // A policy listing a llama.cpp model by its old absolute path must match the clean handle
+        // the adapter now advertises — without a re-toggle — and must not keep the leaky path.
+        let p = SharePolicy::from_legacy_list([
+            "/home/user/models/Qwen3.5-9B-UD-Q4_K_XL.gguf".to_string(),
+            "tinyllama:latest".to_string(),
+        ]);
+        assert_eq!(p.mode, ShareMode::List);
+        assert!(p.is_shared("Qwen3.5-9B-UD-Q4_K_XL"));
+        assert!(!p.models.iter().any(|m| m.contains("/home/user")));
+        assert!(p.is_shared("tinyllama:latest")); // clean id untouched
+    }
+
+    #[test]
+    fn f5_load_migrates_path_keyed_policy_file() {
+        // A file written by an older build (path-keyed) loads as clean handles.
+        let path = std::env::temp_dir().join("oh-f5-load-migrate-test.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mode":"list","models":["/home/user/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"]}"#,
+        )
+        .unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(p.is_shared("Qwen3.5-9B-UD-Q4_K_XL"));
+        assert!(!p.is_shared("/home/user/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

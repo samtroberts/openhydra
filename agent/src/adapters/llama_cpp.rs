@@ -22,7 +22,8 @@ use serde::Deserialize;
 use openhydra_protocol::model_id::{canonical_id_from_hf, parse_hf_model_name};
 
 use crate::adapter::{
-    AdapterError, DetectedModel, EngineAdapter, HttpClient, InferenceRequest, ServeOutcome,
+    normalize_engine_ref, AdapterError, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
+    ServeOutcome,
 };
 use crate::adapters::openai::serve_chat_completions;
 
@@ -138,18 +139,33 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
         let models_json = self.http.get(&format!("{}/v1/models", self.base_url))?;
         let models: ModelsResponse =
             serde_json::from_str(&models_json).map_err(|e| AdapterError::Parse(e.to_string()))?;
-        let mut refs: Vec<String> = models
-            .data
-            .into_iter()
-            .map(|m| m.id)
-            .filter(|id| !id.trim().is_empty())
-            .collect();
+        // Advertise a clean, path-free handle — never the raw `-m` path (privacy + readability).
+        // Skip an id that cleans to empty (a pathological `"/"` or bare `".gguf"`), and drop a
+        // basename collision (two GGUFs sharing a name in different dirs) with a log rather than
+        // silently — a single-model server never hits either, they guard the rare multi-model case.
+        let mut refs: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for id in models.data.into_iter().map(|m| m.id) {
+            if id.trim().is_empty() {
+                continue;
+            }
+            let clean = normalize_engine_ref(&id);
+            if clean.is_empty() {
+                continue;
+            }
+            if !seen.insert(clean.clone()) {
+                eprintln!(
+                    "openhydra-agent: llama.cpp model '{id}' collides with already-detected '{clean}' — skipping"
+                );
+                continue;
+            }
+            refs.push(clean);
+        }
         // Fall back to the GGUF basename if /v1/models reported nothing addressable.
-        if refs.is_empty() {
-            if let Some(base) = props.model_path.rsplit(['/', '\\']).next() {
-                if !base.is_empty() {
-                    refs.push(base.to_string());
-                }
+        if refs.is_empty() && !props.model_path.is_empty() {
+            let clean = normalize_engine_ref(&props.model_path);
+            if !clean.is_empty() {
+                refs.push(clean);
             }
         }
 
@@ -245,6 +261,55 @@ mod tests {
         );
         // No recognisable quant tag → empty quant.
         assert_eq!(parse_gguf_path("model.gguf"), ("model".into(), String::new()));
+    }
+
+    #[test]
+    fn clean_engine_ref_strips_paths_and_extension() {
+        // The kastru case: an absolute path id → basename without .gguf (no home dir / username).
+        assert_eq!(
+            normalize_engine_ref("/home/kastru/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"),
+            "Qwen3.5-9B-UD-Q4_K_XL"
+        );
+        // Windows-style separator + uppercase extension.
+        assert_eq!(normalize_engine_ref(r"C:\models\Llama-3.1-8B.GGUF"), "Llama-3.1-8B");
+        // Bare filename with extension (no directory).
+        assert_eq!(normalize_engine_ref("mistral-7b-Q4_K_M.gguf"), "mistral-7b-Q4_K_M");
+        // Already-clean alias → untouched (no path chars, no .gguf).
+        assert_eq!(normalize_engine_ref("Qwen2.5-7B-Instruct-Q4_K_M"), "Qwen2.5-7B-Instruct-Q4_K_M");
+        // Ollama-style tag → untouched (the colon is not a path separator).
+        assert_eq!(normalize_engine_ref("llama3.2:1b"), "llama3.2:1b");
+        // HF-style namespaced id has a slash but is NOT a path → untouched (don't drop the org).
+        assert_eq!(normalize_engine_ref("Qwen/Qwen2.5-7B-Instruct"), "Qwen/Qwen2.5-7B-Instruct");
+        // Home-relative path → basename.
+        assert_eq!(normalize_engine_ref("~/models/phi-3-mini.gguf"), "phi-3-mini");
+        // Mixed-case extension is stripped case-insensitively (parity with the JS displayModelName).
+        assert_eq!(normalize_engine_ref("/models/Phi-3.GGuf"), "Phi-3");
+        assert_eq!(normalize_engine_ref("model.GgUf"), "model");
+        // Pathological ids that clean to empty (detect_models then skips these).
+        assert_eq!(normalize_engine_ref("/"), "");
+        assert_eq!(normalize_engine_ref(".gguf"), "");
+    }
+
+    #[test]
+    fn detect_never_advertises_a_filesystem_path() {
+        // A llama-server that reports its model id AS the launch path must not leak that path onto
+        // the network — the advertised engine_ref is the clean basename.
+        let http = MockHttp {
+            props: serde_json::json!({
+                "model_path": "/home/kastru/models/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+                "chat_template": QWEN_TEMPLATE,
+                "total_slots": 1,
+            })
+            .to_string(),
+            models: r#"{"object":"list","data":[{"id":"/home/kastru/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"}]}"#.into(),
+            ..Default::default()
+        };
+        let adapter = LlamaCppAdapter::new(DEFAULT_LLAMACPP_URL, http);
+        let models = adapter.detect_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].engine_ref, "Qwen3.5-9B-UD-Q4_K_XL");
+        assert!(!models[0].engine_ref.contains('/'), "must not advertise a path");
+        assert!(!models[0].engine_ref.contains("kastru"), "must not leak the username");
     }
 
     #[test]

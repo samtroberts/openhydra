@@ -9,7 +9,7 @@ import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
 import { toast, menu, closeMenus } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed } from "./stats";
-import { noteSeen, netModels, curModel, renderModels } from "./models";
+import { noteSeen, netModels, curModel, renderModels, displayModelName } from "./models";
 import { renderConnectors } from "./connectors";
 import { renderProviders } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
@@ -123,8 +123,13 @@ $("#theme").onclick = () => setTheme();
 $$(".drop").forEach((d) => d.onclick = (e) => {
   e.stopPropagation();
   const opts = (d.dataset.opts || "").split("|").filter(Boolean);
-  const cur = d.querySelector("span").textContent;
-  menu(d, opts.length ? opts.map((o) => ({ label: o, on: o === cur, fn: () => { d.querySelector("span").textContent = o; if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") updateEngineEndpoint(); if (d.id === "modeldrop" || d.id === "homedrop") { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) other.querySelector("span").textContent = o; } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
+  // Model dropdowns show a clean label but must route on the RAW id: store it in the span's
+  // dataset.value and read that (not the prettified text) as the current selection.
+  const isModel = d.id === "modeldrop" || d.id === "homedrop";
+  const sp = d.querySelector("span");
+  const cur = isModel ? (sp.dataset.value || sp.textContent) : sp.textContent;
+  const setSel = (el, o) => { if (isModel) { el.dataset.value = o; el.textContent = displayModelName(o); } else { el.textContent = o; } };
+  menu(d, opts.length ? opts.map((o) => ({ label: isModel ? displayModelName(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") updateEngineEndpoint(); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
 });
 
 // ── inference range sliders (wireframe verbatim) ──

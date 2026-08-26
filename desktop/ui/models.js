@@ -31,12 +31,36 @@ export function netModels() {
   const sharingLocal = state?.provider?.status?.running ? engines.flatMap((e) => e.models) : [];
   return [...new Set([...net, ...sharingLocal])].sort();
 }
-export function curModel() { const m = $("#modeldrop span").textContent; return m && m !== "—" && !/no models/i.test(m) ? m : ""; }
+// Human-readable model name. Path-addressed engines (llama.cpp) report the model as an absolute
+// path (`/home/alice/models/Qwen3.5-9B-Q4_K_M.gguf`); show the GGUF basename minus the extension so
+// the operator's home dir / OS username never appears and the row stays readable. Ollama-style tags
+// (`llama3.2:1b`) and other clean ids pass through untouched. Display-only — the raw id remains the
+// routing key everywhere it matters (see `curModel`, which reads the stored value, not the label).
+export function displayModelName(id) {
+  if (!id) return id;
+  // Only rewrite genuine filesystem paths — a GGUF file or an absolute/home/drive path. Namespaced
+  // logical ids (`openhydra/auto`, HF-style `Qwen/Qwen2.5-7B`) contain a slash but are NOT paths and
+  // must pass through unchanged.
+  const isPath = /\.gguf$/i.test(id) || /^([/~]|[A-Za-z]:[/\\])/.test(id);
+  if (isPath) {
+    const base = id.split(/[/\\]/).pop() || id;
+    return base.replace(/\.gguf$/i, "");
+  }
+  return id;
+}
+// The selected model to route on: the RAW id stored in the span's dataset, not the (prettified)
+// label. Falls back to the label for safety before the first render sets the value.
+export function curModel() { const sp = $("#modeldrop span"); const m = (sp && (sp.dataset.value || sp.textContent)) || ""; return m && m !== "—" && !/no models/i.test(m) ? m : ""; }
 export function renderModels() {
   const models = netModels(); const opts = models.join("|");
   $("#homedrop").dataset.opts = opts; $("#modeldrop").dataset.opts = opts;
-  const label = models[0] || "— no models yet";
-  for (const d of ["#homedrop", "#modeldrop"]) { const sp = $(d + " span"); const cur = sp.textContent; if (!models.includes(cur)) sp.textContent = label; }
+  for (const d of ["#homedrop", "#modeldrop"]) {
+    const sp = $(d + " span");
+    let cur = sp.dataset.value || sp.textContent;            // raw current selection
+    if (!models.includes(cur)) cur = models[0] || "";        // dropped out → first model
+    sp.dataset.value = cur;                                  // keep the raw id for routing
+    sp.textContent = cur ? displayModelName(cur) : "— no models yet"; // show the clean name
+  }
   $("#mcount").textContent = models.length; $("#homelive").textContent = models.length;
   $("#provcount") && ($("#provcount").textContent = models.length);
   $("#sbmodels").textContent = models.length + " models";

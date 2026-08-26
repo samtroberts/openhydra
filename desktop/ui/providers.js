@@ -2,7 +2,7 @@
 // counts, avg TPS + earned reputation, and a per-model expand (#11b) to the individual providers.
 import { $, $$, esc, peerShort } from "./dom";
 import { state, snap, engines } from "./state";
-import { netModels, modelIdle, seenCount } from "./models";
+import { netModels, modelIdle, seenCount, displayModelName } from "./models";
 import { repByOpenhydra, modelReputation, modelAvgTps } from "./econ";
 import { modelIcon, modelCat, repBadge } from "./format";
 
@@ -31,7 +31,7 @@ import { modelIcon, modelCat, repBadge } from "./format";
       const open = expandedProviders.has(m);
       const caret = canExpand ? `<span class="prowtog" data-m="${esc(m)}" style="cursor:pointer;display:inline-block;width:14px;color:hsl(var(--muted-foreground));transition:transform .12s;transform:rotate(${open ? 90 : 0}deg)">▸</span>` : '<span style="display:inline-block;width:14px"></span>';
       const idle = modelIdle(m);   // W2: seen but quiet → dim, don't drop (rides gossip gaps)
-      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"${idle ? ' style="opacity:.5"' : ""}><td>${caret}${modelIcon(m)}<b>${esc(m)}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : idle ? ' <span class="mut" style="font-size:10.5px">· idle</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
+      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"${idle ? ' style="opacity:.5"' : ""}><td>${caret}${modelIcon(m)}<b title="${esc(m)}">${esc(displayModelName(m))}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : idle ? ' <span class="mut" style="font-size:10.5px">· idle</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td class="num mut">—</td></tr>`;
       if (canExpand && open) {
         html += remote.map((p) => {
           const prep = byOh[p.openhydra_peer_id];

@@ -109,11 +109,14 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
             { peer_id: "12D3KooWEzegXr4qcjEW3WT", quic_direct_v4: 0, quic_direct_v6: 0, tcp_direct: 0, tcp_relay: 1, failure_streak: 0, path: "relay" },
             ...Array.from({ length: 10 }, (_, i) => ({ peer_id: "12D3KooWPeer" + String(i).padStart(2, "0") + "abcd", quic_direct_v4: i % 2, quic_direct_v6: (i + 1) % 2, tcp_direct: 0, tcp_relay: i % 3 === 0 ? 1 : 0, failure_streak: 0, path: i % 3 === 0 ? "relay" : i % 3 === 1 ? "direct" : "mixed" })),
           ],
-          known_models: ["tinyllama:latest", "llama3:latest", "qwen2.5:7b"],
+          known_models: ["tinyllama:latest", "llama3:latest", "qwen2.5:7b", "/home/user/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"],
           known_providers: [
             { model_id: "tinyllama:latest", openhydra_peer_id: "oh_asus", libp2p_peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7" },
             { model_id: "tinyllama:latest", openhydra_peer_id: "oh_mac2", libp2p_peer_id: "12D3KooWSecondTiny99xyz" },
             { model_id: "qwen2.5:7b", openhydra_peer_id: "oh_gpu3", libp2p_peer_id: "12D3KooWEzegXr4qcjEW3WT" },
+            // A path-addressed (llama.cpp) provider, to verify the display normalisation strips the
+            // path (and never leaks a home dir / username) while keeping the raw id for routing.
+            { model_id: "/home/user/models/Qwen3.5-9B-UD-Q4_K_XL.gguf", openhydra_peer_id: "oh_llamacpp", libp2p_peer_id: "12D3KooWLlamaCppPathModel99" },
           ],
           counters: { dcutr_successes: 1, dcutr_failures: 0, reversal_dials: 0, reversal_successes: 0, tier_connect_success: { direct_quic_v4: 2, relay: 1 } },
         },
