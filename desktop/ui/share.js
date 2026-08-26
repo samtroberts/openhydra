@@ -36,48 +36,75 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
   let hideInactive = store.get("oh_hideinactive", false);
   const engineFor = (m) => { for (const e of engines) if (e.models.includes(m)) return e.label; return null; };
 
-  // ── per-model share allowlist (Share view toggles) ──
-  // settings.shared_models empty ⇒ share ALL detected models (the default). Non-empty ⇒ only those.
-  // A per-model toggle edits this list; the provider announces AND serves only shared models (the
-  // gate is enforced agent-side). The list is read at provider start, so a change applies on the
-  // next Sharing restart — we don't auto-restart a running provider mid-serve.
+  // ── per-model share policy (Share view toggles) ──
+  // The intended policy lives in ~/.openhydra/share-policy.json (mode "all" | "list"). The running
+  // provider HOT-RELOADS it, so a toggle applies without a restart. `snap.share` carries the agent's
+  // live view — mode + intended list + the REAL announced set — which we render from; when the
+  // provider is stopped we seed the intended state from `read_share_policy`. New models default OFF
+  // in "list" mode (they must be explicitly shared); the "Share everything" switch sets "all".
+  let policy = null;                    // { mode: "all"|"list", models: Set<string> } — intended
+  let policyLoading = false, savingPolicy = false;
   function shareActiveModels() { return [...new Set(engines.flatMap((e) => e.models))]; }
-  function isModelShared(m) { const s = state?.settings?.shared_models || []; return s.length === 0 || s.includes(m); }
-  async function saveSharedModels(next) {
-    const settings = Object.assign({}, state?.settings || {}, { shared_models: next });
-    if (state?.settings) state.settings.shared_models = next; // optimistic local update
-    try { await call("save_settings", { settings }); } catch (e) { toast(`Save failed: ${e}`); return; }
-    toast(state?.provider?.status?.running ? "Saved — restart Sharing to apply" : "Saved");
-    renderShare();
+  function policyFromSnap() {
+    const s = snap?.share;
+    return s?.share_mode ? { mode: s.share_mode, models: new Set(s.shared_models || []) } : null;
+  }
+  // Resolve the intended policy: while a save is in flight keep the optimistic local copy; otherwise
+  // trust the agent's live view when running (ground truth), and lazily load the file when stopped.
+  function ensurePolicy() {
+    const running = !!state?.provider?.status?.running;
+    if (running && !savingPolicy) { const p = policyFromSnap(); if (p) { policy = p; return; } }
+    if (policy) return;
+    const p = policyFromSnap(); if (p) { policy = p; return; }
+    if (!policyLoading) {
+      policyLoading = true;
+      call("read_share_policy")
+        .then((r) => { policy = { mode: r.mode, models: new Set(r.models || []) }; })
+        .catch(() => { policy = { mode: "all", models: new Set() }; })
+        .finally(() => { policyLoading = false; renderShare(); });
+    }
+    if (!policy) policy = { mode: "all", models: new Set() }; // provisional until the load resolves
+  }
+  function isModelShared(m) { ensurePolicy(); return policy.mode === "all" || policy.models.has(m); }
+  async function savePolicy(mode, models) {
+    policy = { mode, models: new Set(models) };        // optimistic — the row reflects intent at once
+    savingPolicy = true; renderShare();
+    try { await call("save_share_policy", { policy: { version: 1, mode, models } }); }
+    catch (e) { toast(`Save failed: ${e}`); }
+    finally { savingPolicy = false; }
+    emit("refresh");   // pull the fresh /status/share; a "pending" row clears once the announce lands
   }
   async function toggleShareModel(m) {
-    const all = shareActiveModels();
+    ensurePolicy();
+    const wasShared = policy.mode === "all" || policy.models.has(m);
     const running = !!state?.provider?.status?.running;
-    // The switch means "serving this model right now" = sharing is on AND m is in the share set.
-    const servingNow = running && isModelShared(m);
-    if (servingNow) {
-      // Turning a served model OFF. If it's the LAST one still served, the intent is "share
-      // nothing" — which the allowlist can't encode (empty = share all), so stop sharing entirely.
-      const othersServed = all.filter((x) => x !== m && isModelShared(x)).length;
-      if (othersServed === 0) { await setSharing(false); return; }
-      // Otherwise just narrow the allowlist (applies on the next Sharing restart).
-      let list = (state?.settings?.shared_models || []).slice();
-      if (list.length === 0) list = all.slice();               // materialize "share all" first
-      list = list.filter((x) => x !== m);
-      if (all.length && all.every((x) => list.includes(x))) list = []; // all ⇒ default
-      await saveSharedModels(list);
-    } else {
-      // Turning a model ON.
-      let list = (state?.settings?.shared_models || []).slice();
-      if (!running && list.length === 0) list = [m];           // from a stopped/default state, share just this one
-      else if (!list.includes(m)) list.push(m);
-      if (all.length && all.every((x) => list.includes(x))) list = []; // all ⇒ default
-      await saveSharedModels(list);
-      if (!running) await setSharing(true);                    // begin serving
+    let mode = policy.mode, models = new Set(policy.models);
+    if (wasShared) {
+      // Turning OFF. From "all", materialize the current active set first, then drop this one — so
+      // the others stay shared. "Share nothing" is now a valid state (list + empty), so we never
+      // have to stop the whole provider just because the last model was de-selected.
+      if (mode === "all") { mode = "list"; models = new Set(shareActiveModels().filter((x) => x !== m)); }
+      else models.delete(m);
+    } else if (mode === "list") {
+      models.add(m);   // (in "all" mode it's already shared)
     }
+    await savePolicy(mode, [...models]);
+    if (!running && !wasShared) await setSharing(true); // toggled a model on from a stopped node → begin serving
+  }
+  // "Share everything" master switch: ON ⇒ mode "all" (new models auto-share); OFF ⇒ freeze to the
+  // current active set as an explicit "list" (nothing stops, but future models won't auto-share).
+  async function toggleShareAll() {
+    ensurePolicy();
+    const running = !!state?.provider?.status?.running;
+    if (policy.mode === "all") { await savePolicy("list", shareActiveModels()); }
+    else { await savePolicy("all", []); if (!running) await setSharing(true); }
   }
   export function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
+    ensurePolicy();
+    // The REAL advertised set from /status/share (falls back to the log-parsed count pre-M2 agents).
+    const announcedSet = new Set(snap?.share?.announced_models || []);
+    const announcedCount = snap?.share ? announcedSet.size : (running ? (p.announced ?? 0) : 0);
     const head = $("#v-share .row .ctitle").parentElement;
     head.querySelector(".badge").innerHTML = running ? '<span class="dot ok"></span>provider running' : '<span class="dot"></span>not sharing';
     head.querySelector(".badge").className = "badge " + (running ? "ok" : "secondary"); head.querySelector(".badge").style.marginLeft = "8px";
@@ -85,7 +112,7 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
     const stb = $("#sharetoggle");
     if (stb) { stb.textContent = running ? "Stop sharing" : "Start sharing"; stb.className = "btn sm " + (running ? "outline" : "brand"); stb.style.marginLeft = "12px"; }
     const up = snap?.uptime_secs != null ? ` · up ${fmtUptime(snap.uptime_secs)}` : "";
-    head.querySelector(".mut").textContent = `${running ? (p.announced ?? 0) : 0} models announced · gateway :16527${up}`;
+    head.querySelector(".mut").textContent = `${running ? announcedCount : 0} models announced · gateway :16527${up}`;
     const k = $$("#v-share .g4 .kpi .val");
     // #7: durable lifetime totals (survive restart; `used` counts external clients too).
     const served = totalServed(), used = totalUsed();
@@ -118,17 +145,35 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
       const tokens = lifetimeServed(m) || pm.tokens || 0;
       const reqs = pm.requests ?? "—";
       const tps = pm.avg_native_tps ? Math.round(pm.avg_native_tps) : "—";
-      const status = isActive ? `<span class="badge ${running ? "ok" : "secondary"}">${running ? "live" : "ready"}</span>` : `<span class="badge secondary">inactive</span>`;
-      const ann = isActive ? `<div class="switch ${running && isModelShared(m) ? "on" : ""}" data-share="${esc(m)}" title="${running ? "Serve this model on the network" : "Start sharing to serve this model"}"></div>` : `<span class="mut" style="font-size:11px">—</span>`;
+      // Real state, driven by the agent's announced set (not detection/optimism): a shared model is
+      // "live" once actually announced, "pending" in the brief window before the announce lands.
+      const sharedIntent = isActive && isModelShared(m);
+      let status;
+      if (!isActive) status = `<span class="badge secondary">inactive</span>`;
+      else if (!running) status = `<span class="badge secondary">ready</span>`;
+      else if (sharedIntent && announcedSet.has(m)) status = `<span class="badge ok">live</span>`;
+      else if (sharedIntent) status = `<span class="badge warn">pending</span>`;
+      else status = `<span class="badge secondary">off</span>`;
+      const swTitle = !running ? "Share this model when you start sharing"
+        : sharedIntent ? "Sharing on the network — toggle off to stop" : "Toggle on to share this model";
+      const ann = isActive ? `<div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div>` : `<span class="mut" style="font-size:11px">—</span>`;
       rows.push(`<tr${isActive ? "" : ' style="opacity:.5"'}><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td>${ann}</td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
     const hb = $("#hideinactive");
     if (hb) { const anyInactive = allModels.some((m) => !active.has(m)); hb.style.display = anyInactive ? "" : "none"; hb.classList.toggle("outline", hideInactive); hb.classList.toggle("ghost", !hideInactive); hb.textContent = hideInactive ? "Show inactive" : "Hide inactive"; hb.onclick = () => { hideInactive = !hideInactive; store.set("oh_hideinactive", hideInactive); renderShare(); }; }
     renderChart("#sharechart", "share");   // #10 timeline
-    $("#v-share .badge.ok, #v-share .badge").parentElement && ($$("#v-share .card .row .badge")[0]);
-    const ann = $("#v-share .card .row .badge.ok") || $("#servetable").closest(".card").querySelector(".badge");
-    if (ann) { ann.textContent = `${running ? engines.reduce((n, e) => n + e.models.length, 0) : 0} announced`; ann.className = "badge " + (running && engines.length ? "ok" : "secondary"); }
+    // The card-header pill = the REAL announced count (was mislabeled: it counted detected models).
+    const annBadge = $("#servetable").closest(".card").querySelector(".row .badge");
+    if (annBadge) { annBadge.textContent = `${running ? announcedCount : 0} announced`; annBadge.className = "badge " + (running && announcedCount ? "ok" : "secondary"); }
+    // "Share everything" master switch — shown whenever there are models to share.
+    const saw = $("#shareallwrap"), sasw = $("#shareallsw");
+    if (saw && sasw) {
+      const hasActive = shareActiveModels().length > 0;
+      saw.style.display = hasActive ? "inline-flex" : "none";
+      sasw.classList.toggle("on", policy?.mode === "all");
+      sasw.onclick = () => toggleShareAll();
+    }
     $$("#servetable [data-share]").forEach((sw) => sw.onclick = () => toggleShareModel(sw.dataset.share));
     // incoming strip
     // Honest "Incoming" strip: real cumulative serve activity while sharing; hidden when idle.

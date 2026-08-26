@@ -14,6 +14,8 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "start_gateway") { mk.gateway = true; return null; }
     if (cmd === "stop_gateway") { mk.gateway = false; return null; }
     if (cmd === "save_settings") { if (args?.settings) mk.sharedModels = args.settings.shared_models || []; return null; }
+    if (cmd === "save_share_policy") { mk.sharePolicy = args?.policy || { version: 1, mode: "all", models: [] }; return null; }
+    if (cmd === "read_share_policy") return mk.sharePolicy || { version: 1, mode: "all", models: [] };
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "connector_status") {
       const c = (o) => ({ declared_models: [], ...o, connected: !!(mk.connected && mk.connected[o.key]) });
@@ -129,6 +131,12 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
           credit: [{ libp2p_peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7", balance: 5123.4, rate_cap: 1.0 }, { libp2p_peer_id: "12D3KooWEzegXr4qcjEW3WT", balance: 4880.1 }],
           avg_reputation: 65.3, total_credit: 10003.5,
         },
+        share: (() => {
+          const active = ["tinyllama:latest", "llama3.2:1b"]; // the mock ollama's detected models
+          const pol = mk.sharePolicy || { mode: "all", models: [] };
+          const shared = pol.mode === "all" ? active : (pol.models || []).filter((m) => active.includes(m));
+          return { share_mode: pol.mode, shared_models: pol.mode === "all" ? [] : (pol.models || []), announced_models: mk.provider ? shared : [] };
+        })(),
       };
     }
     if (cmd === "chat_completion") {
