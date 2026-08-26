@@ -311,10 +311,52 @@ fn share_policy_path() -> PathBuf {
 /// run after upgrade: an empty list historically meant "share everything" (mode `all`); a non-empty
 /// list becomes an explicit `list`. Existing behavior is preserved across the upgrade. Best-effort —
 /// if the write fails, the agent falls back to share-all with a warning rather than sharing nothing.
-fn ensure_share_policy(settings: &Settings) -> PathBuf {
+/// Ensure a **valid** share-policy file exists before the provider reads it:
+/// - absent → migrate from the legacy list (first run after upgrade);
+/// - present-but-**corrupt** → self-heal: back the bad file up to `.corrupt.bak`, regenerate a safe
+///   default (share-nothing — fail-closed, never over-shares), and raise `reset_flag` so the UI can
+///   tell the user their selection was reset;
+/// - present-and-valid → untouched.
+///
+/// Mirrors the corruption handling `load_settings` already does for `desktop.json`.
+fn ensure_valid_share_policy(
+    settings: &Settings,
+    reset_flag: &std::sync::atomic::AtomicBool,
+) -> PathBuf {
     let path = share_policy_path();
-    migrate_share_policy_if_absent(&path, &settings.shared_models);
+    ensure_valid_share_policy_at(&path, &settings.shared_models, reset_flag);
     path
+}
+
+/// Path-parametrized core of [`ensure_valid_share_policy`] (testable without `~/.openhydra`): sets
+/// `reset_flag` true iff a corrupt file was healed.
+fn ensure_valid_share_policy_at(
+    path: &std::path::Path,
+    legacy: &[String],
+    reset_flag: &std::sync::atomic::AtomicBool,
+) {
+    if !path.exists() {
+        migrate_share_policy_if_absent(path, legacy);
+    } else if openhydra_agent::SharePolicy::load(path).is_err() {
+        heal_corrupt_share_policy(path);
+        reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Back a corrupt policy file up to `.corrupt.bak` (best-effort, for debugging) and overwrite it with
+/// a safe **share-nothing** default. A sharing control never widens on corruption.
+fn heal_corrupt_share_policy(path: &std::path::Path) {
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        let _ = std::fs::write(path.with_extension("json.corrupt.bak"), &raw);
+    }
+    let safe = openhydra_agent::SharePolicy::share_nothing();
+    match safe.write_atomic(path) {
+        Ok(()) => eprintln!(
+            "openhydra: share-policy file {} was corrupt → backed up to .corrupt.bak and reset to share-nothing",
+            path.display()
+        ),
+        Err(e) => eprintln!("openhydra: failed to reset corrupt share policy at {}: {e}", path.display()),
+    }
 }
 
 /// Write a policy file at `path` migrated from a legacy `--share-models` list, but only if the file
@@ -331,16 +373,15 @@ fn migrate_share_policy_if_absent(path: &std::path::Path, legacy: &[String]) {
     }
 }
 
-/// The current share policy from disk, migrating from `settings.shared_models` if the file is absent.
-fn load_share_policy(settings: &Settings) -> openhydra_agent::SharePolicy {
-    let path = share_policy_path();
-    openhydra_agent::SharePolicy::load(&path)
-        .unwrap_or_else(|_| openhydra_agent::SharePolicy::from_legacy_list(settings.shared_models.clone()))
-}
-
 /// Keep the legacy `settings.shared_models` mirror in sync with the policy (one-release
 /// belt-and-suspenders: if the user downgrades, the old desktop still reads this and passes
 /// `--share-models`). `all` ⇒ empty list (legacy "share everything"); `list` ⇒ the explicit models.
+///
+/// KNOWN LIMITATION (M3): the legacy 2-state encoding cannot express "share nothing" — both `all`
+/// and `list []` map to the empty list, which an old build reads as "share everything". In-version
+/// this is harmless (the policy FILE is authoritative and self-heals); the only exposure is a
+/// *downgrade* to a pre-share-policy build while in the share-nothing state, which is documented, not
+/// engineered around (the old format simply can't represent it).
 fn mirror_policy_into_settings(policy: &openhydra_agent::SharePolicy) -> Vec<String> {
     match policy.mode {
         openhydra_agent::ShareMode::All => Vec::new(),
@@ -590,6 +631,10 @@ struct AppState {
     /// Set true when this launch auto-resumed sharing — drives the one-time "Resuming your shared
     /// models…" notice (with a "Don't resume" opt-out) in the UI. Transient, not persisted.
     resumed_on_launch: std::sync::atomic::AtomicBool,
+    /// Set true by the share-policy self-heal (a corrupt file was backed up + reset to a safe
+    /// default). Surfaced once via `get_state` (read-and-clear) so the UI can toast the user that
+    /// their sharing selection was reset. Transient, not persisted.
+    share_policy_reset: std::sync::atomic::AtomicBool,
 }
 
 // ── Log ingestion: strip ANSI, ring-buffer, parse status out of known lines ──
@@ -773,6 +818,9 @@ struct FullState {
     gateway_url: String,
     /// True on the launch that auto-resumed sharing — the UI shows a one-time "Resuming…" notice.
     resumed_on_launch: bool,
+    /// One-shot: the share policy was corrupt and self-healed to a safe default this poll — the UI
+    /// toasts the user once that their sharing selection was reset. Read-and-cleared here.
+    share_policy_reset: bool,
 }
 
 fn view(role: &Arc<Mutex<Role>>) -> RoleView {
@@ -795,6 +843,9 @@ fn get_state(state: tauri::State<'_, AppState>) -> FullState {
         agent_found: agent_binary().is_some(),
         gateway_url,
         resumed_on_launch: state.resumed_on_launch.load(std::sync::atomic::Ordering::Relaxed),
+        // Read-and-clear (swap) so the reset toast fires exactly once per heal, unlike the
+        // session-sticky `resumed_on_launch` load above.
+        share_policy_reset: state.share_policy_reset.swap(false, std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -822,8 +873,9 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     sub.push(openhydra_dir().join("provider-ledger.redb").to_string_lossy().into_owned());
     // Per-model share policy: a hot-reloaded file, so toggling a model in the UI applies to the
     // running provider without a restart (see `save_share_policy`). Migrates the legacy
-    // `settings.shared_models` into the file on first run.
-    let policy_path = ensure_share_policy(&settings);
+    // `settings.shared_models` on first run, and self-heals a corrupt file (→ share-nothing) before
+    // launch so the provider never starts against a bad policy.
+    let policy_path = ensure_valid_share_policy(&settings, &state.share_policy_reset);
     sub.push("--share-policy-file".into());
     sub.push(policy_path.to_string_lossy().into_owned());
     spawn_role(
@@ -846,11 +898,27 @@ fn save_share_policy(
     state: tauri::State<'_, AppState>,
     policy: openhydra_agent::SharePolicy,
 ) -> Result<(), String> {
-    let dir = openhydra_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    persist_share_policy(&state, &policy)
+}
+
+/// Reset sharing preferences to a clean **share-nothing** default (the "Reset sharing preferences"
+/// control, and the safe target for self-heal parity). Non-destructive: clears the selection; the
+/// user re-picks, or one-taps "Share everything". Hot-reloads — no restart.
+#[tauri::command]
+fn reset_share_policy(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    persist_share_policy(&state, &openhydra_agent::SharePolicy::share_nothing())
+}
+
+/// Write the policy file atomically and keep the legacy `settings.shared_models` mirror in sync.
+/// The running provider hot-reloads the file within ~1s (no restart).
+fn persist_share_policy(
+    state: &tauri::State<'_, AppState>,
+    policy: &openhydra_agent::SharePolicy,
+) -> Result<(), String> {
+    std::fs::create_dir_all(openhydra_dir()).map_err(|e| e.to_string())?;
     policy.write_atomic(&share_policy_path()).map_err(|e| e.to_string())?;
     if let Ok(mut s) = state.settings.lock() {
-        let mirror = mirror_policy_into_settings(&policy);
+        let mirror = mirror_policy_into_settings(policy);
         if s.shared_models != mirror {
             s.shared_models = mirror;
             let _ = store_settings(&s);
@@ -867,7 +935,11 @@ fn read_share_policy(
     state: tauri::State<'_, AppState>,
 ) -> Result<openhydra_agent::SharePolicy, String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
-    Ok(load_share_policy(&settings))
+    // Heal-if-corrupt (backs up + resets + flags) then read the now-valid file; fail-closed to
+    // share-nothing if it somehow still doesn't parse.
+    let path = ensure_valid_share_policy(&settings, &state.share_policy_reset);
+    Ok(openhydra_agent::SharePolicy::load(&path)
+        .unwrap_or_else(|_| openhydra_agent::SharePolicy::share_nothing()))
 }
 
 /// #7: the libp2p PeerId of this desktop's own provider identity. The gateway is told this so
@@ -1490,6 +1562,10 @@ fn save_settings(state: tauri::State<'_, AppState>, mut settings: Settings) -> R
     // `resume_on_launch` IS surfaced by the settings toggle now, so its payload value is honoured.
     settings.sharing_enabled = cur.sharing_enabled;
     settings.schema_version = cur.schema_version;
+    // `shared_models` is the policy MIRROR now, owned by the Share view (save_share_policy /
+    // reset_share_policy), not the settings form. Preserve it so a stale echoed payload from the
+    // form can't clobber the freshly-synced mirror (L4). The form no longer sends it either.
+    settings.shared_models = cur.shared_models.clone();
     store_settings(&settings)?;
     *cur = settings;
     Ok(())
@@ -1628,6 +1704,7 @@ fn main() {
             gateway: Arc::new(Mutex::new(Role::new(&GATEWAY_PID))),
             settings: Mutex::new(load_settings()),
             resumed_on_launch: std::sync::atomic::AtomicBool::new(false),
+            share_policy_reset: std::sync::atomic::AtomicBool::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -1637,6 +1714,7 @@ fn main() {
             stop_gateway,
             save_share_policy,
             read_share_policy,
+            reset_share_policy,
             detect_engines_now,
             system_info,
             install_plan,
@@ -1905,5 +1983,54 @@ mod tests {
         let mut m = mirror_policy_into_settings(&SharePolicy::share_list(["b", "a"]));
         m.sort();
         assert_eq!(m, vec!["a", "b"]);
+    }
+
+    // ── R2: self-heal + reset ──
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn heal_backs_up_corrupt_and_resets_to_share_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, b"{ corrupt not json").unwrap();
+        heal_corrupt_share_policy(&path);
+        // the bad bytes are preserved for debugging...
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.corrupt.bak")).unwrap(), "{ corrupt not json");
+        // ...and the live file is now a valid, fail-closed share-nothing policy.
+        let p = SharePolicy::load(&path).unwrap();
+        assert_eq!(p.mode, ShareMode::List);
+        assert!(!p.is_shared("tinyllama:latest"));
+    }
+
+    #[test]
+    fn ensure_valid_heals_corrupt_and_raises_the_reset_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, b"garbage").unwrap();
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &[], &flag);
+        assert!(flag.load(Ordering::Relaxed), "reset flag raised on heal");
+        assert!(!SharePolicy::load(&path).unwrap().is_shared("x")); // healed to share-nothing
+    }
+
+    #[test]
+    fn ensure_valid_leaves_a_good_file_untouched_and_flag_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        SharePolicy::share_list(["keep-me"]).write_atomic(&path).unwrap();
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &["ignored".into()], &flag);
+        assert!(!flag.load(Ordering::Relaxed), "no reset on a valid file");
+        assert!(SharePolicy::load(&path).unwrap().is_shared("keep-me")); // untouched
+    }
+
+    #[test]
+    fn ensure_valid_migrates_when_absent_without_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &["m1".into()], &flag);
+        assert!(!flag.load(Ordering::Relaxed), "migration is not a reset");
+        assert!(SharePolicy::load(&path).unwrap().is_shared("m1"));
     }
 }
