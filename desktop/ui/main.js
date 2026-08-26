@@ -352,10 +352,17 @@ $$(".save").forEach((b) => b.onclick = async () => {
   let gwPort = parseInt((netp.querySelector('#gwport')?.textContent || "").trim(), 10);
   if (!Number.isInteger(gwPort) || gwPort < 1024 || gwPort > 65535) gwPort = state?.settings?.gateway_port || 16527;
   const bootstraps = (netp.querySelector('#bootstraps')?.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean);
-  const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $("#engineautostartsw").classList.contains("on"), resume_on_launch: $("#resumelaunchsw") ? $("#resumelaunchsw").classList.contains("on") : true, search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName, shared_models: state?.settings?.shared_models || [] };
+  // `shared_models` is intentionally NOT sent: it's the policy mirror, owned by the Share view
+  // (save_share_policy / reset_share_policy). The backend preserves it (L4) regardless.
+  const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $("#engineautostartsw").classList.contains("on"), resume_on_launch: $("#resumelaunchsw") ? $("#resumelaunchsw").classList.contains("on") : true, search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
   try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
 });
 $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
+// Reset sharing preferences → clean share-nothing default (hot-reloads; no restart). Non-destructive.
+$("#resetsharebtn")?.addEventListener("click", async () => {
+  try { await call("reset_share_policy"); toast("Sharing preferences reset — nothing is shared until you choose."); await refreshStatus(); }
+  catch (e) { toast(`Reset failed: ${e}`); }
+});
 $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.toggleAttribute("data-adv", on); $("#advsw").classList.toggle("on", on); store.set("oh_adv", on); if (!on && activeView === "peers") go("providers"); };
 // #4: verbose-logs toggle (persist on Save) + Send-logs export
 $("#verboselogsw") && ($("#verboselogsw").onclick = () => $("#verboselogsw").classList.toggle("on"));
@@ -440,7 +447,10 @@ $("#obreplay").onclick = () => coachShow(0);   // replay from Settings
 
 // ── polling ──
 async function refresh() {
-  try { setState(await call("get_state")); } catch {}
+  let st;
+  try { st = await call("get_state"); setState(st); } catch {}
+  // One-shot: the share policy was corrupt and self-healed to a safe default (backend read-and-clear).
+  if (st?.share_policy_reset) toast("Your sharing preferences couldn't be read and were reset — pick which models to share, or use “Share everything”.");
   // Informed opt-out: while this launch's auto-resume is flagged, keep a non-blocking notice up.
   if (state?.resumed_on_launch) ensureResumeNotice();
   renderStatusbar();
@@ -448,18 +458,35 @@ async function refresh() {
   if (activeView === "peers") renderLogs();
 }
 
-// Non-blocking "Resuming your shared models…" banner (informed opt-out). RE-ASSERTED each refresh so a
+// Non-blocking "Resuming sharing of N models…" banner (informed opt-out). RE-ASSERTED each refresh so a
 // first-run / after-update coachmark DOM rebuild can't kill it (that's exactly the update case where
 // this matters). Clears on "Don't resume", ×, or after a short show-window.
-let resumeNoticeDismissed = false, resumeNoticeDeadline = 0;
+let resumeNoticeDismissed = false, resumeNoticeDeadline = 0, resumeLabel = null;
+// B1: name the count in the resume toast — "all models" for share-all, "N model(s)" for a list.
+function shareCountLabel(pol) {
+  if (!pol || !pol.mode) return null;
+  if (pol.mode === "all") return "all models";
+  const n = (pol.models || []).length;
+  return `${n} model${n === 1 ? "" : "s"}`;
+}
+function resumeText() { return resumeLabel ? `Resuming sharing of ${resumeLabel}…` : "Resuming your shared models…"; }
 function ensureResumeNotice() {
   if (resumeNoticeDismissed) return;
   if (!resumeNoticeDeadline) resumeNoticeDeadline = Date.now() + 18000;
   if (Date.now() > resumeNoticeDeadline) { resumeNoticeDismissed = true; document.getElementById("resumenotice")?.remove(); return; }
+  // B1: fetch the resumed policy once to name the count; update the banner in place when it lands.
+  if (resumeLabel === null) {
+    resumeLabel = "";
+    call("read_share_policy").then((r) => {
+      resumeLabel = shareCountLabel(r) || "";
+      const s = document.querySelector("#resumenotice .rn-text");
+      if (s) s.textContent = resumeText();
+    }).catch(() => {});
+  }
   if (document.getElementById("resumenotice")) return;
   const el = document.createElement("div");
   el.id = "resumenotice"; el.className = "resumenotice";
-  el.innerHTML = `<span class="rn-dot">●</span><span>Resuming your shared models…</span>`
+  el.innerHTML = `<span class="rn-dot">●</span><span class="rn-text">${resumeText()}</span>`
     + `<button class="btn ghost sm rn-stop">Don't resume</button><button class="rn-x" title="Dismiss">×</button>`;
   document.body.appendChild(el);
   const dismiss = () => { resumeNoticeDismissed = true; el.remove(); };
@@ -471,6 +498,7 @@ on("refresh-engines", refreshEngines);   // installer.js fires this after an ins
 on("nav", (v) => go(v));                  // feature modules request navigation via the bus
 on("refresh", () => refresh());           // …and a full state refresh
 async function refreshStatus() { try { setSnap(await call("status_snapshot")); } catch { setSnap(null); } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
+on("refresh-status", () => refreshStatus());  // share.js nudges the /status/share poll after a policy save
 $$(".enginst, #refreshEngines").forEach(() => {});
 
 // ── boot ──

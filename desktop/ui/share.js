@@ -44,18 +44,38 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
   // in "list" mode (they must be explicitly shared); the "Share everything" switch sets "all".
   let policy = null;                    // { mode: "all"|"list", models: Set<string> } — intended
   let policyLoading = false, savingPolicy = false;
+  // M4: after a save, keep the optimistic policy authoritative until the agent's live view actually
+  // reflects it — otherwise a stale snapshot poll would revert the just-toggled switch (bounce). A
+  // timeout releases the hold so a permanently-diverging agent can't freeze the UI.
+  let pendingSig = null, pendingSince = 0;
+  const RECONCILE_TIMEOUT_MS = 10000;
+  const policySig = (pol) => pol ? `${pol.mode}|${[...pol.models].sort().join(",")}` : "";
   function shareActiveModels() { return [...new Set(engines.flatMap((e) => e.models))]; }
   function policyFromSnap() {
     const s = snap?.share;
     return s?.share_mode ? { mode: s.share_mode, models: new Set(s.shared_models || []) } : null;
   }
-  // Resolve the intended policy: while a save is in flight keep the optimistic local copy; otherwise
-  // trust the agent's live view when running (ground truth), and lazily load the file when stopped.
+  // Resolve the intended policy. When running, the agent's live view (`snap.share`) is ground truth —
+  // EXCEPT while a save is pending and the view hasn't caught up yet: then hold the optimistic copy.
+  // When stopped, lazily load the file.
   function ensurePolicy() {
     const running = !!state?.provider?.status?.running;
-    if (running && !savingPolicy) { const p = policyFromSnap(); if (p) { policy = p; return; } }
+    if (running && !savingPolicy) {
+      const p = policyFromSnap();
+      if (p) {
+        if (pendingSig !== null) {
+          if (policySig(p) === pendingSig || Date.now() - pendingSince > RECONCILE_TIMEOUT_MS) {
+            pendingSig = null; policy = p;      // confirmed (or timed out) → adopt ground truth
+          }
+          // else: keep the local optimistic `policy` — don't reseed to a stale snapshot
+        } else {
+          policy = p;                            // normal reconcile (also reflects external edits)
+        }
+        return;
+      }
+    }
     if (policy) return;
-    const p = policyFromSnap(); if (p) { policy = p; return; }
+    const p2 = policyFromSnap(); if (p2) { policy = p2; return; }
     if (!policyLoading) {
       policyLoading = true;
       call("read_share_policy")
@@ -67,12 +87,15 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
   }
   function isModelShared(m) { ensurePolicy(); return policy.mode === "all" || policy.models.has(m); }
   async function savePolicy(mode, models) {
-    policy = { mode, models: new Set(models) };        // optimistic — the row reflects intent at once
+    const prev = policy;                                    // L2: rollback target on failure
+    policy = { mode, models: new Set(models) };             // optimistic — the row reflects intent at once
+    pendingSig = policySig(policy); pendingSince = Date.now();
     savingPolicy = true; renderShare();
     try { await call("save_share_policy", { policy: { version: 1, mode, models } }); }
-    catch (e) { toast(`Save failed: ${e}`); }
+    catch (e) { policy = prev; pendingSig = null; toast(`Save failed: ${e}`); }   // L2: roll back
     finally { savingPolicy = false; }
-    emit("refresh");   // pull the fresh /status/share; a "pending" row clears once the announce lands
+    emit("refresh-status");   // pull the fresh /status/share; the sticky hold clears once it matches
+    renderShare();
   }
   async function toggleShareModel(m) {
     ensurePolicy();
@@ -103,8 +126,9 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
     ensurePolicy();
     // The REAL advertised set from /status/share (falls back to the log-parsed count pre-M2 agents).
+    const hasShareView = !!snap?.share;   // L5: a pre-M2 agent has no per-model announced set
     const announcedSet = new Set(snap?.share?.announced_models || []);
-    const announcedCount = snap?.share ? announcedSet.size : (running ? (p.announced ?? 0) : 0);
+    const announcedCount = hasShareView ? announcedSet.size : (running ? (p.announced ?? 0) : 0);
     const head = $("#v-share .row .ctitle").parentElement;
     head.querySelector(".badge").innerHTML = running ? '<span class="dot ok"></span>provider running' : '<span class="dot"></span>not sharing';
     head.querySelector(".badge").className = "badge " + (running ? "ok" : "secondary"); head.querySelector(".badge").style.marginLeft = "8px";
@@ -151,7 +175,7 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
       let status;
       if (!isActive) status = `<span class="badge secondary">inactive</span>`;
       else if (!running) status = `<span class="badge secondary">ready</span>`;
-      else if (sharedIntent && announcedSet.has(m)) status = `<span class="badge ok">live</span>`;
+      else if (sharedIntent && (announcedSet.has(m) || !hasShareView)) status = `<span class="badge ok">live</span>`;
       else if (sharedIntent) status = `<span class="badge warn">pending</span>`;
       else status = `<span class="badge secondary">off</span>`;
       const swTitle = !running ? "Share this model when you start sharing"

@@ -16,6 +16,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "save_settings") { if (args?.settings) mk.sharedModels = args.settings.shared_models || []; return null; }
     if (cmd === "save_share_policy") { mk.sharePolicy = args?.policy || { version: 1, mode: "all", models: [] }; return null; }
     if (cmd === "read_share_policy") return mk.sharePolicy || { version: 1, mode: "all", models: [] };
+    if (cmd === "reset_share_policy") { mk.sharePolicy = { version: 1, mode: "list", models: [] }; return null; }
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "connector_status") {
       const c = (o) => ({ declared_models: [], ...o, connected: !!(mk.connected && mk.connected[o.key]) });
@@ -48,6 +49,8 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
       settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, schema_version: 2 },
       agent_found: true, gateway_url: "http://127.0.0.1:16527/v1", resumed_on_launch: !!mk.resumedOnLaunch,
+      // One-shot reset flag: set localStorage oh_mock_policy_reset=1 to simulate a self-heal toast once.
+      share_policy_reset: (() => { if (localStorage.getItem("oh_mock_policy_reset") === "1") { localStorage.removeItem("oh_mock_policy_reset"); return true; } return false; })(),
     };
     if (cmd === "system_info") return { os: "macos", arch: "aarch64", cpu: "Apple M1", ram_bytes: 8589934592, gpus: [{ name: "Apple M1 (7-core GPU)", vram_bytes: 8589934592, unified: true }] };
     if (cmd === "detect_engines_now") return (mk.runningEngines || mk.installedEngines || ["ollama"]).map((l) => ({ label: l, url: "http://127.0.0.1:11434", models: l === "ollama" ? ["tinyllama:latest", "llama3.2:1b"] : [] }));
