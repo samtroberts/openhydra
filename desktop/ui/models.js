@@ -18,18 +18,30 @@ export function noteSeen() {
   const c = {}; for (const p of provs) c[p.model_id] = (c[p.model_id] || 0) + 1;
   for (const m in c) seenCount[m] = c[m];
 }
+// The local engine's models that are actually SHARED on the network — NOT every model the engine
+// has. A model toggled off in Share is neither announced NOR servable (the provider's serve gate
+// rejects an un-shared model_ref), so it must not appear in the network/browse views as "yours".
+// Gate on the real announced set (`snap.share.announced_models`, correct in both `all` and `list`
+// modes). Falls back to all engine models only when the agent exposes no share view (pre-0.3.16).
+export function localSharedModels() {
+  if (!state?.provider?.status?.running) return [];
+  const all = engines.flatMap((e) => e.models);
+  const sv = snap?.share;
+  if (!sv) return all; // old agent without /status/share → legacy behavior
+  const announced = new Set(sv.announced_models || []);
+  return all.filter((m) => announced.has(m));
+}
 // A model still listed only because of stickiness (seen, but not within the last IDLE_MS) — shown
-// dimmed/"idle", an honest "unconfirmed this instant" signal. Locally-served models are always live.
+// dimmed/"idle", an honest "unconfirmed this instant" signal. Locally-SHARED models are always live.
 export function modelIdle(m) {
-  if (state?.provider?.status?.running && engines.some((e) => e.models.includes(m))) return false;
+  if (localSharedModels().includes(m)) return false;
   const t = seenModels[m];
   return t != null && (Date.now() - t) > IDLE_MS;
 }
 export function netModels() {
   const now = Date.now();
   const net = Object.keys(seenModels).filter((m) => now - seenModels[m] < STICKY_MS);
-  const sharingLocal = state?.provider?.status?.running ? engines.flatMap((e) => e.models) : [];
-  return [...new Set([...net, ...sharingLocal])].sort();
+  return [...new Set([...net, ...localSharedModels()])].sort();
 }
 // Human-readable model name. Path-addressed engines (llama.cpp) report the model as an absolute
 // path (`/home/alice/models/Qwen3.5-9B-Q4_K_M.gguf`); show the GGUF basename minus the extension so

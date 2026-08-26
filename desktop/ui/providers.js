@@ -1,15 +1,15 @@
 // Network › Models view: the announced-provider table grouped by model, with sticky provider
 // counts, avg TPS + earned reputation, and a per-model expand (#11b) to the individual providers.
 import { $, $$, esc, peerShort } from "./dom";
-import { state, snap, engines } from "./state";
-import { netModels, modelIdle, seenCount, displayModelName } from "./models";
+import { snap } from "./state";
+import { netModels, modelIdle, seenCount, displayModelName, localSharedModels } from "./models";
 import { repByOpenhydra, modelReputation, modelAvgTps } from "./econ";
 import { modelIcon, modelCat, repBadge } from "./format";
 
   const expandedProviders = new Set();
   export function renderProviders() {
     const models = netModels();
-    const local = new Set(state?.provider?.status?.running ? engines.flatMap((e) => e.models) : []);
+    const local = new Set(localSharedModels());   // only models actually shared count as "· your machine"
     const strip = $("#v-providers .card.pad");
     strip.querySelectorAll("b")[0].textContent = (snap?.transfers?.tokens_served ?? 0);  // tokens
     strip.querySelectorAll("b")[1].textContent = models.length;                          // models
