@@ -529,6 +529,11 @@ pub struct Provider<A: EngineAdapter> {
     /// sharing in the desktop without restarting the node. Both the announce filter and the serve
     /// gate consult it, so a de-selected model is genuinely off (not merely hidden).
     policy: PolicyWatcher,
+    /// Serializes `announce_models` so the poll thread and the filesystem-watcher thread never
+    /// interleave two announce passes (which could publish a stale status view or refresh a
+    /// just-removed model's DHT record). The poll loop yields via `try_lock` so it never blocks the
+    /// serve loop; the watcher/startup path takes it blocking.
+    announce_lock: Mutex<()>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -559,6 +564,7 @@ impl<A: EngineAdapter> Provider<A> {
             })),
             streams: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
+            announce_lock: Mutex::new(()),
         }
     }
 
@@ -967,7 +973,29 @@ impl<A: EngineAdapter> Provider<A> {
 
     /// Detect the engine's models and announce a record for each. Returns how many were
     /// announced.
+    /// Detect + announce the shared models and publish the status view. Serialized against a
+    /// concurrent watcher/poll announce (blocking) — used by the startup announce and the
+    /// filesystem-watcher thread (blocking on the poll thread's serve loop is fine).
     pub fn announce_models(&self) -> Result<usize, AdapterError> {
+        let _serialize = self.announce_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.announce_models_inner()
+    }
+
+    /// The poll loop's announce: yields to an in-flight announce (the watcher's) via `try_lock`
+    /// instead of blocking the serve loop. `None` = skipped because an announce is already running
+    /// (it's publishing the fresh policy, so this tick has nothing to add).
+    fn announce_models_polled(&self) -> Option<Result<usize, AdapterError>> {
+        match self.announce_lock.try_lock() {
+            Ok(_g) => Some(self.announce_models_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                let _g = e.into_inner();
+                Some(self.announce_models_inner())
+            }
+        }
+    }
+
+    fn announce_models_inner(&self) -> Result<usize, AdapterError> {
         let models = self.adapter.detect_models()?;
         // Snapshot the policy ONCE so the loop filter and the published view see one consistent
         // policy (also the source for `shared_models` below).
@@ -1051,10 +1079,14 @@ impl<A: EngineAdapter> Provider<A> {
         eprintln!("openhydra-agent: watching {} for share-policy changes (event-driven reload)", path.display());
         for res in rx {
             match res {
-                // React only to events touching OUR file (not siblings like the ledger). `reload_if_
-                // changed` is atomic (reload_lock) + mtime-deduped, so a coincident poll-loop reload
-                // won't double-announce.
-                Ok(event) if event.paths.iter().any(|p| p == &path) => {
+                // React only to events touching OUR file (not siblings like the ledger). Match by
+                // FILE NAME, not full path: we watch a single dir, and FSEvents (macOS) may report a
+                // canonicalized/firmlinked path (/System/Volumes/Data/…, /private/var vs /var) that
+                // wouldn't byte-equal the configured path — a file-name match is immune to that and
+                // still excludes the `.json.tmp` write. `announce_models` is serialized (announce_lock)
+                // and `reload_if_changed` is atomic (reload_lock) + mtime-deduped, so a coincident
+                // poll-loop reload/announce can't double-announce.
+                Ok(event) if event.paths.iter().any(|p| p.file_name() == path.file_name()) => {
                     if self.policy.reload_if_changed() {
                         eprintln!("openhydra-agent: share policy changed (watcher) — re-announcing");
                         if let Err(e) = self.announce_models() {
@@ -1161,7 +1193,8 @@ impl<A: EngineAdapter> Provider<A> {
             // FALLBACK hot-reload (the `watch_policy_file` thread is the primary, event-driven path):
             // if the watcher missed an event or couldn't start, this catches a policy change within one
             // poll slice (<1s). Cheap — one `stat` per poll, parse+swap only on an actual change; the
-            // reload_lock + mtime dedup make it safe to run alongside the watcher (no double-announce).
+            // reload_lock + mtime dedup prevent a double *reload*; announce_lock (via the polled
+            // variant below) prevents the watcher's and this loop's announce passes from interleaving.
             let policy_changed = self.policy.reload_if_changed();
             if policy_changed {
                 eprintln!("openhydra-agent: share policy changed — re-announcing");
@@ -1176,9 +1209,12 @@ impl<A: EngineAdapter> Provider<A> {
                 );
             }
             if policy_changed || network_changed || last_announce.elapsed() >= reannounce_every {
-                match self.announce_models() {
-                    Ok(n) => eprintln!("openhydra-agent: re-announced {n} model(s)"),
-                    Err(e) => eprintln!("openhydra-agent: re-announce failed: {e}"),
+                // Non-blocking: if the watcher thread is mid-announce, skip this tick (it's already
+                // publishing the fresh policy) rather than stall the serve loop on its blocking `detect`.
+                match self.announce_models_polled() {
+                    Some(Ok(n)) => eprintln!("openhydra-agent: re-announced {n} model(s)"),
+                    Some(Err(e)) => eprintln!("openhydra-agent: re-announce failed: {e}"),
+                    None => {} // an announce is already in flight (watcher) — nothing to add
                 }
                 last_announce = std::time::Instant::now();
             }

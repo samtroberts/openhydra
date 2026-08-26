@@ -33,7 +33,6 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
     for (let i = 0; i < 24; i++) { await new Promise((r) => setTimeout(r, 300)); try { if (await call("gateway_health")) break; } catch {} }
     emit("refresh"); return true;
   }
-  let hideInactive = store.get("oh_hideinactive", false);
   let hidePast = store.get("oh_hidepast", false);   // B4: collapse the "previously served" table
   const engineFor = (m) => { for (const e of engines) if (e.models.includes(m)) return e.label; return null; };
 
@@ -202,8 +201,6 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
       const pt = $("#pasttoggle");
       if (pt) { pt.textContent = hidePast ? "Show" : "Hide"; pt.onclick = () => { hidePast = !hidePast; store.set("oh_hidepast", hidePast); renderShare(); }; }
     }
-    // The old inline "Hide inactive" button is superseded by the section split.
-    const hb = $("#hideinactive"); if (hb) hb.style.display = "none";
     renderChart("#sharechart", "share");   // #10 timeline
     // The card-header pill = the REAL announced count (was mislabeled: it counted detected models).
     const annBadge = $("#servetable").closest(".card").querySelector(".row .badge");
