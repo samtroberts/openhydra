@@ -40,6 +40,10 @@ openhydra-agent = { path = "../../agent" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Isolated temp dirs for filesystem-touching tests (share-policy migration).
+tempfile = "3"
+
 [profile.release]
 strip = true
 opt-level = "s"

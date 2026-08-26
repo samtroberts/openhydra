@@ -3919,6 +3919,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
 ]
 
 [[package]]

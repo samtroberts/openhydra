@@ -169,9 +169,10 @@ struct Settings {
     verbose_logs: bool,
     /// #9: user-editable device name shown to peers / in the UI. Empty → derive from the OS.
     device_name: String,
-    /// Per-model share allowlist (engine handles). Empty → share every model the engine exposes
-    /// (the default). Non-empty → pass each as `--share-models` so the provider announces and
-    /// serves only these. Restart Sharing to apply a change.
+    /// Legacy per-model share allowlist. Superseded by `~/.openhydra/share-policy.json` (the
+    /// hot-reloaded source of truth — see `save_share_policy`); kept as a one-release **mirror** so a
+    /// downgrade still reads it. Migrated into the policy file on first run (empty → share-all,
+    /// non-empty → that list). Not read by the running provider anymore.
     #[serde(default)]
     shared_models: Vec<String>,
     /// Persisted sharing INTENT — was the provider role running when we last toggled it? The provider
@@ -262,8 +263,10 @@ fn load_settings() -> Settings {
 fn store_settings(s: &Settings) -> Result<(), String> {
     let dir = openhydra_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(), serde_json::to_string_pretty(s).unwrap())
-        .map_err(|e| e.to_string())
+    // Atomic (temp + rename) like the sessions/policy files: a crash mid-write can never truncate
+    // desktop.json — the reader always sees the previous or the new complete file, never a partial.
+    let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
+    write_atomic(&settings_path(), &json)
 }
 
 // ── #1: chat sessions persisted to disk (WebView localStorage isn't durable across restarts
@@ -294,6 +297,55 @@ fn write_atomic(path: &std::path::Path, data: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+// ── Share policy (~/.openhydra/share-policy.json) — the single source of truth for which models
+// the provider shares. The agent hot-reloads this file (see `openhydra_agent::SharePolicy`); the
+// desktop writes it on toggle so a change applies to the running provider with no restart. ──
+
+fn share_policy_path() -> PathBuf {
+    openhydra_dir().join("share-policy.json")
+}
+
+/// Ensure the share-policy file exists, migrating from the legacy `settings.shared_models` on first
+/// run after upgrade: an empty list historically meant "share everything" (mode `all`); a non-empty
+/// list becomes an explicit `list`. Existing behavior is preserved across the upgrade. Best-effort —
+/// if the write fails, the agent falls back to share-all with a warning rather than sharing nothing.
+fn ensure_share_policy(settings: &Settings) -> PathBuf {
+    let path = share_policy_path();
+    migrate_share_policy_if_absent(&path, &settings.shared_models);
+    path
+}
+
+/// Write a policy file at `path` migrated from a legacy `--share-models` list, but only if the file
+/// doesn't already exist (so an existing policy — the source of truth — is never clobbered). Empty
+/// list → `all`; non-empty → `list`. Best-effort: a write error logs and leaves the file absent,
+/// which the agent handles by sharing-all with a warning.
+fn migrate_share_policy_if_absent(path: &std::path::Path, legacy: &[String]) {
+    if path.exists() {
+        return;
+    }
+    let policy = openhydra_agent::SharePolicy::from_legacy_list(legacy.to_vec());
+    if let Err(e) = policy.write_atomic(path) {
+        eprintln!("openhydra: could not write initial share policy to {}: {e}", path.display());
+    }
+}
+
+/// The current share policy from disk, migrating from `settings.shared_models` if the file is absent.
+fn load_share_policy(settings: &Settings) -> openhydra_agent::SharePolicy {
+    let path = share_policy_path();
+    openhydra_agent::SharePolicy::load(&path)
+        .unwrap_or_else(|_| openhydra_agent::SharePolicy::from_legacy_list(settings.shared_models.clone()))
+}
+
+/// Keep the legacy `settings.shared_models` mirror in sync with the policy (one-release
+/// belt-and-suspenders: if the user downgrades, the old desktop still reads this and passes
+/// `--share-models`). `all` ⇒ empty list (legacy "share everything"); `list` ⇒ the explicit models.
+fn mirror_policy_into_settings(policy: &openhydra_agent::SharePolicy) -> Vec<String> {
+    match policy.mode {
+        openhydra_agent::ShareMode::All => Vec::new(),
+        openhydra_agent::ShareMode::List => policy.models.iter().cloned().collect(),
+    }
 }
 
 // ── #7/#10: lifetime served/consumed model stats + daily buckets, persisted to disk. The
@@ -768,14 +820,12 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // single-writer per process, so the gateway role uses a separate file (gateway-ledger.redb).
     sub.push("--db".into());
     sub.push(openhydra_dir().join("provider-ledger.redb").to_string_lossy().into_owned());
-    // Per-model share allowlist: pass each selected model as its own --share-models flag. Empty
-    // list ⇒ no flag ⇒ the agent shares every detected model (the default).
-    for model in &settings.shared_models {
-        if !model.trim().is_empty() {
-            sub.push("--share-models".into());
-            sub.push(model.clone());
-        }
-    }
+    // Per-model share policy: a hot-reloaded file, so toggling a model in the UI applies to the
+    // running provider without a restart (see `save_share_policy`). Migrates the legacy
+    // `settings.shared_models` into the file on first run.
+    let policy_path = ensure_share_policy(&settings);
+    sub.push("--share-policy-file".into());
+    sub.push(policy_path.to_string_lossy().into_owned());
     spawn_role(
         &state.provider,
         "desktop-provider.key",
@@ -786,6 +836,38 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     )?;
     set_sharing_enabled(&state, true); // remember intent so a restart resumes sharing
     Ok(())
+}
+
+/// Persist the share policy (called by the UI when the user toggles a model or the master switch).
+/// Written atomically; the running provider **hot-reloads it within ~1s — no restart**. Also mirrors
+/// into `settings.shared_models` for one-release downgrade safety.
+#[tauri::command]
+fn save_share_policy(
+    state: tauri::State<'_, AppState>,
+    policy: openhydra_agent::SharePolicy,
+) -> Result<(), String> {
+    let dir = openhydra_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    policy.write_atomic(&share_policy_path()).map_err(|e| e.to_string())?;
+    if let Ok(mut s) = state.settings.lock() {
+        let mirror = mirror_policy_into_settings(&policy);
+        if s.shared_models != mirror {
+            s.shared_models = mirror;
+            let _ = store_settings(&s);
+        }
+    }
+    Ok(())
+}
+
+/// The current share policy (migrated from the legacy `settings.shared_models` when the file is
+/// absent). The UI renders each model's *intended* on/off state from this; the *real* announced set
+/// comes from `/status/share` in the status snapshot.
+#[tauri::command]
+fn read_share_policy(
+    state: tauri::State<'_, AppState>,
+) -> Result<openhydra_agent::SharePolicy, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    Ok(load_share_policy(&settings))
 }
 
 /// #7: the libp2p PeerId of this desktop's own provider identity. The gateway is told this so
@@ -868,6 +950,13 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
     Ok(tauri::async_runtime::spawn_blocking(move || {
         let base_port = if prov { PROVIDER_STATUS_PORT } else { GATEWAY_STATUS_PORT };
         let mut base = fetch_status(base_port, "/status")?;
+        // Attach the provider's REAL share view (policy mode + intended list + actually-announced
+        // set) so the UI renders each model's true state instead of guessing from detection.
+        if prov {
+            if let Some(share) = fetch_status(PROVIDER_STATUS_PORT, "/status/share") {
+                base["share"] = share;
+            }
+        }
         if prov && gw {
             // Provider base carries the served side (peers, served counters, `served` ledger
             // rows); the gateway process holds the consumed side + `used` ledger rows. Pull the
@@ -1546,6 +1635,8 @@ fn main() {
             start_gateway,
             stop_provider,
             stop_gateway,
+            save_share_policy,
+            read_share_policy,
             detect_engines_now,
             system_info,
             install_plan,
@@ -1771,5 +1862,48 @@ mod tests {
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(back.sharing_enabled, "sharing intent survives a save/load");
         assert_eq!(back.shared_models, vec!["llama3.1:8b"]);
+    }
+
+    // ── M3: share-policy migration + mirror ──
+    use openhydra_agent::{ShareMode, SharePolicy};
+
+    #[test]
+    fn migrate_empty_legacy_list_writes_share_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        migrate_share_policy_if_absent(&path, &[]);
+        assert_eq!(SharePolicy::load(&path).unwrap().mode, ShareMode::All);
+    }
+
+    #[test]
+    fn migrate_non_empty_legacy_list_writes_explicit_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        migrate_share_policy_if_absent(&path, &["qwen3.8:27b-q8_0".into(), "tinyllama:latest".into()]);
+        let p = SharePolicy::load(&path).unwrap();
+        assert_eq!(p.mode, ShareMode::List);
+        assert!(p.is_shared("qwen3.8:27b-q8_0") && p.is_shared("tinyllama:latest"));
+    }
+
+    #[test]
+    fn migration_never_clobbers_an_existing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        // A user's real policy already on disk...
+        SharePolicy::share_list(["only-this"]).write_atomic(&path).unwrap();
+        // ...must survive a migration attempt driven by a stale legacy list.
+        migrate_share_policy_if_absent(&path, &["something-else".into()]);
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(p.is_shared("only-this") && !p.is_shared("something-else"));
+    }
+
+    #[test]
+    fn mirror_reflects_policy_mode() {
+        // `all` mirrors to the legacy "empty = share everything" sentinel...
+        assert!(mirror_policy_into_settings(&SharePolicy::share_all()).is_empty());
+        // ...and `list` mirrors to the explicit models (so a downgrade still shares the same set).
+        let mut m = mirror_policy_into_settings(&SharePolicy::share_list(["b", "a"]));
+        m.sort();
+        assert_eq!(m, vec!["a", "b"]);
     }
 }
