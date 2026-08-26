@@ -19,7 +19,7 @@ import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
 import { renderSettings, updateEngineEndpoint } from "./settings";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
-import { on } from "./bus";
+import { on, emit } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
 import {
   state, snap, engines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
@@ -360,8 +360,13 @@ $$(".save").forEach((b) => b.onclick = async () => {
 $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
 // Reset sharing preferences → clean share-nothing default (hot-reloads; no restart). Non-destructive.
 $("#resetsharebtn")?.addEventListener("click", async () => {
-  try { await call("reset_share_policy"); toast("Sharing preferences reset — nothing is shared until you choose."); await refreshStatus(); }
-  catch (e) { toast(`Reset failed: ${e}`); }
+  try {
+    await call("reset_share_policy");
+    emit("share-policy-reset");   // invalidate the Share view's cached policy (works even when stopped)
+    toast("Sharing preferences reset — nothing is shared until you choose.");
+    await refreshStatus();
+    if (activeView === "share") renderView();
+  } catch (e) { toast(`Reset failed: ${e}`); }
 });
 $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.toggleAttribute("data-adv", on); $("#advsw").classList.toggle("on", on); store.set("oh_adv", on); if (!on && activeView === "peers") go("providers"); };
 // #4: verbose-logs toggle (persist on Save) + Send-logs export
@@ -467,6 +472,7 @@ function shareCountLabel(pol) {
   if (!pol || !pol.mode) return null;
   if (pol.mode === "all") return "all models";
   const n = (pol.models || []).length;
+  if (n === 0) return null;   // share-nothing → fall back to generic text (no "Resuming sharing of 0 models")
   return `${n} model${n === 1 ? "" : "s"}`;
 }
 function resumeText() { return resumeLabel ? `Resuming sharing of ${resumeLabel}…` : "Resuming your shared models…"; }

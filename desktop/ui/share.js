@@ -5,7 +5,7 @@ import { $, $$, esc } from "./dom";
 import { state, snap, engines } from "./state";
 import { call } from "./bridge";
 import { toast } from "./chrome";
-import { emit } from "./bus";
+import { emit, on } from "./bus";
 import { store } from "./storage";
 import { totalServed, totalUsed, lifetimeServed, statModels } from "./stats";
 import { renderChart } from "./chart";
@@ -50,6 +50,10 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
   let pendingSig = null, pendingSince = 0;
   const RECONCILE_TIMEOUT_MS = 10000;
   const policySig = (pol) => pol ? `${pol.mode}|${[...pol.models].sort().join(",")}` : "";
+  // The policy file was changed OUTSIDE this view (the Settings "Reset" button): drop the cached
+  // policy + any pending hold so the next render re-reads it. Without this, a reset while the
+  // provider is STOPPED would leave the toggles showing the pre-reset selection (review F1/F2).
+  on("share-policy-reset", () => { policy = null; pendingSig = null; });
   function shareActiveModels() { return [...new Set(engines.flatMap((e) => e.models))]; }
   function policyFromSnap() {
     const s = snap?.share;

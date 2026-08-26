@@ -337,26 +337,44 @@ fn ensure_valid_share_policy_at(
 ) {
     if !path.exists() {
         migrate_share_policy_if_absent(path, legacy);
-    } else if openhydra_agent::SharePolicy::load(path).is_err() {
-        heal_corrupt_share_policy(path);
-        reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    match openhydra_agent::SharePolicy::load(path) {
+        Ok(_) => {} // valid → untouched
+        // Genuinely CORRUPT (JSON parse error) → self-heal + notify, but only flag the reset if the
+        // heal actually landed (a failed write must not toast-storm on every poll).
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            if heal_corrupt_share_policy(path).is_ok() {
+                reset_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // A *transient* IO error (permissions, a file briefly locked by AV/backup/indexer, or a
+        // just-deleted file racing `exists()`): the file may be a perfectly valid policy we simply
+        // can't read this instant. Do NOT overwrite it or raise the reset flag — leave it, and let
+        // the agent's `from_file` / `read_share_policy` fail closed in memory. (Closes review F1/F2/F4.)
+        Err(e) => eprintln!(
+            "openhydra: share-policy file {} temporarily unreadable ({e}) — leaving it untouched",
+            path.display()
+        ),
     }
 }
 
 /// Back a corrupt policy file up to `.corrupt.bak` (best-effort, for debugging) and overwrite it with
 /// a safe **share-nothing** default. A sharing control never widens on corruption.
-fn heal_corrupt_share_policy(path: &std::path::Path) {
+/// Back a **corrupt** policy file up to `.corrupt.bak` and overwrite it with a safe share-nothing
+/// default. Returns `Err` if the safe write fails (so the caller can avoid falsely flagging a reset).
+fn heal_corrupt_share_policy(path: &std::path::Path) -> Result<(), String> {
     if let Ok(raw) = std::fs::read_to_string(path) {
         let _ = std::fs::write(path.with_extension("json.corrupt.bak"), &raw);
     }
-    let safe = openhydra_agent::SharePolicy::share_nothing();
-    match safe.write_atomic(path) {
-        Ok(()) => eprintln!(
-            "openhydra: share-policy file {} was corrupt → backed up to .corrupt.bak and reset to share-nothing",
-            path.display()
-        ),
-        Err(e) => eprintln!("openhydra: failed to reset corrupt share policy at {}: {e}", path.display()),
-    }
+    openhydra_agent::SharePolicy::share_nothing()
+        .write_atomic(path)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "openhydra: share-policy file {} was corrupt → backed up to .corrupt.bak and reset to share-nothing",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Write a policy file at `path` migrated from a legacy `--share-models` list, but only if the file
@@ -1993,7 +2011,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("share-policy.json");
         std::fs::write(&path, b"{ corrupt not json").unwrap();
-        heal_corrupt_share_policy(&path);
+        heal_corrupt_share_policy(&path).unwrap();
         // the bad bytes are preserved for debugging...
         assert_eq!(std::fs::read_to_string(path.with_extension("json.corrupt.bak")).unwrap(), "{ corrupt not json");
         // ...and the live file is now a valid, fail-closed share-nothing policy.
@@ -2022,6 +2040,19 @@ mod tests {
         ensure_valid_share_policy_at(&path, &["ignored".into()], &flag);
         assert!(!flag.load(Ordering::Relaxed), "no reset on a valid file");
         assert!(SharePolicy::load(&path).unwrap().is_shared("keep-me")); // untouched
+    }
+
+    #[test]
+    fn ensure_valid_leaves_a_transiently_unreadable_file_untouched() {
+        // A path that exists but yields a NON-InvalidData IO error on read (here: a directory) must
+        // NOT be healed/overwritten or flagged — it may be a valid file we just can't read now. (F1/F2)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::create_dir(&path).unwrap(); // exists() == true, but load() errors non-InvalidData
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &[], &flag);
+        assert!(!flag.load(Ordering::Relaxed), "transient IO error must not raise the reset flag");
+        assert!(path.is_dir(), "the path must be left untouched, not overwritten");
     }
 
     #[test]
