@@ -19,12 +19,14 @@ ignore = [
     "RUSTSEC-2026-0104", # rustls-webpki 0.101 CRL-parse panic — old rustls transitive; fix = drop 0.101
     "RUSTSEC-2026-0098", # rustls-webpki 0.101 name-constraint incorrectly accepted — old rustls transitive; fix = drop 0.101
     "RUSTSEC-2026-0099", # rustls-webpki 0.101 wildcard name-constraint — old rustls transitive; fix = drop 0.101
+    "RUSTSEC-2026-0258", # h2 0.3 unbounded empty DATA frames DoS — via igd UPnP's hyper 0.14 CLIENT (HTTP/1.1 to the LAN router; not an h2 server accepting untrusted peers, so the server-side DoS doesn't apply); fix = igd-next→hyper 1.x (needs libp2p uplift)
     # ---- unmaintained / unsound (informational) ----
     "RUSTSEC-2024-0384", # instant unmaintained (transitive)
     "RUSTSEC-2024-0436", # paste unmaintained (transitive proc-macro)
     "RUSTSEC-2025-0010", # ring <0.17 unmaintained (see RUSTSEC-2025-0009)
     "RUSTSEC-2026-0190", # anyhow Error::downcast_mut unsoundness (transitive)
     "RUSTSEC-2026-0002", # lru IterMut Stacked-Borrows unsoundness (transitive)
+    "RUSTSEC-2026-0253", # lru LruCache::pop() panic-safety use-after-free (transitive; same lru as -0002)
     "RUSTSEC-2026-0186", # memmap2 unchecked pointer-offset unsoundness (transitive)
     "RUSTSEC-2024-0408", # pprof from_raw_parts unsoundness (dev/profiling only)
 ]
