@@ -73,6 +73,12 @@ impl SharePolicy {
         Self { version: default_version(), mode: ShareMode::All, models: BTreeSet::new() }
     }
 
+    /// Share **no** models (mode `list`, empty). The fail-closed state: what a corrupt policy or a
+    /// poisoned lock resolves to, so a sharing control never silently *widens* to share-all.
+    pub fn share_nothing() -> Self {
+        Self { version: default_version(), mode: ShareMode::List, models: BTreeSet::new() }
+    }
+
     /// Share exactly the given engine handles. Duplicates collapse; order is irrelevant.
     pub fn share_list<I, S>(models: I) -> Self
     where
@@ -106,10 +112,13 @@ impl SharePolicy {
     /// as `ServeRequest.model_ref`) is shared under this policy. This is the single decision both
     /// the announce filter and the serve gate consult.
     pub fn is_shared(&self, engine_ref: &str) -> bool {
+        // An empty `engine_ref` is never a real model handle → never shared, in either mode.
+        if engine_ref.is_empty() {
+            return false;
+        }
         match self.mode {
             ShareMode::All => true,
-            // An empty `engine_ref` must never accidentally match a list entry.
-            ShareMode::List => !engine_ref.is_empty() && self.models.contains(engine_ref),
+            ShareMode::List => self.models.contains(engine_ref),
         }
     }
 
@@ -185,9 +194,15 @@ impl PolicyWatcher {
     /// back to share-everything with a warning (so a first-run/parse hiccup never silently shares
     /// nothing — the desktop writes a valid file before launch in the normal flow).
     pub fn from_file(path: PathBuf) -> Self {
+        // Stat BEFORE load (M2): the recorded mtime must never be *newer* than the content we read.
+        // If a write lands between the stat and the load, we record the older mtime and `reload_if_
+        // changed` catches the new content on the next poll — vs stat-after-load, which could record
+        // the new mtime against old content and never reload it.
+        let mtime = file_mtime(&path);
         let policy = match SharePolicy::load(&path) {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Absent on first run (before the desktop writes it) → share-all default.
                 eprintln!(
                     "openhydra-agent: share-policy file {} not found — sharing all detected models until it is written",
                     path.display()
@@ -195,14 +210,16 @@ impl PolicyWatcher {
                 SharePolicy::share_all()
             }
             Err(e) => {
+                // Corrupt (M1): fail CLOSED. A restrictive policy must never silently widen to
+                // share-all on a bad read — share nothing until it's fixed. The desktop self-heals
+                // the file + notifies; this is the agent-side floor for CLI / post-heal corruption.
                 eprintln!(
-                    "openhydra-agent: share-policy file {} unreadable ({e}) — sharing all detected models until it is fixed",
+                    "openhydra-agent: share-policy file {} unreadable ({e}) — sharing NOTHING until it is fixed (fail-closed)",
                     path.display()
                 );
-                SharePolicy::share_all()
+                SharePolicy::share_nothing()
             }
         };
-        let mtime = file_mtime(&path);
         Self { policy: RwLock::new(policy), path: Some(path), last_mtime: Mutex::new(mtime) }
     }
 
@@ -214,7 +231,9 @@ impl PolicyWatcher {
 
     /// A clone of the current policy (for the status API).
     pub fn snapshot(&self) -> SharePolicy {
-        self.policy.read().map(|p| p.clone()).unwrap_or_default()
+        // Fail CLOSED on a poisoned lock (share-nothing), consistent with `is_shared` — never report
+        // share-all from a broken lock (which `unwrap_or_default()` would, since the default is All).
+        self.policy.read().map(|p| p.clone()).unwrap_or_else(|_| SharePolicy::share_nothing())
     }
 
     /// Re-read the file if its mtime changed, swapping the in-memory policy. Returns `true` only
@@ -227,7 +246,9 @@ impl PolicyWatcher {
     pub fn reload_if_changed(&self) -> bool {
         let Some(path) = self.path.as_ref() else { return false };
         let current = file_mtime(path);
-        if *self.last_mtime.lock().unwrap() == current {
+        // Recover a poisoned mtime lock rather than panic (it only ever guards a trivial value, so
+        // poison is practically unreachable — but this keeps the poll thread alive if it ever isn't).
+        if *self.last_mtime.lock().unwrap_or_else(|e| e.into_inner()) == current {
             return false;
         }
         match SharePolicy::load(path) {
@@ -235,11 +256,11 @@ impl PolicyWatcher {
                 if let Ok(mut guard) = self.policy.write() {
                     *guard = policy;
                 }
-                *self.last_mtime.lock().unwrap() = current;
+                *self.last_mtime.lock().unwrap_or_else(|e| e.into_inner()) = current;
                 true
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                *self.last_mtime.lock().unwrap() = current; // record absence; keep last good policy
+                *self.last_mtime.lock().unwrap_or_else(|e| e.into_inner()) = current; // record absence; keep last good policy
                 eprintln!(
                     "openhydra-agent: share-policy file {} removed — keeping the last policy",
                     path.display()
@@ -247,7 +268,11 @@ impl PolicyWatcher {
                 false
             }
             Err(e) => {
-                // Do NOT update the recorded mtime → the next poll retries once the write settles.
+                // Record this mtime too (L1): a persistently-malformed file must not be re-read +
+                // re-parsed + re-logged on every poll slice (500ms, and once per inbound request).
+                // The previous policy is kept; a later *good* write bumps the mtime and is picked up
+                // (safe because the desktop writes atomically — a reader never sees a partial file).
+                *self.last_mtime.lock().unwrap_or_else(|e| e.into_inner()) = current;
                 eprintln!(
                     "openhydra-agent: share-policy file {} unreadable ({e}) — keeping the last policy",
                     path.display()
@@ -267,9 +292,17 @@ mod tests {
         let p = SharePolicy::share_all();
         assert!(p.is_shared("tinyllama:latest"));
         assert!(p.is_shared("qwen3.8:27b-q8_0"));
-        // Even the empty ref is "shared" under All — the announce loop only ever passes real
-        // detected handles, and the serve gate is additionally bounded by what the engine serves.
-        assert!(p.is_shared(""));
+        // An empty ref is never a real model handle → never shared, even under All.
+        assert!(!p.is_shared(""));
+    }
+
+    #[test]
+    fn share_nothing_shares_nothing() {
+        let p = SharePolicy::share_nothing();
+        assert_eq!(p.mode, ShareMode::List);
+        assert!(p.models.is_empty());
+        assert!(!p.is_shared("tinyllama:latest"));
+        assert!(!p.is_shared(""));
     }
 
     #[test]
@@ -371,7 +404,19 @@ mod tests {
     fn from_file_missing_falls_back_to_share_all() {
         let dir = tempfile::tempdir().unwrap();
         let w = PolicyWatcher::from_file(dir.path().join("absent.json"));
-        assert!(w.is_shared("anything:at-all")); // share-all fallback, never share-nothing
+        assert!(w.is_shared("anything:at-all")); // absent (first run) → share-all
+    }
+
+    #[test]
+    fn from_file_corrupt_fails_closed_to_share_nothing() {
+        // M1: a *corrupt* (not merely missing) policy must NOT widen a restrictive config to
+        // share-all. It fails closed to share-nothing until the file is fixed/healed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+        let w = PolicyWatcher::from_file(path);
+        assert!(!w.is_shared("tinyllama:latest"));
+        assert!(!w.is_shared("anything:at-all"));
     }
 
     #[test]
@@ -401,8 +446,11 @@ mod tests {
         std::fs::write(&path, b"{ half-written not json").unwrap(); // a partial/garbage write
         assert!(!w.reload_if_changed(), "malformed → no swap");
         assert!(w.is_shared("a"), "previous policy retained on a bad write");
+        // L1: a second call on the SAME malformed file short-circuits (mtime recorded) → no retry.
+        assert!(!w.reload_if_changed(), "unchanged malformed file → not re-processed");
+        assert!(w.is_shared("a"));
 
-        // The mtime was deliberately NOT recorded, so a subsequent good write is still picked up.
+        // A later *good* write bumps the mtime and IS picked up (recovery after the bad write).
         tick();
         SharePolicy::share_list(["b"]).write_atomic(&path).unwrap();
         assert!(w.reload_if_changed(), "recovers after the file settles");

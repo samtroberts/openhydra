@@ -969,11 +969,15 @@ impl<A: EngineAdapter> Provider<A> {
     /// announced.
     pub fn announce_models(&self) -> Result<usize, AdapterError> {
         let models = self.adapter.detect_models()?;
+        // Snapshot the policy ONCE so the loop filter and the published view see one consistent
+        // policy (also the source for `shared_models` below).
+        let policy = self.policy.snapshot();
         let mut announced: Vec<String> = Vec::new();
+        let mut outcome: Result<(), AdapterError> = Ok(());
         for model in &models {
             // Per-model share policy: skip models the operator hasn't opted to share. The serve
             // path enforces the same gate, so this is discovery hygiene, not the security boundary.
-            if !self.model_shared(&model.engine_ref) {
+            if !policy.is_shared(&model.engine_ref) {
                 continue;
             }
             let record = build_peer_record(
@@ -984,24 +988,26 @@ impl<A: EngineAdapter> Provider<A> {
                 &self.host,
                 self.port,
             );
-            self.net
-                .announce(record)
-                .map_err(|e| AdapterError::Http(format!("announce: {e}")))?;
+            if let Err(e) = self.net.announce(record) {
+                outcome = Err(AdapterError::Http(format!("announce: {e}")));
+                break;
+            }
             announced.push(model.engine_ref.clone());
         }
-        // Publish the real advertised set + the current policy for the status API (the UI reads
-        // this, not an optimistic guess). Only reached on a fully-successful pass — a mid-pass
-        // announce error returns above with the previous view intact.
+        // Publish the status view for the UI (L6): the `shared_models` = the loaded policy's *intent*
+        // (independent of whether the network announce succeeded), and `announced_models` = the subset
+        // actually announced this pass — published even on a mid-loop announce error, so the UI can
+        // reconcile the toggle and honestly show an un-announceable model as "pending" rather than
+        // bouncing. Returns the announce error (if any) after publishing.
         let count = announced.len();
         if let Some(stats) = &self.stats {
-            let policy = self.policy.snapshot();
             stats.publish_share(crate::share_policy::ShareStatusView {
                 share_mode: policy.mode,
-                shared_models: policy.models.into_iter().collect(),
+                shared_models: policy.models.iter().cloned().collect(),
                 announced_models: announced,
             });
         }
-        Ok(count)
+        outcome.map(|()| count)
     }
 
     /// Blocking serve loop: poll inbound requests, serve them, reply, and **periodically
