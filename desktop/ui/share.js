@@ -34,6 +34,7 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
     emit("refresh"); return true;
   }
   let hideInactive = store.get("oh_hideinactive", false);
+  let hidePast = store.get("oh_hidepast", false);   // B4: collapse the "previously served" table
   const engineFor = (m) => { for (const e of engines) if (e.models.includes(m)) return e.label; return null; };
 
   // ── per-model share policy (Share view toggles) ──
@@ -157,49 +158,71 @@ import { fmtNum, fmtUptime, modelIcon } from "./format";
     $$("#v-share .g4 .kpi .sub")[1].textContent = "contribution · served − used (not money)";
     $$("#v-share .g4 .kpi .sub")[2].textContent = "served ÷ used";
     $$("#v-share .g4 .kpi .sub")[3].innerHTML = `<span class="mut">earned on the peers you serve</span>`;
-    // #7: LIFETIME served-models list. Active = a model an installed engine can serve right now;
-    // inactive = previously served (lifetime tokens on record) but not currently loaded — shown
-    // dimmed, hideable. Lifetime tokens come from the durable accumulator so they survive restart.
+    // B4: two tables. Primary = models an engine serves RIGHT NOW, sorted shared-first then by
+    // lifetime tokens. Secondary = models with lifetime tokens on record but no longer detected
+    // (deleted / engine offline). Lifetime tokens come from the durable accumulator (survive restart).
     const per = t?.per_model || {};
     const active = new Set(engines.flatMap((e) => e.models));
-    const lifetime = statModels().filter((id) => lifetimeServed(id) > 0);
-    const allModels = [...new Set([...engines.flatMap((e) => e.models), ...lifetime])]
-      .sort((a, b) => (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0));
+    const activeModels = [...active].sort((a, b) => {
+      const sa = isModelShared(a) ? 1 : 0, sb = isModelShared(b) ? 1 : 0;
+      if (sa !== sb) return sb - sa;                                   // shared first
+      return (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0);      // then by lifetime tokens
+    });
     const rows = [];
-    for (const m of allModels) {
-      const isActive = active.has(m);
-      if (!isActive && hideInactive) continue;
+    for (const m of activeModels) {
       const pm = per[m] || {};
       const tokens = lifetimeServed(m) || pm.tokens || 0;
       const reqs = pm.requests ?? "—";
       const tps = pm.avg_native_tps ? Math.round(pm.avg_native_tps) : "—";
-      // Real state, driven by the agent's announced set (not detection/optimism): a shared model is
-      // "live" once actually announced, "pending" in the brief window before the announce lands.
-      const sharedIntent = isActive && isModelShared(m);
+      // Real state, from the agent's announced set (not detection/optimism): shared → "live" once
+      // actually announced, "pending" in the brief window before the announce lands.
+      const sharedIntent = isModelShared(m);
       let status;
-      if (!isActive) status = `<span class="badge secondary">inactive</span>`;
-      else if (!running) status = `<span class="badge secondary">ready</span>`;
+      if (!running) status = `<span class="badge secondary">ready</span>`;
       else if (sharedIntent && (announcedSet.has(m) || !hasShareView)) status = `<span class="badge ok">live</span>`;
       else if (sharedIntent) status = `<span class="badge warn">pending</span>`;
       else status = `<span class="badge secondary">off</span>`;
       const swTitle = !running ? "Share this model when you start sharing"
         : sharedIntent ? "Sharing on the network — toggle off to stop" : "Toggle on to share this model";
-      const ann = isActive ? `<div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div>` : `<span class="mut" style="font-size:11px">—</span>`;
-      rows.push(`<tr${isActive ? "" : ' style="opacity:.5"'}><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td>${ann}</td></tr>`);
+      rows.push(`<tr><td>${modelIcon(m)}<b>${esc(m)}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td><div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div></td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
-    const hb = $("#hideinactive");
-    if (hb) { const anyInactive = allModels.some((m) => !active.has(m)); hb.style.display = anyInactive ? "" : "none"; hb.classList.toggle("outline", hideInactive); hb.classList.toggle("ghost", !hideInactive); hb.textContent = hideInactive ? "Show inactive" : "Hide inactive"; hb.onclick = () => { hideInactive = !hideInactive; store.set("oh_hideinactive", hideInactive); renderShare(); }; }
+    // "Previously served" — lifetime tokens on record but NOT currently detected.
+    const pastModels = statModels().filter((id) => lifetimeServed(id) > 0 && !active.has(id))
+      .sort((a, b) => (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0));
+    const pastCard = $("#pastcard");
+    if (pastCard) {
+      pastCard.style.display = pastModels.length ? "" : "none";
+      $("#pasttable tbody").innerHTML = pastModels.map((m) =>
+        `<tr><td>${modelIcon(m)}<b>${esc(m)}</b></td><td class="num">${fmtNum(lifetimeServed(m))}</td><td><span class="badge secondary">not on device</span></td></tr>`
+      ).join("");
+      const tbl = $("#pasttable"), foot = pastCard.querySelector(".pager");
+      if (tbl) tbl.style.display = hidePast ? "none" : "";
+      if (foot) foot.style.display = hidePast ? "none" : "";
+      const pt = $("#pasttoggle");
+      if (pt) { pt.textContent = hidePast ? "Show" : "Hide"; pt.onclick = () => { hidePast = !hidePast; store.set("oh_hidepast", hidePast); renderShare(); }; }
+    }
+    // The old inline "Hide inactive" button is superseded by the section split.
+    const hb = $("#hideinactive"); if (hb) hb.style.display = "none";
     renderChart("#sharechart", "share");   // #10 timeline
     // The card-header pill = the REAL announced count (was mislabeled: it counted detected models).
     const annBadge = $("#servetable").closest(".card").querySelector(".row .badge");
     if (annBadge) { annBadge.textContent = `${running ? announcedCount : 0} announced`; annBadge.className = "badge " + (running && announcedCount ? "ok" : "secondary"); }
-    // "Share everything" master switch — shown whenever there are models to share.
+    // "Share everything" master switch — tri-state (B3): ON = mode "all" (every model incl. future);
+    // INDETERMINATE = a specific selection (some shared, not "all" mode); OFF = nothing shared.
     const saw = $("#shareallwrap"), sasw = $("#shareallsw");
     if (saw && sasw) {
-      const hasActive = shareActiveModels().length > 0;
-      saw.style.display = hasActive ? "inline-flex" : "none";
-      sasw.classList.toggle("on", policy?.mode === "all");
+      const allActive = shareActiveModels();
+      saw.style.display = allActive.length ? "inline-flex" : "none";
+      const masterOn = policy?.mode === "all";
+      const someShared = allActive.some((m) => isModelShared(m));
+      sasw.classList.toggle("on", masterOn);
+      sasw.classList.toggle("indeterminate", !masterOn && someShared);
+      sasw.title = masterOn
+        ? "Sharing every model, including ones you add later — click to keep only your current selection"
+        : someShared
+          ? "Sharing a selection — click to share everything (including models you add later)"
+          : "Click to share every model, including ones you add later";
       sasw.onclick = () => toggleShareAll();
     }
     $$("#servetable [data-share]").forEach((sw) => sw.onclick = () => toggleShareModel(sw.dataset.share));

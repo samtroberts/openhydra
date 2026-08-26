@@ -81,6 +81,12 @@
             <div class="pager" style="justify-content:flex-start"><span class="mut">Toggle a model off to stop announcing it. You choose what to serve.</span></div>
           </div>
 
+          <div class="card" id="pastcard" style="margin-top:14px;display:none">
+            <div class="row" style="padding:14px 16px 8px"><div class="ctitle">Models you've previously served</div><div class="grow"></div><button class="btn ghost sm" id="pasttoggle">Hide</button></div>
+            <table id="pasttable"><thead><tr><th>Model</th><th>Tokens</th><th>Status</th></tr></thead><tbody></tbody></table>
+            <div class="pager" style="justify-content:flex-start"><span class="mut">No longer on your device (deleted from the engine or the engine is offline) — lifetime stats kept. Reinstall the model to share it again.</span></div>
+          </div>
+
           <div class="grid g4" style="margin-top:14px">
             <div class="card pad kpi"><div class="lbl">Tokens served</div><div class="val num">184.2k</div><div class="sub up"><span class="icon" data-i="activity"></span>▲ 12% vs yesterday</div></div>
             <div class="card pad kpi"><div class="lbl">Credits earned</div><div class="val num">1,842</div><div class="sub">today · net +877</div></div>
