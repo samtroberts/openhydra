@@ -19,7 +19,7 @@
 //! The pure pieces — record construction and the method-byte dispatch — are unit-tested;
 //! the loop itself is thin glue over the live swarm.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,35 @@ pub fn build_peer_record(
         public_key: public_key_hex.to_string(),
         ..Default::default()
     }
+}
+
+/// M6/F2: decide which models' `MODEL_WITHDRAWN` tombstones to (re)publish this announce pass, and
+/// advance the re-publish countdown in `pending`. Pure so the bookkeeping is unit-testable without a
+/// swarm. Ordering matters:
+///   1. every model dropped since last pass (`last \ desired`) (re)starts a fresh countdown;
+///   2. every model intended again (`desired`) is cancelled — a re-shared model must never be
+///      withdrawn, even if a countdown was still running;
+///   3. every still-pending model is published this pass and its counter decremented, expiring at
+///      zero (so a tombstone is issued exactly `republish_passes` times).
+/// Returns the models to publish now (a fresh, freshness-check-passing message each time).
+fn plan_withdrawals(
+    last: &BTreeSet<String>,
+    desired: &BTreeSet<String>,
+    pending: &mut BTreeMap<String, u8>,
+    republish_passes: u8,
+) -> Vec<String> {
+    for gone in last.difference(desired) {
+        pending.insert(gone.clone(), republish_passes);
+    }
+    for intended in desired {
+        pending.remove(intended);
+    }
+    let to_publish: Vec<String> = pending.keys().cloned().collect();
+    pending.retain(|_, remaining| {
+        *remaining = remaining.saturating_sub(1);
+        *remaining > 0
+    });
+    to_publish
 }
 
 /// Provider-side dispatch for one inbound proxy request → the buffered serve response.
@@ -305,6 +334,14 @@ const MAX_STREAMS_PER_PEER: usize = 128;
 /// Global byte backstop across all live stream tails — a last-resort guard (deltas are small and
 /// pruned, so this rarely bites), evicting the globally-oldest stream if somehow exceeded.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+/// M6/F2 (delivery hardening): how many announce passes a per-model `MODEL_WITHDRAWN` tombstone is
+/// re-published for. A single gossip publish is best-effort — a consumer that was momentarily
+/// un-meshed (or hadn't joined yet) when a model was un-shared would otherwise keep the stale entry
+/// until the ~300s TTL. Re-issuing on the next few passes (each a fresh, freshness-check-passing
+/// message) covers a consumer that (re)connects within that window, while a re-share cancels the
+/// countdown so a model that comes back is never spuriously withdrawn.
+const WITHDRAW_REPUBLISH_PASSES: u8 = 3;
 
 /// A per-nonce append-only log of encoded [`ServeChunk`] frames with a trimmable prefix (P1
 /// streaming). See the module note above.
@@ -534,6 +571,20 @@ pub struct Provider<A: EngineAdapter> {
     /// just-removed model's DHT record). The poll loop yields via `try_lock` so it never blocks the
     /// serve loop; the watcher/startup path takes it blocking.
     announce_lock: Mutex<()>,
+    /// M6: the set of models (engine refs) we advertised on the *previous* announce pass, so the
+    /// next pass can diff it against the current intent and publish a `MODEL_WITHDRAWN` tombstone
+    /// for each model that dropped out (un-shared, or gone from the engine). Tracks *intent*
+    /// (policy ∩ detected), not network-announce success, so a still-shared-but-momentarily-
+    /// unannounceable model is never spuriously withdrawn. Guarded by `announce_lock` in practice
+    /// (only touched inside `announce_models_inner`), but a `Mutex` keeps it `Sync` on its own.
+    last_announced: Mutex<BTreeSet<String>>,
+    /// M6/F2: models with an in-flight `MODEL_WITHDRAWN` re-publish countdown (engine_ref → passes
+    /// remaining). A model un-shared this pass is inserted at [`WITHDRAW_REPUBLISH_PASSES`] and its
+    /// tombstone is re-issued (with a fresh timestamp) on each subsequent announce pass until the
+    /// count hits zero — covering a consumer that missed the first gossip. Re-sharing the model
+    /// removes it here so it is never withdrawn while intended. Bounded (drains to empty), guarded
+    /// by `announce_lock` in practice like [`last_announced`].
+    pending_withdrawals: Mutex<BTreeMap<String, u8>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -565,6 +616,8 @@ impl<A: EngineAdapter> Provider<A> {
             streams: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
+            last_announced: Mutex::new(BTreeSet::new()),
+            pending_withdrawals: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1000,6 +1053,15 @@ impl<A: EngineAdapter> Provider<A> {
         // Snapshot the policy ONCE so the loop filter and the published view see one consistent
         // policy (also the source for `shared_models` below).
         let policy = self.policy.snapshot();
+        // M6: the FULL intended-shared set this pass (policy ∩ detected), computed up-front so it's
+        // independent of where the announce loop below might break on a network error — a
+        // still-intended model we simply didn't *reach* must not look "withdrawn". This is the
+        // diff basis for the tombstones published at the end.
+        let desired: BTreeSet<String> = models
+            .iter()
+            .filter(|m| policy.is_shared(&m.engine_ref))
+            .map(|m| m.engine_ref.clone())
+            .collect();
         let mut announced: Vec<String> = Vec::new();
         let mut outcome: Result<(), AdapterError> = Ok(());
         for model in &models {
@@ -1034,6 +1096,23 @@ impl<A: EngineAdapter> Provider<A> {
                 shared_models: policy.models.iter().cloned().collect(),
                 announced_models: announced,
             });
+        }
+        // M6: publish a per-model tombstone for every model no longer intended (the operator
+        // un-shared it, or it vanished from the engine), so consumers evict just that `(peer, model)`
+        // entry immediately instead of on the ~300s TTL. F2: re-publish it over the next few passes
+        // ([`plan_withdrawals`]) so a briefly-unmeshed consumer still gets it, cancelling on re-share.
+        // Best-effort and outcome-independent: a withdraw publish error is logged, never fatal, and
+        // the model would still expire on the old TTL. `desired` is stored as the new baseline
+        // regardless of the announce outcome so the next pass diffs against true intent.
+        {
+            let mut last = self.last_announced.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self.pending_withdrawals.lock().unwrap_or_else(|e| e.into_inner());
+            for model in plan_withdrawals(&last, &desired, &mut pending, WITHDRAW_REPUBLISH_PASSES) {
+                if let Err(e) = self.net.withdraw_model(model.clone()) {
+                    eprintln!("openhydra-agent: MODEL_WITHDRAWN for {model} failed: {e}");
+                }
+            }
+            *last = desired;
         }
         outcome.map(|()| count)
     }
@@ -1355,6 +1434,70 @@ mod tests {
     use super::*;
     use crate::adapter::{InferenceRequest, ServeOutcome};
     use crate::serve::{parse_response, ServeChunk, ServeRequest};
+
+    // ── M6/F2: withdrawal re-publish planning ────────────────────────────
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn m6f2_new_withdrawal_publishes_and_starts_countdown() {
+        // Last pass announced {a,b}; this pass only {a} is intended → b is withdrawn now and gets a
+        // 3-pass countdown (2 remaining after this publish).
+        let mut pending = BTreeMap::new();
+        let pub1 = plan_withdrawals(&set(&["a", "b"]), &set(&["a"]), &mut pending, 3);
+        assert_eq!(pub1, vec!["b".to_string()]);
+        assert_eq!(pending.get("b"), Some(&2));
+    }
+
+    #[test]
+    fn m6f2_republishes_exactly_n_passes_then_stops() {
+        let mut pending = BTreeMap::new();
+        let last = set(&["a", "b"]);
+        let desired = set(&["a"]); // b stays un-shared every pass
+        // Pass 1 (the drop) + 2 re-publishes = 3 total, then it stops.
+        let p1 = plan_withdrawals(&last, &desired, &mut pending, 3);
+        let p2 = plan_withdrawals(&desired, &desired, &mut pending, 3); // last==desired now (no new drop)
+        let p3 = plan_withdrawals(&desired, &desired, &mut pending, 3);
+        let p4 = plan_withdrawals(&desired, &desired, &mut pending, 3);
+        assert_eq!(p1, vec!["b".to_string()]);
+        assert_eq!(p2, vec!["b".to_string()]);
+        assert_eq!(p3, vec!["b".to_string()]);
+        assert!(p4.is_empty(), "must stop after {WITHDRAW_REPUBLISH_PASSES} passes");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn m6f2_reshare_cancels_pending_withdrawal() {
+        // b is un-shared (countdown running), then re-shared before it expires → it must NOT be
+        // withdrawn again, and the countdown is cleared.
+        let mut pending = BTreeMap::new();
+        let p1 = plan_withdrawals(&set(&["a", "b"]), &set(&["a"]), &mut pending, 3);
+        assert_eq!(p1, vec!["b".to_string()]);
+        // Next pass b is intended again (desired contains b); last was {a} (b not announced last pass).
+        let p2 = plan_withdrawals(&set(&["a"]), &set(&["a", "b"]), &mut pending, 3);
+        assert!(p2.is_empty(), "a re-shared model is never withdrawn");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn m6f2_no_withdrawal_when_nothing_dropped() {
+        let mut pending = BTreeMap::new();
+        // Steady state and a brand-new share both withdraw nothing.
+        assert!(plan_withdrawals(&set(&["a"]), &set(&["a"]), &mut pending, 3).is_empty());
+        assert!(plan_withdrawals(&set(&[]), &set(&["a", "b"]), &mut pending, 3).is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn m6f2_republish_passes_1_publishes_once() {
+        // Guard the saturating_sub edge: passes=1 → published exactly once, no underflow.
+        let mut pending = BTreeMap::new();
+        let p1 = plan_withdrawals(&set(&["a", "b"]), &set(&["a"]), &mut pending, 1);
+        assert_eq!(p1, vec!["b".to_string()]);
+        assert!(pending.is_empty());
+        assert!(plan_withdrawals(&set(&["a"]), &set(&["a"]), &mut pending, 1).is_empty());
+    }
 
     fn detected(canonical: &str) -> DetectedModel {
         DetectedModel {

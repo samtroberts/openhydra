@@ -151,6 +151,17 @@ impl NetworkHandle {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::Announce { record, reply })?
     }
 
+    /// M6: publish a `MODEL_WITHDRAWN` tombstone so consumers evict this node's `model_id`
+    /// entry immediately (the operator un-shared it) instead of waiting out the discover-record
+    /// TTL. Best-effort — a no-mesh publish is reported as `Ok` (the model still expires on the
+    /// old TTL), so a benign early call never trips the provider's re-announce error path.
+    pub fn withdraw_model(&self, model_id: impl Into<String>) -> Result<(), String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::WithdrawModel {
+            model_id: model_id.into(),
+            reply,
+        })?
+    }
+
     /// Discover providers serving `model_id` (empty on an empty DHT).
     pub fn discover(&self, model_id: impl Into<String>) -> Result<Vec<DiscoveredPeer>, String> {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::Discover {

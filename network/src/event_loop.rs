@@ -215,6 +215,15 @@ pub enum SwarmCommand {
         model_id: String,
         reply: oneshot::Sender<Result<Vec<DiscoveredPeer>, String>>,
     },
+    /// M6: publish a `MODEL_WITHDRAWN` tombstone for one model this node has stopped
+    /// serving (the operator un-shared it) so consumers evict just that `(peer, model)`
+    /// entry immediately rather than waiting out the discover-record TTL. Best-effort:
+    /// a publish failure (no mesh peers yet) is non-fatal — the model simply expires on
+    /// the old TTL path, exactly as before this message existed.
+    WithdrawModel {
+        model_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// C11: drop this model's discover-cache entry so the next `Discover` does a fresh
     /// `get_providers` lookup. The consumer sends this when every candidate from a
     /// (possibly cached) discovery failed, so a stale cache hit can't strand the request.
@@ -630,6 +639,26 @@ const GOSSIP_INBOUND_QUEUE_MAX: usize = 256;
 /// property. Travels on the same single topic as the other control events.
 pub const PROVIDER_ANNOUNCE_TYPE: &str = "PROVIDER_ANNOUNCE";
 
+/// M6 (per-model tombstone): the gossipsub envelope `type` a provider publishes to
+/// withdraw a *single* model it has stopped serving (e.g. the operator toggled it off
+/// in the desktop) while the node itself stays up serving its other models. Consumers
+/// fast-path this in Rust — author-check + evict just the `(peer, model)` entry from
+/// `known_peers` — so an un-shared model disappears from browse lists immediately
+/// instead of lingering out its ~300s discover-record TTL. Distinct from `PEER_DEPARTED`,
+/// which evicts the *whole* peer on clean shutdown. Purely additive: a node that predates
+/// this type ignores the message and keeps its TTL-expiry behaviour.
+pub const MODEL_WITHDRAWN_TYPE: &str = "MODEL_WITHDRAWN";
+
+/// M6/F1 (replay hardening): how far a `MODEL_WITHDRAWN` message's `timestamp` may be from the
+/// receiver's clock (either direction) and still be honoured. The timestamp lives inside the
+/// signed gossip payload, so an attacker replaying a captured withdrawal cannot refresh it — once
+/// the original is older than this window the replay is ignored, while a legitimate re-publish
+/// (the provider re-issues over a few announce passes, each a fresh signed message) always carries
+/// a current timestamp and passes. The window is two-sided to tolerate modest clock skew between
+/// nodes; it is deliberately generous (a false-reject merely falls back to the ~300s TTL, and a
+/// false-accept is a bounded browse-list flip) and matches the 120s re-announce cadence.
+pub const MODEL_WITHDRAWN_MAX_AGE_SECS: u64 = 120;
+
 /// R-DHT-1 audit fix: how long a `known_peers` entry we are NOT connected to may
 /// survive in the reaper. A PEX-learned provider is, by definition, one we have
 /// no live connection to (we heard it over gossip via a relay) — reaping it
@@ -984,6 +1013,9 @@ pub async fn run_event_loop(
                 match cmd {
                     Some(SwarmCommand::Announce { record, reply }) => {
                         handle_announce(&mut swarm, &record, reply, &mut state, &keypair);
+                    }
+                    Some(SwarmCommand::WithdrawModel { model_id, reply }) => {
+                        handle_withdraw_model(&mut swarm, &model_id, reply);
                     }
                     Some(SwarmCommand::Discover { model_id, reply }) => {
                         handle_discover(&mut swarm, &model_id, reply, &mut state);
@@ -1643,6 +1675,46 @@ fn publish_provider_pex(swarm: &mut libp2p::Swarm<OpenHydraBehaviour>, record: &
     }
 }
 
+/// M6: publish a `MODEL_WITHDRAWN` tombstone for `model_id` served by this node. The
+/// message is authored by our (signed) gossip identity, so a receiver can trust that the
+/// author == the `libp2p_peer_id` being withdrawn and evict only that `(peer, model)`
+/// entry. Best-effort — an `InsufficientPeers` publish error before the mesh forms is
+/// swallowed (the model still expires on the discover-record TTL), matching the
+/// [`publish_provider_pex`] contract.
+fn handle_withdraw_model(
+    swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
+    model_id: &str,
+    reply: oneshot::Sender<Result<(), String>>,
+) {
+    let envelope = serde_json::json!({
+        "type": MODEL_WITHDRAWN_TYPE,
+        "libp2p_peer_id": swarm.local_peer_id().to_base58(),
+        "model_id": model_id,
+        "timestamp": now_unix_ms() / 1000,
+    });
+    let payload = match serde_json::to_vec(&envelope) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = reply.send(Err(format!("withdraw encode: {e}")));
+            return;
+        }
+    };
+    let topic = libp2p::gossipsub::IdentTopic::new(crate::swarm::GOSSIPSUB_TOPIC);
+    match swarm.behaviour_mut().gossipsub.publish(topic, payload) {
+        Ok(_) => {
+            info!(%model_id, "published MODEL_WITHDRAWN tombstone");
+            let _ = reply.send(Ok(()));
+        }
+        // InsufficientPeers (no mesh yet) is not an error worth surfacing: the model
+        // will fall off consumers' lists on the normal TTL. Report success so the
+        // provider's re-announce loop doesn't treat a benign no-mesh as a failure.
+        Err(e) => {
+            debug!(%e, %model_id, "MODEL_WITHDRAWN publish skipped (no mesh peers)");
+            let _ = reply.send(Ok(()));
+        }
+    }
+}
+
 /// R-DHT-1: ingest an inbound `PROVIDER_ANNOUNCE` gossip message (PEX). Verifies
 /// the embedded signed record AND that the gossip author equals the record's
 /// `libp2p_peer_id` (see [`dht::pex_record_is_authentic`]) before caching it into
@@ -1690,6 +1762,29 @@ fn handle_provider_pex(
     } else {
         debug!(peer_id = %record.peer_id, "provider_pex: refreshed cached provider");
     }
+}
+
+/// M6/F1: is a `MODEL_WITHDRAWN` timestamp (unix seconds) close enough to `now_secs` to honour?
+/// Two-sided so clock skew in either direction is tolerated; `abs_diff` can't underflow. Pure, so
+/// the replay-window policy is unit-testable without a swarm.
+fn withdrawal_is_fresh(timestamp_secs: u64, now_secs: u64, max_age_secs: u64) -> bool {
+    now_secs.abs_diff(timestamp_secs) <= max_age_secs
+}
+
+/// M6: evict every `known_peers` entry for `(libp2p_peer_id, model_id)` — the data half of
+/// handling a `MODEL_WITHDRAWN` tombstone, kept pure so the eviction is unit-testable without a
+/// swarm (the author-authenticity check stays at the call site, where `message.source` lives).
+/// Returns how many entries were removed (0 = we never knew this model from this peer). Matches
+/// on the record fields, not the map key, so it's independent of the `known_peer_key` scheme.
+fn evict_withdrawn_model(
+    known_peers: &mut HashMap<String, PeerRecord>,
+    libp2p_peer_id: &str,
+    model_id: &str,
+) -> usize {
+    let before = known_peers.len();
+    known_peers
+        .retain(|_, record| !(record.libp2p_peer_id == libp2p_peer_id && record.model_id == model_id));
+    before - known_peers.len()
 }
 
 /// C11: is our last completed discover for `model` still within `ttl_ms` and the same
@@ -2552,6 +2647,45 @@ fn handle_swarm_event(
                                         "rejected PEER_DEPARTED: author does not match subject"
                                     );
                                 }
+                            }
+                        }
+                    } else if msg_type == Some(MODEL_WITHDRAWN_TYPE) {
+                        // M6: a provider withdrawing a SINGLE model (it un-shared one but
+                        // stays up serving the rest). Handle entirely in Rust — evict only
+                        // the matching `(peer, model)` entry from `known_peers` so the model
+                        // drops out of browse lists at once instead of on the TTL.
+                        //
+                        // SECURITY: identical trust model to PEER_DEPARTED above — signed +
+                        // strict gossip makes `message.source` the verified author, and we
+                        // require it to equal the `libp2p_peer_id` being withdrawn. A peer may
+                        // only withdraw its OWN model; a forged withdrawal for another peer is
+                        // rejected. Unlike PEER_DEPARTED we deliberately do NOT touch Kademlia:
+                        // the peer is still alive and still serves its other models.
+                        handled_internally = true;
+                        let withdrawn_id = parsed.get("libp2p_peer_id").and_then(|v| v.as_str());
+                        let withdrawn_model = parsed.get("model_id").and_then(|v| v.as_str());
+                        // F1: the timestamp is required (our publisher always sets it, and it is
+                        // signed) — a withdrawal without one is malformed/forged, so drop it.
+                        let ts = parsed.get("timestamp").and_then(|v| v.as_u64());
+                        if let (Some(id_str), Some(model), Some(ts)) =
+                            (withdrawn_id, withdrawn_model, ts)
+                        {
+                            match id_str.parse::<PeerId>() {
+                                Ok(pid) if message.source == Some(pid) => {
+                                    // F1: reject a stale (replayed) withdrawal before evicting. The
+                                    // signed timestamp can't be refreshed by a replayer; a genuine
+                                    // re-publish (F2) carries a current one.
+                                    if !withdrawal_is_fresh(ts, now_unix_ms() / 1000, MODEL_WITHDRAWN_MAX_AGE_SECS) {
+                                        debug!(%pid, %model, ts, "ignored stale MODEL_WITHDRAWN (replay?)");
+                                    } else if evict_withdrawn_model(&mut state.known_peers, id_str, model) > 0 {
+                                        info!(%pid, %model, "evicted model via MODEL_WITHDRAWN gossip");
+                                    }
+                                }
+                                Ok(pid) => warn!(
+                                    ?message.source, %pid, %model,
+                                    "rejected MODEL_WITHDRAWN: author does not match subject"
+                                ),
+                                Err(e) => debug!(%e, "MODEL_WITHDRAWN: unparseable libp2p_peer_id"),
                             }
                         }
                     }
@@ -4254,6 +4388,91 @@ mod tests {
         // A value-based evict (how disconnect/reap work) drops ALL of the node's models at once.
         known.retain(|_, r| r.libp2p_peer_id != "12D3KooWnodeA");
         assert!(known.is_empty());
+    }
+
+    // ── M6: per-model MODEL_WITHDRAWN tombstone eviction ─────────────────
+    fn m6_rec(libp2p: &str, model: &str) -> PeerRecord {
+        PeerRecord {
+            peer_id: format!("node-for-{libp2p}"),
+            model_id: model.into(),
+            libp2p_peer_id: libp2p.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn m6_evict_withdrawn_model_drops_only_the_matching_peer_and_model() {
+        let mut known: HashMap<String, PeerRecord> = HashMap::new();
+        // Peer A serves two models; peer B serves one of the same model names.
+        for r in [
+            m6_rec("12D3KooWA", "qwen3-coder"),
+            m6_rec("12D3KooWA", "llama3.1"),
+            m6_rec("12D3KooWB", "qwen3-coder"),
+        ] {
+            known.insert(known_peer_key(&r), r);
+        }
+        assert_eq!(known.len(), 3);
+
+        // A withdraws just "qwen3-coder": only A's qwen3-coder goes. A's llama3.1 stays
+        // (A is still up serving it), and B's qwen3-coder is untouched (different peer).
+        let evicted = evict_withdrawn_model(&mut known, "12D3KooWA", "qwen3-coder");
+        assert_eq!(evicted, 1);
+        assert_eq!(known.len(), 2);
+        let mut left: Vec<(String, String)> = known
+            .values()
+            .map(|r| (r.libp2p_peer_id.clone(), r.model_id.clone()))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                ("12D3KooWA".to_string(), "llama3.1".to_string()),
+                ("12D3KooWB".to_string(), "qwen3-coder".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn m6_evict_withdrawn_model_unknown_pair_is_a_noop() {
+        let mut known: HashMap<String, PeerRecord> = HashMap::new();
+        let r = m6_rec("12D3KooWA", "qwen3-coder");
+        known.insert(known_peer_key(&r), r);
+        // A model we never learned from that peer → nothing removed, map intact.
+        assert_eq!(evict_withdrawn_model(&mut known, "12D3KooWA", "not-served"), 0);
+        assert_eq!(evict_withdrawn_model(&mut known, "12D3KooWZ", "qwen3-coder"), 0);
+        assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn m6_desired_diff_yields_exactly_the_unshared_models() {
+        // Mirrors announce_models_inner's tombstone diff: last pass advertised {a, b, c};
+        // this pass's intent is {a, c}; so exactly {b} is withdrawn, and {a,c} becomes the new
+        // baseline (no tombstone for a still-shared or a newly-shared model).
+        use std::collections::BTreeSet;
+        let last: BTreeSet<String> =
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let desired: BTreeSet<String> =
+            ["a", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let withdrawn: Vec<String> = last.difference(&desired).cloned().collect();
+        assert_eq!(withdrawn, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn m6_f1_withdrawal_freshness_window() {
+        let max = MODEL_WITHDRAWN_MAX_AGE_SECS;
+        let now = 1_000_000u64;
+        // Exactly-now and within the window (either direction) → fresh.
+        assert!(withdrawal_is_fresh(now, now, max));
+        assert!(withdrawal_is_fresh(now - max, now, max)); // oldest still-accepted
+        assert!(withdrawal_is_fresh(now + max, now, max)); // future-skew boundary
+        assert!(withdrawal_is_fresh(now - max + 1, now, max));
+        // Older than the window → stale (a replay lands here once the original ages out).
+        assert!(!withdrawal_is_fresh(now - max - 1, now, max));
+        assert!(!withdrawal_is_fresh(now - 3600, now, max));
+        // Absurd future timestamp → also rejected (can't outrun the age check).
+        assert!(!withdrawal_is_fresh(now + max + 1, now, max));
+        // Clock at 0 vs a real timestamp must not underflow into a false "fresh".
+        assert!(!withdrawal_is_fresh(1_000_000, 0, max));
     }
 
     #[test]
