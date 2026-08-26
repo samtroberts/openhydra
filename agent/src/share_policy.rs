@@ -26,12 +26,15 @@ use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
 /// How a provider decides which detected models to share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShareMode {
     /// Share every model the engine exposes now or in the future.
     All,
-    /// Share only the explicitly-listed engine handles (see [`SharePolicy::models`]).
+    /// Share only the explicitly-listed engine handles (see [`SharePolicy::models`]). The default
+    /// for an unpopulated status view (a gateway, or a provider before its first announce) — it
+    /// pairs with an empty list to read honestly as "nothing shared yet".
+    #[default]
     List,
 }
 
@@ -131,6 +134,19 @@ impl SharePolicy {
         std::fs::write(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, path)
     }
+}
+
+/// The provider's live share state as the status API reports it: the current policy (mode + the
+/// explicit list, empty in `all`) plus the engine handles actually published by the most recent
+/// announce. The desktop reads this to render each model's real state (announced / pending / off)
+/// instead of guessing from detection + optimistic settings.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ShareStatusView {
+    pub share_mode: ShareMode,
+    /// The explicit allowlist (meaningful in `list` mode; empty in `all`).
+    pub shared_models: Vec<String>,
+    /// What the most recent announce actually advertised — the provider's real broadcast set.
+    pub announced_models: Vec<String>,
 }
 
 /// The last-modified time of `path`, or `None` if it can't be stat'd (missing / permissions).

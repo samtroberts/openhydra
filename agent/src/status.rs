@@ -86,6 +86,10 @@ pub struct TransferStats {
     consumed_per_model: Mutex<HashMap<String, ModelStats>>,
     /// Newest-first ring of recent ledger rows (both `served` and `used`), for the Ledger view.
     recent: Mutex<VecDeque<LedgerRow>>,
+    /// The provider's live share view (policy mode + intended list + last-announced set), written
+    /// by the provider on each announce and read by the `/status/share` endpoint. Empty for the
+    /// consumer/gateway role, which announces nothing.
+    share: Mutex<crate::share_policy::ShareStatusView>,
 }
 
 impl TransferStats {
@@ -138,6 +142,21 @@ impl TransferStats {
                 ring.pop_back();
             }
         }
+    }
+
+    /// Publish the provider's current share view (called by the provider after each announce). The
+    /// status server's `/status/share` endpoint reads it so the desktop can render each model's
+    /// real state (announced / pending / off) rather than guessing from detection + settings.
+    pub fn publish_share(&self, view: crate::share_policy::ShareStatusView) {
+        if let Ok(mut g) = self.share.lock() {
+            *g = view;
+        }
+    }
+
+    /// The most recently published share view (default/empty until the provider announces, and for
+    /// the consumer/gateway role which never announces).
+    pub fn share_snapshot(&self) -> crate::share_policy::ShareStatusView {
+        self.share.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Rehydrate the recent ring + lifetime totals from the durable ledger on boot, so the
@@ -392,6 +411,9 @@ impl StatusServer {
                 Err(e) => return respond(&mut stream, 500, &json(&ErrBody { error: e })),
             },
             "/status/transfers" => json(&self.stats.snapshot()),
+            // Provider share view: policy mode + intended list + the real last-announced set. Empty
+            // for the gateway role. The desktop polls this to render each model's true state.
+            "/status/share" => json(&self.stats.share_snapshot()),
             _ => return respond(&mut stream, 404, r#"{"error":"unknown path"}"#),
         };
         respond(&mut stream, 200, &body)
@@ -572,6 +594,25 @@ mod tests {
         assert_eq!(s.snapshot().recent[0].counterparty, "peerD");
     }
 
+    #[test]
+    fn share_view_publishes_and_snapshots() {
+        use crate::share_policy::{ShareMode, ShareStatusView};
+        let s = TransferStats::default();
+        // Default (never published) reads honestly as "nothing shared".
+        let empty = s.share_snapshot();
+        assert_eq!(empty.share_mode, ShareMode::List);
+        assert!(empty.shared_models.is_empty() && empty.announced_models.is_empty());
+        // After the provider announces, the real advertised set is visible.
+        s.publish_share(ShareStatusView {
+            share_mode: ShareMode::List,
+            shared_models: vec!["qwen3-coder:30b-a3b-q8_0".into(), "qwen3.8:27b-q8_0".into()],
+            announced_models: vec!["qwen3-coder:30b-a3b-q8_0".into()],
+        });
+        let v = s.share_snapshot();
+        assert_eq!(v.shared_models.len(), 2);
+        assert_eq!(v.announced_models, vec!["qwen3-coder:30b-a3b-q8_0"]);
+    }
+
     /// Full loop: live loopback swarm node → StatusClient → HTTP server → parsed JSON,
     /// including the bearer-token gate.
     #[test]
@@ -591,6 +632,11 @@ mod tests {
         let net = openhydra_network::handle::NetworkHandle::start(config).unwrap();
         let stats = Arc::new(TransferStats::default());
         stats.record_serve("m1", 7, 50.0, true);
+        stats.publish_share(crate::share_policy::ShareStatusView {
+            share_mode: crate::share_policy::ShareMode::List,
+            shared_models: vec!["m1".into(), "m2".into()],
+            announced_models: vec!["m1".into()],
+        });
         let addr = StatusServer {
             role: "provider",
             agent_version: "test",
@@ -627,5 +673,13 @@ mod tests {
         let tbody: serde_json::Value =
             serde_json::from_str(t.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(tbody["per_model"]["m1"]["tokens"], 7);
+        // Sub-view: /status/share returns the provider's real share view (mode + intended list +
+        // the actually-announced set) — the source of truth the desktop renders from.
+        let sh = get("/status/share", Some("s3cret"));
+        let sbody: serde_json::Value =
+            serde_json::from_str(sh.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(sbody["share_mode"], "list");
+        assert_eq!(sbody["shared_models"], serde_json::json!(["m1", "m2"]));
+        assert_eq!(sbody["announced_models"], serde_json::json!(["m1"]));
     }
 }

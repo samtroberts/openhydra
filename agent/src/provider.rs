@@ -529,10 +529,6 @@ pub struct Provider<A: EngineAdapter> {
     /// sharing in the desktop without restarting the node. Both the announce filter and the serve
     /// gate consult it, so a de-selected model is genuinely off (not merely hidden).
     policy: PolicyWatcher,
-    /// The engine handles published by the most recent [`Self::announce_models`] pass (the set that
-    /// passed the share filter). Read by the status API so the UI can show the provider's *real*
-    /// advertised set rather than an optimistic guess.
-    announced_models: Mutex<Vec<String>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -563,7 +559,6 @@ impl<A: EngineAdapter> Provider<A> {
             })),
             streams: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
-            announced_models: Mutex::new(Vec::new()),
         }
     }
 
@@ -594,12 +589,6 @@ impl<A: EngineAdapter> Provider<A> {
     /// policy. Fail-closed (share-nothing) on a poisoned lock — matters for the serve gate.
     fn model_shared(&self, model_ref: &str) -> bool {
         self.policy.is_shared(model_ref)
-    }
-
-    /// The engine handles published by the most recent [`announce_models`](Self::announce_models)
-    /// pass — the provider's *real* advertised set (used by the status API).
-    pub fn announced_models(&self) -> Vec<String> {
-        self.announced_models.lock().map(|m| m.clone()).unwrap_or_default()
     }
 
     /// Attach shared transfer counters (P0 introspection — the `--status-bind` server
@@ -1000,12 +989,17 @@ impl<A: EngineAdapter> Provider<A> {
                 .map_err(|e| AdapterError::Http(format!("announce: {e}")))?;
             announced.push(model.engine_ref.clone());
         }
-        // Record the real advertised set for the status API (the UI reads this, not an optimistic
-        // guess). Only overwritten on a fully-successful pass — a mid-pass announce error returns
-        // above with the previous set intact.
+        // Publish the real advertised set + the current policy for the status API (the UI reads
+        // this, not an optimistic guess). Only reached on a fully-successful pass — a mid-pass
+        // announce error returns above with the previous view intact.
         let count = announced.len();
-        if let Ok(mut guard) = self.announced_models.lock() {
-            *guard = announced;
+        if let Some(stats) = &self.stats {
+            let policy = self.policy.snapshot();
+            stats.publish_share(crate::share_policy::ShareStatusView {
+                share_mode: policy.mode,
+                shared_models: policy.models.into_iter().collect(),
+                announced_models: announced,
+            });
         }
         Ok(count)
     }

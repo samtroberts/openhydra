@@ -70,7 +70,7 @@ pub use gateway::serve_http;
 pub use hardening::harden_process;
 pub use http::ReqwestClient;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
-pub use share_policy::{SharePolicy, ShareMode};
+pub use share_policy::{SharePolicy, ShareMode, ShareStatusView};
 pub use status::{CreditEntry, EconomyStats, EconomyView, LedgerRow, RepEntry, StatusServer, TransferStats};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};
 
