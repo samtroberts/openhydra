@@ -39,6 +39,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = "0.1"
 # CLI for the `openhydra-agent` binary (provide / serve roles + node/engine flags).
 clap = { version = "4", features = ["derive"] }
+# Filesystem watcher for event-driven share-policy hot-reload (inotify / FSEvents /
+# ReadDirectoryChangesW). The poll-loop mtime check stays as the portable fallback.
+notify = "6"
 # Surface the network crate's tracing events (libp2p/Kademlia/relay) under RUST_LOG.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

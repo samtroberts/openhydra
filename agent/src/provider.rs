@@ -1023,6 +1023,51 @@ impl<A: EngineAdapter> Provider<A> {
     /// [`WorkerPool`] of that many threads instead of serving inline, so a long generation
     /// (or an M2.3 throttle delay) on one request no longer blocks the others. Re-announce
     /// still runs on the poll thread between polls.
+    /// R6/B2: block on a filesystem watcher and reload+re-announce the share policy the instant the
+    /// file changes (a desktop toggle), rather than waiting out the poll tick. The poll loop's
+    /// periodic `reload_if_changed` remains the portable fallback, so a watcher init/watch failure —
+    /// or a missed event on a flaky filesystem — is non-fatal. No-op for a static policy.
+    fn watch_policy_file(self: Arc<Self>)
+    where
+        A: Send + Sync + 'static,
+    {
+        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+        let Some(path) = self.policy.watched_path() else { return };
+        let Some(dir) = path.parent().map(|p| p.to_path_buf()) else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("openhydra-agent: share-policy watcher init failed ({e}) — using the poll fallback");
+                return;
+            }
+        };
+        // Watch the PARENT dir (non-recursive): the desktop writes atomically (temp → rename), so the
+        // file's inode changes and watching it directly would miss the rename — the dir sees it.
+        if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            eprintln!("openhydra-agent: share-policy watch({}) failed ({e}) — using the poll fallback", dir.display());
+            return;
+        }
+        eprintln!("openhydra-agent: watching {} for share-policy changes (event-driven reload)", path.display());
+        for res in rx {
+            match res {
+                // React only to events touching OUR file (not siblings like the ledger). `reload_if_
+                // changed` is atomic (reload_lock) + mtime-deduped, so a coincident poll-loop reload
+                // won't double-announce.
+                Ok(event) if event.paths.iter().any(|p| p == &path) => {
+                    if self.policy.reload_if_changed() {
+                        eprintln!("openhydra-agent: share policy changed (watcher) — re-announcing");
+                        if let Err(e) = self.announce_models() {
+                            eprintln!("openhydra-agent: re-announce after policy change failed: {e}");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("openhydra-agent: share-policy watch error: {e}"),
+            }
+        }
+    }
+
     pub fn run_inbound(
         self: Arc<Self>,
         poll_timeout: std::time::Duration,
@@ -1033,6 +1078,13 @@ impl<A: EngineAdapter> Provider<A> {
         A: Send + Sync + 'static,
     {
         let pool = WorkerPool::new(max_concurrency);
+        // R6/B2: event-driven share-policy reload. Spawn a filesystem watcher so a desktop toggle
+        // applies in ~ms; the poll loop below keeps its periodic `reload_if_changed` as the portable
+        // fallback (missed events / flaky-FS platforms). No-op for a static `--share-models` policy.
+        {
+            let watcher = Arc::clone(&self);
+            std::thread::spawn(move || watcher.watch_policy_file());
+        }
         let mut last_announce = std::time::Instant::now();
         // #42: track the network generation. The event loop bumps it whenever it
         // rebuilds connectivity after a network change (roam / wake / interface
@@ -1106,10 +1158,10 @@ impl<A: EngineAdapter> Provider<A> {
                     let _ = self.net.respond(shed_id, busy);
                 }
             }
-            // Hot-reload the share policy if the desktop rewrote it → re-announce now so a toggled-on
-            // model is advertised within one poll slice (<1s), and a toggled-off one stops being
-            // refreshed (its record ages out within the provider-record TTL; the serve gate refuses
-            // it immediately). Cheap: one `stat` per poll, parse+swap only on an actual change.
+            // FALLBACK hot-reload (the `watch_policy_file` thread is the primary, event-driven path):
+            // if the watcher missed an event or couldn't start, this catches a policy change within one
+            // poll slice (<1s). Cheap — one `stat` per poll, parse+swap only on an actual change; the
+            // reload_lock + mtime dedup make it safe to run alongside the watcher (no double-announce).
             let policy_changed = self.policy.reload_if_changed();
             if policy_changed {
                 eprintln!("openhydra-agent: share policy changed — re-announcing");

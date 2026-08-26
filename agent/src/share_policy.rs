@@ -173,12 +173,15 @@ pub struct PolicyWatcher {
     path: Option<PathBuf>,
     /// Last-seen mtime of `path`, for cheap change detection (one `stat` per [`Self::reload_if_changed`]).
     last_mtime: Mutex<Option<SystemTime>>,
+    /// Serializes the whole check→load→swap→record of [`Self::reload_if_changed`] so the poll thread
+    /// and the filesystem-watcher thread can't both observe one change and double-reload/announce.
+    reload_lock: Mutex<()>,
 }
 
 impl PolicyWatcher {
     /// A static (non-reloading) watcher around a fixed policy — for tests and non-file callers.
     pub fn r#static(policy: SharePolicy) -> Self {
-        Self { policy: RwLock::new(policy), path: None, last_mtime: Mutex::new(None) }
+        Self { policy: RwLock::new(policy), path: None, last_mtime: Mutex::new(None), reload_lock: Mutex::new(()) }
     }
 
     /// A static watcher from a legacy `--share-models` list (empty ⇒ share-all).
@@ -220,7 +223,7 @@ impl PolicyWatcher {
                 SharePolicy::share_nothing()
             }
         };
-        Self { policy: RwLock::new(policy), path: Some(path), last_mtime: Mutex::new(mtime) }
+        Self { policy: RwLock::new(policy), path: Some(path), last_mtime: Mutex::new(mtime), reload_lock: Mutex::new(()) }
     }
 
     /// Whether `engine_ref` is shared under the current (possibly hot-reloaded) policy. A poisoned
@@ -236,6 +239,12 @@ impl PolicyWatcher {
         self.policy.read().map(|p| p.clone()).unwrap_or_else(|_| SharePolicy::share_nothing())
     }
 
+    /// The file this watcher hot-reloads, if it's file-backed — for a filesystem watcher to observe.
+    /// `None` for a static (`--share-models`) policy that never reloads.
+    pub fn watched_path(&self) -> Option<PathBuf> {
+        self.path.clone()
+    }
+
     /// Re-read the file if its mtime changed, swapping the in-memory policy. Returns `true` only
     /// when the policy was actually swapped (so the caller can trigger an immediate re-announce).
     ///
@@ -245,6 +254,10 @@ impl PolicyWatcher {
     /// retry every poll. A static watcher (no path) always returns `false`.
     pub fn reload_if_changed(&self) -> bool {
         let Some(path) = self.path.as_ref() else { return false };
+        // Hold the reload lock for the whole check→load→swap→record so a concurrent caller (the
+        // poll thread vs the filesystem-watcher thread) can't both see one change: whichever gets
+        // here first reloads and records the new mtime; the other then short-circuits below.
+        let _guard = self.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = file_mtime(path);
         // Recover a poisoned mtime lock rather than panic (it only ever guards a trivial value, so
         // poison is practically unreachable — but this keeps the poll thread alive if it ever isn't).
@@ -470,5 +483,24 @@ mod tests {
         assert!(w.is_shared("a"), "previous policy retained when the file vanishes");
         // Absence recorded → we don't thrash re-reading a missing file every poll.
         assert!(!w.reload_if_changed());
+    }
+
+    #[test]
+    fn concurrent_reload_only_one_observes_the_change() {
+        // R6: the poll thread and the filesystem-watcher thread can both call reload_if_changed for
+        // the same change; the reload_lock + mtime dedup must let EXACTLY ONE observe it (no
+        // double-announce), and the policy still lands.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        SharePolicy::share_list(["a"]).write_atomic(&path).unwrap();
+        let w = std::sync::Arc::new(PolicyWatcher::from_file(path.clone()));
+        tick();
+        SharePolicy::share_list(["b"]).write_atomic(&path).unwrap();
+        let (w1, w2) = (w.clone(), w.clone());
+        let h1 = std::thread::spawn(move || w1.reload_if_changed());
+        let h2 = std::thread::spawn(move || w2.reload_if_changed());
+        let (r1, r2) = (h1.join().unwrap(), h2.join().unwrap());
+        assert!(r1 ^ r2, "exactly one racing reload should observe the change (got {r1}, {r2})");
+        assert!(w.is_shared("b") && !w.is_shared("a"), "policy applied after the race");
     }
 }
