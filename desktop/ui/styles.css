@@ -236,6 +236,10 @@
   .reach-pill .rp:hover{background:hsl(var(--accentbg))}
   .reach-pill .rp.sel{background:hsl(var(--muted));color:hsl(var(--foreground))}
   .reach-pill .rp.sel[data-to="global"]{background:hsl(var(--brand));color:#fff}
+  /* M2: per-row "export card" action + import-preview failure text. */
+  .cardbtn{border:0;background:transparent;cursor:pointer;font-size:13px;opacity:.6;padding:0 2px;line-height:1}
+  .cardbtn:hover{opacity:1}
+  .cardfail{font-size:11.5px;color:hsl(0 72% 55%)}
   /* Tri-state master switch: some-but-not-all shared → knob centered, muted-brand track. */
   .switch.indeterminate{background:hsl(var(--brand) / .45);border-color:transparent}
   .switch.indeterminate::after{left:11px}

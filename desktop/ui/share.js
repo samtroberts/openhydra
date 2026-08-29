@@ -1,7 +1,7 @@
 // Share view (provider role) + the per-model share allowlist + the sharing/gateway lifecycle.
 // setSharing / ensureGateway signal the controller via the bus (emit "nav"/"refresh") instead of
 // importing its go()/refresh() (which would cycle). renderShare is the view-dispatcher entry.
-import { $, $$, esc } from "./dom";
+import { $, $$, esc, escapeHtml } from "./dom";
 import { state, snap, engines } from "./state";
 import { call } from "./bridge";
 import { toast } from "./chrome";
@@ -11,6 +11,7 @@ import { totalServed, totalUsed, lifetimeServed, statModels } from "./stats";
 import { renderChart } from "./chart";
 import { fmtNum, fmtUptime, modelIcon } from "./format";
 import { displayModelName } from "./models";
+import { exportCardModal, ensureImportSection } from "./cards";
 
   let sharingBusy = false;
   export async function setSharing(on) {
@@ -292,11 +293,16 @@ import { displayModelName } from "./models";
       // share switch so the two are never confused. `device`/unknown highlights Private.
       const reachPill = sharedIntent
         ? `<span class="reach-pill" title="How far this model reaches">`
-          + `<button class="rp ${gl ? "" : "sel"}" data-reach="${esc(m)}" data-to="private" title="${SCOPE_META.private.title}">🔒 Private</button>`
-          + `<button class="rp ${gl ? "sel" : ""}" data-reach="${esc(m)}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button>`
+          + `<button class="rp ${gl ? "" : "sel"}" data-reach="${escapeHtml(m)}" data-to="private" title="${SCOPE_META.private.title}">🔒 Private</button>`
+          + `<button class="rp ${gl ? "sel" : ""}" data-reach="${escapeHtml(m)}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button>`
           + `</span>`
         : "";
-      rows.push(`<tr><td>${modelIcon(m)}<b title="${esc(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div>${reachPill}</td></tr>`);
+      // M2: export a signed `.openhydra` card — only for a globally-shared model (a card is a public
+      // pointer, so the export gate refuses anything else anyway).
+      const cardBtn = (sharedIntent && gl)
+        ? `<button class="cardbtn" data-export-card="${escapeHtml(m)}" title="Export a signed .openhydra card — share a link to this model">🔗</button>`
+        : "";
+      rows.push(`<tr><td>${modelIcon(m)}<b title="${escapeHtml(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${escapeHtml(m)}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
     // "Previously served" — lifetime tokens on record but NOT currently detected.
@@ -339,6 +345,10 @@ import { displayModelName } from "./models";
     // Reach pill: each segment declares its target scope; clicking the active one is a no-op (guarded
     // in setModelScope), clicking Global opens the consent gate. The whole segment is the hit target.
     $$("#servetable [data-reach]").forEach((b) => b.onclick = () => setModelScope(b.dataset.reach, b.dataset.to));
+    // M2: export a `.openhydra` card for a globally-shared model.
+    $$("#servetable [data-export-card]").forEach((b) => b.onclick = () => exportCardModal(b.dataset.exportCard));
+    // M2: build the "Add a model by card" import section once (persists across status refreshes).
+    ensureImportSection();
     // incoming strip
     // Honest "Incoming" strip: real cumulative serve activity while sharing; hidden when idle.
     // There is no live concurrent-in-flight telemetry, so we don't fabricate one (the old card

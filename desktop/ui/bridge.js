@@ -25,6 +25,28 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       ? gc[m] != null                                   // explicit Global → per-model consent
       : (pol.default_global_consent ?? null) != null;   // default Global → policy-level consent
   }
+  // A plausible verified card for the browser mock (the real one is signed by the agent).
+  function mockCard(model) {
+    return {
+      schema_version: 1,
+      openhydra_peer_id: "oh_mockcard",
+      libp2p_peer_id: "12D3KooWMockCardProvider99xyzABCDEF",
+      public_key: "00".repeat(32),
+      model_id: model,
+      canonical_id: model.includes("/") ? model : model.replace(":", "/") + "/int4/mockhash1234",
+      weight_hash: "",
+      capability: { params: "3.0B", context_length: 8192, max_output_tokens: 2048, modalities: ["text"] },
+      pricing_mode: "reciprocal",
+      rate_card: null,
+      aup_flags: { uncensored: false, nsfw: false },
+      region: "us",
+      addr_hints: [],
+      signed_at: 1787000000000,
+      expires_at: 1787000000000 + 30 * 24 * 3600 * 1000,
+      sig_alg: 1,
+      signature: "mock-signature-base64url",
+    };
+  }
   function mock(cmd, args) {
     if (cmd === "start_provider") { mk.provider = true; return null; }
     if (cmd === "stop_provider") { mk.provider = false; return null; }
@@ -34,6 +56,26 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "save_share_policy") { mk.sharePolicy = args?.policy || { version: 1, mode: "all", models: [] }; return null; }
     if (cmd === "read_share_policy") return mk.sharePolicy || { version: 1, mode: "all", models: [] };
     if (cmd === "reset_share_policy") { mk.sharePolicy = { version: 1, mode: "list", models: [] }; return null; }
+    // ── M2 `.openhydra` cards (mock) ──
+    if (cmd === "export_card") { const model = args?.model || "qwen3:1.7b"; return { card: mockCard(model), magnet: "openhydra:card:" + btoa("mock-card:" + model) }; }
+    if (cmd === "preview_card") {
+      const t = (args?.input || "").trim();
+      if (!(t.startsWith("openhydra:card:") || t.startsWith("{"))) return Promise.reject("card crypto error: not an openhydra:card: string");
+      return mockCard("granite4.1:3b"); // a pretend remote model
+    }
+    if (cmd === "import_card") {
+      const c = mockCard("granite4.1:3b");
+      mk.importedCards = (mk.importedCards || []).filter((x) => !(x.libp2p_peer_id === c.libp2p_peer_id && x.model_id === c.model_id));
+      mk.importedCards.push(c);
+      return c;
+    }
+    if (cmd === "take_pending_card") return null; // M2.1: no cold-launch card in the browser mock
+    if (cmd === "list_cards") return mk.importedCards || [];
+    if (cmd === "remove_imported_card") {
+      const before = (mk.importedCards || []).length;
+      mk.importedCards = (mk.importedCards || []).filter((x) => !(x.libp2p_peer_id === args?.libp2p_peer_id && x.model_id === args?.model_id));
+      return before - (mk.importedCards || []).length;
+    }
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "connector_status") {
       const c = (o) => ({ declared_models: [], ...o, connected: !!(mk.connected && mk.connected[o.key]) });

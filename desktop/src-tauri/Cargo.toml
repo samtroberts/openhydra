@@ -26,8 +26,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# M2.1: launch OpenHydra when a `.openhydra` file (fileAssociations) or an `openhydra:` magnet link
+# (deep-link scheme) is opened, and route it into the card import flow.
+tauri-plugin-deep-link = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M2.1: parse opened file:/openhydra: URLs (same version Tauri surfaces in RunEvent::Opened).
+url = "2"
 # Connectors: merge the OpenHydra provider block into a tool's own config file. OpenCode is JSON
 # (serde_json), Continue is YAML. serde_yaml is archived-but-stable; it only ever touches a config
 # the user explicitly clicks "Connect" on (always backed up first).
@@ -39,6 +44,12 @@ openhydra-agent = { path = "../../agent" }
 # Signal-safe child cleanup (kill registered agent pids on SIGTERM/SIGINT/SIGHUP).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# M2.1: forward a deep link / opened file to the ALREADY-RUNNING instance (else a second launch
+# spawns a new process with the URL as an argv). The `deep-link` feature wires it into the deep-link
+# plugin's on_open_url on Windows/Linux; on macOS the OS delivers to the running app directly.
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [dev-dependencies]
 # Isolated temp dirs for filesystem-touching tests (share-policy migration).

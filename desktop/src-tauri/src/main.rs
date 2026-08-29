@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 mod cli;
 mod hostinfo;
@@ -975,6 +976,176 @@ fn provider_peer_id() -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// M2: export a signed `.openhydra` card for a shared model. Shells to the agent's `card export`
+/// (loads the provider identity, detects the model, enforces the global-share/consent gate, signs) —
+/// stable, no swarm, like `provider_peer_id`. Returns `{ card, magnet }` for the UI to save/copy.
+#[tauri::command]
+fn export_card(
+    model: String,
+    ttl_secs: Option<u64>,
+    region: Option<String>,
+) -> Result<openhydra_agent::CardExport, String> {
+    let bin = agent_binary().ok_or_else(|| {
+        "openhydra-agent binary not found (bundle missing its sidecar, or no dev build)".to_string()
+    })?;
+    let key = openhydra_dir().join("desktop-provider.key");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--identity")
+        .arg(&key)
+        .arg("card")
+        .arg("export")
+        .arg("--model")
+        .arg(&model)
+        .arg("--share-policy-file")
+        .arg(share_policy_path())
+        .arg("--ttl-secs")
+        .arg(ttl_secs.unwrap_or(30 * 24 * 3600).to_string());
+    if let Some(r) = region.filter(|r| !r.is_empty()) {
+        cmd.arg("--region").arg(r);
+    }
+    let out = cmd.output().map_err(|e| format!("run card export: {e}"))?;
+    if !out.status.success() {
+        // The agent prints a clean `openhydra-agent: <reason>` line to stderr on failure.
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if msg.is_empty() { "card export failed".into() } else { msg });
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse card export output: {e}"))
+}
+
+/// The imported-cards store the gateway reads (`--cards-file`).
+fn cards_file_path() -> PathBuf {
+    openhydra_dir().join("cards.json")
+}
+
+/// Serializes the read-modify-write of `cards.json` across this process's card commands, so two
+/// concurrent imports (or an import racing a removal) can't lose an update. The desktop is the only
+/// writer; the atomic temp+rename in `add_card`/`remove_card` already prevents torn reads.
+static CARDS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// M2.1: a card (magnet text, or the contents of a `.openhydra` file) delivered by an OS file/URL
+/// open, awaiting frontend pickup via `take_pending_card`. Covers the cold-launch race where the app
+/// is opened BY a card before the UI is ready to receive the `card-opened` event.
+struct PendingCard(std::sync::Mutex<Option<String>>);
+
+/// Cap on a `.openhydra` file read — a card is a few KB; this bounds a symlink to `/dev/zero` or a
+/// giant file so an opened file can never hang / OOM the app (review fix #1).
+const MAX_CARD_FILE_BYTES: u64 = 256 * 1024;
+
+/// M2.1: turn an opened URL into card text. An `openhydra:` URL *is* the magnet string; a `file:` URL
+/// (a `.openhydra` file association) is read from disk (guarded). Scheme allowlist — anything else
+/// never touches disk (review fix #1: keeps the `file:` read unreachable from an attacker's
+/// `openhydra:` link, which only ever hits the string arm).
+fn card_text_from_url(url: &url::Url) -> Option<String> {
+    match url.scheme() {
+        "openhydra" => Some(url.as_str().to_string()),
+        "file" => read_card_file(url),
+        _ => None,
+    }
+}
+
+/// Read a `.openhydra` file safely (review fix #1): resolve symlinks and require the RESOLVED file to
+/// actually be a `.openhydra` (so a `.openhydra` symlink pointing at `~/.ssh/id_rsa` or `/dev/zero` is
+/// refused, not read), then read it under a hard size cap. Any failure → `None` (never panics).
+fn read_card_file(url: &url::Url) -> Option<String> {
+    use std::io::Read;
+    let path = url.to_file_path().ok()?;
+    // Canonicalize BEFORE trusting the extension — resolves symlinks so the check applies to the real
+    // target, not the `.openhydra`-named link.
+    let resolved = std::fs::canonicalize(&path).ok()?;
+    if !resolved.extension().is_some_and(|e| e.eq_ignore_ascii_case("openhydra")) {
+        return None;
+    }
+    let file = std::fs::File::open(&resolved).ok()?;
+    if file.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_CARD_FILE_BYTES {
+        return None;
+    }
+    let mut buf = String::new();
+    // `take` bounds the read even for a device file that reports size 0 but streams forever.
+    file.take(MAX_CARD_FILE_BYTES).read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// M2.1 (Win/Linux): a second-launch file open / deep link arrives as a process argument (macOS uses
+/// Apple events → `RunEvent::Opened` / the deep-link plugin, and its file isn't in argv, so this is a
+/// no-op there). Route the first `openhydra:` URL or `.openhydra` file path found in `args`.
+fn deliver_card_from_args<I: IntoIterator<Item = String>>(app: &tauri::AppHandle, args: I) {
+    for arg in args {
+        let url = if arg.starts_with("openhydra:") {
+            arg.parse::<url::Url>().ok()
+        } else if arg.to_ascii_lowercase().ends_with(".openhydra") {
+            std::fs::canonicalize(&arg).ok().and_then(|p| url::Url::from_file_path(p).ok())
+        } else {
+            None
+        };
+        if let Some(u) = url {
+            if let Some(text) = card_text_from_url(&u) {
+                deliver_card(app, text);
+                return; // one card per launch
+            }
+        }
+    }
+}
+
+/// M2.1: stash opened card text for cold-launch pickup AND emit `card-opened` for the already-running
+/// case, then focus the window.
+fn deliver_card(app: &tauri::AppHandle, text: String) {
+    if let Some(state) = app.try_state::<PendingCard>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = Some(text.clone());
+        }
+    }
+    let _ = app.emit("card-opened", text);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_focus();
+    }
+}
+
+/// M2.1: the frontend calls this once on startup to pick up a card the app was launched with (a
+/// double-clicked `.openhydra` file or an `openhydra:` link). Take-and-clear so it fires once.
+#[tauri::command]
+fn take_pending_card(state: tauri::State<'_, PendingCard>) -> Option<String> {
+    state.0.lock().ok().and_then(|mut g| g.take())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// M2: verify a `.openhydra` card (JSON or magnet) WITHOUT persisting it — powers the import preview
+/// so the user sees the provider/model/expiry + ✔ signature before adding.
+#[tauri::command]
+fn preview_card(input: String) -> Result<openhydra_agent::Card, String> {
+    Ok(openhydra_agent::cards::parse_and_verify(&input, now_unix_ms())?.card)
+}
+
+/// M2: import a `.openhydra` card (JSON or magnet). Verifies it in-process (signature, key↔peer-id
+/// binding, privacy, schema, expiry), persists it to the cards store, and returns the verified card
+/// for the preview. The running gateway hot-reloads the store, so the model becomes routable at once.
+#[tauri::command]
+fn import_card(input: String) -> Result<openhydra_agent::Card, String> {
+    let verified = openhydra_agent::cards::parse_and_verify(&input, now_unix_ms())?;
+    let _guard = CARDS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::cards::add_card(&cards_file_path(), &verified.card)?;
+    Ok(verified.card)
+}
+
+/// M2: the currently-valid (verified, unexpired) imported cards, for the "Added via card" list.
+#[tauri::command]
+fn list_cards() -> Result<Vec<openhydra_agent::Card>, String> {
+    let store = openhydra_agent::cards::CardStore::new(cards_file_path());
+    Ok(store.valid_cards(now_unix_ms()))
+}
+
+/// M2: remove an imported card by its `(libp2p_peer_id, model_id)`. Returns how many were removed.
+#[tauri::command]
+fn remove_imported_card(libp2p_peer_id: String, model_id: String) -> Result<usize, String> {
+    let _guard = CARDS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::cards::remove_card(&cards_file_path(), &libp2p_peer_id, &model_id)
+}
+
 #[tauri::command]
 fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
@@ -993,6 +1164,10 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // provider role — redb allows a single writer process per file).
     sub.push("--db".into());
     sub.push(openhydra_dir().join("gateway-ledger.redb").to_string_lossy().into_owned());
+    // M2: route to imported `.openhydra` cards (verified providers dialable by peer id without
+    // discovery). Hot-reloaded, so a card imported while the gateway runs takes effect immediately.
+    sub.push("--cards-file".into());
+    sub.push(cards_file_path().to_string_lossy().into_owned());
     spawn_role(
         &state.gateway,
         "desktop-consumer.key",
@@ -1715,6 +1890,19 @@ fn main() {
     sweep_stale_agents();
     install_signal_handlers();
     tauri::Builder::default()
+        // M2.1: single-instance MUST be first — it forwards a second launch's deep link / opened file
+        // to the running instance (Win/Linux spawn a new process; the `deep-link` feature routes the
+        // URL into `on_open_url`) instead of opening a duplicate window. On macOS the OS delivers to
+        // the running app directly; here we just focus it.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+            // Win/Linux: a second launch by a `.openhydra` file (or an `openhydra:` link the plugin
+            // didn't already forward to on_open_url) carries it in argv. macOS: no-op.
+            deliver_card_from_args(app, argv);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
@@ -1724,6 +1912,7 @@ fn main() {
             resumed_on_launch: std::sync::atomic::AtomicBool::new(false),
             share_policy_reset: std::sync::atomic::AtomicBool::new(false),
         })
+        .manage(PendingCard(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_state,
             start_provider,
@@ -1732,6 +1921,12 @@ fn main() {
             stop_gateway,
             save_share_policy,
             read_share_policy,
+            export_card,
+            preview_card,
+            import_card,
+            list_cards,
+            remove_imported_card,
+            take_pending_card,
             reset_share_policy,
             detect_engines_now,
             system_info,
@@ -1764,6 +1959,29 @@ fn main() {
             uninstall_cli,
         ])
         .setup(|app| {
+            // M2.1: card deep links. A cold launch by an `openhydra:` link surfaces via
+            // `get_current`; subsequent links (app already running) via `on_open_url`. A `.openhydra`
+            // FILE open arrives as `RunEvent::Opened` (below), so the two channels don't overlap.
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for u in &urls {
+                    if let Some(text) = card_text_from_url(u) {
+                        deliver_card(app.handle(), text);
+                    }
+                }
+            }
+            {
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for u in event.urls() {
+                        if let Some(text) = card_text_from_url(&u) {
+                            deliver_card(&handle, text);
+                        }
+                    }
+                });
+            }
+            // Win/Linux cold launch by a `.openhydra` file / `openhydra:` link arrives in the process
+            // args (macOS uses Apple events, so this is a no-op there).
+            deliver_card_from_args(app.handle(), std::env::args().skip(1));
             // Resume sharing if the user was sharing when they last quit (informed opt-out via
             // `resume_on_launch`). The provider is a child process killed on exit, so without this
             // every restart/update silently stopped sharing. The agent re-announces only models the
@@ -1868,10 +2086,23 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error building OpenHydra app")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                kill_all(&app.state::<AppState>());
+        .run(|app, event| match event {
+            tauri::RunEvent::Exit => kill_all(&app.state::<AppState>()),
+            // M2.1: a `.openhydra` file was opened (fileAssociations → `file:` URL). `openhydra:`
+            // scheme URLs are handled by the deep-link plugin above, so only take `file:` here.
+            // `RunEvent::Opened` exists only on macOS/iOS (Win/Linux deliver file opens via argv —
+            // a follow-up); the scheme path is cross-platform via deep-link + single-instance.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            tauri::RunEvent::Opened { urls } => {
+                for u in &urls {
+                    if u.scheme() == "file" {
+                        if let Some(text) = card_text_from_url(u) {
+                            deliver_card(app, text);
+                        }
+                    }
+                }
             }
+            _ => {}
         });
 }
 
@@ -1883,6 +2114,57 @@ mod tests {
     fn strips_ansi_sgr_sequences() {
         let colored = "\u{1b}[2m2026-07-02\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m announced";
         assert_eq!(strip_ansi(colored), "2026-07-02  INFO announced");
+    }
+
+    // ── M2.1 review fix #1: safe `.openhydra` file read ──
+
+    fn file_url(p: &std::path::Path) -> url::Url {
+        url::Url::from_file_path(p).unwrap()
+    }
+
+    #[test]
+    fn read_card_file_reads_a_valid_openhydra_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("card.openhydra");
+        std::fs::write(&p, r#"{"model_id":"x"}"#).unwrap();
+        assert_eq!(read_card_file(&file_url(&p)).as_deref(), Some(r#"{"model_id":"x"}"#));
+    }
+
+    #[test]
+    fn read_card_file_refuses_a_non_openhydra_extension() {
+        // The user could point a `file:` open at any file; only a real `.openhydra` is read.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("secret.txt");
+        std::fs::write(&p, "sensitive").unwrap();
+        assert_eq!(read_card_file(&file_url(&p)), None);
+    }
+
+    #[test]
+    fn read_card_file_caps_the_read_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("huge.openhydra");
+        std::fs::write(&p, vec![b'a'; (MAX_CARD_FILE_BYTES + 10) as usize]).unwrap();
+        assert_eq!(read_card_file(&file_url(&p)), None, "oversize file refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_card_file_refuses_a_symlink_to_a_non_card_target() {
+        // A `.openhydra`-named symlink pointing at a sensitive file must be refused (canonicalize
+        // resolves the link, then the extension check fails on the real target).
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("id_rsa"); // no .openhydra extension
+        std::fs::write(&target, "PRIVATE KEY").unwrap();
+        let link = dir.path().join("evil.openhydra");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_card_file(&file_url(&link)), None);
+    }
+
+    #[test]
+    fn card_text_from_url_never_reads_disk_for_a_non_file_scheme() {
+        // An `openhydra:` URL is the magnet string verbatim — it must never touch the filesystem.
+        let u: url::Url = "openhydra:card:sW5z".parse().unwrap();
+        assert_eq!(card_text_from_url(&u).as_deref(), Some("openhydra:card:sW5z"));
     }
 
     #[test]

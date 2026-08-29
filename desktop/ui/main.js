@@ -15,6 +15,7 @@ import { renderProviders } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
 import { renderEngines } from "./installer";
 import { renderShare, setSharing, toggleSharing, ensureGateway } from "./share";
+import { wireCardDeepLinks } from "./cards";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
 import { renderSettings, updateEngineEndpoint } from "./settings";
@@ -577,6 +578,7 @@ $("#homelogo").src = "/logo-mark.png";
   await refresh(); await refreshEngines(); await refreshSystem();
   await ensureGateway();  // eager: warm discovery so the first chat isn't a cold 504
   await refreshStatus();
+  wireCardDeepLinks();    // M2.1: route a `.openhydra` file / `openhydra:` link into the import flow
 })();
 setInterval(refresh, 2500);
 setInterval(refreshEngines, 10000);
