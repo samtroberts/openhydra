@@ -140,6 +140,105 @@ enum Role {
     /// Export a signed `.openhydra` card — a secret-free "magnet for a model" others import to dial
     /// you directly, no live discovery. Only for a globally-shared model. No swarm. See `card export`.
     Card(CardArgs),
+    /// Manage swarm membership (M3/M4): create a swarm, enroll members, accept a credential. The
+    /// scriptable twin of the desktop Swarms panel — enrollment is offline copy/paste. See `swarm`.
+    Swarm(SwarmArgs),
+}
+
+/// `swarm <action>` — the membership CLI (M3/M4). State lives under `--swarms-dir`.
+#[derive(Args)]
+struct SwarmArgs {
+    #[command(subcommand)]
+    action: SwarmAction,
+}
+
+#[derive(Subcommand)]
+enum SwarmAction {
+    /// Create a swarm (generate the group keypair, persist an owner record). Prints its JSON view.
+    Create(SwarmCreateArgs),
+    /// Build a signed enrollment request from THIS node's `--identity`, to send to a swarm owner.
+    /// Prints the `openhydra:enroll:...` magnet.
+    Request(SwarmRequestArgs),
+    /// (Owner) Approve an enrollment request into a signed credential. Prints the `openhydra:cred:...`
+    /// magnet to send back to the member.
+    Approve(SwarmApproveArgs),
+    /// (Member) Accept a credential the owner returned (verifies + binds to `--identity`). Prints the
+    /// stored JSON view.
+    Accept(SwarmAcceptArgs),
+    /// List this node's swarms as redacted JSON views (no secrets).
+    List(SwarmDirArg),
+    /// (Owner) Revoke a member by its public key.
+    Revoke(SwarmRevokeArgs),
+}
+
+/// The swarms directory, shared by every action. Defaults to `~/.openhydra/swarms`.
+#[derive(Args)]
+struct SwarmDirArg {
+    #[arg(long = "swarms-dir")]
+    swarms_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Args)]
+struct SwarmCreateArgs {
+    /// Human label (e.g. "Home rig").
+    #[arg(long)]
+    label: String,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
+struct SwarmRequestArgs {
+    /// A label for this device (the owner sees it).
+    #[arg(long)]
+    label: String,
+    /// Optional group-public-key hint of which swarm to join.
+    #[arg(long)]
+    swarm: Option<String>,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
+struct SwarmApproveArgs {
+    /// The swarm (group public key) to approve into — must be one you own.
+    #[arg(long)]
+    swarm: String,
+    /// The enrollment request (magnet or JSON) the member sent.
+    #[arg(long)]
+    request: String,
+    /// A label for this member.
+    #[arg(long, default_value = "")]
+    label: String,
+    /// Credential validity in seconds (default 90 days).
+    #[arg(long, default_value_t = 90 * 24 * 3600)]
+    ttl_secs: u64,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
+struct SwarmAcceptArgs {
+    /// The credential (magnet or JSON) the owner returned.
+    #[arg(long)]
+    credential: String,
+    /// Optional local label override (defaults to the swarm's label on the credential).
+    #[arg(long, default_value = "")]
+    label: String,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
+struct SwarmRevokeArgs {
+    /// The swarm (group public key) you own.
+    #[arg(long)]
+    swarm: String,
+    /// The member's public key to revoke.
+    #[arg(long)]
+    member: String,
+    #[command(flatten)]
+    dir: SwarmDirArg,
 }
 
 /// `card <action>` — the `.openhydra` card CLI (M2).
@@ -628,6 +727,75 @@ fn run() -> Result<(), String> {
                         "OK: model {:?} served by {} (openhydra id {}), expires {}",
                         v.card.model_id, v.card.libp2p_peer_id, v.card.openhydra_peer_id, v.card.expires_at
                     );
+                }
+            }
+            return Ok(());
+        }
+        Role::Swarm(args) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // Resolve `--swarms-dir`, defaulting to `~/.openhydra/swarms`.
+            let resolve_dir = |d: Option<std::path::PathBuf>| -> std::path::PathBuf {
+                d.unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                    std::path::PathBuf::from(home).join(".openhydra").join("swarms")
+                })
+            };
+            let identity_path = cli.node.into_config().identity_path;
+            match args.action {
+                SwarmAction::Create(a) => {
+                    let v = openhydra_agent::swarms::create_swarm(
+                        &resolve_dir(a.dir.swarms_dir),
+                        a.label.trim(),
+                        now_ms,
+                    )?;
+                    println!("{}", serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?);
+                }
+                SwarmAction::Request(a) => {
+                    let out = openhydra_agent::swarms::enroll_request_at(
+                        &identity_path,
+                        a.swarm.as_deref().unwrap_or("").trim(),
+                        a.label.trim(),
+                        now_ms,
+                    )?;
+                    // Print just the magnet on stdout (easy to capture over ssh); the request JSON is
+                    // in the magnet.
+                    println!("{}", out.magnet);
+                }
+                SwarmAction::Approve(a) => {
+                    let out = openhydra_agent::swarms::approve_member(
+                        &resolve_dir(a.dir.swarms_dir),
+                        a.swarm.trim(),
+                        a.request.trim(),
+                        a.label.trim(),
+                        a.ttl_secs,
+                        now_ms,
+                    )?;
+                    println!("{}", out.magnet);
+                }
+                SwarmAction::Accept(a) => {
+                    let v = openhydra_agent::swarms::accept_credential_at(
+                        &resolve_dir(a.dir.swarms_dir),
+                        &identity_path,
+                        a.credential.trim(),
+                        a.label.trim(),
+                        now_ms,
+                    )?;
+                    println!("{}", serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?);
+                }
+                SwarmAction::List(a) => {
+                    let v = openhydra_agent::swarms::list_swarms(&resolve_dir(a.swarms_dir))?;
+                    println!("{}", serde_json::to_string(&v).map_err(|e| format!("serialize: {e}"))?);
+                }
+                SwarmAction::Revoke(a) => {
+                    openhydra_agent::swarms::revoke_member(
+                        &resolve_dir(a.dir.swarms_dir),
+                        a.swarm.trim(),
+                        a.member.trim(),
+                    )?;
+                    println!("revoked {}", a.member.trim());
                 }
             }
             return Ok(());
