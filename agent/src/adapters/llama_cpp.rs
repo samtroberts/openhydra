@@ -19,7 +19,9 @@
 
 use serde::Deserialize;
 
-use openhydra_protocol::model_id::{canonical_id_from_hf, parse_hf_model_name};
+use openhydra_protocol::model_id::{
+    canonical_model_id, chat_template_hash, normalize_chat_template, parse_hf_model_name,
+};
 
 use crate::adapter::{
     normalize_engine_ref, AdapterError, DetectedModel, EngineAdapter, HttpClient, InferenceRequest,
@@ -40,6 +42,11 @@ struct Props {
     /// On-disk path of the loaded GGUF, e.g. `/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf`.
     #[serde(default)]
     model_path: String,
+    /// The quantization file type as `llama-server` reports it, e.g. `"Q4_K - Medium"`,
+    /// `"Q8_0"`, `"BF16"`. A reliable quant source even when the filename carries no tag (see
+    /// [`quant_from_ftype`]).
+    #[serde(default)]
+    model_ftype: String,
 }
 
 // ── /v1/models (the id(s) a consumer addresses when serving) ──
@@ -90,6 +97,216 @@ fn parse_gguf_path(model_path: &str) -> (String, String) {
     (stem.to_string(), String::new())
 }
 
+/// Map `llama-server`'s `/props` `model_ftype` string to a GGUF quant tag, e.g.
+/// `"Q4_K - Medium"` → `Q4_K_M`, `"Q5_K - Small"` → `Q5_K_S`, `"Q8_0"` → `Q8_0`,
+/// `"IQ4_XS - 4.25 bpw"` → `IQ4_XS`, `"BF16"` → `BF16`. Returns `None` for an empty/unknown
+/// ftype so the caller falls back to the filename tag. More reliable than the filename because
+/// it comes from the loaded model itself.
+fn quant_from_ftype(ftype: &str) -> Option<String> {
+    let t = ftype.trim().trim_start_matches("mostly ").trim();
+    if t.is_empty() {
+        return None;
+    }
+    // A trailing " - <descriptor>" carries the K-quant size class (Small/Medium/Large); a code
+    // with no descriptor is already a full tag.
+    let (code, desc) = match t.split_once(" - ") {
+        Some((c, d)) => (c.trim(), Some(d.trim().to_ascii_lowercase())),
+        None => (t, None),
+    };
+    if code.is_empty() {
+        return None;
+    }
+    // Quant tags are conventionally upper-case (Q4_K_M, BF16, IQ4_XS); normalise the code so a
+    // lower-case ftype can't leak a mixed-case tag into the display/handle.
+    let code = code.to_ascii_uppercase();
+    if code.ends_with("_K") {
+        let suffix = match desc.as_deref() {
+            Some(d) if d.starts_with("small") => "_S",
+            Some(d) if d.starts_with("medium") => "_M",
+            Some(d) if d.starts_with("large") => "_L",
+            _ => "", // "Q6_K" (no size class) stays as-is
+        };
+        return Some(format!("{code}{suffix}"));
+    }
+    Some(code)
+}
+
+/// Does `s` look like an opaque, content-addressed handle rather than a human model name —
+/// e.g. an Ollama blob (`sha256-…`) or a bare hex digest? Such a handle carries no model info,
+/// so [`detect_models`](LlamaCppAdapter::detect_models) prefers a name synthesised from the GGUF
+/// header instead (when the file is co-located and readable).
+fn is_opaque_ref(s: &str) -> bool {
+    s.starts_with("sha256-")
+        || s.starts_with("sha256:")
+        || (s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// A model's self-described identity, read from the GGUF file header's metadata KV store
+/// (`general.*`). Independent of the filename — so even a hash-named blob names itself.
+#[derive(Debug, Default, Clone)]
+struct GgufMeta {
+    architecture: String,
+    name: String,
+    basename: String,
+    size_label: String,
+}
+
+/// An HF-style model name synthesised from GGUF metadata — `Qwen2.5-0.5B` from `basename` plus
+/// `size_label` — for feeding to `parse_hf_model_name`, so the canonical family/params come out
+/// normalised the same way the filename path does. Prefers `basename` (clean, no size baked in);
+/// falls back to `name` (spaces → dashes). `None` when neither is present.
+fn gguf_hf_name(meta: &GgufMeta) -> Option<String> {
+    let basename = meta.basename.trim();
+    if !basename.is_empty() {
+        let size = meta.size_label.trim();
+        return Some(if size.is_empty() {
+            basename.to_string()
+        } else {
+            format!("{basename}-{size}")
+        });
+    }
+    let name = meta.name.trim();
+    (!name.is_empty()).then(|| name.replace(' ', "-"))
+}
+
+/// Synthesise a clean, addressable handle from GGUF metadata — `Qwen3-1.7B-Q4_K_M` from
+/// `basename=Qwen3`, `size_label=1.7B`, `quant=Q4_K_M`. Used only to replace an opaque engine
+/// id. Prefers `basename` (no size baked in) over `name`; omits a size already present in the
+/// base, and the quant when unknown.
+fn synth_ref(meta: &GgufMeta, quant: &str) -> Option<String> {
+    let base = [meta.basename.as_str(), meta.name.as_str()]
+        .into_iter()
+        .find(|s| !s.trim().is_empty())?;
+    let mut parts = vec![base.trim().replace(' ', "-")];
+    if !meta.size_label.is_empty() && !base.contains(&meta.size_label) {
+        parts.push(meta.size_label.clone());
+    }
+    if !quant.is_empty() {
+        parts.push(quant.to_string());
+    }
+    let cleaned = normalize_engine_ref(&parts.join("-"));
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+// ── GGUF header reader (co-located enrichment) ──
+//
+// Reads the GGUF metadata KV store — a length-prefixed key/type/value stream right after a small
+// fixed header — pulling out the `general.*` identity keys and seeking past everything else
+// (including the large tokenizer arrays). Every read is fallible and bounded; any short read,
+// bad magic, unknown value type, or oversized field yields `None` so a non-co-located or
+// unreadable engine simply falls back to the filename. See the GGUF spec (ggml-org/ggml).
+
+fn rd_u32<R: std::io::Read>(r: &mut R) -> Option<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+fn rd_u64<R: std::io::Read>(r: &mut R) -> Option<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b).ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+/// Read a GGUF string (`u64` length + UTF-8 bytes). Rejects an implausibly long metadata string
+/// (>1 MiB) so a corrupt/hostile header can't drive a huge allocation.
+fn rd_gstr<R: std::io::Read>(r: &mut R) -> Option<String> {
+    let n = rd_u64(r)? as usize;
+    if n > 1 << 20 {
+        return None;
+    }
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Seek past a GGUF value of type `vtype` without materialising it (used for every KV we don't
+/// want). Handles scalars, strings, and arrays of scalars/strings; bails (`None`) on a nested
+/// array or unknown type rather than guessing.
+fn skip_gguf_value<R: std::io::Read + std::io::Seek>(r: &mut R, vtype: u32) -> Option<()> {
+    use std::io::SeekFrom;
+    let scalar = |t: u32| -> Option<i64> {
+        Some(match t {
+            0 | 1 | 7 => 1,       // u8 / i8 / bool
+            2 | 3 => 2,           // u16 / i16
+            4..=6 => 4,           // u32 / i32 / f32
+            10..=12 => 8,         // u64 / i64 / f64
+            _ => return None,
+        })
+    };
+    match vtype {
+        8 => {
+            let n = rd_u64(r)? as i64;
+            r.seek(SeekFrom::Current(n)).ok()?;
+        }
+        9 => {
+            let elem = rd_u32(r)?;
+            let count = rd_u64(r)? as i64;
+            if elem == 8 {
+                for _ in 0..count {
+                    let n = rd_u64(r)? as i64;
+                    r.seek(SeekFrom::Current(n)).ok()?;
+                }
+            } else {
+                let sz = scalar(elem)?;
+                r.seek(SeekFrom::Current(sz.checked_mul(count)?)).ok()?;
+            }
+        }
+        t => {
+            r.seek(SeekFrom::Current(scalar(t)?)).ok()?;
+        }
+    }
+    Some(())
+}
+
+/// Best-effort read of the `general.*` identity from a local GGUF file. `None` if the path isn't
+/// readable (a remote engine), isn't a GGUF, or the header can't be parsed — the caller then
+/// uses the filename. Only the small header prefix is touched; large arrays are seeked over.
+fn read_gguf_metadata(path: &str) -> Option<GgufMeta> {
+    let mut r = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut r, &mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    let version = rd_u32(&mut r)?;
+    if !(2..=3).contains(&version) {
+        return None; // v1 used u32 counts; only v2/v3 are handled
+    }
+    let _tensor_count = rd_u64(&mut r)?;
+    let kv_count = rd_u64(&mut r)?;
+    if kv_count > 100_000 {
+        return None; // sanity bound on a corrupt header
+    }
+    let mut meta = GgufMeta::default();
+    let mut got = 0;
+    for _ in 0..kv_count {
+        let key = rd_gstr(&mut r)?;
+        let vtype = rd_u32(&mut r)?;
+        let slot = match key.as_str() {
+            "general.architecture" => Some(&mut meta.architecture),
+            "general.name" => Some(&mut meta.name),
+            "general.basename" => Some(&mut meta.basename),
+            "general.size_label" => Some(&mut meta.size_label),
+            _ => None,
+        };
+        match slot {
+            Some(dst) if vtype == 8 => {
+                *dst = rd_gstr(&mut r)?;
+                got += 1;
+                if got >= 4 {
+                    break; // have every key we want; stop before the big tensor/tokenizer KVs
+                }
+            }
+            _ => skip_gguf_value(&mut r, vtype)?,
+        }
+    }
+    if meta.architecture.is_empty() && meta.name.is_empty() && meta.basename.is_empty() {
+        return None; // nothing useful
+    }
+    Some(meta)
+}
+
 /// Adapter for a local `llama-server`, generic over the injected HTTP transport.
 pub struct LlamaCppAdapter<H: HttpClient> {
     base_url: String,
@@ -121,14 +338,44 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
         let props: Props =
             serde_json::from_str(&props_json).map_err(|e| AdapterError::Parse(e.to_string()))?;
 
-        let (hf_name, quant) = parse_gguf_path(&props.model_path);
-        let (family, params, _variants) = parse_hf_model_name(&hf_name);
-        // `parse_hf_model_name` yields `params == "unknown"` when it finds no size token;
-        // refuse to mint a misleading `…/unknown/…` id in that case.
-        let canonical_id = if params == "unknown" {
+        // Model identity — prefer the model's own GGUF header (co-located, filename-independent)
+        // over parsing the path, and the engine-reported `model_ftype` over the filename tag for
+        // the quant. The filename remains the fallback for a remote/unreadable engine.
+        let gguf = read_gguf_metadata(&props.model_path);
+        let (hf_name, fn_quant) = parse_gguf_path(&props.model_path);
+        let (fn_family, fn_params, _variants) = parse_hf_model_name(&hf_name);
+
+        // Family/params: trust the filename when it parsed a size (`params != "unknown"`) — this
+        // preserves every existing canonical id exactly. Only when the filename is unparseable (a
+        // hash-named blob, or a name with no size token) fall back to the GGUF header, synthesised
+        // into an HF-style name and run through the *same* `parse_hf_model_name`, so the family
+        // ("Qwen2.5") and the rounded params come out normalised identically to the filename path.
+        // `general.architecture` is deliberately NOT used as the family: it's the coarse
+        // architecture (`qwen2` for Qwen2.5, `llama` for the Llama-3.x/distill cluster), which
+        // would both change existing ids and collide genuinely distinct models.
+        let (family, params) = if fn_params != "unknown" {
+            (fn_family, fn_params)
+        } else if let Some((f, p, _)) = gguf.as_ref().and_then(gguf_hf_name).map(|n| parse_hf_model_name(&n)) {
+            (f, p)
+        } else {
+            (fn_family, fn_params)
+        };
+        let quant = quant_from_ftype(&props.model_ftype).unwrap_or(fn_quant);
+
+        // Canonicalise from the resolved components. `parse_hf_model_name` yields
+        // `params == "unknown"` when it finds no size token; refuse a misleading `…/unknown/…`
+        // id. A missing template or quant also leaves the model advertised uncanonicalised.
+        let has_template = !normalize_chat_template(&props.chat_template).is_empty();
+        let canonical_id = if !has_template
+            || family.is_empty()
+            || params.is_empty()
+            || params == "unknown"
+            || quant.is_empty()
+        {
             String::new()
         } else {
-            match canonical_id_from_hf(&hf_name, &quant, &props.chat_template) {
+            let th = chat_template_hash(&props.chat_template);
+            match canonical_model_id(&family, &params, &quant, &th) {
                 Ok(c) => format!("{}/{}/{}/{}", c.family, c.params, c.quant, c.template_hash),
                 Err(_) => String::new(),
             }
@@ -139,7 +386,24 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
         let models_json = self.http.get(&format!("{}/v1/models", self.base_url))?;
         let models: ModelsResponse =
             serde_json::from_str(&models_json).map_err(|e| AdapterError::Parse(e.to_string()))?;
-        // Advertise a clean, path-free handle — never the raw `-m` path (privacy + readability).
+
+        // A clean handle synthesised from GGUF metadata, used only to replace an *opaque* engine id
+        // (e.g. an Ollama blob's `sha256-…`); `None` for a remote/unreadable engine. The `/props`
+        // GGUF describes a single model, so only substitute it when the server lists exactly one
+        // model — otherwise two distinct opaque ids would both collapse to this one name and one
+        // would be dropped as a collision.
+        let gguf_ref = gguf.as_ref().and_then(|m| synth_ref(m, &quant));
+        let single_model = models.data.len() == 1;
+        let deopaque = |clean: String| -> String {
+            if is_opaque_ref(&clean) {
+                gguf_ref.clone().unwrap_or(clean)
+            } else {
+                clean
+            }
+        };
+
+        // Advertise a clean, path-free handle — never the raw `-m` path (privacy + readability),
+        // and never an opaque blob hash when the GGUF header offers a real name (single-model only).
         // Skip an id that cleans to empty (a pathological `"/"` or bare `".gguf"`), and drop a
         // basename collision (two GGUFs sharing a name in different dirs) with a log rather than
         // silently — a single-model server never hits either, they guard the rare multi-model case.
@@ -153,19 +417,22 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
             if clean.is_empty() {
                 continue;
             }
-            if !seen.insert(clean.clone()) {
+            // Only de-opaque a single-model server, so distinct opaque ids stay distinct.
+            let engine_ref = if single_model { deopaque(clean) } else { clean };
+            if !seen.insert(engine_ref.clone()) {
                 eprintln!(
-                    "openhydra-agent: llama.cpp model '{id}' collides with already-detected '{clean}' — skipping"
+                    "openhydra-agent: llama.cpp model '{id}' collides with already-detected '{engine_ref}' — skipping"
                 );
                 continue;
             }
-            refs.push(clean);
+            refs.push(engine_ref);
         }
-        // Fall back to the GGUF basename if /v1/models reported nothing addressable.
+        // Fall back to the GGUF basename if /v1/models reported nothing addressable. This is
+        // inherently the single-model case, so de-opaque unconditionally here.
         if refs.is_empty() && !props.model_path.is_empty() {
             let clean = normalize_engine_ref(&props.model_path);
             if !clean.is_empty() {
-                refs.push(clean);
+                refs.push(deopaque(clean));
             }
         }
 
@@ -349,6 +616,187 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert!(models[0].canonical_id.is_empty());
         assert_eq!(models[0].engine_ref, "Qwen2.5-7B-Instruct-Q4_K_M");
+    }
+
+    /// A GGUF string (`u64` length + UTF-8) for the fixture builder.
+    fn gstr(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let mut v = (b.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(b);
+        v
+    }
+
+    /// A minimal GGUF v3 header: a string-array KV and a scalar KV (both must be *skipped*) then
+    /// the four `general.*` identity strings. Exercises the reader's skip paths.
+    fn build_gguf(arch: &str, name: &str, basename: &str, size_label: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&6u64.to_le_bytes()); // kv_count: array + scalar + 4 general
+        // array-of-strings (like tokenizer.ggml.tokens) → must be seeked past
+        buf.extend_from_slice(&gstr("tokenizer.ggml.tokens"));
+        buf.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        buf.extend_from_slice(&8u32.to_le_bytes()); // of STRING
+        buf.extend_from_slice(&2u64.to_le_bytes()); // count 2
+        buf.extend_from_slice(&gstr("<a>"));
+        buf.extend_from_slice(&gstr("<bb>"));
+        // scalar u32 → must be seeked past
+        buf.extend_from_slice(&gstr("some.count"));
+        buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
+        buf.extend_from_slice(&123u32.to_le_bytes());
+        for (k, v) in [
+            ("general.architecture", arch),
+            ("general.name", name),
+            ("general.basename", basename),
+            ("general.size_label", size_label),
+        ] {
+            buf.extend_from_slice(&gstr(k));
+            buf.extend_from_slice(&8u32.to_le_bytes()); // STRING
+            buf.extend_from_slice(&gstr(v));
+        }
+        buf
+    }
+
+    fn write_gguf(arch: &str, name: &str, basename: &str, size: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&build_gguf(arch, name, basename, size)).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn quant_from_ftype_maps_llama_server_strings() {
+        assert_eq!(quant_from_ftype("Q4_K - Medium").as_deref(), Some("Q4_K_M"));
+        assert_eq!(quant_from_ftype("Q5_K - Small").as_deref(), Some("Q5_K_S"));
+        assert_eq!(quant_from_ftype("Q6_K").as_deref(), Some("Q6_K")); // no size class
+        assert_eq!(quant_from_ftype("Q8_0").as_deref(), Some("Q8_0"));
+        assert_eq!(quant_from_ftype("IQ4_XS - 4.25 bpw").as_deref(), Some("IQ4_XS"));
+        assert_eq!(quant_from_ftype("BF16").as_deref(), Some("BF16"));
+        assert_eq!(quant_from_ftype("mostly Q4_K - Medium").as_deref(), Some("Q4_K_M"));
+        assert_eq!(quant_from_ftype(""), None);
+        assert_eq!(quant_from_ftype("   "), None);
+    }
+
+    #[test]
+    fn read_gguf_metadata_extracts_general_keys_and_skips_arrays() {
+        let f = write_gguf("qwen3", "Qwen3 1.7B", "Qwen3", "1.7B");
+        let meta = read_gguf_metadata(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(meta.architecture, "qwen3");
+        assert_eq!(meta.name, "Qwen3 1.7B");
+        assert_eq!(meta.basename, "Qwen3");
+        assert_eq!(meta.size_label, "1.7B");
+        // A missing / non-GGUF file → None so the caller falls back to the filename.
+        assert!(read_gguf_metadata("/no/such/file.gguf").is_none());
+    }
+
+    #[test]
+    fn detect_names_a_hash_blob_from_gguf_header_and_ftype() {
+        // The exact case that surfaced the ugly id: llama-server launched on an Ollama
+        // content-addressed blob → model_path + /v1/models id are the opaque `sha256-…`, and the
+        // quant lives only in `model_ftype`. The GGUF header + ftype recover a real identity.
+        let f = write_gguf("qwen3", "Qwen3 1.7B", "Qwen3", "1.7B");
+        let props = serde_json::json!({
+            "model_path": f.path().to_str().unwrap(),
+            "chat_template": QWEN_TEMPLATE,
+            "model_ftype": "Q4_K - Medium",
+            "total_slots": 1,
+        })
+        .to_string();
+        let http = MockHttp {
+            props,
+            models: r#"{"object":"list","data":[{"id":"sha256-3d0b790534fe4b79525fc3692950408dca41171676ed7e21db57af5c65ef6ab6"}]}"#.into(),
+            ..Default::default()
+        };
+        let adapter = LlamaCppAdapter::new(DEFAULT_LLAMACPP_URL, http);
+        let models = adapter.detect_models().unwrap();
+        assert_eq!(models.len(), 1);
+        // Engine handle synthesised from GGUF metadata instead of the opaque hash.
+        assert_eq!(models[0].engine_ref, "Qwen3-1.7B-Q4_K_M");
+        assert!(!models[0].engine_ref.starts_with("sha256"), "opaque blob hash must be replaced");
+        // Canonical id from GGUF architecture/size + ftype quant + the live template.
+        assert!(
+            models[0].canonical_id.starts_with("qwen3/1.7b/int4/"),
+            "canonical_id = {}",
+            models[0].canonical_id
+        );
+        assert_eq!(models[0].family, "qwen3");
+        assert_eq!(models[0].params, "1.7b");
+        assert_eq!(models[0].quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn detect_uses_gguf_basename_not_architecture_for_family() {
+        // GGUF `general.architecture` is the coarse arch — "qwen2" for a Qwen2.5 model. The
+        // canonical family MUST come from `general.basename` ("Qwen2.5"), else distinct models
+        // collapse (Qwen2 vs Qwen2.5 → both "qwen2") and existing ids silently change. Regression
+        // guard for the gap the other tests miss (they use a non-existent path or arch==family).
+        let f = write_gguf("qwen2", "Qwen2.5 0.5B Instruct", "Qwen2.5", "0.5B");
+        let props = serde_json::json!({
+            "model_path": f.path().to_str().unwrap(), // temp name → filename unparseable → GGUF fallback
+            "chat_template": QWEN_TEMPLATE,
+            "model_ftype": "Q4_K - Medium",
+        })
+        .to_string();
+        let http = MockHttp {
+            props,
+            models: r#"{"object":"list","data":[{"id":"sha256-c5396e06af294bd101b30dce59131a76d2b773e76950acc870eda801d3ab0515"}]}"#.into(),
+            ..Default::default()
+        };
+        let adapter = LlamaCppAdapter::new(DEFAULT_LLAMACPP_URL, http);
+        let models = adapter.detect_models().unwrap();
+        assert_eq!(models[0].family, "qwen2.5", "family from basename, NOT architecture 'qwen2'");
+        assert_eq!(models[0].params, "0.5b");
+        assert!(
+            models[0].canonical_id.starts_with("qwen2.5/0.5b/int4/"),
+            "canonical_id = {}",
+            models[0].canonical_id
+        );
+        assert_eq!(models[0].engine_ref, "Qwen2.5-0.5B-Q4_K_M");
+    }
+
+    #[test]
+    fn detect_keeps_distinct_opaque_ids_for_a_multi_model_server() {
+        // Two opaque ids on one server must not both collapse to the single GGUF-synthesised name
+        // (the /props GGUF describes one model). Both models must survive.
+        let f = write_gguf("qwen3", "Qwen3 1.7B", "Qwen3", "1.7B");
+        let props = serde_json::json!({
+            "model_path": f.path().to_str().unwrap(),
+            "chat_template": QWEN_TEMPLATE,
+            "model_ftype": "Q4_K - Medium",
+        })
+        .to_string();
+        let http = MockHttp {
+            props,
+            models: r#"{"object":"list","data":[{"id":"sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":"sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}"#.into(),
+            ..Default::default()
+        };
+        let adapter = LlamaCppAdapter::new(DEFAULT_LLAMACPP_URL, http);
+        let models = adapter.detect_models().unwrap();
+        assert_eq!(models.len(), 2, "both distinct opaque models survive (no collapse)");
+    }
+
+    #[test]
+    fn detect_respects_a_clean_engine_id_over_gguf_synthesis() {
+        // A non-opaque id (an operator `--alias`) is authoritative for the handle; GGUF only
+        // enriches the canonical id, it does not override a real name the operator chose.
+        let f = write_gguf("qwen3", "Qwen3 1.7B", "Qwen3", "1.7B");
+        let props = serde_json::json!({
+            "model_path": f.path().to_str().unwrap(),
+            "chat_template": QWEN_TEMPLATE,
+            "model_ftype": "Q4_K - Medium",
+        })
+        .to_string();
+        let http = MockHttp {
+            props,
+            models: r#"{"object":"list","data":[{"id":"qwen3:1.7b"}]}"#.into(),
+            ..Default::default()
+        };
+        let adapter = LlamaCppAdapter::new(DEFAULT_LLAMACPP_URL, http);
+        let models = adapter.detect_models().unwrap();
+        assert_eq!(models[0].engine_ref, "qwen3:1.7b", "operator alias is kept");
+        assert!(models[0].canonical_id.starts_with("qwen3/1.7b/int4/"));
     }
 
     #[test]
