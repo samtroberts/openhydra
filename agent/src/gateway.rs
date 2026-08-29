@@ -1785,6 +1785,7 @@ pub fn router(
     byok: ByokConfig,
     embeddings_cfg: EmbeddingConfig,
     self_provider: Option<String>,
+    cards: Option<Arc<crate::cards::CardStore>>,
 ) -> Router {
     let node = match store {
         Some(s) => {
@@ -1801,7 +1802,7 @@ pub fn router(
     // #7/#5: completions record per-model consumed tokens + `used` ledger rows into the shared
     // transfer counters the status endpoint serves. #7: mark our own provider so a self-serve
     // settles no receipt and moves no credit.
-    let node = node.with_stats(stats).with_self_provider(self_provider);
+    let node = node.with_stats(stats).with_self_provider(self_provider).with_cards(cards);
     let node = Arc::new(node);
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
@@ -1862,13 +1863,14 @@ pub fn serve_http(
     byok: ByokConfig,
     embeddings_cfg: EmbeddingConfig,
     self_provider: Option<String>,
+    cards: Option<Arc<crate::cards::CardStore>>,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider)
+        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })

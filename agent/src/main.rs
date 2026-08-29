@@ -137,6 +137,70 @@ enum Role {
     /// Un-wire a coding tool: restore the pristine pre-OpenHydra config from its backup (or delete a
     /// file we created). The inverse of `connect`, and the CLI twin of the desktop "Disconnect" button.
     Disconnect(connect_cli::DisconnectArgs),
+    /// Export a signed `.openhydra` card — a secret-free "magnet for a model" others import to dial
+    /// you directly, no live discovery. Only for a globally-shared model. No swarm. See `card export`.
+    Card(CardArgs),
+}
+
+/// `card <action>` — the `.openhydra` card CLI (M2).
+#[derive(Args)]
+struct CardArgs {
+    #[command(subcommand)]
+    action: CardAction,
+}
+
+#[derive(Subcommand)]
+enum CardAction {
+    /// Sign and print a card as JSON `{ "card": {...}, "magnet": "openhydra:card:..." }` for MODEL.
+    Export(CardExportArgs),
+    /// Verify a card (from `--magnet`, `--file`, or stdin) and print its model + provider peer id,
+    /// or the reason it's invalid/expired. Exit non-zero on failure.
+    Verify(CardVerifyArgs),
+}
+
+#[derive(Args)]
+struct CardVerifyArgs {
+    /// A magnet string `openhydra:card:...`.
+    #[arg(long, conflicts_with = "file")]
+    magnet: Option<String>,
+    /// A `.openhydra` JSON file.
+    #[arg(long)]
+    file: Option<std::path::PathBuf>,
+}
+
+#[derive(Args)]
+struct CardExportArgs {
+    /// The engine handle of the model to export (e.g. `qwen3:1.7b`). Must be detected locally.
+    #[arg(long)]
+    model: String,
+    /// Share-policy file consulted for the global-share/consent export gate.
+    #[arg(long = "share-policy-file")]
+    share_policy_file: Option<std::path::PathBuf>,
+    /// Card validity in seconds from now (default 30 days).
+    #[arg(long, default_value_t = 30 * 24 * 3600)]
+    ttl_secs: u64,
+    /// Pricing posture the card declares (a self-claim).
+    #[arg(long, value_enum, default_value_t = CardPricingArg::Reciprocal)]
+    pricing: CardPricingArg,
+    /// Optional region hint (e.g. "in", "us").
+    #[arg(long)]
+    region: Option<String>,
+}
+
+#[derive(Copy, Clone, clap::ValueEnum)]
+enum CardPricingArg {
+    Reciprocal,
+    Paid,
+    AdSupported,
+}
+impl From<CardPricingArg> for openhydra_agent::PricingMode {
+    fn from(p: CardPricingArg) -> Self {
+        match p {
+            CardPricingArg::Reciprocal => openhydra_agent::PricingMode::Reciprocal,
+            CardPricingArg::Paid => openhydra_agent::PricingMode::Paid,
+            CardPricingArg::AdSupported => openhydra_agent::PricingMode::AdSupported,
+        }
+    }
 }
 
 /// Which local engine an agent proxies to. Selects the adapter; the `--engine` URL
@@ -415,6 +479,11 @@ struct ServeArgs {
     #[arg(long = "self-provider")]
     self_provider: Option<String>,
 
+    /// M2: path to the imported-cards store — verified `.openhydra` cards routed by peer id without
+    /// live discovery. Hot-reloaded on change. Omit to disable card routing.
+    #[arg(long = "cards-file")]
+    cards_file: Option<std::path::PathBuf>,
+
     #[command(flatten)]
     aup: AupArgs,
 
@@ -496,6 +565,52 @@ fn run() -> Result<(), String> {
         Role::Launch(args) => return launch::run(args),
         Role::Connect(args) => return connect_cli::run(args),
         Role::Disconnect(args) => return connect_cli::run_disconnect(args),
+        Role::Card(args) => {
+            // `card export` / `card verify`. No swarm.
+            let config = cli.node.into_config();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match args.action {
+                CardAction::Export(a) => {
+                    let out = openhydra_agent::cards::run_export(
+                        &a.model,
+                        a.share_policy_file,
+                        a.ttl_secs,
+                        a.pricing.into(),
+                        a.region,
+                        &config.identity_path,
+                        now_ms,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&out).map_err(|e| format!("serialize card: {e}"))?
+                    );
+                }
+                CardAction::Verify(a) => {
+                    let input = match (a.magnet, a.file) {
+                        (Some(m), _) => m,
+                        (None, Some(f)) => std::fs::read_to_string(&f)
+                            .map_err(|e| format!("read {}: {e}", f.display()))?,
+                        (None, None) => {
+                            use std::io::Read;
+                            let mut s = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut s)
+                                .map_err(|e| format!("read stdin: {e}"))?;
+                            s
+                        }
+                    };
+                    let v = openhydra_agent::cards::parse_and_verify(&input, now_ms)?;
+                    println!(
+                        "OK: model {:?} served by {} (openhydra id {}), expires {}",
+                        v.card.model_id, v.card.libp2p_peer_id, v.card.openhydra_peer_id, v.card.expires_at
+                    );
+                }
+            }
+            return Ok(());
+        }
         other => other, // Provide | Serve — need the swarm
     };
     let status_bind = cli.node.status_bind.clone();
@@ -907,6 +1022,11 @@ fn serve(
     let trusted_proxy = args.rate_limit.trusted_proxy;
     let embeddings = args.byok.embedding_config();
     let byok = args.byok.clone().into_config();
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone())
+    // M2: imported-card routing (verified providers dialable by peer id without discovery).
+    let cards = args.cards_file.clone().map(|p| {
+        eprintln!("openhydra-agent: card imports at {}", p.display());
+        openhydra_agent::cards::CardStore::new(p)
+    });
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

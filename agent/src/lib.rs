@@ -22,6 +22,7 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod cards;
 /// Opt-in engine autostart (starts LM Studio / Ollama when down). Feature-gated so the lean
 /// build carries no process-spawning code.
 #[cfg(feature = "engine-autostart")]
@@ -70,6 +71,13 @@ pub use gateway::serve_http;
 pub use hardening::harden_process;
 pub use http::ReqwestClient;
 pub use provider::{build_peer_record, handle_serve_inbound, Provider, SERVE_REQUEST};
+pub use cards::{build_card, CardExport};
+// M2: the signed `.openhydra` card type + crypto live in the network crate; re-export so the desktop
+// (which path-depends only on this crate) and the binary can use them without a direct network dep.
+pub use openhydra_network::card::{
+    card_is_privacy_safe, sign_card, verify_card, AupFlags, Capability, Card, CardError, PricingMode,
+    RateCard, VerifiedCard, CARD_SCHEMA_VERSION,
+};
 pub use share_policy::{SharePolicy, ShareMode, ShareStatusView};
 pub use status::{CreditEntry, EconomyStats, EconomyView, LedgerRow, RepEntry, StatusServer, TransferStats};
 pub use serve::{handle_serve_request, ServeChunk, ServeRequest, ServeSummary};

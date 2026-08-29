@@ -580,6 +580,9 @@ pub struct ConsumerNode {
     /// Best-effort/advisory — a wrong entry only forfeits the streaming benefit, never correctness
     /// (a re-probe would just re-learn it). Never persisted; a fresh process re-learns on first use.
     buffered_only: Mutex<std::collections::HashSet<String>>,
+    /// M2: imported `.openhydra` cards — verified providers pinned locally and dialable by peer id
+    /// without live discovery. Merged into the candidate set in `serve_once`. `None` = no store.
+    cards: Option<Arc<crate::cards::CardStore>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -608,6 +611,7 @@ impl ConsumerNode {
             stats: None,
             self_provider: None,
             buffered_only: Mutex::new(std::collections::HashSet::new()),
+            cards: None,
         }
     }
 
@@ -622,6 +626,13 @@ impl ConsumerNode {
     /// no credit (builder form). `None`/empty leaves it consumer-only.
     pub fn with_self_provider(mut self, peer_id: Option<String>) -> Self {
         self.self_provider = peer_id.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// M2: attach the imported-cards store so `serve_once` can route to card-pinned providers by peer
+    /// id without live discovery (builder form). `None` leaves card routing off.
+    pub fn with_cards(mut self, cards: Option<Arc<crate::cards::CardStore>>) -> Self {
+        self.cards = cards;
         self
     }
 
@@ -653,6 +664,7 @@ impl ConsumerNode {
             stats: None,
             self_provider: None,
             buffered_only: Mutex::new(std::collections::HashSet::new()),
+            cards: None,
         }
     }
 
@@ -831,6 +843,25 @@ impl ConsumerNode {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::debug!(model, error = %e, "C7: registry query failed (best-effort)"),
+            }
+        }
+        // M2: imported `.openhydra` cards — verified providers pinned locally, dialable by peer id
+        // with no live discovery. Merge them in (deduped by libp2p id) so an imported model routes
+        // even when passive discovery + the bootstrap registry are both silent. The store re-verifies
+        // + expiry-checks on read, so only currently-valid cards are added.
+        if let Some(cards) = &self.cards {
+            let pinned = cards.providers_for(model, now);
+            if !pinned.is_empty() {
+                let known: std::collections::HashSet<&str> =
+                    peers.iter().map(|p| p.libp2p_peer_id.as_str()).collect();
+                let fresh: Vec<_> = pinned
+                    .into_iter()
+                    .filter(|p| !known.contains(p.libp2p_peer_id.as_str()))
+                    .collect();
+                if !fresh.is_empty() {
+                    tracing::info!(model, n = fresh.len(), "M2: added card-pinned providers");
+                    peers.extend(fresh);
+                }
             }
         }
         // "" canonical → any provider of this model_id (template-hash filtering is later).
