@@ -20,7 +20,7 @@
 //! share at any time without restarting the node. This module is the single definition shared by
 //! the agent binary and the desktop (which path-depends on the agent crate as a library).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
@@ -40,9 +40,67 @@ pub enum ShareMode {
     List,
 }
 
+/// How **far** a shared model reaches (M1 — orthogonal to [`ShareMode`], which decides *which*
+/// models are shared). Only [`Scope::Global`] reaches the public DHT / marketplace, and only with
+/// recorded consent — see [`SharePolicy::announce_globally`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// Loopback only — this machine's gateway. Never announced globally. (Full loopback-serve
+    /// enforcement is later; M1 gates the global announce.)
+    Device,
+    /// The operator's trust domain — LAN/mDNS today, cross-network in M4. **Not** on the global
+    /// marketplace. The privacy-first default the desktop preselects for a newly-shared model.
+    Private,
+    /// Announced to the global DHT / marketplace. **Always requires a recorded consent** — a
+    /// per-model [`SharePolicy::global_consent`] entry, or (for a default-Global model) the
+    /// policy-level [`SharePolicy::default_global_consent`]. There is no un-consented global path.
+    Global,
+    /// An unrecognised scope string from a forward/typo'd file. Deserialises here (via
+    /// `#[serde(other)]`) instead of failing the *whole* policy closed, and is treated as **not
+    /// globally announced** (safe) — so one stray character can't silently un-share everything.
+    #[serde(other)]
+    Unknown,
+}
+
 fn default_version() -> u32 {
     1
 }
+
+/// The reach of a shared model with no explicit [`SharePolicy::scopes`] entry. Serde-defaults to
+/// `Global` **on purpose**: a pre-scope (v1) policy file had no scope concept and announced every
+/// shared model globally, so reading one back must keep doing exactly that — upgrading the binary
+/// must never silently un-share a user's models. The desktop writes `Private` here once it owns the
+/// scope UI, which flips new/unset models to private-by-default from that point on.
+fn default_scope() -> Scope {
+    Scope::Global
+}
+
+/// The schema version new policies are written at. Bumped to 3 for consent-hardening: a pre-3
+/// file is migrated on [`SharePolicy::load`] (its grandfathered-Global announce set is preserved
+/// by materialising a consent record — never silently un-shared). The serde default for a
+/// *missing* `version` field stays `1` ([`default_version`]) so an old/unversioned file is still
+/// recognised as pre-3 and migrated.
+const CURRENT_VERSION: u32 = 3;
+
+/// A wall-clock consent timestamp (unix ms) for a config-derived global consent recorded **now** —
+/// an explicit `--share-models` / `share_all()` opt-in this invocation. A real, orderable marker;
+/// never `0`. (Migration-*inherited* consent uses [`MIGRATION_CONSENT_TS`] instead, so it doesn't
+/// churn across restarts — see [`SharePolicy::migrate_consent`].)
+fn consent_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
+}
+
+/// Sentinel consent timestamp (unix ms) for a **migration-inherited** global consent. A legacy
+/// pre-hardening file expressed the operator's opt-in without ever recording a time, so migration
+/// stamps a stable, deterministic marker rather than `SystemTime::now()` — which would churn on
+/// every restart of a file that's never persisted back (`load()` migrates in memory only; a headless
+/// node re-migrates each start — Finding 3). `1` = "epoch+1ms": non-zero, orderable **before** any
+/// real consent, so the audit trail reads it as "inherited, pre-v3" rather than a fabricated moment.
+const MIGRATION_CONSENT_TS: u64 = 1;
 
 /// A provider's model-sharing policy. Serializes to e.g.
 /// `{"version":1,"mode":"list","models":["qwen3-coder:30b-a3b-q8_0"]}`.
@@ -59,6 +117,27 @@ pub struct SharePolicy {
     /// The explicit allowlist for [`ShareMode::List`]. Empty in [`ShareMode::All`].
     #[serde(default)]
     pub models: BTreeSet<String>,
+    /// Per-model reach (M1). A shared model absent here uses [`Self::default_scope`]. Keyed by the
+    /// clean engine handle (migrated like [`Self::models`]).
+    #[serde(default)]
+    pub scopes: BTreeMap<String, Scope>,
+    /// Reach for a shared model with no explicit [`Self::scopes`] entry. Serde-defaults to `Global`
+    /// so a pre-scope policy keeps announcing exactly what it did; the desktop writes `Private` here
+    /// to make new/unset models private-by-default.
+    #[serde(default = "default_scope")]
+    pub default_scope: Scope,
+    /// Per-model consent timestamps (unix ms) recorded when the operator confirms Global publish.
+    /// An **explicit** [`Scope::Global`] announces globally only with a matching entry here
+    /// (fail-closed). Keyed by clean handle.
+    #[serde(default)]
+    pub global_consent: BTreeMap<String, u64>,
+    /// Policy-level consent (unix ms) to announce every **default-Global** model globally —
+    /// including models added later. This is what a "share everything globally" choice (or the
+    /// migration of a legacy default-Global policy) records, so a model reaching global discovery
+    /// via [`Self::default_scope`] `== Global` still has a recorded consent. `None` ⇒ default-Global
+    /// models are **not** announced (fail-closed). See [`Self::announce_globally`].
+    #[serde(default)]
+    pub default_global_consent: Option<u64>,
 }
 
 impl Default for SharePolicy {
@@ -70,15 +149,32 @@ impl Default for SharePolicy {
 }
 
 impl SharePolicy {
-    /// Share every detected model (now and future).
+    /// Share every detected model (now and future). Headless "share everything" — the operator's
+    /// explicit config IS their consent, so it carries a policy-level global consent (announces).
     pub fn share_all() -> Self {
-        Self { version: default_version(), mode: ShareMode::All, models: BTreeSet::new() }
+        Self {
+            version: CURRENT_VERSION,
+            mode: ShareMode::All,
+            models: BTreeSet::new(),
+            scopes: BTreeMap::new(),
+            default_scope: default_scope(),
+            global_consent: BTreeMap::new(),
+            default_global_consent: Some(consent_ts()),
+        }
     }
 
     /// Share **no** models (mode `list`, empty). The fail-closed state: what a corrupt policy or a
     /// poisoned lock resolves to, so a sharing control never silently *widens* to share-all.
     pub fn share_nothing() -> Self {
-        Self { version: default_version(), mode: ShareMode::List, models: BTreeSet::new() }
+        Self {
+            version: CURRENT_VERSION,
+            mode: ShareMode::List,
+            models: BTreeSet::new(),
+            scopes: BTreeMap::new(),
+            default_scope: default_scope(),
+            global_consent: BTreeMap::new(),
+            default_global_consent: None,
+        }
     }
 
     /// Share exactly the given engine handles. Duplicates collapse; order is irrelevant.
@@ -88,9 +184,13 @@ impl SharePolicy {
         S: Into<String>,
     {
         Self {
-            version: default_version(),
+            version: CURRENT_VERSION,
             mode: ShareMode::List,
             models: models.into_iter().map(Into::into).collect(),
+            scopes: BTreeMap::new(),
+            default_scope: default_scope(),
+            global_consent: BTreeMap::new(),
+            default_global_consent: None,
         }
     }
 
@@ -109,7 +209,18 @@ impl SharePolicy {
         if set.is_empty() {
             Self::share_all()
         } else {
-            Self { version: default_version(), mode: ShareMode::List, models: set }
+            // An explicit `--share-models` list is the operator's opt-in → carries a policy-level
+            // global consent so the listed models keep announcing (default-Global) under the
+            // consent-required rule, same as before hardening.
+            Self {
+                version: CURRENT_VERSION,
+                mode: ShareMode::List,
+                models: set,
+                scopes: BTreeMap::new(),
+                default_scope: default_scope(),
+                global_consent: BTreeMap::new(),
+                default_global_consent: Some(consent_ts()),
+            }
         }
     }
 
@@ -121,6 +232,47 @@ impl SharePolicy {
     fn normalize_models(&mut self) {
         if self.mode == ShareMode::List {
             self.models = self.models.iter().map(|m| normalize_engine_ref(m)).collect();
+        }
+        // The scope/consent maps are keyed by the same model handle, so migrate them too — a
+        // future path-keyed entry would otherwise stop matching the clean advertised handle.
+        if !self.scopes.is_empty() {
+            self.scopes =
+                self.scopes.iter().map(|(k, v)| (normalize_engine_ref(k), *v)).collect();
+        }
+        if !self.global_consent.is_empty() {
+            self.global_consent =
+                self.global_consent.iter().map(|(k, v)| (normalize_engine_ref(k), *v)).collect();
+        }
+    }
+
+    /// The reach of `engine_ref`: its explicit [`Self::scopes`] entry, or [`Self::default_scope`].
+    /// (Only meaningful for a shared model; the caller pairs this with [`Self::is_shared`].)
+    pub fn scope_of(&self, engine_ref: &str) -> Scope {
+        self.scopes.get(engine_ref).copied().unwrap_or(self.default_scope)
+    }
+
+    /// Whether `engine_ref` should be announced to the **global** discovery (DHT / marketplace).
+    /// True only when the model is shared, its scope resolves to [`Scope::Global`], and Global
+    /// publish is consented. Consent rule (fail-closed):
+    /// * an **explicit** `Global` (set via the desktop's scope control) needs a matching
+    ///   [`Self::global_consent`] entry — a hand-edited `scope:"global"` with no consent is NOT
+    ///   announced;
+    /// * a model that is Global via [`Self::default_scope`] (no explicit entry) needs the
+    ///   policy-level [`Self::default_global_consent`] — with no record it is NOT announced. There
+    ///   is **no un-consented global path**; a pre-hardening file keeps its behaviour because
+    ///   [`Self::load`] materialises the record on migration (never silently un-shares).
+    pub fn announce_globally(&self, engine_ref: &str) -> bool {
+        if !self.is_shared(engine_ref) || self.scope_of(engine_ref) != Scope::Global {
+            return false;
+        }
+        if self.scopes.contains_key(engine_ref) {
+            // Explicit Global → needs a matching per-model consent.
+            self.global_consent.contains_key(engine_ref)
+        } else {
+            // Global via `default_scope` → needs the policy-level consent. NO grandfather: a
+            // default-Global model with no `default_global_consent` is NOT announced (fail-closed).
+            // Legacy behaviour is preserved instead by [`Self::load`] materialising the record.
+            self.default_global_consent.is_some()
         }
     }
 
@@ -148,7 +300,57 @@ impl SharePolicy {
         // F5 migration: fold legacy path-keyed entries to clean handles so a model shared under an
         // old build's absolute-path id stays shared against the now-clean advertised handle.
         policy.normalize_models();
+        // Consent-hardening migration (v< CURRENT_VERSION): before hardening, a default-Global model
+        // was announced globally with no consent record (the removed grandfather). announce_globally
+        // now REQUIRES a record — so to preserve the exact announced set without silently
+        // un-sharing, materialise the policy-level consent for a pre-3 policy that was actually
+        // announcing default-Global models (mode All, or a non-empty list). A file that shared
+        // nothing gets no consent (so a later share is a fresh, consent-gated decision). Idempotent.
+        policy.migrate_consent();
         Ok(policy)
+    }
+
+    /// One-shot, idempotent migration of a pre-hardening policy so the airtight consent rule keeps
+    /// the same models announced. Under the removed grandfather a model was announced iff
+    /// `is_shared && scope_of == Global`, so migration materialises a consent record for **both**
+    /// global paths that were announcing: the policy-level default, and every explicit
+    /// `scopes:{m:"global"}` entry (whose per-model consent map didn't exist pre-hardening). Never
+    /// pre-consents a model that wasn't shared, and leaves an already-hardened (`v>=CURRENT`)
+    /// policy, a Private default, or a share-nothing policy untouched.
+    ///
+    /// **Deterministic** (Finding 3): the materialised records use the fixed [`MIGRATION_CONSENT_TS`]
+    /// sentinel, not `SystemTime::now()`, so re-migrating the same on-disk file (a headless node that
+    /// never persists back re-migrates on every `load()`/hot-reload) produces byte-identical output —
+    /// the consent timestamp can't churn across restarts. See [`Self::load`].
+    fn migrate_consent(&mut self) {
+        if self.version >= CURRENT_VERSION {
+            return;
+        }
+        let announced_something = self.mode == ShareMode::All || !self.models.is_empty();
+        if self.default_scope == Scope::Global
+            && self.default_global_consent.is_none()
+            && announced_something
+        {
+            self.default_global_consent = Some(MIGRATION_CONSENT_TS);
+        }
+        // Explicit `scope:"global"` entries were announced under the old grandfather too, but
+        // `announce_globally` routes them through the per-model consent branch (which ignores the
+        // default consent above). Materialise a per-model record for each **shared** explicit-Global
+        // model missing one — so migration preserves exactly the old announced set with no silent
+        // un-share (adversarial review Finding 1). Guarded by `is_shared`: an explicit-Global model
+        // that wasn't actually shared wasn't announced, so it must NOT be pre-consented.
+        let needs_consent: Vec<String> = self
+            .scopes
+            .iter()
+            .filter(|(m, s)| {
+                **s == Scope::Global && self.is_shared(m) && !self.global_consent.contains_key(*m)
+            })
+            .map(|(m, _)| m.clone())
+            .collect();
+        for m in needs_consent {
+            self.global_consent.insert(m, MIGRATION_CONSENT_TS);
+        }
+        self.version = CURRENT_VERSION;
     }
 
     /// Write the policy to `path` **atomically** (temp file + rename), so a crash or a concurrent
@@ -251,6 +453,13 @@ impl PolicyWatcher {
     /// lock falls back to share-nothing (fail-closed — matters for the serve gate).
     pub fn is_shared(&self, engine_ref: &str) -> bool {
         self.policy.read().map(|p| p.is_shared(engine_ref)).unwrap_or(false)
+    }
+
+    /// Whether `engine_ref` should be announced to the **global** discovery under the current
+    /// (possibly hot-reloaded) policy — see [`SharePolicy::announce_globally`]. Fail-closed
+    /// (do NOT announce) on a poisoned lock, consistent with [`Self::is_shared`].
+    pub fn announce_globally(&self, engine_ref: &str) -> bool {
+        self.policy.read().map(|p| p.announce_globally(engine_ref)).unwrap_or(false)
     }
 
     /// A clone of the current policy (for the status API).
@@ -412,10 +621,228 @@ mod tests {
     fn json_shape_is_the_documented_contract() {
         let p = SharePolicy::share_list(["b", "a"]); // insertion order irrelevant
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
-        assert_eq!(v["version"], 1);
+        assert_eq!(v["version"], CURRENT_VERSION);
         assert_eq!(v["mode"], "list");
         // BTreeSet ⇒ sorted, deterministic array.
         assert_eq!(v["models"], serde_json::json!(["a", "b"]));
+    }
+
+    // ── scope + consent (M1) ──
+
+    #[test]
+    fn default_global_needs_the_policy_level_consent_no_grandfather() {
+        // The core airtight assertion: a shared model that is Global via `default_scope` (no
+        // explicit `scopes` entry) is announced ONLY with a policy-level `default_global_consent`.
+        // Without it → withheld (the removed grandfather). `share_list` carries no consent.
+        let mut p = SharePolicy::share_list(["a"]);
+        assert_eq!(p.default_scope, Scope::Global);
+        assert_eq!(p.scope_of("a"), Scope::Global, "default-Global (no explicit entry)");
+        assert!(p.default_global_consent.is_none());
+        assert!(!p.announce_globally("a"), "default-Global with NO policy consent → withheld");
+        p.default_global_consent = Some(1);
+        assert!(p.announce_globally("a"), "policy-level consent → announced");
+    }
+
+    #[test]
+    fn no_grandfather_a_raw_v1_policy_does_not_announce_without_a_consent_record() {
+        // Airtight rule: a pre-hardening (v1) policy deserialized WITHOUT migration has no consent
+        // record → default-Global models are NOT announced. (Migration below is what preserves the
+        // legacy set — this proves the grandfather is gone, not just relocated.)
+        let p: SharePolicy =
+            serde_json::from_str(r#"{"version":1,"mode":"list","models":["a","b"]}"#).unwrap();
+        assert_eq!(p.default_scope, Scope::Global);
+        assert!(p.default_global_consent.is_none());
+        assert!(!p.announce_globally("a"), "no consent record → not announced");
+    }
+
+    #[test]
+    fn migration_preserves_the_legacy_global_announce_set_with_a_consent_record() {
+        // The no-silent-un-share guarantee: a pre-3 default-Global policy that WAS announcing keeps
+        // announcing exactly the same models after load()-time migration, now with a record.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, r#"{"version":1,"mode":"list","models":["a","b"]}"#).unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert_eq!(p.version, CURRENT_VERSION, "migrated to current version");
+        assert!(p.default_global_consent.is_some(), "consent record materialised");
+        assert!(p.announce_globally("a") && p.announce_globally("b"), "same set still announced");
+        assert!(!p.announce_globally("c"), "not shared → still not announced");
+    }
+
+    #[test]
+    fn migration_of_share_nothing_does_not_pre_consent_a_future_share() {
+        // A pre-3 policy that shared NOTHING must NOT get a consent record — otherwise a model the
+        // user shares later would auto-announce globally without a consent moment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, r#"{"version":1,"mode":"list","models":[]}"#).unwrap();
+        let mut p = SharePolicy::load(&path).unwrap();
+        assert!(p.default_global_consent.is_none(), "share-nothing → no materialised consent");
+        // Sharing a model now (still default-Global) is NOT announced until consented.
+        p.models.insert("a".into());
+        assert!(!p.announce_globally("a"));
+    }
+
+    #[test]
+    fn migration_preserves_an_explicit_global_scope_entry_from_a_pre3_file() {
+        // Regression (adversarial review Finding 1): a pre-3 file that announced a model via an
+        // EXPLICIT `scopes:{m:"global"}` entry (no consent map — that build predated it) was
+        // announcing `m` under the old grandfather. `announce_globally` routes an explicit-scope
+        // model through the per-model consent branch, which `migrate_consent` used to leave empty →
+        // the model silently un-shared on upgrade. Migration must materialise the per-model consent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+
+        // (a) explicit Global under a Private default — only the per-model path can save it.
+        std::fs::write(
+            &path,
+            r#"{"version":2,"mode":"list","models":["a","b"],"default_scope":"private","scopes":{"a":"global"}}"#,
+        )
+        .unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert_eq!(p.version, CURRENT_VERSION);
+        assert!(p.announce_globally("a"), "explicit-Global model must stay announced after migration");
+        assert!(p.global_consent.contains_key("a"), "per-model consent materialised for it");
+        assert!(!p.announce_globally("b"), "a Private-default model stays off the global net");
+
+        // (b) explicit Global with the default *also* Global (field absent → defaults Global): the
+        // explicit entry must still get a per-model record, not rely on default_global_consent.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mode":"list","models":["a"],"scopes":{"a":"global"}}"#,
+        )
+        .unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(p.announce_globally("a"), "explicit-Global model announced after migration");
+        assert!(p.global_consent.contains_key("a"), "per-model consent materialised");
+
+        // A model with an explicit Global scope but NOT shared (list mode, not in `models`) was not
+        // announced before, so migration must NOT pre-consent it.
+        std::fs::write(
+            &path,
+            r#"{"version":2,"mode":"list","models":[],"default_scope":"private","scopes":{"z":"global"}}"#,
+        )
+        .unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(!p.global_consent.contains_key("z"), "unshared explicit-Global not pre-consented");
+        assert!(!p.announce_globally("z"));
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_leaves_a_hardened_policy_untouched() {
+        // A v3 policy is not re-migrated (no spurious consent), and re-migrating is a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, r#"{"version":3,"mode":"list","models":["a"],"default_scope":"private"}"#).unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert_eq!(p.version, 3);
+        assert!(p.default_global_consent.is_none(), "hardened policy not force-consented");
+        assert!(!p.announce_globally("a"), "private default → not announced");
+    }
+
+    #[test]
+    fn migration_consent_timestamps_are_deterministic_across_repeated_loads() {
+        // Finding 3: `load()` migrates in memory but never persists, so a headless node re-migrates a
+        // still-pre-3 file on every start/hot-reload. The materialised consent records must be
+        // DETERMINISTIC (a fixed sentinel), not a fresh wall-clock each time, or the audit trail
+        // churns on every restart. This file triggers BOTH paths: default-Global (mode All) and an
+        // explicit `scopes` entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(&path, r#"{"version":1,"mode":"all","models":[],"scopes":{"x":"global"}}"#).unwrap();
+        let p1 = SharePolicy::load(&path).unwrap();
+        let p2 = SharePolicy::load(&path).unwrap();
+        assert_eq!(p1, p2, "re-migrating the same still-pre-3 file is byte-identical");
+        // The sentinel, not a churning wall-clock — and it stayed announcing (Finding 1 preserved).
+        assert_eq!(p1.default_global_consent, Some(MIGRATION_CONSENT_TS));
+        assert_eq!(p1.global_consent.get("x"), Some(&MIGRATION_CONSENT_TS));
+        assert!(p1.announce_globally("x"));
+        // An explicit CLI/config opt-in still carries a real wall-clock (only migration is sentinelled).
+        assert!(SharePolicy::share_all().default_global_consent.unwrap() > MIGRATION_CONSENT_TS);
+    }
+
+    #[test]
+    fn unknown_scope_string_degrades_safely_instead_of_failing_the_whole_policy() {
+        // A typo'd / future scope value must not fail the entire policy closed. It parses to
+        // `Scope::Unknown` and is treated as not-globally-announced (safe).
+        let p: SharePolicy = serde_json::from_str(
+            r#"{"version":3,"mode":"list","models":["a","b"],"scopes":{"a":"lan","b":"global"},
+                "global_consent":{"b":5}}"#,
+        )
+        .expect("one bad scope value must not fail the whole policy");
+        assert_eq!(p.scope_of("a"), Scope::Unknown);
+        assert!(!p.announce_globally("a"), "Unknown scope → never announced");
+        assert!(p.is_shared("a"), "still shared (scope only affects reach)");
+        assert!(p.announce_globally("b"), "the valid consented-global entry is unaffected");
+    }
+
+    #[test]
+    fn private_default_keeps_unset_models_off_the_global_net() {
+        // Once the desktop writes default_scope=private, a shared-but-unset model is Private → not
+        // globally announced (privacy-first for new/unset models), but still shared (served).
+        let mut p = SharePolicy::share_list(["a"]);
+        p.default_scope = Scope::Private;
+        assert!(p.is_shared("a"));
+        assert_eq!(p.scope_of("a"), Scope::Private);
+        assert!(!p.announce_globally("a"));
+    }
+
+    #[test]
+    fn explicit_global_requires_consent_fail_closed() {
+        let mut p = SharePolicy::share_list(["a"]);
+        p.default_scope = Scope::Private;
+        p.scopes.insert("a".into(), Scope::Global); // hand-set Global, no consent yet
+        assert_eq!(p.scope_of("a"), Scope::Global);
+        assert!(!p.announce_globally("a"), "explicit Global without consent must not announce");
+
+        p.global_consent.insert("a".into(), 1_725_000_000_000);
+        assert!(p.announce_globally("a"), "consent recorded → announces");
+    }
+
+    #[test]
+    fn device_and_private_scopes_never_announce_globally() {
+        let mut p = SharePolicy::share_list(["dev", "priv"]);
+        p.default_scope = Scope::Private;
+        p.scopes.insert("dev".into(), Scope::Device);
+        p.scopes.insert("priv".into(), Scope::Private);
+        // Even a stray consent entry can't promote a non-Global scope.
+        p.global_consent.insert("dev".into(), 1);
+        p.global_consent.insert("priv".into(), 1);
+        assert!(!p.announce_globally("dev"));
+        assert!(!p.announce_globally("priv"));
+    }
+
+    #[test]
+    fn scope_and_consent_survive_json_round_trip() {
+        let mut p = SharePolicy::share_list(["a", "b"]);
+        p.default_scope = Scope::Private;
+        p.scopes.insert("a".into(), Scope::Global);
+        p.global_consent.insert("a".into(), 42);
+        let back: SharePolicy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(p, back);
+        assert!(back.announce_globally("a"));
+        assert!(!back.announce_globally("b"));
+    }
+
+    #[test]
+    fn load_migrates_path_keyed_scope_and_consent_entries() {
+        // A hand-edited/older file could key scope/consent by a path; load() must fold them to the
+        // clean handle so they keep matching the advertised model.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        std::fs::write(
+            &path,
+            r#"{"version":2,"mode":"list","models":["/home/u/models/Foo-7B-Q4_K_M.gguf"],
+                "default_scope":"private",
+                "scopes":{"/home/u/models/Foo-7B-Q4_K_M.gguf":"global"},
+                "global_consent":{"/home/u/models/Foo-7B-Q4_K_M.gguf":7}}"#,
+        )
+        .unwrap();
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(p.is_shared("Foo-7B-Q4_K_M"));
+        assert_eq!(p.scope_of("Foo-7B-Q4_K_M"), Scope::Global);
+        assert!(p.announce_globally("Foo-7B-Q4_K_M"), "consent migrated with the key");
+        assert!(!p.scopes.keys().any(|k| k.contains("/home/u")));
     }
 
     #[test]
