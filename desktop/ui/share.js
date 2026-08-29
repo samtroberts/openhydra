@@ -54,8 +54,93 @@ import { displayModelName } from "./models";
   // The policy file was changed OUTSIDE this view (the Settings "Reset" button): drop the cached
   // policy + any pending hold so the next render re-reads it. Without this, a reset while the
   // provider is STOPPED would leave the toggles showing the pre-reset selection (review F1/F2).
-  on("share-policy-reset", () => { policy = null; pendingSig = null; });
+  on("share-policy-reset", () => { policy = null; pendingSig = null; scopeLoaded = false; scopeLoadPromise = null; });
   function shareActiveModels() { return [...new Set(engines.flatMap((e) => e.models))]; }
+
+  // ── per-model REACH (scope): device / private / global (M1) ──
+  // Orthogonal to mode/models (which decides *whether* a model is shared) — scope decides *how far*
+  // it reaches. Only `global` (with recorded consent) is announced to the public DHT. The live
+  // status view (`snap.share`) carries no scope, so scope lives in its own state, loaded once from
+  // `read_share_policy` and preserved across snapshot reconciles. `def` (default_scope) stays as the
+  // file has it — `global` for a legacy file, so upgrading NEVER silently un-shares (the agent's
+  // migration materialises the matching consent record); a newly-shared model is set to `private`
+  // explicitly (privacy-first), leaving already-global models on their existing reach.
+  let scope = { def: "global", byModel: new Map(), consent: new Map() };
+  let scopeLoaded = false, scopeLoadPromise = null;
+  function loadScope(r) {
+    scope = {
+      def: r?.default_scope || "global",
+      byModel: new Map(Object.entries(r?.scopes || {})),
+      consent: new Map(Object.entries(r?.global_consent || {})),
+      // Policy-level "share everything globally" consent (consent-hardening). Preserved verbatim so
+      // a save never clears the migration-materialised record (which would un-announce default-Global
+      // models). Phase 3 sets it on a real "Share everything globally" choice; here we only carry it.
+      defConsent: r?.default_global_consent ?? null,
+    };
+    scopeLoaded = true;
+  }
+  // Resolves once scope state is loaded from the file (once). It MUST be awaited by every
+  // scope-mutating action: while the provider is running, `ensurePolicy` reconciles mode/models
+  // from `snap.share` and never loads scope — only this async read does. Without awaiting it, a
+  // toggle/scope change fired before the initial read would persist a TRUNCATED policy: dropping
+  // the file's `scopes`/`global_consent`/`default_global_consent` — which the airtight backend then
+  // reads as un-consented, silently un-announcing every previously-global model — and clobbering
+  // `default_scope`. See the M1 race fix.
+  function ensureScope() {
+    if (scopeLoaded) return Promise.resolve();
+    if (!scopeLoadPromise) {
+      scopeLoadPromise = call("read_share_policy")
+        .then((r) => loadScope(r))
+        .catch(() => { scopeLoaded = true; })   // read failed → keep the safe default; don't loop
+        .finally(() => { renderShare(); });
+    }
+    return scopeLoadPromise;
+  }
+  const effectiveScope = (m) => scope.byModel.get(m) || scope.def;
+  // UI reach is BINARY: global vs not-global. `device` (a deferred, not-yet-offered loopback tier) and
+  // any unknown value collapse to the Private presentation. `isGlobal` is the one enforced distinction.
+  const isGlobal = (m) => effectiveScope(m) === "global";
+  // Binary picker offers Private ↔ Global only. A legacy `device` value still READS/round-trips (it
+  // collapses to the Private presentation via `isGlobal`), but it is never offered as a choice — the
+  // loopback tier lands in M4. Copy uses advertisement language (Private is NOT access-controlled yet).
+  const SCOPE_META = {
+    private: { label: "Private", icon: "🔒", title: "Not on the global network — served only within your trust domain." },
+    global:  { label: "Global",  icon: "🌐", title: "Announced to the global network — others can discover and route to it." },
+  };
+  // Consent gate for Global publish. Returns true only if the operator confirms. Reuses the shared
+  // `.cmodal` chrome (window.confirm is inert in the Tauri webview).
+  function globalConsentModal(m) {
+    return new Promise((resolve) => {
+      const back = document.createElement("div");
+      back.className = "cmodal-back";
+      back.innerHTML =
+        `<div class="cmodal"><div class="cmodal-h"><b>Publish “${esc(displayModelName(m))}” to the global network?</b></div>` +
+        `<div class="cmodal-b">` +
+        `<div class="cmodal-path">Anyone on the OpenHydra network will be able to <b>discover</b> this model, <b>route inference</b> to it, and <b>earn or spend credits</b> against it. Your machine serves the requests.</div>` +
+        `<div class="cmodal-warn">This exposes an <b>offer</b> for this model (its clean handle + capability) to the public network — not your prompts, files, or identity. You can switch it back to Private at any time.</div>` +
+        `</div>` +
+        `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Publish globally</button></div></div>`;
+      document.body.appendChild(back);
+      const done = (v) => { back.remove(); resolve(v); };
+      $(".cx", back).onclick = () => done(false);
+      $(".cok", back).onclick = () => done(true);
+      back.onclick = (e) => { if (e.target === back) done(false); };
+    });
+  }
+  // Flip a shared model's reach (binary: `private` or `global`). Global opens the consent gate;
+  // declining reverts (a re-render resets the switch). Private clears any recorded consent.
+  async function setModelScope(m, next) {
+    ensurePolicy(); await ensureScope();   // never mutate scope on a half-loaded state (race fix)
+    if (next === effectiveScope(m)) return;
+    if (next === "global") {
+      const ok = await globalConsentModal(m);
+      if (!ok) { renderShare(); return; }                 // declined → revert the switch
+      scope.byModel.set(m, "global"); scope.consent.set(m, Date.now());
+    } else {
+      scope.byModel.set(m, next); scope.consent.delete(m); // Private never carries consent
+    }
+    await savePolicy(policy.mode, [...policy.models]);      // scope fields ride along (see savePolicy)
+  }
   function policyFromSnap() {
     const s = snap?.share;
     return s?.share_mode ? { mode: s.share_mode, models: new Set(s.shared_models || []) } : null;
@@ -84,7 +169,7 @@ import { displayModelName } from "./models";
     if (!policyLoading) {
       policyLoading = true;
       call("read_share_policy")
-        .then((r) => { policy = { mode: r.mode, models: new Set(r.models || []) }; })
+        .then((r) => { policy = { mode: r.mode, models: new Set(r.models || []) }; loadScope(r); })
         .catch(() => { policy = { mode: "all", models: new Set() }; })
         .finally(() => { policyLoading = false; renderShare(); });
     }
@@ -93,17 +178,27 @@ import { displayModelName } from "./models";
   function isModelShared(m) { ensurePolicy(); return policy.mode === "all" || policy.models.has(m); }
   async function savePolicy(mode, models) {
     const prev = policy;                                    // L2: rollback target on failure
+    // Snapshot scope too so a failed save reverts reach/consent, not just mode/models (M1).
+    const prevScope = { def: scope.def, byModel: new Map(scope.byModel), consent: new Map(scope.consent), defConsent: scope.defConsent };
     policy = { mode, models: new Set(models) };             // optimistic — the row reflects intent at once
     pendingSig = policySig(policy); pendingSince = Date.now();
     savingPolicy = true; renderShare();
-    try { await call("save_share_policy", { policy: { version: 1, mode, models } }); }
-    catch (e) { policy = prev; pendingSig = null; toast(`Save failed: ${e}`); }   // L2: roll back
+    // The scope maps ride along from module state; version 3 carries the reach/consent shape.
+    const payload = {
+      version: 3, mode, models,
+      default_scope: scope.def,
+      scopes: Object.fromEntries(scope.byModel),
+      global_consent: Object.fromEntries(scope.consent),
+      default_global_consent: scope.defConsent,   // preserve the policy-level consent verbatim
+    };
+    try { await call("save_share_policy", { policy: payload }); }
+    catch (e) { policy = prev; scope = prevScope; pendingSig = null; toast(`Save failed: ${e}`); }   // L2: roll back
     finally { savingPolicy = false; }
     emit("refresh-status");   // pull the fresh /status/share; the sticky hold clears once it matches
     renderShare();
   }
   async function toggleShareModel(m) {
-    ensurePolicy();
+    ensurePolicy(); await ensureScope();   // scope must be loaded before we mutate/persist it (race fix)
     const wasShared = policy.mode === "all" || policy.models.has(m);
     const running = !!state?.provider?.status?.running;
     let mode = policy.mode, models = new Set(policy.models);
@@ -113,8 +208,11 @@ import { displayModelName } from "./models";
       // have to stop the whole provider just because the last model was de-selected.
       if (mode === "all") { mode = "list"; models = new Set(shareActiveModels().filter((x) => x !== m)); }
       else models.delete(m);
+      scope.byModel.delete(m); scope.consent.delete(m);   // un-shared → forget its reach + consent
     } else if (mode === "list") {
       models.add(m);   // (in "all" mode it's already shared)
+      // Privacy-first: a newly-shared model reaches only your trust domain until you opt it Global.
+      if (!scope.byModel.has(m)) scope.byModel.set(m, "private");
     }
     await savePolicy(mode, [...models]);
     if (!running && !wasShared) await setSharing(true); // toggled a model on from a stopped node → begin serving
@@ -129,7 +227,7 @@ import { displayModelName } from "./models";
   }
   export function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;
-    ensurePolicy();
+    ensurePolicy(); ensureScope();
     // The REAL advertised set from /status/share (falls back to the log-parsed count pre-M2 agents).
     const hasShareView = !!snap?.share;   // L5: a pre-M2 agent has no per-model announced set
     const announcedSet = new Set(snap?.share?.announced_models || []);
@@ -177,14 +275,28 @@ import { displayModelName } from "./models";
       // Real state, from the agent's announced set (not detection/optimism): shared → "live" once
       // actually announced, "pending" in the brief window before the announce lands.
       const sharedIntent = isModelShared(m);
+      const gl = isGlobal(m);
+      // Status = the ANNOUNCEMENT state (reach is owned by the pill, so we never repeat "private"
+      // here): a `global` model shows live/pending; a shared non-global model shows "not announced"
+      // (served on the trust domain, absent from the public DHT). `device`/unknown ⇒ non-global.
       let status;
       if (!running) status = `<span class="badge secondary">ready</span>`;
-      else if (sharedIntent && (announcedSet.has(m) || !hasShareView)) status = `<span class="badge ok">live</span>`;
-      else if (sharedIntent) status = `<span class="badge warn">pending</span>`;
-      else status = `<span class="badge secondary">off</span>`;
+      else if (!sharedIntent) status = `<span class="badge secondary">off</span>`;
+      else if (gl) status = (announcedSet.has(m) || !hasShareView)
+        ? `<span class="badge ok">live</span>` : `<span class="badge warn">pending</span>`;
+      else status = `<span class="badge secondary" title="Shared and served on your trust domain, but not announced to the global network.">not announced</span>`;
       const swTitle = !running ? "Share this model when you start sharing"
-        : sharedIntent ? "Sharing on the network — toggle off to stop" : "Toggle on to share this model";
-      rows.push(`<tr><td>${modelIcon(m)}<b title="${esc(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td><div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div></td></tr>`);
+        : sharedIntent ? "Sharing — toggle off to stop" : "Toggle on to share this model";
+      // Reach control (binary), only for a shared model: a Private | Global segmented pill. Choosing
+      // Global opens the consent gate; Private clears the model's consent. Distinct from the on/off
+      // share switch so the two are never confused. `device`/unknown highlights Private.
+      const reachPill = sharedIntent
+        ? `<span class="reach-pill" title="How far this model reaches">`
+          + `<button class="rp ${gl ? "" : "sel"}" data-reach="${esc(m)}" data-to="private" title="${SCOPE_META.private.title}">🔒 Private</button>`
+          + `<button class="rp ${gl ? "sel" : ""}" data-reach="${esc(m)}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button>`
+          + `</span>`
+        : "";
+      rows.push(`<tr><td>${modelIcon(m)}<b title="${esc(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${esc(m)}" title="${swTitle}"></div>${reachPill}</td></tr>`);
     }
     $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
     // "Previously served" — lifetime tokens on record but NOT currently detected.
@@ -224,6 +336,9 @@ import { displayModelName } from "./models";
       sasw.onclick = () => toggleShareAll();
     }
     $$("#servetable [data-share]").forEach((sw) => sw.onclick = () => toggleShareModel(sw.dataset.share));
+    // Reach pill: each segment declares its target scope; clicking the active one is a no-op (guarded
+    // in setModelScope), clicking Global opens the consent gate. The whole segment is the hit target.
+    $$("#servetable [data-reach]").forEach((b) => b.onclick = () => setModelScope(b.dataset.reach, b.dataset.to));
     // incoming strip
     // Honest "Incoming" strip: real cumulative serve activity while sharing; hidden when idle.
     // There is no live concurrent-in-flight telemetry, so we don't fabricate one (the old card
