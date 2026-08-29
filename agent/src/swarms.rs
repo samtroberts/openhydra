@@ -472,6 +472,69 @@ pub fn schema_version() -> u32 {
     MEMBERSHIP_SCHEMA_VERSION
 }
 
+// ── M4-base: consumer-side credential store ──
+//
+// The member/consumer counterpart to [`SwarmAuthorizer`]: a hot-reloaded set of the credentials THIS
+// node holds (from member swarm records), so the consumer can attach one to a serve request to reach
+// a provider's private model. Selection is intentionally simple for v1 (the first still-valid
+// credential) — the common case is a single swarm; per-provider credential matching for multi-swarm
+// membership is a follow-up.
+
+#[derive(Default)]
+struct CredCache {
+    dir_mtime: Option<SystemTime>,
+    creds: Vec<MembershipCredential>,
+    loaded: bool,
+}
+
+/// Hot-reloaded set of the membership credentials this node holds (member records). Rescans the
+/// swarms directory only when its mtime changes.
+pub struct CredentialStore {
+    dir: PathBuf,
+    cache: Mutex<CredCache>,
+}
+
+impl CredentialStore {
+    pub fn new(dir: PathBuf) -> Arc<Self> {
+        Arc::new(Self { dir, cache: Mutex::new(CredCache::default()) })
+    }
+
+    fn refresh(&self) {
+        let dir_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.loaded && c.dir_mtime == dir_mtime {
+            return;
+        }
+        let mut creds = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    if let Ok(rec) = serde_json::from_str::<SwarmRecord>(&s) {
+                        if let Some(cred) = rec.credential {
+                            creds.push(cred);
+                        }
+                    }
+                }
+            }
+        }
+        c.creds = creds;
+        c.dir_mtime = dir_mtime;
+        c.loaded = true;
+    }
+
+    /// The best membership credential to present right now — the first that hasn't expired. `None`
+    /// when this node holds no live credential (the common public-only case).
+    pub fn credential_for(&self, now_ms: u64) -> Option<MembershipCredential> {
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.creds.iter().find(|cr| now_ms < cr.expires_at).cloned()
+    }
+}
+
 // ── M4-base: owner-side serve-gate authorizer ──
 //
 // The provider consults this before serving a `Private`-scope model. It authorizes a credential ONLY
@@ -894,6 +957,35 @@ mod tests {
             matches!(err, AuthzError::NotAuthorized(MembershipError::Revoked(_))),
             "revoked member must be refused after hot-reload, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn credential_store_returns_a_held_unexpired_credential() {
+        // A member node's CredentialStore surfaces the credential it holds (from its member record),
+        // and stops offering it once expired.
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        // TTL 1s → issued 3_000, expires 4_000.
+        let (swarm, cred, _peer) = approved_member(owner_dir.path(), &member, 1);
+        let member_record = SwarmRecord {
+            schema_version: SWARM_RECORD_SCHEMA,
+            swarm_public_key: swarm,
+            label: "Home rig".into(),
+            role: SwarmRole::Member,
+            group_secret_key: None,
+            members: Vec::new(),
+            revoked: BTreeSet::new(),
+            credential: Some(cred),
+            created_at: 4_000,
+        };
+        write_swarm(member_dir.path(), &member_record).unwrap();
+        let store = CredentialStore::new(member_dir.path().to_path_buf());
+        assert!(store.credential_for(3_500).is_some(), "held credential offered before expiry");
+        assert!(store.credential_for(4_000).is_none(), "expired credential not offered");
+        // An empty dir yields nothing.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(CredentialStore::new(empty.path().to_path_buf()).credential_for(3_500).is_none());
     }
 
     #[test]

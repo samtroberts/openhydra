@@ -583,6 +583,9 @@ pub struct ConsumerNode {
     /// M2: imported `.openhydra` cards — verified providers pinned locally and dialable by peer id
     /// without live discovery. Merged into the candidate set in `serve_once`. `None` = no store.
     cards: Option<Arc<crate::cards::CardStore>>,
+    /// M4-base: our held swarm membership credentials, attached to a serve request so a provider will
+    /// serve its private (swarm-scoped) model. `None` = we hold none / private routing off.
+    creds: Option<Arc<crate::swarms::CredentialStore>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -612,6 +615,7 @@ impl ConsumerNode {
             self_provider: None,
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
+            creds: None,
         }
     }
 
@@ -633,6 +637,13 @@ impl ConsumerNode {
     /// id without live discovery (builder form). `None` leaves card routing off.
     pub fn with_cards(mut self, cards: Option<Arc<crate::cards::CardStore>>) -> Self {
         self.cards = cards;
+        self
+    }
+
+    /// M4-base: attach our swarm membership credential store, so `serve_once` presents a credential to
+    /// reach a provider's private model (builder form). `None` leaves private routing off.
+    pub fn with_credentials(mut self, creds: Option<Arc<crate::swarms::CredentialStore>>) -> Self {
+        self.creds = creds;
         self
     }
 
@@ -665,6 +676,7 @@ impl ConsumerNode {
             self_provider: None,
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
+            creds: None,
         }
     }
 
@@ -903,10 +915,10 @@ impl ConsumerNode {
                 tools: tools.to_vec(),
                 think,
                 nonce,
-                // M4-base: a swarm credential to reach a private (swarm-scoped) provider is attached
-                // here; the consumer-side credential store + per-provider selection lands in the next
-                // increment. `None` is correct for the common public case (a global model ignores it).
-                credential: None,
+                // M4-base: present our swarm membership credential so a provider will serve its
+                // private (swarm-scoped) model. A global provider ignores it; a private one verifies
+                // it and binds it to our peer id. `None` when we hold no live credential.
+                credential: self.creds.as_ref().and_then(|c| c.credential_for(now_unix_ms())),
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big

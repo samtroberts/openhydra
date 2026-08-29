@@ -490,6 +490,12 @@ struct ServeArgs {
     #[arg(long = "cards-file")]
     cards_file: Option<std::path::PathBuf>,
 
+    /// M4-base: directory of joined swarm records (`~/.openhydra/swarms/`). When set, a held swarm
+    /// membership credential is presented on serve requests, so a private (swarm-scoped) provider will
+    /// serve us. Hot-reloaded. Omit to disable private routing.
+    #[arg(long = "swarms-dir")]
+    swarms_dir: Option<std::path::PathBuf>,
+
     #[command(flatten)]
     aup: AupArgs,
 
@@ -1040,6 +1046,11 @@ fn serve(
         eprintln!("openhydra-agent: card imports at {}", p.display());
         openhydra_agent::cards::CardStore::new(p)
     });
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards)
+    // M4-base: present a held swarm credential so a private provider serves us.
+    let creds = args.swarms_dir.clone().map(|p| {
+        eprintln!("openhydra-agent: swarm credentials from {}", p.display());
+        openhydra_agent::swarms::CredentialStore::new(p)
+    });
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

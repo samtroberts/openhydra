@@ -87,8 +87,8 @@ pub use openhydra_network::membership::{
     key_fingerprint, EnrollmentRequest, MembershipCredential, MembershipError,
 };
 pub use swarms::{
-    ApprovedCredential, AuthorizedServe, AuthzError, EnrollmentRequestExport, MemberView,
-    SwarmAuthorizer, SwarmRecord, SwarmRole, SwarmView,
+    ApprovedCredential, AuthorizedServe, AuthzError, CredentialStore, EnrollmentRequestExport,
+    MemberView, SwarmAuthorizer, SwarmRecord, SwarmRole, SwarmView,
 };
 pub use share_policy::{SharePolicy, ShareMode, ShareStatusView};
 pub use status::{CreditEntry, EconomyStats, EconomyView, LedgerRow, RepEntry, StatusServer, TransferStats};
