@@ -43,6 +43,9 @@ pub mod receipt;
 pub mod serve;
 pub mod share_policy;
 pub mod slash;
+/// M3: swarm membership glue — persist owner/member swarm state and drive enroll → approve → accept
+/// on top of the pure credential crypto in `openhydra_network::membership`.
+pub mod swarms;
 /// P0 introspection: the `--status-bind` endpoint (network snapshot + transfer counters).
 pub mod status;
 pub mod telemetry;
@@ -77,6 +80,14 @@ pub use cards::{build_card, CardExport};
 pub use openhydra_network::card::{
     card_is_privacy_safe, sign_card, verify_card, AupFlags, Capability, Card, CardError, PricingMode,
     RateCard, VerifiedCard, CARD_SCHEMA_VERSION,
+};
+// M3: swarm membership credential types — re-exported so the desktop (network-crate-free) can hold
+// the view/export shapes the swarm Tauri commands return.
+pub use openhydra_network::membership::{
+    key_fingerprint, EnrollmentRequest, MembershipCredential, MembershipError,
+};
+pub use swarms::{
+    ApprovedCredential, EnrollmentRequestExport, MemberView, SwarmRecord, SwarmRole, SwarmView,
 };
 pub use share_policy::{SharePolicy, ShareMode, ShareStatusView};
 pub use status::{CreditEntry, EconomyStats, EconomyView, LedgerRow, RepEntry, StatusServer, TransferStats};

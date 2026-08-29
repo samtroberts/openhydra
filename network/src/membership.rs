@@ -382,6 +382,68 @@ pub fn credential_member_peer_id(
     Ok(libp2p::PeerId::from_public_key(&libp2p::identity::PublicKey::from(ed)))
 }
 
+/// Generate a fresh Ed25519 **group keypair** for a new swarm; returns `(public_hex, secret_hex)`.
+/// The secret stays on the owner's machine (persisted 0600 by the agent) and is never transmitted;
+/// it is reconstructed only to [`sign_credential_with_secret_hex`]. Kept here so the agent crate
+/// stays libp2p-free (parity with how card signing lives in the network crate).
+pub fn generate_group_keypair_hex() -> Result<(String, String), MembershipError> {
+    let kp = libp2p::identity::Keypair::generate_ed25519();
+    let ed = kp
+        .try_into_ed25519()
+        .map_err(|e| MembershipError::Crypto(format!("not ed25519: {e}")))?;
+    let public = hex::encode(ed.public().to_bytes());
+    let secret = hex::encode(ed.secret().as_ref());
+    Ok((public, secret))
+}
+
+/// Sign a credential using a swarm's stored **group secret** (hex). Reconstructs the group keypair,
+/// scrubs the transient secret copy, and delegates to [`sign_credential`] (which sets
+/// `swarm_public_key`/`sig_alg`/`signature`). The agent calls this with the secret it holds on disk.
+pub fn sign_credential_with_secret_hex(
+    cred: MembershipCredential,
+    group_secret_hex: &str,
+) -> Result<MembershipCredential, MembershipError> {
+    let kp = keypair_from_secret_hex(group_secret_hex)?;
+    sign_credential(cred, &kp)
+}
+
+/// Reconstruct an Ed25519 keypair from a 32-byte secret (hex). Scrubs the decoded bytes.
+fn keypair_from_secret_hex(secret_hex: &str) -> Result<libp2p::identity::Keypair, MembershipError> {
+    use zeroize::Zeroize;
+    let mut bytes = hex::decode(secret_hex)
+        .map_err(|e| MembershipError::Crypto(format!("bad secret hex: {e}")))?;
+    if bytes.len() != 32 {
+        let n = bytes.len();
+        bytes.zeroize();
+        return Err(MembershipError::Crypto(format!("secret must be 32 bytes, got {n}")));
+    }
+    let mut arr: [u8; 32] = match bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            bytes.zeroize();
+            return Err(MembershipError::Crypto("secret length".into()));
+        }
+    };
+    // `try_from_bytes` zeroizes `arr` on success; scrub the Vec copy regardless.
+    let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut arr)
+        .map_err(|e| MembershipError::Crypto(format!("bad ed25519 secret: {e}")));
+    bytes.zeroize();
+    let secret = secret?;
+    Ok(libp2p::identity::Keypair::from(libp2p::identity::ed25519::Keypair::from(secret)))
+}
+
+/// The hex-encoded Ed25519 **public** key of a node identity keypair — so the agent can compute a
+/// member's key for binding without naming libp2p directly.
+pub fn keypair_public_hex(
+    keypair: &libp2p::identity::Keypair,
+) -> Result<String, MembershipError> {
+    let ed = keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|e| MembershipError::Crypto(format!("not ed25519: {e}")))?;
+    Ok(hex::encode(ed.to_bytes()))
+}
+
 fn ed_pubkey_from_hex(
     hex_str: &str,
 ) -> Result<libp2p::identity::ed25519::PublicKey, MembershipError> {
