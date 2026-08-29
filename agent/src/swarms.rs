@@ -11,16 +11,19 @@
 //! [`EnrollmentRequest`] string, the owner approves it into a [`MembershipCredential`] string, the
 //! member accepts that back. Every artifact is public; the group secret stays on the owner's machine.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use openhydra_network::identity::Identity;
 use openhydra_network::membership::{
-    generate_group_keypair_hex, key_fingerprint, keypair_public_hex, sign_credential_with_secret_hex,
-    sign_enrollment_request, verify_credential, verify_credential_for_member,
-    verify_enrollment_request, EnrollmentRequest, MembershipCredential, MEMBERSHIP_SCHEMA_VERSION,
+    credential_member_peer_id, generate_group_keypair_hex, key_fingerprint, keypair_public_hex,
+    sign_credential_with_secret_hex, sign_enrollment_request, verify_credential,
+    verify_credential_for_member, verify_enrollment_request, EnrollmentRequest, MembershipCredential,
+    MembershipError, MEMBERSHIP_SCHEMA_VERSION,
 };
 
 /// Schema version for the on-disk swarm record.
@@ -469,6 +472,150 @@ pub fn schema_version() -> u32 {
     MEMBERSHIP_SCHEMA_VERSION
 }
 
+// ── M4-base: owner-side serve-gate authorizer ──
+//
+// The provider consults this before serving a `Private`-scope model. It authorizes a credential ONLY
+// against swarms THIS node OWNS — the owner holds the revocation set, so revocation is enforced where
+// it's authoritative (M3 review guardrail: a non-owner verifying membership runs against an empty
+// revoked set and would admit a revoked member). Trust binds to `member_public_key` → its libp2p peer
+// id, checked against the live connection's authenticated peer id (never the self-asserted
+// `member_openhydra_peer_id`, guardrail #4).
+
+/// Why a serve request was refused at the swarm gate. Distinct variants so the provider can surface a
+/// precise error and bump the right counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthzError {
+    /// A `Private` model was requested but the request carried no membership credential.
+    NoCredential,
+    /// The credential is for a swarm this provider does not own (so it can't vouch for or revoke it).
+    UnknownSwarm(String),
+    /// The credential failed verification against the owned swarm (bad signature, revoked, expired).
+    NotAuthorized(MembershipError),
+    /// The credential is valid but authorises a different identity than the connecting peer.
+    WrongPeer { credential_peer: String, connection_peer: String },
+}
+
+impl std::fmt::Display for AuthzError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthzError::NoCredential => {
+                write!(f, "this model is private — a swarm membership credential is required")
+            }
+            AuthzError::UnknownSwarm(pk) => {
+                write!(f, "not authorised: credential is for a swarm this provider does not own ({pk})")
+            }
+            AuthzError::NotAuthorized(e) => write!(f, "not authorised for this swarm: {e}"),
+            AuthzError::WrongPeer { credential_peer, connection_peer } => write!(
+                f,
+                "credential authorises {credential_peer} but the request came from {connection_peer}"
+            ),
+        }
+    }
+}
+impl std::error::Error for AuthzError {}
+
+/// A successful gate pass — the member + swarm that authorised this serve (for logging + the
+/// self-serve-like credit flag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedServe {
+    pub swarm_public_key: String,
+    pub member_public_key: String,
+}
+
+struct OwnedSwarm {
+    revoked: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct AuthCache {
+    /// The swarms-dir mtime last scanned (changes on any add/remove/rename — every write goes through
+    /// temp+rename, so a revoke bumps it). `None` until first load / when unavailable → always reload.
+    dir_mtime: Option<SystemTime>,
+    /// Owned swarms indexed by group public key. Only OWNER records (which carry the revoked set).
+    owned: BTreeMap<String, OwnedSwarm>,
+    loaded: bool,
+}
+
+/// Hot-reloaded index of the swarms THIS node owns, used to gate `Private` serves. Rescans the swarms
+/// directory only when its mtime changes, so the steady-state serve path is a cheap `stat`.
+pub struct SwarmAuthorizer {
+    dir: PathBuf,
+    cache: Mutex<AuthCache>,
+}
+
+impl SwarmAuthorizer {
+    pub fn new(dir: PathBuf) -> Arc<Self> {
+        Arc::new(Self { dir, cache: Mutex::new(AuthCache::default()) })
+    }
+
+    /// Reload the owned-swarm index iff the directory changed (or was never loaded). Best-effort: an
+    /// unreadable dir/file is skipped, never errors the serve path. Poison-tolerant.
+    fn refresh(&self) {
+        let dir_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.loaded && c.dir_mtime == dir_mtime {
+            return;
+        }
+        let mut owned = BTreeMap::new();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    if let Ok(rec) = serde_json::from_str::<SwarmRecord>(&s) {
+                        if rec.role == SwarmRole::Owner {
+                            owned.insert(
+                                rec.swarm_public_key.clone(),
+                                OwnedSwarm { revoked: rec.revoked.clone() },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        c.owned = owned;
+        c.dir_mtime = dir_mtime;
+        c.loaded = true;
+    }
+
+    /// Authorize a serve of a `Private` model. `credential` is what the request carried (if any),
+    /// `connection_peer_id` is the libp2p-authenticated sender. Passes only when the credential is for
+    /// a swarm we own, verifies (signature + not-revoked + unexpired) against that swarm's revocation
+    /// set, and its bound member key derives exactly `connection_peer_id`.
+    pub fn authorize(
+        &self,
+        credential: Option<&MembershipCredential>,
+        connection_peer_id: &str,
+        now_ms: u64,
+    ) -> Result<AuthorizedServe, AuthzError> {
+        let cred = credential.ok_or(AuthzError::NoCredential)?;
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let owned = c
+            .owned
+            .get(&cred.swarm_public_key)
+            .ok_or_else(|| AuthzError::UnknownSwarm(cred.swarm_public_key.clone()))?;
+        // Verify against THIS swarm's revocation set (owner-authoritative).
+        verify_credential(cred, now_ms, &owned.revoked).map_err(AuthzError::NotAuthorized)?;
+        // Bind to the live connection: the credential's member key must derive the sender's peer id.
+        let member_peer = credential_member_peer_id(cred)
+            .map_err(AuthzError::NotAuthorized)?
+            .to_string();
+        if member_peer != connection_peer_id {
+            return Err(AuthzError::WrongPeer {
+                credential_peer: member_peer,
+                connection_peer: connection_peer_id.to_string(),
+            });
+        }
+        Ok(AuthorizedServe {
+            swarm_public_key: cred.swarm_public_key.clone(),
+            member_public_key: cred.member_public_key.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +802,127 @@ mod tests {
         // Member previews the credential before accepting.
         let pc = preview_credential(&approved.magnet, 3_500).unwrap();
         assert_eq!(pc.swarm_public_key, swarm.swarm_public_key);
+    }
+
+    // ── M4-base: the owner-side serve-gate authorizer ──
+
+    /// Owner creates a swarm + approves `member`; returns (owner_dir kept alive by caller, swarm pk,
+    /// the signed credential, the member's libp2p peer-id string).
+    fn approved_member(
+        owner_dir: &Path,
+        member: &Identity,
+        ttl_secs: u64,
+    ) -> (String, MembershipCredential, String) {
+        let swarm = create_swarm(owner_dir, "Home rig", 1_000).unwrap();
+        let req = build_enrollment_request(member, &swarm.swarm_public_key, "m", 2_000).unwrap();
+        let approved =
+            approve_member(owner_dir, &swarm.swarm_public_key, &req.magnet, "m", ttl_secs, 3_000).unwrap();
+        let member_peer =
+            credential_member_peer_id(&approved.credential).unwrap().to_string();
+        (swarm.swarm_public_key, approved.credential, member_peer)
+    }
+
+    #[test]
+    fn authorizer_admits_a_valid_credential_bound_to_the_connecting_peer() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (_swarm, cred, member_peer) = approved_member(owner_dir.path(), &member, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        let ok = auth.authorize(Some(&cred), &member_peer, 4_000).unwrap();
+        assert_eq!(ok.member_public_key, our_pk(&member));
+    }
+
+    #[test]
+    fn authorizer_refuses_a_private_serve_with_no_credential() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        assert_eq!(auth.authorize(None, "12D3KooWanyone", 4_000).unwrap_err(), AuthzError::NoCredential);
+    }
+
+    #[test]
+    fn authorizer_refuses_a_credential_for_a_swarm_we_do_not_own() {
+        // A credential issued by a DIFFERENT owner (a swarm this provider doesn't own) is refused —
+        // the provider can't vouch for or revoke a group whose key it doesn't hold (guardrail #3).
+        let other_owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (_swarm, cred, member_peer) = approved_member(other_owner_dir.path(), &member, 24 * HOUR);
+        // A provider with an EMPTY swarms dir (owns nothing).
+        let our_dir = tempfile::tempdir().unwrap();
+        let auth = SwarmAuthorizer::new(our_dir.path().to_path_buf());
+        assert!(matches!(
+            auth.authorize(Some(&cred), &member_peer, 4_000).unwrap_err(),
+            AuthzError::UnknownSwarm(_)
+        ));
+    }
+
+    #[test]
+    fn authorizer_refuses_a_credential_bound_to_a_different_peer() {
+        // A valid credential presented over a connection from a DIFFERENT peer id than it authorises
+        // (a stolen/replayed credential) is refused — trust binds to member_public_key -> peer id.
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (_swarm, cred, _member_peer) = approved_member(owner_dir.path(), &member, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        let err = auth.authorize(Some(&cred), "12D3KooWimposter", 4_000).unwrap_err();
+        assert!(matches!(err, AuthzError::WrongPeer { .. }));
+    }
+
+    #[test]
+    fn authorizer_refuses_an_expired_credential() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        // TTL 1s → issued at 3_000, expires at 4_000.
+        let (_swarm, cred, member_peer) = approved_member(owner_dir.path(), &member, 1);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        assert!(auth.authorize(Some(&cred), &member_peer, 3_999).is_ok(), "still valid before expiry");
+        let err = auth.authorize(Some(&cred), &member_peer, 4_000).unwrap_err();
+        assert!(matches!(err, AuthzError::NotAuthorized(_)));
+    }
+
+    #[test]
+    fn authorizer_hot_reloads_a_revocation() {
+        // A member admitted now must be refused after the owner revokes them — the authorizer picks
+        // up the rewritten swarm file (dir mtime changes on the temp+rename).
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (swarm, cred, member_peer) = approved_member(owner_dir.path(), &member, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        assert!(auth.authorize(Some(&cred), &member_peer, 4_000).is_ok(), "admitted before revoke");
+        revoke_member(owner_dir.path(), &swarm, &our_pk(&member)).unwrap();
+        let err = auth.authorize(Some(&cred), &member_peer, 4_000).unwrap_err();
+        assert!(
+            matches!(err, AuthzError::NotAuthorized(MembershipError::Revoked(_))),
+            "revoked member must be refused after hot-reload, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn authorizer_ignores_member_records_only_owner_swarms_authorize() {
+        // A node that is only a MEMBER of a swarm (holds a credential, not the group key) must NOT
+        // authorize serves for it — it lacks the revocation set (guardrail #3). Persist a genuine
+        // MEMBER record for the swarm, then confirm the authorizer still reports UnknownSwarm (it only
+        // indexes owner records).
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (swarm, cred, member_peer) = approved_member(owner_dir.path(), &member, 24 * HOUR);
+        let member_record = SwarmRecord {
+            schema_version: SWARM_RECORD_SCHEMA,
+            swarm_public_key: swarm.clone(),
+            label: "Home rig".into(),
+            role: SwarmRole::Member,
+            group_secret_key: None,
+            members: Vec::new(),
+            revoked: BTreeSet::new(),
+            credential: Some(cred.clone()),
+            created_at: 4_000,
+        };
+        write_swarm(member_dir.path(), &member_record).unwrap();
+        // The record exists and is for this swarm, but role == Member → the authorizer skips it.
+        let auth = SwarmAuthorizer::new(member_dir.path().to_path_buf());
+        assert!(matches!(
+            auth.authorize(Some(&cred), &member_peer, 4_000).unwrap_err(),
+            AuthzError::UnknownSwarm(_)
+        ));
     }
 }

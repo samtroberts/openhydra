@@ -70,6 +70,13 @@ pub struct ServeRequest {
     /// receipt only if the same nonce is presented with `tokens <= served`, the same model,
     /// once, and fresh. Required: a serve carrying no committed nonce cannot be settled.
     pub nonce: [u8; 16],
+    /// M4-base: a swarm membership credential the consumer presents to reach a provider's
+    /// **private** (swarm-scoped) model. `#[serde(default)]` keeps the wire backward-compatible — an
+    /// older consumer omits it (and can't reach a private model), an older provider ignores it (it
+    /// has no private models to gate). The provider verifies it against a swarm it owns and binds it
+    /// to the authenticated sender before generating; a `global` model ignores it entirely.
+    #[serde(default)]
+    pub credential: Option<openhydra_network::membership::MembershipCredential>,
 }
 
 impl ServeRequest {
@@ -454,6 +461,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
+            credential: None,
         }
     }
 

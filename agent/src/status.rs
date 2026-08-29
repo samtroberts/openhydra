@@ -77,6 +77,9 @@ pub struct TransferStats {
     pub tokens_served: AtomicU64,
     pub serve_errors: AtomicU64,
     pub aup_refusals: AtomicU64,
+    /// M4-base: inbound serves refused at the swarm gate (private model, missing/invalid/wrong-peer
+    /// credential). A visibility counter, like `aup_refusals`.
+    pub swarm_refusals: AtomicU64,
     pub receipts_ledgered: AtomicU64,
     /// Consumer-side totals (mirror of the served ones), for the give-to-get "used" figures.
     pub requests_consumed: AtomicU64,
@@ -197,6 +200,7 @@ impl TransferStats {
             tokens_served: self.tokens_served.load(Ordering::Relaxed),
             serve_errors: self.serve_errors.load(Ordering::Relaxed),
             aup_refusals: self.aup_refusals.load(Ordering::Relaxed),
+            swarm_refusals: self.swarm_refusals.load(Ordering::Relaxed),
             receipts_ledgered: self.receipts_ledgered.load(Ordering::Relaxed),
             requests_consumed: self.requests_consumed.load(Ordering::Relaxed),
             tokens_consumed: self.tokens_consumed.load(Ordering::Relaxed),
@@ -213,6 +217,7 @@ struct TransfersView {
     tokens_served: u64,
     serve_errors: u64,
     aup_refusals: u64,
+    swarm_refusals: u64,
     receipts_ledgered: u64,
     requests_consumed: u64,
     tokens_consumed: u64,

@@ -462,6 +462,15 @@ impl PolicyWatcher {
         self.policy.read().map(|p| p.announce_globally(engine_ref)).unwrap_or(false)
     }
 
+    /// The reach of `engine_ref` under the current (possibly hot-reloaded) policy — the M4 serve gate
+    /// consults this to decide whether a request needs a swarm credential. Fail-closed to
+    /// [`Scope::Private`] on a poisoned lock: never report `Global` (which would drop the credential
+    /// requirement) from a broken lock — the most a poison can do is force the auth gate, never open a
+    /// private model. (`is_shared` runs first and already fails closed, so this is a defence-in-depth.)
+    pub fn scope_of(&self, engine_ref: &str) -> Scope {
+        self.policy.read().map(|p| p.scope_of(engine_ref)).unwrap_or(Scope::Private)
+    }
+
     /// A clone of the current policy (for the status API).
     pub fn snapshot(&self) -> SharePolicy {
         // Fail CLOSED on a poisoned lock (share-nothing), consistent with `is_shared` — never report

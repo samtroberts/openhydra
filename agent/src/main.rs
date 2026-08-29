@@ -426,6 +426,12 @@ struct ProvideArgs {
     #[arg(long = "share-policy-file")]
     share_policy_file: Option<std::path::PathBuf>,
 
+    /// M4-base: directory of owned/joined swarm records (`~/.openhydra/swarms/`). When set, a
+    /// `Private`-scope model is served only to a swarm member presenting a valid credential for a
+    /// swarm this node owns. Omit ⇒ no swarm auth (a private model is then refused for everyone).
+    #[arg(long = "swarms-dir")]
+    swarms_dir: Option<std::path::PathBuf>,
+
     /// Advisory host advertised in records (routing is by libp2p peer id regardless).
     #[arg(long, default_value = "")]
     host: String,
@@ -930,6 +936,13 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
                 args.share_models.join(", ")
             );
         }
+    }
+    // M4-base: attach the owner-side swarm authorizer so `Private`-scope models can be served to
+    // enrolled members. Without it, a private model is refused for everyone (fail-closed).
+    if let Some(dir) = args.swarms_dir.clone() {
+        eprintln!("openhydra-agent: swarm auth from {} (private models gated on membership)", dir.display());
+        provider = provider
+            .with_swarm_authorizer(openhydra_agent::swarms::SwarmAuthorizer::new(dir));
     }
 
     let announced = provider

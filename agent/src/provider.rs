@@ -439,6 +439,55 @@ fn reply_to_matches(reply_to: &str, source_peer: &str) -> bool {
     reply_to == source_peer
 }
 
+/// M4-base reach-gate decision as pure logic (no `self`, unit-testable). Decides *who* may reach an
+/// already-shared model, from its `scope`:
+/// - `Global`  → anyone (public marketplace).
+/// - `Device`  → loopback only: the request must come from this node (`own_peer`) — a self-serve.
+/// - `Private` / `Unknown` → self-serve is allowed; otherwise a valid swarm `credential` (for a swarm
+///   the `authorizer` owns, bound to `source_peer`) is required. `Unknown` (a newer policy's scope
+///   this build can't read) is treated as `Private` so an unrecognised reach never serves the public.
+///
+/// `Ok(())` ⇒ proceed. `Err((reason, is_swarm_refusal))` ⇒ refuse; `is_swarm_refusal` is true only for
+/// a credential-gate failure (so the caller bumps the swarm counter, not for a device-only refusal).
+fn scope_gate(
+    scope: crate::share_policy::Scope,
+    model_ref: &str,
+    source_peer: &str,
+    own_peer: &str,
+    credential: Option<&openhydra_network::membership::MembershipCredential>,
+    authorizer: Option<&crate::swarms::SwarmAuthorizer>,
+    now_ms: u64,
+) -> Result<(), (String, bool)> {
+    use crate::share_policy::Scope;
+    match scope {
+        Scope::Global => Ok(()),
+        Scope::Device => {
+            if source_peer == own_peer {
+                Ok(())
+            } else {
+                Err((
+                    format!("model '{model_ref}' is device-only (not shared beyond this machine)"),
+                    false,
+                ))
+            }
+        }
+        Scope::Private | Scope::Unknown => {
+            if source_peer == own_peer {
+                return Ok(()); // self-serve of one's own private model needs no credential
+            }
+            let Some(auth) = authorizer else {
+                return Err((
+                    format!("model '{model_ref}' is private and this provider has no swarm configured"),
+                    false,
+                ));
+            };
+            auth.authorize(credential, source_peer, now_ms)
+                .map(|_| ())
+                .map_err(|e| (e.to_string(), true))
+        }
+    }
+}
+
 /// F5: run a generation, catching a panic in the adapter/engine and turning it into a terminal
 /// `Error` chunk so a bug can't strand the consumer. Used by **both** serve transports:
 /// - streaming (`SERVE_STREAM`) — the appended terminal flips the stream buffer's `done`, so it
@@ -650,6 +699,10 @@ pub struct Provider<A: EngineAdapter> {
     /// this reaches [`WITHDRAW_ABSENCE_GRACE_PASSES`]; a reappearance (or a policy-driven drop, which
     /// is still *detected*) resets/skips it. Bounded, guarded by `announce_lock` in practice.
     absence_streak: Mutex<BTreeMap<String, u8>>,
+    /// M4-base: owner-side swarm authorizer, consulted for a `Private`-scope model's serve gate.
+    /// `None` → no swarms configured, so a private model is refused for everyone (fail-closed). A
+    /// global model never touches it.
+    swarm_auth: Option<Arc<crate::swarms::SwarmAuthorizer>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -684,6 +737,40 @@ impl<A: EngineAdapter> Provider<A> {
             last_announced: Mutex::new(BTreeSet::new()),
             pending_withdrawals: Mutex::new(BTreeMap::new()),
             absence_streak: Mutex::new(BTreeMap::new()),
+            swarm_auth: None,
+        }
+    }
+
+    /// M4-base: attach the owner-side swarm authorizer (reads `~/.openhydra/swarms/`). Required for a
+    /// `Private`-scope model to be servable — without it every private serve is refused (fail-closed).
+    pub fn with_swarm_authorizer(mut self, auth: Arc<crate::swarms::SwarmAuthorizer>) -> Self {
+        self.swarm_auth = Some(auth);
+        self
+    }
+
+    /// M4-base reach gate: enforce the model's `scope` for an inbound serve from `source_peer` (the
+    /// libp2p-authenticated sender). Returns `None` to proceed, or `Some(framed error)` to refuse.
+    /// Delegates the decision to the pure [`scope_gate`]; here we just supply this node's identity +
+    /// live authorizer, frame the refusal, and bump the swarm-refusal counter.
+    fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
+        match scope_gate(
+            self.policy.scope_of(&req.model_ref),
+            &req.model_ref,
+            source_peer,
+            self.net.libp2p_peer_id(),
+            req.credential.as_ref(),
+            self.swarm_auth.as_deref(),
+            now_unix_ms(),
+        ) {
+            Ok(()) => None,
+            Err((reason, is_swarm_refusal)) => {
+                if is_swarm_refusal {
+                    if let Some(stats) = &self.stats {
+                        stats.swarm_refusals.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Some(frame_response(&[ServeChunk::Error(reason).encode()]))
+            }
         }
     }
 
@@ -933,6 +1020,12 @@ impl<A: EngineAdapter> Provider<A> {
             ))
             .encode()]);
             respond_done(framed, 1);
+            return;
+        }
+        // M4-base reach gate: a `Private` model needs a valid swarm credential bound to this sender;
+        // a `Device` model is loopback-only. Runs after `is_shared` (which-models) — orthogonal.
+        if let Some(refusal) = self.scope_refusal(&req, &source_peer) {
+            respond_done(refusal, 1);
             return;
         }
         // Capture the small fields needed after `req` is moved into the serve (which consumes
@@ -1458,6 +1551,11 @@ impl<A: EngineAdapter> Provider<A> {
                             ))
                             .encode()]);
                         }
+                        // M4-base reach gate (buffered twin of the streaming path): a `Private` model
+                        // needs a valid swarm credential bound to `source_peer`; `Device` is loopback-only.
+                        if let Some(refusal) = self.scope_refusal(&req, source_peer) {
+                            return refusal;
+                        }
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -1701,6 +1799,61 @@ mod tests {
         assert!(!policy.is_shared("qwen2.5:0.5b")); // a different handle on the same node → refused
     }
 
+    // ── M4-base: the pure reach-gate decision ──
+    mod scope_gate_tests {
+        use super::super::scope_gate;
+        use crate::share_policy::Scope;
+        use crate::swarms::{approve_member, build_enrollment_request, create_swarm, SwarmAuthorizer};
+        use openhydra_network::identity::Identity;
+        use openhydra_network::membership::credential_member_peer_id;
+
+        const OWN: &str = "12D3KooWOwnNode";
+        const HOUR: u64 = 3600;
+
+        #[test]
+        fn global_is_open_to_anyone_no_credential_needed() {
+            assert!(scope_gate(Scope::Global, "m", "12D3KooWStranger", OWN, None, None, 0).is_ok());
+        }
+
+        #[test]
+        fn device_is_loopback_only() {
+            // Our own node (self-serve) passes; any other peer is refused as device-only.
+            assert!(scope_gate(Scope::Device, "m", OWN, OWN, None, None, 0).is_ok());
+            let err = scope_gate(Scope::Device, "m", "12D3KooWOther", OWN, None, None, 0).unwrap_err();
+            assert!(err.0.contains("device-only") && !err.1);
+        }
+
+        #[test]
+        fn private_self_serve_needs_no_credential() {
+            assert!(scope_gate(Scope::Private, "m", OWN, OWN, None, None, 0).is_ok());
+        }
+
+        #[test]
+        fn private_without_an_authorizer_is_refused_fail_closed() {
+            let err = scope_gate(Scope::Private, "m", "12D3KooWMember", OWN, None, None, 0).unwrap_err();
+            assert!(err.0.contains("no swarm configured") && !err.1, "device-only-style, not a swarm-counter refusal");
+        }
+
+        #[test]
+        fn private_admits_a_valid_member_and_refuses_a_stranger() {
+            let owner_dir = tempfile::tempdir().unwrap();
+            let member = Identity::load_or_create(&tempfile::tempdir().unwrap().path().join("id")).unwrap();
+            let swarm = create_swarm(owner_dir.path(), "rig", 1_000).unwrap();
+            let req = build_enrollment_request(&member, &swarm.swarm_public_key, "m", 2_000).unwrap();
+            let approved = approve_member(owner_dir.path(), &swarm.swarm_public_key, &req.magnet, "m", 24 * HOUR, 3_000).unwrap();
+            let member_peer = credential_member_peer_id(&approved.credential).unwrap().to_string();
+            let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+
+            // Valid credential bound to the connecting member → proceed.
+            assert!(scope_gate(Scope::Private, "m", &member_peer, OWN, Some(&approved.credential), Some(&auth), 4_000).is_ok());
+            // A stranger with no credential → refused, and it counts as a swarm refusal.
+            let err = scope_gate(Scope::Private, "m", "12D3KooWStranger", OWN, None, Some(&auth), 4_000).unwrap_err();
+            assert!(err.1, "a credential-gate refusal bumps the swarm counter");
+            // `Unknown` scope is gated exactly like `Private` (fail-closed): the same stranger is refused.
+            assert!(scope_gate(Scope::Unknown, "m", "12D3KooWStranger", OWN, None, Some(&auth), 4_000).is_err());
+        }
+    }
+
     struct StubAdapter;
     impl EngineAdapter for StubAdapter {
         fn engine_name(&self) -> &'static str {
@@ -1730,6 +1883,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
+            credential: None,
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -2157,6 +2311,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
+            credential: None,
         };
 
         // Collect the frames the engine produces (the buffered result), then reveal them into the
@@ -2257,6 +2412,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
+            credential: None,
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.

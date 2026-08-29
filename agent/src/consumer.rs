@@ -903,6 +903,10 @@ impl ConsumerNode {
                 tools: tools.to_vec(),
                 think,
                 nonce,
+                // M4-base: a swarm credential to reach a private (swarm-scoped) provider is attached
+                // here; the consumer-side credential store + per-provider selection lands in the next
+                // increment. `None` is correct for the common public case (a global model ignores it).
+                credential: None,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
@@ -1276,6 +1280,8 @@ impl ConsumerNode {
             think: Some(false),
             // Audit serves are never settled into a receipt, but the field is required.
             nonce: rand::random::<[u8; 16]>(),
+            // Audits probe public marketplace providers; no swarm credential.
+            credential: None,
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -1431,6 +1437,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
+            credential: None,
         }
     }
 
