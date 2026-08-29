@@ -118,6 +118,25 @@ const AUDIT_MAX_RATE: f64 = 0.5;
 
 /// Token budget for an audit challenge completion — kept short to bound the audit's compute
 /// cost while leaving enough output to discriminate an honest run from a freeloader.
+///
+/// KNOWN LIMITATION (thinking/reasoning models). The audit probe sets `think:false` (see
+/// [`ConsumerNode::dispatch_full`]) so a reasoning model answers directly within this small
+/// budget and the required nonce echo lands in `audit_body`'s near-the-start window. That holds
+/// once the fleet uniformly honours the switch. During a mixed-version rollout it can misfire
+/// for a provider that does NOT honour `think:false` (a pre-Fix binary, a `/api/show` probe that
+/// failed, or an OpenAI-path template that ignores `enable_thinking`): it still emits a
+/// `<think>…</think>` block, which either (a) spends this whole 64-token budget mid-thought so the
+/// nonce is never reached → recorded as a non-responder, or (b) yields a post-thinking answer that
+/// legitimately diverges (at `temperature 0`, a continuation conditioned on chain-of-thought
+/// differs from one without) from a peer that answered directly → a `common_prefix_ratio` miss.
+/// Deliberately NOT "fixed" by inflating this budget universally: that would 8× the compute of the
+/// (majority) non-thinking audits and *widen* the benign-divergence window, weakening the signal
+/// for everyone. The exposure is bounded and self-correcting — audits are sampled, a 1-vs-1 tie is
+/// `Inconclusive` (no penalty; it escalates to a third), and reputation is long-run — and it
+/// disappears once the fleet converges on honouring `think:false`. If it ever needs an active fix,
+/// the right shape is capability-scoped (down-weight / skip greedy-agreement auditing for
+/// thinking-capable models, whose variable reasoning makes output-agreement the wrong primitive),
+/// not a bigger global budget.
 const AUDIT_MAX_TOKENS: u32 = 64;
 
 /// Pick the best provider from `peers` for a request whose canonical id is
@@ -747,6 +766,7 @@ impl ConsumerNode {
         max_tokens: Option<u32>,
         temperature: Option<f64>,
         tools: Vec<Value>,
+        think: Option<bool>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
@@ -757,14 +777,14 @@ impl ConsumerNode {
         // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
         // model's discovery cache and retry once with a cold get_providers lookup. The retry is
         // only reached when nothing was streamed, so it can never duplicate delivered output.
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, now, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => return Ok(summary),
             AttemptOutcome::Fatal(e) => return Err(e),
             AttemptOutcome::Retryable(_) => {}
         }
         tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
         let _ = self.net.invalidate_discover(model);
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, now, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => Ok(summary),
             AttemptOutcome::Retryable(e) | AttemptOutcome::Fatal(e) => Err(e),
         }
@@ -782,6 +802,7 @@ impl ConsumerNode {
         max_tokens: Option<u32>,
         temperature: Option<f64>,
         tools: &[Value],
+        think: Option<bool>,
         now: u64,
         req_span: &tracing::Span,
         on_delta: &mut dyn FnMut(&str),
@@ -849,6 +870,7 @@ impl ConsumerNode {
                 max_tokens,
                 temperature,
                 tools: tools.to_vec(),
+                think,
                 nonce,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
@@ -1213,6 +1235,14 @@ impl ConsumerNode {
             temperature: Some(0.0),
             // The audit is a plain-text probe — no tools.
             tools: Vec::new(),
+            // Disable thinking for the probe: a reasoning model would otherwise spend the tiny
+            // 64-token budget on chain-of-thought (and prepend a `<think>…</think>` block that
+            // pushes the required nonce echo out of `audit_body`'s near-the-start window),
+            // making an honest provider look like a non-responder. Off ⇒ the nonce + greedy
+            // continuation come straight out, keeping the redundant-exec comparison deterministic.
+            // (Providers that can't honour `think:false` are still covered by `audit_body`'s
+            // leading-`<think>` strip.)
+            think: Some(false),
             // Audit serves are never settled into a receipt, but the field is required.
             nonce: rand::random::<[u8; 16]>(),
         };
@@ -1245,7 +1275,8 @@ impl ConsumerNode {
     /// / engine builds whose greedy output differs; [`agrees`](openhydra_protocol::verify::agrees)
     /// absorbs benign late divergence and the `Inconclusive`-on-tie rule avoids punishing on
     /// ambiguous evidence, but heterogeneous fleets weaken the signal (reputation still
-    /// carries the long-run trust).
+    /// carries the long-run trust). Reasoning models are a specific case of this — see the
+    /// thinking-model limitation documented on [`AUDIT_MAX_TOKENS`].
     pub fn audit_model(
         &self,
         model: &str,
@@ -1367,6 +1398,7 @@ mod tests {
             max_tokens: Some(64),
             temperature: None,
             tools: Vec::new(),
+            think: None,
             nonce: [0u8; 16],
         }
     }

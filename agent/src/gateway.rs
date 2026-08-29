@@ -122,6 +122,32 @@ struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stream_options: Option<StreamOptions>,
+    /// Ollama-native thinking switch: `false` makes a reasoning model answer directly (no
+    /// chain-of-thought), `true` forces thinking on. Highest-precedence thinking control.
+    #[serde(default)]
+    think: Option<bool>,
+    /// vLLM / llama.cpp convention for the same control (`{"enable_thinking": false}`).
+    /// Consulted only when top-level `think` is absent.
+    #[serde(default)]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// The subset of OpenAI-compat `chat_template_kwargs` we read — the thinking toggle that
+/// vLLM / llama.cpp-server accept. Other keys are ignored.
+#[derive(Debug, Deserialize)]
+struct ChatTemplateKwargs {
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+}
+
+impl ChatRequest {
+    /// Resolve the caller's thinking preference to one internal flag. Ollama-native `think`
+    /// wins; otherwise `chat_template_kwargs.enable_thinking`; `None` ⇒ leave the engine's
+    /// default. Threaded to the provider and mapped to each engine's native switch.
+    fn effective_think(&self) -> Option<bool> {
+        self.think
+            .or_else(|| self.chat_template_kwargs.as_ref().and_then(|k| k.enable_thinking))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -608,6 +634,7 @@ fn spawn_worker(
     max_tokens: Option<u32>,
     temperature: Option<f64>,
     tools: Vec<Value>,
+    think: Option<bool>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
@@ -622,7 +649,7 @@ fn spawn_worker(
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
         };
-        match node.complete(&model, messages, max_tokens, temperature, tools, &mut on_delta) {
+        match node.complete(&model, messages, max_tokens, temperature, tools, think, &mut on_delta) {
             Ok(summary) => {
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -667,6 +694,7 @@ async fn chat_completions(
     // dispatch, all inside spawn_dispatch so the backstop bounds the discovery query too. A `/model`
     // session pin steers the `auto`/default case; the resolved concrete model is echoed back.
     let session_pin = state.sessions.get(&skey);
+    let think = req.effective_think();
     let (model, rx, started) = match spawn_dispatch(
         &state,
         &headers,
@@ -677,6 +705,7 @@ async fn chat_completions(
         req.max_tokens,
         req.temperature,
         req.tools,
+        think,
     )
     .await
     {
@@ -719,6 +748,7 @@ async fn spawn_dispatch(
     max_tokens: Option<u32>,
     temperature: Option<f64>,
     tools: Vec<Value>,
+    think: Option<bool>,
 ) -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>, std::time::Instant), DispatchErr>
 {
     // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
@@ -758,7 +788,7 @@ async fn spawn_dispatch(
             gen_permit,
         )
     } else {
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, gen_permit)
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, gen_permit)
     };
     Ok((model, rx, started))
 }
@@ -814,6 +844,9 @@ fn spawn_byok_worker(
             max_tokens,
             temperature,
             tools: Vec::new(),
+            // BYOK thinking-control forwarding is a separate follow-up; hosted adapters use
+            // their own defaults today.
+            think: None,
         };
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
@@ -1292,6 +1325,9 @@ async fn messages(
         req.max_tokens,
         req.temperature,
         tools,
+        // Anthropic-surface thinking control (`thinking:{type}`) mapping is a separate
+        // follow-up; the OpenAI surface carries the Ollama-native `think` switch today.
+        None,
     )
     .await
     {
@@ -2080,12 +2116,36 @@ mod tests {
     }
 
     #[test]
+    fn effective_think_resolves_and_prioritises_native_over_kwargs() {
+        // No thinking control ⇒ leave the engine default.
+        let bare: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[]}"#).unwrap();
+        assert_eq!(bare.effective_think(), None);
+        // Ollama-native top-level `think` is honoured.
+        let native: ChatRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[],"think":false}"#).unwrap();
+        assert_eq!(native.effective_think(), Some(false));
+        // vLLM/llama.cpp `chat_template_kwargs.enable_thinking` is honoured when `think` is absent.
+        let kwargs: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"chat_template_kwargs":{"enable_thinking":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(kwargs.effective_think(), Some(false));
+        // Native `think` wins over `chat_template_kwargs` when both are present.
+        let both: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"think":true,"chat_template_kwargs":{"enable_thinking":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(both.effective_think(), Some(true));
+    }
+
+    #[test]
     fn validation_rejects_empty_model_and_messages() {
-        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None };
+        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
         assert!(validate(&r).is_none());
     }
 

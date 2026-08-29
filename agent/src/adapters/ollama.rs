@@ -65,6 +65,12 @@ struct TagDetails {
 struct ShowResponse {
     #[serde(default)]
     template: String,
+    /// Model capabilities recent Ollama reports, e.g. `["completion","tools","thinking"]`.
+    /// We read `"thinking"` to decide whether it's safe to forward the top-level `think`
+    /// switch — Ollama `/api/chat` returns a 400 (`"… does not support thinking"`) if `think`
+    /// is sent to a model without the capability.
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 // `/api/chat` streaming chunk (newline-delimited JSON). We read the message delta, the
@@ -98,6 +104,14 @@ struct ChatStreamChunk {
 struct ChatStreamMessage {
     #[serde(default)]
     content: String,
+    /// Reasoning models (Qwen3-class, DeepSeek-R1, …) return their chain-of-thought here on
+    /// recent Ollama — SEPARATE from `content`, which stays empty until (or unless) the final
+    /// answer arrives. Serde would silently drop this unknown field, so a model that spends its
+    /// whole budget in the thinking phase (the "cleanup/rewrite" case) would look like it
+    /// returned nothing. We capture it and re-emit it wrapped in `<think>…</think>` in
+    /// [`OllamaAdapter::serve_stream`], mirroring the OpenAI-compat adapter.
+    #[serde(default)]
+    thinking: Option<String>,
     /// Tool calls the model requested (recent Ollama; may arrive on any chunk, usually the
     /// last). Ollama's shape differs from OpenAI's: no `id`, and `arguments` is a JSON
     /// *object*, not a string — both are normalised in [`OllamaAdapter::serve_stream`].
@@ -126,7 +140,12 @@ struct OllamaToolCallFunction {
 
 /// Build the Ollama `/api/chat` request body (always streaming). `max_tokens`/
 /// `temperature` map to Ollama's `options.{num_predict,temperature}`; omitted when unset.
-fn build_chat_body(req: &InferenceRequest) -> String {
+///
+/// `think` is the *capability-gated* thinking switch — the caller ([`serve_stream`]) passes it
+/// through only for a model that advertises the `thinking` capability, so it is never sent to a
+/// model that would 400 on it. It is threaded explicitly (not read from `req.think`) so this
+/// stays a pure function while the capability probe lives on the adapter.
+fn build_chat_body(req: &InferenceRequest, think: Option<bool>) -> String {
     // Map each message, forwarding multi-turn tool state in Ollama's shape: an assistant's
     // `tool_calls` carry `function.{name, arguments}` where **arguments is an object** (the
     // inverse of the string we surface at the gateway — parse it back; fall back to the raw
@@ -167,6 +186,12 @@ fn build_chat_body(req: &InferenceRequest) -> String {
     });
     if !options.is_empty() {
         body["options"] = serde_json::Value::Object(options);
+    }
+    // Ollama's thinking switch is a TOP-LEVEL request key (`think`), not under `options`.
+    // `Some(false)` makes a reasoning model answer directly (no chain-of-thought); `Some(true)`
+    // forces thinking on. Omitted when `None` so a plain request is byte-identical to before.
+    if let Some(think) = think {
+        body["think"] = serde_json::json!(think);
     }
     // Forward the caller's OpenAI-shaped `tools` verbatim — Ollama's `/api/chat` accepts the
     // same schema and streams any resulting `message.tool_calls` back (recent Ollama supports
@@ -250,6 +275,23 @@ impl<H: HttpClient> OllamaAdapter<H> {
             Err(_) => String::new(),
         }
     }
+
+    /// Best-effort check (via `/api/show` `capabilities`) of whether `model_name` supports
+    /// thinking. Used to gate the top-level `think` switch: Ollama's `/api/chat` returns a 400
+    /// for `think` on a model without the capability, so forwarding it unconditionally would
+    /// break otherwise-valid requests. Defaults to `false` on any error or a model that doesn't
+    /// advertise the capability — the conservative choice, since dropping `think` never breaks a
+    /// request (a non-thinking model ignores it anyway) whereas sending it wrongly can 400.
+    /// Consulted only when a caller actually set `think`, so plain serves pay no extra call.
+    fn supports_thinking(&self, model_name: &str) -> bool {
+        let body = serde_json::json!({ "name": model_name }).to_string();
+        match self.http.post_json(&format!("{}/api/show", self.base_url), &body) {
+            Ok(json) => serde_json::from_str::<ShowResponse>(&json)
+                .map(|s| s.capabilities.iter().any(|c| c == "thinking"))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
 }
 
 impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
@@ -276,7 +318,15 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         request: &InferenceRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError> {
-        let body = build_chat_body(request);
+        // Capability-gate the thinking switch: only forward `think` to a model that advertises
+        // the `thinking` capability, so a `think:true`/`think:false` request that lands on a
+        // non-thinking model doesn't 400 (`"… does not support thinking"`). The probe runs only
+        // when a caller actually set `think`, so plain serves make no extra `/api/show` call.
+        let think = match request.think {
+            Some(v) if self.supports_thinking(&request.model_ref) => Some(v),
+            _ => None,
+        };
+        let body = build_chat_body(request, think);
         let lines = self
             .http
             .post_stream(&format!("{}/api/chat", self.base_url), &body)?;
@@ -287,15 +337,43 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         let mut done = false;
         let mut first_token_at: Option<std::time::Instant> = None;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Reasoning models stream chain-of-thought in `message.thinking`, separate from
+        // `content`. Wrap it in a single `<think>…</think>` block as it streams: open on the
+        // first reasoning fragment, close before the first answer token (or at end if the model
+        // only ever reasoned). Mirrors `openai.rs` so the native and OpenAI-compat adapters are
+        // symmetric — reasoning that would otherwise be silently dropped is surfaced, and the
+        // decode-TPS timer anchors on the first REAL generated token (reasoning included).
+        let mut reasoning_open = false;
         for line in lines {
             let line = line?;
             if line.trim().is_empty() {
                 continue; // keep-alive / blank framing line
             }
             let mut chunk = parse_chat_chunk(&line)?;
+            if let Some(reasoning) = chunk
+                .message
+                .thinking
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                if first_token_at.is_none() {
+                    first_token_at = Some(std::time::Instant::now());
+                }
+                if !reasoning_open {
+                    on_delta("<think>");
+                    reasoning_open = true;
+                }
+                on_delta(reasoning);
+                chunk_tokens += 1;
+            }
             if !chunk.message.content.is_empty() {
                 if first_token_at.is_none() {
                     first_token_at = Some(std::time::Instant::now());
+                }
+                // Close the reasoning block before the first answer token.
+                if reasoning_open {
+                    on_delta("</think>\n\n");
+                    reasoning_open = false;
                 }
                 on_delta(&chunk.message.content);
                 chunk_tokens += 1;
@@ -333,6 +411,24 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
                 done = true;
                 break;
             }
+        }
+        // The model produced only reasoning (no answer — e.g. hit the token cap mid-thought):
+        // close the block so the consumer/UI renders the thinking instead of a blank bubble.
+        if reasoning_open {
+            on_delta("</think>");
+        }
+        // Anomaly: the engine reports it evaluated tokens but we emitted nothing (no content,
+        // no reasoning, no tool calls). This is the silent-empty-response failure mode Fix A
+        // targets — surface it rather than returning an invisibly blank serve.
+        if chunk_tokens == 0
+            && tool_calls.is_empty()
+            && eval_count.map(|c| c > 0).unwrap_or(false)
+        {
+            tracing::warn!(
+                eval_count = eval_count.unwrap_or(0),
+                model = %request.model_ref,
+                "ollama serve produced no output despite eval_count>0 (silent empty response)"
+            );
         }
         let tokens = eval_count.unwrap_or(chunk_tokens);
         // Ollama normally reports authoritative eval timing, but occasionally omits
@@ -396,6 +492,12 @@ mod tests {
         tags: String,
         show: String,
         stream_lines: Vec<String>,
+        /// Captures the last `/api/chat` request body so tests can assert what the adapter sent
+        /// (e.g. that the capability gate did/didn't include the top-level `think` key).
+        last_chat_body: std::cell::RefCell<Option<String>>,
+        /// Counts `/api/show` calls so tests can assert the capability probe runs only when a
+        /// caller set `think` (a plain serve must pay no extra round-trip).
+        show_calls: std::cell::RefCell<u32>,
     }
 
     impl HttpClient for MockHttp {
@@ -408,6 +510,7 @@ mod tests {
         }
         fn post_json(&self, url: &str, _body: &str) -> Result<String, AdapterError> {
             if url.ends_with("/api/show") {
+                *self.show_calls.borrow_mut() += 1;
                 Ok(self.show.clone())
             } else {
                 Err(AdapterError::Http(format!("unexpected POST {url}")))
@@ -416,9 +519,10 @@ mod tests {
         fn post_stream(
             &self,
             url: &str,
-            _body: &str,
+            body: &str,
         ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError> {
             if url.ends_with("/api/chat") {
+                *self.last_chat_body.borrow_mut() = Some(body.to_string());
                 Ok(Box::new(self.stream_lines.clone().into_iter().map(Ok)))
             } else {
                 Err(AdapterError::Http(format!("unexpected POST {url}")))
@@ -429,7 +533,7 @@ mod tests {
     fn adapter(tags: &str, show: &str) -> OllamaAdapter<MockHttp> {
         OllamaAdapter::new(
             DEFAULT_OLLAMA_URL,
-            MockHttp { tags: tags.into(), show: show.into(), stream_lines: vec![] },
+            MockHttp { tags: tags.into(), show: show.into(), ..Default::default() },
         )
     }
 
@@ -443,6 +547,19 @@ mod tests {
         )
     }
 
+    /// A serve adapter whose `/api/show` returns `show` — lets the capability gate see (or not
+    /// see) the `thinking` capability.
+    fn serve_adapter_with_show(lines: &[&str], show: &str) -> OllamaAdapter<MockHttp> {
+        OllamaAdapter::new(
+            DEFAULT_OLLAMA_URL,
+            MockHttp {
+                show: show.into(),
+                stream_lines: lines.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
     fn user_req(prompt: &str) -> InferenceRequest {
         InferenceRequest {
             model_ref: "qwen2.5:7b".into(),
@@ -450,6 +567,7 @@ mod tests {
             max_tokens: Some(128),
             temperature: Some(0.7),
             tools: Vec::new(),
+            think: None,
         }
     }
 
@@ -516,7 +634,7 @@ mod tests {
 
     #[test]
     fn build_chat_body_has_stream_messages_and_options() {
-        let body = build_chat_body(&user_req("hi there"));
+        let body = build_chat_body(&user_req("hi there"), None);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["model"], "qwen2.5:7b");
         assert_eq!(v["stream"], true);
@@ -525,6 +643,26 @@ mod tests {
         assert_eq!(v["options"]["num_predict"], 128);
         assert_eq!(v["options"]["temperature"], 0.7);
         assert!(v.get("tools").is_none(), "no tools field on a plain chat");
+        assert!(v.get("think").is_none(), "no think field when unset (byte-identical to before)");
+    }
+
+    #[test]
+    fn build_chat_body_emits_top_level_think_when_set() {
+        // `think` is passed explicitly (the capability-gated value the serve loop resolves).
+        let req = user_req("2+2?");
+        let v: serde_json::Value =
+            serde_json::from_str(&build_chat_body(&req, Some(false))).unwrap();
+        // Ollama's thinking switch is a TOP-LEVEL key, not under `options`.
+        assert_eq!(v["think"], false);
+        assert!(v["options"].get("think").is_none(), "think must not be nested under options");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&build_chat_body(&req, Some(true))).unwrap();
+        assert_eq!(v["think"], true);
+
+        // None ⇒ no key (a plain request, byte-identical to pre-thinking behaviour).
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req, None)).unwrap();
+        assert!(v.get("think").is_none());
     }
 
     #[test]
@@ -534,7 +672,7 @@ mod tests {
             "type": "function",
             "function": { "name": "get_weather", "parameters": { "type": "object" } }
         })];
-        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req, None)).unwrap();
         assert_eq!(v["tools"][0]["function"]["name"], "get_weather");
     }
 
@@ -555,7 +693,7 @@ mod tests {
             },
             ChatMessage { role: "tool".into(), content: "72F".into(), name: Some("get_weather".into()), ..Default::default() },
         ];
-        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req, None)).unwrap();
         // Ollama wants arguments as an OBJECT (we parse our string back), and no id/type.
         assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["name"], "get_weather");
         assert_eq!(v["messages"][0]["tool_calls"][0]["function"]["arguments"]["city"], "SF");
@@ -621,6 +759,97 @@ mod tests {
         assert_eq!(out, "Hello, world");
         assert!(outcome.done);
         assert_eq!(outcome.tokens, 7, "uses Ollama's authoritative eval_count");
+    }
+
+    #[test]
+    fn serve_stream_surfaces_thinking_wrapped_before_content() {
+        // A Qwen3-class thinking model streams its chain-of-thought in `message.thinking`
+        // (content empty) before the answer. Fix A: it must be surfaced, wrapped in a single
+        // `<think>…</think>` block, then the answer — not silently dropped.
+        let lines = [
+            r#"{"message":{"role":"assistant","content":"","thinking":"The user asks 2+2. "},"done":false}"#,
+            r#"{"message":{"content":"","thinking":"That is 4."},"done":false}"#,
+            r#"{"message":{"content":"The answer is 4."},"done":false}"#,
+            r#"{"message":{"content":""},"done":true,"eval_count":12}"#,
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("2+2?"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(
+            out, "<think>The user asks 2+2. That is 4.</think>\n\nThe answer is 4.",
+            "reasoning is wrapped and closed before the answer"
+        );
+        assert!(outcome.done);
+        assert_eq!(outcome.tokens, 12, "uses Ollama's authoritative eval_count");
+    }
+
+    // Capability gate for the `think` switch (Fix 2): forward it only to a model that
+    // advertises the `thinking` capability, else drop it (a non-thinking model 400s on `think`).
+    const SHOW_THINKING: &str = r#"{"template":"t","capabilities":["completion","tools","thinking"]}"#;
+    const SHOW_NO_THINKING: &str = r#"{"template":"t","capabilities":["completion","tools"]}"#;
+
+    #[test]
+    fn serve_stream_forwards_think_for_thinking_capable_model() {
+        let lines = [r#"{"message":{"content":"9"},"done":true,"eval_count":1}"#];
+        let adapter = serve_adapter_with_show(&lines, SHOW_THINKING);
+        let mut req = user_req("2+2?");
+        req.think = Some(false);
+        let mut out = String::new();
+        adapter.serve_stream(&req, &mut |d| out.push_str(d)).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(adapter.http.last_chat_body.borrow().as_deref().unwrap()).unwrap();
+        assert_eq!(body["think"], false, "think forwarded to a thinking-capable model");
+        assert_eq!(*adapter.http.show_calls.borrow(), 1, "capability probed once when think set");
+    }
+
+    #[test]
+    fn serve_stream_drops_think_for_non_thinking_model() {
+        // The regression guard: a `think` request that lands on a non-thinking model must NOT
+        // reach the engine (Ollama 400s on it) — the gate strips it so the serve still succeeds.
+        let lines = [r#"{"message":{"content":"hi"},"done":true,"eval_count":1}"#];
+        let adapter = serve_adapter_with_show(&lines, SHOW_NO_THINKING);
+        let mut req = user_req("hi");
+        req.think = Some(true);
+        let mut out = String::new();
+        adapter.serve_stream(&req, &mut |d| out.push_str(d)).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(adapter.http.last_chat_body.borrow().as_deref().unwrap()).unwrap();
+        assert!(body.get("think").is_none(), "think dropped for a non-thinking model (avoids 400)");
+    }
+
+    #[test]
+    fn serve_stream_makes_no_capability_probe_when_think_unset() {
+        // A plain serve (think:None) must not incur the /api/show capability call — the mock's
+        // empty `show` would parse-fail, but we simply never call it. Body carries no think key.
+        let lines = [r#"{"message":{"content":"hi"},"done":true,"eval_count":1}"#];
+        let adapter = serve_adapter(&lines); // empty show
+        let out_req = user_req("hi"); // think defaults to None
+        let mut out = String::new();
+        adapter.serve_stream(&out_req, &mut |d| out.push_str(d)).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(adapter.http.last_chat_body.borrow().as_deref().unwrap()).unwrap();
+        assert!(body.get("think").is_none());
+        assert_eq!(out, "hi");
+        assert_eq!(*adapter.http.show_calls.borrow(), 0, "no capability probe on a plain serve");
+    }
+
+    #[test]
+    fn serve_stream_closes_think_block_when_only_reasoning() {
+        // The failing "cleanup/rewrite" case: the model spends its whole budget thinking and
+        // emits no `content`. The reasoning must still surface (closed `<think>` block) rather
+        // than a silent empty response.
+        let lines = [
+            r#"{"message":{"content":"","thinking":"Let me reconsider… "},"done":false}"#,
+            r#"{"message":{"content":"","thinking":"still unsure."},"done":true,"eval_count":8}"#,
+        ];
+        let mut out = String::new();
+        let outcome = serve_adapter(&lines)
+            .serve_stream(&user_req("hard question"), &mut |d| out.push_str(d))
+            .unwrap();
+        assert_eq!(out, "<think>Let me reconsider… still unsure.</think>");
+        assert!(outcome.done);
+        assert!(!out.is_empty(), "reasoning-only serve is never silently empty");
     }
 
     #[test]
@@ -712,6 +941,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: Some(0.0),
             tools: Vec::new(),
+            think: None,
         };
         let mut out = String::new();
         let outcome = agent.serve_stream(&req, &mut |d| out.push_str(d)).unwrap();

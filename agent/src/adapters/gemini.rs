@@ -246,7 +246,7 @@ mod tests {
     }
 
     fn req(messages: Vec<ChatMessage>) -> InferenceRequest {
-        InferenceRequest { model_ref: "gemini-1.5-pro".into(), messages, max_tokens: Some(256), temperature: None, tools: Vec::new() }
+        InferenceRequest { model_ref: "gemini-1.5-pro".into(), messages, max_tokens: Some(256), temperature: None, tools: Vec::new(), think: None }
     }
 
     #[test]

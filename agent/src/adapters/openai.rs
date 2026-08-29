@@ -56,6 +56,24 @@ struct ModelEntry {
 
 // ── /v1/chat/completions streaming chunk (SSE `data:` lines of JSON) ──
 
+/// Lenient `Option<String>` deserializer for the reasoning-carrying delta keys. A plain
+/// `Option<String>` field *hard-fails* the whole chunk parse (and so the whole serve) if the
+/// server sends the key with a non-string value — e.g. `reasoning` as an object or number,
+/// which some OpenAI-compat proxies do. These keys are supplementary (chain-of-thought we
+/// surface as `<think>`), never load-bearing, so an unexpected shape must degrade to "no
+/// reasoning surfaced", not break a serve that would otherwise deliver `content`. Accepts a
+/// JSON string (kept), null/absent (`None`), or any other type (ignored → `None`).
+fn de_lenient_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(s)) => Some(s),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ChatChunk {
     #[serde(default)]
@@ -87,15 +105,25 @@ struct Delta {
     /// chain-of-thought here, SEPARATE from `content` (which stays empty until the final
     /// answer). Without reading this the reasoning is silently dropped and a model that spends
     /// its whole budget thinking looks like it returned nothing. We capture it and re-emit it
-    /// wrapped in `<think>…</think>` (see the serve loop).
-    #[serde(default)]
+    /// wrapped in `<think>…</think>` (see the serve loop). Parsed leniently so a non-string
+    /// value can't fail the whole serve (see [`de_lenient_opt_string`]).
+    #[serde(default, deserialize_with = "de_lenient_opt_string")]
     reasoning_content: Option<String>,
-    /// Same chain-of-thought, but under the engine's native `thinking` key. Ollama's `/v1`
-    /// stream emits reasoning here (not `reasoning_content`) on some builds/models, so a thinking
-    /// model served through Ollama would otherwise return an empty `content` with its whole token
-    /// budget spent invisibly. Treated identically to [`reasoning_content`] in the serve loop.
-    #[serde(default)]
+    /// Same chain-of-thought, but under the engine's native `thinking` key. Some OpenAI-compat
+    /// builds emit reasoning here (not `reasoning_content`), so a thinking model would otherwise
+    /// return an empty `content` with its whole token budget spent invisibly. Treated identically
+    /// to [`reasoning_content`] in the serve loop.
+    #[serde(default, deserialize_with = "de_lenient_opt_string")]
     thinking: Option<String>,
+    /// Same chain-of-thought under a third key: `reasoning`. Ollama's OpenAI-compat `/v1` stream
+    /// and OpenRouter emit the reasoning here (verified live against Ollama `/v1` + qwen3), so
+    /// without reading it a thinking model served over the OpenAI protocol drops its whole
+    /// reasoning phase (empty `content` when the budget is spent thinking). Treated identically
+    /// to [`reasoning_content`]/[`thinking`] in the serve loop. Some providers emit `reasoning`
+    /// as a structured object rather than a string — parsed leniently so that can't fail the
+    /// serve (see [`de_lenient_opt_string`]).
+    #[serde(default, deserialize_with = "de_lenient_opt_string")]
+    reasoning: Option<String>,
     /// Tool-call fragments (OpenAI streams these incrementally: `id`/`name` on the first
     /// fragment for an `index`, then `arguments` string pieces on following chunks).
     #[serde(default)]
@@ -182,6 +210,16 @@ fn build_chat_body(req: &InferenceRequest) -> String {
     // empty so a plain chat body is byte-identical to before.
     if !req.tools.is_empty() {
         body["tools"] = serde_json::Value::Array(req.tools.clone());
+    }
+    // Thinking control for reasoning models served over the OpenAI protocol (vLLM, llama.cpp,
+    // LM Studio). The portable lever these engines share is `chat_template_kwargs.enable_thinking`
+    // — the Qwen3 / DeepSeek-R1 chat templates read it to include or skip the reasoning phase.
+    // Unlike Ollama's native top-level `think` key (which 400s on a non-thinking model), this is
+    // a chat-template kwarg: a template that doesn't reference `enable_thinking` simply ignores
+    // it, so it's safe to forward without a capability probe. Omitted when the caller expressed
+    // no preference, keeping a plain body byte-identical to before.
+    if let Some(think) = req.think {
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": think });
     }
     body.to_string()
 }
@@ -322,16 +360,18 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
             // sends after the finish must not inflate `chunk_tokens` (the receipt fallback)
             // or graft extra tool calls onto the assistant turn.
             if !done {
-                // Reasoning arrives as `reasoning_content` (vLLM / LM Studio / OpenAI-compat
-                // convention) or, on some Ollama `/v1` builds, under the engine's native
-                // `thinking` key. Accept whichever is present so the chain-of-thought is never
-                // dropped — both feed the same single `<think>…</think>` block.
+                // Reasoning arrives under one of three keys depending on the engine:
+                // `reasoning_content` (vLLM / LM Studio / DeepSeek convention), `thinking` (some
+                // OpenAI-compat builds), or `reasoning` (Ollama's `/v1` stream, OpenRouter).
+                // Accept whichever is present so the chain-of-thought is never dropped — all feed
+                // the same single `<think>…</think>` block.
                 if let Some(reasoning) = choice
                     .delta
                     .reasoning_content
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .or(choice.delta.thinking.as_deref().filter(|s| !s.is_empty()))
+                    .or(choice.delta.reasoning.as_deref().filter(|s| !s.is_empty()))
                 {
                     if !reasoning.is_empty() {
                         if first_token_at.is_none() {
@@ -508,6 +548,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: Some(0.0),
             tools: Vec::new(),
+            think: None,
         }
     }
 
@@ -618,6 +659,62 @@ mod tests {
     }
 
     #[test]
+    fn serve_stream_wraps_ollama_v1_reasoning_key_like_reasoning_content() {
+        // Ollama's OpenAI-compat /v1 stream (and OpenRouter) emit chain-of-thought under a third
+        // key, `reasoning` — verified live against Ollama /v1 + qwen3. It must be wrapped like the
+        // other two so a thinking model served over the OpenAI protocol doesn't drop its reasoning.
+        let (out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning":"Eight minus "},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning":"three is five."},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"5"},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3}}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>Eight minus three is five.</think>\n\n5");
+        assert_eq!(outcome.tokens, 3);
+        assert!(outcome.done);
+    }
+
+    #[test]
+    fn serve_stream_tolerates_non_string_reasoning_without_failing_the_serve() {
+        // Regression: a server that streams a reasoning key as a JSON object or number (rather
+        // than a string) must NOT fail the whole serve — the reasoning is dropped, `content`
+        // still flows. A plain `Option<String>` field would `Err(invalid type)` on every such
+        // chunk; the lenient deserializer degrades it to `None`.
+        let (out, outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning":{"text":"hidden"},"content":"Answer"},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "Answer", "content survives; the non-string reasoning is dropped, not fatal");
+        assert!(outcome.done);
+
+        // Same tolerance for the other two reasoning keys and a numeric value.
+        let (out, _) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":42,"thinking":{"x":1},"content":"Hi"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "Hi");
+    }
+
+    #[test]
+    fn serve_stream_reasoning_only_v1_response_is_not_silently_empty() {
+        // The silent-empty case on the OpenAI path: the model spends its whole budget in the
+        // `reasoning` phase (Ollama /v1 truncation) and streams no `content`. The reasoning must
+        // still surface (closed <think> block) rather than an empty response.
+        let (out, _outcome) = serve(&[
+            r#"data: {"choices":[{"delta":{"reasoning":"still working"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(out, "<think>still working</think>");
+    }
+
+    #[test]
     fn serve_stream_empty_reasoning_content_does_not_shadow_thinking() {
         // A proxy may stamp an empty `reasoning_content:""` while passing Ollama's native `thinking`
         // through. The empty string must NOT shadow the real thinking — filter empties before the
@@ -673,6 +770,26 @@ mod tests {
         // A plain request carries no tools field.
         let plain: serde_json::Value = serde_json::from_str(&build_chat_body(&req())).unwrap();
         assert!(plain.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_maps_think_to_chat_template_kwargs() {
+        // Fix 3: the OpenAI-protocol engines (vLLM / llama.cpp / LM Studio) get the thinking
+        // control as `chat_template_kwargs.enable_thinking` (their portable lever), NOT Ollama's
+        // top-level `think`.
+        let mut r = req();
+        r.think = Some(false);
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&r)).unwrap();
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(v.get("think").is_none(), "must not use Ollama's native key on the OpenAI protocol");
+
+        r.think = Some(true);
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&r)).unwrap();
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], true);
+
+        // No preference ⇒ no kwarg (plain body unchanged).
+        let plain: serde_json::Value = serde_json::from_str(&build_chat_body(&req())).unwrap();
+        assert!(plain.get("chat_template_kwargs").is_none());
     }
 
     #[test]

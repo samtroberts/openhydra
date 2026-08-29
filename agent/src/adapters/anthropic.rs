@@ -257,7 +257,7 @@ mod tests {
     }
 
     fn req(messages: Vec<ChatMessage>) -> InferenceRequest {
-        InferenceRequest { model_ref: "claude-3-5-sonnet".into(), messages, max_tokens: None, temperature: None, tools: Vec::new() }
+        InferenceRequest { model_ref: "claude-3-5-sonnet".into(), messages, max_tokens: None, temperature: None, tools: Vec::new(), think: None }
     }
 
     #[test]

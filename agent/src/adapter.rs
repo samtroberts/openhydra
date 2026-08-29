@@ -209,6 +209,11 @@ pub struct InferenceRequest {
     /// OpenAI `tools` specs, forwarded opaquely to the engine (empty ⇒ no tools). Carried
     /// as raw JSON so the adapter hands the engine exactly what the client sent.
     pub tools: Vec<Value>,
+    /// Deterministic thinking-mode control for reasoning models: `Some(false)` disables the
+    /// chain-of-thought, `Some(true)` forces it, `None` uses the engine's default. Adapters
+    /// that support it map it to their native switch (Ollama's top-level `think`); adapters
+    /// with no thinking control ignore it.
+    pub think: Option<bool>,
 }
 
 /// Raw counters/timings the engine itself reports for one request — Ollama's

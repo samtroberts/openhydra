@@ -453,12 +453,34 @@ pub fn resolve_audit(results: &[(String, Result<String, String>)]) -> AuditRepor
     AuditReport { verdict, outcomes, non_responders }
 }
 
+/// Strip a single well-formed leading `<think>…</think>` reasoning block (and the whitespace
+/// around it), returning the remainder. A reasoning model served through OpenHydra surfaces its
+/// chain-of-thought wrapped this way *before* the answer (see the engine adapters); the audit
+/// cares only about the answer that follows, and the block would otherwise push the required
+/// nonce echo past [`audit_body`]'s near-the-start window. Only a properly-closed leading block
+/// is removed — an unterminated `<think>` (the model spent its whole budget reasoning) is left
+/// intact so it still fails the nonce check, which is the correct outcome.
+fn strip_leading_think_block(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<think>") {
+        if let Some(end) = rest.find("</think>") {
+            return rest[end + "</think>".len()..].trim_start();
+        }
+    }
+    s
+}
+
 /// Extract the audit-response **body** — the model-generated continuation after the required
 /// nonce echo — or `None` if `output` does not echo `nonce_hex` near the start (B-S2). A
 /// valid redundant-exec response must reproduce the unpredictable nonce *and* a generated
 /// continuation that is not present in the prompt; comparing bodies (not the copyable nonce)
 /// means a freeloader that merely parrots the prompt cannot agree its way to `Honored`.
+///
+/// A leading `<think>…</think>` block (a reasoning model's surfaced chain-of-thought) is
+/// stripped first, so an honest thinking-model provider whose answer echoes the nonce right
+/// after its reasoning is not mis-scored as a non-responder.
 pub fn audit_body<'a>(output: &'a str, nonce_hex: &str) -> Option<&'a str> {
+    let output = strip_leading_think_block(output);
     let pos = output.find(nonce_hex)?;
     if pos > 64 {
         return None; // nonce not echoed near the start → not a proper response
@@ -494,6 +516,28 @@ mod tests {
         // Nonce buried far past the start (not a proper echo) → rejected.
         let buried = format!("{}{n}", "x".repeat(100));
         assert_eq!(audit_body(&buried, n), None);
+    }
+
+    #[test]
+    fn audit_body_strips_leading_think_block_so_thinking_models_are_not_mis_rejected() {
+        let n = "0123456789abcdef0123456789abcdef";
+        // A reasoning model surfaces its chain-of-thought wrapped in <think>…</think> before the
+        // answer. The nonce echo then sits far past char 64, but the answer is a valid response —
+        // stripping the leading block must recover it (regression for the Fix-A × audit defect).
+        let reasoning = "x".repeat(300);
+        let out = format!("<think>{reasoning}</think>\n\n{n}\nthe network by broadcasting");
+        assert_eq!(audit_body(&out, n), Some("the network by broadcasting"));
+
+        // Only a *leading* block is stripped; a non-thinking answer is unchanged.
+        assert_eq!(
+            audit_body(&format!("{n}\nthe network by broadcasting"), n),
+            Some("the network by broadcasting")
+        );
+
+        // An unterminated <think> (model spent its whole budget reasoning, never echoed the
+        // nonce) is left intact → still correctly rejected as a non-response.
+        let never_closed = format!("<think>{reasoning} {n}");
+        assert_eq!(audit_body(&never_closed, n), None);
     }
 
     #[test]

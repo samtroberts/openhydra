@@ -58,6 +58,13 @@ pub struct ServeRequest {
     /// `#[serde(default)]` so an older consumer that omits the field still deserializes.
     #[serde(default)]
     pub tools: Vec<Value>,
+    /// Deterministic thinking-mode control for reasoning models. `Some(false)` asks the engine
+    /// to skip its chain-of-thought (answer goes straight to `content`); `Some(true)` forces it
+    /// on; `None` leaves the engine's default. Normalised at the consumer from the OpenAI-body
+    /// `think` / `chat_template_kwargs.enable_thinking` fields. `#[serde(default)]` keeps the
+    /// wire backward-compatible — an older consumer omits it, an older provider ignores it.
+    #[serde(default)]
+    pub think: Option<bool>,
     /// The receipt nonce the consumer commits *before* the serve (B-S1). The provider
     /// records the tokens it serves under this nonce and later co-signs the settlement
     /// receipt only if the same nonce is presented with `tokens <= served`, the same model,
@@ -225,6 +232,7 @@ pub fn handle_serve_request_parsed(
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         tools: req.tools,
+        think: req.think,
     };
 
     // Scope the delta sink so its &mut borrow of `send_chunk` ends before the terminal
@@ -444,6 +452,7 @@ mod tests {
             max_tokens: Some(64),
             temperature: None,
             tools: Vec::new(),
+            think: None,
             nonce: [0u8; 16],
         }
     }
@@ -489,6 +498,18 @@ mod tests {
     fn serve_request_round_trips() {
         let r = req("12D3KooWConsumer");
         assert_eq!(ServeRequest::decode(&r.encode()).unwrap(), r);
+    }
+
+    #[test]
+    fn serve_request_think_round_trips_and_is_back_compatible() {
+        // The new `think` field round-trips…
+        let mut r = req("12D3KooWConsumer");
+        r.think = Some(false);
+        assert_eq!(ServeRequest::decode(&r.encode()).unwrap().think, Some(false));
+        // …and an OLD consumer that omits the key still decodes (defaults to None) — no wire break.
+        let legacy = br#"{"reply_to":"c","model_ref":"m","messages":[],"nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let decoded = ServeRequest::decode(legacy).expect("legacy ServeRequest without `think` decodes");
+        assert_eq!(decoded.think, None);
     }
 
     #[test]

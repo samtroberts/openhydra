@@ -371,6 +371,7 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     tools: Vec::new(),
+                    think: None,
                 },
                 &mut |d| out.push_str(d),
             )

@@ -1576,6 +1576,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             tools: Vec::new(),
+            think: None,
             nonce: [0u8; 16],
         };
         let mut data = vec![SERVE_REQUEST];
@@ -2002,6 +2003,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             tools: Vec::new(),
+            think: None,
             nonce,
         };
 
@@ -2102,7 +2104,7 @@ mod tests {
         }
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
-            max_tokens: None, temperature: None, tools: Vec::new(), nonce: [0u8; 16],
+            max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
