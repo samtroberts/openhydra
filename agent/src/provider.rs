@@ -753,8 +753,25 @@ impl<A: EngineAdapter> Provider<A> {
     /// Delegates the decision to the pure [`scope_gate`]; here we just supply this node's identity +
     /// live authorizer, frame the refusal, and bump the swarm-refusal counter.
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
+        // Resolve the effective scope. A `model_ref` that exactly matches a model we actually announce
+        // uses that model's scope. A ref that does NOT — yet `is_shared` let it through (e.g. `All`
+        // mode says yes to anything, or a single-model engine serves its one model for any name) —
+        // could be an alias the engine resolves to any shared model, so it is gated at the STRICTEST
+        // scope this node shares (M4 review HIGH: closes an is_shared/scope_of divergence that would
+        // otherwise serve a private model under an unrecognised alias with no credential). An
+        // all-Global node's strictest is Global, so a purely-public node sees no change.
+        let announced = self
+            .last_announced
+            .lock()
+            .map(|s| s.contains(&req.model_ref))
+            .unwrap_or(false);
+        let scope = if announced {
+            self.policy.scope_of(&req.model_ref)
+        } else {
+            self.policy.strictest_scope()
+        };
         match scope_gate(
-            self.policy.scope_of(&req.model_ref),
+            scope,
             &req.model_ref,
             source_peer,
             self.net.libp2p_peer_id(),

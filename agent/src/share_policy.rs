@@ -67,6 +67,26 @@ fn default_version() -> u32 {
     1
 }
 
+/// Rank a scope by how restrictive it is (higher = stricter): `Global` 0 < `Private`/`Unknown` 1 <
+/// `Device` 2. `Unknown` ranks with `Private` (fail-closed — an unrecognised scope is at least
+/// swarm-gated).
+fn scope_rank(s: Scope) -> u8 {
+    match s {
+        Scope::Global => 0,
+        Scope::Private | Scope::Unknown => 1,
+        Scope::Device => 2,
+    }
+}
+
+/// The stricter of two scopes (used to fold a policy down to its most-restrictive reach).
+fn stricter(a: Scope, b: Scope) -> Scope {
+    if scope_rank(b) > scope_rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
 /// The reach of a shared model with no explicit [`SharePolicy::scopes`] entry. Serde-defaults to
 /// `Global` **on purpose**: a pre-scope (v1) policy file had no scope concept and announced every
 /// shared model globally, so reading one back must keep doing exactly that — upgrading the binary
@@ -249,6 +269,22 @@ impl SharePolicy {
     /// (Only meaningful for a shared model; the caller pairs this with [`Self::is_shared`].)
     pub fn scope_of(&self, engine_ref: &str) -> Scope {
         self.scopes.get(engine_ref).copied().unwrap_or(self.default_scope)
+    }
+
+    /// The STRICTEST reach across the whole policy — `default_scope` and every per-model entry.
+    /// Used as the fail-closed scope for a serve whose `model_ref` is not a recognised announced
+    /// handle (M4 review HIGH): in `All` mode `is_shared` says yes to any ref, but such a ref could
+    /// be an alias the engine resolves to *any* shared model — including the strictest — so it must
+    /// be gated at least as strictly as the strictest model this node shares. Strictness order:
+    /// `Device` > `Private`/`Unknown` > `Global`. An all-`Global` policy stays `Global` (no
+    /// regression for a purely-public node); one private model makes an unknown alias require a
+    /// credential.
+    pub fn strictest_scope(&self) -> Scope {
+        let mut strictest = self.default_scope;
+        for s in self.scopes.values() {
+            strictest = stricter(strictest, *s);
+        }
+        strictest
     }
 
     /// Whether `engine_ref` should be announced to the **global** discovery (DHT / marketplace).
@@ -471,6 +507,12 @@ impl PolicyWatcher {
         self.policy.read().map(|p| p.scope_of(engine_ref)).unwrap_or(Scope::Private)
     }
 
+    /// The strictest reach in the policy — see [`SharePolicy::strictest_scope`]. Fail-closed to
+    /// [`Scope::Private`] on a poisoned lock (require a credential, never open).
+    pub fn strictest_scope(&self) -> Scope {
+        self.policy.read().map(|p| p.strictest_scope()).unwrap_or(Scope::Private)
+    }
+
     /// A clone of the current policy (for the status API).
     pub fn snapshot(&self) -> SharePolicy {
         // Fail CLOSED on a poisoned lock (share-nothing), consistent with `is_shared` — never report
@@ -546,6 +588,25 @@ mod tests {
         assert!(p.is_shared("qwen3.8:27b-q8_0"));
         // An empty ref is never a real model handle → never shared, even under All.
         assert!(!p.is_shared(""));
+    }
+
+    #[test]
+    fn strictest_scope_catches_what_scope_of_misses_on_an_alias() {
+        // M4 review HIGH: All mode + default Global + one Private model. `scope_of` on a non-exact
+        // alias falls through to default (Global) — the bypass. `strictest_scope` folds the whole
+        // policy to Private, so the provider gates the alias correctly.
+        let mut p = SharePolicy::share_all(); // mode = All, default_scope = Global
+        p.scopes.insert("llama3.2:latest".into(), Scope::Private);
+        // The bug scope_of would have used for an alias:
+        assert_eq!(p.scope_of("llama3.2"), Scope::Global, "alias misses the exact key → default");
+        // The fail-closed scope the fix uses instead:
+        assert_eq!(p.strictest_scope(), Scope::Private, "one private model tightens the whole policy");
+        // A purely-global policy is unaffected (no regression for a public node).
+        assert_eq!(SharePolicy::share_all().strictest_scope(), Scope::Global);
+        // A Device model is stricter still.
+        let mut d = SharePolicy::share_all();
+        d.scopes.insert("x".into(), Scope::Device);
+        assert_eq!(d.strictest_scope(), Scope::Device);
     }
 
     #[test]

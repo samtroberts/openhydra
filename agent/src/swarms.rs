@@ -472,6 +472,33 @@ pub fn schema_version() -> u32 {
     MEMBERSHIP_SCHEMA_VERSION
 }
 
+/// A cheap freshness signature of the swarms directory: for each `*.json`, its name, byte length, and
+/// mtime, sorted. Used to invalidate the hot-reload caches. More robust than a bare directory mtime
+/// (M4 review MED): it survives a filesystem where `modified()` returns `None` (per-file length still
+/// changes on a rewrite) and a coarse-granularity mtime clock (a `revoke_member` grows the revoked
+/// set, so the owner file's byte length changes even within the same second). Recomputed per call —
+/// a handful of `stat`s on a tiny directory; the expensive JSON parse still runs only on a change.
+type DirSig = Vec<(String, u64, Option<SystemTime>)>;
+
+fn swarms_dir_signature(dir: &Path) -> DirSig {
+    let mut sig = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let (Some(name), Ok(meta)) =
+                (p.file_name().and_then(|n| n.to_str()).map(String::from), e.metadata())
+            {
+                sig.push((name, meta.len(), meta.modified().ok()));
+            }
+        }
+    }
+    sig.sort();
+    sig
+}
+
 // ── M4-base: consumer-side credential store ──
 //
 // The member/consumer counterpart to [`SwarmAuthorizer`]: a hot-reloaded set of the credentials THIS
@@ -482,9 +509,8 @@ pub fn schema_version() -> u32 {
 
 #[derive(Default)]
 struct CredCache {
-    dir_mtime: Option<SystemTime>,
+    sig: Option<DirSig>,
     creds: Vec<MembershipCredential>,
-    loaded: bool,
 }
 
 /// Hot-reloaded set of the membership credentials this node holds (member records). Rescans the
@@ -500,9 +526,9 @@ impl CredentialStore {
     }
 
     fn refresh(&self) {
-        let dir_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        let sig = swarms_dir_signature(&self.dir);
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if c.loaded && c.dir_mtime == dir_mtime {
+        if c.sig.as_ref() == Some(&sig) {
             return;
         }
         let mut creds = Vec::new();
@@ -522,8 +548,7 @@ impl CredentialStore {
             }
         }
         c.creds = creds;
-        c.dir_mtime = dir_mtime;
-        c.loaded = true;
+        c.sig = Some(sig);
     }
 
     /// The best membership credential to present right now — the first that hasn't expired. `None`
@@ -591,12 +616,12 @@ struct OwnedSwarm {
 
 #[derive(Default)]
 struct AuthCache {
-    /// The swarms-dir mtime last scanned (changes on any add/remove/rename — every write goes through
-    /// temp+rename, so a revoke bumps it). `None` until first load / when unavailable → always reload.
-    dir_mtime: Option<SystemTime>,
+    /// The directory signature last scanned (see [`swarms_dir_signature`]). Reloaded whenever it
+    /// changes — robust for a security-critical set (a revoked member must stop being served
+    /// promptly) where a bare directory mtime could go stale.
+    sig: Option<DirSig>,
     /// Owned swarms indexed by group public key. Only OWNER records (which carry the revoked set).
     owned: BTreeMap<String, OwnedSwarm>,
-    loaded: bool,
 }
 
 /// Hot-reloaded index of the swarms THIS node owns, used to gate `Private` serves. Rescans the swarms
@@ -614,9 +639,9 @@ impl SwarmAuthorizer {
     /// Reload the owned-swarm index iff the directory changed (or was never loaded). Best-effort: an
     /// unreadable dir/file is skipped, never errors the serve path. Poison-tolerant.
     fn refresh(&self) {
-        let dir_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        let sig = swarms_dir_signature(&self.dir);
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if c.loaded && c.dir_mtime == dir_mtime {
+        if c.sig.as_ref() == Some(&sig) {
             return;
         }
         let mut owned = BTreeMap::new();
@@ -639,8 +664,7 @@ impl SwarmAuthorizer {
             }
         }
         c.owned = owned;
-        c.dir_mtime = dir_mtime;
-        c.loaded = true;
+        c.sig = Some(sig);
     }
 
     /// Authorize a serve of a `Private` model. `credential` is what the request carried (if any),
