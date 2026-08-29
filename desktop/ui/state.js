@@ -23,3 +23,15 @@ export const setCurChat = (v) => { curChat = v; };
 export const setActiveView = (v) => { activeView = v; };
 export const setDeviceName = (v) => { deviceName = v; };
 export const setUsedTokens = (v) => { usedTokens = v; };
+
+// libp2p ids of the infrastructure this node is connected to (bootstraps + circuit-relay hops).
+// These aren't "peers" a user cares about, so BOTH the Diagnostics peer list and the status-bar
+// peer count exclude them — keeping the two counts consistent. (They used to differ: the footer
+// counted infra while the Diagnostics list filtered it, so a node connected to 3 bootstraps + 1
+// real peer showed "4 peers" in the footer but "1 peer" in Diagnostics.)
+export function infraPeerIds() {
+  const s = new Set();
+  (snap?.network?.relay_reservations || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)\/p2p-circuit/); if (m) s.add(m[1]); });
+  (state?.settings?.bootstraps || []).forEach((a) => { const m = a.match(/\/p2p\/([^/]+)/); if (m) s.add(m[1]); });
+  return s;
+}

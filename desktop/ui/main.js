@@ -22,7 +22,7 @@ import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on, emit } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
 import {
-  state, snap, engines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens,
+  state, snap, engines, sessions, sessionOrder, curChat, activeView, deviceName, usedTokens, infraPeerIds,
   setState, setSnap, setEngines, setInstalledEngines, setSessions, setSessionOrder, setCurChat, setActiveView, setDeviceName, setUsedTokens,
 } from "./state";
 
@@ -306,12 +306,18 @@ async function refreshSystem() { try { sysInfo = await call("system_info"); } ca
 
 // ── status bar + lifecycle ──
 function renderStatusbar() {
-  const p = state?.provider?.status, g = state?.gateway?.status, peers = snap?.network?.peers?.length ?? 0;
+  const p = state?.provider?.status, g = state?.gateway?.status;
+  // Real peers = network participants, excluding infrastructure (bootstraps + relay hops) — matches
+  // the Diagnostics peer list, which filters the same set. The footer used to count infra too, so it
+  // read e.g. "4 peers" while Diagnostics listed 1. `onNetwork` keeps the connection STATUS on ANY
+  // live link, since a bootstrap connection still means we're on the network.
+  const conns = snap?.network?.peers || [], infra = infraPeerIds();
+  const peers = conns.filter((pr) => !infra.has(pr.peer_id)).length, onNetwork = conns.length > 0;
   const anyOn = !!(p?.running || g?.running);
   let dot = "warn pulse", label = "Initializing…";
-  if (state) { if (!anyOn) { dot = ""; label = "Ready — connecting…"; } else if (peers > 0) { dot = "ok pulse"; label = "Connected"; } else { dot = "warn pulse"; label = "Connecting to network…"; } }
+  if (state) { if (!anyOn) { dot = ""; label = "Ready — connecting…"; } else if (onNetwork) { dot = "ok pulse"; label = "Connected"; } else { dot = "warn pulse"; label = "Connecting to network…"; } }
   $("#netdot").className = "dot " + dot; $("#netlabel").textContent = label;
-  $("#sbpeers").textContent = `${peers} peers`;
+  $("#sbpeers").textContent = `${peers} peer${peers === 1 ? "" : "s"}`;
   $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
   $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:16527/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
   // #1: the title-bar CTA reflects state. Off = a brand-filled call-to-action ("Share your
@@ -319,19 +325,24 @@ function renderStatusbar() {
   // as status, not an unclicked CTA. Reuses the app's shared `.btn.on` active treatment.
   const shb = $("#sharecta");
   if (shb) {
-    const n = p?.announced ?? 0, live = !!p?.running;
-    shb.classList.toggle("brand", !live);
-    shb.classList.toggle("on", live);
-    shb.title = live
-      ? `Sharing ${n} model${n === 1 ? "" : "s"} to the network — click to manage`
+    const n = p?.announced ?? 0, running = !!p?.running;
+    const sharing = running && n > 0;   // actually announcing ≥1 model — not merely "provider process up"
+    shb.classList.toggle("brand", !running);   // brand CTA only when there's no provider at all
+    shb.classList.toggle("on", sharing);       // green "active" ONLY when a model is really shared
+    shb.title = running
+      ? (n > 0
+          ? `Sharing ${n} model${n === 1 ? "" : "s"} to the network — click to manage`
+          : "Provider on, but 0 models shared — click to choose what to share")
       : "Share your machine's models to the network";
-    shb.innerHTML = live
-      ? `<span class="dot ok pulse"></span>${n > 0 ? `Sharing ${n} model${n === 1 ? "" : "s"}` : "Sharing…"}`
+    shb.innerHTML = running
+      ? (n > 0
+          ? `<span class="dot ok pulse"></span>Sharing ${n} model${n === 1 ? "" : "s"}`
+          : `<span class="dot"></span>0 models shared`)   // idle: neutral dot, honest label — not "Sharing…"
       : "Share your models";
   }
   $("#sidepeer").textContent = `${deviceName} · ${shortPeer(p?.peer_id || g?.peer_id)}`;
   renderModels();
-  const connected = anyOn && (peers > 0 || netModels().length > 0);
+  const connected = anyOn && (onNetwork || netModels().length > 0);
   $("#homeconnecting").style.display = connected ? "none" : "inline-flex";
   $("#homeready").style.display = connected ? "" : "none";
 }
