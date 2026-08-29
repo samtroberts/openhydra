@@ -175,6 +175,46 @@ fn plan_withdrawals(
     to_publish
 }
 
+/// Withdrawal hysteresis (Finding 2) — compute the **effective** announce set that feeds
+/// [`plan_withdrawals`], damping a transient detection blip so it can't publish a spurious
+/// `MODEL_WITHDRAWN`. A model drops out of the announceable set (`desired`) for one of two reasons,
+/// which this distinguishes:
+///   * it is **still detected** but no longer announceable (the operator un-shared it, or flipped it
+///     to Private) — an intentional withdrawal → evicted **now** (not added back to `effective`), and
+///     its absence streak cleared;
+///   * it **vanished from detection** — possibly a transient (`auto`/[`MultiAdapter`] mode folds one
+///     engine's failed probe into a partial `Ok` list) → kept in `effective` (so no tombstone) until
+///     it has been undetected for `grace` consecutive passes, then released to be withdrawn.
+/// A model announceable again clears its streak. Pure + unit-testable; `absence` carries the streak
+/// across passes. `grace <= 1` disables the hysteresis (immediate withdrawal, the pre-hysteresis
+/// behaviour). The ~300s advert TTL backstops the (bounded) delay for a genuine engine-vanish.
+fn apply_absence_grace(
+    last: &BTreeSet<String>,
+    desired: &BTreeSet<String>,
+    detected: &BTreeSet<String>,
+    absence: &mut BTreeMap<String, u8>,
+    grace: u8,
+) -> BTreeSet<String> {
+    let mut effective = desired.clone();
+    for gone in last.difference(desired) {
+        if detected.contains(gone) {
+            absence.remove(gone); // still present → intentional policy withdrawal, no grace
+            continue;
+        }
+        let streak = absence.entry(gone.clone()).or_insert(0);
+        *streak = streak.saturating_add(1);
+        if *streak < grace {
+            effective.insert(gone.clone()); // within grace → treat as still announced (no tombstone)
+        } else {
+            absence.remove(gone); // grace exhausted → release for withdrawal, stop tracking
+        }
+    }
+    for present in desired {
+        absence.remove(present); // announceable again → reset any streak
+    }
+    effective
+}
+
 /// Provider-side dispatch for one inbound proxy request → the buffered serve response.
 ///
 /// On the [`SERVE_REQUEST`] method byte, run the request through `adapter` and return the
@@ -342,6 +382,24 @@ const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 /// message) covers a consumer that (re)connects within that window, while a re-share cancels the
 /// countdown so a model that comes back is never spuriously withdrawn.
 const WITHDRAW_REPUBLISH_PASSES: u8 = 3;
+
+/// Withdrawal hysteresis (Finding 2): how many *consecutive* announce passes a previously-announced
+/// model must be **absent from detection** before it is tombstoned. In `auto`/[`MultiAdapter`] mode a
+/// transient engine failure is folded into a partial `Ok` list ([`crate::detect::detect_engines`]
+/// drops a failed probe silently), so a model can vanish for a single pass and reappear the next —
+/// without this grace that blip would publish a spurious `MODEL_WITHDRAWN` and flap consumers. `2`
+/// tolerates a single missing pass (the common transient) while still evicting a genuinely-gone model
+/// promptly (well inside the ~300s advert TTL). A *policy* withdrawal (model still detected, just no
+/// longer announceable) bypasses this entirely and evicts at once — see [`apply_absence_grace`].
+///
+/// The grace window is `this × reannounce_secs`. At the default (120s → 240s) a single-pass blip is
+/// fully absorbed: the advert is refreshed on recovery before its ~300s TTL lapses, so consumers see
+/// no eviction at all. If an operator raises `reannounce_secs` past ~150s the grace still suppresses
+/// the *spurious tombstone*, but the advert may TTL-lapse passively before the release decision — a
+/// safe degradation (eviction via TTL instead of an explicit, faster tombstone), not a correctness
+/// issue. Keep the two invariants in mind: `effective ⊇ desired` (a detected+shared model is never
+/// tombstoned) and, in production, `desired ⊆ detected` (both derive from the one detected `models`).
+const WITHDRAW_ABSENCE_GRACE_PASSES: u8 = 2;
 
 /// A per-nonce append-only log of encoded [`ServeChunk`] frames with a trimmable prefix (P1
 /// streaming). See the module note above.
@@ -585,6 +643,13 @@ pub struct Provider<A: EngineAdapter> {
     /// removes it here so it is never withdrawn while intended. Bounded (drains to empty), guarded
     /// by `announce_lock` in practice like [`last_announced`].
     pending_withdrawals: Mutex<BTreeMap<String, u8>>,
+    /// Withdrawal hysteresis (Finding 2): per-model count of consecutive announce passes a
+    /// previously-announced model has been **absent from detection**. `auto`/[`MultiAdapter`] mode
+    /// swallows one engine's transient failure into a partial `Ok` list (a dead engine's models just
+    /// vanish), so a single missing pass must not tombstone. A vanished model is only withdrawn once
+    /// this reaches [`WITHDRAW_ABSENCE_GRACE_PASSES`]; a reappearance (or a policy-driven drop, which
+    /// is still *detected*) resets/skips it. Bounded, guarded by `announce_lock` in practice.
+    absence_streak: Mutex<BTreeMap<String, u8>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -618,6 +683,7 @@ impl<A: EngineAdapter> Provider<A> {
             announce_lock: Mutex::new(()),
             last_announced: Mutex::new(BTreeSet::new()),
             pending_withdrawals: Mutex::new(BTreeMap::new()),
+            absence_streak: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1053,21 +1119,27 @@ impl<A: EngineAdapter> Provider<A> {
         // Snapshot the policy ONCE so the loop filter and the published view see one consistent
         // policy (also the source for `shared_models` below).
         let policy = self.policy.snapshot();
-        // M6: the FULL intended-shared set this pass (policy ∩ detected), computed up-front so it's
-        // independent of where the announce loop below might break on a network error — a
-        // still-intended model we simply didn't *reach* must not look "withdrawn". This is the
-        // diff basis for the tombstones published at the end.
+        // M6: the FULL intended global-announce set this pass (policy ∩ detected ∩ globally-shared),
+        // computed up-front so it's independent of where the announce loop below might break on a
+        // network error — a still-intended model we simply didn't *reach* must not look "withdrawn".
+        // This is the diff basis for the tombstones published at the end. M1: this is the
+        // *global-announce* set (`announce_globally`), not merely `is_shared` — a `private`/`device`
+        // model is still served when reached (the serve gate stays `is_shared`) but is never
+        // published to global discovery, so it must not appear here or get an advert/tombstone.
         let desired: BTreeSet<String> = models
             .iter()
-            .filter(|m| policy.is_shared(&m.engine_ref))
+            .filter(|m| policy.announce_globally(&m.engine_ref))
             .map(|m| m.engine_ref.clone())
             .collect();
         let mut announced: Vec<String> = Vec::new();
         let mut outcome: Result<(), AdapterError> = Ok(());
         for model in &models {
-            // Per-model share policy: skip models the operator hasn't opted to share. The serve
-            // path enforces the same gate, so this is discovery hygiene, not the security boundary.
-            if !policy.is_shared(&model.engine_ref) {
+            // Global-announce gate (M1): publish an advert only for a model whose scope is `global`
+            // and whose Global publish is consented. There is NO grandfather — a legacy file keeps
+            // announcing only because `SharePolicy::load` materialises a consent record on migration.
+            // `private`/`device` models are skipped here but still served if reached — the serve
+            // path enforces `is_shared`, the security boundary; this is discovery hygiene.
+            if !policy.announce_globally(&model.engine_ref) {
                 continue;
             }
             let record = build_peer_record(
@@ -1098,21 +1170,36 @@ impl<A: EngineAdapter> Provider<A> {
             });
         }
         // M6: publish a per-model tombstone for every model no longer intended (the operator
-        // un-shared it, or it vanished from the engine), so consumers evict just that `(peer, model)`
-        // entry immediately instead of on the ~300s TTL. F2: re-publish it over the next few passes
-        // ([`plan_withdrawals`]) so a briefly-unmeshed consumer still gets it, cancelling on re-share.
-        // Best-effort and outcome-independent: a withdraw publish error is logged, never fatal, and
-        // the model would still expire on the old TTL. `desired` is stored as the new baseline
-        // regardless of the announce outcome so the next pass diffs against true intent.
+        // un-shared it, or it vanished from the engine for good), so consumers evict just that
+        // `(peer, model)` entry immediately instead of on the ~300s TTL. F2: re-publish it over the
+        // next few passes ([`plan_withdrawals`]) so a briefly-unmeshed consumer still gets it,
+        // cancelling on re-share. Finding 2: the diff basis is the grace-adjusted `effective` set
+        // ([`apply_absence_grace`]), so a transient detection blip is NOT tombstoned. Best-effort and
+        // outcome-independent: a withdraw publish error is logged, never fatal, and the model would
+        // still expire on the old TTL. `effective` is stored as the new baseline regardless of the
+        // announce outcome so the next pass diffs against true intent.
         {
             let mut last = self.last_announced.lock().unwrap_or_else(|e| e.into_inner());
             let mut pending = self.pending_withdrawals.lock().unwrap_or_else(|e| e.into_inner());
-            for model in plan_withdrawals(&last, &desired, &mut pending, WITHDRAW_REPUBLISH_PASSES) {
+            let mut absence = self.absence_streak.lock().unwrap_or_else(|e| e.into_inner());
+            // Finding 2: damp a transient detection blip. A model dropped from `desired` because it
+            // VANISHED from detection (a possible `auto`-mode partial-`Ok`) is held in `effective` for
+            // a short grace so it isn't tombstoned; a model dropped because the POLICY changed (still
+            // detected, no longer announceable) is withdrawn at once. Diff/baseline against `effective`.
+            let detected: BTreeSet<String> = models.iter().map(|m| m.engine_ref.clone()).collect();
+            let effective = apply_absence_grace(
+                &last,
+                &desired,
+                &detected,
+                &mut absence,
+                WITHDRAW_ABSENCE_GRACE_PASSES,
+            );
+            for model in plan_withdrawals(&last, &effective, &mut pending, WITHDRAW_REPUBLISH_PASSES) {
                 if let Err(e) = self.net.withdraw_model(model.clone()) {
                     eprintln!("openhydra-agent: MODEL_WITHDRAWN for {model} failed: {e}");
                 }
             }
-            *last = desired;
+            *last = effective;
         }
         outcome.map(|()| count)
     }
@@ -1497,6 +1584,71 @@ mod tests {
         assert_eq!(p1, vec!["b".to_string()]);
         assert!(pending.is_empty());
         assert!(plan_withdrawals(&set(&["a"]), &set(&["a"]), &mut pending, 1).is_empty());
+    }
+
+    // ── Finding 2: withdrawal hysteresis (a transient detection blip must not tombstone) ──
+
+    /// Run one announce pass's withdrawal pipeline exactly as `announce_models_inner`: grace-adjust
+    /// `desired` (vs the raw `detected` set) into `effective`, run `plan_withdrawals`, advance the
+    /// baseline. Returns the models tombstoned this pass.
+    fn withdraw_pass(
+        last: &mut BTreeSet<String>,
+        absence: &mut BTreeMap<String, u8>,
+        pending: &mut BTreeMap<String, u8>,
+        desired: &[&str],
+        detected: &[&str],
+        grace: u8,
+    ) -> Vec<String> {
+        let effective = apply_absence_grace(last, &set(desired), &set(detected), absence, grace);
+        let withdrawn = plan_withdrawals(last, &effective, pending, WITHDRAW_REPUBLISH_PASSES);
+        *last = effective;
+        withdrawn
+    }
+
+    #[test]
+    fn f2_transient_single_pass_vanish_does_not_tombstone() {
+        // Pass 1: {a,b} announced & detected. Pass 2: b's engine blips — b vanishes from detection
+        // (auto-mode partial Ok) and is not re-detected. With grace=2 it must NOT be tombstoned.
+        // Pass 3: b is back → still never withdrawn, and no lingering countdown/streak.
+        let (mut last, mut abs, mut pend) = (BTreeSet::new(), BTreeMap::new(), BTreeMap::new());
+        assert!(withdraw_pass(&mut last, &mut abs, &mut pend, &["a", "b"], &["a", "b"], 2).is_empty());
+        let w2 = withdraw_pass(&mut last, &mut abs, &mut pend, &["a"], &["a"], 2); // b vanished (blip)
+        assert!(w2.is_empty(), "a one-pass detection blip must not tombstone");
+        assert!(last.contains("b"), "b held in the baseline through the grace window");
+        let w3 = withdraw_pass(&mut last, &mut abs, &mut pend, &["a", "b"], &["a", "b"], 2); // b back
+        assert!(w3.is_empty(), "b returned within grace → never withdrawn");
+        assert!(pend.is_empty() && abs.is_empty(), "no lingering countdown/streak");
+    }
+
+    #[test]
+    fn f2_policy_withdrawal_of_a_still_detected_model_evicts_immediately() {
+        // b is still DETECTED but no longer `desired` (operator un-shared it / flipped to Private).
+        // Intentional withdrawal → tombstoned at once, no grace, no streak tracked.
+        let (mut last, mut abs, mut pend) = (set(&["a", "b"]), BTreeMap::new(), BTreeMap::new());
+        let w = withdraw_pass(&mut last, &mut abs, &mut pend, &["a"], &["a", "b"], 2);
+        assert_eq!(w, vec!["b".to_string()], "policy drop of a still-detected model evicts now");
+        assert!(!last.contains("b"));
+        assert!(abs.is_empty(), "no streak for an intentional withdrawal");
+    }
+
+    #[test]
+    fn f2_genuine_vanish_tombstones_after_the_grace_window() {
+        // b's engine goes away for good: not withdrawn on the first missing pass, withdrawn on the
+        // second consecutive miss (grace=2).
+        let (mut last, mut abs, mut pend) = (set(&["a", "b"]), BTreeMap::new(), BTreeMap::new());
+        let w1 = withdraw_pass(&mut last, &mut abs, &mut pend, &["a"], &["a"], 2); // miss 1
+        assert!(w1.is_empty(), "grace holds b on the first missing pass");
+        let w2 = withdraw_pass(&mut last, &mut abs, &mut pend, &["a"], &["a"], 2); // miss 2 → withdraw
+        assert_eq!(w2, vec!["b".to_string()], "withdrawn after the grace window");
+        assert!(!last.contains("b"));
+    }
+
+    #[test]
+    fn f2_grace_of_one_is_immediate_withdrawal_the_pre_hysteresis_behaviour() {
+        // grace<=1 disables hysteresis: a vanished model is withdrawn on the first missing pass.
+        let (mut last, mut abs, mut pend) = (set(&["a", "b"]), BTreeMap::new(), BTreeMap::new());
+        let w = withdraw_pass(&mut last, &mut abs, &mut pend, &["a"], &["a"], 1);
+        assert_eq!(w, vec!["b".to_string()]);
     }
 
     fn detected(canonical: &str) -> DetectedModel {
