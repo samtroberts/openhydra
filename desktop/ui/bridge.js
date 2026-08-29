@@ -7,7 +7,24 @@ export async function call(cmd, args) { if (tauri) return tauri.invoke(cmd, args
 export const mockInstallCbs = [];
 export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(ev)); }
 
-  const mk = { provider: false, gateway: false };
+  // Default mock policy = a realistic post-migration "share everything" node: v3, All mode, default
+  // reach Global, WITH the policy-level consent the agent's share_all()/migration would have recorded.
+  // (A raw v1 file would read as un-consented and show everything "pending" — the agent migrates it.)
+  const mk = { provider: false, gateway: false, sharePolicy: { version: 3, mode: "all", models: [], default_scope: "global", default_global_consent: 1787000000000 } };
+  // Mock mirror of the agent's SharePolicy::announce_globally: a model is announced to the (mock) DHT
+  // only when it is shared, its reach resolves to `global`, AND a consent record covers it — a per-model
+  // `global_consent` entry for an explicit-Global model, or policy-level `default_global_consent` for a
+  // default-Global one. Keeps the preview's announced set honest instead of "everything shared".
+  function mockAnnouncedGlobally(m) {
+    const pol = mk.sharePolicy || { mode: "all", models: [] };
+    const scopes = pol.scopes || {}, gc = pol.global_consent || {};
+    const isShared = pol.mode === "all" || (pol.models || []).includes(m);
+    const scope = scopes[m] || pol.default_scope || "global";
+    if (!isShared || scope !== "global") return false;
+    return Object.prototype.hasOwnProperty.call(scopes, m)
+      ? gc[m] != null                                   // explicit Global → per-model consent
+      : (pol.default_global_consent ?? null) != null;   // default Global → policy-level consent
+  }
   function mock(cmd, args) {
     if (cmd === "start_provider") { mk.provider = true; return null; }
     if (cmd === "stop_provider") { mk.provider = false; return null; }
@@ -45,7 +62,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "open_gui") return null;
     if (cmd === "connector_test") return mk.gateway ? "granite4.1:3b" : Promise.reject("gateway unreachable on :16527 — is OpenHydra sharing/serving?");
     if (cmd === "get_state") return {
-      provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: (() => { if (!mk.provider) return 0; const active = ["tinyllama:latest", "llama3.2:1b"]; const pol = mk.sharePolicy || { mode: "all", models: [] }; return pol.mode === "all" ? active.length : (pol.models || []).filter((m) => active.includes(m)).length; })(), relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
+      provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: (() => { if (!mk.provider) return 0; return ["tinyllama:latest", "llama3.2:1b"].filter(mockAnnouncedGlobally).length; })(), relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
       settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, schema_version: 2 },
       agent_found: true, gateway_url: "http://127.0.0.1:16527/v1", resumed_on_launch: !!mk.resumedOnLaunch,
@@ -140,8 +157,9 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
         share: (() => {
           const active = ["tinyllama:latest", "llama3.2:1b"]; // the mock ollama's detected models
           const pol = mk.sharePolicy || { mode: "all", models: [] };
-          const shared = pol.mode === "all" ? active : (pol.models || []).filter((m) => active.includes(m));
-          return { share_mode: pol.mode, shared_models: pol.mode === "all" ? [] : (pol.models || []), announced_models: mk.provider ? shared : [] };
+          // announced_models mirrors the agent's announce_globally (scope==global + a consent record),
+          // NOT just "is shared" — so the mock preview matches the real DHT-announce gating.
+          return { share_mode: pol.mode, shared_models: pol.mode === "all" ? [] : (pol.models || []), announced_models: mk.provider ? active.filter(mockAnnouncedGlobally) : [] };
         })(),
       };
     }
