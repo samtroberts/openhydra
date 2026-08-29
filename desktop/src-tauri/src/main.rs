@@ -1146,6 +1146,122 @@ fn remove_imported_card(libp2p_peer_id: String, model_id: String) -> Result<usiz
     openhydra_agent::cards::remove_card(&cards_file_path(), &libp2p_peer_id, &model_id)
 }
 
+// ── M3: swarm membership (private sharing) ─────────────────────────────────────────────────────
+// Swarm state lives under ~/.openhydra/swarms/ (owner files carry the group secret, 0600). These
+// commands call the agent glue in-process (like card import); the group secret never crosses into JS
+// — list_swarms returns only redacted views. Enrollment is offline copy/paste (no wire in v1). The
+// node identity used to sign enrollment requests / bind accepted credentials is `desktop-provider.key`
+// (the same identity the provider/card-export use), so a swarm binds to this machine's real peer id.
+
+/// Directory holding one JSON file per swarm.
+fn swarms_dir() -> PathBuf {
+    openhydra_dir().join("swarms")
+}
+
+/// The node identity swarm operations sign/bind with (same key as the provider + card export).
+fn swarm_identity_path() -> PathBuf {
+    openhydra_dir().join("desktop-provider.key")
+}
+
+/// Serializes the read-modify-write of a swarm file across this process's swarm commands (approve +
+/// revoke both mutate an owner record). The atomic temp+rename in the agent prevents torn reads.
+static SWARMS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// M3: every swarm on this node, as redacted views (no group secret). Owner + member.
+#[tauri::command]
+fn list_swarms() -> Result<Vec<openhydra_agent::SwarmView>, String> {
+    openhydra_agent::swarms::list_swarms(&swarms_dir())
+}
+
+/// M3: create a swarm (generate the group keypair, persist an owner record). Returns its view.
+#[tauri::command]
+fn create_swarm(label: String) -> Result<openhydra_agent::SwarmView, String> {
+    let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::swarms::create_swarm(&swarms_dir(), label.trim(), now_unix_ms())
+}
+
+/// M3 (member): build a signed enrollment request to send a swarm owner out-of-band. `swarm` is an
+/// optional public-key hint (e.g. from a card) of which swarm to join.
+#[tauri::command]
+fn swarm_enroll_request(
+    swarm: Option<String>,
+    label: String,
+) -> Result<openhydra_agent::EnrollmentRequestExport, String> {
+    openhydra_agent::swarms::enroll_request_at(
+        &swarm_identity_path(),
+        swarm.as_deref().unwrap_or("").trim(),
+        label.trim(),
+        now_unix_ms(),
+    )
+}
+
+/// M3 (owner): preview an incoming enrollment request — verifies the member's signature and returns
+/// their identity + fingerprint to confirm out-of-band, without approving.
+#[tauri::command]
+fn preview_enroll_request(request: String) -> Result<openhydra_agent::EnrollmentRequest, String> {
+    openhydra_agent::swarms::preview_enrollment_request(&request)
+}
+
+/// M3 (owner): approve an enrollment request into a signed credential valid for `ttl_secs` (default
+/// 90 days). Records the member and returns the credential to send back out-of-band.
+#[tauri::command]
+fn swarm_approve_member(
+    swarm_public_key: String,
+    request: String,
+    member_label: String,
+    ttl_secs: Option<u64>,
+) -> Result<openhydra_agent::ApprovedCredential, String> {
+    let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::swarms::approve_member(
+        &swarms_dir(),
+        &swarm_public_key,
+        &request,
+        member_label.trim(),
+        ttl_secs.unwrap_or(90 * 24 * 3600),
+        now_unix_ms(),
+    )
+}
+
+/// M3 (owner): revoke a member by its public key (drops it from the list + adds to the revocation set).
+#[tauri::command]
+fn swarm_revoke_member(swarm_public_key: String, member_public_key: String) -> Result<(), String> {
+    let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::swarms::revoke_member(&swarms_dir(), &swarm_public_key, &member_public_key)
+}
+
+/// M3 (member): preview a credential before accepting — verifies its signature + expiry and returns
+/// the swarm it grants, without persisting.
+#[tauri::command]
+fn preview_swarm_credential(
+    credential: String,
+) -> Result<openhydra_agent::MembershipCredential, String> {
+    openhydra_agent::swarms::preview_credential(&credential, now_unix_ms())
+}
+
+/// M3 (member): accept a credential the owner returned — verifies it is signed, bound to THIS node's
+/// identity, and unexpired, then persists a member record. Returns the stored view.
+#[tauri::command]
+fn swarm_accept_credential(
+    credential: String,
+    label: Option<String>,
+) -> Result<openhydra_agent::SwarmView, String> {
+    let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::swarms::accept_credential_at(
+        &swarms_dir(),
+        &swarm_identity_path(),
+        &credential,
+        label.as_deref().unwrap_or("").trim(),
+        now_unix_ms(),
+    )
+}
+
+/// M3: forget a swarm entirely (owner: destroys the group key; member: drops our credential).
+#[tauri::command]
+fn forget_swarm(swarm_public_key: String) -> Result<(), String> {
+    let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    openhydra_agent::swarms::forget_swarm(&swarms_dir(), &swarm_public_key)
+}
+
 #[tauri::command]
 fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
@@ -1927,6 +2043,15 @@ fn main() {
             list_cards,
             remove_imported_card,
             take_pending_card,
+            list_swarms,
+            create_swarm,
+            swarm_enroll_request,
+            preview_enroll_request,
+            swarm_approve_member,
+            swarm_revoke_member,
+            preview_swarm_credential,
+            swarm_accept_credential,
+            forget_swarm,
             reset_share_policy,
             detect_engines_now,
             system_info,

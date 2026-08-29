@@ -30,6 +30,7 @@
       <div class="nav" data-v="connectors" data-m="home"><span class="icon" data-i="plug"></span>Connectors</div>
       <div class="nav" data-v="providers" data-m="network"><span class="icon" data-i="package"></span>Models</div>
       <div class="nav" data-v="share" data-m="network"><span class="icon" data-i="zap"></span>Share</div>
+      <div class="nav" data-v="swarms" data-m="network"><span class="icon" data-i="users"></span>Swarms</div>
       <div class="nav" data-v="engines" data-m="network"><span class="icon" data-i="monitor"></span>Engines</div>
       <div class="nav" data-v="ledger" data-m="network"><span class="icon" data-i="list"></span>Ledger</div>
       <div class="nav" data-v="peers" data-m="network" data-tier="adv"><span class="icon" data-i="users"></span>Diagnostics and Stats</div>
@@ -107,6 +108,9 @@
             </tbody></table>
           </div>
         </section>
+
+        <!-- SWARMS — private sharing by membership credential (M3). Populated by renderSwarms(). -->
+        <section class="view" id="v-swarms"></section>
 
         <!-- HOME — landing: greeting + prompt box. Sending starts a chat in Recents. -->
         <section class="view on" id="v-home">

@@ -76,6 +76,56 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       mk.importedCards = (mk.importedCards || []).filter((x) => !(x.libp2p_peer_id === args?.libp2p_peer_id && x.model_id === args?.model_id));
       return before - (mk.importedCards || []).length;
     }
+    // ── M3 swarms (mock) — enough state to exercise the full create/enroll/approve/accept flow in a
+    // plain browser. Keys are fake hex; the real agent generates + signs them.
+    const mockHex = (n) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
+    const mockFp = (k) => (k || "").slice(0, 16).toUpperCase().match(/.{1,4}/g)?.join(" ") || "0000 0000 0000 0000";
+    if (cmd === "list_swarms") return mk.swarms || [];
+    if (cmd === "create_swarm") {
+      const pk = mockHex(64);
+      const v = { swarm_public_key: pk, fingerprint: mockFp(pk), label: args?.label || "Swarm", role: "owner", members: [], member_count: 0, revoked_count: 0, credential_expires_at: null, created_at: Date.now() };
+      (mk.swarms || (mk.swarms = [])).push(v);
+      return v;
+    }
+    if (cmd === "swarm_enroll_request") {
+      const pk = mockHex(64);
+      return { request: { schema_version: 1, swarm_public_key: args?.swarm || "", member_openhydra_peer_id: "oh_mockmember", member_public_key: pk, label: args?.label || "device", requested_at: Date.now(), sig_alg: 1, signature: "mock" }, magnet: "openhydra:enroll:" + btoa("mock-enroll:" + (args?.label || "")) };
+    }
+    if (cmd === "preview_enroll_request") {
+      const t = (args?.request || "").trim();
+      if (!(t.startsWith("openhydra:enroll:") || t.startsWith("{"))) return Promise.reject("not an openhydra:enroll: string");
+      return { schema_version: 1, swarm_public_key: "", member_openhydra_peer_id: "oh_mockmember", member_public_key: mk._lastReqKey || (mk._lastReqKey = mockHex(64)), label: "Sam's MacBook", requested_at: Date.now(), sig_alg: 1, signature: "mock" };
+    }
+    if (cmd === "swarm_approve_member") {
+      const s = (mk.swarms || []).find((x) => x.swarm_public_key === args?.swarm_public_key);
+      const memberKey = mk._lastReqKey || mockHex(64);
+      const exp = Date.now() + (args?.ttl_secs || 90 * 24 * 3600) * 1000;
+      if (s) {
+        s.members = s.members.filter((m) => m.member_public_key !== memberKey);
+        s.members.push({ member_public_key: memberKey, fingerprint: mockFp(memberKey), member_openhydra_peer_id: "oh_mockmember", label: args?.member_label || "member", issued_at: Date.now(), expires_at: exp });
+        s.member_count = s.members.length;
+      }
+      mk._lastReqKey = null;
+      return { credential: { schema_version: 1, swarm_public_key: args?.swarm_public_key, member_public_key: memberKey, member_openhydra_peer_id: "oh_mockmember", swarm_label: s?.label || "swarm", issued_at: Date.now(), expires_at: exp, sig_alg: 1, signature: "mock" }, magnet: "openhydra:cred:" + btoa("mock-cred") };
+    }
+    if (cmd === "swarm_revoke_member") {
+      const s = (mk.swarms || []).find((x) => x.swarm_public_key === args?.swarm_public_key);
+      if (s) { s.members = s.members.filter((m) => m.member_public_key !== args?.member_public_key); s.member_count = s.members.length; s.revoked_count = (s.revoked_count || 0) + 1; }
+      return null;
+    }
+    if (cmd === "preview_swarm_credential") {
+      const t = (args?.credential || "").trim();
+      if (!(t.startsWith("openhydra:cred:") || t.startsWith("{"))) return Promise.reject("not an openhydra:cred: string");
+      const pk = mockHex(64);
+      return { schema_version: 1, swarm_public_key: pk, member_public_key: mockHex(64), member_openhydra_peer_id: "oh_me", swarm_label: "Home rig", issued_at: Date.now(), expires_at: Date.now() + 90 * 24 * 3600 * 1000, sig_alg: 1, signature: "mock" };
+    }
+    if (cmd === "swarm_accept_credential") {
+      const pk = mockHex(64);
+      const v = { swarm_public_key: pk, fingerprint: mockFp(pk), label: args?.label || "Home rig", role: "member", members: [], member_count: 0, revoked_count: 0, credential_expires_at: Date.now() + 90 * 24 * 3600 * 1000, created_at: Date.now() };
+      (mk.swarms || (mk.swarms = [])).push(v);
+      return v;
+    }
+    if (cmd === "forget_swarm") { mk.swarms = (mk.swarms || []).filter((x) => x.swarm_public_key !== args?.swarm_public_key); return null; }
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "connector_status") {
       const c = (o) => ({ declared_models: [], ...o, connected: !!(mk.connected && mk.connected[o.key]) });

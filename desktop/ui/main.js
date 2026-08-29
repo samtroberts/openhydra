@@ -16,6 +16,7 @@ import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tabl
 import { renderEngines } from "./installer";
 import { renderShare, setSharing, toggleSharing, ensureGateway } from "./share";
 import { wireCardDeepLinks } from "./cards";
+import { renderSwarms } from "./swarms";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
 import { renderSettings, updateEngineEndpoint } from "./settings";
@@ -90,9 +91,9 @@ let attachments = [];   // chat-local: file attachments queued for the next mess
 
 
 // ── nav / workspace switcher / history (wireframe verbatim + header-hide + renderView) ──
-const titles = { home: "Home", chat: "Chat", activity: "Activity", connectors: "Connectors", providers: "Models", share: "Share", engines: "Engines", ledger: "Ledger", peers: "Diagnostics and Stats", settings: "Settings" };
+const titles = { home: "Home", chat: "Chat", activity: "Activity", connectors: "Connectors", providers: "Models", share: "Share", swarms: "Swarms", engines: "Engines", ledger: "Ledger", peers: "Diagnostics and Stats", settings: "Settings" };
 const searchable = { providers: 1, peers: 1 };
-const VIEWMODE = { home: "home", chat: "home", activity: "home", connectors: "home", providers: "network", share: "network", engines: "network", ledger: "network", peers: "network" };
+const VIEWMODE = { home: "home", chat: "home", activity: "home", connectors: "home", providers: "network", share: "network", swarms: "network", engines: "network", ledger: "network", peers: "network" };
 function setMode(m) { app.dataset.mode = m; $$("#modeswitch button").forEach((b) => b.toggleAttribute("data-on", b.dataset.m === m)); }
 let hist = ["home"], hi = 0;
 function updNavBtns() { $("#navback").classList.toggle("dis", hi <= 0); $("#navfwd").classList.toggle("dis", hi >= hist.length - 1); }
@@ -278,6 +279,7 @@ $("#attachfile").onchange = async (e) => { for (const f of e.target.files) { if 
 // ── view renderers (populate the wireframe's exact tables/cards with live data) ──
 function renderView() {
   if (activeView === "share") renderShare();
+  else if (activeView === "swarms") renderSwarms();
   else if (activeView === "providers") renderProviders();
   else if (activeView === "engines") renderEngines();
   else if (activeView === "activity") renderActivity();

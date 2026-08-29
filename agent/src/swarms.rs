@@ -321,6 +321,31 @@ pub fn build_enrollment_request(
     Ok(EnrollmentRequestExport { request: signed, magnet })
 }
 
+/// Load this node's identity from `identity_path` and build a signed enrollment request — the
+/// desktop entry point (keeps identity loading in the agent, like `run_export`).
+pub fn enroll_request_at(
+    identity_path: &Path,
+    swarm_public_key_hint: &str,
+    label: &str,
+    now_ms: u64,
+) -> Result<EnrollmentRequestExport, String> {
+    let id = Identity::load_or_create(identity_path).map_err(|e| format!("load identity: {e}"))?;
+    build_enrollment_request(&id, swarm_public_key_hint, label, now_ms)
+}
+
+/// Load this node's identity from `identity_path` and accept a credential into `dir` — the desktop
+/// entry point for the member accept flow.
+pub fn accept_credential_at(
+    dir: &Path,
+    identity_path: &Path,
+    credential_str: &str,
+    label: &str,
+    now_ms: u64,
+) -> Result<SwarmView, String> {
+    let id = Identity::load_or_create(identity_path).map_err(|e| format!("load identity: {e}"))?;
+    accept_credential(dir, &id, credential_str, label, now_ms)
+}
+
 /// Accept a credential the owner returned: verify it is (a) validly signed by its group key, (b)
 /// bound to OUR identity, and (c) unexpired, then persist a MEMBER record. Binding to our own key
 /// means we refuse a credential minted for someone else. Returns the stored view.
