@@ -160,9 +160,13 @@ pub fn read_swarm(dir: &Path, swarm_public_key: &str) -> Result<Option<SwarmReco
     }
 }
 
-/// Atomically write a swarm record (temp + 0600 + rename). Owner files carry the group secret, so the
-/// file is created private BEFORE the rename (never briefly world-readable).
+/// Atomically write a swarm record (temp + rename). Owner files carry the group secret, so on Unix the
+/// temp file is created with `0600` **before any bytes are written** (review #1: the old write-then-
+/// chmod left a window where `<pk>.json.tmp` existed world-readable and a local user could race it to
+/// read the group key). A stale temp from a crashed prior write is cleared first so `create_new`
+/// succeeds.
 fn write_swarm(dir: &Path, record: &SwarmRecord) -> Result<(), String> {
+    use std::io::Write;
     let path = swarm_file_path(dir, &record.swarm_public_key)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create swarms dir: {e}"))?;
     let json =
@@ -170,13 +174,19 @@ fn write_swarm(dir: &Path, record: &SwarmRecord) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp); // clear a stale temp so create_new can't collide
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600); // private from creation — the secret is never on disk at wider perms
     }
+    let mut f = opts.open(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    f.write_all(json.as_bytes()).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    f.sync_all().map_err(|e| format!("sync {}: {e}", tmp.display()))?;
+    drop(f);
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename into {}: {e}", path.display()))
 }
 
@@ -425,8 +435,16 @@ pub fn preview_enrollment_request(request_str: &str) -> Result<EnrollmentRequest
     verify_enrollment_request(&req).map(|v| v.request).map_err(|e| e.to_string())
 }
 
+/// Cap on a pasted enrollment request / credential (review #5: parity with the M2 card file cap). A
+/// real artifact is a few hundred bytes; this bounds the work a hostile self-signed paste can force
+/// on preview/approve before the per-field bounds in the crypto core apply.
+const MAX_ARTIFACT_BYTES: usize = 64 * 1024;
+
 fn parse_enrollment_request(s: &str) -> Result<EnrollmentRequest, String> {
     let t = s.trim();
+    if t.len() > MAX_ARTIFACT_BYTES {
+        return Err(format!("enrollment request too large (> {MAX_ARTIFACT_BYTES} bytes)"));
+    }
     if t.starts_with("openhydra:enroll:") {
         EnrollmentRequest::from_magnet(t).map_err(|e| e.to_string())
     } else {
@@ -436,6 +454,9 @@ fn parse_enrollment_request(s: &str) -> Result<EnrollmentRequest, String> {
 
 fn parse_credential(s: &str) -> Result<MembershipCredential, String> {
     let t = s.trim();
+    if t.len() > MAX_ARTIFACT_BYTES {
+        return Err(format!("credential too large (> {MAX_ARTIFACT_BYTES} bytes)"));
+    }
     if t.starts_with("openhydra:cred:") {
         MembershipCredential::from_magnet(t).map_err(|e| e.to_string())
     } else {

@@ -45,6 +45,10 @@ const CRED_MAGNET_PREFIX: &str = "openhydra:cred:";
 /// the UI; a label over this is rejected on sign so a card can't carry an unbounded blob.
 const MAX_LABEL_LEN: usize = 128;
 
+/// Upper bound on a machine id / key-hint scalar (`member_openhydra_peer_id`, the `swarm_public_key`
+/// hint). Real values are short hex; this just stops an unbounded field in a self-signed artifact.
+const MAX_ID_LEN: usize = 256;
+
 fn default_schema() -> u32 {
     MEMBERSHIP_SCHEMA_VERSION
 }
@@ -185,11 +189,41 @@ fn check_label(label: &str, what: &str) -> Result<(), MembershipError> {
     Ok(())
 }
 
+/// A bounded, newline-free scalar (ids, key hints). Bounds the signed preimage — review #5: the free
+/// `member_openhydra_peer_id` and the `swarm_public_key` hint were newline-checked but unbounded, so a
+/// self-signed request could carry a multi-MB field that then persists into the owner's file and the
+/// returned credential. Real keys (64 hex) sit well under the cap.
 fn check_no_newline(s: &str, what: &str) -> Result<(), MembershipError> {
     if s.contains('\n') {
         return Err(MembershipError::Malformed(format!("{what} contains a newline: {s:?}")));
     }
+    if s.len() > MAX_ID_LEN {
+        return Err(MembershipError::Malformed(format!("{what} exceeds {MAX_ID_LEN} bytes")));
+    }
     Ok(())
+}
+
+/// Verify `sig` over `msg` with `ed_pk`, branching explicitly on `alg` — review #2: even though
+/// `is_implemented()` gates the caller today (only Ed25519), a future algorithm marked implemented
+/// (PQC3.1) must NOT silently fall through to Ed25519 verification. Adding the `match` now means the
+/// later algorithm has to supply its own verify path rather than being confused for Ed25519.
+fn verify_with_alg(
+    alg: SigAlg,
+    ed_pk: &libp2p::identity::ed25519::PublicKey,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), MembershipError> {
+    let ok = match alg {
+        SigAlg::Ed25519 => ed_pk.verify(msg, sig),
+        other => {
+            return Err(MembershipError::Crypto(format!("verify not implemented for {other:?}")))
+        }
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(MembershipError::BadSignature)
+    }
 }
 
 // ── enrollment request ──
@@ -255,9 +289,7 @@ pub fn verify_enrollment_request(
     }
     let ed_pk = ed_pubkey_from_hex(&req.member_public_key)?;
     let sig = b64_decode(&req.signature)?;
-    if !ed_pk.verify(&enroll_canonical_bytes(req), &sig) {
-        return Err(MembershipError::BadSignature);
-    }
+    verify_with_alg(alg, &ed_pk, &enroll_canonical_bytes(req), &sig)?;
     Ok(VerifiedRequest { request: req.clone() })
 }
 
@@ -336,9 +368,7 @@ pub fn verify_credential(
     // Verify the group-key signature.
     let group_pk = ed_pubkey_from_hex(&cred.swarm_public_key)?;
     let sig = b64_decode(&cred.signature)?;
-    if !group_pk.verify(&cred_canonical_bytes(cred), &sig) {
-        return Err(MembershipError::BadSignature);
-    }
+    verify_with_alg(alg, &group_pk, &cred_canonical_bytes(cred), &sig)?;
     // `member_public_key` must be a real Ed25519 key (so a serve gate can derive its peer id). This
     // also rejects a credential whose member key can't map to any identity.
     ed_pubkey_from_hex(&cred.member_public_key)?;
@@ -870,6 +900,23 @@ mod tests {
         let other = libp2p::identity::Keypair::generate_ed25519();
         assert_ne!(fp, key_fingerprint(&pubkey_hex(&other)));
         assert_eq!(key_fingerprint("nothex"), "invalid-key");
+    }
+
+    #[test]
+    fn an_overlong_id_field_is_rejected() {
+        // Review #5: `member_openhydra_peer_id` / the `swarm_public_key` hint are bounded, so a
+        // self-signed request can't carry a multi-MB field that then persists + echoes into a credential.
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let mut req = EnrollmentRequest::new_unsigned(
+            "x".repeat(MAX_ID_LEN + 1),
+            "",
+            "ok",
+            issued(),
+        );
+        assert!(matches!(sign_enrollment_request(req, &member), Err(MembershipError::Malformed(_))));
+        // Overlong swarm hint likewise.
+        req = EnrollmentRequest::new_unsigned("oh_m", "a".repeat(MAX_ID_LEN + 1), "ok", issued());
+        assert!(matches!(sign_enrollment_request(req, &member), Err(MembershipError::Malformed(_))));
     }
 
     #[test]
