@@ -41,7 +41,7 @@ pub fn relay_reservation_addr(
         .with(libp2p::multiaddr::Protocol::P2pCircuit)
 }
 
-/// Known bootstrap relay servers (production Linode nodes).
+/// Known bootstrap relay servers (production nodes: 3 Linodes + netcup DE).
 pub const BOOTSTRAP_RELAYS: &[&str] = &[
     // US (Dallas) — IPv4 (keep for legacy nodes)
     "/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
@@ -49,12 +49,17 @@ pub const BOOTSTRAP_RELAYS: &[&str] = &[
     "/ip4/172.105.69.49/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT",
     // AP (Singapore) — IPv4 (keep for legacy nodes)
     "/ip4/172.104.164.98/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
+    // DE (netcup) — IPv4. 4th bootstrap since 2026-06-15; added to the relay pool
+    // 2026-08-28 so peers actually reserve/relay through it (was mesh-only before).
+    "/ip4/85.209.48.209/tcp/4001/p2p/12D3KooWHNQ9nMedT3ZaMjj4xX7Mf4dxmTZ3cAX3tnJfyERV9Bua",
     // US (Dallas) — IPv6
     "/ip6/2600:3c03::2000:68ff:fe81:55b0/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb",
     // EU (London) — IPv6
     "/ip6/2a01:7e01::2000:84ff:fec5:4520/tcp/4001/p2p/12D3KooWEzegXr4qcj37EWF2aQo9vp121MGrCaCwYcJF2oTkW3WT",
     // AP (Singapore) — IPv6
     "/ip6/2400:8901::2000:86ff:fe58:6d39/tcp/4001/p2p/12D3KooWPgqZBgLZ1f94AQ7sbeyEz5UJ4jiT4d3zuQp2t61VLPZo",
+    // DE (netcup) — IPv6
+    "/ip6/2a03:4000:41:ed1:384a:c3ff:fef1:2c58/tcp/4001/p2p/12D3KooWHNQ9nMedT3ZaMjj4xX7Mf4dxmTZ3cAX3tnJfyERV9Bua",
 ];
 
 /// IP addresses of the production bootstrap relay servers.
@@ -65,9 +70,11 @@ pub const BOOTSTRAP_RELAY_IPS: &[&str] = &[
     "45.79.190.172",   // US (Dallas) IPv4
     "172.105.69.49",   // EU (London) IPv4
     "172.104.164.98",  // AP (Singapore) IPv4
+    "85.209.48.209",   // DE (netcup) IPv4
     "2600:3c03::2000:68ff:fe81:55b0",   // US (Dallas) IPv6
     "2a01:7e01::2000:84ff:fec5:4520",   // EU (London) IPv6
     "2400:8901::2000:86ff:fe58:6d39",   // AP (Singapore) IPv6
+    "2a03:4000:41:ed1:384a:c3ff:fef1:2c58",   // DE (netcup) IPv6
 ];
 
 /// Check if an IP string matches a known bootstrap relay server.
@@ -664,6 +671,27 @@ mod tests {
     }
 
     #[test]
+    fn netcup_is_in_the_bootstrap_relay_pool() {
+        // R1 (2026-08-28): netcup (the DE 4th bootstrap, live since 2026-06-15) was
+        // part of the bootstrap gossip mesh but absent from BOOTSTRAP_RELAYS, so peers
+        // never reserved/relayed through it. It must now be a trusted relay peer id
+        // (v4 + v6 entries) and classified as a relay IP. Guards against a regression
+        // that drops it back to mesh-only.
+        let netcup: PeerId = "12D3KooWHNQ9nMedT3ZaMjj4xX7Mf4dxmTZ3cAX3tnJfyERV9Bua"
+            .parse()
+            .unwrap();
+        assert!(
+            bootstrap_relay_peer_ids().contains(&netcup),
+            "netcup peer id must be a trusted relay hop",
+        );
+        assert!(is_bootstrap_relay_ip("85.209.48.209"), "netcup v4 must classify as a relay IP");
+        assert!(
+            is_bootstrap_relay_ip("2a03:4000:41:ed1:384a:c3ff:fef1:2c58"),
+            "netcup v6 must classify as a relay IP",
+        );
+    }
+
+    #[test]
     fn ds5_accepts_circuit_through_a_trusted_relay_for_matching_target() {
         let relay = PeerId::random();
         let target = PeerId::random();
@@ -677,13 +705,15 @@ mod tests {
 
     #[test]
     fn ds5_accepts_runtime_configured_relay_not_in_hardcoded_ip_list() {
-        // Regression test for the netcup gap: a relay we use at runtime (in the
-        // trusted set via --bootstrap) is accepted even though its IP is nowhere
-        // in BOOTSTRAP_RELAYS — the whole point of keying on peer id.
-        let netcup = PeerId::random();
+        // A relay we use only at runtime (in the trusted set via --bootstrap) is
+        // accepted even though its IP is nowhere in BOOTSTRAP_RELAYS — the whole
+        // point of keying trust on peer id, not IP. (netcup used to be this case;
+        // it's now in BOOTSTRAP_RELAYS, so use a documentation IP that never is.)
+        let runtime_relay = PeerId::random();
         let target = PeerId::random();
-        let trusted: std::collections::HashSet<PeerId> = [netcup].into_iter().collect();
-        let addr = format!("/ip4/85.209.48.209/tcp/4001/p2p/{netcup}/p2p-circuit/p2p/{target}");
+        let trusted: std::collections::HashSet<PeerId> = [runtime_relay].into_iter().collect();
+        let addr =
+            format!("/ip4/203.0.113.7/tcp/4001/p2p/{runtime_relay}/p2p-circuit/p2p/{target}");
         assert!(safe_injectable_circuit_addr(&addr, &target, &trusted).is_some());
     }
 
