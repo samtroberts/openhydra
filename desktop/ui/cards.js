@@ -9,23 +9,43 @@ import { displayModelName } from "./models";
 
 const CARD_TTL_SECS = 30 * 24 * 3600; // 30 days
 
-// ── export: sign + show a card (magnet + JSON) for a globally-shared model ──
-export async function exportCardModal(model) {
+// ── export: sign + show a card (magnet + JSON). Public for a global model; private (swarm-bound,
+// M4) for a private one — the caller passes `isPrivate` and we resolve which owned swarm to bind. ──
+export async function exportCardModal(model, isPrivate = false) {
+  let swarm = null;
+  if (isPrivate) {
+    // A private card must name a swarm the user OWNS. Pick from owned swarms; guide them to Swarms if
+    // none. (One owned swarm → use it; several → ask.)
+    let owned = [];
+    try {
+      owned = (await call("list_swarms")).filter((s) => s.role === "owner");
+    } catch {}
+    if (!owned.length) {
+      toast("Create a swarm first (Swarms tab) — a private card is bound to a swarm you own");
+      return;
+    }
+    swarm = owned.length === 1 ? owned[0].swarm_public_key : await pickSwarm(owned);
+    if (!swarm) return; // cancelled
+  }
   let out;
   try {
-    out = await call("export_card", { model, ttl_secs: CARD_TTL_SECS, region: null });
+    out = await call("export_card", { model, ttl_secs: CARD_TTL_SECS, region: null, swarm });
   } catch (e) {
     toast(`Export failed: ${e}`);
     return;
   }
   const { card, magnet } = out;
   const json = JSON.stringify(card, null, 2);
+  const priv = !!card.swarm_public_key;
+  const blurb = priv
+    ? `Send this to a swarm member and they can add your model — connecting to you directly. It's a <b>private</b> card: only a member of your swarm can actually serve from it (others are refused). Signed, carries no secret, expires in 30 days.`
+    : `Send this to someone and they can add your model to their OpenHydra — connecting to you directly, no discovery needed. It's signed, carries no secret, and expires in 30 days.`;
   const back = document.createElement("div");
   back.className = "cmodal-back";
   back.innerHTML =
-    `<div class="cmodal" style="max-width:560px"><div class="cmodal-h"><b>Share “${escapeHtml(displayModelName(model))}” as a card</b></div>` +
+    `<div class="cmodal" style="max-width:560px"><div class="cmodal-h"><b>Share “${escapeHtml(displayModelName(model))}” as a ${priv ? "private " : ""}card</b></div>` +
     `<div class="cmodal-b">` +
-      `<div class="cmodal-path">Send this to someone and they can add your model to their OpenHydra — connecting to you directly, no discovery needed. It's signed, carries no secret, and expires in 30 days.</div>` +
+      `<div class="cmodal-path">${blurb}</div>` +
       `<label class="mut" style="font-size:11px;margin-top:10px;display:block">Magnet string</label>` +
       `<textarea class="input mono cardmagnet" rows="3" readonly style="width:100%;font-size:10.5px">${escapeHtml(magnet)}</textarea>` +
     `</div>` +
@@ -35,6 +55,31 @@ export async function exportCardModal(model) {
   $(".ccopymag", back).onclick = () => { navigator.clipboard?.writeText(magnet); toast("Card copied — send it to add your model"); close(); };
   $(".ccopyjson", back).onclick = () => { navigator.clipboard?.writeText(json); toast("Card JSON copied"); };
   back.onclick = (e) => { if (e.target === back) close(); };
+}
+
+// Choose which owned swarm a private card binds to (when the user owns more than one). Resolves to a
+// swarm_public_key, or null if cancelled.
+function pickSwarm(owned) {
+  return new Promise((resolve) => {
+    const back = document.createElement("div");
+    back.className = "cmodal-back";
+    back.innerHTML =
+      `<div class="cmodal" style="max-width:460px"><div class="cmodal-h"><b>Which swarm is this card for?</b></div>` +
+      `<div class="cmodal-b"><div class="cmodal-path">Only members of the swarm you pick will be able to serve from this card.</div>` +
+      owned
+        .map(
+          (s) =>
+            `<button class="btn outline sm pickswarm" data-pk="${escapeHtml(s.swarm_public_key)}" style="display:block;width:100%;text-align:left;margin-top:8px">` +
+            `<b>${escapeHtml(s.label || "Swarm")}</b> <span class="mut mono" style="font-size:10.5px">${escapeHtml(s.fingerprint)}</span></button>`,
+        )
+        .join("") +
+      `</div><div class="cmodal-f"><button class="btn ghost sm pickcancel">Cancel</button></div></div>`;
+    document.body.appendChild(back);
+    const done = (v) => { back.remove(); resolve(v); };
+    $$(".pickswarm", back).forEach((b) => (b.onclick = () => done(b.dataset.pk)));
+    $(".pickcancel", back).onclick = () => done(null);
+    back.onclick = (e) => { if (e.target === back) done(null); };
+  });
 }
 
 // ── M2.1: launch-on-open. A double-clicked `.openhydra` file or an `openhydra:` magnet link opens
@@ -155,10 +200,15 @@ function cardPreviewHtml(c) {
   const price =
     c.pricing_mode === "paid" ? "paid" : c.pricing_mode === "ad_supported" ? "ad-supported" : "free (reciprocal)";
   const region = c.region ? `${escapeHtml(c.region)} · ` : "";
+  // M4: a swarm-bound card is private — serving needs a membership credential for that swarm.
+  const priv = c.swarm_public_key
+    ? ` <span class="badge secondary" title="Private — you must be a member of this swarm to serve from it">🔒 private</span>`
+    : "";
   return (
     `<div class="card pad" style="font-size:11.5px">` +
-    `<div><b>${escapeHtml(displayModelName(c.model_id))}</b> <span class="badge ok">✔ signature valid</span></div>` +
+    `<div><b>${escapeHtml(displayModelName(c.model_id))}</b> <span class="badge ok">✔ signature valid</span>${priv}</div>` +
     `<div class="mut" style="margin-top:4px">provider ${escapeHtml(peerShort(c.libp2p_peer_id))} · ${escapeHtml(price)} · ${region}expires ${escapeHtml(exp)}</div>` +
+    (c.swarm_public_key ? `<div class="mut" style="margin-top:2px">swarm ${escapeHtml(peerShort(c.swarm_public_key))} — you'll serve from it only if you're a member</div>` : "") +
     (c.canonical_id ? `<div class="mut" style="margin-top:2px">${escapeHtml(c.canonical_id)}</div>` : "") +
     `</div>`
   );

@@ -558,6 +558,18 @@ impl CredentialStore {
         let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         c.creds.iter().find(|cr| now_ms < cr.expires_at).cloned()
     }
+
+    /// The live credential for a SPECIFIC swarm (hex group public key) — used when a private card
+    /// names the swarm its provider gates on, so a multi-swarm member presents the RIGHT credential.
+    /// `None` if we hold no live credential for that swarm.
+    pub fn credential_for_swarm(&self, swarm_public_key: &str, now_ms: u64) -> Option<MembershipCredential> {
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.creds
+            .iter()
+            .find(|cr| now_ms < cr.expires_at && cr.swarm_public_key == swarm_public_key)
+            .cloned()
+    }
 }
 
 // ── M4-base: owner-side serve-gate authorizer ──

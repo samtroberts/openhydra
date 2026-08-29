@@ -298,10 +298,11 @@ import { exportCardModal, ensureImportSection } from "./cards";
           + `<button class="rp ${gl ? "sel" : ""}" data-reach="${escapeHtml(m)}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button>`
           + `</span>`
         : "";
-      // M2: export a signed `.openhydra` card — only for a globally-shared model (a card is a public
-      // pointer, so the export gate refuses anything else anyway).
-      const cardBtn = (sharedIntent && gl)
-        ? `<button class="cardbtn" data-export-card="${escapeHtml(m)}" title="Export a signed .openhydra card — share a link to this model">🔗</button>`
+      // M2/M4: export a signed `.openhydra` card. A GLOBAL model → a public card (a link anyone can
+      // use). A PRIVATE model (M4) → a private card bound to a swarm you own (only members can serve
+      // from it). Shown for any shared model; the private branch prompts for the swarm.
+      const cardBtn = sharedIntent
+        ? `<button class="cardbtn" data-export-card="${escapeHtml(m)}" data-private="${gl ? "0" : "1"}" title="${gl ? "Export a public .openhydra card — a link to this model" : "Export a private .openhydra card for a swarm — only members can serve from it"}">🔗</button>`
         : "";
       rows.push(`<tr><td>${modelIcon(m)}<b title="${escapeHtml(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${escapeHtml(m)}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
     }
@@ -346,8 +347,9 @@ import { exportCardModal, ensureImportSection } from "./cards";
     // Reach pill: each segment declares its target scope; clicking the active one is a no-op (guarded
     // in setModelScope), clicking Global opens the consent gate. The whole segment is the hit target.
     $$("#servetable [data-reach]").forEach((b) => b.onclick = () => setModelScope(b.dataset.reach, b.dataset.to));
-    // M2: export a `.openhydra` card for a globally-shared model.
-    $$("#servetable [data-export-card]").forEach((b) => b.onclick = () => exportCardModal(b.dataset.exportCard));
+    // M2/M4: export a `.openhydra` card — public for a global model, or private (swarm-bound) for a
+    // private one.
+    $$("#servetable [data-export-card]").forEach((b) => b.onclick = () => exportCardModal(b.dataset.exportCard, b.dataset.private === "1"));
     // M2: build the "Add a model by card" import section once (persists across status refreshes).
     ensureImportSection();
     // incoming strip

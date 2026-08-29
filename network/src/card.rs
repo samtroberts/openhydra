@@ -21,9 +21,14 @@ use serde::{Deserialize, Serialize};
 
 use openhydra_protocol::crypto_agility::SigAlg;
 
-/// The schema version new cards are written at. A verifier rejects a card from a *newer* schema it
-/// can't fully validate rather than trusting fields it doesn't understand.
-pub const CARD_SCHEMA_VERSION: u32 = 1;
+/// The highest card schema version this build understands. A verifier rejects a card from a *newer*
+/// schema rather than trusting fields it doesn't understand. Cards are written at the LOWEST schema
+/// that fits: a plain public card stays `1` (readable by every older client); a **private** card that
+/// carries a `swarm_public_key` binding (M4) is written at `2`, so an older client — which couldn't
+/// honour the swarm gate anyway — cleanly rejects it as an unsupported schema.
+pub const CARD_SCHEMA_VERSION: u32 = 2;
+/// The schema a card with a swarm binding (a private card) is written at.
+const CARD_SCHEMA_PRIVATE: u32 = 2;
 
 /// Domain-separation header for the signing preimage (bumped with any preimage layout change, so a
 /// signature can never be replayed across card versions or against another OpenHydra signed type).
@@ -141,6 +146,15 @@ pub struct Card {
     /// Multiaddr hints (NON-authoritative — the truth is resolved live by `libp2p_peer_id`).
     #[serde(default)]
     pub addr_hints: Vec<String>,
+
+    /// M4: swarm binding. Empty ⇒ a public/global card (anyone may route to it). Non-empty ⇒ this is
+    /// a **private** card for a swarm-gated model: the hex group public key of the swarm the provider
+    /// serves it to. An importer treats the model as private (the provider refuses it without a
+    /// membership credential) and presents the credential for *this* swarm. A card carrying it is
+    /// written at schema `2` (older clients, which can't honour the gate, reject it). NOT a secret —
+    /// the group *public* key only. Signed like every other field.
+    #[serde(default)]
+    pub swarm_public_key: String,
 
     // ── freshness + tamper-evidence ──
     pub signed_at: u64,
@@ -284,11 +298,23 @@ fn card_is_wellformed(card: &Card) -> Result<(), CardError> {
         card.capability.params.as_str(),
         card.region.as_deref().unwrap_or(""),
         card.rate_card.as_ref().map(|r| r.unit.as_str()).unwrap_or(""),
+        card.swarm_public_key.as_str(),
     ];
     for s in scalars {
         if s.contains('\n') {
             return Err(CardError::Malformed(format!("field contains a newline: {s:?}")));
         }
+    }
+    // A swarm binding, when present, must be a 64-hex group public key (so an importer can derive its
+    // fingerprint / match a held credential); reject anything else rather than sign a junk binding.
+    if !card.swarm_public_key.is_empty()
+        && !(card.swarm_public_key.len() == 64
+            && card.swarm_public_key.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(CardError::Malformed(format!(
+            "swarm_public_key must be 64 hex chars: {:?}",
+            card.swarm_public_key
+        )));
     }
     for m in &card.capability.modalities {
         if m.contains(',') || m.contains('\n') {
@@ -311,7 +337,7 @@ pub fn card_canonical_bytes(c: &Card) -> Vec<u8> {
         Some(r) => (r.in_per_mtok, r.out_per_mtok, r.unit.as_str()),
         None => (0, 0, ""),
     };
-    format!(
+    let mut s = format!(
         "{CARD_DOMAIN}\nsig_alg={}\nschema_version={}\n\
          openhydra_peer_id={}\nlibp2p_peer_id={}\npublic_key={}\n\
          model_id={}\ncanonical_id={}\nweight_hash={}\n\
@@ -342,8 +368,14 @@ pub fn card_canonical_bytes(c: &Card) -> Vec<u8> {
         c.addr_hints.join(","),
         c.signed_at,
         c.expires_at,
-    )
-    .into_bytes()
+    );
+    // Schema-2 field, appended ONLY for schema >= 2 so a schema-1 card's preimage is byte-identical
+    // to what it was signed with (older/plain cards keep verifying). A private card (schema 2) binds
+    // its swarm into the signature here.
+    if c.schema_version >= CARD_SCHEMA_PRIVATE {
+        s.push_str(&format!("\nswarm_public_key={}", c.swarm_public_key));
+    }
+    s.into_bytes()
 }
 
 /// Sign a card with `keypair`, populating `public_key`, `libp2p_peer_id`, `sig_alg`, and `signature`
@@ -360,6 +392,10 @@ pub fn sign_card(
     card.public_key = hex::encode(ed.to_bytes());
     card.libp2p_peer_id = libp2p::PeerId::from_public_key(&keypair.public()).to_string();
     card.sig_alg = SigAlg::Ed25519.to_u8();
+    // A card carrying a swarm binding is a schema-2 (private) card; a plain card stays schema 1 so
+    // older clients keep reading it. Set this BEFORE the preimage is built (the schema is signed, and
+    // it decides whether the swarm line is part of the preimage).
+    card.schema_version = if card.swarm_public_key.is_empty() { 1 } else { CARD_SCHEMA_PRIVATE };
     // Never sign a card that would leak a path/username (defence: the caller should already pass a
     // clean handle, but the signature makes the leak permanent + re-shareable, so gate here too).
     card_is_privacy_safe(&card)?;
@@ -446,11 +482,18 @@ impl Card {
             aup_flags: AupFlags::default(),
             region: None,
             addr_hints: Vec::new(),
+            swarm_public_key: String::new(),
             signed_at,
             expires_at,
             sig_alg: default_sig_alg(),
             signature: String::new(),
         }
+    }
+
+    /// Whether this is a private (swarm-gated) card — the provider will refuse the model without a
+    /// membership credential for [`Self::swarm_public_key`].
+    pub fn is_private(&self) -> bool {
+        !self.swarm_public_key.is_empty()
     }
 
     /// Pretty JSON for a `.openhydra` file.
@@ -503,11 +546,17 @@ mod tests {
             aup_flags: AupFlags::default(),
             region: Some("in".into()),
             addr_hints: vec!["/ip4/1.2.3.4/tcp/4111".into()],
+            swarm_public_key: String::new(),
             signed_at: 1_700_000_000_000,
             expires_at: 1_800_000_000_000,
             sig_alg: default_sig_alg(),
             signature: String::new(),
         }
+    }
+
+    // A valid 64-hex group public key for private-card tests.
+    fn a_swarm_key() -> String {
+        "a".repeat(64)
     }
 
     fn now_before_expiry() -> u64 {
@@ -580,14 +629,62 @@ mod tests {
 
     #[test]
     fn a_newer_schema_is_rejected() {
+        // `sign_card` now sets the schema itself (1 plain / 2 private), so hand-sign a card claiming a
+        // future schema (bypassing that) to prove verify rejects it.
         let kp = libp2p::identity::Keypair::generate_ed25519();
         let mut c = a_card();
         c.schema_version = CARD_SCHEMA_VERSION + 1;
-        let signed = sign_card(c, &kp).unwrap();
+        let ed = kp.public().try_into_ed25519().unwrap();
+        c.public_key = hex::encode(ed.to_bytes());
+        c.libp2p_peer_id = libp2p::PeerId::from_public_key(&kp.public()).to_string();
+        c.sig_alg = SigAlg::Ed25519.to_u8();
+        c.signature = b64_encode(&kp.sign(&card_canonical_bytes(&c)).unwrap());
         assert_eq!(
-            verify_card(&signed, now_before_expiry()).unwrap_err(),
+            verify_card(&c, now_before_expiry()).unwrap_err(),
             CardError::UnsupportedSchema(CARD_SCHEMA_VERSION + 1)
         );
+    }
+
+    #[test]
+    fn a_private_card_binds_its_swarm_at_schema_2() {
+        // A card with a swarm binding is signed at schema 2, is_private() is true, and the binding is
+        // covered by the signature (tampering it breaks verification).
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut c = a_card();
+        c.swarm_public_key = a_swarm_key();
+        let signed = sign_card(c, &kp).unwrap();
+        assert_eq!(signed.schema_version, 2, "a swarm-bound card is schema 2");
+        assert!(signed.is_private());
+        let v = verify_card(&signed, now_before_expiry()).unwrap();
+        assert_eq!(v.card.swarm_public_key, a_swarm_key());
+        // Tamper the swarm binding after signing → the signature no longer verifies.
+        let mut t = signed.clone();
+        t.swarm_public_key = "b".repeat(64);
+        assert_eq!(verify_card(&t, now_before_expiry()).unwrap_err(), CardError::BadSignature);
+        // Round-trips through JSON + magnet.
+        assert!(verify_card(&Card::from_json(&signed.to_json().unwrap()).unwrap(), now_before_expiry()).is_ok());
+        assert!(verify_card(&Card::from_magnet(&signed.to_magnet().unwrap()).unwrap(), now_before_expiry()).is_ok());
+    }
+
+    #[test]
+    fn a_plain_card_stays_schema_1_and_is_not_private() {
+        // No swarm binding ⇒ schema 1 (older clients keep reading it), is_private() false, and the
+        // preimage has NO swarm line (a schema-1 signature is byte-identical to the pre-M4 layout).
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let signed = sign_card(a_card(), &kp).unwrap();
+        assert_eq!(signed.schema_version, 1);
+        assert!(!signed.is_private());
+        assert!(!String::from_utf8(card_canonical_bytes(&signed)).unwrap().contains("swarm_public_key"));
+    }
+
+    #[test]
+    fn a_junk_swarm_binding_is_refused() {
+        // A non-hex / wrong-length swarm binding is rejected on sign (keeps a private card's binding a
+        // real group key an importer can use).
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut c = a_card();
+        c.swarm_public_key = "not-a-key".into();
+        assert!(matches!(sign_card(c, &kp), Err(CardError::Malformed(_))));
     }
 
     #[test]

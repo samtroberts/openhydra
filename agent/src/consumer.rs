@@ -60,6 +60,9 @@ pub struct SelectedProvider {
     pub public_key: String,
     /// The model id the provider serves.
     pub model_id: String,
+    /// M4: the swarm (hex group public key) this candidate is gated on, when it came from a private
+    /// card — the consumer presents the matching credential on this route. `""` for a public route.
+    pub swarm_public_key: String,
 }
 
 // Per-provider attempt budget for the (buffered) serve round-trip — see [`attempt_timeout`].
@@ -218,6 +221,7 @@ pub fn rank_providers_with_reputation(
                     peer_id: p.peer_id.clone(),
                     public_key: p.public_key.clone(),
                     model_id: p.model_id.clone(),
+                    swarm_public_key: p.swarm_public_key.clone(),
                 })
         })
         .collect();
@@ -915,10 +919,18 @@ impl ConsumerNode {
                 tools: tools.to_vec(),
                 think,
                 nonce,
-                // M4-base: present our swarm membership credential so a provider will serve its
-                // private (swarm-scoped) model. A global provider ignores it; a private one verifies
-                // it and binds it to our peer id. `None` when we hold no live credential.
-                credential: self.creds.as_ref().and_then(|c| c.credential_for(now_unix_ms())),
+                // M4-base: present our swarm membership credential ONLY on a private route — a
+                // candidate that came from a private card names the swarm it's gated on
+                // (`provider.swarm_public_key`), and we attach the matching credential. This both
+                // reaches the private model AND avoids leaking swarm membership to public/global
+                // providers (we never attach a credential to a public serve). `None` otherwise.
+                credential: if provider.swarm_public_key.is_empty() {
+                    None
+                } else {
+                    self.creds
+                        .as_ref()
+                        .and_then(|c| c.credential_for_swarm(&provider.swarm_public_key, now_unix_ms()))
+                },
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big

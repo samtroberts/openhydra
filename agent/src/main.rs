@@ -185,6 +185,13 @@ struct CardExportArgs {
     /// Optional region hint (e.g. "in", "us").
     #[arg(long)]
     region: Option<String>,
+    /// M4: export a PRIVATE card bound to this swarm (hex group public key). The model must be shared
+    /// with reach Private and you must own the swarm (`--swarms-dir`). Omit for a public card.
+    #[arg(long = "swarm")]
+    swarm: Option<String>,
+    /// M4: swarms directory (`~/.openhydra/swarms/`), to confirm you own the `--swarm` you're binding.
+    #[arg(long = "swarms-dir")]
+    swarms_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Copy, Clone, clap::ValueEnum)]
@@ -594,6 +601,8 @@ fn run() -> Result<(), String> {
                         a.region,
                         &config.identity_path,
                         now_ms,
+                        a.swarm,
+                        a.swarms_dir,
                     )?;
                     println!(
                         "{}",

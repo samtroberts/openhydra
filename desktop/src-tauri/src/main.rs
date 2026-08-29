@@ -979,14 +979,17 @@ fn provider_peer_id() -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-/// M2: export a signed `.openhydra` card for a shared model. Shells to the agent's `card export`
-/// (loads the provider identity, detects the model, enforces the global-share/consent gate, signs) —
-/// stable, no swarm, like `provider_peer_id`. Returns `{ card, magnet }` for the UI to save/copy.
+/// M2/M4: export a signed `.openhydra` card for a shared model. Shells to the agent's `card export`
+/// (loads the provider identity, detects the model, enforces the reach/consent gate, signs). With
+/// `swarm` set (M4) it exports a PRIVATE card bound to that owned swarm; otherwise a public card.
+/// Returns `{ card, magnet }` for the UI to save/copy. The identity is `desktop-provider.key` — the
+/// key the provider serves with, which the private serve gate authorizes members against.
 #[tauri::command]
 fn export_card(
     model: String,
     ttl_secs: Option<u64>,
     region: Option<String>,
+    swarm: Option<String>,
 ) -> Result<openhydra_agent::CardExport, String> {
     let bin = agent_binary().ok_or_else(|| {
         "openhydra-agent binary not found (bundle missing its sidecar, or no dev build)".to_string()
@@ -1005,6 +1008,11 @@ fn export_card(
         .arg(ttl_secs.unwrap_or(30 * 24 * 3600).to_string());
     if let Some(r) = region.filter(|r| !r.is_empty()) {
         cmd.arg("--region").arg(r);
+    }
+    // M4: a private card names the swarm it's gated on + points the export at the swarms dir (to
+    // confirm ownership).
+    if let Some(pk) = swarm.filter(|s| !s.is_empty()) {
+        cmd.arg("--swarm").arg(pk).arg("--swarms-dir").arg(swarms_dir());
     }
     let out = cmd.output().map_err(|e| format!("run card export: {e}"))?;
     if !out.status.success() {

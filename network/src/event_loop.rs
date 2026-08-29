@@ -3694,6 +3694,8 @@ fn record_to_discovered(r: &PeerRecord) -> DiscoveredPeer {
         // R-DHT-8: liveness is stamped by `maybe_reply_discover` (which has the
         // live connection table); default false here.
         connected: false,
+        // A public (DHT) discovery is never a private-swarm route.
+        swarm_public_key: String::new(),
     }
 }
 

@@ -25,10 +25,11 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       ? gc[m] != null                                   // explicit Global → per-model consent
       : (pol.default_global_consent ?? null) != null;   // default Global → policy-level consent
   }
-  // A plausible verified card for the browser mock (the real one is signed by the agent).
-  function mockCard(model) {
+  // A plausible verified card for the browser mock (the real one is signed by the agent). A non-empty
+  // `swarm` makes it a private (M4, schema 2) card.
+  function mockCard(model, swarm) {
     return {
-      schema_version: 1,
+      schema_version: swarm ? 2 : 1,
       openhydra_peer_id: "oh_mockcard",
       libp2p_peer_id: "12D3KooWMockCardProvider99xyzABCDEF",
       public_key: "00".repeat(32),
@@ -41,6 +42,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       aup_flags: { uncensored: false, nsfw: false },
       region: "us",
       addr_hints: [],
+      swarm_public_key: swarm || "",
       signed_at: 1787000000000,
       expires_at: 1787000000000 + 30 * 24 * 3600 * 1000,
       sig_alg: 1,
@@ -57,14 +59,17 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "read_share_policy") return mk.sharePolicy || { version: 1, mode: "all", models: [] };
     if (cmd === "reset_share_policy") { mk.sharePolicy = { version: 1, mode: "list", models: [] }; return null; }
     // ── M2 `.openhydra` cards (mock) ──
-    if (cmd === "export_card") { const model = args?.model || "qwen3:1.7b"; return { card: mockCard(model), magnet: "openhydra:card:" + btoa("mock-card:" + model) }; }
+    if (cmd === "export_card") { const model = args?.model || "qwen3:1.7b"; const sw = args?.swarm || ""; return { card: mockCard(model, sw), magnet: "openhydra:card:" + (sw ? "priv." : "") + btoa("mock-card:" + model) }; }
+    // A private-card magnet (from a private export) previews/imports as a swarm-bound card so the UI
+    // shows the 🔒 badge; a plain magnet stays public.
+    const mockRemoteCard = (t) => mockCard("granite4.1:3b", /card:priv\./.test(t || "") ? "f".repeat(64) : "");
     if (cmd === "preview_card") {
       const t = (args?.input || "").trim();
       if (!(t.startsWith("openhydra:card:") || t.startsWith("{"))) return Promise.reject("card crypto error: not an openhydra:card: string");
-      return mockCard("granite4.1:3b"); // a pretend remote model
+      return mockRemoteCard(t);
     }
     if (cmd === "import_card") {
-      const c = mockCard("granite4.1:3b");
+      const c = mockRemoteCard((args?.input || ""));
       mk.importedCards = (mk.importedCards || []).filter((x) => !(x.libp2p_peer_id === c.libp2p_peer_id && x.model_id === c.model_id));
       mk.importedCards.push(c);
       return c;

@@ -189,6 +189,11 @@ pub struct DiscoveredPeer {
     /// decode to `false`.
     #[serde(default)]
     pub connected: bool,
+    /// M4: when this candidate came from a **private** `.openhydra` card, the swarm (hex group public
+    /// key) the provider gates the model on. The consumer presents the credential for THIS swarm and
+    /// attaches it only on such private routes. `""` for a public discovery/registry/card candidate.
+    #[serde(default)]
+    pub swarm_public_key: String,
 }
 
 impl PeerRecord {

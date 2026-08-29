@@ -31,6 +31,7 @@ pub fn build_card(
     ttl_secs: u64,
     pricing: PricingMode,
     region: Option<String>,
+    swarm_public_key: Option<String>,
 ) -> Card {
     let expires_at = signed_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
     let mut card = Card::new_unsigned(
@@ -48,13 +49,20 @@ pub fn build_card(
     };
     card.pricing_mode = pricing;
     card.region = region;
+    // M4: a swarm binding makes this a private card (the model is served only to a member of this
+    // swarm). `sign_card` promotes it to schema 2.
+    if let Some(pk) = swarm_public_key.filter(|s| !s.is_empty()) {
+        card.swarm_public_key = pk;
+    }
     card
 }
 
-/// Run the `card export` subcommand: load the identity, detect `model` on a local engine, refuse
-/// unless it is globally shared (consented) per the share policy — a card is a **public** pointer, so
-/// a private/device or un-shared model must never be exported — then build + sign the card and return
-/// it with its magnet string. `now_ms` is injected (no hidden clock). No swarm needed.
+/// Run the `card export` subcommand: load the identity, detect `model` locally, run the reach gate,
+/// then build + sign the card. Two modes: a PUBLIC card (no `--swarm`) requires the model to be
+/// Global + consented; a PRIVATE card (`--swarm <pk>`, M4) requires the model to be shared with reach
+/// Private and the node to OWN that swarm (`--swarms-dir`), so the card names the swarm its provider
+/// gates on. `now_ms` is injected (no hidden clock).
+#[allow(clippy::too_many_arguments)]
 pub fn run_export(
     model: &str,
     share_policy_file: Option<PathBuf>,
@@ -63,16 +71,17 @@ pub fn run_export(
     region: Option<String>,
     identity_path: &Path,
     now_ms: u64,
+    swarm_public_key: Option<String>,
+    swarms_dir: Option<PathBuf>,
 ) -> Result<CardExport, String> {
     // Export gate, part 1 — fail-closed without a policy file (checked FIRST so it fails fast and is
     // testable without a live engine). Review fix (MODERATE): previously `None` fell back to
     // `share_all()`, so `card export --model X` with the flag omitted would export a model the user
-    // had marked private. A card is a public descriptor, so refuse unless the policy confirms the
-    // model is meant to be global. (The desktop always passes --share-policy-file.)
+    // had marked private. A card carries reach, so refuse unless the policy confirms the model's reach.
     let policy_file = share_policy_file.ok_or_else(|| {
         format!(
-            "refusing to export {model:?} without --share-policy-file — a card is a public \
-             descriptor, so pass the share-policy file to run the global-share/consent gate"
+            "refusing to export {model:?} without --share-policy-file — pass the share-policy file to \
+             run the reach/consent gate"
         )
     })?;
     let policy = crate::share_policy::SharePolicy::load(&policy_file)
@@ -91,15 +100,48 @@ pub fn run_export(
             format!("model {model:?} is not detected on any local engine — start the engine that serves it, then retry")
         })?;
 
-    // Export gate, part 2 — only a globally-shared, consented model may become a public card.
-    if !policy.announce_globally(&detected.engine_ref) {
-        return Err(format!(
-            "model {model:?} is not shared to the global network (or its global-publish consent is missing) — \
-             a card is a public descriptor, so set the model's reach to Global first"
-        ));
-    }
+    // Export gate, part 2 — reach-dependent:
+    let swarm_binding = match swarm_public_key.filter(|s| !s.is_empty()) {
+        // M4 PRIVATE card: bind to a swarm. The model must be shared + Private (not a public model),
+        // and we must OWN that swarm — the provider's serve gate only authorizes credentials for
+        // swarms it owns, so a card naming a swarm we don't own would be unusable. Verified against
+        // the swarms dir.
+        Some(pk) => {
+            if !policy.is_shared(&detected.engine_ref) {
+                return Err(format!("model {model:?} is not shared, so it can't be exported"));
+            }
+            if policy.scope_of(&detected.engine_ref) != crate::share_policy::Scope::Private {
+                return Err(format!(
+                    "model {model:?} is not Private — a swarm-bound card is for a private model; set \
+                     its reach to Private first (or export a public card without --swarm)"
+                ));
+            }
+            let dir = swarms_dir.ok_or_else(|| {
+                "a swarm-bound card needs --swarms-dir to confirm you own the swarm".to_string()
+            })?;
+            match crate::swarms::read_swarm(&dir, &pk)? {
+                Some(rec) if rec.role == crate::swarms::SwarmRole::Owner => {}
+                _ => {
+                    return Err(format!(
+                        "you don't own swarm {pk} — only a swarm's owner can issue a card for it"
+                    ))
+                }
+            }
+            Some(pk)
+        }
+        // PUBLIC card: only a globally-shared, consented model may become one.
+        None => {
+            if !policy.announce_globally(&detected.engine_ref) {
+                return Err(format!(
+                    "model {model:?} is not shared to the global network (or its global-publish consent \
+                     is missing) — set the model's reach to Global, or pass --swarm to export a private card"
+                ));
+            }
+            None
+        }
+    };
 
-    let card = build_card(detected, &id.openhydra_peer_id, now_ms, ttl_secs, pricing, region);
+    let card = build_card(detected, &id.openhydra_peer_id, now_ms, ttl_secs, pricing, region, swarm_binding);
     let signed = sign_card(card, &id.keypair).map_err(|e| e.to_string())?;
     let magnet = signed.to_magnet().map_err(|e| e.to_string())?;
     Ok(CardExport { card: signed, magnet })
@@ -134,6 +176,9 @@ pub fn card_to_discovered(card: &Card) -> DiscoveredPeer {
         canonical_model_id: card.canonical_id.clone(),
         context_length: card.capability.context_length,
         max_output_tokens: card.capability.max_output_tokens,
+        // M4: a private card carries its swarm binding through to routing, so the consumer presents
+        // the matching credential (and only on this private route).
+        swarm_public_key: card.swarm_public_key.clone(),
         ..Default::default()
     }
 }
@@ -259,13 +304,25 @@ mod tests {
     #[test]
     fn build_card_maps_fields_and_computes_expiry() {
         let m = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b");
-        let c = build_card(&m, "oh_abc", 1_000, 3600, PricingMode::Reciprocal, Some("in".into()));
+        let c = build_card(&m, "oh_abc", 1_000, 3600, PricingMode::Reciprocal, Some("in".into()), None);
         assert_eq!(c.openhydra_peer_id, "oh_abc");
         assert_eq!(c.model_id, "qwen3:1.7b");
         assert_eq!(c.canonical_id, "qwen3/1.7b/int4/deadbeef");
         assert_eq!(c.capability.params, "1.7b");
         assert_eq!(c.region.as_deref(), Some("in"));
         assert_eq!(c.expires_at, 1_000 + 3600 * 1000);
+    }
+
+    #[test]
+    fn build_card_with_a_swarm_binding_is_private() {
+        let m = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b");
+        let pk = "a".repeat(64);
+        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, Some(pk.clone()));
+        assert_eq!(c.swarm_public_key, pk);
+        assert!(c.is_private());
+        // No binding → public.
+        let pubc = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        assert!(!pubc.is_private());
     }
 
     #[test]
@@ -276,7 +333,7 @@ mod tests {
             "qwen3/1.7b/int4/deadbeef",
             "1.7b",
         );
-        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None);
+        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
         assert_eq!(c.model_id, "Qwen3-1.7B-Q4_K_M");
         assert!(!c.model_id.contains('/') && !c.model_id.to_ascii_lowercase().contains(".gguf"));
         // The card would pass the sign-side privacy gate.
@@ -370,7 +427,7 @@ mod tests {
         // Review fix (MODERATE): fail-closed — no --share-policy-file must NOT fall back to share-all
         // (which would export a private model). Checked before detection, so no live engine needed.
         let dir = tempfile::tempdir().unwrap();
-        let err = run_export("qwen3:1.7b", None, 60, PricingMode::Reciprocal, None, &dir.path().join("id.key"), 1_000)
+        let err = run_export("qwen3:1.7b", None, 60, PricingMode::Reciprocal, None, &dir.path().join("id.key"), 1_000, None, None)
             .unwrap_err();
         assert!(err.contains("--share-policy-file"), "got: {err}");
     }
