@@ -17,6 +17,9 @@ pub mod dht;
 pub mod event_loop;
 pub mod identity;
 pub mod mdns;
+/// Swarm membership credentials (M3): a group keypair whose owner signs credentials over member
+/// public keys — the "private key for private sharing" crypto core. Sibling of [`card`].
+pub mod membership;
 pub mod nat;
 pub mod node;
 pub mod pcp;
