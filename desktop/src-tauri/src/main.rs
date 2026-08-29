@@ -897,6 +897,9 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let policy_path = ensure_valid_share_policy(&settings, &state.share_policy_reset);
     sub.push("--share-policy-file".into());
     sub.push(policy_path.to_string_lossy().into_owned());
+    // M4-base: gate Private-scope models on swarm membership (owner-side authorizer reads this dir).
+    sub.push("--swarms-dir".into());
+    sub.push(swarms_dir().to_string_lossy().into_owned());
     spawn_role(
         &state.provider,
         "desktop-provider.key",
@@ -1158,9 +1161,13 @@ fn swarms_dir() -> PathBuf {
     openhydra_dir().join("swarms")
 }
 
-/// The node identity swarm operations sign/bind with (same key as the provider + card export).
+/// The node identity swarm membership binds to. This MUST be the identity that dials OUT to consume,
+/// i.e. the gateway/**consumer** key — a credential is bound to the member's peer id and checked
+/// against the connection's authenticated peer id at the provider's serve gate (M4-base). Enrolling
+/// with the consumer key means the credential the gateway later presents matches the peer it connects
+/// as. (Swarm *ownership* — create/approve/revoke — uses the group key, independent of this.)
 fn swarm_identity_path() -> PathBuf {
-    openhydra_dir().join("desktop-provider.key")
+    openhydra_dir().join("desktop-consumer.key")
 }
 
 /// Serializes the read-modify-write of a swarm file across this process's swarm commands (approve +
@@ -1284,6 +1291,10 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // discovery). Hot-reloaded, so a card imported while the gateway runs takes effect immediately.
     sub.push("--cards-file".into());
     sub.push(cards_file_path().to_string_lossy().into_owned());
+    // M4-base: present a held swarm membership credential so a private (swarm-scoped) provider serves
+    // us. The credential is bound to this same `desktop-consumer.key` (see `swarm_identity_path`).
+    sub.push("--swarms-dir".into());
+    sub.push(swarms_dir().to_string_lossy().into_owned());
     spawn_role(
         &state.gateway,
         "desktop-consumer.key",

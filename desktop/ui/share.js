@@ -102,10 +102,11 @@ import { exportCardModal, ensureImportSection } from "./cards";
   // any unknown value collapse to the Private presentation. `isGlobal` is the one enforced distinction.
   const isGlobal = (m) => effectiveScope(m) === "global";
   // Binary picker offers Private ↔ Global only. A legacy `device` value still READS/round-trips (it
-  // collapses to the Private presentation via `isGlobal`), but it is never offered as a choice — the
-  // loopback tier lands in M4. Copy uses advertisement language (Private is NOT access-controlled yet).
+  // collapses to the Private presentation via `isGlobal`), but it is never offered as a choice.
+  // M4-base: Private is now access-controlled — the provider serves a Private model only to a member
+  // of a swarm you own (see the Swarms tab), not merely un-announced. Copy reflects that.
   const SCOPE_META = {
-    private: { label: "Private", icon: "🔒", title: "Not on the global network — served only within your trust domain." },
+    private: { label: "Private", icon: "🔒", title: "Off the global network — served only to members of a swarm you own (set up in Swarms)." },
     global:  { label: "Global",  icon: "🌐", title: "Announced to the global network — others can discover and route to it." },
   };
   // Consent gate for Global publish. Returns true only if the operator confirms. Reuses the shared
