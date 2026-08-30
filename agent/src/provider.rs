@@ -83,6 +83,13 @@ pub const FETCH_CHUNKS: u8 = 0x14;
 /// falls back to [`SERVE_REQUEST`].
 pub const SERVE_STREAM: u8 = 0x13;
 
+/// libp2p proxy method byte for an M5 **remote scope-set** control command (a control-capable swarm
+/// member → an owner's rig): `0x15 ‖ json(RemoteScopeSet)`. The provider authenticates it
+/// owner-authoritatively (credential [`CAP_CONTROL`] bound to the connecting peer + a member
+/// signature + a replay window) and applies the scope to its share policy. Replies with a
+/// `json(RemoteScopeAck)`. (0x14 is [`FETCH_CHUNKS`].)
+pub const REMOTE_SCOPE_SET: u8 = 0x15;
+
 /// How long a completed (or in-flight) serve result stays fetchable. Must comfortably exceed
 /// the NAT/relay re-establishment window (~10–70s) so a reconnecting consumer still finds it.
 const RESULT_TTL_MS: u64 = 120_000;
@@ -703,6 +710,11 @@ pub struct Provider<A: EngineAdapter> {
     /// `None` → no swarms configured, so a private model is refused for everyone (fail-closed). A
     /// global model never touches it.
     swarm_auth: Option<Arc<crate::swarms::SwarmAuthorizer>>,
+    /// M5: highest `issued_at_ms` of a remote-control command already applied, per control member
+    /// (keyed by `member_public_key`). A new command must be strictly newer, so the same signed
+    /// command can't be re-applied within the replay window (defence-in-depth on top of the Noise
+    /// channel + the ±skew bound). Bounded by the number of distinct control members (small).
+    remote_cmd_last_applied: Mutex<HashMap<String, u64>>,
 }
 
 impl<A: EngineAdapter> Provider<A> {
@@ -738,6 +750,7 @@ impl<A: EngineAdapter> Provider<A> {
             pending_withdrawals: Mutex::new(BTreeMap::new()),
             absence_streak: Mutex::new(BTreeMap::new()),
             swarm_auth: None,
+            remote_cmd_last_applied: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1497,11 +1510,107 @@ impl<A: EngineAdapter> Provider<A> {
         }
     }
 
+    /// M5: handle a `REMOTE_SCOPE_SET` command — a control-capable swarm member, from another
+    /// device, flips one of this rig's models between Private/Global (etc.). `body` is the
+    /// json-encoded [`RemoteScopeSet`] (the method byte already stripped); returns the json-encoded
+    /// [`RemoteScopeAck`]. Every check is fail-closed and the reply never leaks internal state.
+    ///
+    /// Order matters: replay window → owner-authoritative credential authz ([`CAP_CONTROL`] + bound
+    /// to `source_peer`) → the member's own signature over the exact command → scope parse → apply.
+    /// The credential check is the real trust gate (it verifies against a swarm THIS node owns and
+    /// its live revocation set); the command signature adds non-repudiation + integrity independent
+    /// of the transport. Applying rides the normal share-policy hot-reload (a later re-announce
+    /// publishes a newly-Global model — announced *by this rig*, per the M5 design).
+    fn handle_remote_scope_set(&self, source_peer: &str, body: &[u8]) -> Vec<u8> {
+        use crate::share_policy::Scope;
+        use openhydra_network::remote_control::{RemoteScopeAck, RemoteScopeSet};
+        let refuse = |msg: String| {
+            tracing::warn!(peer = %source_peer, %msg, "remote-scope-set refused (M5)");
+            RemoteScopeAck::Refused(msg).encode()
+        };
+        // Only an owner rig (one with a swarm authorizer) can be remote-controlled.
+        let Some(auth) = self.swarm_auth.as_deref() else {
+            return refuse("this provider is not a swarm owner (no rig control)".into());
+        };
+        let cmd = match RemoteScopeSet::decode(body) {
+            Ok(c) => c,
+            Err(e) => return refuse(format!("undecodable command: {e}")),
+        };
+        let now = now_unix_ms();
+        // 1. Replay/skew window — a captured command can't be re-applied later.
+        if !cmd.within_replay_window(now) {
+            return refuse("command timestamp is outside the accepted window".into());
+        }
+        // 2. Owner-authoritative authz: the credential must be for a swarm we own, verify (sig +
+        //    not-revoked + unexpired), grant CAP_CONTROL, and bind to the connecting peer.
+        let member_key = match auth.authorize_control(Some(&cmd.credential), source_peer, now) {
+            Ok(a) => a.member_public_key,
+            Err(e) => return refuse(format!("{e}")),
+        };
+        // 3. The member signed THIS command (non-repudiation + integrity beyond the transport).
+        if let Err(e) = cmd.verify_command_sig() {
+            return refuse(format!("bad command signature: {e}"));
+        }
+        // 4. Parse the requested scope (fail-closed on an unknown string).
+        let scope = match cmd.scope.as_str() {
+            "global" => Scope::Global,
+            "private" => Scope::Private,
+            "device" => Scope::Device,
+            other => return refuse(format!("unknown scope '{other}'")),
+        };
+        // Read the FRESHEST policy for the gates below — a control credential grants rig-wide
+        // authority over the owner's shared models (not per-swarm/per-model), so both the
+        // shared-model check and the publish gate must see any change the owner just made on disk,
+        // not a stale hot-reload snapshot (review LOW: closes the ~poll-interval TOCTOU where a
+        // Global command could slip through just after the owner set `allow_remote_publish=false`).
+        self.policy.reload_if_changed();
+        // 5. Only re-scope a model this rig ALREADY shares — remote control adjusts the reach of a
+        //    shared model, it never shares a new one (that would let a control device expose a model
+        //    the owner never chose to share, and would leave a latent Global+consent record on it).
+        if !self.model_shared(&cmd.model_id) {
+            return refuse(format!("model '{}' is not shared by this rig", cmd.model_id));
+        }
+        // 5b. Public exposure gate (M5 review, HIGH/MED): making a model MORE private is always fine,
+        //     but flipping it to Global (public/marketplace) via a remote command is allowed only
+        //     when the rig owner has left `allow_remote_publish` on. The owner can switch it off to
+        //     forbid any remote publish outright; the CAP_CONTROL grant itself is still the primary
+        //     authorisation.
+        if scope == Scope::Global && !self.policy.snapshot().allow_remote_publish {
+            return refuse(
+                "remote publish to Global is disabled on this rig (allow_remote_publish=false)".into(),
+            );
+        }
+        // 5c. Monotonic replay guard: a command must be strictly newer than the last we applied for
+        //     this member. Check-and-advance together so two concurrent commands can't both pass; a
+        //     failed apply below still consumes the timestamp (the sender just re-issues a fresh one).
+        {
+            let mut last = self.remote_cmd_last_applied.lock().unwrap_or_else(|e| e.into_inner());
+            if last.get(&member_key).is_some_and(|&prev| cmd.issued_at_ms <= prev) {
+                return refuse("command is not newer than the last applied for this member".into());
+            }
+            last.insert(member_key.clone(), cmd.issued_at_ms);
+        }
+        // 6. Apply to the live, file-backed policy (a static policy can't be remote-set).
+        let Some(path) = self.policy.watched_path() else {
+            return refuse("provider share policy is not file-backed".into());
+        };
+        match SharePolicy::set_model_scope(&path, &cmd.model_id, scope, now) {
+            Ok(_) => {
+                tracing::info!(model = %cmd.model_id, scope = %cmd.scope, peer = %source_peer,
+                    "remote-scope-set applied (M5)");
+                RemoteScopeAck::Applied { model_id: cmd.model_id, scope: cmd.scope }.encode()
+            }
+            Err(e) => refuse(format!("could not apply scope: {e}")),
+        }
+    }
+
     /// Route one inbound request by its method byte: serve completions, settle receipts.
     /// `source_peer` is the libp2p-authenticated sender, used to rate-limit per peer.
     /// `parsed` is the already-decoded serve request (F-C5), `None` for non-serve frames.
     fn dispatch(&self, source_peer: &str, data: &[u8], parsed: Option<ServeRequest>) -> Vec<u8> {
         match data.first() {
+            // M5: an owner-authorised remote-control device flips a model's share scope on this rig.
+            Some(&REMOTE_SCOPE_SET) => self.handle_remote_scope_set(source_peer, &data[1..]),
             Some(&RECEIPT_REQUEST) => {
                 // E-S8: shed a receipt flood before spending any crypto, keyed on the
                 // authenticated sender so one abusive peer can't starve others' receipts.

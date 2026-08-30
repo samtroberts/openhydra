@@ -30,7 +30,25 @@ use openhydra_protocol::crypto_agility::SigAlg;
 
 /// Schema version new artifacts are written at. A verifier rejects a *newer* schema it can't fully
 /// validate rather than trusting fields it doesn't understand (parity with [`crate::card`]).
-pub const MEMBERSHIP_SCHEMA_VERSION: u32 = 1;
+pub const MEMBERSHIP_SCHEMA_VERSION: u32 = 2;
+
+/// Schema at which a credential's signed preimage includes the `capabilities` field. A schema-1
+/// (serve-only) credential omits it entirely, so every credential issued before M5 — and every
+/// enrollment request — verifies byte-for-byte unchanged.
+const CRED_SCHEMA_CAPABILITIES: u32 = 2;
+
+/// Capability bits a membership credential grants (M5). `CAP_SERVE` = consume this swarm's private
+/// models (the M4 serve gate); `CAP_CONTROL` = issue owner-authorised remote-control commands to a
+/// rig (M5 `REMOTE_SCOPE_SET`, e.g. flip a model's scope). Bits compose. A schema-1 credential (no
+/// field) grants exactly `CAP_SERVE` — remote control is a strict opt-in the owner must issue.
+pub const CAP_SERVE: u32 = 1;
+pub const CAP_CONTROL: u32 = 2;
+/// All bits this build understands — a credential carrying any other bit is rejected wellformed
+/// (fail-closed: an unknown capability grants nothing rather than something unintended).
+const CAP_KNOWN: u32 = CAP_SERVE | CAP_CONTROL;
+fn default_capabilities() -> u32 {
+    CAP_SERVE
+}
 
 /// Domain-separation header for the credential preimage (bumped with any layout change).
 const CRED_DOMAIN: &str = "openhydra-swarm-credential-v1";
@@ -50,7 +68,9 @@ const MAX_LABEL_LEN: usize = 128;
 const MAX_ID_LEN: usize = 256;
 
 fn default_schema() -> u32 {
-    MEMBERSHIP_SCHEMA_VERSION
+    // A blob that predates the `schema_version` field is a v1 (serve-only) artifact — treat it as
+    // schema 1 so its preimage omits `capabilities`, matching how it was originally signed.
+    1
 }
 fn default_sig_alg() -> u8 {
     SigAlg::Ed25519.to_u8()
@@ -157,6 +177,12 @@ pub struct MembershipCredential {
     pub swarm_label: String,
     pub issued_at: u64,
     pub expires_at: u64,
+    /// Capability bits (M5): [`CAP_SERVE`] | [`CAP_CONTROL`]. Part of the signed preimage **only**
+    /// for `schema_version >= 2` (see [`cred_canonical_bytes`]); a schema-1 credential omits the
+    /// field and is read as [`CAP_SERVE`] — so old credentials keep exactly their prior authority
+    /// and can never be silently upgraded to `CAP_CONTROL`.
+    #[serde(default = "default_capabilities")]
+    pub capabilities: u32,
     #[serde(default = "default_sig_alg")]
     pub sig_alg: u8,
     /// base64url signature over [`cred_canonical_bytes`], by the swarm's group key.
@@ -298,7 +324,7 @@ pub fn verify_enrollment_request(
 /// Deterministic signing preimage for a membership credential. Domain-separated, binds `sig_alg`,
 /// excludes only `signature`.
 pub fn cred_canonical_bytes(c: &MembershipCredential) -> Vec<u8> {
-    format!(
+    let mut s = format!(
         "{CRED_DOMAIN}\nsig_alg={}\nschema_version={}\n\
          swarm_public_key={}\nmember_public_key={}\nmember_openhydra_peer_id={}\n\
          swarm_label={}\nissued_at={}\nexpires_at={}",
@@ -310,8 +336,14 @@ pub fn cred_canonical_bytes(c: &MembershipCredential) -> Vec<u8> {
         c.swarm_label,
         c.issued_at,
         c.expires_at,
-    )
-    .into_bytes()
+    );
+    // `capabilities` enters the preimage only at schema >= 2, so a schema-1 (serve-only) credential
+    // hashes exactly as it did before M5 — every credential issued earlier verifies unchanged, and a
+    // schema-1 blob can't be re-read as carrying CAP_CONTROL (the bits aren't signed for it).
+    if c.schema_version >= CRED_SCHEMA_CAPABILITIES {
+        s.push_str(&format!("\ncapabilities={}", c.capabilities));
+    }
+    s.into_bytes()
 }
 
 /// Sign a membership credential with the **swarm's group keypair**, populating `swarm_public_key`,
@@ -369,6 +401,28 @@ pub fn verify_credential(
     let group_pk = ed_pubkey_from_hex(&cred.swarm_public_key)?;
     let sig = b64_decode(&cred.signature)?;
     verify_with_alg(alg, &group_pk, &cred_canonical_bytes(cred), &sig)?;
+    // Fail-closed on capability bits this build doesn't understand: even with a valid owner signature,
+    // a credential granting a future/unknown capability is rejected rather than honoured partially, so
+    // an old binary can't be handed a capability it can't reason about. (Schema-1 creds default to the
+    // known CAP_SERVE, so this only bites a genuinely newer grant.)
+    if cred.capabilities & !CAP_KNOWN != 0 {
+        return Err(MembershipError::Malformed(format!(
+            "credential grants unknown capability bits: {:#x}",
+            cred.capabilities & !CAP_KNOWN
+        )));
+    }
+    // CRITICAL (M5 review): a schema-1 credential does NOT sign `capabilities` (see
+    // `cred_canonical_bytes`), so the deserialized value is attacker-mutable. Refuse any schema-1
+    // credential carrying anything other than the sole grant a v1 credential can make — `CAP_SERVE` —
+    // so a serve-only member can't flip the field to `CAP_CONTROL` on a still-valid signature and
+    // escalate to rig control. Legit schema-1 creds always carry exactly `CAP_SERVE` (the serde
+    // default / `new_unsigned`), so this preserves byte-for-byte v1 compatibility.
+    if cred.schema_version < CRED_SCHEMA_CAPABILITIES && cred.capabilities != CAP_SERVE {
+        return Err(MembershipError::Malformed(
+            "schema-1 credential may only grant CAP_SERVE (capabilities are unsigned at schema 1)"
+                .to_string(),
+        ));
+    }
     // `member_public_key` must be a real Ed25519 key (so a serve gate can derive its peer id). This
     // also rejects a credential whose member key can't map to any identity.
     ed_pubkey_from_hex(&cred.member_public_key)?;
@@ -511,7 +565,8 @@ impl EnrollmentRequest {
         requested_at: u64,
     ) -> EnrollmentRequest {
         EnrollmentRequest {
-            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            // Enrollment has no capabilities concept — stays schema 1, unchanged by M5.
+            schema_version: 1,
             swarm_public_key: swarm_public_key.into(),
             member_openhydra_peer_id: member_openhydra_peer_id.into(),
             member_public_key: String::new(),
@@ -555,16 +610,49 @@ impl MembershipCredential {
         expires_at: u64,
     ) -> MembershipCredential {
         MembershipCredential {
-            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            // Serve-only credentials stay schema 1 (no `capabilities` in the preimage) — byte-for-byte
+            // identical to pre-M5; `.granting()` bumps to schema 2 when extra capabilities are added.
+            schema_version: 1,
             swarm_public_key: String::new(),
             member_public_key: member_public_key.into(),
             member_openhydra_peer_id: member_openhydra_peer_id.into(),
             swarm_label: swarm_label.into(),
             issued_at,
             expires_at,
+            capabilities: CAP_SERVE,
             sig_alg: default_sig_alg(),
             signature: String::new(),
         }
+    }
+
+    /// Set the credential's capability bits (M5). Adding anything beyond [`CAP_SERVE`] bumps the
+    /// schema to 2 so the bits enter the signed preimage; a plain `CAP_SERVE` stays schema 1. Call
+    /// before signing. E.g. `.granting(CAP_SERVE | CAP_CONTROL)` for a rig-control device.
+    pub fn granting(mut self, capabilities: u32) -> MembershipCredential {
+        self.capabilities = capabilities;
+        if capabilities & !CAP_SERVE != 0 {
+            self.schema_version = CRED_SCHEMA_CAPABILITIES;
+        }
+        self
+    }
+
+    /// The capabilities this credential actually grants. For a schema-1 credential the `capabilities`
+    /// field isn't part of the signed preimage (so it's untrusted), so the effective grant is the
+    /// hardcoded [`CAP_SERVE`] regardless of the deserialized value — the schema-1 spoof can never
+    /// yield [`CAP_CONTROL`] here even if `verify_credential` were somehow skipped. At schema >= 2 the
+    /// field is signed, so it's trusted as-is.
+    pub fn effective_capabilities(&self) -> u32 {
+        if self.schema_version >= CRED_SCHEMA_CAPABILITIES {
+            self.capabilities
+        } else {
+            CAP_SERVE
+        }
+    }
+
+    /// Does this credential grant `cap` (e.g. [`CAP_CONTROL`])? Bit-test against
+    /// [`Self::effective_capabilities`] — a schema-1 credential grants exactly [`CAP_SERVE`].
+    pub fn has_capability(&self, cap: u32) -> bool {
+        self.effective_capabilities() & cap != 0
     }
 
     pub fn to_json(&self) -> Result<String, MembershipError> {
@@ -633,6 +721,120 @@ mod tests {
 
     fn pubkey_hex(kp: &libp2p::identity::Keypair) -> String {
         hex::encode(kp.public().try_into_ed25519().unwrap().to_bytes())
+    }
+
+    // ── M5 capabilities ──
+
+    #[test]
+    fn serve_credential_stays_schema_1_and_grants_only_serve() {
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let cred = a_credential(&group, &pubkey_hex(&member));
+        assert_eq!(cred.schema_version, 1, "serve-only credential must stay schema 1");
+        assert!(cred.has_capability(CAP_SERVE));
+        assert!(!cred.has_capability(CAP_CONTROL), "serve credential must NOT grant control");
+        // And it verifies.
+        verify_credential(&cred, now_before_expiry(), &no_revocations()).unwrap();
+    }
+
+    #[test]
+    fn a_schema_1_credential_preimage_ignores_the_defaulted_capabilities_field() {
+        // v1 compat: the capabilities field defaults to CAP_SERVE on a schema-1 cred, but it must NOT
+        // enter the preimage — so a credential signed before M5 (no field) verifies byte-for-byte.
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let mut cred = a_credential(&group, &pubkey_hex(&member));
+        // Simulate a re-read where the field flips to a different value: schema-1 preimage must be
+        // unchanged, so the ORIGINAL signature still verifies regardless of the field.
+        let sig_before = cred.signature.clone();
+        assert_eq!(cred.schema_version, 1);
+        // Preimage is identical whether capabilities is CAP_SERVE or anything else, at schema 1.
+        let pre_default = cred_canonical_bytes(&cred);
+        cred.capabilities = 999; // a schema-1 cred's preimage ignores this
+        let pre_mutated = cred_canonical_bytes(&cred);
+        assert_eq!(pre_default, pre_mutated, "schema-1 preimage must not include capabilities");
+        cred.signature = sig_before;
+        cred.capabilities = CAP_SERVE;
+        verify_credential(&cred, now_before_expiry(), &no_revocations()).unwrap();
+    }
+
+    #[test]
+    fn a_control_credential_is_schema_2_verifies_and_grants_control() {
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let cred = MembershipCredential::new_unsigned(
+            pubkey_hex(&member),
+            "oh_member",
+            "Home rig",
+            issued(),
+            expires(),
+        )
+        .granting(CAP_SERVE | CAP_CONTROL);
+        let signed = sign_credential(cred, &group).unwrap();
+        assert_eq!(signed.schema_version, 2, "a control grant bumps to schema 2");
+        assert!(signed.has_capability(CAP_SERVE));
+        assert!(signed.has_capability(CAP_CONTROL));
+        verify_credential(&signed, now_before_expiry(), &no_revocations()).unwrap();
+    }
+
+    #[test]
+    fn tampering_a_control_credentials_capabilities_breaks_the_signature() {
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let mut signed = sign_credential(
+            MembershipCredential::new_unsigned(pubkey_hex(&member), "oh", "Rig", issued(), expires())
+                .granting(CAP_SERVE | CAP_CONTROL),
+            &group,
+        )
+        .unwrap();
+        // Downgrade the control bit off (a member trying to keep serve but the attacker adding control,
+        // or vice-versa) — the schema-2 preimage covers capabilities, so the signature must break.
+        signed.capabilities = CAP_SERVE;
+        assert_eq!(
+            verify_credential(&signed, now_before_expiry(), &no_revocations()),
+            Err(MembershipError::BadSignature),
+        );
+    }
+
+    #[test]
+    fn schema_1_capability_spoof_is_rejected_and_never_grants_control() {
+        // M5 CRITICAL regression: a serve-only member edits the (unsigned-at-schema-1) capabilities
+        // field to CAP_CONTROL while keeping schema 1 — the group signature still matches the
+        // schema-1 preimage, so verification MUST reject it explicitly, and even if it didn't,
+        // effective_capabilities must never expose CAP_CONTROL for a schema-1 credential.
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let mut cred = a_credential(&group, &pubkey_hex(&member)); // schema 1, CAP_SERVE, validly signed
+        assert_eq!(cred.schema_version, 1);
+        let sig_before = cred.signature.clone();
+        // Spoof: add the control bit without touching schema or signature.
+        cred.capabilities = CAP_SERVE | CAP_CONTROL;
+        assert_eq!(cred.signature, sig_before, "attacker leaves the signature untouched");
+        // 1) verify_credential rejects the spoof (capabilities unsigned at schema 1).
+        assert!(matches!(
+            verify_credential(&cred, now_before_expiry(), &no_revocations()),
+            Err(MembershipError::Malformed(_)),
+        ));
+        // 2) defense-in-depth: the effective grant is still only CAP_SERVE.
+        assert!(!cred.has_capability(CAP_CONTROL), "schema-1 cred must never expose CAP_CONTROL");
+        assert!(cred.has_capability(CAP_SERVE));
+    }
+
+    #[test]
+    fn a_credential_granting_an_unknown_capability_bit_is_rejected_fail_closed() {
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        // A future/owner-signed capability this build doesn't understand → rejected, not honoured.
+        let signed = sign_credential(
+            MembershipCredential::new_unsigned(pubkey_hex(&member), "oh", "Rig", issued(), expires())
+                .granting(CAP_SERVE | 0x1000),
+            &group,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_credential(&signed, now_before_expiry(), &no_revocations()),
+            Err(MembershipError::Malformed(_)),
+        ));
     }
 
     #[test]

@@ -79,7 +79,9 @@ function swarmCardHtml(s) {
 
   const actions = owner
     ? `<button class="btn brand sm swaddmember" data-swarm="${escapeHtml(s.swarm_public_key)}" data-label="${escapeHtml(s.label)}">Add member</button>`
-    : "";
+    : s.member_can_control
+      ? `<button class="btn brand sm swremote" data-swarm="${escapeHtml(s.swarm_public_key)}" data-label="${escapeHtml(s.label)}" title="Flip one of this rig's models between Private and Global from here">Control rig</button>`
+      : "";
 
   return (
     `<div class="card" style="margin-bottom:14px">` +
@@ -99,6 +101,9 @@ function swarmCardHtml(s) {
 function wireSwarmCards(host, swarms) {
   $$(".swaddmember", host).forEach((b) => {
     b.onclick = () => approveMemberModal(b.dataset.swarm, b.dataset.label);
+  });
+  $$(".swremote", host).forEach((b) => {
+    b.onclick = () => remoteScopeModal(b.dataset.swarm, b.dataset.label);
   });
   $$(".swrevoke", host).forEach((b) => {
     b.onclick = async () => {
@@ -214,7 +219,10 @@ function approveMemberModal(swarmPublicKey, swarmLabel) {
         `<div class="mut" style="margin-top:2px">id ${escapeHtml(peerShort(r.member_openhydra_peer_id))}</div>` +
         `</div>` +
         `<label class="mut" style="font-size:11px;margin-top:10px;display:block">Label for this member</label>` +
-        `<input class="input swmlabel" value="${escapeHtml(r.label || "")}" placeholder="e.g. Sam's MacBook" style="width:100%" maxlength="128"/>`;
+        `<input class="input swmlabel" value="${escapeHtml(r.label || "")}" placeholder="e.g. Sam's MacBook" style="width:100%" maxlength="128"/>` +
+        `<label class="mut" style="display:flex;align-items:flex-start;gap:8px;margin-top:10px;font-size:11.5px;cursor:pointer">` +
+        `<input type="checkbox" class="swctl" style="margin-top:2px"/>` +
+        `<span>Also grant <b>remote control</b> of my rigs — this device can flip my models' scope (including publishing to Global) from anywhere. Only tick this for a device you own and trust.</span></label>`;
       // Swap the footer to an Approve action now that a valid request is loaded.
       foot.innerHTML = `<button class="btn ghost sm swcancel2">Close</button><button class="btn sm brand swapprove">Approve &amp; issue credential</button>`;
       $(".swcancel2", back).onclick = close;
@@ -229,17 +237,22 @@ function approveMemberModal(swarmPublicKey, swarmLabel) {
 
 async function doApprove(back, close, swarmPublicKey, requestText) {
   const memberLabel = ($(".swmlabel", back)?.value || "").trim();
+  const control = !!$(".swctl", back)?.checked;
   try {
     const approved = await call("swarm_approve_member", {
       swarm_public_key: swarmPublicKey,
       request: requestText,
       member_label: memberLabel,
       ttl_secs: CRED_TTL_SECS,
+      control,
     });
     // Show the credential to send back — replace the body with a copy box.
     const magnet = approved.magnet;
+    const controlNote = control
+      ? ` <b>This is a control credential</b> — that device will be able to remote-set your rigs' model scopes.`
+      : "";
     $(".cmodal-b", back).innerHTML =
-      `<div class="cmodal-path">Approved. Send this credential back to the member — they paste it into “Join a swarm” to finish. It's signed and carries no secret.</div>` +
+      `<div class="cmodal-path">Approved.${controlNote} Send this credential back to the member — they paste it into “Join a swarm” to finish. It's signed and carries no secret.</div>` +
       `<textarea class="input mono" rows="3" readonly style="width:100%;font-size:10.5px;margin-top:10px">${escapeHtml(magnet)}</textarea>`;
     $(".cmodal-f", back).innerHTML =
       `<button class="btn ghost sm swdone">Done</button><button class="btn sm brand swcopycred">Copy credential</button>`;
@@ -251,6 +264,65 @@ async function doApprove(back, close, swarmPublicKey, requestText) {
   } catch (e) {
     toast(`Approve failed: ${e}`);
   }
+}
+
+// ── control a rig (member, M5): send a signed REMOTE_SCOPE_SET to flip a model's scope ──
+function remoteScopeModal(swarmPublicKey, swarmLabel) {
+  const lab = `<label class="mut" style="font-size:11px;margin-top:10px;display:block">`;
+  const { back, close } = modal(
+    `Control a rig in “${swarmLabel}”`,
+    `<div class="cmodal-path">Flip one of this rig owner's shared models between Private and Global from here. You'll need the rig's peer id (shown in its app's Peers view) and the model's name. The rig verifies your control credential before applying — and can refuse to publish if its owner turned remote publishing off.</div>` +
+      `${lab}Rig peer id</label>` +
+      `<input class="input mono swrig" placeholder="12D3KooW…" style="width:100%;font-size:10.5px"/>` +
+      `${lab}Model</label>` +
+      `<input class="input swrmodel" placeholder="e.g. llama3.1:8b" style="width:100%"/>` +
+      `${lab}New scope</label>` +
+      `<select class="input swrscope" style="width:100%">` +
+      `<option value="private">Private — swarm members only</option>` +
+      `<option value="global">Global — public / marketplace</option>` +
+      `<option value="device">Device — loopback only</option>` +
+      `</select>` +
+      `<div class="swrout" style="margin-top:10px"></div>`,
+    `<button class="btn ghost sm swcancel">Cancel</button><button class="btn sm brand swrsend">Send to rig</button>`,
+  );
+  $(".swcancel", back).onclick = close;
+  $(".swrig", back).focus();
+  $(".swrsend", back).onclick = async () => {
+    const provider = ($(".swrig", back).value || "").trim();
+    const model = ($(".swrmodel", back).value || "").trim();
+    const scope = $(".swrscope", back).value;
+    if (!provider || !model) {
+      toast("Enter the rig peer id and the model");
+      return;
+    }
+    // M1 consent surface: making a model Global is public exposure — confirm before sending.
+    if (
+      scope === "global" &&
+      !confirm(
+        `Publish “${model}” GLOBALLY on the rig?\n\n` +
+          `The model becomes discoverable and routable on the public network / marketplace ` +
+          `(the rig serves and earns/spends against it). The rig will refuse if its owner has ` +
+          `disabled remote publishing.`,
+      )
+    ) {
+      return;
+    }
+    const out = $(".swrout", back);
+    out.innerHTML = `<span class="mut" style="font-size:11.5px">Dialing the rig and sending…</span>`;
+    try {
+      const ack = await call("swarm_remote_scope", {
+        swarm_public_key: swarmPublicKey,
+        provider,
+        model,
+        scope,
+      });
+      out.innerHTML =
+        `<div class="card pad" style="font-size:11.5px"><span class="badge ok">✔ applied</span> ${escapeHtml(ack)}</div>`;
+      toast("Rig updated");
+    } catch (e) {
+      out.innerHTML = `<div class="cardfail">✕ ${escapeHtml(String(e))}</div>`;
+    }
+  };
 }
 
 // ── join a swarm (member): generate a request to send, then paste the credential you get back ──

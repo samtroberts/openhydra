@@ -158,6 +158,20 @@ pub struct SharePolicy {
     /// models are **not** announced (fail-closed). See [`Self::announce_globally`].
     #[serde(default)]
     pub default_global_consent: Option<u64>,
+    /// M5: may an owner-authorised remote-control device (a `CAP_CONTROL` swarm member) flip one of
+    /// this rig's shared models to **Global** (public/marketplace exposure) via `REMOTE_SCOPE_SET`?
+    /// Remote control can always make a shared model *more* private regardless; this gates only the
+    /// public-exposure direction. Defaults **on**: the real authorisation is the deliberate act of
+    /// issuing a `CAP_CONTROL` credential (nobody can remote-control a rig until the owner does), and
+    /// this is a secondary lock a cautious owner can switch **off** to forbid remote publishing
+    /// entirely. A pre-M5 policy file (no field) reads as `true`.
+    #[serde(default = "default_allow_remote_publish")]
+    pub allow_remote_publish: bool,
+}
+
+/// Serde default for [`SharePolicy::allow_remote_publish`] — see that field.
+fn default_allow_remote_publish() -> bool {
+    true
 }
 
 impl Default for SharePolicy {
@@ -180,6 +194,7 @@ impl SharePolicy {
             default_scope: default_scope(),
             global_consent: BTreeMap::new(),
             default_global_consent: Some(consent_ts()),
+            allow_remote_publish: default_allow_remote_publish(),
         }
     }
 
@@ -194,6 +209,7 @@ impl SharePolicy {
             default_scope: default_scope(),
             global_consent: BTreeMap::new(),
             default_global_consent: None,
+            allow_remote_publish: default_allow_remote_publish(),
         }
     }
 
@@ -211,6 +227,7 @@ impl SharePolicy {
             default_scope: default_scope(),
             global_consent: BTreeMap::new(),
             default_global_consent: None,
+            allow_remote_publish: default_allow_remote_publish(),
         }
     }
 
@@ -240,6 +257,7 @@ impl SharePolicy {
                 default_scope: default_scope(),
                 global_consent: BTreeMap::new(),
                 default_global_consent: Some(consent_ts()),
+            allow_remote_publish: default_allow_remote_publish(),
             }
         }
     }
@@ -402,6 +420,35 @@ impl SharePolicy {
         std::fs::write(&tmp, json.as_bytes())?;
         std::fs::rename(&tmp, path)
     }
+
+    /// M5: apply a single model's `scope` to the policy file at `path` (load → mutate → atomic
+    /// write), returning the new policy. The running provider's [`PolicyWatcher`] hot-reloads it on
+    /// the next check. Flipping a model to [`Scope::Global`] records a per-model `global_consent`
+    /// stamped `now_ms` — an owner-authorised remote-control command **is** the consent, so the
+    /// consent-gated announce path (see [`Self::announce_globally`]) fires; flipping to any
+    /// non-Global scope **clears** that model's consent (fail-closed). Keyed by the clean engine
+    /// handle so it matches the announced id. Does not add the model to the share list — it re-scopes
+    /// an already-shared model; a scope on an unshared model stays inert behind the `is_shared` gate.
+    pub fn set_model_scope(
+        path: &Path,
+        model_id: &str,
+        scope: Scope,
+        now_ms: u64,
+    ) -> std::io::Result<Self> {
+        let mut policy = Self::load(path)?;
+        let clean = normalize_engine_ref(model_id);
+        policy.scopes.insert(clean.clone(), scope);
+        match scope {
+            Scope::Global => {
+                policy.global_consent.insert(clean, now_ms);
+            }
+            _ => {
+                policy.global_consent.remove(&clean);
+            }
+        }
+        policy.write_atomic(path)?;
+        Ok(policy)
+    }
 }
 
 /// The provider's live share state as the status API reports it: the current policy (mode + the
@@ -442,6 +489,7 @@ impl PolicyWatcher {
     pub fn r#static(policy: SharePolicy) -> Self {
         Self { policy: RwLock::new(policy), path: None, last_mtime: Mutex::new(None), reload_lock: Mutex::new(()) }
     }
+
 
     /// A static watcher from a legacy `--share-models` list (empty ⇒ share-all).
     pub fn from_legacy_list<I, S>(models: I) -> Self
@@ -580,6 +628,47 @@ impl PolicyWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_remote_publish_defaults_on_and_survives_a_pre_m5_file() {
+        // A pre-M5 policy file (no `allow_remote_publish`) must read as `true` — remote publish is on
+        // by default; the real gate is issuing a CAP_CONTROL credential.
+        let p: SharePolicy =
+            serde_json::from_str(r#"{"version":3,"mode":"all","models":[]}"#).unwrap();
+        assert!(p.allow_remote_publish, "missing field defaults to on");
+        assert!(SharePolicy::share_all().allow_remote_publish);
+        assert!(SharePolicy::share_nothing().allow_remote_publish);
+        // And an explicit off round-trips.
+        let mut off = SharePolicy::share_all();
+        off.allow_remote_publish = false;
+        let back: SharePolicy = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.allow_remote_publish);
+    }
+
+    #[test]
+    fn set_model_scope_flips_scope_and_manages_global_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        // A shared model, default-private with no consent.
+        let mut base = SharePolicy::share_list(["llama3.1:8b"]);
+        base.default_scope = Scope::Private;
+        base.default_global_consent = None;
+        base.write_atomic(&path).unwrap();
+
+        // Flip to Global → scope Global AND a per-model consent is recorded → announces.
+        let p = SharePolicy::set_model_scope(&path, "llama3.1:8b", Scope::Global, 12_345).unwrap();
+        assert_eq!(p.scopes.get("llama3.1:8b"), Some(&Scope::Global));
+        assert_eq!(p.global_consent.get("llama3.1:8b"), Some(&12_345));
+        assert!(p.announce_globally("llama3.1:8b"), "global+consent must announce");
+        // Persisted: a fresh load sees it.
+        assert!(SharePolicy::load(&path).unwrap().announce_globally("llama3.1:8b"));
+
+        // Flip back to Private → scope Private AND the consent is cleared (fail-closed).
+        let p = SharePolicy::set_model_scope(&path, "llama3.1:8b", Scope::Private, 20_000).unwrap();
+        assert_eq!(p.scopes.get("llama3.1:8b"), Some(&Scope::Private));
+        assert_eq!(p.global_consent.get("llama3.1:8b"), None, "going private clears consent");
+        assert!(!p.announce_globally("llama3.1:8b"));
+    }
 
     #[test]
     fn all_shares_anything() {

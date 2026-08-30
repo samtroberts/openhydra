@@ -1219,22 +1219,77 @@ fn preview_enroll_request(request: String) -> Result<openhydra_agent::Enrollment
 
 /// M3 (owner): approve an enrollment request into a signed credential valid for `ttl_secs` (default
 /// 90 days). Records the member and returns the credential to send back out-of-band.
+///
+/// M5: `control=true` also grants the remote-control capability (`CAP_CONTROL`) — that member's
+/// device can then flip this owner's rig models' scope via `swarm_remote_scope`. Grant it only to
+/// your own trusted devices; a plain member stays serve-only.
 #[tauri::command]
 fn swarm_approve_member(
     swarm_public_key: String,
     request: String,
     member_label: String,
     ttl_secs: Option<u64>,
+    control: Option<bool>,
 ) -> Result<openhydra_agent::ApprovedCredential, String> {
     let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    openhydra_agent::swarms::approve_member(
+    let caps = if control.unwrap_or(false) {
+        openhydra_agent::CAP_SERVE | openhydra_agent::CAP_CONTROL
+    } else {
+        openhydra_agent::CAP_SERVE
+    };
+    openhydra_agent::swarms::approve_member_with_caps(
         &swarms_dir(),
         &swarm_public_key,
         &request,
         member_label.trim(),
         ttl_secs.unwrap_or(90 * 24 * 3600),
+        caps,
         now_unix_ms(),
     )
+}
+
+/// M5 (control member): send a signed `REMOTE_SCOPE_SET` to a rig — flip one of its shared models'
+/// scope (`global` | `private` | `device`) from this device. Shells to the agent's `swarm
+/// remote-scope` (it needs a live one-shot node to dial the rig); the identity is the
+/// consumer/dialing key the control credential is bound to. Returns the rig's ack line
+/// (`applied: <model> -> <scope>`), or the rig's refusal / a transport error.
+#[tauri::command]
+fn swarm_remote_scope(
+    swarm_public_key: String,
+    provider: String,
+    model: String,
+    scope: String,
+) -> Result<String, String> {
+    let scope = scope.trim().to_lowercase();
+    if !matches!(scope.as_str(), "global" | "private" | "device") {
+        return Err(format!("invalid scope '{scope}' (expected global|private|device)"));
+    }
+    let bin = agent_binary().ok_or_else(|| {
+        "openhydra-agent binary not found (bundle missing its sidecar, or no dev build)".to_string()
+    })?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--identity").arg(swarm_identity_path());
+    for b in load_settings().bootstraps.iter().filter(|b| !b.is_empty()) {
+        cmd.arg("--bootstrap").arg(b);
+    }
+    cmd.arg("swarm")
+        .arg("remote-scope")
+        .arg("--swarm")
+        .arg(swarm_public_key.trim())
+        .arg("--provider")
+        .arg(provider.trim())
+        .arg("--model")
+        .arg(model.trim())
+        .arg("--scope")
+        .arg(&scope)
+        .arg("--swarms-dir")
+        .arg(swarms_dir());
+    let out = cmd.output().map_err(|e| format!("run remote-scope: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if msg.is_empty() { "remote-scope failed".into() } else { msg });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// M3 (owner): revoke a member by its public key (drops it from the list + adds to the revocation set).
@@ -2067,6 +2122,7 @@ fn main() {
             swarm_enroll_request,
             preview_enroll_request,
             swarm_approve_member,
+            swarm_remote_scope,
             swarm_revoke_member,
             preview_swarm_credential,
             swarm_accept_credential,

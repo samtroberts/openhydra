@@ -84,7 +84,7 @@ pub use openhydra_network::card::{
 // M3: swarm membership credential types — re-exported so the desktop (network-crate-free) can hold
 // the view/export shapes the swarm Tauri commands return.
 pub use openhydra_network::membership::{
-    key_fingerprint, EnrollmentRequest, MembershipCredential, MembershipError,
+    key_fingerprint, EnrollmentRequest, MembershipCredential, MembershipError, CAP_CONTROL, CAP_SERVE,
 };
 pub use swarms::{
     ApprovedCredential, AuthorizedServe, AuthzError, CredentialStore, EnrollmentRequestExport,

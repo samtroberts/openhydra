@@ -169,6 +169,9 @@ enum SwarmAction {
     List(SwarmDirArg),
     /// (Owner) Revoke a member by its public key.
     Revoke(SwarmRevokeArgs),
+    /// (Control member, M5) Send a signed `REMOTE_SCOPE_SET` to a rig: flip one of its models'
+    /// share scope (Private/Global/Device) from this device. Needs a stored control credential.
+    RemoteScope(SwarmRemoteScopeArgs),
 }
 
 /// The swarms directory, shared by every action. Defaults to `~/.openhydra/swarms`.
@@ -213,6 +216,33 @@ struct SwarmApproveArgs {
     /// Credential validity in seconds (default 90 days).
     #[arg(long, default_value_t = 90 * 24 * 3600)]
     ttl_secs: u64,
+    /// Also grant this member the M5 **remote-control** capability (`CAP_CONTROL`) — it can then send
+    /// `swarm remote-scope` commands to flip this owner's rig models' scope. Grant this only to your
+    /// OWN trusted devices; omit for an ordinary consume-only member.
+    #[arg(long)]
+    control: bool,
+    #[command(flatten)]
+    dir: SwarmDirArg,
+}
+
+#[derive(Args)]
+struct SwarmRemoteScopeArgs {
+    /// The swarm (group public key) whose stored control credential to present. This node must hold a
+    /// member credential for it (from `swarm accept`) that grants `CAP_CONTROL`.
+    #[arg(long)]
+    swarm: String,
+    /// The target rig's libp2p peer id (the provider to command).
+    #[arg(long)]
+    provider: String,
+    /// The model (engine handle) to re-scope on the rig.
+    #[arg(long)]
+    model: String,
+    /// The new scope: `global` | `private` | `device`.
+    #[arg(long)]
+    scope: String,
+    /// Round-trip timeout in seconds.
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
     #[command(flatten)]
     dir: SwarmDirArg,
 }
@@ -743,7 +773,10 @@ fn run() -> Result<(), String> {
                     std::path::PathBuf::from(home).join(".openhydra").join("swarms")
                 })
             };
-            let identity_path = cli.node.into_config().identity_path;
+            // Keep the whole config: most swarm actions are offline (identity only), but `remote-scope`
+            // needs the bootstrap peers to start a live node and dial the rig.
+            let config = cli.node.into_config();
+            let identity_path = config.identity_path.clone();
             match args.action {
                 SwarmAction::Create(a) => {
                     let v = openhydra_agent::swarms::create_swarm(
@@ -765,14 +798,20 @@ fn run() -> Result<(), String> {
                     println!("{}", out.magnet);
                 }
                 SwarmAction::Approve(a) => {
-                    let out = openhydra_agent::swarms::approve_member(
+                    use openhydra_network::membership::{CAP_CONTROL, CAP_SERVE};
+                    let caps = if a.control { CAP_SERVE | CAP_CONTROL } else { CAP_SERVE };
+                    let out = openhydra_agent::swarms::approve_member_with_caps(
                         &resolve_dir(a.dir.swarms_dir),
                         a.swarm.trim(),
                         a.request.trim(),
                         a.label.trim(),
                         a.ttl_secs,
+                        caps,
                         now_ms,
                     )?;
+                    if a.control {
+                        eprintln!("openhydra-agent: issued a CONTROL credential (CAP_SERVE|CAP_CONTROL)");
+                    }
                     println!("{}", out.magnet);
                 }
                 SwarmAction::Accept(a) => {
@@ -796,6 +835,64 @@ fn run() -> Result<(), String> {
                         a.member.trim(),
                     )?;
                     println!("revoked {}", a.member.trim());
+                }
+                SwarmAction::RemoteScope(a) => {
+                    use openhydra_network::identity::Identity;
+                    use openhydra_network::membership::CAP_CONTROL;
+                    use openhydra_network::remote_control::{RemoteScopeAck, RemoteScopeSet};
+                    // Validate the scope before dialing anything.
+                    let scope = a.scope.trim().to_lowercase();
+                    if !matches!(scope.as_str(), "global" | "private" | "device") {
+                        return Err(format!(
+                            "invalid --scope '{}' (expected global|private|device)",
+                            a.scope
+                        ));
+                    }
+                    let dir = resolve_dir(a.dir.swarms_dir);
+                    let cred = openhydra_agent::swarms::member_credential_for(&dir, a.swarm.trim())?;
+                    if !cred.has_capability(CAP_CONTROL) {
+                        return Err("this swarm credential does not grant CAP_CONTROL — ask the \
+                                    owner to re-approve your device with `--control`"
+                            .to_string());
+                    }
+                    let identity = Identity::load_or_create(&identity_path)
+                        .map_err(|e| format!("load identity: {e}"))?;
+                    let cmd = RemoteScopeSet::signed(
+                        a.model.trim(),
+                        scope.clone(),
+                        now_ms,
+                        cred,
+                        &identity.keypair,
+                    )
+                    .map_err(|e| format!("sign command: {e}"))?;
+                    // Bring up a live node and dial the rig (via relay if needed).
+                    let net = NetworkHandle::start(config)?;
+                    eprintln!(
+                        "openhydra-agent: node up — libp2p={}; dialing rig {} to set {} -> {}",
+                        net.libp2p_peer_id(),
+                        a.provider.trim(),
+                        a.model.trim(),
+                        scope,
+                    );
+                    // Give the node a moment to connect to the bootstrap relay so a relayed
+                    // provider is reachable before the one-shot command.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let mut data = vec![openhydra_agent::provider::REMOTE_SCOPE_SET];
+                    data.extend_from_slice(&cmd.encode());
+                    let resp = net.proxy_forward_timeout(
+                        a.provider.trim().to_string(),
+                        data,
+                        std::time::Duration::from_secs(a.timeout_secs),
+                    )?;
+                    match RemoteScopeAck::decode(&resp) {
+                        Ok(RemoteScopeAck::Applied { model_id, scope }) => {
+                            println!("applied: {model_id} -> {scope}");
+                        }
+                        Ok(RemoteScopeAck::Refused(reason)) => {
+                            return Err(format!("rig refused: {reason}"));
+                        }
+                        Err(e) => return Err(format!("unexpected reply from rig: {e}")),
+                    }
                 }
             }
             return Ok(());

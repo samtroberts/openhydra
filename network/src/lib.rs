@@ -22,6 +22,9 @@ pub mod mdns;
 pub mod membership;
 pub mod nat;
 pub mod node;
+/// M5: the signed `REMOTE_SCOPE_SET` remote-rig control command — a control-capable swarm member
+/// flips a model's share scope on an owner's rig from another device. Sibling of [`membership`].
+pub mod remote_control;
 pub mod pcp;
 pub mod registry;
 pub mod registry_proto;

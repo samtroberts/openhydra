@@ -23,7 +23,7 @@ use openhydra_network::membership::{
     credential_member_peer_id, generate_group_keypair_hex, key_fingerprint, keypair_public_hex,
     sign_credential_with_secret_hex, sign_enrollment_request, verify_credential,
     verify_credential_for_member, verify_enrollment_request, EnrollmentRequest, MembershipCredential,
-    MembershipError, MEMBERSHIP_SCHEMA_VERSION,
+    MembershipError, CAP_CONTROL, CAP_SERVE, MEMBERSHIP_SCHEMA_VERSION,
 };
 
 /// Schema version for the on-disk swarm record.
@@ -107,6 +107,9 @@ pub struct SwarmView {
     pub revoked_count: usize,
     /// MEMBER: when our credential expires (ms), if we hold one.
     pub credential_expires_at: Option<u64>,
+    /// MEMBER (M5): true iff our stored credential grants `CAP_CONTROL` — i.e. this device can send
+    /// remote scope-set commands to this swarm owner's rigs. Owners read `false` here.
+    pub member_can_control: bool,
     pub created_at: u64,
 }
 
@@ -133,6 +136,10 @@ impl SwarmRecord {
             member_count: self.members.len(),
             revoked_count: self.revoked.len(),
             credential_expires_at: self.credential.as_ref().map(|c| c.expires_at),
+            member_can_control: self
+                .credential
+                .as_ref()
+                .is_some_and(|c| c.has_capability(CAP_CONTROL)),
             created_at: self.created_at,
         }
     }
@@ -161,6 +168,23 @@ pub fn read_swarm(dir: &Path, swarm_public_key: &str) -> Result<Option<SwarmReco
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read swarm file: {e}")),
     }
+}
+
+/// Load THIS node's stored **member** credential for a swarm (the one saved by `swarm accept`). Used
+/// by the M5 remote-scope CLI to present a control credential. Errors if the swarm is unknown here or
+/// no credential is stored (e.g. this node is the owner, or never accepted one).
+pub fn member_credential_for(
+    dir: &Path,
+    swarm_public_key: &str,
+) -> Result<MembershipCredential, String> {
+    let rec = read_swarm(dir, swarm_public_key)?
+        .ok_or_else(|| format!("no swarm {swarm_public_key} on this node"))?;
+    rec.credential.ok_or_else(|| {
+        format!(
+            "no member credential stored for swarm {swarm_public_key} \
+             (are you the owner, or have you not run `swarm accept` yet?)"
+        )
+    })
 }
 
 /// Atomically write a swarm record (temp + rename). Owner files carry the group secret, so on Unix the
@@ -241,12 +265,31 @@ pub fn create_swarm(dir: &Path, label: &str, now_ms: u64) -> Result<SwarmView, S
 /// member holds `member_public_key`), signs a credential with the group key valid for `ttl_secs`,
 /// records the member, and persists. Returns `(credential, magnet)` — the owner sends either back to
 /// the member out-of-band. Refuses if the request names a *different* swarm, or the member is revoked.
+/// Owner approves a member with the default (serve-only) capability — the common case. See
+/// [`approve_member_with_caps`] to also grant [`CAP_CONTROL`] (an M5 rig-control device).
 pub fn approve_member(
     dir: &Path,
     swarm_public_key: &str,
     request_str: &str,
     member_label: &str,
     ttl_secs: u64,
+    now_ms: u64,
+) -> Result<ApprovedCredential, String> {
+    approve_member_with_caps(dir, swarm_public_key, request_str, member_label, ttl_secs, CAP_SERVE, now_ms)
+}
+
+/// Owner approves an enrollment request into a signed credential granting `capabilities`
+/// ([`CAP_SERVE`] and/or [`CAP_CONTROL`], M5). Verifies the request (proving the requester holds the
+/// key), refuses a revoked member, records it, and persists. Returns `(credential, magnet)` — the
+/// owner sends either back to the member. A `CAP_CONTROL` grant lets that member's device issue
+/// `REMOTE_SCOPE_SET` commands to this owner's rigs.
+pub fn approve_member_with_caps(
+    dir: &Path,
+    swarm_public_key: &str,
+    request_str: &str,
+    member_label: &str,
+    ttl_secs: u64,
+    capabilities: u32,
     now_ms: u64,
 ) -> Result<ApprovedCredential, String> {
     let mut record = read_swarm(dir, swarm_public_key)?
@@ -282,7 +325,8 @@ pub fn approve_member(
         &record.label,
         now_ms,
         expires_at,
-    );
+    )
+    .granting(capabilities);
     let signed =
         sign_credential_with_secret_hex(cred, &secret).map_err(|e| format!("sign credential: {e}"))?;
     let magnet = signed.to_magnet().map_err(|e| e.to_string())?;
@@ -593,6 +637,10 @@ pub enum AuthzError {
     NotAuthorized(MembershipError),
     /// The credential is valid but authorises a different identity than the connecting peer.
     WrongPeer { credential_peer: String, connection_peer: String },
+    /// The credential is valid + bound to the peer, but lacks the capability this action needs
+    /// (M5): e.g. a serve-only credential trying to issue a remote-control command, or a
+    /// control-only credential trying to consume. `need`/`have` are the capability bitmasks.
+    MissingCapability { need: u32, have: u32 },
 }
 
 impl std::fmt::Display for AuthzError {
@@ -608,6 +656,10 @@ impl std::fmt::Display for AuthzError {
             AuthzError::WrongPeer { credential_peer, connection_peer } => write!(
                 f,
                 "credential authorises {credential_peer} but the request came from {connection_peer}"
+            ),
+            AuthzError::MissingCapability { need, have } => write!(
+                f,
+                "credential lacks the required capability (need {need:#x}, have {have:#x})"
             ),
         }
     }
@@ -679,16 +731,19 @@ impl SwarmAuthorizer {
         c.sig = Some(sig);
     }
 
-    /// Authorize a serve of a `Private` model. `credential` is what the request carried (if any),
-    /// `connection_peer_id` is the libp2p-authenticated sender. Passes only when the credential is for
-    /// a swarm we own, verifies (signature + not-revoked + unexpired) against that swarm's revocation
-    /// set, and its bound member key derives exactly `connection_peer_id`.
-    pub fn authorize(
+    /// Shared gate: the credential must be for a swarm we own, verify (signature + not-revoked +
+    /// unexpired) against that swarm's revocation set, grant `required_cap`, and its bound member key
+    /// must derive exactly `connection_peer_id` (the libp2p-authenticated sender). Returns
+    /// `(swarm_public_key, member_public_key)`. The capability check is what separates a serve grant
+    /// from a control grant — least-privilege, so a serve-only credential can never remote-control a
+    /// rig (and a control-only credential can never consume).
+    fn authorize_capability(
         &self,
         credential: Option<&MembershipCredential>,
         connection_peer_id: &str,
+        required_cap: u32,
         now_ms: u64,
-    ) -> Result<AuthorizedServe, AuthzError> {
+    ) -> Result<(String, String), AuthzError> {
         let cred = credential.ok_or(AuthzError::NoCredential)?;
         self.refresh();
         let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -698,6 +753,10 @@ impl SwarmAuthorizer {
             .ok_or_else(|| AuthzError::UnknownSwarm(cred.swarm_public_key.clone()))?;
         // Verify against THIS swarm's revocation set (owner-authoritative).
         verify_credential(cred, now_ms, &owned.revoked).map_err(AuthzError::NotAuthorized)?;
+        // Least-privilege: the credential must actually grant the capability for this action.
+        if !cred.has_capability(required_cap) {
+            return Err(AuthzError::MissingCapability { need: required_cap, have: cred.capabilities });
+        }
         // Bind to the live connection: the credential's member key must derive the sender's peer id.
         let member_peer = credential_member_peer_id(cred)
             .map_err(AuthzError::NotAuthorized)?
@@ -708,11 +767,43 @@ impl SwarmAuthorizer {
                 connection_peer: connection_peer_id.to_string(),
             });
         }
-        Ok(AuthorizedServe {
-            swarm_public_key: cred.swarm_public_key.clone(),
-            member_public_key: cred.member_public_key.clone(),
-        })
+        Ok((cred.swarm_public_key.clone(), cred.member_public_key.clone()))
     }
+
+    /// Authorize a serve of a `Private` model — requires [`CAP_SERVE`] (M4 gate, now capability-gated
+    /// so a control-only credential can't consume).
+    pub fn authorize(
+        &self,
+        credential: Option<&MembershipCredential>,
+        connection_peer_id: &str,
+        now_ms: u64,
+    ) -> Result<AuthorizedServe, AuthzError> {
+        let (swarm_public_key, member_public_key) =
+            self.authorize_capability(credential, connection_peer_id, CAP_SERVE, now_ms)?;
+        Ok(AuthorizedServe { swarm_public_key, member_public_key })
+    }
+
+    /// Authorize a remote-control command (M5 `REMOTE_SCOPE_SET`) — requires [`CAP_CONTROL`]. The
+    /// same owner-authoritative verification + connection binding as a serve, but gated on the control
+    /// capability the owner must have explicitly issued.
+    pub fn authorize_control(
+        &self,
+        credential: Option<&MembershipCredential>,
+        connection_peer_id: &str,
+        now_ms: u64,
+    ) -> Result<AuthorizedControl, AuthzError> {
+        let (swarm_public_key, member_public_key) =
+            self.authorize_capability(credential, connection_peer_id, CAP_CONTROL, now_ms)?;
+        Ok(AuthorizedControl { swarm_public_key, member_public_key })
+    }
+}
+
+/// A successful control-authz pass (M5) — the member + swarm authorised to issue a rig-control
+/// command to this owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedControl {
+    pub swarm_public_key: String,
+    pub member_public_key: String,
 }
 
 #[cfg(test)]
@@ -919,6 +1010,86 @@ mod tests {
         let member_peer =
             credential_member_peer_id(&approved.credential).unwrap().to_string();
         (swarm.swarm_public_key, approved.credential, member_peer)
+    }
+
+    /// Like [`approved_member`] but issues a credential granting exactly `capabilities` (M5).
+    fn approved_member_with_caps(
+        owner_dir: &Path,
+        member: &Identity,
+        capabilities: u32,
+        ttl_secs: u64,
+    ) -> (String, MembershipCredential, String) {
+        let swarm = create_swarm(owner_dir, "Home rig", 1_000).unwrap();
+        let req = build_enrollment_request(member, &swarm.swarm_public_key, "m", 2_000).unwrap();
+        let approved = approve_member_with_caps(
+            owner_dir,
+            &swarm.swarm_public_key,
+            &req.magnet,
+            "m",
+            ttl_secs,
+            capabilities,
+            3_000,
+        )
+        .unwrap();
+        let member_peer = credential_member_peer_id(&approved.credential).unwrap().to_string();
+        (swarm.swarm_public_key, approved.credential, member_peer)
+    }
+
+    #[test]
+    fn a_serve_only_credential_cannot_authorize_control() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (_swarm, cred, member_peer) = approved_member(owner_dir.path(), &member, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        // Serve passes...
+        assert!(auth.authorize(Some(&cred), &member_peer, 4_000).is_ok());
+        // ...but control is refused: the owner never granted CAP_CONTROL.
+        assert!(matches!(
+            auth.authorize_control(Some(&cred), &member_peer, 4_000).unwrap_err(),
+            AuthzError::MissingCapability { .. },
+        ));
+    }
+
+    #[test]
+    fn a_control_credential_authorizes_control_and_serve_when_granted_both() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (_swarm, cred, member_peer) =
+            approved_member_with_caps(owner_dir.path(), &member, CAP_SERVE | CAP_CONTROL, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        let ctl = auth.authorize_control(Some(&cred), &member_peer, 4_000).unwrap();
+        assert_eq!(ctl.member_public_key, our_pk(&member));
+        // Granted both, so serve still works too.
+        assert!(auth.authorize(Some(&cred), &member_peer, 4_000).is_ok());
+    }
+
+    #[test]
+    fn a_control_only_credential_cannot_serve() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        // CAP_CONTROL without CAP_SERVE — a pure remote (can command, can't consume).
+        let (_swarm, cred, member_peer) =
+            approved_member_with_caps(owner_dir.path(), &member, CAP_CONTROL, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        assert!(auth.authorize_control(Some(&cred), &member_peer, 4_000).is_ok());
+        assert!(matches!(
+            auth.authorize(Some(&cred), &member_peer, 4_000).unwrap_err(),
+            AuthzError::MissingCapability { .. },
+        ));
+    }
+
+    #[test]
+    fn control_authz_still_binds_to_the_connecting_peer() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member = an_identity();
+        let (_swarm, cred, _member_peer) =
+            approved_member_with_caps(owner_dir.path(), &member, CAP_SERVE | CAP_CONTROL, 24 * HOUR);
+        let auth = SwarmAuthorizer::new(owner_dir.path().to_path_buf());
+        // A stolen control credential presented from a different peer id is refused.
+        assert!(matches!(
+            auth.authorize_control(Some(&cred), "12D3KooWimposter", 4_000).unwrap_err(),
+            AuthzError::WrongPeer { .. },
+        ));
     }
 
     #[test]
