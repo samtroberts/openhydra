@@ -216,11 +216,14 @@ struct SwarmApproveArgs {
     /// Credential validity in seconds (default 90 days).
     #[arg(long, default_value_t = 90 * 24 * 3600)]
     ttl_secs: u64,
-    /// Also grant this member the M5 **remote-control** capability (`CAP_CONTROL`) — it can then send
-    /// `swarm remote-scope` commands to flip this owner's rig models' scope. Grant this only to your
-    /// OWN trusted devices; omit for an ordinary consume-only member.
-    #[arg(long)]
-    control: bool,
+    /// What this credential grants (M5 dedicated control identity):
+    /// `serve` (default) → a consume/serve credential; `control` → a **remote-control**-only
+    /// credential (`CAP_CONTROL`) that can send `swarm remote-scope` commands to flip this owner's rig
+    /// models' scope. A control credential is minted against the member's *control* key and carries no
+    /// serve access. Granting "both" is two approvals — run this once per request (the member sends a
+    /// consume request from their consumer key and a control request from their control key).
+    #[arg(long, default_value = "serve")]
+    grant: String,
     #[command(flatten)]
     dir: SwarmDirArg,
 }
@@ -228,7 +231,8 @@ struct SwarmApproveArgs {
 #[derive(Args)]
 struct SwarmRemoteScopeArgs {
     /// The swarm (group public key) whose stored control credential to present. This node must hold a
-    /// member credential for it (from `swarm accept`) that grants `CAP_CONTROL`.
+    /// control credential for it (from `swarm accept` of a `--grant control` credential), and the
+    /// global `--identity` must be the **control key** that credential is bound to.
     #[arg(long)]
     swarm: String,
     /// The target rig's libp2p peer id (the provider to command).
@@ -799,7 +803,22 @@ fn run() -> Result<(), String> {
                 }
                 SwarmAction::Approve(a) => {
                     use openhydra_network::membership::{CAP_CONTROL, CAP_SERVE};
-                    let caps = if a.control { CAP_SERVE | CAP_CONTROL } else { CAP_SERVE };
+                    // Map the grant to a single capability — control credentials are CONTROL-only (bound
+                    // to the member's control key), serve credentials are SERVE-only. "Both" is two
+                    // approvals, one per key (see --grant help), so it is not a single grant here.
+                    let (caps, kind) = match a.grant.trim().to_lowercase().as_str() {
+                        "serve" | "" => (CAP_SERVE, "serve"),
+                        "control" => (CAP_CONTROL, "control"),
+                        "both" => {
+                            return Err("--grant both is two approvals: run `swarm approve --grant \
+                                        serve` on the member's consume request and `--grant control` \
+                                        on their control request (each binds a different key)"
+                                .to_string())
+                        }
+                        other => {
+                            return Err(format!("invalid --grant '{other}' (expected serve|control)"))
+                        }
+                    };
                     let out = openhydra_agent::swarms::approve_member_with_caps(
                         &resolve_dir(a.dir.swarms_dir),
                         a.swarm.trim(),
@@ -809,9 +828,7 @@ fn run() -> Result<(), String> {
                         caps,
                         now_ms,
                     )?;
-                    if a.control {
-                        eprintln!("openhydra-agent: issued a CONTROL credential (CAP_SERVE|CAP_CONTROL)");
-                    }
+                    eprintln!("openhydra-agent: issued a {kind} credential");
                     println!("{}", out.magnet);
                 }
                 SwarmAction::Accept(a) => {
@@ -849,10 +866,13 @@ fn run() -> Result<(), String> {
                         ));
                     }
                     let dir = resolve_dir(a.dir.swarms_dir);
-                    let cred = openhydra_agent::swarms::member_credential_for(&dir, a.swarm.trim())?;
+                    // Load the CONTROL credential (dedicated control identity, M5). `--identity` must be
+                    // the control key this credential is bound to — the rig binds it to the dialing peer.
+                    let cred = openhydra_agent::swarms::control_credential_for(&dir, a.swarm.trim())?;
                     if !cred.has_capability(CAP_CONTROL) {
                         return Err("this swarm credential does not grant CAP_CONTROL — ask the \
-                                    owner to re-approve your device with `--control`"
+                                    owner to approve your control device with `swarm approve --grant \
+                                    control`"
                             .to_string());
                     }
                     let identity = Identity::load_or_create(&identity_path)

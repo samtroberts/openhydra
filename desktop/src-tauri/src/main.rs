@@ -1178,6 +1178,15 @@ fn swarm_identity_path() -> PathBuf {
     openhydra_dir().join("desktop-consumer.key")
 }
 
+/// M5 dedicated control identity: the key a **control** credential binds to, distinct from the
+/// consumer/gateway key. A remote-scope one-shot dials as this key, so it never shares a PeerId with
+/// the running gateway (review finding B6). Generated lazily on first control enrollment (0600 via the
+/// agent's identity loader). Kept separate so leaking the always-online consumer key can't republish a
+/// rig, and a genuinely control-only device carries no serve access.
+fn swarm_control_identity_path() -> PathBuf {
+    openhydra_dir().join("desktop-control.key")
+}
+
 /// Serializes the read-modify-write of a swarm file across this process's swarm commands (approve +
 /// revoke both mutate an owner record). The atomic temp+rename in the agent prevents torn reads.
 static SWARMS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1195,19 +1204,62 @@ fn create_swarm(label: String) -> Result<openhydra_agent::SwarmView, String> {
     openhydra_agent::swarms::create_swarm(&swarms_dir(), label.trim(), now_unix_ms())
 }
 
-/// M3 (member): build a signed enrollment request to send a swarm owner out-of-band. `swarm` is an
-/// optional public-key hint (e.g. from a card) of which swarm to join.
+/// One or both enrollment requests a member emits (M5 dedicated control identity). *Consume* fills
+/// `consume` (from the consumer key), *control* fills `control` (from the control key), *both* fills
+/// both — the member sends whichever are present to the owner in one message.
+#[derive(serde::Serialize)]
+struct EnrollRequests {
+    consume: Option<openhydra_agent::EnrollmentRequestExport>,
+    control: Option<openhydra_agent::EnrollmentRequestExport>,
+}
+
+/// M3/M5 (member): build the signed enrollment request(s) to send a swarm owner out-of-band. `swarm`
+/// is an optional public-key hint (e.g. from a card) of which swarm to join. `role` selects which
+/// identities to request from: `consume` (consumer key, default), `control` (control key — grants no
+/// serve access), or `both` (a request from each key; "both" is inherently two credentials because
+/// control and consume bind to different keys).
 #[tauri::command]
 fn swarm_enroll_request(
     swarm: Option<String>,
     label: String,
-) -> Result<openhydra_agent::EnrollmentRequestExport, String> {
-    openhydra_agent::swarms::enroll_request_at(
-        &swarm_identity_path(),
-        swarm.as_deref().unwrap_or("").trim(),
-        label.trim(),
-        now_unix_ms(),
-    )
+    role: Option<String>,
+) -> Result<EnrollRequests, String> {
+    let hint = swarm.as_deref().unwrap_or("").trim().to_string();
+    let label = label.trim().to_string();
+    let now = now_unix_ms();
+    let want_consume;
+    let want_control;
+    match role.as_deref().unwrap_or("consume") {
+        "consume" | "" => {
+            want_consume = true;
+            want_control = false;
+        }
+        "control" => {
+            want_consume = false;
+            want_control = true;
+        }
+        "both" => {
+            want_consume = true;
+            want_control = true;
+        }
+        other => return Err(format!("invalid role '{other}' (expected consume|control|both)")),
+    }
+    let consume = if want_consume {
+        Some(openhydra_agent::swarms::enroll_request_at(&swarm_identity_path(), &hint, &label, now)?)
+    } else {
+        None
+    };
+    let control = if want_control {
+        Some(openhydra_agent::swarms::enroll_request_at(
+            &swarm_control_identity_path(),
+            &hint,
+            &label,
+            now,
+        )?)
+    } else {
+        None
+    };
+    Ok(EnrollRequests { consume, control })
 }
 
 /// M3 (owner): preview an incoming enrollment request — verifies the member's signature and returns
@@ -1217,42 +1269,78 @@ fn preview_enroll_request(request: String) -> Result<openhydra_agent::Enrollment
     openhydra_agent::swarms::preview_enrollment_request(&request)
 }
 
-/// M3 (owner): approve an enrollment request into a signed credential valid for `ttl_secs` (default
-/// 90 days). Records the member and returns the credential to send back out-of-band.
+/// The credential(s) an owner returns to a member (M5 dedicated control identity). *Consume* fills
+/// `consume` (a `CAP_SERVE` credential on the member's consumer key); *control* fills `control` (a
+/// `CAP_CONTROL`-only credential on the member's control key); *both* fills both.
+#[derive(serde::Serialize)]
+struct ApprovedCredentials {
+    consume: Option<openhydra_agent::ApprovedCredential>,
+    control: Option<openhydra_agent::ApprovedCredential>,
+}
+
+/// M3/M5 (owner): approve enrollment request(s) into signed credential(s) valid for `ttl_secs`
+/// (default 90 days), records the member(s), returns the credential(s) to send back out-of-band.
 ///
-/// M5: `control=true` also grants the remote-control capability (`CAP_CONTROL`) — that member's
-/// device can then flip this owner's rig models' scope via `swarm_remote_scope`. Grant it only to
-/// your own trusted devices; a plain member stays serve-only.
+/// `grant` selects the capability: `consume` (default) → a serve credential over `request`; `control`
+/// → a `CAP_CONTROL`-only credential over `request`; `both` → a serve credential over `request` *and*
+/// a control credential over `control_request` (the member's two requests bind different keys, so
+/// "both" is two credentials). A control credential lets that device flip this owner's rig models'
+/// scope via `swarm_remote_scope` — grant it only to your own trusted devices; it carries no serve
+/// access.
 #[tauri::command]
 fn swarm_approve_member(
     swarm_public_key: String,
     request: String,
+    control_request: Option<String>,
     member_label: String,
     ttl_secs: Option<u64>,
-    control: Option<bool>,
-) -> Result<openhydra_agent::ApprovedCredential, String> {
+    grant: Option<String>,
+) -> Result<ApprovedCredentials, String> {
     let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let caps = if control.unwrap_or(false) {
-        openhydra_agent::CAP_SERVE | openhydra_agent::CAP_CONTROL
-    } else {
-        openhydra_agent::CAP_SERVE
+    let ttl = ttl_secs.unwrap_or(90 * 24 * 3600);
+    let label = member_label.trim().to_string();
+    let approve = |req: &str, caps: u32| {
+        openhydra_agent::swarms::approve_member_with_caps(
+            &swarms_dir(),
+            &swarm_public_key,
+            req,
+            &label,
+            ttl,
+            caps,
+            now_unix_ms(),
+        )
     };
-    openhydra_agent::swarms::approve_member_with_caps(
-        &swarms_dir(),
-        &swarm_public_key,
-        &request,
-        member_label.trim(),
-        ttl_secs.unwrap_or(90 * 24 * 3600),
-        caps,
-        now_unix_ms(),
-    )
+    match grant.as_deref().unwrap_or("consume") {
+        "consume" | "" => Ok(ApprovedCredentials {
+            consume: Some(approve(&request, openhydra_agent::CAP_SERVE)?),
+            control: None,
+        }),
+        "control" => Ok(ApprovedCredentials {
+            consume: None,
+            control: Some(approve(&request, openhydra_agent::CAP_CONTROL)?),
+        }),
+        "both" => {
+            let control_req = control_request
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "grant 'both' needs the member's control request too (control_request)".to_string()
+                })?;
+            Ok(ApprovedCredentials {
+                consume: Some(approve(&request, openhydra_agent::CAP_SERVE)?),
+                control: Some(approve(control_req, openhydra_agent::CAP_CONTROL)?),
+            })
+        }
+        other => Err(format!("invalid grant '{other}' (expected consume|control|both)")),
+    }
 }
 
 /// M5 (control member): send a signed `REMOTE_SCOPE_SET` to a rig — flip one of its shared models'
 /// scope (`global` | `private` | `device`) from this device. Shells to the agent's `swarm
-/// remote-scope` (it needs a live one-shot node to dial the rig); the identity is the
-/// consumer/dialing key the control credential is bound to. Returns the rig's ack line
-/// (`applied: <model> -> <scope>`), or the rig's refusal / a transport error.
+/// remote-scope` (it needs a live one-shot node to dial the rig), dialing as the **control** key the
+/// stored control credential is bound to (see `swarm_control_identity_path`). Returns the rig's ack
+/// line (`applied: <model> -> <scope>`), or the rig's refusal / a transport error.
 #[tauri::command]
 fn swarm_remote_scope(
     swarm_public_key: String,
@@ -1267,8 +1355,16 @@ fn swarm_remote_scope(
     let bin = agent_binary().ok_or_else(|| {
         "openhydra-agent binary not found (bundle missing its sidecar, or no dev build)".to_string()
     })?;
+    // Dial as the key the control credential is bound to — the dedicated control key on the clean path,
+    // or the consumer key on the Inc-D fallback (a legacy dual-cap credential). This is the B6 fix: the
+    // one-shot control node no longer reuses the gateway's consumer-key PeerId.
+    let identity = openhydra_agent::swarms::control_identity_for(
+        &swarms_dir(),
+        swarm_public_key.trim(),
+        &[swarm_control_identity_path(), swarm_identity_path()],
+    )?;
     let mut cmd = Command::new(&bin);
-    cmd.arg("--identity").arg(swarm_identity_path());
+    cmd.arg("--identity").arg(identity);
     for b in load_settings().bootstraps.iter().filter(|b| !b.is_empty()) {
         cmd.arg("--bootstrap").arg(b);
     }
@@ -1308,21 +1404,34 @@ fn preview_swarm_credential(
     openhydra_agent::swarms::preview_credential(&credential, now_unix_ms())
 }
 
-/// M3 (member): accept a credential the owner returned — verifies it is signed, bound to THIS node's
-/// identity, and unexpired, then persists a member record. Returns the stored view.
+/// Accept one credential, binding against the identity its capability implies: a `CAP_CONTROL`-only
+/// credential binds to the control key; anything granting serve binds to the consumer key. The agent's
+/// accept then re-verifies the binding and routes storage into the matching slot (Inc A).
+fn accept_one_credential(credential: &str, label: &str) -> Result<openhydra_agent::SwarmView, String> {
+    let preview = openhydra_agent::swarms::preview_credential(credential, now_unix_ms())?;
+    let is_control_only =
+        preview.has_capability(openhydra_agent::CAP_CONTROL) && !preview.has_capability(openhydra_agent::CAP_SERVE);
+    let identity = if is_control_only { swarm_control_identity_path() } else { swarm_identity_path() };
+    openhydra_agent::swarms::accept_credential_at(&swarms_dir(), &identity, credential, label, now_unix_ms())
+}
+
+/// M3/M5 (member): accept the credential(s) the owner returned — verifies each is signed, bound to the
+/// right local identity (control creds → control key, serve creds → consumer key), and unexpired, then
+/// persists them. `control_credential` carries the second credential of a "both" grant. Returns the
+/// final stored view (both slots populated for "both").
 #[tauri::command]
 fn swarm_accept_credential(
     credential: String,
+    control_credential: Option<String>,
     label: Option<String>,
 ) -> Result<openhydra_agent::SwarmView, String> {
     let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    openhydra_agent::swarms::accept_credential_at(
-        &swarms_dir(),
-        &swarm_identity_path(),
-        &credential,
-        label.as_deref().unwrap_or("").trim(),
-        now_unix_ms(),
-    )
+    let label = label.as_deref().unwrap_or("").trim();
+    let mut view = accept_one_credential(credential.trim(), label)?;
+    if let Some(cc) = control_credential.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        view = accept_one_credential(cc, label)?;
+    }
+    Ok(view)
 }
 
 /// M3: forget a swarm entirely (owner: destroys the group key; member: drops our credential).

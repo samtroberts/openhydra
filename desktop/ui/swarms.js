@@ -158,6 +158,48 @@ function copyBtnRow(text, okMsg) {
   };
 }
 
+// A small segmented (single-choice) control. `options` = [{v,label,title}]; `selected` is the default
+// value. Wire the change with `wireSegmented`. Used for the three-way Consume/Control/Both grant + the
+// member's request role (M5 dedicated control identity).
+function segmented(name, options, selected) {
+  return (
+    `<div class="row" data-seg="${escapeHtml(name)}" role="group" style="gap:6px;margin-top:6px">` +
+    options
+      .map(
+        (o) =>
+          `<button type="button" class="btn ${o.v === selected ? "brand" : "outline"} sm segbtn" ` +
+          `data-seg-val="${escapeHtml(o.v)}" title="${escapeHtml(o.title || "")}">${escapeHtml(o.label)}</button>`,
+      )
+      .join("") +
+    `</div>`
+  );
+}
+
+function wireSegmented(root, name, onChange) {
+  const wrap = root.querySelector(`[data-seg="${name}"]`);
+  if (!wrap) return;
+  wrap.querySelectorAll(".segbtn").forEach((b) => {
+    b.onclick = () => {
+      wrap.querySelectorAll(".segbtn").forEach((x) => x.classList.replace("brand", "outline"));
+      b.classList.replace("outline", "brand");
+      onChange(b.dataset.segVal);
+    };
+  });
+}
+
+// A read-only credential/request box with a copy button. `idx` makes the copy button class unique so
+// several boxes can coexist in one modal (a "Both" grant returns two credentials).
+function credBox(title, magnet, note, idx) {
+  return (
+    `<div style="margin-top:12px">` +
+    `<div style="font-size:11.5px"><b>${escapeHtml(title)}</b></div>` +
+    `<div class="mut" style="font-size:11px;margin:2px 0 4px">${escapeHtml(note)}</div>` +
+    `<textarea class="input mono" rows="3" readonly style="width:100%;font-size:10.5px">${escapeHtml(magnet)}</textarea>` +
+    `<div class="row" style="margin-top:4px"><button class="btn sm brand swcopy${idx}">Copy</button></div>` +
+    `</div>`
+  );
+}
+
 // ── create swarm (owner) ──
 function createSwarmModal() {
   const { back, close } = modal(
@@ -187,46 +229,74 @@ function createSwarmModal() {
   };
 }
 
-// ── approve member (owner): paste request → preview fingerprint → approve → hand back credential ──
+// ── approve member (owner): choose grant → paste request(s) → preview fingerprint(s) → approve →
+// hand back credential(s). Grant is three-way (M5 dedicated control identity): Consume (serve), Control
+// (a CAP_CONTROL-only credential on the member's control key), or Both (two credentials — control and
+// consume bind different keys, so there is no single-key "both"). ──
+const GRANT_OPTIONS = [
+  { v: "consume", label: "Use models", title: "A member who can use your private models (no rig control)" },
+  { v: "control", label: "Control rig", title: "A control-only device: can flip your rigs' model scope (incl. publish). No serve access." },
+  { v: "both", label: "Both", title: "Two credentials — consume on their consumer key, control on their control key" },
+];
+
 function approveMemberModal(swarmPublicKey, swarmLabel) {
   const { back, close } = modal(
     `Add a member to “${swarmLabel}”`,
-    `<div class="cmodal-path">Paste the enrollment request the person sent you. Confirm their fingerprint with them (voice/in person) before approving — that's what stops you enrolling the wrong key.</div>` +
-      `<textarea class="input mono swreq" rows="3" placeholder="openhydra:enroll:…   or the request JSON" style="width:100%;font-size:11px;margin-top:10px"></textarea>` +
+    `<div class="cmodal-path">Choose what to grant, then paste the enrollment request(s) the person sent you. Confirm their fingerprint with them (voice/in person) before approving — that's what stops you enrolling the wrong key.</div>` +
+      `<label class="mut" style="font-size:11px;margin-top:10px;display:block">What to grant</label>` +
+      segmented("grant", GRANT_OPTIONS, "consume") +
+      `<label class="mut swreqlabel" style="font-size:11px;margin-top:10px;display:block">Enrollment request</label>` +
+      `<textarea class="input mono swreq" rows="3" placeholder="openhydra:enroll:…   or the request JSON" style="width:100%;font-size:11px"></textarea>` +
+      `<div class="swctlreqwrap" style="display:none">` +
+      `<label class="mut" style="font-size:11px;margin-top:10px;display:block">Control request (their second magnet, from their control key)</label>` +
+      `<textarea class="input mono swctlreq" rows="3" placeholder="openhydra:enroll:…   (control key)" style="width:100%;font-size:11px"></textarea>` +
+      `</div>` +
       `<div class="row" style="margin-top:8px"><button class="btn outline sm swpreview">Preview</button></div>` +
       `<div class="swpreviewout" style="margin-top:8px"></div>`,
     `<button class="btn ghost sm swcancel">Close</button>`,
   );
-  const req = $(".swreq", back);
+  let grant = "consume";
   const out = $(".swpreviewout", back);
   const foot = $(".cmodal-f", back);
   $(".swcancel", back).onclick = close;
+  wireSegmented(back, "grant", (v) => {
+    grant = v;
+    $(".swctlreqwrap", back).style.display = v === "both" ? "" : "none";
+    $(".swreqlabel", back).textContent =
+      v === "control" ? "Control request (from their control key)" : "Enrollment request";
+    // A grant change invalidates any prior preview.
+    out.innerHTML = "";
+    foot.innerHTML = `<button class="btn ghost sm swcancel">Close</button>`;
+    $(".swcancel", back).onclick = close;
+  });
 
   $(".swpreview", back).onclick = async () => {
-    const text = (req.value || "").trim();
-    if (!text) {
+    const req = ($(".swreq", back).value || "").trim();
+    const ctlReq = ($(".swctlreq", back)?.value || "").trim();
+    if (!req) {
       toast("Paste a request first");
+      return;
+    }
+    if (grant === "both" && !ctlReq) {
+      toast("Paste the control request too (their second magnet)");
       return;
     }
     out.innerHTML = `<span class="mut" style="font-size:11.5px">Verifying…</span>`;
     try {
-      const r = await call("preview_enroll_request", { request: text });
-      const fp = await fingerprintOf(r.member_public_key);
+      // Preview the primary request; for "both" preview the control request as well and show both.
+      const primary = await call("preview_enroll_request", { request: req });
+      const cards = [await requestCardHtml(primary, grant === "control" ? "control" : "consume")];
+      if (grant === "both") {
+        const ctl = await call("preview_enroll_request", { request: ctlReq });
+        cards.push(await requestCardHtml(ctl, "control"));
+      }
       out.innerHTML =
-        `<div class="card pad" style="font-size:11.5px">` +
-        `<div><b>${escapeHtml(r.label || "member")}</b> <span class="badge ok">✔ request signed</span></div>` +
-        `<div class="mut mono" style="margin-top:4px;font-size:11px" title="Confirm this with them out-of-band">${escapeHtml(fp)}</div>` +
-        `<div class="mut" style="margin-top:2px">id ${escapeHtml(peerShort(r.member_openhydra_peer_id))}</div>` +
-        `</div>` +
+        cards.join("") +
         `<label class="mut" style="font-size:11px;margin-top:10px;display:block">Label for this member</label>` +
-        `<input class="input swmlabel" value="${escapeHtml(r.label || "")}" placeholder="e.g. Sam's MacBook" style="width:100%" maxlength="128"/>` +
-        `<label class="mut" style="display:flex;align-items:flex-start;gap:8px;margin-top:10px;font-size:11.5px;cursor:pointer">` +
-        `<input type="checkbox" class="swctl" style="margin-top:2px"/>` +
-        `<span>Also grant <b>remote control</b> of my rigs — this device can flip my models' scope (including publishing to Global) from anywhere. Only tick this for a device you own and trust.</span></label>`;
-      // Swap the footer to an Approve action now that a valid request is loaded.
-      foot.innerHTML = `<button class="btn ghost sm swcancel2">Close</button><button class="btn sm brand swapprove">Approve &amp; issue credential</button>`;
+        `<input class="input swmlabel" value="${escapeHtml(primary.label || "")}" placeholder="e.g. Sam's MacBook" style="width:100%" maxlength="128"/>`;
+      foot.innerHTML = `<button class="btn ghost sm swcancel2">Close</button><button class="btn sm brand swapprove">Approve &amp; issue</button>`;
       $(".swcancel2", back).onclick = close;
-      $(".swapprove", back).onclick = () => doApprove(back, close, swarmPublicKey, text);
+      $(".swapprove", back).onclick = () => doApprove(back, close, swarmPublicKey, grant, req, ctlReq);
     } catch (e) {
       out.innerHTML = `<div class="cardfail">✕ ${escapeHtml(String(e))}</div>`;
       foot.innerHTML = `<button class="btn ghost sm swcancel3">Close</button>`;
@@ -235,28 +305,61 @@ function approveMemberModal(swarmPublicKey, swarmLabel) {
   };
 }
 
-async function doApprove(back, close, swarmPublicKey, requestText) {
+// A verified-request preview card. `kind` labels what this key will be granted so the owner sees, per
+// request, whether it's the consume key or the control key.
+async function requestCardHtml(r, kind) {
+  const fp = await fingerprintOf(r.member_public_key);
+  const tag =
+    kind === "control"
+      ? `<span class="badge secondary" title="This key will get a control-only credential">🔒 control key</span>`
+      : `<span class="badge secondary" title="This key will get a serve/consume credential">consume key</span>`;
+  return (
+    `<div class="card pad" style="font-size:11.5px;margin-bottom:6px">` +
+    `<div><b>${escapeHtml(r.label || "member")}</b> <span class="badge ok">✔ request signed</span> ${tag}</div>` +
+    `<div class="mut mono" style="margin-top:4px;font-size:11px" title="Confirm this with them out-of-band">${escapeHtml(fp)}</div>` +
+    `<div class="mut" style="margin-top:2px">id ${escapeHtml(peerShort(r.member_openhydra_peer_id))}</div>` +
+    `</div>`
+  );
+}
+
+async function doApprove(back, close, swarmPublicKey, grant, request, controlRequest) {
   const memberLabel = ($(".swmlabel", back)?.value || "").trim();
-  const control = !!$(".swctl", back)?.checked;
   try {
     const approved = await call("swarm_approve_member", {
       swarm_public_key: swarmPublicKey,
-      request: requestText,
+      request,
+      control_request: grant === "both" ? controlRequest : null,
       member_label: memberLabel,
       ttl_secs: CRED_TTL_SECS,
-      control,
+      grant,
     });
-    // Show the credential to send back — replace the body with a copy box.
-    const magnet = approved.magnet;
-    const controlNote = control
-      ? ` <b>This is a control credential</b> — that device will be able to remote-set your rigs' model scopes.`
-      : "";
+    const boxes = [];
+    if (approved.consume)
+      boxes.push(
+        credBox(
+          "Consume credential",
+          approved.consume.magnet,
+          "Lets the device use your private models. Send it to the member.",
+          0,
+        ),
+      );
+    if (approved.control)
+      boxes.push(
+        credBox(
+          "🔒 Control credential",
+          approved.control.magnet,
+          "Lets the device remote-set your rigs' model scope (incl. publish). Control only — no serve access. Send it to the member.",
+          1,
+        ),
+      );
     $(".cmodal-b", back).innerHTML =
-      `<div class="cmodal-path">Approved.${controlNote} Send this credential back to the member — they paste it into “Join a swarm” to finish. It's signed and carries no secret.</div>` +
-      `<textarea class="input mono" rows="3" readonly style="width:100%;font-size:10.5px;margin-top:10px">${escapeHtml(magnet)}</textarea>`;
-    $(".cmodal-f", back).innerHTML =
-      `<button class="btn ghost sm swdone">Done</button><button class="btn sm brand swcopycred">Copy credential</button>`;
-    $(".swcopycred", back).onclick = copyBtnRow(magnet, "Credential copied — send it to the member");
+      `<div class="cmodal-path">Approved. Send the credential${boxes.length > 1 ? "s" : ""} back to the member — they paste ${boxes.length > 1 ? "them" : "it"} into “Join a swarm” to finish. Signed, no secret inside.</div>` +
+      boxes.join("");
+    $(".cmodal-f", back).innerHTML = `<button class="btn ghost sm swdone">Done</button>`;
+    if (approved.consume)
+      $(".swcopy0", back).onclick = copyBtnRow(approved.consume.magnet, "Consume credential copied");
+    if (approved.control)
+      $(".swcopy1", back).onclick = copyBtnRow(approved.control.magnet, "Control credential copied");
     $(".swdone", back).onclick = () => {
       close();
       renderSwarms();
@@ -325,11 +428,22 @@ function remoteScopeModal(swarmPublicKey, swarmLabel) {
   };
 }
 
-// ── join a swarm (member): generate a request to send, then paste the credential you get back ──
+// ── join a swarm (member): pick a role, generate the request(s) to send, then paste the credential(s)
+// you get back. Role (M5 dedicated control identity): Use models (consume key), Control rig (a
+// dedicated control key — no serve access), or Both (a request from each key). "Both" is inherently two
+// credentials because control and consume bind different keys. ──
+const ROLE_OPTIONS = [
+  { v: "consume", label: "Use models", title: "Request access to use this swarm's private models" },
+  { v: "control", label: "Control rig", title: "Request control-only access — flip the owner's rig model scope. No serve access." },
+  { v: "both", label: "Both", title: "Request both — one credential per key (consume + control)" },
+];
+
 function joinSwarmModal() {
   const { back, close } = modal(
     "Join a swarm",
-    `<div class="cmodal-path">Two steps. First generate your enrollment request and send it to the swarm's owner (any channel — it's public). When they send a credential back, paste it below to finish.</div>` +
+    `<div class="cmodal-path">Two steps. Pick what you want, generate your request(s) and send them to the swarm's owner (any channel — they're public). When they send the credential(s) back, paste them below to finish.</div>` +
+      `<label class="mut" style="font-size:11px;margin-top:10px;display:block">What you want</label>` +
+      segmented("role", ROLE_OPTIONS, "consume") +
       `<label class="mut" style="font-size:11px;margin-top:10px;display:block">A name for this device (the owner sees it)</label>` +
       `<input class="input swdev" placeholder="e.g. Sam's MacBook" style="width:100%" maxlength="128"/>` +
       `<label class="mut" style="font-size:11px;margin-top:8px;display:block">Swarm key (optional — pin which swarm you're joining)</label>` +
@@ -339,16 +453,26 @@ function joinSwarmModal() {
       `<hr style="border:0;border-top:1px solid var(--line);margin:14px 0"/>` +
       `<label class="mut" style="font-size:11px;display:block">Paste the credential the owner sent back</label>` +
       `<textarea class="input mono swcred" rows="3" placeholder="openhydra:cred:…   or the credential JSON" style="width:100%;font-size:11px;margin-top:6px"></textarea>` +
+      `<div class="swcred2wrap" style="display:none">` +
+      `<label class="mut" style="font-size:11px;margin-top:8px;display:block">Second credential (the 🔒 control one, for “Both”)</label>` +
+      `<textarea class="input mono swcred2" rows="3" placeholder="openhydra:cred:…   (control)" style="width:100%;font-size:11px;margin-top:6px"></textarea>` +
+      `</div>` +
       `<div class="row" style="margin-top:8px"><button class="btn outline sm swcredpreview">Preview</button><button class="btn brand sm swaccept" style="display:none">Add swarm</button></div>` +
       `<div class="swcredout" style="margin-top:8px"></div>`,
     `<button class="btn ghost sm swcancel">Close</button>`,
     600,
   );
+  let role = "consume";
   const dev = $(".swdev", back);
   const hint = $(".swhint", back);
   const genOut = $(".swgenout", back);
+  const acceptBtn = $(".swaccept", back);
   dev.focus();
   $(".swcancel", back).onclick = close;
+  wireSegmented(back, "role", (v) => {
+    role = v;
+    $(".swcred2wrap", back).style.display = v === "both" ? "" : "none";
+  });
 
   $(".swgen", back).onclick = async () => {
     const label = (dev.value || "").trim();
@@ -358,41 +482,54 @@ function joinSwarmModal() {
     }
     genOut.innerHTML = `<span class="mut" style="font-size:11.5px">Signing…</span>`;
     try {
-      const r = await call("swarm_enroll_request", { swarm: (hint.value || "").trim() || null, label });
-      const magnet = r.magnet;
-      genOut.innerHTML =
-        `<textarea class="input mono" rows="3" readonly style="width:100%;font-size:10.5px">${escapeHtml(magnet)}</textarea>` +
-        `<div class="row" style="margin-top:6px"><button class="btn sm brand swcopyreq">Copy request</button><span class="mut" style="font-size:11px;align-self:center;margin-left:8px">Send this to the owner.</span></div>`;
-      $(".swcopyreq", back).onclick = copyBtnRow(magnet, "Request copied — send it to the owner");
+      const r = await call("swarm_enroll_request", {
+        swarm: (hint.value || "").trim() || null,
+        label,
+        role,
+      });
+      const boxes = [];
+      if (r.consume)
+        boxes.push(credBox("Enrollment request", r.consume.magnet, "Send this to the owner.", 0));
+      if (r.control)
+        boxes.push(
+          credBox("🔒 Control request", r.control.magnet, "Send this too — it's from your control key.", 1),
+        );
+      genOut.innerHTML = boxes.join("");
+      if (r.consume) $(".swcopy0", back).onclick = copyBtnRow(r.consume.magnet, "Request copied");
+      if (r.control) $(".swcopy1", back).onclick = copyBtnRow(r.control.magnet, "Control request copied");
     } catch (e) {
       genOut.innerHTML = `<div class="cardfail">✕ ${escapeHtml(String(e))}</div>`;
     }
   };
 
   const cred = $(".swcred", back);
+  const cred2 = $(".swcred2", back);
   const credOut = $(".swcredout", back);
-  const acceptBtn = $(".swaccept", back);
-  let previewed = null;
+  let previewed = null; // { credential, control_credential|null }
 
   $(".swcredpreview", back).onclick = async () => {
     const text = (cred.value || "").trim();
+    const text2 = (cred2?.value || "").trim();
     if (!text) {
       toast("Paste a credential first");
+      return;
+    }
+    if (role === "both" && !text2) {
+      toast("Paste the second (control) credential too");
       return;
     }
     credOut.innerHTML = `<span class="mut" style="font-size:11.5px">Verifying…</span>`;
     acceptBtn.style.display = "none";
     previewed = null;
     try {
-      const c = await call("preview_swarm_credential", { credential: text });
-      const fp = await fingerprintOf(c.swarm_public_key);
-      credOut.innerHTML =
-        `<div class="card pad" style="font-size:11.5px">` +
-        `<div><b>${escapeHtml(c.swarm_label || "swarm")}</b> <span class="badge ok">✔ signature valid</span></div>` +
-        `<div class="mut mono" style="margin-top:4px;font-size:11px">${escapeHtml(fp)}</div>` +
-        `<div class="mut" style="margin-top:2px">expires ${new Date(Number(c.expires_at)).toLocaleDateString()}</div>` +
-        `</div>`;
-      previewed = text;
+      const c1 = await call("preview_swarm_credential", { credential: text });
+      const cards = [credentialCardHtml(c1, await fingerprintOf(c1.swarm_public_key))];
+      if (role === "both") {
+        const c2 = await call("preview_swarm_credential", { credential: text2 });
+        cards.push(credentialCardHtml(c2, await fingerprintOf(c2.swarm_public_key)));
+      }
+      credOut.innerHTML = cards.join("");
+      previewed = { credential: text, control_credential: role === "both" ? text2 : null };
       acceptBtn.style.display = "";
     } catch (e) {
       credOut.innerHTML = `<div class="cardfail">✕ ${escapeHtml(String(e))}</div>`;
@@ -402,7 +539,11 @@ function joinSwarmModal() {
   acceptBtn.onclick = async () => {
     if (!previewed) return;
     try {
-      const v = await call("swarm_accept_credential", { credential: previewed, label: null });
+      const v = await call("swarm_accept_credential", {
+        credential: previewed.credential,
+        control_credential: previewed.control_credential,
+        label: null,
+      });
       toast(`Joined “${v.label || "swarm"}”`);
       close();
       renderSwarms();
@@ -410,6 +551,25 @@ function joinSwarmModal() {
       toast(`Couldn't join: ${e}`);
     }
   };
+}
+
+// A verified-credential preview card, tagged by the capability it grants so the member sees whether a
+// pasted credential is a consume or a 🔒 control credential.
+function credentialCardHtml(c, fp) {
+  const caps = Number(c.capabilities || 0);
+  const isControl = (caps & 2) !== 0 && (caps & 1) === 0; // CAP_CONTROL without CAP_SERVE
+  const tag = isControl
+    ? ` <span class="badge secondary">🔒 control</span>`
+    : (caps & 2) !== 0
+      ? ` <span class="badge secondary">consume + control</span>`
+      : "";
+  return (
+    `<div class="card pad" style="font-size:11.5px;margin-bottom:6px">` +
+    `<div><b>${escapeHtml(c.swarm_label || "swarm")}</b> <span class="badge ok">✔ signature valid</span>${tag}</div>` +
+    `<div class="mut mono" style="margin-top:4px;font-size:11px">${escapeHtml(fp)}</div>` +
+    `<div class="mut" style="margin-top:2px">expires ${new Date(Number(c.expires_at)).toLocaleDateString()}</div>` +
+    `</div>`
+  );
 }
 
 // A fingerprint helper: the backend already computes fingerprints for stored keys, but a freshly

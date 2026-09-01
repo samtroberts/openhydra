@@ -71,9 +71,15 @@ pub struct SwarmRecord {
     /// OWNER ONLY: revoked member public keys (checked by `verify_credential`).
     #[serde(default)]
     pub revoked: BTreeSet<String>,
-    /// MEMBER ONLY: our credential from the owner.
+    /// MEMBER ONLY: our **serve** credential from the owner (bound to the consumer/serve identity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<MembershipCredential>,
+    /// MEMBER ONLY (M5 dedicated control identity): our **control** credential from the owner
+    /// (`CAP_CONTROL`-only, bound to the *control* identity — a distinct key from `credential`'s). Held
+    /// separately so a control action dials as the control key and never shares a PeerId with the
+    /// running consumer gateway (review finding B6). Absent for serve-only members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_credential: Option<MembershipCredential>,
     pub created_at: u64,
 }
 
@@ -107,15 +113,32 @@ pub struct SwarmView {
     pub revoked_count: usize,
     /// MEMBER: when our credential expires (ms), if we hold one.
     pub credential_expires_at: Option<u64>,
-    /// MEMBER (M5): true iff our stored credential grants `CAP_CONTROL` — i.e. this device can send
-    /// remote scope-set commands to this swarm owner's rigs. Owners read `false` here.
+    /// MEMBER (M5): true iff this device holds a control-capable credential for the swarm — i.e. it
+    /// can send remote scope-set commands to this swarm owner's rigs. Derived from `control_credential`
+    /// (dedicated control identity), falling back to a legacy dual-cap `credential` that still carries
+    /// `CAP_CONTROL`. Owners read `false` here.
     pub member_can_control: bool,
+    /// MEMBER (M5): when our control credential expires (ms), if we hold one. `None` for serve-only
+    /// members. Lets the UI show the control grant's lifetime distinctly from the serve credential.
+    pub control_credential_expires_at: Option<u64>,
     pub created_at: u64,
 }
 
 impl SwarmRecord {
+    /// The control-capable credential this record can act on, if any: the dedicated `control_credential`
+    /// first, else a legacy dual-cap `credential` that still grants `CAP_CONTROL` (the transitional
+    /// fallback of Inc D — keeps a pre-dedicated-identity setup working while emitting no churn once a
+    /// real control credential is enrolled).
+    fn control_capable_credential(&self) -> Option<&MembershipCredential> {
+        self.control_credential
+            .as_ref()
+            .filter(|c| c.has_capability(CAP_CONTROL))
+            .or_else(|| self.credential.as_ref().filter(|c| c.has_capability(CAP_CONTROL)))
+    }
+
     /// Redact to a UI-safe view (drops `group_secret_key` and never reintroduces it).
     pub fn to_view(&self) -> SwarmView {
+        let control_cred = self.control_capable_credential();
         SwarmView {
             swarm_public_key: self.swarm_public_key.clone(),
             fingerprint: key_fingerprint(&self.swarm_public_key),
@@ -136,10 +159,8 @@ impl SwarmRecord {
             member_count: self.members.len(),
             revoked_count: self.revoked.len(),
             credential_expires_at: self.credential.as_ref().map(|c| c.expires_at),
-            member_can_control: self
-                .credential
-                .as_ref()
-                .is_some_and(|c| c.has_capability(CAP_CONTROL)),
+            member_can_control: control_cred.is_some(),
+            control_credential_expires_at: control_cred.map(|c| c.expires_at),
             created_at: self.created_at,
         }
     }
@@ -185,6 +206,57 @@ pub fn member_credential_for(
              (are you the owner, or have you not run `swarm accept` yet?)"
         )
     })
+}
+
+/// Load THIS node's stored **control** credential for a swarm (M5 dedicated control identity). Used by
+/// the remote-scope CLI to present a `CAP_CONTROL` credential. Returns the dedicated `control_credential`
+/// when present; otherwise falls back to a legacy dual-cap serve `credential` that still grants
+/// `CAP_CONTROL` (Inc D transitional path — reproduces the old consumer-key dial, but keeps a
+/// pre-dedicated-identity setup working). Errors if the swarm is unknown here or this node holds no
+/// control-capable credential for it.
+pub fn control_credential_for(
+    dir: &Path,
+    swarm_public_key: &str,
+) -> Result<MembershipCredential, String> {
+    let rec = read_swarm(dir, swarm_public_key)?
+        .ok_or_else(|| format!("no swarm {swarm_public_key} on this node"))?;
+    rec.control_capable_credential().cloned().ok_or_else(|| {
+        format!(
+            "no control credential stored for swarm {swarm_public_key} \
+             (enroll a control device: the owner runs `swarm approve --grant control`)"
+        )
+    })
+}
+
+/// Pick the identity to **dial as** for a remote-scope command: the candidate identity file whose
+/// public key the swarm's control credential is bound to. On the clean path this is the dedicated
+/// control key; on the Inc-D fallback (a legacy dual-cap credential) it is the consumer key the
+/// credential was minted against. Candidate files that don't exist are skipped and never created, so
+/// probing for the control key can't spuriously generate one. Errors if no control credential is held
+/// or no present candidate matches its bound key. This is what keeps the one-shot control node off the
+/// gateway's PeerId (review finding B6): dialing as the credential's own bound key.
+pub fn control_identity_for(
+    dir: &Path,
+    swarm_public_key: &str,
+    candidate_identity_paths: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let cred = control_credential_for(dir, swarm_public_key)?;
+    let bound = &cred.member_public_key;
+    for path in candidate_identity_paths {
+        if !path.exists() {
+            continue;
+        }
+        let id = Identity::load_or_create(path)
+            .map_err(|e| format!("load identity {}: {e}", path.display()))?;
+        let pk = keypair_public_hex(&id.keypair).map_err(|e| e.to_string())?;
+        if &pk == bound {
+            return Ok(path.clone());
+        }
+    }
+    Err(format!(
+        "no local identity matches the control credential for swarm {swarm_public_key} \
+         (bound to {bound}) — enroll a control device"
+    ))
 }
 
 /// Atomically write a swarm record (temp + rename). Owner files carry the group secret, so on Unix the
@@ -255,6 +327,7 @@ pub fn create_swarm(dir: &Path, label: &str, now_ms: u64) -> Result<SwarmView, S
         members: Vec::new(),
         revoked: BTreeSet::new(),
         credential: None,
+        control_credential: None,
         created_at: now_ms,
     };
     write_swarm(dir, &record)?;
@@ -404,8 +477,14 @@ pub fn accept_credential_at(
 }
 
 /// Accept a credential the owner returned: verify it is (a) validly signed by its group key, (b)
-/// bound to OUR identity, and (c) unexpired, then persist a MEMBER record. Binding to our own key
-/// means we refuse a credential minted for someone else. Returns the stored view.
+/// bound to OUR identity, and (c) unexpired, then persist it into a MEMBER record. Binding to our own
+/// key means we refuse a credential minted for someone else. Returns the stored view.
+///
+/// **Capability routing (M5 dedicated control identity).** A `CAP_CONTROL`-only credential lands in
+/// `control_credential` (it is bound to the *control* identity — a distinct key); anything granting
+/// serve lands in `credential`. When a record for this swarm already exists we **merge** into it, so
+/// accepting a control credential never clobbers a stored serve credential and vice versa (they are
+/// bound to different keys and arrive in separate accept calls, one per identity).
 pub fn accept_credential(
     dir: &Path,
     identity: &Identity,
@@ -420,7 +499,13 @@ pub fn accept_credential(
     verify_credential_for_member(&cred, &our_pk, now_ms, &BTreeSet::new())
         .map_err(|e| format!("credential not valid for this node: {e}"))?;
 
-    let record = SwarmRecord {
+    // Route by capability: control-only → the dedicated control slot; anything with serve → the serve
+    // slot (a legacy dual-cap credential lands here and remains usable as a fallback, see Inc D).
+    let is_control_only = cred.has_capability(CAP_CONTROL) && !cred.has_capability(CAP_SERVE);
+
+    // Merge into an existing record for this swarm so the two credentials (bound to different keys)
+    // coexist; otherwise start a fresh MEMBER record.
+    let mut record = read_swarm(dir, &cred.swarm_public_key)?.unwrap_or_else(|| SwarmRecord {
         schema_version: SWARM_RECORD_SCHEMA,
         swarm_public_key: cred.swarm_public_key.clone(),
         label: if label.is_empty() { cred.swarm_label.clone() } else { label.to_string() },
@@ -428,9 +513,18 @@ pub fn accept_credential(
         group_secret_key: None,
         members: Vec::new(),
         revoked: BTreeSet::new(),
-        credential: Some(cred),
+        credential: None,
+        control_credential: None,
         created_at: now_ms,
-    };
+    });
+    if !label.is_empty() {
+        record.label = label.to_string();
+    }
+    if is_control_only {
+        record.control_credential = Some(cred);
+    } else {
+        record.credential = Some(cred);
+    }
     write_swarm(dir, &record)?;
     Ok(record.to_view())
 }
@@ -1184,6 +1278,7 @@ mod tests {
             members: Vec::new(),
             revoked: BTreeSet::new(),
             credential: Some(cred),
+            control_credential: None,
             created_at: 4_000,
         };
         write_swarm(member_dir.path(), &member_record).unwrap();
@@ -1214,6 +1309,7 @@ mod tests {
             members: Vec::new(),
             revoked: BTreeSet::new(),
             credential: Some(cred.clone()),
+            control_credential: None,
             created_at: 4_000,
         };
         write_swarm(member_dir.path(), &member_record).unwrap();
@@ -1223,5 +1319,140 @@ mod tests {
             auth.authorize(Some(&cred), &member_peer, 4_000).unwrap_err(),
             AuthzError::UnknownSwarm(_)
         ));
+    }
+
+    // ── M5 dedicated control identity: two-credential storage + routing ──
+
+    /// Owner issues a credential granting exactly `caps` to `member`'s key, in swarm `swarm_pk`.
+    fn issue_credential(
+        owner_dir: &Path,
+        swarm_pk: &str,
+        member: &Identity,
+        caps: u32,
+    ) -> ApprovedCredential {
+        let req = build_enrollment_request(member, swarm_pk, "m", 2_000).unwrap();
+        approve_member_with_caps(owner_dir, swarm_pk, &req.magnet, "m", 24 * HOUR, caps, 3_000).unwrap()
+    }
+
+    #[test]
+    fn accept_routes_a_control_only_credential_to_its_own_slot() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let consumer = an_identity();
+        let control = an_identity();
+        let swarm = create_swarm(owner_dir.path(), "Home rig", 1_000).unwrap();
+        let swarm_pk = swarm.swarm_public_key.clone();
+
+        // Serve credential on the consumer key → lands in `credential`; not control-capable yet.
+        let serve = issue_credential(owner_dir.path(), &swarm_pk, &consumer, CAP_SERVE);
+        let v1 = accept_credential(member_dir.path(), &consumer, &serve.magnet, "", 4_000).unwrap();
+        assert!(!v1.member_can_control, "serve-only member cannot control");
+        assert!(v1.control_credential_expires_at.is_none());
+
+        // Control credential on a DIFFERENT control key → lands in `control_credential`, keeps serve.
+        let ctl = issue_credential(owner_dir.path(), &swarm_pk, &control, CAP_CONTROL);
+        let v2 = accept_credential(member_dir.path(), &control, &ctl.magnet, "", 5_000).unwrap();
+        assert!(v2.member_can_control, "now holds a control credential");
+        assert!(v2.control_credential_expires_at.is_some());
+
+        // Both persist, each bound to its own key.
+        let rec = read_swarm(member_dir.path(), &swarm_pk).unwrap().unwrap();
+        assert_eq!(rec.credential.as_ref().unwrap().member_public_key, our_pk(&consumer));
+        assert_eq!(rec.control_credential.as_ref().unwrap().member_public_key, our_pk(&control));
+        // control_credential_for returns the dedicated control credential (bound to the control key).
+        let got = control_credential_for(member_dir.path(), &swarm_pk).unwrap();
+        assert_eq!(got.member_public_key, our_pk(&control));
+        assert!(got.has_capability(CAP_CONTROL) && !got.has_capability(CAP_SERVE));
+    }
+
+    #[test]
+    fn control_credential_for_errors_for_a_serve_only_member() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let consumer = an_identity();
+        let swarm = create_swarm(owner_dir.path(), "Home rig", 1_000).unwrap();
+        let serve = issue_credential(owner_dir.path(), &swarm.swarm_public_key, &consumer, CAP_SERVE);
+        accept_credential(member_dir.path(), &consumer, &serve.magnet, "", 4_000).unwrap();
+        let err = control_credential_for(member_dir.path(), &swarm.swarm_public_key).unwrap_err();
+        assert!(err.contains("no control credential"), "got: {err}");
+        assert!(!list_swarms(member_dir.path()).unwrap()[0].member_can_control);
+    }
+
+    #[test]
+    fn control_credential_for_falls_back_to_a_dual_cap_serve_credential() {
+        // Inc D transitional fallback: a legacy M5 credential (CAP_SERVE|CAP_CONTROL on the consumer
+        // key) lands in `credential`, yet still authorises control until a dedicated one is enrolled.
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let consumer = an_identity();
+        let swarm = create_swarm(owner_dir.path(), "Home rig", 1_000).unwrap();
+        let dual =
+            issue_credential(owner_dir.path(), &swarm.swarm_public_key, &consumer, CAP_SERVE | CAP_CONTROL);
+        accept_credential(member_dir.path(), &consumer, &dual.magnet, "", 4_000).unwrap();
+        let rec = read_swarm(member_dir.path(), &swarm.swarm_public_key).unwrap().unwrap();
+        assert!(rec.control_credential.is_none(), "dual-cap cred stays in the serve slot");
+        assert!(rec.credential.as_ref().unwrap().has_capability(CAP_CONTROL));
+        let got = control_credential_for(member_dir.path(), &swarm.swarm_public_key).unwrap();
+        assert_eq!(got.member_public_key, our_pk(&consumer));
+        assert!(
+            list_swarms(member_dir.path()).unwrap()[0].member_can_control,
+            "fallback makes a dual-cap member control-capable"
+        );
+    }
+
+    #[test]
+    fn accepting_a_control_credential_bound_to_another_key_is_refused() {
+        // The accept binding check (Inc E concern) still fires for control credentials: a control
+        // credential minted for one key can't be stored by a node holding a different key.
+        let owner_dir = tempfile::tempdir().unwrap();
+        let attacker_dir = tempfile::tempdir().unwrap();
+        let control = an_identity();
+        let attacker = an_identity();
+        let swarm = create_swarm(owner_dir.path(), "Home rig", 1_000).unwrap();
+        let ctl = issue_credential(owner_dir.path(), &swarm.swarm_public_key, &control, CAP_CONTROL);
+        let err = accept_credential(attacker_dir.path(), &attacker, &ctl.magnet, "", 4_000).unwrap_err();
+        assert!(err.contains("not valid for this node"), "got: {err}");
+    }
+
+    #[test]
+    fn control_identity_for_picks_the_dedicated_control_key() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let consumer_path = keys.path().join("desktop-consumer.key");
+        let control_path = keys.path().join("desktop-control.key");
+        let consumer = Identity::load_or_create(&consumer_path).unwrap();
+        let control = Identity::load_or_create(&control_path).unwrap();
+        let swarm = create_swarm(owner_dir.path(), "Home rig", 1_000).unwrap();
+        let pk = swarm.swarm_public_key.clone();
+        let serve = issue_credential(owner_dir.path(), &pk, &consumer, CAP_SERVE);
+        accept_credential(member_dir.path(), &consumer, &serve.magnet, "", 4_000).unwrap();
+        let ctl = issue_credential(owner_dir.path(), &pk, &control, CAP_CONTROL);
+        accept_credential(member_dir.path(), &control, &ctl.magnet, "", 5_000).unwrap();
+        // A dedicated control credential → dial as the CONTROL key (the B6 fix).
+        let chosen =
+            control_identity_for(member_dir.path(), &pk, &[control_path.clone(), consumer_path.clone()])
+                .unwrap();
+        assert_eq!(chosen, control_path);
+    }
+
+    #[test]
+    fn control_identity_for_falls_back_to_the_consumer_key_without_creating_a_control_key() {
+        let owner_dir = tempfile::tempdir().unwrap();
+        let member_dir = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let consumer_path = keys.path().join("desktop-consumer.key");
+        let control_path = keys.path().join("desktop-control.key"); // intentionally never created
+        let consumer = Identity::load_or_create(&consumer_path).unwrap();
+        let swarm = create_swarm(owner_dir.path(), "Home rig", 1_000).unwrap();
+        let pk = swarm.swarm_public_key.clone();
+        let dual = issue_credential(owner_dir.path(), &pk, &consumer, CAP_SERVE | CAP_CONTROL);
+        accept_credential(member_dir.path(), &consumer, &dual.magnet, "", 4_000).unwrap();
+        // The absent control-key candidate is skipped; the dual-cap cred is bound to the consumer key.
+        let chosen =
+            control_identity_for(member_dir.path(), &pk, &[control_path.clone(), consumer_path.clone()])
+                .unwrap();
+        assert_eq!(chosen, consumer_path);
+        assert!(!control_path.exists(), "probing candidates must not create a key file");
     }
 }
