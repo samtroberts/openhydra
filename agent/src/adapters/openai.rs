@@ -205,6 +205,12 @@ fn build_chat_body(req: &InferenceRequest) -> String {
     if let Some(t) = req.temperature {
         body["temperature"] = serde_json::json!(t);
     }
+    // Deterministic serve (2b): pin the OpenAI-family `seed` so a temp=0 generation is
+    // reproducible on engines that honour it (vLLM, llama.cpp, LM Studio, Exo). Omitted when unset
+    // so a plain body is byte-identical to before.
+    if let Some(seed) = req.seed {
+        body["seed"] = serde_json::json!(seed);
+    }
     // Forward the caller's OpenAI-shaped `tools` verbatim — vLLM / LM Studio / llama.cpp /
     // Exo all accept the OpenAI schema and stream `tool_calls` deltas back. Omitted when
     // empty so a plain chat body is byte-identical to before.
@@ -548,7 +554,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: Some(0.0),
             tools: Vec::new(),
-            think: None,
+            think: None, seed: None,
         }
     }
 
@@ -770,6 +776,18 @@ mod tests {
         // A plain request carries no tools field.
         let plain: serde_json::Value = serde_json::from_str(&build_chat_body(&req())).unwrap();
         assert!(plain.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_chat_body_pins_seed_for_a_deterministic_serve() {
+        // Deterministic serve (2b): a set seed appears as top-level `seed`; unset ⇒ no key.
+        let mut r = req();
+        r.seed = Some(7);
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&r)).unwrap();
+        assert_eq!(v["seed"], 7);
+
+        let plain: serde_json::Value = serde_json::from_str(&build_chat_body(&req())).unwrap();
+        assert!(plain.get("seed").is_none(), "no seed key when unset");
     }
 
     #[test]

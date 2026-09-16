@@ -214,6 +214,13 @@ pub struct InferenceRequest {
     /// that support it map it to their native switch (Ollama's top-level `think`); adapters
     /// with no thinking control ignore it.
     pub think: Option<bool>,
+    /// Fixed RNG seed for a **deterministic serve** (temp=0 + this seed), or `None` for the
+    /// engine's default sampling. Set by [`crate::serve::handle_serve_request_parsed`] from the
+    /// request's `deterministic` params so the same `(model, quant, prompt, seed)` reproduces the
+    /// same output — the precondition that makes a fingerprint / redundant-exec check meaningful
+    /// (PROOF_OF_INFERENCE §12 Phase 1). Adapters that support it map it to their native seed
+    /// (Ollama `options.seed`, OpenAI-family `seed`); adapters with no seed control ignore it.
+    pub seed: Option<u64>,
 }
 
 /// Raw counters/timings the engine itself reports for one request — Ollama's

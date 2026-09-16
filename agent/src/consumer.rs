@@ -43,7 +43,8 @@ use crate::adapter::{AdapterError, ChatMessage, ToolCall};
 use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
 use crate::receipt::request_receipt;
 use crate::serve::{
-    parse_response, FetchChunksResponse, FetchResponse, ServeChunk, ServeRequest, ServeSummary,
+    parse_response, DeterministicParams, FetchChunksResponse, FetchResponse, ServeChunk,
+    ServeRequest, ServeSummary,
 };
 
 fn now_unix_ms() -> u64 {
@@ -149,6 +150,13 @@ const AUDIT_MAX_RATE: f64 = 0.5;
 /// thinking-capable models, whose variable reasoning makes output-agreement the wrong primitive),
 /// not a bigger global budget.
 const AUDIT_MAX_TOKENS: u32 = 64;
+
+/// The fixed RNG seed every audit probe pins (UNIFIED_TRUST_STACK 2b). A single shared value makes
+/// a temp=0 redundant-exec probe reproducible *across* honest providers running the same model +
+/// quant — tightening output agreement (an honest pair should now match to the token, not merely
+/// "agree closely"), which sharpens the A1 authenticity signal. Providers that predate the
+/// `deterministic` field ignore the seed and still serve temp=0 via the request's `temperature`.
+const AUDIT_SEED: u64 = 0;
 
 /// Pick the best provider from `peers` for a request whose canonical id is
 /// `request_canonical` (use `""` to match any provider of the discovered model_id).
@@ -1036,6 +1044,9 @@ impl ConsumerNode {
                         .as_ref()
                         .and_then(|c| c.credential_for_swarm(&provider.swarm_public_key, now_unix_ms()))
                 },
+                // A user-facing serve keeps the caller's own sampling — deterministic mode is
+                // opt-in (used by the audit probe below), not forced on real generations.
+                deterministic: None,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
@@ -1436,6 +1447,9 @@ impl ConsumerNode {
             nonce: rand::random::<[u8; 16]>(),
             // Audits probe public marketplace providers; no swarm credential.
             credential: None,
+            // Pin a fixed seed (2b): a temp=0 probe with a shared seed is reproducible across
+            // honest providers, so redundant-exec agreement is exact rather than approximate.
+            deterministic: Some(DeterministicParams { seed: AUDIT_SEED }),
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -1615,6 +1629,7 @@ mod tests {
             think: None,
             nonce: [0u8; 16],
             credential: None,
+            deterministic: None,
         }
     }
 

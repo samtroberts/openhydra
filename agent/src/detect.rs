@@ -256,7 +256,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             tools: Vec::new(),
-            think: None,
+            think: None, seed: None,
         }
     }
 

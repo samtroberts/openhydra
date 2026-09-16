@@ -179,6 +179,11 @@ fn build_chat_body(req: &InferenceRequest, think: Option<bool>) -> String {
     if let Some(t) = req.temperature {
         options.insert("temperature".into(), serde_json::json!(t));
     }
+    // Deterministic serve (2b): pin Ollama's RNG seed so a temp=0 generation is reproducible.
+    // Omitted when unset so a plain request is byte-identical to before.
+    if let Some(seed) = req.seed {
+        options.insert("seed".into(), serde_json::json!(seed));
+    }
     let mut body = serde_json::json!({
         "model": req.model_ref,
         "messages": messages,
@@ -567,7 +572,7 @@ mod tests {
             max_tokens: Some(128),
             temperature: Some(0.7),
             tools: Vec::new(),
-            think: None,
+            think: None, seed: None,
         }
     }
 
@@ -644,6 +649,20 @@ mod tests {
         assert_eq!(v["options"]["temperature"], 0.7);
         assert!(v.get("tools").is_none(), "no tools field on a plain chat");
         assert!(v.get("think").is_none(), "no think field when unset (byte-identical to before)");
+    }
+
+    #[test]
+    fn build_chat_body_pins_seed_for_a_deterministic_serve() {
+        // Deterministic serve (2b): a set seed appears under `options.seed`; unset ⇒ no key
+        // (byte-identical to before).
+        let mut req = user_req("hi");
+        req.seed = Some(7);
+        let v: serde_json::Value = serde_json::from_str(&build_chat_body(&req, None)).unwrap();
+        assert_eq!(v["options"]["seed"], 7);
+
+        let plain: serde_json::Value =
+            serde_json::from_str(&build_chat_body(&user_req("hi"), None)).unwrap();
+        assert!(plain["options"].get("seed").is_none(), "no seed key when unset");
     }
 
     #[test]
@@ -941,7 +960,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: Some(0.0),
             tools: Vec::new(),
-            think: None,
+            think: None, seed: None,
         };
         let mut out = String::new();
         let outcome = agent.serve_stream(&req, &mut |d| out.push_str(d)).unwrap();

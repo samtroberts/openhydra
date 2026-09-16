@@ -2025,7 +2025,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
-            credential: None,
+            credential: None, deterministic: None,
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -2455,7 +2455,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
-            credential: None,
+            credential: None, deterministic: None,
         };
 
         // Collect the frames the engine produces (the buffered result), then reveal them into the
@@ -2556,7 +2556,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None,
+            credential: None, deterministic: None,
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.

@@ -77,6 +77,24 @@ pub struct ServeRequest {
     /// to the authenticated sender before generating; a `global` model ignores it entirely.
     #[serde(default)]
     pub credential: Option<openhydra_network::membership::MembershipCredential>,
+    /// UNIFIED_TRUST_STACK Increment 2b: when set, ask the provider for a **deterministic serve** —
+    /// temperature pinned to 0 and the carried seed pinned — so the same `(model, quant, prompt)`
+    /// reproduces the same output and a fingerprint / redundant-exec check is meaningful
+    /// (PROOF_OF_INFERENCE §12 Phase 1). Overrides [`temperature`](Self::temperature) to 0.
+    /// `#[serde(default)]` keeps the wire backward-compatible — an older consumer omits it, an older
+    /// provider ignores it (its adapter simply won't pin the seed).
+    #[serde(default)]
+    pub deterministic: Option<DeterministicParams>,
+}
+
+/// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
+/// by the canonical model id the consumer routed to, so only the RNG seed needs carrying;
+/// temperature is forced to 0 by the provider when this is present. See [`ServeRequest::deterministic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeterministicParams {
+    /// The RNG seed the provider pins for this serve. A fixed value makes generation reproducible
+    /// across providers running the same model + quant.
+    pub seed: u64,
 }
 
 impl ServeRequest {
@@ -233,13 +251,20 @@ pub fn handle_serve_request_parsed(
     adapter: &dyn EngineAdapter,
     send_chunk: &mut dyn FnMut(&[u8]),
 ) -> ServeSummary {
+    // A deterministic serve pins temperature to 0 and carries a fixed seed, overriding any
+    // temperature the request also set (2b). Otherwise the request's own sampling is used.
+    let (temperature, seed) = match req.deterministic {
+        Some(d) => (Some(0.0), Some(d.seed)),
+        None => (req.temperature, None),
+    };
     let infer = InferenceRequest {
         model_ref: req.model_ref,
         messages: req.messages,
         max_tokens: req.max_tokens,
-        temperature: req.temperature,
+        temperature,
         tools: req.tools,
         think: req.think,
+        seed,
     };
 
     // Scope the delta sink so its &mut borrow of `send_chunk` ends before the terminal
@@ -462,6 +487,7 @@ mod tests {
             think: None,
             nonce: [0u8; 16],
             credential: None,
+            deterministic: None,
         }
     }
 
@@ -518,6 +544,65 @@ mod tests {
         let legacy = br#"{"reply_to":"c","model_ref":"m","messages":[],"nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
         let decoded = ServeRequest::decode(legacy).expect("legacy ServeRequest without `think` decodes");
         assert_eq!(decoded.think, None);
+    }
+
+    #[test]
+    fn deterministic_request_pins_temp_zero_and_threads_the_seed() {
+        use std::cell::Cell;
+        // A capturing adapter that records the temperature + seed it was handed.
+        struct CaptureAdapter {
+            temperature: Cell<Option<f64>>,
+            seed: Cell<Option<u64>>,
+        }
+        impl EngineAdapter for CaptureAdapter {
+            fn engine_name(&self) -> &'static str {
+                "capture"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(
+                &self,
+                request: &InferenceRequest,
+                _on_delta: &mut dyn FnMut(&str),
+            ) -> Result<ServeOutcome, AdapterError> {
+                self.temperature.set(request.temperature);
+                self.seed.set(request.seed);
+                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            }
+        }
+
+        // A deterministic request overrides even an explicit temperature and pins the seed.
+        let mut r = req("c");
+        r.temperature = Some(0.9);
+        r.deterministic = Some(DeterministicParams { seed: 7 });
+        let adapter = CaptureAdapter { temperature: Cell::new(None), seed: Cell::new(None) };
+        let _ = handle_serve_request_parsed(r, &adapter, &mut |_| {});
+        assert_eq!(adapter.temperature.get(), Some(0.0), "deterministic pins temp=0");
+        assert_eq!(adapter.seed.get(), Some(7), "deterministic threads the seed");
+
+        // A plain request keeps its own sampling and pins no seed.
+        let mut r = req("c");
+        r.temperature = Some(0.9);
+        let adapter = CaptureAdapter { temperature: Cell::new(None), seed: Cell::new(None) };
+        let _ = handle_serve_request_parsed(r, &adapter, &mut |_| {});
+        assert_eq!(adapter.temperature.get(), Some(0.9));
+        assert_eq!(adapter.seed.get(), None);
+    }
+
+    #[test]
+    fn serve_request_deterministic_round_trips_and_is_back_compatible() {
+        // The new `deterministic` field round-trips…
+        let mut r = req("c");
+        r.deterministic = Some(DeterministicParams { seed: 42 });
+        assert_eq!(
+            ServeRequest::decode(&r.encode()).unwrap().deterministic,
+            Some(DeterministicParams { seed: 42 })
+        );
+        // …and an OLD consumer that omits the key still decodes (defaults to None) — no wire break.
+        let legacy = br#"{"reply_to":"c","model_ref":"m","messages":[],"nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let decoded = ServeRequest::decode(legacy).expect("legacy ServeRequest without `deterministic` decodes");
+        assert_eq!(decoded.deterministic, None);
     }
 
     #[test]

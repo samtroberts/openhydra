@@ -847,6 +847,8 @@ fn spawn_byok_worker(
             // BYOK thinking-control forwarding is a separate follow-up; hosted adapters use
             // their own defaults today.
             think: None,
+            // The local gateway path does not request a deterministic serve.
+            seed: None,
         };
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
