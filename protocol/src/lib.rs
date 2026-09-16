@@ -22,6 +22,7 @@
 //! - [`store`] — persistent ledger over `redb` (§6 credit ledger, M2.3)
 //! - [`weight`] — model cost-weight registry: footprint → cost-tier (credit tiering Phase 1)
 //! - [`award`] — tier-award policy: max-awardable-tier curve + escrow + graduated failure (Phase 4)
+//! - [`trust`] — unified trust stack: authenticity/privacy/settlement tiers + buyer policy (UNIFIED_TRUST_STACK_v1)
 
 pub mod award;
 pub mod credit;
@@ -30,5 +31,6 @@ pub mod model_id;
 pub mod receipts;
 pub mod router;
 pub mod store;
+pub mod trust;
 pub mod verify;
 pub mod weight;
