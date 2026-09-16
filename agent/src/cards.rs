@@ -41,6 +41,12 @@ pub fn build_card(
         expires_at,
     );
     card.canonical_id = model.canonical_id.clone();
+    // Disclose the engine's possession digest on the card's (already signed) weight_hash, when the
+    // engine reports one (UNIFIED_TRUST_STACK 2c). Empty for engines that expose no digest — the
+    // field stays "" and the card is byte-identical to before. **Disclosed, not verified**: no
+    // expected-digest registry exists to check it against yet, so a verifier must not treat a
+    // present weight_hash as a possession proof (it never raises the authenticity tier on its own).
+    card.weight_hash = model.weight_digest.clone();
     card.capability = Capability {
         params: model.params.clone(),
         context_length: 0,
@@ -298,6 +304,7 @@ mod tests {
             params: params.to_string(),
             quant: "int4".to_string(),
             size_bytes: 0,
+            weight_digest: String::new(),
         }
     }
 
@@ -311,6 +318,20 @@ mod tests {
         assert_eq!(c.capability.params, "1.7b");
         assert_eq!(c.region.as_deref(), Some("in"));
         assert_eq!(c.expires_at, 1_000 + 3600 * 1000);
+    }
+
+    #[test]
+    fn build_card_discloses_the_possession_digest_on_weight_hash() {
+        // 2c: an engine that reports a possession digest has it carried onto the (signed)
+        // weight_hash…
+        let mut m = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b");
+        m.weight_digest = "sha256:abc123".into();
+        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        assert_eq!(c.weight_hash, "sha256:abc123", "digest disclosed on the card");
+        // …and an engine that reports none leaves weight_hash empty (byte-identical to before).
+        let plain = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b"); // weight_digest = ""
+        let pc = build_card(&plain, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        assert!(pc.weight_hash.is_empty(), "no digest → empty weight_hash");
     }
 
     #[test]

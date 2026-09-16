@@ -1899,6 +1899,7 @@ mod tests {
             params: "7.6b".into(),
             quant: "q4_k_m".into(),
             size_bytes: 42,
+            weight_digest: String::new(),
         }
     }
 

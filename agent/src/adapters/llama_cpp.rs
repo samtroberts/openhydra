@@ -445,6 +445,7 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
                 params: params.clone(),
                 quant: quant.clone(),
                 size_bytes: 0,
+                weight_digest: String::new(),
             })
             .collect())
     }

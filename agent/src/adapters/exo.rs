@@ -154,6 +154,7 @@ impl<H: HttpClient> EngineAdapter for ExoAdapter<H> {
                 params: String::new(),
                 quant: String::new(),
                 size_bytes: 0,
+                weight_digest: String::new(),
             })
             .collect())
     }

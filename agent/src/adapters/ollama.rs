@@ -47,6 +47,10 @@ struct TagEntry {
     name: String,
     #[serde(default)]
     size: u64,
+    /// Ollama's content-addressed manifest digest for this model (`"sha256:…"`), when present —
+    /// disclosed as a possession digest (UNIFIED_TRUST_STACK 2c). Absent on very old builds → `""`.
+    #[serde(default)]
+    digest: String,
     #[serde(default)]
     details: TagDetails,
 }
@@ -251,6 +255,10 @@ fn detected_from(entry: &TagEntry, template: &str) -> DetectedModel {
         params: entry.details.parameter_size.clone(),
         quant: entry.details.quantization_level.clone(),
         size_bytes: entry.size,
+        // Disclose Ollama's manifest digest as a possession digest (2c) — carried onto the signed
+        // card's weight_hash. Not verified (no expected-digest registry yet), so it never lifts the
+        // authenticity tier on its own.
+        weight_digest: entry.digest.clone(),
     }
 }
 
@@ -633,6 +641,22 @@ mod tests {
         assert_ne!(a, c, "a different chat template → a different canonical id");
         assert_eq!(canonical_for("", "7.6B", "Q4_K_M", "t"), ""); // missing family
         assert_eq!(canonical_for("qwen2", "7.6B", "Q4_K_M", ""), ""); // missing template
+    }
+
+    #[test]
+    fn tags_response_parses_the_digest_and_detected_from_discloses_it() {
+        // 2c: the `/api/tags` manifest digest is parsed and carried onto DetectedModel.weight_digest
+        // (→ the card's weight_hash) as a possession digest. Disclosed, not verified.
+        let json = r#"{"models":[{"name":"qwen2.5:7b","size":123,"digest":"sha256:deadbeef",
+            "details":{"family":"qwen2","parameter_size":"7.6B","quantization_level":"Q4_K_M"}}]}"#;
+        let tags: TagsResponse = serde_json::from_str(json).unwrap();
+        let d = detected_from(&tags.models[0], "the-chat-template");
+        assert_eq!(d.weight_digest, "sha256:deadbeef");
+        assert_eq!(d.engine_ref, "qwen2.5:7b");
+        // An older Ollama that omits `digest` → empty (no possession disclosed), no parse failure.
+        let legacy: TagsResponse =
+            serde_json::from_str(r#"{"models":[{"name":"m","size":0,"details":{}}]}"#).unwrap();
+        assert!(detected_from(&legacy.models[0], "t").weight_digest.is_empty());
     }
 
     // ── streaming completion proxy ──

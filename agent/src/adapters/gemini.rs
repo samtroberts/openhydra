@@ -156,6 +156,7 @@ impl<H: HttpClient> EngineAdapter for GeminiAdapter<H> {
                 params: String::new(),
                 quant: String::new(),
                 size_bytes: 0,
+                weight_digest: String::new(),
             })
             .collect())
     }
