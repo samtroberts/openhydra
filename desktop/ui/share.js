@@ -7,7 +7,7 @@ import { call } from "./bridge";
 import { toast } from "./chrome";
 import { emit, on } from "./bus";
 import { store } from "./storage";
-import { totalServed, totalUsed, lifetimeServed, statModels } from "./stats";
+import { totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent, lifetimeServed, statModels } from "./stats";
 import { renderChart } from "./chart";
 import { fmtNum, fmtUptime, modelIcon } from "./format";
 import { displayModelName } from "./models";
@@ -245,10 +245,11 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const k = $$("#v-share .g4 .kpi .val");
     // #7: durable lifetime totals (survive restart; `used` counts external clients too).
     const served = totalServed(), used = totalUsed();
-    // #3 fix: "Credits earned" = net CONTRIBUTION (served − used), which RISES with serving and
-    // falls with using — the earlier `economy.total_credit` summed counterparty balances and
-    // moved the wrong way (provider's number dropped on serve). Contribution-based per decision.
-    const netCredits = served - used;
+    // #3 fix: "Credits earned" = net CONTRIBUTION, which RISES with serving and falls with using
+    // (the earlier `economy.total_credit` summed counterparty balances and moved the wrong way).
+    // Credit-tiering: this is now COST-WEIGHTED (earned − spent), so a 30B serve counts for far more
+    // than a 1B one — not the flat served − used tokens.
+    const netCredits = totalCreditsEarned() - totalCreditsSpent();
     const ratio = used > 0 ? (served / used) : (served > 0 ? null : 0);
     k[0].textContent = fmtNum(served);
     k[1].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();

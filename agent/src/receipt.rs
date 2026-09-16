@@ -51,7 +51,8 @@ fn receipt_err(e: ReceiptError) -> AdapterError {
 
 fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8> {
     let model = payload.model_id.as_bytes();
-    let mut b = Vec::with_capacity(REQ_FIXED + model.len());
+    let canonical = payload.canonical_model_id.as_bytes();
+    let mut b = Vec::with_capacity(REQ_FIXED + model.len() + 2 + canonical.len());
     b.extend_from_slice(payload.provider.as_bytes());
     b.extend_from_slice(payload.consumer.as_bytes());
     b.extend_from_slice(&payload.nonce);
@@ -60,6 +61,21 @@ fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8>
     b.extend_from_slice(&consumer_sig.to_bytes());
     b.extend_from_slice(&(model.len() as u16).to_le_bytes());
     b.extend_from_slice(model);
+    // receipt-carries-canonical: append the canonical id (length-prefixed, possibly empty) so the
+    // provider co-signs the same one the consumer weights by. A legacy request that omits this
+    // trailer decodes to an empty canonical (see decode_request).
+    b.extend_from_slice(&(canonical.len() as u16).to_le_bytes());
+    b.extend_from_slice(canonical);
+    // Carry the completion split too (review M3): the consumer signs `canonical_bytes()` including
+    // completion, so the framing MUST transmit it or the provider reconstructs a different preimage
+    // and every settlement fails closed once Phase 2b sets `Some`. `has_completion:u8 [+ u64]`.
+    match payload.completion_tokens {
+        Some(c) => {
+            b.push(1u8);
+            b.extend_from_slice(&c.to_le_bytes());
+        }
+        None => b.push(0u8),
+    }
     b
 }
 
@@ -73,13 +89,58 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
     u8x8.copy_from_slice(&data[88..96]);
     let ts = u64::from_le_bytes(u8x8);
     let model_len = u16::from_le_bytes([data[160], data[161]]) as usize;
-    if data.len() != REQ_FIXED + model_len {
+    let model_end = REQ_FIXED + model_len;
+    if data.len() < model_end {
         return Err(AdapterError::Parse("receipt request length mismatch".into()));
     }
-    let model = std::str::from_utf8(&data[162..162 + model_len])
+    let model = std::str::from_utf8(&data[162..model_end])
         .map_err(|e| AdapterError::Parse(format!("receipt model utf8: {e}")))?;
-    let payload = payload_from_bytes(&data[0..32], &data[32..64], model, tokens, &data[64..80], ts)
-        .map_err(AdapterError::Parse)?;
+    // Optional trailers after the model: a length-prefixed canonical id, then the completion split.
+    // Three shapes are accepted for backward compatibility: legacy (no trailer → empty canonical,
+    // no split); canonical-only; canonical + completion. A legacy request decodes to nano fallback.
+    let (canonical, completion) = if data.len() == model_end {
+        ("", None)
+    } else {
+        if data.len() < model_end + 2 {
+            return Err(AdapterError::Parse("receipt request canonical length truncated".into()));
+        }
+        let clen = u16::from_le_bytes([data[model_end], data[model_end + 1]]) as usize;
+        let after_canonical = model_end + 2 + clen;
+        if data.len() < after_canonical {
+            return Err(AdapterError::Parse("receipt request canonical truncated".into()));
+        }
+        let canonical = std::str::from_utf8(&data[model_end + 2..after_canonical])
+            .map_err(|e| AdapterError::Parse(format!("receipt canonical utf8: {e}")))?;
+        // Completion trailer (M3): `has_completion:u8 [+ u64]`. Absent (canonical-only framing) → None.
+        let completion = if data.len() == after_canonical {
+            None
+        } else {
+            match data[after_canonical] {
+                0 => {
+                    if data.len() != after_canonical + 1 {
+                        return Err(AdapterError::Parse("receipt request length mismatch".into()));
+                    }
+                    None
+                }
+                1 => {
+                    if data.len() != after_canonical + 1 + 8 {
+                        return Err(AdapterError::Parse("receipt request length mismatch".into()));
+                    }
+                    let mut c = [0u8; 8];
+                    c.copy_from_slice(&data[after_canonical + 1..after_canonical + 9]);
+                    Some(u64::from_le_bytes(c))
+                }
+                other => {
+                    return Err(AdapterError::Parse(format!("bad completion flag: {other}")));
+                }
+            }
+        };
+        (canonical, completion)
+    };
+    let payload = payload_from_bytes(
+        &data[0..32], &data[32..64], model, tokens, &data[64..80], ts, completion, canonical,
+    )
+    .map_err(AdapterError::Parse)?;
     let consumer_sig = to_sig(&data[96..160])?;
     Ok((payload, consumer_sig))
 }
@@ -114,10 +175,19 @@ pub fn request_receipt(
     tokens: u64,
     nonce: [u8; 16],
     ts_unix_ms: u64,
+    canonical_model_id: &str,
 ) -> Result<CoSignedReceipt, AdapterError> {
-    let payload =
-        payload_from_bytes(provider_pub, consumer_pub, model_id, tokens, &nonce, ts_unix_ms)
-            .map_err(AdapterError::Parse)?;
+    let payload = payload_from_bytes(
+        provider_pub,
+        consumer_pub,
+        model_id,
+        tokens,
+        &nonce,
+        ts_unix_ms,
+        None,
+        canonical_model_id,
+    )
+    .map_err(AdapterError::Parse)?;
     let consumer_sig = to_sig(&sign(&payload.canonical_bytes()))?;
 
     let mut framed = vec![RECEIPT_REQUEST];
@@ -215,10 +285,45 @@ mod tests {
             512,
             [42u8; 16],
             1_700_000_000_000,
+            "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
         )
         .unwrap();
         assert_eq!(receipt.payload.tokens, 512);
+        assert_eq!(receipt.payload.canonical_model_id, "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
+            "canonical id flows end-to-end through the request framing and is co-signed");
         assert_eq!(verify_receipt(&receipt), Ok(()));
+    }
+
+    #[test]
+    fn request_framing_round_trips_a_completion_split() {
+        // Review M3: the framing must carry `completion_tokens`, else the day Phase 2b signs a
+        // `Some` split the provider would reconstruct `None`, the co-sign preimage would differ, and
+        // every settlement would fail closed. Here: a Some-completion payload survives encode→decode.
+        use ed25519_dalek::{Signer, SigningKey};
+        use openhydra_protocol::receipts::{ReceiptPayload, cosign_bytes, verify_receipt, CoSignedReceipt};
+        use openhydra_protocol::crypto_agility::SigAlg;
+        let consumer = SigningKey::from_bytes(&[7u8; 32]);
+        let provider = SigningKey::from_bytes(&[9u8; 32]);
+        let payload = ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen2.5:7b".to_string(),
+            tokens: 100,
+            nonce: [3u8; 16],
+            ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: Some(60),
+            canonical_model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),
+        };
+        let consumer_sig = consumer.sign(&payload.canonical_bytes());
+        let framed = encode_request(&payload, &consumer_sig);
+        let (decoded, decoded_sig) = decode_request(&framed).unwrap();
+        assert_eq!(decoded.completion_tokens, Some(60), "the split survives the framing");
+        assert_eq!(decoded.canonical_model_id, payload.canonical_model_id);
+        // The provider co-signs the decoded payload; if the preimage matched, verify passes.
+        let provider_sig = provider.sign(&cosign_bytes(&decoded, &decoded_sig));
+        let receipt = CoSignedReceipt { payload: decoded, consumer_sig: decoded_sig, provider_sig };
+        assert_eq!(verify_receipt(&receipt), Ok(()), "provider reconstructs the identical preimage");
     }
 
     #[test]
@@ -244,6 +349,7 @@ mod tests {
             10,
             [1u8; 16],
             1,
+            "",
         )
         .unwrap_err();
         assert!(matches!(err, AdapterError::Http(m) if m.contains("different provider")));
@@ -270,6 +376,7 @@ mod tests {
             1,
             [1u8; 16],
             1,
+            "",
         )
         .unwrap_err();
         assert!(matches!(err, AdapterError::Http(m) if m.contains("provider rejected")));

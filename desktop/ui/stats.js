@@ -7,6 +7,11 @@ import { call } from "./bridge";
 
   const HOUR_MS = 3600000, STATS_KEEP_HOURS = 24 * 31;   // ~31 days of hourly buckets
   let statsDB = { models: {} };                          // hydrated on boot from load_stats
+  // Credit-tiering: durable lifetime **cost-weighted** credits (earned/spent), accumulated by
+  // diffing the agent's since-boot `credits_earned`/`credits_spent` the same restart-aware way as
+  // tokens. `last*` hold the previous reading for the diff. Distinct from the raw token totals: a
+  // 30B serve earns far more credit than a 1B one for the same tokens.
+  function creditsRec() { return (statsDB.credits ||= { earned: 0, spent: 0, lastEarned: 0, lastSpent: 0 }); }
   let statsDirty = false, statsSaveT = 0;
   function hourKey(ms) { return Math.floor(ms / HOUR_MS); }
   function statModel(id) {
@@ -33,6 +38,17 @@ import { call } from "./bridge";
     const now = Date.now(), t = snap.transfers;
     for (const [id, pm] of Object.entries(t.per_model || {})) foldCounter(statModel(id), pm.tokens, "lastServed", "s", now);
     for (const [id, pm] of Object.entries(t.consumed_per_model || {})) foldCounter(statModel(id), pm.tokens, "lastUsed", "u", now);
+    // Cost-weighted credits (aggregate, restart-aware diff — a reading below the last means the
+    // agent restarted, so the whole reading is the fresh delta).
+    const cr = creditsRec();
+    const foldCredit = (raw, totalK, lastK) => {
+      raw = Math.max(0, Math.round(raw || 0));
+      const delta = raw >= cr[lastK] ? raw - cr[lastK] : raw;
+      cr[lastK] = raw;
+      if (delta > 0) cr[totalK] += delta;
+    };
+    foldCredit(t.credits_earned, "earned", "lastEarned");
+    foldCredit(t.credits_spent, "spent", "lastSpent");
     // Prune buckets older than the retention window (keeps stats.json bounded).
     const floor = hourKey(now) - STATS_KEEP_HOURS;
     for (const m of Object.values(statsDB.models)) for (const k in m.buckets) if (+k < floor) delete m.buckets[k];
@@ -51,6 +67,10 @@ import { call } from "./bridge";
   // tokens consumed by external OpenAI clients (e.g. a coding agent), not just in-app chats.
   export const totalServed = () => Object.values(statsDB.models).reduce((a, m) => a + (m.servedTotal || 0), 0) || (snap?.transfers?.tokens_served ?? 0);
   export const totalUsed = () => Object.values(statsDB.models).reduce((a, m) => a + (m.usedTotal || 0), 0) || (snap?.transfers?.tokens_consumed ?? usedTokens);
+  // Durable lifetime cost-weighted credits (fall back to the agent's since-boot reading until the
+  // accumulator has data).
+  export const totalCreditsEarned = () => (statsDB.credits?.earned || 0) || (snap?.transfers?.credits_earned ?? 0);
+  export const totalCreditsSpent = () => (statsDB.credits?.spent || 0) || (snap?.transfers?.credits_spent ?? 0);
   // Aggregate buckets for a range into ordered time-slots, each a per-model {s,u}. 24h → hourly
   // (24 slots), 7d/30d → daily. Returns { slots:[{label,models:{id:{s,u}}}], models:Set }.
   export function statsSeries(range) {

@@ -38,6 +38,10 @@ const RECEIPTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("receipts")
 const PEER_REPUTATION: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_reputation");
 /// Durable per-peer give/take credit snapshot (M2.3), keyed by `peer_id` → opaque blob.
 const PEER_CREDIT: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_credit");
+/// Durable per-`(peer, model)` audit-history snapshot (credit-tiering Phase 4), keyed by the
+/// composite `crate::verify::reputation_key(peer, model)` → an [`AuditStats`] blob. Drives the
+/// `max_awardable_tier` gate; rehydrated so a restart resumes at the same awarded tier.
+const PEER_AUDIT_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_audit_stats");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
 /// Durable ledger rows for the desktop Ledger view, keyed by a monotonic sequence → a compact
@@ -181,6 +185,7 @@ impl Store {
             wtx.open_table(RECEIPTS).map_err(StoreError::from)?;
             wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
             wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
+            wtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
@@ -310,19 +315,24 @@ impl Store {
     }
 
     // ── PEER_REPUTATION ──
+    //
+    // Keyed by the composite `crate::verify::reputation_key(peer_id, model_id)` since credit-
+    // tiering Phase 4a — reputation is per `(peer_id, model_id)`, not per provider (anti-Sybil).
+    // The `key` args below are that composite string; legacy bare-`peer_id` rows are skipped on
+    // boot (see [`load_state_into_memory`](Self::load_state_into_memory)).
 
-    /// Checkpoint a peer's reputation snapshot blob.
-    pub fn put_reputation(&self, peer_id: &str, blob: &[u8]) -> Result<(), StoreError> {
+    /// Checkpoint a reputation snapshot blob under its composite `(peer, model)` key.
+    pub fn put_reputation(&self, key: &str, blob: &[u8]) -> Result<(), StoreError> {
         let wtx = self.db.begin_write().map_err(StoreError::from)?;
         {
             let mut t = wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
-            t.insert(peer_id, blob).map_err(StoreError::from)?;
+            t.insert(key, blob).map_err(StoreError::from)?;
         }
         wtx.commit().map_err(StoreError::from)?;
         Ok(())
     }
 
-    /// Read a peer's reputation snapshot blob, or `None` if we hold none.
+    /// Read a reputation snapshot blob by its composite `(peer, model)` key, or `None` if none.
     pub fn get_reputation(&self, peer_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let rtx = self.db.begin_read().map_err(StoreError::from)?;
         let t = rtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
@@ -369,6 +379,44 @@ impl Store {
         Ok(())
     }
 
+    // ── PEER_AUDIT_STATS (credit-tiering Phase 4 award gate) ──
+
+    /// Checkpoint an [`AuditStats`] snapshot under its composite `(peer, model)` key
+    /// (`crate::verify::reputation_key`).
+    pub fn put_audit_stats(&self, key: &str, blob: &[u8]) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
+            t.insert(key, blob).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Read an [`AuditStats`] snapshot blob by its composite key, or `None` if none.
+    pub fn get_audit_stats(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
+        let got = t.get(key).map_err(StoreError::from)?;
+        Ok(got.map(|g| g.value().to_vec()))
+    }
+
+    /// Rehydrate the in-memory per-`(peer, model)` audit-history map on boot (Phase 4), keyed by
+    /// the composite `(peer, model)` key. Mirrors [`load_credit_into_memory`](Self::load_credit_into_memory).
+    pub fn load_audit_stats_into_memory(
+        &self,
+        audit_stats: &mut HashMap<String, crate::award::AuditStats>,
+    ) -> Result<(), StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            let stats = crate::award::AuditStats::from_bytes(val.value()).map_err(StoreError)?;
+            audit_stats.insert(key.value().to_string(), stats);
+        }
+        Ok(())
+    }
+
     // ── NONCES (replay protection) ──
 
     /// Mark a receipt nonce as spent.
@@ -397,13 +445,14 @@ impl Store {
     /// never leave a receipt without its replay-guard nonce (which would let it be
     /// double-counted), nor a reputation bump without the receipt that justified it.
     ///
-    /// The nonce is taken from `receipt.payload.nonce`. `peer_id` is whichever peer the
-    /// reputation update is *about* (e.g. the serving provider, for a consumer-side
-    /// honored receipt) — the caller passes the post-update tracker.
+    /// The nonce is taken from `receipt.payload.nonce`. `rep_key` is the composite
+    /// `crate::verify::reputation_key(peer_id, model_id)` the reputation update is *about* (the
+    /// serving provider **and** the served model, since Phase 4a) — the caller passes the
+    /// post-update tracker.
     pub fn flush_receipt_and_reputation(
         &self,
         receipt: &CoSignedReceipt,
-        peer_id: &str,
+        rep_key: &str,
         reputation: &ReputationTracker,
     ) -> Result<(), StoreError> {
         let nonce = receipt.payload.nonce;
@@ -421,7 +470,7 @@ impl Store {
         }
         {
             let mut t = wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
-            t.insert(peer_id, rep_blob.as_slice()).map_err(StoreError::from)?;
+            t.insert(rep_key, rep_blob.as_slice()).map_err(StoreError::from)?;
         }
         wtx.commit().map_err(StoreError::from)?; // one atomic commit for all three writes
         Ok(())
@@ -487,8 +536,18 @@ impl Store {
         let reps = rtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
         for entry in reps.iter().map_err(StoreError::from)? {
             let (key, val) = entry.map_err(StoreError::from)?;
+            let key = key.value();
+            // Phase 4a migration (Option A): reputation is now keyed per `(peer_id, model_id)`
+            // (`crate::verify::reputation_key`). A key with no separator is a **legacy** bare-
+            // `peer_id` snapshot — a cross-model aggregate that can't be attributed to any one
+            // model — so we skip it: per-`(peer, model)` reputation starts fresh at neutral rather
+            // than inheriting (and re-opening the Sybil hole the re-key closes). The orphaned rows
+            // are harmless and a later GC can prune them.
+            if crate::verify::split_reputation_key(key).is_none() {
+                continue;
+            }
             let tracker = ReputationTracker::from_bytes(val.value()).map_err(StoreError)?;
-            reputation.insert(key.value().to_string(), tracker);
+            reputation.insert(key.to_string(), tracker);
         }
         Ok(())
     }
@@ -681,6 +740,8 @@ mod tests {
             tokens: 128,
             nonce,
             ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
         };
         let receipt = build_receipt(payload, &consumer, &provider);
 
@@ -713,7 +774,9 @@ mod tests {
         let (_dir, path) = temp_db();
         let consumer = SigningKey::from_bytes(&[7u8; 32]);
         let provider = SigningKey::from_bytes(&[9u8; 32]);
-        let peer_id = "12D3KooWProvider";
+        // Phase 4a: reputation is keyed per (peer, model) — the flush/rehydrate uses the composite.
+        let peer_id = crate::verify::reputation_key("12D3KooWProvider", "qwen3.5/2b/fp16/5632a1b48425a5ae");
+        let peer_id = peer_id.as_str();
         let nonce = [42u8; 16];
 
         let payload = ReceiptPayload {
@@ -724,6 +787,8 @@ mod tests {
             tokens: 512,
             nonce,
             ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
         };
         let receipt = build_receipt(payload, &consumer, &provider);
 
@@ -760,5 +825,34 @@ mod tests {
         let decoded = CoSignedReceipt::from_bytes(&blob).unwrap();
         assert_eq!(decoded.payload.tokens, 512);
         assert_eq!(verify_receipt(&decoded), Ok(()), "signatures survived the flush");
+    }
+
+    #[test]
+    fn legacy_bare_peer_reputation_is_dropped_on_boot() {
+        // Phase 4a Option-A migration: a pre-re-key snapshot written under a bare peer_id (no
+        // separator) is a cross-model aggregate and must NOT rehydrate — per-(peer,model)
+        // reputation starts fresh. A composite-keyed snapshot in the same table still loads.
+        use crate::verify::{reputation_key, ReputationTracker, VerificationOutcome};
+
+        let (_dir, path) = temp_db();
+        let now = 1_700_000_000_000u64;
+        let mut tracker = ReputationTracker::new(now);
+        tracker.record(VerificationOutcome::Honored, now);
+        let blob = tracker.to_bytes();
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.put_reputation("12D3KooWLegacyBarePeer", &blob).unwrap(); // legacy (no separator)
+            store.put_reputation(&reputation_key("12D3KooWPeer", "qwen3.5/2b/fp16/aa"), &blob).unwrap();
+        }
+
+        let reopened = Store::open(&path).unwrap();
+        let mut nonces = NonceTracker::new();
+        let mut reputation: HashMap<String, ReputationTracker> = HashMap::new();
+        reopened.load_state_into_memory(&mut nonces, &mut reputation).unwrap();
+
+        assert_eq!(reputation.len(), 1, "only the composite-keyed snapshot rehydrates");
+        assert!(reputation.contains_key(&reputation_key("12D3KooWPeer", "qwen3.5/2b/fp16/aa")));
+        assert!(!reputation.contains_key("12D3KooWLegacyBarePeer"), "legacy bare-peer key dropped");
     }
 }

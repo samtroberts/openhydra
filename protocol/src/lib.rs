@@ -20,7 +20,10 @@
 //! - [`verify`] — verification policy: reputation feedback + decay (§7)
 //! - [`credit`] — give/take credit accounting + rate-cap throttle (§6, M2.3)
 //! - [`store`] — persistent ledger over `redb` (§6 credit ledger, M2.3)
+//! - [`weight`] — model cost-weight registry: footprint → cost-tier (credit tiering Phase 1)
+//! - [`award`] — tier-award policy: max-awardable-tier curve + escrow + graduated failure (Phase 4)
 
+pub mod award;
 pub mod credit;
 pub mod crypto_agility;
 pub mod model_id;
@@ -28,3 +31,4 @@ pub mod receipts;
 pub mod router;
 pub mod store;
 pub mod verify;
+pub mod weight;

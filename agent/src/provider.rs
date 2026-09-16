@@ -1134,6 +1134,22 @@ impl<A: EngineAdapter> Provider<A> {
             Ok(id) => id,
             Err(_) => return,
         };
+        // Credit-tiering: the cost-weighted "credits earned" is weighted by the model the provider
+        // ACTUALLY served — its own validated engine **handle** (`payload.model_id`, bound to the
+        // serve commitment) — NOT the consumer-supplied `canonical_model_id` (which no commitment
+        // check validates: a malicious consumer could downgrade it to underpay us — review H1/H3).
+        // The handle-implied tier is conservative (assumes cheapest quant) and is the honest ceiling
+        // until model-authenticity fingerprinting lands. Uses the signed completion split if present.
+        let earned = openhydra_protocol::weight::credits_for_receipt(
+            openhydra_protocol::weight::cost_tier_for_handle(&accepted.payload.model_id).weight(),
+            accepted.payload.tokens,
+            accepted.payload.completion_tokens,
+        );
+        if let Some(stats) = &self.stats {
+            stats.add_credits_earned(earned);
+        }
+        // Give/take throttle = bandwidth priority in RAW tokens (review H2: the throttle constants
+        // are token-scaled; cost-weighting them truncated earns and over-throttled consumers).
         let snapshot = {
             let mut map = match self.credit.lock() {
                 Ok(m) => m,
@@ -2089,6 +2105,8 @@ mod tests {
             tokens,
             nonce,
             ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
         };
         build_receipt(payload, &consumer, &provider)
     }

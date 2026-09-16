@@ -2,15 +2,17 @@
 // the rolling recent-chat TPS/RTT + node uptime line, and the served-vs-used timeline chart.
 import { $, $$ } from "./dom";
 import { snap } from "./state";
-import { totalServed, totalUsed } from "./stats";
+import { totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { fmtNum, fmtUptime } from "./format";
 import { renderChart } from "./chart";
 import { mean, tpsSamples, rttSamples } from "./telemetry";
 
   export function renderActivity() {
     const t = snap?.transfers, k = $$("#v-activity .g4 .kpi .val");
-    const served = totalServed(), used = totalUsed();   // #7 durable lifetime totals
-    const netCredits = served - used;   // #3: net balance rises with serving, falls with using
+    const served = totalServed(), used = totalUsed();   // #7 durable lifetime totals (tokens)
+    // Credit-tiering: net balance is now COST-WEIGHTED credits (earned − spent), so serving a 30B
+    // model counts for far more than a 1B one — not the flat served − used tokens.
+    const netCredits = totalCreditsEarned() - totalCreditsSpent();
     const ratio = used > 0 ? (served / used) : (served > 0 ? null : 0);
     k[0].textContent = fmtNum(served);
     k[1].textContent = fmtNum(used);
@@ -18,7 +20,7 @@ import { mean, tpsSamples, rttSamples } from "./telemetry";
     k[3].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     $$("#v-activity .g4 .kpi .sub")[0].innerHTML = `<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} receipts co-signed`;
     $$("#v-activity .g4 .kpi .sub")[1].textContent = "this device";
-    $$("#v-activity .g4 .kpi .sub")[2].textContent = "net contribution · served − used";
+    $$("#v-activity .g4 .kpi .sub")[2].textContent = "net credits · cost-weighted, earned − spent";
     $$("#v-activity .g4 .kpi .sub")[3].textContent = "served ÷ used";
     // Rolling per-chat throughput/latency — the only place an aggregated TPS/RTT is honest,
     // since the agent emits these per-request. Uptime rounds out the "your node" picture.

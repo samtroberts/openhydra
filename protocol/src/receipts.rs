@@ -40,6 +40,11 @@ pub const COSIGN_DOMAIN: &[u8] = b"openhydra/receipt-cosign/v2";
 /// Serialization format version for [`CoSignedReceipt::to_bytes`] — v2 is the
 /// agile, length-prefixed layout (PQC0.1). Bumped on any layout change.
 const RECEIPT_FORMAT_V2: u8 = 2;
+/// v3 (credit-tiering Phase 2) is v2 plus a `completion_tokens: u64` field after `ts_unix_ms`.
+/// A receipt carrying the prompt/completion split (`Some`) serializes as v3; a legacy receipt
+/// with no split (`None`) still serializes as **v2** (byte-identical), and a v2 blob decodes to
+/// `None` — so old stored receipts round-trip unchanged and new ones are self-describing.
+const RECEIPT_FORMAT_V3: u8 = 3;
 
 /// The content both parties sign over (the consumer directly, the provider via the
 /// co-signature). Identities are ed25519 public keys.
@@ -54,12 +59,29 @@ pub struct ReceiptPayload {
     pub consumer: VerifyingKey,
     /// Canonical model id served (protocol.md §4).
     pub model_id: String,
-    /// Tokens the consumer acknowledges receiving.
+    /// Tokens the consumer acknowledges receiving (the **total**: prompt + completion).
     pub tokens: u64,
     /// 128-bit nonce — unique per receipt; prevents double-counting / replay.
     pub nonce: [u8; 16],
     /// Receipt timestamp (unix ms).
     pub ts_unix_ms: u64,
+    /// **Completion (output) tokens** of the `tokens` total, so credit can weight decode above
+    /// prefill (`prompt = tokens − completion`; credit-tiering Phase 2). `None` = the split is
+    /// **unknown** — a legacy receipt signed before this field existed (decoded from a v2 blob), or
+    /// a path that doesn't carry it; Phase 3 weights those at a neutral blended in/out rate.
+    /// `Some(c)` is **bound into the signed preimage** ([`canonical_bytes`](Self::canonical_bytes))
+    /// so it can't be stripped or altered without invalidating both signatures. Prospective: real
+    /// completions are ≥ 1, so `Some(0)` (a genuine empty completion) stays distinct from `None`.
+    pub completion_tokens: Option<u64>,
+    /// The **canonical** model id (`family/params/quant/template_hash`) both parties agree was
+    /// served, so the credit ledger can look up the cost-tier weight from the *signed* receipt
+    /// rather than a per-node guess (credit-tiering — receipt-carries-canonical). `model_id` above
+    /// stays the raw engine handle the consumer requested (used for the B-S1 serve-commitment
+    /// binding); this is the precise identity for **weighting**. `""` = unknown/legacy (a v2
+    /// receipt, or a provider that advertised no canonical id) → the ledger falls back to the
+    /// conservative nano tier. Bound into the signed preimage (only when non-empty, so a legacy
+    /// receipt stays byte-identical) — a provider can't inflate its earned tier by forging it.
+    pub canonical_model_id: String,
 }
 
 impl ReceiptPayload {
@@ -68,7 +90,7 @@ impl ReceiptPayload {
     /// signature — see the golden test). The `sig_alg` byte is bound in right after the
     /// domain so the chosen algorithm is signed over (no silent downgrade).
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(RECEIPT_DOMAIN.len() + 1 + 32 + 32 + 4 + self.model_id.len() + 8 + 16 + 8);
+        let mut b = Vec::with_capacity(RECEIPT_DOMAIN.len() + 1 + 32 + 32 + 4 + self.model_id.len() + 8 + 16 + 8 + 9);
         b.extend_from_slice(RECEIPT_DOMAIN);
         b.push(self.sig_alg.to_u8());
         b.extend_from_slice(self.provider.as_bytes());
@@ -78,6 +100,24 @@ impl ReceiptPayload {
         b.extend_from_slice(&self.tokens.to_le_bytes());
         b.extend_from_slice(&self.nonce);
         b.extend_from_slice(&self.ts_unix_ms.to_le_bytes());
+        // Phase 2: the prompt/completion split, bound in *only when known* so it can't be stripped
+        // or forged without breaking both signatures. A legacy receipt (`None`) appends nothing, so
+        // its preimage is **byte-identical** to the pre-Phase-2 format — old signatures still verify
+        // and the golden vectors are unchanged. A `1` tag before the value keeps `Some(c)`
+        // unambiguous against the empty (`None`) tail (an attacker can't downgrade a signed
+        // `Some` to `None`, nor promote a `None` to `Some`, without a signature that doesn't exist).
+        if let Some(completion) = self.completion_tokens {
+            b.push(1u8);
+            b.extend_from_slice(&completion.to_le_bytes());
+        }
+        // The canonical model id, bound in only when present — same downgrade-proofing as the
+        // completion split: an empty canonical appends nothing (legacy byte-identical), and a `2`
+        // tag + length-prefixed id keeps it unforgeable and unambiguous against the empty tail.
+        if !self.canonical_model_id.is_empty() {
+            b.push(2u8);
+            b.extend_from_slice(&(self.canonical_model_id.len() as u32).to_le_bytes());
+            b.extend_from_slice(self.canonical_model_id.as_bytes());
+        }
         b
     }
 }
@@ -96,6 +136,7 @@ pub fn cosign_bytes(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u
 
 /// Build a [`ReceiptPayload`] from raw byte components (32-byte public keys, 16-byte
 /// nonce), validating lengths. For the FFI / node-method callers.
+#[allow(clippy::too_many_arguments)]
 pub fn payload_from_bytes(
     provider_pub: &[u8],
     consumer_pub: &[u8],
@@ -103,6 +144,8 @@ pub fn payload_from_bytes(
     tokens: u64,
     nonce: &[u8],
     ts_unix_ms: u64,
+    completion_tokens: Option<u64>,
+    canonical_model_id: &str,
 ) -> Result<ReceiptPayload, String> {
     let provider = VerifyingKey::from_bytes(
         provider_pub
@@ -129,6 +172,8 @@ pub fn payload_from_bytes(
         tokens,
         nonce,
         ts_unix_ms,
+        completion_tokens,
+        canonical_model_id: canonical_model_id.to_string(),
     })
 }
 
@@ -200,7 +245,12 @@ impl CoSignedReceipt {
     /// Layout (little-endian, PQC0.1 v2): `format:u8(=2) sig_alg:u8 provider[32]
     /// consumer[32] nonce[16] tokens:u64[8] ts_unix_ms:u64[8] consumer_sig_len:u16[2]
     /// consumer_sig[len] provider_sig_len:u16[2] provider_sig[len] model_len:u32[4]
-    /// model_id[model_len]`.
+    /// model_id[model_len]`. **v3** (credit-tiering) inserts, right after `ts_unix_ms`, an optional
+    /// `completion_tokens` and the `canonical_model_id`: `has_completion:u8[1]
+    /// completion_tokens:u64[8]?(only if has_completion=1) canonical_len:u32[4]
+    /// canonical_model_id[canonical_len]`. A receipt serializes as v3 when it carries **either** the
+    /// split or a canonical id; a receipt with neither stays byte-identical v2, so old stored blobs
+    /// round-trip unchanged.
     ///
     /// Signatures are **length-prefixed** (not fixed at 64 bytes) so a future ML-DSA /
     /// hybrid signature (PQC3.1) fits without another format change. This is the full
@@ -208,18 +258,32 @@ impl CoSignedReceipt {
     /// domain-tagged *signed preimage* (which carries no signatures).
     pub fn to_bytes(&self) -> Vec<u8> {
         let model = self.payload.model_id.as_bytes();
+        let canonical = self.payload.canonical_model_id.as_bytes();
         let csig = self.consumer_sig.to_bytes();
         let psig = self.provider_sig.to_bytes();
+        // v3 iff the receipt carries any of the newer fields; otherwise byte-identical legacy v2.
+        let is_v3 = self.payload.completion_tokens.is_some() || !canonical.is_empty();
         let mut b = Vec::with_capacity(
-            2 + 32 + 32 + 16 + 8 + 8 + 2 + csig.len() + 2 + psig.len() + 4 + model.len(),
+            2 + 32 + 32 + 16 + 8 + 8 + 1 + 8 + 4 + canonical.len() + 2 + csig.len() + 2 + psig.len() + 4 + model.len(),
         );
-        b.push(RECEIPT_FORMAT_V2);
+        b.push(if is_v3 { RECEIPT_FORMAT_V3 } else { RECEIPT_FORMAT_V2 });
         b.push(self.payload.sig_alg.to_u8());
         b.extend_from_slice(self.payload.provider.as_bytes());
         b.extend_from_slice(self.payload.consumer.as_bytes());
         b.extend_from_slice(&self.payload.nonce);
         b.extend_from_slice(&self.payload.tokens.to_le_bytes());
         b.extend_from_slice(&self.payload.ts_unix_ms.to_le_bytes());
+        if is_v3 {
+            match self.payload.completion_tokens {
+                Some(completion) => {
+                    b.push(1u8);
+                    b.extend_from_slice(&completion.to_le_bytes());
+                }
+                None => b.push(0u8),
+            }
+            b.extend_from_slice(&(canonical.len() as u32).to_le_bytes());
+            b.extend_from_slice(canonical);
+        }
         b.extend_from_slice(&(csig.len() as u16).to_le_bytes());
         b.extend_from_slice(&csig);
         b.extend_from_slice(&(psig.len() as u16).to_le_bytes());
@@ -236,7 +300,7 @@ impl CoSignedReceipt {
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         let mut cur = Cursor { data, pos: 0 };
         let fmt = cur.u8()?;
-        if fmt != RECEIPT_FORMAT_V2 {
+        if fmt != RECEIPT_FORMAT_V2 && fmt != RECEIPT_FORMAT_V3 {
             return Err(format!("unsupported receipt format version: {fmt}"));
         }
         let sig_alg = SigAlg::from_u8(cur.u8()?).map_err(|e| e.to_string())?;
@@ -247,6 +311,23 @@ impl CoSignedReceipt {
         let nonce = cur.arr::<16>()?;
         let tokens = u64::from_le_bytes(cur.arr::<8>()?);
         let ts_unix_ms = u64::from_le_bytes(cur.arr::<8>()?);
+        // v3 carries the optional completion split + canonical id here; v2 predates both (→ None /
+        // empty, a legacy receipt).
+        let (completion_tokens, canonical_model_id) = if fmt == RECEIPT_FORMAT_V3 {
+            let completion = match cur.u8()? {
+                0 => None,
+                1 => Some(u64::from_le_bytes(cur.arr::<8>()?)),
+                other => return Err(format!("bad completion presence flag: {other}")),
+            };
+            let clen = u32::from_le_bytes(cur.arr::<4>()?) as usize;
+            let cbytes = cur.take(clen)?;
+            let canonical = std::str::from_utf8(cbytes)
+                .map_err(|e| format!("bad canonical id utf8: {e}"))?
+                .to_string();
+            (completion, canonical)
+        } else {
+            (None, String::new())
+        };
         let consumer_sig = read_sig(sig_alg, cur.lp16()?)?;
         let provider_sig = read_sig(sig_alg, cur.lp16()?)?;
         let model_len = u32::from_le_bytes(cur.arr::<4>()?) as usize;
@@ -258,7 +339,10 @@ impl CoSignedReceipt {
             .map_err(|e| format!("bad model id utf8: {e}"))?
             .to_string();
         Ok(CoSignedReceipt {
-            payload: ReceiptPayload { sig_alg, provider, consumer, model_id, tokens, nonce, ts_unix_ms },
+            payload: ReceiptPayload {
+                sig_alg, provider, consumer, model_id, tokens, nonce, ts_unix_ms, completion_tokens,
+                canonical_model_id,
+            },
             consumer_sig,
             provider_sig,
         })
@@ -402,6 +486,8 @@ mod tests {
             tokens,
             nonce,
             ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
         }
     }
 
@@ -550,6 +636,22 @@ mod tests {
         assert_eq!(r1.consumer_sig.to_bytes(), r2.consumer_sig.to_bytes());
         assert_eq!(r1.provider_sig.to_bytes(), r2.provider_sig.to_bytes());
         assert_eq!(verify_receipt(&r1), Ok(()));
+        // FROZEN backward-compat vectors (review crypto-F4): this fixed payload is a *legacy* receipt
+        // (completion_tokens=None, canonical_model_id="") so its preimage is the pre-credit-tiering
+        // v2 format. Pinning the exact signatures means any future change to `canonical_bytes()` that
+        // would break an already-signed on-disk receipt fails THIS test loudly. Regenerate ONLY with
+        // a deliberate, documented wire-format bump.
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(
+            hex(&r1.consumer_sig.to_bytes()),
+            "bdfcb72a888d254dde366d5025b712aa41fdeca7ef2200ee296940f917be0aa65c5d16c556c587e5a69eb64ef51731e89d85587372a0fd84d9b0700430bf6b01",
+            "legacy consumer signature changed — a credit-tiering field leaked into the v2 preimage?"
+        );
+        assert_eq!(
+            hex(&r1.provider_sig.to_bytes()),
+            "8596fd54d823cc2e39f23c485d6a68e1764fd5e3ff54c5f90544d54b0edb0ab08f45bf577725a44e9b8b9d22ac7c83606c0ea114f9b1b23291cbfc89f2f46907",
+            "legacy provider co-signature changed — v2 cosign preimage drift"
+        );
     }
 
     // ── PQC0.1 crypto-agility ──────────────────────────────────────────────
@@ -601,6 +703,150 @@ mod tests {
         let back = CoSignedReceipt::from_bytes(&r.to_bytes()).unwrap();
         assert_eq!(back.payload.sig_alg, SigAlg::Ed25519);
         assert_eq!(back.payload.tokens, 777);
+        assert_eq!(verify_receipt(&back), Ok(()));
+    }
+
+    // ── Phase 2: completion_tokens split ───────────────────────────────────
+
+    fn split_payload(consumer: &SigningKey, provider: &SigningKey, tokens: u64, completion: u64) -> ReceiptPayload {
+        let mut pl = payload(consumer, provider, tokens, [3u8; 16]);
+        pl.completion_tokens = Some(completion);
+        pl
+    }
+
+    #[test]
+    fn a_no_split_receipt_is_byte_identical_to_the_legacy_format() {
+        // Backward compat: a `None` receipt appends nothing to the preimage and serializes as v2,
+        // so old signatures verify and old blobs are unchanged. (The golden-vectors test above
+        // pins the exact bytes; here we assert the shape directly.)
+        let (c, p) = keys();
+        let r = build_receipt(payload(&c, &p, 512, [1u8; 16]), &c, &p); // completion_tokens: None
+        assert_eq!(r.to_bytes()[0], RECEIPT_FORMAT_V2, "no-split receipt stays v2 on the wire");
+        assert_eq!(verify_receipt(&r), Ok(()));
+    }
+
+    #[test]
+    fn completion_split_binds_into_preimage_and_verifies() {
+        // Two payloads identical except for completion_tokens must sign different bytes — the split
+        // is committed, so it can't be altered without breaking the signature.
+        let (c, p) = keys();
+        let none = payload(&c, &p, 100, [3u8; 16]);
+        let some = split_payload(&c, &p, 100, 80);
+        assert_ne!(none.canonical_bytes(), some.canonical_bytes(), "the split must change the preimage");
+        assert_eq!(some.canonical_bytes().len(), none.canonical_bytes().len() + 9, "tag byte + u64");
+        // Two different splits also differ.
+        assert_ne!(split_payload(&c, &p, 100, 80).canonical_bytes(), split_payload(&c, &p, 100, 20).canonical_bytes());
+        // A receipt carrying the split still co-signs and verifies.
+        let r = build_receipt(some, &c, &p);
+        assert_eq!(verify_receipt(&r), Ok(()));
+    }
+
+    #[test]
+    fn v3_blob_roundtrips_preserving_the_split() {
+        let (c, p) = keys();
+        let r = build_receipt(split_payload(&c, &p, 512, 300), &c, &p);
+        let blob = r.to_bytes();
+        assert_eq!(blob[0], RECEIPT_FORMAT_V3, "a receipt with the split serializes as v3");
+        let back = CoSignedReceipt::from_bytes(&blob).unwrap();
+        assert_eq!(back.payload.completion_tokens, Some(300));
+        assert_eq!(back.payload.tokens, 512);
+        assert_eq!(verify_receipt(&back), Ok(()), "signatures survive the v3 round-trip");
+        // Some(0) — a genuine empty completion — stays distinct from None (legacy/unknown).
+        let z = build_receipt(split_payload(&c, &p, 5, 0), &c, &p);
+        assert_eq!(z.to_bytes()[0], RECEIPT_FORMAT_V3);
+        assert_eq!(CoSignedReceipt::from_bytes(&z.to_bytes()).unwrap().payload.completion_tokens, Some(0));
+    }
+
+    #[test]
+    fn legacy_v2_blob_decodes_as_no_split() {
+        // A stored v2 blob (no completion field) must decode to None, not error — this is what
+        // lets pre-Phase-2 receipts on live nodes still load.
+        let (c, p) = keys();
+        let r = build_receipt(payload(&c, &p, 128, [7u8; 16]), &c, &p);
+        let blob = r.to_bytes();
+        assert_eq!(blob[0], RECEIPT_FORMAT_V2);
+        let back = CoSignedReceipt::from_bytes(&blob).unwrap();
+        assert_eq!(back.payload.completion_tokens, None, "a v2 blob decodes as unknown split");
+        assert_eq!(verify_receipt(&back), Ok(()));
+    }
+
+    #[test]
+    fn tampering_with_the_split_is_rejected() {
+        // Downgrade / forgery defence: altering the signed completion count, or stripping it to
+        // pretend the receipt is legacy, breaks the consumer signature.
+        let (c, p) = keys();
+        let mut r = build_receipt(split_payload(&c, &p, 100, 80), &c, &p);
+        r.payload.completion_tokens = Some(20); // inflate the cheap-prefill share
+        assert_eq!(verify_receipt(&r), Err(ReceiptError::BadConsumerSig));
+        // Strip the split entirely (claim legacy) — also breaks the signature it was signed with.
+        let mut stripped = build_receipt(split_payload(&c, &p, 100, 80), &c, &p);
+        stripped.payload.completion_tokens = None;
+        assert_eq!(verify_receipt(&stripped), Err(ReceiptError::BadConsumerSig));
+    }
+
+    #[test]
+    fn payload_from_bytes_threads_the_split() {
+        let (c, p) = keys();
+        let pl = payload_from_bytes(
+            p.verifying_key().as_bytes(),
+            c.verifying_key().as_bytes(),
+            "qwen3.5/2b/fp16/5632a1b48425a5ae",
+            100,
+            &[3u8; 16],
+            1_700_000_000_000,
+            Some(64),
+            "qwen3.5/2b/fp16/5632a1b48425a5ae",
+        )
+        .unwrap();
+        assert_eq!(pl.completion_tokens, Some(64));
+        assert_eq!(pl.canonical_model_id, "qwen3.5/2b/fp16/5632a1b48425a5ae");
+    }
+
+    // ── receipt-carries-canonical ──
+
+    #[test]
+    fn canonical_id_binds_into_preimage_and_roundtrips() {
+        let (c, p) = keys();
+        let mut pl = payload(&c, &p, 100, [4u8; 16]);
+        pl.canonical_model_id = "qwen3-coder/30b-a3b/int4/abcd0123abcd0123".to_string();
+        // Bound into the signed bytes → can't be swapped without breaking the signature.
+        let mut other = payload(&c, &p, 100, [4u8; 16]);
+        other.canonical_model_id = "tinyllama/1b/int4/abcd0123abcd0123".to_string();
+        assert_ne!(pl.canonical_bytes(), other.canonical_bytes());
+        // A carrying receipt serializes v3 and round-trips the canonical id + verifies.
+        let r = build_receipt(pl, &c, &p);
+        assert_eq!(r.to_bytes()[0], RECEIPT_FORMAT_V3);
+        let back = CoSignedReceipt::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back.payload.canonical_model_id, "qwen3-coder/30b-a3b/int4/abcd0123abcd0123");
+        assert_eq!(back.payload.completion_tokens, None, "canonical alone doesn't imply a split");
+        assert_eq!(verify_receipt(&back), Ok(()));
+    }
+
+    #[test]
+    fn empty_canonical_stays_legacy_v2_and_forging_it_is_rejected() {
+        let (c, p) = keys();
+        // No canonical, no split → byte-identical legacy v2.
+        let r = build_receipt(payload(&c, &p, 50, [5u8; 16]), &c, &p);
+        assert_eq!(r.to_bytes()[0], RECEIPT_FORMAT_V2);
+        let back = CoSignedReceipt::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back.payload.canonical_model_id, "");
+        // A provider that forges a big-model canonical onto a signed receipt breaks the signature.
+        let mut forged = build_receipt(payload(&c, &p, 50, [5u8; 16]), &c, &p);
+        forged.payload.canonical_model_id = "deepseek/671b/int8/abcd0123abcd0123".to_string();
+        assert_eq!(verify_receipt(&forged), Err(ReceiptError::BadConsumerSig));
+    }
+
+    #[test]
+    fn both_canonical_and_split_together_roundtrip() {
+        let (c, p) = keys();
+        let mut pl = payload(&c, &p, 200, [6u8; 16]);
+        pl.completion_tokens = Some(150);
+        pl.canonical_model_id = "llama/70b/int8/abcd0123abcd0123".to_string();
+        let r = build_receipt(pl, &c, &p);
+        assert_eq!(r.to_bytes()[0], RECEIPT_FORMAT_V3);
+        let back = CoSignedReceipt::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back.payload.completion_tokens, Some(150));
+        assert_eq!(back.payload.canonical_model_id, "llama/70b/int8/abcd0123abcd0123");
         assert_eq!(verify_receipt(&back), Ok(()));
     }
 }

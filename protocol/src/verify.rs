@@ -207,6 +207,40 @@ pub fn sample_rate_for_reputation(reputation: f64, min_rate: f64, max_rate: f64)
     rate.clamp(min_rate.min(max_rate), min_rate.max(max_rate))
 }
 
+// ── Per-(peer, model) reputation keying (credit-tiering Phase 4a) ──
+//
+// Reputation is tracked per **`(peer_id, model_id)`**, not per provider (anti-Sybil): trust a
+// provider earns serving `tinyllama` must grant it **nothing** when it later *claims* to serve
+// `qwen3-coder:30b` (else it could farm cheap trust, then instantly earn the 30× cost-tier at high
+// trust — see `CREDIT_TIERING_PLAN_v2` Decision #4). The durable [`crate::store`] map and the
+// in-memory tracker map are both keyed by the composite string these helpers build/parse.
+
+/// Separator between the peer id and model id in a per-`(peer, model)` reputation key. `NUL`
+/// never appears in a base58 libp2p peer id nor in a canonical `family/params/quant/hash` model
+/// id, so it is an unambiguous delimiter — and its **absence** marks a legacy bare-`peer_id` key
+/// from before the Phase 4a re-key, which boot migration skips (per-model reputation starts fresh).
+pub const REPUTATION_KEY_SEP: char = '\u{0}';
+
+/// Build the reputation map key for a `(peer_id, model_id)` pair: `"{peer_id}\0{model_id}"`.
+/// The same key is used for the in-memory [`ReputationTracker`] map and the durable snapshot
+/// ([`crate::store::Store::put_reputation`]), so a served outcome and a later lookup land in the
+/// same per-model bucket.
+pub fn reputation_key(peer_id: &str, model_id: &str) -> String {
+    let mut k = String::with_capacity(peer_id.len() + 1 + model_id.len());
+    k.push_str(peer_id);
+    k.push(REPUTATION_KEY_SEP);
+    k.push_str(model_id);
+    k
+}
+
+/// Split a composite reputation key back into `(peer_id, model_id)`, or `None` when it carries no
+/// [`REPUTATION_KEY_SEP`] — i.e. a **legacy** bare-`peer_id` snapshot written before the Phase 4a
+/// re-key. Callers use `None` to drop those on boot (Option A migration: per-`(peer, model)`
+/// reputation starts fresh rather than inheriting a cross-model aggregate).
+pub fn split_reputation_key(key: &str) -> Option<(&str, &str)> {
+    key.split_once(REPUTATION_KEY_SEP)
+}
+
 // ── Verification primitives (TOPLOC proof-of-inference) ──
 
 /// TOPLOC locality-sensitive activation hash (protocol.md §7) — a **byte-identical**
@@ -725,6 +759,31 @@ mod tests {
         let (lo, hi) = (0.01, 0.5);
         assert!((sample_rate_for_reputation(999.0, lo, hi) - lo).abs() < 1e-9);
         assert!((sample_rate_for_reputation(-50.0, lo, hi) - hi).abs() < 1e-9);
+    }
+
+    // ── per-(peer, model) reputation keying (Phase 4a) ──
+
+    #[test]
+    fn reputation_key_roundtrips_peer_and_model() {
+        let k = reputation_key("12D3KooWProvider", "qwen3.5/2b/fp16/5632a1b4");
+        assert_eq!(split_reputation_key(&k), Some(("12D3KooWProvider", "qwen3.5/2b/fp16/5632a1b4")));
+    }
+
+    #[test]
+    fn reputation_keys_separate_models_of_one_peer() {
+        // The anti-Sybil property: the same peer's two models are distinct keys, so trust on one
+        // grants nothing on the other.
+        let tiny = reputation_key("peerA", "tinyllama/1b/int4/aa");
+        let big = reputation_key("peerA", "qwen3-coder/30b/int4/bb");
+        assert_ne!(tiny, big);
+    }
+
+    #[test]
+    fn legacy_bare_peer_key_has_no_separator() {
+        // A pre-Phase-4a snapshot was keyed by the bare peer id → no separator → skipped on boot.
+        assert_eq!(split_reputation_key("12D3KooWLegacyPeer"), None);
+        // An empty model still counts as composite (separator present) — never mistaken for legacy.
+        assert_eq!(split_reputation_key(&reputation_key("peerA", "")), Some(("peerA", "")));
     }
 
     // ── TOPLOC activation hash ──

@@ -81,9 +81,17 @@ pub struct TransferStats {
     /// credential). A visibility counter, like `aup_refusals`.
     pub swarm_refusals: AtomicU64,
     pub receipts_ledgered: AtomicU64,
+    /// Credit-tiering: **cost-weighted** credit earned on settled serves (`Σ cost_tier.weight ×
+    /// weighted_tokens`), the honest replacement for the flat served-token count. Accrued at
+    /// settlement (a co-signed receipt carries the canonical id → the real tier). Distinct from
+    /// `tokens_served`: a 30B serve earns far more credit than a 1B one for the same tokens.
+    pub credits_earned: AtomicU64,
     /// Consumer-side totals (mirror of the served ones), for the give-to-get "used" figures.
     pub requests_consumed: AtomicU64,
     pub tokens_consumed: AtomicU64,
+    /// Credit-tiering: cost-weighted credit **spent** on consumptions (at the model's claimed tier —
+    /// you pay full for what you use). The symmetric half of `credits_earned`.
+    pub credits_spent: AtomicU64,
     per_model: Mutex<HashMap<String, ModelStats>>,
     /// Per-model consumed aggregates (consumer/gateway side). TPS is not meaningful here.
     consumed_per_model: Mutex<HashMap<String, ModelStats>>,
@@ -128,6 +136,18 @@ impl TransferStats {
             entry.requests += 1;
             entry.tokens += tokens;
         }
+    }
+
+    /// Accrue cost-weighted credit **earned** on a settled serve (credit-tiering). Called by the
+    /// provider from `record_consumption`, where the co-signed receipt supplies the canonical id.
+    pub fn add_credits_earned(&self, credits: u64) {
+        self.credits_earned.fetch_add(credits, Ordering::Relaxed);
+    }
+
+    /// Accrue cost-weighted credit **spent** on a consumption (credit-tiering). Called by the
+    /// consumer at settlement, where it knows the provider's canonical id.
+    pub fn add_credits_spent(&self, credits: u64) {
+        self.credits_spent.fetch_add(credits, Ordering::Relaxed);
     }
 
     /// Push a recent ledger row (newest-first, bounded). `now_ms` is passed in so the caller
@@ -202,8 +222,10 @@ impl TransferStats {
             aup_refusals: self.aup_refusals.load(Ordering::Relaxed),
             swarm_refusals: self.swarm_refusals.load(Ordering::Relaxed),
             receipts_ledgered: self.receipts_ledgered.load(Ordering::Relaxed),
+            credits_earned: self.credits_earned.load(Ordering::Relaxed),
             requests_consumed: self.requests_consumed.load(Ordering::Relaxed),
             tokens_consumed: self.tokens_consumed.load(Ordering::Relaxed),
+            credits_spent: self.credits_spent.load(Ordering::Relaxed),
             per_model: self.per_model.lock().map(|m| m.clone()).unwrap_or_default(),
             consumed_per_model: self.consumed_per_model.lock().map(|m| m.clone()).unwrap_or_default(),
             recent: self.recent.lock().map(|r| r.iter().cloned().collect()).unwrap_or_default(),
@@ -219,18 +241,25 @@ struct TransfersView {
     aup_refusals: u64,
     swarm_refusals: u64,
     receipts_ledgered: u64,
+    credits_earned: u64,
     requests_consumed: u64,
     tokens_consumed: u64,
+    credits_spent: u64,
     per_model: HashMap<String, ModelStats>,
     consumed_per_model: HashMap<String, ModelStats>,
     recent: Vec<LedgerRow>,
 }
 
-/// One counterparty's earned reputation (consumer-side, keyed by **OpenHydra** peer id —
-/// the receipt/reputation key).
+/// One counterparty's earned reputation for one model (consumer-side). Reputation is per
+/// `(peer, model)` since credit-tiering Phase 4a, so an entry is a `(openhydra_peer_id, model_id)`
+/// pair; `model_id` is omitted only for a legacy pre-migration snapshot that carried no model.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepEntry {
     pub openhydra_peer_id: String,
+    /// The model this score is for (the model half of the reputation key). `None` only for a
+    /// legacy bare-peer snapshot (should not occur after the Phase 4a boot migration).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     /// Earned reputation in `[0, 100]`, decayed to now (50 = neutral). See `verify.rs`.
     pub score: f64,
 }

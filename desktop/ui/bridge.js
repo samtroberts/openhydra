@@ -247,7 +247,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
         },
         transfers: {
           requests_served: 3, tokens_served: 1280, serve_errors: 0, aup_refusals: 0, receipts_ledgered: 3,
-          requests_consumed: 2, tokens_consumed: 722,
+          credits_earned: 15360, requests_consumed: 2, tokens_consumed: 722, credits_spent: 8664,
           per_model: { "tinyllama:latest": { requests: 3, tokens: 1280, avg_native_tps: 73.2 } },
           consumed_per_model: { "qwen2.5:7b": { requests: 2, tokens: 722, avg_native_tps: 0 } },
           recent: [
@@ -258,7 +258,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
         },
         economy: {
           role: "consumer",
-          reputation: [{ openhydra_peer_id: "oh_asus", score: 72.5 }, { openhydra_peer_id: "oh_mac2", score: 64.0 }, { openhydra_peer_id: "oh_gpu3", score: 58.0 }],
+          reputation: [{ openhydra_peer_id: "oh_asus", model_id: "tinyllama:latest", score: 72.5 }, { openhydra_peer_id: "oh_mac2", model_id: "tinyllama:latest", score: 64.0 }, { openhydra_peer_id: "oh_gpu3", model_id: "qwen2.5:7b", score: 58.0 }],
           credit: [{ libp2p_peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7", balance: 5123.4, rate_cap: 1.0 }, { libp2p_peer_id: "12D3KooWEzegXr4qcjEW3WT", balance: 4880.1 }],
           avg_reputation: 65.3, total_credit: 10003.5,
         },

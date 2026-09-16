@@ -28,10 +28,13 @@ use openhydra_protocol::receipts::NonceTracker;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
 use openhydra_protocol::store::Store;
 use openhydra_protocol::verify::{
-    audit_body, resolve_audit, sample_rate_for_reputation, AuditReport, RedundantVerdict,
+    audit_body, reputation_key, resolve_audit, sample_rate_for_reputation, split_reputation_key,
+    AuditReport, RedundantVerdict,
     ReputationTracker,
     VerificationOutcome, NEUTRAL_REPUTATION,
 };
+use openhydra_protocol::award::{AuditClass, AuditStats};
+use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt};
 
 use serde_json::Value;
 
@@ -54,12 +57,16 @@ fn now_unix_ms() -> u64 {
 pub struct SelectedProvider {
     /// libp2p id — the `proxy_forward` dial target.
     pub libp2p_peer_id: String,
-    /// OpenHydra id — the reputation / receipt key.
+    /// OpenHydra id — the peer half of the reputation / receipt key.
     pub peer_id: String,
     /// Provider's ed25519 public key (hex) — for the co-signed receipt at EOS.
     pub public_key: String,
     /// The model id the provider serves.
     pub model_id: String,
+    /// The provider's canonical model id (`family/params/quant/hash`), or `""` if it advertised
+    /// none (legacy). The model half of the per-`(peer, model)` reputation key — canonical when
+    /// present, else the raw [`model_id`](Self::model_id) (see [`rep_model_key`]).
+    pub canonical_model_id: String,
     /// M4: the swarm (hex group public key) this candidate is gated on, when it came from a private
     /// card — the consumer presents the matching credential on this route. `""` for a public route.
     pub swarm_public_key: String,
@@ -170,18 +177,31 @@ pub fn rank_providers(
     request_canonical: &str,
     tier: u8,
 ) -> Vec<SelectedProvider> {
-    rank_providers_with_reputation(peers, request_canonical, tier, &|_| None)
+    rank_providers_with_reputation(peers, request_canonical, tier, &|_, _| None)
 }
 
-/// As [`rank_providers`], but `earned_reputation(peer_id)` may override a provider's
-/// reputation with the consumer's locally-earned score (M2.2(a)). `Some(score)` wins;
-/// `None` falls back to the self-reported DHT value (neutral when absent). This is the
-/// closed loop that downranks a provider that has misbehaved with *this* consumer.
+/// The model half of a per-`(peer, model)` reputation key for a provider (credit-tiering
+/// Phase 4a): the raw engine **handle** (`DiscoveredPeer.model_id`). We key on the handle, not the
+/// self-declared canonical, because (a) the handle is the commitment-bound identity the audit
+/// actually exercises, and (b) it matches `KnownProvider.model_id` so the desktop can join
+/// reputation to a provider row. Using one derivation everywhere (serve + audit + settle) keeps a
+/// served outcome and a later lookup in the same reputation bucket. The `canonical` argument is
+/// retained for call-site symmetry but no longer selected (an untrusted label must not partition
+/// trust differently from what was served).
+fn rep_model_key<'a>(_canonical_model_id: &'a str, model_id: &'a str) -> &'a str {
+    model_id
+}
+
+/// As [`rank_providers`], but `earned_reputation(peer_id, model_key)` may override a provider's
+/// reputation with the consumer's locally-earned score for **that model** (M2.2(a) + Phase 4a
+/// per-`(peer, model)` keying). `Some(score)` wins; `None` falls back to the self-reported DHT
+/// value (neutral when absent). This is the closed loop that downranks a provider that has
+/// misbehaved with *this* consumer *on this model* — trust on another model does not carry over.
 pub fn rank_providers_with_reputation(
     peers: &[DiscoveredPeer],
     request_canonical: &str,
     tier: u8,
-    earned_reputation: &dyn Fn(&str) -> Option<f64>,
+    earned_reputation: &dyn Fn(&str, &str) -> Option<f64>,
 ) -> Vec<SelectedProvider> {
     let compatible: Vec<&DiscoveredPeer> = peers
         .iter()
@@ -200,9 +220,10 @@ pub fn rank_providers_with_reputation(
             peer_id: p.peer_id.clone(),
             latency_ms: 1.0, // RTT survey deferred (matches the M1.3 router default)
             load_pct: p.load_pct,
-            // Earned reputation (local tracker) wins; else the self-reported DHT value;
-            // else neutral. A provider that failed *us* ranks below an untried one.
-            reputation: earned_reputation(&p.peer_id)
+            // Earned reputation (local tracker, per (peer, model)) wins; else the self-reported
+            // DHT value; else neutral. A provider that failed *us* on this model ranks below an
+            // untried one.
+            reputation: earned_reputation(&p.peer_id, rep_model_key(&p.canonical_model_id, &p.model_id))
                 .unwrap_or(if p.reputation_score > 0.0 { p.reputation_score } else { 50.0 }),
             bandwidth_mbps: 0.0,
             s2s_rtt_ms: 0.0,
@@ -221,6 +242,7 @@ pub fn rank_providers_with_reputation(
                     peer_id: p.peer_id.clone(),
                     public_key: p.public_key.clone(),
                     model_id: p.model_id.clone(),
+                    canonical_model_id: p.canonical_model_id.clone(),
                     swarm_public_key: p.swarm_public_key.clone(),
                 })
         })
@@ -557,9 +579,14 @@ pub struct ConsumerNode {
     /// the receipts use. Mutated on `&self` (the gateway calls `complete` from a blocking
     /// task), so it lives behind a `Mutex`.
     reputation: Mutex<HashMap<String, ReputationTracker>>,
-    /// Optional durable backing for `reputation` (M2.2(a)) and `credit` (M2.3). When
-    /// present, both maps are rehydrated from it at startup and flushed back on each
-    /// update, so trust and give/take survive a restart. `None` = ephemeral.
+    /// Credit-tiering Phase 4: per-`(peer, model)` audit history (`n` passing audits + pass-rate
+    /// `a`), keyed by the same composite `reputation_key` as `reputation`. Drives the
+    /// `max_awardable_tier` gate on how much give-side credit a provider earns for a big model it
+    /// hasn't proven it serves. Fed by `audit_model`, persisted like `reputation`.
+    audit_stats: Mutex<HashMap<String, AuditStats>>,
+    /// Optional durable backing for `reputation` (M2.2(a)), `credit` (M2.3), and `audit_stats`
+    /// (Phase 4). When present, the maps are rehydrated from it at startup and flushed back on each
+    /// update, so trust, give/take, and audit history survive a restart. `None` = ephemeral.
     store: Option<Store>,
     /// M2.3 give-side credit, keyed by **provider libp2p PeerId** — the dial target we
     /// settled a receipt with. When a provider co-signs our receipt it *served* us, so we
@@ -613,6 +640,7 @@ impl ConsumerNode {
             net,
             tier: 2,
             reputation: Mutex::new(HashMap::new()),
+            audit_stats: Mutex::new(HashMap::new()),
             store: None,
             credit: Mutex::new(HashMap::new()),
             stats: None,
@@ -670,10 +698,15 @@ impl ConsumerNode {
         if let Err(e) = store.load_credit_into_memory(&mut credit) {
             tracing::warn!(error = %e, "could not rehydrate credit from store; starting fresh");
         }
+        let mut audit_stats = HashMap::new();
+        if let Err(e) = store.load_audit_stats_into_memory(&mut audit_stats) {
+            tracing::warn!(error = %e, "could not rehydrate audit stats from store; starting fresh");
+        }
         Self {
             net,
             tier: 2,
             reputation: Mutex::new(reputation),
+            audit_stats: Mutex::new(audit_stats),
             store: Some(store),
             credit: Mutex::new(credit),
             stats: None,
@@ -697,10 +730,13 @@ impl ConsumerNode {
         }
     }
 
-    /// The consumer's locally-earned reputation for `peer_id`, decayed to `now_ms`, or
-    /// `None` if this consumer has no history with it (→ neutral in ranking).
-    fn earned_reputation(&self, peer_id: &str, now_ms: u64) -> Option<f64> {
-        self.reputation.lock().ok()?.get(peer_id).map(|t| t.score_at(now_ms))
+    /// The consumer's locally-earned reputation for `peer_id` **on `model_key`**, decayed to
+    /// `now_ms`, or `None` if this consumer has no history with that `(peer, model)` (→ neutral in
+    /// ranking). Per-`(peer, model)` since Phase 4a: trust the peer earned on another model does
+    /// not answer here (anti-Sybil). `model_key` is [`rep_model_key`]'s output.
+    fn earned_reputation(&self, peer_id: &str, model_key: &str, now_ms: u64) -> Option<f64> {
+        let key = reputation_key(peer_id, model_key);
+        self.reputation.lock().ok()?.get(&key).map(|t| t.score_at(now_ms))
     }
 
     /// Snapshot the consumer's give-to-get economy for the status endpoint: earned
@@ -720,9 +756,19 @@ impl ConsumerNode {
             .lock()
             .map(|m| {
                 m.iter()
-                    .map(|(id, t)| crate::status::RepEntry {
-                        openhydra_peer_id: id.clone(),
-                        score: (t.raw_score() * 10.0).round() / 10.0,
+                    .map(|(key, t)| {
+                        // Phase 4a: the map key is the composite `(peer, model)` — split it back
+                        // for display. A key without the separator (should not occur post-migration)
+                        // degrades gracefully to peer-only with no model.
+                        let (peer, model) = match split_reputation_key(key) {
+                            Some((p, m)) => (p.to_string(), Some(m.to_string())),
+                            None => (key.clone(), None),
+                        };
+                        crate::status::RepEntry {
+                            openhydra_peer_id: peer,
+                            model_id: model,
+                            score: (t.raw_score() * 10.0).round() / 10.0,
+                        }
                     })
                     .collect()
             })
@@ -748,22 +794,60 @@ impl ConsumerNode {
     /// tracker, then best-effort persists the snapshot (reputation is advisory — a failed
     /// write must never break the request path). Feeds the next ranking so a provider that
     /// misbehaves with this consumer is downranked out of routing.
-    fn record_outcome(&self, peer_id: &str, outcome: VerificationOutcome, now_ms: u64) {
+    fn record_outcome(&self, peer_id: &str, model_key: &str, outcome: VerificationOutcome, now_ms: u64) {
+        // Per-(peer, model) since Phase 4a: an outcome moves trust for THIS model only. A provider
+        // that farms trust on a cheap model earns nothing toward a bigger one it later claims.
+        let key = reputation_key(peer_id, model_key);
         let snapshot = {
             let mut map = match self.reputation.lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
             let tracker = map
-                .entry(peer_id.to_string())
+                .entry(key.clone())
                 .or_insert_with(|| ReputationTracker::new(now_ms));
             tracker.record(outcome, now_ms);
             tracker.to_bytes()
         };
         // Persist outside the lock (don't hold the Mutex across the redb write).
         if let Some(store) = &self.store {
-            if let Err(e) = store.put_reputation(peer_id, &snapshot) {
-                tracing::debug!(error = %e, peer_id, "reputation persist failed");
+            if let Err(e) = store.put_reputation(&key, &snapshot) {
+                tracing::debug!(error = %e, peer_id, model = model_key, "reputation persist failed");
+            }
+        }
+    }
+
+    /// The cost-tier a provider may currently **earn** at for `model_key` (credit-tiering Phase 4):
+    /// the model's `claimed` cost-tier, gated by this `(peer, model)`'s audit history + reputation
+    /// via `max_awardable_tier`. No audit history yet → the conservative floor (nano), so a provider
+    /// earns the big-model rate only once it has *proven* (temp=0 audits) it serves the big model.
+    /// Fold one redundant-exec audit outcome for `(peer, model_key)` into the per-`(peer, model)`
+    /// audit history (`n`/`a`, [`AuditStats`]) and persist it. Only substantive verdicts reach here —
+    /// a `Pass` (agreed) or a `Fail` (clear temp=0 divergence); non-responders / inconclusive audits
+    /// are not evidence and never call this.
+    ///
+    /// **Note (post-review):** this collects the audit history + reputation-adjacent signal, but the
+    /// `max_awardable_tier` *gate* (and the [`GradedFault`] escalation ladder) it feeds is **not**
+    /// wired to any spendable credit today — the give/take throttle is raw-token (bandwidth) and
+    /// displayed credit is weighted by the validated handle. The gate belongs with the future
+    /// **payout** layer; the pure primitives (`max_awardable_tier`, `GradedFault`, escrow) live in
+    /// [`openhydra_protocol::award`] awaiting it. Feeding [`AuditStats`] now keeps the durable audit
+    /// history warm for that layer; the ephemeral fault ladder is deferred with it (a log-only
+    /// escalation over unpersisted state would reset every restart and mislead — review state-F4).
+    fn record_audit(&self, peer_id: &str, model_key: &str, class: AuditClass, now_ms: u64) {
+        let key = reputation_key(peer_id, model_key);
+        let snapshot = {
+            let mut m = match self.audit_stats.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let s = m.entry(key.clone()).or_insert_with(|| AuditStats::new(now_ms));
+            s.record(class, now_ms);
+            s.to_bytes()
+        };
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_audit_stats(&key, &snapshot) {
+                tracing::debug!(error = %e, peer_id, model = model_key, "audit stats persist failed");
             }
         }
     }
@@ -883,8 +967,8 @@ impl ConsumerNode {
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
         // a provider that has failed this consumer ranks below an untried one.
-        let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid| {
-            self.earned_reputation(pid, now)
+        let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid, mkey| {
+            self.earned_reputation(pid, mkey, now)
         });
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
@@ -1052,17 +1136,18 @@ impl ConsumerNode {
                             }
                         }
                     }
-                    // M2.2(a): a clean served completion earns the provider reputation — but not
-                    // for a self-serve (no earning off yourself).
+                    // M2.2(a): a clean served completion earns the provider reputation for THIS
+                    // model (Phase 4a) — but not for a self-serve (no earning off yourself).
+                    let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                     if !self_serve {
-                        self.record_outcome(&provider.peer_id, VerificationOutcome::Honored, now);
+                        self.record_outcome(&provider.peer_id, model_key, VerificationOutcome::Honored, now);
                     }
                     req_span.record("provider", provider.peer_id.as_str());
                     req_span.record("tokens", summary.tokens);
                     // M2.2(b): sampled background redundant-exec audit of this provider (off
                     // the response path — the caller already has its completion).
                     if !self_serve {
-                        self.maybe_audit(model, &provider.peer_id);
+                        self.maybe_audit(model, model_key, &provider.peer_id);
                     }
                     return AttemptOutcome::Served(summary);
                 }
@@ -1075,7 +1160,8 @@ impl ConsumerNode {
                     // reputation, so a dead/erroring one is downranked on the next discover.
                     // #7: never ding our own provider's reputation on a self-serve.
                     if !self.is_self_serve(&provider.libp2p_peer_id) {
-                        self.record_outcome(&provider.peer_id, VerificationOutcome::Rejected, now);
+                        let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
+                        self.record_outcome(&provider.peer_id, model_key, VerificationOutcome::Rejected, now);
                     }
                     if delivered {
                         // Already streamed part of a completion to the client — failing over
@@ -1176,6 +1262,11 @@ impl ConsumerNode {
         let node = Arc::clone(self);
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let model_id = provider.model_id.clone();
+        // `canonical` is still carried in the receipt (records what the provider claimed, for future
+        // fingerprint verification); `model_key` is the validated handle used for reputation + the
+        // cost-weighted display credit (the identity the audit actually exercises — review H1/H3).
+        let canonical = provider.canonical_model_id.clone();
+        let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string();
         std::thread::spawn(move || {
             let sign = |msg: &[u8]| node.net.sign(msg).unwrap_or_default();
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -1194,22 +1285,34 @@ impl ConsumerNode {
                 tokens,
                 nonce,
                 now_unix_ms(),
+                &canonical,
             )
             .is_ok()
             {
-                node.record_contribution(&provider_libp2p, tokens);
+                node.record_contribution(&provider_libp2p, &model_key, tokens);
             }
         });
     }
 
-    /// Record that `provider_libp2p_id` **served** us `tokens` (M2.3 give-side): the provider
-    /// earns give/take credit in our ledger, keyed by its libp2p id. The counterparty is our
-    /// own node, so the per-counterparty cap bounds how much any one provider can earn from
-    /// serving *us* alone (anti-collusion). Best-effort persisted; a failed write never
-    /// affects the completion (credit is advisory).
-    fn record_contribution(&self, provider_libp2p_id: &str, tokens: u64) {
+    /// Record that a provider **served** us `tokens` (give-side, M2.3): the provider earns give/take
+    /// throttle credit in our ledger, keyed by its libp2p id, in **raw tokens** — the throttle is
+    /// bandwidth priority and its constants are token-scaled (review H2). Separately, the
+    /// cost-weighted "credits spent" display counter is incremented, weighted by the validated
+    /// handle. The per-counterparty cap still bounds collusion. Best-effort persisted; a failed
+    /// write never affects the completion.
+    ///
+    /// `model_key` is the provider's validated engine **handle** (= [`rep_model_key`]) — it keys the
+    /// per-`(peer, model)` reputation and sizes the cost-weighted display credit (the handle-implied
+    /// tier is the ceiling until model-authenticity fingerprinting lands; a self-declared canonical
+    /// can't inflate it — review H1/H3). The give-side receipt carries no prompt/completion split
+    /// yet (Phase 2b) → the blended in/out rate.
+    fn record_contribution(&self, provider_libp2p_id: &str, model_key: &str, tokens: u64) {
         let now = now_unix_ms();
         let me = self.net.libp2p_peer_id().to_string();
+
+        // Give/take throttle = BANDWIDTH priority, in RAW tokens (review H2: decoupled from cost-tier
+        // weighting — `STARTER_GRANT`/`PER_COUNTERPARTY_CAP`/`DEFICIT_SPAN` are token-scaled, and
+        // feeding 150× weighted amounts through them truncated earns and over-throttled consumers).
         let snapshot = {
             let mut map = match self.credit.lock() {
                 Ok(m) => m,
@@ -1221,6 +1324,12 @@ impl ConsumerNode {
             acct.record_served(&me, tokens, now);
             acct.to_bytes()
         };
+        // Display: cost-weighted credit SPENT, weighted by the **validated handle** (`model_key`) —
+        // the ceiling that stops a mislabelled canonical inflating the number.
+        if let Some(stats) = &self.stats {
+            let spent = credits_for_receipt(cost_tier_for_handle(model_key).weight(), tokens, None);
+            stats.add_credits_spent(spent);
+        }
         if let Some(store) = &self.store {
             if let Err(e) = store.put_credit(provider_libp2p_id, &snapshot) {
                 tracing::debug!(error = %e, provider_libp2p_id, "credit persist failed");
@@ -1246,8 +1355,8 @@ impl ConsumerNode {
     /// against this to decide whether to [`audit_model`](Self::audit_model) after serving.
     /// Pure read of the earned-reputation map — exposed so the trigger policy is testable
     /// and tunable separately from the dispatch.
-    pub fn audit_rate_for(&self, peer_id: &str, now_ms: u64) -> f64 {
-        let rep = self.earned_reputation(peer_id, now_ms).unwrap_or(NEUTRAL_REPUTATION);
+    pub fn audit_rate_for(&self, peer_id: &str, model_key: &str, now_ms: u64) -> f64 {
+        let rep = self.earned_reputation(peer_id, model_key, now_ms).unwrap_or(NEUTRAL_REPUTATION);
         sample_rate_for_reputation(rep, AUDIT_MIN_RATE, AUDIT_MAX_RATE)
     }
 
@@ -1259,8 +1368,8 @@ impl ConsumerNode {
     /// the caller's latency path. The audit records its own outcomes (a confirmed outlier →
     /// `Failed`); here we only log the verdict. A `< 2 providers` error just means the model
     /// can't be cross-checked right now — logged at debug, not an error.
-    fn maybe_audit(self: &Arc<Self>, model: &str, provider_peer_id: &str) {
-        let rate = self.audit_rate_for(provider_peer_id, now_unix_ms());
+    fn maybe_audit(self: &Arc<Self>, model: &str, model_key: &str, provider_peer_id: &str) {
+        let rate = self.audit_rate_for(provider_peer_id, model_key, now_unix_ms());
         if rand::random::<f64>() >= rate {
             return; // not sampled this time
         }
@@ -1349,8 +1458,9 @@ impl ConsumerNode {
             .net
             .discover(model)
             .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
-        let candidates =
-            rank_providers_with_reputation(&peers, "", self.tier, &|pid| self.earned_reputation(pid, now));
+        let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid, mkey| {
+            self.earned_reputation(pid, mkey, now)
+        });
         if candidates.len() < 2 {
             return Err(AdapterError::Http(format!(
                 "redundant-exec audit needs ≥2 providers for '{model}', found {}",
@@ -1390,8 +1500,30 @@ impl ConsumerNode {
             }
         }
 
+        // Phase 4a: record each audit outcome under the SAME per-(peer, model) key the serve path
+        // uses, so an audit `Failed` downranks the provider on this model specifically. Every
+        // peer_id in `report.outcomes` came from `candidates`, so resolve the model key from there
+        // (falling back to the audited `model` handle for safety).
+        let key_of: std::collections::HashMap<&str, &str> = candidates
+            .iter()
+            .map(|c| (c.peer_id.as_str(), rep_model_key(&c.canonical_model_id, &c.model_id)))
+            .collect();
         for (peer_id, outcome) in &report.outcomes {
-            self.record_outcome(peer_id, *outcome, now);
+            let model_key = key_of.get(peer_id.as_str()).copied().unwrap_or(model);
+            self.record_outcome(peer_id, model_key, *outcome, now);
+            // Phase 4: fold the substantive temp=0 verdicts into the per-(peer,model) audit history
+            // — an agreed serve is a Pass (lifts `n`), a clear divergence a Fail. A non-responder
+            // (`Rejected`, a timeout) is not model-fraud evidence, so it never touches the history.
+            // (This history feeds the future payout gate; it does not gate any spendable credit
+            // today — the throttle is raw-token and display is handle-weighted.)
+            let class = match outcome {
+                VerificationOutcome::Honored => Some(AuditClass::Pass),
+                VerificationOutcome::Failed => Some(AuditClass::Fail),
+                VerificationOutcome::Rejected => None,
+            };
+            if let Some(class) = class {
+                self.record_audit(peer_id, model_key, class, now);
+            }
         }
         Ok(report)
     }
@@ -1970,10 +2102,34 @@ mod tests {
         // The closed loop: two equal-throughput providers, both self-reporting neutral;
         // the one with a low EARNED reputation ranks last.
         let peers = vec![discovered("bad", TPL_A, 20.0), discovered("good", TPL_A, 20.0)];
-        let earned = |pid: &str| if pid == "bad" { Some(5.0) } else { None };
+        let earned = |pid: &str, _model: &str| if pid == "bad" { Some(5.0) } else { None };
         let ranked = rank_providers_with_reputation(&peers, TPL_A, 2, &earned);
         let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
         assert_eq!(ids, vec!["good", "bad"], "low earned reputation must rank a provider last");
+    }
+
+    #[test]
+    fn ranking_threads_the_provider_model_to_the_reputation_lookup() {
+        // Phase 4a: the earned-reputation closure is asked per (peer, MODEL) — the ranker must pass
+        // the provider's canonical model, so a low score keyed to model X only bites on model X.
+        let peers = vec![discovered("p", TPL_A, 20.0)];
+        // The reputation lookup is keyed by the provider's validated HANDLE (`model_id`, "m" in the
+        // `discovered` helper), not its self-declared canonical.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let spy = |_pid: &str, model: &str| {
+            seen.borrow_mut().push(model.to_string());
+            None
+        };
+        rank_providers_with_reputation(&peers, "", 2, &spy);
+        assert_eq!(seen.into_inner(), vec!["m".to_string()], "lookup keyed by the provider's handle");
+    }
+
+    #[test]
+    fn rep_model_key_uses_the_validated_handle_not_the_canonical() {
+        // Keyed on the handle (matches KnownProvider.model_id + the commitment-bound identity),
+        // regardless of the untrusted self-declared canonical.
+        assert_eq!(rep_model_key("qwen3.5/2b/fp16/aa", "qwen2.5:7b"), "qwen2.5:7b");
+        assert_eq!(rep_model_key("", "qwen2.5:7b"), "qwen2.5:7b");
     }
 
     #[test]
@@ -1994,7 +2150,7 @@ mod tests {
         // Earned reputation only ever *overrides* — with no history (lookup → None for
         // all), the result must equal the plain reputation-agnostic ranking.
         let peers = vec![discovered("a", TPL_A, 5.0), discovered("b", TPL_A, 45.0)];
-        let with_none = rank_providers_with_reputation(&peers, TPL_A, 2, &|_| None);
+        let with_none = rank_providers_with_reputation(&peers, TPL_A, 2, &|_, _| None);
         let plain = rank_providers(&peers, TPL_A, 2);
         assert_eq!(
             with_none.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
