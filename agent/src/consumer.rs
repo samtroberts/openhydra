@@ -35,8 +35,8 @@ use openhydra_protocol::verify::{
 };
 use openhydra_protocol::award::{AuditClass, AuditStats};
 use openhydra_protocol::trust::{
-    authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityTier, MethodFlags,
-    PolicyMode, PrivacyTier, SettlementTier,
+    authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
+    MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
 use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt};
 
@@ -836,7 +836,17 @@ impl ConsumerNode {
             .ok()
             .and_then(|m| m.get(&key).map(|s| (s.pass_rate(now_ms), s.recent_passes(now_ms))))
             .unwrap_or((1.0, 0));
-        authenticity_tier_from(reputation, rate, passes, MethodFlags::default())
+        // Route through the curated redundant-exec verifier (Increment 3b) — the live caller of the
+        // Verifier seam. Same core resolution as `economy_snapshot`'s display path; no live
+        // per-serve outcome is tracked here yet, so `latest_outcome` is None.
+        let evidence = AuthenticityEvidence {
+            reputation,
+            audit_pass_rate: rate,
+            passing_audits: passes,
+            methods: MethodFlags::default(),
+            latest_outcome: None,
+        };
+        RedundantExecAuthenticity.verify(&evidence).authenticity
     }
 
     /// Snapshot the consumer's give-to-get economy for the status endpoint: earned

@@ -386,6 +386,117 @@ pub fn max_cost_tier_for_authenticity(authenticity: AuthenticityTier, claimed: C
     claimed.min(cap)
 }
 
+// ── Verifier plugin seam (UNIFIED_TRUST_STACK Increment 3, AntSeed-borrowed) ──
+//
+// The detection side of the stack. A `Verifier` turns evidence into an authenticity verdict; the
+// enforcement side (the credit-tiering `award` primitives, the routing `AssurancePolicy`) consumes
+// the tier. Verifiers are **curated and version-pinned** — an id embeds an explicit version
+// (`name@N`), never a floating "latest", so a verifier's behaviour is pinned to its id. Today there
+// is exactly one (redundant-exec authenticity); TEE-attestation / possession-with-anchor verifiers
+// plug into the same seam as they become buildable.
+
+/// A verdict from one [`Verifier`]: the authenticity tier it establishes, plus whether that verdict
+/// is **determinate** (settled from sufficient evidence) and so may be cached, versus transient /
+/// inconclusive (insufficient evidence, a probe error) which must **never** be cached — a transient
+/// "unknown" must not be frozen into a lasting low tier (AntSeed's "verdict cache that refuses to
+/// cache transient failures").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierVerdict {
+    /// The pinned id of the verifier that produced this verdict (`name@N`).
+    pub verifier_id: String,
+    /// The authenticity tier the verifier established.
+    pub authenticity: AuthenticityTier,
+    /// True when the verdict is settled and may be cached; false for a transient / inconclusive
+    /// result (see [`cacheable`](Self::cacheable)).
+    pub determinate: bool,
+}
+
+impl VerifierVerdict {
+    /// Whether this verdict may be cached. A transient / inconclusive verdict returns `false` — the
+    /// cache must re-derive it next time rather than freeze an "unknown" into a lasting tier.
+    pub fn cacheable(&self) -> bool {
+        self.determinate
+    }
+}
+
+/// A detection plugin: turns accumulated [`AuthenticityEvidence`] into a [`VerifierVerdict`]. Pure
+/// (no I/O in this trait) and object-safe, so a [`VerifierRegistry`] can hold a curated set behind
+/// `dyn`. The buyer's [`AssurancePolicy`] decides what to *do* with the resulting tier; the verifier
+/// only *establishes* it.
+pub trait Verifier {
+    /// This verifier's curated, version-pinned id (`name@N`). Stable for the life of the version.
+    fn id(&self) -> &str;
+    /// Establish an authenticity verdict from the evidence.
+    fn verify(&self, evidence: &AuthenticityEvidence) -> VerifierVerdict;
+}
+
+/// The redundant-execution + reputation authenticity verifier — the one detection mechanism built
+/// today (it reads the audit history the consumer already accrues). Establishes `A0`/`A1`; a hard
+/// PoI method in the evidence lifts it to `A2`, and a hardware-attested flag to `A3`, via the shared
+/// [`authenticity_tier_from`]. A live [`Failed`](VerificationOutcome::Failed) outcome pins the floor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RedundantExecAuthenticity;
+
+impl RedundantExecAuthenticity {
+    /// The curated, version-pinned id.
+    pub const ID: &'static str = "redundant-exec-authenticity@1";
+}
+
+impl Verifier for RedundantExecAuthenticity {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn verify(&self, evidence: &AuthenticityEvidence) -> VerifierVerdict {
+        let authenticity = if matches!(evidence.latest_outcome, Some(VerificationOutcome::Failed)) {
+            AuthenticityTier::SelfReported
+        } else {
+            authenticity_tier_from(
+                evidence.reputation,
+                evidence.audit_pass_rate,
+                evidence.passing_audits,
+                evidence.methods,
+            )
+        };
+        // Determinate only with real evidence: at least one passing audit, or a decisive latest
+        // outcome. With NO evidence the `A0` is a transient "unknown" (an untried `(peer, model)`),
+        // not a proven floor — it must not be cached (it will lift as soon as audits accrue).
+        let determinate = evidence.passing_audits > 0 || evidence.latest_outcome.is_some();
+        VerifierVerdict { verifier_id: Self::ID.to_string(), authenticity, determinate }
+    }
+}
+
+/// A curated, version-pinned set of [`Verifier`]s. Lookup is by exact pinned id — there is no
+/// floating "latest", so which verifier runs is always explicit and reproducible.
+pub struct VerifierRegistry {
+    verifiers: Vec<Box<dyn Verifier>>,
+}
+
+impl VerifierRegistry {
+    /// The curated default set shipped today: just the redundant-exec authenticity verifier. New
+    /// verifiers (possession-with-anchor, TEE attestation) are added here as they become buildable.
+    pub fn curated() -> Self {
+        Self { verifiers: vec![Box::new(RedundantExecAuthenticity)] }
+    }
+
+    /// The verifier with this exact pinned id, or `None` — an unknown / unpinned id resolves to
+    /// nothing rather than silently falling back to some default.
+    pub fn get(&self, id: &str) -> Option<&dyn Verifier> {
+        self.verifiers.iter().find(|v| v.id() == id).map(|v| v.as_ref())
+    }
+
+    /// Every curated verifier's pinned id.
+    pub fn ids(&self) -> Vec<&str> {
+        self.verifiers.iter().map(|v| v.id()).collect()
+    }
+}
+
+impl Default for VerifierRegistry {
+    fn default() -> Self {
+        Self::curated()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +741,53 @@ mod tests {
                 assert!(w[1] >= w[0], "cap must not decrease as authenticity rises");
             }
         }
+    }
+
+    // ── verifier plugin seam ──
+
+    #[test]
+    fn redundant_exec_verifier_matches_the_shared_resolution() {
+        // The verifier and the routing resolver share authenticity_tier_from, so they agree.
+        let v = RedundantExecAuthenticity;
+        let ev = evidence(R_MIN, A_MIN, 1, flags_none(), None);
+        let verdict = v.verify(&ev);
+        assert_eq!(verdict.verifier_id, "redundant-exec-authenticity@1");
+        assert_eq!(verdict.authenticity, AuthenticityTier::ReputationRedundant);
+        assert_eq!(
+            verdict.authenticity,
+            authenticity_tier_from(ev.reputation, ev.audit_pass_rate, ev.passing_audits, ev.methods)
+        );
+    }
+
+    #[test]
+    fn a_no_evidence_verdict_is_a0_and_not_cacheable() {
+        // A fresh (peer,model): A0, but a *transient* unknown — it must not be cached (it lifts as
+        // soon as audits accrue).
+        let verdict = RedundantExecAuthenticity.verify(&evidence(50.0, 1.0, 0, flags_none(), None));
+        assert_eq!(verdict.authenticity, AuthenticityTier::SelfReported);
+        assert!(!verdict.cacheable(), "a no-evidence A0 is transient, never cached");
+    }
+
+    #[test]
+    fn a_verdict_with_real_evidence_is_determinate_and_cacheable() {
+        let with_audits = RedundantExecAuthenticity.verify(&evidence(R_MIN, A_MIN, 3, flags_none(), None));
+        assert!(with_audits.cacheable(), "passing audits make the verdict determinate");
+        // A live Failed is also determinate (a settled divergence), pinned to the floor.
+        let failed = RedundantExecAuthenticity
+            .verify(&evidence(95.0, 0.99, 50, flags_none(), Some(VerificationOutcome::Failed)));
+        assert_eq!(failed.authenticity, AuthenticityTier::SelfReported);
+        assert!(failed.cacheable());
+    }
+
+    #[test]
+    fn registry_is_curated_and_version_pinned() {
+        let reg = VerifierRegistry::curated();
+        assert_eq!(reg.ids(), vec!["redundant-exec-authenticity@1"]);
+        // Ids embed an explicit version; there is no floating "latest".
+        assert!(reg.ids().iter().all(|id| id.contains('@') && !id.contains("latest")));
+        assert!(reg.get("redundant-exec-authenticity@1").is_some());
+        // An unknown / unpinned id resolves to nothing (no silent fallback).
+        assert!(reg.get("redundant-exec-authenticity").is_none());
+        assert!(reg.get("nonexistent@1").is_none());
     }
 }
