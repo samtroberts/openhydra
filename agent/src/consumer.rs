@@ -34,7 +34,10 @@ use openhydra_protocol::verify::{
     VerificationOutcome, NEUTRAL_REPUTATION,
 };
 use openhydra_protocol::award::{AuditClass, AuditStats};
-use openhydra_protocol::trust::{authenticity_tier_from, MethodFlags};
+use openhydra_protocol::trust::{
+    authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityTier, MethodFlags,
+    PolicyMode, PrivacyTier, SettlementTier,
+};
 use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt};
 
 use serde_json::Value;
@@ -212,12 +215,68 @@ pub fn rank_providers_with_reputation(
     tier: u8,
     earned_reputation: &dyn Fn(&str, &str) -> Option<f64>,
 ) -> Vec<SelectedProvider> {
+    // No buyer assurance policy → the open policy (admits everything), so the authenticity
+    // resolver is never consulted and ranking is unchanged.
+    rank_providers_with_assurance(
+        peers,
+        request_canonical,
+        tier,
+        earned_reputation,
+        &|_, _| AuthenticityTier::SelfReported,
+        &AssurancePolicy::OPEN,
+    )
+}
+
+/// As [`rank_providers_with_reputation`], but a buyer's [`AssurancePolicy`] gates the candidate set
+/// (UNIFIED_TRUST_STACK Increment 3). For each canonical-compatible provider, the caller's
+/// `achieved_authenticity(peer_id, model_key)` resolves the tier this consumer has established for
+/// the `(peer, model)` from its own redundant-exec audit history (the tier is never the provider's
+/// word). The gate then depends on the policy's [`PolicyMode`]:
+///
+/// * [`HardGate`](PolicyMode::HardGate) — a provider whose achieved assurance does not clear the
+///   policy's floors is **dropped** before scoring (AntSeed's `--require-verifier`). If none clear
+///   it, routing is empty and the serve fails over to nothing (fail-closed) — the honest outcome
+///   when a buyer demands a tier no reachable provider has proven.
+/// * [`VerifyButRoute`](PolicyMode::VerifyButRoute) — every compatible provider is kept and ranked
+///   as before; the achieved tier is surfaced (see `economy_snapshot`), not gated on.
+///
+/// Privacy and Settlement are resolved at their disclosed baseline (`P0`/`S0`) here — their
+/// verifiers are not built yet — so a policy that requires a privacy/settlement floor above the
+/// baseline admits nobody under `HardGate` (fail-closed, honest) until those axes are verifiable.
+pub fn rank_providers_with_assurance(
+    peers: &[DiscoveredPeer],
+    request_canonical: &str,
+    tier: u8,
+    earned_reputation: &dyn Fn(&str, &str) -> Option<f64>,
+    achieved_authenticity: &dyn Fn(&str, &str) -> AuthenticityTier,
+    policy: &AssurancePolicy,
+) -> Vec<SelectedProvider> {
     let compatible: Vec<&DiscoveredPeer> = peers
         .iter()
         .filter(|p| {
-            request_canonical.is_empty()
+            let canonical_ok = request_canonical.is_empty()
                 || p.canonical_model_id.is_empty()
-                || is_compatible(request_canonical, &p.canonical_model_id)
+                || is_compatible(request_canonical, &p.canonical_model_id);
+            if !canonical_ok {
+                return false;
+            }
+            // Buyer assurance gate. Only HardGate drops candidates; VerifyButRoute keeps them
+            // (the achieved tier is surfaced, not used to route). Privacy/Settlement are at their
+            // disclosed baseline until their verifiers exist.
+            match policy.mode {
+                PolicyMode::VerifyButRoute => true,
+                PolicyMode::HardGate => {
+                    let achieved = AssuranceTier {
+                        authenticity: achieved_authenticity(
+                            &p.peer_id,
+                            rep_model_key(&p.canonical_model_id, &p.model_id),
+                        ),
+                        privacy: PrivacyTier::None,
+                        settlement: SettlementTier::CreditsOnly,
+                    };
+                    policy.admits(&achieved)
+                }
+            }
         })
         .collect();
     if compatible.is_empty() {
@@ -626,6 +685,10 @@ pub struct ConsumerNode {
     /// M4-base: our held swarm membership credentials, attached to a serve request so a provider will
     /// serve its private (swarm-scoped) model. `None` = we hold none / private routing off.
     creds: Option<Arc<crate::swarms::CredentialStore>>,
+    /// UNIFIED_TRUST_STACK Increment 3: the buyer's required assurance for routing. Default
+    /// [`AssurancePolicy::OPEN`] (admits every provider, verify-but-route) — set a stricter policy
+    /// to hard-gate routing on an achieved authenticity tier. `Copy`, so it's read cheaply per serve.
+    assurance: AssurancePolicy,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -657,7 +720,16 @@ impl ConsumerNode {
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             creds: None,
+            assurance: AssurancePolicy::OPEN,
         }
+    }
+
+    /// Set the buyer's required [`AssurancePolicy`] for routing (builder form; keeps the other
+    /// constructor signatures unchanged). The default is [`AssurancePolicy::OPEN`] — pass a
+    /// stricter policy to hard-gate routing on an achieved authenticity tier (Increment 3).
+    pub fn with_assurance_policy(mut self, policy: AssurancePolicy) -> Self {
+        self.assurance = policy;
+        self
     }
 
     /// Attach the shared transfer counters so completions record per-model consumed tokens
@@ -723,6 +795,7 @@ impl ConsumerNode {
             buffered_only: Mutex::new(std::collections::HashSet::new()),
             cards: None,
             creds: None,
+            assurance: AssurancePolicy::OPEN,
         }
     }
 
@@ -746,6 +819,24 @@ impl ConsumerNode {
     fn earned_reputation(&self, peer_id: &str, model_key: &str, now_ms: u64) -> Option<f64> {
         let key = reputation_key(peer_id, model_key);
         self.reputation.lock().ok()?.get(&key).map(|t| t.score_at(now_ms))
+    }
+
+    /// The achieved [`AuthenticityTier`] this consumer has established for `(peer_id, model_key)`
+    /// from its own redundant-exec audit history (UNIFIED_TRUST_STACK Increment 3 — the routing
+    /// gate's resolver). Uses the **decayed** earned reputation (the live trust the router already
+    /// ranks on), the recency-weighted audit pass-rate + passing count, and no hard PoI method
+    /// (A0/A1 only, per 2a). An untried `(peer, model)` resolves to `A0` (`NEUTRAL_REPUTATION` is
+    /// below `R_MIN`), so a buyer requiring `A1+` never routes to a provider it has not yet proven.
+    fn authenticity_of(&self, peer_id: &str, model_key: &str, now_ms: u64) -> AuthenticityTier {
+        let reputation = self.earned_reputation(peer_id, model_key, now_ms).unwrap_or(NEUTRAL_REPUTATION);
+        let key = reputation_key(peer_id, model_key);
+        let (rate, passes) = self
+            .audit_stats
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).map(|s| (s.pass_rate(now_ms), s.recent_passes(now_ms))))
+            .unwrap_or((1.0, 0));
+        authenticity_tier_from(reputation, rate, passes, MethodFlags::default())
     }
 
     /// Snapshot the consumer's give-to-get economy for the status endpoint: earned
@@ -995,10 +1086,17 @@ impl ConsumerNode {
         }
         // "" canonical → any provider of this model_id (template-hash filtering is later).
         // M2.2(a): earned local reputation overrides the (neutral) self-reported score, so
-        // a provider that has failed this consumer ranks below an untried one.
-        let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid, mkey| {
-            self.earned_reputation(pid, mkey, now)
-        });
+        // a provider that has failed this consumer ranks below an untried one. Increment 3: the
+        // buyer's assurance policy hard-gates (or, by default, verify-but-routes) on the achieved
+        // authenticity tier this consumer has established from its own audits.
+        let candidates = rank_providers_with_assurance(
+            &peers,
+            "",
+            self.tier,
+            &|pid, mkey| self.earned_reputation(pid, mkey, now),
+            &|pid, mkey| self.authenticity_of(pid, mkey, now),
+            &self.assurance,
+        );
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
@@ -2190,6 +2288,105 @@ mod tests {
         let plain = rank_providers(&peers, TPL_A, 2);
         assert_eq!(
             with_none.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+            plain.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    // ── Increment 3: buyer assurance policy gates routing ──
+
+    fn require_a1(mode: PolicyMode) -> AssurancePolicy {
+        AssurancePolicy {
+            min_authenticity: AuthenticityTier::ReputationRedundant,
+            min_privacy: PrivacyTier::None,
+            min_settlement: SettlementTier::CreditsOnly,
+            mode,
+        }
+    }
+
+    #[test]
+    fn hard_gate_drops_providers_below_the_required_authenticity_tier() {
+        // "proven" resolves to A1, "fresh" to A0; a policy requiring A1 under HardGate keeps only
+        // the proven provider — even though "fresh" has the higher capability score.
+        let peers = vec![discovered("fresh", TPL_A, 45.0), discovered("proven", TPL_A, 5.0)];
+        let tier = |pid: &str, _m: &str| {
+            if pid == "proven" {
+                AuthenticityTier::ReputationRedundant
+            } else {
+                AuthenticityTier::SelfReported
+            }
+        };
+        let ranked = rank_providers_with_assurance(
+            &peers,
+            TPL_A,
+            2,
+            &|_, _| None,
+            &tier,
+            &require_a1(PolicyMode::HardGate),
+        );
+        let ids: Vec<&str> = ranked.iter().map(|p| p.peer_id.as_str()).collect();
+        assert_eq!(ids, vec!["proven"], "HardGate drops the sub-tier provider");
+    }
+
+    #[test]
+    fn verify_but_route_keeps_every_provider_regardless_of_tier() {
+        // The same split, but VerifyButRoute keeps both (the achieved tier is surfaced elsewhere,
+        // not used to route), so the result equals the ungated ranking.
+        let peers = vec![discovered("fresh", TPL_A, 45.0), discovered("proven", TPL_A, 5.0)];
+        let tier = |pid: &str, _m: &str| {
+            if pid == "proven" {
+                AuthenticityTier::ReputationRedundant
+            } else {
+                AuthenticityTier::SelfReported
+            }
+        };
+        let gated = rank_providers_with_assurance(
+            &peers,
+            TPL_A,
+            2,
+            &|_, _| None,
+            &tier,
+            &require_a1(PolicyMode::VerifyButRoute),
+        );
+        let plain = rank_providers(&peers, TPL_A, 2);
+        assert_eq!(
+            gated.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+            plain.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
+            "VerifyButRoute never drops a candidate",
+        );
+    }
+
+    #[test]
+    fn hard_gate_with_no_qualifying_provider_fails_closed() {
+        // Every provider is A0; requiring A1 under HardGate admits nobody (fail-closed) — the honest
+        // outcome when a buyer demands a tier no reachable provider has proven.
+        let peers = vec![discovered("a", TPL_A, 45.0), discovered("b", TPL_A, 5.0)];
+        let ranked = rank_providers_with_assurance(
+            &peers,
+            TPL_A,
+            2,
+            &|_, _| None,
+            &|_, _| AuthenticityTier::SelfReported,
+            &require_a1(PolicyMode::HardGate),
+        );
+        assert!(ranked.is_empty(), "no provider clears the floor → empty routing");
+    }
+
+    #[test]
+    fn open_policy_matches_plain_reputation_ranking() {
+        // The OPEN policy admits everything, so assurance-gated ranking equals the plain path even
+        // when the resolver would report A0 for all — the backward-compatible default.
+        let peers = vec![discovered("a", TPL_A, 5.0), discovered("b", TPL_A, 45.0)];
+        let gated = rank_providers_with_assurance(
+            &peers,
+            TPL_A,
+            2,
+            &|_, _| None,
+            &|_, _| AuthenticityTier::SelfReported,
+            &AssurancePolicy::OPEN,
+        );
+        let plain = rank_providers(&peers, TPL_A, 2);
+        assert_eq!(
+            gated.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
             plain.iter().map(|p| p.peer_id.clone()).collect::<Vec<_>>(),
         );
     }
