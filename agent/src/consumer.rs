@@ -34,6 +34,7 @@ use openhydra_protocol::verify::{
     VerificationOutcome, NEUTRAL_REPUTATION,
 };
 use openhydra_protocol::award::{AuditClass, AuditStats};
+use openhydra_protocol::trust::{authenticity_tier_from, MethodFlags};
 use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt};
 
 use serde_json::Value;
@@ -751,6 +752,16 @@ impl ConsumerNode {
     /// display uses the stable standing score, which persists across re-announce and restart.
     pub fn economy_snapshot(&self) -> (Vec<crate::status::RepEntry>, Vec<crate::status::CreditEntry>) {
         let now = now_unix_ms();
+        // Snapshot the redundant-exec audit history first, under its own lock, released before the
+        // reputation lock is taken — the two maps share the composite `(peer, model)` key, but they
+        // are never held nested, so taking them in sequence avoids any lock-ordering hazard.
+        let audit: std::collections::HashMap<String, (f64, u32)> = self
+            .audit_stats
+            .lock()
+            .map(|m| {
+                m.iter().map(|(k, s)| (k.clone(), (s.pass_rate(now), s.recent_passes(now)))).collect()
+            })
+            .unwrap_or_default();
         let reputation = self
             .reputation
             .lock()
@@ -764,10 +775,20 @@ impl ConsumerNode {
                             Some((p, m)) => (p.to_string(), Some(m.to_string())),
                             None => (key.clone(), None),
                         };
+                        // The achieved authenticity tier from the redundant-exec evidence already
+                        // tracked for this `(peer, model)` (UNIFIED_TRUST_STACK Increment 2a). A0/A1
+                        // only: `MethodFlags::default()` — a live A2+ needs a verifiable
+                        // possession/fingerprint method, which is disclosed-but-not-verified until an
+                        // anchor exists (Increment 2c). Reputation uses the stable standing score
+                        // (same as `score`), so the tier does not flicker on decay between polls.
+                        let (rate, passes) = audit.get(key).copied().unwrap_or((1.0, 0));
+                        let tier =
+                            authenticity_tier_from(t.raw_score(), rate, passes, MethodFlags::default());
                         crate::status::RepEntry {
                             openhydra_peer_id: peer,
                             model_id: model,
                             score: (t.raw_score() * 10.0).round() / 10.0,
+                            authenticity: Some(tier.label().to_string()),
                         }
                     })
                     .collect()

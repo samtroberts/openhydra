@@ -262,6 +262,12 @@ pub struct RepEntry {
     pub model_id: Option<String>,
     /// Earned reputation in `[0, 100]`, decayed to now (50 = neutral). See `verify.rs`.
     pub score: f64,
+    /// The achieved authenticity tier for this `(peer, model)` (`trust::AuthenticityTier` label,
+    /// e.g. `"A1-reputation-redundant"`) — resolved from the redundant-exec audit history this
+    /// consumer has for the pair (UNIFIED_TRUST_STACK). A0/A1 today; a verified A2+ awaits a
+    /// possession/fingerprint anchor. `None` for a legacy snapshot that carried no such resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticity: Option<String>,
 }
 
 /// One counterparty's give/take credit standing (keyed by **libp2p** peer id — the dial
