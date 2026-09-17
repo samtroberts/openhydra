@@ -23,11 +23,13 @@
 //! - [`weight`] — model cost-weight registry: footprint → cost-tier (credit tiering Phase 1)
 //! - [`award`] — tier-award policy: max-awardable-tier curve + escrow + graduated failure (Phase 4)
 //! - [`trust`] — unified trust stack: authenticity/privacy/settlement tiers + buyer policy (UNIFIED_TRUST_STACK_v1)
+//! - [`payout`] — payout-layer earn-gate: rail-specific (crypto rate-cap / fiat escrow) + 4% fee (PAYMENTS_PLAN_v1)
 
 pub mod award;
 pub mod credit;
 pub mod crypto_agility;
 pub mod model_id;
+pub mod payout;
 pub mod receipts;
 pub mod router;
 pub mod store;
