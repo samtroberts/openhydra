@@ -454,18 +454,31 @@ impl Store {
 
     /// Rehydrate the in-memory per-`(peer, model)` gated-voucher map on boot, keyed by the composite
     /// `(peer, model)` key. Mirrors [`load_audit_stats_into_memory`](Self::load_audit_stats_into_memory).
+    ///
+    /// **Resilience (F9):** a single undecodable voucher row is **skipped**, not fatal — one corrupt
+    /// row must not wipe every other pair's voucher (the pre-F9 `?` propagated to the caller, which
+    /// discarded the whole map and "started fresh"). Skipping is fail-safe here: a consumer that loses
+    /// a voucher would re-accrue from zero and sign a *lower* cumulative, which the provider's
+    /// monotonic [`check_cumulative`](crate::payout::check_cumulative) guard rejects — no double-pay.
+    /// Returns the number of rows skipped so the caller can log it; genuine storage-engine faults
+    /// (open/iterate) still propagate as `Err`.
     pub fn load_gated_vouchers_into_memory(
         &self,
         vouchers: &mut HashMap<String, crate::payout::GatedVoucher>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<usize, StoreError> {
         let rtx = self.db.begin_read().map_err(StoreError::from)?;
         let t = rtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
+        let mut skipped = 0usize;
         for entry in t.iter().map_err(StoreError::from)? {
             let (key, val) = entry.map_err(StoreError::from)?;
-            let voucher = crate::payout::GatedVoucher::from_bytes(val.value()).map_err(StoreError)?;
-            vouchers.insert(key.value().to_string(), voucher);
+            match crate::payout::GatedVoucher::from_bytes(val.value()) {
+                Ok(voucher) => {
+                    vouchers.insert(key.value().to_string(), voucher);
+                }
+                Err(_) => skipped += 1, // corrupt/legacy row → skip, keep the rest
+            }
         }
-        Ok(())
+        Ok(skipped)
     }
 
     // ── PROVIDER_SETTLED (provider-side co-signed cumulative high-water mark, review F2) ──
@@ -483,21 +496,25 @@ impl Store {
     }
 
     /// Rehydrate the provider's per-`(consumer, model)` last-cumulative map on boot. A wrong-length
-    /// row is skipped (fail-safe) rather than aborting the whole load.
+    /// row is skipped (fail-safe) rather than aborting the whole load. Returns the number of rows
+    /// skipped so the caller can log it (F9); storage-engine faults still propagate as `Err`.
     pub fn load_provider_settled_into_memory(
         &self,
         settled: &mut HashMap<String, u64>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<usize, StoreError> {
         let rtx = self.db.begin_read().map_err(StoreError::from)?;
         let t = rtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
+        let mut skipped = 0usize;
         for entry in t.iter().map_err(StoreError::from)? {
             let (key, val) = entry.map_err(StoreError::from)?;
             let bytes = val.value();
             if bytes.len() == 8 {
                 settled.insert(key.value().to_string(), u64::from_le_bytes(bytes.try_into().unwrap()));
+            } else {
+                skipped += 1; // wrong-length/corrupt row → skip, keep the rest
             }
         }
-        Ok(())
+        Ok(skipped)
     }
 
     // ── NONCES (replay protection) ──
@@ -772,8 +789,31 @@ mod tests {
         // A monotonic raise overwrites.
         store.put_provider_settled(&key, 19_200).unwrap();
         let mut map = std::collections::HashMap::new();
-        store.load_provider_settled_into_memory(&mut map).unwrap();
+        let skipped = store.load_provider_settled_into_memory(&mut map).unwrap();
         assert_eq!(map.get(&key).copied(), Some(19_200));
+        assert_eq!(skipped, 0, "a clean table skips nothing");
+    }
+
+    #[test]
+    fn gated_voucher_load_skips_a_corrupt_row_and_keeps_the_rest() {
+        // F9: one undecodable voucher row must not wipe every other pair's voucher. The loader skips
+        // it, keeps the good rows, and reports the skip count (the pre-F9 `?` aborted the whole load,
+        // so the caller discarded the entire map and "started fresh").
+        use crate::payout::GatedVoucher;
+        use crate::verify::reputation_key;
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        let good = reputation_key("peerGood", "qwen2.5:7b");
+        let bad = reputation_key("peerBad", "qwen2.5:7b");
+        store.put_gated_voucher(&good, &GatedVoucher { cumulative_net: 1_152, cumulative_fee: 48 }.to_bytes()).unwrap();
+        store.put_gated_voucher(&bad, &[0xde, 0xad, 0xbe, 0xef]).unwrap(); // wrong length → undecodable
+
+        let mut map = std::collections::HashMap::new();
+        let skipped = store.load_gated_vouchers_into_memory(&mut map).unwrap();
+        assert_eq!(skipped, 1, "the corrupt row is counted as skipped");
+        assert_eq!(map.get(&good).copied(), Some(GatedVoucher { cumulative_net: 1_152, cumulative_fee: 48 }),
+            "the good voucher survives a sibling corrupt row");
+        assert!(!map.contains_key(&bad), "the corrupt row is absent, not fatal");
     }
 
     #[test]

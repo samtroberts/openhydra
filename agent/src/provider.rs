@@ -1195,8 +1195,10 @@ impl<A: EngineAdapter> Provider<A> {
         // Review F2: rehydrate the last co-signed cumulative per (consumer, model) so a restart can't
         // accept a lower/replayed cumulative than one already co-signed.
         if let Ok(mut map) = self.settled_cumulative.lock() {
-            if let Err(e) = store.load_provider_settled_into_memory(&mut map) {
-                eprintln!("openhydra-agent: could not rehydrate settled cumulatives from store: {e}");
+            match store.load_provider_settled_into_memory(&mut map) {
+                Ok(0) => {}
+                Ok(skipped) => eprintln!("openhydra-agent: skipped {skipped} corrupt settled-cumulative row(s) on rehydrate; kept the rest"),
+                Err(e) => eprintln!("openhydra-agent: could not rehydrate settled cumulatives from store: {e}"),
             }
         }
         Self { store: Some(store), ..self }

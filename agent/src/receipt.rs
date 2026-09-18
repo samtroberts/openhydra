@@ -16,6 +16,7 @@
 
 use ed25519_dalek::Signature;
 
+use openhydra_protocol::crypto_agility::SigAlg;
 use openhydra_protocol::receipts::{
     cosign_bytes, payload_from_bytes, verify_receipt, CoSignedReceipt, ReceiptError, ReceiptPayload,
 };
@@ -80,9 +81,26 @@ fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8>
     // framing MUST transmit it or the provider reconstructs a different preimage and settlement fails
     // closed. Appended ONLY when `Some` (`has_cumulative:u8=1 + u64`), so every non-crypto serve's
     // framing stays byte-identical to before and a provider that never sees a voucher is unaffected.
-    if let Some(v) = payload.cumulative_amount {
-        b.push(1u8);
-        b.extend_from_slice(&v.to_le_bytes());
+    //
+    // sig_alg (F6): `canonical_bytes()` binds the signature-algorithm discriminant into the signed
+    // preimage, so the framing MUST transmit it too or a non-Ed25519 consumer's provider would
+    // reconstruct a different preimage and every settlement fails closed. It is the LAST trailer,
+    // emitted as a single discriminant byte and ONLY when non-Ed25519 — so today's Ed25519-only
+    // traffic stays byte-identical (absent trailer ⇒ Ed25519 on decode) and an already-deployed
+    // provider that predates this trailer is unaffected. When it IS emitted, the (otherwise optional)
+    // cumulative trailer's flag byte is written first even if `None`, so the positional decode stays
+    // unambiguous.
+    let emit_sig_alg = payload.sig_alg != SigAlg::Ed25519;
+    match payload.cumulative_amount {
+        Some(v) => {
+            b.push(1u8);
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        None if emit_sig_alg => b.push(0u8), // explicit `no cumulative`, so the sig_alg byte follows cleanly
+        None => {}
+    }
+    if emit_sig_alg {
+        b.push(payload.sig_alg.to_u8());
     }
     b
 }
@@ -154,14 +172,29 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
     let completion = read_flag_u64(data, &mut pos, "completion")?;
     // Cumulative-voucher trailer (crypto-rail, v4): `has_cumulative:u8 [+ u64]`.
     let cumulative = read_flag_u64(data, &mut pos, "cumulative")?;
+    // sig_alg trailer (F6): a single discriminant byte, present iff bytes remain. Absent ⇒ Ed25519
+    // (the legacy/common path, byte-identical to before). A future non-Ed25519 consumer transmits it
+    // so the provider reconstructs the SAME `canonical_bytes()` preimage the consumer signed; because
+    // sig_alg is bound into that preimage, a tampered discriminant just fails signature verification.
+    let sig_alg = if pos == data.len() {
+        SigAlg::Ed25519
+    } else {
+        let alg = SigAlg::from_u8(data[pos])
+            .map_err(|e| AdapterError::Parse(format!("receipt request sig_alg: {e}")))?;
+        pos += 1;
+        alg
+    };
     if pos != data.len() {
         return Err(AdapterError::Parse("receipt request has trailing bytes".into()));
     }
-    let payload = payload_from_bytes(
+    let mut payload = payload_from_bytes(
         &data[0..32], &data[32..64], model, tokens, &data[64..80], ts, completion, canonical,
         cumulative,
     )
     .map_err(AdapterError::Parse)?;
+    // `payload_from_bytes` is the classical constructor (defaults Ed25519); stamp the wire-declared
+    // algorithm so the co-sign preimage matches the consumer's.
+    payload.sig_alg = sig_alg;
     let consumer_sig = to_sig(&data[96..160])?;
     Ok((payload, consumer_sig))
 }
@@ -351,6 +384,53 @@ mod tests {
         let provider_sig = provider.sign(&cosign_bytes(&decoded, &decoded_sig));
         let receipt = CoSignedReceipt { payload: decoded, consumer_sig: decoded_sig, provider_sig };
         assert_eq!(verify_receipt(&receipt), Ok(()), "provider reconstructs the identical preimage");
+    }
+
+    #[test]
+    fn request_framing_transmits_sig_alg_and_stays_byte_identical_for_ed25519() {
+        // F6: `canonical_bytes()` binds sig_alg into the signed preimage, so the request framing must
+        // transmit it — otherwise a future non-Ed25519 consumer's provider reconstructs a different
+        // preimage via `payload_from_bytes` (which defaults Ed25519) and every settlement fails closed.
+        use openhydra_protocol::crypto_agility::SigAlg;
+        let consumer = signer(7);
+        let provider = signer(9);
+        let base = ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen2.5:7b".to_string(),
+            tokens: 100,
+            nonce: [3u8; 16],
+            ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
+            cumulative_amount: None,
+        };
+        let sig = provider.sign(b"placeholder"); // any 64-byte sig; the framing doesn't re-verify it here
+
+        // Ed25519 (the only implemented alg): NO trailer emitted, and decode still recovers Ed25519.
+        let ed_framed = encode_request(&base, &sig);
+        let (ed_decoded, _) = decode_request(&ed_framed).unwrap();
+        assert_eq!(ed_decoded.sig_alg, SigAlg::Ed25519);
+
+        // A non-Ed25519 discriminant is carried through the framing verbatim (forward-compat plumbing
+        // for PQC3.1 — we can't verify it yet, but the provider must reconstruct the SAME sig_alg the
+        // consumer signed). Emitting the trailer must lengthen the frame by exactly one byte.
+        let mut pqc = base.clone();
+        pqc.sig_alg = SigAlg::MlDsa65;
+        let pqc_framed = encode_request(&pqc, &sig);
+        assert_eq!(pqc_framed.len(), ed_framed.len() + 2,
+            "explicit cumulative `0` flag (so the positional decode stays unambiguous) + the discriminant byte");
+        let (pqc_decoded, _) = decode_request(&pqc_framed).unwrap();
+        assert_eq!(pqc_decoded.sig_alg, SigAlg::MlDsa65, "the wire-declared algorithm survives the round-trip");
+
+        // The trailer must also compose with a cumulative voucher: cumulative Some + non-Ed25519.
+        let mut both = base.clone();
+        both.sig_alg = SigAlg::MlDsa65;
+        both.cumulative_amount = Some(9_600);
+        let (both_decoded, _) = decode_request(&encode_request(&both, &sig)).unwrap();
+        assert_eq!(both_decoded.sig_alg, SigAlg::MlDsa65);
+        assert_eq!(both_decoded.cumulative_amount, Some(9_600));
     }
 
     #[test]

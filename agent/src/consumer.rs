@@ -731,6 +731,15 @@ enum AttemptOutcome {
     Fatal(AdapterError),
 }
 
+/// Evict per-`(peer, model)` settlement locks that no settle is using, keeping the lock map bounded
+/// on a long-lived node (review F1 follow-up). An entry is **idle** iff only the map references its
+/// `Arc` (`strong_count == 1`); any in-flight or waiting settle captured an extra clone (in
+/// `settle_receipt`, before it takes the guard), so a busy pair's lock keeps `strong_count >= 2` and
+/// survives the sweep — the serialization guarantee is never broken by pruning.
+fn prune_idle_settle_locks(locks: &mut HashMap<String, Arc<Mutex<()>>>) {
+    locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+}
+
 impl ConsumerNode {
     /// An in-memory consumer (reputation and credit are not persisted across restarts).
     pub fn new(net: NetworkHandle) -> Self {
@@ -772,8 +781,17 @@ impl ConsumerNode {
 
     /// The per-`(peer, model)` settlement lock for `vkey`, creating it on first use — held across a
     /// settle's read→co-sign→commit so concurrent settles to the same pair serialize (review F1).
+    ///
+    /// Bounds the lock map: a long-lived node churning through many providers would otherwise grow one
+    /// permanent entry per distinct `(peer, model)` ever settled. Past a threshold we sweep entries no
+    /// settle is using (`prune_idle_settle_locks`) before handing back this pair's lock. The sweep is
+    /// gated on size so the common path stays O(1).
     fn settle_lock_for(&self, vkey: &str) -> Arc<Mutex<()>> {
+        const PRUNE_THRESHOLD: usize = 256;
         let mut locks = self.settle_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.len() >= PRUNE_THRESHOLD {
+            prune_idle_settle_locks(&mut locks);
+        }
         locks.entry(vkey.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
 
@@ -829,8 +847,10 @@ impl ConsumerNode {
             tracing::warn!(error = %e, "could not rehydrate audit stats from store; starting fresh");
         }
         let mut gated_vouchers = HashMap::new();
-        if let Err(e) = store.load_gated_vouchers_into_memory(&mut gated_vouchers) {
-            tracing::warn!(error = %e, "could not rehydrate gated vouchers from store; starting fresh");
+        match store.load_gated_vouchers_into_memory(&mut gated_vouchers) {
+            Ok(0) => {}
+            Ok(skipped) => tracing::warn!(skipped, "skipped corrupt gated-voucher rows on rehydrate; kept the rest"),
+            Err(e) => tracing::warn!(error = %e, "could not rehydrate gated vouchers from store; starting fresh"),
         }
         Self {
             net,
@@ -1835,6 +1855,26 @@ mod tests {
     use super::*;
     use crate::adapter::{DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
     use crate::provider::handle_serve_inbound;
+
+    #[test]
+    fn prune_idle_settle_locks_evicts_only_unheld_entries() {
+        // F1 follow-up: the settlement-lock map must stay bounded. An idle pair (only the map holds
+        // its Arc) is evicted; a pair with an in-flight settle (an extra Arc clone alive, as
+        // `settle_receipt` captures before locking) is retained so serialization is never broken.
+        let mut locks: HashMap<String, Arc<Mutex<()>>> = HashMap::new();
+        locks.insert("idle-a".to_string(), Arc::new(Mutex::new(())));
+        locks.insert("idle-b".to_string(), Arc::new(Mutex::new(())));
+        let held = Arc::new(Mutex::new(()));
+        locks.insert("busy".to_string(), held.clone()); // an in-flight settle holds this clone
+
+        prune_idle_settle_locks(&mut locks);
+
+        assert!(locks.contains_key("busy"), "a pair with an in-flight settle is never evicted");
+        assert!(!locks.contains_key("idle-a"), "idle entries are swept");
+        assert!(!locks.contains_key("idle-b"));
+        assert_eq!(locks.len(), 1);
+        drop(held);
+    }
 
     /// A canned engine: emits fixed deltas (or fails).
     struct StubAdapter {
