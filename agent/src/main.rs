@@ -1214,11 +1214,19 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         stats.rehydrate_ledger(&rows, served, used, n);
     }
     let aup = args.aup.clone().into_policy();
+    // Review F2: the provider validates a receipt's crypto-rail cumulative against a token floor when
+    // it knows the settlement peg — the same opt-in env var the gateway uses. Unset/zero → the
+    // provider validates monotonicity only.
+    let settlement_peg = std::env::var("OPENHYDRA_USDC_MICROS_PER_CREDIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     let mut provider = Provider::new(adapter, net)
         .with_address(args.host, args.port)
         .with_store(store)
         .with_aup(aup)
-        .with_stats(stats);
+        .with_stats(stats)
+        .with_settlement_peg(settlement_peg);
     // A hot-reloadable policy file (the desktop path) takes precedence over the static
     // `--share-models` list. Only one governs sharing, so we never mix the two.
     if let Some(path) = args.share_policy_file.clone() {

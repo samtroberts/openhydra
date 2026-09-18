@@ -659,6 +659,14 @@ pub struct Provider<A: EngineAdapter> {
     /// B-S1/B-S7: receipt-nonce → what we served under it, so a settlement receipt is checked
     /// against real work (tokens ≤ served, model match, single-use, fresh). Bounded + pruned.
     serve_commitments: Mutex<HashMap<[u8; 16], ServeCommitment>>,
+    /// Review F2 — provider-side crypto-rail voucher validation: the last co-signed
+    /// `cumulative_amount` per `(consumer, model)`, so a new receipt's cumulative is checked
+    /// monotonic (and, when a peg is configured, above the token floor) BEFORE we counter-sign it.
+    /// Keyed by `reputation_key(hex(consumer_pubkey), model_id)`; persisted like the credit map.
+    settled_cumulative: Mutex<HashMap<String, u64>>,
+    /// The provider's configured settlement peg (USDC micro-units per credit unit), for the F2 floor
+    /// check. `None` = not opted into the crypto rail → monotonic-only validation.
+    settlement_peg: Option<u64>,
     /// E-S8: global token-bucket cap on inbound receipt settlements — sheds a receipt flood
     /// *before* the Ed25519 verify+sign, so receipt crypto can't monopolize the worker pool.
     receipt_rl: Arc<RateLimiter>,
@@ -730,6 +738,8 @@ impl<A: EngineAdapter> Provider<A> {
             aup: AupPolicy::permissive(),
             stats: None,
             serve_commitments: Mutex::new(HashMap::new()),
+            settled_cumulative: Mutex::new(HashMap::new()),
+            settlement_peg: None,
             receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
                 rps: RECEIPT_RATE_RPS,
                 burst: RECEIPT_RATE_BURST,
@@ -758,6 +768,13 @@ impl<A: EngineAdapter> Provider<A> {
     /// `Private`-scope model to be servable — without it every private serve is refused (fail-closed).
     pub fn with_swarm_authorizer(mut self, auth: Arc<crate::swarms::SwarmAuthorizer>) -> Self {
         self.swarm_auth = Some(auth);
+        self
+    }
+
+    /// Set the provider's settlement peg (USDC micro-units per credit unit) for the F2 floor check
+    /// (builder form). `0`/unset leaves it `None` → monotonic-only cumulative validation.
+    pub fn with_settlement_peg(mut self, micros_per_credit: u64) -> Self {
+        self.settlement_peg = (micros_per_credit > 0).then_some(micros_per_credit);
         self
     }
 
@@ -1110,12 +1127,76 @@ impl<A: EngineAdapter> Provider<A> {
         )
     }
 
+    /// The `(consumer, model)` key for the provider-side settled-cumulative map (review F2).
+    fn settled_key(p: &openhydra_protocol::receipts::ReceiptPayload) -> String {
+        openhydra_protocol::verify::reputation_key(&hex::encode(p.consumer.as_bytes()), &p.model_id)
+    }
+
+    /// Review F2: validate a receipt's `cumulative_amount` against the last one we co-signed for this
+    /// `(consumer, model)` **before** counter-signing — monotonic, and (when a peg is configured)
+    /// above the token floor, so a consumer can't under-sign or replay a lower amount and have us
+    /// accept it. Read-only (the accepted value is recorded only after a successful co-sign). A
+    /// `None` cumulative (legacy / crypto-rail-off receipt) always passes.
+    fn validate_settlement_cumulative(
+        &self,
+        p: &openhydra_protocol::receipts::ReceiptPayload,
+    ) -> Result<(), String> {
+        let key = Self::settled_key(p);
+        let last = self
+            .settled_cumulative
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+            .unwrap_or(0);
+        let units = openhydra_protocol::weight::receipt_weighted_units(p.tokens, p.completion_tokens);
+        openhydra_protocol::payout::check_cumulative(last, p.cumulative_amount, units, self.settlement_peg)
+            .map_err(|e| match e {
+                openhydra_protocol::payout::CumulativeError::NonMonotonic => {
+                    "cumulative amount is non-monotonic".to_string()
+                }
+                openhydra_protocol::payout::CumulativeError::BelowFloor => {
+                    "cumulative amount below the floor for tokens served".to_string()
+                }
+            })
+    }
+
+    /// Record the co-signed cumulative for this `(consumer, model)` after a successful co-sign
+    /// (review F2). Monotonic `max`, so a concurrent or out-of-order co-sign can't lower it;
+    /// best-effort persisted so a restart can't accept a lower/replayed cumulative.
+    fn record_settlement_cumulative(&self, p: &openhydra_protocol::receipts::ReceiptPayload) {
+        let Some(cumulative) = p.cumulative_amount else {
+            return;
+        };
+        let key = Self::settled_key(p);
+        let stored = {
+            let mut map = match self.settled_cumulative.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let e = map.entry(key.clone()).or_insert(0);
+            *e = (*e).max(cumulative);
+            *e
+        };
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_provider_settled(&key, stored) {
+                eprintln!("openhydra-agent: settled-cumulative persist failed: {e}");
+            }
+        }
+    }
+
     /// Attach a ledger so accepted co-signed receipts are persisted (M2.3), and rehydrate
     /// the give/take credit map from it so throttling survives a restart.
     pub fn with_store(self, store: Store) -> Self {
         if let Ok(mut map) = self.credit.lock() {
             if let Err(e) = store.load_credit_into_memory(&mut map) {
                 eprintln!("openhydra-agent: could not rehydrate credit from store: {e}");
+            }
+        }
+        // Review F2: rehydrate the last co-signed cumulative per (consumer, model) so a restart can't
+        // accept a lower/replayed cumulative than one already co-signed.
+        if let Ok(mut map) = self.settled_cumulative.lock() {
+            if let Err(e) = store.load_provider_settled_into_memory(&mut map) {
+                eprintln!("openhydra-agent: could not rehydrate settled cumulatives from store: {e}");
             }
         }
         Self { store: Some(store), ..self }
@@ -1639,8 +1720,11 @@ impl<A: EngineAdapter> Provider<A> {
                 }
                 let sign = |msg: &[u8]| self.net.sign(msg).unwrap_or_default();
                 let provider_pub = self.net.public_key_bytes().unwrap_or_default();
-                // B-S1: only co-sign a receipt that settles a real serve we recorded.
+                // B-S1: only co-sign a receipt that settles a real serve we recorded. Review F2: also
+                // reject a non-monotonic / under-signed crypto-rail cumulative BEFORE consuming the
+                // commitment (so a bad cumulative doesn't burn the single-use nonce).
                 let bind = |p: &openhydra_protocol::receipts::ReceiptPayload| {
+                    self.validate_settlement_cumulative(p)?;
                     self.check_and_consume_commitment(p)
                 };
                 let (response, accepted) =
@@ -1650,6 +1734,8 @@ impl<A: EngineAdapter> Provider<A> {
                 // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
                 if let Some(receipt) = &accepted {
                     self.record_consumption(receipt);
+                    // Review F2: advance our co-signed cumulative high-water mark for this pair.
+                    self.record_settlement_cumulative(&receipt.payload);
                     if let Some(stats) = &self.stats {
                         stats.receipts_ledgered.fetch_add(1, Ordering::Relaxed);
                         // #5 Ledger: a co-signed receipt is an authoritative "served" transaction

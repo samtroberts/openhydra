@@ -48,6 +48,11 @@ const PEER_AUDIT_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("pee
 /// could later claim on-chain. No real value; the running accrual only.
 const PEER_GATED_ACCRUAL: TableDefinition<&str, &[u8]> =
     TableDefinition::new("peer_gated_accrual");
+
+/// Provider-side last co-signed cumulative amount per `(consumer, model)` (review F2) — the
+/// monotonic high-water mark the provider validates a new receipt's `cumulative_amount` against
+/// before counter-signing. Value = a `u64` (USDC micro-units) little-endian.
+const PROVIDER_SETTLED: TableDefinition<&str, &[u8]> = TableDefinition::new("provider_settled");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
 /// Durable ledger rows for the desktop Ledger view, keyed by a monotonic sequence → a compact
@@ -193,6 +198,7 @@ impl Store {
             wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
             wtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
             wtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
+            wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
@@ -462,6 +468,38 @@ impl Store {
         Ok(())
     }
 
+    // ── PROVIDER_SETTLED (provider-side co-signed cumulative high-water mark, review F2) ──
+
+    /// Checkpoint the provider's last co-signed cumulative for a `(consumer, model)` key. Value is a
+    /// `u64` (USDC micro-units) little-endian; monotonic, so a write only ever raises it.
+    pub fn put_provider_settled(&self, key: &str, cumulative: u64) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
+            t.insert(key, &cumulative.to_le_bytes()[..]).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Rehydrate the provider's per-`(consumer, model)` last-cumulative map on boot. A wrong-length
+    /// row is skipped (fail-safe) rather than aborting the whole load.
+    pub fn load_provider_settled_into_memory(
+        &self,
+        settled: &mut HashMap<String, u64>,
+    ) -> Result<(), StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            let bytes = val.value();
+            if bytes.len() == 8 {
+                settled.insert(key.value().to_string(), u64::from_le_bytes(bytes.try_into().unwrap()));
+            }
+        }
+        Ok(())
+    }
+
     // ── NONCES (replay protection) ──
 
     /// Mark a receipt nonce as spent.
@@ -721,6 +759,21 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         store.load_gated_vouchers_into_memory(&mut map).unwrap();
         assert_eq!(map.get(&key).copied(), Some(v), "voucher rehydrates with its cumulative totals");
+    }
+
+    #[test]
+    fn provider_settled_cumulative_roundtrips_and_rehydrates() {
+        // Review F2: the provider's last co-signed cumulative per (consumer, model) persists.
+        use crate::verify::reputation_key;
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        let key = reputation_key("consumerhex", "qwen2.5:7b");
+        store.put_provider_settled(&key, 9_600).unwrap();
+        // A monotonic raise overwrites.
+        store.put_provider_settled(&key, 19_200).unwrap();
+        let mut map = std::collections::HashMap::new();
+        store.load_provider_settled_into_memory(&mut map).unwrap();
+        assert_eq!(map.get(&key).copied(), Some(19_200));
     }
 
     #[test]

@@ -176,6 +176,51 @@ pub fn escrow_release(escrowed: u64, action: FaultAction) -> EscrowRelease {
     }
 }
 
+/// Why a provider rejected a co-signed cumulative amount ([`check_cumulative`], review F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CumulativeError {
+    /// The cumulative went **backward** (below the last one this provider co-signed for the pair) —
+    /// a replay or a stale/forged lower amount.
+    NonMonotonic,
+    /// The cumulative rose by **less than the floor** owed for the tokens served this receipt — a
+    /// consumer under-signing the payment (e.g. `Some(1)` for a real serve).
+    BelowFloor,
+}
+
+/// Provider-side validation of a co-signed `cumulative_amount` before the provider counter-signs
+/// (review F2): the provider accepts the consumer-authored figure, so it must at least (a) refuse a
+/// **non-monotonic** cumulative (below the last it co-signed for this pair), and (b) when it knows
+/// the settlement peg, refuse one whose **delta is below the floor** (`weighted_units` at the floor
+/// tier — [`CostTier::Nano`], weight `1`) for the tokens served. The floor cannot be forged down
+/// because the provider computes it from its **own** validated token count + peg; it does not need
+/// the consumer's private authenticity tier (which only ever *raises* the amount above the floor).
+///
+/// `last` = the last cumulative co-signed for this `(consumer, model)` (0 if none). `cumulative` =
+/// the receipt's amount (`None` = a legacy/no-crypto receipt → always Ok, nothing to settle).
+/// `weighted_units` = [`crate::weight::receipt_weighted_units`] for this receipt. `peg` = the
+/// provider's configured USDC-per-credit peg, or `None` to skip the floor check (monotonic only).
+pub fn check_cumulative(
+    last: u64,
+    cumulative: Option<u64>,
+    weighted_units: u64,
+    peg: Option<u64>,
+) -> Result<(), CumulativeError> {
+    let Some(cumulative) = cumulative else {
+        return Ok(());
+    };
+    if cumulative < last {
+        return Err(CumulativeError::NonMonotonic);
+    }
+    if let Some(peg) = peg {
+        // Floor tier (Nano) weight is 1, so the floor gross == weighted_units converted to the asset.
+        let floor = credits_to_asset_micros(weighted_units, peg);
+        if cumulative.saturating_sub(last) < floor {
+            return Err(CumulativeError::BelowFloor);
+        }
+    }
+    Ok(())
+}
+
 /// A monotonic per-`(consumer, provider, model)` accrual of authenticity-gated credit — the
 /// off-chain running **voucher** the crypto rail settles against (PAYMENTS_PLAN_v1 crypto sequence
 /// step 3). Each served step adds its [`gated_accrual`] (provider net + the 4% protocol fee); the
@@ -367,6 +412,22 @@ mod tests {
         v.accrue(gated_accrual(Mega, EnergyFingerprintPossession, 100)); // full 15000: net 14400 fee 600
         assert_eq!((v.cumulative_net, v.cumulative_fee), (1_152 + 14_400, 48 + 600));
         assert!(v.cumulative_gross() >= 1_200, "cumulative gross only rises");
+    }
+
+    #[test]
+    fn check_cumulative_enforces_monotonicity_and_the_floor() {
+        // No cumulative (legacy receipt) is always fine.
+        assert_eq!(check_cumulative(100, None, 50, Some(5)), Ok(()));
+        // Backward → NonMonotonic (replay / stale / forged-lower).
+        assert_eq!(check_cumulative(100, Some(99), 50, Some(5)), Err(CumulativeError::NonMonotonic));
+        assert_eq!(check_cumulative(100, Some(100), 0, None), Ok(()), "equal is monotonic-ok");
+        // Floor: units=50, peg=5 → floor = 250. A delta below 250 for a real serve is under-signing.
+        assert_eq!(check_cumulative(100, Some(100 + 1), 50, Some(5)), Err(CumulativeError::BelowFloor));
+        assert_eq!(check_cumulative(100, Some(100 + 249), 50, Some(5)), Err(CumulativeError::BelowFloor));
+        assert_eq!(check_cumulative(100, Some(100 + 250), 50, Some(5)), Ok(()), "delta == floor is ok");
+        assert_eq!(check_cumulative(100, Some(100 + 999), 50, Some(5)), Ok(()), "above floor is ok");
+        // Without a peg, only monotonicity is enforced (no floor) — a tiny delta passes.
+        assert_eq!(check_cumulative(100, Some(101), 50, None), Ok(()));
     }
 
     #[test]
