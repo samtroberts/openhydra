@@ -1096,6 +1096,16 @@ impl ConsumerNode {
     /// Commit `split` into the `(peer, model)` voucher at composite `key` (accrue + persist). Called
     /// **only after** the provider co-signs the receipt carrying the resulting cumulative amount, so
     /// the voucher stays equal to the latest co-signed claim. Off-chain accounting; no value moves.
+    /// Advance and persist this `(peer, model)`'s gated voucher after a successful co-sign.
+    ///
+    /// ⚠️ LIVENESS GAP (review F-3, pre-crypto-go-live): the voucher is monotonic and the provider
+    /// retains a persisted high-water (`PROVIDER_SETTLED`). If this consumer ever loses its local
+    /// voucher (e.g. an F9 corrupt-row skip resets the base to 0), every subsequent serve signs a
+    /// cumulative below the provider's retained high-water → the provider rejects it `NonMonotonic` →
+    /// no receipt for that pair ever settles again. This is fail-SAFE (never double-pays) but a
+    /// permanent settlement dead-end for the pair, with no re-sync path. Before crypto payout goes
+    /// live, add a signed high-water reconciliation (provider attests its current cumulative; consumer
+    /// adopts it) so a consumer can recover its base after voucher loss.
     fn commit_gated_voucher(&self, key: &str, split: FeeSplit) {
         let snapshot = {
             let mut map = match self.gated_vouchers.lock() {

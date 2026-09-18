@@ -495,26 +495,51 @@ impl Store {
         Ok(())
     }
 
-    /// Rehydrate the provider's per-`(consumer, model)` last-cumulative map on boot. A wrong-length
-    /// row is skipped (fail-safe) rather than aborting the whole load. Returns the number of rows
-    /// skipped so the caller can log it (F9); storage-engine faults still propagate as `Err`.
+    /// Test-only: write a raw (possibly wrong-length) value into `PROVIDER_SETTLED`, to exercise the
+    /// corrupt-row quarantine path of [`load_provider_settled_into_memory`](Self::load_provider_settled_into_memory).
+    #[cfg(test)]
+    pub(crate) fn put_provider_settled_raw(&self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
+            t.insert(key, bytes).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Rehydrate the provider's per-`(consumer, model)` last-cumulative map on boot, keeping the whole
+    /// load resilient to a single corrupt row (F9). Returns the number of rows quarantined so the
+    /// caller can log it; storage-engine faults still propagate as `Err`.
+    ///
+    /// **Fail-CLOSED per pair (review B):** unlike the *consumer* voucher loader — where a lost voucher
+    /// is fail-safe because this same provider high-water backstops it — this map **is** the monotonic
+    /// replay backstop `validate_settlement_cumulative` reads. Silently dropping a corrupt row would
+    /// reset that pair's high-water to `0` (fail-OPEN: a previously-superseded lower cumulative could be
+    /// co-signed again). Instead a corrupt row is **quarantined** by seeding the pair's high-water to
+    /// `u64::MAX`, so every cumulative for it is rejected as non-monotonic until an operator clears the
+    /// row — the pair can't settle, but it can't regress either. The key is intact (only the value is
+    /// malformed), so we know exactly which pair to quarantine.
     pub fn load_provider_settled_into_memory(
         &self,
         settled: &mut HashMap<String, u64>,
     ) -> Result<usize, StoreError> {
         let rtx = self.db.begin_read().map_err(StoreError::from)?;
         let t = rtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
-        let mut skipped = 0usize;
+        let mut quarantined = 0usize;
         for entry in t.iter().map_err(StoreError::from)? {
             let (key, val) = entry.map_err(StoreError::from)?;
             let bytes = val.value();
             if bytes.len() == 8 {
                 settled.insert(key.value().to_string(), u64::from_le_bytes(bytes.try_into().unwrap()));
             } else {
-                skipped += 1; // wrong-length/corrupt row → skip, keep the rest
+                // Corrupt value → fail closed: quarantine this pair at the max high-water so no
+                // cumulative can settle (or regress) against it until the row is fixed.
+                settled.insert(key.value().to_string(), u64::MAX);
+                quarantined += 1;
             }
         }
-        Ok(skipped)
+        Ok(quarantined)
     }
 
     // ── NONCES (replay protection) ──
@@ -791,7 +816,27 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         let skipped = store.load_provider_settled_into_memory(&mut map).unwrap();
         assert_eq!(map.get(&key).copied(), Some(19_200));
-        assert_eq!(skipped, 0, "a clean table skips nothing");
+        assert_eq!(skipped, 0, "a clean table quarantines nothing");
+    }
+
+    #[test]
+    fn provider_settled_load_quarantines_a_corrupt_row_fail_closed() {
+        // Review B: the provider high-water is the monotonic replay backstop, so a corrupt row must NOT
+        // silently reset the pair to 0 (fail-open). It is quarantined at u64::MAX so nothing can settle
+        // (or regress) for that pair until an operator fixes it, while every good row still rehydrates.
+        use crate::verify::reputation_key;
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        let good = reputation_key("consumerGood", "qwen2.5:7b");
+        let bad = reputation_key("consumerBad", "qwen2.5:7b");
+        store.put_provider_settled(&good, 9_600).unwrap();
+        store.put_provider_settled_raw(&bad, &[0xde, 0xad, 0xbe]).unwrap(); // wrong length
+
+        let mut map = std::collections::HashMap::new();
+        let quarantined = store.load_provider_settled_into_memory(&mut map).unwrap();
+        assert_eq!(quarantined, 1, "the corrupt row is counted as quarantined");
+        assert_eq!(map.get(&good).copied(), Some(9_600), "the good high-water survives");
+        assert_eq!(map.get(&bad).copied(), Some(u64::MAX), "the corrupt pair is fail-closed at MAX");
     }
 
     #[test]

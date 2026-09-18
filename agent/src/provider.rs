@@ -727,11 +727,18 @@ pub struct Provider<A: EngineAdapter> {
 }
 
 /// v5 denomination gate (pure): a crypto-rail receipt's declared settlement asset + reference-price
-/// peg must match the provider's own when the provider runs the crypto rail. Returns the refusal
-/// reason on mismatch. A non-crypto receipt (`cumulative_amount == None`) or a provider with no peg
-/// configured always passes — there is nothing to disagree about. This is the payoff of binding the
-/// asset + peg into the signed receipt (`RECEIPT_FORMAT_V5`): a consumer using a different peg or a
-/// different asset is caught before the provider co-signs a claim it can't honour.
+/// peg must match the provider's own before it co-signs. A non-crypto receipt (`cumulative_amount ==
+/// None`) always passes. This is the payoff of binding the asset + peg into the signed receipt
+/// (`RECEIPT_FORMAT_V5`): a consumer using a different peg or a different asset is caught before the
+/// provider co-signs a claim it can't honour.
+///
+/// **Fail-CLOSED on `our_peg == None` (review A):** a receipt that carries a `cumulative_amount` is a
+/// crypto-rail voucher; only a consumer whose own peg is set stamps one. If THIS provider has no peg
+/// configured, it cannot validate the denomination, so it MUST refuse rather than co-sign an
+/// unvalidated claim — otherwise a provider that intends to run the crypto rail but boots with the peg
+/// env unset/zero (`with_settlement_peg(0)` → `None`) would silently co-sign vouchers at
+/// consumer-dictated pegs (and `check_cumulative` skips the floor too). Refusing surfaces the
+/// misconfiguration instead of producing a signed artifact the provider can't disclaim.
 fn check_settlement_denomination(
     cumulative_amount: Option<u64>,
     settlement_asset: Option<SettlementAsset>,
@@ -742,7 +749,11 @@ fn check_settlement_denomination(
         return Ok(());
     }
     let Some(our_peg) = our_peg else {
-        return Ok(());
+        return Err(
+            "crypto-rail receipt (carries a cumulative voucher) but this provider has no settlement \
+             peg configured — refusing to co-sign an unvalidated denomination (v5)"
+                .to_string(),
+        );
     };
     if settlement_asset != Some(SettlementAsset::Usdc) {
         return Err("crypto-rail receipt settlement asset is missing or unsupported (v5)".to_string());
@@ -1233,7 +1244,10 @@ impl<A: EngineAdapter> Provider<A> {
         if let Ok(mut map) = self.settled_cumulative.lock() {
             match store.load_provider_settled_into_memory(&mut map) {
                 Ok(0) => {}
-                Ok(skipped) => eprintln!("openhydra-agent: skipped {skipped} corrupt settled-cumulative row(s) on rehydrate; kept the rest"),
+                Ok(quarantined) => eprintln!(
+                    "openhydra-agent: quarantined {quarantined} corrupt settled-cumulative row(s) on rehydrate \
+                     (fail-closed at max high-water until the row is fixed); kept the rest"
+                ),
                 Err(e) => eprintln!("openhydra-agent: could not rehydrate settled cumulatives from store: {e}"),
             }
         }
@@ -2195,8 +2209,12 @@ mod tests {
         assert!(check_settlement_denomination(Some(9_600), usdc, Some(1_200), our).is_ok());
         // A non-crypto receipt (no cumulative) is not gated, whatever the fields say.
         assert!(check_settlement_denomination(None, None, None, our).is_ok());
-        // A provider not running the crypto rail (no peg) can't disagree → passes.
-        assert!(check_settlement_denomination(Some(9_600), usdc, Some(9_999), None).is_ok());
+        // A non-crypto receipt on a peg-less provider is fine (nothing to settle).
+        assert!(check_settlement_denomination(None, None, None, None).is_ok());
+
+        // Review A: a crypto voucher (cumulative present) on a provider with NO peg → fail-CLOSED,
+        // rather than silently co-signing an unvalidated denomination on misconfiguration.
+        assert!(check_settlement_denomination(Some(9_600), usdc, Some(9_999), None).is_err());
 
         // A peg the provider never agreed to → rejected (the core v5 payoff).
         assert!(check_settlement_denomination(Some(9_600), usdc, Some(2_400), our).is_err());

@@ -206,6 +206,8 @@ pub fn payload_from_bytes(
     completion_tokens: Option<u64>,
     canonical_model_id: &str,
     cumulative_amount: Option<u64>,
+    settlement_asset: Option<SettlementAsset>,
+    peg_micros_per_credit: Option<u64>,
 ) -> Result<ReceiptPayload, String> {
     let provider = VerifyingKey::from_bytes(
         provider_pub
@@ -235,11 +237,11 @@ pub fn payload_from_bytes(
         completion_tokens,
         canonical_model_id: canonical_model_id.to_string(),
         cumulative_amount,
-        // The crypto-rail denomination (v5) isn't a raw-bytes/FFI concern — the caller (consumer
-        // settle path) stamps `settlement_asset` + `peg_micros_per_credit` explicitly after building,
-        // and the wire decoder sets them from the framing trailers. Default to absent here.
-        settlement_asset: None,
-        peg_micros_per_credit: None,
+        // The crypto-rail denomination (v5) is threaded as explicit params alongside `cumulative_amount`
+        // — a caller building a v5 payload must supply the asset + peg (removes the footgun of a
+        // silently-`None` field the caller has to remember to stamp afterward).
+        settlement_asset,
+        peg_micros_per_credit,
     })
 }
 
@@ -989,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_from_bytes_threads_the_split() {
+    fn payload_from_bytes_threads_the_split_and_denomination() {
         let (c, p) = keys();
         let pl = payload_from_bytes(
             p.verifying_key().as_bytes(),
@@ -1000,11 +1002,16 @@ mod tests {
             1_700_000_000_000,
             Some(64),
             "qwen3.5/2b/fp16/5632a1b48425a5ae",
-            None,
+            Some(9_600),
+            Some(SettlementAsset::Usdc),
+            Some(1_200),
         )
         .unwrap();
         assert_eq!(pl.completion_tokens, Some(64));
         assert_eq!(pl.canonical_model_id, "qwen3.5/2b/fp16/5632a1b48425a5ae");
+        assert_eq!(pl.cumulative_amount, Some(9_600));
+        assert_eq!(pl.settlement_asset, Some(SettlementAsset::Usdc), "v5 asset threaded, not defaulted");
+        assert_eq!(pl.peg_micros_per_credit, Some(1_200), "v5 peg threaded, not defaulted");
     }
 
     // ── receipt-carries-canonical ──

@@ -512,6 +512,8 @@ mod tests {
             None,
             "",
             cumulative,
+            None,
+            None,
         )
         .unwrap();
         payload.cumulative_amount = cumulative;
@@ -613,6 +615,29 @@ mod tests {
         let receipt = voucher_receipt(&consumer, &provider, Some(9_600));
         let binding = sign_payout_binding(&provider, [5u8; 32], 1_000);
         claim_from_receipt(&receipt, &binding).unwrap()
+    }
+
+    /// CROSS-LANGUAGE GOLDEN (parity with the on-chain Anchor program's `settle_claim_preimage`): a
+    /// fixed Solana claim must reconstruct this exact preimage. The Anchor program's unit test pins the
+    /// identical bytes, so the message the program's Ed25519 introspection matches is byte-for-byte the
+    /// one `solana_preimage` (and the off-chain signer) produced. Regenerate ONLY with a coordinated
+    /// wire bump on both sides.
+    #[test]
+    fn solana_preimage_cross_language_golden() {
+        let claim = SettlementClaim {
+            provider: [0x11u8; 32],
+            consumer: [0x22u8; 32],
+            model_id: "qwen2.5:7b".to_string(),
+            cumulative_amount: 100_000,
+            payout: PayoutTarget::Solana([0x33u8; 32]),
+        };
+        let pre = claim.solana_preimage().unwrap();
+        let hex = pre.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            hex,
+            "6f70656e68796472612f736f6c616e612d736574746c652f7631111111111111111111111111111111111111111111111111111111111111111122222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333a0860100000000000a0000007177656e322e353a3762",
+            "Solana claim preimage drift — on-chain/off-chain parity broken (or a deliberate bump)"
+        );
     }
 
     #[test]
@@ -726,6 +751,30 @@ mod tests {
         high65[..64].copy_from_slice(&high.to_bytes());
         high65[64] = 27;
         assert_eq!(recover_evm_signer(&digest, &high65), None, "high-s must be rejected");
+    }
+
+    /// CROSS-LANGUAGE GOLDEN (parity with the Solidity `OpenHydraSettlement.digestOf`): a fixed claim
+    /// + fixed EIP-712 domain must produce this exact 32-byte digest. The Foundry test
+    /// `test_eip712_digest_matches_rust_golden` pins the identical bytes, so the off-chain
+    /// `recover_evm_signer` and the on-chain `ecrecover` provably agree on which digest is signed.
+    /// Regenerate ONLY with a deliberate, coordinated EIP-712 version bump on both sides.
+    #[test]
+    fn eip712_digest_cross_language_golden() {
+        let claim = SettlementClaim {
+            provider: [0x11u8; 32],
+            consumer: [0x22u8; 32],
+            model_id: "qwen2.5:7b".to_string(),
+            cumulative_amount: 100_000,
+            payout: PayoutTarget::Evm([0xABu8; 20]),
+        };
+        let domain = Eip712Domain { chain_id: 8453, verifying_contract: [0xCCu8; 20] };
+        let digest = claim.eip712_digest(&domain).unwrap();
+        let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            hex,
+            "a3cd9b3cb6dbd590c004a95113e457831526cff559e6707131e7f39c71e80f36",
+            "EIP-712 digest drift — off-chain/on-chain parity broken (or a deliberate version bump)"
+        );
     }
 
     #[test]

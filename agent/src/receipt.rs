@@ -246,15 +246,12 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
     }
     let mut payload = payload_from_bytes(
         &data[0..32], &data[32..64], model, tokens, &data[64..80], ts, completion, canonical,
-        cumulative,
+        cumulative, settlement_asset, peg,
     )
     .map_err(AdapterError::Parse)?;
-    // `payload_from_bytes` is the classical constructor (defaults Ed25519 + no v5 denomination); stamp
-    // the wire-declared algorithm and settlement asset/peg so the co-sign preimage matches the
-    // consumer's exactly.
+    // `payload_from_bytes` is the classical Ed25519 constructor; stamp the wire-declared algorithm so
+    // the co-sign preimage matches the consumer's exactly (the v5 asset/peg are threaded as params).
     payload.sig_alg = sig_alg;
-    payload.settlement_asset = settlement_asset;
-    payload.peg_micros_per_credit = peg;
     let consumer_sig = to_sig(&data[96..160])?;
     Ok((payload, consumer_sig))
 }
@@ -294,7 +291,7 @@ pub fn request_receipt(
     settlement_asset: Option<SettlementAsset>,
     peg_micros_per_credit: Option<u64>,
 ) -> Result<CoSignedReceipt, AdapterError> {
-    let mut payload = payload_from_bytes(
+    let payload = payload_from_bytes(
         provider_pub,
         consumer_pub,
         model_id,
@@ -304,12 +301,13 @@ pub fn request_receipt(
         None,
         canonical_model_id,
         cumulative_amount,
+        // v5 denomination binding: the consumer supplies the asset + peg it converted the cumulative
+        // with, so both parties co-sign the same claim units (and a provider can reject a peg it never
+        // agreed to).
+        settlement_asset,
+        peg_micros_per_credit,
     )
     .map_err(AdapterError::Parse)?;
-    // v5 denomination binding: the consumer stamps the asset + peg it converted the cumulative with,
-    // so both parties co-sign the same claim units (and a provider can reject a peg it never agreed to).
-    payload.settlement_asset = settlement_asset;
-    payload.peg_micros_per_credit = peg_micros_per_credit;
     let consumer_sig = to_sig(&sign(&payload.canonical_bytes()))?;
 
     let mut framed = vec![RECEIPT_REQUEST];
@@ -656,6 +654,39 @@ mod tests {
         for seed in 0u16..96 {
             let n = (seed as usize * 7) % (REQ_FIXED + 40);
             corpus.push((0..n).map(|i| (seed.wrapping_mul(31).wrapping_add(i as u16)) as u8).collect());
+        }
+        // v5/F6 trailer-targeted blobs: a well-formed fixed header + empty model + canonical(len 0),
+        // then ADVERSARIAL cumulative/asset/peg/sig_alg trailer bytes, so the new `read_flag_u8`/
+        // `read_flag_u64`/`from_u8`/trailing-bytes paths are exercised (not just the header length
+        // checks the pseudo-random blobs mostly hit). Each must Err, never panic.
+        {
+            // base: REQ_FIXED bytes, model_len = 0 at [160..162], then canonical clen = 0.
+            let base = || {
+                let mut v = vec![0u8; REQ_FIXED];
+                v[160] = 0;
+                v[161] = 0;
+                v.extend_from_slice(&[0x00, 0x00]); // canonical length-prefix = 0
+                v
+            };
+            let trailers: &[&[u8]] = &[
+                &[0x00, 0x01],                   // completion=0, cumulative flag=1 but no u64 (truncated)
+                &[0x03],                         // bad completion presence flag
+                &[0x00, 0x00, 0x01, 0x00],       // asset flag=1, disc=0 → invalid SettlementAsset
+                &[0x00, 0x00, 0x02],             // bad asset presence flag
+                &[0x00, 0x00, 0x00, 0x01],       // peg flag=1 but no u64 (truncated)
+                &[0x00, 0x00, 0x00, 0x00, 0xFF], // all absent, then sig_alg disc 0xFF (unknown)
+                &[0x00, 0x00, 0x00, 0x00, 0x01, 0x00], // sig_alg=Ed25519 then a trailing byte
+                &[0x01, 0, 0, 0, 0, 0, 0, 0, 0,  // completion=1 + u64
+                  0x01, 0, 0, 0, 0, 0, 0, 0, 0,  // cumulative=1 + u64
+                  0x01, 0x01,                    // asset=1 + Usdc
+                  0x01, 0, 0, 0, 0, 0, 0, 0, 0,  // peg=1 + u64
+                  0x02],                         // sig_alg = MlDsa65 (well-formed v5+PQC frame shape)
+            ];
+            for t in trailers {
+                let mut v = base();
+                v.extend_from_slice(t);
+                corpus.push(v);
+            }
         }
 
         let provider = signer(9);
