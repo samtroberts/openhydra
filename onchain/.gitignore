@@ -1,0 +1,13 @@
+# Rust / Anchor build output + local state
+target/
+.anchor/
+test-ledger/
+
+# Foundry build output, cache, and vendored deps (re-fetched — see README)
+out/
+cache/
+lib/
+broadcast/
+
+# node
+node_modules/
