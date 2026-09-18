@@ -1805,13 +1805,13 @@ pub fn router(
     // #7/#5: completions record per-model consumed tokens + `used` ledger rows into the shared
     // transfer counters the status endpoint serves. #7: mark our own provider so a self-serve
     // settles no receipt and moves no credit.
-    // Crypto-rail settlement peg (USDC micro-units per credit unit): config via
-    // `OPENHYDRA_USDC_MICROS_PER_CREDIT`, else the documented default. A bad/zero value keeps the
-    // default (see `with_settlement_peg`), so a misconfigured env var can't zero out vouchers.
+    // Crypto-rail settlement peg (USDC micro-units per credit unit): opt-in via
+    // `OPENHYDRA_USDC_MICROS_PER_CREDIT`. Unset/invalid/zero → the crypto rail stays OFF (no
+    // cumulative stamped), so a node never emits mis-denominated vouchers (review F3).
     let settlement_peg = std::env::var("OPENHYDRA_USDC_MICROS_PER_CREDIT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(crate::consumer::DEFAULT_USDC_MICROS_PER_CREDIT);
+        .unwrap_or(0);
     let node = node
         .with_stats(stats)
         .with_self_provider(self_provider)

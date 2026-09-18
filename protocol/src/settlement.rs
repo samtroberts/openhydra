@@ -209,9 +209,9 @@ impl SettlementClaim {
 // The voucher layer above ([`crate::payout::GatedVoucher`], the v4 co-signed receipt, and
 // [`SettlementClaim`]) is **chain-independent** — it names amounts and Ed25519 accounts, nothing
 // chain-specific. The only place chains differ is the **on-chain proof format**, so a thin backend
-// trait is the whole seam. Solana is built (native Ed25519); Base is a documented, fail-closed stub
-// (it needs a secp256k1 dual-sign + EIP-712 — a k256 dependency + the cross-curve binding + its own
-// program audit + geofencing — added additively only if the Base/x402 ecosystem reach earns it).
+// trait is the whole seam. Both are built: Solana (native Ed25519, no dual-sign) and Base (secp256k1
+// + EIP-712 — see the Base/EVM section below). Base still gated by its own on-chain program audit +
+// geofencing before real value; ship Solana first.
 
 /// A settlement chain OpenHydra can pay out on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +418,14 @@ impl SettlementClaim {
 /// or `{0,1}`) over an EIP-712 `digest` — the on-chain `ecrecover`. `None` on any malformed input.
 pub fn recover_evm_signer(digest: &[u8; 32], sig_65: &[u8; 65]) -> Option<[u8; 20]> {
     let signature = EcdsaSignature::from_slice(&sig_65[..64]).ok()?;
+    // Reject high-`s` signatures (EIP-2 low-`s` requirement, review F5): `normalize_s` returns
+    // `Some` only when `s` was in the upper half-order (non-canonical). A high-`s` and its low-`s`
+    // twin recover the same address, so this is not a forgery guard — it matches an on-chain
+    // contract (OpenZeppelin `ECDSA.recover`) that rejects the malleable encoding, so the off-chain
+    // mirror and the contract agree on exactly which signatures are valid.
+    if signature.normalize_s().is_some() {
+        return None;
+    }
     // Accept both Ethereum's `27/28` and the raw `0/1` recovery-id conventions.
     let v = sig_65[64];
     let rec_byte = if v >= 27 { v - 27 } else { v };
@@ -711,6 +719,13 @@ mod tests {
         let mut bad = sig65;
         bad[0] ^= 0xFF;
         assert_ne!(recover_evm_signer(&digest, &bad), Some(expected));
+        // High-`s` (EIP-2 non-canonical) is rejected (review F5). Build the malleable twin `n − s`.
+        let s_neg = -*sig.s();
+        let high = EcdsaSignature::from_scalars((*sig.r()).to_bytes(), s_neg.to_bytes()).unwrap();
+        let mut high65 = [0u8; 65];
+        high65[..64].copy_from_slice(&high.to_bytes());
+        high65[64] = 27;
+        assert_eq!(recover_evm_signer(&digest, &high65), None, "high-s must be rejected");
     }
 
     #[test]

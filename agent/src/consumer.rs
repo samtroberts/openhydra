@@ -162,14 +162,12 @@ const AUDIT_MAX_TOKENS: u32 = 64;
 /// `deterministic` field ignore the seed and still serve temp=0 via the request's `temperature`.
 const AUDIT_SEED: u64 = 0;
 
-/// Default reference-price peg for the crypto rail: settlement-asset (USDC, 6 decimals) **micro-units
-/// per credit unit** (`SOLANA_SETTLEMENT_PROGRAM_SPEC` §2). The consumer converts each gated accrual
-/// to the settlement asset at sign time, so the co-signed voucher/receipt carries the on-chain amount
-/// directly (no on-chain oracle). The live value is **config-driven** ([`ConsumerNode::with_settlement_peg`],
-/// wired from `OPENHYDRA_USDC_MICROS_PER_CREDIT`); this default (`1` = 1 credit → 1 µUSDC) applies
-/// only when unset. ⚠️ The real $/credit peg is a CREDIT_TIERING business parameter (and ideally a
-/// signed receipt term) — set it via config before any real settlement.
-pub const DEFAULT_USDC_MICROS_PER_CREDIT: u64 = 1;
+// Crypto-rail settlement peg (USDC micro-units per credit unit): **opt-in, no numeric default**
+// (review F3). A node stamps a crypto-rail cumulative voucher on its receipts ONLY when a peg is
+// explicitly configured (`OPENHYDRA_USDC_MICROS_PER_CREDIT` → [`ConsumerNode::with_settlement_peg`]);
+// unconfigured, it stamps no crypto amount (a legacy receipt) rather than mis-denominated ~1-µUSDC
+// vouchers. The real $/credit peg is a CREDIT_TIERING business parameter (ideally a signed receipt
+// term) — set it via config before any real settlement.
 
 /// Pick the best provider from `peers` for a request whose canonical id is
 /// `request_canonical` (use `""` to match any provider of the discovered model_id).
@@ -708,9 +706,15 @@ pub struct ConsumerNode {
     /// to hard-gate routing on an achieved authenticity tier. `Copy`, so it's read cheaply per serve.
     assurance: AssurancePolicy,
     /// Crypto-rail reference-price peg (USDC micro-units per credit unit) applied when stamping the
-    /// gated voucher on a receipt. Config-driven ([`with_settlement_peg`](Self::with_settlement_peg));
-    /// defaults to [`DEFAULT_USDC_MICROS_PER_CREDIT`].
-    settlement_peg: u64,
+    /// gated voucher on a receipt. **`None` = the crypto rail is off** for this node — no cumulative
+    /// is stamped (review F3, opt-in). Set via [`with_settlement_peg`](Self::with_settlement_peg).
+    settlement_peg: Option<u64>,
+    /// Per-`(peer, model)` serialization locks for settlement (review F1). The cumulative voucher must
+    /// advance monotonically, but `settle_receipt` reads the base, co-signs over a network round-trip,
+    /// then commits — so concurrent settles to the same pair would race and emit non-monotonic /
+    /// divergent co-signed cumulatives. Each settle holds its pair's lock across the whole
+    /// read→co-sign→commit window. Grows one entry per distinct `(peer, model)` seen.
+    settle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -744,7 +748,8 @@ impl ConsumerNode {
             cards: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
-            settlement_peg: DEFAULT_USDC_MICROS_PER_CREDIT,
+            settlement_peg: None,
+            settle_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -756,15 +761,20 @@ impl ConsumerNode {
         self
     }
 
-    /// Set the crypto-rail settlement peg (USDC micro-units per credit unit) used when stamping the
-    /// gated voucher on receipts (builder form). Defaults to [`DEFAULT_USDC_MICROS_PER_CREDIT`]; the
-    /// live gateway wires it from `OPENHYDRA_USDC_MICROS_PER_CREDIT`. A `0` peg is ignored (keeps the
-    /// default) so a misconfigured empty value can't zero out every voucher.
+    /// Enable the crypto rail with a settlement peg (USDC micro-units per credit unit) used when
+    /// stamping the gated voucher on receipts (builder form). The live gateway wires it from
+    /// `OPENHYDRA_USDC_MICROS_PER_CREDIT`. A `0` (or unset) peg leaves the crypto rail **off** — no
+    /// cumulative is stamped — so a node can't silently emit mis-denominated vouchers (review F3).
     pub fn with_settlement_peg(mut self, micros_per_credit: u64) -> Self {
-        if micros_per_credit > 0 {
-            self.settlement_peg = micros_per_credit;
-        }
+        self.settlement_peg = (micros_per_credit > 0).then_some(micros_per_credit);
         self
+    }
+
+    /// The per-`(peer, model)` settlement lock for `vkey`, creating it on first use — held across a
+    /// settle's read→co-sign→commit so concurrent settles to the same pair serialize (review F1).
+    fn settle_lock_for(&self, vkey: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.settle_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(vkey.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
 
     /// Attach the shared transfer counters so completions record per-model consumed tokens
@@ -836,7 +846,8 @@ impl ConsumerNode {
             cards: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
-            settlement_peg: DEFAULT_USDC_MICROS_PER_CREDIT,
+            settlement_peg: None,
+            settle_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1045,11 +1056,11 @@ impl ConsumerNode {
     /// no oracle). Pure over the current audit/reputation state — no voucher mutation. Used both to
     /// stamp the receipt's cumulative amount and (on a successful co-sign) to commit the voucher, so
     /// the two always agree.
-    fn gated_split_for(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64) -> FeeSplit {
+    fn gated_split_for(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64, peg: u64) -> FeeSplit {
         let units = receipt_weighted_units(tokens, None);
         let claimed = cost_tier_for_handle(model_key);
         let achieved = self.authenticity_of(peer_id, model_key, now_ms);
-        gated_accrual_asset(claimed, achieved, units, self.settlement_peg)
+        gated_accrual_asset(claimed, achieved, units, peg)
     }
 
     /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or
@@ -1517,16 +1528,26 @@ impl ConsumerNode {
                     .map_err(AdapterError::Http)
             };
             let now = now_unix_ms();
-            // Crypto-rail (off-chain): compute this serve's authenticity-gated split and stamp the
-            // receipt with the resulting cumulative voucher amount (previous cumulative + this serve's
-            // gross) BEFORE the consumer signs, so both parties co-sign the same claim. The voucher is
-            // committed only after a successful co-sign, keeping it equal to the latest co-signed
-            // cumulative. No value moves — the on-chain claim against this voucher is a later slice.
             let vkey = reputation_key(&peer_id, &model_key);
-            let split = node.gated_split_for(&peer_id, &model_key, tokens, now);
-            let cumulative = node
-                .gated_cumulative_gross(&vkey)
-                .saturating_add(split.net_to_provider + split.protocol_fee);
+            // Review F1: serialize settlement for this `(peer, model)` across the whole
+            // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to
+            // the same pair can't read the same base and emit non-monotonic / divergent co-signed
+            // cumulatives. Different pairs still settle in parallel.
+            let key_lock = node.settle_lock_for(&vkey);
+            let _settle_guard = key_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Crypto-rail (off-chain), only when a settlement peg is configured (review F3): compute
+            // this serve's authenticity-gated split and the resulting cumulative voucher amount
+            // (previous cumulative + this serve's gross), stamped BEFORE the consumer signs so both
+            // parties co-sign the same claim. The voucher is committed only after a successful
+            // co-sign, keeping it equal to the latest co-signed cumulative. No value moves.
+            let voucher = node.settlement_peg.map(|peg| {
+                let split = node.gated_split_for(&peer_id, &model_key, tokens, now, peg);
+                let cumulative = node
+                    .gated_cumulative_gross(&vkey)
+                    .saturating_add(split.net_to_provider + split.protocol_fee);
+                (split, cumulative)
+            });
             // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
             // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
             if request_receipt(
@@ -1539,12 +1560,14 @@ impl ConsumerNode {
                 nonce,
                 now,
                 &canonical,
-                Some(cumulative),
+                voucher.map(|(_, cumulative)| cumulative),
             )
             .is_ok()
             {
                 node.record_contribution(&provider_libp2p, &model_key, tokens);
-                node.commit_gated_voucher(&vkey, split);
+                if let Some((split, _)) = voucher {
+                    node.commit_gated_voucher(&vkey, split);
+                }
             }
         });
     }
