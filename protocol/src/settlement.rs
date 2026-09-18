@@ -54,6 +54,9 @@ pub enum SettlementError {
     NotAVoucher,
     /// The receipt's own signatures do not verify (tampered or corrupt).
     BadReceipt,
+    /// This chain's settlement backend is not built yet (e.g. the Base/EVM secp256k1 path) — fail
+    /// closed rather than fabricate a proof.
+    BackendNotImplemented,
 }
 
 /// A provider's authorization of the Solana account that receives its payouts. The provider's
@@ -175,6 +178,94 @@ impl SettlementClaim {
     }
 }
 
+// ── Chain-agnostic settlement backend seam ────────────────────────────────
+//
+// The voucher layer above ([`crate::payout::GatedVoucher`], the v4 co-signed receipt, and
+// [`SettlementClaim`]) is **chain-independent** — it names amounts and Ed25519 accounts, nothing
+// chain-specific. The only place chains differ is the **on-chain proof format**, so a thin backend
+// trait is the whole seam. Solana is built (native Ed25519); Base is a documented, fail-closed stub
+// (it needs a secp256k1 dual-sign + EIP-712 — a k256 dependency + the cross-curve binding + its own
+// program audit + geofencing — added additively only if the Base/x402 ecosystem reach earns it).
+
+/// A settlement chain OpenHydra can pay out on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    /// Solana — native Ed25519 accounts + on-chain Ed25519 verification. No dual-sign, no new dep.
+    Solana,
+    /// Base (EVM L2) — needs a secp256k1 co-signature bound to the Ed25519 identity (`ecrecover`).
+    Base,
+}
+
+impl Chain {
+    /// A stable lower-case label for display / telemetry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Chain::Solana => "solana",
+            Chain::Base => "base",
+        }
+    }
+
+    /// Whether this chain needs a **secp256k1 dual-sign** bound to the Ed25519 identity (EVM
+    /// `ecrecover`) *in addition to* the native Ed25519 receipt signatures. Solana verifies Ed25519
+    /// natively → `false`; Base/EVM → `true`.
+    pub fn requires_dual_sign(self) -> bool {
+        match self {
+            Chain::Solana => false,
+            Chain::Base => true,
+        }
+    }
+}
+
+/// A per-chain settlement backend: turns a validated, chain-agnostic [`SettlementClaim`] into the
+/// canonical preimage that chain's on-chain program verifies against. The claim itself (and the
+/// whole voucher layer) is shared; only this is chain-specific. Object-safe, so a node can hold a
+/// `Box<dyn SettlementBackend>` chosen by config.
+pub trait SettlementBackend {
+    /// Which chain this backend settles on.
+    fn chain(&self) -> Chain;
+
+    /// The canonical claim preimage this chain's program verifies against (a deterministic
+    /// serialization of the claim — **not** a pinned program ABI). `Err(BackendNotImplemented)` for
+    /// a chain whose settlement backend is not built yet.
+    fn claim_preimage(&self, claim: &SettlementClaim) -> Result<Vec<u8>, SettlementError>;
+}
+
+/// The Solana settlement backend (built). Solana verifies the receipt's existing Ed25519
+/// co-signatures natively and pays the [`PayoutBinding`]'s account, so the claim's own canonical
+/// message ([`SettlementClaim::message`]) is the preimage — no extra signature, no dependency.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SolanaBackend;
+
+impl SettlementBackend for SolanaBackend {
+    fn chain(&self) -> Chain {
+        Chain::Solana
+    }
+
+    fn claim_preimage(&self, claim: &SettlementClaim) -> Result<Vec<u8>, SettlementError> {
+        Ok(claim.message())
+    }
+}
+
+/// The Base/EVM settlement backend — **documented stub, not built**. Base cannot verify Ed25519
+/// natively, so it needs a secp256k1 co-signature bound to the Ed25519 identity (`ecrecover`) over
+/// an EIP-712 digest — which re-introduces a `k256` dependency, the cross-curve identity↔secp256k1
+/// binding (fund-loss if mis-designed), and a separate program audit + geofencing analysis. Added
+/// additively when the Base/x402/Coinbase-ecosystem reach justifies it; until then every method
+/// fails closed rather than fabricate an EIP-712 proof.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BaseBackend;
+
+impl SettlementBackend for BaseBackend {
+    fn chain(&self) -> Chain {
+        Chain::Base
+    }
+
+    fn claim_preimage(&self, _claim: &SettlementClaim) -> Result<Vec<u8>, SettlementError> {
+        // No EIP-712 / secp256k1 path exists yet — do not fabricate a proof.
+        Err(SettlementError::BackendNotImplemented)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +382,45 @@ mod tests {
         // Inflate the claimed cumulative after signing → the receipt's own signatures no longer verify.
         receipt.payload.cumulative_amount = Some(999_999);
         assert_eq!(claim_from_receipt(&receipt, &binding), Err(SettlementError::BadReceipt));
+    }
+
+    // ── chain-agnostic backend seam ──
+
+    fn a_claim() -> SettlementClaim {
+        let (consumer, provider) = keys();
+        let receipt = voucher_receipt(&consumer, &provider, Some(9_600));
+        let binding = sign_payout_binding(&provider, [5u8; 32], 1_000);
+        claim_from_receipt(&receipt, &binding).unwrap()
+    }
+
+    #[test]
+    fn solana_backend_yields_the_claim_message_and_needs_no_dual_sign() {
+        let claim = a_claim();
+        let backend = SolanaBackend;
+        assert_eq!(backend.chain(), Chain::Solana);
+        assert!(!Chain::Solana.requires_dual_sign(), "Solana verifies Ed25519 natively");
+        assert_eq!(backend.claim_preimage(&claim).unwrap(), claim.message());
+    }
+
+    #[test]
+    fn base_backend_is_a_fail_closed_stub_that_flags_the_dual_sign() {
+        let claim = a_claim();
+        let backend = BaseBackend;
+        assert_eq!(backend.chain(), Chain::Base);
+        assert!(Chain::Base.requires_dual_sign(), "Base needs a secp256k1 ecrecover dual-sign");
+        // The unbuilt EVM path fails closed rather than fabricate an EIP-712 proof.
+        assert_eq!(backend.claim_preimage(&claim), Err(SettlementError::BackendNotImplemented));
+    }
+
+    #[test]
+    fn backends_are_object_safe_and_selectable_by_config() {
+        // A node holds whichever backend its config chose behind one trait object.
+        let claim = a_claim();
+        let backends: Vec<Box<dyn SettlementBackend>> = vec![Box::new(SolanaBackend), Box::new(BaseBackend)];
+        let labels: Vec<&str> = backends.iter().map(|b| b.chain().label()).collect();
+        assert_eq!(labels, vec!["solana", "base"]);
+        // Only the built backend produces a preimage.
+        assert!(backends[0].claim_preimage(&claim).is_ok());
+        assert!(backends[1].claim_preimage(&claim).is_err());
     }
 }
