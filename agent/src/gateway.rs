@@ -1805,11 +1805,19 @@ pub fn router(
     // #7/#5: completions record per-model consumed tokens + `used` ledger rows into the shared
     // transfer counters the status endpoint serves. #7: mark our own provider so a self-serve
     // settles no receipt and moves no credit.
+    // Crypto-rail settlement peg (USDC micro-units per credit unit): config via
+    // `OPENHYDRA_USDC_MICROS_PER_CREDIT`, else the documented default. A bad/zero value keeps the
+    // default (see `with_settlement_peg`), so a misconfigured env var can't zero out vouchers.
+    let settlement_peg = std::env::var("OPENHYDRA_USDC_MICROS_PER_CREDIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(crate::consumer::DEFAULT_USDC_MICROS_PER_CREDIT);
     let node = node
         .with_stats(stats)
         .with_self_provider(self_provider)
         .with_cards(cards)
-        .with_credentials(creds);
+        .with_credentials(creds)
+        .with_settlement_peg(settlement_peg);
     let node = Arc::new(node);
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the

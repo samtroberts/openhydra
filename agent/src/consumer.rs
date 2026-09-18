@@ -162,13 +162,14 @@ const AUDIT_MAX_TOKENS: u32 = 64;
 /// `deterministic` field ignore the seed and still serve temp=0 via the request's `temperature`.
 const AUDIT_SEED: u64 = 0;
 
-/// Reference-price peg for the crypto rail: settlement-asset (USDC, 6 decimals) **micro-units per
-/// credit unit** (`SOLANA_SETTLEMENT_PROGRAM_SPEC` §2). The consumer converts each gated accrual to
-/// the settlement asset at sign time, so the co-signed voucher/receipt carries the on-chain amount
-/// directly (no on-chain oracle). ⚠️ **PLACEHOLDER** — the real $/credit peg is a CREDIT_TIERING
-/// business parameter that must be wired from config (and ideally a signed receipt term) before any
-/// real settlement; `1` = 1 credit → 1 µUSDC.
-const USDC_MICROS_PER_CREDIT: u64 = 1;
+/// Default reference-price peg for the crypto rail: settlement-asset (USDC, 6 decimals) **micro-units
+/// per credit unit** (`SOLANA_SETTLEMENT_PROGRAM_SPEC` §2). The consumer converts each gated accrual
+/// to the settlement asset at sign time, so the co-signed voucher/receipt carries the on-chain amount
+/// directly (no on-chain oracle). The live value is **config-driven** ([`ConsumerNode::with_settlement_peg`],
+/// wired from `OPENHYDRA_USDC_MICROS_PER_CREDIT`); this default (`1` = 1 credit → 1 µUSDC) applies
+/// only when unset. ⚠️ The real $/credit peg is a CREDIT_TIERING business parameter (and ideally a
+/// signed receipt term) — set it via config before any real settlement.
+pub const DEFAULT_USDC_MICROS_PER_CREDIT: u64 = 1;
 
 /// Pick the best provider from `peers` for a request whose canonical id is
 /// `request_canonical` (use `""` to match any provider of the discovered model_id).
@@ -706,6 +707,10 @@ pub struct ConsumerNode {
     /// [`AssurancePolicy::OPEN`] (admits every provider, verify-but-route) — set a stricter policy
     /// to hard-gate routing on an achieved authenticity tier. `Copy`, so it's read cheaply per serve.
     assurance: AssurancePolicy,
+    /// Crypto-rail reference-price peg (USDC micro-units per credit unit) applied when stamping the
+    /// gated voucher on a receipt. Config-driven ([`with_settlement_peg`](Self::with_settlement_peg));
+    /// defaults to [`DEFAULT_USDC_MICROS_PER_CREDIT`].
+    settlement_peg: u64,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -739,6 +744,7 @@ impl ConsumerNode {
             cards: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
+            settlement_peg: DEFAULT_USDC_MICROS_PER_CREDIT,
         }
     }
 
@@ -747,6 +753,17 @@ impl ConsumerNode {
     /// stricter policy to hard-gate routing on an achieved authenticity tier (Increment 3).
     pub fn with_assurance_policy(mut self, policy: AssurancePolicy) -> Self {
         self.assurance = policy;
+        self
+    }
+
+    /// Set the crypto-rail settlement peg (USDC micro-units per credit unit) used when stamping the
+    /// gated voucher on receipts (builder form). Defaults to [`DEFAULT_USDC_MICROS_PER_CREDIT`]; the
+    /// live gateway wires it from `OPENHYDRA_USDC_MICROS_PER_CREDIT`. A `0` peg is ignored (keeps the
+    /// default) so a misconfigured empty value can't zero out every voucher.
+    pub fn with_settlement_peg(mut self, micros_per_credit: u64) -> Self {
+        if micros_per_credit > 0 {
+            self.settlement_peg = micros_per_credit;
+        }
         self
     }
 
@@ -819,6 +836,7 @@ impl ConsumerNode {
             cards: None,
             creds: None,
             assurance: AssurancePolicy::OPEN,
+            settlement_peg: DEFAULT_USDC_MICROS_PER_CREDIT,
         }
     }
 
@@ -1031,7 +1049,7 @@ impl ConsumerNode {
         let units = receipt_weighted_units(tokens, None);
         let claimed = cost_tier_for_handle(model_key);
         let achieved = self.authenticity_of(peer_id, model_key, now_ms);
-        gated_accrual_asset(claimed, achieved, units, USDC_MICROS_PER_CREDIT)
+        gated_accrual_asset(claimed, achieved, units, self.settlement_peg)
     }
 
     /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or
