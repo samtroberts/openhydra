@@ -24,6 +24,7 @@
 //! - [`award`] — tier-award policy: max-awardable-tier curve + escrow + graduated failure (Phase 4)
 //! - [`trust`] — unified trust stack: authenticity/privacy/settlement tiers + buyer policy (UNIFIED_TRUST_STACK_v1)
 //! - [`payout`] — payout-layer earn-gate: rail-specific (crypto rate-cap / fiat escrow) + 4% fee (PAYMENTS_PLAN_v1)
+//! - [`settlement`] — Solana settlement primitives: Ed25519 payout binding + voucher settlement claim (PAYMENTS_PLAN_v1 step 3)
 
 pub mod award;
 pub mod credit;
@@ -32,6 +33,7 @@ pub mod model_id;
 pub mod payout;
 pub mod receipts;
 pub mod router;
+pub mod settlement;
 pub mod store;
 pub mod trust;
 pub mod verify;
