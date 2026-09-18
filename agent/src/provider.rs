@@ -30,6 +30,7 @@ use crate::share_policy::{PolicyWatcher, SharePolicy};
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
 use openhydra_protocol::credit::{throttle_multiplier, CreditAccount};
+use openhydra_protocol::payout::SettlementAsset;
 use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
@@ -725,6 +726,33 @@ pub struct Provider<A: EngineAdapter> {
     remote_cmd_last_applied: Mutex<HashMap<String, u64>>,
 }
 
+/// v5 denomination gate (pure): a crypto-rail receipt's declared settlement asset + reference-price
+/// peg must match the provider's own when the provider runs the crypto rail. Returns the refusal
+/// reason on mismatch. A non-crypto receipt (`cumulative_amount == None`) or a provider with no peg
+/// configured always passes — there is nothing to disagree about. This is the payoff of binding the
+/// asset + peg into the signed receipt (`RECEIPT_FORMAT_V5`): a consumer using a different peg or a
+/// different asset is caught before the provider co-signs a claim it can't honour.
+fn check_settlement_denomination(
+    cumulative_amount: Option<u64>,
+    settlement_asset: Option<SettlementAsset>,
+    peg_micros_per_credit: Option<u64>,
+    our_peg: Option<u64>,
+) -> Result<(), String> {
+    if cumulative_amount.is_none() {
+        return Ok(());
+    }
+    let Some(our_peg) = our_peg else {
+        return Ok(());
+    };
+    if settlement_asset != Some(SettlementAsset::Usdc) {
+        return Err("crypto-rail receipt settlement asset is missing or unsupported (v5)".to_string());
+    }
+    if peg_micros_per_credit != Some(our_peg) {
+        return Err("crypto-rail receipt peg is missing or does not match the provider's configured peg (v5)".to_string());
+    }
+    Ok(())
+}
+
 impl<A: EngineAdapter> Provider<A> {
     pub fn new(adapter: A, net: NetworkHandle) -> Self {
         Self {
@@ -1141,6 +1169,14 @@ impl<A: EngineAdapter> Provider<A> {
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
     ) -> Result<(), String> {
+        // v5 denomination binding: reject a crypto-rail receipt whose declared asset/peg we never
+        // agreed to, before `check_cumulative` and before the serve-commitment nonce is consumed.
+        check_settlement_denomination(
+            p.cumulative_amount,
+            p.settlement_asset,
+            p.peg_micros_per_credit,
+            self.settlement_peg,
+        )?;
         let key = Self::settled_key(p);
         let last = self
             .settled_cumulative
@@ -2150,6 +2186,26 @@ mod tests {
     }
 
     #[test]
+    fn v5_denomination_gate_rejects_only_a_real_mismatch() {
+        use openhydra_protocol::payout::SettlementAsset;
+        let usdc = Some(SettlementAsset::Usdc);
+        let our = Some(1_200u64);
+
+        // Matching asset + peg → accepted.
+        assert!(check_settlement_denomination(Some(9_600), usdc, Some(1_200), our).is_ok());
+        // A non-crypto receipt (no cumulative) is not gated, whatever the fields say.
+        assert!(check_settlement_denomination(None, None, None, our).is_ok());
+        // A provider not running the crypto rail (no peg) can't disagree → passes.
+        assert!(check_settlement_denomination(Some(9_600), usdc, Some(9_999), None).is_ok());
+
+        // A peg the provider never agreed to → rejected (the core v5 payoff).
+        assert!(check_settlement_denomination(Some(9_600), usdc, Some(2_400), our).is_err());
+        // A crypto receipt missing the peg or asset entirely → rejected.
+        assert!(check_settlement_denomination(Some(9_600), usdc, None, our).is_err());
+        assert!(check_settlement_denomination(Some(9_600), None, Some(1_200), our).is_err());
+    }
+
+    #[test]
     fn es8_receipt_limiter_admits_burst_then_sheds_then_refills() {
         let rl = receipt_limiter();
         let t = 1_000_000u64;
@@ -2197,6 +2253,8 @@ mod tests {
             completion_tokens: None,
             canonical_model_id: String::new(),
             cumulative_amount: None,
+            settlement_asset: None,
+            peg_micros_per_credit: None,
         };
         build_receipt(payload, &consumer, &provider)
     }

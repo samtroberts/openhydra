@@ -899,6 +899,8 @@ mod tests {
             completion_tokens: None,
             canonical_model_id: String::new(),
             cumulative_amount: None,
+            settlement_asset: None,
+            peg_micros_per_credit: None,
         };
         let receipt = build_receipt(payload, &consumer, &provider);
 
@@ -947,6 +949,8 @@ mod tests {
             completion_tokens: None,
             canonical_model_id: String::new(),
             cumulative_amount: None,
+            settlement_asset: None,
+            peg_micros_per_credit: None,
         };
         let receipt = build_receipt(payload, &consumer, &provider);
 

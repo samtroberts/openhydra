@@ -17,6 +17,7 @@
 use ed25519_dalek::Signature;
 
 use openhydra_protocol::crypto_agility::SigAlg;
+use openhydra_protocol::payout::SettlementAsset;
 use openhydra_protocol::receipts::{
     cosign_bytes, payload_from_bytes, verify_receipt, CoSignedReceipt, ReceiptError, ReceiptPayload,
 };
@@ -82,25 +83,49 @@ fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8>
     // closed. Appended ONLY when `Some` (`has_cumulative:u8=1 + u64`), so every non-crypto serve's
     // framing stays byte-identical to before and a provider that never sees a voucher is unaffected.
     //
-    // sig_alg (F6): `canonical_bytes()` binds the signature-algorithm discriminant into the signed
-    // preimage, so the framing MUST transmit it too or a non-Ed25519 consumer's provider would
-    // reconstruct a different preimage and every settlement fails closed. It is the LAST trailer,
-    // emitted as a single discriminant byte and ONLY when non-Ed25519 — so today's Ed25519-only
-    // traffic stays byte-identical (absent trailer ⇒ Ed25519 on decode) and an already-deployed
-    // provider that predates this trailer is unaffected. When it IS emitted, the (otherwise optional)
-    // cumulative trailer's flag byte is written first even if `None`, so the positional decode stays
-    // unambiguous.
+    // The remaining trailers all bind into `canonical_bytes()`, so the framing MUST transmit each or
+    // the provider reconstructs a different preimage and settlement fails closed. Fixed frame order
+    // (…cumulative, settlement-asset [v5], peg [v5], sig_alg [F6]) with a presence-chain rule: a
+    // trailer's flag byte is written when it OR any LATER trailer is present, so the positional decode
+    // stays unambiguous. A plain non-crypto Ed25519 serve emits none of them and stays byte-identical
+    // to the pre-v5/pre-F6 framing (absent ⇒ None / Ed25519 on decode), so a deployed peer predating
+    // these trailers is unaffected.
+    //
+    // v5 (denomination binding): the settlement asset + reference-price peg the cumulative was
+    // converted with. Binding + transmitting them lets the provider reject a peg/asset it never agreed
+    // to before co-signing, instead of silently co-signing a mis-denominated claim.
     let emit_sig_alg = payload.sig_alg != SigAlg::Ed25519;
+    let emit_peg = payload.peg_micros_per_credit.is_some() || emit_sig_alg;
+    let emit_asset = payload.settlement_asset.is_some() || emit_peg;
+    let emit_cumulative = payload.cumulative_amount.is_some() || emit_asset;
     match payload.cumulative_amount {
         Some(v) => {
             b.push(1u8);
             b.extend_from_slice(&v.to_le_bytes());
         }
-        None if emit_sig_alg => b.push(0u8), // explicit `no cumulative`, so the sig_alg byte follows cleanly
+        None if emit_cumulative => b.push(0u8), // explicit `no cumulative`, so later trailers follow cleanly
         None => {}
     }
+    if emit_asset {
+        match payload.settlement_asset {
+            Some(a) => {
+                b.push(1u8);
+                b.push(a.to_u8());
+            }
+            None => b.push(0u8),
+        }
+    }
+    if emit_peg {
+        match payload.peg_micros_per_credit {
+            Some(p) => {
+                b.push(1u8);
+                b.extend_from_slice(&p.to_le_bytes());
+            }
+            None => b.push(0u8),
+        }
+    }
     if emit_sig_alg {
-        b.push(payload.sig_alg.to_u8());
+        b.push(payload.sig_alg.to_u8()); // bare discriminant, always last
     }
     b
 }
@@ -124,6 +149,28 @@ fn read_flag_u64(data: &[u8], pos: &mut usize, what: &str) -> Result<Option<u64>
             v.copy_from_slice(&data[*pos..*pos + 8]);
             *pos += 8;
             Ok(Some(u64::from_le_bytes(v)))
+        }
+        other => Err(AdapterError::Parse(format!("bad {what} flag: {other}"))),
+    }
+}
+
+/// Read an optional `has_x:u8 [+ value:u8]` trailer at `*pos`, advancing `*pos`. Same shape as
+/// [`read_flag_u64`] but a single-byte value — used by the v5 settlement-asset trailer.
+fn read_flag_u8(data: &[u8], pos: &mut usize, what: &str) -> Result<Option<u8>, AdapterError> {
+    if data.len() == *pos {
+        return Ok(None);
+    }
+    let flag = data[*pos];
+    *pos += 1;
+    match flag {
+        0 => Ok(None),
+        1 => {
+            if data.len() < *pos + 1 {
+                return Err(AdapterError::Parse(format!("receipt request {what} truncated")));
+            }
+            let v = data[*pos];
+            *pos += 1;
+            Ok(Some(v))
         }
         other => Err(AdapterError::Parse(format!("bad {what} flag: {other}"))),
     }
@@ -172,6 +219,16 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
     let completion = read_flag_u64(data, &mut pos, "completion")?;
     // Cumulative-voucher trailer (crypto-rail, v4): `has_cumulative:u8 [+ u64]`.
     let cumulative = read_flag_u64(data, &mut pos, "cumulative")?;
+    // Settlement-asset (v5): `has_asset:u8 [+ discriminant:u8]`.
+    let settlement_asset = match read_flag_u8(data, &mut pos, "settlement asset")? {
+        Some(disc) => Some(
+            SettlementAsset::from_u8(disc)
+                .map_err(|e| AdapterError::Parse(format!("receipt request settlement asset: {e}")))?,
+        ),
+        None => None,
+    };
+    // Reference-price peg (v5): `has_peg:u8 [+ u64]`.
+    let peg = read_flag_u64(data, &mut pos, "peg")?;
     // sig_alg trailer (F6): a single discriminant byte, present iff bytes remain. Absent ⇒ Ed25519
     // (the legacy/common path, byte-identical to before). A future non-Ed25519 consumer transmits it
     // so the provider reconstructs the SAME `canonical_bytes()` preimage the consumer signed; because
@@ -192,9 +249,12 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
         cumulative,
     )
     .map_err(AdapterError::Parse)?;
-    // `payload_from_bytes` is the classical constructor (defaults Ed25519); stamp the wire-declared
-    // algorithm so the co-sign preimage matches the consumer's.
+    // `payload_from_bytes` is the classical constructor (defaults Ed25519 + no v5 denomination); stamp
+    // the wire-declared algorithm and settlement asset/peg so the co-sign preimage matches the
+    // consumer's exactly.
     payload.sig_alg = sig_alg;
+    payload.settlement_asset = settlement_asset;
+    payload.peg_micros_per_credit = peg;
     let consumer_sig = to_sig(&data[96..160])?;
     Ok((payload, consumer_sig))
 }
@@ -231,8 +291,10 @@ pub fn request_receipt(
     ts_unix_ms: u64,
     canonical_model_id: &str,
     cumulative_amount: Option<u64>,
+    settlement_asset: Option<SettlementAsset>,
+    peg_micros_per_credit: Option<u64>,
 ) -> Result<CoSignedReceipt, AdapterError> {
-    let payload = payload_from_bytes(
+    let mut payload = payload_from_bytes(
         provider_pub,
         consumer_pub,
         model_id,
@@ -244,6 +306,10 @@ pub fn request_receipt(
         cumulative_amount,
     )
     .map_err(AdapterError::Parse)?;
+    // v5 denomination binding: the consumer stamps the asset + peg it converted the cumulative with,
+    // so both parties co-sign the same claim units (and a provider can reject a peg it never agreed to).
+    payload.settlement_asset = settlement_asset;
+    payload.peg_micros_per_credit = peg_micros_per_credit;
     let consumer_sig = to_sig(&sign(&payload.canonical_bytes()))?;
 
     let mut framed = vec![RECEIPT_REQUEST];
@@ -343,6 +409,8 @@ mod tests {
             1_700_000_000_000,
             "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
             Some(9_600),
+            Some(SettlementAsset::Usdc),
+            Some(1_200),
         )
         .unwrap();
         assert_eq!(receipt.payload.tokens, 512);
@@ -350,6 +418,10 @@ mod tests {
             "canonical id flows end-to-end through the request framing and is co-signed");
         assert_eq!(receipt.payload.cumulative_amount, Some(9_600),
             "the crypto-rail cumulative voucher amount flows end-to-end and is co-signed");
+        assert_eq!(receipt.payload.settlement_asset, Some(SettlementAsset::Usdc),
+            "the v5 settlement asset flows end-to-end and is co-signed");
+        assert_eq!(receipt.payload.peg_micros_per_credit, Some(1_200),
+            "the v5 reference-price peg flows end-to-end and is co-signed");
         assert_eq!(verify_receipt(&receipt), Ok(()));
     }
 
@@ -374,6 +446,8 @@ mod tests {
             completion_tokens: Some(60),
             canonical_model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),
             cumulative_amount: None,
+            settlement_asset: None,
+            peg_micros_per_credit: None,
         };
         let consumer_sig = consumer.sign(&payload.canonical_bytes());
         let framed = encode_request(&payload, &consumer_sig);
@@ -405,6 +479,8 @@ mod tests {
             completion_tokens: None,
             canonical_model_id: String::new(),
             cumulative_amount: None,
+            settlement_asset: None,
+            peg_micros_per_credit: None,
         };
         let sig = provider.sign(b"placeholder"); // any 64-byte sig; the framing doesn't re-verify it here
 
@@ -415,12 +491,13 @@ mod tests {
 
         // A non-Ed25519 discriminant is carried through the framing verbatim (forward-compat plumbing
         // for PQC3.1 — we can't verify it yet, but the provider must reconstruct the SAME sig_alg the
-        // consumer signed). Emitting the trailer must lengthen the frame by exactly one byte.
+        // consumer signed). sig_alg is the LAST trailer, so emitting it forces the preceding optional
+        // trailers' presence flags: cumulative `0`, asset `0`, peg `0`, then the discriminant = +4.
         let mut pqc = base.clone();
         pqc.sig_alg = SigAlg::MlDsa65;
         let pqc_framed = encode_request(&pqc, &sig);
-        assert_eq!(pqc_framed.len(), ed_framed.len() + 2,
-            "explicit cumulative `0` flag (so the positional decode stays unambiguous) + the discriminant byte");
+        assert_eq!(pqc_framed.len(), ed_framed.len() + 4,
+            "cumulative/asset/peg `0` flags (positional decode stays unambiguous) + the discriminant byte");
         let (pqc_decoded, _) = decode_request(&pqc_framed).unwrap();
         assert_eq!(pqc_decoded.sig_alg, SigAlg::MlDsa65, "the wire-declared algorithm survives the round-trip");
 
@@ -431,6 +508,46 @@ mod tests {
         let (both_decoded, _) = decode_request(&encode_request(&both, &sig)).unwrap();
         assert_eq!(both_decoded.sig_alg, SigAlg::MlDsa65);
         assert_eq!(both_decoded.cumulative_amount, Some(9_600));
+    }
+
+    #[test]
+    fn request_framing_round_trips_the_v5_denomination() {
+        // v5: the settlement asset + peg bind into `canonical_bytes()`, so the framing must carry them
+        // or the provider reconstructs a different preimage and settlement fails closed. A full
+        // cumulative+asset+peg payload survives encode→decode and the provider re-derives the identical
+        // preimage (verify passes).
+        let consumer = signer(7);
+        let provider = signer(9);
+        let base = ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen2.5:7b".to_string(),
+            tokens: 100,
+            nonce: [3u8; 16],
+            ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
+            cumulative_amount: Some(9_600),
+            settlement_asset: Some(SettlementAsset::Usdc),
+            peg_micros_per_credit: Some(1_200),
+        };
+        let consumer_sig = consumer.sign(&base.canonical_bytes());
+        let (decoded, decoded_sig) = decode_request(&encode_request(&base, &consumer_sig)).unwrap();
+        assert_eq!(decoded.settlement_asset, Some(SettlementAsset::Usdc), "the asset survives the framing");
+        assert_eq!(decoded.peg_micros_per_credit, Some(1_200), "the peg survives the framing");
+        assert_eq!(decoded.cumulative_amount, Some(9_600));
+        let provider_sig = provider.sign(&cosign_bytes(&decoded, &decoded_sig));
+        let receipt = CoSignedReceipt { payload: decoded, consumer_sig: decoded_sig, provider_sig };
+        assert_eq!(verify_receipt(&receipt), Ok(()), "provider reconstructs the identical v5 preimage");
+
+        // Asset-only (no peg) also survives — each field is independent in the framing.
+        let mut asset_only = base.clone();
+        asset_only.peg_micros_per_credit = None;
+        let s2 = consumer.sign(&asset_only.canonical_bytes());
+        let (d2, _) = decode_request(&encode_request(&asset_only, &s2)).unwrap();
+        assert_eq!(d2.settlement_asset, Some(SettlementAsset::Usdc));
+        assert_eq!(d2.peg_micros_per_credit, None);
     }
 
     #[test]
@@ -457,6 +574,8 @@ mod tests {
             [1u8; 16],
             1,
             "",
+            None,
+            None,
             None,
         )
         .unwrap_err();
@@ -485,6 +604,8 @@ mod tests {
             [1u8; 16],
             1,
             "",
+            None,
+            None,
             None,
         )
         .unwrap_err();

@@ -38,7 +38,7 @@ use openhydra_protocol::trust::{
     authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
     MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
-use openhydra_protocol::payout::{gated_accrual_asset, FeeSplit, GatedVoucher};
+use openhydra_protocol::payout::{gated_accrual_asset, FeeSplit, GatedVoucher, SettlementAsset};
 use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt, receipt_weighted_units};
 
 use serde_json::Value;
@@ -1581,6 +1581,10 @@ impl ConsumerNode {
                 now,
                 &canonical,
                 voucher.map(|(_, cumulative)| cumulative),
+                // v5 denomination binding: when the crypto rail is on, stamp the asset (USDC today) +
+                // the exact peg used, so the provider co-signs — and can reject — the claim's units.
+                voucher.map(|_| SettlementAsset::Usdc),
+                node.settlement_peg,
             )
             .is_ok()
             {

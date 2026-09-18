@@ -89,6 +89,34 @@ pub fn gated_accrual(claimed: CostTier, achieved: AuthenticityTier, weighted_uni
     protocol_fee(gross_at_tier(awarded, weighted_units))
 }
 
+/// The on-chain settlement asset a crypto-rail voucher/receipt is denominated in. The `cumulative_amount`
+/// on a receipt is in **this asset's smallest unit** (micro-units), converted from credit units via
+/// the reference-price peg. Bound into the signed receipt preimage (`RECEIPT_FORMAT_V5`, tag 4) so a
+/// consumer and provider that disagree on the asset can't silently co-sign a claim — the mismatch
+/// breaks the signature / is rejected before co-sign. Discriminants are stable + never `0` (a `0` byte
+/// is reserved-invalid), mirroring [`crate::crypto_agility::SigAlg`], so the enum can grow (USDT, …)
+/// without colliding with a legacy absent field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SettlementAsset {
+    /// USD Coin (6-decimal micro-units). The only asset settled today.
+    Usdc = 1,
+}
+
+impl SettlementAsset {
+    /// Stable wire discriminant (never `0`).
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+    /// Parse a wire discriminant; an unknown value is rejected rather than defaulted.
+    pub fn from_u8(v: u8) -> Result<Self, String> {
+        match v {
+            1 => Ok(Self::Usdc),
+            other => Err(format!("unknown settlement asset discriminant: {other}")),
+        }
+    }
+}
+
 /// Convert an amount in **credit units** to the settlement asset's smallest unit (e.g. USDC
 /// micro-units at 6 decimals) using `micros_per_credit` — the reference-price peg
 /// (CREDIT_TIERING $/credit). Saturating `u128` product, so a pathological value pins at `u64::MAX`
@@ -346,6 +374,14 @@ mod tests {
         assert_eq!(credits_to_asset_micros(1_000, 6), 6_000);
         assert_eq!(credits_to_asset_micros(0, 6), 0);
         assert_eq!(credits_to_asset_micros(u64::MAX, u64::MAX), u64::MAX, "saturates, never wraps");
+    }
+
+    #[test]
+    fn settlement_asset_discriminant_roundtrips_and_rejects_unknown() {
+        assert_eq!(SettlementAsset::Usdc.to_u8(), 1, "stable wire discriminant");
+        assert_eq!(SettlementAsset::from_u8(1), Ok(SettlementAsset::Usdc));
+        assert!(SettlementAsset::from_u8(0).is_err(), "0 is reserved-invalid (distinct from an absent field)");
+        assert!(SettlementAsset::from_u8(2).is_err(), "an unknown asset is rejected, never defaulted");
     }
 
     // ── fiat: escrowed_split holds the delta, fees the redeemable ──
