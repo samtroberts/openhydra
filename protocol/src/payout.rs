@@ -151,6 +151,56 @@ pub fn escrow_release(escrowed: u64, action: FaultAction) -> EscrowRelease {
     }
 }
 
+/// A monotonic per-`(consumer, provider, model)` accrual of authenticity-gated credit — the
+/// off-chain running **voucher** the crypto rail settles against (PAYMENTS_PLAN_v1 crypto sequence
+/// step 3). Each served step adds its [`gated_accrual`] (provider net + the 4% protocol fee); the
+/// totals only ever rise, so the latest voucher is the cumulative amount a provider could claim.
+///
+/// **No real value moves here** — this is the off-chain accrual (the metering half). The on-chain
+/// claim that pays it out (and its legal gates: non-custodial opinion, contract audit, geofencing)
+/// is a later slice. 16-byte little-endian wire form (`net ‖ fee`) so it persists beside the other
+/// per-`(peer, model)` state ([`crate::award::AuditStats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatedVoucher {
+    /// Cumulative net owed to the provider (the `0.96` share).
+    pub cumulative_net: u64,
+    /// Cumulative protocol fee accrued (the `0.04` share).
+    pub cumulative_fee: u64,
+}
+
+impl GatedVoucher {
+    /// Add one served step's gated split. Monotonic — both totals only ever rise (saturating, so a
+    /// pathological overflow pins at `u64::MAX` rather than wrapping a voucher backwards).
+    pub fn accrue(&mut self, split: FeeSplit) {
+        self.cumulative_net = self.cumulative_net.saturating_add(split.net_to_provider);
+        self.cumulative_fee = self.cumulative_fee.saturating_add(split.protocol_fee);
+    }
+
+    /// The cumulative gross authorized (`net + fee`) — what the on-chain contract would split.
+    pub fn cumulative_gross(&self) -> u64 {
+        self.cumulative_net.saturating_add(self.cumulative_fee)
+    }
+
+    /// Serialize to the 16-byte snapshot (`cumulative_net` LE ‖ `cumulative_fee` LE).
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&self.cumulative_net.to_le_bytes());
+        b[8..16].copy_from_slice(&self.cumulative_fee.to_le_bytes());
+        b
+    }
+
+    /// Parse a 16-byte snapshot, or `Err` if the blob is the wrong length (a corrupt row must fail
+    /// closed, never silently zero a voucher).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() != 16 {
+            return Err(format!("GatedVoucher: expected 16 bytes, got {}", data.len()));
+        }
+        let cumulative_net = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let cumulative_fee = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        Ok(Self { cumulative_net, cumulative_fee })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +306,29 @@ mod tests {
             assert_eq!(r.clawed_back, 10_000, "a proven substitution returns the held delta");
             assert_eq!((r.released_net, r.protocol_fee), (0, 0), "nothing pays out on a fault");
         }
+    }
+
+    // ── GatedVoucher: monotonic accrual + round-trip ──
+
+    #[test]
+    fn voucher_accrues_monotonically() {
+        let mut v = GatedVoucher::default();
+        v.accrue(gated_accrual(Mega, ReputationRedundant, 100)); // A1 caps Mega→Medium: net 1152 fee 48
+        assert_eq!((v.cumulative_net, v.cumulative_fee), (1_152, 48));
+        assert_eq!(v.cumulative_gross(), 1_200);
+        // A second, higher-tier step only ever adds — the voucher never moves backward.
+        v.accrue(gated_accrual(Mega, EnergyFingerprintPossession, 100)); // full 15000: net 14400 fee 600
+        assert_eq!((v.cumulative_net, v.cumulative_fee), (1_152 + 14_400, 48 + 600));
+        assert!(v.cumulative_gross() >= 1_200, "cumulative gross only rises");
+    }
+
+    #[test]
+    fn voucher_round_trips_through_bytes() {
+        let v = GatedVoucher { cumulative_net: 123_456, cumulative_fee: 5_144 };
+        assert_eq!(GatedVoucher::from_bytes(&v.to_bytes()).unwrap(), v);
+        assert_eq!(v.to_bytes().len(), 16);
+        // A wrong-length blob fails closed rather than zeroing the voucher.
+        assert!(GatedVoucher::from_bytes(&[0u8; 15]).is_err());
+        assert!(GatedVoucher::from_bytes(&[]).is_err());
     }
 }

@@ -42,6 +42,12 @@ const PEER_CREDIT: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_cre
 /// composite `crate::verify::reputation_key(peer, model)` → an [`AuditStats`] blob. Drives the
 /// `max_awardable_tier` gate; rehydrated so a restart resumes at the same awarded tier.
 const PEER_AUDIT_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_audit_stats");
+
+/// Off-chain crypto-rail **gated voucher** (`crate::payout::GatedVoucher`) per composite
+/// `(peer, model)` key — the monotonic cumulative authenticity-gated amount (net + fee) a provider
+/// could later claim on-chain. No real value; the running accrual only.
+const PEER_GATED_ACCRUAL: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("peer_gated_accrual");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
 /// Durable ledger rows for the desktop Ledger view, keyed by a monotonic sequence → a compact
@@ -186,6 +192,7 @@ impl Store {
             wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
             wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
             wtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
+            wtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
@@ -413,6 +420,44 @@ impl Store {
             let (key, val) = entry.map_err(StoreError::from)?;
             let stats = crate::award::AuditStats::from_bytes(val.value()).map_err(StoreError)?;
             audit_stats.insert(key.value().to_string(), stats);
+        }
+        Ok(())
+    }
+
+    // ── PEER_GATED_ACCRUAL (crypto-rail gated voucher, off-chain) ──
+
+    /// Checkpoint a [`crate::payout::GatedVoucher`] snapshot under its composite `(peer, model)` key
+    /// (`crate::verify::reputation_key`). The voucher is monotonic, so a write only ever raises it.
+    pub fn put_gated_voucher(&self, key: &str, blob: &[u8]) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
+            t.insert(key, blob).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Read a [`crate::payout::GatedVoucher`] snapshot blob by its composite key, or `None` if none.
+    pub fn get_gated_voucher(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
+        let got = t.get(key).map_err(StoreError::from)?;
+        Ok(got.map(|g| g.value().to_vec()))
+    }
+
+    /// Rehydrate the in-memory per-`(peer, model)` gated-voucher map on boot, keyed by the composite
+    /// `(peer, model)` key. Mirrors [`load_audit_stats_into_memory`](Self::load_audit_stats_into_memory).
+    pub fn load_gated_vouchers_into_memory(
+        &self,
+        vouchers: &mut HashMap<String, crate::payout::GatedVoucher>,
+    ) -> Result<(), StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            let voucher = crate::payout::GatedVoucher::from_bytes(val.value()).map_err(StoreError)?;
+            vouchers.insert(key.value().to_string(), voucher);
         }
         Ok(())
     }
@@ -658,6 +703,24 @@ mod tests {
         assert_eq!(store.get_reputation("peerA").unwrap().as_deref(), Some(&b"rep-snapshot"[..]));
         assert!(store.has_nonce(&nonce).unwrap());
         assert_eq!(store.receipt_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn gated_voucher_roundtrips_and_rehydrates() {
+        // Crypto-rail off-chain voucher: the monotonic cumulative gated amount persists + rehydrates.
+        use crate::payout::GatedVoucher;
+        use crate::verify::reputation_key;
+        let (_dir, path) = temp_db();
+        let store = Store::open(&path).unwrap();
+        let key = reputation_key("peerV", "qwen2.5:7b");
+        assert_eq!(store.get_gated_voucher(&key).unwrap(), None);
+
+        let v = GatedVoucher { cumulative_net: 1_152, cumulative_fee: 48 };
+        store.put_gated_voucher(&key, &v.to_bytes()).unwrap();
+
+        let mut map = std::collections::HashMap::new();
+        store.load_gated_vouchers_into_memory(&mut map).unwrap();
+        assert_eq!(map.get(&key).copied(), Some(v), "voucher rehydrates with its cumulative totals");
     }
 
     #[test]

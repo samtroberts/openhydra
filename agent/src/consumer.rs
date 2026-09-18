@@ -38,7 +38,8 @@ use openhydra_protocol::trust::{
     authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
     MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
-use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt};
+use openhydra_protocol::payout::{gated_accrual, GatedVoucher};
+use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt, receipt_weighted_units};
 
 use serde_json::Value;
 
@@ -652,6 +653,14 @@ pub struct ConsumerNode {
     /// `max_awardable_tier` gate on how much give-side credit a provider earns for a big model it
     /// hasn't proven it serves. Fed by `audit_model`, persisted like `reputation`.
     audit_stats: Mutex<HashMap<String, AuditStats>>,
+    /// Crypto-rail off-chain **gated voucher** per composite `(peer, model)` key (UNIFIED_TRUST_STACK
+    /// crypto sequence step 3): the monotonic cumulative authenticity-gated amount (provider net +
+    /// 4% protocol fee) this consumer has authorized to a provider — the running total the crypto
+    /// rail would settle against. Metered at the *achieved*-tier rate ([`gated_accrual`]), so it only
+    /// ever accrues at the proven rate (no authenticity escrow on crypto). **No real value moves** —
+    /// off-chain accounting; the on-chain claim is a later, legally-gated slice. Persisted like
+    /// `audit_stats`.
+    gated_vouchers: Mutex<HashMap<String, GatedVoucher>>,
     /// Optional durable backing for `reputation` (M2.2(a)), `credit` (M2.3), and `audit_stats`
     /// (Phase 4). When present, the maps are rehydrated from it at startup and flushed back on each
     /// update, so trust, give/take, and audit history survive a restart. `None` = ephemeral.
@@ -713,6 +722,7 @@ impl ConsumerNode {
             tier: 2,
             reputation: Mutex::new(HashMap::new()),
             audit_stats: Mutex::new(HashMap::new()),
+            gated_vouchers: Mutex::new(HashMap::new()),
             store: None,
             credit: Mutex::new(HashMap::new()),
             stats: None,
@@ -783,11 +793,16 @@ impl ConsumerNode {
         if let Err(e) = store.load_audit_stats_into_memory(&mut audit_stats) {
             tracing::warn!(error = %e, "could not rehydrate audit stats from store; starting fresh");
         }
+        let mut gated_vouchers = HashMap::new();
+        if let Err(e) = store.load_gated_vouchers_into_memory(&mut gated_vouchers) {
+            tracing::warn!(error = %e, "could not rehydrate gated vouchers from store; starting fresh");
+        }
         Self {
             net,
             tier: 2,
             reputation: Mutex::new(reputation),
             audit_stats: Mutex::new(audit_stats),
+            gated_vouchers: Mutex::new(gated_vouchers),
             store: Some(store),
             credit: Mutex::new(credit),
             stats: None,
@@ -871,6 +886,13 @@ impl ConsumerNode {
                 m.iter().map(|(k, s)| (k.clone(), (s.pass_rate(now), s.recent_passes(now)))).collect()
             })
             .unwrap_or_default();
+        // Crypto-rail voucher: cumulative net owed per `(peer, model)`. Snapshotted under its own
+        // lock, released before reputation is taken (same composite key, never held nested).
+        let gated: std::collections::HashMap<String, u64> = self
+            .gated_vouchers
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.cumulative_net)).collect())
+            .unwrap_or_default();
         let reputation = self
             .reputation
             .lock()
@@ -898,6 +920,7 @@ impl ConsumerNode {
                             model_id: model,
                             score: (t.raw_score() * 10.0).round() / 10.0,
                             authenticity: Some(tier.label().to_string()),
+                            gated_net: gated.get(key).copied().filter(|&n| n > 0),
                         }
                     })
                     .collect()
@@ -978,6 +1001,37 @@ impl ConsumerNode {
         if let Some(store) = &self.store {
             if let Err(e) = store.put_audit_stats(&key, &snapshot) {
                 tracing::debug!(error = %e, peer_id, model = model_key, "audit stats persist failed");
+            }
+        }
+    }
+
+    /// Accrue this serve's authenticity-gated amount into the per-`(peer, model)` crypto-rail
+    /// **voucher** (UNIFIED_TRUST_STACK crypto sequence step 3). The rate is capped at the *achieved*
+    /// authenticity tier ([`gated_accrual`] over the handle-implied claimed tier — the same H1/H3
+    /// ceiling), so the voucher only ever accrues at the **proven** rate; the crypto rail needs no
+    /// authenticity escrow. `peer_id` is the provider's OpenHydra id (keys the composite voucher +
+    /// the `authenticity_of` lookup); `model_key` is its validated handle. **Off-chain accounting
+    /// only — no value moves**; best-effort persisted, a failed write never affects the completion.
+    fn record_gated_accrual(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64) {
+        // Weighted units first (io-split blended, no completion split on the give-side receipt yet),
+        // then the authenticity-gated split at the achieved tier.
+        let units = receipt_weighted_units(tokens, None);
+        let claimed = cost_tier_for_handle(model_key);
+        let achieved = self.authenticity_of(peer_id, model_key, now_ms);
+        let split = gated_accrual(claimed, achieved, units);
+        let key = reputation_key(peer_id, model_key);
+        let snapshot = {
+            let mut map = match self.gated_vouchers.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let voucher = map.entry(key.clone()).or_default();
+            voucher.accrue(split);
+            voucher.to_bytes()
+        };
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_gated_voucher(&key, &snapshot) {
+                tracing::debug!(error = %e, peer_id, model = model_key, "gated voucher persist failed");
             }
         }
     }
@@ -1407,6 +1461,8 @@ impl ConsumerNode {
         // cost-weighted display credit (the identity the audit actually exercises — review H1/H3).
         let canonical = provider.canonical_model_id.clone();
         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string();
+        // The provider's OpenHydra id — keys the per-(peer, model) gated voucher + authenticity lookup.
+        let peer_id = provider.peer_id.clone();
         std::thread::spawn(move || {
             let sign = |msg: &[u8]| node.net.sign(msg).unwrap_or_default();
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -1430,6 +1486,9 @@ impl ConsumerNode {
             .is_ok()
             {
                 node.record_contribution(&provider_libp2p, &model_key, tokens);
+                // Crypto-rail (off-chain): accrue this serve at the authenticity-gated rate into the
+                // per-(peer, model) voucher. No value moves; the on-chain claim is a later slice.
+                node.record_gated_accrual(&peer_id, &model_key, tokens, now_unix_ms());
             }
         });
     }

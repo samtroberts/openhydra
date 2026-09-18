@@ -268,6 +268,12 @@ pub struct RepEntry {
     /// possession/fingerprint anchor. `None` for a legacy snapshot that carried no such resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authenticity: Option<String>,
+    /// Cumulative **gated voucher** net owed to this provider for this model — the off-chain
+    /// crypto-rail running total (`payout::GatedVoucher.cumulative_net`), metered at the achieved
+    /// authenticity rate. `None`/omitted until any gated amount has accrued. No real value moves;
+    /// this is the accrual the crypto rail would settle against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gated_net: Option<u64>,
 }
 
 /// One counterparty's give/take credit standing (keyed by **libp2p** peer id — the dial
