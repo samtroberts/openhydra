@@ -805,6 +805,7 @@ mod tests {
             ts_unix_ms: 1_700_000_000_000,
             completion_tokens: None,
             canonical_model_id: String::new(),
+            cumulative_amount: None,
         };
         let receipt = build_receipt(payload, &consumer, &provider);
 
@@ -852,6 +853,7 @@ mod tests {
             ts_unix_ms: 1_700_000_000_000,
             completion_tokens: None,
             canonical_model_id: String::new(),
+            cumulative_amount: None,
         };
         let receipt = build_receipt(payload, &consumer, &provider);
 

@@ -45,6 +45,11 @@ const RECEIPT_FORMAT_V2: u8 = 2;
 /// with no split (`None`) still serializes as **v2** (byte-identical), and a v2 blob decodes to
 /// `None` — so old stored receipts round-trip unchanged and new ones are self-describing.
 const RECEIPT_FORMAT_V3: u8 = 3;
+/// v4 (crypto-rail, PAYMENTS_PLAN_v1 step 3) is v3 plus a monotonic `cumulative_amount: u64` — the
+/// running authenticity-gated voucher total this receipt attests. A receipt carrying it serializes
+/// as v4 (a strict superset of the v3 block); a receipt without it stays byte-identical v2/v3, and a
+/// v2/v3 blob decodes to `None`.
+const RECEIPT_FORMAT_V4: u8 = 4;
 
 /// The content both parties sign over (the consumer directly, the provider via the
 /// co-signature). Identities are ed25519 public keys.
@@ -82,6 +87,15 @@ pub struct ReceiptPayload {
     /// conservative nano tier. Bound into the signed preimage (only when non-empty, so a legacy
     /// receipt stays byte-identical) — a provider can't inflate its earned tier by forging it.
     pub canonical_model_id: String,
+    /// The **cumulative** authenticity-gated amount (gross: provider net + protocol fee) this
+    /// consumer has authorized to this provider for this model across all serves in the pair — the
+    /// monotonic crypto-rail voucher total ([`crate::payout::GatedVoucher`]) the on-chain claim
+    /// settles against (PAYMENTS_PLAN_v1 crypto step 3). `Some` binds it into the signed preimage
+    /// (tag 3) so neither party can alter the claim amount without invalidating both signatures;
+    /// `None` = a receipt carrying no crypto-rail voucher (every non-crypto serve), which stays
+    /// **byte-identical** to v2/v3. No real value moves at receipt time; this is the signed claim
+    /// the (later, legally-gated) on-chain settlement pays out against.
+    pub cumulative_amount: Option<u64>,
 }
 
 impl ReceiptPayload {
@@ -118,6 +132,15 @@ impl ReceiptPayload {
             b.extend_from_slice(&(self.canonical_model_id.len() as u32).to_le_bytes());
             b.extend_from_slice(self.canonical_model_id.as_bytes());
         }
+        // The crypto-rail cumulative voucher amount (tag 3), bound in only when present — same
+        // downgrade-proofing as the two fields above: `None` appends nothing (legacy byte-identical),
+        // a `3` tag + u64 keeps it unforgeable and unambiguous against the empty tail. Tags are
+        // appended in a fixed order (1 completion, 2 canonical, 3 cumulative) so the preimage is
+        // deterministic.
+        if let Some(cumulative) = self.cumulative_amount {
+            b.push(3u8);
+            b.extend_from_slice(&cumulative.to_le_bytes());
+        }
         b
     }
 }
@@ -146,6 +169,7 @@ pub fn payload_from_bytes(
     ts_unix_ms: u64,
     completion_tokens: Option<u64>,
     canonical_model_id: &str,
+    cumulative_amount: Option<u64>,
 ) -> Result<ReceiptPayload, String> {
     let provider = VerifyingKey::from_bytes(
         provider_pub
@@ -174,6 +198,7 @@ pub fn payload_from_bytes(
         ts_unix_ms,
         completion_tokens,
         canonical_model_id: canonical_model_id.to_string(),
+        cumulative_amount,
     })
 }
 
@@ -261,19 +286,29 @@ impl CoSignedReceipt {
         let canonical = self.payload.canonical_model_id.as_bytes();
         let csig = self.consumer_sig.to_bytes();
         let psig = self.provider_sig.to_bytes();
-        // v3 iff the receipt carries any of the newer fields; otherwise byte-identical legacy v2.
+        // Version escalation (each a strict superset): v4 iff a cumulative voucher amount, else v3
+        // iff the split or a canonical id, else byte-identical legacy v2. A v4 blob still carries the
+        // v3 block (so completion/canonical parse), then the cumulative u64.
+        let is_v4 = self.payload.cumulative_amount.is_some();
         let is_v3 = self.payload.completion_tokens.is_some() || !canonical.is_empty();
         let mut b = Vec::with_capacity(
-            2 + 32 + 32 + 16 + 8 + 8 + 1 + 8 + 4 + canonical.len() + 2 + csig.len() + 2 + psig.len() + 4 + model.len(),
+            2 + 32 + 32 + 16 + 8 + 8 + 1 + 8 + 4 + canonical.len() + 8 + 2 + csig.len() + 2 + psig.len() + 4 + model.len(),
         );
-        b.push(if is_v3 { RECEIPT_FORMAT_V3 } else { RECEIPT_FORMAT_V2 });
+        b.push(if is_v4 {
+            RECEIPT_FORMAT_V4
+        } else if is_v3 {
+            RECEIPT_FORMAT_V3
+        } else {
+            RECEIPT_FORMAT_V2
+        });
         b.push(self.payload.sig_alg.to_u8());
         b.extend_from_slice(self.payload.provider.as_bytes());
         b.extend_from_slice(self.payload.consumer.as_bytes());
         b.extend_from_slice(&self.payload.nonce);
         b.extend_from_slice(&self.payload.tokens.to_le_bytes());
         b.extend_from_slice(&self.payload.ts_unix_ms.to_le_bytes());
-        if is_v3 {
+        // The v3 field block is present in both v3 and v4 blobs.
+        if is_v3 || is_v4 {
             match self.payload.completion_tokens {
                 Some(completion) => {
                     b.push(1u8);
@@ -283,6 +318,10 @@ impl CoSignedReceipt {
             }
             b.extend_from_slice(&(canonical.len() as u32).to_le_bytes());
             b.extend_from_slice(canonical);
+        }
+        // v4 tail: the cumulative voucher amount (always `Some` when `is_v4`).
+        if let Some(cumulative) = self.payload.cumulative_amount {
+            b.extend_from_slice(&cumulative.to_le_bytes());
         }
         b.extend_from_slice(&(csig.len() as u16).to_le_bytes());
         b.extend_from_slice(&csig);
@@ -300,7 +339,7 @@ impl CoSignedReceipt {
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         let mut cur = Cursor { data, pos: 0 };
         let fmt = cur.u8()?;
-        if fmt != RECEIPT_FORMAT_V2 && fmt != RECEIPT_FORMAT_V3 {
+        if fmt != RECEIPT_FORMAT_V2 && fmt != RECEIPT_FORMAT_V3 && fmt != RECEIPT_FORMAT_V4 {
             return Err(format!("unsupported receipt format version: {fmt}"));
         }
         let sig_alg = SigAlg::from_u8(cur.u8()?).map_err(|e| e.to_string())?;
@@ -311,9 +350,9 @@ impl CoSignedReceipt {
         let nonce = cur.arr::<16>()?;
         let tokens = u64::from_le_bytes(cur.arr::<8>()?);
         let ts_unix_ms = u64::from_le_bytes(cur.arr::<8>()?);
-        // v3 carries the optional completion split + canonical id here; v2 predates both (→ None /
+        // v3 and v4 carry the completion split + canonical id here; v2 predates both (→ None /
         // empty, a legacy receipt).
-        let (completion_tokens, canonical_model_id) = if fmt == RECEIPT_FORMAT_V3 {
+        let (completion_tokens, canonical_model_id) = if fmt == RECEIPT_FORMAT_V3 || fmt == RECEIPT_FORMAT_V4 {
             let completion = match cur.u8()? {
                 0 => None,
                 1 => Some(u64::from_le_bytes(cur.arr::<8>()?)),
@@ -328,6 +367,12 @@ impl CoSignedReceipt {
         } else {
             (None, String::new())
         };
+        // v4 tail: the cumulative voucher amount (a plain u64 — v4 is only emitted when it is set).
+        let cumulative_amount = if fmt == RECEIPT_FORMAT_V4 {
+            Some(u64::from_le_bytes(cur.arr::<8>()?))
+        } else {
+            None
+        };
         let consumer_sig = read_sig(sig_alg, cur.lp16()?)?;
         let provider_sig = read_sig(sig_alg, cur.lp16()?)?;
         let model_len = u32::from_le_bytes(cur.arr::<4>()?) as usize;
@@ -341,7 +386,7 @@ impl CoSignedReceipt {
         Ok(CoSignedReceipt {
             payload: ReceiptPayload {
                 sig_alg, provider, consumer, model_id, tokens, nonce, ts_unix_ms, completion_tokens,
-                canonical_model_id,
+                canonical_model_id, cumulative_amount,
             },
             consumer_sig,
             provider_sig,
@@ -488,6 +533,7 @@ mod tests {
             ts_unix_ms: 1_700_000_000_000,
             completion_tokens: None,
             canonical_model_id: String::new(),
+            cumulative_amount: None,
         }
     }
 
@@ -757,6 +803,68 @@ mod tests {
         assert_eq!(CoSignedReceipt::from_bytes(&z.to_bytes()).unwrap().payload.completion_tokens, Some(0));
     }
 
+    // ── v4: crypto-rail cumulative voucher amount ──────────────────────────
+
+    fn cumulative_payload(consumer: &SigningKey, provider: &SigningKey, tokens: u64, cumulative: u64) -> ReceiptPayload {
+        let mut pl = payload(consumer, provider, tokens, [4u8; 16]);
+        pl.cumulative_amount = Some(cumulative);
+        pl
+    }
+
+    #[test]
+    fn a_no_cumulative_receipt_stays_v2_v3_byte_identical() {
+        // A receipt without a cumulative voucher never serializes as v4 — a plain one stays v2, a
+        // split/canonical one stays v3 — so legacy blobs + the golden signatures are untouched.
+        let (c, p) = keys();
+        let plain = build_receipt(payload(&c, &p, 512, [1u8; 16]), &c, &p);
+        assert_eq!(plain.to_bytes()[0], RECEIPT_FORMAT_V2);
+        let split = build_receipt(split_payload(&c, &p, 512, 300), &c, &p);
+        assert_eq!(split.to_bytes()[0], RECEIPT_FORMAT_V3);
+    }
+
+    #[test]
+    fn cumulative_binds_into_preimage_and_verifies() {
+        // Two payloads identical except for the cumulative amount must sign different bytes — the
+        // claim amount is committed, so neither party can alter it without breaking the signature.
+        let (c, p) = keys();
+        let none = payload(&c, &p, 100, [4u8; 16]);
+        let some = cumulative_payload(&c, &p, 100, 9_600);
+        assert_ne!(none.canonical_bytes(), some.canonical_bytes(), "the cumulative must change the preimage");
+        assert_eq!(some.canonical_bytes().len(), none.canonical_bytes().len() + 9, "tag byte + u64");
+        // Two different cumulative totals also differ.
+        assert_ne!(
+            cumulative_payload(&c, &p, 100, 9_600).canonical_bytes(),
+            cumulative_payload(&c, &p, 100, 19_200).canonical_bytes()
+        );
+        let r = build_receipt(some, &c, &p);
+        assert_eq!(verify_receipt(&r), Ok(()));
+    }
+
+    #[test]
+    fn v4_blob_roundtrips_preserving_cumulative_and_the_v3_fields() {
+        let (c, p) = keys();
+        // A v4 receipt that ALSO carries the split + canonical — v4 is a strict superset of v3.
+        let mut pl = cumulative_payload(&c, &p, 512, 48_000);
+        pl.completion_tokens = Some(300);
+        pl.canonical_model_id = "qwen3.5/2b/fp16/5632a1b48425a5ae".to_string();
+        let r = build_receipt(pl, &c, &p);
+        let blob = r.to_bytes();
+        assert_eq!(blob[0], RECEIPT_FORMAT_V4, "a receipt with a cumulative serializes as v4");
+        let back = CoSignedReceipt::from_bytes(&blob).unwrap();
+        assert_eq!(back.payload.cumulative_amount, Some(48_000));
+        assert_eq!(back.payload.completion_tokens, Some(300));
+        assert_eq!(back.payload.canonical_model_id, "qwen3.5/2b/fp16/5632a1b48425a5ae");
+        assert_eq!(back.payload.tokens, 512);
+        assert_eq!(verify_receipt(&back), Ok(()), "signatures survive the v4 round-trip");
+        // A v4 receipt with NO split/canonical still round-trips (the v3 block is empty but present).
+        let bare = build_receipt(cumulative_payload(&c, &p, 5, 1), &c, &p);
+        assert_eq!(bare.to_bytes()[0], RECEIPT_FORMAT_V4);
+        let back = CoSignedReceipt::from_bytes(&bare.to_bytes()).unwrap();
+        assert_eq!(back.payload.cumulative_amount, Some(1));
+        assert_eq!(back.payload.completion_tokens, None);
+        assert!(back.payload.canonical_model_id.is_empty());
+    }
+
     #[test]
     fn legacy_v2_blob_decodes_as_no_split() {
         // A stored v2 blob (no completion field) must decode to None, not error — this is what
@@ -796,6 +904,7 @@ mod tests {
             1_700_000_000_000,
             Some(64),
             "qwen3.5/2b/fp16/5632a1b48425a5ae",
+            None,
         )
         .unwrap();
         assert_eq!(pl.completion_tokens, Some(64));

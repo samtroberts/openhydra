@@ -38,7 +38,7 @@ use openhydra_protocol::trust::{
     authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
     MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
-use openhydra_protocol::payout::{gated_accrual, GatedVoucher};
+use openhydra_protocol::payout::{gated_accrual, FeeSplit, GatedVoucher};
 use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt, receipt_weighted_units};
 
 use serde_json::Value;
@@ -1012,26 +1012,43 @@ impl ConsumerNode {
     /// authenticity escrow. `peer_id` is the provider's OpenHydra id (keys the composite voucher +
     /// the `authenticity_of` lookup); `model_key` is its validated handle. **Off-chain accounting
     /// only — no value moves**; best-effort persisted, a failed write never affects the completion.
-    fn record_gated_accrual(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64) {
-        // Weighted units first (io-split blended, no completion split on the give-side receipt yet),
-        // then the authenticity-gated split at the achieved tier.
+    /// This serve's authenticity-gated split (crypto-rail): the *awarded*-tier amount for `tokens`
+    /// (net to provider + 4% fee), capped at the achieved tier. Pure over the current audit/
+    /// reputation state — no voucher mutation. Used both to stamp the receipt's cumulative amount and
+    /// (on a successful co-sign) to commit the voucher, so the two always agree.
+    fn gated_split_for(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64) -> FeeSplit {
         let units = receipt_weighted_units(tokens, None);
         let claimed = cost_tier_for_handle(model_key);
         let achieved = self.authenticity_of(peer_id, model_key, now_ms);
-        let split = gated_accrual(claimed, achieved, units);
-        let key = reputation_key(peer_id, model_key);
+        gated_accrual(claimed, achieved, units)
+    }
+
+    /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or
+    /// `0` if none yet — the base the next receipt's cumulative amount builds on.
+    fn gated_cumulative_gross(&self, key: &str) -> u64 {
+        self.gated_vouchers
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key).map(|v| v.cumulative_gross()))
+            .unwrap_or(0)
+    }
+
+    /// Commit `split` into the `(peer, model)` voucher at composite `key` (accrue + persist). Called
+    /// **only after** the provider co-signs the receipt carrying the resulting cumulative amount, so
+    /// the voucher stays equal to the latest co-signed claim. Off-chain accounting; no value moves.
+    fn commit_gated_voucher(&self, key: &str, split: FeeSplit) {
         let snapshot = {
             let mut map = match self.gated_vouchers.lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
-            let voucher = map.entry(key.clone()).or_default();
+            let voucher = map.entry(key.to_string()).or_default();
             voucher.accrue(split);
             voucher.to_bytes()
         };
         if let Some(store) = &self.store {
-            if let Err(e) = store.put_gated_voucher(&key, &snapshot) {
-                tracing::debug!(error = %e, peer_id, model = model_key, "gated voucher persist failed");
+            if let Err(e) = store.put_gated_voucher(key, &snapshot) {
+                tracing::debug!(error = %e, "gated voucher persist failed");
             }
         }
     }
@@ -1470,6 +1487,17 @@ impl ConsumerNode {
                     .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), SETTLE_TIMEOUT)
                     .map_err(AdapterError::Http)
             };
+            let now = now_unix_ms();
+            // Crypto-rail (off-chain): compute this serve's authenticity-gated split and stamp the
+            // receipt with the resulting cumulative voucher amount (previous cumulative + this serve's
+            // gross) BEFORE the consumer signs, so both parties co-sign the same claim. The voucher is
+            // committed only after a successful co-sign, keeping it equal to the latest co-signed
+            // cumulative. No value moves — the on-chain claim against this voucher is a later slice.
+            let vkey = reputation_key(&peer_id, &model_key);
+            let split = node.gated_split_for(&peer_id, &model_key, tokens, now);
+            let cumulative = node
+                .gated_cumulative_gross(&vkey)
+                .saturating_add(split.net_to_provider + split.protocol_fee);
             // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
             // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
             if request_receipt(
@@ -1480,15 +1508,14 @@ impl ConsumerNode {
                 &model_id,
                 tokens,
                 nonce,
-                now_unix_ms(),
+                now,
                 &canonical,
+                Some(cumulative),
             )
             .is_ok()
             {
                 node.record_contribution(&provider_libp2p, &model_key, tokens);
-                // Crypto-rail (off-chain): accrue this serve at the authenticity-gated rate into the
-                // per-(peer, model) voucher. No value moves; the on-chain claim is a later slice.
-                node.record_gated_accrual(&peer_id, &model_key, tokens, now_unix_ms());
+                node.commit_gated_voucher(&vkey, split);
             }
         });
     }

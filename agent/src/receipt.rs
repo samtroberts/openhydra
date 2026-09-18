@@ -76,7 +76,39 @@ fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8>
         }
         None => b.push(0u8),
     }
+    // Crypto-rail cumulative voucher amount: the consumer signs it into `canonical_bytes()`, so the
+    // framing MUST transmit it or the provider reconstructs a different preimage and settlement fails
+    // closed. Appended ONLY when `Some` (`has_cumulative:u8=1 + u64`), so every non-crypto serve's
+    // framing stays byte-identical to before and a provider that never sees a voucher is unaffected.
+    if let Some(v) = payload.cumulative_amount {
+        b.push(1u8);
+        b.extend_from_slice(&v.to_le_bytes());
+    }
     b
+}
+
+/// Read an optional `has_x:u8 [+ u64-LE]` trailer at `*pos`, advancing `*pos`. No bytes remaining →
+/// `None`; flag `0` → `None`; flag `1` → the following `u64`; any other flag or a truncated value is
+/// an error. Shared by the completion + cumulative receipt-request trailers.
+fn read_flag_u64(data: &[u8], pos: &mut usize, what: &str) -> Result<Option<u64>, AdapterError> {
+    if data.len() == *pos {
+        return Ok(None);
+    }
+    let flag = data[*pos];
+    *pos += 1;
+    match flag {
+        0 => Ok(None),
+        1 => {
+            if data.len() < *pos + 8 {
+                return Err(AdapterError::Parse(format!("receipt request {what} truncated")));
+            }
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&data[*pos..*pos + 8]);
+            *pos += 8;
+            Ok(Some(u64::from_le_bytes(v)))
+        }
+        other => Err(AdapterError::Parse(format!("bad {what} flag: {other}"))),
+    }
 }
 
 fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterError> {
@@ -95,50 +127,39 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
     }
     let model = std::str::from_utf8(&data[162..model_end])
         .map_err(|e| AdapterError::Parse(format!("receipt model utf8: {e}")))?;
-    // Optional trailers after the model: a length-prefixed canonical id, then the completion split.
-    // Three shapes are accepted for backward compatibility: legacy (no trailer → empty canonical,
-    // no split); canonical-only; canonical + completion. A legacy request decodes to nano fallback.
-    let (canonical, completion) = if data.len() == model_end {
-        ("", None)
+    // Optional trailers after the model, parsed in order: a length-prefixed canonical id, then the
+    // completion split, then the crypto-rail cumulative voucher amount — each present iff bytes
+    // remain, so every earlier wire shape still decodes (legacy no-trailer → empty/None; canonical-
+    // only; canonical + completion; canonical + completion + cumulative). A trailing-bytes check at
+    // the end keeps the framing strict.
+    let mut pos = model_end;
+    let canonical = if data.len() == pos {
+        ""
     } else {
-        if data.len() < model_end + 2 {
+        if data.len() < pos + 2 {
             return Err(AdapterError::Parse("receipt request canonical length truncated".into()));
         }
-        let clen = u16::from_le_bytes([data[model_end], data[model_end + 1]]) as usize;
-        let after_canonical = model_end + 2 + clen;
-        if data.len() < after_canonical {
+        let clen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        let end = pos + clen;
+        if data.len() < end {
             return Err(AdapterError::Parse("receipt request canonical truncated".into()));
         }
-        let canonical = std::str::from_utf8(&data[model_end + 2..after_canonical])
+        let canonical = std::str::from_utf8(&data[pos..end])
             .map_err(|e| AdapterError::Parse(format!("receipt canonical utf8: {e}")))?;
-        // Completion trailer (M3): `has_completion:u8 [+ u64]`. Absent (canonical-only framing) → None.
-        let completion = if data.len() == after_canonical {
-            None
-        } else {
-            match data[after_canonical] {
-                0 => {
-                    if data.len() != after_canonical + 1 {
-                        return Err(AdapterError::Parse("receipt request length mismatch".into()));
-                    }
-                    None
-                }
-                1 => {
-                    if data.len() != after_canonical + 1 + 8 {
-                        return Err(AdapterError::Parse("receipt request length mismatch".into()));
-                    }
-                    let mut c = [0u8; 8];
-                    c.copy_from_slice(&data[after_canonical + 1..after_canonical + 9]);
-                    Some(u64::from_le_bytes(c))
-                }
-                other => {
-                    return Err(AdapterError::Parse(format!("bad completion flag: {other}")));
-                }
-            }
-        };
-        (canonical, completion)
+        pos = end;
+        canonical
     };
+    // Completion trailer (M3): `has_completion:u8 [+ u64]`.
+    let completion = read_flag_u64(data, &mut pos, "completion")?;
+    // Cumulative-voucher trailer (crypto-rail, v4): `has_cumulative:u8 [+ u64]`.
+    let cumulative = read_flag_u64(data, &mut pos, "cumulative")?;
+    if pos != data.len() {
+        return Err(AdapterError::Parse("receipt request has trailing bytes".into()));
+    }
     let payload = payload_from_bytes(
         &data[0..32], &data[32..64], model, tokens, &data[64..80], ts, completion, canonical,
+        cumulative,
     )
     .map_err(AdapterError::Parse)?;
     let consumer_sig = to_sig(&data[96..160])?;
@@ -176,6 +197,7 @@ pub fn request_receipt(
     nonce: [u8; 16],
     ts_unix_ms: u64,
     canonical_model_id: &str,
+    cumulative_amount: Option<u64>,
 ) -> Result<CoSignedReceipt, AdapterError> {
     let payload = payload_from_bytes(
         provider_pub,
@@ -186,6 +208,7 @@ pub fn request_receipt(
         ts_unix_ms,
         None,
         canonical_model_id,
+        cumulative_amount,
     )
     .map_err(AdapterError::Parse)?;
     let consumer_sig = to_sig(&sign(&payload.canonical_bytes()))?;
@@ -286,11 +309,14 @@ mod tests {
             [42u8; 16],
             1_700_000_000_000,
             "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
+            Some(9_600),
         )
         .unwrap();
         assert_eq!(receipt.payload.tokens, 512);
         assert_eq!(receipt.payload.canonical_model_id, "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
             "canonical id flows end-to-end through the request framing and is co-signed");
+        assert_eq!(receipt.payload.cumulative_amount, Some(9_600),
+            "the crypto-rail cumulative voucher amount flows end-to-end and is co-signed");
         assert_eq!(verify_receipt(&receipt), Ok(()));
     }
 
@@ -314,6 +340,7 @@ mod tests {
             ts_unix_ms: 1_700_000_000_000,
             completion_tokens: Some(60),
             canonical_model_id: "qwen2.5/7b/q4_k_m/abcd0123abcd0123".to_string(),
+            cumulative_amount: None,
         };
         let consumer_sig = consumer.sign(&payload.canonical_bytes());
         let framed = encode_request(&payload, &consumer_sig);
@@ -350,6 +377,7 @@ mod tests {
             [1u8; 16],
             1,
             "",
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AdapterError::Http(m) if m.contains("different provider")));
@@ -377,6 +405,7 @@ mod tests {
             [1u8; 16],
             1,
             "",
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AdapterError::Http(m) if m.contains("provider rejected")));
