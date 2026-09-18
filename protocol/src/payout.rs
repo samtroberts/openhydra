@@ -79,13 +79,38 @@ fn gross_at_tier(tier: CostTier, weighted_units: u64) -> u64 {
 }
 
 /// **Crypto rail** — the authenticity-gated amount that accrues for `weighted_units` metered this
-/// step, net of the protocol fee. The rate is capped at the *awarded* tier
+/// step, net of the protocol fee, **in credit units**. The rate is capped at the *awarded* tier
 /// ([`max_cost_tier_for_authenticity`]), so the running micropayment receipt only ever accrues at
 /// the proven rate — **no escrow, no clawback**. Returns the provider net + the protocol fee (the
-/// on-chain `0.96 / 0.04` split for this accrual).
+/// on-chain `0.96 / 0.04` split for this accrual). For on-chain settlement use
+/// [`gated_accrual_asset`], which denominates in the settlement asset.
 pub fn gated_accrual(claimed: CostTier, achieved: AuthenticityTier, weighted_units: u64) -> FeeSplit {
     let awarded = max_cost_tier_for_authenticity(achieved, claimed);
     protocol_fee(gross_at_tier(awarded, weighted_units))
+}
+
+/// Convert an amount in **credit units** to the settlement asset's smallest unit (e.g. USDC
+/// micro-units at 6 decimals) using `micros_per_credit` — the reference-price peg
+/// (CREDIT_TIERING $/credit). Saturating `u128` product, so a pathological value pins at `u64::MAX`
+/// rather than wrapping.
+pub fn credits_to_asset_micros(credit_units: u64, micros_per_credit: u64) -> u64 {
+    ((credit_units as u128).saturating_mul(micros_per_credit as u128)).min(u64::MAX as u128) as u64
+}
+
+/// **Crypto rail, on-chain-denominated** — like [`gated_accrual`], but the gross is converted to the
+/// **settlement asset's smallest unit** (USDC micro-units) via `micros_per_credit` **before** the 4%
+/// split, so the co-signed voucher/receipt carries the on-chain-settleable amount directly. The peg
+/// is applied at **sign time**, which is why the Solana program needs no on-chain oracle
+/// (`SOLANA_SETTLEMENT_PROGRAM_SPEC` §2). Same authenticity rate-cap as [`gated_accrual`].
+pub fn gated_accrual_asset(
+    claimed: CostTier,
+    achieved: AuthenticityTier,
+    weighted_units: u64,
+    micros_per_credit: u64,
+) -> FeeSplit {
+    let awarded = max_cost_tier_for_authenticity(achieved, claimed);
+    let gross_credits = gross_at_tier(awarded, weighted_units);
+    protocol_fee(credits_to_asset_micros(gross_credits, micros_per_credit))
 }
 
 /// **Fiat rail** — the authenticity-gated split of a receipt worth `weighted_units` at its *claimed*
@@ -254,6 +279,28 @@ mod tests {
         let a1 = gated_accrual(Mega, ReputationRedundant, 100);
         assert_eq!(a1.protocol_fee, 48);
         assert_eq!(a1.net_to_provider, 1_152);
+    }
+
+    #[test]
+    fn asset_denominated_accrual_applies_the_peg_before_the_split() {
+        // A1 caps Mega→Medium: gross_credits = 1200. Peg = 5 µUSDC/credit → gross_asset = 6000,
+        // fee = 240, net = 5760. Peg applied before the 4% split (spec §2 — no on-chain oracle).
+        let peg = 5;
+        let a = gated_accrual_asset(Mega, ReputationRedundant, 100, peg);
+        assert_eq!(a.net_to_provider + a.protocol_fee, 6_000, "gross converted to the asset");
+        assert_eq!(a.protocol_fee, 240);
+        assert_eq!(a.net_to_provider, 5_760);
+        // Equivalent to converting the credit-unit gross then taking the fee.
+        let credit_gross =
+            gated_accrual(Mega, ReputationRedundant, 100).net_to_provider + gated_accrual(Mega, ReputationRedundant, 100).protocol_fee;
+        assert_eq!(a.net_to_provider + a.protocol_fee, credits_to_asset_micros(credit_gross, peg));
+    }
+
+    #[test]
+    fn credits_to_asset_micros_scales_and_saturates() {
+        assert_eq!(credits_to_asset_micros(1_000, 6), 6_000);
+        assert_eq!(credits_to_asset_micros(0, 6), 0);
+        assert_eq!(credits_to_asset_micros(u64::MAX, u64::MAX), u64::MAX, "saturates, never wraps");
     }
 
     // ── fiat: escrowed_split holds the delta, fees the redeemable ──

@@ -38,7 +38,7 @@ use openhydra_protocol::trust::{
     authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
     MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
-use openhydra_protocol::payout::{gated_accrual, FeeSplit, GatedVoucher};
+use openhydra_protocol::payout::{gated_accrual_asset, FeeSplit, GatedVoucher};
 use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt, receipt_weighted_units};
 
 use serde_json::Value;
@@ -161,6 +161,14 @@ const AUDIT_MAX_TOKENS: u32 = 64;
 /// "agree closely"), which sharpens the A1 authenticity signal. Providers that predate the
 /// `deterministic` field ignore the seed and still serve temp=0 via the request's `temperature`.
 const AUDIT_SEED: u64 = 0;
+
+/// Reference-price peg for the crypto rail: settlement-asset (USDC, 6 decimals) **micro-units per
+/// credit unit** (`SOLANA_SETTLEMENT_PROGRAM_SPEC` §2). The consumer converts each gated accrual to
+/// the settlement asset at sign time, so the co-signed voucher/receipt carries the on-chain amount
+/// directly (no on-chain oracle). ⚠️ **PLACEHOLDER** — the real $/credit peg is a CREDIT_TIERING
+/// business parameter that must be wired from config (and ideally a signed receipt term) before any
+/// real settlement; `1` = 1 credit → 1 µUSDC.
+const USDC_MICROS_PER_CREDIT: u64 = 1;
 
 /// Pick the best provider from `peers` for a request whose canonical id is
 /// `request_canonical` (use `""` to match any provider of the discovered model_id).
@@ -1012,15 +1020,18 @@ impl ConsumerNode {
     /// authenticity escrow. `peer_id` is the provider's OpenHydra id (keys the composite voucher +
     /// the `authenticity_of` lookup); `model_key` is its validated handle. **Off-chain accounting
     /// only — no value moves**; best-effort persisted, a failed write never affects the completion.
-    /// This serve's authenticity-gated split (crypto-rail): the *awarded*-tier amount for `tokens`
-    /// (net to provider + 4% fee), capped at the achieved tier. Pure over the current audit/
-    /// reputation state — no voucher mutation. Used both to stamp the receipt's cumulative amount and
-    /// (on a successful co-sign) to commit the voucher, so the two always agree.
+    /// This serve's authenticity-gated split (crypto-rail), denominated in **settlement-asset
+    /// micro-units** (USDC): the *awarded*-tier amount for `tokens` (net to provider + 4% fee),
+    /// capped at the achieved tier and converted to the asset via [`USDC_MICROS_PER_CREDIT`] at sign
+    /// time (`SOLANA_SETTLEMENT_PROGRAM_SPEC` §2 — the on-chain program settles this number directly,
+    /// no oracle). Pure over the current audit/reputation state — no voucher mutation. Used both to
+    /// stamp the receipt's cumulative amount and (on a successful co-sign) to commit the voucher, so
+    /// the two always agree.
     fn gated_split_for(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64) -> FeeSplit {
         let units = receipt_weighted_units(tokens, None);
         let claimed = cost_tier_for_handle(model_key);
         let achieved = self.authenticity_of(peer_id, model_key, now_ms);
-        gated_accrual(claimed, achieved, units)
+        gated_accrual_asset(claimed, achieved, units, USDC_MICROS_PER_CREDIT)
     }
 
     /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or

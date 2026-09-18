@@ -87,10 +87,13 @@ pub struct ReceiptPayload {
     /// conservative nano tier. Bound into the signed preimage (only when non-empty, so a legacy
     /// receipt stays byte-identical) — a provider can't inflate its earned tier by forging it.
     pub canonical_model_id: String,
-    /// The **cumulative** authenticity-gated amount (gross: provider net + protocol fee) this
-    /// consumer has authorized to this provider for this model across all serves in the pair — the
-    /// monotonic crypto-rail voucher total ([`crate::payout::GatedVoucher`]) the on-chain claim
-    /// settles against (PAYMENTS_PLAN_v1 crypto step 3). `Some` binds it into the signed preimage
+    /// The **cumulative** authenticity-gated amount (gross: provider net + protocol fee), in the
+    /// **settlement asset's smallest unit** (USDC micro-units — converted from credit units at sign
+    /// time via the reference-price peg, `SOLANA_SETTLEMENT_PROGRAM_SPEC` §2, so the on-chain program
+    /// settles it directly with no oracle), that this consumer has authorized to this provider for
+    /// this model across all serves in the pair — the monotonic crypto-rail voucher total
+    /// ([`crate::payout::GatedVoucher`]) the on-chain claim settles against (PAYMENTS_PLAN_v1 crypto
+    /// step 3). `Some` binds it into the signed preimage
     /// (tag 3) so neither party can alter the claim amount without invalidating both signatures;
     /// `None` = a receipt carrying no crypto-rail voucher (every non-crypto serve), which stays
     /// **byte-identical** to v2/v3. No real value moves at receipt time; this is the signed claim
