@@ -32,8 +32,17 @@
 //! canonical statement of the claim, not a pinned program ABI.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
+use sha3::{Digest, Keccak256};
 
 use crate::receipts::{verify_receipt, CoSignedReceipt};
+
+/// keccak-256 (Ethereum's hash) of `data`.
+fn keccak256(data: &[u8]) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(data);
+    h.finalize().into()
+}
 
 /// Domain separator for a [`PayoutBinding`] signature (prevents cross-protocol signature reuse).
 pub const PAYOUT_BINDING_DOMAIN: &[u8] = b"openhydra/solana-payout/v1";
@@ -54,9 +63,22 @@ pub enum SettlementError {
     NotAVoucher,
     /// The receipt's own signatures do not verify (tampered or corrupt).
     BadReceipt,
-    /// This chain's settlement backend is not built yet (e.g. the Base/EVM secp256k1 path) — fail
-    /// closed rather than fabricate a proof.
+    /// This chain's settlement backend is not built yet — fail closed rather than fabricate a proof.
     BackendNotImplemented,
+    /// The claim's [`PayoutTarget`] is for a different chain than the backend (e.g. a Solana payout
+    /// handed to the Base backend).
+    ChainMismatch,
+}
+
+/// Where a settlement pays the provider — the one chain-specific field on an otherwise chain-agnostic
+/// [`SettlementClaim`]. A Solana account is a 32-byte Ed25519 public key; an EVM account is a 20-byte
+/// address (`keccak256(secp256k1_pubkey)[12..]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayoutTarget {
+    /// A Solana account (32-byte Ed25519 public key).
+    Solana([u8; 32]),
+    /// An EVM account (20-byte address).
+    Evm([u8; 20]),
 }
 
 /// A provider's authorization of the Solana account that receives its payouts. The provider's
@@ -130,10 +152,11 @@ pub struct SettlementClaim {
     pub consumer: [u8; 32],
     /// The raw engine handle served (identity of the pair's model bucket).
     pub model_id: String,
-    /// The monotonic cumulative amount authorized (gross: provider net + protocol fee).
+    /// The monotonic cumulative amount authorized (gross: provider net + protocol fee), in the
+    /// settlement asset's smallest unit (USDC micro-units).
     pub cumulative_amount: u64,
-    /// Where the provider's share is paid (from the [`PayoutBinding`]).
-    pub payout_address: [u8; 32],
+    /// Where the provider's share is paid — chain-specific (from the chain's payout binding).
+    pub payout: PayoutTarget,
 }
 
 /// Build a [`SettlementClaim`] from a co-signed voucher receipt and the provider's payout binding.
@@ -156,25 +179,28 @@ pub fn claim_from_receipt(
         consumer: receipt.payload.consumer.to_bytes(),
         model_id: receipt.payload.model_id.clone(),
         cumulative_amount,
-        payout_address: binding.payout_address,
+        payout: PayoutTarget::Solana(binding.payout_address),
     })
 }
 
 impl SettlementClaim {
-    /// A deterministic canonical statement of the claim (domain ‖ provider ‖ consumer ‖ payout ‖
-    /// cumulative ‖ model). A digest for a claim-level signature or an on-chain log — **not** a
-    /// pinned program ABI (the on-chain instruction layout is the program's to define).
-    pub fn message(&self) -> Vec<u8> {
+    /// The Solana canonical claim preimage (domain ‖ provider ‖ consumer ‖ payout(32) ‖ cumulative ‖
+    /// model) — the message the Solana program verifies the receipt's Ed25519 signatures against.
+    /// `None` if the payout is not a Solana target. **Not** a pinned program ABI.
+    pub fn solana_preimage(&self) -> Option<Vec<u8>> {
+        let PayoutTarget::Solana(addr) = self.payout else {
+            return None;
+        };
         let model = self.model_id.as_bytes();
         let mut b = Vec::with_capacity(SETTLEMENT_CLAIM_DOMAIN.len() + 32 * 3 + 8 + 4 + model.len());
         b.extend_from_slice(SETTLEMENT_CLAIM_DOMAIN);
         b.extend_from_slice(&self.provider);
         b.extend_from_slice(&self.consumer);
-        b.extend_from_slice(&self.payout_address);
+        b.extend_from_slice(&addr);
         b.extend_from_slice(&self.cumulative_amount.to_le_bytes());
         b.extend_from_slice(&(model.len() as u32).to_le_bytes());
         b.extend_from_slice(model);
-        b
+        Some(b)
     }
 }
 
@@ -231,8 +257,8 @@ pub trait SettlementBackend {
 }
 
 /// The Solana settlement backend (built). Solana verifies the receipt's existing Ed25519
-/// co-signatures natively and pays the [`PayoutBinding`]'s account, so the claim's own canonical
-/// message ([`SettlementClaim::message`]) is the preimage — no extra signature, no dependency.
+/// co-signatures natively and pays the [`PayoutBinding`]'s account, so the claim's Solana preimage
+/// ([`SettlementClaim::solana_preimage`]) is the message — no extra signature, no dependency.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SolanaBackend;
 
@@ -242,28 +268,216 @@ impl SettlementBackend for SolanaBackend {
     }
 
     fn claim_preimage(&self, claim: &SettlementClaim) -> Result<Vec<u8>, SettlementError> {
-        Ok(claim.message())
+        claim.solana_preimage().ok_or(SettlementError::ChainMismatch)
     }
 }
 
-/// The Base/EVM settlement backend — **documented stub, not built**. Base cannot verify Ed25519
-/// natively, so it needs a secp256k1 co-signature bound to the Ed25519 identity (`ecrecover`) over
-/// an EIP-712 digest — which re-introduces a `k256` dependency, the cross-curve identity↔secp256k1
-/// binding (fund-loss if mis-designed), and a separate program audit + geofencing analysis. Added
-/// additively when the Base/x402/Coinbase-ecosystem reach justifies it; until then every method
-/// fails closed rather than fabricate an EIP-712 proof.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BaseBackend;
+// ── Base / EVM settlement (secp256k1 + EIP-712) ───────────────────────────
+//
+// Base (EVM L2) cannot verify Ed25519 natively, so it settles with **secp256k1** (`ecrecover`) over
+// an **EIP-712** digest, and the Ed25519 identity **attests** its EVM payout address (the cross-curve
+// binding). The voucher layer is unchanged — only the on-chain proof format differs.
+
+/// Domain separator for an [`EvmPayoutBinding`] signature.
+pub const EVM_PAYOUT_BINDING_DOMAIN: &[u8] = b"openhydra/base-payout/v1";
+
+/// The 20-byte EVM address for a secp256k1 verifying key: `keccak256(uncompressed_pubkey[1..])[12..]`
+/// (the last 20 bytes of the hash of the 64-byte `x‖y`, dropping the `0x04` prefix).
+pub fn evm_address(pubkey: &EcdsaVerifyingKey) -> [u8; 20] {
+    let point = pubkey.to_encoded_point(false); // uncompressed: 0x04 ‖ x(32) ‖ y(32)
+    let hash = keccak256(&point.as_bytes()[1..]);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..]);
+    addr
+}
+
+/// A provider's authorization of the **EVM** account that receives its Base payouts — the cross-curve
+/// analogue of [`PayoutBinding`]. The provider's OpenHydra **Ed25519** identity (which earns the
+/// voucher) signs the chosen 20-byte EVM address, so the on-chain program can prove the same entity
+/// owns both keys. `ts_unix_ms` orders rotations. (No secp256k1 is needed to *make* the binding — it
+/// attests a given address; secp256k1 enters only when the provider later signs the settlement with
+/// its EVM wallet.)
+#[derive(Debug, Clone)]
+pub struct EvmPayoutBinding {
+    /// The provider's OpenHydra identity — the voucher payee.
+    pub identity: VerifyingKey,
+    /// The EVM account to receive payout (20-byte address).
+    pub evm_address: [u8; 20],
+    /// When this binding was made (unix ms) — later supersedes earlier for the same identity.
+    pub ts_unix_ms: u64,
+    /// The identity's Ed25519 signature over [`evm_binding_message`].
+    pub signature: Signature,
+}
+
+/// The bytes an identity signs to authorize an EVM payout address: domain ‖ evm_address ‖ ts (LE).
+pub fn evm_binding_message(evm_address: &[u8; 20], ts_unix_ms: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(EVM_PAYOUT_BINDING_DOMAIN.len() + 20 + 8);
+    b.extend_from_slice(EVM_PAYOUT_BINDING_DOMAIN);
+    b.extend_from_slice(evm_address);
+    b.extend_from_slice(&ts_unix_ms.to_le_bytes());
+    b
+}
+
+/// Sign an [`EvmPayoutBinding`]: the Ed25519 identity authorizes `evm_address` to receive its Base
+/// payouts.
+pub fn sign_evm_payout_binding(
+    identity_key: &SigningKey,
+    evm_address: [u8; 20],
+    ts_unix_ms: u64,
+) -> EvmPayoutBinding {
+    let signature = identity_key.sign(&evm_binding_message(&evm_address, ts_unix_ms));
+    EvmPayoutBinding {
+        identity: identity_key.verifying_key(),
+        evm_address,
+        ts_unix_ms,
+        signature,
+    }
+}
+
+/// Whether an EVM payout binding's Ed25519 signature verifies.
+pub fn verify_evm_payout_binding(binding: &EvmPayoutBinding) -> bool {
+    binding
+        .identity
+        .verify(&evm_binding_message(&binding.evm_address, binding.ts_unix_ms), &binding.signature)
+        .is_ok()
+}
+
+/// EIP-712 domain parameters for the settlement contract. `chain_id` + `verifying_contract` are
+/// **deployment values** (the deployed program's chain + address), not known until deploy — carried
+/// here so the digest matches exactly what the contract computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eip712Domain {
+    pub chain_id: u64,
+    pub verifying_contract: [u8; 20],
+}
+
+/// The EIP-712 domain type string (`name` + `version` are fixed for the protocol).
+const EIP712_DOMAIN_TYPE: &[u8] =
+    b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+const EIP712_DOMAIN_NAME: &[u8] = b"OpenHydra Settlement";
+const EIP712_DOMAIN_VERSION: &[u8] = b"1";
+/// The settlement claim's EIP-712 type string — the on-chain contract MUST hash the identical
+/// string, so this is the pinned type (any change is a breaking, coordinated version bump).
+const EIP712_CLAIM_TYPE: &[u8] = b"SettlementClaim(bytes32 provider,bytes32 consumer,address payoutAddress,uint256 cumulativeAmount,string modelId)";
+
+/// A `u64` as a 32-byte big-endian EVM word.
+fn u256_word(x: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&x.to_be_bytes());
+    w
+}
+
+/// A 20-byte EVM address left-padded to a 32-byte word.
+fn address_word(addr: &[u8; 20]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(addr);
+    w
+}
+
+impl Eip712Domain {
+    /// The EIP-712 `domainSeparator`.
+    fn separator(&self) -> [u8; 32] {
+        let mut enc = Vec::with_capacity(32 * 5);
+        enc.extend_from_slice(&keccak256(EIP712_DOMAIN_TYPE));
+        enc.extend_from_slice(&keccak256(EIP712_DOMAIN_NAME));
+        enc.extend_from_slice(&keccak256(EIP712_DOMAIN_VERSION));
+        enc.extend_from_slice(&u256_word(self.chain_id));
+        enc.extend_from_slice(&address_word(&self.verifying_contract));
+        keccak256(&enc)
+    }
+}
+
+impl SettlementClaim {
+    /// The EIP-712 digest an EVM `ecrecover` verifies a secp256k1 settlement signature against:
+    /// `keccak256(0x19 0x01 ‖ domainSeparator ‖ hashStruct(claim))`. `None` unless the payout is an
+    /// EVM target. The contract computes the identical digest; only `chain_id` + `verifying_contract`
+    /// are deployment-specific.
+    pub fn eip712_digest(&self, domain: &Eip712Domain) -> Option<[u8; 32]> {
+        let PayoutTarget::Evm(payout) = self.payout else {
+            return None;
+        };
+        // hashStruct(claim) = keccak256(typeHash ‖ provider ‖ consumer ‖ payout ‖ cumulative ‖ keccak(modelId))
+        let mut sd = Vec::with_capacity(32 * 6);
+        sd.extend_from_slice(&keccak256(EIP712_CLAIM_TYPE));
+        sd.extend_from_slice(&self.provider);
+        sd.extend_from_slice(&self.consumer);
+        sd.extend_from_slice(&address_word(&payout));
+        sd.extend_from_slice(&u256_word(self.cumulative_amount));
+        sd.extend_from_slice(&keccak256(self.model_id.as_bytes()));
+        let hash_struct = keccak256(&sd);
+
+        let mut pre = Vec::with_capacity(2 + 32 + 32);
+        pre.extend_from_slice(&[0x19, 0x01]);
+        pre.extend_from_slice(&domain.separator());
+        pre.extend_from_slice(&hash_struct);
+        Some(keccak256(&pre))
+    }
+}
+
+/// Recover the 20-byte EVM signer address from a 65-byte secp256k1 signature (`r‖s‖v`, `v ∈ {27,28}`
+/// or `{0,1}`) over an EIP-712 `digest` — the on-chain `ecrecover`. `None` on any malformed input.
+pub fn recover_evm_signer(digest: &[u8; 32], sig_65: &[u8; 65]) -> Option<[u8; 20]> {
+    let signature = EcdsaSignature::from_slice(&sig_65[..64]).ok()?;
+    // Accept both Ethereum's `27/28` and the raw `0/1` recovery-id conventions.
+    let v = sig_65[64];
+    let rec_byte = if v >= 27 { v - 27 } else { v };
+    let recovery_id = RecoveryId::from_byte(rec_byte)?;
+    let vk = EcdsaVerifyingKey::recover_from_prehash(digest, &signature, recovery_id).ok()?;
+    Some(evm_address(&vk))
+}
+
+/// The Base/EVM settlement backend (built). Base settles via a secp256k1 signature over the claim's
+/// [`eip712_digest`](SettlementClaim::eip712_digest); [`claim_preimage`](Self::claim_preimage)
+/// returns that 32-byte digest. The on-chain contract `ecrecover`s the signature to an EVM address
+/// and checks it against the provider's / consumer's [`EvmPayoutBinding`]. `chain_id` +
+/// `verifying_contract` are the deployed program's; until it exists this is unwired.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseBackend {
+    pub domain: Eip712Domain,
+}
+
+impl BaseBackend {
+    /// A backend for the given EVM chain id + deployed contract address.
+    pub fn new(chain_id: u64, verifying_contract: [u8; 20]) -> Self {
+        Self { domain: Eip712Domain { chain_id, verifying_contract } }
+    }
+}
 
 impl SettlementBackend for BaseBackend {
     fn chain(&self) -> Chain {
         Chain::Base
     }
 
-    fn claim_preimage(&self, _claim: &SettlementClaim) -> Result<Vec<u8>, SettlementError> {
-        // No EIP-712 / secp256k1 path exists yet — do not fabricate a proof.
-        Err(SettlementError::BackendNotImplemented)
+    fn claim_preimage(&self, claim: &SettlementClaim) -> Result<Vec<u8>, SettlementError> {
+        claim
+            .eip712_digest(&self.domain)
+            .map(|d| d.to_vec())
+            .ok_or(SettlementError::ChainMismatch)
     }
+}
+
+/// Build a [`SettlementClaim`] with an **EVM** payout target from a co-signed voucher receipt and the
+/// provider's EVM payout binding. Same fail-closed checks as [`claim_from_receipt`] (verify the
+/// binding, match the provider, require a cumulative, verify the receipt).
+pub fn claim_from_receipt_evm(
+    receipt: &CoSignedReceipt,
+    binding: &EvmPayoutBinding,
+) -> Result<SettlementClaim, SettlementError> {
+    if !verify_evm_payout_binding(binding) {
+        return Err(SettlementError::BadBindingSignature);
+    }
+    if binding.identity.to_bytes() != receipt.payload.provider.to_bytes() {
+        return Err(SettlementError::BindingProviderMismatch);
+    }
+    let cumulative_amount = receipt.payload.cumulative_amount.ok_or(SettlementError::NotAVoucher)?;
+    verify_receipt(receipt).map_err(|_| SettlementError::BadReceipt)?;
+    Ok(SettlementClaim {
+        provider: receipt.payload.provider.to_bytes(),
+        consumer: receipt.payload.consumer.to_bytes(),
+        model_id: receipt.payload.model_id.clone(),
+        cumulative_amount,
+        payout: PayoutTarget::Evm(binding.evm_address),
+    })
 }
 
 #[cfg(test)]
@@ -337,9 +551,9 @@ mod tests {
         assert_eq!(claim.provider, provider.verifying_key().to_bytes());
         assert_eq!(claim.consumer, consumer.verifying_key().to_bytes());
         assert_eq!(claim.cumulative_amount, 9_600);
-        assert_eq!(claim.payout_address, [5u8; 32]);
+        assert_eq!(claim.payout, PayoutTarget::Solana([5u8; 32]));
         assert_eq!(claim.model_id, "qwen2.5:7b");
-        assert!(!claim.message().is_empty());
+        assert!(claim.solana_preimage().is_some());
     }
 
     #[test]
@@ -399,28 +613,113 @@ mod tests {
         let backend = SolanaBackend;
         assert_eq!(backend.chain(), Chain::Solana);
         assert!(!Chain::Solana.requires_dual_sign(), "Solana verifies Ed25519 natively");
-        assert_eq!(backend.claim_preimage(&claim).unwrap(), claim.message());
+        assert_eq!(backend.claim_preimage(&claim).unwrap(), claim.solana_preimage().unwrap());
     }
 
     #[test]
-    fn base_backend_is_a_fail_closed_stub_that_flags_the_dual_sign() {
-        let claim = a_claim();
-        let backend = BaseBackend;
-        assert_eq!(backend.chain(), Chain::Base);
-        assert!(Chain::Base.requires_dual_sign(), "Base needs a secp256k1 ecrecover dual-sign");
-        // The unbuilt EVM path fails closed rather than fabricate an EIP-712 proof.
-        assert_eq!(backend.claim_preimage(&claim), Err(SettlementError::BackendNotImplemented));
+    fn a_backend_rejects_a_claim_for_the_other_chain() {
+        // A Solana-target claim handed to the Base backend (and vice versa) is a ChainMismatch, not a
+        // fabricated proof.
+        let solana_claim = a_claim(); // PayoutTarget::Solana
+        let base = BaseBackend::new(8453, [0u8; 20]);
+        assert_eq!(base.claim_preimage(&solana_claim), Err(SettlementError::ChainMismatch));
+        let evm_claim = an_evm_claim();
+        assert_eq!(SolanaBackend.claim_preimage(&evm_claim), Err(SettlementError::ChainMismatch));
     }
 
     #[test]
     fn backends_are_object_safe_and_selectable_by_config() {
         // A node holds whichever backend its config chose behind one trait object.
-        let claim = a_claim();
-        let backends: Vec<Box<dyn SettlementBackend>> = vec![Box::new(SolanaBackend), Box::new(BaseBackend)];
+        let backends: Vec<Box<dyn SettlementBackend>> =
+            vec![Box::new(SolanaBackend), Box::new(BaseBackend::new(8453, [0u8; 20]))];
         let labels: Vec<&str> = backends.iter().map(|b| b.chain().label()).collect();
         assert_eq!(labels, vec!["solana", "base"]);
-        // Only the built backend produces a preimage.
-        assert!(backends[0].claim_preimage(&claim).is_ok());
-        assert!(backends[1].claim_preimage(&claim).is_err());
+        // Each backend produces a preimage for its own chain's claim.
+        assert!(backends[0].claim_preimage(&a_claim()).is_ok());
+        assert!(backends[1].claim_preimage(&an_evm_claim()).is_ok());
+    }
+
+    // ── Base / EVM settlement ──
+
+    fn an_evm_claim() -> SettlementClaim {
+        let (consumer, provider) = keys();
+        let receipt = voucher_receipt(&consumer, &provider, Some(9_600));
+        let binding = sign_evm_payout_binding(&provider, [0xAB; 20], 1_000);
+        claim_from_receipt_evm(&receipt, &binding).unwrap()
+    }
+
+    #[test]
+    fn an_evm_binding_verifies_and_a_tampered_one_does_not() {
+        let (_, provider) = keys();
+        let binding = sign_evm_payout_binding(&provider, [0xAB; 20], 1_000);
+        assert!(verify_evm_payout_binding(&binding));
+        let mut evil = binding.clone();
+        evil.evm_address = [0xCD; 20];
+        assert!(!verify_evm_payout_binding(&evil), "redirecting the EVM address breaks the signature");
+    }
+
+    #[test]
+    fn claim_from_receipt_evm_sets_an_evm_payout_target() {
+        let claim = an_evm_claim();
+        assert_eq!(claim.payout, PayoutTarget::Evm([0xAB; 20]));
+        assert_eq!(claim.cumulative_amount, 9_600);
+        // Same fail-closed checks as the Solana path: a binding for a different provider is rejected.
+        let (consumer, provider) = keys();
+        let receipt = voucher_receipt(&consumer, &provider, Some(9_600));
+        let attacker = SigningKey::from_bytes(&[13u8; 32]);
+        let evil = sign_evm_payout_binding(&attacker, [0xEE; 20], 1_000);
+        assert_eq!(
+            claim_from_receipt_evm(&receipt, &evil),
+            Err(SettlementError::BindingProviderMismatch)
+        );
+    }
+
+    #[test]
+    fn eip712_digest_is_deterministic_and_field_sensitive() {
+        let claim = an_evm_claim();
+        let domain = Eip712Domain { chain_id: 8453, verifying_contract: [1u8; 20] };
+        let d1 = claim.eip712_digest(&domain).unwrap();
+        assert_eq!(d1, claim.eip712_digest(&domain).unwrap(), "deterministic");
+        assert_eq!(d1.len(), 32);
+        // A different chain id / contract → a different digest (domain-separated).
+        let other = Eip712Domain { chain_id: 1, verifying_contract: [1u8; 20] };
+        assert_ne!(d1, claim.eip712_digest(&other).unwrap());
+        // A different cumulative amount → a different digest.
+        let mut claim2 = claim.clone();
+        claim2.cumulative_amount = 9_601;
+        assert_ne!(d1, claim2.eip712_digest(&domain).unwrap());
+        // A Solana-target claim has no EIP-712 digest.
+        assert!(a_claim().eip712_digest(&domain).is_none());
+    }
+
+    #[test]
+    fn secp256k1_recover_round_trips_to_the_signer_address() {
+        use k256::ecdsa::SigningKey as EcdsaSigningKey;
+        let claim = an_evm_claim();
+        let domain = Eip712Domain { chain_id: 8453, verifying_contract: [1u8; 20] };
+        let digest = claim.eip712_digest(&domain).unwrap();
+
+        // An EVM wallet signs the digest; recover_evm_signer must return that wallet's address.
+        let wallet = EcdsaSigningKey::from_bytes(&[0x11u8; 32].into()).unwrap();
+        let expected = evm_address(wallet.verifying_key());
+        let (sig, rec) = wallet.sign_prehash_recoverable(&digest).unwrap();
+        let mut sig65 = [0u8; 65];
+        sig65[..64].copy_from_slice(&sig.to_bytes());
+        sig65[64] = rec.to_byte() + 27; // Ethereum's v convention
+        assert_eq!(recover_evm_signer(&digest, &sig65), Some(expected));
+        // A wrong signature recovers a different (or no) address, never the expected one by accident.
+        let mut bad = sig65;
+        bad[0] ^= 0xFF;
+        assert_ne!(recover_evm_signer(&digest, &bad), Some(expected));
+    }
+
+    #[test]
+    fn base_backend_claim_preimage_is_the_eip712_digest() {
+        let claim = an_evm_claim();
+        let backend = BaseBackend::new(8453, [1u8; 20]);
+        assert_eq!(backend.chain(), Chain::Base);
+        assert!(Chain::Base.requires_dual_sign(), "Base needs a secp256k1 ecrecover dual-sign");
+        let pre = backend.claim_preimage(&claim).unwrap();
+        assert_eq!(pre, claim.eip712_digest(&backend.domain).unwrap().to_vec());
     }
 }
