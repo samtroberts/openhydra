@@ -21,6 +21,9 @@ redb = "2"
 # neither; a future `base` cargo feature could gate these if crate size matters.
 k256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
+# Device attestation (attest.rs): P-256 ECDSA verify — the curve Apple's Secure Enclave signs with.
+# Pure-Rust RustCrypto, same `ecdsa`/`elliptic-curve` 0.13 family as k256.
+p256 = { version = "0.13", features = ["ecdsa"] }
 
 [dev-dependencies]
 tempfile = "3"

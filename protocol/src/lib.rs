@@ -13,6 +13,7 @@
 //! protocol can be unit-tested (and later reused, e.g. in a verifier or a CLI) without
 //! standing up a swarm or a Python interpreter.
 //!
+//! - [`attest`] — device attestation: signed claim + P-256 verify + the A3 lift rule (ATTESTED_ENGINE_TIER_PLAN_v1 Phase 0)
 //! - [`crypto_agility`] — algorithm registry: versioned wire discriminants (PQC0.1)
 //! - [`model_id`] — canonical model identity & equivalence (protocol.md §4)
 //! - [`router`] — provider scoring / ranking + resolve→route orchestration (§5)
@@ -26,6 +27,7 @@
 //! - [`payout`] — payout-layer earn-gate: rail-specific (crypto rate-cap / fiat escrow) + 4% fee (PAYMENTS_PLAN_v1)
 //! - [`settlement`] — Solana settlement primitives: Ed25519 payout binding + voucher settlement claim (PAYMENTS_PLAN_v1 step 3)
 
+pub mod attest;
 pub mod award;
 pub mod credit;
 pub mod crypto_agility;

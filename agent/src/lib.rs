@@ -21,6 +21,7 @@
 //! mapping are unit-tested against fixtures with no live engine.
 
 pub mod adapter;
+pub mod attest;
 pub mod adapters;
 pub mod cards;
 /// Opt-in engine autostart (starts LM Studio / Ollama when down). Feature-gated so the lean
