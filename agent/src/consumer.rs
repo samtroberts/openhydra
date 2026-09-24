@@ -44,6 +44,7 @@ use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt, rece
 use serde_json::Value;
 
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
+use crate::attest::{attest_provider, AttestRecord};
 use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
 use crate::receipt::request_receipt;
 use crate::serve::{
@@ -124,6 +125,20 @@ const FETCH_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// the detached settlement thread — kept well below the serve budget ([`attempt_timeout`]) since credit is
 /// advisory and a dropped settlement never affects the delivered completion.
 const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound on one device-attestation challenge round-trip (detached, off the response path).
+const ATTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Consumer-side device attestation of providers (ATTESTED_ENGINE_TIER_PLAN_v1 Phase 0, opt-in).
+/// The result is surfaced as a device-trust badge; it never changes routing or the authenticity tier.
+struct ProviderAttestation {
+    /// SHA-256 hashes of trusted OpenHydra release binaries (see `AttestPolicy::trusted_binaries`).
+    trusted_binaries: Vec<[u8; 32]>,
+    /// Latest challenge record per provider, keyed by OpenHydra peer id.
+    records: Mutex<HashMap<String, AttestRecord>>,
+    /// Providers with a challenge in flight, so concurrent serves don't all challenge at once.
+    inflight: Mutex<std::collections::HashSet<String>>,
+}
 
 /// Redundant-execution audit sampling bounds (M2.2(b)), fed to
 /// [`sample_rate_for_reputation`]. A fully-trusted provider is audited rarely
@@ -715,6 +730,8 @@ pub struct ConsumerNode {
     /// divergent co-signed cumulatives. Each settle holds its pair's lock across the whole
     /// read→co-sign→commit window. Grows one entry per distinct `(peer, model)` seen.
     settle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Device attestation of providers (Phase 0). `None` = off (the default).
+    provider_attest: Option<Arc<ProviderAttestation>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -759,6 +776,7 @@ impl ConsumerNode {
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
             settle_locks: Mutex::new(HashMap::new()),
+            provider_attest: None,
         }
     }
 
@@ -768,6 +786,25 @@ impl ConsumerNode {
     pub fn with_assurance_policy(mut self, policy: AssurancePolicy) -> Self {
         self.assurance = policy;
         self
+    }
+
+    /// Opt in to device attestation of providers (builder form): after a served completion, challenge
+    /// the provider in the background (at most every few minutes) and surface the verified
+    /// device-trust level in the status view. `trusted_binaries` are the release binary hashes to
+    /// accept. Purely informational in Phase 0: routing and authenticity tiers are unchanged.
+    pub fn with_provider_attestation(mut self, trusted_binaries: Vec<[u8; 32]>) -> Self {
+        self.provider_attest = Some(Arc::new(ProviderAttestation {
+            trusted_binaries,
+            records: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(std::collections::HashSet::new()),
+        }));
+        self
+    }
+
+    /// The latest device-attestation record for a provider (OpenHydra peer id), if any.
+    pub fn attest_record(&self, peer_id: &str) -> Option<AttestRecord> {
+        let attest = self.provider_attest.as_ref()?;
+        attest.records.lock().unwrap_or_else(|e| e.into_inner()).get(peer_id).cloned()
     }
 
     /// Enable the crypto rail with a settlement peg (USDC micro-units per credit unit) used when
@@ -868,6 +905,7 @@ impl ConsumerNode {
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
             settle_locks: Mutex::new(HashMap::new()),
+            provider_attest: None,
         }
     }
 
@@ -950,6 +988,20 @@ impl ConsumerNode {
             .lock()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.cumulative_net)).collect())
             .unwrap_or_default();
+        // Device attestation (Phase 0): the verified device-trust level + key rotations per provider.
+        // Snapshotted under its own lock, released before reputation is taken.
+        let device: std::collections::HashMap<String, (Option<&'static str>, u32)> = self
+            .provider_attest
+            .as_ref()
+            .map(|a| {
+                a.records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(peer, r)| (peer.clone(), (r.device_trust().map(|t| t.label()), r.key_rotations)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let reputation = self
             .reputation
             .lock()
@@ -972,12 +1024,15 @@ impl ConsumerNode {
                         let (rate, passes) = audit.get(key).copied().unwrap_or((1.0, 0));
                         let tier =
                             authenticity_tier_from(t.raw_score(), rate, passes, MethodFlags::default());
+                        let (device_trust, rotations) = device.get(&peer).copied().unwrap_or((None, 0));
                         crate::status::RepEntry {
                             openhydra_peer_id: peer,
                             model_id: model,
                             score: (t.raw_score() * 10.0).round() / 10.0,
                             authenticity: Some(tier.label().to_string()),
                             gated_net: gated.get(key).copied().filter(|&n| n > 0),
+                            device_trust: device_trust.map(str::to_string),
+                            device_key_rotations: (rotations > 0).then_some(rotations),
                         }
                     })
                     .collect()
@@ -1429,6 +1484,8 @@ impl ConsumerNode {
                     // the response path — the caller already has its completion).
                     if !self_serve {
                         self.maybe_audit(model, model_key, &provider.peer_id);
+                        // Phase 0 device attestation (opt-in, detached, rate-limited per provider).
+                        self.maybe_attest(&provider);
                     }
                     return AttemptOutcome::Served(summary);
                 }
@@ -1680,6 +1737,44 @@ impl ConsumerNode {
     /// the caller's latency path. The audit records its own outcomes (a confirmed outlier →
     /// `Failed`); here we only log the verdict. A `< 2 providers` error just means the model
     /// can't be cross-checked right now — logged at debug, not an error.
+    /// Device attestation (Phase 0): if enabled and this provider is due, challenge it in a detached
+    /// thread (bounded by [`ATTEST_TIMEOUT`]) and record the outcome. Never touches the completion.
+    fn maybe_attest(self: &Arc<Self>, provider: &SelectedProvider) {
+        let Some(attest) = self.provider_attest.clone() else { return };
+        let now = now_unix_ms();
+        let prev = attest.records.lock().unwrap_or_else(|e| e.into_inner()).get(&provider.peer_id).cloned();
+        if prev.as_ref().is_some_and(|r| !r.due(now)) {
+            return;
+        }
+        if !attest.inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(provider.peer_id.clone()) {
+            return; // a challenge to this provider is already running
+        }
+        let node = Arc::clone(self);
+        let peer_id = provider.peer_id.clone();
+        let libp2p = provider.libp2p_peer_id.clone();
+        let model = provider.model_id.clone();
+        std::thread::spawn(move || {
+            let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
+                node.net.proxy_forward_timeout(libp2p.clone(), framed.to_vec(), ATTEST_TIMEOUT)
+            };
+            let record = attest_provider(
+                &mut transport,
+                &model,
+                rand::random(),
+                now_unix_ms(),
+                &attest.trusted_binaries,
+                prev.as_ref(),
+            );
+            if record.key_rotations > prev.as_ref().map_or(0, |p| p.key_rotations) {
+                tracing::warn!(provider = %peer_id, rotations = record.key_rotations,
+                    "provider attestation key changed (expected on restart for unsigned builds)");
+            }
+            tracing::info!(provider = %peer_id, model, outcome = ?record.outcome, "device attestation");
+            attest.records.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.clone(), record);
+            attest.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
+        });
+    }
+
     fn maybe_audit(self: &Arc<Self>, model: &str, model_key: &str, provider_peer_id: &str) {
         let rate = self.audit_rate_for(provider_peer_id, model_key, now_unix_ms());
         if rand::random::<f64>() >= rate {

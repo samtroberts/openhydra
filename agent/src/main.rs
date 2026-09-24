@@ -597,6 +597,13 @@ struct ProvideArgs {
     #[arg(long, default_value_t = 8)]
     max_concurrency: usize,
 
+    /// Answer device-attestation challenges with a Secure Enclave key (Apple Silicon only; off by
+    /// default). Consumers see a `self_signed` device badge — a live, nonce-bound key and this
+    /// Mac's *claimed* profile (chip, OS, SIP, Secure Boot, binary hash). It does not raise the
+    /// authenticity tier. Only publicly announced models are attested.
+    #[arg(long)]
+    attest: bool,
+
     #[command(flatten)]
     aup: AupArgs,
 }
@@ -635,6 +642,19 @@ struct ServeArgs {
     /// serve us. Hot-reloaded. Omit to disable private routing.
     #[arg(long = "swarms-dir")]
     swarms_dir: Option<std::path::PathBuf>,
+
+    /// Challenge providers for a device attestation after serving (in the background, at most every
+    /// few minutes each) and show the verified level as a device badge in the status view. Off by
+    /// default; informational only — it changes neither routing nor the authenticity tier.
+    #[arg(long = "attest-providers")]
+    attest_providers: bool,
+
+    /// SHA-256 (hex) of a provider binary to trust when verifying attestations (repeatable). This
+    /// gateway's own binary hash is always trusted, so providers on the same release build verify
+    /// with no extra config. Without a hardware attestation chain this is release hygiene, not a
+    /// security boundary.
+    #[arg(long = "trusted-binary-hash")]
+    trusted_binary_hash: Vec<String>,
 
     #[command(flatten)]
     aup: AupArgs,
@@ -1185,6 +1205,20 @@ fn ensure_engine_if_requested<A: EngineAdapter>(
 
 /// Run a provider over a chosen engine adapter: open the ledger, announce the engine's
 /// models, then serve inbound requests forever. Generic so every [`EngineKind`] reuses it.
+/// The Secure Enclave attestor for `provide --attest`.
+#[cfg(target_os = "macos")]
+fn secure_enclave_attestor() -> Result<openhydra_agent::attest::Attestor, String> {
+    let attestor = openhydra_agent::attest::Attestor::secure_enclave()
+        .map_err(|e| format!("--attest: {e} (needs an Apple Silicon Mac with a Secure Enclave)"))?;
+    eprintln!("openhydra-agent: device attestation on (Secure Enclave, self_signed; per-process key)");
+    Ok(attestor)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn secure_enclave_attestor() -> Result<openhydra_agent::attest::Attestor, String> {
+    Err("--attest needs an Apple Silicon Mac (Secure Enclave); not available on this platform".into())
+}
+
 fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     adapter: A,
     engine_url: String,
@@ -1244,6 +1278,11 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
                 args.share_models.join(", ")
             );
         }
+    }
+    // Phase 0 device attestation (opt-in). The operator asked for it explicitly, so a missing Secure
+    // Enclave is a startup error rather than a silent downgrade.
+    if args.attest {
+        provider = provider.with_attestor(secure_enclave_attestor()?);
     }
     // M4-base: attach the owner-side swarm authorizer so `Private`-scope models can be served to
     // enrolled members. Without it, a private model is refused for everyone (fail-closed).
@@ -1353,6 +1392,23 @@ fn serve(
         eprintln!("openhydra-agent: swarm credentials from {}", p.display());
         openhydra_agent::swarms::CredentialStore::new(p)
     });
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds)
+    // Phase 0 device attestation of providers (opt-in).
+    let provider_attest = if args.attest_providers {
+        let mut trusted = vec![openhydra_agent::attest::binary_hash()
+            .map_err(|e| format!("hash this binary for --attest-providers: {e}"))?];
+        for h in &args.trusted_binary_hash {
+            let bytes = hex::decode(h.trim()).map_err(|e| format!("--trusted-binary-hash {h}: {e}"))?;
+            trusted.push(bytes.try_into().map_err(|_| format!("--trusted-binary-hash {h}: expected 32 bytes"))?);
+        }
+        eprintln!(
+            "openhydra-agent: attesting providers (device badge only); trusting {} binary hash(es), incl. this build {}",
+            trusted.len(),
+            hex::encode(trusted[0]),
+        );
+        Some(trusted)
+    } else {
+        None
+    };
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

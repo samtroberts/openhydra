@@ -70,6 +70,8 @@ core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
 [dev-dependencies]
+# Device attestation wire tests: a software P-256 key stands in for the Secure Enclave.
+p256 = { version = "0.13", features = ["ecdsa"] }
 # Isolated identity dirs for the status-endpoint tests (mirrors network's dev-deps).
 tempfile = "3"
 # `test-util` (paused time: `start_paused`, `advance`) for deterministic timing tests — the

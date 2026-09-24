@@ -35,6 +35,7 @@ use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
+use crate::attest::{attest_refusal, handle_attest_inbound, Attestor, ATTEST_CHALLENGE};
 use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
@@ -103,6 +104,11 @@ const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const FETCH_RATE_RPS: f64 = 50.0;
 const FETCH_RATE_BURST: f64 = 100.0;
 const FETCH_RATE_MAX_TRACKED: usize = 4096;
+/// Per-peer cap on attestation challenges. Each answer is a Secure Enclave signature (slower than
+/// Ed25519), and a consumer re-attests only every few minutes, so a low rate is plenty.
+const ATTEST_RATE_RPS: f64 = 5.0;
+const ATTEST_RATE_BURST: f64 = 10.0;
+const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 
 /// A buffered serve result, keyed by the consumer's committed nonce, so a reconnecting
 /// consumer can fetch it after the serve connection drops (reconnect-and-fetch).
@@ -678,6 +684,11 @@ pub struct Provider<A: EngineAdapter> {
     /// E-S8: per-peer rate cap on fetch requests (mirrors `receipt_rl`; a separate bucket so a
     /// fetch flood can't shed receipts and vice-versa). Shared by `FETCH_RESULT` + `FETCH_CHUNKS`.
     fetch_rl: Arc<RateLimiter>,
+    /// Device attestation (ATTESTED_ENGINE_TIER_PLAN_v1 Phase 0): answers `ATTEST_CHALLENGE` when the
+    /// operator opted in (`provide --attest`). `None` → every challenge is refused.
+    attestor: Option<Arc<Attestor>>,
+    /// Per-peer rate cap on attestation challenges (a separate bucket from receipts/fetches).
+    attest_rl: Arc<RateLimiter>,
     /// P1 streaming: nonce → trimmable-log [`StreamBuffer`], populated by `SERVE_STREAM` and
     /// polled/pruned by `FETCH_CHUNKS`. Separate from `results` (0x10/0x11 buffered path) so the
     /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
@@ -792,6 +803,13 @@ impl<A: EngineAdapter> Provider<A> {
                 max_inflight: 0,
                 max_tracked: FETCH_RATE_MAX_TRACKED,
             })),
+            attestor: None,
+            attest_rl: Arc::new(RateLimiter::new(RateLimitConfig {
+                rps: ATTEST_RATE_RPS,
+                burst: ATTEST_RATE_BURST,
+                max_inflight: 0,
+                max_tracked: ATTEST_RATE_MAX_TRACKED,
+            })),
             streams: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
@@ -807,6 +825,13 @@ impl<A: EngineAdapter> Provider<A> {
     /// `Private`-scope model to be servable — without it every private serve is refused (fail-closed).
     pub fn with_swarm_authorizer(mut self, auth: Arc<crate::swarms::SwarmAuthorizer>) -> Self {
         self.swarm_auth = Some(auth);
+        self
+    }
+
+    /// Opt in to device attestation: answer `ATTEST_CHALLENGE` with claims signed by `attestor`
+    /// (builder form). Only models this node announces publicly are attestable.
+    pub fn with_attestor(mut self, attestor: Attestor) -> Self {
+        self.attestor = Some(Arc::new(attestor));
         self
     }
 
@@ -1590,6 +1615,7 @@ impl<A: EngineAdapter> Provider<A> {
                 // slow one doesn't head-of-line-block the rest.
                 let provider = Arc::clone(&self);
                 let shed_id = request_id.clone();
+                let is_attest = data.first() == Some(&ATTEST_CHALLENGE);
                 let accepted = pool.submit(move || {
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
@@ -1622,9 +1648,13 @@ impl<A: EngineAdapter> Provider<A> {
                     // the consumer fails fast instead of waiting out its request timeout,
                     // and provider memory stays bounded under a burst.
                     // See docs/CODEBASE_HARDENING_PLAN.md (A3).
-                    let busy = frame_response(&[
-                        ServeChunk::Error("provider overloaded, retry".into()).encode(),
-                    ]);
+                    // An attestation challenge gets an attestation-framed refusal, so the consumer
+                    // retries later instead of mistaking the serve-error frame for a legacy provider.
+                    let busy = if is_attest {
+                        attest_refusal("provider overloaded, retry")
+                    } else {
+                        frame_response(&[ServeChunk::Error("provider overloaded, retry".into()).encode()])
+                    };
                     let _ = self.net.respond(shed_id, busy);
                 }
             }
@@ -1760,6 +1790,20 @@ impl<A: EngineAdapter> Provider<A> {
         match data.first() {
             // M5: an owner-authorised remote-control device flips a model's share scope on this rig.
             Some(&REMOTE_SCOPE_SET) => self.handle_remote_scope_set(source_peer, &data[1..]),
+            // Device attestation challenge (Phase 0). Rate-limited per authenticated peer before any
+            // signing; only publicly-announced models are attestable (a private or unshared model
+            // gets the same refusal, so a challenge can't probe for private models).
+            Some(&ATTEST_CHALLENGE) => {
+                if self.attest_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+                    return attest_refusal("attestation rate limited, retry");
+                }
+                handle_attest_inbound(
+                    &data[1..],
+                    self.attestor.as_deref(),
+                    &|model| self.policy.announce_globally(model),
+                    now_unix_ms(),
+                )
+            }
             Some(&RECEIPT_REQUEST) => {
                 // E-S8: shed a receipt flood before spending any crypto, keyed on the
                 // authenticated sender so one abusive peer can't starve others' receipts.

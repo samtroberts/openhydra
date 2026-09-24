@@ -97,6 +97,16 @@ pub enum DeviceTrust {
     HardwareChain,
 }
 
+impl DeviceTrust {
+    /// Stable display label (status API / badges), mirroring darkbloom's trust levels.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceTrust::SelfSigned => "self_signed",
+            DeviceTrust::HardwareChain => "hardware",
+        }
+    }
+}
+
 /// Why an attestation was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestError {

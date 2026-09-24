@@ -1789,6 +1789,7 @@ pub fn router(
     self_provider: Option<String>,
     cards: Option<Arc<crate::cards::CardStore>>,
     creds: Option<Arc<crate::swarms::CredentialStore>>,
+    provider_attest: Option<Vec<[u8; 32]>>,
 ) -> Router {
     let node = match store {
         Some(s) => {
@@ -1818,6 +1819,11 @@ pub fn router(
         .with_cards(cards)
         .with_credentials(creds)
         .with_settlement_peg(settlement_peg);
+    // Phase 0 device attestation of providers (opt-in): informational device-trust badge only.
+    let node = match provider_attest {
+        Some(trusted) => node.with_provider_attestation(trusted),
+        None => node,
+    };
     let node = Arc::new(node);
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
@@ -1880,13 +1886,14 @@ pub fn serve_http(
     self_provider: Option<String>,
     cards: Option<Arc<crate::cards::CardStore>>,
     creds: Option<Arc<crate::swarms::CredentialStore>>,
+    provider_attest: Option<Vec<[u8; 32]>>,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds)
+        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })

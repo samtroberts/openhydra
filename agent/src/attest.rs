@@ -22,10 +22,42 @@
 //! * Device facts are read through direct system APIs (`sysctlbyname`, `csr_get_active_config`,
 //!   the IORegistry), never by spawning a helper process a hijacked `PATH` could substitute.
 
+use openhydra_protocol::attest::{verify_attestation, AttestPolicy, Attestation, AttestationClaim, DeviceTrust};
 use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "macos")]
 pub use macos::{device_facts, SecureEnclaveSigner};
+
+/// libp2p proxy method byte for an attestation challenge (consumer → provider):
+/// `0x16 ‖ nonce(32) ‖ u16-LE model_len ‖ model_id`. (0x15 is `REMOTE_SCOPE_SET`.)
+pub const ATTEST_CHALLENGE: u8 = 0x16;
+
+/// Every attestation response starts with this magic. A legacy provider answers an unknown method
+/// byte with a framed serve error, which starts with a u32-LE frame length — so it can't be mistaken
+/// for an attestation response (that length would be ~826 MB).
+pub const ATTEST_RESP_MAGIC: &[u8; 4] = b"OHA1";
+const RESP_OK: u8 = 0x00;
+const RESP_REFUSED: u8 = 0x01;
+/// Longest model id a challenge may carry.
+const MAX_MODEL_ID_LEN: usize = 256;
+
+/// A request/response round-trip to one provider (a `proxy_forward` in production).
+pub type Transport<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>, String> + 'a;
+
+/// Why a challenge didn't yield an attestation (consumer side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChallengeError {
+    /// The request never got a reply.
+    Transport(String),
+    /// The provider doesn't speak the attestation protocol (a legacy build).
+    Unsupported,
+    /// The provider understood but declined (no attestor, model not attestable, signing failed).
+    Refused(String),
+    /// The reply was malformed.
+    Malformed,
+    /// The attestation names a different model than the one challenged.
+    WrongModel,
+}
 
 /// What the device reports about itself. Unverified: see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +89,138 @@ pub fn binary_hash() -> std::io::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(hasher.finalize().into())
+}
+
+/// A signing function: turns a claim into a signed [`Attestation`].
+pub type ClaimSigner = Box<dyn Fn(AttestationClaim) -> Result<Attestation, AttestSignError> + Send + Sync>;
+
+/// Provider side: answers attestation challenges. Built once at startup (device facts and the binary
+/// hash don't change while the process runs), only when the operator opts in.
+pub struct Attestor {
+    facts: DeviceFacts,
+    binary_hash: [u8; 32],
+    signer: ClaimSigner,
+}
+
+impl Attestor {
+    pub fn new(facts: DeviceFacts, binary_hash: [u8; 32], signer: ClaimSigner) -> Self {
+        Self { facts, binary_hash, signer }
+    }
+
+    /// An attestor backed by a fresh Secure Enclave key and this Mac's device facts.
+    #[cfg(target_os = "macos")]
+    pub fn secure_enclave() -> Result<Self, String> {
+        let signer = SecureEnclaveSigner::new().map_err(|e| format!("Secure Enclave key: {e:?}"))?;
+        let bin = binary_hash().map_err(|e| format!("hash running binary: {e}"))?;
+        Ok(Self::new(device_facts(), bin, Box::new(move |claim| signer.sign(claim))))
+    }
+
+    /// Sign a claim that this device serves `model_id`, over the consumer's `nonce`.
+    pub fn attest(&self, model_id: &str, nonce: [u8; 32], now_unix_ms: u64) -> Result<Attestation, AttestSignError> {
+        (self.signer)(AttestationClaim {
+            chip: self.facts.chip.clone(),
+            os_build: self.facts.os_build.clone(),
+            sip_enabled: self.facts.sip_enabled,
+            secure_boot_enabled: self.facts.secure_boot_enabled,
+            binary_hash: self.binary_hash,
+            model_id: model_id.to_string(),
+            // Phase 0: the engine is external, so there is no in-process `active_model_hash`, and the
+            // external digest is not bound either — neither would lift a tier (see protocol docs).
+            model_digest: None,
+            active_model_hash: None,
+            session_pubkey: None,
+            nonce,
+            ts_unix_ms: now_unix_ms,
+        })
+    }
+}
+
+/// Consumer side: frame a challenge body (method byte included).
+pub fn encode_challenge(nonce: &[u8; 32], model_id: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + 32 + 2 + model_id.len());
+    b.push(ATTEST_CHALLENGE);
+    b.extend_from_slice(nonce);
+    b.extend_from_slice(&(model_id.len() as u16).to_le_bytes());
+    b.extend_from_slice(model_id.as_bytes());
+    b
+}
+
+fn decode_challenge(body: &[u8]) -> Option<([u8; 32], String)> {
+    let nonce: [u8; 32] = body.get(..32)?.try_into().ok()?;
+    let len = u16::from_le_bytes(body.get(32..34)?.try_into().ok()?) as usize;
+    if len > MAX_MODEL_ID_LEN || body.len() != 34 + len {
+        return None;
+    }
+    let model = String::from_utf8(body[34..].to_vec()).ok()?;
+    Some((nonce, model))
+}
+
+/// A `Refused` attestation reply — for refusals decided outside [`handle_attest_inbound`] (e.g. the
+/// provider's rate limit), so the consumer reads a refusal rather than a legacy "unsupported" reply.
+pub fn attest_refusal(reason: &str) -> Vec<u8> {
+    attest_response(RESP_REFUSED, reason.as_bytes())
+}
+
+fn attest_response(status: u8, body: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(5 + body.len());
+    b.extend_from_slice(ATTEST_RESP_MAGIC);
+    b.push(status);
+    b.extend_from_slice(body);
+    b
+}
+
+/// Provider side: answer an inbound challenge (`body` = the bytes after the method byte). Never
+/// panics — every failure is a `Refused` reply. `attestable(model)` must be true only for models
+/// this node announces publicly: a model that is unshared or private-scope gets the **same**
+/// refusal, so a challenge can't reveal that a private model exists.
+pub fn handle_attest_inbound(
+    body: &[u8],
+    attestor: Option<&Attestor>,
+    attestable: &dyn Fn(&str) -> bool,
+    now_unix_ms: u64,
+) -> Vec<u8> {
+    let Some(attestor) = attestor else {
+        return attest_response(RESP_REFUSED, b"attestation not offered by this provider");
+    };
+    let Some((nonce, model)) = decode_challenge(body) else {
+        return attest_response(RESP_REFUSED, b"malformed challenge");
+    };
+    if !attestable(&model) {
+        return attest_response(RESP_REFUSED, b"model not attestable here");
+    }
+    match attestor.attest(&model, nonce, now_unix_ms) {
+        Ok(att) => attest_response(RESP_OK, &att.to_bytes()),
+        Err(_) => attest_response(RESP_REFUSED, b"attestation signing failed"),
+    }
+}
+
+/// Consumer side: send one challenge for `model_id` over `transport` and decode the reply. This does
+/// **not** verify the signature or policy — pass the result to
+/// [`openhydra_protocol::attest::verify_attestation`]. It does check that the attestation is for the
+/// model challenged.
+pub fn request_attestation(
+    transport: &mut Transport<'_>,
+    nonce: [u8; 32],
+    model_id: &str,
+) -> Result<Attestation, ChallengeError> {
+    if model_id.len() > MAX_MODEL_ID_LEN {
+        return Err(ChallengeError::Malformed);
+    }
+    let reply = transport(&encode_challenge(&nonce, model_id)).map_err(ChallengeError::Transport)?;
+    let Some(rest) = reply.strip_prefix(ATTEST_RESP_MAGIC.as_slice()) else {
+        return Err(ChallengeError::Unsupported);
+    };
+    match rest.split_first() {
+        Some((&RESP_OK, body)) => {
+            let att = Attestation::from_bytes(body).map_err(|_| ChallengeError::Malformed)?;
+            if att.claim.model_id != model_id {
+                return Err(ChallengeError::WrongModel);
+            }
+            Ok(att)
+        }
+        Some((&RESP_REFUSED, reason)) => Err(ChallengeError::Refused(String::from_utf8_lossy(reason).into_owned())),
+        _ => Err(ChallengeError::Malformed),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -193,9 +357,309 @@ mod macos {
     }
 }
 
+/// How often a consumer re-challenges a provider after a verified or failed attempt.
+pub const ATTEST_REFRESH_MS: u64 = 5 * 60 * 1000;
+/// How long a consumer leaves a provider that doesn't speak the protocol (a legacy build).
+pub const ATTEST_UNSUPPORTED_BACKOFF_MS: u64 = 60 * 60 * 1000;
+/// Oldest acceptable claim (covers the round-trip plus modest clock drift; the fresh nonce is the
+/// real replay defence).
+const ATTEST_MAX_AGE_MS: u64 = 120_000;
+/// How far ahead of the consumer's clock a provider's claim may be dated.
+const ATTEST_MAX_SKEW_MS: u64 = 30_000;
+
+/// The outcome of the latest challenge to one provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestOutcome {
+    /// The attestation verified at this level.
+    Verified(DeviceTrust),
+    /// The provider doesn't speak the protocol.
+    Unsupported,
+    /// Anything else: refused, transport error, malformed, wrong model, or failed verification.
+    Failed(String),
+}
+
+/// Consumer-side record of the latest challenge to one provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestRecord {
+    pub last_attempt_ms: u64,
+    pub outcome: AttestOutcome,
+    /// The key of the last *verified* attestation (kept across failed attempts).
+    pub key: Option<[u8; 65]>,
+    /// How many times a verified key differed from the previous verified key. In Phase 0 unsigned
+    /// builds use a per-process key, so a restart rotates it; this is surfaced, not blocked.
+    pub key_rotations: u32,
+}
+
+impl AttestRecord {
+    /// Whether it's time to challenge this provider again.
+    pub fn due(&self, now_unix_ms: u64) -> bool {
+        let wait = match self.outcome {
+            AttestOutcome::Unsupported => ATTEST_UNSUPPORTED_BACKOFF_MS,
+            _ => ATTEST_REFRESH_MS,
+        };
+        now_unix_ms.saturating_sub(self.last_attempt_ms) >= wait
+    }
+
+    /// The device-trust level this record currently supports — only a verified outcome counts.
+    pub fn device_trust(&self) -> Option<DeviceTrust> {
+        match self.outcome {
+            AttestOutcome::Verified(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Consumer side: challenge one provider for `model_id`, verify the reply, and fold the result into
+/// the provider's previous record. Pure apart from `transport`.
+///
+/// A verified attestation's key is compared with the previous verified key: a change increments
+/// `key_rotations` (and is logged by the caller) rather than failing — see [`AttestRecord`].
+pub fn attest_provider(
+    transport: &mut Transport<'_>,
+    model_id: &str,
+    nonce: [u8; 32],
+    now_unix_ms: u64,
+    trusted_binaries: &[[u8; 32]],
+    prev: Option<&AttestRecord>,
+) -> AttestRecord {
+    let key = prev.and_then(|p| p.key);
+    let key_rotations = prev.map_or(0, |p| p.key_rotations);
+    let failed = |outcome| AttestRecord { last_attempt_ms: now_unix_ms, outcome, key, key_rotations };
+
+    let att = match request_attestation(transport, nonce, model_id) {
+        Ok(att) => att,
+        Err(ChallengeError::Unsupported) => return failed(AttestOutcome::Unsupported),
+        Err(e) => return failed(AttestOutcome::Failed(format!("{e:?}"))),
+    };
+    let policy = AttestPolicy {
+        expected_nonce: nonce,
+        now_unix_ms,
+        max_age_ms: ATTEST_MAX_AGE_MS,
+        max_skew_ms: ATTEST_MAX_SKEW_MS,
+        trusted_binaries,
+        pinned_key: None,
+    };
+    match verify_attestation(&att, &policy) {
+        Ok(trust) => AttestRecord {
+            last_attempt_ms: now_unix_ms,
+            outcome: AttestOutcome::Verified(trust),
+            key: Some(att.signing_key),
+            key_rotations: key_rotations + u32::from(key.is_some_and(|k| k != att.signing_key)),
+        },
+        Err(e) => failed(AttestOutcome::Failed(format!("{e:?}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::signature::Signer as _;
+
+    const NOW: u64 = 1_790_000_000_000;
+    const BIN: [u8; 32] = [0xB1; 32];
+
+    /// An attestor over a software P-256 key (stands in for the Secure Enclave, so the wire protocol
+    /// is tested on every platform).
+    fn software_attestor() -> Attestor {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7; 32]).unwrap();
+        let public: [u8; 65] = sk.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap();
+        let facts = DeviceFacts {
+            chip: "Apple M1".into(),
+            os_build: "25G76".into(),
+            sip_enabled: true,
+            secure_boot_enabled: true,
+        };
+        Attestor::new(
+            facts,
+            BIN,
+            Box::new(move |claim| {
+                let sig: p256::ecdsa::Signature = sk.sign(&Attestation::signing_bytes(&claim, &public));
+                Ok(Attestation { claim, signing_key: public, signature_der: sig.to_der().as_bytes().to_vec() })
+            }),
+        )
+    }
+
+    fn public_only(model: &str) -> bool {
+        model == "qwen2.5-0.5b"
+    }
+
+    /// A transport that delivers the challenge straight to a provider handler.
+    fn loopback<'a>(
+        attestor: Option<&'a Attestor>,
+    ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + 'a {
+        move |framed: &[u8]| {
+            assert_eq!(framed.first(), Some(&ATTEST_CHALLENGE));
+            Ok(handle_attest_inbound(&framed[1..], attestor, &public_only, NOW))
+        }
+    }
+
+    fn refusal(reply: &[u8]) -> String {
+        let rest = reply.strip_prefix(ATTEST_RESP_MAGIC.as_slice()).unwrap();
+        assert_eq!(rest[0], RESP_REFUSED);
+        String::from_utf8(rest[1..].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn challenge_round_trip_verifies() {
+        let attestor = software_attestor();
+        let nonce = [0x33; 32];
+        let att = request_attestation(&mut loopback(Some(&attestor)), nonce, "qwen2.5-0.5b").unwrap();
+        let trusted = [BIN];
+        let policy = AttestPolicy {
+            expected_nonce: nonce,
+            now_unix_ms: NOW,
+            max_age_ms: 60_000,
+            max_skew_ms: 5_000,
+            trusted_binaries: &trusted,
+            pinned_key: None,
+        };
+        assert_eq!(verify_attestation(&att, &policy), Ok(DeviceTrust::SelfSigned));
+        assert_eq!(att.claim.model_id, "qwen2.5-0.5b");
+        assert_eq!(att.claim.active_model_hash, None);
+    }
+
+    #[test]
+    fn unshared_and_private_models_get_the_same_refusal() {
+        let attestor = software_attestor();
+        // `public_only` stands in for `announce_globally`: both an unshared and a private model are
+        // simply "not attestable" — the refusal text is identical, so nothing leaks.
+        let a = handle_attest_inbound(&encode_challenge(&[1; 32], "private-model")[1..], Some(&attestor), &public_only, NOW);
+        let b = handle_attest_inbound(&encode_challenge(&[1; 32], "never-heard-of-it")[1..], Some(&attestor), &public_only, NOW);
+        assert_eq!(a, b);
+        assert_eq!(refusal(&a), "model not attestable here");
+        assert_eq!(
+            request_attestation(&mut loopback(Some(&attestor)), [1; 32], "private-model"),
+            Err(ChallengeError::Refused("model not attestable here".into()))
+        );
+    }
+
+    #[test]
+    fn a_provider_without_an_attestor_refuses() {
+        assert_eq!(
+            request_attestation(&mut loopback(None), [1; 32], "qwen2.5-0.5b"),
+            Err(ChallengeError::Refused("attestation not offered by this provider".into()))
+        );
+    }
+
+    #[test]
+    fn malformed_challenges_are_refused() {
+        let attestor = software_attestor();
+        let good = encode_challenge(&[1; 32], "qwen2.5-0.5b");
+        let mut long_len = good.clone();
+        long_len[33..35].copy_from_slice(&(MAX_MODEL_ID_LEN as u16 + 1).to_le_bytes());
+        let mut trailing = good.clone();
+        trailing.push(0);
+        for body in [&good[1..10], &good[1..34], &long_len[1..], &trailing[1..], &[][..]] {
+            assert_eq!(
+                refusal(&handle_attest_inbound(body, Some(&attestor), &public_only, NOW)),
+                "malformed challenge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_provider_reply_reads_as_unsupported() {
+        // What a pre-attestation provider sends for an unknown method byte: a framed serve error.
+        let legacy = crate::serve::frame_response(&[crate::serve::ServeChunk::Error("unsupported method".into()).encode()]);
+        let mut transport = |_: &[u8]| Ok(legacy.clone());
+        assert_eq!(request_attestation(&mut transport, [1; 32], "m"), Err(ChallengeError::Unsupported));
+    }
+
+    #[test]
+    fn an_attestation_for_another_model_is_rejected() {
+        let attestor = software_attestor();
+        // A provider that answers with an attestation for a different (public) model than asked.
+        let mut transport = |_: &[u8]| {
+            Ok(handle_attest_inbound(&encode_challenge(&[1; 32], "qwen2.5-0.5b")[1..], Some(&attestor), &|_| true, NOW))
+        };
+        assert_eq!(request_attestation(&mut transport, [1; 32], "gpt-oss-120b"), Err(ChallengeError::WrongModel));
+    }
+
+    #[test]
+    fn transport_errors_and_garbage_replies_never_panic() {
+        let mut down = |_: &[u8]| Err("timeout".to_string());
+        assert_eq!(request_attestation(&mut down, [1; 32], "m"), Err(ChallengeError::Transport("timeout".into())));
+
+        let attestor = software_attestor();
+        let good = handle_attest_inbound(&encode_challenge(&[1; 32], "qwen2.5-0.5b")[1..], Some(&attestor), &public_only, NOW);
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0xFF;
+            let mut t = |_: &[u8]| Ok(bad.clone());
+            let _ = request_attestation(&mut t, [1; 32], "qwen2.5-0.5b");
+        }
+        for n in 0..good.len() {
+            let cut = good[..n].to_vec();
+            let mut t = |_: &[u8]| Ok(cut.clone());
+            assert!(request_attestation(&mut t, [1; 32], "qwen2.5-0.5b").is_err());
+        }
+    }
+
+    /// An attestor over a software key seeded with `seed` (a different seed = a rotated key).
+    fn attestor_with_key(seed: u8) -> Attestor {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let public: [u8; 65] = sk.verifying_key().to_encoded_point(false).as_bytes().try_into().unwrap();
+        let facts = software_attestor().facts;
+        Attestor::new(
+            facts,
+            BIN,
+            Box::new(move |claim| {
+                let sig: p256::ecdsa::Signature = sk.sign(&Attestation::signing_bytes(&claim, &public));
+                Ok(Attestation { claim, signing_key: public, signature_der: sig.to_der().as_bytes().to_vec() })
+            }),
+        )
+    }
+
+    #[test]
+    fn attest_provider_records_verification_and_key_rotation() {
+        let first = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
+        assert_eq!(first.outcome, AttestOutcome::Verified(DeviceTrust::SelfSigned));
+        assert_eq!(first.device_trust(), Some(DeviceTrust::SelfSigned));
+        assert_eq!(first.key_rotations, 0);
+
+        // Same key again: no rotation.
+        let again = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[BIN], Some(&first));
+        assert_eq!(again.key_rotations, 0);
+
+        // Provider restarted with a fresh per-process key: still verified, rotation counted.
+        let rotated = attest_provider(&mut loopback(Some(&attestor_with_key(2))), "qwen2.5-0.5b", [3; 32], NOW, &[BIN], Some(&again));
+        assert_eq!(rotated.outcome, AttestOutcome::Verified(DeviceTrust::SelfSigned));
+        assert_eq!(rotated.key_rotations, 1);
+        assert_ne!(rotated.key, first.key);
+    }
+
+    #[test]
+    fn attest_provider_failures_keep_the_last_verified_key() {
+        let ok = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
+
+        // Untrusted binary → Failed, but the last verified key and rotation count are kept.
+        let untrusted = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[[0; 32]], Some(&ok));
+        assert!(matches!(untrusted.outcome, AttestOutcome::Failed(ref e) if e.contains("UntrustedBinary")));
+        assert_eq!(untrusted.device_trust(), None);
+        assert_eq!(untrusted.key, ok.key);
+
+        // Refusal and transport errors are Failed too.
+        let refused = attest_provider(&mut loopback(None), "qwen2.5-0.5b", [3; 32], NOW, &[BIN], Some(&ok));
+        assert!(matches!(refused.outcome, AttestOutcome::Failed(_)));
+        let mut down = |_: &[u8]| Err("timeout".to_string());
+        let dropped = attest_provider(&mut down, "qwen2.5-0.5b", [4; 32], NOW, &[BIN], Some(&ok));
+        assert!(matches!(dropped.outcome, AttestOutcome::Failed(_)));
+        assert_eq!(dropped.key, ok.key);
+    }
+
+    #[test]
+    fn retry_timing_backs_off_legacy_providers() {
+        let legacy = crate::serve::frame_response(&[crate::serve::ServeChunk::Error("unsupported method".into()).encode()]);
+        let mut t = |_: &[u8]| Ok(legacy.clone());
+        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[BIN], None);
+        assert_eq!(rec.outcome, AttestOutcome::Unsupported);
+        assert!(!rec.due(NOW + ATTEST_REFRESH_MS));
+        assert!(rec.due(NOW + ATTEST_UNSUPPORTED_BACKOFF_MS));
+
+        let ok = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
+        assert!(!ok.due(NOW + ATTEST_REFRESH_MS - 1));
+        assert!(ok.due(NOW + ATTEST_REFRESH_MS));
+    }
 
     #[test]
     fn binary_hash_is_stable() {

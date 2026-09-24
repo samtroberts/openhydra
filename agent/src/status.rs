@@ -274,6 +274,16 @@ pub struct RepEntry {
     /// this is the accrual the crypto rail would settle against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gated_net: Option<u64>,
+    /// Device attestation (ATTESTED_ENGINE_TIER_PLAN_v1 Phase 0) of this provider, per device (so the
+    /// same on every model row for a peer): `"self_signed"` when its latest challenge verified. A
+    /// device badge, **not** an authenticity tier — it proves a live key and a *claimed* device
+    /// profile, not which model ran. `None` when attestation is off, never tried, or failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_trust: Option<String>,
+    /// How many times this provider's verified attestation key has changed (a restart rotates the
+    /// per-process key on unsigned builds). Omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_key_rotations: Option<u32>,
 }
 
 /// One counterparty's give/take credit standing (keyed by **libp2p** peer id — the dial
