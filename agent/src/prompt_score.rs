@@ -403,21 +403,26 @@ pub fn select_reference<'a>(
 /// raises its price. With a qualifying, fresh pass streak (`status`) against a reference whose
 /// identity is known, the price follows that **verified** identity instead — its exact size and
 /// quantisation — whether that is higher (an honest BF16 model) or lower (a big name on a small model).
+/// `identity_of(tag)` resolves a [`reference_tag`] to the identity of the reference it names (a
+/// local reference file, or registry packs seen for that label).
 pub fn priced_tier(
     handle: &str,
     status: Option<&LogprobStatus>,
-    refs: &[std::sync::Arc<LoadedReference>],
+    identity_of: &dyn Fn([u8; 16]) -> Option<ModelIdentity>,
     now_ms: u64,
 ) -> CostTier {
     let by_handle = cost_tier_for_handle(handle);
     let Some(st) = status.filter(|st| st.evidence(now_ms).0) else {
         return by_handle;
     };
-    refs.iter()
-        .find(|r| reference_tag(&r.set) == st.reference)
-        .and_then(|r| r.set.identity.as_ref())
+    identity_of(st.reference)
         .and_then(|id| cost_tier_for_params_quant(&id.params, &id.quant))
         .unwrap_or(by_handle)
+}
+
+/// Resolve a reference tag against local reference files.
+pub fn identity_in(refs: &[std::sync::Arc<LoadedReference>], tag: [u8; 16]) -> Option<ModelIdentity> {
+    refs.iter().find(|r| reference_tag(&r.set) == tag).and_then(|r| r.set.identity.clone())
 }
 
 /// A 16-byte tag of a reference (by its label), kept in [`LogprobStatus`] so a verdict stays tied to
@@ -1146,17 +1151,17 @@ mod tests {
         let mut round = ChallengeRound::new();
         let mut st = LogprobStatus::default();
         st.switch_reference(reference_tag(&bf16.set), &mut round);
-        assert_eq!(priced_tier(handle, None, &refs, 0), floor);
+        assert_eq!(priced_tier(handle, None, &|t| identity_in(&refs, t), 0), floor);
         st.on_verdict(PASS, 0);
-        assert_eq!(priced_tier(handle, Some(&st), &refs, 1), floor, "one pass is not enough");
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 1), floor, "one pass is not enough");
         st.on_verdict(PASS, 30 * H);
         st.on_verdict(PASS, 48 * H);
-        assert_eq!(priced_tier(handle, Some(&st), &refs, 48 * H + 1), verified);
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 48 * H + 1), verified);
         // Stale, failed, or against a reference that's no longer loaded → back to the name's price.
-        assert_eq!(priced_tier(handle, Some(&st), &refs, 72 * H + 1), floor);
-        assert_eq!(priced_tier(handle, Some(&st), &[], 48 * H + 1), floor);
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 72 * H + 1), floor);
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&[], t), 48 * H + 1), floor);
         st.on_verdict(FAIL, 49 * H);
-        assert_eq!(priced_tier(handle, Some(&st), &refs, 49 * H + 1), floor);
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 49 * H + 1), floor);
         // A big name on a small verified model is priced as the small one.
         let small = with_identity(&base, "qwen3.5", "0.8b", "q4_k_m", &[]);
         let mut st = LogprobStatus::default();
@@ -1164,6 +1169,7 @@ mod tests {
         for at in [0, 24 * H, 48 * H] {
             st.on_verdict(PASS, at);
         }
-        assert_eq!(priced_tier("llama-70b", Some(&st), &[small], 48 * H + 1), cost_tier_for_params_quant("0.8b", "q4_k_m").unwrap());
+        let smalls = [small];
+        assert_eq!(priced_tier("llama-70b", Some(&st), &|t| identity_in(&smalls, t), 48 * H + 1), cost_tier_for_params_quant("0.8b", "q4_k_m").unwrap());
     }
 }

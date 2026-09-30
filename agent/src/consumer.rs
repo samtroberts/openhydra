@@ -48,7 +48,7 @@ use serde_json::Value;
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
 use crate::attest::{attest_provider, AttestRecord};
 use crate::prompt_score::{
-    decode_logprob_state, encode_logprob_state, priced_tier, quant_hint_from_name, reference_tag, request_model_info, run_round,
+    decode_logprob_state, encode_logprob_state, identity_in, priced_tier, quant_hint_from_name, reference_tag, request_model_info, run_round,
     select_reference, LoadedReference, LogprobStatus, RoundOutcome, ScoreChallengeError, StatusEffect,
     LOGPROB_BACKOFF_MS, LOGPROB_RETRY_MS,
 };
@@ -153,6 +153,10 @@ struct ProviderAttestation {
 /// method flag (→ A2 once the redundant-exec gates are met); a failing one pins the floor.
 struct ProviderLogprob {
     refs: Vec<Arc<LoadedReference>>,
+    /// A reference registry to ask for round packs when no local reference covers a model.
+    registry: Option<crate::registry_client::RegistryClient>,
+    /// Identities of registry references seen this run, by reference tag (for pricing).
+    registry_identities: Mutex<HashMap<[u8; 16], openhydra_protocol::logprob::ModelIdentity>>,
     /// Per `(peer, model)`: texts issued so far + the round in progress. Persisted (with the status)
     /// in the store's log-prob table and saved before each text is sent, so a restart never re-sends
     /// a text a provider has seen.
@@ -838,8 +842,12 @@ impl ConsumerNode {
     /// completion from a provider whose model handle one of `refs` covers, run a challenge round in
     /// the background (at most every few hours per `(peer, model)`). The verdict feeds the audit
     /// history, reputation, and the authenticity tier — a pass can lift a provider to A2.
-    pub fn with_logprob_checks(mut self, refs: Vec<LoadedReference>) -> Self {
-        if refs.is_empty() {
+    pub fn with_logprob_checks(
+        mut self,
+        refs: Vec<LoadedReference>,
+        registry: Option<crate::registry_client::RegistryClient>,
+    ) -> Self {
+        if refs.is_empty() && registry.is_none() {
             return self;
         }
         // Rehydrate: which texts each provider has already been sent, the round in progress, and the
@@ -864,6 +872,8 @@ impl ConsumerNode {
         }
         self.provider_logprob = Some(Arc::new(ProviderLogprob {
             refs: refs.into_iter().map(Arc::new).collect(),
+            registry,
+            registry_identities: Mutex::new(HashMap::new()),
             rounds: Mutex::new(rounds),
             status: Mutex::new(status),
             inflight: Mutex::new(std::collections::HashSet::new()),
@@ -1259,7 +1269,11 @@ impl ConsumerNode {
         let Some(lp) = &self.provider_logprob else { return cost_tier_for_handle(model_key) };
         let key = reputation_key(peer_id, model_key);
         let status = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
-        priced_tier(model_key, status.as_ref(), &lp.refs, now_ms)
+        let identity_of = |tag: [u8; 16]| {
+            identity_in(&lp.refs, tag)
+                .or_else(|| lp.registry_identities.lock().unwrap_or_else(|e| e.into_inner()).get(&tag).cloned())
+        };
+        priced_tier(model_key, status.as_ref(), &identity_of, now_ms)
     }
 
     /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or
@@ -1940,7 +1954,35 @@ impl ConsumerNode {
                         "model name and declared quantisation disagree; checking the declared one");
                 }
             }
-            let Some(reference) = select_reference(&lp.refs, &model, declared.as_ref()).cloned() else {
+            // A local reference file first; else a fresh round pack from the registry (never-issued
+            // texts, signature checked against the pinned key). A pack is one round's worth, so its
+            // round starts clean — the registry, not the per-provider record, prevents re-use.
+            let mut from_registry = false;
+            let reference = match select_reference(&lp.refs, &model, declared.as_ref()).cloned() {
+                Some(r) => Some(r),
+                None => match &lp.registry {
+                    Some(reg) => match reg.fetch_pack(declared.as_ref(), &model) {
+                        Ok(pack) => {
+                            from_registry = true;
+                            let set = pack.to_reference_set();
+                            if let Some(id) = &set.identity {
+                                lp.registry_identities
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(reference_tag(&set), id.clone());
+                            }
+                            Some(Arc::new(LoadedReference { handles: pack.handles, set }))
+                        }
+                        Err(crate::registry_client::RegistryError::NoReference) => None,
+                        Err(e) => {
+                            tracing::warn!(provider = %peer_id, model, error = ?e, "no round pack from the registry");
+                            None
+                        }
+                    },
+                    None => None,
+                },
+            };
+            let Some(reference) = reference else {
                 let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
                 status.entry(key.clone()).or_default().next_due_ms = now_unix_ms() + LOGPROB_BACKOFF_MS;
                 drop(status);
@@ -1950,6 +1992,9 @@ impl ConsumerNode {
                 return;
             };
             let mut round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
+            if from_registry {
+                round = ChallengeRound::new();
+            }
             if lp.status.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default()
                 .switch_reference(reference_tag(&reference.set), &mut round)
             {

@@ -25,6 +25,7 @@
 //! - [`award`] — tier-award policy: max-awardable-tier curve + escrow + graduated failure (Phase 4)
 //! - [`logprob`] — teacher-forced log-prob identity check: per-text MAD / honest band, aggregate cut-off (Track A2-Logprob)
 //! - [`trust`] — unified trust stack: authenticity/privacy/settlement tiers + buyer policy (UNIFIED_TRUST_STACK_v1)
+//! - [`refpool`] — reference registry core: signed round packs + the issue-once pool (Track A2-Logprob)
 //! - [`payout`] — payout-layer earn-gate: rail-specific (crypto rate-cap / fiat escrow) + 4% fee (PAYMENTS_PLAN_v1)
 //! - [`settlement`] — Solana settlement primitives: Ed25519 payout binding + voucher settlement claim (PAYMENTS_PLAN_v1 step 3)
 
@@ -36,6 +37,7 @@ pub mod logprob;
 pub mod model_id;
 pub mod payout;
 pub mod receipts;
+pub mod refpool;
 pub mod router;
 pub mod settlement;
 pub mod store;

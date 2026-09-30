@@ -42,6 +42,7 @@ pub mod prompt_score;
 pub mod provider;
 pub mod ratelimit;
 pub mod receipt;
+pub mod registry_client;
 pub mod serve;
 pub mod share_policy;
 pub mod slash;

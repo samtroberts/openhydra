@@ -42,6 +42,7 @@ use openhydra_protocol::store::Store;
 mod launch;
 mod connect_cli;
 mod refbuild;
+mod registry_cli;
 
 /// OpenHydra agent — a gateway in front of whatever inference engine you already run.
 #[derive(Parser)]
@@ -149,6 +150,10 @@ enum Role {
     /// score them on the reference, honest and substitute engine configurations, then assemble a
     /// reference with a calibrated cut-off for `serve --logprob-reference`. No swarm.
     Refbuild(refbuild::RefbuildArgs),
+    /// Run a reference registry (for network operators): holds reference texts built with
+    /// `refbuild` and hands gateways signed round packs, issuing every text once network-wide.
+    /// See `registry init`. No swarm.
+    Registry(registry_cli::RegistryArgs),
 }
 
 /// `swarm <action>` — the membership CLI (M3/M4). State lives under `--swarms-dir`.
@@ -687,6 +692,20 @@ struct ServeArgs {
     #[arg(long = "logprob-reference")]
     logprob_reference: Vec<std::path::PathBuf>,
 
+    /// A reference registry (`openhydra-agent registry serve`) to get round packs from when no local
+    /// reference covers a provider's model. HTTPS, or http:// to localhost only.
+    #[arg(long = "logprob-registry", requires_all = ["logprob_registry_key_file", "logprob_registry_pubkey"])]
+    logprob_registry: Option<String>,
+
+    /// File holding this gateway's registry API key (from `registry keys add`).
+    #[arg(long = "logprob-registry-key-file")]
+    logprob_registry_key_file: Option<std::path::PathBuf>,
+
+    /// The registry's public key (hex, from `registry pubkey`); packs signed by anything else are
+    /// rejected.
+    #[arg(long = "logprob-registry-pubkey")]
+    logprob_registry_pubkey: Option<String>,
+
     #[command(flatten)]
     aup: AupArgs,
 
@@ -769,6 +788,7 @@ fn run() -> Result<(), String> {
         Role::Connect(args) => return connect_cli::run(args),
         Role::Disconnect(args) => return connect_cli::run_disconnect(args),
         Role::Refbuild(args) => return refbuild::run(args),
+        Role::Registry(args) => return registry_cli::run(args),
         Role::Card(args) => {
             // `card export` / `card verify`. No swarm.
             let config = cli.node.into_config();
@@ -1492,6 +1512,17 @@ fn serve(
         );
         logprob_refs.push(r);
     }
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs)
+    let logprob_registry = match &args.logprob_registry {
+        Some(url) => {
+            let key_file = args.logprob_registry_key_file.as_ref().expect("clap requires it");
+            let key = std::fs::read_to_string(key_file).map_err(|e| format!("{}: {e}", key_file.display()))?;
+            let pubkey = args.logprob_registry_pubkey.as_deref().expect("clap requires it");
+            let client = openhydra_agent::registry_client::RegistryClient::new(url, &key, pubkey)?;
+            eprintln!("openhydra-agent: log-prob round packs from registry {url}");
+            Some(client)
+        }
+        None => None,
+    };
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }
