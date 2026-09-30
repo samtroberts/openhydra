@@ -42,6 +42,7 @@ use openhydra_protocol::store::Store;
 mod launch;
 mod connect_cli;
 mod refbuild;
+mod refbuild_texts;
 mod registry_cli;
 
 /// OpenHydra agent — a gateway in front of whatever inference engine you already run.

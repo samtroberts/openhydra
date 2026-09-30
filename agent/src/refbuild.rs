@@ -10,6 +10,8 @@
 //! Three steps, so the engine runs can happen on different machines (CUDA on one box, Metal on a
 //! Mac, CPU anywhere) and the result is reproducible from the saved files:
 //!
+//! 0. `refbuild generate` / `refbuild texts` — produce texts nobody can have pre-scored: sampled
+//!    from an LLM, and/or random crops of local files (see `refbuild_texts`).
 //! 1. `refbuild tokenize` — turn texts into token ids with the reference engine's own tokenizer
 //!    (vLLM or llama.cpp `/tokenize`, no special tokens), dropping texts outside the length window.
 //! 2. `refbuild score` — score every text teacher-forced on one engine configuration (vLLM, SGLang,
@@ -40,9 +42,15 @@ pub struct RefbuildArgs {
 
 #[derive(Subcommand)]
 enum RefbuildAction {
+    /// Generate fresh texts from an LLM with randomized topic / language / form prompts (JSON Lines).
+    Generate(crate::refbuild_texts::GenerateArgs),
+    /// Mix generated texts and random crops of local files into a texts file, with a provenance
+    /// manifest.
+    Texts(crate::refbuild_texts::TextsArgs),
     /// Tokenize texts (a JSON array of strings) with the reference engine's tokenizer.
     Tokenize(TokenizeArgs),
-    /// Score every tokenized text on one engine configuration and save the run.
+    /// Score every tokenized text on one engine configuration and save the run. Progress is saved
+    /// after every text (`<out>.partial`), so an interrupted run resumes where it stopped.
     Score(ScoreArgs),
     /// Combine saved runs into a reference file with a calibrated cut-off.
     Assemble(AssembleArgs),
@@ -148,6 +156,8 @@ struct AssembleArgs {
 
 pub fn run(args: RefbuildArgs) -> Result<(), String> {
     match args.action {
+        RefbuildAction::Generate(a) => crate::refbuild_texts::generate(a),
+        RefbuildAction::Texts(a) => crate::refbuild_texts::texts(a),
         RefbuildAction::Tokenize(a) => tokenize(a),
         RefbuildAction::Score(a) => score(a),
         RefbuildAction::Assemble(a) => assemble(a),
@@ -236,24 +246,65 @@ fn tokenize(a: TokenizeArgs) -> Result<(), String> {
     )
 }
 
+/// Scores already saved in `<out>.partial` for these ids (header line + one line per text), in order.
+fn resume_partial(path: &Path, digest: &str, n: usize) -> Vec<Vec<f32>> {
+    let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
+    let mut lines = raw.lines();
+    let header_ok = lines
+        .next()
+        .and_then(|l| serde_json::from_str::<Value>(l).ok())
+        .is_some_and(|h| h.get("ids_sha256").and_then(Value::as_str) == Some(digest));
+    if !header_ok {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let Some(v) = serde_json::from_str::<Value>(line).ok() else { break }; // a torn last line
+        if v.get("i").and_then(Value::as_u64) != Some(out.len() as u64) || out.len() >= n {
+            break;
+        }
+        match serde_json::from_value::<Vec<f32>>(v.get("logprobs").cloned().unwrap_or(Value::Null)) {
+            Ok(lps) => out.push(lps),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 fn score(a: ScoreArgs) -> Result<(), String> {
+    use std::io::Write;
     let ids = parse_ids(&read_json(&a.ids)?)?;
+    let digest = ids_digest(&ids);
     let http = ReqwestClient::new().map_err(|e| e.to_string())?;
     let root = a.engine.trim_end_matches('/').trim_end_matches("/v1");
+    let partial = a.out.with_extension("partial");
+    let mut logprobs = resume_partial(&partial, &digest, ids.len());
+    // Rewrite the partial file from what was recovered (drops a torn tail), then append.
+    let mut file = std::fs::File::create(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
+    writeln!(file, "{}", json!({"ids_sha256": digest, "label": a.label})).map_err(|e| e.to_string())?;
+    for (i, lps) in logprobs.iter().enumerate() {
+        writeln!(file, "{}", json!({"i": i, "logprobs": lps})).map_err(|e| e.to_string())?;
+    }
+    if !logprobs.is_empty() {
+        eprintln!("refbuild: {} resuming at {}/{}", a.label, logprobs.len(), ids.len());
+    }
     let started = std::time::Instant::now();
-    let mut logprobs = Vec::with_capacity(ids.len());
-    for (i, t) in ids.iter().enumerate() {
-        let lps = score_prompt(&http, root, a.api, &a.model, t).map_err(|e| format!("text {i}: {e}"))?;
+    for i in logprobs.len()..ids.len() {
+        let lps = score_prompt(&http, root, a.api, &a.model, &ids[i]).map_err(|e| format!("text {i}: {e}"))?;
+        writeln!(file, "{}", json!({"i": i, "logprobs": lps})).map_err(|e| e.to_string())?;
+        file.flush().map_err(|e| e.to_string())?;
         logprobs.push(lps);
-        if (i + 1) % 10 == 0 || i + 1 == ids.len() {
+        if (i + 1) % 25 == 0 || i + 1 == ids.len() {
             eprintln!("refbuild: {} scored {}/{} ({:.1} s)", a.label, i + 1, ids.len(), started.elapsed().as_secs_f64());
         }
     }
     write_json(
         &a.out,
         &json!({"label": a.label, "engine": a.engine, "api": format!("{:?}", a.api), "model": a.model,
-                "ids_sha256": ids_digest(&ids), "logprobs": logprobs}),
-    )
+                "ids_sha256": digest, "logprobs": logprobs}),
+    )?;
+    std::fs::remove_file(&partial).ok();
+    Ok(())
 }
 
 /// Load a saved run and check it scored exactly these ids.
@@ -373,6 +424,21 @@ mod tests {
         assert_eq!((body["add_special"].clone(), body["content"].clone()), (json!(false), json!("hi")));
         assert_eq!(tokens_from_reply(r#"{"count":2,"tokens":[9707,11]}"#).unwrap(), vec![9707, 11]);
         assert!(tokens_from_reply(r#"{"tokens":["a"]}"#).is_err());
+    }
+
+    #[test]
+    fn partial_scores_resume_only_for_the_same_ids_and_stop_at_a_torn_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("run.partial");
+        std::fs::write(
+            &p,
+            format!("{}\n{}\n{}\n{{\"i\":2,\"logpr", json!({"ids_sha256": "abc"}), json!({"i": 0, "logprobs": [-1.0]}), json!({"i": 1, "logprobs": [-2.0]})),
+        )
+        .unwrap();
+        assert_eq!(resume_partial(&p, "abc", 5), vec![vec![-1.0], vec![-2.0]]);
+        assert!(resume_partial(&p, "other", 5).is_empty(), "different ids → start over");
+        assert_eq!(resume_partial(&p, "abc", 1).len(), 1, "never more than the ids");
+        assert!(resume_partial(&dir.path().join("none"), "abc", 5).is_empty());
     }
 
     #[test]
