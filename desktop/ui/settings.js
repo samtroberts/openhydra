@@ -30,6 +30,7 @@ import { state, engines, deviceName } from "./state";
     const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
     updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
     $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
+    $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!p.settings.authenticity_checks);
     $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);
     $("#advsw").classList.toggle("on", $("#app").hasAttribute("data-adv"));
     $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4

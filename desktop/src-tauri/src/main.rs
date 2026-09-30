@@ -160,6 +160,11 @@ struct Settings {
     gateway_port: u16,
     /// Pass `--engine-autostart` to the provider (start LM Studio / Ollama if down).
     engine_autostart: bool,
+    /// Pass `--prompt-scoring auto`: let gateways run the teacher-forced log-prob identity check on
+    /// this provider's vLLM / SGLang / patched-mistral.rs engines (the route to the A2 authenticity
+    /// tier). Opt-in — the checks spend engine time (at most 2 at once). Engines that can't score
+    /// (Ollama, llama.cpp, LM Studio) just refuse.
+    authenticity_checks: bool,
     /// Optional SearXNG-compatible search endpoint (e.g. `http://127.0.0.1:8888`) powering
     /// the chat "web" toggle. Empty → the toggle is hidden. The operator brings their own
     /// search backend, same BYO philosophy as engines.
@@ -205,6 +210,7 @@ impl Default for Settings {
             // ComfyUI 8188). Still user-overridable in Settings.
             gateway_port: 16527,
             engine_autostart: true,
+            authenticity_checks: false,
             search_url: String::new(),
             verbose_logs: false,
             device_name: String::new(),
@@ -885,6 +891,10 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut sub = vec!["provide".to_string(), "--engine-kind".into(), "auto".into()];
     if settings.engine_autostart {
         sub.push("--engine-autostart".into());
+    }
+    if settings.authenticity_checks {
+        sub.push("--prompt-scoring".into());
+        sub.push("auto".into());
     }
     // Persist the receipt ledger + take-side credit across restarts. Own redb file: redb is
     // single-writer per process, so the gateway role uses a separate file (gateway-ledger.redb).
@@ -2510,6 +2520,7 @@ mod tests {
         let d = Settings::default();
         assert_eq!(d.gateway_port, 16527);
         assert!(d.engine_autostart);
+        assert!(!d.authenticity_checks, "authenticity checks are opt-in");
         let json = serde_json::to_string(&d).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.gateway_port, 16527);
@@ -2532,6 +2543,7 @@ mod tests {
         assert_eq!(s.shared_models, vec!["qwen3-coder:30b-a3b-q8_0"]);
         assert_eq!(s.device_name, "Asus");
         assert!(s.engine_autostart);
+        assert!(!s.authenticity_checks, "an older config without the field loads as off");
         // new fields default sanely (unknown at old-schema time)
         assert!(!s.sharing_enabled, "unknown sharing intent defaults off, not a spurious on");
         assert!(s.resume_on_launch, "resume defaults on");

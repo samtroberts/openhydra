@@ -172,7 +172,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "get_state") return {
       provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: (() => { if (!mk.provider) return 0; return ["tinyllama:latest", "llama3.2:1b"].filter(mockAnnouncedGlobally).length; })(), relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
-      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, schema_version: 2 },
+      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, authenticity_checks: false, search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, schema_version: 2 },
       agent_found: true, gateway_url: "http://127.0.0.1:16527/v1", resumed_on_launch: !!mk.resumedOnLaunch,
       // One-shot reset flag: set localStorage oh_mock_policy_reset=1 to simulate a self-heal toast once.
       share_policy_reset: (() => { if (localStorage.getItem("oh_mock_policy_reset") === "1") { localStorage.removeItem("oh_mock_policy_reset"); return true; } return false; })(),
