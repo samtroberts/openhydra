@@ -317,6 +317,22 @@ async fn packs(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     let name = reg.authorize(&headers)?;
+    // The rest of an undecided round: `{"continue": "<first pack id hex>"}`.
+    if let Some(first) = req.get("continue").and_then(Value::as_str) {
+        let first: [u8; 16] = hex::decode(first).ok().and_then(|b| b.try_into().ok()).ok_or(StatusCode::BAD_REQUEST)?;
+        return match reg.pool.continue_pack(first, reg.spare, &name, rand::random::<[u8; 16]>(), now_ms()) {
+            Ok(pack) => {
+                let (bytes, sig) = sign_pack(&pack, &reg.key);
+                Ok(Json(pack_reply(&bytes, &sig, &reg.key.verifying_key().to_bytes())))
+            }
+            Err(PoolError::Exhausted) => Ok(Json(json!({"status": "exhausted"}))),
+            Err(PoolError::Key(_)) => Err(StatusCode::FORBIDDEN),
+            Err(e) => {
+                tracing::error!(error = ?e, "continuing a pack failed");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
     let identity = req.get("identity").filter(|v| !v.is_null()).map(|v| {
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
         ModelIdentity::new(s("family"), s("params"), s("quant"))
@@ -390,6 +406,7 @@ mod tests {
                 .collect(),
             cutoff: 2.24,
             min_texts: 4,
+            early_stop: vec![],
         };
         pool.import(&set, &["Qwen3.5-9B-Q4_K_M".into()], [1; 16], 0).unwrap();
         let key = "ohreg_test".to_string();
@@ -433,6 +450,36 @@ mod tests {
             assert_eq!(client.fetch_pack(id.as_ref(), "x"), Err(openhydra_agent::registry_client::RegistryError::Exhausted));
             let other = ModelIdentity::new("qwen3.5", "9b", "q4_0");
             assert_eq!(client.fetch_pack(other.as_ref(), "y"), Err(openhydra_agent::registry_client::RegistryError::NoReference));
+        });
+    }
+
+    #[test]
+    fn an_undecided_first_stage_is_continued_once_over_http() {
+        let (reg, key) = registry(4, 60);
+        let mut set = ReferenceSet {
+            model_key: "g".into(),
+            identity: ModelIdentity::new("gemma4", "e4b", "q4_k_m"),
+            texts: (0..30)
+                .map(|i| {
+                    let ids: Vec<u32> = (0..20).map(|k| (10_000 + i * 50 + k) as u32).collect();
+                    ReferenceText { id: format!("g{i}"), logprobs: vec![-0.5; 19], token_ids: ids, band: 0.02 }
+                })
+                .collect(),
+            cutoff: 2.0,
+            min_texts: 12,
+            early_stop: vec![],
+        };
+        set.early_stop = vec![openhydra_protocol::logprob::Checkpoint { after: 4, pass_below: Some(1.5), fail_above: 2.5 }];
+        reg.pool.import(&set, &[], [7; 16], 0).unwrap();
+        let pubkey = hex::encode(reg.key.verifying_key().to_bytes());
+        with_server(reg, move |url| {
+            use openhydra_agent::registry_client::RegistryError;
+            let client = RegistryClient::new(&url, &key, &pubkey).unwrap();
+            let first = client.fetch_pack(set.identity.as_ref(), "x").unwrap();
+            assert_eq!(first.texts.len(), 5, "checkpoint 4 + 1 spare");
+            let rest = client.continue_pack(first.pack_id).unwrap();
+            assert_eq!(rest.texts.len(), 8, "to min_texts 12 + 1 spare");
+            assert!(matches!(client.continue_pack(first.pack_id), Err(RegistryError::Request(e)) if e.contains("403")));
         });
     }
 

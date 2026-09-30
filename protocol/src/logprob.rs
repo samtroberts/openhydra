@@ -121,6 +121,21 @@ pub struct ReferenceSet {
     pub cutoff: f64,
     /// Texts per round; see [`DEFAULT_MIN_TEXTS`].
     pub min_texts: usize,
+    /// Where a round may stop before `min_texts` (calibrated by [`build_reference`]); empty = never.
+    pub early_stop: Vec<Checkpoint>,
+}
+
+/// An early-stopping point in a round: after `after` texts, the running mean ratio decides the round
+/// if it is clearly on one side. Never looser or harsher than the full round: `fail_above` is at least
+/// the cut-off, `pass_below` at most the cut-off; in between, the round goes on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Checkpoint {
+    pub after: usize,
+    /// Pass early if the mean is below this (substitutes' low end at this point). `None` when the
+    /// reference was built without substitutes: no evidence that a low mean excludes them.
+    pub pass_below: Option<f64>,
+    /// Fail early if the mean is above this (honest runs' high end at this point).
+    pub fail_above: f64,
 }
 
 /// Why a reference set can't be used.
@@ -136,7 +151,8 @@ pub enum ReferenceError {
     BadLogprob(String),
     /// A band is non-finite or not positive.
     BadBand(String),
-    /// The cut-off is non-finite or not positive, or `min_texts` is 0.
+    /// The cut-off is non-finite or not positive, `min_texts` is 0, or an early-stop checkpoint is
+    /// out of order, past the round size, or looser/harsher than the cut-off.
     BadParams,
     /// Fewer texts than one round needs.
     TooFewTexts { have: usize, need: usize },
@@ -158,8 +174,27 @@ impl ReferenceText {
 impl ReferenceSet {
     /// Check the set is internally consistent. Call once on load; the scorer assumes a valid set.
     pub fn validate(&self) -> Result<(), ReferenceError> {
+        self.validate_texts()?;
+        if self.texts.len() < self.min_texts {
+            return Err(ReferenceError::TooFewTexts { have: self.texts.len(), need: self.min_texts });
+        }
+        Ok(())
+    }
+
+    /// As [`validate`](Self::validate) but without requiring a full round of texts — for a first-stage
+    /// round pack, which holds only enough texts to reach the first early-stop checkpoint.
+    pub fn validate_texts(&self) -> Result<(), ReferenceError> {
         if !(self.cutoff.is_finite() && self.cutoff > 0.0) || self.min_texts == 0 {
             return Err(ReferenceError::BadParams);
+        }
+        let mut prev = 0;
+        for cp in &self.early_stop {
+            let pass_ok = cp.pass_below.map_or(true, |p| p.is_finite() && p > 0.0 && p <= self.cutoff);
+            let fail_ok = cp.fail_above.is_finite() && cp.fail_above >= self.cutoff;
+            if cp.after <= prev || cp.after >= self.min_texts || !pass_ok || !fail_ok {
+                return Err(ReferenceError::BadParams);
+            }
+            prev = cp.after;
         }
         let mut ids = BTreeSet::new();
         let mut digests = BTreeSet::new();
@@ -179,9 +214,6 @@ impl ReferenceSet {
             if !(t.band.is_finite() && t.band > 0.0) {
                 return Err(ReferenceError::BadBand(t.id.clone()));
             }
-        }
-        if self.texts.len() < self.min_texts {
-            return Err(ReferenceError::TooFewTexts { have: self.texts.len(), need: self.min_texts });
         }
         Ok(())
     }
@@ -330,11 +362,24 @@ impl ChallengeRound {
         }
         let ratio = text_ratio(text, observed).map_err(RoundError::Score)?;
         self.ratios.push(ratio);
-        if self.ratios.len() < set.min_texts {
-            return Ok(None);
+        let n = self.ratios.len();
+        let verdict = if n >= set.min_texts {
+            aggregate_verdict(&self.ratios, set.cutoff)
+        } else if let Some(cp) = set.early_stop.iter().find(|c| c.after == n) {
+            let aggregate = self.ratios.iter().sum::<f64>() / n as f64;
+            if aggregate > cp.fail_above {
+                Some(LogprobVerdict::Fail { aggregate })
+            } else if cp.pass_below.is_some_and(|p| aggregate < p) {
+                Some(LogprobVerdict::Pass { aggregate })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if verdict.is_some() {
+            self.ratios.clear();
         }
-        let verdict = aggregate_verdict(&self.ratios, set.cutoff);
-        self.ratios.clear();
         Ok(verdict)
     }
 
@@ -456,6 +501,11 @@ pub struct BuildParams {
     pub coverage: f64,
     /// The substitutes' low end must be at least this multiple of the honest high end.
     pub min_gap: f64,
+    /// Early-stop checkpoints to calibrate (text counts below `min_texts`).
+    pub checkpoints: Vec<usize>,
+    /// Coverage for the early-stop thresholds — stricter than `coverage`, since a round may stop at
+    /// any checkpoint (e.g. 0.999).
+    pub early_coverage: f64,
 }
 
 impl BuildParams {
@@ -470,6 +520,8 @@ impl BuildParams {
             seed: 0x00DD_BA11,
             coverage: 0.995,
             min_gap: 1.15,
+            checkpoints: vec![8, 12, 16],
+            early_coverage: 0.999,
         }
     }
 }
@@ -489,6 +541,8 @@ pub struct Calibration {
     /// False when no substitutes were given: the cut-off then only protects honest providers and
     /// says nothing about what it would catch.
     pub calibrated: bool,
+    /// The calibrated early-stop checkpoints (as stored on the set).
+    pub early_stop: Vec<Checkpoint>,
 }
 
 /// Why a reference couldn't be built.
@@ -622,6 +676,30 @@ pub fn build_reference(
         Some(low) => ((honest_edge * low).sqrt(), true),
         None => (honest_edge * p.min_gap, false),
     };
+    // Early stopping: at each checkpoint m, the honest runs' high end and the substitutes' low end
+    // over random partial rounds of m texts, clamped so a checkpoint is never looser or harsher than
+    // the full round.
+    let mut early_stop = Vec::new();
+    for &m in p.checkpoints.iter().filter(|&&m| m > 0 && m < p.min_texts && m <= n) {
+        let mut hs = Vec::with_capacity(rounds * honest.len());
+        let mut ss: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); substitutes.len()];
+        for _ in 0..p.rounds.max(1) {
+            let idx = rng.sample(n, m);
+            for (mm, b) in honest_mads.iter().zip(&loo_bands) {
+                hs.push(mean_ratio(mm, b, &idx));
+            }
+            for (acc, mm) in ss.iter_mut().zip(&sub_mads) {
+                acc.push(mean_ratio(mm, &band, &idx));
+            }
+        }
+        let fail_above = quantile(&mut hs, p.early_coverage).max(cutoff);
+        let pass_below = ss
+            .iter_mut()
+            .map(|v| quantile(v, 1.0 - p.early_coverage))
+            .min_by(|a, b| a.partial_cmp(b).expect("finite"))
+            .map(|low| low.min(cutoff));
+        early_stop.push(Checkpoint { after: m, pass_below, fail_above });
+    }
     let set = ReferenceSet {
         model_key: p.label.clone(),
         identity: p.identity.clone(),
@@ -635,9 +713,10 @@ pub fn build_reference(
             .collect(),
         cutoff,
         min_texts: p.min_texts,
+        early_stop: early_stop.clone(),
     };
     set.validate().map_err(BuildError::Invalid)?;
-    Ok((set, Calibration { honest: honest_full, substitutes: sub_full, honest_high, substitute_low, cutoff, calibrated }))
+    Ok((set, Calibration { honest: honest_full, substitutes: sub_full, honest_high, substitute_low, cutoff, calibrated, early_stop }))
 }
 
 #[cfg(test)]
@@ -666,6 +745,7 @@ mod tests {
                 .collect(),
             cutoff: DEFAULT_CUTOFF,
             min_texts,
+            early_stop: vec![],
         }
     }
 
@@ -1059,5 +1139,80 @@ mod tests {
             build_reference(&ids, &reference, &[good, nan], &[], &p).unwrap_err(),
             BuildError::BadRun { run: "nan".into(), text: 5 }
         );
+    }
+
+    // ── early stopping ──
+
+    #[test]
+    fn checkpoints_must_be_ordered_inside_the_round_and_no_looser_than_the_cutoff() {
+        let cp = |after, pass_below, fail_above| Checkpoint { after, pass_below, fail_above };
+        let mut s = set(24, 24);
+        s.early_stop = vec![cp(8, Some(1.2), 1.5), cp(12, None, 1.4)];
+        assert_eq!(s.validate(), Ok(()));
+        for bad in [
+            vec![cp(12, None, 2.0), cp(8, None, 2.0)], // out of order
+            vec![cp(24, None, 2.0)],                   // not before the end of the round
+            vec![cp(8, Some(1.5), 2.0)],               // pass_below above the cut-off (looser)
+            vec![cp(8, None, 1.2)],                    // fail_above below the cut-off (harsher)
+            vec![cp(0, None, 2.0)],
+        ] {
+            s.early_stop = bad;
+            assert_eq!(s.validate(), Err(ReferenceError::BadParams));
+        }
+        // A first-stage pack may hold fewer texts than a full round.
+        let mut small = set(10, 24);
+        small.early_stop = vec![cp(8, Some(1.2), 1.5)];
+        assert!(small.validate().is_err());
+        assert_eq!(small.validate_texts(), Ok(()));
+    }
+
+    #[test]
+    fn a_round_stops_early_only_when_the_mean_is_clearly_on_one_side() {
+        let mut s = set(40, 24);
+        s.early_stop = vec![Checkpoint { after: 8, pass_below: Some(1.0), fail_above: 2.0 }];
+        let play = |mad: f64| {
+            let mut r = ChallengeRound::new();
+            for i in 0..24 {
+                let t = r.next_text(&s, |_| 0).unwrap().clone();
+                if let Some(v) = r.record(&s, &t.id, &shifted(&t, mad)).unwrap() {
+                    return (i + 1, v.passed());
+                }
+            }
+            unreachable!()
+        };
+        assert_eq!(play(0.01), (8, true), "0.5x: honest-looking, passes at the checkpoint");
+        assert_eq!(play(0.08), (8, false), "4x: fails at the checkpoint");
+        assert_eq!(play(0.024), (24, true), "1.2x: undecided at 8, full round passes (cut-off 1.35)");
+        assert_eq!(play(0.03), (24, false), "1.5x: undecided at 8, full round fails");
+    }
+
+    #[test]
+    fn the_builder_calibrates_checkpoints_that_stop_clear_cases_early() {
+        let (ids, reference) = build_fixture(80);
+        let honest = vec![offset_run(&reference, "cpu", 0.020, 0.3), offset_run(&reference, "other", 0.015, 0.3)];
+        let subs = vec![offset_run(&reference, "q4_0", 0.080, 0.3)];
+        let mut p = BuildParams::new("x", None);
+        p.rounds = 400;
+        let (set, cal) = build_reference(&ids, &reference, &honest, &subs, &p).unwrap();
+        assert_eq!(set.early_stop.iter().map(|c| c.after).collect::<Vec<_>>(), vec![8, 12, 16]);
+        assert_eq!(cal.early_stop, set.early_stop);
+        for cp in &set.early_stop {
+            assert!(cp.fail_above >= set.cutoff && cp.pass_below.unwrap() <= set.cutoff, "{cp:?}");
+        }
+        // Without substitutes there is no early pass.
+        let (plain, _) = build_reference(&ids, &reference, &honest, &[], &p).unwrap();
+        assert!(plain.early_stop.iter().all(|c| c.pass_below.is_none()));
+        // A clear substitute is decided at the first checkpoint.
+        let mut r = ChallengeRound::new();
+        let mut decided = None;
+        for i in 0..24 {
+            let t = r.next_text(&set, |_| 0).unwrap().clone();
+            let k: usize = t.id.rsplit('#').next().unwrap().parse().unwrap();
+            if let Some(v) = r.record(&set, &t.id, &subs[0].logprobs[k]).unwrap() {
+                decided = Some((i + 1, v.passed()));
+                break;
+            }
+        }
+        assert_eq!(decided, Some((8, false)));
     }
 }

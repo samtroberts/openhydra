@@ -1958,12 +1958,14 @@ impl ConsumerNode {
             // texts, signature checked against the pinned key). A pack is one round's worth, so its
             // round starts clean — the registry, not the per-provider record, prevents re-use.
             let mut from_registry = false;
+            let mut first_pack = None;
             let reference = match select_reference(&lp.refs, &model, declared.as_ref()).cloned() {
                 Some(r) => Some(r),
                 None => match &lp.registry {
                     Some(reg) => match reg.fetch_pack(declared.as_ref(), &model) {
                         Ok(pack) => {
                             from_registry = true;
+                            first_pack = Some(pack.pack_id);
                             let set = pack.to_reference_set();
                             if let Some(id) = &set.identity {
                                 lp.registry_identities
@@ -2012,15 +2014,36 @@ impl ConsumerNode {
             let current = |lp: &ProviderLogprob| {
                 lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied().unwrap_or_default()
             };
-            let outcome = run_round(
-                &mut round,
-                &reference.set,
-                &model,
-                &mut transport,
-                &mut |n| rand::random::<u64>() as usize % n,
-                &mut || std::thread::sleep(LOGPROB_BUSY_PAUSE),
-                &mut |r| node.persist_logprob_state(&key, current(&lp), r),
-            );
+            // A registry pack may be a first stage: if the round is still undecided when its texts run
+            // out, ask once for the rest of the round (same batch) and carry on.
+            let issued_before = round.issued_count();
+            let mut reference = reference;
+            let outcome = loop {
+                let outcome = run_round(
+                    &mut round,
+                    &reference.set,
+                    &model,
+                    &mut transport,
+                    &mut |n| rand::random::<u64>() as usize % n,
+                    &mut || std::thread::sleep(LOGPROB_BUSY_PAUSE),
+                    &mut |r| node.persist_logprob_state(&key, current(&lp), r),
+                );
+                let (RoundOutcome::Exhausted, Some(first), Some(reg)) = (&outcome, first_pack.take(), &lp.registry) else {
+                    break outcome;
+                };
+                if round.progress() == 0 {
+                    break outcome;
+                }
+                match reg.continue_pack(first) {
+                    Ok(more) => {
+                        let mut set = reference.set.clone();
+                        set.texts.extend(more.texts);
+                        reference = Arc::new(LoadedReference { handles: reference.handles.clone(), set });
+                    }
+                    Err(e) => break RoundOutcome::Incomplete(format!("no continuation pack: {e:?}")),
+                }
+            };
+            let texts_used = round.issued_count() - issued_before;
             let now = now_unix_ms();
             let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
             let st = status.entry(key.clone()).or_default();
@@ -2028,7 +2051,7 @@ impl ConsumerNode {
             // earlier round, or earlier in this one) — never a first contact or our own text shortage.
             let answered = st.verdict.is_some() || round.progress() > 0;
             let effect = match &outcome {
-                RoundOutcome::Verdict(v) => st.on_verdict(*v, now),
+                RoundOutcome::Verdict(v) => st.on_verdict_jittered(*v, now, rand::random::<f64>() * 2.0 - 1.0),
                 RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, LOGPROB_RETRY_MS, now),
                 RoundOutcome::Unsupported => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS, now),
                 RoundOutcome::Exhausted => st.on_no_verdict(false, LOGPROB_BACKOFF_MS, now),
@@ -2047,10 +2070,10 @@ impl ConsumerNode {
             }
             match outcome {
                 RoundOutcome::Verdict(v) if v.passed() => {
-                    tracing::info!(provider = %peer_id, model, aggregate = v.aggregate(), streak, "log-prob check passed")
+                    tracing::info!(provider = %peer_id, model, aggregate = v.aggregate(), streak, texts = texts_used, "log-prob check passed")
                 }
                 RoundOutcome::Verdict(v) => tracing::warn!(provider = %peer_id, model, aggregate = v.aggregate(),
-                    cutoff = reference.set.cutoff, "log-prob check FAILED (different model or quantization)"),
+                    texts = texts_used, "log-prob check FAILED (different model or quantization)"),
                 RoundOutcome::Incomplete(reason) => {
                     tracing::debug!(provider = %peer_id, model, reason, "log-prob round interrupted")
                 }

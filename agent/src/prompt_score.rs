@@ -324,6 +324,14 @@ pub struct LoadedReference {
 }
 
 #[derive(Deserialize)]
+struct CheckpointFile {
+    after: usize,
+    #[serde(default)]
+    pass_below: Option<f64>,
+    fail_above: f64,
+}
+
+#[derive(Deserialize)]
 struct ReferenceModel {
     family: String,
     params: String,
@@ -341,6 +349,8 @@ struct ReferenceFile {
     cutoff: Option<f64>,
     #[serde(default)]
     min_texts: Option<usize>,
+    #[serde(default)]
+    early_stop: Vec<CheckpointFile>,
     texts: Vec<ReferenceTextFile>,
 }
 
@@ -378,6 +388,11 @@ pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
             .collect(),
         cutoff: f.cutoff.unwrap_or(DEFAULT_CUTOFF),
         min_texts: f.min_texts.unwrap_or(DEFAULT_MIN_TEXTS),
+        early_stop: f
+            .early_stop
+            .into_iter()
+            .map(|c| openhydra_protocol::logprob::Checkpoint { after: c.after, pass_below: c.pass_below, fail_above: c.fail_above })
+            .collect(),
     };
     set.validate().map_err(|e| format!("reference set {}: {e:?}", set.model_key))?;
     if let Some(t) = set.texts.iter().find(|t| t.token_ids.len() > MAX_CHALLENGE_TOKENS) {
@@ -470,9 +485,8 @@ pub fn run_round(
 ) -> RoundOutcome {
     let mut busy = 0;
     loop {
-        if !round.can_complete_round(set) {
-            return RoundOutcome::Exhausted;
-        }
+        // Out of unsent texts: the round can't go on with this set (a first-stage registry pack is
+        // topped up by the caller; a local set needs fresh texts).
         let Some(text) = round.next_text(set, &mut *pick) else {
             return RoundOutcome::Exhausted;
         };
@@ -509,10 +523,32 @@ pub fn run_round(
 
 // ── Consumer side: per-provider check history ──
 
-/// How long a verdict counts toward the authenticity tier.
+/// How long a verdict counts toward the authenticity tier, at least — a longer pass streak is
+/// re-checked less often, and its pass stays valid for twice that interval ([`validity_ms`]).
 pub const LOGPROB_VALID_MS: u64 = 24 * 60 * 60 * 1000;
-/// Re-check a provider this long after a verdict (well inside [`LOGPROB_VALID_MS`]).
+/// Re-check a provider this long after a verdict while its pass streak is short.
 pub const LOGPROB_REFRESH_MS: u64 = 6 * 60 * 60 * 1000;
+/// Random spread of every re-check time (±25%), so a provider can't time a model swap between checks.
+pub const LOGPROB_REFRESH_JITTER: f64 = 0.25;
+
+/// How long after a verdict to re-check, by pass streak: 6 h until the streak qualifies
+/// (< [`LOGPROB_MIN_PASSES`]), 12 h for a qualified streak, 24 h once it is twice that long. A fail
+/// resets the streak, so a provider caught once goes back to the 6-hour cadence.
+pub fn refresh_interval_ms(pass_streak: u32) -> u64 {
+    if pass_streak >= 2 * LOGPROB_MIN_PASSES {
+        4 * LOGPROB_REFRESH_MS
+    } else if pass_streak >= LOGPROB_MIN_PASSES {
+        2 * LOGPROB_REFRESH_MS
+    } else {
+        LOGPROB_REFRESH_MS
+    }
+}
+
+/// How long a verdict counts: twice the re-check interval (so a trusted provider doesn't drop out of
+/// A2 between checks), and never less than [`LOGPROB_VALID_MS`].
+pub fn validity_ms(pass_streak: u32) -> u64 {
+    (2 * refresh_interval_ms(pass_streak)).max(LOGPROB_VALID_MS)
+}
 /// Retry an interrupted round after this long.
 pub const LOGPROB_RETRY_MS: u64 = 10 * 60 * 1000;
 /// Back off from a legacy provider, or from one whose unsent texts ran out.
@@ -572,10 +608,15 @@ impl LogprobStatus {
 
     /// Record a completed round.
     pub fn on_verdict(&mut self, verdict: LogprobVerdict, now_ms: u64) -> StatusEffect {
+        self.on_verdict_jittered(verdict, now_ms, 0.0)
+    }
+
+    /// As [`on_verdict`](Self::on_verdict), with the re-check time moved by `jitter` (a fraction in
+    /// `[-1, 1]`, scaled by [`LOGPROB_REFRESH_JITTER`]) — the caller supplies the randomness.
+    pub fn on_verdict_jittered(&mut self, verdict: LogprobVerdict, now_ms: u64, jitter: f64) -> StatusEffect {
         self.verdict = Some((verdict, now_ms));
         self.evasions = 0;
-        self.next_due_ms = now_ms + LOGPROB_REFRESH_MS;
-        if verdict.passed() {
+        let effect = if verdict.passed() {
             if self.pass_streak == 0 {
                 self.streak_since_ms = now_ms;
             }
@@ -585,7 +626,11 @@ impl LogprobStatus {
             self.pass_streak = 0;
             self.streak_since_ms = 0;
             StatusEffect::Fail
-        }
+        };
+        let base = refresh_interval_ms(self.pass_streak) as f64;
+        let factor = 1.0 + LOGPROB_REFRESH_JITTER * jitter.clamp(-1.0, 1.0);
+        self.next_due_ms = now_ms + (base * factor) as u64;
+        effect
     }
 
     /// Record a run that ended without a verdict. `counts_against` is true when the provider has
@@ -622,7 +667,7 @@ impl LogprobStatus {
     /// floor. An evasion penalty just breaks the streak.
     pub fn evidence(&self, now_ms: u64) -> (bool, Option<VerificationOutcome>) {
         match self.verdict {
-            Some((v, at)) if now_ms.saturating_sub(at) < LOGPROB_VALID_MS => {
+            Some((v, at)) if now_ms.saturating_sub(at) < validity_ms(self.pass_streak) => {
                 (v.passed() && self.streak_qualifies(), Some(v.outcome()))
             }
             _ => (false, None),
@@ -882,8 +927,9 @@ mod tests {
             RoundOutcome::Verdict(v) => assert!(!v.passed(), "{v:?}"),
             other => panic!("{other:?}"),
         }
-        // 8 of 10 texts used: a third round can't be drawn.
+        // 8 of 10 texts used: a third round plays the last two, then runs out.
         assert_eq!(run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &mut || {}, &mut |_| {}), RoundOutcome::Exhausted);
+        assert_eq!((round.progress(), round.issued_count()), (2, 10));
     }
 
     #[test]
@@ -978,7 +1024,7 @@ mod tests {
         assert_eq!(st.label().unwrap(), "pass 0.94x");
         // Stale after 24 h without a new round.
         assert!(!st.evidence(72 * H).0);
-        assert_eq!(st.next_due_ms, 48 * H + LOGPROB_REFRESH_MS);
+        assert_eq!(st.next_due_ms, 48 * H + 2 * LOGPROB_REFRESH_MS, "a qualified streak is re-checked every 12 h");
     }
 
     #[test]
@@ -1171,5 +1217,30 @@ mod tests {
         }
         let smalls = [small];
         assert_eq!(priced_tier("llama-70b", Some(&st), &|t| identity_in(&smalls, t), 48 * H + 1), cost_tier_for_params_quant("0.8b", "q4_k_m").unwrap());
+    }
+
+    #[test]
+    fn a_longer_clean_streak_is_checked_less_often_with_random_spread() {
+        assert_eq!(refresh_interval_ms(0), 6 * H);
+        assert_eq!(refresh_interval_ms(2), 6 * H);
+        assert_eq!(refresh_interval_ms(3), 12 * H);
+        assert_eq!(refresh_interval_ms(6), 24 * H);
+        assert_eq!(validity_ms(0), 24 * H);
+        assert_eq!(validity_ms(6), 48 * H, "a 24-hour cadence stays valid across one late check");
+        let mut st = LogprobStatus::default();
+        for i in 0..6 {
+            st.on_verdict(PASS, i * 24 * H);
+        }
+        assert_eq!(st.next_due_ms, 5 * 24 * H + 24 * H);
+        let mut early = st;
+        early.on_verdict_jittered(PASS, 200 * H, -1.0);
+        let mut late = st;
+        late.on_verdict_jittered(PASS, 200 * H, 1.0);
+        assert_eq!((early.next_due_ms - 200 * H, late.next_due_ms - 200 * H), (18 * H, 30 * H));
+        // Still A2 36 hours after a pass on the 24-hour cadence; a fail drops back to 6-hourly.
+        assert!(st.evidence(5 * 24 * H + 36 * H).0);
+        st.on_verdict(FAIL, 300 * H);
+        assert_eq!(st.next_due_ms, 306 * H);
+        assert!(!st.evidence(300 * H + 1).0);
     }
 }

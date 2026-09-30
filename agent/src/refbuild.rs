@@ -54,6 +54,20 @@ enum RefbuildAction {
     Score(ScoreArgs),
     /// Combine saved runs into a reference file with a calibrated cut-off.
     Assemble(AssembleArgs),
+    /// Combine the shards of one run (`score --shard i/n`, e.g. from several CPU machines) into a run.
+    Merge(MergeArgs),
+}
+
+#[derive(Args)]
+struct MergeArgs {
+    /// The token ids the shards were scored on.
+    #[arg(long)]
+    ids: PathBuf,
+    /// Shard files (every shard of the run, once each).
+    #[arg(long = "shard", required = true)]
+    shards: Vec<PathBuf>,
+    #[arg(long)]
+    out: PathBuf,
 }
 
 /// Which tokenize endpoint to call.
@@ -107,6 +121,22 @@ struct ScoreArgs {
     label: String,
     #[arg(long)]
     out: PathBuf,
+    /// Requests in flight at once — hides network latency; results are still saved in order.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
+    /// Score only shard `i` of `n` (texts whose index ≡ i mod n), e.g. `0/4` — to split a slow run
+    /// (CPU) across machines; combine the shards with `refbuild merge`.
+    #[arg(long, value_parser = parse_shard)]
+    shard: Option<(usize, usize)>,
+}
+
+fn parse_shard(s: &str) -> Result<(usize, usize), String> {
+    let (i, n) = s.split_once('/').ok_or("expected i/n, e.g. 0/4")?;
+    let (i, n): (usize, usize) = (i.parse().map_err(|_| "bad shard index")?, n.parse().map_err(|_| "bad shard count")?);
+    if n == 0 || i >= n {
+        return Err("need 0 <= i < n".into());
+    }
+    Ok((i, n))
 }
 
 #[derive(Args)]
@@ -161,6 +191,7 @@ pub fn run(args: RefbuildArgs) -> Result<(), String> {
         RefbuildAction::Tokenize(a) => tokenize(a),
         RefbuildAction::Score(a) => score(a),
         RefbuildAction::Assemble(a) => assemble(a),
+        RefbuildAction::Merge(a) => merge(a),
     }
 }
 
@@ -246,15 +277,12 @@ fn tokenize(a: TokenizeArgs) -> Result<(), String> {
     )
 }
 
-/// Scores already saved in `<out>.partial` for these ids (header line + one line per text), in order.
-fn resume_partial(path: &Path, digest: &str, n: usize) -> Vec<Vec<f32>> {
+/// Scores already saved in `<out>.partial` for this work (header line + one line per position of the
+/// work list, in order).
+fn resume_partial(path: &Path, header: &Value, n: usize) -> Vec<Vec<f32>> {
     let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
     let mut lines = raw.lines();
-    let header_ok = lines
-        .next()
-        .and_then(|l| serde_json::from_str::<Value>(l).ok())
-        .is_some_and(|h| h.get("ids_sha256").and_then(Value::as_str) == Some(digest));
-    if !header_ok {
+    if lines.next().and_then(|l| serde_json::from_str::<Value>(l).ok()).as_ref() != Some(header) {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -272,38 +300,136 @@ fn resume_partial(path: &Path, digest: &str, n: usize) -> Vec<Vec<f32>> {
 }
 
 fn score(a: ScoreArgs) -> Result<(), String> {
+    use std::collections::BTreeMap;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     let ids = parse_ids(&read_json(&a.ids)?)?;
     let digest = ids_digest(&ids);
-    let http = ReqwestClient::new().map_err(|e| e.to_string())?;
-    let root = a.engine.trim_end_matches('/').trim_end_matches("/v1");
+    let (shard_i, shard_n) = a.shard.unwrap_or((0, 1));
+    let work: Vec<usize> = (0..ids.len()).filter(|t| t % shard_n == shard_i).collect();
+    let root = a.engine.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let header = json!({"ids_sha256": digest, "label": a.label, "shard": [shard_i, shard_n]});
     let partial = a.out.with_extension("partial");
-    let mut logprobs = resume_partial(&partial, &digest, ids.len());
-    // Rewrite the partial file from what was recovered (drops a torn tail), then append.
+    let done = resume_partial(&partial, &header, work.len());
+    // Rewrite the partial file from what was recovered (drops a torn tail), then append in order.
     let mut file = std::fs::File::create(&partial).map_err(|e| format!("{}: {e}", partial.display()))?;
-    writeln!(file, "{}", json!({"ids_sha256": digest, "label": a.label})).map_err(|e| e.to_string())?;
-    for (i, lps) in logprobs.iter().enumerate() {
-        writeln!(file, "{}", json!({"i": i, "logprobs": lps})).map_err(|e| e.to_string())?;
+    writeln!(file, "{header}").map_err(|e| e.to_string())?;
+    for (k, lps) in done.iter().enumerate() {
+        writeln!(file, "{}", json!({"i": k, "logprobs": lps})).map_err(|e| e.to_string())?;
     }
-    if !logprobs.is_empty() {
-        eprintln!("refbuild: {} resuming at {}/{}", a.label, logprobs.len(), ids.len());
+    if !done.is_empty() {
+        eprintln!("refbuild: {} resuming at {}/{}", a.label, done.len(), work.len());
     }
     let started = std::time::Instant::now();
-    for i in logprobs.len()..ids.len() {
-        let lps = score_prompt(&http, root, a.api, &a.model, &ids[i]).map_err(|e| format!("text {i}: {e}"))?;
-        writeln!(file, "{}", json!({"i": i, "logprobs": lps})).map_err(|e| e.to_string())?;
-        file.flush().map_err(|e| e.to_string())?;
-        logprobs.push(lps);
-        if (i + 1) % 25 == 0 || i + 1 == ids.len() {
-            eprintln!("refbuild: {} scored {}/{} ({:.1} s)", a.label, i + 1, ids.len(), started.elapsed().as_secs_f64());
+    let resumed = done.len();
+    // Workers score positions in any order; the writer saves them strictly in order, so a crash
+    // leaves a clean, resumable prefix.
+    struct Sink {
+        file: std::fs::File,
+        results: Vec<Vec<f32>>,
+        pending: BTreeMap<usize, Vec<f32>>,
+        error: Option<String>,
+    }
+    let sink = Mutex::new(Sink { file, results: done, pending: BTreeMap::new(), error: None });
+    let next = AtomicUsize::new(resumed);
+    std::thread::scope(|s| {
+        for _ in 0..a.concurrency.max(1) {
+            s.spawn(|| {
+                let http = match ReqwestClient::new() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        sink.lock().unwrap_or_else(|p| p.into_inner()).error.get_or_insert(e.to_string());
+                        return;
+                    }
+                };
+                loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&t) = work.get(k) else { break };
+                    if sink.lock().unwrap_or_else(|p| p.into_inner()).error.is_some() {
+                        break;
+                    }
+                    let res = score_prompt(&http, &root, a.api, &a.model, &ids[t]);
+                    let mut g = sink.lock().unwrap_or_else(|p| p.into_inner());
+                    match res {
+                        Err(e) => {
+                            g.error.get_or_insert(format!("text {t}: {e}"));
+                            break;
+                        }
+                        Ok(lps) => {
+                            g.pending.insert(k, lps);
+                            while let Some(lps) = { let n = g.results.len(); g.pending.remove(&n) } {
+                                let n = g.results.len();
+                                let line = json!({"i": n, "logprobs": lps}).to_string();
+                                if let Err(e) = writeln!(g.file, "{line}").and_then(|_| g.file.flush()) {
+                                    g.error.get_or_insert(e.to_string());
+                                }
+                                g.results.push(lps);
+                                if (n + 1) % 25 == 0 || n + 1 == work.len() {
+                                    eprintln!("refbuild: {} scored {}/{} ({:.1} s)", a.label, n + 1, work.len(), started.elapsed().as_secs_f64());
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let sink = sink.into_inner().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = sink.error {
+        return Err(format!("{e} (progress saved in {}; rerun to resume)", partial.display()));
+    }
+    let common = json!({"label": a.label, "engine": a.engine, "api": format!("{:?}", a.api), "model": a.model, "ids_sha256": digest});
+    let mut out = common;
+    if shard_n == 1 {
+        out["logprobs"] = json!(sink.results);
+    } else {
+        out["shard"] = json!([shard_i, shard_n]);
+        out["indices"] = json!(work);
+        out["logprobs"] = json!(sink.results);
+    }
+    write_json(&a.out, &out)?;
+    std::fs::remove_file(&partial).ok();
+    Ok(())
+}
+
+/// Combine shard files into one run, checking they cover every text exactly once.
+fn merge(a: MergeArgs) -> Result<(), String> {
+    let ids = parse_ids(&read_json(&a.ids)?)?;
+    let digest = ids_digest(&ids);
+    let mut slots: Vec<Option<Vec<f32>>> = vec![None; ids.len()];
+    let mut label = None;
+    for path in &a.shards {
+        let v = read_json(path)?;
+        if v.get("ids_sha256").and_then(Value::as_str) != Some(digest.as_str()) {
+            return Err(format!("{}: scored different token ids", path.display()));
+        }
+        let this = v.get("label").and_then(Value::as_str).unwrap_or("?").to_string();
+        if label.get_or_insert_with(|| this.clone()) != &this {
+            return Err(format!("{}: label {this} differs from the other shards", path.display()));
+        }
+        let indices: Vec<usize> = serde_json::from_value(v.get("indices").cloned().unwrap_or(Value::Null))
+            .map_err(|_| format!("{}: not a shard (no indices)", path.display()))?;
+        let lps: Vec<Vec<f32>> =
+            serde_json::from_value(v.get("logprobs").cloned().unwrap_or(Value::Null)).map_err(|e| format!("{}: {e}", path.display()))?;
+        if indices.len() != lps.len() {
+            return Err(format!("{}: {} indices but {} score lists", path.display(), indices.len(), lps.len()));
+        }
+        for (i, l) in indices.into_iter().zip(lps) {
+            let slot = slots.get_mut(i).ok_or_else(|| format!("{}: text {i} out of range", path.display()))?;
+            if slot.replace(l).is_some() {
+                return Err(format!("text {i} is in more than one shard"));
+            }
         }
     }
-    write_json(
-        &a.out,
-        &json!({"label": a.label, "engine": a.engine, "api": format!("{:?}", a.api), "model": a.model,
-                "ids_sha256": digest, "logprobs": logprobs}),
-    )?;
-    std::fs::remove_file(&partial).ok();
+    let missing = slots.iter().filter(|s| s.is_none()).count();
+    if missing > 0 {
+        return Err(format!("{missing} texts are in no shard"));
+    }
+    let logprobs: Vec<Vec<f32>> = slots.into_iter().map(|s| s.expect("checked")).collect();
+    write_json(&a.out, &json!({"label": label, "ids_sha256": digest, "merged_from": a.shards.len(), "logprobs": logprobs}))?;
+    eprintln!("refbuild: merged {} shards → {}", a.shards.len(), a.out.display());
     Ok(())
 }
 
@@ -348,6 +474,7 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
         "handles": a.handles,
         "cutoff": set.cutoff,
         "min_texts": set.min_texts,
+        "early_stop": set.early_stop.iter().map(|c| json!({"after": c.after, "pass_below": c.pass_below, "fail_above": c.fail_above})).collect::<Vec<_>>(),
         "texts": set.texts.iter().map(|t| json!({"id": t.id, "token_ids": t.token_ids, "logprobs": t.logprobs, "band": t.band})).collect::<Vec<_>>(),
     });
     if let Some(id) = &identity {
@@ -383,6 +510,14 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
         ),
         None => eprintln!("  UNCALIBRATED (no substitutes): honest ≤ x{:.2} → cut-off x{:.2}", cal.honest_high, cal.cutoff),
     }
+    for c in &cal.early_stop {
+        eprintln!(
+            "  early stop after {:2} texts: pass below {}, fail above x{:.2}",
+            c.after,
+            c.pass_below.map_or("—".to_string(), |p| format!("x{p:.2}")),
+            c.fail_above
+        );
+    }
     if let Some(report) = &a.report {
         write_json(
             report,
@@ -392,6 +527,7 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
                 "honest": cal.honest, "substitutes": cal.substitutes,
                 "honest_high": cal.honest_high, "substitute_low": cal.substitute_low,
                 "cutoff": cal.cutoff, "calibrated": cal.calibrated, "coverage": a.coverage, "min_gap": a.min_gap,
+                "early_stop": cal.early_stop.iter().map(|c| json!({"after": c.after, "pass_below": c.pass_below, "fail_above": c.fail_above})).collect::<Vec<_>>(),
                 "band_min": bands[0], "band_median": bands[bands.len() / 2], "band_max": bands[bands.len() - 1],
             }),
         )?;
@@ -430,15 +566,17 @@ mod tests {
     fn partial_scores_resume_only_for_the_same_ids_and_stop_at_a_torn_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("run.partial");
+        let header = json!({"ids_sha256": "abc", "label": "x", "shard": [0, 1]});
         std::fs::write(
             &p,
-            format!("{}\n{}\n{}\n{{\"i\":2,\"logpr", json!({"ids_sha256": "abc"}), json!({"i": 0, "logprobs": [-1.0]}), json!({"i": 1, "logprobs": [-2.0]})),
+            format!("{}\n{}\n{}\n{{\"i\":2,\"logpr", header, json!({"i": 0, "logprobs": [-1.0]}), json!({"i": 1, "logprobs": [-2.0]})),
         )
         .unwrap();
-        assert_eq!(resume_partial(&p, "abc", 5), vec![vec![-1.0], vec![-2.0]]);
-        assert!(resume_partial(&p, "other", 5).is_empty(), "different ids → start over");
-        assert_eq!(resume_partial(&p, "abc", 1).len(), 1, "never more than the ids");
-        assert!(resume_partial(&dir.path().join("none"), "abc", 5).is_empty());
+        assert_eq!(resume_partial(&p, &header, 5), vec![vec![-1.0], vec![-2.0]]);
+        let other = json!({"ids_sha256": "abc", "label": "x", "shard": [1, 2]});
+        assert!(resume_partial(&p, &other, 5).is_empty(), "different ids or shard → start over");
+        assert_eq!(resume_partial(&p, &header, 1).len(), 1, "never more than the work");
+        assert!(resume_partial(&dir.path().join("none"), &header, 5).is_empty());
     }
 
     #[test]
@@ -448,5 +586,29 @@ mod tests {
         write_json(&p, &json!({"label": "x", "ids_sha256": "abc", "logprobs": [[-1.0]]})).unwrap();
         assert!(load_run(&p, "def").unwrap_err().contains("different token ids"));
         assert_eq!(load_run(&p, "abc").unwrap().logprobs, vec![vec![-1.0]]);
+    }
+
+    #[test]
+    fn shards_parse_and_merge_back_into_one_run() {
+        assert_eq!(parse_shard("1/4"), Ok((1, 4)));
+        assert!(parse_shard("4/4").is_err() && parse_shard("x").is_err() && parse_shard("0/0").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let ids: Vec<Vec<u32>> = (0..5).map(|t| vec![t, t + 1, t + 2]).collect();
+        let d = ids_digest(&ids);
+        let ids_path = dir.path().join("ids.json");
+        write_json(&ids_path, &json!({"ids": ids})).unwrap();
+        let shard = |i: usize, idx: Vec<usize>| {
+            let p = dir.path().join(format!("s{i}.json"));
+            let lps: Vec<Vec<f32>> = idx.iter().map(|&t| vec![-(t as f32), -1.0]).collect();
+            write_json(&p, &json!({"label": "cpu", "ids_sha256": d, "shard": [i, 2], "indices": idx, "logprobs": lps})).unwrap();
+            p
+        };
+        let (a, b) = (shard(0, vec![0, 2, 4]), shard(1, vec![1, 3]));
+        let out = dir.path().join("run.json");
+        merge(MergeArgs { ids: ids_path.clone(), shards: vec![b.clone(), a.clone()], out: out.clone() }).unwrap();
+        let run = load_run(&out, &d).unwrap();
+        assert_eq!(run.logprobs.iter().map(|l| l[0]).collect::<Vec<_>>(), vec![0.0, -1.0, -2.0, -3.0, -4.0]);
+        assert!(merge(MergeArgs { ids: ids_path.clone(), shards: vec![a.clone()], out: out.clone() }).unwrap_err().contains("in no shard"));
+        assert!(merge(MergeArgs { ids: ids_path, shards: vec![a.clone(), a], out }).unwrap_err().contains("more than one shard"));
     }
 }

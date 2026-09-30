@@ -89,6 +89,18 @@ impl RegistryClient {
             .map_err(|e| RegistryError::Request(e.to_string()))?;
         parse_pack_reply(&reply, &self.pinned)
     }
+
+    /// Ask for the rest of a round whose first-stage pack (`first_pack_id`) didn't decide it.
+    pub fn continue_pack(&self, first_pack_id: [u8; 16]) -> Result<RefPack, RegistryError> {
+        let body = json!({"continue": hex::encode(first_pack_id)});
+        let auth = format!("Bearer {}", self.api_key);
+        let reply = self
+            .http
+            .post_json_with_headers(&format!("{}/v1/packs", self.base), &body.to_string(), &[("authorization", auth.as_str())])
+            .map_err(|e| RegistryError::Request(e.to_string()))?;
+        let pack = parse_pack_reply(&reply, &self.pinned)?;
+        Ok(pack)
+    }
 }
 
 /// Decode a `/v1/packs` reply and verify the pack against `pinned`.
@@ -143,6 +155,7 @@ mod tests {
                 .collect(),
             cutoff: 2.24,
             min_texts: 4,
+            early_stop: vec![],
         };
         pool.import(&set, &[], [1; 16], 0).unwrap();
         pool.issue_pack(set.identity.as_ref(), None, 0, "gw", [2; 16], 0).unwrap()

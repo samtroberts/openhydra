@@ -25,11 +25,14 @@ use std::path::Path;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use redb::{Database, ReadableTable, TableDefinition};
 
-use crate::logprob::{ModelIdentity, ReferenceSet, ReferenceText};
+use crate::logprob::{Checkpoint, ModelIdentity, ReferenceSet, ReferenceText};
 
 /// Signature domain for round packs.
 const PACK_DOMAIN: &[u8] = b"openhydra-refpack-v1\0";
 const PACK_FORMAT_V1: u8 = 0x01;
+/// v2 adds early-stop checkpoints.
+const PACK_FORMAT_V2: u8 = 0x02;
+const MAX_CHECKPOINTS: usize = 64;
 /// Bounds enforced when decoding (a pack is attacker-reachable input if the signature check is ever
 /// skipped or the key leaks; decode never allocates without a bound).
 const MAX_PACK_TEXTS: usize = 512;
@@ -71,6 +74,20 @@ impl W {
         self.u32(t.logprobs.len() as u32);
         for lp in &t.logprobs {
             self.u32(lp.to_bits());
+        }
+    }
+    fn checkpoints(&mut self, cps: &[Checkpoint]) {
+        self.u32(cps.len() as u32);
+        for c in cps {
+            self.u32(c.after as u32);
+            match c.pass_below {
+                Some(p) => {
+                    self.u8(1);
+                    self.f64(p);
+                }
+                None => self.u8(0),
+            }
+            self.f64(c.fail_above);
         }
     }
     fn identity(&mut self, id: &Option<ModelIdentity>) {
@@ -129,6 +146,20 @@ impl<'a> R<'a> {
         let logprobs = (0..m).map(|_| self.u32().map(f32::from_bits)).collect::<Option<Vec<_>>>()?;
         Some(ReferenceText { id, token_ids, logprobs, band })
     }
+    fn checkpoints(&mut self) -> Option<Vec<Checkpoint>> {
+        let n = self.len(MAX_CHECKPOINTS)?;
+        (0..n)
+            .map(|_| {
+                let after = self.u32()? as usize;
+                let pass_below = match self.u8()? {
+                    0 => None,
+                    1 => Some(self.f64()?),
+                    _ => return None,
+                };
+                Some(Checkpoint { after, pass_below, fail_above: self.f64()? })
+            })
+            .collect()
+    }
     fn identity(&mut self) -> Option<Option<ModelIdentity>> {
         match self.u8()? {
             0 => Some(None),
@@ -159,6 +190,7 @@ pub struct RefPack {
     pub handles: Vec<String>,
     pub cutoff: f64,
     pub min_texts: u32,
+    pub early_stop: Vec<Checkpoint>,
     pub texts: Vec<ReferenceText>,
 }
 
@@ -177,7 +209,7 @@ impl RefPack {
     /// Canonical encoding — what is signed.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(PACK_FORMAT_V1);
+        w.u8(PACK_FORMAT_V2);
         w.bytes(&self.pack_id);
         w.bytes(&self.batch_id);
         w.u64(self.issued_ms);
@@ -190,6 +222,7 @@ impl RefPack {
         }
         w.f64(self.cutoff);
         w.u32(self.min_texts);
+        w.checkpoints(&self.early_stop);
         w.u32(self.texts.len() as u32);
         for t in &self.texts {
             w.text(t);
@@ -202,7 +235,8 @@ impl RefPack {
     pub fn decode(bytes: &[u8]) -> Result<Self, PackError> {
         let mut r = R(bytes);
         let pack = (|| {
-            if r.u8()? != PACK_FORMAT_V1 {
+            let version = r.u8()?;
+            if version != PACK_FORMAT_V1 && version != PACK_FORMAT_V2 {
                 return None;
             }
             let pack_id = r.arr16()?;
@@ -215,15 +249,17 @@ impl RefPack {
             let handles = (0..nh).map(|_| r.str()).collect::<Option<Vec<_>>>()?;
             let cutoff = r.f64()?;
             let min_texts = r.u32()?;
+            let early_stop = if version >= PACK_FORMAT_V2 { r.checkpoints()? } else { Vec::new() };
             let nt = r.len(MAX_PACK_TEXTS)?;
             let texts = (0..nt).map(|_| r.text()).collect::<Option<Vec<_>>>()?;
-            Some(RefPack { pack_id, batch_id, issued_ms, issued_to, label, identity, handles, cutoff, min_texts, texts })
+            Some(RefPack { pack_id, batch_id, issued_ms, issued_to, label, identity, handles, cutoff, min_texts, early_stop, texts })
         })()
         .ok_or(PackError::Malformed)?;
         if !r.0.is_empty() {
             return Err(PackError::Malformed);
         }
-        pack.to_reference_set().validate().map_err(|_| PackError::Malformed)?;
+        // A pack may hold fewer texts than a full round (a first stage, topped up on request).
+        pack.to_reference_set().validate_texts().map_err(|_| PackError::Malformed)?;
         Ok(pack)
     }
 
@@ -235,6 +271,7 @@ impl RefPack {
             texts: self.texts.clone(),
             cutoff: self.cutoff,
             min_texts: self.min_texts as usize,
+            early_stop: self.early_stop.clone(),
         }
     }
 }
@@ -282,6 +319,7 @@ pub struct BatchInfo {
     pub handles: Vec<String>,
     pub cutoff: f64,
     pub min_texts: u32,
+    pub early_stop: Vec<Checkpoint>,
     pub total: u32,
     pub imported_ms: u64,
 }
@@ -289,7 +327,7 @@ pub struct BatchInfo {
 impl BatchInfo {
     fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(1);
+        w.u8(2);
         w.bytes(&self.batch_id);
         w.str(&self.label);
         w.identity(&self.identity);
@@ -301,12 +339,14 @@ impl BatchInfo {
         w.u32(self.min_texts);
         w.u32(self.total);
         w.u64(self.imported_ms);
+        w.checkpoints(&self.early_stop);
         w.0
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
         let mut r = R(b);
-        if r.u8()? != 1 {
+        let version = r.u8()?;
+        if version != 1 && version != 2 {
             return None;
         }
         let batch_id = r.arr16()?;
@@ -314,16 +354,9 @@ impl BatchInfo {
         let identity = r.identity()?;
         let nh = r.len(MAX_HANDLES)?;
         let handles = (0..nh).map(|_| r.str()).collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            batch_id,
-            label,
-            identity,
-            handles,
-            cutoff: r.f64()?,
-            min_texts: r.u32()?,
-            total: r.u32()?,
-            imported_ms: r.u64()?,
-        })
+        let (cutoff, min_texts, total, imported_ms) = (r.f64()?, r.u32()?, r.u32()?, r.u64()?);
+        let early_stop = if version >= 2 { r.checkpoints()? } else { Vec::new() };
+        Some(Self { batch_id, label, identity, handles, cutoff, min_texts, early_stop, total, imported_ms })
     }
 
     fn matches_identity(&self, identity: Option<&ModelIdentity>) -> bool {
@@ -431,6 +464,7 @@ impl RefPool {
             handles: handles.to_vec(),
             cutoff: set.cutoff,
             min_texts: set.min_texts as u32,
+            early_stop: set.early_stop.clone(),
             total: set.texts.len() as u32,
             imported_ms: now_ms,
         };
@@ -482,9 +516,11 @@ impl RefPool {
         Ok(out)
     }
 
-    /// Issue a round pack: `min_texts + spare` never-issued texts (at least `min_texts`, fewer spares
-    /// if that's all that's left) from the oldest batch serving `identity` / `handle`. Atomic: the
-    /// texts are marked issued in the same transaction that reads them.
+    /// Issue a round pack from the oldest batch serving `identity` / `handle` that still has a full
+    /// round (`min_texts + spare`) left. With early-stop checkpoints the pack is a **first stage** —
+    /// enough texts for the first checkpoint plus `spare` — and the rest of the round is issued only
+    /// if the gateway asks ([`continue_pack`](Self::continue_pack)), so rounds that stop early don't
+    /// burn a full round of texts. Atomic: texts are marked issued in the same transaction.
     pub fn issue_pack(
         &self,
         identity: Option<&ModelIdentity>,
@@ -497,8 +533,7 @@ impl RefPool {
         let wtx = self.db.begin_write().map_err(db)?;
         let pack = {
             let batches = wtx.open_table(BATCHES).map_err(db)?;
-            let mut next = wtx.open_table(NEXT).map_err(db)?;
-            let texts = wtx.open_table(TEXTS).map_err(db)?;
+            let next = wtx.open_table(NEXT).map_err(db)?;
             // Batches made from the exact declared identity win; name matches are only the fallback.
             let (mut by_identity, mut by_handle) = (Vec::new(), Vec::new());
             for row in batches.iter().map_err(db)? {
@@ -520,26 +555,16 @@ impl RefPool {
                 let used = next.get(bid.as_str()).map_err(db)?.map(|g| g.value()).unwrap_or(info.total);
                 let left = info.total.saturating_sub(used);
                 if left >= info.min_texts {
-                    let count = left.min(info.min_texts + spare);
-                    chosen = Some((bid, info, used, count));
+                    let full = left.min(info.min_texts + spare);
+                    let first = info.early_stop.first().map_or(full, |c| (c.after as u32 + spare).min(full));
+                    chosen = Some((bid, info, first));
                     break;
                 }
             }
-            let (bid, info, start, count) = chosen.ok_or(PoolError::Exhausted)?;
-            let mut picked = Vec::with_capacity(count as usize);
-            for i in start..start + count {
-                let row = texts.get((bid.as_str(), i)).map_err(db)?.ok_or_else(|| PoolError::Db("missing text".into()))?;
-                picked.push(R(row.value()).text().ok_or_else(|| PoolError::Db("corrupt text".into()))?);
-            }
-            next.insert(bid.as_str(), start + count).map_err(db)?;
-            let mut rec = W(Vec::new());
-            rec.u8(1);
-            rec.str(issued_to);
-            rec.str(&bid);
-            rec.u32(start);
-            rec.u32(count);
-            rec.u64(now_ms);
-            wtx.open_table(PACKS).map_err(db)?.insert(hex::encode(pack_id).as_str(), rec.0.as_slice()).map_err(db)?;
+            drop(next);
+            let (bid, info, count) = chosen.ok_or(PoolError::Exhausted)?;
+            let picked = take_texts(&wtx, &bid, count)?;
+            record_pack(&wtx, pack_id, issued_to, &bid, count, false, now_ms)?;
             RefPack {
                 pack_id,
                 batch_id: info.batch_id,
@@ -550,6 +575,65 @@ impl RefPool {
                 handles: info.handles,
                 cutoff: info.cutoff,
                 min_texts: info.min_texts,
+                early_stop: info.early_stop,
+                texts: picked,
+            }
+        };
+        wtx.commit().map_err(db)?;
+        Ok(pack)
+    }
+
+    /// Issue the rest of a round whose first stage (`first_pack_id`) didn't decide it: up to
+    /// `min_texts + spare` texts in all, from the **same batch** (same cut-off and calibration).
+    /// Only the key the first stage went to may continue it, and only once.
+    pub fn continue_pack(
+        &self,
+        first_pack_id: [u8; 16],
+        spare: u32,
+        issued_to: &str,
+        pack_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<RefPack, PoolError> {
+        let wtx = self.db.begin_write().map_err(db)?;
+        let pack = {
+            let first_hex = hex::encode(first_pack_id);
+            let rec = {
+                let packs = wtx.open_table(PACKS).map_err(db)?;
+                let row = packs.get(first_hex.as_str()).map_err(db)?.ok_or_else(|| PoolError::Key("unknown pack".into()))?;
+                PackRecord::decode(row.value()).ok_or_else(|| PoolError::Db("corrupt pack record".into()))?
+            };
+            if rec.issued_to != issued_to || rec.continuation || rec.continued {
+                return Err(PoolError::Key("pack not continuable by this key".into()));
+            }
+            let info = {
+                let batches = wtx.open_table(BATCHES).map_err(db)?;
+                let row = batches.get(rec.batch.as_str()).map_err(db)?.ok_or_else(|| PoolError::Db("missing batch".into()))?;
+                BatchInfo::decode(row.value()).ok_or_else(|| PoolError::Db("corrupt batch row".into()))?
+            };
+            let want = (info.min_texts + spare).saturating_sub(rec.count);
+            let used = wtx.open_table(NEXT).map_err(db)?.get(rec.batch.as_str()).map_err(db)?.map(|g| g.value()).unwrap_or(info.total);
+            let left = info.total.saturating_sub(used);
+            // Enough to finish the round (the spares are best-effort).
+            if want == 0 || left < info.min_texts.saturating_sub(rec.count) {
+                return Err(PoolError::Exhausted);
+            }
+            let count = want.min(left);
+            let picked = take_texts(&wtx, &rec.batch, count)?;
+            let mut done = rec.clone();
+            done.continued = true;
+            wtx.open_table(PACKS).map_err(db)?.insert(first_hex.as_str(), done.encode().as_slice()).map_err(db)?;
+            record_pack(&wtx, pack_id, issued_to, &rec.batch, count, true, now_ms)?;
+            RefPack {
+                pack_id,
+                batch_id: info.batch_id,
+                issued_ms: now_ms,
+                issued_to: issued_to.to_string(),
+                label: info.label,
+                identity: info.identity,
+                handles: info.handles,
+                cutoff: info.cutoff,
+                min_texts: info.min_texts,
+                early_stop: info.early_stop,
                 texts: picked,
             }
         };
@@ -614,6 +698,74 @@ impl RefPool {
     }
 }
 
+/// Take the next `count` never-issued texts of batch `bid` and advance its cursor.
+fn take_texts(wtx: &redb::WriteTransaction, bid: &str, count: u32) -> Result<Vec<ReferenceText>, PoolError> {
+    let mut next = wtx.open_table(NEXT).map_err(db)?;
+    let texts = wtx.open_table(TEXTS).map_err(db)?;
+    let start = next.get(bid).map_err(db)?.map(|g| g.value()).ok_or_else(|| PoolError::Db("missing cursor".into()))?;
+    let mut picked = Vec::with_capacity(count as usize);
+    for i in start..start + count {
+        let row = texts.get((bid, i)).map_err(db)?.ok_or_else(|| PoolError::Db("missing text".into()))?;
+        picked.push(R(row.value()).text().ok_or_else(|| PoolError::Db("corrupt text".into()))?);
+    }
+    next.insert(bid, start + count).map_err(db)?;
+    Ok(picked)
+}
+
+/// Who a pack went to, from which batch, how many texts; whether it is a continuation, and whether it
+/// has been continued.
+#[derive(Debug, Clone, PartialEq)]
+struct PackRecord {
+    issued_to: String,
+    batch: String,
+    count: u32,
+    ms: u64,
+    continuation: bool,
+    continued: bool,
+}
+
+impl PackRecord {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(2);
+        w.str(&self.issued_to);
+        w.str(&self.batch);
+        w.u32(self.count);
+        w.u64(self.ms);
+        w.u8(self.continuation as u8);
+        w.u8(self.continued as u8);
+        w.0
+    }
+    fn decode(b: &[u8]) -> Option<Self> {
+        let mut r = R(b);
+        if r.u8()? != 2 {
+            return None;
+        }
+        Some(Self {
+            issued_to: r.str()?,
+            batch: r.str()?,
+            count: r.u32()?,
+            ms: r.u64()?,
+            continuation: r.u8()? == 1,
+            continued: r.u8()? == 1,
+        })
+    }
+}
+
+fn record_pack(
+    wtx: &redb::WriteTransaction,
+    pack_id: [u8; 16],
+    issued_to: &str,
+    batch: &str,
+    count: u32,
+    continuation: bool,
+    now_ms: u64,
+) -> Result<(), PoolError> {
+    let rec = PackRecord { issued_to: issued_to.into(), batch: batch.into(), count, ms: now_ms, continuation, continued: false };
+    wtx.open_table(PACKS).map_err(db)?.insert(hex::encode(pack_id).as_str(), rec.encode().as_slice()).map_err(db)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +788,7 @@ mod tests {
                 .collect(),
             cutoff: DEFAULT_CUTOFF,
             min_texts: 4,
+            early_stop: vec![],
         }
     }
 
@@ -679,9 +832,59 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert_eq!(RefPack::decode(&long), Err(PackError::Malformed));
-        let mut v2 = bytes;
-        v2[0] = 2;
-        assert_eq!(RefPack::decode(&v2), Err(PackError::Malformed));
+        let mut unknown = bytes;
+        unknown[0] = 3;
+        assert_eq!(RefPack::decode(&unknown), Err(PackError::Malformed));
+    }
+
+    #[test]
+    fn packs_carry_checkpoints_and_may_hold_less_than_a_round() {
+        let pool = RefPool::open_in_memory().unwrap();
+        let mut s = set("q", 12, 0, q4km());
+        s.min_texts = 10;
+        s.early_stop = vec![Checkpoint { after: 4, pass_below: Some(1.2), fail_above: 1.6 }, Checkpoint { after: 6, pass_below: None, fail_above: 1.5 }];
+        pool.import(&s, &[], [1; 16], 0).unwrap();
+        assert_eq!(pool.status().unwrap()[0].info.early_stop, s.early_stop);
+        let mut p = pool.issue_pack(q4km().as_ref(), None, 0, "g", [2; 16], 0).unwrap();
+        assert_eq!(p.early_stop, s.early_stop);
+        // A first-stage pack: fewer texts than a full round still decodes.
+        p.texts.truncate(5);
+        assert_eq!(RefPack::decode(&p.encode()).unwrap(), p);
+        // A version-1 pack (no checkpoint list) still decodes, with no early stopping.
+        let mut v1 = p.clone();
+        v1.early_stop.clear();
+        let mut bytes = v1.encode();
+        let at = 1 + 16 + 16 + 8 + (4 + v1.issued_to.len()) + (4 + v1.label.len());
+        let id = v1.identity.as_ref().unwrap();
+        let at = at + 1 + (4 + id.family.len()) + (4 + id.params.len()) + (4 + id.quant.len()) + 4 + 8 + 4;
+        assert_eq!(&bytes[at..at + 4], &[0, 0, 0, 0], "the empty checkpoint list");
+        bytes.drain(at..at + 4);
+        bytes[0] = 1;
+        assert_eq!(RefPack::decode(&bytes).unwrap(), v1);
+    }
+
+    #[test]
+    fn with_checkpoints_a_round_is_issued_in_two_stages() {
+        let pool = RefPool::open_in_memory().unwrap();
+        let mut s = set("q", 30, 0, q4km());
+        s.min_texts = 12;
+        s.early_stop = vec![Checkpoint { after: 4, pass_below: Some(1.2), fail_above: 1.6 }];
+        pool.import(&s, &[], [1; 16], 0).unwrap();
+        let first = pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [10; 16], 0).unwrap();
+        assert_eq!(first.texts.len(), 6, "first checkpoint + spare");
+        assert!(matches!(pool.continue_pack([10; 16], 2, "gw2", [11; 16], 0), Err(PoolError::Key(_))), "another key can't");
+        let rest = pool.continue_pack([10; 16], 2, "gw1", [11; 16], 0).unwrap();
+        assert_eq!(rest.texts.len(), 8, "the rest of min_texts + spare");
+        assert_eq!((rest.batch_id, rest.cutoff), (first.batch_id, first.cutoff));
+        assert!(rest.texts.iter().all(|t| first.texts.iter().all(|u| u.digest() != t.digest())));
+        assert!(matches!(pool.continue_pack([10; 16], 2, "gw1", [12; 16], 0), Err(PoolError::Key(_))), "only once");
+        assert!(matches!(pool.continue_pack([11; 16], 2, "gw1", [13; 16], 0), Err(PoolError::Key(_))), "not a continuation");
+        assert!(matches!(pool.continue_pack([99; 16], 2, "gw1", [14; 16], 0), Err(PoolError::Key(_))), "unknown pack");
+        // 30 − 14 = 16 left: another full round can start (6), but its continuation then needs 6 of
+        // the remaining 10 — fine; a third first stage finds only 4 < 12 left.
+        let second = pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [20; 16], 0).unwrap();
+        assert_eq!(second.texts.len(), 6);
+        assert_eq!(pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [21; 16], 0).unwrap_err(), PoolError::Exhausted);
     }
 
     #[test]
