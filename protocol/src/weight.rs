@@ -67,9 +67,21 @@ pub fn bytes_per_param(normalized_quant: &str) -> f64 {
         "fp16" | "bf16" => 2.0,
         "fp8" | "int8" => 1.0,
         "int4" => 0.5,
+        // GGUF k-/legacy quants that `normalize_quant` keeps as-is (it folds only 4- and 8-bit):
+        // their average bits per weight, so a Q6_K model isn't priced like a 4-bit one.
+        q if q.starts_with("q6") => 6.5 / 8.0,
+        q if q.starts_with("q5") => 5.5 / 8.0,
+        q if q.starts_with("q3") => 3.5 / 8.0,
+        q if q.starts_with("q2") => 2.6 / 8.0,
         // Unknown → assume the cheapest realistic packing (int4). Conservative: never over-award.
         _ => 0.5,
     }
+}
+
+/// The [`CostTier`] for an explicit `(params, quant)` — e.g. a model identity verified against a
+/// log-prob reference. `None` when `params` is unparseable (the caller keeps its fallback).
+pub fn cost_tier_for_params_quant(params: &str, quant: &str) -> Option<CostTier> {
+    footprint_gb(params, quant).map(cost_tier_for_footprint)
 }
 
 /// Parse the **total** parameter count (in billions) from a canonical-id `params` component
@@ -329,6 +341,19 @@ pub fn credits_for_receipt(weight: f64, total_tokens: u64, completion_tokens: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gguf_k_quants_are_priced_by_their_bit_width() {
+        assert_eq!(bytes_per_param(&normalize_quant("Q6_K")), 6.5 / 8.0);
+        assert_eq!(bytes_per_param(&normalize_quant("Q5_K_M")), 5.5 / 8.0);
+        assert_eq!(bytes_per_param(&normalize_quant("Q3_K_M")), 3.5 / 8.0);
+        assert_eq!(bytes_per_param(&normalize_quant("Q4_K_M")), 0.5); // folded to int4
+        assert_eq!(bytes_per_param(&normalize_quant("Q8_0")), 1.0); // folded to int8
+        assert_eq!(bytes_per_param("iq4_xs"), 0.5); // unknown stays conservative
+        assert_eq!(cost_tier_for_params_quant("9b", "bf16"), Some(cost_tier_for_footprint(18.0)));
+        assert!(cost_tier_for_params_quant("9b", "q6_k") > cost_tier_for_params_quant("9b", "q4_k_m"));
+        assert_eq!(cost_tier_for_params_quant("unknown", "bf16"), None);
+    }
 
     fn id(params: &str, quant: &str) -> CanonicalModelId {
         CanonicalModelId {

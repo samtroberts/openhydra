@@ -25,15 +25,22 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use openhydra_protocol::logprob::{
-    ChallengeRound, LogprobVerdict, ReferenceSet, ReferenceText, RoundError, DEFAULT_CUTOFF, DEFAULT_MIN_TEXTS,
+    ChallengeRound, LogprobVerdict, ModelIdentity, ReferenceSet, ReferenceText, RoundError, DEFAULT_CUTOFF,
+    DEFAULT_MIN_TEXTS,
 };
-use serde::Deserialize;
+use openhydra_protocol::weight::{cost_tier_for_handle, cost_tier_for_params_quant, CostTier};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::adapter::EngineAdapter;
 use openhydra_protocol::verify::VerificationOutcome;
 
 /// libp2p proxy method byte for a prompt-scoring challenge. (0x16 is `ATTEST_CHALLENGE`.)
 pub const PROMPT_SCORE_CHALLENGE: u8 = 0x17;
+/// libp2p proxy method byte asking which exact model a handle is (`0x18 ‖ u16-LE len ‖ model_ref`);
+/// the reply's OK body is a JSON [`ModelInfo`]. Lets a verifier pick the reference for the precise
+/// quantisation before it sends any text.
+pub const MODEL_INFO_REQUEST: u8 = 0x18;
 
 /// Every reply starts with this magic (see the module docs for why a legacy reply can't).
 pub const SCORE_RESP_MAGIC: &[u8; 4] = b"OHS1";
@@ -135,6 +142,102 @@ impl InflightGate {
     }
 }
 
+/// What a provider declares about a model it serves: the identity a verifier matches references
+/// against. Its own word — the log-prob check is what tests it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelInfo {
+    pub family: String,
+    pub params: String,
+    /// The precise quantisation (`Q4_K_M`, `Q8_0`, `BF16`), or `""` when unknown.
+    pub quant: String,
+    /// Content digest of the weights when the engine reports one (Ollama's `sha256-…`), else `""`.
+    #[serde(default)]
+    pub weight_digest: String,
+}
+
+impl ModelInfo {
+    /// The declared identity, when complete.
+    pub fn identity(&self) -> Option<ModelIdentity> {
+        ModelIdentity::new(&self.family, &self.params, &self.quant)
+    }
+}
+
+/// Consumer side: frame a model-info request (method byte included).
+pub fn encode_info_request(model_ref: &str) -> Option<Vec<u8>> {
+    if model_ref.len() > MAX_MODEL_REF_LEN {
+        return None;
+    }
+    let mut b = Vec::with_capacity(3 + model_ref.len());
+    b.push(MODEL_INFO_REQUEST);
+    b.extend_from_slice(&(model_ref.len() as u16).to_le_bytes());
+    b.extend_from_slice(model_ref.as_bytes());
+    Some(b)
+}
+
+fn decode_info_request(body: &[u8]) -> Option<String> {
+    let len = u16::from_le_bytes(body.get(..2)?.try_into().ok()?) as usize;
+    if len > MAX_MODEL_REF_LEN || body.len() != 2 + len {
+        return None;
+    }
+    String::from_utf8(body[2..].to_vec()).ok()
+}
+
+/// Provider side: answer a model-info request. Same gates as scoring: only when the operator opted
+/// in (`enabled`) and only for publicly announced models (`scorable`); `info(model)` looks the model
+/// up in what the engine detected.
+pub fn handle_model_info_inbound(
+    body: &[u8],
+    enabled: bool,
+    scorable: &dyn Fn(&str) -> bool,
+    info: &dyn Fn(&str) -> Option<ModelInfo>,
+) -> Vec<u8> {
+    if !enabled {
+        return score_refusal("prompt scoring not offered by this provider");
+    }
+    let Some(model) = decode_info_request(body) else {
+        return score_refusal("malformed request");
+    };
+    if !scorable(&model) {
+        return score_refusal("model not scorable here");
+    }
+    match info(&model).and_then(|i| serde_json::to_vec(&i).ok()) {
+        Some(json) => response(RESP_OK, &json),
+        None => score_refusal("model not scorable here"),
+    }
+}
+
+/// Consumer side: ask a provider which exact model `model_ref` is.
+pub fn request_model_info(transport: &mut Transport<'_>, model_ref: &str) -> Result<ModelInfo, ScoreChallengeError> {
+    let framed = encode_info_request(model_ref).ok_or(ScoreChallengeError::Malformed)?;
+    let reply = transport(&framed).map_err(ScoreChallengeError::Transport)?;
+    let Some(rest) = reply.strip_prefix(SCORE_RESP_MAGIC.as_slice()) else {
+        return Err(ScoreChallengeError::Unsupported);
+    };
+    match rest.split_first() {
+        Some((&RESP_OK, body)) => serde_json::from_slice(body).map_err(|_| ScoreChallengeError::Malformed),
+        Some((&RESP_REFUSED, reason)) => {
+            Err(ScoreChallengeError::Refused(String::from_utf8_lossy(reason).into_owned()))
+        }
+        _ => Err(ScoreChallengeError::Malformed),
+    }
+}
+
+/// The quantisation a model *name* suggests (`Qwen3.5-9B-Q4_K_M` → `q4_k_m`, `…-FP8` → `fp8`), if
+/// any — to flag a name that disagrees with the declared identity.
+pub fn quant_hint_from_name(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let base = base.strip_suffix(".gguf").unwrap_or(base);
+    base.split(['-', '.', ':'])
+        .rev()
+        .map(|t| t.to_lowercase())
+        .find(|t| {
+            let digit_after = |p: &str| t.strip_prefix(p).is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+            (digit_after("q") || digit_after("iq"))
+                || matches!(t.as_str(), "bf16" | "f16" | "fp16" | "fp8" | "int4" | "int8" | "awq" | "gptq")
+        })
+        .and_then(|t| ModelIdentity::new("x", "1b", &t).map(|i| i.quant))
+}
+
 /// Provider side: answer a challenge (`body` = the bytes after the method byte). Never panics; every
 /// failure is a refusal. `engine` is `None` unless the operator opted in. `scorable(model)` must be
 /// true only for models this node announces publicly, so a challenge can't probe for a private
@@ -221,8 +324,18 @@ pub struct LoadedReference {
 }
 
 #[derive(Deserialize)]
+struct ReferenceModel {
+    family: String,
+    params: String,
+    quant: String,
+}
+
+#[derive(Deserialize)]
 struct ReferenceFile {
     model_key: String,
+    #[serde(default)]
+    model: Option<ReferenceModel>,
+    #[serde(default)]
     handles: Vec<String>,
     #[serde(default)]
     cutoff: Option<f64>,
@@ -240,14 +353,24 @@ struct ReferenceTextFile {
 }
 
 /// Parse and validate a reference-set file:
-/// `{"model_key", "handles": [...], "cutoff"?, "min_texts"?, "texts": [{"id", "token_ids", "logprobs", "band"}]}`.
+/// `{"model_key", "model"?: {"family", "params", "quant"}, "handles"?: [...], "cutoff"?, "min_texts"?,
+/// "texts": [{"id", "token_ids", "logprobs", "band"}]}`. It needs a `model` identity (matched against
+/// the identity a provider declares) or at least one handle (matched against the model's name).
 pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
     let f: ReferenceFile = serde_json::from_str(json).map_err(|e| format!("reference set: {e}"))?;
-    if f.handles.iter().all(|h| h.trim().is_empty()) {
-        return Err("reference set: no model handles".into());
+    let identity = match &f.model {
+        Some(m) => Some(
+            ModelIdentity::new(&m.family, &m.params, &m.quant)
+                .ok_or_else(|| format!("reference set {}: incomplete model identity", f.model_key))?,
+        ),
+        None => None,
+    };
+    if identity.is_none() && f.handles.iter().all(|h| h.trim().is_empty()) {
+        return Err("reference set: needs a model identity or at least one handle".into());
     }
     let set = ReferenceSet {
         model_key: f.model_key,
+        identity,
         texts: f
             .texts
             .into_iter()
@@ -261,6 +384,47 @@ pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
         return Err(format!("reference set {}: text {} exceeds {MAX_CHALLENGE_TOKENS} tokens", set.model_key, t.id));
     }
     Ok(LoadedReference { handles: f.handles, set })
+}
+
+/// The reference to check a provider's model against: the one made from the exact identity the
+/// provider declares, else one listing the model's name as a handle. `None` when neither exists.
+pub fn select_reference<'a>(
+    refs: &'a [std::sync::Arc<LoadedReference>],
+    handle: &str,
+    declared: Option<&ModelIdentity>,
+) -> Option<&'a std::sync::Arc<LoadedReference>> {
+    declared
+        .and_then(|id| refs.iter().find(|r| r.set.identity.as_ref() == Some(id)))
+        .or_else(|| refs.iter().find(|r| r.handles.iter().any(|h| h == handle)))
+}
+
+/// The cost tier a serve is priced at before the authenticity gate. By default the model name's
+/// conservative estimate (its size at 4-bit, [`cost_tier_for_handle`]): a provider's word never
+/// raises its price. With a qualifying, fresh pass streak (`status`) against a reference whose
+/// identity is known, the price follows that **verified** identity instead — its exact size and
+/// quantisation — whether that is higher (an honest BF16 model) or lower (a big name on a small model).
+pub fn priced_tier(
+    handle: &str,
+    status: Option<&LogprobStatus>,
+    refs: &[std::sync::Arc<LoadedReference>],
+    now_ms: u64,
+) -> CostTier {
+    let by_handle = cost_tier_for_handle(handle);
+    let Some(st) = status.filter(|st| st.evidence(now_ms).0) else {
+        return by_handle;
+    };
+    refs.iter()
+        .find(|r| reference_tag(&r.set) == st.reference)
+        .and_then(|r| r.set.identity.as_ref())
+        .and_then(|id| cost_tier_for_params_quant(&id.params, &id.quant))
+        .unwrap_or(by_handle)
+}
+
+/// A 16-byte tag of a reference (by its label), kept in [`LogprobStatus`] so a verdict stays tied to
+/// the reference it was earned against.
+pub fn reference_tag(set: &ReferenceSet) -> [u8; 16] {
+    let d = Sha256::digest(set.model_key.as_bytes());
+    d[..16].try_into().expect("16 of 32 bytes")
 }
 
 /// Read and validate a reference-set file.
@@ -372,6 +536,8 @@ pub struct LogprobStatus {
     pub evaded_at_ms: u64,
     /// Earliest time the next run may start.
     pub next_due_ms: u64,
+    /// [`reference_tag`] of the reference the verdict and streak were earned against (zero = none).
+    pub reference: [u8; 16],
 }
 
 /// What the gateway must record after a run, beyond updating the status.
@@ -387,6 +553,18 @@ pub enum StatusEffect {
 }
 
 impl LogprobStatus {
+    /// Point the status at the reference now in use. A different reference means a different claimed
+    /// model: the verdict, streak and evasion count belong to the old one, so they're cleared, and so
+    /// are the round's in-progress ratios (issued texts stay issued). Returns whether it changed.
+    pub fn switch_reference(&mut self, tag: [u8; 16], round: &mut ChallengeRound) -> bool {
+        if self.reference == tag {
+            return false;
+        }
+        *self = Self { next_due_ms: self.next_due_ms, reference: tag, ..Self::default() };
+        round.reset_progress();
+        true
+    }
+
     /// Record a completed round.
     pub fn on_verdict(&mut self, verdict: LogprobVerdict, now_ms: u64) -> StatusEffect {
         self.verdict = Some((verdict, now_ms));
@@ -459,10 +637,10 @@ impl LogprobStatus {
         })
     }
 
-    const LEN: usize = 50;
+    const LEN: usize = 66;
 
-    /// `0x02 ‖ kind(0 none, 1 pass, 2 fail) ‖ aggregate f64 ‖ at u64 ‖ pass_streak u32 ‖
-    /// streak_since u64 ‖ evasions u32 ‖ evaded_at u64 ‖ next_due u64` (LE).
+    /// `0x03 ‖ kind(0 none, 1 pass, 2 fail) ‖ aggregate f64 ‖ at u64 ‖ pass_streak u32 ‖
+    /// streak_since u64 ‖ evasions u32 ‖ evaded_at u64 ‖ next_due u64 ‖ reference [16]` (LE).
     fn to_bytes(self) -> [u8; Self::LEN] {
         let (kind, aggregate, at) = match self.verdict {
             None => (0u8, 0.0, 0),
@@ -470,7 +648,7 @@ impl LogprobStatus {
             Some((LogprobVerdict::Fail { aggregate }, at)) => (2, aggregate, at),
         };
         let mut b = Vec::with_capacity(Self::LEN);
-        b.push(0x02);
+        b.push(0x03);
         b.push(kind);
         b.extend_from_slice(&aggregate.to_le_bytes());
         b.extend_from_slice(&at.to_le_bytes());
@@ -479,11 +657,12 @@ impl LogprobStatus {
         b.extend_from_slice(&self.evasions.to_le_bytes());
         b.extend_from_slice(&self.evaded_at_ms.to_le_bytes());
         b.extend_from_slice(&self.next_due_ms.to_le_bytes());
+        b.extend_from_slice(&self.reference);
         b.try_into().expect("fixed layout")
     }
 
     fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() != Self::LEN || b[0] != 0x02 {
+        if b.len() != Self::LEN || b[0] != 0x03 {
             return None;
         }
         let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
@@ -503,6 +682,7 @@ impl LogprobStatus {
             evasions: u32_at(30),
             evaded_at_ms: u64_at(34),
             next_due_ms: u64_at(42),
+            reference: b[50..66].try_into().unwrap(),
         })
     }
 }
@@ -658,7 +838,7 @@ mod tests {
         assert!(parse_reference(&ref_json(3, 4)).unwrap_err().contains("TooFewTexts"));
         assert!(parse_reference("{").is_err());
         let no_handles = ref_json(4, 4).replace(r#"["public"]"#, "[]");
-        assert!(parse_reference(&no_handles).unwrap_err().contains("no model handles"));
+        assert!(parse_reference(&no_handles).unwrap_err().contains("identity or at least one handle"));
     }
 
     /// A transport to an in-process provider whose engine scores exactly the reference (honest, the
@@ -853,10 +1033,137 @@ mod tests {
         bad[1] = 7;
         assert!(decode_logprob_state(&bad).is_none());
         let mut old = good.clone();
-        old[0] = 0x01;
+        old[0] = 0x02;
         assert!(decode_logprob_state(&old).is_none(), "older format is not misread");
         let mut long = good;
         long.push(0);
         assert!(decode_logprob_state(&long).is_none());
+    }
+
+    // ── identity: model info, reference selection, pricing ──
+
+    fn info_transport<'a>(
+        enabled: bool,
+        info: &'a dyn Fn(&str) -> Option<ModelInfo>,
+    ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + 'a {
+        move |framed: &[u8]| {
+            assert_eq!(framed[0], MODEL_INFO_REQUEST);
+            Ok(handle_model_info_inbound(&framed[1..], enabled, &|m| m != "private", info))
+        }
+    }
+
+    #[test]
+    fn model_info_round_trips_and_is_gated_like_scoring() {
+        let q4 = ModelInfo { family: "qwen3.5".into(), params: "9b".into(), quant: "Q4_K_M".into(), weight_digest: "".into() };
+        let known = |m: &str| (m != "unknown").then(|| q4.clone());
+        let mut t = info_transport(true, &known);
+        let got = request_model_info(&mut t, "Qwen3.5-9B-Q4_K_M").unwrap();
+        assert_eq!(got, q4);
+        assert_eq!(got.identity().unwrap().key(), "qwen3.5/9b/q4_k_m");
+        // A private model and an undetected one get the same refusal.
+        let private = request_model_info(&mut t, "private");
+        assert!(matches!(&private, Err(ScoreChallengeError::Refused(_))));
+        assert_eq!(private, request_model_info(&mut t, "unknown"));
+        // Not opted in.
+        let mut off = info_transport(false, &known);
+        assert!(matches!(request_model_info(&mut off, "x"), Err(ScoreChallengeError::Refused(r)) if r.contains("not offered")));
+        // Legacy provider.
+        let mut legacy = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![0x13, 0, 0, 0]) };
+        assert_eq!(request_model_info(&mut legacy, "x"), Err(ScoreChallengeError::Unsupported));
+        // An empty quant means no usable identity.
+        assert_eq!(ModelInfo { quant: "".into(), ..q4.clone() }.identity(), None);
+    }
+
+    #[test]
+    fn names_hint_at_their_quantisation() {
+        assert_eq!(quant_hint_from_name("Qwen3.5-9B-Q4_K_M").as_deref(), Some("q4_k_m"));
+        assert_eq!(quant_hint_from_name("models/cheat/Qwen3.5-9B-Q4_K_M.gguf").as_deref(), Some("q4_k_m"));
+        assert_eq!(quant_hint_from_name("Qwen/Qwen3.5-9B-FP8").as_deref(), Some("fp8"));
+        assert_eq!(quant_hint_from_name("gemma-4-E4B-it-BF16").as_deref(), Some("bf16"));
+        assert_eq!(quant_hint_from_name("llama3.2:1b-instruct-q8_0").as_deref(), Some("q8_0"));
+        assert_eq!(quant_hint_from_name("Qwen/Qwen3.5-9B"), None);
+        assert_eq!(quant_hint_from_name("qwen3.5:9b"), None);
+    }
+
+    fn with_identity(json: &str, family: &str, params: &str, quant: &str, handles: &[&str]) -> std::sync::Arc<LoadedReference> {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["model"] = serde_json::json!({"family": family, "params": params, "quant": quant});
+        v["model_key"] = serde_json::json!(format!("{family}-{params}@{quant}"));
+        v["handles"] = serde_json::json!(handles);
+        std::sync::Arc::new(parse_reference(&v.to_string()).unwrap())
+    }
+
+    #[test]
+    fn references_are_chosen_by_declared_identity_then_by_name() {
+        let base = ref_json(4, 4);
+        let q4km = with_identity(&base, "qwen3.5", "9b", "q4_k_m", &[]);
+        let q40 = with_identity(&base, "qwen3.5", "9b", "Q4_0", &[]);
+        let named = with_identity(&base, "qwen3.5", "9b", "bf16", &["Qwen/Qwen3.5-9B"]);
+        let refs = vec![q4km.clone(), q40.clone(), named.clone()];
+        let id = |q: &str| ModelIdentity::new("Qwen3.5", "9B", q);
+        // A renamed Q4_0 file is checked against the Q4_0 reference, whatever its name says.
+        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "Qwen3.5-9B-Q4_K_M", id("Q4_0").as_ref()).unwrap(), &q40));
+        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "anything", id("Q4_K_M").as_ref()).unwrap(), &q4km));
+        // No identity (legacy provider / unknown quant) → by name.
+        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "Qwen/Qwen3.5-9B", None).unwrap(), &named));
+        assert!(select_reference(&refs, "other", id("Q6_K").as_ref()).is_none());
+        // A reference needs an identity or a handle.
+        let mut bare: serde_json::Value = serde_json::from_str(&base).unwrap();
+        bare["handles"] = serde_json::json!([]);
+        assert!(parse_reference(&bare.to_string()).unwrap_err().contains("identity or at least one handle"));
+    }
+
+    #[test]
+    fn switching_reference_clears_the_old_claim() {
+        let base = ref_json(8, 4);
+        let a = with_identity(&base, "qwen3.5", "9b", "q4_k_m", &[]);
+        let b = with_identity(&base, "qwen3.5", "9b", "q4_0", &[]);
+        let mut round = ChallengeRound::new();
+        let t = round.next_text(&a.set, |_| 0).unwrap().clone();
+        round.record(&a.set, &t.id, &t.logprobs).unwrap();
+        let mut st = LogprobStatus::default();
+        assert!(st.switch_reference(reference_tag(&a.set), &mut round));
+        assert_eq!(round.progress(), 0, "first binding also starts the round clean");
+        round.next_text(&a.set, |_| 0);
+        st.on_verdict(PASS, 0);
+        st.next_due_ms = 99;
+        assert!(!st.switch_reference(reference_tag(&a.set), &mut round), "same reference: no change");
+        assert_eq!(st.pass_streak, 1);
+        assert!(st.switch_reference(reference_tag(&b.set), &mut round));
+        assert_eq!((st.verdict, st.pass_streak, st.next_due_ms), (None, 0, 99));
+        assert_eq!(round.issued_count(), 2, "texts already sent stay burned");
+    }
+
+    #[test]
+    fn price_follows_the_verified_identity_only_with_a_qualifying_streak() {
+        let base = ref_json(4, 4);
+        let bf16 = with_identity(&base, "qwen3.5", "9b", "bf16", &[]);
+        let refs = vec![bf16.clone()];
+        let handle = "Qwen/Qwen3.5-9B";
+        let floor = cost_tier_for_handle(handle); // 9B at 4-bit
+        let verified = cost_tier_for_params_quant("9b", "bf16").unwrap();
+        assert!(verified > floor);
+        let mut round = ChallengeRound::new();
+        let mut st = LogprobStatus::default();
+        st.switch_reference(reference_tag(&bf16.set), &mut round);
+        assert_eq!(priced_tier(handle, None, &refs, 0), floor);
+        st.on_verdict(PASS, 0);
+        assert_eq!(priced_tier(handle, Some(&st), &refs, 1), floor, "one pass is not enough");
+        st.on_verdict(PASS, 30 * H);
+        st.on_verdict(PASS, 48 * H);
+        assert_eq!(priced_tier(handle, Some(&st), &refs, 48 * H + 1), verified);
+        // Stale, failed, or against a reference that's no longer loaded → back to the name's price.
+        assert_eq!(priced_tier(handle, Some(&st), &refs, 72 * H + 1), floor);
+        assert_eq!(priced_tier(handle, Some(&st), &[], 48 * H + 1), floor);
+        st.on_verdict(FAIL, 49 * H);
+        assert_eq!(priced_tier(handle, Some(&st), &refs, 49 * H + 1), floor);
+        // A big name on a small verified model is priced as the small one.
+        let small = with_identity(&base, "qwen3.5", "0.8b", "q4_k_m", &[]);
+        let mut st = LogprobStatus::default();
+        st.switch_reference(reference_tag(&small.set), &mut ChallengeRound::new());
+        for at in [0, 24 * H, 48 * H] {
+            st.on_verdict(PASS, at);
+        }
+        assert_eq!(priced_tier("llama-70b", Some(&st), &[small], 48 * H + 1), cost_tier_for_params_quant("0.8b", "q4_k_m").unwrap());
     }
 }

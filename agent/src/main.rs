@@ -615,6 +615,13 @@ struct ProvideArgs {
     #[arg(long = "prompt-scoring")]
     prompt_scoring: Option<openhydra_agent::adapters::scoring::ScoringChoice>,
 
+    /// The quantisation to declare, for authenticity checks, for models whose engine doesn't report
+    /// one — e.g. `bf16` or `fp8` for the checkpoint a vLLM / SGLang server loaded. Gateways test the
+    /// model against the reference for exactly this quant, so declare what you actually serve.
+    /// Ollama and llama.cpp report their own quant and ignore this.
+    #[arg(long = "declare-quant")]
+    declare_quant: Option<String>,
+
     #[command(flatten)]
     aup: AupArgs,
 }
@@ -1335,7 +1342,7 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
             ScoringChoice::Dialect(d) => format!("{d:?} API"),
         };
         eprintln!("openhydra-agent: answering prompt-scoring challenges ({api}, ≤2 at once)");
-        provider = provider.with_prompt_scoring();
+        provider = provider.with_prompt_scoring().with_declared_quant(args.declare_quant.clone());
     }
     // M4-base: attach the owner-side swarm authorizer so `Private`-scope models can be served to
     // enrolled members. Without it, a private model is refused for everyone (fail-closed).
@@ -1466,12 +1473,16 @@ fn serve(
     let mut logprob_refs = Vec::new();
     for path in &args.logprob_reference {
         let r = openhydra_agent::prompt_score::load_reference(path)?;
+        let matches = match (&r.set.identity, r.handles.is_empty()) {
+            (Some(id), true) => format!("model {}", id.key()),
+            (Some(id), false) => format!("model {}, names {}", id.key(), r.handles.join(", ")),
+            (None, _) => format!("names {}", r.handles.join(", ")),
+        };
         eprintln!(
-            "openhydra-agent: log-prob checks for {} ({} texts, cut-off {:.2}x, handles: {})",
+            "openhydra-agent: log-prob checks for {} ({} texts, cut-off {:.2}x, {matches})",
             r.set.model_key,
             r.set.texts.len(),
             r.set.cutoff,
-            r.handles.join(", ")
         );
         logprob_refs.push(r);
     }

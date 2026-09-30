@@ -36,7 +36,10 @@ use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::attest::{attest_refusal, handle_attest_inbound, Attestor, ATTEST_CHALLENGE};
-use crate::prompt_score::{handle_prompt_score_inbound, score_refusal, InflightGate, PROMPT_SCORE_CHALLENGE};
+use crate::prompt_score::{
+    handle_model_info_inbound, handle_prompt_score_inbound, quant_hint_from_name, score_refusal, InflightGate,
+    ModelInfo, MODEL_INFO_REQUEST, PROMPT_SCORE_CHALLENGE,
+};
 use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
@@ -700,8 +703,13 @@ pub struct Provider<A: EngineAdapter> {
     prompt_scoring: bool,
     /// Caps challenges scored at once, provider-wide (engines OOM on concurrent prompt log-probs).
     score_gate: InflightGate,
-    /// Per-peer rate cap on prompt-scoring challenges.
+    /// Per-peer rate cap on prompt-scoring challenges (and model-info requests).
     score_rl: Arc<RateLimiter>,
+    /// What the engine last reported for each model, keyed by handle — the source of the identity
+    /// declared in a model-info reply. Refreshed on every announce pass.
+    detected: Mutex<HashMap<String, DetectedModel>>,
+    /// Quantisation to declare for models whose engine doesn't report one (`provide --declare-quant`).
+    declared_quant: Option<String>,
     /// P1 streaming: nonce → trimmable-log [`StreamBuffer`], populated by `SERVE_STREAM` and
     /// polled/pruned by `FETCH_CHUNKS`. Separate from `results` (0x10/0x11 buffered path) so the
     /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
@@ -831,6 +839,8 @@ impl<A: EngineAdapter> Provider<A> {
                 max_inflight: 0,
                 max_tracked: ATTEST_RATE_MAX_TRACKED,
             })),
+            detected: Mutex::new(HashMap::new()),
+            declared_quant: None,
             streams: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
@@ -861,6 +871,34 @@ impl<A: EngineAdapter> Provider<A> {
     pub fn with_prompt_scoring(mut self) -> Self {
         self.prompt_scoring = true;
         self
+    }
+
+    /// Declare the quantisation of models whose engine doesn't report one (builder form) — e.g. the
+    /// checkpoint a vLLM / SGLang server loaded (`bf16`, `fp8`). Engines that report a quant (Ollama,
+    /// llama.cpp from the GGUF header) keep their own.
+    pub fn with_declared_quant(mut self, quant: Option<String>) -> Self {
+        self.declared_quant = quant.filter(|q| !q.trim().is_empty());
+        self
+    }
+
+    /// The identity this provider declares for `model_ref` in a model-info reply: the engine's own
+    /// family / params / quant where it reports them, else parsed from the name, with the quant from
+    /// `--declare-quant` or a tag in the name. `None` for a model the engine didn't report.
+    fn model_info(&self, model_ref: &str) -> Option<ModelInfo> {
+        let m = self.detected.lock().unwrap_or_else(|e| e.into_inner()).get(model_ref).cloned()?;
+        let (name_family, name_params, _) = openhydra_protocol::model_id::parse_hf_model_name(&m.engine_ref);
+        let or = |a: &str, b: String| if a.trim().is_empty() { b } else { a.to_string() };
+        let quant = if m.quant.trim().is_empty() {
+            self.declared_quant.clone().or_else(|| quant_hint_from_name(&m.engine_ref)).unwrap_or_default()
+        } else {
+            m.quant.clone()
+        };
+        Some(ModelInfo {
+            family: or(&m.family, name_family),
+            params: or(&m.params, name_params),
+            quant,
+            weight_digest: m.weight_digest.clone(),
+        })
     }
 
     /// Set the provider's settlement peg (USDC micro-units per credit unit) for the F2 floor check
@@ -1441,6 +1479,8 @@ impl<A: EngineAdapter> Provider<A> {
 
     fn announce_models_inner(&self) -> Result<usize, AdapterError> {
         let models = self.adapter.detect_models()?;
+        *self.detected.lock().unwrap_or_else(|e| e.into_inner()) =
+            models.iter().map(|m| (m.engine_ref.clone(), m.clone())).collect();
         // Snapshot the policy ONCE so the loop filter and the published view see one consistent
         // policy (also the source for `shared_models` below).
         let policy = self.policy.snapshot();
@@ -1644,7 +1684,7 @@ impl<A: EngineAdapter> Provider<A> {
                 let provider = Arc::clone(&self);
                 let shed_id = request_id.clone();
                 let is_attest = data.first() == Some(&ATTEST_CHALLENGE);
-                let is_score = data.first() == Some(&PROMPT_SCORE_CHALLENGE);
+                let is_score = matches!(data.first(), Some(&PROMPT_SCORE_CHALLENGE) | Some(&MODEL_INFO_REQUEST));
                 let accepted = pool.submit(move || {
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
@@ -1846,6 +1886,18 @@ impl<A: EngineAdapter> Provider<A> {
                     self.prompt_scoring.then_some(&self.adapter as &dyn EngineAdapter),
                     &self.score_gate,
                     &|model| self.policy.announce_globally(model),
+                )
+            }
+            // Which exact model a handle is (so the verifier can pick the reference for its quant).
+            Some(&MODEL_INFO_REQUEST) => {
+                if self.score_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+                    return score_refusal("prompt scoring rate limited, retry");
+                }
+                handle_model_info_inbound(
+                    &data[1..],
+                    self.prompt_scoring,
+                    &|model| self.policy.announce_globally(model),
+                    &|model| self.model_info(model),
                 )
             }
             Some(&RECEIPT_REQUEST) => {

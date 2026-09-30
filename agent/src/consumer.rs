@@ -39,14 +39,17 @@ use openhydra_protocol::trust::{
     MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
 use openhydra_protocol::payout::{gated_accrual_asset, FeeSplit, GatedVoucher, SettlementAsset};
-use openhydra_protocol::weight::{cost_tier_for_handle, credits_for_receipt, receipt_weighted_units};
+use openhydra_protocol::weight::{
+    cost_tier_for_handle, credits_for_receipt, receipt_weighted_units, CostTier,
+};
 
 use serde_json::Value;
 
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
 use crate::attest::{attest_provider, AttestRecord};
 use crate::prompt_score::{
-    decode_logprob_state, encode_logprob_state, run_round, LoadedReference, LogprobStatus, RoundOutcome, StatusEffect,
+    decode_logprob_state, encode_logprob_state, priced_tier, quant_hint_from_name, reference_tag, request_model_info, run_round,
+    select_reference, LoadedReference, LogprobStatus, RoundOutcome, ScoreChallengeError, StatusEffect,
     LOGPROB_BACKOFF_MS, LOGPROB_RETRY_MS,
 };
 use openhydra_protocol::logprob::ChallengeRound;
@@ -1241,9 +1244,22 @@ impl ConsumerNode {
     /// the two always agree.
     fn gated_split_for(&self, peer_id: &str, model_key: &str, tokens: u64, now_ms: u64, peg: u64) -> FeeSplit {
         let units = receipt_weighted_units(tokens, None);
-        let claimed = cost_tier_for_handle(model_key);
+        let claimed = self.claimed_tier(peer_id, model_key, now_ms);
         let achieved = self.authenticity_of(peer_id, model_key, now_ms);
         gated_accrual_asset(claimed, achieved, units, peg)
+    }
+
+    /// The cost tier a serve from `(peer_id, model_key)` is priced at before the authenticity gate.
+    /// Normally the handle's conservative estimate (its size at 4-bit — the provider's name alone is
+    /// never trusted for more). Once the provider has a qualifying log-prob pass streak against a
+    /// reference with a known identity, the price follows **that verified identity** — the exact size
+    /// and quantisation it proved it serves — so an honest BF16 provider earns the BF16 rate and a
+    /// renamed model earns the rate of what it really is. The authenticity gate still applies on top.
+    fn claimed_tier(&self, peer_id: &str, model_key: &str, now_ms: u64) -> CostTier {
+        let Some(lp) = &self.provider_logprob else { return cost_tier_for_handle(model_key) };
+        let key = reputation_key(peer_id, model_key);
+        let status = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
+        priced_tier(model_key, status.as_ref(), &lp.refs, now_ms)
     }
 
     /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or
@@ -1765,7 +1781,7 @@ impl ConsumerNode {
             )
             .is_ok()
             {
-                node.record_contribution(&provider_libp2p, &model_key, tokens);
+                node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
                 if let Some((split, _)) = voucher {
                     node.commit_gated_voucher(&vkey, split);
                 }
@@ -1785,7 +1801,7 @@ impl ConsumerNode {
     /// tier is the ceiling until model-authenticity fingerprinting lands; a self-declared canonical
     /// can't inflate it — review H1/H3). The give-side receipt carries no prompt/completion split
     /// yet (Phase 2b) → the blended in/out rate.
-    fn record_contribution(&self, provider_libp2p_id: &str, model_key: &str, tokens: u64) {
+    fn record_contribution(&self, provider_libp2p_id: &str, peer_id: &str, model_key: &str, tokens: u64) {
         let now = now_unix_ms();
         let me = self.net.libp2p_peer_id().to_string();
 
@@ -1806,7 +1822,7 @@ impl ConsumerNode {
         // Display: cost-weighted credit SPENT, weighted by the **validated handle** (`model_key`) —
         // the ceiling that stops a mislabelled canonical inflating the number.
         if let Some(stats) = &self.stats {
-            let spent = credits_for_receipt(cost_tier_for_handle(model_key).weight(), tokens, None);
+            let spent = credits_for_receipt(self.claimed_tier(peer_id, model_key, now).weight(), tokens, None);
             stats.add_credits_spent(spent);
         }
         if let Some(store) = &self.store {
@@ -1890,11 +1906,6 @@ impl ConsumerNode {
     /// into the audit history + reputation. Never touches the completion.
     fn maybe_logprob_check(self: &Arc<Self>, provider: &SelectedProvider, model_key: &str) {
         let Some(lp) = self.provider_logprob.clone() else { return };
-        let Some(reference) =
-            lp.refs.iter().find(|r| r.handles.contains(&provider.model_id)).cloned()
-        else {
-            return;
-        };
         let key = reputation_key(&provider.peer_id, model_key);
         let now = now_unix_ms();
         if lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| now < s.next_due_ms) {
@@ -1909,7 +1920,42 @@ impl ConsumerNode {
         let model = provider.model_id.clone();
         let model_key = model_key.to_string();
         std::thread::spawn(move || {
+            // Which exact model is this? The provider declares its identity (engine-reported family /
+            // size / precise quant); the reference for that identity is used, else one listing the
+            // model's name. A legacy provider can't say — its name is all there is.
+            let mut info_transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
+                node.net.proxy_forward_timeout(libp2p.clone(), framed.to_vec(), LOGPROB_TIMEOUT)
+            };
+            let declared = match request_model_info(&mut info_transport, &model) {
+                Ok(info) => info.identity(),
+                Err(ScoreChallengeError::Unsupported) | Err(ScoreChallengeError::Refused(_)) => None,
+                Err(e) => {
+                    tracing::debug!(provider = %peer_id, model, error = ?e, "model-info request failed");
+                    None
+                }
+            };
+            if let (Some(hint), Some(id)) = (quant_hint_from_name(&model), declared.as_ref()) {
+                if hint != id.quant {
+                    tracing::warn!(provider = %peer_id, model, name_says = hint, declared = id.quant,
+                        "model name and declared quantisation disagree; checking the declared one");
+                }
+            }
+            let Some(reference) = select_reference(&lp.refs, &model, declared.as_ref()).cloned() else {
+                let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
+                status.entry(key.clone()).or_default().next_due_ms = now_unix_ms() + LOGPROB_BACKOFF_MS;
+                drop(status);
+                tracing::debug!(provider = %peer_id, model, declared = ?declared.as_ref().map(|i| i.key()),
+                    "no log-prob reference for this model");
+                lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                return;
+            };
             let mut round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
+            if lp.status.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default()
+                .switch_reference(reference_tag(&reference.set), &mut round)
+            {
+                tracing::info!(provider = %peer_id, model, reference = reference.set.model_key,
+                    "log-prob checks now use this reference");
+            }
             let mut last_send: Option<std::time::Instant> = None;
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
                 if let Some(wait) = last_send.and_then(|t| LOGPROB_PACE.checked_sub(t.elapsed())) {

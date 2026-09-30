@@ -73,11 +73,49 @@ pub struct ReferenceText {
     pub band: f64,
 }
 
+/// Which exact model a reference was made from: family, size and the **precise** quantisation
+/// (`q4_k_m`, not the canonical id's folded `int4` — neighbouring quants need different references).
+/// Matched against the identity a provider declares for the model it serves.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModelIdentity {
+    pub family: String,
+    pub params: String,
+    pub quant: String,
+}
+
+impl ModelIdentity {
+    /// Build a normalised identity: lower-cased and trimmed, with the float spellings folded
+    /// (`BF16`/`bfloat16` → `bf16`, `F16`/`float16` → `fp16`, `F32` → `fp32`). GGUF quant labels
+    /// stay precise (`Q4_K_M` → `q4_k_m`). `None` if any part is empty or the size is `unknown`.
+    pub fn new(family: &str, params: &str, quant: &str) -> Option<Self> {
+        let family = family.trim().to_lowercase();
+        let params = params.trim().to_lowercase();
+        let quant = match quant.trim().to_lowercase().as_str() {
+            "bf16" | "bfloat16" => "bf16".to_string(),
+            "f16" | "fp16" | "float16" | "half" => "fp16".to_string(),
+            "f32" | "fp32" | "float32" => "fp32".to_string(),
+            q => q.to_string(),
+        };
+        if family.is_empty() || params.is_empty() || params == "unknown" || quant.is_empty() {
+            return None;
+        }
+        Some(Self { family, params, quant })
+    }
+
+    /// `family/params/quant`, e.g. `qwen3.5/9b/q4_k_m`.
+    pub fn key(&self) -> String {
+        format!("{}/{}/{}", self.family, self.params, self.quant)
+    }
+}
+
 /// Every reference text for one claimed model, plus the decision parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReferenceSet {
-    /// The canonical `model_id@quant` the reference was made from (the handle the provider claims).
+    /// A label for the reference (e.g. `qwen3.5-9b@q4_k_m`), for logs.
     pub model_key: String,
+    /// The exact model the reference was made from, when known — how a provider's declared
+    /// identity is matched to it (name aliases are the fallback).
+    pub identity: Option<ModelIdentity>,
     pub texts: Vec<ReferenceText>,
     /// Aggregate cut-off; see [`DEFAULT_CUTOFF`].
     pub cutoff: f64,
@@ -300,6 +338,12 @@ impl ChallengeRound {
         Ok(verdict)
     }
 
+    /// Drop the ratios of the round in progress (e.g. the provider now declares a different model,
+    /// so they were scored against another reference). Issued texts stay issued.
+    pub fn reset_progress(&mut self) {
+        self.ratios.clear();
+    }
+
     /// Ratios recorded so far in the current round.
     pub fn progress(&self) -> usize {
         self.ratios.len()
@@ -390,6 +434,7 @@ mod tests {
     fn set(n_texts: usize, min_texts: usize) -> ReferenceSet {
         ReferenceSet {
             model_key: "qwen3.5-9b@bf16".into(),
+            identity: ModelIdentity::new("qwen3.5", "9b", "bf16"),
             texts: (0..n_texts)
                 .map(|i| {
                     let mut t = text(&format!("t{i}"), 32, 0.02);
@@ -653,6 +698,30 @@ mod tests {
         }
         assert!(!seen.contains(&"fresh-looking".to_string()));
         assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn identities_normalise_but_keep_gguf_quants_precise() {
+        let a = ModelIdentity::new(" Qwen3.5 ", "9B", "BF16").unwrap();
+        assert_eq!(a, ModelIdentity::new("qwen3.5", "9b", "bfloat16").unwrap());
+        assert_eq!(a.key(), "qwen3.5/9b/bf16");
+        assert_eq!(ModelIdentity::new("qwen3.5", "9b", "F16").unwrap().quant, "fp16");
+        let k = ModelIdentity::new("qwen3.5", "9b", "Q4_K_M").unwrap();
+        assert_eq!(k.quant, "q4_k_m");
+        assert_ne!(k, ModelIdentity::new("qwen3.5", "9b", "Q4_0").unwrap());
+        assert_eq!(ModelIdentity::new("qwen3.5", "unknown", "bf16"), None);
+        assert_eq!(ModelIdentity::new("qwen3.5", "9b", ""), None);
+    }
+
+    #[test]
+    fn resetting_progress_keeps_the_issued_texts() {
+        let s = set(6, 3);
+        let mut r = ChallengeRound::new();
+        let t = r.next_text(&s, |_| 0).unwrap().clone();
+        r.record(&s, &t.id, &t.logprobs).unwrap();
+        assert_eq!(r.progress(), 1);
+        r.reset_progress();
+        assert_eq!((r.progress(), r.issued_count()), (0, 1));
     }
 
     #[test]
