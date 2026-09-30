@@ -35,7 +35,7 @@ use openhydra_protocol::verify::{
 };
 use openhydra_protocol::award::{AuditClass, AuditStats};
 use openhydra_protocol::trust::{
-    authenticity_tier_from, AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
+    AssurancePolicy, AssuranceTier, AuthenticityEvidence, AuthenticityTier,
     MethodFlags, PolicyMode, PrivacyTier, RedundantExecAuthenticity, SettlementTier, Verifier,
 };
 use openhydra_protocol::payout::{gated_accrual_asset, FeeSplit, GatedVoucher, SettlementAsset};
@@ -45,6 +45,11 @@ use serde_json::Value;
 
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
 use crate::attest::{attest_provider, AttestRecord};
+use crate::prompt_score::{
+    decode_logprob_state, encode_logprob_state, run_round, LoadedReference, LogprobStatus, RoundOutcome, StatusEffect,
+    LOGPROB_BACKOFF_MS, LOGPROB_RETRY_MS,
+};
+use openhydra_protocol::logprob::ChallengeRound;
 use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
 use crate::receipt::request_receipt;
 use crate::serve::{
@@ -139,6 +144,28 @@ struct ProviderAttestation {
     /// Providers with a challenge in flight, so concurrent serves don't all challenge at once.
     inflight: Mutex<std::collections::HashSet<String>>,
 }
+
+/// Track A2-Logprob: prompt-scoring challenges to providers whose model this gateway holds a
+/// reference set for (opt-in, `serve --logprob-reference`). A passing round sets the log-prob
+/// method flag (→ A2 once the redundant-exec gates are met); a failing one pins the floor.
+struct ProviderLogprob {
+    refs: Vec<Arc<LoadedReference>>,
+    /// Per `(peer, model)`: texts issued so far + the round in progress. Persisted (with the status)
+    /// in the store's log-prob table and saved before each text is sent, so a restart never re-sends
+    /// a text a provider has seen.
+    rounds: Mutex<HashMap<String, ChallengeRound>>,
+    status: Mutex<HashMap<String, LogprobStatus>>,
+    inflight: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Per-challenge round-trip budget (one prompt-scoring pass is ~1 s on an L4).
+const LOGPROB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Pause after a busy refusal before the next challenge.
+const LOGPROB_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Minimum gap between challenges to one provider. Keeps a round under the provider's per-peer rate
+/// limit (2/s) even on a fast engine — a refused challenge still burns its text — and spreads the
+/// round out instead of firing it as one burst.
+const LOGPROB_PACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Redundant-execution audit sampling bounds (M2.2(b)), fed to
 /// [`sample_rate_for_reputation`]. A fully-trusted provider is audited rarely
@@ -732,6 +759,8 @@ pub struct ConsumerNode {
     settle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Device attestation of providers (Phase 0). `None` = off (the default).
     provider_attest: Option<Arc<ProviderAttestation>>,
+    /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
+    provider_logprob: Option<Arc<ProviderLogprob>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -777,6 +806,7 @@ impl ConsumerNode {
             settlement_peg: None,
             settle_locks: Mutex::new(HashMap::new()),
             provider_attest: None,
+            provider_logprob: None,
         }
     }
 
@@ -799,6 +829,60 @@ impl ConsumerNode {
             inflight: Mutex::new(std::collections::HashSet::new()),
         }));
         self
+    }
+
+    /// Opt in to prompt-scoring (log-prob) checks of providers (builder form): after a served
+    /// completion from a provider whose model handle one of `refs` covers, run a challenge round in
+    /// the background (at most every few hours per `(peer, model)`). The verdict feeds the audit
+    /// history, reputation, and the authenticity tier — a pass can lift a provider to A2.
+    pub fn with_logprob_checks(mut self, refs: Vec<LoadedReference>) -> Self {
+        if refs.is_empty() {
+            return self;
+        }
+        // Rehydrate: which texts each provider has already been sent, the round in progress, and the
+        // latest verdict. A corrupt row is skipped with a warning (its provider then looks fresh to
+        // us — the one case a text could be re-sent).
+        let (mut rounds, mut status) = (HashMap::new(), HashMap::new());
+        if let Some(store) = &self.store {
+            match store.load_logprob_states() {
+                Ok(rows) => {
+                    for (key, blob) in rows {
+                        match decode_logprob_state(&blob) {
+                            Some((st, round)) => {
+                                status.insert(key.clone(), st);
+                                rounds.insert(key, round);
+                            }
+                            None => tracing::warn!(key, "skipping a corrupt log-prob state row"),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not load log-prob state"),
+            }
+        }
+        self.provider_logprob = Some(Arc::new(ProviderLogprob {
+            refs: refs.into_iter().map(Arc::new).collect(),
+            rounds: Mutex::new(rounds),
+            status: Mutex::new(status),
+            inflight: Mutex::new(std::collections::HashSet::new()),
+        }));
+        self
+    }
+
+    /// Persist one `(peer, model)`'s log-prob state (best-effort: a failed write is logged, never
+    /// fails the check).
+    fn persist_logprob_state(&self, key: &str, status: LogprobStatus, round: &ChallengeRound) {
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_logprob_state(key, &encode_logprob_state(status, round)) {
+                tracing::warn!(error = %e, key, "log-prob state persist failed");
+            }
+        }
+    }
+
+    /// The latest log-prob status for `(peer_id, model_key)`, if checks are on and it was tried.
+    pub fn logprob_status(&self, peer_id: &str, model_key: &str) -> Option<LogprobStatus> {
+        let lp = self.provider_logprob.as_ref()?;
+        let key = reputation_key(peer_id, model_key);
+        lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied()
     }
 
     /// The latest device-attestation record for a provider (OpenHydra peer id), if any.
@@ -906,6 +990,7 @@ impl ConsumerNode {
             settlement_peg: None,
             settle_locks: Mutex::new(HashMap::new()),
             provider_attest: None,
+            provider_logprob: None,
         }
     }
 
@@ -947,14 +1032,20 @@ impl ConsumerNode {
             .and_then(|m| m.get(&key).map(|s| (s.pass_rate(now_ms), s.recent_passes(now_ms))))
             .unwrap_or((1.0, 0));
         // Route through the curated redundant-exec verifier (Increment 3b) — the live caller of the
-        // Verifier seam. Same core resolution as `economy_snapshot`'s display path; no live
-        // per-serve outcome is tracked here yet, so `latest_outcome` is None.
+        // Verifier seam. Same core resolution as `economy_snapshot`'s display path. A recent
+        // log-prob verdict (Track A2-Logprob) supplies the log-prob method flag and the latest
+        // outcome; without one there is no hard method and no live outcome.
+        let (logprob, latest_outcome) = self
+            .provider_logprob
+            .as_ref()
+            .and_then(|lp| lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied())
+            .map_or((false, None), |st| st.evidence(now_ms));
         let evidence = AuthenticityEvidence {
             reputation,
             audit_pass_rate: rate,
             passing_audits: passes,
-            methods: MethodFlags::default(),
-            latest_outcome: None,
+            methods: MethodFlags { logprob_commitment: logprob, ..MethodFlags::default() },
+            latest_outcome,
         };
         RedundantExecAuthenticity.verify(&evidence).authenticity
     }
@@ -1002,6 +1093,12 @@ impl ConsumerNode {
                     .collect()
             })
             .unwrap_or_default();
+        // Log-prob verdicts (Track A2-Logprob), snapshotted under their own lock like the rest.
+        let logprob: std::collections::HashMap<String, LogprobStatus> = self
+            .provider_logprob
+            .as_ref()
+            .map(|lp| lp.status.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default();
         let reputation = self
             .reputation
             .lock()
@@ -1016,14 +1113,24 @@ impl ConsumerNode {
                             None => (key.clone(), None),
                         };
                         // The achieved authenticity tier from the redundant-exec evidence already
-                        // tracked for this `(peer, model)` (UNIFIED_TRUST_STACK Increment 2a). A0/A1
-                        // only: `MethodFlags::default()` — a live A2+ needs a verifiable
-                        // possession/fingerprint method, which is disclosed-but-not-verified until an
-                        // anchor exists (Increment 2c). Reputation uses the stable standing score
-                        // (same as `score`), so the tier does not flicker on decay between polls.
+                        // tracked for this `(peer, model)` (UNIFIED_TRUST_STACK Increment 2a), plus a
+                        // recent log-prob verdict when checks are on (Track A2-Logprob): a pass is
+                        // the hard method that allows A2, a fail pins the floor. Reputation uses the
+                        // stable standing score (same as `score`), so the tier does not flicker on
+                        // decay between polls.
                         let (rate, passes) = audit.get(key).copied().unwrap_or((1.0, 0));
-                        let tier =
-                            authenticity_tier_from(t.raw_score(), rate, passes, MethodFlags::default());
+                        let lp = logprob.get(key);
+                        let (lp_flag, latest_outcome) = lp.map_or((false, None), |st| st.evidence(now));
+                        let tier = RedundantExecAuthenticity
+                            .verify(&AuthenticityEvidence {
+                                reputation: t.raw_score(),
+                                audit_pass_rate: rate,
+                                passing_audits: passes,
+                                methods: MethodFlags { logprob_commitment: lp_flag, ..MethodFlags::default() },
+                                latest_outcome,
+                            })
+                            .authenticity;
+                        let logprob_check = lp.and_then(|st| st.label());
                         let (device_trust, rotations) = device.get(&peer).copied().unwrap_or((None, 0));
                         crate::status::RepEntry {
                             openhydra_peer_id: peer,
@@ -1033,6 +1140,7 @@ impl ConsumerNode {
                             gated_net: gated.get(key).copied().filter(|&n| n > 0),
                             device_trust: device_trust.map(str::to_string),
                             device_key_rotations: (rotations > 0).then_some(rotations),
+                            logprob_check,
                         }
                     })
                     .collect()
@@ -1486,6 +1594,8 @@ impl ConsumerNode {
                         self.maybe_audit(model, model_key, &provider.peer_id);
                         // Phase 0 device attestation (opt-in, detached, rate-limited per provider).
                         self.maybe_attest(&provider);
+                        // Track A2-Logprob prompt-scoring round (opt-in, detached, every few hours).
+                        self.maybe_logprob_check(&provider, model_key);
                     }
                     return AttemptOutcome::Served(summary);
                 }
@@ -1772,6 +1882,100 @@ impl ConsumerNode {
             tracing::info!(provider = %peer_id, model, outcome = ?record.outcome, "device attestation");
             attest.records.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.clone(), record);
             attest.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
+        });
+    }
+
+    /// Track A2-Logprob: if checks are on, a reference set covers this provider's model handle, and
+    /// the `(peer, model)` is due, run a challenge round in a detached thread and fold the verdict
+    /// into the audit history + reputation. Never touches the completion.
+    fn maybe_logprob_check(self: &Arc<Self>, provider: &SelectedProvider, model_key: &str) {
+        let Some(lp) = self.provider_logprob.clone() else { return };
+        let Some(reference) =
+            lp.refs.iter().find(|r| r.handles.contains(&provider.model_id)).cloned()
+        else {
+            return;
+        };
+        let key = reputation_key(&provider.peer_id, model_key);
+        let now = now_unix_ms();
+        if lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| now < s.next_due_ms) {
+            return;
+        }
+        if !lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
+            return; // a round for this (peer, model) is already running
+        }
+        let node = Arc::clone(self);
+        let peer_id = provider.peer_id.clone();
+        let libp2p = provider.libp2p_peer_id.clone();
+        let model = provider.model_id.clone();
+        let model_key = model_key.to_string();
+        std::thread::spawn(move || {
+            let mut round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
+            let mut last_send: Option<std::time::Instant> = None;
+            let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
+                if let Some(wait) = last_send.and_then(|t| LOGPROB_PACE.checked_sub(t.elapsed())) {
+                    std::thread::sleep(wait);
+                }
+                last_send = Some(std::time::Instant::now());
+                node.net.proxy_forward_timeout(libp2p.clone(), framed.to_vec(), LOGPROB_TIMEOUT)
+            };
+            let current = |lp: &ProviderLogprob| {
+                lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied().unwrap_or_default()
+            };
+            let outcome = run_round(
+                &mut round,
+                &reference.set,
+                &model,
+                &mut transport,
+                &mut |n| rand::random::<u64>() as usize % n,
+                &mut || std::thread::sleep(LOGPROB_BUSY_PAUSE),
+                &mut |r| node.persist_logprob_state(&key, current(&lp), r),
+            );
+            let now = now_unix_ms();
+            let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
+            let st = status.entry(key.clone()).or_default();
+            // A stopped run only counts against a provider that has scored texts for us before (in an
+            // earlier round, or earlier in this one) — never a first contact or our own text shortage.
+            let answered = st.verdict.is_some() || round.progress() > 0;
+            let effect = match &outcome {
+                RoundOutcome::Verdict(v) => st.on_verdict(*v, now),
+                RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, LOGPROB_RETRY_MS, now),
+                RoundOutcome::Unsupported => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS, now),
+                RoundOutcome::Exhausted => st.on_no_verdict(false, LOGPROB_BACKOFF_MS, now),
+            };
+            let streak = st.pass_streak;
+            drop(status);
+            // A pass earns no audit credit or reputation by itself (it only sets the method flag once
+            // the streak qualifies): reputation must come from served traffic, audits from audits.
+            match effect {
+                StatusEffect::None => {}
+                StatusEffect::Fail => {
+                    node.record_audit(&peer_id, &model_key, AuditClass::Fail, now);
+                    node.record_outcome(&peer_id, &model_key, VerificationOutcome::Failed, now);
+                }
+                StatusEffect::Evasion => node.record_audit(&peer_id, &model_key, AuditClass::Fail, now),
+            }
+            match outcome {
+                RoundOutcome::Verdict(v) if v.passed() => {
+                    tracing::info!(provider = %peer_id, model, aggregate = v.aggregate(), streak, "log-prob check passed")
+                }
+                RoundOutcome::Verdict(v) => tracing::warn!(provider = %peer_id, model, aggregate = v.aggregate(),
+                    cutoff = reference.set.cutoff, "log-prob check FAILED (different model or quantization)"),
+                RoundOutcome::Incomplete(reason) => {
+                    tracing::debug!(provider = %peer_id, model, reason, "log-prob round interrupted")
+                }
+                RoundOutcome::Unsupported => {
+                    tracing::debug!(provider = %peer_id, model, "provider does not answer prompt-scoring challenges")
+                }
+                RoundOutcome::Exhausted => tracing::warn!(provider = %peer_id, model, reference = reference.set.model_key,
+                    "log-prob reference set exhausted for this provider; add fresh texts"),
+            }
+            if effect == StatusEffect::Evasion {
+                tracing::warn!(provider = %peer_id, model, "provider keeps dodging log-prob checks; counted as a failed audit");
+            }
+            let final_status = current(&lp);
+            node.persist_logprob_state(&key, final_status, &round);
+            lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), round);
+            lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
         });
     }
 
@@ -2553,6 +2757,54 @@ mod tests {
         };
         rank_providers_with_reputation(&peers, "", 2, &spy);
         assert_eq!(seen.into_inner(), vec!["m".to_string()], "lookup keyed by the provider's handle");
+    }
+
+    #[test]
+    fn only_a_qualifying_pass_streak_moves_a_provider_to_a2() {
+        use crate::prompt_score::{LOGPROB_MIN_PASSES, LOGPROB_MIN_SPAN_MS, LOGPROB_VALID_MS};
+        use openhydra_protocol::logprob::LogprobVerdict;
+        let pass = LogprobVerdict::Pass { aggregate: 0.97 };
+        let fail = LogprobVerdict::Fail { aggregate: 1.62 };
+        let resolve = |st: &LogprobStatus, now: u64| {
+            let (flag, latest_outcome) = st.evidence(now);
+            RedundantExecAuthenticity
+                .verify(&AuthenticityEvidence {
+                    reputation: 80.0,
+                    audit_pass_rate: 1.0,
+                    passing_audits: 5,
+                    methods: MethodFlags { logprob_commitment: flag, ..MethodFlags::default() },
+                    latest_outcome,
+                })
+                .authenticity
+        };
+        let day = 24 * 60 * 60 * 1000;
+        let mut st = LogprobStatus::default();
+        // No verdict: a proven provider stays at A1.
+        assert_eq!(resolve(&st, day), AuthenticityTier::ReputationRedundant);
+        // One pass, or several within a day, is not enough.
+        for i in 0..LOGPROB_MIN_PASSES {
+            st.on_verdict(pass, day + u64::from(i) * 60_000);
+        }
+        assert_eq!(resolve(&st, day + 3 * 60_000), AuthenticityTier::ReputationRedundant);
+        // Passes spread over the minimum span → A2, while the latest stays fresh.
+        let later = day + LOGPROB_MIN_SPAN_MS;
+        st.on_verdict(pass, later);
+        assert_eq!(resolve(&st, later + 1), AuthenticityTier::EnergyFingerprintPossession);
+        assert_eq!(resolve(&st, later + LOGPROB_VALID_MS), AuthenticityTier::ReputationRedundant, "stale");
+        // A fail pins the floor and resets the streak.
+        st.on_verdict(fail, later + 2);
+        assert_eq!(resolve(&st, later + 3), AuthenticityTier::SelfReported);
+        st.on_verdict(pass, later + 4);
+        assert_eq!(resolve(&st, later + 5), AuthenticityTier::ReputationRedundant);
+        // A pass alone doesn't lift an unproven provider: A2 still needs the reputation gates.
+        let unproven = RedundantExecAuthenticity.verify(&AuthenticityEvidence {
+            reputation: NEUTRAL_REPUTATION,
+            audit_pass_rate: 1.0,
+            passing_audits: 0,
+            methods: MethodFlags { logprob_commitment: true, ..MethodFlags::default() },
+            latest_outcome: None,
+        });
+        assert_eq!(unproven.authenticity, AuthenticityTier::SelfReported);
     }
 
     #[test]

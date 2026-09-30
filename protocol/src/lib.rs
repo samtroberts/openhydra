@@ -23,6 +23,7 @@
 //! - [`store`] — persistent ledger over `redb` (§6 credit ledger, M2.3)
 //! - [`weight`] — model cost-weight registry: footprint → cost-tier (credit tiering Phase 1)
 //! - [`award`] — tier-award policy: max-awardable-tier curve + escrow + graduated failure (Phase 4)
+//! - [`logprob`] — teacher-forced log-prob identity check: per-text MAD / honest band, aggregate cut-off (Track A2-Logprob)
 //! - [`trust`] — unified trust stack: authenticity/privacy/settlement tiers + buyer policy (UNIFIED_TRUST_STACK_v1)
 //! - [`payout`] — payout-layer earn-gate: rail-specific (crypto rate-cap / fiat escrow) + 4% fee (PAYMENTS_PLAN_v1)
 //! - [`settlement`] — Solana settlement primitives: Ed25519 payout binding + voucher settlement claim (PAYMENTS_PLAN_v1 step 3)
@@ -31,6 +32,7 @@ pub mod attest;
 pub mod award;
 pub mod credit;
 pub mod crypto_agility;
+pub mod logprob;
 pub mod model_id;
 pub mod payout;
 pub mod receipts;

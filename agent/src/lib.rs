@@ -38,6 +38,7 @@ pub mod gateway;
 pub mod hardening;
 pub mod http;
 pub mod metrics;
+pub mod prompt_score;
 pub mod provider;
 pub mod ratelimit;
 pub mod receipt;

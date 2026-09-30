@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use openhydra_agent::adapters::scoring::ScoringChoice;
 use openhydra_agent::{
     live_comfyui, live_comfyui_with_workflows, live_exo, live_llamacpp, live_ollama, live_openai,
     serve_http, AupPolicy,
@@ -604,6 +605,15 @@ struct ProvideArgs {
     #[arg(long)]
     attest: bool,
 
+    /// Answer prompt-scoring challenges (the teacher-forced log-prob identity check behind the A2
+    /// authenticity tier). `auto` identifies each engine's scoring API itself (vLLM, SGLang, or
+    /// mistral.rs with the OpenHydra scoring patch) — the only choice with `--engine-kind auto`;
+    /// `vllm` / `sglang` / `mistralrs` name it explicitly (needs `--engine-kind vllm` or `openai`).
+    /// Off by default; at most 2 challenges are scored at once. Only publicly announced models are
+    /// scorable; engines that can't score (Ollama, llama-server, LM Studio) refuse.
+    #[arg(long = "prompt-scoring")]
+    prompt_scoring: Option<openhydra_agent::adapters::scoring::ScoringChoice>,
+
     #[command(flatten)]
     aup: AupArgs,
 }
@@ -655,6 +665,14 @@ struct ServeArgs {
     /// security boundary.
     #[arg(long = "trusted-binary-hash")]
     trusted_binary_hash: Vec<String>,
+
+    /// A private log-prob reference set (JSON) for the teacher-forced identity check (repeatable, one
+    /// per model). After serving a model a set covers, the gateway challenges the provider in the
+    /// background (every few hours) and a passing round lifts it toward the A2 authenticity tier; a
+    /// failing one drops it to A0. Keep these files private: a provider that has seen a text can
+    /// replay an honest answer. Providers must run `provide --prompt-scoring`.
+    #[arg(long = "logprob-reference")]
+    logprob_reference: Vec<std::path::PathBuf>,
 
     #[command(flatten)]
     aup: AupArgs,
@@ -1015,7 +1033,13 @@ fn provide(
     // zero-config default. It handles its own autostart, so it branches out before we resolve
     // a single engine URL.
     if args.engine_kind == EngineKind::Auto {
+        if matches!(args.prompt_scoring, Some(ScoringChoice::Dialect(_))) {
+            return Err("with --engine-kind auto, use --prompt-scoring auto (each engine is identified separately)".into());
+        }
         return provide_auto(net, stats, economy, args);
+    }
+    if args.prompt_scoring.is_some() && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Openai) {
+        return Err("--prompt-scoring needs --engine-kind vllm or openai (the engine's OpenAI-compatible server)".into());
     }
 
     let url = args
@@ -1031,7 +1055,12 @@ fn provide(
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Vllm => {
-            let a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
+            let mut a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
+            a = match args.prompt_scoring {
+                Some(ScoringChoice::Dialect(dialect)) => a.with_prompt_scoring(dialect),
+                Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),
+                None => a,
+            };
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::LmStudio => {
@@ -1056,7 +1085,12 @@ fn provide(
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Openai => {
-            let a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
+            let mut a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
+            a = match args.prompt_scoring {
+                Some(ScoringChoice::Dialect(dialect)) => a.with_prompt_scoring(dialect),
+                Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),
+                None => a,
+            };
             run_single_engine(a, url, args, net, stats, economy)
         }
     }
@@ -1116,7 +1150,9 @@ fn provide_auto(
 
     // The MultiAdapter re-probes on every re-announce tick, so engines/models started later
     // are absorbed with no restart. Drop the decision-scan's adapters; it rebuilds its own.
-    run_provider(openhydra_agent::detect::MultiAdapter::new(), "auto".to_string(), args, net, stats, economy)
+    let multi = openhydra_agent::detect::MultiAdapter::new();
+    let multi = if args.prompt_scoring.is_some() { multi.with_auto_prompt_scoring() } else { multi };
+    run_provider(multi, "auto".to_string(), args, net, stats, economy)
 }
 
 /// The fail-fast message when auto mode finds no engine (§5 of the autostart plan).
@@ -1284,6 +1320,15 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     if args.attest {
         provider = provider.with_attestor(secure_enclave_attestor()?);
     }
+    // Track A2-Logprob: answer prompt-scoring challenges (the adapter was given the dialect above).
+    if let Some(choice) = args.prompt_scoring {
+        let api = match choice {
+            ScoringChoice::Auto => "identified per engine".to_string(),
+            ScoringChoice::Dialect(d) => format!("{d:?} API"),
+        };
+        eprintln!("openhydra-agent: answering prompt-scoring challenges ({api}, ≤2 at once)");
+        provider = provider.with_prompt_scoring();
+    }
     // M4-base: attach the owner-side swarm authorizer so `Private`-scope models can be served to
     // enrolled members. Without it, a private model is refused for everyone (fail-closed).
     if let Some(dir) = args.swarms_dir.clone() {
@@ -1409,6 +1454,19 @@ fn serve(
     } else {
         None
     };
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest)
+    // Track A2-Logprob reference sets (opt-in). A bad file is a startup error, not a silent skip.
+    let mut logprob_refs = Vec::new();
+    for path in &args.logprob_reference {
+        let r = openhydra_agent::prompt_score::load_reference(path)?;
+        eprintln!(
+            "openhydra-agent: log-prob checks for {} ({} texts, cut-off {:.2}x, handles: {})",
+            r.set.model_key,
+            r.set.texts.len(),
+            r.set.cutoff,
+            r.handles.join(", ")
+        );
+        logprob_refs.push(r);
+    }
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

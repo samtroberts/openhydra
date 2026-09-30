@@ -24,6 +24,10 @@
 
 use serde::Deserialize;
 
+use std::sync::Mutex;
+
+use super::scoring::{fingerprint, score_prompt, ScoringDialect};
+
 use crate::adapter::{
     AdapterError, DetectedModel, EngineAdapter, EngineMetrics, HttpClient, InferenceRequest,
     ServeOutcome, ToolCall, ToolCallFunction,
@@ -38,6 +42,8 @@ const MAX_TOOL_CALLS: usize = 64;
 pub const DEFAULT_VLLM_URL: &str = "http://127.0.0.1:8000";
 /// Default LM Studio endpoint.
 pub const DEFAULT_LM_STUDIO_URL: &str = "http://127.0.0.1:1234";
+/// SGLang's default serve address (`--port 30000`).
+pub const DEFAULT_SGLANG_URL: &str = "http://127.0.0.1:30000";
 
 // ── /v1/models (only the fields we use; unknown fields ignored) ──
 
@@ -256,6 +262,18 @@ pub struct OpenAiAdapter<H: HttpClient> {
     /// Engine label for [`EngineAdapter::engine_name`] (`"vllm"`, `"lm-studio"`, …).
     name: &'static str,
     http: H,
+    /// The engine's prompt-scoring API (`provide --prompt-scoring`).
+    scoring: Scoring,
+}
+
+/// How an [`OpenAiAdapter`] knows which prompt-scoring API its engine speaks.
+enum Scoring {
+    Off,
+    /// Declared by the operator.
+    Fixed(ScoringDialect),
+    /// Fingerprinted on first use and cached; the cache is cleared when scoring fails, so a different
+    /// engine taking over the port is re-identified on the next challenge.
+    Auto(Mutex<Option<ScoringDialect>>),
 }
 
 impl<H: HttpClient> OpenAiAdapter<H> {
@@ -269,7 +287,7 @@ impl<H: HttpClient> OpenAiAdapter<H> {
             .trim_end_matches("/v1")
             .trim_end_matches('/')
             .to_string();
-        Self { base_url: root, name, http }
+        Self { base_url: root, name, http, scoring: Scoring::Off }
     }
 
     /// vLLM convenience constructor.
@@ -280,6 +298,19 @@ impl<H: HttpClient> OpenAiAdapter<H> {
     /// LM Studio convenience constructor.
     pub fn lm_studio(base_url: impl Into<String>, http: H) -> Self {
         Self::new(base_url, "lm-studio", http)
+    }
+
+    /// Declare the engine's prompt-scoring API, enabling [`EngineAdapter::score_prompt`].
+    pub fn with_prompt_scoring(mut self, dialect: ScoringDialect) -> Self {
+        self.scoring = Scoring::Fixed(dialect);
+        self
+    }
+
+    /// Enable [`EngineAdapter::score_prompt`] with the API identified from the engine itself
+    /// ([`fingerprint`]) the first time a challenge arrives.
+    pub fn with_auto_prompt_scoring(mut self) -> Self {
+        self.scoring = Scoring::Auto(Mutex::new(None));
+        self
     }
 }
 
@@ -321,6 +352,25 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
             request,
             on_delta,
         )
+    }
+
+    fn score_prompt(&self, model_ref: &str, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+        match &self.scoring {
+            Scoring::Off => Err(AdapterError::Unsupported(format!("prompt scoring not enabled for {}", self.name))),
+            Scoring::Fixed(dialect) => score_prompt(&self.http, &self.base_url, *dialect, model_ref, token_ids),
+            Scoring::Auto(cache) => {
+                let cached = *cache.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(dialect) = cached.or_else(|| fingerprint(&self.http, &self.base_url)) else {
+                    return Err(AdapterError::Unsupported(format!(
+                        "no prompt-scoring API recognised at {} ({})",
+                        self.base_url, self.name
+                    )));
+                };
+                let result = score_prompt(&self.http, &self.base_url, dialect, model_ref, token_ids);
+                *cache.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then_some(dialect);
+                result
+            }
+        }
     }
 }
 
@@ -920,6 +970,59 @@ mod tests {
     fn serve_stream_malformed_chunk_is_a_parse_error() {
         let err = serve(&["data: {not valid json"]).unwrap_err();
         assert!(matches!(err, AdapterError::Parse(_)), "got {err:?}");
+    }
+
+    /// An engine whose identity can change: `/version` answers as vLLM when `vllm` is set; POSTs to
+    /// the vLLM scoring route succeed only then. Counts fingerprint probes.
+    struct Swappable {
+        vllm: std::cell::Cell<bool>,
+        probes: std::cell::Cell<u32>,
+    }
+
+    impl HttpClient for Swappable {
+        fn get(&self, url: &str) -> Result<String, AdapterError> {
+            if url.ends_with("/version") {
+                self.probes.set(self.probes.get() + 1);
+                if self.vllm.get() {
+                    return Ok(r#"{"version":"0.30.0"}"#.into());
+                }
+            }
+            Err(AdapterError::Http("404".into()))
+        }
+        fn get_status(&self, _url: &str) -> Result<u16, AdapterError> {
+            Ok(404)
+        }
+        fn post_json(&self, url: &str, _body: &str) -> Result<String, AdapterError> {
+            if self.vllm.get() && url.ends_with("/v1/completions") {
+                return Ok(r#"{"choices":[{"prompt_logprobs":[null,{"7":{"logprob":-0.5}}]}]}"#.into());
+            }
+            Err(AdapterError::Http("404".into()))
+        }
+        fn post_stream(
+            &self,
+            _url: &str,
+            _body: &str,
+        ) -> Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, AdapterError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn auto_scoring_identifies_the_engine_once_and_again_after_a_failure() {
+        let http = Swappable { vllm: true.into(), probes: 0.into() };
+        let a = OpenAiAdapter::new("http://h:8000", "vllm", http).with_auto_prompt_scoring();
+        assert_eq!(a.score_prompt("m", &[3, 7]), Ok(vec![-0.5]));
+        assert_eq!(a.score_prompt("m", &[3, 7]), Ok(vec![-0.5]));
+        assert_eq!(a.http.probes.get(), 1, "identified once, then cached");
+        // Another engine takes over the port: scoring fails, the cache clears, and the next
+        // challenge re-identifies (and finds nothing it can score with).
+        a.http.vllm.set(false);
+        assert!(a.score_prompt("m", &[3, 7]).is_err());
+        assert!(matches!(a.score_prompt("m", &[3, 7]), Err(AdapterError::Unsupported(_))));
+        assert_eq!(a.http.probes.get(), 2);
+        // Off by default.
+        let off = OpenAiAdapter::new("http://h:8000", "vllm", Swappable { vllm: true.into(), probes: 0.into() });
+        assert!(matches!(off.score_prompt("m", &[3, 7]), Err(AdapterError::Unsupported(_))));
     }
 
     #[test]

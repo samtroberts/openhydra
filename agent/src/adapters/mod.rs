@@ -43,3 +43,4 @@ pub mod gemini;
 pub mod llama_cpp;
 pub mod ollama;
 pub mod openai;
+pub mod scoring;

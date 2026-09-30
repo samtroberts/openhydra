@@ -1,0 +1,862 @@
+// Copyright 2026 OpenHydra contributors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+//! Prompt-scoring challenge over the network (Track A2-Logprob, ATTESTED_ENGINE_TIER_PLAN_v1 §10.1).
+//!
+//! A consumer sends a provider pre-tokenized text; the provider has its engine score it
+//! teacher-forced ([`EngineAdapter::score_prompt`]) and returns the per-position log-probs. The
+//! consumer judges them against its own reference with [`openhydra_protocol::logprob`]. The provider
+//! never learns the reference or the verdict.
+//!
+//! Wire (consumer → provider): `0x17 ‖ u16-LE model_len ‖ model_ref ‖ u32-LE n ‖ n × u32-LE ids`.
+//! Reply: `OHS1 ‖ status ‖ body`, where an OK body is `u32-LE m ‖ m × f32-LE` (m = n − 1) and a
+//! refusal body is a UTF-8 reason. A legacy provider answers the unknown method byte with a framed
+//! serve error, which can't start with `OHS1`, so the consumer reads it as
+//! [`ScoreChallengeError::Unsupported`].
+//!
+//! Scoring is opt-in on the provider (`provide --prompt-scoring <dialect>`) and bounded to
+//! [`MAX_INFLIGHT`] at once: concurrent prompt-log-prob requests OOM-crashed vLLM (Gemma 4 E4B at
+//! 16) and SGLang (Qwen3.5-9B at 4) on a 24 GB L4.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use openhydra_protocol::logprob::{
+    ChallengeRound, LogprobVerdict, ReferenceSet, ReferenceText, RoundError, DEFAULT_CUTOFF, DEFAULT_MIN_TEXTS,
+};
+use serde::Deserialize;
+
+use crate::adapter::EngineAdapter;
+use openhydra_protocol::verify::VerificationOutcome;
+
+/// libp2p proxy method byte for a prompt-scoring challenge. (0x16 is `ATTEST_CHALLENGE`.)
+pub const PROMPT_SCORE_CHALLENGE: u8 = 0x17;
+
+/// Every reply starts with this magic (see the module docs for why a legacy reply can't).
+pub const SCORE_RESP_MAGIC: &[u8; 4] = b"OHS1";
+const RESP_OK: u8 = 0x00;
+const RESP_REFUSED: u8 = 0x01;
+
+/// Longest model handle a challenge may carry.
+const MAX_MODEL_REF_LEN: usize = 256;
+/// Most tokens one challenge may ask the engine to score.
+pub const MAX_CHALLENGE_TOKENS: usize = 4096;
+/// Challenges the provider scores at once; the rest are refused ("busy") for the consumer to retry.
+pub const MAX_INFLIGHT: usize = 2;
+
+/// Why a challenge didn't yield scores (consumer side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScoreChallengeError {
+    /// The request never got a reply.
+    Transport(String),
+    /// The provider doesn't speak this protocol (a legacy build).
+    Unsupported,
+    /// The provider understood but declined (not opted in, busy, engine can't score, model not public).
+    Refused(String),
+    /// The reply was malformed, or has the wrong number of scores.
+    Malformed,
+}
+
+/// Consumer side: frame a challenge (method byte included). `None` if the model handle or the
+/// token count is out of bounds.
+pub fn encode_challenge(model_ref: &str, token_ids: &[u32]) -> Option<Vec<u8>> {
+    if model_ref.len() > MAX_MODEL_REF_LEN || token_ids.len() < 2 || token_ids.len() > MAX_CHALLENGE_TOKENS {
+        return None;
+    }
+    let mut b = Vec::with_capacity(1 + 2 + model_ref.len() + 4 + 4 * token_ids.len());
+    b.push(PROMPT_SCORE_CHALLENGE);
+    b.extend_from_slice(&(model_ref.len() as u16).to_le_bytes());
+    b.extend_from_slice(model_ref.as_bytes());
+    b.extend_from_slice(&(token_ids.len() as u32).to_le_bytes());
+    for id in token_ids {
+        b.extend_from_slice(&id.to_le_bytes());
+    }
+    Some(b)
+}
+
+fn decode_challenge(body: &[u8]) -> Option<(String, Vec<u32>)> {
+    let len = u16::from_le_bytes(body.get(..2)?.try_into().ok()?) as usize;
+    if len > MAX_MODEL_REF_LEN {
+        return None;
+    }
+    let model = String::from_utf8(body.get(2..2 + len)?.to_vec()).ok()?;
+    let rest = &body[2 + len..];
+    let n = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    if !(2..=MAX_CHALLENGE_TOKENS).contains(&n) || rest.len() != 4 + 4 * n {
+        return None;
+    }
+    let ids = rest[4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    Some((model, ids))
+}
+
+/// A refusal reply — also for refusals decided before [`handle_prompt_score_inbound`] runs (the
+/// worker pool shedding), so the consumer reads "refused" rather than "legacy provider".
+pub fn score_refusal(reason: &str) -> Vec<u8> {
+    response(RESP_REFUSED, reason.as_bytes())
+}
+
+fn response(status: u8, body: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(5 + body.len());
+    b.extend_from_slice(SCORE_RESP_MAGIC);
+    b.push(status);
+    b.extend_from_slice(body);
+    b
+}
+
+/// Caps how many challenges are scored at once, provider-wide.
+#[derive(Debug, Default)]
+pub struct InflightGate {
+    current: AtomicUsize,
+}
+
+/// Holds one slot of an [`InflightGate`] until dropped.
+pub struct InflightSlot<'a>(&'a InflightGate);
+
+impl Drop for InflightSlot<'_> {
+    fn drop(&mut self) {
+        self.0.current.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl InflightGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take a slot, or `None` if [`MAX_INFLIGHT`] are already taken.
+    pub fn try_enter(&self) -> Option<InflightSlot<'_>> {
+        self.current
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_INFLIGHT).then_some(n + 1))
+            .ok()
+            .map(|_| InflightSlot(self))
+    }
+}
+
+/// Provider side: answer a challenge (`body` = the bytes after the method byte). Never panics; every
+/// failure is a refusal. `engine` is `None` unless the operator opted in. `scorable(model)` must be
+/// true only for models this node announces publicly, so a challenge can't probe for a private
+/// model (it gets the same refusal as an unknown one). Engine errors are logged here and replied to
+/// generically, so a challenge can't read engine internals.
+pub fn handle_prompt_score_inbound(
+    body: &[u8],
+    engine: Option<&dyn EngineAdapter>,
+    gate: &InflightGate,
+    scorable: &dyn Fn(&str) -> bool,
+) -> Vec<u8> {
+    let Some(engine) = engine else {
+        return score_refusal("prompt scoring not offered by this provider");
+    };
+    let Some((model, ids)) = decode_challenge(body) else {
+        return score_refusal("malformed challenge");
+    };
+    if !scorable(&model) {
+        return score_refusal("model not scorable here");
+    }
+    let Some(_slot) = gate.try_enter() else {
+        return score_refusal("prompt scoring busy, retry");
+    };
+    match engine.score_prompt(&model, &ids) {
+        Ok(lps) if lps.len() + 1 == ids.len() => {
+            let mut b = Vec::with_capacity(4 + 4 * lps.len());
+            b.extend_from_slice(&(lps.len() as u32).to_le_bytes());
+            for lp in &lps {
+                b.extend_from_slice(&lp.to_le_bytes());
+            }
+            response(RESP_OK, &b)
+        }
+        Ok(lps) => {
+            tracing::warn!(model, sent = ids.len(), got = lps.len(), "engine returned the wrong number of prompt scores");
+            score_refusal("engine could not score the prompt")
+        }
+        Err(e) => {
+            tracing::warn!(model, error = %e, "prompt scoring failed");
+            score_refusal("engine could not score the prompt")
+        }
+    }
+}
+
+/// A request/response round-trip to one provider (a `proxy_forward` in production).
+pub type Transport<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>, String> + 'a;
+
+/// Consumer side: send one challenge and decode the reply into `token_ids.len() - 1` log-probs.
+/// Doesn't judge them — that's [`openhydra_protocol::logprob`].
+pub fn request_prompt_scores(
+    transport: &mut Transport<'_>,
+    model_ref: &str,
+    token_ids: &[u32],
+) -> Result<Vec<f32>, ScoreChallengeError> {
+    let framed = encode_challenge(model_ref, token_ids).ok_or(ScoreChallengeError::Malformed)?;
+    let reply = transport(&framed).map_err(ScoreChallengeError::Transport)?;
+    let Some(rest) = reply.strip_prefix(SCORE_RESP_MAGIC.as_slice()) else {
+        return Err(ScoreChallengeError::Unsupported);
+    };
+    match rest.split_first() {
+        Some((&RESP_OK, body)) => {
+            let m = u32::from_le_bytes(body.get(..4).ok_or(ScoreChallengeError::Malformed)?.try_into().unwrap()) as usize;
+            if m + 1 != token_ids.len() || body.len() != 4 + 4 * m {
+                return Err(ScoreChallengeError::Malformed);
+            }
+            Ok(body[4..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        }
+        Some((&RESP_REFUSED, reason)) => {
+            Err(ScoreChallengeError::Refused(String::from_utf8_lossy(reason).into_owned()))
+        }
+        _ => Err(ScoreChallengeError::Malformed),
+    }
+}
+
+// ── Consumer side: reference sets + challenge rounds ──
+
+/// A verifier's reference set and the provider model handles it applies to (a vLLM served-model
+/// name, an Ollama tag, …). Loaded from a JSON file the verifier keeps private: a text a provider
+/// has already seen can be scored offline by the honest model and replayed, so the set must not be
+/// published and a text is never sent twice to the same provider.
+#[derive(Debug, Clone)]
+pub struct LoadedReference {
+    pub handles: Vec<String>,
+    pub set: ReferenceSet,
+}
+
+#[derive(Deserialize)]
+struct ReferenceFile {
+    model_key: String,
+    handles: Vec<String>,
+    #[serde(default)]
+    cutoff: Option<f64>,
+    #[serde(default)]
+    min_texts: Option<usize>,
+    texts: Vec<ReferenceTextFile>,
+}
+
+#[derive(Deserialize)]
+struct ReferenceTextFile {
+    id: String,
+    token_ids: Vec<u32>,
+    logprobs: Vec<f32>,
+    band: f64,
+}
+
+/// Parse and validate a reference-set file:
+/// `{"model_key", "handles": [...], "cutoff"?, "min_texts"?, "texts": [{"id", "token_ids", "logprobs", "band"}]}`.
+pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
+    let f: ReferenceFile = serde_json::from_str(json).map_err(|e| format!("reference set: {e}"))?;
+    if f.handles.iter().all(|h| h.trim().is_empty()) {
+        return Err("reference set: no model handles".into());
+    }
+    let set = ReferenceSet {
+        model_key: f.model_key,
+        texts: f
+            .texts
+            .into_iter()
+            .map(|t| ReferenceText { id: t.id, token_ids: t.token_ids, logprobs: t.logprobs, band: t.band })
+            .collect(),
+        cutoff: f.cutoff.unwrap_or(DEFAULT_CUTOFF),
+        min_texts: f.min_texts.unwrap_or(DEFAULT_MIN_TEXTS),
+    };
+    set.validate().map_err(|e| format!("reference set {}: {e:?}", set.model_key))?;
+    if let Some(t) = set.texts.iter().find(|t| t.token_ids.len() > MAX_CHALLENGE_TOKENS) {
+        return Err(format!("reference set {}: text {} exceeds {MAX_CHALLENGE_TOKENS} tokens", set.model_key, t.id));
+    }
+    Ok(LoadedReference { handles: f.handles, set })
+}
+
+/// Read and validate a reference-set file.
+pub fn load_reference(path: &std::path::Path) -> Result<LoadedReference, String> {
+    let json = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_reference(&json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How a run of challenges ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoundOutcome {
+    /// The round completed.
+    Verdict(LogprobVerdict),
+    /// Stopped early (refusal, transport error, malformed reply). Ratios recorded so far are kept
+    /// for the next attempt; the texts already sent stay burned.
+    Incomplete(String),
+    /// The provider doesn't speak the protocol (legacy build).
+    Unsupported,
+    /// Not enough unsent texts left for this provider — the verifier needs a fresh set.
+    Exhausted,
+}
+
+/// Busy / rate-limited refusals tolerated in a row before a run gives up.
+const MAX_BUSY_RETRIES: usize = 3;
+
+/// Send challenges one at a time until the round closes or something stops it. `pick(n)` chooses
+/// which unsent text goes next (random in production); `pause()` backs off after a busy refusal.
+/// `persist(round)` runs after each text is issued — **before** it is sent, so a crash can't forget
+/// a text the provider has seen — and after each reply is recorded.
+pub fn run_round(
+    round: &mut ChallengeRound,
+    set: &ReferenceSet,
+    model_ref: &str,
+    transport: &mut Transport<'_>,
+    pick: &mut dyn FnMut(usize) -> usize,
+    pause: &mut dyn FnMut(),
+    persist: &mut dyn FnMut(&ChallengeRound),
+) -> RoundOutcome {
+    let mut busy = 0;
+    loop {
+        if !round.can_complete_round(set) {
+            return RoundOutcome::Exhausted;
+        }
+        let Some(text) = round.next_text(set, &mut *pick) else {
+            return RoundOutcome::Exhausted;
+        };
+        let (id, token_ids) = (text.id.clone(), text.token_ids.clone());
+        persist(round);
+        let reply = request_prompt_scores(transport, model_ref, &token_ids);
+        let recorded = reply.as_ref().ok().map(|scores| round.record(set, &id, scores));
+        if reply.is_err() {
+            round.abandon(&id);
+        }
+        persist(round);
+        match reply {
+            Ok(_) => match recorded.expect("recorded for Ok") {
+                Ok(Some(verdict)) => return RoundOutcome::Verdict(verdict),
+                Ok(None) => busy = 0,
+                Err(RoundError::Score(e)) => return RoundOutcome::Incomplete(format!("unscorable reply: {e:?}")),
+                Err(e) => return RoundOutcome::Incomplete(format!("{e:?}")),
+            },
+            Err(err) => {
+                match err {
+                    ScoreChallengeError::Unsupported => return RoundOutcome::Unsupported,
+                    ScoreChallengeError::Refused(r) if r.contains("retry") && busy + 1 < MAX_BUSY_RETRIES => {
+                        busy += 1;
+                        pause();
+                    }
+                    ScoreChallengeError::Refused(r) => return RoundOutcome::Incomplete(format!("refused: {r}")),
+                    ScoreChallengeError::Transport(e) => return RoundOutcome::Incomplete(format!("transport: {e}")),
+                    ScoreChallengeError::Malformed => return RoundOutcome::Incomplete("malformed reply".into()),
+                }
+            }
+        }
+    }
+}
+
+// ── Consumer side: per-provider check history ──
+
+/// How long a verdict counts toward the authenticity tier.
+pub const LOGPROB_VALID_MS: u64 = 24 * 60 * 60 * 1000;
+/// Re-check a provider this long after a verdict (well inside [`LOGPROB_VALID_MS`]).
+pub const LOGPROB_REFRESH_MS: u64 = 6 * 60 * 60 * 1000;
+/// Retry an interrupted round after this long.
+pub const LOGPROB_RETRY_MS: u64 = 10 * 60 * 1000;
+/// Back off from a legacy provider, or from one whose unsent texts ran out.
+pub const LOGPROB_BACKOFF_MS: u64 = 60 * 60 * 1000;
+/// Passing rounds in a row needed before the log-prob method flag counts toward A2 …
+pub const LOGPROB_MIN_PASSES: u32 = 3;
+/// … with the first of them at least this long before the latest, so one lucky afternoon (or one
+/// window where only the challenges went to the real model) isn't enough.
+pub const LOGPROB_MIN_SPAN_MS: u64 = 48 * 60 * 60 * 1000;
+/// Runs in a row that end without a verdict — refused, timed out, unsupported — from a provider that
+/// has answered before, after which the gateway treats it as dodging the check.
+pub const LOGPROB_MAX_EVASIONS: u32 = 3;
+
+/// One `(peer, model)`'s log-prob check history, as the gateway sees it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LogprobStatus {
+    /// The latest completed round's verdict and when it closed.
+    pub verdict: Option<(LogprobVerdict, u64)>,
+    /// Passing rounds in a row (reset by a fail or an evasion penalty).
+    pub pass_streak: u32,
+    /// When the first pass of the current streak closed.
+    pub streak_since_ms: u64,
+    /// Runs in a row that ended without a verdict after the provider had answered before.
+    pub evasions: u32,
+    /// When the latest evasion penalty was applied (0 = never).
+    pub evaded_at_ms: u64,
+    /// Earliest time the next run may start.
+    pub next_due_ms: u64,
+}
+
+/// What the gateway must record after a run, beyond updating the status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusEffect {
+    /// Nothing: a pass (which by itself earns no audit credit or reputation), or a run that ended
+    /// early without being held against the provider.
+    None,
+    /// A failed round: a failed audit plus a `Failed` reputation outcome.
+    Fail,
+    /// Repeated dodging: a failed audit, but no reputation cut — it could be a flaky connection.
+    Evasion,
+}
+
+impl LogprobStatus {
+    /// Record a completed round.
+    pub fn on_verdict(&mut self, verdict: LogprobVerdict, now_ms: u64) -> StatusEffect {
+        self.verdict = Some((verdict, now_ms));
+        self.evasions = 0;
+        self.next_due_ms = now_ms + LOGPROB_REFRESH_MS;
+        if verdict.passed() {
+            if self.pass_streak == 0 {
+                self.streak_since_ms = now_ms;
+            }
+            self.pass_streak += 1;
+            StatusEffect::None
+        } else {
+            self.pass_streak = 0;
+            self.streak_since_ms = 0;
+            StatusEffect::Fail
+        }
+    }
+
+    /// Record a run that ended without a verdict. `counts_against` is true when the provider has
+    /// answered before and the run stopped on its side (refusal, timeout, a broken reply, or it
+    /// stopped supporting the protocol) — false for a first contact or for our own shortage of texts.
+    pub fn on_no_verdict(&mut self, counts_against: bool, retry_ms: u64, now_ms: u64) -> StatusEffect {
+        self.next_due_ms = now_ms + retry_ms;
+        if !counts_against {
+            return StatusEffect::None;
+        }
+        self.evasions += 1;
+        if self.evasions < LOGPROB_MAX_EVASIONS {
+            return StatusEffect::None;
+        }
+        self.evasions = 0;
+        self.pass_streak = 0;
+        self.streak_since_ms = 0;
+        self.evaded_at_ms = now_ms;
+        StatusEffect::Evasion
+    }
+
+    /// Whether the pass streak is long enough, and spread over long enough, to count.
+    pub fn streak_qualifies(&self) -> bool {
+        match self.verdict {
+            Some((v, at)) if v.passed() => {
+                self.pass_streak >= LOGPROB_MIN_PASSES && at.saturating_sub(self.streak_since_ms) >= LOGPROB_MIN_SPAN_MS
+            }
+            _ => false,
+        }
+    }
+
+    /// `(log-prob method flag, latest outcome)` for the authenticity evidence. The flag needs a fresh
+    /// pass (within [`LOGPROB_VALID_MS`]) at the end of a qualifying streak; a fresh fail forces the
+    /// floor. An evasion penalty just breaks the streak.
+    pub fn evidence(&self, now_ms: u64) -> (bool, Option<VerificationOutcome>) {
+        match self.verdict {
+            Some((v, at)) if now_ms.saturating_sub(at) < LOGPROB_VALID_MS => {
+                (v.passed() && self.streak_qualifies(), Some(v.outcome()))
+            }
+            _ => (false, None),
+        }
+    }
+
+    /// Short status-view label, e.g. `"pass 0.94x (1/3)"`, `"pass 0.94x"`, `"fail 1.69x"`.
+    pub fn label(&self) -> Option<String> {
+        let (v, _) = self.verdict?;
+        Some(match v {
+            LogprobVerdict::Fail { aggregate } => format!("fail {aggregate:.2}x"),
+            LogprobVerdict::Pass { aggregate } if self.streak_qualifies() => format!("pass {aggregate:.2}x"),
+            LogprobVerdict::Pass { aggregate } if self.pass_streak == 0 => format!("pass {aggregate:.2}x (streak reset)"),
+            LogprobVerdict::Pass { aggregate } => {
+                format!("pass {aggregate:.2}x ({}/{LOGPROB_MIN_PASSES})", self.pass_streak.min(LOGPROB_MIN_PASSES))
+            }
+        })
+    }
+
+    const LEN: usize = 50;
+
+    /// `0x02 ‖ kind(0 none, 1 pass, 2 fail) ‖ aggregate f64 ‖ at u64 ‖ pass_streak u32 ‖
+    /// streak_since u64 ‖ evasions u32 ‖ evaded_at u64 ‖ next_due u64` (LE).
+    fn to_bytes(self) -> [u8; Self::LEN] {
+        let (kind, aggregate, at) = match self.verdict {
+            None => (0u8, 0.0, 0),
+            Some((LogprobVerdict::Pass { aggregate }, at)) => (1, aggregate, at),
+            Some((LogprobVerdict::Fail { aggregate }, at)) => (2, aggregate, at),
+        };
+        let mut b = Vec::with_capacity(Self::LEN);
+        b.push(0x02);
+        b.push(kind);
+        b.extend_from_slice(&aggregate.to_le_bytes());
+        b.extend_from_slice(&at.to_le_bytes());
+        b.extend_from_slice(&self.pass_streak.to_le_bytes());
+        b.extend_from_slice(&self.streak_since_ms.to_le_bytes());
+        b.extend_from_slice(&self.evasions.to_le_bytes());
+        b.extend_from_slice(&self.evaded_at_ms.to_le_bytes());
+        b.extend_from_slice(&self.next_due_ms.to_le_bytes());
+        b.try_into().expect("fixed layout")
+    }
+
+    fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::LEN || b[0] != 0x02 {
+            return None;
+        }
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        let aggregate = f64::from_le_bytes(b[2..10].try_into().unwrap());
+        let at = u64_at(10);
+        let verdict = match b[1] {
+            0 => None,
+            1 if aggregate.is_finite() => Some((LogprobVerdict::Pass { aggregate }, at)),
+            2 if aggregate.is_finite() => Some((LogprobVerdict::Fail { aggregate }, at)),
+            _ => return None,
+        };
+        Some(Self {
+            verdict,
+            pass_streak: u32_at(18),
+            streak_since_ms: u64_at(22),
+            evasions: u32_at(30),
+            evaded_at_ms: u64_at(34),
+            next_due_ms: u64_at(42),
+        })
+    }
+}
+
+/// One `(peer, model)`'s persisted state: the status followed by the challenge round.
+pub fn encode_logprob_state(status: LogprobStatus, round: &ChallengeRound) -> Vec<u8> {
+    let mut b = status.to_bytes().to_vec();
+    b.extend_from_slice(&round.to_bytes());
+    b
+}
+
+/// Inverse of [`encode_logprob_state`]; `None` for a corrupt or older-format row.
+pub fn decode_logprob_state(b: &[u8]) -> Option<(LogprobStatus, ChallengeRound)> {
+    let status = LogprobStatus::from_bytes(b.get(..LogprobStatus::LEN)?)?;
+    let round = ChallengeRound::from_bytes(&b[LogprobStatus::LEN..]).ok()?;
+    Some((status, round))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{AdapterError, DetectedModel, InferenceRequest, ServeOutcome};
+
+    /// Scores position i as −(id of the next token) / 10, or fails / misbehaves on request.
+    struct Scorer {
+        mode: &'static str,
+    }
+
+    impl EngineAdapter for Scorer {
+        fn engine_name(&self) -> &'static str {
+            "stub"
+        }
+        fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+            Ok(vec![])
+        }
+        fn serve_stream(&self, _: &InferenceRequest, _: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
+            unreachable!()
+        }
+        fn score_prompt(&self, _model: &str, ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+            match self.mode {
+                "err" => Err(AdapterError::Http("secret engine detail".into())),
+                "short" => Ok(vec![-0.1]),
+                _ => Ok(ids[1..].iter().map(|&i| -(i as f32) / 10.0).collect()),
+            }
+        }
+    }
+
+    fn roundtrip(engine: Option<&dyn EngineAdapter>, gate: &InflightGate, model: &str, ids: &[u32]) -> Result<Vec<f32>, ScoreChallengeError> {
+        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
+            assert_eq!(framed[0], PROMPT_SCORE_CHALLENGE);
+            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| m == "public"))
+        };
+        request_prompt_scores(&mut transport, model, ids)
+    }
+
+    #[test]
+    fn a_challenge_round_trips_the_engine_scores() {
+        let gate = InflightGate::new();
+        let out = roundtrip(Some(&Scorer { mode: "ok" }), &gate, "public", &[1, 5, 10]).unwrap();
+        assert_eq!(out, vec![-0.5, -1.0]);
+    }
+
+    #[test]
+    fn refusals_are_readable_and_generic() {
+        let gate = InflightGate::new();
+        let r = |e: Option<&dyn EngineAdapter>, m: &str| roundtrip(e, &gate, m, &[1, 2, 3]);
+        assert!(matches!(r(None, "public"), Err(ScoreChallengeError::Refused(s)) if s.contains("not offered")));
+        // A private or unknown model gets the same refusal.
+        assert_eq!(r(Some(&Scorer { mode: "ok" }), "private"), r(Some(&Scorer { mode: "ok" }), "nope"));
+        // Engine errors don't leak through.
+        match r(Some(&Scorer { mode: "err" }), "public") {
+            Err(ScoreChallengeError::Refused(s)) => assert!(!s.contains("secret")),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(r(Some(&Scorer { mode: "short" }), "public"), Err(ScoreChallengeError::Refused(_))));
+    }
+
+    #[test]
+    fn the_gate_caps_concurrent_scoring() {
+        let gate = InflightGate::new();
+        let a = gate.try_enter().unwrap();
+        let _b = gate.try_enter().unwrap();
+        assert!(gate.try_enter().is_none());
+        assert!(matches!(
+            roundtrip(Some(&Scorer { mode: "ok" }), &gate, "public", &[1, 2]),
+            Err(ScoreChallengeError::Refused(s)) if s.contains("busy")
+        ));
+        drop(a);
+        assert!(roundtrip(Some(&Scorer { mode: "ok" }), &gate, "public", &[1, 2]).is_ok());
+        // The slot taken by that challenge was released.
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[test]
+    fn out_of_bounds_challenges_are_not_sent() {
+        assert!(encode_challenge("m", &[1]).is_none());
+        assert!(encode_challenge("m", &vec![0; MAX_CHALLENGE_TOKENS + 1]).is_none());
+        assert!(encode_challenge(&"x".repeat(MAX_MODEL_REF_LEN + 1), &[1, 2]).is_none());
+        assert!(encode_challenge("m", &vec![0; MAX_CHALLENGE_TOKENS]).is_some());
+    }
+
+    #[test]
+    fn malformed_challenge_bodies_are_refused_without_panicking() {
+        let gate = InflightGate::new();
+        let engine = Scorer { mode: "ok" };
+        let good = encode_challenge("public", &[1, 2, 3]).unwrap();
+        for cut in 0..good.len() - 1 {
+            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|_| true);
+            assert!(reply.starts_with(SCORE_RESP_MAGIC));
+            assert_eq!(reply[4], RESP_REFUSED);
+        }
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|_| true)[4], RESP_REFUSED);
+    }
+
+    #[test]
+    fn a_legacy_or_garbled_reply_is_classified() {
+        let mut legacy = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![0x13, 0, 0, 0, 3]) };
+        assert_eq!(request_prompt_scores(&mut legacy, "m", &[1, 2]), Err(ScoreChallengeError::Unsupported));
+        let mut wrong_count = |_: &[u8]| -> Result<Vec<u8>, String> {
+            let mut b = SCORE_RESP_MAGIC.to_vec();
+            b.push(RESP_OK);
+            b.extend_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&[0; 8]);
+            Ok(b)
+        };
+        assert_eq!(request_prompt_scores(&mut wrong_count, "m", &[1, 2]), Err(ScoreChallengeError::Malformed));
+        let mut down = |_: &[u8]| -> Result<Vec<u8>, String> { Err("timeout".into()) };
+        assert_eq!(request_prompt_scores(&mut down, "m", &[1, 2]), Err(ScoreChallengeError::Transport("timeout".into())));
+    }
+
+    // ── reference sets + rounds ──
+
+    fn ref_json(n_texts: usize, min_texts: usize) -> String {
+        let texts: Vec<_> = (0..n_texts)
+            .map(|i| {
+                let ids: Vec<u32> = (0..20).map(|k| (i * 100 + k) as u32).collect();
+                let lps: Vec<f32> = ids[1..].iter().map(|&t| -(t as f32) / 10.0).collect();
+                serde_json::json!({"id": format!("t{i}"), "token_ids": ids, "logprobs": lps, "band": 0.02})
+            })
+            .collect();
+        serde_json::json!({"model_key": "m@bf16", "handles": ["public"], "min_texts": min_texts, "texts": texts})
+            .to_string()
+    }
+
+    #[test]
+    fn reference_files_parse_and_validate() {
+        let r = parse_reference(&ref_json(4, 4)).unwrap();
+        assert_eq!(r.handles, vec!["public".to_string()]);
+        assert_eq!(r.set.cutoff, DEFAULT_CUTOFF);
+        assert_eq!(r.set.texts.len(), 4);
+        assert!(parse_reference(&ref_json(3, 4)).unwrap_err().contains("TooFewTexts"));
+        assert!(parse_reference("{").is_err());
+        let no_handles = ref_json(4, 4).replace(r#"["public"]"#, "[]");
+        assert!(parse_reference(&no_handles).unwrap_err().contains("no model handles"));
+    }
+
+    /// A transport to an in-process provider whose engine scores exactly the reference (honest, the
+    /// stub's formula matches `ref_json`) or shifted by `shift` nats per position.
+    fn provider(shift: f32, gate: &InflightGate) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + '_ {
+        struct Shifted(f32);
+        impl EngineAdapter for Shifted {
+            fn engine_name(&self) -> &'static str {
+                "stub"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(&self, _: &InferenceRequest, _: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
+                unreachable!()
+            }
+            fn score_prompt(&self, _: &str, ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+                Ok(ids[1..].iter().map(|&t| -(t as f32) / 10.0 - self.0).collect())
+            }
+        }
+        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| m == "public"))
+    }
+
+    #[test]
+    fn an_honest_provider_passes_and_a_substitute_fails() {
+        let r = parse_reference(&ref_json(10, 4)).unwrap();
+        let gate = InflightGate::new();
+        let mut round = ChallengeRound::new();
+        let mut honest = provider(0.01, &gate);
+        match run_round(&mut round, &r.set, "public", &mut honest, &mut |n| n - 1, &mut || {}, &mut |_| {}) {
+            RoundOutcome::Verdict(v) => assert!(v.passed(), "{v:?}"),
+            other => panic!("{other:?}"),
+        }
+        let mut sub = provider(0.05, &gate);
+        match run_round(&mut round, &r.set, "public", &mut sub, &mut |_| 0, &mut || {}, &mut |_| {}) {
+            RoundOutcome::Verdict(v) => assert!(!v.passed(), "{v:?}"),
+            other => panic!("{other:?}"),
+        }
+        // 8 of 10 texts used: a third round can't be drawn.
+        assert_eq!(run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &mut || {}, &mut |_| {}), RoundOutcome::Exhausted);
+    }
+
+    #[test]
+    fn each_text_is_persisted_before_it_is_sent() {
+        use std::cell::RefCell;
+        let r = parse_reference(&ref_json(4, 4)).unwrap();
+        let gate = InflightGate::new();
+        let saved = RefCell::new(Vec::<usize>::new()); // issued count at each save
+        let at_send = RefCell::new(Vec::<usize>::new()); // latest saved issued count when each text goes out
+        let mut honest = provider(0.0, &gate);
+        let mut transport = |f: &[u8]| {
+            at_send.borrow_mut().push(saved.borrow().last().copied().unwrap_or(0));
+            honest(f)
+        };
+        let mut round = ChallengeRound::new();
+        let out = run_round(&mut round, &r.set, "public", &mut transport, &mut |_| 0, &mut || {}, &mut |rd| {
+            saved.borrow_mut().push(rd.issued_count())
+        });
+        assert!(matches!(out, RoundOutcome::Verdict(_)));
+        assert_eq!(*at_send.borrow(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_legacy_provider_stops_the_round_as_unsupported() {
+        let r = parse_reference(&ref_json(4, 4)).unwrap();
+        let mut round = ChallengeRound::new();
+        let mut legacy = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![0x13, 0, 0, 0]) };
+        assert_eq!(run_round(&mut round, &r.set, "public", &mut legacy, &mut |_| 0, &mut || {}, &mut |_| {}), RoundOutcome::Unsupported);
+        assert_eq!(round.in_flight(), 0);
+    }
+
+    #[test]
+    fn busy_refusals_back_off_then_give_up_keeping_progress() {
+        let r = parse_reference(&ref_json(12, 4)).unwrap();
+        let mut round = ChallengeRound::new();
+        let gate = InflightGate::new();
+        let mut honest = provider(0.0, &gate);
+        let mut calls = 0;
+        let mut flaky = |f: &[u8]| -> Result<Vec<u8>, String> {
+            calls += 1;
+            if calls <= 2 { honest(f) } else { Ok(score_refusal("prompt scoring busy, retry")) }
+        };
+        let mut pauses = 0;
+        let out = run_round(&mut round, &r.set, "public", &mut flaky, &mut |_| 0, &mut || pauses += 1, &mut |_| {});
+        assert!(matches!(out, RoundOutcome::Incomplete(ref s) if s.contains("busy")), "{out:?}");
+        assert_eq!(pauses, MAX_BUSY_RETRIES - 1);
+        assert_eq!(round.progress(), 2);
+        // The next attempt picks up where it left off and completes with 2 more texts.
+        let mut honest = provider(0.0, &gate);
+        assert!(matches!(
+            run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &mut || {}, &mut |_| {}),
+            RoundOutcome::Verdict(v) if v.passed()
+        ));
+    }
+
+    #[test]
+    fn a_hard_refusal_or_transport_error_stops_the_round() {
+        let r = parse_reference(&ref_json(8, 4)).unwrap();
+        let gate = InflightGate::new();
+        let mut round = ChallengeRound::new();
+        let mut private = provider(0.0, &gate);
+        assert!(matches!(
+            run_round(&mut round, &r.set, "private", &mut private, &mut |_| 0, &mut || {}, &mut |_| {}),
+            RoundOutcome::Incomplete(s) if s.contains("not scorable")
+        ));
+        let mut down = |_: &[u8]| -> Result<Vec<u8>, String> { Err("timeout".into()) };
+        assert!(matches!(
+            run_round(&mut round, &r.set, "public", &mut down, &mut |_| 0, &mut || {}, &mut |_| {}),
+            RoundOutcome::Incomplete(s) if s.contains("timeout")
+        ));
+    }
+
+    // ── check history (LogprobStatus) ──
+
+    const PASS: LogprobVerdict = LogprobVerdict::Pass { aggregate: 0.94 };
+    const FAIL: LogprobVerdict = LogprobVerdict::Fail { aggregate: 1.69 };
+    const H: u64 = 60 * 60 * 1000;
+
+    #[test]
+    fn a_pass_needs_a_streak_spread_over_the_minimum_span() {
+        let mut st = LogprobStatus::default();
+        assert_eq!(st.on_verdict(PASS, 0), StatusEffect::None, "a pass earns no audit or reputation");
+        assert_eq!(st.label().unwrap(), "pass 0.94x (1/3)");
+        st.on_verdict(PASS, 6 * H);
+        st.on_verdict(PASS, 12 * H);
+        assert_eq!(st.pass_streak, 3);
+        assert!(!st.streak_qualifies(), "3 passes inside 12 h don't span 48 h");
+        assert!(!st.evidence(12 * H + 1).0);
+        st.on_verdict(PASS, 48 * H);
+        assert!(st.streak_qualifies());
+        assert_eq!(st.evidence(48 * H + 1), (true, Some(VerificationOutcome::Honored)));
+        assert_eq!(st.label().unwrap(), "pass 0.94x");
+        // Stale after 24 h without a new round.
+        assert!(!st.evidence(72 * H).0);
+        assert_eq!(st.next_due_ms, 48 * H + LOGPROB_REFRESH_MS);
+    }
+
+    #[test]
+    fn a_fail_penalises_and_resets_the_streak() {
+        let mut st = LogprobStatus::default();
+        st.on_verdict(PASS, 0);
+        st.on_verdict(PASS, 30 * H);
+        assert_eq!(st.on_verdict(FAIL, 31 * H), StatusEffect::Fail);
+        assert_eq!((st.pass_streak, st.streak_since_ms), (0, 0));
+        assert_eq!(st.evidence(31 * H + 1), (false, Some(VerificationOutcome::Failed)));
+        assert_eq!(st.label().unwrap(), "fail 1.69x");
+        st.on_verdict(PASS, 32 * H);
+        assert_eq!((st.pass_streak, st.streak_since_ms), (1, 32 * H), "a new streak starts from scratch");
+    }
+
+    #[test]
+    fn repeated_dodging_after_answering_is_penalised_once_per_run_of_three() {
+        let mut st = LogprobStatus::default();
+        // First contact: stopping early is never held against a provider.
+        for i in 0..5 {
+            assert_eq!(st.on_no_verdict(false, LOGPROB_RETRY_MS, i), StatusEffect::None);
+        }
+        assert_eq!(st.evasions, 0);
+        st.on_verdict(PASS, 0);
+        st.on_verdict(PASS, 30 * H);
+        assert_eq!(st.on_no_verdict(true, LOGPROB_RETRY_MS, 31 * H), StatusEffect::None);
+        assert_eq!(st.on_no_verdict(true, LOGPROB_RETRY_MS, 32 * H), StatusEffect::None);
+        assert_eq!(st.on_no_verdict(true, LOGPROB_RETRY_MS, 33 * H), StatusEffect::Evasion);
+        assert_eq!((st.pass_streak, st.evasions, st.evaded_at_ms), (0, 0, 33 * H));
+        assert!(!st.evidence(33 * H + 1).0, "the old pass no longer counts");
+        assert_eq!(st.label().unwrap(), "pass 0.94x (streak reset)");
+        assert_eq!(st.next_due_ms, 33 * H + LOGPROB_RETRY_MS);
+        // A completed round clears the count.
+        st.on_no_verdict(true, LOGPROB_RETRY_MS, 34 * H);
+        st.on_verdict(PASS, 35 * H);
+        assert_eq!(st.evasions, 0);
+    }
+
+    #[test]
+    fn check_history_round_trips_and_rejects_corruption() {
+        let mut round = ChallengeRound::new();
+        let r = parse_reference(&ref_json(4, 4)).unwrap();
+        round.next_text(&r.set, |_| 0);
+        let mut st = LogprobStatus::default();
+        st.on_verdict(PASS, 5);
+        st.on_verdict(FAIL, 6);
+        st.on_verdict(PASS, 7);
+        st.on_no_verdict(true, 9, 8);
+        for s in [LogprobStatus::default(), st] {
+            let (back, rd) = decode_logprob_state(&encode_logprob_state(s, &round)).unwrap();
+            assert_eq!(back, s);
+            assert_eq!(rd.issued_count(), 1);
+        }
+        let good = encode_logprob_state(st, &round);
+        assert!(decode_logprob_state(&good[..LogprobStatus::LEN - 1]).is_none());
+        let mut bad = good.clone();
+        bad[1] = 7;
+        assert!(decode_logprob_state(&bad).is_none());
+        let mut old = good.clone();
+        old[0] = 0x01;
+        assert!(decode_logprob_state(&old).is_none(), "older format is not misread");
+        let mut long = good;
+        long.push(0);
+        assert!(decode_logprob_state(&long).is_none());
+    }
+}

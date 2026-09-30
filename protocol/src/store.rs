@@ -43,6 +43,11 @@ const PEER_CREDIT: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_cre
 /// `max_awardable_tier` gate; rehydrated so a restart resumes at the same awarded tier.
 const PEER_AUDIT_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_audit_stats");
 
+/// Teacher-forced log-prob checks (Track A2-Logprob) per composite `(peer, model)` key → an opaque
+/// agent blob (latest verdict + the texts already sent to that provider + the round in progress).
+/// Persisted so a restart never re-sends a text the provider has seen.
+const PEER_LOGPROB: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_logprob");
+
 /// Off-chain crypto-rail **gated voucher** (`crate::payout::GatedVoucher`) per composite
 /// `(peer, model)` key — the monotonic cumulative authenticity-gated amount (net + fee) a provider
 /// could later claim on-chain. No real value; the running accrual only.
@@ -197,6 +202,7 @@ impl Store {
             wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
             wtx.open_table(PEER_CREDIT).map_err(StoreError::from)?;
             wtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
+            wtx.open_table(PEER_LOGPROB).map_err(StoreError::from)?;
             wtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
             wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
@@ -428,6 +434,31 @@ impl Store {
             audit_stats.insert(key.value().to_string(), stats);
         }
         Ok(())
+    }
+
+    // ── PEER_LOGPROB (log-prob challenge state) ──
+
+    /// Write the log-prob challenge state blob for a composite `(peer, model)` key.
+    pub fn put_logprob_state(&self, key: &str, blob: &[u8]) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PEER_LOGPROB).map_err(StoreError::from)?;
+            t.insert(key, blob).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Every persisted log-prob challenge state, `(composite key, blob)`, for rehydration on boot.
+    pub fn load_logprob_states(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PEER_LOGPROB).map_err(StoreError::from)?;
+        let mut out = Vec::new();
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            out.push((key.value().to_string(), val.value().to_vec()));
+        }
+        Ok(out)
     }
 
     // ── PEER_GATED_ACCRUAL (crypto-rail gated voucher, off-chain) ──
@@ -722,6 +753,21 @@ mod tests {
         assert_eq!(recent[2].counterparty, "peerA"); // oldest last
         // Totals: served 30+7=37 over 2 rows; used 5.
         assert_eq!(store.ledger_totals().unwrap(), (37, 5, 2));
+    }
+
+    #[test]
+    fn logprob_state_persists_across_reopen() {
+        let (_dir, path) = temp_db();
+        {
+            let store = Store::open(&path).unwrap();
+            store.put_logprob_state("peerA\0m", &[1, 2, 3]).unwrap();
+            store.put_logprob_state("peerA\0m", &[4, 5]).unwrap(); // overwrite
+            store.put_logprob_state("peerB\0m", &[6]).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let mut got = store.load_logprob_states().unwrap();
+        got.sort();
+        assert_eq!(got, vec![("peerA\0m".to_string(), vec![4, 5]), ("peerB\0m".to_string(), vec![6])]);
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub enum AdapterError {
     Http(String),
     /// A response could not be parsed into the expected shape.
     Parse(String),
+    /// The engine (or this adapter) doesn't offer the requested capability.
+    Unsupported(String),
 }
 
 impl fmt::Display for AdapterError {
@@ -32,6 +34,7 @@ impl fmt::Display for AdapterError {
         match self {
             AdapterError::Http(m) => write!(f, "engine http error: {m}"),
             AdapterError::Parse(m) => write!(f, "engine response parse error: {m}"),
+            AdapterError::Unsupported(m) => write!(f, "engine capability unsupported: {m}"),
         }
     }
 }
@@ -44,6 +47,12 @@ impl std::error::Error for AdapterError {}
 pub trait HttpClient {
     /// `GET {url}` → response body as a string.
     fn get(&self, url: &str) -> Result<String, AdapterError>;
+    /// `GET {url}` → just the HTTP status, **including** error statuses (a 404 or 405 is an answer
+    /// here, not an error). Used to fingerprint engines by which routes they have. The default
+    /// can only tell success from failure; the live client returns the real status.
+    fn get_status(&self, url: &str) -> Result<u16, AdapterError> {
+        self.get(url).map(|_| 200)
+    }
     /// `POST {url}` with a JSON `body` → response body as a string.
     fn post_json(&self, url: &str, body: &str) -> Result<String, AdapterError>;
     /// `POST {url}` with a JSON `body`, streaming the response as a **lazy** iterator of
@@ -335,6 +344,14 @@ pub trait EngineAdapter {
         request: &InferenceRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeOutcome, AdapterError>;
+
+    /// Teacher-forced prompt scoring (Track A2-Logprob): the engine's log-prob of each
+    /// `token_ids[i + 1]` given `token_ids[..=i]`, so one fewer value than ids. Only engines that
+    /// expose prompt log-probs can answer (vLLM, SGLang, patched mistral.rs); the default refuses.
+    fn score_prompt(&self, model_ref: &str, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+        let _ = (model_ref, token_ids);
+        Err(AdapterError::Unsupported(format!("{} does not expose prompt log-probs", self.engine_name())))
+    }
 }
 
 /// The result of an embeddings request: one vector per input, in input order, plus the

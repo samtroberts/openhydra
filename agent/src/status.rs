@@ -284,6 +284,11 @@ pub struct RepEntry {
     /// per-process key on unsigned builds). Omitted when zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_key_rotations: Option<u32>,
+    /// Latest prompt-scoring (log-prob) verdict for this `(peer, model)` (Track A2-Logprob), e.g.
+    /// `"pass 0.97x"` / `"fail 1.62x"` — the aggregate against the reference set's cut-off. `None`
+    /// when checks are off or no round has completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprob_check: Option<String>,
 }
 
 /// One counterparty's give/take credit standing (keyed by **libp2p** peer id — the dial

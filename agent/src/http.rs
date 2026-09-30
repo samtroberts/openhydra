@@ -73,6 +73,10 @@ impl HttpClient for ReqwestClient {
             .map_err(http_err)
     }
 
+    fn get_status(&self, url: &str) -> Result<u16, AdapterError> {
+        Ok(self.client.get(url).timeout(GET_TIMEOUT).send().map_err(http_err)?.status().as_u16())
+    }
+
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
         Ok(self
             .client

@@ -29,7 +29,7 @@ use crate::adapters::comfyui::{ComfyUiAdapter, DEFAULT_COMFYUI_URL};
 use crate::adapters::exo::{ExoAdapter, DEFAULT_EXO_URL};
 use crate::adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 use crate::adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
-use crate::adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};
+use crate::adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_SGLANG_URL, DEFAULT_VLLM_URL};
 use crate::http::ReqwestClient;
 
 /// Connect timeout for a detection probe. Localhost refuses instantly when a port is dead,
@@ -57,7 +57,9 @@ pub type SharedAdapter = Arc<dyn EngineAdapter + Send + Sync>;
 struct ProbeSpec {
     label: &'static str,
     url: &'static str,
-    build: fn(&str) -> Result<SharedAdapter, AdapterError>,
+    /// Build the adapter. The flag enables auto-identified prompt scoring (Track A2-Logprob) on the
+    /// OpenAI-compatible engines; the others can't score and ignore it.
+    build: fn(&str, bool) -> Result<SharedAdapter, AdapterError>,
 }
 
 fn probe_specs() -> Vec<ProbeSpec> {
@@ -68,6 +70,7 @@ fn probe_specs() -> Vec<ProbeSpec> {
         ProbeSpec { label: "llama.cpp", url: DEFAULT_LLAMACPP_URL, build: build_llamacpp },
         ProbeSpec { label: "lm-studio", url: DEFAULT_LM_STUDIO_URL, build: build_lmstudio },
         ProbeSpec { label: "vllm", url: DEFAULT_VLLM_URL, build: build_vllm },
+        ProbeSpec { label: "sglang", url: DEFAULT_SGLANG_URL, build: build_sglang },
         ProbeSpec { label: "exo", url: DEFAULT_EXO_URL, build: build_exo },
         ProbeSpec { label: "comfyui", url: DEFAULT_COMFYUI_URL, build: build_comfyui },
     ]
@@ -77,22 +80,32 @@ fn probe_client() -> Result<ReqwestClient, AdapterError> {
     ReqwestClient::with_connect_timeout(PROBE_CONNECT_TIMEOUT)
 }
 
-fn build_ollama(u: &str) -> Result<SharedAdapter, AdapterError> {
+fn build_ollama(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
     Ok(Arc::new(OllamaAdapter::new(u, probe_client()?)))
 }
-fn build_llamacpp(u: &str) -> Result<SharedAdapter, AdapterError> {
+fn build_llamacpp(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
     Ok(Arc::new(LlamaCppAdapter::new(u, probe_client()?)))
 }
-fn build_lmstudio(u: &str) -> Result<SharedAdapter, AdapterError> {
-    Ok(Arc::new(OpenAiAdapter::new(u, "lm-studio", probe_client()?)))
+/// An OpenAI-compatible engine at `u`. With `scoring`, the prompt-scoring API is identified from the
+/// engine itself on the first challenge — port 1234 is LM Studio's default but also mistral.rs's,
+/// and the label is only a guess from the port.
+fn build_openai(u: &str, name: &'static str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
+    let adapter = OpenAiAdapter::new(u, name, probe_client()?);
+    Ok(Arc::new(if scoring { adapter.with_auto_prompt_scoring() } else { adapter }))
 }
-fn build_vllm(u: &str) -> Result<SharedAdapter, AdapterError> {
-    Ok(Arc::new(OpenAiAdapter::new(u, "vllm", probe_client()?)))
+fn build_lmstudio(u: &str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
+    build_openai(u, "lm-studio", scoring)
 }
-fn build_comfyui(u: &str) -> Result<SharedAdapter, AdapterError> {
+fn build_vllm(u: &str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
+    build_openai(u, "vllm", scoring)
+}
+fn build_sglang(u: &str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
+    build_openai(u, "sglang", scoring)
+}
+fn build_comfyui(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
     Ok(Arc::new(ComfyUiAdapter::new(u, probe_client()?)))
 }
-fn build_exo(u: &str) -> Result<SharedAdapter, AdapterError> {
+fn build_exo(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
     // Exo needs its own adapter (detects placed-and-ready models via /state, not the
     // /v1/models catalog) — see [`crate::adapters::exo`].
     Ok(Arc::new(ExoAdapter::new(u, probe_client()?)))
@@ -102,15 +115,21 @@ fn build_exo(u: &str) -> Result<SharedAdapter, AdapterError> {
 /// [`probe_specs`] order. An engine is "found" when its adapter's `detect_models` succeeds
 /// (server up), even if it currently serves zero models.
 pub fn detect_engines() -> Vec<DetectedEngine> {
+    detect_engines_with(false)
+}
+
+/// As [`detect_engines`], with auto-identified prompt scoring enabled on the OpenAI-compatible
+/// engines when `scoring` is set.
+pub fn detect_engines_with(scoring: bool) -> Vec<DetectedEngine> {
     let handles: Vec<_> = probe_specs()
         .into_iter()
-        .map(|spec| std::thread::spawn(move || probe_one(spec)))
+        .map(|spec| std::thread::spawn(move || probe_one(spec, scoring)))
         .collect();
     handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
 }
 
-fn probe_one(spec: ProbeSpec) -> Option<DetectedEngine> {
-    let adapter = (spec.build)(spec.url).ok()?;
+fn probe_one(spec: ProbeSpec, scoring: bool) -> Option<DetectedEngine> {
+    let adapter = (spec.build)(spec.url, scoring).ok()?;
     match adapter.detect_models() {
         Ok(models) => Some(DetectedEngine { label: spec.label, url: spec.url, adapter, models }),
         Err(_) => None, // connection refused / wrong service on the port → not this engine
@@ -148,17 +167,26 @@ fn build_routes(engines: &[DetectedEngine]) -> RouteTable {
 /// that appear after startup are absorbed with no restart.
 pub struct MultiAdapter {
     table: RwLock<RouteTable>,
+    /// Enable auto-identified prompt scoring on the OpenAI-compatible engines it detects.
+    scoring: bool,
 }
 
 impl MultiAdapter {
     /// An empty multi-adapter; the first `detect_models` populates it by probing.
     pub fn new() -> Self {
-        Self { table: RwLock::new(RouteTable { routes: HashMap::new(), models: Vec::new() }) }
+        Self { table: RwLock::new(RouteTable { routes: HashMap::new(), models: Vec::new() }), scoring: false }
+    }
+
+    /// Enable prompt scoring (`provide --engine-kind auto --prompt-scoring auto`): each detected
+    /// vLLM / SGLang / patched-mistral.rs engine answers with its own API, identified on first use.
+    pub fn with_auto_prompt_scoring(mut self) -> Self {
+        self.scoring = true;
+        self
     }
 
     #[cfg(test)]
     fn from_engines(engines: Vec<DetectedEngine>) -> Self {
-        Self { table: RwLock::new(build_routes(&engines)) }
+        Self { table: RwLock::new(build_routes(&engines)), scoring: false }
     }
 }
 
@@ -174,7 +202,7 @@ impl EngineAdapter for MultiAdapter {
     }
 
     fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
-        let table = build_routes(&detect_engines());
+        let table = build_routes(&detect_engines_with(self.scoring));
         let models = table.models.clone();
         // F-C6: recover from a poisoned lock instead of silently skipping the
         // update — otherwise we'd return (and announce) `models` while the route
@@ -198,6 +226,14 @@ impl EngineAdapter for MultiAdapter {
                 "no local engine serves model '{}' (auto mode)",
                 request.model_ref
             ))),
+        }
+    }
+
+    fn score_prompt(&self, model_ref: &str, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+        let adapter = self.table.read().ok().and_then(|t| t.routes.get(model_ref).cloned());
+        match adapter {
+            Some(adapter) => adapter.score_prompt(model_ref, token_ids),
+            None => Err(AdapterError::Http(format!("no local engine serves model '{model_ref}' (auto mode)"))),
         }
     }
 }

@@ -36,6 +36,7 @@ use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
 use crate::attest::{attest_refusal, handle_attest_inbound, Attestor, ATTEST_CHALLENGE};
+use crate::prompt_score::{handle_prompt_score_inbound, score_refusal, InflightGate, PROMPT_SCORE_CHALLENGE};
 use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, RECEIPT_REQUEST};
@@ -109,6 +110,11 @@ const FETCH_RATE_MAX_TRACKED: usize = 4096;
 const ATTEST_RATE_RPS: f64 = 5.0;
 const ATTEST_RATE_BURST: f64 = 10.0;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
+/// Per-peer cap on prompt-scoring challenges. A verifier round is 24 challenges sent one at a time
+/// (~1 s each on an L4), so this admits a round without queueing but stops one peer hogging the
+/// engine; the provider-wide `InflightGate` is the hard bound.
+const SCORE_RATE_RPS: f64 = 2.0;
+const SCORE_RATE_BURST: f64 = 4.0;
 
 /// A buffered serve result, keyed by the consumer's committed nonce, so a reconnecting
 /// consumer can fetch it after the serve connection drops (reconnect-and-fetch).
@@ -689,6 +695,13 @@ pub struct Provider<A: EngineAdapter> {
     attestor: Option<Arc<Attestor>>,
     /// Per-peer rate cap on attestation challenges (a separate bucket from receipts/fetches).
     attest_rl: Arc<RateLimiter>,
+    /// Prompt-scoring challenges (Track A2-Logprob): answered only when the operator declared the
+    /// engine's scoring API (`provide --prompt-scoring`).
+    prompt_scoring: bool,
+    /// Caps challenges scored at once, provider-wide (engines OOM on concurrent prompt log-probs).
+    score_gate: InflightGate,
+    /// Per-peer rate cap on prompt-scoring challenges.
+    score_rl: Arc<RateLimiter>,
     /// P1 streaming: nonce → trimmable-log [`StreamBuffer`], populated by `SERVE_STREAM` and
     /// polled/pruned by `FETCH_CHUNKS`. Separate from `results` (0x10/0x11 buffered path) so the
     /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
@@ -810,6 +823,14 @@ impl<A: EngineAdapter> Provider<A> {
                 max_inflight: 0,
                 max_tracked: ATTEST_RATE_MAX_TRACKED,
             })),
+            prompt_scoring: false,
+            score_gate: InflightGate::new(),
+            score_rl: Arc::new(RateLimiter::new(RateLimitConfig {
+                rps: SCORE_RATE_RPS,
+                burst: SCORE_RATE_BURST,
+                max_inflight: 0,
+                max_tracked: ATTEST_RATE_MAX_TRACKED,
+            })),
             streams: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
@@ -832,6 +853,13 @@ impl<A: EngineAdapter> Provider<A> {
     /// (builder form). Only models this node announces publicly are attestable.
     pub fn with_attestor(mut self, attestor: Attestor) -> Self {
         self.attestor = Some(Arc::new(attestor));
+        self
+    }
+
+    /// Opt in to answering `PROMPT_SCORE_CHALLENGE` (builder form). The adapter must be able to
+    /// score (`OpenAiAdapter::with_prompt_scoring`); only publicly-announced models are scorable.
+    pub fn with_prompt_scoring(mut self) -> Self {
+        self.prompt_scoring = true;
         self
     }
 
@@ -1616,6 +1644,7 @@ impl<A: EngineAdapter> Provider<A> {
                 let provider = Arc::clone(&self);
                 let shed_id = request_id.clone();
                 let is_attest = data.first() == Some(&ATTEST_CHALLENGE);
+                let is_score = data.first() == Some(&PROMPT_SCORE_CHALLENGE);
                 let accepted = pool.submit(move || {
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
@@ -1652,6 +1681,8 @@ impl<A: EngineAdapter> Provider<A> {
                     // retries later instead of mistaking the serve-error frame for a legacy provider.
                     let busy = if is_attest {
                         attest_refusal("provider overloaded, retry")
+                    } else if is_score {
+                        score_refusal("provider overloaded, retry")
                     } else {
                         frame_response(&[ServeChunk::Error("provider overloaded, retry".into()).encode()])
                     };
@@ -1802,6 +1833,19 @@ impl<A: EngineAdapter> Provider<A> {
                     self.attestor.as_deref(),
                     &|model| self.policy.announce_globally(model),
                     now_unix_ms(),
+                )
+            }
+            // Prompt-scoring challenge (Track A2-Logprob): opt-in, per-peer rate-limited, and capped
+            // provider-wide; same public-models-only rule as attestation.
+            Some(&PROMPT_SCORE_CHALLENGE) => {
+                if self.score_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+                    return score_refusal("prompt scoring rate limited, retry");
+                }
+                handle_prompt_score_inbound(
+                    &data[1..],
+                    self.prompt_scoring.then_some(&self.adapter as &dyn EngineAdapter),
+                    &self.score_gate,
+                    &|model| self.policy.announce_globally(model),
                 )
             }
             Some(&RECEIPT_REQUEST) => {
