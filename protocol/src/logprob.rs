@@ -418,6 +418,228 @@ impl ChallengeRound {
 
 const ROUND_FORMAT_V1: u8 = 0x01;
 
+// ── Building a reference set from engine runs ──
+//
+// A reference is built offline by the verifier: the texts are scored teacher-forced by a reference
+// run (the claimed model on a trusted engine), by several **honest** runs (the same weights on other
+// engines / backends / batch settings), and optionally by **substitute** runs (cheaper quants,
+// fine-tunes — what a cheater might serve). Each text's honest band is the largest honest MAD; the
+// cut-off is calibrated on random rounds of `min_texts` texts, between how high honest runs score
+// (each against a band built without it) and how low substitutes score.
+
+/// One engine configuration's teacher-forced log-probs for every text of a build, in text order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunScores {
+    pub label: String,
+    /// `logprobs[t]` has one entry per token of text `t` after the first.
+    pub logprobs: Vec<Vec<f32>>,
+}
+
+/// Knobs for [`build_reference`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuildParams {
+    /// Label for the reference (e.g. `qwen3.5-9b@q4_k_m`); text ids are derived from it.
+    pub label: String,
+    pub identity: Option<ModelIdentity>,
+    /// Texts per verification round (the cut-off is calibrated for this round size).
+    pub min_texts: usize,
+    /// Smallest band allowed, in nats, so an honest run that happens to be bit-identical to the
+    /// reference can't shrink a text's band to zero.
+    pub band_floor: f64,
+    /// Also floor each band at this fraction of the median band.
+    pub band_floor_of_median: f64,
+    /// Random rounds drawn for calibration (deterministic from `seed`).
+    pub rounds: usize,
+    pub seed: u64,
+    /// Honest runs must stay below the cut-off in this fraction of calibration rounds, substitutes
+    /// above it in the same fraction (e.g. 0.995).
+    pub coverage: f64,
+    /// The substitutes' low end must be at least this multiple of the honest high end.
+    pub min_gap: f64,
+}
+
+impl BuildParams {
+    pub fn new(label: impl Into<String>, identity: Option<ModelIdentity>) -> Self {
+        Self {
+            label: label.into(),
+            identity,
+            min_texts: DEFAULT_MIN_TEXTS,
+            band_floor: 1e-3,
+            band_floor_of_median: 0.25,
+            rounds: 2000,
+            seed: 0x00DD_BA11,
+            coverage: 0.995,
+            min_gap: 1.15,
+        }
+    }
+}
+
+/// How the cut-off was chosen, for the build report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calibration {
+    /// Each honest run's aggregate over all texts, against a band built without it.
+    pub honest: Vec<(String, f64)>,
+    /// Each substitute run's aggregate over all texts.
+    pub substitutes: Vec<(String, f64)>,
+    /// The `coverage` quantile of honest round aggregates (the cut-off uses it floored at 1.0).
+    pub honest_high: f64,
+    /// The `1 − coverage` quantile of substitute round aggregates (lowest across substitutes).
+    pub substitute_low: Option<f64>,
+    pub cutoff: f64,
+    /// False when no substitutes were given: the cut-off then only protects honest providers and
+    /// says nothing about what it would catch.
+    pub calibrated: bool,
+}
+
+/// Why a reference couldn't be built.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildError {
+    /// Fewer texts than one round.
+    TooFewTexts { have: usize, need: usize },
+    /// Leave-one-out calibration needs at least two honest runs.
+    TooFewHonestRuns(usize),
+    /// A run's scores don't line up with the texts (wrong count or length), or hold invalid values.
+    BadRun { run: String, text: usize },
+    /// Honest and substitute scores overlap: no cut-off separates them with the required gap.
+    NoSeparation { honest_high: f64, substitute_low: f64 },
+    /// The assembled set failed validation.
+    Invalid(ReferenceError),
+}
+
+/// Deterministic splitmix64 — enough to draw calibration rounds reproducibly without a dependency.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// `k` distinct indices below `n` (partial Fisher–Yates).
+    fn sample(&mut self, n: usize, k: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..n).collect();
+        for i in 0..k {
+            let j = i + (self.next() % (n - i) as u64) as usize;
+            idx.swap(i, j);
+        }
+        idx.truncate(k);
+        idx
+    }
+}
+
+fn quantile(values: &mut [f64], q: f64) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let pos = ((values.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
+    values[pos]
+}
+
+/// Per-text bands from the honest MADs (`mads[run][text]`), each floored.
+fn bands(mads: &[&Vec<f64>], p: &BuildParams) -> Vec<f64> {
+    let n = mads[0].len();
+    let raw: Vec<f64> = (0..n).map(|t| mads.iter().map(|m| m[t]).fold(0.0, f64::max)).collect();
+    let mut sorted = raw.clone();
+    let median = quantile(&mut sorted, 0.5);
+    let floor = p.band_floor.max(p.band_floor_of_median * median);
+    raw.into_iter().map(|b| b.max(floor)).collect()
+}
+
+/// Build a [`ReferenceSet`] from engine runs over the same pre-tokenized texts, and calibrate its
+/// cut-off. Refuses (`NoSeparation`) when substitutes don't clear the honest runs by `min_gap`.
+pub fn build_reference(
+    token_ids: &[Vec<u32>],
+    reference: &RunScores,
+    honest: &[RunScores],
+    substitutes: &[RunScores],
+    p: &BuildParams,
+) -> Result<(ReferenceSet, Calibration), BuildError> {
+    let n = token_ids.len();
+    if n < p.min_texts || n == 0 {
+        return Err(BuildError::TooFewTexts { have: n, need: p.min_texts.max(1) });
+    }
+    if honest.len() < 2 {
+        return Err(BuildError::TooFewHonestRuns(honest.len()));
+    }
+    let check = |run: &RunScores| -> Result<(), BuildError> {
+        if run.logprobs.len() != n {
+            return Err(BuildError::BadRun { run: run.label.clone(), text: run.logprobs.len().min(n) });
+        }
+        for (t, (lps, ids)) in run.logprobs.iter().zip(token_ids).enumerate() {
+            if lps.len() + 1 != ids.len() || lps.iter().any(|&lp| !valid_logprob(lp)) {
+                return Err(BuildError::BadRun { run: run.label.clone(), text: t });
+            }
+        }
+        Ok(())
+    };
+    for run in std::iter::once(reference).chain(honest).chain(substitutes) {
+        check(run)?;
+    }
+    let mads = |run: &RunScores| -> Vec<f64> {
+        (0..n).map(|t| text_mad(&reference.logprobs[t], &run.logprobs[t]).expect("checked")).collect()
+    };
+    let honest_mads: Vec<Vec<f64>> = honest.iter().map(mads).collect();
+    let sub_mads: Vec<Vec<f64>> = substitutes.iter().map(mads).collect();
+    let band = bands(&honest_mads.iter().collect::<Vec<_>>(), p);
+    // Each honest run against a band built from the others (it must not vouch for itself).
+    let loo_bands: Vec<Vec<f64>> = (0..honest.len())
+        .map(|k| bands(&honest_mads.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, m)| m).collect::<Vec<_>>(), p))
+        .collect();
+    let mean_ratio = |m: &[f64], b: &[f64], idx: &[usize]| idx.iter().map(|&t| m[t] / b[t]).sum::<f64>() / idx.len() as f64;
+    let all: Vec<usize> = (0..n).collect();
+    let honest_full: Vec<(String, f64)> =
+        honest.iter().zip(&honest_mads).zip(&loo_bands).map(|((r, m), b)| (r.label.clone(), mean_ratio(m, b, &all))).collect();
+    let sub_full: Vec<(String, f64)> =
+        substitutes.iter().zip(&sub_mads).map(|(r, m)| (r.label.clone(), mean_ratio(m, &band, &all))).collect();
+
+    let mut rng = SplitMix(p.seed);
+    let rounds = if n == p.min_texts { 1 } else { p.rounds.max(1) };
+    let mut honest_rounds = Vec::with_capacity(rounds * honest.len());
+    let mut sub_rounds: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); substitutes.len()];
+    for _ in 0..rounds {
+        let idx = rng.sample(n, p.min_texts);
+        for (m, b) in honest_mads.iter().zip(&loo_bands) {
+            honest_rounds.push(mean_ratio(m, b, &idx));
+        }
+        for (acc, m) in sub_rounds.iter_mut().zip(&sub_mads) {
+            acc.push(mean_ratio(m, &band, &idx));
+        }
+    }
+    let honest_high = quantile(&mut honest_rounds, p.coverage);
+    let substitute_low = sub_rounds
+        .iter_mut()
+        .map(|r| quantile(r, 1.0 - p.coverage))
+        .min_by(|a, b| a.partial_cmp(b).expect("finite"));
+    // Honest tolerance is at least one band: runs that agree unusually closely (scores well below
+    // 1×) must not pull the cut-off down so far that an honest backend missing from the build fails.
+    let honest_edge = honest_high.max(1.0);
+    let (cutoff, calibrated) = match substitute_low {
+        Some(low) if low < honest_edge * p.min_gap => {
+            return Err(BuildError::NoSeparation { honest_high, substitute_low: low });
+        }
+        // Geometric midpoint: equal headroom (as a ratio) on both sides.
+        Some(low) => ((honest_edge * low).sqrt(), true),
+        None => (honest_edge * p.min_gap, false),
+    };
+    let set = ReferenceSet {
+        model_key: p.label.clone(),
+        identity: p.identity.clone(),
+        texts: (0..n)
+            .map(|t| ReferenceText {
+                id: format!("{}#{t:05}", p.label),
+                token_ids: token_ids[t].clone(),
+                logprobs: reference.logprobs[t].clone(),
+                band: band[t],
+            })
+            .collect(),
+        cutoff,
+        min_texts: p.min_texts,
+    };
+    set.validate().map_err(BuildError::Invalid)?;
+    Ok((set, Calibration { honest: honest_full, substitutes: sub_full, honest_high, substitute_low, cutoff, calibrated }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,5 +951,113 @@ mod tests {
         let s = set(3, 2);
         let mut r = ChallengeRound::new();
         assert!(r.next_text(&s, |_| 99).is_some());
+    }
+
+    // ── build_reference ──
+
+    /// `n` texts of 32 tokens with a reference, and runs offset from it by `mad` nats (with a little
+    /// per-text variation so bands differ).
+    fn build_fixture(n: usize) -> (Vec<Vec<u32>>, RunScores) {
+        let ids: Vec<Vec<u32>> = (0..n).map(|t| (0..32).map(|k| (t * 100 + k) as u32).collect()).collect();
+        let lps = ids.iter().map(|x| x[1..].iter().map(|&v| -((v % 9) as f32) * 0.3 - 0.05).collect()).collect();
+        (ids, RunScores { label: "ref".into(), logprobs: lps })
+    }
+
+    fn offset_run(reference: &RunScores, label: &str, mad: f64, jitter: f64) -> RunScores {
+        RunScores {
+            label: label.into(),
+            logprobs: reference
+                .logprobs
+                .iter()
+                .enumerate()
+                .map(|(t, x)| {
+                    let d = mad * (1.0 + jitter * ((t % 5) as f64 - 2.0) / 2.0);
+                    x.iter().map(|&v| v - d as f32).collect()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_reference_is_built_and_calibrated_between_honest_and_substitute_runs() {
+        let (ids, reference) = build_fixture(60);
+        let honest = vec![offset_run(&reference, "cpu", 0.020, 0.3), offset_run(&reference, "other-engine", 0.015, 0.3)];
+        let subs = vec![offset_run(&reference, "q4_0", 0.080, 0.3)];
+        let mut p = BuildParams::new("qwen3.5-9b@q4_k_m", ModelIdentity::new("qwen3.5", "9b", "q4_k_m"));
+        p.rounds = 300;
+        let (set, cal) = build_reference(&ids, &reference, &honest, &subs, &p).unwrap();
+        assert_eq!(set.texts.len(), 60);
+        assert_eq!(set.identity, p.identity);
+        assert!(cal.calibrated);
+        assert!(cal.honest_high.max(1.0) < cal.cutoff && cal.cutoff < cal.substitute_low.unwrap(), "{cal:?}");
+        // The cut-off works on the set it was built for: a fresh honest-like run passes a round, the
+        // substitute fails one.
+        let mut round = ChallengeRound::new();
+        let honestish = offset_run(&reference, "x", 0.017, 0.3);
+        let verdict = (0..24)
+            .map(|_| {
+                let t = round.next_text(&set, |_| 0).unwrap().clone();
+                let i: usize = t.id.rsplit('#').next().unwrap().parse().unwrap();
+                round.record(&set, &t.id, &honestish.logprobs[i]).unwrap()
+            })
+            .last()
+            .unwrap()
+            .unwrap();
+        assert!(verdict.passed(), "{verdict:?}");
+        // Deterministic.
+        let (_, again) = build_reference(&ids, &reference, &honest, &subs, &p).unwrap();
+        assert_eq!(again, cal);
+    }
+
+    #[test]
+    fn overlapping_substitutes_are_refused() {
+        let (ids, reference) = build_fixture(30);
+        let honest = vec![offset_run(&reference, "a", 0.020, 0.2), offset_run(&reference, "b", 0.020, 0.2)];
+        let close = vec![offset_run(&reference, "q8_0", 0.021, 0.2)];
+        let p = BuildParams::new("x", None);
+        assert!(matches!(build_reference(&ids, &reference, &honest, &close, &p), Err(BuildError::NoSeparation { .. })));
+    }
+
+    #[test]
+    fn without_substitutes_the_cutoff_is_marked_uncalibrated() {
+        let (ids, reference) = build_fixture(24);
+        let honest = vec![offset_run(&reference, "a", 0.02, 0.2), offset_run(&reference, "b", 0.01, 0.2)];
+        let (_, cal) = build_reference(&ids, &reference, &honest, &[], &BuildParams::new("x", None)).unwrap();
+        assert!(!cal.calibrated);
+        assert_eq!(cal.substitute_low, None);
+        assert!((cal.cutoff - cal.honest_high.max(1.0) * 1.15).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_bit_identical_honest_run_cannot_zero_a_band() {
+        let (ids, reference) = build_fixture(24);
+        let same = RunScores { label: "same-engine".into(), logprobs: reference.logprobs.clone() };
+        let honest = vec![same.clone(), same];
+        let (set, cal) = build_reference(&ids, &reference, &honest, &[], &BuildParams::new("x", None)).unwrap();
+        assert!(set.texts.iter().all(|t| t.band >= 1e-3));
+        assert_eq!(cal.honest_high, 0.0);
+        assert!((cal.cutoff - 1.15).abs() < 1e-12, "tolerance of at least one band");
+    }
+
+    #[test]
+    fn malformed_inputs_are_rejected() {
+        let (ids, reference) = build_fixture(24);
+        let good = offset_run(&reference, "a", 0.02, 0.0);
+        let p = BuildParams::new("x", None);
+        assert_eq!(build_reference(&ids[..10], &reference, &[good.clone(), good.clone()], &[], &p).unwrap_err(), BuildError::TooFewTexts { have: 10, need: 24 });
+        assert_eq!(build_reference(&ids, &reference, std::slice::from_ref(&good), &[], &p).unwrap_err(), BuildError::TooFewHonestRuns(1));
+        let mut short = good.clone();
+        short.logprobs[3].pop();
+        assert_eq!(
+            build_reference(&ids, &reference, &[good.clone(), short], &[], &p).unwrap_err(),
+            BuildError::BadRun { run: "a".into(), text: 3 }
+        );
+        let mut nan = good.clone();
+        nan.label = "nan".into();
+        nan.logprobs[5][0] = f32::NAN;
+        assert_eq!(
+            build_reference(&ids, &reference, &[good, nan], &[], &p).unwrap_err(),
+            BuildError::BadRun { run: "nan".into(), text: 5 }
+        );
     }
 }

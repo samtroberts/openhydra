@@ -41,6 +41,7 @@ use openhydra_protocol::store::Store;
 
 mod launch;
 mod connect_cli;
+mod refbuild;
 
 /// OpenHydra agent — a gateway in front of whatever inference engine you already run.
 #[derive(Parser)]
@@ -144,6 +145,10 @@ enum Role {
     /// Manage swarm membership (M3/M4): create a swarm, enroll members, accept a credential. The
     /// scriptable twin of the desktop Swarms panel — enrollment is offline copy/paste. See `swarm`.
     Swarm(SwarmArgs),
+    /// Build a reference set for the log-prob identity check (for gateway operators): tokenize texts,
+    /// score them on the reference, honest and substitute engine configurations, then assemble a
+    /// reference with a calibrated cut-off for `serve --logprob-reference`. No swarm.
+    Refbuild(refbuild::RefbuildArgs),
 }
 
 /// `swarm <action>` — the membership CLI (M3/M4). State lives under `--swarms-dir`.
@@ -763,6 +768,7 @@ fn run() -> Result<(), String> {
         Role::Launch(args) => return launch::run(args),
         Role::Connect(args) => return connect_cli::run(args),
         Role::Disconnect(args) => return connect_cli::run_disconnect(args),
+        Role::Refbuild(args) => return refbuild::run(args),
         Role::Card(args) => {
             // `card export` / `card verify`. No swarm.
             let config = cli.node.into_config();
