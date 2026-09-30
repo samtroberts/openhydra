@@ -83,8 +83,9 @@ fn probe_client() -> Result<ReqwestClient, AdapterError> {
 fn build_ollama(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
     Ok(Arc::new(OllamaAdapter::new(u, probe_client()?)))
 }
-fn build_llamacpp(u: &str, _scoring: bool) -> Result<SharedAdapter, AdapterError> {
-    Ok(Arc::new(LlamaCppAdapter::new(u, probe_client()?)))
+fn build_llamacpp(u: &str, scoring: bool) -> Result<SharedAdapter, AdapterError> {
+    let adapter = LlamaCppAdapter::new(u, probe_client()?);
+    Ok(Arc::new(if scoring { adapter.with_auto_prompt_scoring() } else { adapter }))
 }
 /// An OpenAI-compatible engine at `u`. With `scoring`, the prompt-scoring API is identified from the
 /// engine itself on the first challenge — port 1234 is LM Studio's default but also mistral.rs's,

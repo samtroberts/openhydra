@@ -28,6 +28,7 @@ use crate::adapter::{
     ServeOutcome,
 };
 use crate::adapters::openai::serve_chat_completions;
+use crate::adapters::scoring::{ScoringConfig, ScoringDialect};
 
 /// Default `llama-server` endpoint.
 pub const DEFAULT_LLAMACPP_URL: &str = "http://127.0.0.1:8080";
@@ -311,6 +312,9 @@ fn read_gguf_metadata(path: &str) -> Option<GgufMeta> {
 pub struct LlamaCppAdapter<H: HttpClient> {
     base_url: String,
     http: H,
+    /// Prompt scoring (`provide --prompt-scoring`): needs a llama-server with the OpenHydra scoring
+    /// patch, started with `--prompt-scoring`.
+    scoring: ScoringConfig,
 }
 
 impl<H: HttpClient> LlamaCppAdapter<H> {
@@ -323,7 +327,19 @@ impl<H: HttpClient> LlamaCppAdapter<H> {
             .trim_end_matches("/v1")
             .trim_end_matches('/')
             .to_string();
-        Self { base_url: root, http }
+        Self { base_url: root, http, scoring: ScoringConfig::Off }
+    }
+
+    /// Enable [`EngineAdapter::score_prompt`] with a declared API.
+    pub fn with_prompt_scoring(mut self, dialect: ScoringDialect) -> Self {
+        self.scoring = ScoringConfig::Fixed(dialect);
+        self
+    }
+
+    /// Enable [`EngineAdapter::score_prompt`], identifying the API from the server on first use.
+    pub fn with_auto_prompt_scoring(mut self) -> Self {
+        self.scoring = ScoringConfig::auto();
+        self
     }
 }
 
@@ -448,6 +464,10 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
                 weight_digest: String::new(),
             })
             .collect())
+    }
+
+    fn score_prompt(&self, model_ref: &str, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+        self.scoring.score(&self.http, &self.base_url, "llama.cpp", model_ref, token_ids)
     }
 
     fn serve_stream(

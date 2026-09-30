@@ -24,9 +24,7 @@
 
 use serde::Deserialize;
 
-use std::sync::Mutex;
-
-use super::scoring::{fingerprint, score_prompt, ScoringDialect};
+use super::scoring::{ScoringConfig, ScoringDialect};
 
 use crate::adapter::{
     AdapterError, DetectedModel, EngineAdapter, EngineMetrics, HttpClient, InferenceRequest,
@@ -263,17 +261,7 @@ pub struct OpenAiAdapter<H: HttpClient> {
     name: &'static str,
     http: H,
     /// The engine's prompt-scoring API (`provide --prompt-scoring`).
-    scoring: Scoring,
-}
-
-/// How an [`OpenAiAdapter`] knows which prompt-scoring API its engine speaks.
-enum Scoring {
-    Off,
-    /// Declared by the operator.
-    Fixed(ScoringDialect),
-    /// Fingerprinted on first use and cached; the cache is cleared when scoring fails, so a different
-    /// engine taking over the port is re-identified on the next challenge.
-    Auto(Mutex<Option<ScoringDialect>>),
+    scoring: ScoringConfig,
 }
 
 impl<H: HttpClient> OpenAiAdapter<H> {
@@ -287,7 +275,7 @@ impl<H: HttpClient> OpenAiAdapter<H> {
             .trim_end_matches("/v1")
             .trim_end_matches('/')
             .to_string();
-        Self { base_url: root, name, http, scoring: Scoring::Off }
+        Self { base_url: root, name, http, scoring: ScoringConfig::Off }
     }
 
     /// vLLM convenience constructor.
@@ -302,14 +290,14 @@ impl<H: HttpClient> OpenAiAdapter<H> {
 
     /// Declare the engine's prompt-scoring API, enabling [`EngineAdapter::score_prompt`].
     pub fn with_prompt_scoring(mut self, dialect: ScoringDialect) -> Self {
-        self.scoring = Scoring::Fixed(dialect);
+        self.scoring = ScoringConfig::Fixed(dialect);
         self
     }
 
     /// Enable [`EngineAdapter::score_prompt`] with the API identified from the engine itself
-    /// ([`fingerprint`]) the first time a challenge arrives.
+    /// ([`fingerprint`](super::scoring::fingerprint)) the first time a challenge arrives.
     pub fn with_auto_prompt_scoring(mut self) -> Self {
-        self.scoring = Scoring::Auto(Mutex::new(None));
+        self.scoring = ScoringConfig::auto();
         self
     }
 }
@@ -355,22 +343,7 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
     }
 
     fn score_prompt(&self, model_ref: &str, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
-        match &self.scoring {
-            Scoring::Off => Err(AdapterError::Unsupported(format!("prompt scoring not enabled for {}", self.name))),
-            Scoring::Fixed(dialect) => score_prompt(&self.http, &self.base_url, *dialect, model_ref, token_ids),
-            Scoring::Auto(cache) => {
-                let cached = *cache.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(dialect) = cached.or_else(|| fingerprint(&self.http, &self.base_url)) else {
-                    return Err(AdapterError::Unsupported(format!(
-                        "no prompt-scoring API recognised at {} ({})",
-                        self.base_url, self.name
-                    )));
-                };
-                let result = score_prompt(&self.http, &self.base_url, dialect, model_ref, token_ids);
-                *cache.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then_some(dialect);
-                result
-            }
-        }
+        self.scoring.score(&self.http, &self.base_url, self.name, model_ref, token_ids)
     }
 }
 

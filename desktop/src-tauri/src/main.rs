@@ -161,9 +161,10 @@ struct Settings {
     /// Pass `--engine-autostart` to the provider (start LM Studio / Ollama if down).
     engine_autostart: bool,
     /// Pass `--prompt-scoring auto`: let gateways run the teacher-forced log-prob identity check on
-    /// this provider's vLLM / SGLang / patched-mistral.rs engines (the route to the A2 authenticity
-    /// tier). Opt-in — the checks spend engine time (at most 2 at once). Engines that can't score
-    /// (Ollama, llama.cpp, LM Studio) just refuse.
+    /// this provider's vLLM / SGLang engines, or llama.cpp / mistral.rs builds with the OpenHydra
+    /// scoring endpoint (the route to the A2 authenticity tier). Opt-in — the checks spend engine
+    /// time (at most 2 at once). Engines that can't score (Ollama, LM Studio, stock llama.cpp) just
+    /// refuse.
     authenticity_checks: bool,
     /// Optional SearXNG-compatible search endpoint (e.g. `http://127.0.0.1:8888`) powering
     /// the chat "web" toggle. Empty → the toggle is hidden. The operator brings their own

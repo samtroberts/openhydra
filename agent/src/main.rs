@@ -606,11 +606,12 @@ struct ProvideArgs {
     attest: bool,
 
     /// Answer prompt-scoring challenges (the teacher-forced log-prob identity check behind the A2
-    /// authenticity tier). `auto` identifies each engine's scoring API itself (vLLM, SGLang, or
-    /// mistral.rs with the OpenHydra scoring patch) — the only choice with `--engine-kind auto`;
-    /// `vllm` / `sglang` / `mistralrs` name it explicitly (needs `--engine-kind vllm` or `openai`).
-    /// Off by default; at most 2 challenges are scored at once. Only publicly announced models are
-    /// scorable; engines that can't score (Ollama, llama-server, LM Studio) refuse.
+    /// authenticity tier). `auto` identifies each engine's scoring API itself (vLLM, SGLang, or the
+    /// OpenHydra scoring endpoint of patched mistral.rs / llama-server `--prompt-scoring`) — the only
+    /// choice with `--engine-kind auto`; `vllm` / `sglang` / `openhydra` name it explicitly (needs
+    /// `--engine-kind vllm`, `openai` or `llama-cpp`). Off by default; at most 2 challenges are scored
+    /// at once. Only publicly announced models are scorable; engines that can't score (Ollama,
+    /// LM Studio, stock llama-server) refuse.
     #[arg(long = "prompt-scoring")]
     prompt_scoring: Option<openhydra_agent::adapters::scoring::ScoringChoice>,
 
@@ -1038,8 +1039,10 @@ fn provide(
         }
         return provide_auto(net, stats, economy, args);
     }
-    if args.prompt_scoring.is_some() && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Openai) {
-        return Err("--prompt-scoring needs --engine-kind vllm or openai (the engine's OpenAI-compatible server)".into());
+    if args.prompt_scoring.is_some()
+        && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Openai | EngineKind::LlamaCpp)
+    {
+        return Err("--prompt-scoring needs --engine-kind vllm, openai or llama-cpp".into());
     }
 
     let url = args
@@ -1068,7 +1071,12 @@ fn provide(
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::LlamaCpp => {
-            let a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
+            let mut a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
+            a = match args.prompt_scoring {
+                Some(ScoringChoice::Dialect(dialect)) => a.with_prompt_scoring(dialect),
+                Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),
+                None => a,
+            };
             run_single_engine(a, url, args, net, stats, economy)
         }
         EngineKind::Exo => {
