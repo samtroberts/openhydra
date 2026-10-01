@@ -19,7 +19,9 @@
 //!    Run it once for the reference, once per honest configuration, once per substitute.
 //! 3. `refbuild assemble` — combine the runs into a reference file: per-text honest bands and a
 //!    cut-off calibrated between honest and substitute runs
-//!    ([`openhydra_protocol::logprob::build_reference`]). Refuses when they don't separate.
+//!    ([`openhydra_protocol::logprob::build_reference`]). Refuses when they don't separate. Tag
+//!    honest runs of one kind of setup with a group (`--honest cpu=run.json`) so they are left out
+//!    together in calibration and can't vouch for each other.
 //!
 //! The output is what `serve --logprob-reference` loads. Keep it private: a text a provider has seen
 //! can be answered from an offline honest run.
@@ -130,6 +132,17 @@ struct ScoreArgs {
     shard: Option<(usize, usize)>,
 }
 
+/// `GROUP=PATH` or `PATH`. A GROUP is a short tag of letters, digits, `-`, `_`, `.`.
+fn parse_honest(s: &str) -> Result<(Option<String>, PathBuf), String> {
+    let tag = |g: &str| !g.is_empty() && g.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    match s.split_once('=') {
+        Some((g, path)) if tag(g) && !path.is_empty() => Ok((Some(g.to_string()), PathBuf::from(path))),
+        Some((g, _)) if tag(g) => Err("empty path after GROUP=".into()),
+        _ if s.is_empty() => Err("empty path".into()),
+        _ => Ok((None, PathBuf::from(s))),
+    }
+}
+
 fn parse_shard(s: &str) -> Result<(usize, usize), String> {
     let (i, n) = s.split_once('/').ok_or("expected i/n, e.g. 0/4")?;
     let (i, n): (usize, usize) = (i.parse().map_err(|_| "bad shard index")?, n.parse().map_err(|_| "bad shard count")?);
@@ -146,9 +159,11 @@ struct AssembleArgs {
     /// The reference run (the claimed model on the trusted engine).
     #[arg(long)]
     reference: PathBuf,
-    /// An honest run: the same weights on another engine / backend / setting (at least two).
-    #[arg(long = "honest")]
-    honest: Vec<PathBuf>,
+    /// An honest run: the same weights on another engine / backend / setting, as `[GROUP=]PATH`.
+    /// Runs of one kind of setup (e.g. CPU builds of one engine) should share a GROUP: calibration
+    /// leaves a whole group out at a time. Ungrouped runs are their own group; at least two groups.
+    #[arg(long = "honest", value_parser = parse_honest)]
+    honest: Vec<(Option<String>, PathBuf)>,
     /// A substitute run: what a cheater might serve instead (cheaper quant, fine-tune).
     #[arg(long = "substitute")]
     substitutes: Vec<PathBuf>,
@@ -443,14 +458,18 @@ fn load_run(path: &Path, digest: &str) -> Result<RunScores, String> {
     let label = v.get("label").and_then(Value::as_str).unwrap_or("?").to_string();
     let logprobs: Vec<Vec<f32>> =
         serde_json::from_value(v.get("logprobs").cloned().unwrap_or(Value::Null)).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(RunScores { label, logprobs })
+    Ok(RunScores { label, group: None, logprobs })
 }
 
 fn assemble(a: AssembleArgs) -> Result<(), String> {
     let ids = parse_ids(&read_json(&a.ids)?)?;
     let digest = ids_digest(&ids);
     let reference = load_run(&a.reference, &digest)?;
-    let honest = a.honest.iter().map(|p| load_run(p, &digest)).collect::<Result<Vec<_>, _>>()?;
+    let honest = a
+        .honest
+        .iter()
+        .map(|(group, p)| load_run(p, &digest).map(|r| RunScores { group: group.clone(), ..r }))
+        .collect::<Result<Vec<_>, _>>()?;
     let subs = a.substitutes.iter().map(|p| load_run(p, &digest)).collect::<Result<Vec<_>, _>>()?;
     if subs.is_empty() && !a.allow_uncalibrated {
         return Err("no --substitute runs: pass --allow-uncalibrated to build a cut-off that only protects honest providers".into());
@@ -494,8 +513,9 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
         bands[bands.len() - 1],
         bands[bands.len() / 2]
     );
-    for (label, agg) in &cal.honest {
-        eprintln!("  honest     {label:28} x{agg:.2} (against a band without it)");
+    for ((label, agg), run) in cal.honest.iter().zip(&honest) {
+        let label = run.group.as_ref().map_or(label.clone(), |g| format!("[{g}] {label}"));
+        eprintln!("  honest     {label:28} x{agg:.2} (against a band without its group)");
     }
     for (label, agg) in &cal.substitutes {
         eprintln!("  substitute {label:28} x{agg:.2}");
@@ -524,7 +544,8 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
             &json!({
                 "label": set.model_key, "texts": set.texts.len(), "min_texts": set.min_texts,
                 "ids_sha256": digest, "reference": reference.label,
-                "honest": cal.honest, "substitutes": cal.substitutes,
+                "honest": cal.honest, "honest_groups": honest.iter().map(|r| r.group.clone()).collect::<Vec<_>>(),
+                "substitutes": cal.substitutes,
                 "honest_high": cal.honest_high, "substitute_low": cal.substitute_low,
                 "cutoff": cal.cutoff, "calibrated": cal.calibrated, "coverage": a.coverage, "min_gap": a.min_gap,
                 "early_stop": cal.early_stop.iter().map(|c| json!({"after": c.after, "pass_below": c.pass_below, "fail_above": c.fail_above})).collect::<Vec<_>>(),
@@ -539,6 +560,17 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn honest_runs_parse_with_an_optional_group() {
+        assert_eq!(parse_honest("run_cpu.json"), Ok((None, PathBuf::from("run_cpu.json"))));
+        assert_eq!(parse_honest("cpu=run_cpu.json"), Ok((Some("cpu".into()), PathBuf::from("run_cpu.json"))));
+        assert_eq!(parse_honest("llama.cpp-cpu=/a/b=c.json"), Ok((Some("llama.cpp-cpu".into()), PathBuf::from("/a/b=c.json"))));
+        // Not a tag before the '=': the whole thing is a path.
+        assert_eq!(parse_honest("/runs/x=1.json"), Ok((None, PathBuf::from("/runs/x=1.json"))));
+        assert!(parse_honest("cpu=").is_err());
+        assert!(parse_honest("").is_err());
+    }
 
     #[test]
     fn ids_parse_from_either_format_and_digest_is_order_sensitive() {

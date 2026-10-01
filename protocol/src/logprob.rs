@@ -470,12 +470,16 @@ const ROUND_FORMAT_V1: u8 = 0x01;
 // engines / backends / batch settings), and optionally by **substitute** runs (cheaper quants,
 // fine-tunes — what a cheater might serve). Each text's honest band is the largest honest MAD; the
 // cut-off is calibrated on random rounds of `min_texts` texts, between how high honest runs score
-// (each against a band built without it) and how low substitutes score.
+// (each against a band built without its group) and how low substitutes score.
 
 /// One engine configuration's teacher-forced log-probs for every text of a build, in text order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunScores {
     pub label: String,
+    /// Honest runs of one kind of setup (e.g. two CPU builds of the same engine) share a group and
+    /// are left out together in calibration, so near-identical runs can't vouch for each other and
+    /// shrink the tolerance for a kind of setup the build never measured. `None`: its own group.
+    pub group: Option<String>,
     /// `logprobs[t]` has one entry per token of text `t` after the first.
     pub logprobs: Vec<Vec<f32>>,
 }
@@ -529,7 +533,7 @@ impl BuildParams {
 /// How the cut-off was chosen, for the build report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calibration {
-    /// Each honest run's aggregate over all texts, against a band built without it.
+    /// Each honest run's aggregate over all texts, against a band built without its group.
     pub honest: Vec<(String, f64)>,
     /// Each substitute run's aggregate over all texts.
     pub substitutes: Vec<(String, f64)>,
@@ -550,8 +554,9 @@ pub struct Calibration {
 pub enum BuildError {
     /// Fewer texts than one round.
     TooFewTexts { have: usize, need: usize },
-    /// Leave-one-out calibration needs at least two honest runs.
-    TooFewHonestRuns(usize),
+    /// Leave-one-group-out calibration needs honest runs from at least two groups (an ungrouped
+    /// run is its own group). Holds the number of groups given.
+    TooFewHonestGroups(usize),
     /// A run's scores don't line up with the texts (wrong count or length), or hold invalid values.
     BadRun { run: String, text: usize },
     /// Honest and substitute scores overlap: no cut-off separates them with the required gap.
@@ -613,8 +618,10 @@ pub fn build_reference(
     if n < p.min_texts || n == 0 {
         return Err(BuildError::TooFewTexts { have: n, need: p.min_texts.max(1) });
     }
-    if honest.len() < 2 {
-        return Err(BuildError::TooFewHonestRuns(honest.len()));
+    let same_group = |k: usize, j: usize| k == j || matches!((&honest[k].group, &honest[j].group), (Some(a), Some(b)) if a == b);
+    let groups = (0..honest.len()).filter(|&k| !(0..k).any(|j| same_group(k, j))).count();
+    if groups < 2 {
+        return Err(BuildError::TooFewHonestGroups(groups));
     }
     let check = |run: &RunScores| -> Result<(), BuildError> {
         if run.logprobs.len() != n {
@@ -636,9 +643,10 @@ pub fn build_reference(
     let honest_mads: Vec<Vec<f64>> = honest.iter().map(mads).collect();
     let sub_mads: Vec<Vec<f64>> = substitutes.iter().map(mads).collect();
     let band = bands(&honest_mads.iter().collect::<Vec<_>>(), p);
-    // Each honest run against a band built from the others (it must not vouch for itself).
+    // Each honest run against a band built from the other groups (neither it nor a run of the same
+    // kind may vouch for it): the stand-in for a kind of setup the build never measured.
     let loo_bands: Vec<Vec<f64>> = (0..honest.len())
-        .map(|k| bands(&honest_mads.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, m)| m).collect::<Vec<_>>(), p))
+        .map(|k| bands(&honest_mads.iter().enumerate().filter(|(j, _)| !same_group(k, *j)).map(|(_, m)| m).collect::<Vec<_>>(), p))
         .collect();
     let mean_ratio = |m: &[f64], b: &[f64], idx: &[usize]| idx.iter().map(|&t| m[t] / b[t]).sum::<f64>() / idx.len() as f64;
     let all: Vec<usize> = (0..n).collect();
@@ -1040,12 +1048,13 @@ mod tests {
     fn build_fixture(n: usize) -> (Vec<Vec<u32>>, RunScores) {
         let ids: Vec<Vec<u32>> = (0..n).map(|t| (0..32).map(|k| (t * 100 + k) as u32).collect()).collect();
         let lps = ids.iter().map(|x| x[1..].iter().map(|&v| -((v % 9) as f32) * 0.3 - 0.05).collect()).collect();
-        (ids, RunScores { label: "ref".into(), logprobs: lps })
+        (ids, RunScores { label: "ref".into(), group: None, logprobs: lps })
     }
 
     fn offset_run(reference: &RunScores, label: &str, mad: f64, jitter: f64) -> RunScores {
         RunScores {
             label: label.into(),
+            group: None,
             logprobs: reference
                 .logprobs
                 .iter()
@@ -1090,6 +1099,30 @@ mod tests {
     }
 
     #[test]
+    fn runs_of_one_group_are_left_out_together_so_they_cannot_vouch_for_each_other() {
+        // Two near-identical CPU builds and two GPU engines. Left out one run at a time, each CPU run
+        // is covered by its twin and the honest tolerance collapses to ~1x; left out as a group, it is
+        // scored against the GPU-only band — the honest stand-in for a kind of setup never measured.
+        let (ids, reference) = build_fixture(60);
+        let cpu = |label: &str, mad| RunScores { group: Some("cpu".into()), ..offset_run(&reference, label, mad, 0.3) };
+        let gpu = vec![offset_run(&reference, "gpu-a", 0.010, 0.3), offset_run(&reference, "gpu-b", 0.012, 0.3)];
+        let grouped: Vec<RunScores> = [cpu("cpu-native", 0.030), cpu("cpu-fma", 0.031)].into_iter().chain(gpu.clone()).collect();
+        let ungrouped: Vec<RunScores> = grouped.iter().map(|r| RunScores { group: None, ..r.clone() }).collect();
+        let subs = vec![offset_run(&reference, "q4_0", 0.200, 0.3)];
+        let mut p = BuildParams::new("x", None);
+        p.rounds = 300;
+        let (set_u, cal_u) = build_reference(&ids, &reference, &ungrouped, &subs, &p).unwrap();
+        let (set_g, cal_g) = build_reference(&ids, &reference, &grouped, &subs, &p).unwrap();
+        // The stored bands don't change; only the calibration does.
+        assert_eq!(set_u.texts, set_g.texts);
+        assert!(cal_u.honest[0].1 < 1.0, "{cal_u:?}");
+        assert!(cal_g.honest[0].1 > 2.0 && cal_g.honest[1].1 > 2.0, "{cal_g:?}");
+        assert_eq!(cal_u.honest[2..], cal_g.honest[2..], "ungrouped runs score as before");
+        assert!(cal_g.honest_high > 2.0 && cal_u.honest_high < 1.1, "{cal_u:?} {cal_g:?}");
+        assert!(cal_g.cutoff > cal_u.cutoff * 1.3, "{} vs {}", cal_g.cutoff, cal_u.cutoff);
+    }
+
+    #[test]
     fn overlapping_substitutes_are_refused() {
         let (ids, reference) = build_fixture(30);
         let honest = vec![offset_run(&reference, "a", 0.020, 0.2), offset_run(&reference, "b", 0.020, 0.2)];
@@ -1111,7 +1144,7 @@ mod tests {
     #[test]
     fn a_bit_identical_honest_run_cannot_zero_a_band() {
         let (ids, reference) = build_fixture(24);
-        let same = RunScores { label: "same-engine".into(), logprobs: reference.logprobs.clone() };
+        let same = RunScores { label: "same-engine".into(), group: None, logprobs: reference.logprobs.clone() };
         let honest = vec![same.clone(), same];
         let (set, cal) = build_reference(&ids, &reference, &honest, &[], &BuildParams::new("x", None)).unwrap();
         assert!(set.texts.iter().all(|t| t.band >= 1e-3));
@@ -1125,7 +1158,13 @@ mod tests {
         let good = offset_run(&reference, "a", 0.02, 0.0);
         let p = BuildParams::new("x", None);
         assert_eq!(build_reference(&ids[..10], &reference, &[good.clone(), good.clone()], &[], &p).unwrap_err(), BuildError::TooFewTexts { have: 10, need: 24 });
-        assert_eq!(build_reference(&ids, &reference, std::slice::from_ref(&good), &[], &p).unwrap_err(), BuildError::TooFewHonestRuns(1));
+        assert_eq!(build_reference(&ids, &reference, std::slice::from_ref(&good), &[], &p).unwrap_err(), BuildError::TooFewHonestGroups(1));
+        // Two runs of one group are still one group: nothing left to calibrate them against.
+        let grouped = |label: &str| RunScores { label: label.into(), group: Some("cpu".into()), ..good.clone() };
+        assert_eq!(
+            build_reference(&ids, &reference, &[grouped("cpu-a"), grouped("cpu-b")], &[], &p).unwrap_err(),
+            BuildError::TooFewHonestGroups(1)
+        );
         let mut short = good.clone();
         short.logprobs[3].pop();
         assert_eq!(
