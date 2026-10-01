@@ -25,13 +25,16 @@ use std::path::Path;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use redb::{Database, ReadableTable, TableDefinition};
 
-use crate::logprob::{Checkpoint, ModelIdentity, ReferenceSet, ReferenceText};
+use crate::logprob::{normalize_weights_digest, Checkpoint, ModelIdentity, ReferenceSet, ReferenceText};
 
 /// Signature domain for round packs.
 const PACK_DOMAIN: &[u8] = b"openhydra-refpack-v1\0";
 const PACK_FORMAT_V1: u8 = 0x01;
 /// v2 adds early-stop checkpoints.
 const PACK_FORMAT_V2: u8 = 0x02;
+/// v3 adds the weights-file digest. A pack without one is still written as v2, byte for byte, so
+/// gateways that predate digests keep verifying it.
+const PACK_FORMAT_V3: u8 = 0x03;
 const MAX_CHECKPOINTS: usize = 64;
 /// Bounds enforced when decoding (a pack is attacker-reachable input if the signature check is ever
 /// skipped or the key leaks; decode never allocates without a bound).
@@ -88,6 +91,15 @@ impl W {
                 None => self.u8(0),
             }
             self.f64(c.fail_above);
+        }
+    }
+    fn opt_str(&mut self, s: &Option<String>) {
+        match s {
+            None => self.u8(0),
+            Some(s) => {
+                self.u8(1);
+                self.str(s);
+            }
         }
     }
     fn identity(&mut self, id: &Option<ModelIdentity>) {
@@ -160,6 +172,17 @@ impl<'a> R<'a> {
             })
             .collect()
     }
+    /// An optional weights digest; only the canonical form is accepted.
+    fn weights(&mut self) -> Option<Option<String>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => {
+                let s = self.str()?;
+                (normalize_weights_digest(&s).as_deref() == Some(s.as_str())).then_some(Some(s))
+            }
+            _ => None,
+        }
+    }
     fn identity(&mut self) -> Option<Option<ModelIdentity>> {
         match self.u8()? {
             0 => Some(None),
@@ -191,6 +214,8 @@ pub struct RefPack {
     pub cutoff: f64,
     pub min_texts: u32,
     pub early_stop: Vec<Checkpoint>,
+    /// The weights file the batch was scored from ([`ReferenceSet::weights`]).
+    pub weights: Option<String>,
     pub texts: Vec<ReferenceText>,
 }
 
@@ -209,7 +234,7 @@ impl RefPack {
     /// Canonical encoding — what is signed.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(PACK_FORMAT_V2);
+        w.u8(if self.weights.is_some() { PACK_FORMAT_V3 } else { PACK_FORMAT_V2 });
         w.bytes(&self.pack_id);
         w.bytes(&self.batch_id);
         w.u64(self.issued_ms);
@@ -223,6 +248,9 @@ impl RefPack {
         w.f64(self.cutoff);
         w.u32(self.min_texts);
         w.checkpoints(&self.early_stop);
+        if self.weights.is_some() {
+            w.opt_str(&self.weights);
+        }
         w.u32(self.texts.len() as u32);
         for t in &self.texts {
             w.text(t);
@@ -236,7 +264,7 @@ impl RefPack {
         let mut r = R(bytes);
         let pack = (|| {
             let version = r.u8()?;
-            if version != PACK_FORMAT_V1 && version != PACK_FORMAT_V2 {
+            if !(PACK_FORMAT_V1..=PACK_FORMAT_V3).contains(&version) {
                 return None;
             }
             let pack_id = r.arr16()?;
@@ -250,9 +278,11 @@ impl RefPack {
             let cutoff = r.f64()?;
             let min_texts = r.u32()?;
             let early_stop = if version >= PACK_FORMAT_V2 { r.checkpoints()? } else { Vec::new() };
+            // v3 always carries a digest (a pack without one is written as v2).
+            let weights = if version >= PACK_FORMAT_V3 { Some(r.weights()??) } else { None };
             let nt = r.len(MAX_PACK_TEXTS)?;
             let texts = (0..nt).map(|_| r.text()).collect::<Option<Vec<_>>>()?;
-            Some(RefPack { pack_id, batch_id, issued_ms, issued_to, label, identity, handles, cutoff, min_texts, early_stop, texts })
+            Some(RefPack { pack_id, batch_id, issued_ms, issued_to, label, identity, handles, cutoff, min_texts, early_stop, weights, texts })
         })()
         .ok_or(PackError::Malformed)?;
         if !r.0.is_empty() {
@@ -268,6 +298,7 @@ impl RefPack {
         ReferenceSet {
             model_key: self.label.clone(),
             identity: self.identity.clone(),
+            weights: self.weights.clone(),
             texts: self.texts.clone(),
             cutoff: self.cutoff,
             min_texts: self.min_texts as usize,
@@ -322,6 +353,8 @@ pub struct BatchInfo {
     pub early_stop: Vec<Checkpoint>,
     pub total: u32,
     pub imported_ms: u64,
+    /// The weights file the batch was scored from ([`ReferenceSet::weights`]).
+    pub weights: Option<String>,
 }
 
 impl BatchInfo {
@@ -335,7 +368,7 @@ impl BatchInfo {
 
     fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(2);
+        w.u8(if self.weights.is_some() { 3 } else { 2 });
         w.bytes(&self.batch_id);
         w.str(&self.label);
         w.identity(&self.identity);
@@ -348,13 +381,16 @@ impl BatchInfo {
         w.u32(self.total);
         w.u64(self.imported_ms);
         w.checkpoints(&self.early_stop);
+        if self.weights.is_some() {
+            w.opt_str(&self.weights);
+        }
         w.0
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
         let mut r = R(b);
         let version = r.u8()?;
-        if version != 1 && version != 2 {
+        if !(1..=3).contains(&version) {
             return None;
         }
         let batch_id = r.arr16()?;
@@ -364,7 +400,8 @@ impl BatchInfo {
         let handles = (0..nh).map(|_| r.str()).collect::<Option<Vec<_>>>()?;
         let (cutoff, min_texts, total, imported_ms) = (r.f64()?, r.u32()?, r.u32()?, r.u64()?);
         let early_stop = if version >= 2 { r.checkpoints()? } else { Vec::new() };
-        Some(Self { batch_id, label, identity, handles, cutoff, min_texts, early_stop, total, imported_ms })
+        let weights = if version >= 3 { Some(r.weights()??) } else { None };
+        Some(Self { batch_id, label, identity, handles, cutoff, min_texts, early_stop, total, imported_ms, weights })
     }
 
     fn matches_identity(&self, identity: Option<&ModelIdentity>) -> bool {
@@ -475,6 +512,7 @@ impl RefPool {
             early_stop: set.early_stop.clone(),
             total: set.texts.len() as u32,
             imported_ms: now_ms,
+            weights: set.weights.clone(),
         };
         let digests: std::collections::HashSet<[u8; 32]> = set.texts.iter().map(|t| t.digest()).collect();
         let wtx = self.db.begin_write().map_err(db)?;
@@ -524,36 +562,44 @@ impl RefPool {
         Ok(out)
     }
 
-    /// Issue a round pack from the oldest batch serving `identity` / `handle` that still has a full
-    /// round (`min_texts + spare`) left. With early-stop checkpoints the pack is a **first stage** —
+    /// Issue a round pack from the oldest batch serving `identity` / `handle` / `weights` that still
+    /// has a full round (`min_texts + spare`) left. A batch scored from a known weights file serves
+    /// only providers declaring that file (the check tells files apart, not quantisation labels);
+    /// batches without a digest match the identity, then the names. With early-stop checkpoints the pack is a **first stage** —
     /// enough texts for the first checkpoint plus `spare` — and the rest of the round is issued only
     /// if the gateway asks ([`continue_pack`](Self::continue_pack)), so rounds that stop early don't
     /// burn a full round of texts. Atomic: texts are marked issued in the same transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_pack(
         &self,
         identity: Option<&ModelIdentity>,
         handle: Option<&str>,
+        weights: Option<&str>,
         spare: u32,
         issued_to: &str,
         pack_id: [u8; 16],
         now_ms: u64,
     ) -> Result<RefPack, PoolError> {
+        let weights = weights.and_then(normalize_weights_digest);
         let wtx = self.db.begin_write().map_err(db)?;
         let pack = {
             let batches = wtx.open_table(BATCHES).map_err(db)?;
             let next = wtx.open_table(NEXT).map_err(db)?;
-            // Batches made from the exact declared identity win; name matches are only the fallback.
-            let (mut by_identity, mut by_handle) = (Vec::new(), Vec::new());
+            // The exact weights file wins, then the declared identity, then the names.
+            let (mut by_weights, mut by_identity, mut by_handle) = (Vec::new(), Vec::new(), Vec::new());
             for row in batches.iter().map_err(db)? {
                 let (k, v) = row.map_err(db)?;
                 let info = BatchInfo::decode(v.value()).ok_or_else(|| PoolError::Db("corrupt batch row".into()))?;
-                if info.matches_identity(identity) {
-                    by_identity.push((k.value().to_string(), info));
-                } else if info.matches_handle(handle) {
-                    by_handle.push((k.value().to_string(), info));
+                let bid = k.value().to_string();
+                match &info.weights {
+                    Some(w) if weights.as_ref() == Some(w) => by_weights.push((bid, info)),
+                    Some(_) => {}
+                    None if info.matches_identity(identity) => by_identity.push((bid, info)),
+                    None if info.matches_handle(handle) => by_handle.push((bid, info)),
+                    None => {}
                 }
             }
-            let mut candidates = if by_identity.is_empty() { by_handle } else { by_identity };
+            let mut candidates = [by_weights, by_identity, by_handle].into_iter().find(|c| !c.is_empty()).unwrap_or_default();
             if candidates.is_empty() {
                 return Err(PoolError::NoReference);
             }
@@ -583,6 +629,7 @@ impl RefPool {
                 cutoff: info.cutoff,
                 min_texts: info.min_texts,
                 early_stop: info.early_stop,
+                weights: info.weights,
                 texts: picked,
             }
         };
@@ -641,6 +688,7 @@ impl RefPool {
                 cutoff: info.cutoff,
                 min_texts: info.min_texts,
                 early_stop: info.early_stop,
+                weights: info.weights,
                 texts: picked,
             }
         };
@@ -789,6 +837,7 @@ mod tests {
             early_stop: vec![],
             total: 240,
             imported_ms: 0,
+            weights: None,
         };
         assert_eq!(info.texts_per_round(4), (28, 28), "no checkpoints: a full round either way");
         info.early_stop = vec![Checkpoint { after: 8, pass_below: Some(2.0), fail_above: 2.0 }];
@@ -798,10 +847,60 @@ mod tests {
     }
     use crate::logprob::{ChallengeRound, DEFAULT_CUTOFF};
 
+    fn digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    #[test]
+    fn a_batch_from_a_known_file_serves_only_providers_declaring_that_file() {
+        let pool = RefPool::open_in_memory().unwrap();
+        let weighted = |label: &str, offset, w: char| ReferenceSet { weights: Some(digest(w)), ..set(label, 30, offset, q4km()) };
+        pool.import(&weighted("ollama", 0, 'a'), &[], [1; 16], 1).unwrap();
+        pool.import(&weighted("qwen-official", 100_000, 'b'), &[], [2; 16], 2).unwrap();
+        let label = |id: Option<ModelIdentity>, w: Option<String>, n: u8| {
+            pool.issue_pack(id.as_ref(), None, w.as_deref(), 0, "g", [n; 16], 0).map(|p| (p.label, p.weights))
+        };
+        assert_eq!(label(q4km(), Some(digest('a')), 10), Ok(("ollama".into(), Some(digest('a')))));
+        // Any spelling of the digest; the file wins over everything else.
+        let ollama_spelling = format!("sha256-{}", "B".repeat(64));
+        assert_eq!(label(None, Some(ollama_spelling), 11).unwrap().0, "qwen-official");
+        // Same label, unknown or undeclared file: neither file-specific batch applies.
+        assert_eq!(label(q4km(), Some(digest('c')), 12), Err(PoolError::NoReference));
+        assert_eq!(label(q4km(), None, 13), Err(PoolError::NoReference));
+        // A legacy batch (no digest) is the fallback for those, by identity as before.
+        pool.import(&set("legacy", 30, 200_000, q4km()), &[], [3; 16], 3).unwrap();
+        assert_eq!(label(q4km(), Some(digest('c')), 14).unwrap(), ("legacy".into(), None));
+        assert_eq!(label(q4km(), None, 15).unwrap().0, "legacy");
+        assert_eq!(label(q4km(), Some(digest('a')), 16).unwrap().0, "ollama", "the file still wins over the legacy batch");
+        // The digest survives the pool's own storage.
+        let stored: Vec<_> = pool.status().unwrap().into_iter().map(|b| b.info.weights).collect();
+        assert_eq!(stored, vec![Some(digest('a')), Some(digest('b')), None]);
+    }
+
+    #[test]
+    fn packs_carry_the_digest_and_stay_v2_without_one() {
+        let pool = RefPool::open_in_memory().unwrap();
+        pool.import(&ReferenceSet { weights: Some(digest('d')), ..set("w", 30, 0, q4km()) }, &[], [1; 16], 1).unwrap();
+        pool.import(&set("plain", 30, 100_000, None), &["plain".into()], [2; 16], 2).unwrap();
+        let with = pool.issue_pack(None, None, Some(&digest('d')), 0, "g", [3; 16], 0).unwrap();
+        let bytes = with.encode();
+        assert_eq!(bytes[0], PACK_FORMAT_V3);
+        assert_eq!(RefPack::decode(&bytes).unwrap(), with);
+        assert_eq!(with.to_reference_set().weights, Some(digest('d')));
+        let without = pool.issue_pack(None, Some("plain"), None, 0, "g", [4; 16], 0).unwrap();
+        assert_eq!(without.encode()[0], PACK_FORMAT_V2, "readable by gateways that predate digests");
+        assert_eq!(RefPack::decode(&without.encode()).unwrap().weights, None);
+        // A non-canonical digest in a v3 pack is rejected.
+        let mut odd = with.clone();
+        odd.weights = Some(format!("sha256-{}", "d".repeat(64)));
+        assert_eq!(RefPack::decode(&odd.encode()), Err(PackError::Malformed));
+    }
+
     fn set(label: &str, n: usize, offset: u32, identity: Option<ModelIdentity>) -> ReferenceSet {
         ReferenceSet {
             model_key: label.into(),
             identity,
+            weights: None,
             texts: (0..n)
                 .map(|i| {
                     let ids: Vec<u32> = (0..20).map(|k| offset + (i * 100 + k) as u32).collect();
@@ -827,7 +926,7 @@ mod tests {
     fn packs_round_trip_and_verify_only_under_the_pinned_key() {
         let pool = RefPool::open_in_memory().unwrap();
         pool.import(&set("q", 10, 0, q4km()), &[], [1; 16], 5).unwrap();
-        let pack = pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [9; 16], 7).unwrap();
+        let pack = pool.issue_pack(q4km().as_ref(), None, None, 2, "gw1", [9; 16], 7).unwrap();
         assert_eq!(pack.texts.len(), 6);
         assert_eq!((pack.issued_to.as_str(), pack.issued_ms, pack.identity.clone()), ("gw1", 7, q4km()));
         let key = SigningKey::from_bytes(&[3; 32]);
@@ -852,7 +951,7 @@ mod tests {
     fn decoding_is_strict() {
         let pool = RefPool::open_in_memory().unwrap();
         pool.import(&set("q", 6, 0, q4km()), &["Qwen3.5-9B".into()], [1; 16], 0).unwrap();
-        let bytes = pool.issue_pack(None, Some("Qwen3.5-9B"), 0, "gw", [2; 16], 0).unwrap().encode();
+        let bytes = pool.issue_pack(None, Some("Qwen3.5-9B"), None, 0, "gw", [2; 16], 0).unwrap().encode();
         for cut in 0..bytes.len() {
             assert_eq!(RefPack::decode(&bytes[..cut]), Err(PackError::Malformed), "cut {cut}");
         }
@@ -872,7 +971,7 @@ mod tests {
         s.early_stop = vec![Checkpoint { after: 4, pass_below: Some(1.2), fail_above: 1.6 }, Checkpoint { after: 6, pass_below: None, fail_above: 1.5 }];
         pool.import(&s, &[], [1; 16], 0).unwrap();
         assert_eq!(pool.status().unwrap()[0].info.early_stop, s.early_stop);
-        let mut p = pool.issue_pack(q4km().as_ref(), None, 0, "g", [2; 16], 0).unwrap();
+        let mut p = pool.issue_pack(q4km().as_ref(), None, None, 0, "g", [2; 16], 0).unwrap();
         assert_eq!(p.early_stop, s.early_stop);
         // A first-stage pack: fewer texts than a full round still decodes.
         p.texts.truncate(5);
@@ -897,7 +996,7 @@ mod tests {
         s.min_texts = 12;
         s.early_stop = vec![Checkpoint { after: 4, pass_below: Some(1.2), fail_above: 1.6 }];
         pool.import(&s, &[], [1; 16], 0).unwrap();
-        let first = pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [10; 16], 0).unwrap();
+        let first = pool.issue_pack(q4km().as_ref(), None, None, 2, "gw1", [10; 16], 0).unwrap();
         assert_eq!(first.texts.len(), 6, "first checkpoint + spare");
         assert!(matches!(pool.continue_pack([10; 16], 2, "gw2", [11; 16], 0), Err(PoolError::Key(_))), "another key can't");
         let rest = pool.continue_pack([10; 16], 2, "gw1", [11; 16], 0).unwrap();
@@ -909,9 +1008,9 @@ mod tests {
         assert!(matches!(pool.continue_pack([99; 16], 2, "gw1", [14; 16], 0), Err(PoolError::Key(_))), "unknown pack");
         // 30 − 14 = 16 left: another full round can start (6), but its continuation then needs 6 of
         // the remaining 10 — fine; a third first stage finds only 4 < 12 left.
-        let second = pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [20; 16], 0).unwrap();
+        let second = pool.issue_pack(q4km().as_ref(), None, None, 2, "gw1", [20; 16], 0).unwrap();
         assert_eq!(second.texts.len(), 6);
-        assert_eq!(pool.issue_pack(q4km().as_ref(), None, 2, "gw1", [21; 16], 0).unwrap_err(), PoolError::Exhausted);
+        assert_eq!(pool.issue_pack(q4km().as_ref(), None, None, 2, "gw1", [21; 16], 0).unwrap_err(), PoolError::Exhausted);
     }
 
     #[test]
@@ -922,7 +1021,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         let mut packs = 0;
         loop {
-            match pool.issue_pack(q4km().as_ref(), None, 1, if packs % 2 == 0 { "gw1" } else { "gw2" }, [packs as u8; 16], 3) {
+            match pool.issue_pack(q4km().as_ref(), None, None, 1, if packs % 2 == 0 { "gw1" } else { "gw2" }, [packs as u8; 16], 3) {
                 Ok(p) => {
                     assert!(p.texts.len() >= 4);
                     for t in &p.texts {
@@ -947,11 +1046,11 @@ mod tests {
         let pool = RefPool::open_in_memory().unwrap();
         pool.import(&set("named", 4, 0, None), &["Qwen/Qwen3.5-9B".into()], [1; 16], 1).unwrap();
         pool.import(&set("q4", 4, 5000, q4km()), &[], [2; 16], 2).unwrap();
-        assert_eq!(pool.issue_pack(q4km().as_ref(), Some("Qwen/Qwen3.5-9B"), 0, "g", [1; 16], 0).unwrap().label, "q4");
-        assert_eq!(pool.issue_pack(None, Some("Qwen/Qwen3.5-9B"), 0, "g", [2; 16], 0).unwrap().label, "named");
+        assert_eq!(pool.issue_pack(q4km().as_ref(), Some("Qwen/Qwen3.5-9B"), None, 0, "g", [1; 16], 0).unwrap().label, "q4");
+        assert_eq!(pool.issue_pack(None, Some("Qwen/Qwen3.5-9B"), None, 0, "g", [2; 16], 0).unwrap().label, "named");
         let q40 = ModelIdentity::new("qwen3.5", "9b", "q4_0");
-        assert_eq!(pool.issue_pack(q40.as_ref(), Some("other"), 0, "g", [3; 16], 0), Err(PoolError::NoReference));
-        assert_eq!(pool.issue_pack(q4km().as_ref(), None, 0, "g", [4; 16], 0), Err(PoolError::Exhausted));
+        assert_eq!(pool.issue_pack(q40.as_ref(), Some("other"), None, 0, "g", [3; 16], 0), Err(PoolError::NoReference));
+        assert_eq!(pool.issue_pack(q4km().as_ref(), None, None, 0, "g", [4; 16], 0), Err(PoolError::Exhausted));
     }
 
     #[test]
@@ -984,11 +1083,11 @@ mod tests {
         {
             let pool = RefPool::open(&path).unwrap();
             pool.import(&set("a", 8, 0, q4km()), &[], [1; 16], 0).unwrap();
-            pool.issue_pack(q4km().as_ref(), None, 0, "g", [1; 16], 0).unwrap();
+            pool.issue_pack(q4km().as_ref(), None, None, 0, "g", [1; 16], 0).unwrap();
         }
         let pool = RefPool::open(&path).unwrap();
         assert_eq!(pool.status().unwrap()[0].remaining, 4);
-        let p = pool.issue_pack(q4km().as_ref(), None, 0, "g", [2; 16], 0).unwrap();
+        let p = pool.issue_pack(q4km().as_ref(), None, None, 0, "g", [2; 16], 0).unwrap();
         assert_eq!(p.texts[0].id, "a#4");
     }
 }

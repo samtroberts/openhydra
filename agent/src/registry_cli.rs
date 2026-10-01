@@ -28,7 +28,7 @@ use clap::{Args, Subcommand};
 use ed25519_dalek::SigningKey;
 use openhydra_agent::prompt_score::load_reference;
 use openhydra_agent::registry_client::pack_reply;
-use openhydra_protocol::logprob::ModelIdentity;
+use openhydra_protocol::logprob::{normalize_weights_digest, ModelIdentity};
 use openhydra_protocol::refpool::{sign_pack, BatchStatus, PoolError, RefPool};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -315,6 +315,7 @@ async fn pool_view(State(reg): State<Arc<Registry>>, headers: HeaderMap) -> Resu
         .map(|b| json!({
             "label": b.info.label,
             "identity": b.info.identity.as_ref().map(|i| i.key()),
+            "weights": b.info.weights,
             "handles": b.info.handles,
             "min_texts": b.info.min_texts,
             "remaining": b.remaining,
@@ -356,13 +357,17 @@ async fn packs(
         None => None,
     };
     let handle = req.get("handle").and_then(Value::as_str).filter(|h| !h.is_empty() && h.len() <= 256);
-    if identity.is_none() && handle.is_none() {
+    let weights = match req.get("weights").filter(|v| !v.is_null()) {
+        Some(v) => Some(v.as_str().and_then(normalize_weights_digest).ok_or(StatusCode::BAD_REQUEST)?),
+        None => None,
+    };
+    if identity.is_none() && handle.is_none() && weights.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
     if !reg.take_token(&name) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    match reg.pool.issue_pack(identity.as_ref(), handle, reg.spare, &name, rand::random::<[u8; 16]>(), now_ms()) {
+    match reg.pool.issue_pack(identity.as_ref(), handle, weights.as_deref(), reg.spare, &name, rand::random::<[u8; 16]>(), now_ms()) {
         Ok(pack) => {
             let (bytes, sig) = sign_pack(&pack, &reg.key);
             tracing::info!(gateway = name, label = pack.label, texts = pack.texts.len(), "issued a round pack");
@@ -411,6 +416,7 @@ mod tests {
         let set = ReferenceSet {
             model_key: "qwen3.5-9b@q4_k_m".into(),
             identity: ModelIdentity::new("qwen3.5", "9b", "q4_k_m"),
+            weights: None,
             texts: (0..texts)
                 .map(|i| {
                     let ids: Vec<u32> = (0..20).map(|k| (i * 50 + k) as u32).collect();
@@ -455,14 +461,14 @@ mod tests {
         with_server(reg, move |url| {
             let client = RegistryClient::new(&url, &key, &pubkey).unwrap();
             let id = ModelIdentity::new("Qwen3.5", "9B", "Q4_K_M");
-            let a = client.fetch_pack(id.as_ref(), "whatever").unwrap();
-            let b = client.fetch_pack(None, "Qwen3.5-9B-Q4_K_M").unwrap();
+            let a = client.fetch_pack(id.as_ref(), None, "whatever").unwrap();
+            let b = client.fetch_pack(None, None, "Qwen3.5-9B-Q4_K_M").unwrap();
             assert_eq!((a.texts.len(), b.texts.len()), (5, 5));
             assert_eq!(a.issued_to, "gw1");
             assert!(a.texts.iter().all(|t| b.texts.iter().all(|u| u.digest() != t.digest())));
-            assert_eq!(client.fetch_pack(id.as_ref(), "x"), Err(openhydra_agent::registry_client::RegistryError::Exhausted));
+            assert_eq!(client.fetch_pack(id.as_ref(), None, "x"), Err(openhydra_agent::registry_client::RegistryError::Exhausted));
             let other = ModelIdentity::new("qwen3.5", "9b", "q4_0");
-            assert_eq!(client.fetch_pack(other.as_ref(), "y"), Err(openhydra_agent::registry_client::RegistryError::NoReference));
+            assert_eq!(client.fetch_pack(other.as_ref(), None, "y"), Err(openhydra_agent::registry_client::RegistryError::NoReference));
         });
     }
 
@@ -481,6 +487,7 @@ mod tests {
         let mut set = ReferenceSet {
             model_key: "g".into(),
             identity: ModelIdentity::new("gemma4", "e4b", "q4_k_m"),
+            weights: None,
             texts: (0..30)
                 .map(|i| {
                     let ids: Vec<u32> = (0..20).map(|k| (10_000 + i * 50 + k) as u32).collect();
@@ -497,7 +504,7 @@ mod tests {
         with_server(reg, move |url| {
             use openhydra_agent::registry_client::RegistryError;
             let client = RegistryClient::new(&url, &key, &pubkey).unwrap();
-            let first = client.fetch_pack(set.identity.as_ref(), "x").unwrap();
+            let first = client.fetch_pack(set.identity.as_ref(), None, "x").unwrap();
             assert_eq!(first.texts.len(), 5, "checkpoint 4 + 1 spare");
             let rest = client.continue_pack(first.pack_id).unwrap();
             assert_eq!(rest.texts.len(), 8, "to min_texts 12 + 1 spare");
@@ -513,13 +520,13 @@ mod tests {
             use openhydra_agent::registry_client::RegistryError;
             let id = ModelIdentity::new("qwen3.5", "9b", "q4_k_m");
             let bad = RegistryClient::new(&url, "ohreg_wrong", &pubkey).unwrap();
-            assert!(matches!(bad.fetch_pack(id.as_ref(), "x"), Err(RegistryError::Request(e)) if e.contains("401")));
+            assert!(matches!(bad.fetch_pack(id.as_ref(), None, "x"), Err(RegistryError::Request(e)) if e.contains("401")));
             let wrong_pin = RegistryClient::new(&url, &key, &"11".repeat(32)).unwrap();
-            assert!(matches!(wrong_pin.fetch_pack(id.as_ref(), "x"), Err(RegistryError::Invalid(_))));
+            assert!(matches!(wrong_pin.fetch_pack(id.as_ref(), None, "x"), Err(RegistryError::Invalid(_))));
             // The wrong-pin fetch still consumed a pack token: one left, then 429.
             let good = RegistryClient::new(&url, &key, &pubkey).unwrap();
-            assert!(good.fetch_pack(id.as_ref(), "x").is_ok());
-            assert!(matches!(good.fetch_pack(id.as_ref(), "x"), Err(RegistryError::Request(e)) if e.contains("429")));
+            assert!(good.fetch_pack(id.as_ref(), None, "x").is_ok());
+            assert!(matches!(good.fetch_pack(id.as_ref(), None, "x"), Err(RegistryError::Request(e)) if e.contains("429")));
         });
     }
 }

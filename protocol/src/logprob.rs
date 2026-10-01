@@ -108,6 +108,14 @@ impl ModelIdentity {
     }
 }
 
+/// A weights-file digest in its one canonical form, `sha256:<64 lower-case hex>`. Accepts that form,
+/// Ollama's blob spelling `sha256-<hex>`, or bare hex; `None` for anything else.
+pub fn normalize_weights_digest(digest: &str) -> Option<String> {
+    let d = digest.trim();
+    let hex = d.strip_prefix("sha256:").or_else(|| d.strip_prefix("sha256-")).unwrap_or(d);
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{}", hex.to_ascii_lowercase()))
+}
+
 /// Every reference text for one claimed model, plus the decision parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReferenceSet {
@@ -116,6 +124,12 @@ pub struct ReferenceSet {
     /// The exact model the reference was made from, when known — how a provider's declared
     /// identity is matched to it (name aliases are the fallback).
     pub identity: Option<ModelIdentity>,
+    /// Digest of the weights file the reference was scored from ([`normalize_weights_digest`] form).
+    /// The check tells weights **files** apart, not quantisation labels: two honest `Q4_K_M` files
+    /// of one model from different quantisers differ as much as a cheaper substitute does. So a set
+    /// with a digest applies only to a provider declaring that same file; one without (legacy)
+    /// falls back to the identity and names.
+    pub weights: Option<String>,
     pub texts: Vec<ReferenceText>,
     /// Aggregate cut-off; see [`DEFAULT_CUTOFF`].
     pub cutoff: f64,
@@ -151,8 +165,9 @@ pub enum ReferenceError {
     BadLogprob(String),
     /// A band is non-finite or not positive.
     BadBand(String),
-    /// The cut-off is non-finite or not positive, `min_texts` is 0, or an early-stop checkpoint is
-    /// out of order, past the round size, or looser/harsher than the cut-off.
+    /// The cut-off is non-finite or not positive, `min_texts` is 0, an early-stop checkpoint is out
+    /// of order, past the round size, or looser/harsher than the cut-off, or the weights digest
+    /// isn't in canonical form.
     BadParams,
     /// Fewer texts than one round needs.
     TooFewTexts { have: usize, need: usize },
@@ -185,6 +200,9 @@ impl ReferenceSet {
     /// round pack, which holds only enough texts to reach the first early-stop checkpoint.
     pub fn validate_texts(&self) -> Result<(), ReferenceError> {
         if !(self.cutoff.is_finite() && self.cutoff > 0.0) || self.min_texts == 0 {
+            return Err(ReferenceError::BadParams);
+        }
+        if self.weights.as_deref().is_some_and(|w| normalize_weights_digest(w).as_deref() != Some(w)) {
             return Err(ReferenceError::BadParams);
         }
         let mut prev = 0;
@@ -490,6 +508,8 @@ pub struct BuildParams {
     /// Label for the reference (e.g. `qwen3.5-9b@q4_k_m`); text ids are derived from it.
     pub label: String,
     pub identity: Option<ModelIdentity>,
+    /// Digest of the weights file the reference run scored ([`ReferenceSet::weights`]).
+    pub weights: Option<String>,
     /// Texts per verification round (the cut-off is calibrated for this round size).
     pub min_texts: usize,
     /// Smallest band allowed, in nats, so an honest run that happens to be bit-identical to the
@@ -517,6 +537,7 @@ impl BuildParams {
         Self {
             label: label.into(),
             identity,
+            weights: None,
             min_texts: DEFAULT_MIN_TEXTS,
             band_floor: 1e-3,
             band_floor_of_median: 0.25,
@@ -711,6 +732,7 @@ pub fn build_reference(
     let set = ReferenceSet {
         model_key: p.label.clone(),
         identity: p.identity.clone(),
+        weights: p.weights.clone(),
         texts: (0..n)
             .map(|t| ReferenceText {
                 id: format!("{}#{t:05}", p.label),
@@ -744,6 +766,7 @@ mod tests {
         ReferenceSet {
             model_key: "qwen3.5-9b@bf16".into(),
             identity: ModelIdentity::new("qwen3.5", "9b", "bf16"),
+            weights: None,
             texts: (0..n_texts)
                 .map(|i| {
                     let mut t = text(&format!("t{i}"), 32, 0.02);
@@ -1032,6 +1055,23 @@ mod tests {
         assert_eq!(r.progress(), 1);
         r.reset_progress();
         assert_eq!((r.progress(), r.issued_count()), (0, 1));
+    }
+
+    #[test]
+    fn weights_digests_have_one_canonical_form() {
+        let hex = "C5396E06AF294BD101B30DCE59131A76D2B773E76950ACC870EDA801D3AB0515";
+        let canon = format!("sha256:{}", hex.to_lowercase());
+        for spelling in [format!("sha256:{hex}"), format!("sha256-{}", hex.to_lowercase()), hex.to_string(), format!(" {canon} ")] {
+            assert_eq!(normalize_weights_digest(&spelling).as_deref(), Some(canon.as_str()), "{spelling}");
+        }
+        for bad in ["", "sha256:", "sha256:abc", "md5:c5396e06af294bd101b30dce59131a76d2b773e76950acc870eda801d3ab0515", &"g".repeat(64)] {
+            assert_eq!(normalize_weights_digest(bad), None, "{bad}");
+        }
+        let mut s = set(3, 2);
+        s.weights = Some(canon);
+        assert_eq!(s.validate(), Ok(()));
+        s.weights = Some(format!("sha256-{}", hex.to_lowercase()));
+        assert_eq!(s.validate(), Err(ReferenceError::BadParams), "stored digests must be canonical");
     }
 
     #[test]

@@ -286,12 +286,11 @@ pub struct DetectedModel {
     pub quant: String,
     /// On-disk size in bytes, if the engine reports it (0 otherwise).
     pub size_bytes: u64,
-    /// A content-addressed **possession digest** the engine reports for this model's weights, when
-    /// it exposes one (Ollama's manifest `sha256-…` `digest`), else `""`. Disclosed on the signed
-    /// `.openhydra` card's `weight_hash` (UNIFIED_TRUST_STACK 2c) so a future verifier can bind a
-    /// serve to a specific artifact. **Disclosed, not verified**: no expected-digest registry
-    /// exists yet to check it against, so it never on its own raises the authenticity tier
-    /// (`trust::MethodFlags::possession` stays false until an anchor lands).
+    /// sha256 of the **weights file** the engine serves, as `sha256:<hex>` (Ollama's content-addressed
+    /// model blob; the GGUF a llama.cpp server loaded, hashed locally), else `""`. Log-prob references
+    /// are matched to it (the check tells weights files apart, not quantisation labels), and it is
+    /// disclosed on the signed `.openhydra` card's `weight_hash` (UNIFIED_TRUST_STACK 2c). On its own
+    /// it is only **disclosed**: it raises nothing until a log-prob round against that file passes.
     pub weight_digest: String,
 }
 

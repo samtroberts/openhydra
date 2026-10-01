@@ -1940,12 +1940,13 @@ impl ConsumerNode {
             let mut info_transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
                 node.net.proxy_forward_timeout(libp2p.clone(), framed.to_vec(), LOGPROB_TIMEOUT)
             };
-            let declared = match request_model_info(&mut info_transport, &model) {
-                Ok(info) => info.identity(),
-                Err(ScoreChallengeError::Unsupported) | Err(ScoreChallengeError::Refused(_)) => None,
+            // …and which exact weights file: references made from a file apply only to that file.
+            let (declared, weights) = match request_model_info(&mut info_transport, &model) {
+                Ok(info) => (info.identity(), info.weights()),
+                Err(ScoreChallengeError::Unsupported) | Err(ScoreChallengeError::Refused(_)) => (None, None),
                 Err(e) => {
                     tracing::debug!(provider = %peer_id, model, error = ?e, "model-info request failed");
-                    None
+                    (None, None)
                 }
             };
             if let (Some(hint), Some(id)) = (quant_hint_from_name(&model), declared.as_ref()) {
@@ -1957,7 +1958,7 @@ impl ConsumerNode {
             // Can it score right now? A throwaway prompt first, before any reference text is spent
             // (a registry pack's texts are used up network-wide the moment it's issued) — only when
             // there is something to check against.
-            if lp.registry.is_some() || select_reference(&lp.refs, &model, declared.as_ref()).is_some() {
+            if lp.registry.is_some() || select_reference(&lp.refs, &model, declared.as_ref(), weights.as_deref()).is_some() {
                 let pause = &mut || std::thread::sleep(LOGPROB_BUSY_PAUSE);
                 if let Some(outcome) = probe_scoring(&mut info_transport, &model, pause) {
                     let round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
@@ -1970,10 +1971,10 @@ impl ConsumerNode {
             // round starts clean — the registry, not the per-provider record, prevents re-use.
             let mut from_registry = false;
             let mut first_pack = None;
-            let reference = match select_reference(&lp.refs, &model, declared.as_ref()).cloned() {
+            let reference = match select_reference(&lp.refs, &model, declared.as_ref(), weights.as_deref()).cloned() {
                 Some(r) => Some(r),
                 None => match &lp.registry {
-                    Some(reg) => match reg.fetch_pack(declared.as_ref(), &model) {
+                    Some(reg) => match reg.fetch_pack(declared.as_ref(), weights.as_deref(), &model) {
                         Ok(pack) => {
                             from_registry = true;
                             first_pack = Some(pack.pack_id);

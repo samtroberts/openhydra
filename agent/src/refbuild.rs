@@ -32,7 +32,7 @@ use clap::{Args, Subcommand};
 use openhydra_agent::adapter::HttpClient;
 use openhydra_agent::adapters::scoring::{score_prompt, ScoringDialect};
 use openhydra_agent::http::ReqwestClient;
-use openhydra_protocol::logprob::{build_reference, BuildParams, ModelIdentity, RunScores, MIN_TEXT_TOKENS};
+use openhydra_protocol::logprob::{build_reference, normalize_weights_digest, BuildParams, ModelIdentity, RunScores, MIN_TEXT_TOKENS};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -180,6 +180,14 @@ struct AssembleArgs {
     /// Model names to match as well (or instead of an identity).
     #[arg(long = "handle")]
     handles: Vec<String>,
+    /// The weights file the reference run loaded (hashed with sha256): the reference then applies
+    /// only to providers serving that exact file. Strongly recommended — two honest files with the
+    /// same quantisation label (different quantisers) differ as much as a cheaper substitute does.
+    #[arg(long, conflicts_with = "weights_sha256")]
+    weights_file: Option<PathBuf>,
+    /// The same, as a digest (`sha256:<hex>`, Ollama's `sha256-<hex>` blob name, or bare hex).
+    #[arg(long)]
+    weights_sha256: Option<String>,
     /// Texts per verification round.
     #[arg(long, default_value_t = openhydra_protocol::logprob::DEFAULT_MIN_TEXTS)]
     min_texts: usize,
@@ -448,6 +456,14 @@ fn merge(a: MergeArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// sha256 of a file, streamed, as `sha256:<hex>`.
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
 /// Load a saved run and check it scored exactly these ids.
 fn load_run(path: &Path, digest: &str) -> Result<RunScores, String> {
     let v = read_json(path)?;
@@ -479,10 +495,25 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
         (None, None, None) => None,
         _ => return Err("give all of --family, --params and --quant, or none".into()),
     };
-    if identity.is_none() && a.handles.is_empty() {
-        return Err("give a model identity (--family/--params/--quant) or at least one --handle".into());
+    let weights = match (&a.weights_file, &a.weights_sha256) {
+        (Some(path), _) => {
+            eprintln!("refbuild: hashing {} …", path.display());
+            Some(file_sha256(path)?)
+        }
+        (None, Some(d)) => Some(normalize_weights_digest(d).ok_or("--weights-sha256 must be a sha256 digest (64 hex)")?),
+        (None, None) => {
+            eprintln!(
+                "refbuild: WARNING no --weights-file: the reference will be matched by identity/name only, and an honest \
+                 provider serving a different file with the same label would fail it"
+            );
+            None
+        }
+    };
+    if identity.is_none() && weights.is_none() && a.handles.is_empty() {
+        return Err("give a model identity (--family/--params/--quant), --weights-file, or at least one --handle".into());
     }
     let mut params = BuildParams::new(a.label.clone(), identity.clone());
+    params.weights = weights.clone();
     params.min_texts = a.min_texts;
     params.min_gap = a.min_gap;
     params.coverage = a.coverage;
@@ -498,6 +529,9 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
     });
     if let Some(id) = &identity {
         out["model"] = json!({"family": id.family, "params": id.params, "quant": id.quant});
+    }
+    if let Some(w) = &weights {
+        out["weights"] = json!(w);
     }
     // Round-trip through the loader the gateway uses, so a file that won't load is never written.
     openhydra_agent::prompt_score::parse_reference(&out.to_string())?;
@@ -542,7 +576,7 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
         write_json(
             report,
             &json!({
-                "label": set.model_key, "texts": set.texts.len(), "min_texts": set.min_texts,
+                "label": set.model_key, "weights": set.weights, "texts": set.texts.len(), "min_texts": set.min_texts,
                 "ids_sha256": digest, "reference": reference.label,
                 "honest": cal.honest, "honest_groups": honest.iter().map(|r| r.group.clone()).collect::<Vec<_>>(),
                 "substitutes": cal.substitutes,

@@ -47,10 +47,6 @@ struct TagEntry {
     name: String,
     #[serde(default)]
     size: u64,
-    /// Ollama's content-addressed manifest digest for this model (`"sha256:…"`), when present —
-    /// disclosed as a possession digest (UNIFIED_TRUST_STACK 2c). Absent on very old builds → `""`.
-    #[serde(default)]
-    digest: String,
     #[serde(default)]
     details: TagDetails,
 }
@@ -75,6 +71,21 @@ struct ShowResponse {
     /// is sent to a model without the capability.
     #[serde(default)]
     capabilities: Vec<String>,
+    /// The model's Modelfile; its `FROM` line names the weights blob (`…/blobs/sha256-<hex>`).
+    #[serde(default)]
+    modelfile: String,
+}
+
+/// The weights file's sha256 from a Modelfile's `FROM …/blobs/sha256-<hex>` line, as
+/// `sha256:<hex>`. Ollama's blobs are content-addressed, so the name *is* the file's digest — no
+/// hashing needed. `""` when the Modelfile doesn't point at a blob.
+fn weights_digest_from_modelfile(modelfile: &str) -> String {
+    modelfile
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("FROM "))
+        .filter_map(|path| path.trim().rsplit(['/', '\\']).next())
+        .find_map(|name| name.strip_prefix("sha256-").and_then(openhydra_protocol::logprob::normalize_weights_digest))
+        .unwrap_or_default()
 }
 
 // `/api/chat` streaming chunk (newline-delimited JSON). We read the message delta, the
@@ -242,7 +253,8 @@ fn canonical_for(family: &str, params: &str, quant: &str, template: &str) -> Str
     }
 }
 
-fn detected_from(entry: &TagEntry, template: &str) -> DetectedModel {
+fn detected_from(entry: &TagEntry, show: &ShowResponse) -> DetectedModel {
+    let template = show.template.as_str();
     DetectedModel {
         engine_ref: entry.name.clone(),
         canonical_id: canonical_for(
@@ -255,10 +267,9 @@ fn detected_from(entry: &TagEntry, template: &str) -> DetectedModel {
         params: entry.details.parameter_size.clone(),
         quant: entry.details.quantization_level.clone(),
         size_bytes: entry.size,
-        // Disclose Ollama's manifest digest as a possession digest (2c) — carried onto the signed
-        // card's weight_hash. Not verified (no expected-digest registry yet), so it never lifts the
-        // authenticity tier on its own.
-        weight_digest: entry.digest.clone(),
+        // The weights blob's digest (not the manifest's, which changes with the template or system
+        // prompt): what log-prob references are matched against, and the card's weight_hash (2c).
+        weight_digest: weights_digest_from_modelfile(&show.modelfile),
     }
 }
 
@@ -277,15 +288,14 @@ impl<H: HttpClient> OllamaAdapter<H> {
         }
     }
 
-    /// Best-effort fetch of a model's chat template via `/api/show`. A failure or a
-    /// missing template yields `""` (the model is still advertised, just uncanonicalised).
-    fn fetch_template(&self, model_name: &str) -> String {
+    /// Best-effort fetch of a model's `/api/show` detail (chat template, Modelfile). A failure
+    /// yields an empty one: the model is still advertised, just uncanonicalised and without a
+    /// weights digest.
+    fn fetch_show(&self, model_name: &str) -> ShowResponse {
         let body = serde_json::json!({ "name": model_name }).to_string();
         match self.http.post_json(&format!("{}/api/show", self.base_url), &body) {
-            Ok(json) => serde_json::from_str::<ShowResponse>(&json)
-                .map(|s| s.template)
-                .unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(json) => serde_json::from_str::<ShowResponse>(&json).unwrap_or_default(),
+            Err(_) => ShowResponse::default(),
         }
     }
 
@@ -319,10 +329,7 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         Ok(tags
             .models
             .iter()
-            .map(|m| {
-                let template = self.fetch_template(&m.name);
-                detected_from(m, &template)
-            })
+            .map(|m| detected_from(m, &self.fetch_show(&m.name)))
             .collect())
     }
 
@@ -644,19 +651,27 @@ mod tests {
     }
 
     #[test]
-    fn tags_response_parses_the_digest_and_detected_from_discloses_it() {
-        // 2c: the `/api/tags` manifest digest is parsed and carried onto DetectedModel.weight_digest
-        // (→ the card's weight_hash) as a possession digest. Disclosed, not verified.
-        let json = r#"{"models":[{"name":"qwen2.5:7b","size":123,"digest":"sha256:deadbeef",
-            "details":{"family":"qwen2","parameter_size":"7.6B","quantization_level":"Q4_K_M"}}]}"#;
+    fn the_weights_digest_is_the_model_blob_named_in_the_modelfile() {
+        // The weights blob's digest (content-addressed), not the manifest digest /api/tags reports.
+        let blob = "c5396e06af294bd101b30dce59131a76d2b773e76950acc870eda801d3ab0515";
+        let json = r#"{"models":[{"name":"qwen2.5:0.5b","size":123,"digest":"a8b0c51577010a279d933d14c2a8ab4b268079d44c5c8830c0a93900f1827c67",
+            "details":{"family":"qwen2","parameter_size":"494.03M","quantization_level":"Q4_K_M"}}]}"#;
         let tags: TagsResponse = serde_json::from_str(json).unwrap();
-        let d = detected_from(&tags.models[0], "the-chat-template");
-        assert_eq!(d.weight_digest, "sha256:deadbeef");
-        assert_eq!(d.engine_ref, "qwen2.5:7b");
-        // An older Ollama that omits `digest` → empty (no possession disclosed), no parse failure.
-        let legacy: TagsResponse =
-            serde_json::from_str(r#"{"models":[{"name":"m","size":0,"details":{}}]}"#).unwrap();
-        assert!(detected_from(&legacy.models[0], "t").weight_digest.is_empty());
+        let show: ShowResponse = serde_json::from_value(serde_json::json!({
+            "template": "the-chat-template",
+            "modelfile": format!("# Modelfile generated by \"ollama show\"\nFROM /Users/x/.ollama/models/blobs/sha256-{blob}\nTEMPLATE \"\"\"…\"\"\"\n"),
+        }))
+        .unwrap();
+        let d = detected_from(&tags.models[0], &show);
+        assert_eq!(d.weight_digest, format!("sha256:{blob}"));
+        assert_eq!(d.engine_ref, "qwen2.5:0.5b");
+        // Windows paths, and a Modelfile that doesn't point at a blob (or no /api/show at all).
+        assert_eq!(weights_digest_from_modelfile(&format!("FROM C:\\Users\\x\\.ollama\\models\\blobs\\sha256-{blob}")), format!("sha256:{blob}"));
+        assert_eq!(weights_digest_from_modelfile("FROM ./local.gguf"), "");
+        assert!(detected_from(&tags.models[0], &ShowResponse::default()).weight_digest.is_empty());
+        // An older Ollama that omits `digest` still parses.
+        let legacy: TagsResponse = serde_json::from_str(r#"{"models":[{"name":"m","size":0,"details":{}}]}"#).unwrap();
+        assert!(detected_from(&legacy.models[0], &show).weight_digest.starts_with("sha256:"));
     }
 
     // ── streaming completion proxy ──

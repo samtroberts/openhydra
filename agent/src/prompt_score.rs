@@ -25,8 +25,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use openhydra_protocol::logprob::{
-    ChallengeRound, LogprobVerdict, ModelIdentity, ReferenceSet, ReferenceText, RoundError, DEFAULT_CUTOFF,
-    DEFAULT_MIN_TEXTS,
+    normalize_weights_digest, ChallengeRound, LogprobVerdict, ModelIdentity, ReferenceSet, ReferenceText, RoundError,
+    DEFAULT_CUTOFF, DEFAULT_MIN_TEXTS,
 };
 use openhydra_protocol::weight::{cost_tier_for_handle, cost_tier_for_params_quant, CostTier};
 use serde::{Deserialize, Serialize};
@@ -152,7 +152,8 @@ pub struct ModelInfo {
     pub params: String,
     /// The precise quantisation (`Q4_K_M`, `Q8_0`, `BF16`), or `""` when unknown.
     pub quant: String,
-    /// Content digest of the weights when the engine reports one (Ollama's `sha256-…`), else `""`.
+    /// sha256 of the weights **file** the engine serves (`sha256:<hex>`; Ollama's model blob, or the
+    /// GGUF file a llama.cpp server loaded), else `""`. Matched to references made from that file.
     #[serde(default)]
     pub weight_digest: String,
 }
@@ -161,6 +162,11 @@ impl ModelInfo {
     /// The declared identity, when complete.
     pub fn identity(&self) -> Option<ModelIdentity> {
         ModelIdentity::new(&self.family, &self.params, &self.quant)
+    }
+
+    /// The declared weights file, in canonical form, when it is a sha256 digest.
+    pub fn weights(&self) -> Option<String> {
+        normalize_weights_digest(&self.weight_digest)
     }
 }
 
@@ -353,6 +359,9 @@ struct ReferenceFile {
     min_texts: Option<usize>,
     #[serde(default)]
     early_stop: Vec<CheckpointFile>,
+    /// Digest of the weights file the reference was scored from (`sha256:<hex>`).
+    #[serde(default)]
+    weights: Option<String>,
     texts: Vec<ReferenceTextFile>,
 }
 
@@ -365,9 +374,10 @@ struct ReferenceTextFile {
 }
 
 /// Parse and validate a reference-set file:
-/// `{"model_key", "model"?: {"family", "params", "quant"}, "handles"?: [...], "cutoff"?, "min_texts"?,
-/// "texts": [{"id", "token_ids", "logprobs", "band"}]}`. It needs a `model` identity (matched against
-/// the identity a provider declares) or at least one handle (matched against the model's name).
+/// `{"model_key", "model"?: {"family", "params", "quant"}, "weights"?: "sha256:<hex>", "handles"?: [...],
+/// "cutoff"?, "min_texts"?, "texts": [{"id", "token_ids", "logprobs", "band"}]}`. It needs a `model`
+/// identity (matched against the identity a provider declares), a `weights` digest (matched against
+/// the weights file it declares) or at least one handle (matched against the model's name).
 pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
     let f: ReferenceFile = serde_json::from_str(json).map_err(|e| format!("reference set: {e}"))?;
     let identity = match &f.model {
@@ -377,12 +387,19 @@ pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
         ),
         None => None,
     };
-    if identity.is_none() && f.handles.iter().all(|h| h.trim().is_empty()) {
-        return Err("reference set: needs a model identity or at least one handle".into());
+    let weights = match &f.weights {
+        Some(w) => Some(
+            normalize_weights_digest(w).ok_or_else(|| format!("reference set {}: weights must be sha256:<64 hex>", f.model_key))?,
+        ),
+        None => None,
+    };
+    if identity.is_none() && weights.is_none() && f.handles.iter().all(|h| h.trim().is_empty()) {
+        return Err("reference set: needs a model identity, a weights digest or at least one handle".into());
     }
     let set = ReferenceSet {
         model_key: f.model_key,
         identity,
+        weights,
         texts: f
             .texts
             .into_iter()
@@ -403,16 +420,25 @@ pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
     Ok(LoadedReference { handles: f.handles, set })
 }
 
-/// The reference to check a provider's model against: the one made from the exact identity the
-/// provider declares, else one listing the model's name as a handle. `None` when neither exists.
+/// The reference to check a provider's model against: the one scored from the weights file the
+/// provider declares (`weights`, any digest spelling); else, among references not tied to a file,
+/// the one made from the declared identity, then one listing the model's name. A reference tied to
+/// a file never applies to a different or undeclared file: two honest files with the same label
+/// differ as much as a substitute does. `None` when nothing applies.
 pub fn select_reference<'a>(
     refs: &'a [std::sync::Arc<LoadedReference>],
     handle: &str,
     declared: Option<&ModelIdentity>,
+    weights: Option<&str>,
 ) -> Option<&'a std::sync::Arc<LoadedReference>> {
+    let weights = weights.and_then(normalize_weights_digest);
+    if let Some(r) = weights.as_ref().and_then(|w| refs.iter().find(|r| r.set.weights.as_ref() == Some(w))) {
+        return Some(r);
+    }
+    let legacy = || refs.iter().filter(|r| r.set.weights.is_none());
     declared
-        .and_then(|id| refs.iter().find(|r| r.set.identity.as_ref() == Some(id)))
-        .or_else(|| refs.iter().find(|r| r.handles.iter().any(|h| h == handle)))
+        .and_then(|id| legacy().find(|r| r.set.identity.as_ref() == Some(id)))
+        .or_else(|| legacy().find(|r| r.handles.iter().any(|h| h == handle)))
 }
 
 /// The cost tier a serve is priced at before the authenticity gate. By default the model name's
@@ -442,11 +468,16 @@ pub fn identity_in(refs: &[std::sync::Arc<LoadedReference>], tag: [u8; 16]) -> O
     refs.iter().find(|r| reference_tag(&r.set) == tag).and_then(|r| r.set.identity.clone())
 }
 
-/// A 16-byte tag of a reference (by its label), kept in [`LogprobStatus`] so a verdict stays tied to
-/// the reference it was earned against.
+/// A 16-byte tag of a reference (its label, and its weights file when it has one), kept in
+/// [`LogprobStatus`] so a verdict stays tied to the reference it was earned against.
 pub fn reference_tag(set: &ReferenceSet) -> [u8; 16] {
-    let d = Sha256::digest(set.model_key.as_bytes());
-    d[..16].try_into().expect("16 of 32 bytes")
+    let mut h = Sha256::new();
+    h.update(set.model_key.as_bytes());
+    if let Some(w) = &set.weights {
+        h.update([0]);
+        h.update(w.as_bytes());
+    }
+    h.finalize()[..16].try_into().expect("16 of 32 bytes")
 }
 
 /// Read and validate a reference-set file.
@@ -952,7 +983,7 @@ mod tests {
         assert!(parse_reference(&ref_json(3, 4)).unwrap_err().contains("TooFewTexts"));
         assert!(parse_reference("{").is_err());
         let no_handles = ref_json(4, 4).replace(r#"["public"]"#, "[]");
-        assert!(parse_reference(&no_handles).unwrap_err().contains("identity or at least one handle"));
+        assert!(parse_reference(&no_handles).unwrap_err().contains("or at least one handle"));
     }
 
     /// A transport to an in-process provider whose engine scores exactly the reference (honest, the
@@ -1217,15 +1248,54 @@ mod tests {
         let refs = vec![q4km.clone(), q40.clone(), named.clone()];
         let id = |q: &str| ModelIdentity::new("Qwen3.5", "9B", q);
         // A renamed Q4_0 file is checked against the Q4_0 reference, whatever its name says.
-        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "Qwen3.5-9B-Q4_K_M", id("Q4_0").as_ref()).unwrap(), &q40));
-        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "anything", id("Q4_K_M").as_ref()).unwrap(), &q4km));
+        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "Qwen3.5-9B-Q4_K_M", id("Q4_0").as_ref(), None).unwrap(), &q40));
+        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "anything", id("Q4_K_M").as_ref(), None).unwrap(), &q4km));
         // No identity (legacy provider / unknown quant) → by name.
-        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "Qwen/Qwen3.5-9B", None).unwrap(), &named));
-        assert!(select_reference(&refs, "other", id("Q6_K").as_ref()).is_none());
+        assert!(std::sync::Arc::ptr_eq(select_reference(&refs, "Qwen/Qwen3.5-9B", None, None).unwrap(), &named));
+        assert!(select_reference(&refs, "other", id("Q6_K").as_ref(), None).is_none());
         // A reference needs an identity or a handle.
         let mut bare: serde_json::Value = serde_json::from_str(&base).unwrap();
         bare["handles"] = serde_json::json!([]);
-        assert!(parse_reference(&bare.to_string()).unwrap_err().contains("identity or at least one handle"));
+        assert!(parse_reference(&bare.to_string()).unwrap_err().contains("or at least one handle"));
+    }
+
+    #[test]
+    fn a_reference_tied_to_a_weights_file_applies_only_to_that_file() {
+        let base = ref_json(4, 4);
+        let with_weights = |w: Option<&str>| {
+            let mut v: serde_json::Value = serde_json::from_str(&base).unwrap();
+            v["model"] = serde_json::json!({"family": "qwen2.5", "params": "0.5b", "quant": "q4_k_m"});
+            v["model_key"] = serde_json::json!("qwen2.5-0.5b@q4_k_m");
+            if let Some(w) = w {
+                v["weights"] = serde_json::json!(w);
+            }
+            std::sync::Arc::new(parse_reference(&v.to_string()).unwrap())
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let ollama = with_weights(Some(&format!("sha256-{a}")));
+        let official = with_weights(Some(&format!("sha256:{b}")));
+        assert_eq!(ollama.set.weights.as_deref(), Some(format!("sha256:{a}").as_str()), "stored in canonical form");
+        let id = ModelIdentity::new("qwen2.5", "0.5b", "q4_k_m");
+        let refs = vec![ollama.clone(), official.clone()];
+        let pick = |refs: &[std::sync::Arc<LoadedReference>], w: Option<&str>| select_reference(refs, "public", id.as_ref(), w).cloned();
+        assert!(std::sync::Arc::ptr_eq(&pick(&refs, Some(&a.to_uppercase())).unwrap(), &ollama));
+        assert!(std::sync::Arc::ptr_eq(&pick(&refs, Some(&format!("sha256:{b}"))).unwrap(), &official));
+        // Same identity and name, but another or no declared file: neither applies.
+        assert!(pick(&refs, Some(&"c".repeat(64))).is_none());
+        assert!(pick(&refs, None).is_none());
+        // A legacy reference (no file) is the fallback, by identity as before.
+        let legacy = with_weights(None);
+        let refs = vec![ollama.clone(), legacy.clone()];
+        assert!(std::sync::Arc::ptr_eq(&pick(&refs, None).unwrap(), &legacy));
+        assert!(std::sync::Arc::ptr_eq(&pick(&refs, Some(&"c".repeat(64))).unwrap(), &legacy));
+        assert!(std::sync::Arc::ptr_eq(&pick(&refs, Some(&a)).unwrap(), &ollama));
+        // Different files, different tags (a streak earned on one file doesn't carry to another).
+        assert_ne!(reference_tag(&ollama.set), reference_tag(&official.set));
+        assert_ne!(reference_tag(&ollama.set), reference_tag(&legacy.set));
+        // A malformed digest is refused at load.
+        let mut bad: serde_json::Value = serde_json::from_str(&base).unwrap();
+        bad["weights"] = serde_json::json!("sha256:xyz");
+        assert!(parse_reference(&bad.to_string()).unwrap_err().contains("weights"));
     }
 
     #[test]

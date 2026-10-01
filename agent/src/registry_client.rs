@@ -13,7 +13,7 @@
 //!
 //! Wire (JSON over HTTPS; plain HTTP only to a loopback host):
 //! `POST /v1/packs` with `Authorization: Bearer <key>` and
-//! `{"identity": {"family", "params", "quant"} | null, "handle": "..."}` →
+//! `{"identity": {"family", "params", "quant"} | null, "weights": "sha256:<hex>" | null, "handle": "..."}` →
 //! `{"status": "ok", "pack": base64, "signature": hex, "key": hex}` or
 //! `{"status": "no_reference" | "exhausted"}`. A bad key is a 401, a rate limit a 429.
 
@@ -76,10 +76,11 @@ impl RegistryClient {
         Ok(Self { base, api_key, pinned, http: ReqwestClient::new().map_err(|e| e.to_string())? })
     }
 
-    /// Ask for a round pack for the declared identity (preferred) or the model's name.
-    pub fn fetch_pack(&self, identity: Option<&ModelIdentity>, handle: &str) -> Result<RefPack, RegistryError> {
+    /// Ask for a round pack for the declared weights file (preferred), identity, or the model's name.
+    pub fn fetch_pack(&self, identity: Option<&ModelIdentity>, weights: Option<&str>, handle: &str) -> Result<RefPack, RegistryError> {
         let body = json!({
             "identity": identity.map(|i| json!({"family": i.family, "params": i.params, "quant": i.quant})),
+            "weights": weights,
             "handle": handle,
         });
         let auth = format!("Bearer {}", self.api_key);
@@ -147,6 +148,7 @@ mod tests {
         let set = ReferenceSet {
             model_key: "qwen3.5-9b@q4_k_m".into(),
             identity: ModelIdentity::new("qwen3.5", "9b", "q4_k_m"),
+            weights: None,
             texts: (0..4)
                 .map(|i| {
                     let ids: Vec<u32> = (0..20).map(|k| (i * 50 + k) as u32).collect();
@@ -158,7 +160,7 @@ mod tests {
             early_stop: vec![],
         };
         pool.import(&set, &[], [1; 16], 0).unwrap();
-        pool.issue_pack(set.identity.as_ref(), None, 0, "gw", [2; 16], 0).unwrap()
+        pool.issue_pack(set.identity.as_ref(), None, None, 0, "gw", [2; 16], 0).unwrap()
     }
 
     #[test]
