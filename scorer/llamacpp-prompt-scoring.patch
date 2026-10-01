@@ -1,0 +1,397 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63e3427..06b33cf 100755
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3591,6 +3591,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.endpoint_metrics = true;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_METRICS"));
++    add_opt(common_arg(
++        {"--prompt-scoring"},
++        string_format("enable POST /v1/prompt_logprobs: the log-prob of every token of a given token "
++                      "sequence given the tokens before it, i.e. teacher-forced scoring (default: %s)",
++                      params.endpoint_prompt_logprobs ? "enabled" : "disabled"),
++        [](common_params & params) {
++            params.endpoint_prompt_logprobs = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_SCORING"));
++    add_opt(common_arg(
++        {"--prompt-scoring-chunk"}, "N",
++        string_format("tokens per decode for prompt scoring; halved at startup until scoring fits in device "
++                      "memory (default: %d)", params.prompt_scoring_chunk),
++        [](common_params & params, int value) {
++            if (value < 32) {
++                throw std::invalid_argument("--prompt-scoring-chunk must be at least 32");
++            }
++            params.prompt_scoring_chunk = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPT_SCORING_CHUNK"));
++    add_opt(common_arg(
++        {"--exit-on-stdin-eof"},
++        "exit when stdin is closed: lets a supervising process (e.g. an OpenHydra agent running this as its "
++        "prompt scorer) take the server down with it however it ends, crash included (default: off)",
++        [](common_params & params) {
++            params.exit_on_stdin_eof = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--props"},
+         string_format("enable changing global properties via POST /props (default: %s)", params.endpoint_props ? "enabled" : "disabled"),
+diff --git a/common/common.h b/common/common.h
+index 9194d3d..8090e8b 100755
+--- a/common/common.h
++++ b/common/common.h
+@@ -672,6 +672,9 @@ struct common_params {
+     bool endpoint_slots   = true;
+     bool endpoint_props   = false; // only control POST requests, not GET
+     bool endpoint_metrics = false;
++    bool endpoint_prompt_logprobs = false; // POST /v1/prompt_logprobs: teacher-forced prompt scoring
++    int  prompt_scoring_chunk     = 256;   // tokens per decode for prompt scoring (smaller if it does not fit)
++    bool exit_on_stdin_eof        = false; // exit when stdin closes (a supervising process went away)
+ 
+     // enable built-in tools
+     std::vector<std::string> server_tools;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e95fb63..bbfd385 100755
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,6 @@
+ #include "server-context.h"
++
++#include <thread>
+ #include "server-chat.h"
+ #include "server-common.h"
+ #include "server-http.h"
+@@ -4157,6 +4159,136 @@ private:
+ server_context::server_context() : impl(new server_context_impl()) {}
+ server_context::~server_context() = default;
+ 
++// Teacher-forced prompt scoring on a separate, short-lived llama_context over the serving weights,
++// in decodes of `chunk` tokens. With `out` null only the forward passes run (the startup probe).
++// False when the context can't be created or a decode fails (typically out of device memory).
++bool server_routes::score_prompt_tokens(const llama_tokens & ids, int chunk, json * out) {
++    const int n = (int) ids.size();
++    chunk = std::min(n, chunk);
++    // logits for every position of a chunk: keep chunks small so the output buffer
++    // (chunk * n_vocab floats) stays modest for large vocabularies
++    llama_context_params cparams = common_context_params_to_llama(params);
++    cparams.n_ctx     = n;
++    cparams.n_batch   = chunk;
++    cparams.n_ubatch  = chunk;
++    cparams.n_seq_max = 1;
++    cparams.n_outputs_max         = chunk; // logits for every position (the server default is 1 per sequence)
++    cparams.n_outputs_max_per_seq = chunk;
++    cparams.embeddings = false;
++    llama_context * lctx = llama_init_from_model(ctx_server.model_tgt, cparams);
++    if (lctx == nullptr) {
++        return false;
++    }
++    std::unique_ptr<llama_context, decltype(&llama_free)> guard(lctx, llama_free);
++    const int n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
++
++    json lps = json::array(), ranks = json::array(), top_ids = json::array(), top_lps = json::array();
++    llama_batch batch = llama_batch_init(chunk, 0, 1);
++    for (int start = 0; start < n; start += chunk) {
++        const int len = std::min(chunk, n - start);
++        common_batch_clear(batch);
++        for (int i = 0; i < len; i++) {
++            const int pos = start + i;
++            common_batch_add(batch, ids[pos], pos, { 0 }, pos + 1 < n); // no logits needed for the last token
++        }
++        if (llama_decode(lctx, batch) != 0) {
++            llama_batch_free(batch);
++            return false;
++        }
++        if (out == nullptr) {
++            continue;
++        }
++        // The per-position log-softmax over the whole vocabulary dominates the cost (the forward
++        // pass is far cheaper), so positions are spread over the CPU cores. Each position is
++        // computed exactly as before, so the results are unchanged.
++        const int n_out = std::max(0, std::min(len, n - 1 - start));
++        std::vector<const float *> rows(n_out);
++        for (int i = 0; i < n_out; i++) {
++            rows[i] = llama_get_logits_ith(lctx, i);
++        }
++        std::vector<double> c_lp(n_out), c_top(n_out);
++        std::vector<int> c_rank(n_out), c_arg(n_out);
++        auto score_rows = [&](int first, int step) {
++            for (int i = first; i < n_out; i += step) {
++                const float * lg = rows[i];
++                const llama_token next = ids[start + i + 1];
++                double mx = lg[0];
++                int arg = 0;
++                for (int v = 1; v < n_vocab; v++) {
++                    if (lg[v] > mx) { mx = lg[v]; arg = v; }
++                }
++                double z = 0.0;
++                int rank = 1;
++                for (int v = 0; v < n_vocab; v++) {
++                    z += std::exp((double) lg[v] - mx);
++                    rank += lg[v] > lg[next];
++                }
++                const double lse = mx + std::log(z);
++                c_lp[i] = (double) lg[next] - lse;
++                c_top[i] = mx - lse;
++                c_rank[i] = rank;
++                c_arg[i] = arg;
++            }
++        };
++        const int n_thr = std::max(1, std::min<int>(n_out, (int) std::thread::hardware_concurrency()));
++        std::vector<std::thread> workers;
++        for (int w = 1; w < n_thr; w++) {
++            workers.emplace_back(score_rows, w, n_thr);
++        }
++        score_rows(0, n_thr);
++        for (auto & t : workers) {
++            t.join();
++        }
++        for (int i = 0; i < n_out; i++) {
++            lps.push_back(c_lp[i]);
++            ranks.push_back(c_rank[i]);
++            top_ids.push_back(c_arg[i]);
++            top_lps.push_back(c_top[i]);
++        }
++    }
++    llama_batch_free(batch);
++    if (out != nullptr) {
++        *out = json{
++            {"token_ids", ids},
++            {"logprobs", lps},
++            {"ranks", ranks},
++            {"top1_ids", top_ids},
++            {"top1_logprobs", top_lps},
++        };
++    }
++    return true;
++}
++
++void server_routes::probe_prompt_scoring() {
++    if (!params.endpoint_prompt_logprobs) {
++        return;
++    }
++    // A scoring context comes on top of the serving context, and --fit doesn't count it. Score the
++    // longest accepted prompt once now, so a server that can't do it says so at startup instead of
++    // failing challenges later; a smaller chunk needs less memory.
++    const int n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
++    llama_tokens ids(PROMPT_SCORING_MAX_TOKENS);
++    for (int i = 0; i < PROMPT_SCORING_MAX_TOKENS; i++) {
++        ids[i] = (llama_token) ((1000 + 7919LL * i) % n_vocab);
++    }
++    std::lock_guard<std::mutex> lock(mutex_prompt_scoring);
++    for (int chunk = std::max(params.prompt_scoring_chunk, PROMPT_SCORING_MIN_CHUNK); chunk >= PROMPT_SCORING_MIN_CHUNK; chunk /= 2) {
++        if (score_prompt_tokens(ids, chunk, nullptr)) {
++            prompt_scoring_chunk.store(chunk);
++            if (chunk < params.prompt_scoring_chunk) {
++                SRV_WRN("prompt scoring: chunks of %d tokens did not fit in device memory, using %d\n", params.prompt_scoring_chunk, chunk);
++            }
++            SRV_INF("prompt scoring: ready (up to %d tokens, chunks of %d)\n", PROMPT_SCORING_MAX_TOKENS, chunk);
++            return;
++        }
++        SRV_WRN("prompt scoring: a %d-token prompt in chunks of %d did not fit in device memory\n", PROMPT_SCORING_MAX_TOKENS, chunk);
++    }
++    prompt_scoring_chunk.store(0);
++    SRV_ERR("%s", "prompt scoring DISABLED: it does not fit in device memory next to the model. Offload fewer layers "
++                  "(-ngl), raise --fit-target, or on Apple Silicon try --load-mode none (a memory-mapped model is "
++                  "mapped whole into GPU memory)\n");
++}
++
+ bool server_context::load_model(common_params & params) {
+     return impl->load_model(params);
+ }
+@@ -4624,6 +4756,7 @@ static json get_res_props(const server_context_meta & meta, const common_params
+         { "endpoint_slots",              params.endpoint_slots },
+         { "endpoint_props",              params.endpoint_props },
+         { "endpoint_metrics",            params.endpoint_metrics },
++        { "endpoint_prompt_logprobs",    params.endpoint_prompt_logprobs },
+         { "ui",                          params.ui },
+         { "ui_settings",                 meta.json_ui_settings },
+         { "chat_template",               tmpl_default },
+@@ -5136,6 +5269,75 @@ void server_routes::init_routes() {
+         return res;
+     };
+ 
++    // Teacher-forced prompt scoring: for a token sequence, the log-prob of each token given the
++    // tokens before it (plus its rank and the top-1 alternative). Runs outside the slot scheduler on a
++    // separate, short-lived llama_context over the same weights, one request at a time, so a score
++    // never depends on what else the server is batching. Base weights only: LoRA adapters and control
++    // vectors applied to the serving context are not applied here.
++    //
++    //   POST /v1/prompt_logprobs {"prompt_token_ids": [t0, t1, ...]}
++    //   -> {"model": ..., "scores": {"token_ids": [...], "logprobs": [...], "ranks": [...],
++    //                                "top1_ids": [...], "top1_logprobs": [...]}}
++    //
++    // The arrays after token_ids have one entry per token after the first.
++    this->post_prompt_logprobs = [this](const server_http_req & req) {
++        auto res = create_response();
++        if (!params.endpoint_prompt_logprobs) {
++            res->error(format_error_response("This server does not support prompt scoring. Start it with `--prompt-scoring`", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++        if (prompt_scoring_chunk.load() == 0) {
++            res->error(format_error_response("prompt scoring is disabled: it did not fit in device memory at startup", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++        const json body = json::parse(req.body);
++        const llama_tokens ids = body.at("prompt_token_ids").get<llama_tokens>();
++        if (ids.size() < 2 || ids.size() > (size_t) PROMPT_SCORING_MAX_TOKENS) {
++            res->error(format_error_response(string_format("prompt_token_ids must hold 2 to %d tokens", PROMPT_SCORING_MAX_TOKENS), ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++        const int n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
++        for (const llama_token id : ids) {
++            if (id < 0 || id >= n_vocab) {
++                res->error(format_error_response("prompt_token_ids contains an invalid token id", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++        }
++
++        std::lock_guard<std::mutex> lock(mutex_prompt_scoring);
++
++        // A decode that runs out of device memory (e.g. other work on the GPU since startup) is
++        // retried on a fresh context with half the chunk, and the smaller chunk is kept.
++        json scores;
++        int chunk = prompt_scoring_chunk.load();
++        while (!score_prompt_tokens(ids, chunk, &scores)) {
++            if (chunk <= PROMPT_SCORING_MIN_CHUNK) {
++                res->error(format_error_response("prompt scoring failed: not enough device memory", ERROR_TYPE_UNAVAILABLE));
++                return res;
++            }
++            chunk /= 2;
++            prompt_scoring_chunk.store(chunk);
++            SRV_WRN("prompt scoring: decode failed, retrying with chunks of %d tokens\n", chunk);
++        }
++        res->ok(json{
++            {"model", meta->model_name},
++            {"scores", scores},
++        });
++        return res;
++    };
++
++    // GET on the scoring route answers 405, so a client can tell "scoring available" (405) from
++    // "no such route" (404) without sending a prompt
++    this->get_prompt_logprobs = [this](const server_http_req &) {
++        auto res = create_response(true);
++        if (prompt_scoring_chunk.load() == 0) {
++            res->error(format_error_response("prompt scoring is disabled: it did not fit in device memory at startup", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++        res->error(json{{"code", 405}, {"message", "use POST"}, {"type", "invalid_request_error"}});
++        return res;
++    };
++
+     this->post_embeddings = [this](const server_http_req & req) {
+         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_NONE);
+     };
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 7265cca..40250d4 100755
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -6,6 +6,7 @@
+ 
+ #include "json.h"
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <memory>
+ #include <mutex>
+@@ -116,6 +117,10 @@ struct server_context {
+ // forward declarations
+ struct server_res_generator;
+ 
++// longest prompt POST /v1/prompt_logprobs accepts, and the smallest decode chunk it falls back to
++constexpr int PROMPT_SCORING_MAX_TOKENS = 512; // = OpenHydra MAX_CHALLENGE_TOKENS
++constexpr int PROMPT_SCORING_MIN_CHUNK  = 32;
++
+ struct server_routes {
+     server_routes(const common_params & params, server_context & ctx_server);
+ 
+@@ -149,6 +154,8 @@ struct server_routes {
+     server_http_context::handler_t get_models;
+     server_http_context::handler_t post_tokenize;
+     server_http_context::handler_t post_detokenize;
++    server_http_context::handler_t post_prompt_logprobs;
++    server_http_context::handler_t get_prompt_logprobs;
+     server_http_context::handler_t post_embeddings;
+     server_http_context::handler_t post_embeddings_oai;
+     server_http_context::handler_t post_rerank;
+@@ -158,6 +165,10 @@ struct server_routes {
+     // to be used in router mode
+     json get_model_info() const;
+ 
++    // with --prompt-scoring: check, after load_model(), that scoring the longest accepted prompt fits
++    // in device memory, picking the largest chunk that does (or disabling scoring)
++    void probe_prompt_scoring();
++
+ private:
+     std::unique_ptr<server_res_generator> handle_completions_impl(
+             const server_http_req & req,
+@@ -177,6 +188,13 @@ private:
+     const common_params & params;
+     server_context_impl & ctx_server;
+ 
++    // prompt scoring runs one request at a time, on its own short-lived llama_context
++    std::mutex mutex_prompt_scoring;
++    // tokens per decode for prompt scoring: set by probe_prompt_scoring(), halved when a request runs
++    // out of device memory; 0 = scoring disabled (it didn't fit)
++    std::atomic<int> prompt_scoring_chunk{0};
++    bool score_prompt_tokens(const llama_tokens & ids, int chunk, json * out);
++
+     server_queue & queue_tasks;
+     server_response & queue_results;
+     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 049bdce..edf0f43 100755
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -108,6 +108,23 @@ int llama_server(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    // a supervisor holds our stdin open for as long as it wants us; when it goes away, so do we
++    if (params.exit_on_stdin_eof) {
++        std::thread([] {
++            char buf[256];
++            while (std::fread(buf, 1, sizeof(buf), stdin) > 0) {
++            }
++            std::_Exit(0);
++        }).detach();
++    }
++
++    // prompt scoring reads the loaded weights directly, outside the task queue, so the model must
++    // not be unloaded under it
++    if (params.endpoint_prompt_logprobs && params.sleep_idle_seconds > 0) {
++        fprintf(stderr, "--prompt-scoring cannot be combined with --sleep-idle-seconds\n");
++        return 1;
++    }
++
+     llama_backend_init();
+     llama_numa_init(params.numa);
+ 
+@@ -228,6 +245,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         routes.post_embeddings_oai         = models_routes->proxy_post;
+         routes.post_rerank                 = models_routes->proxy_post;
+         routes.post_tokenize               = models_routes->proxy_post;
++        routes.post_prompt_logprobs        = models_routes->proxy_post;
+         routes.post_detokenize             = models_routes->proxy_post;
+         routes.post_apply_template         = models_routes->proxy_post;
+         routes.post_chat_completions_tok   = models_routes->proxy_post;
+@@ -276,6 +294,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
+     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
+     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
++    ctx_http.post("/v1/prompt_logprobs",       ex_wrapper(routes.post_prompt_logprobs));
++    if (params.endpoint_prompt_logprobs) {
++        ctx_http.get("/v1/prompt_logprobs",    ex_wrapper(routes.get_prompt_logprobs));
++    }
+     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+     // token counting
+     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
+@@ -480,6 +502,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         }
+ 
+         routes.update_meta(ctx_server);
++        routes.probe_prompt_scoring();
+         ctx_http.is_ready.store(true);
+ 
+         SRV_INF("%s", "model loaded\n");

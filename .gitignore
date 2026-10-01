@@ -159,3 +159,6 @@ desktop/src-tauri/WixTools/
 /profiling/
 /_peers_disabled/
 /AWS Credits*
+
+# openhydra-scorer build work dir (scorer/build.sh)
+scorer/.build/

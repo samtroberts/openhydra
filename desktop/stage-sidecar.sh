@@ -11,3 +11,11 @@ EXT=""; [[ "$TRIPLE" == *windows* ]] && EXT=".exe"
 cargo build --release -p openhydra-agent
 cp "target/release/openhydra-agent$EXT" "desktop/src-tauri/binaries/openhydra-agent-$TRIPLE$EXT"
 echo "staged sidecar: openhydra-agent-$TRIPLE$EXT ($(cd target/release && md5 -q openhydra-agent 2>/dev/null || echo built))"
+# The prompt scorer (patched llama-server) the agent runs for Ollama models' authenticity checks.
+# Rebuilt only when the pinned llama.cpp commit or the patch changes (a build takes minutes).
+SCORER="desktop/src-tauri/binaries/openhydra-scorer-$TRIPLE$EXT"
+STAMP="$(cat scorer/LLAMACPP_COMMIT scorer/llamacpp-prompt-scoring.patch scorer/build.sh | shasum -a 256 | cut -c1-16)"
+if [[ ! -x "$SCORER" || "$(cat "$SCORER.stamp" 2>/dev/null)" != "$STAMP" ]]; then
+  scorer/build.sh "$SCORER" && echo "$STAMP" > "$SCORER.stamp"
+fi
+echo "staged sidecar: openhydra-scorer-$TRIPLE$EXT"

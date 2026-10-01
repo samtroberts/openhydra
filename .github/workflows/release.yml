@@ -92,6 +92,32 @@ jobs:
           cp "target/release/openhydra-agent$EXT" \
              "desktop/src-tauri/binaries/openhydra-agent-${{ matrix.triple }}$EXT"
 
+      # The prompt scorer the agent runs to answer authenticity checks for Ollama models
+      # (agent/src/side_scorer.rs): llama.cpp at a pinned commit + OpenHydra's patch. Takes minutes,
+      # so it is rebuilt only when scorer/ changes.
+      - name: Cache openhydra-scorer
+        id: scorer-cache
+        uses: actions/cache@v4
+        with:
+          path: scorer-bin
+          key: openhydra-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/**') }}
+
+      - name: Build openhydra-scorer
+        if: steps.scorer-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          EXT=""
+          if [[ "${{ matrix.triple }}" == *windows* ]]; then EXT=".exe"; fi
+          scorer/build.sh "scorer-bin/openhydra-scorer$EXT"
+
+      - name: Stage scorer sidecar
+        shell: bash
+        run: |
+          EXT=""
+          if [[ "${{ matrix.triple }}" == *windows* ]]; then EXT=".exe"; fi
+          cp "scorer-bin/openhydra-scorer$EXT" \
+             "desktop/src-tauri/binaries/openhydra-scorer-${{ matrix.triple }}$EXT"
+
       # 2) The desktop app + installers (signed so the auto-updater accepts them).
       - name: Build desktop app
         working-directory: desktop
@@ -133,6 +159,7 @@ jobs:
           EXT=""
           if [[ "${{ matrix.triple }}" == *windows* ]]; then EXT=".exe"; fi
           cp "target/release/openhydra-agent$EXT" "dist/openhydra-agent-${{ matrix.triple }}$EXT"
+          cp "scorer-bin/openhydra-scorer$EXT" "dist/openhydra-scorer-${{ matrix.triple }}$EXT"
           B=desktop/src-tauri/target/release/bundle
           find "$B" -name "*.dmg" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.deb" -exec cp {} dist/ \; 2>/dev/null || true

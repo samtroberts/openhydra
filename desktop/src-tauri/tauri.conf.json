@@ -38,7 +38,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/openhydra-agent"],
+    "externalBin": ["binaries/openhydra-agent", "binaries/openhydra-scorer"],
     "fileAssociations": [
       {
         "ext": ["openhydra"],
