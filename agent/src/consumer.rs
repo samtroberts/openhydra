@@ -48,7 +48,7 @@ use serde_json::Value;
 use crate::adapter::{AdapterError, ChatMessage, ToolCall};
 use crate::attest::{attest_provider, AttestRecord};
 use crate::prompt_score::{
-    decode_logprob_state, encode_logprob_state, identity_in, priced_tier, quant_hint_from_name, reference_tag, request_model_info, run_round,
+    decode_logprob_state, encode_logprob_state, identity_in, priced_tier, probe_scoring, quant_hint_from_name, reference_tag, request_model_info, run_round,
     select_reference, LoadedReference, LogprobStatus, RoundOutcome, ScoreChallengeError, StatusEffect,
     LOGPROB_BACKOFF_MS, LOGPROB_RETRY_MS,
 };
@@ -1954,6 +1954,17 @@ impl ConsumerNode {
                         "model name and declared quantisation disagree; checking the declared one");
                 }
             }
+            // Can it score right now? A throwaway prompt first, before any reference text is spent
+            // (a registry pack's texts are used up network-wide the moment it's issued) — only when
+            // there is something to check against.
+            if lp.registry.is_some() || select_reference(&lp.refs, &model, declared.as_ref()).is_some() {
+                let pause = &mut || std::thread::sleep(LOGPROB_BUSY_PAUSE);
+                if let Some(outcome) = probe_scoring(&mut info_transport, &model, pause) {
+                    let round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
+                    node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, 0, None);
+                    return;
+                }
+            }
             // A local reference file first; else a fresh round pack from the registry (never-issued
             // texts, signature checked against the pinned key). A pack is one round's worth, so its
             // round starts clean — the registry, not the per-provider record, prevents re-use.
@@ -2044,53 +2055,71 @@ impl ConsumerNode {
                 }
             };
             let texts_used = round.issued_count() - issued_before;
-            let now = now_unix_ms();
-            let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
-            let st = status.entry(key.clone()).or_default();
-            // A stopped run only counts against a provider that has scored texts for us before (in an
-            // earlier round, or earlier in this one) — never a first contact or our own text shortage.
-            let answered = st.verdict.is_some() || round.progress() > 0;
-            let effect = match &outcome {
-                RoundOutcome::Verdict(v) => st.on_verdict_jittered(*v, now, rand::random::<f64>() * 2.0 - 1.0),
-                RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, LOGPROB_RETRY_MS, now),
-                RoundOutcome::Unsupported => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS, now),
-                RoundOutcome::Exhausted => st.on_no_verdict(false, LOGPROB_BACKOFF_MS, now),
-            };
-            let streak = st.pass_streak;
-            drop(status);
-            // A pass earns no audit credit or reputation by itself (it only sets the method flag once
-            // the streak qualifies): reputation must come from served traffic, audits from audits.
-            match effect {
-                StatusEffect::None => {}
-                StatusEffect::Fail => {
-                    node.record_audit(&peer_id, &model_key, AuditClass::Fail, now);
-                    node.record_outcome(&peer_id, &model_key, VerificationOutcome::Failed, now);
-                }
-                StatusEffect::Evasion => node.record_audit(&peer_id, &model_key, AuditClass::Fail, now),
-            }
-            match outcome {
-                RoundOutcome::Verdict(v) if v.passed() => {
-                    tracing::info!(provider = %peer_id, model, aggregate = v.aggregate(), streak, texts = texts_used, "log-prob check passed")
-                }
-                RoundOutcome::Verdict(v) => tracing::warn!(provider = %peer_id, model, aggregate = v.aggregate(),
-                    texts = texts_used, "log-prob check FAILED (different model or quantization)"),
-                RoundOutcome::Incomplete(reason) => {
-                    tracing::debug!(provider = %peer_id, model, reason, "log-prob round interrupted")
-                }
-                RoundOutcome::Unsupported => {
-                    tracing::debug!(provider = %peer_id, model, "provider does not answer prompt-scoring challenges")
-                }
-                RoundOutcome::Exhausted => tracing::warn!(provider = %peer_id, model, reference = reference.set.model_key,
-                    "log-prob reference set exhausted for this provider; add fresh texts"),
-            }
-            if effect == StatusEffect::Evasion {
-                tracing::warn!(provider = %peer_id, model, "provider keeps dodging log-prob checks; counted as a failed audit");
-            }
-            let final_status = current(&lp);
-            node.persist_logprob_state(&key, final_status, &round);
-            lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), round);
-            lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, texts_used, Some(&reference.set.model_key));
         });
+    }
+
+    /// Apply how a log-prob run ended: status (verdict, streak, evasions, next check), audit /
+    /// outcome effects, logs, persistence; then release the (peer, model) for the next run.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_logprob_round(
+        &self,
+        lp: &ProviderLogprob,
+        key: &str,
+        peer_id: &str,
+        model: &str,
+        model_key: &str,
+        outcome: RoundOutcome,
+        round: ChallengeRound,
+        texts_used: usize,
+        reference_key: Option<&str>,
+    ) {
+        let now = now_unix_ms();
+        let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
+        let st = status.entry(key.to_string()).or_default();
+        // A stopped run only counts against a provider that has scored texts for us before (in an
+        // earlier round, or earlier in this one) — never a first contact or our own text shortage.
+        let answered = st.verdict.is_some() || round.progress() > 0;
+        let effect = match &outcome {
+            RoundOutcome::Verdict(v) => st.on_verdict_jittered(*v, now, rand::random::<f64>() * 2.0 - 1.0),
+            RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, LOGPROB_RETRY_MS, now),
+            RoundOutcome::Unsupported => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS, now),
+            RoundOutcome::Exhausted => st.on_no_verdict(false, LOGPROB_BACKOFF_MS, now),
+        };
+        let streak = st.pass_streak;
+        let final_status = *st;
+        drop(status);
+        // A pass earns no audit credit or reputation by itself (it only sets the method flag once
+        // the streak qualifies): reputation must come from served traffic, audits from audits.
+        match effect {
+            StatusEffect::None => {}
+            StatusEffect::Fail => {
+                self.record_audit(peer_id, model_key, AuditClass::Fail, now);
+                self.record_outcome(peer_id, model_key, VerificationOutcome::Failed, now);
+            }
+            StatusEffect::Evasion => self.record_audit(peer_id, model_key, AuditClass::Fail, now),
+        }
+        match outcome {
+            RoundOutcome::Verdict(v) if v.passed() => {
+                tracing::info!(provider = %peer_id, model, aggregate = v.aggregate(), streak, texts = texts_used, "log-prob check passed")
+            }
+            RoundOutcome::Verdict(v) => tracing::warn!(provider = %peer_id, model, aggregate = v.aggregate(),
+                texts = texts_used, "log-prob check FAILED (different model or quantization)"),
+            RoundOutcome::Incomplete(reason) => {
+                tracing::debug!(provider = %peer_id, model, reason, "log-prob round interrupted")
+            }
+            RoundOutcome::Unsupported => {
+                tracing::debug!(provider = %peer_id, model, "provider does not answer prompt-scoring challenges")
+            }
+            RoundOutcome::Exhausted => tracing::warn!(provider = %peer_id, model, reference = reference_key.unwrap_or("?"),
+                "log-prob reference set exhausted for this provider; add fresh texts"),
+        }
+        if effect == StatusEffect::Evasion {
+            tracing::warn!(provider = %peer_id, model, "provider keeps dodging log-prob checks; counted as a failed audit");
+        }
+        self.persist_logprob_state(key, final_status, &round);
+        lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), round);
+        lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
 
     fn maybe_audit(self: &Arc<Self>, model: &str, model_key: &str, provider_peer_id: &str) {

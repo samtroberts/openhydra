@@ -523,6 +523,34 @@ pub fn run_round(
     }
 }
 
+/// The throwaway prompt [`probe_scoring`] sends: low token ids, valid in any vocabulary, and not a
+/// reference text (nothing is learned from its scores).
+const PROBE_TOKENS: [u32; 16] = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015];
+
+/// Send a throwaway prompt before a round, so no reference text — a registry pack's are used up
+/// network-wide the moment they're issued — is spent on a provider that can't score right now
+/// (scoring off, or its engine disabled scoring at startup). `None` when it scored; else how the
+/// round would have ended, with busy refusals retried as in [`run_round`]. It reveals nothing a real
+/// challenge doesn't: challenges are recognisable by their method byte anyway.
+pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut dyn FnMut()) -> Option<RoundOutcome> {
+    let mut busy = 0;
+    loop {
+        return match request_prompt_scores(transport, model_ref, &PROBE_TOKENS) {
+            Ok(scores) if scores.iter().all(|&lp| lp.is_finite() && lp <= 0.0) => None,
+            Ok(_) => Some(RoundOutcome::Incomplete("unscorable reply to the probe".into())),
+            Err(ScoreChallengeError::Unsupported) => Some(RoundOutcome::Unsupported),
+            Err(ScoreChallengeError::Refused(r)) if r.contains("retry") && busy + 1 < MAX_BUSY_RETRIES => {
+                busy += 1;
+                pause();
+                continue;
+            }
+            Err(ScoreChallengeError::Refused(r)) => Some(RoundOutcome::Incomplete(format!("refused: {r}"))),
+            Err(ScoreChallengeError::Transport(e)) => Some(RoundOutcome::Incomplete(format!("transport: {e}"))),
+            Err(ScoreChallengeError::Malformed) => Some(RoundOutcome::Incomplete("malformed reply".into())),
+        };
+    }
+}
+
 // ── Consumer side: per-provider check history ──
 
 /// How long a verdict counts toward the authenticity tier, at least — a longer pass streak is
@@ -810,6 +838,40 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(r(Some(&Scorer { mode: "short" }), "public"), Err(ScoreChallengeError::Refused(_))));
+    }
+
+    #[test]
+    fn the_probe_spends_no_reference_text_and_reports_why_a_provider_cannot_score() {
+        let gate = InflightGate::new();
+        let probe = |engine: Option<&dyn EngineAdapter>| {
+            let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
+                assert_eq!(decode_challenge(&framed[1..]).unwrap().1, PROBE_TOKENS.to_vec());
+                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| m == "public"))
+            };
+            probe_scoring(&mut transport, "public", &mut || {})
+        };
+        assert_eq!(probe(Some(&Scorer { mode: "ok" })), None);
+        assert!(matches!(probe(None), Some(RoundOutcome::Incomplete(r)) if r.contains("not offered")));
+        assert!(matches!(probe(Some(&Scorer { mode: "err" })), Some(RoundOutcome::Incomplete(_))));
+        assert!(matches!(probe(Some(&Scorer { mode: "short" })), Some(RoundOutcome::Incomplete(_))));
+        let mut legacy = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(b"no magic".to_vec()) };
+        assert_eq!(probe_scoring(&mut legacy, "public", &mut || {}), Some(RoundOutcome::Unsupported));
+        let mut down = |_: &[u8]| -> Result<Vec<u8>, String> { Err("timeout".into()) };
+        assert!(matches!(probe_scoring(&mut down, "public", &mut || {}), Some(RoundOutcome::Incomplete(r)) if r.contains("timeout")));
+        // Busy refusals are retried, up to the same limit as a round.
+        for (busy_replies, expect_ok) in [(MAX_BUSY_RETRIES - 1, true), (MAX_BUSY_RETRIES, false)] {
+            let (mut sent, mut pauses) = (0, 0);
+            let mut flaky = |framed: &[u8]| -> Result<Vec<u8>, String> {
+                sent += 1;
+                if sent <= busy_replies {
+                    return Ok(score_refusal("prompt scoring busy, retry"));
+                }
+                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true))
+            };
+            let out = probe_scoring(&mut flaky, "public", &mut || pauses += 1);
+            assert_eq!(out.is_none(), expect_ok, "{busy_replies} busy replies: {out:?}");
+            assert_eq!(pauses, busy_replies.min(MAX_BUSY_RETRIES - 1));
+        }
     }
 
     #[test]
