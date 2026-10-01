@@ -165,8 +165,9 @@ struct ProviderLogprob {
     inflight: Mutex<std::collections::HashSet<String>>,
 }
 
-/// Per-challenge round-trip budget (one prompt-scoring pass is ~1 s on an L4).
-const LOGPROB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-challenge round-trip budget. One pass is ~1 s on a GPU, but a side-scorer on a laptop CPU
+/// takes 25-90 s for a 9B model's text; kept under the transport's own 120 s request limit.
+const LOGPROB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(110);
 /// Pause after a busy refusal before the next challenge.
 const LOGPROB_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Minimum gap between challenges to one provider. Keeps a round under the provider's per-peer rate

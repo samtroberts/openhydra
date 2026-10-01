@@ -21,6 +21,7 @@
 //! internally. A single node can't yet be both provider and gateway at once
 //! (`NetworkHandle` is owned by one role); run two processes for the M3.1 two-node test.
 
+use openhydra_agent::side_scorer::SideScored;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -621,8 +622,9 @@ struct ProvideArgs {
     /// OpenHydra scoring endpoint of patched mistral.rs / llama-server `--prompt-scoring`) — the only
     /// choice with `--engine-kind auto`; `vllm` / `sglang` / `openhydra` name it explicitly (needs
     /// `--engine-kind vllm`, `openai` or `llama-cpp`). Off by default; at most 2 challenges are scored
-    /// at once. Only publicly announced models are scorable; engines that can't score (Ollama,
-    /// LM Studio, stock llama-server) refuse.
+    /// at once. Only publicly announced models are scorable. Ollama can't score a prompt itself: its
+    /// models are scored by the side-scorer (see `--side-scorer`) on their weights file; without
+    /// one, and for LM Studio and stock llama-server, challenges are refused.
     #[arg(long = "prompt-scoring")]
     prompt_scoring: Option<openhydra_agent::adapters::scoring::ScoringChoice>,
 
@@ -632,6 +634,16 @@ struct ProvideArgs {
     /// Ollama and llama.cpp report their own quant and ignore this.
     #[arg(long = "declare-quant")]
     declare_quant: Option<String>,
+
+    /// The side-scorer for `--prompt-scoring` on engines that can't score a prompt themselves
+    /// (Ollama): OpenHydra's patched llama-server, started on the model's own weights file when a
+    /// challenge arrives and stopped when idle. Defaults to `openhydra-scorer` next to this binary.
+    #[arg(long = "side-scorer")]
+    side_scorer: Option<std::path::PathBuf>,
+
+    /// Don't use a side-scorer (models of engines that can't score are then refused, as before).
+    #[arg(long = "no-side-scorer", conflicts_with = "side_scorer")]
+    no_side_scorer: bool,
 
     #[command(flatten)]
     aup: AupArgs,
@@ -1073,10 +1085,17 @@ fn provide(
         }
         return provide_auto(net, stats, economy, args);
     }
+    let scorer = side_scorer(&args)?;
     if args.prompt_scoring.is_some()
         && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Openai | EngineKind::LlamaCpp)
+        && !(scorer.is_some() && args.engine_kind == EngineKind::Ollama)
     {
-        return Err("--prompt-scoring needs --engine-kind vllm, openai or llama-cpp".into());
+        return Err("--prompt-scoring needs --engine-kind vllm, openai or llama-cpp, or ollama with a side-scorer \
+                    (openhydra-scorer next to this binary, or --side-scorer)"
+            .into());
+    }
+    if matches!(args.prompt_scoring, Some(ScoringChoice::Dialect(_))) && args.engine_kind == EngineKind::Ollama {
+        return Err("Ollama is scored by the side-scorer: use --prompt-scoring auto".into());
     }
 
     let url = args
@@ -1089,7 +1108,7 @@ fn provide(
         EngineKind::Auto => unreachable!("handled above"),
         EngineKind::Ollama => {
             let a = live_ollama(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
         EngineKind::Vllm => {
             let mut a = live_openai(&url, "vllm").map_err(|e| format!("engine {url}: {e}"))?;
@@ -1098,11 +1117,11 @@ fn provide(
                 Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),
                 None => a,
             };
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
         EngineKind::LmStudio => {
             let a = live_openai(&url, "lm-studio").map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
         EngineKind::LlamaCpp => {
             let mut a = live_llamacpp(&url).map_err(|e| format!("engine {url}: {e}"))?;
@@ -1111,11 +1130,11 @@ fn provide(
                 Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),
                 None => a,
             };
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
         EngineKind::Exo => {
             let a = live_exo(&url).map_err(|e| format!("engine {url}: {e}"))?;
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
         EngineKind::Comfyui => {
             // BYO-workflow when a template dir is given; else the built-in SD graph.
@@ -1124,7 +1143,7 @@ fn provide(
                     .map_err(|e| format!("engine {url}: {e}"))?,
                 None => live_comfyui(&url).map_err(|e| format!("engine {url}: {e}"))?,
             };
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
         EngineKind::Openai => {
             let mut a = live_openai(&url, "openai").map_err(|e| format!("engine {url}: {e}"))?;
@@ -1133,7 +1152,7 @@ fn provide(
                 Some(ScoringChoice::Auto) => a.with_auto_prompt_scoring(),
                 None => a,
             };
-            run_single_engine(a, url, args, net, stats, economy)
+            run_single_engine(SideScored::new(a, scorer.clone()), url, args, net, stats, economy)
         }
     }
 }
@@ -1194,7 +1213,30 @@ fn provide_auto(
     // are absorbed with no restart. Drop the decision-scan's adapters; it rebuilds its own.
     let multi = openhydra_agent::detect::MultiAdapter::new();
     let multi = if args.prompt_scoring.is_some() { multi.with_auto_prompt_scoring() } else { multi };
-    run_provider(multi, "auto".to_string(), args, net, stats, economy)
+    let scorer = side_scorer(&args)?;
+    run_provider(SideScored::new(multi, scorer), "auto".to_string(), args, net, stats, economy)
+}
+
+/// The side-scorer `--prompt-scoring` uses for engines that can't score (see `--side-scorer`):
+/// `None` when scoring is off, `--no-side-scorer` is given, or no scorer binary is found.
+fn side_scorer(args: &ProvideArgs) -> Result<Option<std::sync::Arc<openhydra_agent::side_scorer::LiveSideScorer>>, String> {
+    if args.prompt_scoring.is_none() || args.no_side_scorer {
+        return Ok(None);
+    }
+    match openhydra_agent::side_scorer::locate_scorer(args.side_scorer.as_deref()) {
+        Some(bin) => {
+            eprintln!("openhydra-agent: side-scorer for engines that can't score: {}", bin.display());
+            openhydra_agent::side_scorer::live_side_scorer(bin).map(Some)
+        }
+        None if args.side_scorer.is_some() => Err(format!("--side-scorer: no such file: {}", args.side_scorer.as_ref().unwrap().display())),
+        None => {
+            eprintln!(
+                "openhydra-agent: no side-scorer (openhydra-scorer) next to this binary: models of engines that can't \
+                 score a prompt (Ollama, LM Studio) will refuse authenticity checks"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// The fail-fast message when auto mode finds no engine (§5 of the autostart plan).

@@ -27,6 +27,8 @@ pub enum AdapterError {
     Parse(String),
     /// The engine (or this adapter) doesn't offer the requested capability.
     Unsupported(String),
+    /// Temporarily unable (e.g. a prompt scorer still loading its model); retry shortly.
+    Busy(String),
 }
 
 impl fmt::Display for AdapterError {
@@ -35,6 +37,7 @@ impl fmt::Display for AdapterError {
             AdapterError::Http(m) => write!(f, "engine http error: {m}"),
             AdapterError::Parse(m) => write!(f, "engine response parse error: {m}"),
             AdapterError::Unsupported(m) => write!(f, "engine capability unsupported: {m}"),
+            AdapterError::Busy(m) => write!(f, "engine busy: {m}"),
         }
     }
 }
@@ -350,6 +353,14 @@ pub trait EngineAdapter {
     fn score_prompt(&self, model_ref: &str, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
         let _ = (model_ref, token_ids);
         Err(AdapterError::Unsupported(format!("{} does not expose prompt log-probs", self.engine_name())))
+    }
+
+    /// The local file holding `model_ref`'s weights (a GGUF), when the engine reveals it and it is
+    /// readable here — what a side-scorer scores for an engine that can't score itself. `None` by
+    /// default.
+    fn weights_path(&self, model_ref: &str) -> Option<std::path::PathBuf> {
+        let _ = model_ref;
+        None
     }
 }
 

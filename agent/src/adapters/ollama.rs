@@ -76,6 +76,15 @@ struct ShowResponse {
     modelfile: String,
 }
 
+/// The weights blob a Modelfile's `FROM` line names (a local GGUF path), when it is one.
+fn weights_blob_path(modelfile: &str) -> Option<std::path::PathBuf> {
+    modelfile
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("FROM "))
+        .map(|p| std::path::PathBuf::from(p.trim()))
+        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sha256-")))
+}
+
 /// The weights file's sha256 from a Modelfile's `FROM …/blobs/sha256-<hex>` line, as
 /// `sha256:<hex>`. Ollama's blobs are content-addressed, so the name *is* the file's digest — no
 /// hashing needed. `""` when the Modelfile doesn't point at a blob.
@@ -320,6 +329,12 @@ impl<H: HttpClient> OllamaAdapter<H> {
 impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
     fn engine_name(&self) -> &'static str {
         "ollama"
+    }
+
+    /// The model's blob file, from `/api/show`'s Modelfile, when it exists on this machine (Ollama
+    /// running locally) — scored by the side-scorer, since Ollama can't score a prompt itself.
+    fn weights_path(&self, model_ref: &str) -> Option<std::path::PathBuf> {
+        weights_blob_path(&self.fetch_show(model_ref).modelfile).filter(|p| p.is_file())
     }
 
     fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {

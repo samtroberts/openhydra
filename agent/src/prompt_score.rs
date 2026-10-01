@@ -32,7 +32,7 @@ use openhydra_protocol::weight::{cost_tier_for_handle, cost_tier_for_params_quan
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::adapter::EngineAdapter;
+use crate::adapter::{AdapterError, EngineAdapter};
 use openhydra_protocol::verify::VerificationOutcome;
 
 /// libp2p proxy method byte for a prompt-scoring challenge. (0x16 is `ATTEST_CHALLENGE`.)
@@ -282,6 +282,10 @@ pub fn handle_prompt_score_inbound(
             tracing::warn!(model, sent = ids.len(), got = lps.len(), "engine returned the wrong number of prompt scores");
             score_refusal("engine could not score the prompt")
         }
+        Err(AdapterError::Busy(e)) => {
+            tracing::info!(model, reason = %e, "prompt scoring not ready yet");
+            score_refusal("prompt scoring warming up, retry")
+        }
         Err(e) => {
             tracing::warn!(model, error = %e, "prompt scoring failed");
             score_refusal("engine could not score the prompt")
@@ -502,6 +506,10 @@ pub enum RoundOutcome {
 
 /// Busy / rate-limited refusals tolerated in a row before a run gives up.
 const MAX_BUSY_RETRIES: usize = 3;
+/// Retryable refusals [`probe_scoring`] waits through: a side-scorer loading its model answers
+/// "warming up, retry" for a minute or two (with 2 s pauses, ~2.5 min), and that must never count
+/// as a provider dodging the check.
+const MAX_PROBE_RETRIES: usize = 75;
 
 /// Send challenges one at a time until the round closes or something stops it. `pick(n)` chooses
 /// which unsent text goes next (random in production); `pause()` backs off after a busy refusal.
@@ -561,8 +569,9 @@ const PROBE_TOKENS: [u32; 16] = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007,
 /// Send a throwaway prompt before a round, so no reference text — a registry pack's are used up
 /// network-wide the moment they're issued — is spent on a provider that can't score right now
 /// (scoring off, or its engine disabled scoring at startup). `None` when it scored; else how the
-/// round would have ended, with busy refusals retried as in [`run_round`]. It reveals nothing a real
-/// challenge doesn't: challenges are recognisable by their method byte anyway.
+/// round would have ended. Retryable refusals (busy, a side-scorer warming up) are waited through
+/// for up to [`MAX_PROBE_RETRIES`] pauses, so the round that follows runs on a warm scorer. It
+/// reveals nothing a real challenge doesn't: challenges are recognisable by their method byte anyway.
 pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut dyn FnMut()) -> Option<RoundOutcome> {
     let mut busy = 0;
     loop {
@@ -570,7 +579,7 @@ pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut
             Ok(scores) if scores.iter().all(|&lp| lp.is_finite() && lp <= 0.0) => None,
             Ok(_) => Some(RoundOutcome::Incomplete("unscorable reply to the probe".into())),
             Err(ScoreChallengeError::Unsupported) => Some(RoundOutcome::Unsupported),
-            Err(ScoreChallengeError::Refused(r)) if r.contains("retry") && busy + 1 < MAX_BUSY_RETRIES => {
+            Err(ScoreChallengeError::Refused(r)) if r.contains("retry") && busy + 1 < MAX_PROBE_RETRIES => {
                 busy += 1;
                 pause();
                 continue;
@@ -835,6 +844,7 @@ mod tests {
         fn score_prompt(&self, _model: &str, ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
             match self.mode {
                 "err" => Err(AdapterError::Http("secret engine detail".into())),
+                "busy" => Err(AdapterError::Busy("loading a 9 GB model".into())),
                 "short" => Ok(vec![-0.1]),
                 _ => Ok(ids[1..].iter().map(|&i| -(i as f32) / 10.0).collect()),
             }
@@ -869,6 +879,11 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(r(Some(&Scorer { mode: "short" }), "public"), Err(ScoreChallengeError::Refused(_))));
+        // A scorer still starting is a retryable refusal (never a dodge), and leaks nothing either.
+        match r(Some(&Scorer { mode: "busy" }), "public") {
+            Err(ScoreChallengeError::Refused(s)) => assert!(s.contains("retry") && !s.contains("9 GB"), "{s}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -889,19 +904,19 @@ mod tests {
         assert_eq!(probe_scoring(&mut legacy, "public", &mut || {}), Some(RoundOutcome::Unsupported));
         let mut down = |_: &[u8]| -> Result<Vec<u8>, String> { Err("timeout".into()) };
         assert!(matches!(probe_scoring(&mut down, "public", &mut || {}), Some(RoundOutcome::Incomplete(r)) if r.contains("timeout")));
-        // Busy refusals are retried, up to the same limit as a round.
-        for (busy_replies, expect_ok) in [(MAX_BUSY_RETRIES - 1, true), (MAX_BUSY_RETRIES, false)] {
+        // Retryable refusals (busy, a scorer warming up) are waited through, up to the probe's limit.
+        for (busy_replies, expect_ok) in [(MAX_PROBE_RETRIES - 1, true), (MAX_PROBE_RETRIES, false)] {
             let (mut sent, mut pauses) = (0, 0);
             let mut flaky = |framed: &[u8]| -> Result<Vec<u8>, String> {
                 sent += 1;
                 if sent <= busy_replies {
-                    return Ok(score_refusal("prompt scoring busy, retry"));
+                    return Ok(score_refusal(if sent % 2 == 0 { "prompt scoring busy, retry" } else { "prompt scoring warming up, retry" }));
                 }
                 Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true))
             };
             let out = probe_scoring(&mut flaky, "public", &mut || pauses += 1);
             assert_eq!(out.is_none(), expect_ok, "{busy_replies} busy replies: {out:?}");
-            assert_eq!(pauses, busy_replies.min(MAX_BUSY_RETRIES - 1));
+            assert_eq!(pauses, busy_replies.min(MAX_PROBE_RETRIES - 1));
         }
     }
 

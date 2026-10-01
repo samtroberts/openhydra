@@ -45,6 +45,7 @@ pub mod receipt;
 pub mod registry_client;
 pub mod serve;
 pub mod share_policy;
+pub mod side_scorer;
 pub mod slash;
 /// M3: swarm membership glue — persist owner/member swarm state and drive enroll → approve → accept
 /// on top of the pure credential crypto in `openhydra_network::membership`.

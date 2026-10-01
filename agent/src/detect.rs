@@ -237,6 +237,11 @@ impl EngineAdapter for MultiAdapter {
             None => Err(AdapterError::Http(format!("no local engine serves model '{model_ref}' (auto mode)"))),
         }
     }
+
+    fn weights_path(&self, model_ref: &str) -> Option<std::path::PathBuf> {
+        let adapter = self.table.read().ok().and_then(|t| t.routes.get(model_ref).cloned());
+        adapter.and_then(|a| a.weights_path(model_ref))
+    }
 }
 
 #[cfg(test)]
