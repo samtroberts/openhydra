@@ -49,8 +49,10 @@ const RESP_REFUSED: u8 = 0x01;
 
 /// Longest model handle a challenge may carry.
 const MAX_MODEL_REF_LEN: usize = 256;
-/// Most tokens one challenge may ask the engine to score.
-pub const MAX_CHALLENGE_TOKENS: usize = 4096;
+/// Most tokens one challenge may ask the engine to score. The patched llama.cpp endpoint checks at
+/// startup that a prompt this long fits in device memory (and disables scoring if not), so the two
+/// must agree; `refbuild tokenize` keeps texts within it.
+pub const MAX_CHALLENGE_TOKENS: usize = 512;
 /// Challenges the provider scores at once; the rest are refused ("busy") for the consumer to retry.
 pub const MAX_INFLIGHT: usize = 2;
 
