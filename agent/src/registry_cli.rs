@@ -29,9 +29,12 @@ use ed25519_dalek::SigningKey;
 use openhydra_agent::prompt_score::load_reference;
 use openhydra_agent::registry_client::pack_reply;
 use openhydra_protocol::logprob::ModelIdentity;
-use openhydra_protocol::refpool::{sign_pack, PoolError, RefPool};
+use openhydra_protocol::refpool::{sign_pack, BatchStatus, PoolError, RefPool};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+/// Extra texts per pack beyond one round (the `serve --spare` default).
+const DEFAULT_SPARE: u32 = 4;
 
 #[derive(Args)]
 pub struct RegistryArgs {
@@ -103,7 +106,7 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:7870")]
     bind: String,
     /// Extra texts per pack beyond one round, so a refused challenge doesn't sink the round.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = DEFAULT_SPARE)]
     spare: u32,
     /// Packs one gateway key may take per hour.
     #[arg(long, default_value_t = 60)]
@@ -203,15 +206,17 @@ pub fn run(args: RegistryArgs) -> Result<(), String> {
         RegistryAction::Status(d) => {
             let pool = open_pool(&d.dir)?;
             for b in pool.status().map_err(|e| format!("{e:?}"))? {
+                let (all_full, all_early) = rounds_left(&b, DEFAULT_SPARE);
                 println!(
-                    "{}  {:24} {:22} cut-off x{:.2}  {}/{} texts left (≈{} rounds)",
+                    "{}  {:24} {:22} cut-off x{:.2}  {}/{} texts left (≈{} rounds, ≈{} if decided early)",
                     hex::encode(b.info.batch_id),
                     b.info.label,
                     b.info.identity.as_ref().map(|i| i.key()).unwrap_or_else(|| b.info.handles.join(",")),
                     b.info.cutoff,
                     b.remaining,
                     b.info.total,
-                    b.remaining / b.info.min_texts.max(1)
+                    all_full,
+                    all_early
                 );
             }
             Ok(())
@@ -295,6 +300,13 @@ async fn health(State(reg): State<Arc<Registry>>) -> Json<Value> {
     Json(json!({"ok": true, "key": hex::encode(reg.key.verifying_key().to_bytes())}))
 }
 
+/// Rounds the batch's unissued texts still make: `(if every round runs to the end, if every round is
+/// decided at the first early-stop checkpoint)`. Real rounds land in between.
+fn rounds_left(b: &BatchStatus, spare: u32) -> (u32, u32) {
+    let (first, full) = b.info.texts_per_round(spare);
+    (b.remaining / full.max(1), b.remaining / first.max(1))
+}
+
 async fn pool_view(State(reg): State<Arc<Registry>>, headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
     reg.authorize(&headers)?;
     let batches = reg.pool.status().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -306,7 +318,8 @@ async fn pool_view(State(reg): State<Arc<Registry>>, headers: HeaderMap) -> Resu
             "handles": b.info.handles,
             "min_texts": b.info.min_texts,
             "remaining": b.remaining,
-            "rounds_left": b.remaining / b.info.min_texts.max(1),
+            "rounds_left": rounds_left(b, reg.spare).0,
+            "rounds_left_if_early": rounds_left(b, reg.spare).1,
         }))
         .collect::<Vec<_>>())))
 }
@@ -451,6 +464,15 @@ mod tests {
             let other = ModelIdentity::new("qwen3.5", "9b", "q4_0");
             assert_eq!(client.fetch_pack(other.as_ref(), "y"), Err(openhydra_agent::registry_client::RegistryError::NoReference));
         });
+    }
+
+    #[test]
+    fn rounds_left_counts_both_full_and_early_decided_rounds() {
+        let (reg, _) = registry(30, 60);
+        let b = &reg.pool.status().unwrap()[0];
+        let (first, full) = b.info.texts_per_round(reg.spare);
+        assert_eq!(rounds_left(b, reg.spare), (b.remaining / full, b.remaining / first));
+        assert!(rounds_left(b, reg.spare).0 <= rounds_left(b, reg.spare).1);
     }
 
     #[test]

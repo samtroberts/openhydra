@@ -325,6 +325,14 @@ pub struct BatchInfo {
 }
 
 impl BatchInfo {
+    /// Texts one round takes from this batch with `spare` extra per pack: `(decided at the first
+    /// early-stop checkpoint, run to the end)`. Without checkpoints both are a full round.
+    pub fn texts_per_round(&self, spare: u32) -> (u32, u32) {
+        let full = self.min_texts + spare;
+        let first = self.early_stop.first().map_or(full, |c| (c.after as u32 + spare).min(full));
+        (first, full)
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         w.u8(2);
@@ -555,9 +563,8 @@ impl RefPool {
                 let used = next.get(bid.as_str()).map_err(db)?.map(|g| g.value()).unwrap_or(info.total);
                 let left = info.total.saturating_sub(used);
                 if left >= info.min_texts {
-                    let full = left.min(info.min_texts + spare);
-                    let first = info.early_stop.first().map_or(full, |c| (c.after as u32 + spare).min(full));
-                    chosen = Some((bid, info, first));
+                    let (first, full) = info.texts_per_round(spare);
+                    chosen = Some((bid, info, first.min(full.min(left))));
                     break;
                 }
             }
@@ -769,6 +776,26 @@ fn record_pack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_round_takes_the_first_checkpoint_plus_spare_when_decided_early() {
+        let mut info = BatchInfo {
+            batch_id: [0; 16],
+            label: "x".into(),
+            identity: None,
+            handles: vec![],
+            cutoff: 2.0,
+            min_texts: 24,
+            early_stop: vec![],
+            total: 240,
+            imported_ms: 0,
+        };
+        assert_eq!(info.texts_per_round(4), (28, 28), "no checkpoints: a full round either way");
+        info.early_stop = vec![Checkpoint { after: 8, pass_below: Some(2.0), fail_above: 2.0 }];
+        assert_eq!(info.texts_per_round(4), (12, 28));
+        info.early_stop[0].after = 26;
+        assert_eq!(info.texts_per_round(4).0, 28, "never more than a full round");
+    }
     use crate::logprob::{ChallengeRound, DEFAULT_CUTOFF};
 
     fn set(label: &str, n: usize, offset: u32, identity: Option<ModelIdentity>) -> ReferenceSet {
