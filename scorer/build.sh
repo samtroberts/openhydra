@@ -55,8 +55,13 @@ case "$(uname -s)" in
   # ggml's own thread pool instead of OpenMP: no libgomp the user's system might lack.
   *) FLAGS+=(-DGGML_OPENMP=OFF) ;;
 esac
-cmake -S "$SRC" -B "$SRC/build-scorer" "${FLAGS[@]}" > "$WORK/configure.log"
-cmake --build "$SRC/build-scorer" --target llama-server --config Release --parallel > "$WORK/build.log"
+cmake -S "$SRC" -B "$SRC/build-scorer" "${FLAGS[@]}" > "$WORK/configure.log" 2>&1 \
+  || { tail -30 "$WORK/configure.log" >&2; exit 1; }
+# An explicit job count: a bare --parallel is an unbounded `make -j` with the Makefile generator, which
+# runs every compile at once and runs a CI runner out of memory.
+JOBS="${SCORER_JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+cmake --build "$SRC/build-scorer" --target llama-server --config Release --parallel "$JOBS" > "$WORK/build.log" 2>&1 \
+  || { tail -30 "$WORK/build.log" >&2; exit 1; }
 
 BIN="$(find "$SRC/build-scorer/bin" -type f \( -name llama-server -o -name llama-server.exe \) | head -n 1)"
 [[ -n "$BIN" ]] || { echo "scorer/build.sh: no llama-server built (see $WORK/build.log)" >&2; exit 1; }

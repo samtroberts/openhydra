@@ -42,6 +42,9 @@ LLAMACPP = [
 # Vendored directories the list above covers.
 LLAMACPP_VENDOR = {"cpp-httplib", "hash", "miniaudio", "nlohmann", "sheredom", "stb"}
 
+# Path dependencies under --own-root are our own code, except third-party crates vendored in these.
+VENDORED_DIRS = {"patched-deps", "vendor", "third_party", "third-party"}
+
 LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|unlicense)([-_.].*)?$", re.I)
 
 MIT_TEMPLATE = """Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
@@ -129,10 +132,12 @@ def cargo(manifest, package, out, target=None, features=None, no_default=False, 
             crates[(m.group(1), m.group(2))] = (src[0] if src else "", licence, repo)
     parts, by_hash = [], {}
     for (name, version), (src, licence, repo) in sorted(crates.items()):
-        if src.startswith("/"):
+        if os.path.isabs(src) or re.match(r"^[A-Za-z]:[\\/]", src):  # a path dependency (cargo prints D:\ on Windows)
             pdir, walk_up = os.path.realpath(src), manifest_dir
             if own_root and (pdir == own_root or pdir.startswith(own_root + os.sep)):
-                continue  # our own code
+                if not VENDORED_DIRS & set(os.path.relpath(pdir, own_root).split(os.sep)):
+                    continue  # our own code
+                walk_up = None  # a vendored crate: its own licence, never ours
         elif src.startswith("http"):
             pdir, walk_up = git_checkout(cargo_home, name, src)
         else:
