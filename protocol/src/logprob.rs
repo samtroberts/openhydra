@@ -169,6 +169,10 @@ pub enum ReferenceError {
     /// of order, past the round size, or looser/harsher than the cut-off, or the weights digest
     /// isn't in canonical form.
     BadParams,
+    /// Tied to a weights file but with no model identity. A digest match bypasses the model's name,
+    /// so without an identity a pass would leave the price to the name the provider chose: a
+    /// small model's file passing under a big model's name.
+    WeightsWithoutIdentity,
     /// Fewer texts than one round needs.
     TooFewTexts { have: usize, need: usize },
 }
@@ -204,6 +208,9 @@ impl ReferenceSet {
         }
         if self.weights.as_deref().is_some_and(|w| normalize_weights_digest(w).as_deref() != Some(w)) {
             return Err(ReferenceError::BadParams);
+        }
+        if self.weights.is_some() && self.identity.is_none() {
+            return Err(ReferenceError::WeightsWithoutIdentity);
         }
         let mut prev = 0;
         for cp in &self.early_stop {
@@ -1072,6 +1079,12 @@ mod tests {
         assert_eq!(s.validate(), Ok(()));
         s.weights = Some(format!("sha256-{}", hex.to_lowercase()));
         assert_eq!(s.validate(), Err(ReferenceError::BadParams), "stored digests must be canonical");
+        // A file-tied reference prices a pass by its identity, so it must have one.
+        s.weights = normalize_weights_digest(hex);
+        s.identity = None;
+        assert_eq!(s.validate(), Err(ReferenceError::WeightsWithoutIdentity));
+        s.weights = None;
+        assert_eq!(s.validate(), Ok(()), "a name-only reference needs no identity");
     }
 
     #[test]

@@ -157,12 +157,26 @@ struct ProviderLogprob {
     registry: Option<crate::registry_client::RegistryClient>,
     /// Identities of registry references seen this run, by reference tag (for pricing).
     registry_identities: Mutex<HashMap<[u8; 16], openhydra_protocol::logprob::ModelIdentity>>,
+    /// Weights files of the file-tied registry references seen this run, by reference tag.
+    registry_weights: Mutex<HashMap<[u8; 16], String>>,
     /// Per `(peer, model)`: texts issued so far + the round in progress. Persisted (with the status)
     /// in the store's log-prob table and saved before each text is sent, so a restart never re-sends
     /// a text a provider has seen.
     rounds: Mutex<HashMap<String, ChallengeRound>>,
     status: Mutex<HashMap<String, LogprobStatus>>,
     inflight: Mutex<std::collections::HashSet<String>>,
+}
+
+impl ProviderLogprob {
+    /// The weights file a reference tag was made from, when it names a file-tied reference this
+    /// gateway knows (a local file, or a registry pack seen this run).
+    fn tied_weights(&self, tag: [u8; 16]) -> Option<String> {
+        self.refs
+            .iter()
+            .find(|r| reference_tag(&r.set) == tag)
+            .and_then(|r| r.set.weights.clone())
+            .or_else(|| self.registry_weights.lock().unwrap_or_else(|e| e.into_inner()).get(&tag).cloned())
+    }
 }
 
 /// Per-challenge round-trip budget. One pass is ~1 s on a GPU, but a side-scorer on a laptop CPU
@@ -875,6 +889,7 @@ impl ConsumerNode {
             refs: refs.into_iter().map(Arc::new).collect(),
             registry,
             registry_identities: Mutex::new(HashMap::new()),
+            registry_weights: Mutex::new(HashMap::new()),
             rounds: Mutex::new(rounds),
             status: Mutex::new(status),
             inflight: Mutex::new(std::collections::HashSet::new()),
@@ -1956,6 +1971,30 @@ impl ConsumerNode {
                         "model name and declared quantisation disagree; checking the declared one");
                 }
             }
+            // Verified on one weights file, now declaring another or none: that pass doesn't carry over.
+            let current = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|st| st.reference);
+            let verified_on = current.filter(|t| *t != [0; 16]).and_then(|t| lp.tied_weights(t));
+            if let Some(verified_on) = verified_on.filter(|w| weights.as_deref() != Some(w.as_str())) {
+                let mut round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
+                if weights.is_none() {
+                    // None declared: an agent hashes the file in the background after a restart, so
+                    // retry soon (and keep the streak); one that keeps not declaring it is dodging.
+                    tracing::info!(provider = %peer_id, model, verified_on, "provider no longer declares the weights file it was verified on");
+                    let outcome = RoundOutcome::Incomplete("weights file not declared".into());
+                    node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, 0, None);
+                    return;
+                }
+                tracing::info!(provider = %peer_id, model, verified_on, now = weights.as_deref().unwrap_or_default(),
+                    "provider declares a different weights file than it was verified on; its pass is void");
+                let voided = {
+                    let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
+                    let st = status.entry(key.clone()).or_default();
+                    st.switch_reference([0; 16], &mut round);
+                    *st
+                };
+                node.persist_logprob_state(&key, voided, &round);
+                lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), round);
+            }
             // Can it score right now? A throwaway prompt first, before any reference text is spent
             // (a registry pack's texts are used up network-wide the moment it's issued) — only when
             // there is something to check against.
@@ -1985,6 +2024,9 @@ impl ConsumerNode {
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .insert(reference_tag(&set), id.clone());
+                            }
+                            if let Some(w) = &set.weights {
+                                lp.registry_weights.lock().unwrap_or_else(|e| e.into_inner()).insert(reference_tag(&set), w.clone());
                             }
                             Some(Arc::new(LoadedReference { handles: pack.handles, set }))
                         }

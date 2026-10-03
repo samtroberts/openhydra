@@ -502,6 +502,11 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
             None
         }
     };
+    if weights.is_some() && identity.is_none() {
+        return Err("a reference tied to a weights file needs the model identity too (--family/--params/--quant): \
+                    a provider's model is priced by it after a pass"
+            .into());
+    }
     if identity.is_none() && weights.is_none() && a.handles.is_empty() {
         return Err("give a model identity (--family/--params/--quant), --weights-file, or at least one --handle".into());
     }
