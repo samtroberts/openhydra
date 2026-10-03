@@ -175,12 +175,20 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           npm ci || npm install
-          if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+          # A missing secret arrives as an EMPTY variable, which Tauri still tries to sign with
+          # (failing the bundle): unset them all so "no secrets" really means an unsigned build.
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          fi
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "Apple Developer ID present → macOS build will be SIGNED + NOTARIZED"
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             echo "::warning::No APPLE_SIGNING_IDENTITY → macOS build is UNSIGNED (Gatekeeper will warn)"
           fi
-          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             echo "Updater signing key present → building signed updater artifacts"
             npm exec tauri build -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
           else
