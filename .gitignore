@@ -150,6 +150,8 @@ scripts/ab_pipeline_depth.sh
 desktop/node_modules/
 desktop/src-tauri/target/
 desktop/src-tauri/binaries/
+# licence notices assembled at build time (desktop/stage-notices.sh)
+desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt
 desktop/src-tauri/gen/
 desktop/src-tauri/WixTools/
 !desktop/package-lock.json

@@ -1,0 +1,2 @@
+# Shell scripts run on the Windows CI leg too (Git Bash), where autocrlf would break them.
+*.sh text eol=lf

@@ -39,6 +39,7 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/openhydra-agent", "binaries/openhydra-scorer"],
+    "resources": { "resources/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt" },
     "fileAssociations": [
       {
         "ext": ["openhydra"],

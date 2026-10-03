@@ -117,6 +117,8 @@ jobs:
           if [[ "${{ matrix.triple }}" == *windows* ]]; then EXT=".exe"; fi
           cp "scorer-bin/openhydra-scorer$EXT" \
              "desktop/src-tauri/binaries/openhydra-scorer-${{ matrix.triple }}$EXT"
+          cp scorer-bin/openhydra-scorer.notices.txt \
+             "desktop/src-tauri/binaries/openhydra-scorer-${{ matrix.triple }}.notices.txt"
 
       # macOS also ships the MLX scorer: patched mistral.rs for LM Studio's MLX models
       # (scorer/mistralrs), bundled through tauri.macos.conf.json. A ~10 min build, so cached.
@@ -126,7 +128,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: mlx-scorer-bin
-          key: openhydra-mlx-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/mistralrs/**') }}
+          key: openhydra-mlx-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/mistralrs/**', 'scorer/notices.py') }}
 
       - name: Build openhydra-mlx-scorer (macOS)
         if: startsWith(matrix.platform, 'macos') && steps.mlx-scorer-cache.outputs.cache-hit != 'true'
@@ -139,6 +141,13 @@ jobs:
         run: |
           cp mlx-scorer-bin/openhydra-mlx-scorer \
              "desktop/src-tauri/binaries/openhydra-mlx-scorer-${{ matrix.triple }}"
+          cp mlx-scorer-bin/openhydra-mlx-scorer.notices.txt \
+             "desktop/src-tauri/binaries/openhydra-mlx-scorer-${{ matrix.triple }}.notices.txt"
+
+      # Licence notices of all the third-party code shipped (app resource + published beside the CLI).
+      - name: Stage licence notices
+        shell: bash
+        run: desktop/stage-notices.sh "${{ matrix.triple }}"
 
       # 2) The desktop app + installers (signed so the auto-updater accepts them).
       - name: Build desktop app
@@ -174,6 +183,19 @@ jobs:
           fi
         shell: bash
 
+      # Nothing shipped may need the VC++ redistributable (Windows doesn't include it): the agent and
+      # desktop app link the C runtime statically (.cargo/config.toml), the scorer too (scorer/build.sh).
+      - name: Check Windows binaries need no VC++ runtime DLLs
+        if: startsWith(matrix.platform, 'windows')
+        shell: bash
+        run: |
+          for f in target/release/openhydra-agent.exe scorer-bin/openhydra-scorer.exe \
+                   desktop/src-tauri/target/release/openhydra-desktop.exe; do
+            if grep -aiqE '(vcruntime140(_1)?|msvcp140)\.dll' "$f"; then
+              echo "::error::$f imports the VC++ runtime DLLs"; exit 1
+            fi
+          done
+
       - name: Collect artifacts
         shell: bash
         run: |
@@ -185,6 +207,7 @@ jobs:
           if [[ "${{ matrix.triple }}" == *apple-darwin ]]; then
             cp mlx-scorer-bin/openhydra-mlx-scorer "dist/openhydra-mlx-scorer-${{ matrix.triple }}"
           fi
+          cp desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt "dist/THIRD_PARTY_NOTICES-${{ matrix.triple }}.txt"
           B=desktop/src-tauri/target/release/bundle
           find "$B" -name "*.dmg" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.deb" -exec cp {} dist/ \; 2>/dev/null || true
@@ -251,9 +274,9 @@ jobs:
 
           # (regex on filename) -> stable "latest/" filename
           STABLE = [
-            (re.compile(r'aarch64-apple-darwin$'),        'openhydra-agent-aarch64-apple-darwin'),
-            (re.compile(r'x86_64-unknown-linux-gnu$'),    'openhydra-agent-x86_64-unknown-linux-gnu'),
-            (re.compile(r'x86_64-pc-windows-msvc\.exe$'), 'openhydra-agent-x86_64-pc-windows-msvc.exe'),
+            (re.compile(r'^openhydra-agent-aarch64-apple-darwin$'),        'openhydra-agent-aarch64-apple-darwin'),
+            (re.compile(r'^openhydra-agent-x86_64-unknown-linux-gnu$'),    'openhydra-agent-x86_64-unknown-linux-gnu'),
+            (re.compile(r'^openhydra-agent-x86_64-pc-windows-msvc\.exe$'), 'openhydra-agent-x86_64-pc-windows-msvc.exe'),
             (re.compile(r'\.dmg$'),                        'OpenHydra-macos-arm64.dmg'),
             (re.compile(r'x64-setup\.exe$'),               'OpenHydra-windows-x64-setup.exe'),
             (re.compile(r'\.msi$'),                        'OpenHydra-windows-x64.msi'),
