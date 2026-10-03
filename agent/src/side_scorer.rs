@@ -321,7 +321,10 @@ pub struct ProcessLauncher {
 
 impl ProcessLauncher {
     pub fn new(gguf: Option<PathBuf>, mlx: Option<PathBuf>) -> Self {
-        Self { gguf, mlx, ready_timeout: Duration::from_secs(300) }
+        // A 9B model on a CPU-only Linux box took 120 s to start with the file cached and over
+        // 300 s from cold network storage (the startup check runs a full 512-token pass). A
+        // challenge never waits on this: it is told to retry while the scorer starts.
+        Self { gguf, mlx, ready_timeout: Duration::from_secs(900) }
     }
 }
 
