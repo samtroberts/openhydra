@@ -180,8 +180,9 @@ struct AssembleArgs {
     /// Model names to match as well (or instead of an identity).
     #[arg(long = "handle")]
     handles: Vec<String>,
-    /// The weights file the reference run loaded (hashed with sha256): the reference then applies
-    /// only to providers serving that exact file. Strongly recommended — two honest files with the
+    /// The weights the reference run loaded — a GGUF file, or an MLX model directory (digest rules
+    /// in `openhydra_agent::weights`): the reference then applies only to providers serving exactly
+    /// those weights. Strongly recommended — two honest files with the
     /// same quantisation label (different quantisers) differ as much as a cheaper substitute does.
     #[arg(long, conflicts_with = "weights_sha256")]
     weights_file: Option<PathBuf>,
@@ -456,14 +457,6 @@ fn merge(a: MergeArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// sha256 of a file, streamed, as `sha256:<hex>`.
-fn file_sha256(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
-}
-
 /// Load a saved run and check it scored exactly these ids.
 fn load_run(path: &Path, digest: &str) -> Result<RunScores, String> {
     let v = read_json(path)?;
@@ -498,7 +491,7 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
     let weights = match (&a.weights_file, &a.weights_sha256) {
         (Some(path), _) => {
             eprintln!("refbuild: hashing {} …", path.display());
-            Some(file_sha256(path)?)
+            Some(openhydra_agent::weights::digest_now(path).map_err(|e| format!("{}: {e}", path.display()))?)
         }
         (None, Some(d)) => Some(normalize_weights_digest(d).ok_or("--weights-sha256 must be a sha256 digest (64 hex)")?),
         (None, None) => {

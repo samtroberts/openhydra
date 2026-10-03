@@ -75,6 +75,8 @@ Cargo.lock
 # releases must be reproducible and auditable (see .github/workflows/security.yml). Mirrors
 # the desktop lock negation further down this file.
 !/Cargo.lock
+# The MLX scorer is its own workspace: its lock pins mlx-rs / MLX, which decide its numbers.
+!/scorer/mlx/Cargo.lock
 
 # ── Terraform ─────────────────────────────────────────────────────────────────
 .terraform/
@@ -162,3 +164,4 @@ desktop/src-tauri/WixTools/
 
 # openhydra-scorer build work dir (scorer/build.sh)
 scorer/.build/
+scorer/mlx/target/

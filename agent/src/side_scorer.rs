@@ -12,10 +12,12 @@
 //! * It is started on the first challenge for a file and stopped after [`IDLE_STOP`] without one, so
 //!   it holds no memory between checks. A challenge that arrives while it is still loading is told
 //!   to retry ([`AdapterError::Busy`]); gateways wait out a warm-up before counting anything.
+//! * Two scorers: `openhydra-scorer` (patched llama-server) for a GGUF file, `openhydra-mlx-scorer`
+//!   for an MLX model directory (LM Studio's MLX engine), with the same interface.
 //! * GPU when it fits: it starts with the engine's defaults (GPU offload, sized to free memory), and
 //!   the scorer's own startup check disables scoring when the scoring buffers don't fit next to the
-//!   model — then it is restarted without the memory-mapped load (Apple Silicon maps the whole file
-//!   into GPU memory) and finally on the CPU alone.
+//!   model — then a GGUF scorer is restarted without the memory-mapped load (Apple Silicon maps the
+//!   whole file into GPU memory) and finally on the CPU alone. MLX runs on the GPU only.
 //! * What a pass proves is unchanged: the provider holds the claimed weights file and computes with
 //!   it. It doesn't prove the engine serves that file (challenges are recognisable either way).
 
@@ -26,8 +28,10 @@ use std::time::{Duration, Instant};
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter, HttpClient, InferenceRequest, ServeOutcome};
 use crate::adapters::scoring::{score_prompt, ScoringDialect};
 
-/// File name of the bundled scorer (OpenHydra's patched llama-server), next to the agent binary.
+/// File name of the bundled GGUF scorer (OpenHydra's patched llama-server), next to the agent.
 pub const SCORER_BIN: &str = "openhydra-scorer";
+/// File name of the bundled MLX scorer (`scorer/mlx`, macOS), next to the agent.
+pub const MLX_SCORER_BIN: &str = "openhydra-mlx-scorer";
 /// Stop the scorer after this long without a challenge.
 pub const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
 /// How long a challenge waits for a starting scorer before it is told to retry.
@@ -35,20 +39,24 @@ const CHALLENGE_WAIT: Duration = Duration::from_secs(20);
 /// After every way of starting a file's scorer failed, don't try that file again for this long.
 const FAILED_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
-/// The scorer binary to use: `explicit` if given, else [`SCORER_BIN`] next to the running agent.
-pub fn locate_scorer(explicit: Option<&Path>) -> Option<PathBuf> {
+/// A scorer binary: `explicit` if given, else `name` next to the running agent.
+pub fn locate_scorer(explicit: Option<&Path>, name: &str) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return p.is_file().then(|| p.to_path_buf());
     }
     let exe = std::env::current_exe().ok()?;
-    let name = if cfg!(windows) { format!("{SCORER_BIN}.exe") } else { SCORER_BIN.to_string() };
+    let name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     let p = exe.parent()?.join(name);
     p.is_file().then_some(p)
 }
 
-/// The ways a scorer is started, in order: GPU defaults, then (Apple Silicon) without the
-/// memory-mapped load, then CPU only. Each is kept only if its startup check leaves scoring on.
-fn attempts() -> Vec<Vec<String>> {
+/// The ways a scorer is started, in order; each is kept only if its startup check leaves scoring
+/// on. A GGUF file: GPU defaults, then (Apple Silicon) without the memory-mapped load, then CPU
+/// only. An MLX model directory: the GPU only — MLX's CPU path takes minutes for one prompt.
+fn attempts(weights: &Path) -> Vec<Vec<String>> {
+    if weights.is_dir() {
+        return vec![vec![]];
+    }
     let mut v = vec![vec![]];
     if cfg!(target_os = "macos") {
         v.push(vec!["--load-mode".into(), "none".into()]);
@@ -163,7 +171,7 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
 fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path) {
     let started = Instant::now();
     let mut outcome = None;
-    for extra in attempts() {
+    for extra in attempts(weights) {
         match inner.launcher.launch(weights, &extra) {
             // The scorer's own startup check answers GET with 405 when scoring is on, 501 when it
             // had to disable it (the scoring buffers don't fit next to the model).
@@ -202,17 +210,19 @@ fn idle_reaper<H>(inner: Weak<Inner<H>>) {
 
 // ── the real scorer process ──
 
-/// Starts `openhydra-scorer` (a patched llama-server, with the prompt-scoring endpoint and
-/// `--exit-on-stdin-eof`) as a child process on a free local port.
+/// Starts a scorer as a child process on a free local port: `openhydra-scorer` (a patched
+/// llama-server) for a GGUF file, `openhydra-mlx-scorer` for an MLX model directory. Both take the
+/// same flags, including `--exit-on-stdin-eof`.
 pub struct ProcessLauncher {
-    binary: PathBuf,
+    gguf: Option<PathBuf>,
+    mlx: Option<PathBuf>,
     /// How long a start may take (loading a multi-GB model on the CPU is slow).
     ready_timeout: Duration,
 }
 
 impl ProcessLauncher {
-    pub fn new(binary: PathBuf) -> Self {
-        Self { binary, ready_timeout: Duration::from_secs(300) }
+    pub fn new(gguf: Option<PathBuf>, mlx: Option<PathBuf>) -> Self {
+        Self { gguf, mlx, ready_timeout: Duration::from_secs(300) }
     }
 }
 
@@ -243,9 +253,13 @@ impl Drop for ProcessInstance {
 
 impl ScorerLauncher for ProcessLauncher {
     fn launch(&self, weights: &Path, extra: &[String]) -> Result<Box<dyn ScorerInstance>, String> {
+        let binary = if weights.is_dir() { &self.mlx } else { &self.gguf };
+        let binary = binary.as_ref().ok_or_else(|| {
+            format!("no {} available for {}", if weights.is_dir() { MLX_SCORER_BIN } else { SCORER_BIN }, weights.display())
+        })?;
         let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_err(|e| e.to_string())?.port();
         let log = std::fs::File::create(std::env::temp_dir().join("openhydra-scorer.log")).map_err(|e| e.to_string())?;
-        let mut child = std::process::Command::new(&self.binary)
+        let mut child = std::process::Command::new(binary)
             .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--prompt-scoring", "--exit-on-stdin-eof"])
             .args(["-c", "4096", "-np", "1", "-m"])
             .arg(weights)
@@ -254,7 +268,7 @@ impl ScorerLauncher for ProcessLauncher {
             .stdout(log.try_clone().map_err(|e| e.to_string())?)
             .stderr(log)
             .spawn()
-            .map_err(|e| format!("{}: {e}", self.binary.display()))?;
+            .map_err(|e| format!("{}: {e}", binary.display()))?;
         let lifeline = child.stdin.take();
         let mut instance = ProcessInstance { child, _lifeline: lifeline, base: format!("http://127.0.0.1:{port}") };
         let http = crate::http::ReqwestClient::new().map_err(|e| e.to_string())?;
@@ -275,9 +289,12 @@ impl ScorerLauncher for ProcessLauncher {
 /// The scorer's HTTP client for production: [`crate::http::ReqwestClient`].
 pub type LiveSideScorer = SideScorer<crate::http::ReqwestClient>;
 
-/// A side-scorer running `binary` (see [`locate_scorer`]).
-pub fn live_side_scorer(binary: PathBuf) -> Result<Arc<LiveSideScorer>, String> {
-    Ok(Arc::new(SideScorer::new(Box::new(ProcessLauncher::new(binary)), crate::http::ReqwestClient::new().map_err(|e| e.to_string())?)))
+/// A side-scorer running these scorer binaries (see [`locate_scorer`]); at least one is needed.
+pub fn live_side_scorer(gguf: Option<PathBuf>, mlx: Option<PathBuf>) -> Result<Arc<LiveSideScorer>, String> {
+    if gguf.is_none() && mlx.is_none() {
+        return Err("no scorer binary".into());
+    }
+    Ok(Arc::new(SideScorer::new(Box::new(ProcessLauncher::new(gguf, mlx)), crate::http::ReqwestClient::new().map_err(|e| e.to_string())?)))
 }
 
 // ── the adapter wrapper ──
@@ -404,7 +421,7 @@ mod tests {
         let (s, launches) = scorer(vec![501, 501, 501], Duration::ZERO);
         assert!(matches!(score_patiently(&s, "/big.gguf"), Err(AdapterError::Unsupported(_))));
         let tried = launches.load(Ordering::SeqCst);
-        assert_eq!(tried, attempts().len());
+        assert_eq!(tried, attempts(Path::new("/big.gguf")).len());
         // Not retried right away.
         assert!(matches!(s.score(Path::new("/big.gguf"), &[1, 2]), Err(AdapterError::Unsupported(_))));
         assert_eq!(launches.load(Ordering::SeqCst), tried);

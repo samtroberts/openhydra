@@ -1,0 +1,14 @@
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/openhydra-agent",
+      "binaries/openhydra-scorer",
+      "binaries/openhydra-mlx-scorer"
+    ],
+    "macOS": {
+      "files": {
+        "MacOS/mlx.metallib": "binaries/mlx.metallib"
+      }
+    }
+  }
+}

@@ -308,59 +308,9 @@ fn read_gguf_metadata(path: &str) -> Option<GgufMeta> {
     Some(meta)
 }
 
-/// sha256 of a local weights file as `sha256:<hex>`, or `""` if it can't be read here (a remote
-/// engine, an empty path) **or isn't hashed yet**. Hashing a multi-GB GGUF takes seconds, so it
-/// never holds up detection (and with it the announce): the first call starts it on a background
-/// thread and returns `""`; detection re-runs every announce and picks the digest up then. Cached
-/// per process by path, size and modification time, so a replaced file is hashed afresh.
+/// The served weights file's digest — see [`crate::weights::weights_digest`].
 pub(crate) fn file_weights_digest(path: &str) -> String {
-    file_weights_digest_with(path, |job| {
-        std::thread::spawn(job);
-    })
-}
-
-/// [`file_weights_digest`] with the way the hashing job is run injected (tests run it inline).
-fn file_weights_digest_with(path: &str, run: impl FnOnce(Box<dyn FnOnce() + Send>)) -> String {
-    use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    type Key = (String, u64, Option<std::time::SystemTime>);
-    /// `None` while a hash is running (so it starts once), `Some("")` if it failed.
-    static CACHE: OnceLock<Mutex<HashMap<Key, Option<String>>>> = OnceLock::new();
-    if path.trim().is_empty() {
-        return String::new();
-    }
-    let Ok(meta) = std::fs::metadata(path) else { return String::new() };
-    if !meta.is_file() {
-        return String::new();
-    }
-    let key = (path.to_string(), meta.len(), meta.modified().ok());
-    let cache = CACHE.get_or_init(Default::default);
-    {
-        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-        match c.get(&key) {
-            Some(Some(d)) => return d.clone(),
-            Some(None) => return String::new(),
-            None => {
-                c.insert(key.clone(), None);
-            }
-        }
-    }
-    let (path, len, lookup) = (path.to_string(), meta.len(), key.clone());
-    run(Box::new(move || {
-        let started = std::time::Instant::now();
-        let digest = std::fs::File::open(&path)
-            .and_then(|mut f| {
-                let mut hasher = Sha256::new();
-                std::io::copy(&mut f, &mut hasher)?;
-                Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
-            })
-            .unwrap_or_default();
-        tracing::info!(bytes = len, ms = started.elapsed().as_millis() as u64, ok = !digest.is_empty(), "hashed the served weights file");
-        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Some(digest));
-    }));
-    // Done already when run inline; on a thread, usually not yet.
-    cache.lock().unwrap_or_else(|e| e.into_inner()).get(&lookup).cloned().flatten().unwrap_or_default()
+    crate::weights::weights_digest(std::path::Path::new(path))
 }
 
 /// Adapter for a local `llama-server`, generic over the injected HTTP transport.
@@ -548,33 +498,6 @@ impl<H: HttpClient> EngineAdapter for LlamaCppAdapter<H> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_weights_digest_is_the_files_sha256_and_empty_when_unreadable() {
-        let dir = std::env::temp_dir().join(format!("oh-weights-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("m.gguf");
-        std::fs::write(&path, b"abc").unwrap();
-        let p = path.to_str().unwrap();
-        // sha256("abc")
-        let abc = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        let inline = |job: Box<dyn FnOnce() + Send>| job();
-        assert_eq!(file_weights_digest_with(p, inline), abc);
-        assert_eq!(file_weights_digest_with(p, |_| panic!("cached: no second hash")), abc);
-        std::fs::write(&path, b"abcd").unwrap(); // a changed file (different size) is re-hashed
-        let later = dir.join("later.gguf");
-        std::fs::write(&later, b"abc").unwrap();
-        // In the background: nothing yet (detection doesn't wait), started once, then cached.
-        let mut job = None;
-        assert_eq!(file_weights_digest_with(later.to_str().unwrap(), |j| job = Some(j)), "");
-        assert_eq!(file_weights_digest_with(later.to_str().unwrap(), |_| panic!("already running")), "");
-        job.expect("hash started")();
-        assert_eq!(file_weights_digest(later.to_str().unwrap()), abc);
-        assert_ne!(file_weights_digest_with(p, inline), abc);
-        assert_eq!(file_weights_digest(""), "");
-        assert_eq!(file_weights_digest(dir.to_str().unwrap()), "", "a directory isn't a weights file");
-        assert_eq!(file_weights_digest("/nonexistent/m.gguf"), "");
-        std::fs::remove_dir_all(&dir).ok();
-    }
     use crate::adapter::ChatMessage;
 
     const QWEN_TEMPLATE: &str = "{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}<|im_start|>user\n{{ .Prompt }}<|im_end|>\n<|im_start|>assistant\n";

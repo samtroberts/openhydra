@@ -19,3 +19,10 @@ if [[ ! -x "$SCORER" || "$(cat "$SCORER.stamp" 2>/dev/null)" != "$STAMP" ]]; the
   scorer/build.sh "$SCORER" && echo "$STAMP" > "$SCORER.stamp"
 fi
 echo "staged sidecar: openhydra-scorer-$TRIPLE$EXT"
+# macOS also ships the MLX scorer (LM Studio's MLX models), bundled via tauri.macos.conf.json.
+if [[ "$TRIPLE" == *apple-darwin ]]; then
+  scorer/mlx/build.sh scorer/mlx/target/stage
+  cp scorer/mlx/target/stage/openhydra-mlx-scorer "desktop/src-tauri/binaries/openhydra-mlx-scorer-$TRIPLE"
+  cp scorer/mlx/target/stage/mlx.metallib desktop/src-tauri/binaries/mlx.metallib   # must sit next to it (MacOS/)
+  echo "staged sidecar: openhydra-mlx-scorer-$TRIPLE + mlx.metallib"
+fi

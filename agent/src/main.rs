@@ -641,8 +641,13 @@ struct ProvideArgs {
     #[arg(long = "side-scorer")]
     side_scorer: Option<std::path::PathBuf>,
 
+    /// The side-scorer for LM Studio's MLX models: `openhydra-mlx-scorer` (macOS). Defaults to the
+    /// one next to this binary.
+    #[arg(long = "mlx-scorer")]
+    mlx_scorer: Option<std::path::PathBuf>,
+
     /// Don't use a side-scorer (models of engines that can't score are then refused, as before).
-    #[arg(long = "no-side-scorer", conflicts_with = "side_scorer")]
+    #[arg(long = "no-side-scorer", conflicts_with_all = ["side_scorer", "mlx_scorer"])]
     no_side_scorer: bool,
 
     #[command(flatten)]
@@ -1088,14 +1093,14 @@ fn provide(
     let scorer = side_scorer(&args)?;
     if args.prompt_scoring.is_some()
         && !matches!(args.engine_kind, EngineKind::Vllm | EngineKind::Openai | EngineKind::LlamaCpp)
-        && !(scorer.is_some() && args.engine_kind == EngineKind::Ollama)
+        && !(scorer.is_some() && matches!(args.engine_kind, EngineKind::Ollama | EngineKind::LmStudio))
     {
-        return Err("--prompt-scoring needs --engine-kind vllm, openai or llama-cpp, or ollama with a side-scorer \
-                    (openhydra-scorer next to this binary, or --side-scorer)"
+        return Err("--prompt-scoring needs --engine-kind vllm, openai or llama-cpp, or ollama / lm-studio with a \
+                    side-scorer (openhydra-scorer / openhydra-mlx-scorer next to this binary, or --side-scorer / --mlx-scorer)"
             .into());
     }
-    if matches!(args.prompt_scoring, Some(ScoringChoice::Dialect(_))) && args.engine_kind == EngineKind::Ollama {
-        return Err("Ollama is scored by the side-scorer: use --prompt-scoring auto".into());
+    if matches!(args.prompt_scoring, Some(ScoringChoice::Dialect(_))) && matches!(args.engine_kind, EngineKind::Ollama | EngineKind::LmStudio) {
+        return Err("Ollama and LM Studio are scored by the side-scorer: use --prompt-scoring auto".into());
     }
 
     let url = args
@@ -1223,20 +1228,24 @@ fn side_scorer(args: &ProvideArgs) -> Result<Option<std::sync::Arc<openhydra_age
     if args.prompt_scoring.is_none() || args.no_side_scorer {
         return Ok(None);
     }
-    match openhydra_agent::side_scorer::locate_scorer(args.side_scorer.as_deref()) {
-        Some(bin) => {
-            eprintln!("openhydra-agent: side-scorer for engines that can't score: {}", bin.display());
-            openhydra_agent::side_scorer::live_side_scorer(bin).map(Some)
-        }
-        None if args.side_scorer.is_some() => Err(format!("--side-scorer: no such file: {}", args.side_scorer.as_ref().unwrap().display())),
-        None => {
-            eprintln!(
-                "openhydra-agent: no side-scorer (openhydra-scorer) next to this binary: models of engines that can't \
-                 score a prompt (Ollama, LM Studio) will refuse authenticity checks"
-            );
-            Ok(None)
+    use openhydra_agent::side_scorer::{live_side_scorer, locate_scorer, MLX_SCORER_BIN, SCORER_BIN};
+    let gguf = locate_scorer(args.side_scorer.as_deref(), SCORER_BIN);
+    let mlx = locate_scorer(args.mlx_scorer.as_deref(), MLX_SCORER_BIN);
+    for (given, found, flag) in [(&args.side_scorer, &gguf, "--side-scorer"), (&args.mlx_scorer, &mlx, "--mlx-scorer")] {
+        if let (Some(p), None) = (given, found) {
+            return Err(format!("{flag}: no such file: {}", p.display()));
         }
     }
+    for (found, what) in [(&gguf, "GGUF models (Ollama, LM Studio)"), (&mlx, "MLX models (LM Studio)")] {
+        match found {
+            Some(bin) => eprintln!("openhydra-agent: side-scorer for {what}: {}", bin.display()),
+            None => eprintln!("openhydra-agent: no side-scorer for {what}: their authenticity checks are refused"),
+        }
+    }
+    if gguf.is_none() && mlx.is_none() {
+        return Ok(None);
+    }
+    live_side_scorer(gguf, mlx).map(Some)
 }
 
 /// The fail-fast message when auto mode finds no engine (§5 of the autostart plan).

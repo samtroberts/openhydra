@@ -324,9 +324,16 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
                 params: String::new(),
                 quant: String::new(),
                 size_bytes: 0,
-                weight_digest: String::new(),
+                // LM Studio's weights are on this machine: their digest (hashed in the background).
+                weight_digest: self.weights_path(&m.id).map(|p| crate::weights::weights_digest(&p)).unwrap_or_default(),
             })
             .collect())
+    }
+
+    /// LM Studio's model files (a GGUF, or an MLX model directory), via `lms ls`; other
+    /// OpenAI-compatible engines don't reveal theirs.
+    fn weights_path(&self, model_ref: &str) -> Option<std::path::PathBuf> {
+        (self.name == "lm-studio").then(|| crate::lmstudio::weights_path(model_ref)).flatten()
     }
 
     fn serve_stream(
