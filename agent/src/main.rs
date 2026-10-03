@@ -1228,13 +1228,17 @@ fn side_scorer(args: &ProvideArgs) -> Result<Option<std::sync::Arc<openhydra_age
     if args.prompt_scoring.is_none() || args.no_side_scorer {
         return Ok(None);
     }
-    use openhydra_agent::side_scorer::{live_side_scorer, locate_scorer, MLX_SCORER_BIN, SCORER_BIN};
-    let gguf = locate_scorer(args.side_scorer.as_deref(), SCORER_BIN);
+    use openhydra_agent::side_scorer::{cpu_runs_gguf_scorer, live_side_scorer, locate_scorer, MLX_SCORER_BIN, SCORER_BIN};
+    let mut gguf = locate_scorer(args.side_scorer.as_deref(), SCORER_BIN);
     let mlx = locate_scorer(args.mlx_scorer.as_deref(), MLX_SCORER_BIN);
     for (given, found, flag) in [(&args.side_scorer, &gguf, "--side-scorer"), (&args.mlx_scorer, &mlx, "--mlx-scorer")] {
         if let (Some(p), None) = (given, found) {
             return Err(format!("{flag}: no such file: {}", p.display()));
         }
+    }
+    if gguf.is_some() && !cpu_runs_gguf_scorer() {
+        eprintln!("openhydra-agent: this CPU lacks AVX2/FMA/F16C, which the GGUF side-scorer needs");
+        gguf = None;
     }
     for (found, what) in [(&gguf, "GGUF models (Ollama, LM Studio)"), (&mlx, "MLX models (LM Studio)")] {
         match found {

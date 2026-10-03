@@ -506,10 +506,11 @@ pub enum RoundOutcome {
 
 /// Busy / rate-limited refusals tolerated in a row before a run gives up.
 const MAX_BUSY_RETRIES: usize = 3;
-/// Retryable refusals [`probe_scoring`] waits through: a side-scorer loading its model answers
-/// "warming up, retry" for a minute or two (with 2 s pauses, ~2.5 min), and that must never count
-/// as a provider dodging the check.
-const MAX_PROBE_RETRIES: usize = 75;
+/// Retryable refusals [`probe_scoring`] waits through (with 2 s pauses, ~5 min): a side-scorer
+/// answers "warming up, retry" while it loads the model (a minute or two) and while another of the
+/// provider's models finishes its round first (a scorer holds one model at a time), and that must
+/// never count as a provider dodging the check.
+const MAX_PROBE_RETRIES: usize = 150;
 
 /// Send challenges one at a time until the round closes or something stops it. `pick(n)` chooses
 /// which unsent text goes next (random in production); `pause()` backs off after a busy refusal.

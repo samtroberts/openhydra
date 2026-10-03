@@ -22,6 +22,7 @@
 //! * What a pass proves is unchanged: the provider holds the claimed weights file and computes with
 //!   it. It doesn't prove the engine serves that file (challenges are recognisable either way).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -39,6 +40,10 @@ pub const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
 const CHALLENGE_WAIT: Duration = Duration::from_secs(20);
 /// After every way of starting a file's scorer failed, don't try that file again for this long.
 const FAILED_BACKOFF: Duration = Duration::from_secs(30 * 60);
+/// A scorer used this recently is not replaced by another file's: a gateway's round sends its texts
+/// back to back, and switching files under it would end the round early — held against the
+/// provider. The other file's challenge is told to retry (its gateway waits several minutes).
+const SWITCH_HOLD: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(30) };
 
 /// A scorer binary: `explicit` if given, else `name` next to the running agent.
 pub fn locate_scorer(explicit: Option<&Path>, name: &str) -> Option<PathBuf> {
@@ -77,21 +82,50 @@ pub trait ScorerInstance: Send {
 /// Starts scorer processes (a real child process in production; a stub in tests).
 pub trait ScorerLauncher: Send + Sync {
     /// Start a scorer on `weights` with `extra` arguments and return once it answers HTTP.
-    fn launch(&self, weights: &Path, extra: &[String]) -> Result<Box<dyn ScorerInstance>, String>;
+    /// `attempt` counts the start-up modes tried for this start (0 = the first).
+    fn launch(&self, weights: &Path, extra: &[String], attempt: usize) -> Result<Box<dyn ScorerInstance>, String>;
+    /// Whether there is a scorer for this kind of weights at all (no MLX scorer off macOS, …).
+    fn can_score(&self, _weights: &Path) -> bool {
+        true
+    }
 }
 
 enum State {
     Idle,
     Starting(PathBuf),
-    Ready { weights: PathBuf, instance: Box<dyn ScorerInstance>, last_used: Instant },
-    Failed { weights: PathBuf, at: Instant },
+    /// `active`: challenges being scored right now; the process is never replaced under one.
+    /// `stamp`: the weights' size and modification time at start (a file replaced in place gets a
+    /// new scorer). `errors`: scorings in a row the live process failed on its side.
+    Ready { weights: PathBuf, stamp: Option<Stamp>, instance: Box<dyn ScorerInstance>, last_used: Instant, active: usize, errors: u32 },
 }
+
+/// Size and latest modification time of a weights file, or of an MLX directory's files.
+type Stamp = (u64, std::time::SystemTime);
+
+fn stamp(weights: &Path) -> Option<Stamp> {
+    let files: Vec<PathBuf> = if weights.is_dir() {
+        std::fs::read_dir(weights).ok()?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect()
+    } else {
+        vec![weights.to_path_buf()]
+    };
+    files.iter().try_fold((0u64, std::time::UNIX_EPOCH), |(size, newest), f| {
+        let m = std::fs::metadata(f).ok()?;
+        Some((size + m.len(), newest.max(m.modified().ok()?)))
+    })
+}
+
+/// Scorings in a row a live scorer may fail on its own side (not the challenger's) before it is
+/// stopped and its file backed off like a failed start — e.g. it ran out of memory after starting.
+const MAX_SCORER_ERRORS: u32 = 3;
 
 struct Inner<H> {
     launcher: Box<dyn ScorerLauncher>,
     http: H,
     state: Mutex<State>,
     changed: Condvar,
+    /// Files whose scorer couldn't be started (or kept failing), when, and why; not retried for
+    /// [`FAILED_BACKOFF`]. Per file, so a challenge for another model doesn't erase it.
+    failed: Mutex<HashMap<PathBuf, (Instant, String)>>,
 }
 
 /// Manages one scorer at a time (one weights file); see the module docs.
@@ -103,7 +137,13 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
     /// A side-scorer starting processes with `launcher` and talking to them with `http`. Starts a
     /// background thread that stops an idle scorer.
     pub fn new(launcher: Box<dyn ScorerLauncher>, http: H) -> Self {
-        let inner = Arc::new(Inner { launcher, http, state: Mutex::new(State::Idle), changed: Condvar::new() });
+        let inner = Arc::new(Inner {
+            launcher,
+            http,
+            state: Mutex::new(State::Idle),
+            changed: Condvar::new(),
+            failed: Mutex::new(HashMap::new()),
+        });
         let weak = Arc::downgrade(&inner);
         std::thread::spawn(move || idle_reaper(weak));
         Self { inner }
@@ -112,15 +152,37 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
     /// Score `token_ids` with a scorer on `weights` (starting or switching it as needed).
     /// [`AdapterError::Busy`] while it is still starting.
     pub fn score(&self, weights: &Path, token_ids: &[u32]) -> Result<Vec<f32>, AdapterError> {
+        if weights.is_dir() {
+            // mistral.rs doesn't bound-check token ids, and these come from the network: one past
+            // the embedding table would be an out-of-bounds read on the GPU.
+            let vocab = mlx_vocab_size(weights).ok_or_else(|| AdapterError::Unsupported("model config has no vocab_size".into()))?;
+            if token_ids.iter().any(|&id| id >= vocab) {
+                return Err(AdapterError::Unsupported("token id outside the model's vocabulary".into()));
+            }
+        }
         let base = self.ready(weights)?;
         let out = score_prompt(&self.inner.http, &base, ScoringDialect::OpenHydra, "default", token_ids);
-        if out.is_err() {
-            // A dead process is replaced on the next challenge; a live one just failed this text.
-            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let State::Ready { instance, .. } = &mut *st {
-                if !instance.alive() {
-                    *st = State::Idle;
+        let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let State::Ready { weights: w, instance, active, last_used, errors, .. } = &mut *st {
+            if w == weights {
+                *active = active.saturating_sub(1);
+                *last_used = Instant::now();
+                match &out {
+                    Ok(_) => *errors = 0,
+                    // A request the scorer rejected (4xx) is the challenger's doing, not the scorer's.
+                    Err(AdapterError::Http(m)) if m.contains("client error") => {}
+                    Err(_) => *errors += 1,
                 }
+            }
+            if out.is_err() && !instance.alive() {
+                *st = State::Idle; // a dead process is replaced on the next challenge
+            } else if matches!(&*st, State::Ready { active: 0, errors, .. } if *errors >= MAX_SCORER_ERRORS) {
+                tracing::warn!(weights = %weights.display(), "the prompt scorer keeps failing; stopping it");
+                self.inner.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    weights.to_path_buf(),
+                    (Instant::now(), "the prompt scorer kept failing (out of memory?)".into()),
+                );
+                *st = State::Idle;
             }
         }
         out
@@ -129,6 +191,15 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
     /// The base URL of a ready scorer on `weights`, starting one if needed.
     fn ready(&self, weights: &Path) -> Result<String, AdapterError> {
         let inner = &self.inner;
+        if !inner.launcher.can_score(weights) {
+            return Err(AdapterError::Unsupported("no prompt scorer for this kind of model here".into()));
+        }
+        if let Some((at, why)) = inner.failed.lock().unwrap_or_else(|e| e.into_inner()).get(weights) {
+            if at.elapsed() < FAILED_BACKOFF {
+                return Err(AdapterError::Unsupported(why.clone()));
+            }
+        }
+        let current = stamp(weights);
         let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + CHALLENGE_WAIT;
         loop {
@@ -139,12 +210,14 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 }
             }
             match &mut *st {
-                State::Ready { weights: w, instance, last_used } if w == weights => {
+                State::Ready { weights: w, stamp, instance, last_used, active, .. } if w == weights && *stamp == current => {
                     *last_used = Instant::now();
+                    *active += 1;
                     return Ok(instance.base_url().to_string());
                 }
-                State::Failed { weights: w, at } if w == weights && at.elapsed() < FAILED_BACKOFF => {
-                    return Err(AdapterError::Unsupported("prompt scoring doesn't fit in memory next to this model".into()));
+                State::Ready { active, last_used, .. } if *active > 0 || last_used.elapsed() < SWITCH_HOLD => {
+                    // Another file's scorer (or this file's, replaced on disk) in use: wait for it.
+                    return Err(AdapterError::Busy("prompt scorer is busy with another model".into()));
                 }
                 State::Starting(w) if w == weights => {
                     let now = Instant::now();
@@ -152,16 +225,21 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                         return Err(AdapterError::Busy("prompt scorer is still starting".into()));
                     }
                     st = inner.changed.wait_timeout(st, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+                    if let Some((_, why)) = inner.failed.lock().unwrap_or_else(|e| e.into_inner()).get(weights) {
+                        if matches!(&*st, State::Idle) {
+                            return Err(AdapterError::Unsupported(why.clone())); // this start just failed
+                        }
+                    }
                 }
                 State::Starting(_) => {
                     // Another file's scorer is starting; this one waits its turn.
                     return Err(AdapterError::Busy("prompt scorer is busy with another model".into()));
                 }
                 _ => {
-                    // Idle, a dead or other file's scorer, or an expired failure: (re)start.
+                    // Idle, or an idle scorer on another file (or this file before it changed): start.
                     *st = State::Starting(weights.to_path_buf());
                     let (inner2, path) = (Arc::clone(inner), weights.to_path_buf());
-                    std::thread::spawn(move || start(&inner2, &path));
+                    std::thread::spawn(move || start(&inner2, &path, current));
                 }
             }
         }
@@ -169,11 +247,11 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
 }
 
 /// Bring up a scorer on `weights`, trying each start-up mode until one keeps scoring enabled.
-fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path) {
+fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path, stamp: Option<Stamp>) {
     let started = Instant::now();
-    let mut outcome = None;
-    for extra in attempts(weights) {
-        match inner.launcher.launch(weights, &extra) {
+    let (mut outcome, mut didnt_fit, mut last_error) = (None, false, String::new());
+    for (attempt, extra) in attempts(weights).into_iter().enumerate() {
+        match inner.launcher.launch(weights, &extra, attempt) {
             // The llama.cpp scorer's own startup check answers GET with 405 when scoring is on, 501
             // when it had to disable it (the scoring buffers don't fit next to the model). The MLX
             // scorer has no such check, so it is done here: the longest accepted prompt must score.
@@ -186,16 +264,31 @@ fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path) {
                 outcome = Some(instance);
                 break;
             }
-            Ok(_) => tracing::info!(weights = %weights.display(), mode = ?extra, "prompt scoring didn't fit this way; trying the next"),
-            Err(e) => tracing::warn!(weights = %weights.display(), mode = ?extra, error = %e, "prompt scorer failed to start"),
+            Ok(_) => {
+                didnt_fit = true;
+                tracing::info!(weights = %weights.display(), mode = ?extra, "prompt scoring didn't fit this way; trying the next");
+            }
+            Err(e) => {
+                tracing::warn!(weights = %weights.display(), mode = ?extra, error = %e, "prompt scorer failed to start");
+                last_error = e;
+            }
         }
     }
     let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
     *st = match outcome {
-        Some(instance) => State::Ready { weights: weights.to_path_buf(), instance, last_used: Instant::now() },
+        Some(instance) => {
+            inner.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(weights);
+            State::Ready { weights: weights.to_path_buf(), stamp, instance, last_used: Instant::now(), active: 0, errors: 0 }
+        }
         None => {
-            tracing::warn!(weights = %weights.display(), "prompt scoring unavailable for this model: it doesn't fit in memory");
-            State::Failed { weights: weights.to_path_buf(), at: Instant::now() }
+            let why = if didnt_fit {
+                "prompt scoring doesn't fit in memory next to this model".to_string()
+            } else {
+                format!("the prompt scorer failed to start: {last_error}")
+            };
+            tracing::warn!(weights = %weights.display(), reason = %why, "prompt scoring unavailable for this model");
+            inner.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(weights.to_path_buf(), (Instant::now(), why));
+            State::Idle
         }
     };
     inner.changed.notify_all();
@@ -207,7 +300,7 @@ fn idle_reaper<H>(inner: Weak<Inner<H>>) {
         std::thread::sleep(Duration::from_secs(30));
         let Some(inner) = inner.upgrade() else { return };
         let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(&*st, State::Ready { last_used, .. } if last_used.elapsed() >= IDLE_STOP) {
+        if matches!(&*st, State::Ready { last_used, active: 0, .. } if last_used.elapsed() >= IDLE_STOP) {
             tracing::info!("stopping the idle prompt scorer");
             *st = State::Idle; // dropping the instance stops the process
         }
@@ -258,34 +351,111 @@ impl Drop for ProcessInstance {
 }
 
 impl ScorerLauncher for ProcessLauncher {
-    fn launch(&self, weights: &Path, extra: &[String]) -> Result<Box<dyn ScorerInstance>, String> {
-        let binary = if weights.is_dir() { &self.mlx } else { &self.gguf };
-        let binary = binary.as_ref().ok_or_else(|| {
+    fn launch(&self, weights: &Path, extra: &[String], attempt: usize) -> Result<Box<dyn ScorerInstance>, String> {
+        let binary = self.binary_for(weights).ok_or_else(|| {
             format!("no {} available for {}", if weights.is_dir() { MLX_SCORER_BIN } else { SCORER_BIN }, weights.display())
         })?;
-        let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_err(|e| e.to_string())?.port();
-        let log = std::fs::File::create(std::env::temp_dir().join("openhydra-scorer.log")).map_err(|e| e.to_string())?;
-        let mut child = std::process::Command::new(binary)
-            .args(scorer_args(weights, port, extra))
-            .stdin(std::process::Stdio::piped())
-            .stdout(log.try_clone().map_err(|e| e.to_string())?)
-            .stderr(log)
-            .spawn()
-            .map_err(|e| format!("{}: {e}", binary.display()))?;
-        let lifeline = child.stdin.take();
-        let mut instance = ProcessInstance { child, _lifeline: lifeline, base: format!("http://127.0.0.1:{port}") };
-        let http = crate::http::ReqwestClient::new().map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + self.ready_timeout;
-        while Instant::now() < deadline {
-            if !instance.alive() {
-                return Err("the scorer exited while loading (see openhydra-scorer.log in the temp directory)".into());
+        let log_path = scorer_log_path();
+        // Each start's log holds all of its modes (the first truncates); one log per agent process.
+        let mut log = open_log(&log_path, attempt == 0).map_err(|e| format!("{}: {e}", log_path.display()))?;
+        // The port is picked by binding and releasing it, so another process can take it before the
+        // scorer binds: then the scorer exits saying so, and another port is tried.
+        for _ in 0..3 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_err(|e| e.to_string())?.port();
+            use std::io::Write;
+            let _ = writeln!(log, "== openhydra-agent: starting {} {:?} on port {port}", binary.display(), extra);
+            let mut child = std::process::Command::new(binary)
+                .args(scorer_args(weights, port, extra))
+                .stdin(std::process::Stdio::piped())
+                .stdout(log.try_clone().map_err(|e| e.to_string())?)
+                .stderr(log.try_clone().map_err(|e| e.to_string())?)
+                .spawn()
+                .map_err(|e| format!("{}: {e}", binary.display()))?;
+            let lifeline = child.stdin.take();
+            let mut instance = ProcessInstance { child, _lifeline: lifeline, base: format!("http://127.0.0.1:{port}") };
+            let http = crate::http::ReqwestClient::new().map_err(|e| e.to_string())?;
+            let deadline = Instant::now() + self.ready_timeout;
+            let mut exited = false;
+            while Instant::now() < deadline {
+                if !instance.alive() {
+                    exited = true;
+                    break;
+                }
+                if http.get(&format!("{}/v1/models", instance.base)).is_ok() {
+                    return Ok(Box::new(instance));
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
-            if http.get(&format!("{}/v1/models", instance.base)).is_ok() {
-                return Ok(Box::new(instance));
+            if !exited {
+                return Err("the scorer didn't come up in time".into());
             }
-            std::thread::sleep(Duration::from_millis(500));
+            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let tail = tail.rsplit("== openhydra-agent: starting").next().unwrap_or_default();
+            if !(tail.contains("in use") || tail.contains("couldn't bind") || tail.contains("bind HTTP")) {
+                return Err(format!("the scorer exited while loading (see {})", log_path.display()));
+            }
         }
-        Err("the scorer didn't come up in time".into())
+        Err("no free local port for the scorer".into())
+    }
+
+    fn can_score(&self, weights: &Path) -> bool {
+        self.binary_for(weights).is_some()
+    }
+}
+
+impl ProcessLauncher {
+    fn binary_for(&self, weights: &Path) -> Option<&PathBuf> {
+        if weights.is_dir() {
+            self.mlx.as_ref()
+        } else {
+            self.gguf.as_ref()
+        }
+    }
+}
+
+/// The scorer's log: in the temp directory, named for this agent process (two agents on one machine
+/// don't share one).
+pub fn scorer_log_path() -> PathBuf {
+    std::env::temp_dir().join(format!("openhydra-scorer-{}.log", std::process::id()))
+}
+
+/// Open the log for appending (`truncate`: start it afresh), never following a symlink planted at
+/// that path (the temp directory is shared with other users on Linux).
+fn open_log(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if truncate {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    if !truncate {
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::End(0))?;
+    }
+    Ok(f)
+}
+
+/// Whether this CPU can run the GGUF scorer. Its x86 build targets AVX2-class CPUs (ggml's portable
+/// default: AVX, AVX2, FMA, F16C, BMI2 — Intel Haswell / AMD Excavator and later); on an older one
+/// it would die of an illegal instruction on every start. Other architectures: yes.
+pub fn cpu_runs_gguf_scorer() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+            && std::arch::is_x86_feature_detected!("bmi2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
     }
 }
 
@@ -297,7 +467,8 @@ fn scorer_args(weights: &Path, port: u16, extra: &[String]) -> Vec<std::ffi::OsS
     let mut args: Vec<std::ffi::OsString> = if weights.is_dir() {
         ["serve", "-p", port.as_str(), "--host", "127.0.0.1", "--no-ui", "--exit-on-stdin-eof", "-m"].map(Into::into).to_vec()
     } else {
-        ["--host", "127.0.0.1", "--port", port.as_str(), "--prompt-scoring", "--exit-on-stdin-eof", "-c", "4096", "-np", "1", "-m"]
+        // -c only sizes the serving slot, which a scorer never uses (scoring makes its own context)
+        ["--host", "127.0.0.1", "--port", port.as_str(), "--prompt-scoring", "--exit-on-stdin-eof", "-c", "512", "-np", "1", "-m"]
             .map(Into::into)
             .to_vec()
     };
@@ -310,6 +481,14 @@ fn scorer_args(weights: &Path, port: u16, extra: &[String]) -> Vec<std::ffi::OsS
 /// ids, valid in any vocabulary).
 fn probe_prompt() -> Vec<u32> {
     (0..crate::prompt_score::MAX_CHALLENGE_TOKENS as u32).map(|i| 1000 + (i * 37) % 20000).collect()
+}
+
+/// The vocabulary size in an MLX model directory's `config.json` (top level, or under `text_config`
+/// for multimodal checkpoints).
+fn mlx_vocab_size(dir: &Path) -> Option<u32> {
+    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    let v = cfg.get("vocab_size").or_else(|| cfg.get("text_config").and_then(|t| t.get("vocab_size")))?;
+    u32::try_from(v.as_u64()?).ok()
 }
 
 /// The scorer's HTTP client for production: [`crate::http::ReqwestClient`].
@@ -372,9 +551,11 @@ mod tests {
     /// stub that scores every position −0.5.
     struct Stub {
         launches: Arc<AtomicUsize>,
-        /// Status the n-th launched instance answers GET /v1/prompt_logprobs with.
+        /// Status the n-th launched instance answers GET /v1/prompt_logprobs with (0: it fails to start).
         statuses: Vec<u16>,
         delay: Duration,
+        /// Whether a scorer exists for a path containing "nokind" (`can_score`).
+        nokind: bool,
     }
     struct StubInstance(String);
     impl ScorerInstance for StubInstance {
@@ -386,10 +567,16 @@ mod tests {
         }
     }
     impl ScorerLauncher for Stub {
-        fn launch(&self, _: &Path, _: &[String]) -> Result<Box<dyn ScorerInstance>, String> {
+        fn launch(&self, _: &Path, _: &[String], _: usize) -> Result<Box<dyn ScorerInstance>, String> {
             std::thread::sleep(self.delay);
             let n = self.launches.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(StubInstance(format!("http://stub/{}", self.statuses.get(n).copied().unwrap_or(501)))))
+            match self.statuses.get(n).copied().unwrap_or(501) {
+                0 => Err("boom".into()),
+                status => Ok(Box::new(StubInstance(format!("http://stub/{status}")))),
+            }
+        }
+        fn can_score(&self, weights: &Path) -> bool {
+            self.nokind || !weights.to_string_lossy().contains("nokind")
         }
     }
     struct StubHttp;
@@ -403,6 +590,12 @@ mod tests {
         }
         fn post_json(&self, _: &str, body: &str) -> Result<String, AdapterError> {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            // Token 998: the scorer rejects the request; 999: it fails on its side.
+            match v["prompt_token_ids"][0].as_u64() {
+                Some(998) => return Err(AdapterError::Http("HTTP status client error (400 Bad Request)".into())),
+                Some(999) => return Err(AdapterError::Http("HTTP status server error (503 Service Unavailable)".into())),
+                _ => {}
+            }
             let n = v["prompt_token_ids"].as_array().unwrap().len();
             Ok(serde_json::json!({"scores": {"token_ids": v["prompt_token_ids"], "logprobs": vec![-0.5; n - 1]}}).to_string())
         }
@@ -412,7 +605,7 @@ mod tests {
     }
     fn scorer(statuses: Vec<u16>, delay: Duration) -> (SideScorer<StubHttp>, Arc<AtomicUsize>) {
         let launches = Arc::new(AtomicUsize::new(0));
-        (SideScorer::new(Box::new(Stub { launches: launches.clone(), statuses, delay }), StubHttp), launches)
+        (SideScorer::new(Box::new(Stub { launches: launches.clone(), statuses, delay, nokind: false }), StubHttp), launches)
     }
     /// Score, waiting out warm-up refusals as a gateway would.
     fn score_patiently(s: &SideScorer<StubHttp>, path: &str) -> Result<Vec<f32>, AdapterError> {
@@ -434,9 +627,119 @@ mod tests {
         // Warm now: no new launch.
         assert!(s.score(Path::new("/m.gguf"), &[1, 2]).is_ok());
         assert_eq!(launches.load(Ordering::SeqCst), 2);
-        // Another file replaces it.
+        // Another file waits while this one is in use (a round in progress), then replaces it.
+        assert!(matches!(s.score(Path::new("/other.gguf"), &[1, 2]), Err(AdapterError::Busy(m)) if m.contains("another model")));
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        std::thread::sleep(SWITCH_HOLD);
         let _ = score_patiently(&s, "/other.gguf");
         assert!(launches.load(Ordering::SeqCst) > 2);
+    }
+
+    #[test]
+    fn a_failed_file_is_remembered_with_its_reason_while_other_files_are_scored() {
+        let n = attempts(Path::new("/big.gguf")).len();
+        let mut statuses = vec![501; n];
+        statuses.push(405); // the next file's scorer fits
+        let (s, launches) = scorer(statuses, Duration::ZERO);
+        assert!(matches!(score_patiently(&s, "/big.gguf"), Err(AdapterError::Unsupported(m)) if m.contains("doesn't fit")));
+        assert!(score_patiently(&s, "/small.gguf").is_ok());
+        // Scoring another file didn't erase the failure: still refused, nothing relaunched.
+        assert!(matches!(s.score(Path::new("/big.gguf"), &[1, 2]), Err(AdapterError::Unsupported(_))));
+        assert_eq!(launches.load(Ordering::SeqCst), n + 1);
+        // A scorer that can't start at all says so (not "doesn't fit").
+        let (s, _) = scorer(vec![0; n], Duration::ZERO);
+        assert!(matches!(score_patiently(&s, "/m.gguf"), Err(AdapterError::Unsupported(m)) if m.contains("failed to start: boom")));
+    }
+
+    #[test]
+    fn a_kind_of_model_without_a_scorer_leaves_the_running_one_alone() {
+        let (s, launches) = scorer(vec![405], Duration::ZERO);
+        assert!(score_patiently(&s, "/m.gguf").is_ok());
+        std::thread::sleep(SWITCH_HOLD); // idle enough to be replaced, if it were
+        assert!(matches!(s.score(Path::new("/nokind"), &[1, 2]), Err(AdapterError::Unsupported(_))));
+        assert!(s.score(Path::new("/m.gguf"), &[1, 2]).is_ok(), "still the same scorer");
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_scorer_failing_on_its_own_side_is_stopped_but_bad_requests_dont_count() {
+        let (s, launches) = scorer(vec![405, 405], Duration::ZERO);
+        assert!(score_patiently(&s, "/m.gguf").is_ok());
+        for _ in 0..MAX_SCORER_ERRORS + 2 {
+            assert!(s.score(Path::new("/m.gguf"), &[998, 1]).is_err()); // a challenger's bad request
+        }
+        assert!(s.score(Path::new("/m.gguf"), &[1, 2]).is_ok(), "bad requests don't stop the scorer");
+        for _ in 0..MAX_SCORER_ERRORS {
+            assert!(s.score(Path::new("/m.gguf"), &[999, 1]).is_err());
+        }
+        assert!(matches!(s.score(Path::new("/m.gguf"), &[1, 2]), Err(AdapterError::Unsupported(m)) if m.contains("kept failing")));
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "backed off, not restarted");
+    }
+
+    #[test]
+    fn weights_replaced_in_place_get_a_new_scorer() {
+        let dir = std::env::temp_dir().join(format!("oh-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("m.gguf");
+        std::fs::write(&file, b"v1").unwrap();
+        let (s, launches) = scorer(vec![405, 405], Duration::ZERO);
+        assert!(score_patiently(&s, file.to_str().unwrap()).is_ok());
+        std::fs::write(&file, b"version 2").unwrap();
+        std::thread::sleep(SWITCH_HOLD);
+        assert!(score_patiently(&s, file.to_str().unwrap()).is_ok());
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_log_keeps_every_mode_of_a_start_and_never_follows_a_planted_link() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("oh-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("scorer.log");
+        writeln!(open_log(&log, true).unwrap(), "first mode").unwrap();
+        writeln!(open_log(&log, false).unwrap(), "second mode").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "first mode\nsecond mode\n");
+        writeln!(open_log(&log, true).unwrap(), "next start").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "next start\n");
+        #[cfg(unix)]
+        {
+            let target = dir.join("victim");
+            std::fs::write(&target, b"keep").unwrap();
+            let link = dir.join("planted.log");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(open_log(&link, true).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        }
+        assert!(scorer_log_path().to_string_lossy().contains(&std::process::id().to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_scorer_is_never_replaced_while_it_scores() {
+        let (s, launches) = scorer(vec![405], Duration::ZERO);
+        let base = s.ready(Path::new("/a.gguf")).unwrap(); // a challenge for A is being scored
+        assert!(base.starts_with("http://stub/"));
+        std::thread::sleep(SWITCH_HOLD);
+        assert!(matches!(s.score(Path::new("/b.gguf"), &[1, 2]), Err(AdapterError::Busy(_))));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mlx_token_ids_outside_the_vocabulary_never_reach_the_scorer() {
+        let dir = std::env::temp_dir().join(format!("oh-mlx-vocab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Multimodal checkpoints keep it under text_config.
+        std::fs::write(dir.join("config.json"), r#"{"text_config": {"vocab_size": 100}}"#).unwrap();
+        let (s, launches) = scorer(vec![405], Duration::ZERO);
+        assert!(matches!(s.score(&dir, &[1, 100]), Err(AdapterError::Unsupported(m)) if m.contains("vocabulary")));
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        assert!(matches!(s.score(&dir, &[1, 2]), Err(AdapterError::Unsupported(_))));
+        assert_eq!(mlx_vocab_size(Path::new("/nonexistent")), None);
+        std::fs::write(dir.join("config.json"), r#"{"vocab_size": 151936}"#).unwrap();
+        assert_eq!(mlx_vocab_size(&dir), Some(151936));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -461,7 +764,7 @@ mod tests {
         let mlx = s(scorer_args(&dir, 4242, &[]));
         assert_eq!(mlx, format!("serve -p 4242 --host 127.0.0.1 --no-ui --exit-on-stdin-eof -m {}", dir.display()));
         let gguf = s(scorer_args(Path::new("/m/x.gguf"), 4242, &["-ngl".into(), "0".into()]));
-        assert_eq!(gguf, "--host 127.0.0.1 --port 4242 --prompt-scoring --exit-on-stdin-eof -c 4096 -np 1 -m /m/x.gguf -ngl 0");
+        assert_eq!(gguf, "--host 127.0.0.1 --port 4242 --prompt-scoring --exit-on-stdin-eof -c 512 -np 1 -m /m/x.gguf -ngl 0");
         std::fs::remove_dir_all(&dir).ok();
         let probe = probe_prompt();
         assert_eq!(probe.len(), crate::prompt_score::MAX_CHALLENGE_TOKENS);

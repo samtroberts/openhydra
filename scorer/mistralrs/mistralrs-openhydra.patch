@@ -27,7 +27,7 @@ diff --git a/mistralrs-cli/src/main.rs b/mistralrs-cli/src/main.rs
 index 2f981cd..3598163 100644
 --- a/mistralrs-cli/src/main.rs
 +++ b/mistralrs-cli/src/main.rs
-@@ -45,6 +45,15 @@ async fn main() -> Result<()> {
+@@ -45,6 +45,20 @@ async fn main() -> Result<()> {
              agent_options,
              sandbox,
          } => {
@@ -37,7 +37,12 @@ index 2f981cd..3598163 100644
 +                    use std::io::Read;
 +                    let mut buf = [0u8; 256];
 +                    while std::io::stdin().read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
-+                    std::process::exit(0);
++                    // _exit, not exit: no exit handlers while the engine's threads still run (one
++                    // that blocks would leave the server up without its supervisor).
++                    unsafe extern "C" {
++                        fn _exit(code: i32) -> !;
++                    }
++                    unsafe { _exit(0) }
 +                });
 +            }
              let model_type = resolve_model_type(model_type, default_model)?;

@@ -86,13 +86,50 @@ pub fn models() -> Vec<LmsModel> {
         }
     }
     let list = (|| {
-        let out = std::process::Command::new(lms_binary()?).args(["ls", "--json"]).stdin(std::process::Stdio::null()).output().ok()?;
-        let root = models_root()?;
-        out.status.success().then(|| parse_listing(&String::from_utf8_lossy(&out.stdout), &root))
+        let stdout = run_with_timeout(&lms_binary()?, &["ls", "--json"], LMS_TIMEOUT)?;
+        Some(parse_listing(&String::from_utf8_lossy(&stdout), &models_root()?))
     })()
     .unwrap_or_default();
     *c = Some((Instant::now(), list.clone()));
     list
+}
+
+/// How long `lms ls` may take. It runs under the cache lock that announces and challenges wait on,
+/// and `lms` can hang (e.g. while it wakes the LM Studio service).
+const LMS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `program args`' stdout if it exits successfully within `timeout`; else it is killed and `None`.
+fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    // Read on another thread, so a large listing can't fill the pipe and stall the child; the result
+    // is awaited with the same deadline (a process it left running could hold the pipe open).
+    let mut pipe = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = tx.send(pipe.read_to_end(&mut buf).ok().map(|_| buf));
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let out = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(1)).ok()??;
+    status.success().then_some(out)
 }
 
 /// The local weights of the LM Studio model served as `key`, when they exist here.

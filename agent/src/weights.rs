@@ -9,9 +9,9 @@
 //! (the check tells weights files apart, not quantisation labels).
 //!
 //! * A file (a GGUF): its sha256.
-//! * A directory (an MLX model): the sha256 of a manifest listing `config.json` and every
-//!   `*.safetensors` file directly in it, sorted by name, one `<name>\0<file sha256 hex>\n` line each
-//!   — the config is included because it decides how the weights are computed with.
+//! * A directory (an MLX model): the sha256 of a manifest listing `config.json` and the model's
+//!   weights files ([`dir_members`]), sorted by name, one `<name>\0<file sha256 hex>\n` line each —
+//!   the config is included because it decides how the weights are computed with.
 
 use std::collections::HashMap;
 use std::io;
@@ -27,19 +27,46 @@ fn file_sha256_hex(path: &Path) -> io::Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
-/// The files of an MLX model directory that go into its digest, sorted by name.
+/// The files of an MLX model directory that go into its digest, sorted by name: `config.json` and
+/// the model's weights — the shards its `model.safetensors.index.json` lists when it has one, else
+/// its `model*.safetensors` (else every `*.safetensors`). Other files (a LoRA's
+/// `adapters.safetensors`, a leftover original checkpoint) don't change the digest, and a member that
+/// can't be read (a broken link of a half-downloaded snapshot) is an error, never left out.
 fn dir_members(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name == "config.json" || name.ends_with(".safetensors")
-        })
-        .collect();
-    files.sort();
-    if !files.iter().any(|p| p.ends_with("config.json")) || files.len() < 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not an MLX model directory (config.json + *.safetensors)"));
+    let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
+    let mut names: Vec<String> = match std::fs::read(dir.join("model.safetensors.index.json")) {
+        Ok(index) => {
+            let index: serde_json::Value = serde_json::from_slice(&index).map_err(|e| bad(format!("model.safetensors.index.json: {e}")))?;
+            let map = index.get("weight_map").and_then(|m| m.as_object()).ok_or_else(|| bad("index without weight_map".into()))?;
+            map.values().filter_map(|v| v.as_str().map(String::from)).collect()
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let all: Vec<String> = std::fs::read_dir(dir)?
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".safetensors"))
+                .collect();
+            let model: Vec<String> = all.iter().filter(|n| n.starts_with("model")).cloned().collect();
+            if model.is_empty() { all } else { model }
+        }
+        Err(e) => return Err(e),
+    };
+    if names.is_empty() {
+        return Err(bad("not an MLX model directory (config.json + *.safetensors)".into()));
+    }
+    names.push("config.json".into());
+    names.sort();
+    names.dedup();
+    let mut files = Vec::with_capacity(names.len());
+    for name in names {
+        // Shard names come from a file: plain names in this directory only.
+        if name.contains('/') || name.contains('\\') || name == ".." {
+            return Err(bad(format!("unexpected weights file name {name:?}")));
+        }
+        let f = dir.join(&name);
+        if !f.is_file() {
+            return Err(bad(format!("{name} is missing or unreadable")));
+        }
+        files.push(f);
     }
     Ok(files)
 }
@@ -154,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn an_mlx_directory_digest_covers_its_config_and_every_safetensors_file() {
+    fn an_mlx_directory_digest_covers_its_config_and_model_weights_only() {
         let dir = tmp("mlx");
         std::fs::write(dir.join("config.json"), b"{}").unwrap();
         std::fs::write(dir.join("model-00002-of-00002.safetensors"), b"two").unwrap();
@@ -167,6 +194,24 @@ mod tests {
         assert_eq!(d, format!("sha256:{}", hex::encode(Sha256::digest(manifest.as_bytes()))));
         // The tokenizer doesn't count; the config and the weights do.
         std::fs::write(dir.join("tokenizer.json"), b"changed").unwrap();
+        assert_eq!(digest_now(&dir).unwrap(), d);
+        // Nor does a stray safetensors file next to the model's (a LoRA adapter).
+        std::fs::write(dir.join("adapters.safetensors"), b"lora").unwrap();
+        assert_eq!(digest_now(&dir).unwrap(), d);
+        // With an index, exactly the shards it lists: the same files, the same digest.
+        let index = r#"{"weight_map": {"a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors", "c": "model-00001-of-00002.safetensors"}}"#;
+        std::fs::write(dir.join("model.safetensors.index.json"), index).unwrap();
+        assert_eq!(digest_now(&dir).unwrap(), d);
+        // A listed shard that can't be read (a broken link of a half-finished download): no digest.
+        std::fs::remove_file(dir.join("model-00002-of-00002.safetensors")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("model-00002-of-00002.safetensors")).unwrap();
+        assert!(digest_now(&dir).is_err());
+        std::fs::remove_file(dir.join("model-00002-of-00002.safetensors")).ok();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), b"two").unwrap();
+        std::fs::write(dir.join("model.safetensors.index.json"), r#"{"weight_map": {"a": "../escape.safetensors"}}"#).unwrap();
+        assert!(digest_now(&dir).is_err(), "shard names stay inside the directory");
+        std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
         assert_eq!(digest_now(&dir).unwrap(), d);
         std::fs::write(dir.join("config.json"), b"{\"bits\": 8}").unwrap();
         assert_ne!(digest_now(&dir).unwrap(), d);
