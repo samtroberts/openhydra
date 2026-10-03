@@ -4,7 +4,7 @@
   "version": "0.2.0",
   "scripts": {
     "tauri": "tauri",
-    "sidecar": "cargo build --release -p openhydra-agent --manifest-path ../Cargo.toml && mkdir -p src-tauri/target/release && cp ../target/release/openhydra-agent src-tauri/target/release/openhydra-agent && (cp src-tauri/binaries/openhydra-scorer-$(rustc -vV | awk '/host:/{print $2}') src-tauri/target/release/openhydra-scorer 2>/dev/null || echo \"no staged openhydra-scorer (run ./stage-sidecar.sh): Ollama models can't be authenticity-checked in dev\") && (cp src-tauri/binaries/openhydra-mlx-scorer-$(rustc -vV | awk '/host:/{print $2}') src-tauri/target/release/openhydra-mlx-scorer 2>/dev/null && cp src-tauri/binaries/mlx.metallib src-tauri/target/release/mlx.metallib 2>/dev/null || true) && echo \"sidecar refreshed: $(ls -la src-tauri/target/release/openhydra-agent | awk '{print $6,$7,$8}')\"",
+    "sidecar": "cargo build --release -p openhydra-agent --manifest-path ../Cargo.toml && mkdir -p src-tauri/target/release && cp ../target/release/openhydra-agent src-tauri/target/release/openhydra-agent && (cp src-tauri/binaries/openhydra-scorer-$(rustc -vV | awk '/host:/{print $2}') src-tauri/target/release/openhydra-scorer 2>/dev/null || echo \"no staged openhydra-scorer (run ./stage-sidecar.sh): Ollama models can't be authenticity-checked in dev\") && (cp src-tauri/binaries/openhydra-mlx-scorer-$(rustc -vV | awk '/host:/{print $2}') src-tauri/target/release/openhydra-mlx-scorer 2>/dev/null || true) && echo \"sidecar refreshed: $(ls -la src-tauri/target/release/openhydra-agent | awk '{print $6,$7,$8}')\"",
     "dev:vite": "vite",
     "build": "vite build",
     "dev": "npm run sidecar && tauri dev --release"

@@ -324,8 +324,9 @@ impl<H: HttpClient> EngineAdapter for OpenAiAdapter<H> {
                 params: String::new(),
                 quant: String::new(),
                 size_bytes: 0,
-                // LM Studio's weights are on this machine: their digest (hashed in the background).
-                weight_digest: self.weights_path(&m.id).map(|p| crate::weights::weights_digest(&p)).unwrap_or_default(),
+                // LM Studio's weights are local, but hashing them is left to the provider, which does
+                // it only for the models it shares (see `weights_path`).
+                weight_digest: String::new(),
             })
             .collect())
     }

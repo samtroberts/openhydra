@@ -1478,12 +1478,22 @@ impl<A: EngineAdapter> Provider<A> {
     }
 
     fn announce_models_inner(&self) -> Result<usize, AdapterError> {
-        let models = self.adapter.detect_models()?;
-        *self.detected.lock().unwrap_or_else(|e| e.into_inner()) =
-            models.iter().map(|m| (m.engine_ref.clone(), m.clone())).collect();
+        let mut models = self.adapter.detect_models()?;
         // Snapshot the policy ONCE so the loop filter and the published view see one consistent
         // policy (also the source for `shared_models` below).
         let policy = self.policy.snapshot();
+        // The weights digest log-prob references are matched to, for engines whose adapter reveals
+        // where the weights are but not their digest (LM Studio): hashed in the background (cached)
+        // and only for the models actually shared — never for everything an engine has on disk.
+        if self.prompt_scoring {
+            for m in models.iter_mut().filter(|m| m.weight_digest.is_empty() && policy.announce_globally(&m.engine_ref)) {
+                if let Some(path) = self.adapter.weights_path(&m.engine_ref) {
+                    m.weight_digest = crate::weights::weights_digest(&path);
+                }
+            }
+        }
+        *self.detected.lock().unwrap_or_else(|e| e.into_inner()) =
+            models.iter().map(|m| (m.engine_ref.clone(), m.clone())).collect();
         // M6: the FULL intended global-announce set this pass (policy ∩ detected ∩ globally-shared),
         // computed up-front so it's independent of where the announce loop below might break on a
         // network error — a still-intended model we simply didn't *reach* must not look "withdrawn".

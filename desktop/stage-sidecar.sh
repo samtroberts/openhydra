@@ -19,10 +19,13 @@ if [[ ! -x "$SCORER" || "$(cat "$SCORER.stamp" 2>/dev/null)" != "$STAMP" ]]; the
   scorer/build.sh "$SCORER" && echo "$STAMP" > "$SCORER.stamp"
 fi
 echo "staged sidecar: openhydra-scorer-$TRIPLE$EXT"
-# macOS also ships the MLX scorer (LM Studio's MLX models), bundled via tauri.macos.conf.json.
+# macOS also ships the MLX scorer (patched mistral.rs, for LM Studio's MLX models), bundled via
+# tauri.macos.conf.json; rebuilt only when its pinned commit or patch changes (Rust 1.94+).
 if [[ "$TRIPLE" == *apple-darwin ]]; then
-  scorer/mlx/build.sh scorer/mlx/target/stage
-  cp scorer/mlx/target/stage/openhydra-mlx-scorer "desktop/src-tauri/binaries/openhydra-mlx-scorer-$TRIPLE"
-  cp scorer/mlx/target/stage/mlx.metallib desktop/src-tauri/binaries/mlx.metallib   # must sit next to it (MacOS/)
-  echo "staged sidecar: openhydra-mlx-scorer-$TRIPLE + mlx.metallib"
+  MLX_SCORER="desktop/src-tauri/binaries/openhydra-mlx-scorer-$TRIPLE"
+  MLX_STAMP="$(cat scorer/mistralrs/MISTRALRS_COMMIT scorer/mistralrs/mistralrs-openhydra.patch scorer/mistralrs/build.sh | shasum -a 256 | cut -c1-16)"
+  if [[ ! -x "$MLX_SCORER" || "$(cat "$MLX_SCORER.stamp" 2>/dev/null)" != "$MLX_STAMP" ]]; then
+    scorer/mistralrs/build.sh "$MLX_SCORER" && echo "$MLX_STAMP" > "$MLX_SCORER.stamp"
+  fi
+  echo "staged sidecar: openhydra-mlx-scorer-$TRIPLE"
 fi

@@ -13,7 +13,8 @@
 //!   it holds no memory between checks. A challenge that arrives while it is still loading is told
 //!   to retry ([`AdapterError::Busy`]); gateways wait out a warm-up before counting anything.
 //! * Two scorers: `openhydra-scorer` (patched llama-server) for a GGUF file, `openhydra-mlx-scorer`
-//!   for an MLX model directory (LM Studio's MLX engine), with the same interface.
+//!   (patched mistral.rs, `scorer/mistralrs`) for an MLX model directory (LM Studio's MLX engine),
+//!   with the same scoring endpoint.
 //! * GPU when it fits: it starts with the engine's defaults (GPU offload, sized to free memory), and
 //!   the scorer's own startup check disables scoring when the scoring buffers don't fit next to the
 //!   model — then a GGUF scorer is restarted without the memory-mapped load (Apple Silicon maps the
@@ -30,7 +31,7 @@ use crate::adapters::scoring::{score_prompt, ScoringDialect};
 
 /// File name of the bundled GGUF scorer (OpenHydra's patched llama-server), next to the agent.
 pub const SCORER_BIN: &str = "openhydra-scorer";
-/// File name of the bundled MLX scorer (`scorer/mlx`, macOS), next to the agent.
+/// File name of the bundled MLX scorer (patched mistral.rs, `scorer/mistralrs`, macOS), next to the agent.
 pub const MLX_SCORER_BIN: &str = "openhydra-mlx-scorer";
 /// Stop the scorer after this long without a challenge.
 pub const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
@@ -173,9 +174,14 @@ fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path) {
     let mut outcome = None;
     for extra in attempts(weights) {
         match inner.launcher.launch(weights, &extra) {
-            // The scorer's own startup check answers GET with 405 when scoring is on, 501 when it
-            // had to disable it (the scoring buffers don't fit next to the model).
-            Ok(instance) if inner.http.get_status(&format!("{}/v1/prompt_logprobs", instance.base_url())).ok() == Some(405) => {
+            // The llama.cpp scorer's own startup check answers GET with 405 when scoring is on, 501
+            // when it had to disable it (the scoring buffers don't fit next to the model). The MLX
+            // scorer has no such check, so it is done here: the longest accepted prompt must score.
+            Ok(instance)
+                if inner.http.get_status(&format!("{}/v1/prompt_logprobs", instance.base_url())).ok() == Some(405)
+                    && (!weights.is_dir()
+                        || score_prompt(&inner.http, instance.base_url(), ScoringDialect::OpenHydra, "default", &probe_prompt()).is_ok()) =>
+            {
                 tracing::info!(weights = %weights.display(), mode = ?extra, secs = started.elapsed().as_secs(), "prompt scorer ready");
                 outcome = Some(instance);
                 break;
@@ -211,8 +217,8 @@ fn idle_reaper<H>(inner: Weak<Inner<H>>) {
 // ── the real scorer process ──
 
 /// Starts a scorer as a child process on a free local port: `openhydra-scorer` (a patched
-/// llama-server) for a GGUF file, `openhydra-mlx-scorer` for an MLX model directory. Both take the
-/// same flags, including `--exit-on-stdin-eof`.
+/// llama-server) for a GGUF file, `openhydra-mlx-scorer` (patched mistral.rs) for an MLX model
+/// directory ([`scorer_args`]); both run with `--exit-on-stdin-eof`.
 pub struct ProcessLauncher {
     gguf: Option<PathBuf>,
     mlx: Option<PathBuf>,
@@ -260,10 +266,7 @@ impl ScorerLauncher for ProcessLauncher {
         let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_err(|e| e.to_string())?.port();
         let log = std::fs::File::create(std::env::temp_dir().join("openhydra-scorer.log")).map_err(|e| e.to_string())?;
         let mut child = std::process::Command::new(binary)
-            .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--prompt-scoring", "--exit-on-stdin-eof"])
-            .args(["-c", "4096", "-np", "1", "-m"])
-            .arg(weights)
-            .args(extra)
+            .args(scorer_args(weights, port, extra))
             .stdin(std::process::Stdio::piped())
             .stdout(log.try_clone().map_err(|e| e.to_string())?)
             .stderr(log)
@@ -284,6 +287,29 @@ impl ScorerLauncher for ProcessLauncher {
         }
         Err("the scorer didn't come up in time".into())
     }
+}
+
+/// The command line for a scorer on `weights`, listening on `port` (localhost only), with `extra`
+/// start-mode arguments. A GGUF file: the patched llama-server. An MLX model directory: patched
+/// mistral.rs (`serve`), with its web UI off.
+fn scorer_args(weights: &Path, port: u16, extra: &[String]) -> Vec<std::ffi::OsString> {
+    let port = port.to_string();
+    let mut args: Vec<std::ffi::OsString> = if weights.is_dir() {
+        ["serve", "-p", port.as_str(), "--host", "127.0.0.1", "--no-ui", "--exit-on-stdin-eof", "-m"].map(Into::into).to_vec()
+    } else {
+        ["--host", "127.0.0.1", "--port", port.as_str(), "--prompt-scoring", "--exit-on-stdin-eof", "-c", "4096", "-np", "1", "-m"]
+            .map(Into::into)
+            .to_vec()
+    };
+    args.push(weights.as_os_str().to_owned());
+    args.extend(extra.iter().map(Into::into));
+    args
+}
+
+/// A synthetic prompt of the longest accepted length, for the MLX scorer's startup check (low token
+/// ids, valid in any vocabulary).
+fn probe_prompt() -> Vec<u32> {
+    (0..crate::prompt_score::MAX_CHALLENGE_TOKENS as u32).map(|i| 1000 + (i * 37) % 20000).collect()
 }
 
 /// The scorer's HTTP client for production: [`crate::http::ReqwestClient`].
@@ -425,6 +451,21 @@ mod tests {
         // Not retried right away.
         assert!(matches!(s.score(Path::new("/big.gguf"), &[1, 2]), Err(AdapterError::Unsupported(_))));
         assert_eq!(launches.load(Ordering::SeqCst), tried);
+    }
+
+    #[test]
+    fn each_kind_of_weights_gets_its_scorers_command_line_on_localhost() {
+        let s = |v: Vec<std::ffi::OsString>| v.into_iter().map(|a| a.into_string().unwrap()).collect::<Vec<_>>().join(" ");
+        let dir = std::env::temp_dir().join(format!("oh-mlx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mlx = s(scorer_args(&dir, 4242, &[]));
+        assert_eq!(mlx, format!("serve -p 4242 --host 127.0.0.1 --no-ui --exit-on-stdin-eof -m {}", dir.display()));
+        let gguf = s(scorer_args(Path::new("/m/x.gguf"), 4242, &["-ngl".into(), "0".into()]));
+        assert_eq!(gguf, "--host 127.0.0.1 --port 4242 --prompt-scoring --exit-on-stdin-eof -c 4096 -np 1 -m /m/x.gguf -ngl 0");
+        std::fs::remove_dir_all(&dir).ok();
+        let probe = probe_prompt();
+        assert_eq!(probe.len(), crate::prompt_score::MAX_CHALLENGE_TOKENS);
+        assert!(probe.iter().all(|&t| (1000..21000).contains(&t)));
     }
 
     #[test]

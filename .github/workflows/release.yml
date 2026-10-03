@@ -118,17 +118,27 @@ jobs:
           cp "scorer-bin/openhydra-scorer$EXT" \
              "desktop/src-tauri/binaries/openhydra-scorer-${{ matrix.triple }}$EXT"
 
-      # macOS also ships the MLX scorer (LM Studio's MLX models; scorer/mlx, pure Rust on mlx-rs),
-      # bundled through tauri.macos.conf.json.
-      - name: Build + stage openhydra-mlx-scorer (macOS)
+      # macOS also ships the MLX scorer: patched mistral.rs for LM Studio's MLX models
+      # (scorer/mistralrs), bundled through tauri.macos.conf.json. A ~10 min build, so cached.
+      - name: Cache openhydra-mlx-scorer (macOS)
+        if: startsWith(matrix.platform, 'macos')
+        id: mlx-scorer-cache
+        uses: actions/cache@v4
+        with:
+          path: mlx-scorer-bin
+          key: openhydra-mlx-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/mistralrs/**') }}
+
+      - name: Build openhydra-mlx-scorer (macOS)
+        if: startsWith(matrix.platform, 'macos') && steps.mlx-scorer-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: scorer/mistralrs/build.sh mlx-scorer-bin/openhydra-mlx-scorer
+
+      - name: Stage openhydra-mlx-scorer (macOS)
         if: startsWith(matrix.platform, 'macos')
         shell: bash
         run: |
-          scorer/mlx/build.sh scorer/mlx/target/stage
-          cp scorer/mlx/target/stage/openhydra-mlx-scorer \
+          cp mlx-scorer-bin/openhydra-mlx-scorer \
              "desktop/src-tauri/binaries/openhydra-mlx-scorer-${{ matrix.triple }}"
-          # MLX loads its kernel library from next to the binary (tauri.macos.conf.json → MacOS/).
-          cp scorer/mlx/target/stage/mlx.metallib desktop/src-tauri/binaries/mlx.metallib
 
       # 2) The desktop app + installers (signed so the auto-updater accepts them).
       - name: Build desktop app
@@ -173,9 +183,7 @@ jobs:
           cp "target/release/openhydra-agent$EXT" "dist/openhydra-agent-${{ matrix.triple }}$EXT"
           cp "scorer-bin/openhydra-scorer$EXT" "dist/openhydra-scorer-${{ matrix.triple }}$EXT"
           if [[ "${{ matrix.triple }}" == *apple-darwin ]]; then
-            # The MLX scorer and its kernel library belong side by side: one archive.
-            tar -czf "dist/openhydra-mlx-scorer-${{ matrix.triple }}.tar.gz" -C scorer/mlx/target/stage \
-              openhydra-mlx-scorer mlx.metallib
+            cp mlx-scorer-bin/openhydra-mlx-scorer "dist/openhydra-mlx-scorer-${{ matrix.triple }}"
           fi
           B=desktop/src-tauri/target/release/bundle
           find "$B" -name "*.dmg" -exec cp {} dist/ \; 2>/dev/null || true

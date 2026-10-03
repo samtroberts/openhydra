@@ -1,3 +1,0 @@
-# mlx-sys builds MLX with CMake; this toolchain file only turns on JIT Metal kernels (see jit.cmake).
-[env]
-CMAKE_TOOLCHAIN_FILE = { value = "jit.cmake", relative = true }

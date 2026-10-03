@@ -1,0 +1,991 @@
+diff --git a/mistralrs-cli/src/args/server.rs b/mistralrs-cli/src/args/server.rs
+index 53470cd..3ea09be 100644
+--- a/mistralrs-cli/src/args/server.rs
++++ b/mistralrs-cli/src/args/server.rs
+@@ -22,6 +22,12 @@ pub struct ServerOptions {
+     #[serde(default)]
+     pub no_ui: bool,
+ 
++    /// Exit when stdin is closed: lets a supervising process (e.g. an OpenHydra agent running this as
++    /// its prompt scorer) take the server down with it however it ends, crash included.
++    #[arg(long)]
++    #[serde(default)]
++    pub exit_on_stdin_eof: bool,
++
+     /// Also expose the loaded model as an MCP server on this port (JSON-RPC 2.0 at POST /mcp).
+     #[arg(long)]
+     #[serde(default)]
+@@ -71,6 +77,7 @@ impl Default for ServerOptions {
+             port: 1234,
+             host: "0.0.0.0".to_string(),
+             no_ui: false,
++            exit_on_stdin_eof: false,
+             mcp_port: None,
+             max_tool_rounds: None,
+             tool_dispatch_url: None,
+diff --git a/mistralrs-cli/src/main.rs b/mistralrs-cli/src/main.rs
+index 2f981cd..3598163 100644
+--- a/mistralrs-cli/src/main.rs
++++ b/mistralrs-cli/src/main.rs
+@@ -45,6 +45,15 @@ async fn main() -> Result<()> {
+             agent_options,
+             sandbox,
+         } => {
++            if server.exit_on_stdin_eof {
++                // The supervisor holds our stdin open for as long as it wants us.
++                std::thread::spawn(|| {
++                    use std::io::Read;
++                    let mut buf = [0u8; 256];
++                    while std::io::stdin().read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
++                    std::process::exit(0);
++                });
++            }
+             let model_type = resolve_model_type(model_type, default_model)?;
+             run_server(
+                 model_type,
+diff --git a/mistralrs-core/src/gdn/weights.rs b/mistralrs-core/src/gdn/weights.rs
+index fc8e366..be74825 100644
+--- a/mistralrs-core/src/gdn/weights.rs
++++ b/mistralrs-core/src/gdn/weights.rs
+@@ -332,10 +332,15 @@ impl GdnWeights {
+                 }
+             }
+         };
+-        let conv1d_weight = move_to_target(
+-            vb_la.get((dims.conv_dim, 1, dims.conv_kernel_size), "conv1d.weight")?,
+-            isq_target_device.as_ref(),
+-        )?;
++        // MLX-converted checkpoints (mlx_lm's `sanitize`) store this channels-last: [conv_dim, kernel, 1].
++        let conv1d = match vb_la.get((dims.conv_dim, 1, dims.conv_kernel_size), "conv1d.weight") {
++            Ok(w) => w,
++            Err(_) => vb_la
++                .get((dims.conv_dim, dims.conv_kernel_size, 1), "conv1d.weight")?
++                .transpose(1, 2)?
++                .contiguous()?,
++        };
++        let conv1d_weight = move_to_target(conv1d, isq_target_device.as_ref())?;
+         // The recurrence consumes these in f32 every step; A_log is f32 in the checkpoint anyway
+         let vb_f32 = vb_la.clone().set_dtype(DType::F32);
+         let dt_bias = move_to_target(
+diff --git a/mistralrs-core/src/layers.rs b/mistralrs-core/src/layers.rs
+index 1a7790a..738a3fd 100644
+--- a/mistralrs-core/src/layers.rs
++++ b/mistralrs-core/src/layers.rs
+@@ -521,6 +521,22 @@ impl GemmaRmsNorm {
+         })
+     }
+ 
++    /// As [`new`](Self::new), but when `already_shifted` the checkpoint's weight already holds `1 + w`
++    /// (MLX-converted checkpoints: mlx_lm's `sanitize` bakes the `+1` in), so it is used as is;
++    /// `original_weight` keeps the zero-centred form.
++    pub fn new_shifted(size: usize, eps: f64, vb: ShardedVarBuilder, already_shifted: bool) -> Result<Self> {
++        if !already_shifted {
++            return Self::new(size, eps, vb);
++        }
++        let weight = vb.get(size, "weight")?;
++        let original_weight = (&weight - 1.0)?;
++        Ok(Self {
++            eps,
++            original_weight,
++            weight,
++        })
++    }
++
+     pub fn weight(&self) -> &Tensor {
+         &self.weight
+     }
+diff --git a/mistralrs-core/src/lib.rs b/mistralrs-core/src/lib.rs
+index d9cb5a2..d0feb9f 100644
+--- a/mistralrs-core/src/lib.rs
++++ b/mistralrs-core/src/lib.rs
+@@ -94,6 +94,8 @@ mod paged_attention;
+ mod perf_flags;
+ mod pipeline;
+ mod prefix_cacher;
++mod prompt_scoring;
++pub use prompt_scoring::{prompt_scores_from_logits, PromptScores};
+ pub mod reasoning_parsers;
+ pub mod remote_fetch;
+ mod request;
+diff --git a/mistralrs-core/src/models/qwen3_next.rs b/mistralrs-core/src/models/qwen3_next.rs
+index a466726..0d2ec17 100644
+--- a/mistralrs-core/src/models/qwen3_next.rs
++++ b/mistralrs-core/src/models/qwen3_next.rs
+@@ -94,6 +94,10 @@ pub struct Config {
+     pub quantization_config: Option<QuantizedConfig>,
+     #[serde(default, rename = "_mistralrs_gdn_v_head_layout")]
+     gdn_v_head_layout: GdnVHeadLayout,
++    /// Set at load, not read from config.json: the checkpoint is MLX-converted, so its `(1 + w)` norm
++    /// weights already hold the `+1` (see `GemmaRmsNorm::new_shifted`).
++    #[serde(skip)]
++    pub mlx_shifted_norms: bool,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -236,8 +240,8 @@ impl FullAttention {
+ 
+         // QK norms use (1+weight) formulation; pass loading_isq=false to ensure device placement
+         let vb_sa_norms = mapper.set_device(layer_idx, vb.pp("self_attn"), false);
+-        let q_norm = GemmaRmsNorm::new(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("q_norm"))?;
+-        let k_norm = GemmaRmsNorm::new(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("k_norm"))?;
++        let q_norm = GemmaRmsNorm::new_shifted(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("q_norm"), cfg.mlx_shifted_norms)?;
++        let k_norm = GemmaRmsNorm::new_shifted(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("k_norm"), cfg.mlx_shifted_norms)?;
+ 
+         let sliding_window = None;
+         Ok(Self {
+@@ -730,6 +734,24 @@ impl Model {
+         attention_mechanism: AttentionImplementation,
+     ) -> Result<Self> {
+         let vb_m = vb.pp("model");
++        // An MLX-converted checkpoint (mlx_lm) stores the GatedDeltaNet conv1d weight channels-last
++        // ([conv_dim, kernel, 1]) and the (1 + w) norm weights with the +1 already added.
++        let mlx_layout = cfg
++            .layer_types()
++            .iter()
++            .position(|t| matches!(t, LayerType::LinearAttention))
++            .and_then(|i| {
++                vb_m.pp("layers").pp(i).pp("linear_attn").tensor_shape("conv1d.weight").map(|s| s.last() == Some(&1))
++            })
++            .unwrap_or(false);
++        let mlx_cfg;
++        let cfg = if mlx_layout {
++            tracing::info!("MLX-converted checkpoint: reading its norm weights as already shifted");
++            mlx_cfg = Config { mlx_shifted_norms: true, ..cfg.clone() };
++            &mlx_cfg
++        } else {
++            cfg
++        };
+         let vb_lm_head = vb.pp("lm_head");
+ 
+         if let Some(ref quant_cfg) = &cfg.quantization_config {
+@@ -769,11 +791,10 @@ impl Model {
+             embed_tokens.clone()
+         };
+ 
+-        let norm = GemmaRmsNorm::new(
++        let norm = GemmaRmsNorm::new_shifted(
+             cfg.hidden_size,
+             cfg.rms_norm_eps,
+-            mapper.set_nm_device(vb_m.pp("norm"), false),
+-        )?;
++            mapper.set_nm_device(vb_m.pp("norm"), false), cfg.mlx_shifted_norms)?;
+ 
+         let layer_types = cfg.layer_types();
+ 
+@@ -867,16 +888,14 @@ impl Model {
+                 }
+             };
+ 
+-            let input_layernorm = GemmaRmsNorm::new(
++            let input_layernorm = GemmaRmsNorm::new_shifted(
+                 cfg.hidden_size,
+                 cfg.rms_norm_eps,
+-                mapper.set_device(i, vb_layer.pp("input_layernorm"), false),
+-            )?;
+-            let post_attention_layernorm = GemmaRmsNorm::new(
++                mapper.set_device(i, vb_layer.pp("input_layernorm"), false), cfg.mlx_shifted_norms)?;
++            let post_attention_layernorm = GemmaRmsNorm::new_shifted(
+                 cfg.hidden_size,
+                 cfg.rms_norm_eps,
+-                mapper.set_device(i, vb_layer.pp("post_attention_layernorm"), false),
+-            )?;
++                mapper.set_device(i, vb_layer.pp("post_attention_layernorm"), false), cfg.mlx_shifted_norms)?;
+ 
+             let moe = SparseMoeBlock::new(
+                 cfg,
+diff --git a/mistralrs-core/src/pipeline/mod.rs b/mistralrs-core/src/pipeline/mod.rs
+index ad4ebc4..87c7980 100644
+--- a/mistralrs-core/src/pipeline/mod.rs
++++ b/mistralrs-core/src/pipeline/mod.rs
+@@ -867,7 +867,10 @@ impl<'a> ModelForwardContext<'a> {
+     }
+ 
+     pub(crate) fn requires_full_prefill_queries(&self) -> bool {
++        // A request that wants logits for more than its last row (e.g. raw-logits prompt scoring)
++        // needs every query row through every layer, so row-dropping prefill shortcuts must stay off.
+         self.requires_full_prefill_queries
++            || self.context_lens.iter().any(|&(start, len)| start == 0 && len > 1)
+     }
+ 
+     pub(crate) fn cache(&self) -> &ForwardCache<'a> {
+diff --git a/mistralrs-core/src/pipeline/sampling.rs b/mistralrs-core/src/pipeline/sampling.rs
+index 7062708..9ac12e7 100644
+--- a/mistralrs-core/src/pipeline/sampling.rs
++++ b/mistralrs-core/src/pipeline/sampling.rs
+@@ -1213,9 +1213,11 @@ fn final_batched_logits(logits: &Tensor) -> Result<Tensor> {
+             "batched causal logits must have shape [batch, ..., vocab] with singleton middle dimensions, got {dims:?}"
+         );
+     }
++    // The batched CUDA samplers require F32, like the per-sequence path (stack_final_logits).
+     logits
+         .contiguous()?
+-        .reshape((dims[0], dims[dims.len() - 1]))
++        .reshape((dims[0], dims[dims.len() - 1]))?
++        .to_dtype(DType::F32)
+ }
+ 
+ fn coalesce_batch_logits_to_cpu(logits: Vec<Tensor>) -> Result<Vec<Tensor>> {
+diff --git a/mistralrs-core/src/prompt_scoring.rs b/mistralrs-core/src/prompt_scoring.rs
+new file mode 100644
+index 0000000..b34ac58
+--- /dev/null
++++ b/mistralrs-core/src/prompt_scoring.rs
+@@ -0,0 +1,96 @@
++//! Teacher-forced prompt scoring.
++//!
++//! A verifier that knows which model a server claims to run can check that claim by asking the
++//! server how likely each token of a fixed reference text is, given the tokens before it, and
++//! comparing the answers with a trusted reference engine. This module turns the raw prompt logits
++//! returned for a `return_raw_logits` request (every prompt row, see `inputs_processor`) into those
++//! per-token log-probabilities, plus each token's rank and the model's own top choice.
++
++use candle_core::{DType, Result, Tensor, D};
++use serde::Serialize;
++
++/// Teacher-forced scores for one prompt. Position `t` scores `token_ids[t + 1]` given
++/// `token_ids[..=t]`, so every vector has `token_ids.len() - 1` entries.
++#[derive(Debug, Clone, PartialEq, Serialize)]
++pub struct PromptScores {
++    pub token_ids: Vec<u32>,
++    /// `log P(token_ids[t + 1] | token_ids[..=t])`, computed in f32.
++    pub logprobs: Vec<f32>,
++    /// 1 + the number of vocabulary entries the model rated strictly more likely than the actual token.
++    pub ranks: Vec<u32>,
++    /// The model's most likely next token at each position.
++    pub top1_ids: Vec<u32>,
++    /// The log-probability of `top1_ids[t]`.
++    pub top1_logprobs: Vec<f32>,
++}
++
++/// Scores `token_ids` from the raw prompt logits of a `return_raw_logits` request: one tensor per
++/// prompt chunk, each `(rows, vocab)` (a single row may arrive as `(vocab,)`), in prompt order.
++pub fn prompt_scores_from_logits(logits_chunks: &[Tensor], token_ids: &[u32]) -> Result<PromptScores> {
++    let rows = logits_chunks
++        .iter()
++        .map(|chunk| match chunk.rank() {
++            1 => chunk.unsqueeze(0),
++            2 => Ok(chunk.clone()),
++            3 => chunk.flatten_to(1),
++            r => candle_core::bail!("prompt scoring: unexpected logits rank {r}"),
++        })
++        .collect::<Result<Vec<_>>>()?;
++    let logits = Tensor::cat(&rows, 0)?.to_dtype(DType::F32)?;
++    let n = logits.dim(0)?;
++    if n != token_ids.len() {
++        candle_core::bail!(
++            "prompt scoring: got logits for {n} positions but {} prompt tokens (were all prompt rows returned?)",
++            token_ids.len()
++        );
++    }
++    if n < 2 {
++        candle_core::bail!("prompt scoring needs at least 2 tokens, got {n}");
++    }
++    let logp = candle_nn::ops::log_softmax(&logits, D::Minus1)?.narrow(0, 0, n - 1)?;
++    let next = Tensor::from_vec(token_ids[1..].to_vec(), (n - 1, 1), logp.device())?;
++    let actual = logp.gather(&next, 1)?;
++    let ranks = logp
++        .broadcast_gt(&actual)?
++        .to_dtype(DType::U32)?
++        .sum(D::Minus1)?
++        .to_vec1::<u32>()?
++        .into_iter()
++        .map(|higher| higher + 1)
++        .collect();
++    Ok(PromptScores {
++        token_ids: token_ids.to_vec(),
++        logprobs: actual.squeeze(1)?.to_vec1::<f32>()?,
++        ranks,
++        top1_ids: logp.argmax(D::Minus1)?.to_vec1::<u32>()?,
++        top1_logprobs: logp.max(D::Minus1)?.to_vec1::<f32>()?,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use candle_core::Device;
++
++    #[test]
++    fn scores_match_a_hand_computed_log_softmax() -> Result<()> {
++        // 3 prompt tokens over a 4-token vocabulary, split across two chunks.
++        let chunk_a = Tensor::new(&[[2.0f32, 1.0, 0.0, -1.0], [0.0, 0.0, 3.0, 0.0]], &Device::Cpu)?;
++        let chunk_b = Tensor::new(&[1.0f32, 1.0, 1.0, 1.0], &Device::Cpu)?;
++        let scores = prompt_scores_from_logits(&[chunk_a, chunk_b], &[0, 1, 3])?;
++        let lse0 = (2f32.exp() + 1f32.exp() + 1.0 + (-1f32).exp()).ln();
++        let lse1 = (3.0f32 + 3f32.exp()).ln();
++        assert!((scores.logprobs[0] - (1.0 - lse0)).abs() < 1e-6);
++        assert!((scores.logprobs[1] - (0.0 - lse1)).abs() < 1e-6);
++        assert_eq!(scores.ranks, vec![2, 2]);
++        assert_eq!(scores.top1_ids, vec![0, 2]);
++        assert!((scores.top1_logprobs[1] - (3.0 - lse1)).abs() < 1e-6);
++        Ok(())
++    }
++
++    #[test]
++    fn rejects_logits_that_do_not_cover_the_prompt() {
++        let last_row_only = Tensor::zeros((1, 4), DType::F32, &Device::Cpu).unwrap();
++        assert!(prompt_scores_from_logits(&[last_row_only], &[0, 1, 2]).is_err());
++    }
++}
+diff --git a/mistralrs-core/src/vision_models/qwen3_5/config.rs b/mistralrs-core/src/vision_models/qwen3_5/config.rs
+index a76bb60..667b68b 100644
+--- a/mistralrs-core/src/vision_models/qwen3_5/config.rs
++++ b/mistralrs-core/src/vision_models/qwen3_5/config.rs
+@@ -257,6 +257,10 @@ pub struct TextConfig {
+     pub mtp_num_hidden_layers: usize,
+     #[serde(default)]
+     pub mtp_use_dedicated_embeddings: bool,
++    /// Set at load, not read from config.json: the checkpoint is MLX-converted, so its `(1 + w)` norm
++    /// weights already hold the `+1` (see `GemmaRmsNorm::new_shifted`).
++    #[serde(skip)]
++    pub mlx_shifted_norms: bool,
+ }
+ 
+ impl TextConfig {
+diff --git a/mistralrs-core/src/vision_models/qwen3_5/text.rs b/mistralrs-core/src/vision_models/qwen3_5/text.rs
+index a6caa5e..f491d1b 100644
+--- a/mistralrs-core/src/vision_models/qwen3_5/text.rs
++++ b/mistralrs-core/src/vision_models/qwen3_5/text.rs
+@@ -217,8 +217,8 @@ impl FullAttention {
+             vb_sa.pp("o_proj"),
+         )?;
+ 
+-        let q_norm = GemmaRmsNorm::new(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("q_norm"))?;
+-        let k_norm = GemmaRmsNorm::new(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("k_norm"))?;
++        let q_norm = GemmaRmsNorm::new_shifted(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("q_norm"), cfg.mlx_shifted_norms)?;
++        let k_norm = GemmaRmsNorm::new_shifted(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("k_norm"), cfg.mlx_shifted_norms)?;
+ 
+         Ok(Self {
+             q_proj,
+@@ -582,16 +582,14 @@ impl DecoderLayer {
+             paged_attn,
+             comm,
+         )?;
+-        let input_layernorm = GemmaRmsNorm::new(
++        let input_layernorm = GemmaRmsNorm::new_shifted(
+             cfg.hidden_size,
+             cfg.rms_norm_eps,
+-            vb_plain.pp("input_layernorm"),
+-        )?;
+-        let post_attention_layernorm = GemmaRmsNorm::new(
++            vb_plain.pp("input_layernorm"), cfg.mlx_shifted_norms)?;
++        let post_attention_layernorm = GemmaRmsNorm::new_shifted(
+             cfg.hidden_size,
+             cfg.rms_norm_eps,
+-            vb_plain.pp("post_attention_layernorm"),
+-        )?;
++            vb_plain.pp("post_attention_layernorm"), cfg.mlx_shifted_norms)?;
+         let mlp = Mlp::new(
+             vb_quant.pp("mlp"),
+             cfg.hidden_size,
+@@ -1283,6 +1281,24 @@ impl Qwen3_5TextModel {
+             });
+         }
+ 
++        // An MLX-converted checkpoint (mlx_lm) stores the GatedDeltaNet conv1d weight channels-last
++        // ([conv_dim, kernel, 1]) and the (1 + w) norm weights with the +1 already added.
++        let mlx_layout = cfg
++            .layer_types()
++            .iter()
++            .position(|t| matches!(t, LayerType::LinearAttention))
++            .and_then(|i| {
++                vb_m.pp("layers").pp(i).pp("linear_attn").tensor_shape("conv1d.weight").map(|s| s.last() == Some(&1))
++            })
++            .unwrap_or(false);
++        let mlx_cfg;
++        let cfg = if mlx_layout {
++            tracing::info!("MLX-converted checkpoint: reading its norm weights as already shifted");
++            mlx_cfg = TextConfig { mlx_shifted_norms: true, ..cfg.clone() };
++            &mlx_cfg
++        } else {
++            cfg
++        };
+         let vb_l = vb_m.pp("layers");
+         let layers = NiceProgressBar::<_, 'b'>(
+             0..cfg.num_hidden_layers,
+@@ -1323,20 +1339,18 @@ impl Qwen3_5TextModel {
+                 )?),
+             };
+ 
+-            let input_layernorm = GemmaRmsNorm::new(
++            let input_layernorm = GemmaRmsNorm::new_shifted(
+                 cfg.hidden_size,
+                 cfg.rms_norm_eps,
+-                mapper.set_device(layer_idx, vb_l.pp(layer_idx).pp("input_layernorm"), false),
+-            )?;
+-            let post_attention_layernorm = GemmaRmsNorm::new(
++                mapper.set_device(layer_idx, vb_l.pp(layer_idx).pp("input_layernorm"), false), cfg.mlx_shifted_norms)?;
++            let post_attention_layernorm = GemmaRmsNorm::new_shifted(
+                 cfg.hidden_size,
+                 cfg.rms_norm_eps,
+                 mapper.set_device(
+                     layer_idx,
+                     vb_l.pp(layer_idx).pp("post_attention_layernorm"),
+                     false,
+-                ),
+-            )?;
++                ), cfg.mlx_shifted_norms)?;
+ 
+             let mlp = Mlp::new(
+                 mapper.set_device(
+@@ -1359,11 +1373,10 @@ impl Qwen3_5TextModel {
+             })
+         })?;
+ 
+-        let norm = GemmaRmsNorm::new(
++        let norm = GemmaRmsNorm::new_shifted(
+             cfg.hidden_size,
+             cfg.rms_norm_eps,
+-            mapper.set_nm_device(vb_m.pp("norm"), false),
+-        )?;
++            mapper.set_nm_device(vb_m.pp("norm"), false), cfg.mlx_shifted_norms)?;
+         let lm_head = if !tie {
+             ReplicatedLayer::new(
+                 cfg.hidden_size,
+diff --git a/mistralrs-core/src/vision_models/qwen3_5_moe/config.rs b/mistralrs-core/src/vision_models/qwen3_5_moe/config.rs
+index 5e6d335..495472a 100644
+--- a/mistralrs-core/src/vision_models/qwen3_5_moe/config.rs
++++ b/mistralrs-core/src/vision_models/qwen3_5_moe/config.rs
+@@ -62,6 +62,10 @@ pub struct TextConfig {
+     pub quantization_config: Option<QuantizedConfig>,
+     #[serde(default, rename = "_mistralrs_gdn_v_head_layout")]
+     pub(crate) gdn_v_head_layout: GdnVHeadLayout,
++    /// Set at load, not read from config.json: the checkpoint is MLX-converted, so its `(1 + w)` norm
++    /// weights already hold the `+1` (see `GemmaRmsNorm::new_shifted`).
++    #[serde(skip)]
++    pub mlx_shifted_norms: bool,
+ }
+ 
+ impl TextConfig {
+diff --git a/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs b/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs
+index 30c6831..7ec557c 100644
+--- a/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs
++++ b/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs
+@@ -150,8 +150,8 @@ impl FullAttention {
+         } else {
+             None
+         };
+-        let q_norm = GemmaRmsNorm::new(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("q_norm"))?;
+-        let k_norm = GemmaRmsNorm::new(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("k_norm"))?;
++        let q_norm = GemmaRmsNorm::new_shifted(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("q_norm"), cfg.mlx_shifted_norms)?;
++        let k_norm = GemmaRmsNorm::new_shifted(head_dim, cfg.rms_norm_eps, vb_sa_norms.pp("k_norm"), cfg.mlx_shifted_norms)?;
+ 
+         Ok(Self {
+             q_proj,
+@@ -587,6 +587,24 @@ impl Qwen3_5MoeTextModel {
+             });
+         }
+ 
++        // An MLX-converted checkpoint (mlx_lm) stores the GatedDeltaNet conv1d weight channels-last
++        // ([conv_dim, kernel, 1]) and the (1 + w) norm weights with the +1 already added.
++        let mlx_layout = cfg
++            .layer_types()
++            .iter()
++            .position(|t| matches!(t, LayerType::LinearAttention))
++            .and_then(|i| {
++                vb_m.pp("layers").pp(i).pp("linear_attn").tensor_shape("conv1d.weight").map(|s| s.last() == Some(&1))
++            })
++            .unwrap_or(false);
++        let mlx_cfg;
++        let cfg = if mlx_layout {
++            tracing::info!("MLX-converted checkpoint: reading its norm weights as already shifted");
++            mlx_cfg = TextConfig { mlx_shifted_norms: true, ..cfg.clone() };
++            &mlx_cfg
++        } else {
++            cfg
++        };
+         let vb_l = vb_m.pp("layers");
+         let layers = NiceProgressBar::<_, 'b'>(
+             0..cfg.num_hidden_layers,
+@@ -627,20 +645,18 @@ impl Qwen3_5MoeTextModel {
+                 )?),
+             };
+ 
+-            let input_layernorm = GemmaRmsNorm::new(
++            let input_layernorm = GemmaRmsNorm::new_shifted(
+                 cfg.hidden_size,
+                 cfg.rms_norm_eps,
+-                mapper.set_device(layer_idx, vb_l.pp(layer_idx).pp("input_layernorm"), false),
+-            )?;
+-            let post_attention_layernorm = GemmaRmsNorm::new(
++                mapper.set_device(layer_idx, vb_l.pp(layer_idx).pp("input_layernorm"), false), cfg.mlx_shifted_norms)?;
++            let post_attention_layernorm = GemmaRmsNorm::new_shifted(
+                 cfg.hidden_size,
+                 cfg.rms_norm_eps,
+                 mapper.set_device(
+                     layer_idx,
+                     vb_l.pp(layer_idx).pp("post_attention_layernorm"),
+                     false,
+-                ),
+-            )?;
++                ), cfg.mlx_shifted_norms)?;
+ 
+             let moe = SparseMoeBlock::new(
+                 cfg,
+@@ -664,11 +680,10 @@ impl Qwen3_5MoeTextModel {
+             })
+         })?;
+ 
+-        let norm = GemmaRmsNorm::new(
++        let norm = GemmaRmsNorm::new_shifted(
+             cfg.hidden_size,
+             cfg.rms_norm_eps,
+-            mapper.set_nm_device(vb_m.pp("norm"), false),
+-        )?;
++            mapper.set_nm_device(vb_m.pp("norm"), false), cfg.mlx_shifted_norms)?;
+         let lm_head = if !tie {
+             ReplicatedLayer::new(
+                 cfg.hidden_size,
+diff --git a/mistralrs-server-core/src/lib.rs b/mistralrs-server-core/src/lib.rs
+index 15591c8..7183b63 100644
+--- a/mistralrs-server-core/src/lib.rs
++++ b/mistralrs-server-core/src/lib.rs
+@@ -255,6 +255,7 @@ pub mod mistralrs_for_server_builder;
+ pub mod mistralrs_server_router_builder;
+ pub mod openai;
+ pub mod openapi_doc;
++pub mod prompt_logprobs;
+ pub mod responses;
+ pub mod responses_types;
+ pub mod route_registry;
+diff --git a/mistralrs-server-core/src/mistralrs_server_router_builder.rs b/mistralrs-server-core/src/mistralrs_server_router_builder.rs
+index 7980e6e..312b736 100644
+--- a/mistralrs-server-core/src/mistralrs_server_router_builder.rs
++++ b/mistralrs-server-core/src/mistralrs_server_router_builder.rs
+@@ -21,6 +21,7 @@ use crate::{
+     chat_completion::chatcompletions,
+     completions::completions,
+     embeddings::embeddings,
++    prompt_logprobs::prompt_logprobs,
+     files::{
+         delete_file, get_container_file, get_container_file_content, get_file, get_file_content,
+         list_container_files, list_files, upload_file,
+@@ -41,7 +42,7 @@ use crate::{
+         AGENT_APPROVAL_ROUTE, ANTHROPIC_COUNT_TOKENS_ROUTE, ANTHROPIC_MESSAGES_ROUTE,
+         CALIBRATION_APPLY_ROUTE, CALIBRATION_START_ROUTE, CALIBRATION_STATUS_ROUTE,
+         CANCEL_RESPONSE_ROUTE, CHAT_COMPLETIONS_ROUTE, COMPLETIONS_ROUTE, CONTAINER_FILES_ROUTE,
+-        CONTAINER_FILE_CONTENT_ROUTE, CONTAINER_FILE_ROUTE, EMBEDDINGS_ROUTE, FILES_ROUTE,
++        CONTAINER_FILE_CONTENT_ROUTE, CONTAINER_FILE_ROUTE, EMBEDDINGS_ROUTE, PROMPT_LOGPROBS_ROUTE, FILES_ROUTE,
+         FILE_CONTENT_ROUTE, FILE_ROUTE, HEALTH_ROUTE, IMAGE_GENERATION_ROUTE,
+         LIST_LORA_ADAPTERS_ROUTE, LOAD_LORA_ADAPTER_ROUTE, MODELS_ROUTE, MODEL_STATUS_ROUTE,
+         RELOAD_MODEL_ROUTE, RESPONSES_ROUTE, RESPONSE_ROUTE, RE_ISQ_ROUTE, ROOT_ROUTE,
+@@ -380,6 +381,7 @@ fn init_router(
+         )
+         .route(COMPLETIONS_ROUTE.path, post(completions))
+         .route(EMBEDDINGS_ROUTE.path, post(embeddings))
++        .route(PROMPT_LOGPROBS_ROUTE.path, post(prompt_logprobs))
+         .route(MODELS_ROUTE.path, get(models))
+         .route(LIST_LORA_ADAPTERS_ROUTE.path, get(list_lora_adapters))
+         .route(UNLOAD_MODEL_ROUTE.path, post(unload_model))
+diff --git a/mistralrs-server-core/src/prompt_logprobs.rs b/mistralrs-server-core/src/prompt_logprobs.rs
+new file mode 100644
+index 0000000..9776154
+--- /dev/null
++++ b/mistralrs-server-core/src/prompt_logprobs.rs
+@@ -0,0 +1,198 @@
++//! `POST /v1/prompt_logprobs`: teacher-forced prompt scoring.
++//!
++//! Scores exact prompt token ids in one prefill (no generation) and returns, for every position,
++//! the log-probability of the actual next token, its rank and the model's top choice. The
++//! `prompt_logprobs` array follows vLLM's shape (`null` for the first token, then a map from token
++//! id to `{logprob, rank}`), so a verifier can read either engine the same way.
++
++use anyhow::Error as AnyhowError;
++use axum::{
++    extract::{rejection::JsonRejection, Json, State},
++    response::IntoResponse,
++};
++use mistralrs_core::{
++    prompt_scores_from_logits, Constraint, NormalRequest, PromptScores, Request, RequestMessage,
++    Response, SamplingParams,
++};
++use serde::{Deserialize, Serialize};
++use serde_json::{json, Value};
++
++use crate::{
++    handler_core::{
++        create_response_channel, openai_error_from_error, send_request_with_model, ApiError,
++        ApiErrorKind,
++    },
++    types::ExtractedMistralRsState,
++    util::validate_model_name,
++};
++
++#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
++pub struct PromptLogprobsRequest {
++    #[serde(default = "default_model")]
++    pub model: String,
++    /// The exact token ids to score (include BOS if the model expects one).
++    pub prompt_token_ids: Vec<u32>,
++}
++
++fn default_model() -> String {
++    "default".to_string()
++}
++
++#[derive(Debug, Serialize, utoipa::ToSchema)]
++pub struct PromptLogprobsResponse {
++    pub model: String,
++    #[schema(value_type = Object)]
++    pub scores: Value,
++    /// vLLM-style: `[null, {"<id>": {"logprob": f, "rank": r}, ...}, ...]`.
++    #[schema(value_type = Vec<Object>)]
++    pub prompt_logprobs: Vec<Value>,
++}
++
++pub enum PromptLogprobsResponder {
++    Json(PromptLogprobsResponse),
++    InternalError(AnyhowError),
++    ValidationError(AnyhowError),
++}
++
++impl IntoResponse for PromptLogprobsResponder {
++    fn into_response(self) -> axum::response::Response {
++        match self {
++            Self::Json(r) => Json(r).into_response(),
++            Self::InternalError(e) => openai_error_from_error(e.as_ref(), ApiErrorKind::Internal),
++            Self::ValidationError(e) => {
++                openai_error_from_error(e.as_ref(), ApiErrorKind::InvalidRequest)
++            }
++        }
++    }
++}
++
++fn vllm_prompt_logprobs(scores: &PromptScores) -> Vec<Value> {
++    let mut out = vec![Value::Null];
++    for t in 0..scores.logprobs.len() {
++        let mut entry = serde_json::Map::new();
++        entry.insert(
++            scores.token_ids[t + 1].to_string(),
++            json!({"logprob": scores.logprobs[t], "rank": scores.ranks[t]}),
++        );
++        entry
++            .entry(scores.top1_ids[t].to_string())
++            .or_insert(json!({"logprob": scores.top1_logprobs[t], "rank": 1}));
++        out.push(Value::Object(entry));
++    }
++    out
++}
++
++#[utoipa::path(
++    post,
++    tag = "Mistral.rs",
++    path = "/v1/prompt_logprobs",
++    request_body = PromptLogprobsRequest,
++    responses((status = 200, description = "Teacher-forced prompt scores", body = PromptLogprobsResponse))
++)]
++pub async fn prompt_logprobs(
++    State(state): ExtractedMistralRsState,
++    payload: Result<Json<PromptLogprobsRequest>, JsonRejection>,
++) -> PromptLogprobsResponder {
++    let req = match payload {
++        Ok(Json(r)) => r,
++        Err(e) => {
++            return PromptLogprobsResponder::ValidationError(AnyhowError::new(
++                ApiError::from_json_rejection(e),
++            ))
++        }
++    };
++    if let Err(e) = validate_model_name(&req.model, state.clone()) {
++        return PromptLogprobsResponder::ValidationError(e.into());
++    }
++    if req.prompt_token_ids.len() < 2 {
++        return PromptLogprobsResponder::ValidationError(AnyhowError::new(ApiError::new(
++            ApiErrorKind::InvalidRequest,
++            "prompt_token_ids must contain at least 2 tokens.",
++            Some("invalid_input"),
++            Some("prompt_token_ids"),
++        )));
++    }
++    let model_id = (req.model != "default").then(|| req.model.clone());
++    let (tx, mut rx) = create_response_channel(Some(1));
++    let request = Request::Normal(Box::new(NormalRequest {
++        id: state.next_request_id(),
++        queued_at: None,
++        messages: RequestMessage::CompletionTokens(req.prompt_token_ids.clone()),
++        sampling_params: SamplingParams {
++            // One step: a raw-logits request finishes after the prompt forward (0 is rejected).
++            max_len: Some(1),
++            ..SamplingParams::deterministic()
++        },
++        seed: None,
++        response: tx,
++        return_logprobs: false,
++        is_streaming: false,
++        suffix: None,
++        constraint: Constraint::None,
++        tool_choice: None,
++        tools: None,
++        logits_processors: None,
++        // Raw-logits requests get every prompt row, run alone in their prompt batch and skip the prefix cache.
++        return_raw_logits: true,
++        web_search_options: None,
++        enable_code_execution: false,
++        enable_shell: false,
++        shell_options: None,
++        code_execution_permission: None,
++        code_execution_approval_notifier: None,
++        agent_permission: None,
++        agent_approval_handler: None,
++        agent_approval_notifier: None,
++        max_tool_rounds: None,
++        tool_dispatch_url: None,
++        model_id: model_id.clone(),
++        adapter: None,
++        truncate_sequence: false,
++        session_id: None,
++        files: None,
++        input_files: Vec::new(),
++    }));
++    if let Err(e) = send_request_with_model(&state, request, model_id.as_deref()).await {
++        return PromptLogprobsResponder::InternalError(e.into());
++    }
++    let scores = loop {
++        match rx.recv().await {
++            Some(Response::Raw {
++                logits_chunks,
++                tokens,
++            }) => {
++                if tokens != req.prompt_token_ids {
++                    return PromptLogprobsResponder::InternalError(anyhow::anyhow!(
++                        "engine scored {} tokens, expected the {} requested",
++                        tokens.len(),
++                        req.prompt_token_ids.len()
++                    ));
++                }
++                match prompt_scores_from_logits(&logits_chunks, &req.prompt_token_ids) {
++                    Ok(s) => break s,
++                    Err(e) => return PromptLogprobsResponder::InternalError(e.into()),
++                }
++            }
++            Some(Response::ValidationError(e)) => {
++                return PromptLogprobsResponder::ValidationError(anyhow::anyhow!("{e}"))
++            }
++            Some(other) => match other.as_result() {
++                Err(e) => {
++                    tracing::warn!("prompt_logprobs failed: {e}");
++                    return PromptLogprobsResponder::InternalError(anyhow::anyhow!("{e}"));
++                }
++                Ok(_) => continue,
++            },
++            None => {
++                return PromptLogprobsResponder::InternalError(anyhow::anyhow!(
++                    "engine closed the response channel"
++                ))
++            }
++        }
++    };
++    PromptLogprobsResponder::Json(PromptLogprobsResponse {
++        model: req.model,
++        prompt_logprobs: vllm_prompt_logprobs(&scores),
++        scores: serde_json::to_value(&scores).unwrap_or(Value::Null),
++    })
++}
+diff --git a/mistralrs-server-core/src/route_registry.rs b/mistralrs-server-core/src/route_registry.rs
+index a5b89cb..aa1c095 100644
+--- a/mistralrs-server-core/src/route_registry.rs
++++ b/mistralrs-server-core/src/route_registry.rs
+@@ -33,6 +33,8 @@ pub const ANTHROPIC_COUNT_TOKENS_ROUTE: RouteInfo =
+ pub const COMPLETIONS_ROUTE: RouteInfo =
+     RouteInfo::new("/v1/completions", "POST", RouteKind::OpenAi);
+ pub const EMBEDDINGS_ROUTE: RouteInfo = RouteInfo::new("/v1/embeddings", "POST", RouteKind::OpenAi);
++pub const PROMPT_LOGPROBS_ROUTE: RouteInfo =
++    RouteInfo::new("/v1/prompt_logprobs", "POST", RouteKind::MistralRs);
+ pub const MODELS_ROUTE: RouteInfo = RouteInfo::new("/v1/models", "GET", RouteKind::OpenAi);
+ pub const LOAD_LORA_ADAPTER_ROUTE: RouteInfo =
+     RouteInfo::new("/v1/load_lora_adapter", "POST", RouteKind::MistralRs);
+@@ -134,6 +136,7 @@ pub const MISTRALRS_API_ROUTES: &[RouteInfo] = &[
+     ANTHROPIC_COUNT_TOKENS_ROUTE,
+     COMPLETIONS_ROUTE,
+     EMBEDDINGS_ROUTE,
++    PROMPT_LOGPROBS_ROUTE,
+     IMAGE_GENERATION_ROUTE,
+     SPEECH_GENERATION_ROUTE,
+     FILES_ROUTE,
+diff --git a/mistralrs/Cargo.toml b/mistralrs/Cargo.toml
+index ca7e41e..30851af 100644
+--- a/mistralrs/Cargo.toml
++++ b/mistralrs/Cargo.toml
+@@ -37,6 +37,10 @@ tracing-subscriber.workspace = true
+ 
+ # ========== Getting Started ==========
+ 
++[[example]]
++name = "prompt_scoring"
++path = "examples/advanced/prompt_scoring/main.rs"
++
+ [[example]]
+ name = "text_generation"
+ path = "examples/getting_started/text_generation/main.rs"
+diff --git a/mistralrs/examples/advanced/prompt_scoring/main.rs b/mistralrs/examples/advanced/prompt_scoring/main.rs
+new file mode 100644
+index 0000000..e8bc550
+--- /dev/null
++++ b/mistralrs/examples/advanced/prompt_scoring/main.rs
+@@ -0,0 +1,46 @@
++//! Teacher-forced prompt scoring through the library API (`Model::score_prompt`).
++//!
++//! Scores every token-id list in a JSON file (`[[id, ...], ...]`) and writes per-token
++//! log-probabilities and top-1 ids as `[{"lp": [...], "top1": [...]}, ...]`.
++//!
++//! Run with: `cargo run --release --example prompt_scoring -p mistralrs -- --model-id <dir> --ids ids.json --out out.json`
++
++use std::time::Instant;
++
++use anyhow::Result;
++use clap::Parser;
++use mistralrs::ModelBuilder;
++
++#[derive(Parser)]
++struct Args {
++    /// Model to load (Hugging Face id or local directory).
++    #[arg(short, long)]
++    model_id: String,
++    /// JSON file with a list of token-id lists to score.
++    #[arg(long)]
++    ids: String,
++    /// Where to write the scores.
++    #[arg(long)]
++    out: String,
++}
++
++#[tokio::main]
++async fn main() -> Result<()> {
++    let args = Args::parse();
++    let model = ModelBuilder::new(&args.model_id).with_logging().build().await?;
++    let texts: Vec<Vec<u32>> = serde_json::from_str(&std::fs::read_to_string(&args.ids)?)?;
++    let mut out = Vec::new();
++    for (i, ids) in texts.into_iter().enumerate() {
++        let start = Instant::now();
++        let scores = model.score_prompt(ids).await?;
++        println!(
++            "text {i}: {} tokens scored in {:.0} ms, mean logprob {:.4}",
++            scores.token_ids.len(),
++            start.elapsed().as_secs_f64() * 1e3,
++            scores.logprobs.iter().sum::<f32>() / scores.logprobs.len() as f32
++        );
++        out.push(serde_json::json!({"lp": scores.logprobs, "top1": scores.top1_ids}));
++    }
++    std::fs::write(&args.out, serde_json::to_string(&out)?)?;
++    Ok(())
++}
+diff --git a/mistralrs/src/lib.rs b/mistralrs/src/lib.rs
+index 5358125..87ef5e3 100644
+--- a/mistralrs/src/lib.rs
++++ b/mistralrs/src/lib.rs
+@@ -260,6 +260,7 @@ pub use mistralrs_core::{
+     WIRE_EMBED_LIMIT_BYTES,
+ };
+ pub use mistralrs_core::{CalibrationAction, CalibrationStatus};
++pub use mistralrs_core::{prompt_scores_from_logits, PromptScores};
+ pub use mistralrs_core::{
+     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
+ };
+diff --git a/mistralrs/src/model.rs b/mistralrs/src/model.rs
+index 2d2f01e..e8273e3 100644
+--- a/mistralrs/src/model.rs
++++ b/mistralrs/src/model.rs
+@@ -501,6 +501,103 @@ impl Model {
+         }
+     }
+ 
++    // ========================================================================
++    // Prompt scoring
++    // ========================================================================
++
++    /// Teacher-forced prompt scoring: how likely the model finds each token of `token_ids` given
++    /// the tokens before it, plus each token's rank and the model's top choice, from one prefill
++    /// with no generation. Pass exact token ids (include BOS if the model expects one).
++    ///
++    /// The request runs as a raw-logits request, so it gets its own prompt batch and bypasses the
++    /// prefix cache even while other requests are being served.
++    pub async fn score_prompt(&self, token_ids: Vec<u32>) -> crate::error::Result<PromptScores> {
++        self.score_prompt_with_model(token_ids, None).await
++    }
++
++    /// [`score_prompt`](Self::score_prompt) against a specific model. If `model_id` is `None`, the
++    /// request is sent to the default model.
++    pub async fn score_prompt_with_model(
++        &self,
++        token_ids: Vec<u32>,
++        model_id: Option<&str>,
++    ) -> crate::error::Result<PromptScores> {
++        if token_ids.len() < 2 {
++            return Err(SdkError::RequestValidation(
++                "score_prompt needs at least 2 tokens".to_string(),
++            ));
++        }
++        let (tx, mut rx) = channel(1);
++        let request = Request::Normal(Box::new(NormalRequest {
++            messages: RequestMessage::CompletionTokens(token_ids.clone()),
++            sampling_params: SamplingParams {
++                // One step: a raw-logits request finishes after the prompt forward (0 is rejected).
++                max_len: Some(1),
++                ..SamplingParams::deterministic()
++            },
++            seed: None,
++            response: tx,
++            return_logprobs: false,
++            is_streaming: false,
++            id: 0,
++            queued_at: None,
++            constraint: Constraint::None,
++            suffix: None,
++            tools: None,
++            tool_choice: None,
++            logits_processors: None,
++            return_raw_logits: true,
++            web_search_options: None,
++            enable_code_execution: false,
++            enable_shell: false,
++            shell_options: None,
++            code_execution_permission: None,
++            code_execution_approval_notifier: None,
++            agent_permission: None,
++            agent_approval_handler: None,
++            agent_approval_notifier: None,
++            max_tool_rounds: None,
++            tool_dispatch_url: None,
++            model_id: model_id.map(|s| s.to_string()),
++            adapter: None,
++            truncate_sequence: false,
++            session_id: None,
++            files: None,
++            input_files: Vec::new(),
++        }));
++        self.runner.get_sender(model_id)?.send(request).await?;
++        loop {
++            let resp = rx
++                .recv()
++                .await
++                .ok_or(SdkError::Channel("channel closed unexpectedly".into()))?
++                .as_result()?;
++            match resp {
++                ResponseOk::Raw {
++                    logits_chunks,
++                    tokens,
++                } => {
++                    if tokens != token_ids {
++                        return Err(SdkError::Inference(
++                            format!(
++                                "engine scored {} tokens, expected the {} requested",
++                                tokens.len(),
++                                token_ids.len()
++                            )
++                            .into(),
++                        ));
++                    }
++                    return prompt_scores_from_logits(&logits_chunks, &token_ids)
++                        .map_err(|e| SdkError::Inference(Box::new(e)));
++                }
++                ResponseOk::AgenticToolCallProgress { .. }
++                | ResponseOk::BlockDenoisingProgress(_)
++                | ResponseOk::File(_) => continue,
++                _ => return Err(SdkError::UnexpectedResponse { expected: "Raw" }),
++            }
++        }
++    }
++
+     // ========================================================================
+     // Convenience Methods
+     // ========================================================================
