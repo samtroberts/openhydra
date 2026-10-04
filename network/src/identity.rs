@@ -25,6 +25,13 @@ struct IdentityFile {
 }
 
 /// Loaded identity with both libp2p and OpenHydra peer IDs.
+/// The OpenHydra peer id of an Ed25519 public key: the first 8 bytes of its SHA-256, as 16 hex
+/// characters. Always derived from the key, never taken on trust: reputation, receipts, vouchers
+/// and attestations are keyed by it, so a peer must not be able to claim another's.
+pub fn openhydra_peer_id(public_key: &[u8]) -> String {
+    hex::encode(&Sha256::digest(public_key)[..8])
+}
+
 pub struct Identity {
     pub keypair: identity::Keypair,
     pub libp2p_peer_id: libp2p::PeerId,
@@ -77,10 +84,27 @@ impl Identity {
         file.private_key.zeroize();
         data.zeroize();
 
+        // The id is derived from the key; the file's copy is only a convenience for people reading
+        // it. One that disagrees (edited, or from a different derivation) is ignored, since every
+        // other node derives the id from the key and would reject records carrying the file's.
+        let public = keypair
+            .public()
+            .try_into_ed25519()
+            .map_err(|_| "identity key is not ed25519")?
+            .to_bytes();
+        let openhydra_peer_id = openhydra_peer_id(&public);
+        if file.peer_id != openhydra_peer_id {
+            tracing::warn!(
+                path = %path.display(),
+                file = %file.peer_id,
+                derived = %openhydra_peer_id,
+                "identity file's peer_id doesn't match its key; using the one derived from the key"
+            );
+        }
         Ok(Identity {
             keypair,
             libp2p_peer_id,
-            openhydra_peer_id: file.peer_id,
+            openhydra_peer_id,
         })
     }
 
@@ -97,13 +121,7 @@ impl Identity {
         let secret_bytes = secret_obj.as_ref();
         let public_bytes = ed25519_kp.public().to_bytes();
 
-        // OpenHydra peer_id = SHA256(public_key_bytes)[:16] as hex.
-        let openhydra_peer_id = {
-            let mut hasher = Sha256::new();
-            hasher.update(&public_bytes);
-            let hash = hasher.finalize();
-            hex::encode(&hash[..8]) // 8 bytes = 16 hex chars
-        };
+        let openhydra_peer_id = openhydra_peer_id(&public_bytes);
 
         // Write JSON file.
         if let Some(parent) = path.parent() {
@@ -190,5 +208,17 @@ mod tests {
         assert_eq!(id.openhydra_peer_id, "919cafdbe635606c");
         // libp2p PeerId is different (multihash) but deterministic.
         assert!(!id.libp2p_peer_id.to_string().is_empty());
+    }
+
+    #[test]
+    fn an_edited_peer_id_in_the_file_is_ignored() {
+        let tmp = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "public_key": "fec7e292a1d53e7b07c633c3ac827ca1232dc1e2d381476970adf4531c67e92d",
+            "private_key": "4553afd57d4c9d372fbdf2ee081a21eb14e0ce77e1b360061660b7c84d8d3e92",
+            "peer_id": "0123456789abcdef"
+        }"#;
+        std::fs::write(tmp.path(), json).unwrap();
+        assert_eq!(Identity::load(tmp.path()).unwrap().openhydra_peer_id, "919cafdbe635606c");
     }
 }

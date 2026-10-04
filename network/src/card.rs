@@ -391,6 +391,8 @@ pub fn sign_card(
         .map_err(|e| CardError::Crypto(format!("not ed25519: {e}")))?;
     card.public_key = hex::encode(ed.to_bytes());
     card.libp2p_peer_id = libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+    // Both peer ids are the key's own (verify_card rejects any other).
+    card.openhydra_peer_id = crate::identity::openhydra_peer_id(&ed.to_bytes());
     card.sig_alg = SigAlg::Ed25519.to_u8();
     // A card carrying a swarm binding is a schema-2 (private) card; a plain card stays schema 1 so
     // older clients keep reading it. Set this BEFORE the preimage is built (the schema is signed, and
@@ -445,6 +447,11 @@ pub fn verify_card(card: &Card, now_ms: u64) -> Result<VerifiedCard, CardError> 
             claimed: card.libp2p_peer_id.clone(),
             derived,
         });
+    }
+    // …and the OpenHydra peer id (see dht::verify_peer_record).
+    let openhydra_id = crate::identity::openhydra_peer_id(&pk_bytes);
+    if card.openhydra_peer_id != openhydra_id {
+        return Err(CardError::PeerIdMismatch { claimed: card.openhydra_peer_id.clone(), derived: openhydra_id });
     }
     let sig = b64_decode(&card.signature)?;
     if !ed_pk.verify(&card_canonical_bytes(card), &sig) {
@@ -561,6 +568,15 @@ mod tests {
 
     fn now_before_expiry() -> u64 {
         1_750_000_000_000
+    }
+
+    #[test]
+    fn a_card_claiming_another_peers_openhydra_id_is_rejected() {
+        let attacker = libp2p::identity::Keypair::generate_ed25519();
+        let mut forged = sign_card(a_card(), &attacker).unwrap();
+        forged.openhydra_peer_id = "0123456789abcdef".into();
+        forged.signature = b64_encode(&attacker.sign(&card_canonical_bytes(&forged)).unwrap());
+        assert!(matches!(verify_card(&forged, now_before_expiry()), Err(CardError::PeerIdMismatch { .. })));
     }
 
     #[test]

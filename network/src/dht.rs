@@ -108,6 +108,8 @@ pub fn sign_peer_record(
     signed.public_key = hex::encode(ed25519_pk.to_bytes());
     signed.libp2p_peer_id =
         libp2p::PeerId::from_public_key(&keypair.public()).to_string();
+    // Both peer ids are the key's own (verify_peer_record rejects any other).
+    signed.peer_id = crate::identity::openhydra_peer_id(&ed25519_pk.to_bytes());
     // Crypto-agility (PQC0.1): this path signs with Ed25519; record it so the
     // verifier dispatches correctly and the algorithm is bound into the preimage.
     signed.sig_alg = SigAlg::Ed25519.to_u8();
@@ -177,6 +179,13 @@ pub fn verify_peer_record(record: &PeerRecord) -> Result<(), String> {
             "peer_id mismatch: record={} derived={derived}",
             record.libp2p_peer_id
         ));
+    }
+    // The OpenHydra peer id too: everything a consumer remembers about a provider (reputation,
+    // vouchers, authenticity, attestation) is keyed by it, so it must be the key's own — otherwise
+    // a peer could advertise another's id under its own key and inherit (or spoil) its record.
+    let openhydra_id = crate::identity::openhydra_peer_id(&pk_bytes);
+    if record.peer_id != openhydra_id {
+        return Err(format!("openhydra peer_id mismatch: record={} derived={openhydra_id}", record.peer_id));
     }
     let sig = base64_urlsafe_decode(&record.signature)?;
     if ed_pk.verify(&canonical_bytes(record), &sig) {
@@ -267,6 +276,26 @@ mod tests {
         };
         let signed = sign_peer_record(&record, &kp).unwrap();
         // A genuine signed record verifies.
+        verify_peer_record(&signed).unwrap();
+    }
+
+    #[test]
+    fn test_verify_rejects_another_peers_openhydra_id() {
+        // An attacker signs, with its own key, a record claiming a victim's OpenHydra id: the
+        // signature is genuine, but the id isn't the key's.
+        let victim = libp2p::identity::Keypair::generate_ed25519();
+        let victim_id = crate::identity::openhydra_peer_id(&victim.public().try_into_ed25519().unwrap().to_bytes());
+        let attacker = libp2p::identity::Keypair::generate_ed25519();
+        let record = PeerRecord { model_id: "m".into(), host: "1.2.3.4".into(), port: 1, ..Default::default() };
+        let mut forged = sign_peer_record(&record, &attacker).unwrap();
+        assert_ne!(forged.peer_id, victim_id);
+        forged.peer_id = victim_id;
+        forged.signature = base64_urlsafe_encode(&attacker.sign(&canonical_bytes(&forged)).unwrap());
+        let err = verify_peer_record(&forged).unwrap_err();
+        assert!(err.contains("openhydra peer_id mismatch"), "{err}");
+        // Signing stamps the key's own id, whatever the record said.
+        let signed = sign_peer_record(&PeerRecord { peer_id: "anything".into(), ..record }, &victim).unwrap();
+        assert_eq!(signed.peer_id, crate::identity::openhydra_peer_id(&victim.public().try_into_ed25519().unwrap().to_bytes()));
         verify_peer_record(&signed).unwrap();
     }
 
