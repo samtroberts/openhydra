@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build openhydra-scorer: llama.cpp's llama-server at the commit in LLAMACPP_COMMIT, with OpenHydra's
-# prompt-scoring patch (POST /v1/prompt_logprobs, a startup memory check, --exit-on-stdin-eof), as
-# one self-contained binary the agent runs as its side-scorer (agent/src/side_scorer.rs).
+# prompt-scoring patch (POST /v1/prompt_logprobs, a startup memory check, --exit-on-stdin-eof) and its
+# loader for the Qwen3.5 GGUFs Ollama publishes (llamacpp-ollama-compat.patch), as one self-contained binary the agent runs as its side-scorer (agent/src/side_scorer.rs).
 #
 #   scorer/build.sh <out-path>
 #
@@ -14,6 +14,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:?usage: scorer/build.sh <out-path>}"
 COMMIT="$(tr -d ' \r\n' < "$HERE/LLAMACPP_COMMIT")"
 PATCH="$HERE/llamacpp-prompt-scoring.patch"
+# Loads the Qwen3.5 GGUFs Ollama publishes (its own layout; see the patch), applied after PATCH.
+COMPAT_PATCH="$HERE/llamacpp-ollama-compat.patch"
 WORK="${SCORER_WORK:-$HERE/.build}"
 SRC="$WORK/llama.cpp"
 mkdir -p "$WORK"
@@ -27,7 +29,7 @@ if [[ -n "${LLAMACPP_SRC:-}" ]]; then
     [[ -e "$entry" ]] || continue
     case "$(basename "$entry")" in build*) ;; *) cp -R "$entry" "$SRC/" ;; esac
   done
-  (cd "$SRC" && patch -p1 --forward --silent < "$PATCH")
+  (cd "$SRC" && patch -p1 --forward --silent < "$PATCH" && patch -p1 --forward --silent < "$COMPAT_PATCH")
 else
   if [[ ! -d "$SRC/.git" ]]; then
     git init -q "$SRC"
@@ -37,6 +39,7 @@ else
   git -C "$SRC" checkout -q --force FETCH_HEAD
   git -C "$SRC" clean -qfdx -e 'build-scorer'
   git -C "$SRC" apply "$PATCH"
+  git -C "$SRC" apply "$COMPAT_PATCH"
 fi
 
 FLAGS=(

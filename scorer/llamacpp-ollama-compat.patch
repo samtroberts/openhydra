@@ -1,0 +1,85 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 43c396f..bcbe9b0
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -714,6 +714,80 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+     }
+ 
++    // OpenHydra: Qwen3.5 GGUFs exported by Ollama (its published qwen35 / qwen35moe blobs) store a
++    // few things differently from llama.cpp's own conversion. Applied here are the four text-model
++    // fixes of Ollama's own compatibility layer (ollama/ollama, llama/compat/llama-ollama-compat.cpp,
++    // MIT): the per-layer KV-head array becomes its maximum, the M-RoPE sections are padded to 4,
++    // `ssm_dt` is renamed `ssm_dt.bias`, and the bundled vision and MTP tensors are left out. The
++    // weights themselves are unchanged (Ollama's V-head order is the tiled one llama.cpp's converter
++    // writes too).
++    if (metadata != nullptr && (arch_name == "qwen35" || arch_name == "qwen35moe")) {
++        const std::string pre = arch_name;
++        auto has_key = [&](const char * suffix) { return gguf_find_key(metadata, (pre + suffix).c_str()) >= 0; };
++        auto has_prefix = [&](const char * p) {
++            for (const auto & it : weights_map) {
++                if (it.first.rfind(p, 0) == 0) {
++                    return true;
++                }
++            }
++            return false;
++        };
++        const bool ollama = has_key(".vision.block_count") || has_key(".image_token_id") ||
++            has_key(".ssm.v_head_reordered") || has_key(".rope.mrope_interleaved") ||
++            has_prefix("v.") || has_prefix("mtp.");
++        if (ollama) {
++            LLAMA_LOG_INFO("%s: Ollama-format %s GGUF: applying its compatibility fixes\n", __func__, arch_name.c_str());
++            // 1. attention.head_count_kv: a per-layer array (0 for the recurrent layers) -> its maximum
++            {
++                const std::string key = pre + ".attention.head_count_kv";
++                const int64_t kid = gguf_find_key(metadata, key.c_str());
++                if (kid >= 0 && gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY &&
++                        (gguf_get_arr_type(metadata, kid) == GGUF_TYPE_UINT32 || gguf_get_arr_type(metadata, kid) == GGUF_TYPE_INT32)) {
++                    const auto * a = static_cast<const uint32_t *>(gguf_get_arr_data(metadata, kid));
++                    uint32_t mx = 0;
++                    for (size_t i = 0; i < gguf_get_arr_n(metadata, kid); i++) {
++                        mx = std::max(mx, a[i]);
++                    }
++                    if (mx > 0) {
++                        gguf_remove_key(metadata, key.c_str());
++                        gguf_set_val_u32(metadata, key.c_str(), mx);
++                    }
++                }
++            }
++            // 2. rope.dimension_sections: 3 entries -> 4 (the trailing section is 0)
++            {
++                const std::string key = pre + ".rope.dimension_sections";
++                const int64_t kid = gguf_find_key(metadata, key.c_str());
++                if (kid >= 0 && gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY &&
++                        gguf_get_arr_type(metadata, kid) == GGUF_TYPE_INT32 && gguf_get_arr_n(metadata, kid) == 3) {
++                    const auto * s = static_cast<const int32_t *>(gguf_get_arr_data(metadata, kid));
++                    const int32_t padded[4] = { s[0], s[1], s[2], 0 };
++                    gguf_set_arr_data(metadata, key.c_str(), GGUF_TYPE_INT32, padded, 4);
++                }
++            }
++            // 3. `blk.N.ssm_dt` -> `blk.N.ssm_dt.bias`; 4. vision (v., mm.) and MTP (mtp.) tensors left out
++            std::vector<std::string> names;
++            for (const auto & it : weights_map) {
++                names.push_back(it.first);
++            }
++            for (const auto & name : names) {
++                auto node = weights_map.extract(name);
++                const llama_tensor_weight & w = node.mapped();
++                if (name.rfind("v.", 0) == 0 || name.rfind("mm.", 0) == 0 || name.rfind("mtp.", 0) == 0) {
++                    n_elements -= ggml_nelements(w.tensor);
++                    n_bytes    -= ggml_nbytes(w.tensor);
++                    continue;
++                }
++                static const std::string dt = ".ssm_dt";
++                if (name.size() > dt.size() && name.compare(name.size() - dt.size(), dt.size(), dt) == 0) {
++                    node.key() = name + ".bias";
++                    ggml_set_name(w.tensor, node.key().c_str());
++                }
++                weights_map.insert(std::move(node));
++            }
++        }
++    }
++
+     n_kv      = gguf_get_n_kv(metadata);
+     n_tensors = weights_map.size();
+ 

@@ -38,6 +38,8 @@ LLAMACPP = [
     ("subprocess.h (sheredom)", "Unlicense", "vendor/sheredom/subprocess.h", ("/*", "*/")),
     ("stb_image", "MIT or public domain", "vendor/stb/stb_image.h", ("This software is available under 2 licenses", "*/")),
     ("miniaudio", "MIT-0 or public domain", "vendor/miniaudio/miniaudio.h", ("This software is available as a choice", "*/")),
+    # llamacpp-ollama-compat.patch applies the Qwen3.5 fixes of Ollama's compatibility layer.
+    ("Ollama (Qwen3.5 GGUF compatibility, in llamacpp-ollama-compat.patch)", "MIT", "@scorer/licenses/LICENSE-ollama", "file"),
 ]
 # Vendored directories the list above covers.
 LLAMACPP_VENDOR = {"cpp-httplib", "hash", "miniaudio", "nlohmann", "sheredom", "stb"}
@@ -89,7 +91,8 @@ def llamacpp(src, out):
         die(f"unknown vendored code in llama.cpp: {sorted(vendored - LLAMACPP_VENDOR)} (add its licence to LLAMACPP)")
     parts = []
     for name, licence, rel, how in LLAMACPP:
-        path = os.path.join(src, rel)
+        # "@scorer/…" entries are licences kept in this repo (code our patches derive from).
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel[len("@scorer/"):]) if rel.startswith("@scorer/") else os.path.join(src, rel)
         if not os.path.isfile(path):
             die(f"{rel} is missing (llama.cpp changed: review LLAMACPP)")
         text = read(path)
