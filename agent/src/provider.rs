@@ -303,6 +303,15 @@ const RECEIPT_RATE_BURST: f64 = 100.0;
 /// DoS; memory is O(currently-throttled peers), bounded by this.
 const RECEIPT_RATE_MAX_TRACKED: usize = 4096;
 
+/// The weighted units a crypto-rail receipt must pay at least (the F2 floor): what we served by our
+/// own count (`committed`, the serve commitment under the receipt's nonce), at the blended rate
+/// the consumer's own step uses. Never the receipt's `tokens` or `completion_tokens`, which the
+/// consumer fills in. Without an open commitment, the receipt's count (the commitment check
+/// rejects that receipt anyway).
+fn settlement_floor_units(committed: Option<u64>, receipt_tokens: u64) -> u64 {
+    openhydra_protocol::weight::receipt_weighted_units(committed.unwrap_or(receipt_tokens), None)
+}
+
 /// Pure B-S1/B-S7 validation, extracted so it is unit-testable without a live `Provider`.
 /// Prunes expired commitments, checks the receipt fields against the serve recorded under
 /// `nonce`, and consumes the commitment (single-use) on success. `Err(reason)` rejects the
@@ -1267,6 +1276,12 @@ impl<A: EngineAdapter> Provider<A> {
     /// above the token floor, so a consumer can't under-sign or replay a lower amount and have us
     /// accept it. Read-only (the accepted value is recorded only after a successful co-sign). A
     /// `None` cumulative (legacy / crypto-rail-off receipt) always passes.
+    /// The completion tokens we recorded serving under this receipt's nonce (our own count), if
+    /// the commitment is still open. Read without consuming it.
+    fn committed_tokens(&self, nonce: &[u8; 16]) -> Option<u64> {
+        self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).get(nonce).map(|c| c.tokens)
+    }
+
     fn validate_settlement_cumulative(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
@@ -1286,7 +1301,11 @@ impl<A: EngineAdapter> Provider<A> {
             .ok()
             .and_then(|m| m.get(&key).copied())
             .unwrap_or(0);
-        let units = openhydra_protocol::weight::receipt_weighted_units(p.tokens, p.completion_tokens);
+        // The floor is what we served, by our own count: the receipt's `tokens` and its
+        // completion/prompt split are the consumer's to fill in, so a floor built from them could
+        // be talked down to zero. Weighted like the consumer's own step (blended rate, no split).
+        // No open commitment → no floor here; the commitment check then rejects the receipt.
+        let units = settlement_floor_units(self.committed_tokens(&p.nonce), p.tokens);
         openhydra_protocol::payout::check_cumulative(last, p.cumulative_amount, units, self.settlement_peg)
             .map_err(|e| match e {
                 openhydra_protocol::payout::CumulativeError::NonMonotonic => {
@@ -2046,6 +2065,21 @@ impl<A: EngineAdapter> Provider<A> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_settlement_floor_is_what_we_served_not_what_the_consumer_declares() {
+        use openhydra_protocol::weight::receipt_weighted_units;
+        // A consumer declaring 0 tokens (or any split) still owes the floor for the 100 served.
+        assert_eq!(settlement_floor_units(Some(100), 0), receipt_weighted_units(100, None));
+        assert_eq!(settlement_floor_units(Some(100), 100), receipt_weighted_units(100, None));
+        assert!(settlement_floor_units(Some(100), 0) > 0);
+        let peg = 1_000;
+        assert_eq!(
+            openhydra_protocol::payout::check_cumulative(500, Some(500), settlement_floor_units(Some(100), 0), Some(peg)),
+            Err(openhydra_protocol::payout::CumulativeError::BelowFloor),
+            "a zero step for a real serve is refused"
+        );
+    }
+
     use super::*;
     use crate::adapter::{InferenceRequest, ServeOutcome};
     use crate::serve::{parse_response, ServeChunk, ServeRequest};

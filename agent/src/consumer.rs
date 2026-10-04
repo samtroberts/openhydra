@@ -98,6 +98,24 @@ const ATTEMPT_TIMEOUT_BASE_SECS: u64 = 45; // discovery jitter + a cold model lo
 const ATTEMPT_TIMEOUT_MS_PER_TOKEN: u64 = 40; // generation + prefill headroom on a slow remote model
 const ATTEMPT_TIMEOUT_MIN_SECS: u64 = 45;
 const ATTEMPT_TIMEOUT_MAX_SECS: u64 = 240; // bound so a dead provider still frees its slot for failover
+/// Tokens with no text of their own (end-of-turn, special markers) allowed on top of the
+/// delivered bytes in [`signable_tokens`].
+const SIGNABLE_TOKEN_SLACK: u64 = 16;
+
+/// The completion-token count a consumer co-signs a receipt for: the provider's own count, but
+/// never more than the request allowed (`max_tokens`) nor more than could have produced the text
+/// it delivered — every generated token decodes to at least one byte (reasoning is delivered too,
+/// as a `<think>` block, and tool calls count by their name + arguments), plus a small allowance
+/// for tokens that decode to nothing. The receipt's cumulative payment is computed from this, so
+/// a provider can't bill for tokens it never sent. An honest provider's count is always within it;
+/// one that over-reports gets no co-signed receipt for the difference (the provider refuses a
+/// receipt below its own count).
+pub(crate) fn signable_tokens(reported: u64, max_tokens: Option<u32>, delivered_bytes: u64) -> u64 {
+    let bound = delivered_bytes.saturating_add(SIGNABLE_TOKEN_SLACK);
+    let by_request = max_tokens.map_or(u64::MAX, u64::from);
+    reported.min(bound).min(by_request)
+}
+
 /// Assumed output length when a request omits `max_tokens`, for budgeting only.
 const ATTEMPT_TIMEOUT_DEFAULT_TOKENS: u64 = 1024;
 
@@ -1470,6 +1488,9 @@ impl ConsumerNode {
         // hang the request (bounded proxy_forward) and we fail over to the next — but only
         // while nothing has been streamed yet, since partial output can't be un-sent.
         let mut delivered = false;
+        // Bytes of text the provider actually delivered (every attempt): bounds the token count
+        // we sign for (see `signable_tokens`).
+        let delivered_bytes = std::cell::Cell::new(0u64);
         let mut last_err: Option<AdapterError> = None;
         for (i, provider) in candidates.into_iter().enumerate() {
             let _attempt_span = tracing::info_span!(
@@ -1517,6 +1538,7 @@ impl ConsumerNode {
             let result = {
                 let mut guarded = |d: &str| {
                     delivered = true;
+                    delivered_bytes.set(delivered_bytes.get() + d.len() as u64);
                     on_delta(d);
                 };
                 // Buffered (0x10) round-trip with 0x11 reconnect-fetch drop recovery — the proven
@@ -1602,7 +1624,18 @@ impl ConsumerNode {
                     // delivered; a failed/slow settlement must not fail the completion).
                     if summary.ok && summary.tokens > 0 {
                         if !self_serve {
-                            self.settle_receipt(&provider, summary.tokens, nonce);
+                            // Sign for what we can vouch for, not whatever the provider reports.
+                            let calls: u64 = summary
+                                .tool_calls
+                                .iter()
+                                .map(|c| (c.function.name.len() + c.function.arguments.len()) as u64)
+                                .sum();
+                            let tokens = signable_tokens(summary.tokens, max_tokens, delivered_bytes.get() + calls);
+                            if tokens < summary.tokens {
+                                tracing::warn!(provider = %provider.peer_id, reported = summary.tokens, signable = tokens,
+                                    "provider reported more tokens than it could have served; signing for fewer");
+                            }
+                            self.settle_receipt(&provider, tokens, nonce);
                         }
                         // #7/#5: per-model consumed tracking (pure usage — kept for self too) + a
                         // `used` give/take ledger row (only for a real counterparty, not self).
@@ -2353,6 +2386,21 @@ pub fn default_challenge() -> (Vec<ChatMessage>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_consumer_signs_for_no_more_tokens_than_it_was_served() {
+        // An honest count is signed as reported.
+        assert_eq!(signable_tokens(40, Some(64), 150), 40);
+        assert_eq!(signable_tokens(40, None, 150), 40);
+        // A provider claiming a billion tokens for a short reply is held to what it delivered…
+        assert_eq!(signable_tokens(1_000_000_000, None, 30), 30 + SIGNABLE_TOKEN_SLACK);
+        // …and never past the request's own limit.
+        assert_eq!(signable_tokens(1_000_000_000, Some(8), 10_000), 8);
+        // A few textless tokens (end of turn) are allowed for.
+        assert_eq!(signable_tokens(12, None, 10), 12);
+        assert_eq!(signable_tokens(u64::MAX, None, u64::MAX), u64::MAX);
+    }
+
     use crate::adapter::{DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
     use crate::provider::handle_serve_inbound;
 
