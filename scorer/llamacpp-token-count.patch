@@ -5,7 +5,7 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 
 --- a/tools/server/main.cpp
 +++ b/tools/server/main.cpp
-@@ -1,5 +1,129 @@
+@@ -1,5 +1,142 @@
 +#include "common.h"
 +#include "gguf.h"
 +#include "llama.h"
@@ -49,10 +49,13 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +    for (const char * key : { "split.no", "split.count", "split.tensors.count" }) {
 +        gguf_remove_key(dst, key);
 +    }
-+    const bool ok = gguf_write_to_file(dst, out, /*only_meta =*/ true);
++    // Written beside `out` and moved there only once it loads: a failed export leaves nothing behind.
++    const std::string tmp = std::string(out) + ".tmp";
++    const bool ok = gguf_write_to_file(dst, tmp.c_str(), /*only_meta =*/ true);
 +    gguf_free(dst);
 +    gguf_free(src);
 +    if (!ok) {
++        std::remove(tmp.c_str());
 +        fprintf(stderr, "export-vocab: can't write %s\n", out);
 +        return 1;
 +    }
@@ -61,13 +64,23 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +    llama_backend_init();
 +    llama_model_params mparams = llama_model_default_params();
 +    mparams.vocab_only = true;
-+    llama_model * model = llama_model_load_from_file(out, mparams);
-+    if (!model) {
++    llama_model * model = llama_model_load_from_file(tmp.c_str(), mparams);
++    const bool loads = model != nullptr;
++    if (model) {
++        llama_model_free(model);
++    }
++    llama_backend_free();
++    if (!loads) {
++        std::remove(tmp.c_str());
 +        fprintf(stderr, "export-vocab: %s doesn't load as a vocabulary\n", out);
 +        return 1;
 +    }
-+    llama_model_free(model);
-+    llama_backend_free();
++    std::remove(out); // rename won't replace a file on Windows
++    if (std::rename(tmp.c_str(), out) != 0) {
++        std::remove(tmp.c_str());
++        fprintf(stderr, "export-vocab: can't write %s\n", out);
++        return 1;
++    }
 +    return 0;
 +}
 +
