@@ -98,6 +98,13 @@ const ATTEMPT_TIMEOUT_BASE_SECS: u64 = 45; // discovery jitter + a cold model lo
 const ATTEMPT_TIMEOUT_MS_PER_TOKEN: u64 = 40; // generation + prefill headroom on a slow remote model
 const ATTEMPT_TIMEOUT_MIN_SECS: u64 = 45;
 const ATTEMPT_TIMEOUT_MAX_SECS: u64 = 240; // bound so a dead provider still frees its slot for failover
+/// The crypto-rail voucher key of a provider: its `(peer, model)` reputation key plus its full
+/// public key. Payment state follows the key the on-chain claim is made with, so two providers whose
+/// 64-bit OpenHydra ids collide never share (and each claim) one running total.
+pub(crate) fn voucher_key(peer_id: &str, model_key: &str, provider_pub: &[u8]) -> String {
+    format!("{}#{}", reputation_key(peer_id, model_key), hex::encode(provider_pub))
+}
+
 /// Tokens with no text of their own (end-of-turn, special markers) allowed on top of the
 /// delivered bytes in [`signable_tokens`].
 const SIGNABLE_TOKEN_SLACK: u64 = 16;
@@ -1124,7 +1131,16 @@ impl ConsumerNode {
         let gated: std::collections::HashMap<String, u64> = self
             .gated_vouchers
             .lock()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.cumulative_net)).collect())
+            .map(|m| {
+                // Vouchers are per provider key ("<peer:model>#<pubkey>"); the view sums them per
+                // (peer, model), the key the rest of the snapshot uses.
+                let mut by_pair = std::collections::HashMap::new();
+                for (k, v) in m.iter() {
+                    let pair = k.split_once('#').map_or(k.as_str(), |(pair, _)| pair);
+                    *by_pair.entry(pair.to_string()).or_insert(0u64) += v.cumulative_net;
+                }
+                by_pair
+            })
             .unwrap_or_default();
         // Device attestation (Phase 0): the verified device-trust level + key rotations per provider.
         // Snapshotted under its own lock, released before reputation is taken.
@@ -1804,7 +1820,11 @@ impl ConsumerNode {
                     .map_err(AdapterError::Http)
             };
             let now = now_unix_ms();
-            let vkey = reputation_key(&peer_id, &model_key);
+            // The voucher is keyed by the provider's full public key — what the on-chain claim (and
+            // its already-settled amount) is keyed by — not just its 64-bit OpenHydra id: two keys
+            // sharing an id (a ~2^32 search) would otherwise share one running total, and each
+            // claim all of it on-chain.
+            let vkey = voucher_key(&peer_id, &model_key, &provider_pub);
             // Review F1: serialize settlement for this `(peer, model)` across the whole
             // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to
             // the same pair can't read the same base and emit non-monotonic / divergent co-signed
@@ -2386,6 +2406,15 @@ pub fn default_challenge() -> (Vec<ChatMessage>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vouchers_of_two_keys_with_one_peer_id_are_separate() {
+        // A colliding pair of provider keys under one 64-bit id: separate running totals.
+        let a = voucher_key("0123456789abcdef", "qwen", &[1u8; 32]);
+        let b = voucher_key("0123456789abcdef", "qwen", &[2u8; 32]);
+        assert_ne!(a, b);
+        assert!(a.starts_with(&reputation_key("0123456789abcdef", "qwen")));
+    }
 
     #[test]
     fn a_consumer_signs_for_no_more_tokens_than_it_was_served() {
