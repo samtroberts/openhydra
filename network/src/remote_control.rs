@@ -155,7 +155,7 @@ mod tests {
         member_pk_hex: &str,
     ) -> MembershipCredential {
         sign_credential(
-            MembershipCredential::new_unsigned(member_pk_hex, "oh", "Home rig", 1_000, 9_999_999_999_000)
+            MembershipCredential::new_unsigned(member_pk_hex, "", "Home rig", 1_000, 9_999_999_999_000)
                 .granting(CAP_SERVE | CAP_CONTROL),
             group,
         )

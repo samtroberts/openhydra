@@ -272,6 +272,22 @@ pub fn enroll_canonical_bytes(r: &EnrollmentRequest) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A member's OpenHydra id is the one its key derives ([`crate::identity::openhydra_peer_id`]), so
+/// the id an owner sees (and swarm views show) can't be another machine's. Empty (legacy) passes.
+fn check_member_id(declared: &str, member_public_key: &str) -> Result<(), MembershipError> {
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let pk = ed_pubkey_from_hex(member_public_key)?;
+    let derived = crate::identity::openhydra_peer_id(&pk.to_bytes());
+    if declared != derived {
+        return Err(MembershipError::Malformed(format!(
+            "member_openhydra_peer_id {declared} is not the id of member_public_key ({derived})"
+        )));
+    }
+    Ok(())
+}
+
 /// Sign an enrollment request with the **member's node identity keypair**, populating
 /// `member_public_key`, `member_openhydra_peer_id` is caller-supplied, `sig_alg`, and `signature`.
 /// The member proves possession of its identity key so the owner can trust the bound public key.
@@ -288,6 +304,7 @@ pub fn sign_enrollment_request(
     check_label(&req.label, "label")?;
     check_no_newline(&req.member_openhydra_peer_id, "member_openhydra_peer_id")?;
     check_no_newline(&req.swarm_public_key, "swarm_public_key")?;
+    check_member_id(&req.member_openhydra_peer_id, &req.member_public_key)?;
     let sig = member_keypair
         .sign(&enroll_canonical_bytes(&req))
         .map_err(|e| MembershipError::Crypto(format!("sign failed: {e}")))?;
@@ -316,6 +333,7 @@ pub fn verify_enrollment_request(
     let ed_pk = ed_pubkey_from_hex(&req.member_public_key)?;
     let sig = b64_decode(&req.signature)?;
     verify_with_alg(alg, &ed_pk, &enroll_canonical_bytes(req), &sig)?;
+    check_member_id(&req.member_openhydra_peer_id, &req.member_public_key)?;
     Ok(VerifiedRequest { request: req.clone() })
 }
 
@@ -401,6 +419,7 @@ pub fn verify_credential(
     let group_pk = ed_pubkey_from_hex(&cred.swarm_public_key)?;
     let sig = b64_decode(&cred.signature)?;
     verify_with_alg(alg, &group_pk, &cred_canonical_bytes(cred), &sig)?;
+    check_member_id(&cred.member_openhydra_peer_id, &cred.member_public_key)?;
     // Fail-closed on capability bits this build doesn't understand: even with a valid owner signature,
     // a credential granting a future/unknown capability is rejected rather than honoured partially, so
     // an old binary can't be handed a capability it can't reason about. (Schema-1 creds default to the
@@ -697,7 +716,7 @@ mod tests {
 
     fn a_request(member: &libp2p::identity::Keypair, swarm_pk: &str) -> EnrollmentRequest {
         let req = EnrollmentRequest::new_unsigned(
-            "oh_member",
+            "",
             swarm_pk,
             "Sam's MacBook",
             issued(),
@@ -711,7 +730,7 @@ mod tests {
     ) -> MembershipCredential {
         let cred = MembershipCredential::new_unsigned(
             member_pk_hex,
-            "oh_member",
+            "",
             "Home rig",
             issued(),
             expires(),
@@ -764,7 +783,7 @@ mod tests {
         let member = libp2p::identity::Keypair::generate_ed25519();
         let cred = MembershipCredential::new_unsigned(
             pubkey_hex(&member),
-            "oh_member",
+            "",
             "Home rig",
             issued(),
             expires(),
@@ -983,7 +1002,7 @@ mod tests {
         let member = libp2p::identity::Keypair::generate_ed25519();
         let mut cred = MembershipCredential::new_unsigned(
             pubkey_hex(&member),
-            "oh_member",
+            "",
             "Home rig",
             issued(),
             expires(),
@@ -1003,7 +1022,7 @@ mod tests {
         // Newline in the label → rejected on sign (keeps the preimage injective).
         let nl = MembershipCredential::new_unsigned(
             pubkey_hex(&member),
-            "oh_member",
+            "",
             "home\nmalicious=1",
             issued(),
             expires(),
@@ -1012,7 +1031,7 @@ mod tests {
         // Overlong label → rejected on sign.
         let long = MembershipCredential::new_unsigned(
             pubkey_hex(&member),
-            "oh_member",
+            "",
             "x".repeat(MAX_LABEL_LEN + 1),
             issued(),
             expires(),
@@ -1022,7 +1041,7 @@ mod tests {
         // on verify too.
         let mut c = MembershipCredential::new_unsigned(
             pubkey_hex(&member),
-            "oh_member",
+            "",
             "ok",
             issued(),
             expires(),
@@ -1117,8 +1136,34 @@ mod tests {
         );
         assert!(matches!(sign_enrollment_request(req, &member), Err(MembershipError::Malformed(_))));
         // Overlong swarm hint likewise.
-        req = EnrollmentRequest::new_unsigned("oh_m", "a".repeat(MAX_ID_LEN + 1), "ok", issued());
+        req = EnrollmentRequest::new_unsigned("", "a".repeat(MAX_ID_LEN + 1), "ok", issued());
         assert!(matches!(sign_enrollment_request(req, &member), Err(MembershipError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_member_id_must_be_the_one_its_key_derives() {
+        let group = libp2p::identity::Keypair::generate_ed25519();
+        let member = libp2p::identity::Keypair::generate_ed25519();
+        let other = libp2p::identity::Keypair::generate_ed25519();
+        let id_of = |kp: &libp2p::identity::Keypair| {
+            crate::identity::openhydra_peer_id(&kp.public().try_into_ed25519().unwrap().to_bytes())
+        };
+        // Its own id: signs and verifies, for a request and a credential alike.
+        let req = sign_enrollment_request(EnrollmentRequest::new_unsigned(id_of(&member), "", "ok", issued()), &member)
+            .unwrap();
+        assert!(verify_enrollment_request(&req).is_ok());
+        let cred = MembershipCredential::new_unsigned(pubkey_hex(&member), id_of(&member), "Home rig", issued(), expires());
+        assert!(verify_credential(&sign_credential(cred, &group).unwrap(), now_before_expiry(), &no_revocations()).is_ok());
+        // Another machine's id: refused when signing a request…
+        let spoof = EnrollmentRequest::new_unsigned(id_of(&other), "", "ok", issued());
+        assert!(matches!(sign_enrollment_request(spoof, &member), Err(MembershipError::Malformed(_))));
+        // …and when verifying a credential an owner signed with it anyway.
+        let cred = MembershipCredential::new_unsigned(pubkey_hex(&member), id_of(&other), "Home rig", issued(), expires());
+        let signed = sign_credential(cred, &group).unwrap();
+        assert!(matches!(
+            verify_credential(&signed, now_before_expiry(), &no_revocations()),
+            Err(MembershipError::Malformed(_))
+        ));
     }
 
     #[test]
