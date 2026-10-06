@@ -868,6 +868,8 @@ pub struct ConsumerNode {
     /// gated voucher on a receipt. **`None` = the crypto rail is off** for this node — no cumulative
     /// is stamped (review F3, opt-in). Set via [`with_settlement_peg`](Self::with_settlement_peg).
     settlement_peg: Option<u64>,
+    /// The on-chain deployment paying receipts settle on: each carries its claim, signed for it.
+    settlement_chain: Option<crate::settlement_config::SettlementChain>,
     /// Per-`(peer, model)` serialization locks for settlement (review F1). The cumulative voucher must
     /// advance monotonically, but `settle_receipt` reads the base, co-signs over a network round-trip,
     /// then commits — so concurrent settles to the same pair would race and emit non-monotonic /
@@ -923,6 +925,7 @@ impl ConsumerNode {
             creds: None,
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
+            settlement_chain: None,
             settle_locks: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_attest: None,
@@ -1079,6 +1082,13 @@ impl ConsumerNode {
     /// stamping the gated voucher on receipts (builder form). The live gateway wires it from
     /// `OPENHYDRA_USDC_MICROS_PER_CREDIT`. A `0` (or unset) peg leaves the crypto rail **off** — no
     /// cumulative is stamped — so a node can't silently emit mis-denominated vouchers (review F3).
+    /// Settle paying receipts on `chain` (builder form): each carries its on-chain claim, signed for
+    /// that deployment by our identity (Solana) or wallet (Base).
+    pub fn with_settlement_chain(mut self, chain: Option<crate::settlement_config::SettlementChain>) -> Self {
+        self.settlement_chain = chain;
+        self
+    }
+
     pub fn with_settlement_peg(mut self, micros_per_credit: u64) -> Self {
         self.settlement_peg = (micros_per_credit > 0).then_some(micros_per_credit);
         self
@@ -1172,6 +1182,7 @@ impl ConsumerNode {
             creds: None,
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
+            settlement_chain: None,
             settle_locks: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_attest: None,
@@ -1694,6 +1705,7 @@ impl ConsumerNode {
                 deterministic: None,
                 // On the crypto rail, offer to pay at our peg (a provider that charges needs it).
                 settlement_peg: self.settlement_peg,
+                settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
@@ -2038,6 +2050,22 @@ impl ConsumerNode {
                     (split, cumulative)
                 })
             };
+            // On a settlement chain: the receipt's on-chain claim, valid for CLAIM_LIFETIME_SECS.
+            let chain = node.settlement_chain.clone();
+            let sign_claim = |claim: &openhydra_protocol::settlement::SettlementClaim| -> Vec<u8> {
+                use openhydra_protocol::settlement::ChainDomain;
+                match chain.as_ref().map(|c| (&c.domain, c.evm_wallet.as_deref())) {
+                    Some((d @ ChainDomain::Solana(_), _)) => node.net.sign(&d.claim_message(claim)).unwrap_or_default(),
+                    Some((ChainDomain::Base(d), Some(wallet))) => {
+                        openhydra_protocol::settlement::sign_evm_claim(wallet, d, claim).to_vec()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            let expires_at = now / 1000 + openhydra_protocol::settlement::CLAIM_LIFETIME_SECS;
+            let claim_signer = chain.as_ref().map(|_| {
+                (expires_at, &sign_claim as &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)
+            });
             let mut settle = |voucher: Option<(FeeSplit, u64)>| {
                 request_receipt(
                     &sign,
@@ -2055,6 +2083,7 @@ impl ConsumerNode {
                     // claim's units.
                     voucher.map(|_| SettlementAsset::Usdc),
                     node.settlement_peg,
+                    claim_signer,
                 )
             };
             let mut voucher = compute_voucher();
@@ -2503,6 +2532,7 @@ impl ConsumerNode {
             deterministic: Some(DeterministicParams { seed: AUDIT_SEED }),
             // Audits are paid for like any serve (and so look like one).
             settlement_peg: self.settlement_peg,
+            settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -2816,6 +2846,7 @@ mod tests {
             credential: None,
             deterministic: None,
             settlement_peg: None,
+            settlement_domain: None,
         }
     }
 

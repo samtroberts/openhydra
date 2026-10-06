@@ -45,6 +45,7 @@ pub mod ratelimit;
 pub mod receipt;
 pub mod registry_client;
 pub mod serve;
+pub mod settlement_config;
 pub mod share_policy;
 pub mod side_scorer;
 pub mod slash;

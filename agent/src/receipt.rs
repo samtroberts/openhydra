@@ -94,7 +94,39 @@ fn receipt_err(e: ReceiptError) -> AdapterError {
     AdapterError::Http(format!("receipt rejected: {which}"))
 }
 
+/// A consumer's signature over a paying receipt's on-chain claim (claim format v6,
+/// [`openhydra_protocol::settlement::SettlementClaim`]): the claim is the receipt's provider,
+/// consumer, model and cumulative amount, with this expiry. Carried beside the receipt (its own
+/// signature, outside the receipt's), so a provider co-signs a paying receipt only with a claim it can
+/// settle on-chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimSig {
+    /// Unix seconds after which the claim no longer settles.
+    pub expires_at: u64,
+    /// Solana: the 64-byte Ed25519 signature by the consumer; Base: the 65-byte `r‖s‖v` by its wallet.
+    pub sig: Vec<u8>,
+}
+
+/// The longest claim signature carried (Base's 65 bytes).
+const MAX_CLAIM_SIG: usize = 65;
+
+/// The on-chain claim a receipt payload stands for, valid until `expires_at` (`None` without a
+/// cumulative amount: not a paying receipt).
+pub fn claim_for(payload: &ReceiptPayload, expires_at: u64) -> Option<openhydra_protocol::settlement::SettlementClaim> {
+    Some(openhydra_protocol::settlement::SettlementClaim {
+        provider: payload.provider.to_bytes(),
+        consumer: payload.consumer.to_bytes(),
+        model_id: payload.model_id.clone(),
+        cumulative_amount: payload.cumulative_amount?,
+        expires_at,
+    })
+}
+
 fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8> {
+    encode_request_with_claim(payload, consumer_sig, None)
+}
+
+fn encode_request_with_claim(payload: &ReceiptPayload, consumer_sig: &Signature, claim: Option<&ClaimSig>) -> Vec<u8> {
     let model = payload.model_id.as_bytes();
     let canonical = payload.canonical_model_id.as_bytes();
     let mut b = Vec::with_capacity(REQ_FIXED + model.len() + 2 + canonical.len());
@@ -137,7 +169,8 @@ fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8>
     // v5 (denomination binding): the settlement asset + reference-price peg the cumulative was
     // converted with. Binding + transmitting them lets the provider reject a peg/asset it never agreed
     // to before co-signing, instead of silently co-signing a mis-denominated claim.
-    let emit_sig_alg = payload.sig_alg != SigAlg::Ed25519;
+    // A claim trailer follows sig_alg, so a claim makes it explicit (positional decode).
+    let emit_sig_alg = payload.sig_alg != SigAlg::Ed25519 || claim.is_some();
     let emit_peg = payload.peg_micros_per_credit.is_some() || emit_sig_alg;
     let emit_asset = payload.settlement_asset.is_some() || emit_peg;
     let emit_cumulative = payload.cumulative_amount.is_some() || emit_asset;
@@ -168,7 +201,13 @@ fn encode_request(payload: &ReceiptPayload, consumer_sig: &Signature) -> Vec<u8>
         }
     }
     if emit_sig_alg {
-        b.push(payload.sig_alg.to_u8()); // bare discriminant, always last
+        b.push(payload.sig_alg.to_u8()); // bare discriminant
+    }
+    // Claim trailer (claim format v6): `expires_at:u64 ‖ sig_len:u8 ‖ sig`, last.
+    if let Some(c) = claim {
+        b.extend_from_slice(&c.expires_at.to_le_bytes());
+        b.push(c.sig.len().min(MAX_CLAIM_SIG) as u8);
+        b.extend_from_slice(&c.sig[..c.sig.len().min(MAX_CLAIM_SIG)]);
     }
     b
 }
@@ -220,6 +259,10 @@ fn read_flag_u8(data: &[u8], pos: &mut usize, what: &str) -> Result<Option<u8>, 
 }
 
 fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterError> {
+    decode_request_with_claim(data).map(|(p, s, _)| (p, s))
+}
+
+fn decode_request_with_claim(data: &[u8]) -> Result<(ReceiptPayload, Signature, Option<ClaimSig>), AdapterError> {
     if data.len() < REQ_FIXED {
         return Err(AdapterError::Parse("receipt request truncated".into()));
     }
@@ -284,6 +327,22 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
         pos += 1;
         alg
     };
+    let claim = if pos == data.len() {
+        None
+    } else {
+        if data.len() < pos + 9 {
+            return Err(AdapterError::Parse("receipt request claim truncated".into()));
+        }
+        let expires_at = u64::from_le_bytes(data[pos..pos + 8].try_into().expect("8 bytes"));
+        let len = data[pos + 8] as usize;
+        pos += 9;
+        if len > MAX_CLAIM_SIG || data.len() < pos + len {
+            return Err(AdapterError::Parse("receipt request claim signature truncated".into()));
+        }
+        let sig = data[pos..pos + len].to_vec();
+        pos += len;
+        Some(ClaimSig { expires_at, sig })
+    };
     if pos != data.len() {
         return Err(AdapterError::Parse("receipt request has trailing bytes".into()));
     }
@@ -296,7 +355,7 @@ fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterErr
     // the co-sign preimage matches the consumer's exactly (the v5 asset/peg are threaded as params).
     payload.sig_alg = sig_alg;
     let consumer_sig = to_sig(&data[96..160])?;
-    Ok((payload, consumer_sig))
+    Ok((payload, consumer_sig, claim))
 }
 
 fn ok_response(provider_sig: &Signature) -> Vec<u8> {
@@ -352,6 +411,7 @@ pub fn request_receipt(
     cumulative_amount: Option<u64>,
     settlement_asset: Option<SettlementAsset>,
     peg_micros_per_credit: Option<u64>,
+    claim_signer: Option<(u64, &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)>,
 ) -> Result<CoSignedReceipt, ReceiptFailure> {
     let payload = payload_from_bytes(
         provider_pub,
@@ -372,8 +432,12 @@ pub fn request_receipt(
     .map_err(AdapterError::Parse)?;
     let consumer_sig = to_sig(&sign(&payload.canonical_bytes()))?;
 
+    // On a settlement chain, a paying receipt carries its on-chain claim, signed for that chain.
+    let claim = claim_signer.and_then(|(expires_at, sign_claim)| {
+        claim_for(&payload, expires_at).map(|c| ClaimSig { expires_at, sig: sign_claim(&c) })
+    });
     let mut framed = vec![RECEIPT_REQUEST];
-    framed.extend_from_slice(&encode_request(&payload, &consumer_sig));
+    framed.extend_from_slice(&encode_request_with_claim(&payload, &consumer_sig, claim.as_ref()));
     let response = transport(&framed)?;
 
     let provider_sig = match response.first() {
@@ -404,12 +468,12 @@ pub fn handle_receipt_inbound(
     data: &[u8],
     sign: &dyn Fn(&[u8]) -> Vec<u8>,
     this_provider_pub: &[u8],
-    bind_check: &dyn Fn(&ReceiptPayload) -> Result<(), BindRejection>,
+    bind_check: &dyn Fn(&ReceiptPayload, Option<&ClaimSig>) -> Result<(), BindRejection>,
 ) -> (Vec<u8>, Option<CoSignedReceipt>) {
     if data.first() != Some(&RECEIPT_REQUEST) {
         return (err_response("unsupported method"), None);
     }
-    let (payload, consumer_sig) = match decode_request(&data[1..]) {
+    let (payload, consumer_sig, claim) = match decode_request_with_claim(&data[1..]) {
         Ok(x) => x,
         Err(e) => return (err_response(&e.to_string()), None),
     };
@@ -425,7 +489,7 @@ pub fn handle_receipt_inbound(
     }
     // B-S1: the receipt must settle against a real serve the provider recorded (right
     // tokens/model, fresh, single-use). Reject before co-signing if the binding fails.
-    match bind_check(&payload) {
+    match bind_check(&payload, claim.as_ref()) {
         Ok(()) => {}
         Err(BindRejection::Reject(reason)) => return (err_response(&reason), None),
         Err(BindRejection::Behind(latest)) => {
@@ -470,7 +534,7 @@ mod tests {
         let psign = sign_with(&provider);
         // The transport IS the provider's handler — in-process round-trip.
         let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            Ok(handle_receipt_inbound(req, &psign, &provider_pub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(())).0)
+            Ok(handle_receipt_inbound(req, &psign, &provider_pub, &|_: &ReceiptPayload, _: Option<&ClaimSig>| Ok::<(), BindRejection>(())).0)
         };
 
         let receipt = request_receipt(
@@ -485,8 +549,7 @@ mod tests {
             "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
             Some(9_600),
             Some(SettlementAsset::Usdc),
-            Some(1_200),
-        )
+            Some(1_200), None)
         .unwrap();
         assert_eq!(receipt.payload.tokens, 512);
         assert_eq!(receipt.payload.canonical_model_id, "qwen2.5/7b/q4_k_m/abcd0123abcd0123",
@@ -505,10 +568,10 @@ mod tests {
         let (csign, psign) = (sign_with(consumer), sign_with(provider));
         let ppub = pubkey(provider);
         let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            Ok(handle_receipt_inbound(req, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(())).0)
+            Ok(handle_receipt_inbound(req, &psign, &ppub, &|_: &ReceiptPayload, _: Option<&ClaimSig>| Ok::<(), BindRejection>(())).0)
         };
         request_receipt(&csign, &mut transport, &ppub, &pubkey(consumer), "m", 10, [nonce; 16], 1, "",
-            Some(cumulative), Some(SettlementAsset::Usdc), Some(1)).unwrap()
+            Some(cumulative), Some(SettlementAsset::Usdc), Some(1), None).unwrap()
     }
 
     #[test]
@@ -519,16 +582,60 @@ mod tests {
         let (csign, psign, ppub) = (sign_with(&consumer), sign_with(&provider), pubkey(&provider));
         let kept = latest.clone();
         let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            let bind = |_: &ReceiptPayload| Err(BindRejection::Behind(Box::new(kept.clone())));
+            let bind = |_: &ReceiptPayload, _: Option<&ClaimSig>| Err(BindRejection::Behind(Box::new(kept.clone())));
             Ok(handle_receipt_inbound(req, &psign, &ppub, &bind).0)
         };
         let err = request_receipt(&csign, &mut transport, &ppub, &pubkey(&consumer), "m", 10, [2u8; 16], 2, "",
-            Some(300), Some(SettlementAsset::Usdc), Some(1)).unwrap_err();
+            Some(300), Some(SettlementAsset::Usdc), Some(1), None).unwrap_err();
         let ReceiptFailure::Behind(back) = err else { panic!("expected the provider's latest receipt") };
         assert_eq!(back.payload.cumulative_amount, Some(500));
         assert_eq!(back.payload.nonce, [1u8; 16]);
         assert_eq!(verify_receipt(&back), Ok(()), "it arrives intact, both signatures valid");
         assert_eq!(decode_cosigned(&encode_cosigned(&latest)).unwrap().to_bytes(), latest.to_bytes());
+    }
+
+    #[test]
+    fn a_paying_receipt_carries_its_on_chain_claim_to_the_provider() {
+        use openhydra_protocol::settlement::{verify_claim, ChainDomain, ClaimSigner, SolanaDomain, CLAIM_LIFETIME_SECS};
+        let (consumer, provider) = (signer(7), signer(9));
+        let (csign, psign, ppub) = (sign_with(&consumer), sign_with(&provider), pubkey(&provider));
+        let chain = ChainDomain::Solana(SolanaDomain { program_id: [4; 32], cluster: [5; 32] });
+        let now = 1_760_000_000u64;
+        let seen = std::cell::RefCell::new(None);
+        let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            let bind = |p: &ReceiptPayload, claim: Option<&ClaimSig>| {
+                let c = claim.ok_or("no claim")?;
+                let settlement = claim_for(p, c.expires_at).ok_or("no cumulative")?;
+                *seen.borrow_mut() = Some(verify_claim(&chain, &settlement, &c.sig, now));
+                Ok::<(), BindRejection>(())
+            };
+            Ok(handle_receipt_inbound(req, &psign, &ppub, &bind).0)
+        };
+        let sign_claim = |c: &openhydra_protocol::settlement::SettlementClaim| csign(&chain.claim_message(c));
+        let receipt = request_receipt(&csign, &mut transport, &ppub, &pubkey(&consumer), "m", 10, [1u8; 16], 1, "",
+            Some(500), Some(SettlementAsset::Usdc), Some(1), Some((now + CLAIM_LIFETIME_SECS, &sign_claim))).unwrap();
+        assert_eq!(receipt.payload.cumulative_amount, Some(500));
+        assert_eq!(*seen.borrow(), Some(Ok(ClaimSigner::Solana)), "the provider got a claim valid for its deployment");
+    }
+
+    #[test]
+    fn the_claim_trailer_round_trips_and_is_strict() {
+        let (consumer, provider) = (signer(7), signer(9));
+        let payload = payload_from_bytes(&pubkey(&provider), &pubkey(&consumer), "m", 10, &[5u8; 16], 1, None, "",
+            Some(100), Some(SettlementAsset::Usdc), Some(1)).unwrap();
+        let sig = to_sig(&sign_with(&consumer)(&payload.canonical_bytes())).unwrap();
+        let claim = ClaimSig { expires_at: 1_800_000_000, sig: vec![9u8; 65] };
+        let framed = encode_request_with_claim(&payload, &sig, Some(&claim));
+        let (p2, s2, c2) = decode_request_with_claim(&framed).unwrap();
+        assert_eq!((p2.canonical_bytes(), s2, c2), (payload.canonical_bytes(), sig, Some(claim)));
+        // The receipt's own framing (no claim) is unchanged by the trailer's existence.
+        assert_eq!(decode_request_with_claim(&encode_request(&payload, &sig)).unwrap().2, None);
+        // A signature length past the largest is malformed, and so is a truncated trailer.
+        let mut bad = framed.clone();
+        let at = bad.len() - 65 - 1;
+        bad[at] = 66;
+        assert!(decode_request_with_claim(&bad).is_err());
+        assert!(decode_request_with_claim(&framed[..framed.len() - 1]).is_err());
     }
 
     #[test]
@@ -542,7 +649,7 @@ mod tests {
         let mut framed = vec![RECEIPT_REQUEST];
         framed.extend_from_slice(&encode_request(&payload, &forged));
         let reached = std::cell::Cell::new(false);
-        let bind = |_: &ReceiptPayload| {
+        let bind = |_: &ReceiptPayload, _: Option<&ClaimSig>| {
             reached.set(true);
             Ok::<(), BindRejection>(())
         };
@@ -689,7 +796,7 @@ mod tests {
         let a_pub = pubkey(&provider_a);
         // ...but it's delivered to A's handler.
         let mut transport =
-            |req: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(handle_receipt_inbound(req, &a_sign, &a_pub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(())).0) };
+            |req: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(handle_receipt_inbound(req, &a_sign, &a_pub, &|_: &ReceiptPayload, _: Option<&ClaimSig>| Ok::<(), BindRejection>(())).0) };
 
         let err = request_receipt(
             &csign,
@@ -703,8 +810,7 @@ mod tests {
             "",
             None,
             None,
-            None,
-        )
+            None, None)
         .unwrap_err();
         assert!(matches!(err, ReceiptFailure::Failed(AdapterError::Http(m)) if m.contains("different provider")));
     }
@@ -712,7 +818,7 @@ mod tests {
     #[test]
     fn provider_handler_ledgers_only_accepted_receipts() {
         let provider = signer(9);
-        let (_, accepted) = handle_receipt_inbound(b"\x99garbage", &sign_with(&provider), &pubkey(&provider), &|_: &ReceiptPayload| Ok::<(), BindRejection>(()));
+        let (_, accepted) = handle_receipt_inbound(b"\x99garbage", &sign_with(&provider), &pubkey(&provider), &|_: &ReceiptPayload, _: Option<&ClaimSig>| Ok::<(), BindRejection>(()));
         assert!(accepted.is_none()); // wrong method byte → no receipt to ledger
     }
 
@@ -733,8 +839,7 @@ mod tests {
             "",
             None,
             None,
-            None,
-        )
+            None, None)
         .unwrap_err();
         assert!(matches!(err, ReceiptFailure::Failed(AdapterError::Http(m)) if m.contains("provider rejected")));
     }
@@ -826,10 +931,10 @@ mod tests {
             let _ = decode_request(bytes);
             // Full inbound path incl. the `data.first()` method-byte strip — results ignored,
             // the point is "no panic". Feed both the raw bytes and a 0x12-prefixed variant.
-            let _ = handle_receipt_inbound(bytes, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(()));
+            let _ = handle_receipt_inbound(bytes, &psign, &ppub, &|_: &ReceiptPayload, _: Option<&ClaimSig>| Ok::<(), BindRejection>(()));
             let mut framed = vec![RECEIPT_REQUEST];
             framed.extend_from_slice(bytes);
-            let _ = handle_receipt_inbound(&framed, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(()));
+            let _ = handle_receipt_inbound(&framed, &psign, &ppub, &|_: &ReceiptPayload, _: Option<&ClaimSig>| Ok::<(), BindRejection>(()));
         }
     }
 }

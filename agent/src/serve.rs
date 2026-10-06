@@ -163,6 +163,11 @@ pub struct ServeRequest {
     /// consumer that doesn't pay (or predates the field).
     #[serde(default)]
     pub settlement_peg: Option<u64>,
+    /// The on-chain deployment the consumer settles on ([`openhydra_protocol::settlement::ChainDomain::fingerprint`]).
+    /// A provider settling on a chain refuses a serve for another deployment (or none), before running
+    /// the engine. `None` from a consumer off-chain (or predating the field).
+    #[serde(default)]
+    pub settlement_domain: Option<String>,
 }
 
 /// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
@@ -584,6 +589,7 @@ mod tests {
             credential: None,
             deterministic: None,
             settlement_peg: None,
+            settlement_domain: None,
         }
     }
 

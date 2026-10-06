@@ -126,6 +126,27 @@ impl ChainDomain {
         }
     }
 
+    /// A short fingerprint of the deployment (hex, 16 bytes of SHA-256 over the chain and its domain):
+    /// how a consumer says up front which deployment it will settle on, so a provider can refuse a
+    /// serve it couldn't be paid for.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        match self {
+            ChainDomain::Solana(d) => {
+                h.update(b"solana");
+                h.update(d.program_id);
+                h.update(d.cluster);
+            }
+            ChainDomain::Base(d) => {
+                h.update(b"base");
+                h.update(d.chain_id.to_le_bytes());
+                h.update(d.verifying_contract);
+            }
+        }
+        hex::encode(&h.finalize()[..16])
+    }
+
     /// What the consumer signs for `claim` on this deployment: the Solana preimage (signed with
     /// Ed25519), or the 32-byte EIP-712 digest (signed with secp256k1).
     pub fn claim_message(&self, claim: &SettlementClaim) -> Vec<u8> {
@@ -642,6 +663,16 @@ mod tests {
         let mut evil = binding.clone();
         evil.evm_address = [0xCD; 20];
         assert!(!verify_evm_payout_binding(&evil), "redirecting the EVM address breaks the signature");
+    }
+
+    #[test]
+    fn a_fingerprint_tells_deployments_apart() {
+        let sol = ChainDomain::Solana(domain());
+        assert_eq!(sol.fingerprint(), ChainDomain::Solana(domain()).fingerprint());
+        assert_ne!(sol.fingerprint(), ChainDomain::Solana(SolanaDomain { cluster: [0x66; 32], ..domain() }).fingerprint());
+        let base = ChainDomain::Base(Eip712Domain { chain_id: 8453, verifying_contract: [1; 20] });
+        assert_ne!(base.fingerprint(), ChainDomain::Base(Eip712Domain { chain_id: 84532, verifying_contract: [1; 20] }).fingerprint());
+        assert_eq!(sol.fingerprint().len(), 32);
     }
 
     #[test]

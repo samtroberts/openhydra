@@ -1352,6 +1352,26 @@ fn secure_enclave_attestor() -> Result<openhydra_agent::attest::Attestor, String
     Err("--attest needs an Apple Silicon Mac (Secure Enclave); not available on this platform".into())
 }
 
+/// The settlement chain from the environment, checked against the peg (a chain settles only paying
+/// receipts, so it needs one), and announced.
+fn settlement_chain_for(
+    peg: u64,
+    consumer: bool,
+) -> Result<Option<openhydra_agent::settlement_config::SettlementChain>, String> {
+    let chain = openhydra_agent::settlement_config::from_env(consumer)?;
+    if let Some(c) = &chain {
+        if peg == 0 {
+            return Err("OPENHYDRA_SETTLEMENT_CHAIN needs OPENHYDRA_USDC_MICROS_PER_CREDIT: only paying receipts settle on-chain".into());
+        }
+        eprintln!(
+            "openhydra-agent: paying receipts settle on {} (deployment {})",
+            c.domain.chain().label(),
+            c.domain.fingerprint()
+        );
+    }
+    Ok(chain)
+}
+
 fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
     adapter: A,
     engine_url: String,
@@ -1388,12 +1408,16 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
+    // The on-chain deployment paying receipts settle on (opt-in; needs the peg: only paying receipts
+    // carry claims).
+    let settlement_chain = settlement_chain_for(settlement_peg, false)?;
     let mut provider = Provider::new(adapter, net)
         .with_address(args.host, args.port)
         .with_store(store)
         .with_aup(aup)
         .with_stats(stats)
-        .with_settlement_peg(settlement_peg);
+        .with_settlement_peg(settlement_peg)
+        .with_settlement_chain(settlement_chain.map(|c| c.domain));
     // A hot-reloadable policy file (the desktop path) takes precedence over the static
     // `--share-models` list. Only one governs sharing, so we never mix the two.
     if let Some(path) = args.share_policy_file.clone() {
@@ -1551,6 +1575,10 @@ fn serve(
     } else {
         None
     };
+    // The on-chain deployment paying receipts settle on: a bad configuration is a startup error (the
+    // gateway reads it again from the same environment).
+    let peg = std::env::var("OPENHYDRA_USDC_MICROS_PER_CREDIT").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    settlement_chain_for(peg, true)?;
     // Track A2-Logprob reference sets (opt-in). A bad file is a startup error, not a silent skip.
     let mut logprob_refs = Vec::new();
     for path in &args.logprob_reference {

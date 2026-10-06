@@ -63,6 +63,9 @@ const PROVIDER_SETTLED: TableDefinition<&str, &[u8]> = TableDefinition::new("pro
 /// whose cumulative is behind it, so the pair can catch up after a lost reply or a lost voucher.
 const PROVIDER_SETTLED_RECEIPT: TableDefinition<&str, &[u8]> =
     TableDefinition::new("provider_settled_receipt");
+/// Provider-side: the consumer's on-chain claim signature for that receipt (same key), when it
+/// settles on a chain: `expires_at (u64 LE) ‖ signature`. With the receipt, what a provider submits.
+const PROVIDER_SETTLED_CLAIM: TableDefinition<&str, &[u8]> = TableDefinition::new("provider_settled_claim");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
 /// Durable ledger rows for the desktop Ledger view, keyed by a monotonic sequence → a compact
@@ -211,6 +214,7 @@ impl Store {
             wtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
             wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
             wtx.open_table(PROVIDER_SETTLED_RECEIPT).map_err(StoreError::from)?;
+            wtx.open_table(PROVIDER_SETTLED_CLAIM).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
@@ -586,6 +590,7 @@ impl Store {
         key: &str,
         cumulative: u64,
         receipt: &CoSignedReceipt,
+        claim: Option<(u64, &[u8])>,
     ) -> Result<(), StoreError> {
         let blob = receipt.to_bytes();
         let wtx = self.db.begin_write().map_err(StoreError::from)?;
@@ -594,6 +599,18 @@ impl Store {
             t.insert(key, &cumulative.to_le_bytes()[..]).map_err(StoreError::from)?;
             let mut r = wtx.open_table(PROVIDER_SETTLED_RECEIPT).map_err(StoreError::from)?;
             r.insert(key, blob.as_slice()).map_err(StoreError::from)?;
+            let mut c = wtx.open_table(PROVIDER_SETTLED_CLAIM).map_err(StoreError::from)?;
+            match claim {
+                Some((expires_at, sig)) => {
+                    let mut v = expires_at.to_le_bytes().to_vec();
+                    v.extend_from_slice(sig);
+                    c.insert(key, v.as_slice()).map_err(StoreError::from)?;
+                }
+                // A newer receipt without a claim: an older claim is not this receipt's.
+                None => {
+                    c.remove(key).map_err(StoreError::from)?;
+                }
+            }
         }
         wtx.commit().map_err(StoreError::from)?;
         Ok(())
@@ -616,6 +633,28 @@ impl Store {
                 }
                 Err(_) => skipped += 1,
             }
+        }
+        Ok(skipped)
+    }
+
+    /// Rehydrate the latest on-chain claim (`expires_at`, signature) per `(consumer, model)` on boot.
+    /// A row too short to hold an expiry is skipped; returns how many were.
+    pub fn load_provider_settled_claims_into_memory(
+        &self,
+        claims: &mut HashMap<String, (u64, Vec<u8>)>,
+    ) -> Result<usize, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PROVIDER_SETTLED_CLAIM).map_err(StoreError::from)?;
+        let mut skipped = 0usize;
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            let v = val.value();
+            if v.len() < 8 {
+                skipped += 1;
+                continue;
+            }
+            let expires_at = u64::from_le_bytes(v[..8].try_into().expect("8 bytes"));
+            claims.insert(key.value().to_string(), (expires_at, v[8..].to_vec()));
         }
         Ok(skipped)
     }
@@ -787,13 +826,21 @@ mod tests {
         let consumer_sig = consumer.sign(&payload.canonical_bytes());
         let provider_sig = provider.sign(&crate::receipts::cosign_bytes(&payload, &consumer_sig));
         let receipt = CoSignedReceipt { payload, consumer_sig, provider_sig };
-        store.put_provider_settled_receipt("k", 500, &receipt).unwrap();
+        store.put_provider_settled_receipt("k", 500, &receipt, Some((1_800_000_000, &[7u8; 64]))).unwrap();
         let mut highs = HashMap::new();
         assert_eq!(store.load_provider_settled_into_memory(&mut highs).unwrap(), 0);
         assert_eq!(highs.get("k"), Some(&500));
         let mut receipts = HashMap::new();
         assert_eq!(store.load_provider_settled_receipts_into_memory(&mut receipts).unwrap(), 0);
         assert_eq!(receipts["k"].to_bytes(), receipt.to_bytes());
+        let mut claims = HashMap::new();
+        assert_eq!(store.load_provider_settled_claims_into_memory(&mut claims).unwrap(), 0);
+        assert_eq!(claims["k"], (1_800_000_000, vec![7u8; 64]));
+        // A later receipt without a claim drops the old claim (it isn't that receipt's).
+        store.put_provider_settled_receipt("k", 600, &receipt, None).unwrap();
+        let mut claims = HashMap::new();
+        store.load_provider_settled_claims_into_memory(&mut claims).unwrap();
+        assert!(claims.is_empty());
     }
 
     #[test]

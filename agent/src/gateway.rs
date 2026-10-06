@@ -1845,7 +1845,9 @@ pub fn router(
         .with_self_provider(self_provider)
         .with_cards(cards)
         .with_credentials(creds)
-        .with_settlement_peg(settlement_peg);
+        .with_settlement_peg(settlement_peg)
+        // The on-chain deployment paying receipts settle on (validated at startup in `serve`).
+        .with_settlement_chain(crate::settlement_config::from_env(true).ok().flatten());
     // Phase 0 device attestation of providers (opt-in): informational device-trust badge only.
     let node = match provider_attest {
         Some(trusted) => node.with_provider_attestation(trusted),

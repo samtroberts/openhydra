@@ -761,6 +761,11 @@ pub struct Provider<A: EngineAdapter> {
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
+    /// The on-chain claim kept with each `settled_receipts` entry (same key), on a settlement chain.
+    settled_claims: Mutex<HashMap<String, crate::receipt::ClaimSig>>,
+    /// The on-chain deployment paying receipts settle on: a paying receipt is co-signed only with a
+    /// valid claim for it (see `with_settlement_chain`).
+    settlement_chain: Option<openhydra_protocol::settlement::ChainDomain>,
     /// The provider's configured settlement peg (USDC micro-units per credit unit), for the F2 floor
     /// check. `None` = not opted into the crypto rail → monotonic-only validation.
     settlement_peg: Option<u64>,
@@ -899,6 +904,8 @@ impl<A: EngineAdapter> Provider<A> {
             settled_cumulative: Mutex::new(HashMap::new()),
             settled_receipts: Mutex::new(HashMap::new()),
             receipt_lock: Mutex::new(()),
+            settled_claims: Mutex::new(HashMap::new()),
+            settlement_chain: None,
             payment_defaults: Mutex::new(HashMap::new()),
             settlement_peg: None,
             receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
@@ -999,6 +1006,13 @@ impl<A: EngineAdapter> Provider<A> {
 
     /// Set the provider's settlement peg (USDC micro-units per credit unit) for the F2 floor check
     /// (builder form). `0`/unset leaves it `None` → monotonic-only cumulative validation.
+    /// Settle paying receipts on `chain` (builder form): co-sign one only with the consumer's valid
+    /// on-chain claim for that deployment, and serve only consumers settling there.
+    pub fn with_settlement_chain(mut self, chain: Option<openhydra_protocol::settlement::ChainDomain>) -> Self {
+        self.settlement_chain = chain;
+        self
+    }
+
     pub fn with_settlement_peg(mut self, micros_per_credit: u64) -> Self {
         self.settlement_peg = (micros_per_credit > 0).then_some(micros_per_credit);
         self
@@ -1046,6 +1060,15 @@ impl<A: EngineAdapter> Provider<A> {
             return refuse(format!(
                 "this provider charges (settlement peg {peg} micro-USDC per credit); the request doesn't offer to pay it"
             ));
+        }
+        if let Some(chain) = &self.settlement_chain {
+            if req.settlement_domain.as_deref() != Some(chain.fingerprint().as_str()) {
+                return refuse(format!(
+                    "this provider settles on {} deployment {}; the request doesn't settle there",
+                    chain.chain().label(),
+                    chain.fingerprint()
+                ));
+            }
         }
         let now = now_unix_ms();
         let unsettled: Vec<(u64, u64)> = {
@@ -1478,7 +1501,27 @@ impl<A: EngineAdapter> Provider<A> {
     /// Record the co-signed cumulative for this `(consumer, model)` after a successful co-sign
     /// (review F2). Monotonic `max`, so a concurrent or out-of-order co-sign can't lower it;
     /// best-effort persisted so a restart can't accept a lower/replayed cumulative.
-    fn record_settlement_cumulative(&self, receipt: &openhydra_protocol::receipts::CoSignedReceipt) {
+    /// On a settlement chain, a paying receipt must carry the consumer's valid on-chain claim for it.
+    fn check_settlement_claim(
+        &self,
+        p: &openhydra_protocol::receipts::ReceiptPayload,
+        claim: Option<&crate::receipt::ClaimSig>,
+    ) -> Result<(), String> {
+        let (Some(chain), Some(_)) = (&self.settlement_chain, p.cumulative_amount) else {
+            return Ok(());
+        };
+        let c = claim.ok_or("this provider settles on-chain: the receipt carries no claim")?;
+        let settlement = crate::receipt::claim_for(p, c.expires_at).ok_or("no cumulative")?;
+        openhydra_protocol::settlement::verify_claim(chain, &settlement, &c.sig, now_unix_ms() / 1000)
+            .map(|_| ())
+            .map_err(|e| format!("the receipt's on-chain claim is not valid here: {e:?}"))
+    }
+
+    fn record_settlement_cumulative(
+        &self,
+        receipt: &openhydra_protocol::receipts::CoSignedReceipt,
+        claim: Option<&crate::receipt::ClaimSig>,
+    ) {
         let p = &receipt.payload;
         let Some(cumulative) = p.cumulative_amount else {
             return;
@@ -1499,8 +1542,21 @@ impl<A: EngineAdapter> Provider<A> {
             return;
         }
         self.settled_receipts.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), receipt.clone());
+        {
+            let mut claims = self.settled_claims.lock().unwrap_or_else(|e| e.into_inner());
+            match claim {
+                Some(c) => {
+                    tracing::debug!(consumer = %hex::encode(p.consumer.as_bytes()), provider = %hex::encode(p.provider.as_bytes()),
+                        model = %p.model_id, cumulative, expires_at = c.expires_at, sig = %hex::encode(&c.sig),
+                        "kept the on-chain claim");
+                    claims.insert(key.clone(), c.clone())
+                }
+                None => claims.remove(&key),
+            };
+        }
         if let Some(store) = &self.store {
-            if let Err(e) = store.put_provider_settled_receipt(&key, cumulative, receipt) {
+            let claim = claim.map(|c| (c.expires_at, c.sig.as_slice()));
+            if let Err(e) = store.put_provider_settled_receipt(&key, cumulative, receipt, claim) {
                 eprintln!("openhydra-agent: settled-cumulative persist failed: {e}");
             }
         }
@@ -1531,6 +1587,18 @@ impl<A: EngineAdapter> Provider<A> {
                 Ok(0) => {}
                 Ok(skipped) => eprintln!("openhydra-agent: skipped {skipped} undecodable settled receipt(s) on rehydrate"),
                 Err(e) => eprintln!("openhydra-agent: could not rehydrate settled receipts from store: {e}"),
+            }
+        }
+        if let Ok(mut map) = self.settled_claims.lock() {
+            let mut raw = HashMap::new();
+            match store.load_provider_settled_claims_into_memory(&mut raw) {
+                Ok(skipped) => {
+                    if skipped > 0 {
+                        eprintln!("openhydra-agent: skipped {skipped} undecodable settled claim(s) on rehydrate");
+                    }
+                    map.extend(raw.into_iter().map(|(k, (expires_at, sig))| (k, crate::receipt::ClaimSig { expires_at, sig })));
+                }
+                Err(e) => eprintln!("openhydra-agent: could not rehydrate settled claims from store: {e}"),
             }
         }
         Self { store: Some(store), ..self }
@@ -2118,9 +2186,14 @@ impl<A: EngineAdapter> Provider<A> {
                 // B-S1: only co-sign a receipt that settles a real serve we recorded. Review F2: also
                 // reject a non-monotonic / under-signed crypto-rail cumulative BEFORE consuming the
                 // commitment (so a bad cumulative doesn't burn the single-use nonce).
-                let bind = |p: &openhydra_protocol::receipts::ReceiptPayload| {
+                // The claim that came with the receipt, kept once it is co-signed.
+                let accepted_claim = std::cell::RefCell::new(None);
+                let bind = |p: &openhydra_protocol::receipts::ReceiptPayload, claim: Option<&crate::receipt::ClaimSig>| {
                     self.validate_settlement_cumulative(p)?;
-                    self.check_and_consume_commitment(p, source_peer).map_err(BindRejection::from)
+                    self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
+                    self.check_and_consume_commitment(p, source_peer).map_err(BindRejection::from)?;
+                    *accepted_claim.borrow_mut() = claim.cloned();
+                    Ok(())
                 };
                 // Validate, co-sign and record as one step (see `receipt_lock`).
                 let _receipt_guard = self.receipt_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2132,7 +2205,7 @@ impl<A: EngineAdapter> Provider<A> {
                 if let Some(receipt) = &accepted {
                     self.record_consumption(receipt);
                     // Review F2: advance our co-signed cumulative high-water mark for this pair.
-                    self.record_settlement_cumulative(receipt);
+                    self.record_settlement_cumulative(receipt, accepted_claim.borrow().as_ref());
                     if let Some(stats) = &self.stats {
                         stats.receipts_ledgered.fetch_add(1, Ordering::Relaxed);
                         // #5 Ledger: a co-signed receipt is an authoritative "served" transaction
@@ -2527,7 +2600,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None,
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -3022,7 +3095,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
-            credential: None, deterministic: None, settlement_peg: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None,
         };
 
         // Collect the frames the engine produces (the buffered result), then reveal them into the
@@ -3123,7 +3196,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None,
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.

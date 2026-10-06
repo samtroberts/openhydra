@@ -2753,11 +2753,13 @@ version = "0.3.20"
 dependencies = [
  "axum",
  "base64",
+ "bs58",
  "clap",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "ed25519-dalek",
  "hex",
+ "k256",
  "libc",
  "notify",
  "openhydra-network",

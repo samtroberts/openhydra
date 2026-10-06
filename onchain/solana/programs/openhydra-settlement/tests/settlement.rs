@@ -120,6 +120,10 @@ fn send(ctx: &mut Ctx, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), 
 }
 
 fn try_initialize(ctx: &mut Ctx, by: &Keypair, refund_delay_secs: i64) -> Result<(), String> {
+    try_initialize_on(ctx, by, refund_delay_secs, CLUSTER)
+}
+
+fn try_initialize_on(ctx: &mut Ctx, by: &Keypair, refund_delay_secs: i64, cluster: [u8; 32]) -> Result<(), String> {
     let ix = Instruction {
         program_id: ctx.program_id,
         accounts: openhydra_settlement::accounts::Initialize {
@@ -134,7 +138,7 @@ fn try_initialize(ctx: &mut Ctx, by: &Keypair, refund_delay_secs: i64) -> Result
             fee_account: ctx.fee_authority.pubkey(),
             usdc_mint: Pubkey::new_unique(),
             refund_delay_secs,
-            cluster: CLUSTER,
+            cluster,
         }
         .data(),
     };
@@ -524,4 +528,78 @@ fn fees_accrue_for_the_fee_authority_to_withdraw() {
     assert!(withdraw_fees(&mut ctx, &fa, 4_001).is_err(), "no more than accrued");
     withdraw_fees(&mut ctx, &fa, 4_000).expect("the fee authority takes its fees");
     assert_eq!(config_state(&ctx).accrued_fees, 0);
+}
+
+/// An account owned by this program holding `value` (Anchor-serialized), as if it had been created by
+/// the program — for state the test can't create through instructions without the parties' keys.
+fn put_program_account<T: anchor_lang::AccountSerialize>(ctx: &mut Ctx, at: Pubkey, value: &T, space: usize) {
+    let mut data = Vec::new();
+    value.try_serialize(&mut data).unwrap();
+    data.resize(space, 0);
+    let mut acct = ctx.svm.get_account(&program_data_address(&ctx.program_id)).unwrap();
+    acct.owner = ctx.program_id;
+    acct.executable = false;
+    acct.lamports = 1_000_000_000;
+    acct.data = data;
+    ctx.svm.set_account(at, acct).unwrap();
+}
+
+/// End-to-end with the agent: settle, on this program, a claim a live gateway signed (from the
+/// provider's "kept the on-chain claim" debug log). The vault and payout binding are written directly
+/// (the test holds neither party's key); the consumer's signature over the claim is the agent's own.
+///
+///   OPENHYDRA_AGENT_CLAIM="<consumer hex> <provider hex> <model> <cumulative> <expires_at> <sig hex> <cluster hex>" \
+///     cargo test -- --ignored settles_a_claim_made_by_the_agent
+#[test]
+#[ignore]
+fn settles_a_claim_made_by_the_agent() {
+    let raw = std::env::var("OPENHYDRA_AGENT_CLAIM").expect("OPENHYDRA_AGENT_CLAIM");
+    let f: Vec<&str> = raw.split_whitespace().collect();
+    let b32 = |h: &str| -> [u8; 32] { hex_decode(h).try_into().unwrap() };
+    let (consumer, provider, model) = (b32(f[0]), b32(f[1]), f[2].to_string());
+    let (cumulative, expires_at): (u64, u64) = (f[3].parse().unwrap(), f[4].parse().unwrap());
+    let sig: [u8; 64] = hex_decode(f[5]).try_into().unwrap();
+    let cluster = b32(f[6]);
+
+    let mut ctx = setup();
+    let admin = ctx.admin.insecure_clone();
+    try_initialize_on(&mut ctx, &admin, 86_400, cluster).expect("initialize");
+    let consumer_key = Pubkey::new_from_array(consumer);
+    let vault = Pubkey::find_program_address(&[b"vault", consumer_key.as_ref(), &provider], &ctx.program_id).0;
+    let v = openhydra_settlement::Vault { consumer: consumer_key, provider, balance: 10_000_000, exit_requested_at: 0 };
+    put_program_account(&mut ctx, vault, &v, 8 + 32 + 32 + 8 + 8);
+    let binding = Pubkey::find_program_address(&[b"payout", &provider], &ctx.program_id).0;
+    let pb = openhydra_settlement::PayoutBinding { provider, payout_address: provider, ts_unix_ms: 1, initialized: true };
+    put_program_account(&mut ctx, binding, &pb, 8 + 32 + 32 + 8 + 1);
+
+    let msg = settle_claim_preimage(&ctx.program_id.to_bytes(), &cluster, &provider, &consumer, cumulative, expires_at, &model);
+    let ed_ix = ed25519_ix(&consumer, &sig, &msg);
+    let channel = Pubkey::find_program_address(&[b"channel", &consumer, &provider, &model_hash(&model)], &ctx.program_id).0;
+    let settle_ix = Instruction {
+        program_id: ctx.program_id,
+        accounts: openhydra_settlement::accounts::Settle {
+            payer: ctx.payer.pubkey(),
+            config: ctx.config,
+            vault,
+            channel,
+            payout_binding: binding,
+            instructions_sysvar: ctx.instr_sysvar,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: openhydra_settlement::instruction::Settle {
+            claim: openhydra_settlement::SettleClaimArgs { provider, consumer, cumulative_amount: cumulative, expires_at, model_id: model.clone() },
+        }
+        .data(),
+    };
+    let payer = ctx.payer.insecure_clone();
+    send(&mut ctx, &[ed_ix, settle_ix], &[&payer]).expect("the agent's claim settles");
+    let acct = ctx.svm.get_account(&channel).unwrap();
+    let ch = openhydra_settlement::Channel::try_deserialize(&mut &acct.data[..]).unwrap();
+    assert_eq!(ch.settled_amount, cumulative);
+    println!("settled {cumulative} for {model}: vault now {}", 10_000_000 - cumulative);
+}
+
+fn hex_decode(h: &str) -> Vec<u8> {
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
 }
