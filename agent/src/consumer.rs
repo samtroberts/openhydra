@@ -186,8 +186,13 @@ fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64)
 enum BehindReceipt {
     /// Not a valid receipt between this consumer and provider for this model, with a cumulative.
     NotOurs,
-    /// Ours, but no further than our voucher already is: nothing to catch up to.
+    /// Ours, but no further than what this serve's receipt built on: nothing to catch up to (a
+    /// provider refusing this serve's amount isn't ahead of us; it disputes it).
     Stale,
+    /// Ours and further along, but not shown to be signed for the deployment we settle on: on a
+    /// settlement chain only the receipt's claim, signed for this deployment, shows that. A receipt
+    /// from another deployment (or from before one) would re-authorize that history here.
+    NotThisDeployment,
     /// This very serve's receipt (same nonce), co-signed before at this cumulative: it settled, and
     /// only the reply was lost.
     ThisServe(u64),
@@ -195,27 +200,53 @@ enum BehindReceipt {
     Adopt(u64),
 }
 
+/// What a "behind" receipt is judged against: this serve's receipt and the settlement it uses.
+struct BehindContext<'a> {
+    consumer_pub: &'a [u8],
+    provider_pub: &'a [u8],
+    model_id: &'a str,
+    nonce: &'a [u8; 16],
+    /// What this serve's receipt built on: the higher of the pair's voucher and the most we had
+    /// signed for it before this serve.
+    base: u64,
+    /// The peg receipts are signed at now.
+    peg: Option<u64>,
+    /// Whether the receipt was signed for the deployment we settle on (always, off-chain).
+    signed_here: &'a dyn Fn(&crate::receipt::LatestReceipt) -> bool,
+}
+
 /// Judge a provider's "behind" receipt. Only a receipt this consumer signed (and the provider
-/// co-signed) for this pair and model counts: the provider can claim anything we signed, so its
-/// cumulative is safe to adopt; nothing else is.
-fn judge_behind_receipt(
-    latest: &openhydra_protocol::receipts::CoSignedReceipt,
-    consumer_pub: &[u8],
-    provider_pub: &[u8],
-    model_id: &str,
-    nonce: &[u8; 16],
-    own_gross: u64,
-) -> BehindReceipt {
-    let p = &latest.payload;
-    let ours = openhydra_protocol::receipts::verify_receipt(latest).is_ok()
-        && p.consumer.as_bytes() == consumer_pub
-        && p.provider.as_bytes() == provider_pub
-        && p.model_id == model_id;
+/// co-signed) for this pair and model, at the peg we sign at now, counts: the provider can claim
+/// anything we signed, so its cumulative is safe to adopt when it was signed for this deployment and
+/// is past what this serve built on; nothing else is.
+fn judge_behind_receipt(latest: &crate::receipt::LatestReceipt, cx: &BehindContext) -> BehindReceipt {
+    let p = &latest.receipt.payload;
+    let ours = openhydra_protocol::receipts::verify_receipt(&latest.receipt).is_ok()
+        && p.consumer.as_bytes() == cx.consumer_pub
+        && p.provider.as_bytes() == cx.provider_pub
+        && p.model_id == cx.model_id
+        && p.peg_micros_per_credit == cx.peg
+        && p.settlement_asset == cx.peg.map(|_| SettlementAsset::Usdc);
     match p.cumulative_amount {
-        Some(c) if ours && &p.nonce == nonce => BehindReceipt::ThisServe(c),
-        Some(c) if ours && c > own_gross => BehindReceipt::Adopt(c),
-        Some(_) if ours => BehindReceipt::Stale,
+        Some(c) if ours && &p.nonce == cx.nonce => BehindReceipt::ThisServe(c),
+        Some(c) if ours && c <= cx.base => BehindReceipt::Stale,
+        Some(_) if ours && !(cx.signed_here)(latest) => BehindReceipt::NotThisDeployment,
+        Some(c) if ours => BehindReceipt::Adopt(c),
         _ => BehindReceipt::NotOurs,
+    }
+}
+
+/// Whether `latest` was signed for `chain`'s deployment, by this consumer: its claim's signature
+/// checks there (Solana: by the receipt's consumer key; Base: by our wallet). Off-chain, always.
+fn signed_for_deployment(chain: Option<&crate::settlement_config::SettlementChain>, latest: &crate::receipt::LatestReceipt) -> bool {
+    use openhydra_protocol::settlement::{claim_signer, evm_address, ClaimSigner};
+    let Some(chain) = chain else { return true };
+    let Some(sig) = &latest.claim else { return false };
+    let Some(claim) = crate::receipt::claim_for(&latest.receipt.payload, sig.expires_at) else { return false };
+    match claim_signer(&chain.domain, &claim, &sig.sig) {
+        Ok(ClaimSigner::Solana) => true,
+        Ok(ClaimSigner::Evm(addr)) => chain.evm_wallet.as_ref().is_some_and(|w| evm_address(w.verifying_key()) == addr),
+        Err(_) => false,
     }
 }
 
@@ -2092,11 +2123,10 @@ impl ConsumerNode {
             // co-sign, keeping it equal to the latest co-signed cumulative. No value moves.
             // Built on the highest cumulative we ever signed for the pair (co-signed or not: anything
             // signed can be claimed), so a lost reply or a lost voucher never shortchanges the provider.
-            let compute_voucher = || {
+            let compute_voucher = |base: u64| {
                 node.settlement_peg.map(|peg| {
                     let split = node.gated_split_for(&peer_id, &model_key, tokens, now, peg);
-                    let cumulative = node.settle_base(&vkey).saturating_add(split.net_to_provider + split.protocol_fee);
-                    (split, cumulative)
+                    (split, base.saturating_add(split.net_to_provider + split.protocol_fee))
                 })
             };
             // On a settlement chain: the receipt's on-chain claim, valid for CLAIM_LIFETIME_SECS.
@@ -2150,23 +2180,35 @@ impl ConsumerNode {
                 }
                 outcome
             };
-            let mut voucher = compute_voucher();
+            let base = node.settle_base(&vkey);
+            let mut voucher = compute_voucher(base);
             let mut outcome = settle(voucher);
             // Behind the provider's high-water: catch up to the receipt it sent back (ours, by its
             // signature) and sign again on top of it — once.
             let mut settled_earlier = false;
             if let Err(ReceiptFailure::Behind(latest)) = &outcome {
-                let own = node.gated_cumulative_gross(&vkey);
-                match judge_behind_receipt(latest, &consumer_pub, &provider_pub, &model_id, &nonce, own) {
+                let signed_here = |l: &crate::receipt::LatestReceipt| signed_for_deployment(chain.as_ref(), l);
+                let cx = BehindContext {
+                    consumer_pub: &consumer_pub,
+                    provider_pub: &provider_pub,
+                    model_id: &model_id,
+                    nonce: &nonce,
+                    base,
+                    peg: node.settlement_peg,
+                    signed_here: &signed_here,
+                };
+                match judge_behind_receipt(latest, &cx) {
                     BehindReceipt::ThisServe(c) => {
                         node.raise_gated_voucher(&vkey, c);
                         settled_earlier = true;
                     }
                     BehindReceipt::Adopt(c) => {
-                        tracing::info!(provider = %peer_id, from = own, to = c,
+                        tracing::info!(provider = %peer_id, from = base, to = c,
                             "settlement was behind the provider's last co-signed receipt; caught up");
                         node.raise_gated_voucher(&vkey, c);
-                        voucher = compute_voucher();
+                        // On top of the provider's receipt, not of the one we just signed: that one
+                        // already holds this serve.
+                        voucher = compute_voucher(c);
                         outcome = settle(voucher);
                     }
                     other => tracing::warn!(provider = %peer_id, ?other,
@@ -2804,28 +2846,79 @@ mod tests {
 
     #[test]
     fn a_consumer_adopts_only_its_own_receipt_from_a_provider() {
+        use crate::receipt::LatestReceipt;
         use ed25519_dalek::{Signer, SigningKey};
         use openhydra_protocol::receipts::{cosign_bytes, payload_from_bytes, CoSignedReceipt};
         let consumer = SigningKey::from_bytes(&[7u8; 32]);
         let provider = SigningKey::from_bytes(&[9u8; 32]);
         let (cpub, ppub) = (consumer.verifying_key().to_bytes(), provider.verifying_key().to_bytes());
-        let receipt = |signer: &SigningKey, nonce: u8, model: &str, cumulative: u64| {
+        let signed_at = |signer: &SigningKey, nonce: u8, model: &str, cumulative: u64, peg: u64| {
             let payload = payload_from_bytes(&ppub, &cpub, model, 10, &[nonce; 16], 1, None, "",
-                Some(cumulative), None, None).unwrap();
+                Some(cumulative), Some(SettlementAsset::Usdc), Some(peg)).unwrap();
             let consumer_sig = signer.sign(&payload.canonical_bytes());
             let provider_sig = provider.sign(&cosign_bytes(&payload, &consumer_sig));
-            CoSignedReceipt { payload, consumer_sig, provider_sig }
+            LatestReceipt { receipt: CoSignedReceipt { payload, consumer_sig, provider_sig }, claim: None }
         };
-        let judge = |r: &CoSignedReceipt, own: u64| judge_behind_receipt(r, &cpub, &ppub, "m", &[2u8; 16], own);
-        // An earlier serve's receipt past our voucher: adopt it.
+        let receipt = |signer: &SigningKey, nonce: u8, model: &str, cumulative: u64| signed_at(signer, nonce, model, cumulative, 1);
+        let judge_where = |r: &LatestReceipt, base: u64, here: bool| {
+            let signed_here = |_: &LatestReceipt| here;
+            let cx = BehindContext {
+                consumer_pub: &cpub,
+                provider_pub: &ppub,
+                model_id: "m",
+                nonce: &[2u8; 16],
+                base,
+                peg: Some(1),
+                signed_here: &signed_here,
+            };
+            judge_behind_receipt(r, &cx)
+        };
+        let judge = |r: &LatestReceipt, base: u64| judge_where(r, base, true);
+        // An earlier serve's receipt past what this serve built on: adopt it.
         assert_eq!(judge(&receipt(&consumer, 1, "m", 500), 300), BehindReceipt::Adopt(500));
-        // Not past it: nothing to catch up to.
+        // Not past it: nothing to catch up to. That includes a provider refusing this serve's amount
+        // while holding a receipt we had already built on (review S6: adopting it would charge this
+        // serve twice).
         assert_eq!(judge(&receipt(&consumer, 1, "m", 500), 500), BehindReceipt::Stale);
+        assert_eq!(judge(&receipt(&consumer, 1, "m", 400), 500), BehindReceipt::Stale);
         // This serve's own receipt (its co-sign reply was lost): it settled.
         assert_eq!(judge(&receipt(&consumer, 2, "m", 500), 300), BehindReceipt::ThisServe(500));
-        // Signed by someone else, or for another model: never adopted.
+        // Signed by someone else, for another model, or at another peg: never adopted.
         assert_eq!(judge(&receipt(&SigningKey::from_bytes(&[8u8; 32]), 1, "m", 9_999), 0), BehindReceipt::NotOurs);
         assert_eq!(judge(&receipt(&consumer, 1, "other", 9_999), 0), BehindReceipt::NotOurs);
+        assert_eq!(judge(&signed_at(&consumer, 1, "m", 9_999, 2), 0), BehindReceipt::NotOurs);
+        // Ours, but not shown to be signed for the deployment we settle on (review S1).
+        assert_eq!(judge_where(&receipt(&consumer, 1, "m", 9_999), 0, false), BehindReceipt::NotThisDeployment);
+    }
+
+    #[test]
+    fn only_a_claim_signed_for_this_deployment_shows_a_receipt_belongs_to_it() {
+        use crate::receipt::{claim_for, ClaimSig, LatestReceipt};
+        use crate::settlement_config::SettlementChain;
+        use ed25519_dalek::{Signer, SigningKey};
+        use openhydra_protocol::receipts::{cosign_bytes, payload_from_bytes, CoSignedReceipt};
+        use openhydra_protocol::settlement::{ChainDomain, SolanaDomain};
+        let consumer = SigningKey::from_bytes(&[7u8; 32]);
+        let provider = SigningKey::from_bytes(&[9u8; 32]);
+        let (cpub, ppub) = (consumer.verifying_key().to_bytes(), provider.verifying_key().to_bytes());
+        let payload = payload_from_bytes(&ppub, &cpub, "m", 10, &[1; 16], 1, None, "",
+            Some(500), Some(SettlementAsset::Usdc), Some(1)).unwrap();
+        let consumer_sig = consumer.sign(&payload.canonical_bytes());
+        let provider_sig = provider.sign(&cosign_bytes(&payload, &consumer_sig));
+        let receipt = CoSignedReceipt { payload, consumer_sig, provider_sig };
+        let here = ChainDomain::Solana(SolanaDomain { program_id: [4; 32], cluster: [5; 32] });
+        let elsewhere = ChainDomain::Solana(SolanaDomain { program_id: [4; 32], cluster: [6; 32] });
+        let with_claim_for = |domain: &ChainDomain| {
+            let claim = claim_for(&receipt.payload, 1_800_000_000).unwrap();
+            let sig = consumer.sign(&domain.claim_message(&claim)).to_bytes().to_vec();
+            LatestReceipt { receipt: receipt.clone(), claim: Some(ClaimSig { expires_at: 1_800_000_000, sig }) }
+        };
+        let chain = SettlementChain { domain: here.clone(), evm_wallet: None };
+        assert!(signed_for_deployment(Some(&chain), &with_claim_for(&here)));
+        assert!(!signed_for_deployment(Some(&chain), &with_claim_for(&elsewhere)), "another cluster's claim");
+        let bare = LatestReceipt { receipt: receipt.clone(), claim: None };
+        assert!(!signed_for_deployment(Some(&chain), &bare), "no claim: nothing shows where it was signed");
+        assert!(signed_for_deployment(None, &bare), "off-chain there is no deployment to tell apart");
     }
 
     #[test]

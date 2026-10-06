@@ -1704,9 +1704,20 @@ impl<A: EngineAdapter> Provider<A> {
                 // A consumer behind our high-water (a co-sign reply it never got, a voucher it lost)
                 // would be refused on every receipt from here on: send it the receipt that set the
                 // high-water, which it signed, so it can sign on top of it.
+                // On a settlement chain its claim goes with it: the claim is what shows the consumer
+                // the receipt was signed for this deployment.
                 let latest = self.settled_receipts.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
                 match (e, latest) {
-                    (_, Some(r)) if r.payload.cumulative_amount == Some(last) => BindRejection::Behind(Box::new(r)),
+                    (_, Some(r)) if r.payload.cumulative_amount == Some(last) => {
+                        let claim = self
+                            .settled_claims
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&key)
+                            .filter(|k| k.cumulative == last)
+                            .map(|k| crate::receipt::ClaimSig { expires_at: k.expires_at, sig: k.sig.clone() });
+                        BindRejection::Behind(Box::new(crate::receipt::LatestReceipt { receipt: r, claim }))
+                    }
                     (openhydra_protocol::payout::CumulativeError::NonMonotonic, _) => {
                         "cumulative amount is non-monotonic".into()
                     }

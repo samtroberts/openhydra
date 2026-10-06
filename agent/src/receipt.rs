@@ -30,8 +30,17 @@ pub const RECEIPT_REQUEST: u8 = 0x12;
 const RESP_OK: u8 = 0x00;
 const RESP_ERR: u8 = 0x01;
 /// The receipt's cumulative is behind the provider's latest co-signed one for the pair, which
-/// follows ([`encode_cosigned`]) so the consumer can catch up.
+/// follows ([`encode_latest`]) so the consumer can catch up.
 const RESP_BEHIND: u8 = 0x02;
+
+/// The latest co-signed receipt a provider holds for a pair, and (on a settlement chain) the
+/// consumer's on-chain claim for it. The claim is what shows the receipt was signed for this
+/// deployment: the receipt itself names none.
+#[derive(Debug, Clone)]
+pub struct LatestReceipt {
+    pub receipt: CoSignedReceipt,
+    pub claim: Option<ClaimSig>,
+}
 
 /// Why a provider's bind check turned a receipt down.
 #[derive(Debug, Clone)]
@@ -42,7 +51,7 @@ pub enum BindRejection {
     /// `(consumer, model)` — a co-sign reply the consumer never got, or a voucher it lost. That
     /// receipt goes back: it carries the consumer's own signature, so the consumer can adopt its
     /// cumulative and sign again on top of it.
-    Behind(Box<CoSignedReceipt>),
+    Behind(Box<LatestReceipt>),
 }
 
 impl From<String> for BindRejection {
@@ -64,7 +73,7 @@ pub enum ReceiptFailure {
     Failed(AdapterError),
     /// The provider holds a later co-signed receipt for the pair (see [`BindRejection::Behind`]).
     /// Not yet checked: the consumer verifies it is its own before trusting it.
-    Behind(Box<CoSignedReceipt>),
+    Behind(Box<LatestReceipt>),
 }
 
 impl From<AdapterError> for ReceiptFailure {
@@ -258,6 +267,7 @@ fn read_flag_u8(data: &[u8], pos: &mut usize, what: &str) -> Result<Option<u8>, 
     }
 }
 
+#[cfg(test)]
 fn decode_request(data: &[u8]) -> Result<(ReceiptPayload, Signature), AdapterError> {
     decode_request_with_claim(data).map(|(p, s, _)| (p, s))
 }
@@ -383,12 +393,26 @@ pub fn encode_cosigned(receipt: &CoSignedReceipt) -> Vec<u8> {
 
 /// The inverse of [`encode_cosigned`]. Decodes only; the signatures are not checked.
 pub fn decode_cosigned(bytes: &[u8]) -> Result<CoSignedReceipt, AdapterError> {
+    let latest = decode_latest(bytes)?;
+    Ok(latest.receipt)
+}
+
+/// A [`RESP_BEHIND`] reply's body: [`encode_cosigned`], with the claim (if any) after the request.
+pub fn encode_latest(latest: &LatestReceipt) -> Vec<u8> {
+    let r = &latest.receipt;
+    let mut b = r.provider_sig.to_bytes().to_vec();
+    b.extend_from_slice(&encode_request_with_claim(&r.payload, &r.consumer_sig, latest.claim.as_ref()));
+    b
+}
+
+/// The inverse of [`encode_latest`]. Decodes only; no signature is checked.
+pub fn decode_latest(bytes: &[u8]) -> Result<LatestReceipt, AdapterError> {
     if bytes.len() < 64 {
         return Err(AdapterError::Parse("co-signed receipt truncated".into()));
     }
     let provider_sig = to_sig(&bytes[..64])?;
-    let (payload, consumer_sig) = decode_request(&bytes[64..])?;
-    Ok(CoSignedReceipt { payload, consumer_sig, provider_sig })
+    let (payload, consumer_sig, claim) = decode_request_with_claim(&bytes[64..])?;
+    Ok(LatestReceipt { receipt: CoSignedReceipt { payload, consumer_sig, provider_sig }, claim })
 }
 
 /// Consumer side: build the receipt, sign it, settle with the provider over `transport`,
@@ -449,7 +473,7 @@ pub fn request_receipt(
             ))
             .into())
         }
-        Some(&RESP_BEHIND) => return Err(ReceiptFailure::Behind(Box::new(decode_cosigned(&response[1..])?))),
+        Some(&RESP_BEHIND) => return Err(ReceiptFailure::Behind(Box::new(decode_latest(&response[1..])?))),
         _ => return Err(AdapterError::Parse("receipt response malformed".into()).into()),
     };
 
@@ -494,7 +518,7 @@ pub fn handle_receipt_inbound(
         Err(BindRejection::Reject(reason)) => return (err_response(&reason), None),
         Err(BindRejection::Behind(latest)) => {
             let mut b = vec![RESP_BEHIND];
-            b.extend_from_slice(&encode_cosigned(&latest));
+            b.extend_from_slice(&encode_latest(&latest));
             return (b, None);
         }
     }
@@ -582,16 +606,24 @@ mod tests {
         let (csign, psign, ppub) = (sign_with(&consumer), sign_with(&provider), pubkey(&provider));
         let kept = latest.clone();
         let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            let bind = |_: &ReceiptPayload, _: Option<&ClaimSig>| Err(BindRejection::Behind(Box::new(kept.clone())));
+            let bind = |_: &ReceiptPayload, _: Option<&ClaimSig>| {
+                Err(BindRejection::Behind(Box::new(LatestReceipt { receipt: kept.clone(), claim: None })))
+            };
             Ok(handle_receipt_inbound(req, &psign, &ppub, &bind).0)
         };
         let err = request_receipt(&csign, &mut transport, &ppub, &pubkey(&consumer), "m", 10, [2u8; 16], 2, "",
             Some(300), Some(SettlementAsset::Usdc), Some(1), None).unwrap_err();
         let ReceiptFailure::Behind(back) = err else { panic!("expected the provider's latest receipt") };
+        let back = back.receipt;
         assert_eq!(back.payload.cumulative_amount, Some(500));
         assert_eq!(back.payload.nonce, [1u8; 16]);
         assert_eq!(verify_receipt(&back), Ok(()), "it arrives intact, both signatures valid");
         assert_eq!(decode_cosigned(&encode_cosigned(&latest)).unwrap().to_bytes(), latest.to_bytes());
+        // On a settlement chain the receipt's claim travels with it.
+        let with_claim = LatestReceipt { receipt: latest.clone(), claim: Some(ClaimSig { expires_at: 77, sig: vec![3; 64] }) };
+        let back = decode_latest(&encode_latest(&with_claim)).unwrap();
+        assert_eq!(back.receipt.to_bytes(), latest.to_bytes());
+        assert_eq!(back.claim, with_claim.claim);
     }
 
     #[test]

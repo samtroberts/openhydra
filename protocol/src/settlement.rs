@@ -313,6 +313,12 @@ pub fn verify_claim(
     if claim.expires_at < now_secs.saturating_add(MIN_CLAIM_LIFETIME_SECS) {
         return Err(SettlementError::ClaimExpiresTooSoon);
     }
+    claim_signer(domain, claim, sig)
+}
+
+/// Who signed `claim` on `domain` (see [`verify_claim`]), whatever its expiry: a signature that
+/// checks here was made for this deployment.
+pub fn claim_signer(domain: &ChainDomain, claim: &SettlementClaim, sig: &[u8]) -> Result<ClaimSigner, SettlementError> {
     match domain {
         ChainDomain::Solana(d) => {
             let consumer = VerifyingKey::from_bytes(&claim.consumer).map_err(|_| SettlementError::BadClaimSignature)?;
