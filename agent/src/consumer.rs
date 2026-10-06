@@ -157,6 +157,10 @@ const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Settlements in flight at once, across all providers. Each is a detached thread; past this a new
 /// one is dropped (logged) rather than spawned, so a burst of serves can't grow threads without bound.
 const MAX_SETTLES_IN_FLIGHT: usize = 512;
+/// How long a provider that refused us over payment is tried last (see `payment_refusals`).
+const PAYMENT_REFUSAL_TTL_MS: u64 = 10 * 60 * 1000;
+/// Payment refusals remembered at once (the oldest are forgotten first).
+const MAX_PAYMENT_REFUSALS: usize = 1024;
 /// Settlements running or queued for one `(peer, model)`. They run one at a time (its lock), so with
 /// a provider that black-holes receipts each waits out [`SETTLE_TIMEOUT`] in turn; more than a few
 /// queued behind it would only wait to fail.
@@ -924,6 +928,10 @@ pub struct ConsumerNode {
     settle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Settlement threads running now (bounded by [`MAX_SETTLES_IN_FLIGHT`]).
     settles_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// `(provider libp2p id, model)` → when it last refused us over payment: tried last (and not
+    /// audited) for [`PAYMENT_REFUSAL_TTL_MS`], so a consumer that doesn't pay its price doesn't ask
+    /// it first on every request.
+    payment_refusals: Mutex<HashMap<(String, String), u64>>,
     /// Device attestation of providers (Phase 0). `None` = off (the default).
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
@@ -975,6 +983,7 @@ impl ConsumerNode {
             settlement_chain: None,
             settle_locks: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            payment_refusals: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
         }
@@ -1249,6 +1258,7 @@ impl ConsumerNode {
             settlement_chain: None,
             settle_locks: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            payment_refusals: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
         }
@@ -1546,6 +1556,27 @@ impl ConsumerNode {
     }
 
 
+    /// Remember that `provider` refused us `model` over payment (see `payment_refusals`).
+    fn note_payment_refusal(&self, provider: &str, model: &str, now: u64) {
+        let mut m = self.payment_refusals.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, at| now.saturating_sub(*at) <= PAYMENT_REFUSAL_TTL_MS);
+        if m.len() >= MAX_PAYMENT_REFUSALS {
+            if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
+        m.insert((provider.to_string(), model.to_string()), now);
+    }
+
+    /// Whether `provider` refused us `model` over payment within [`PAYMENT_REFUSAL_TTL_MS`].
+    fn refused_payment(&self, provider: &str, model: &str, now: u64) -> bool {
+        self.payment_refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(provider.to_string(), model.to_string()))
+            .is_some_and(|at| now.saturating_sub(*at) <= PAYMENT_REFUSAL_TTL_MS)
+    }
+
     /// On Base, the wallet our claims are signed with, as a serve request names it.
     fn settlement_wallet(&self) -> Option<String> {
         let wallet = self.settlement_chain.as_ref()?.evm_wallet.as_ref()?;
@@ -1713,7 +1744,7 @@ impl ConsumerNode {
         // a provider that has failed this consumer ranks below an untried one. Increment 3: the
         // buyer's assurance policy hard-gates (or, by default, verify-but-routes) on the achieved
         // authenticity tier this consumer has established from its own audits.
-        let candidates = rank_providers_with_assurance(
+        let mut candidates = rank_providers_with_assurance(
             &peers,
             "",
             self.tier,
@@ -1721,6 +1752,8 @@ impl ConsumerNode {
             &|pid, mkey| self.authenticity_of(pid, mkey, now),
             &self.assurance,
         );
+        // Providers that just refused us over payment go last (in their order).
+        candidates.sort_by_key(|c| self.refused_payment(&c.libp2p_peer_id, &c.model_id, now));
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
@@ -1975,8 +2008,14 @@ impl ConsumerNode {
                     // M2.2(a): a failed/refused serve attempt costs the provider
                     // reputation, so a dead/erroring one is downranked on the next discover.
                     // #7: never ding our own provider's reputation on a self-serve.
-                    // A provider that charges refusing us over payment did nothing wrong: no penalty.
-                    if !self.is_self_serve(&provider.libp2p_peer_id) && !crate::serve::is_payment_refusal(&e.to_string()) {
+                    // A provider that charges refusing us over payment, before serving anything, did
+                    // nothing wrong: no penalty, but it goes last for a while. A "refusal" after
+                    // output was delivered is a failed serve like any other.
+                    let refused = !delivered && crate::serve::is_payment_refusal(&e);
+                    if refused {
+                        self.note_payment_refusal(&provider.libp2p_peer_id, &provider.model_id, now);
+                    }
+                    if !self.is_self_serve(&provider.libp2p_peer_id) && !refused {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                         self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
                     }
@@ -2716,11 +2755,31 @@ impl ConsumerNode {
             )));
         }
 
-        // Dispatch to the top two, then escalate to a third only if they can't decide.
+        // Dispatch to the top two, then escalate to a third only if they can't decide. A provider
+        // that charges and refuses us over payment isn't a non-responder (a price, not a fault): it
+        // is skipped for the next one, and so is one that just refused us.
+        let mut pool = candidates.iter().filter(|c| !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now));
+        let mut ask = |results: &mut Vec<(String, Result<String, String>)>| {
+            for provider in pool.by_ref() {
+                match self.dispatch_full(provider, challenge) {
+                    Err(e) if crate::serve::is_payment_refusal(&e) => {
+                        self.note_payment_refusal(&provider.libp2p_peer_id, &provider.model_id, now);
+                    }
+                    out => {
+                        results.push((provider.state_id.clone(), out.map_err(|e| e.to_string())));
+                        return;
+                    }
+                }
+            }
+        };
         let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(3);
-        for provider in candidates.iter().take(2) {
-            let out = self.dispatch_full(provider, challenge).map_err(|e| e.to_string());
-            results.push((provider.state_id.clone(), out));
+        ask(&mut results);
+        ask(&mut results);
+        if results.len() < 2 {
+            return Err(AdapterError::Http(format!(
+                "redundant-exec audit needs ≥2 providers that serve us '{model}', found {}",
+                results.len()
+            )));
         }
         // B-S2: gate each response on the required nonce echo and compare only the generated
         // *body* (after the nonce) — a freeloader that parrots the copyable prompt is filtered
@@ -2741,9 +2800,8 @@ impl ConsumerNode {
         };
         let mut report = resolve_audit(&gate(&results));
         if report.verdict == RedundantVerdict::Inconclusive {
-            if let Some(third) = candidates.get(2) {
-                let out = self.dispatch_full(third, challenge).map_err(|e| e.to_string());
-                results.push((third.state_id.clone(), out));
+            ask(&mut results);
+            if results.len() == 3 {
                 report = resolve_audit(&gate(&results));
             }
         }

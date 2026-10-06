@@ -52,9 +52,12 @@ pub const BILLING_VERSION: u8 = 2;
 /// or its unpaid serves). A consumer doesn't hold it against the provider: it is a price, not a fault.
 pub const PAYMENT_REFUSAL: &str = "payment required: ";
 
-/// Whether a serve error is a [`PAYMENT_REFUSAL`].
-pub fn is_payment_refusal(error: &str) -> bool {
-    error.contains(PAYMENT_REFUSAL)
+/// Whether a serve error is a [`PAYMENT_REFUSAL`]: the provider's error frame, starting with it.
+/// (Not an error that merely mentions it: a provider's other errors, an engine's text among them,
+/// can say anything.) Only a refusal before anything was delivered is one; a provider refuses at
+/// admission, never mid-stream.
+pub fn is_payment_refusal(error: &crate::adapter::AdapterError) -> bool {
+    matches!(error, crate::adapter::AdapterError::Http(m) if m.starts_with(PAYMENT_REFUSAL))
 }
 
 /// Tokens with no text of their own (end-of-turn and other special markers) allowed on top of the
@@ -672,6 +675,15 @@ mod tests {
             frames.push(ServeChunk::decode(bytes).unwrap());
         });
         (frames, summary)
+    }
+
+    #[test]
+    fn only_a_provider_error_starting_with_the_refusal_is_one() {
+        use crate::adapter::AdapterError;
+        assert!(is_payment_refusal(&AdapterError::Http(format!("{PAYMENT_REFUSAL}settle first"))));
+        // An error that merely mentions it (an engine's text, say) isn't one.
+        assert!(!is_payment_refusal(&AdapterError::Http(format!("engine said: {PAYMENT_REFUSAL}x"))));
+        assert!(!is_payment_refusal(&AdapterError::Parse(format!("{PAYMENT_REFUSAL}x"))));
     }
 
     #[test]
