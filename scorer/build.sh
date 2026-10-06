@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build openhydra-scorer: llama.cpp's llama-server at the commit in LLAMACPP_COMMIT, with OpenHydra's
-# prompt-scoring patch (POST /v1/prompt_logprobs, a startup memory check, --exit-on-stdin-eof) and its
-# loader for the Qwen3.5 GGUFs Ollama publishes (llamacpp-ollama-compat.patch), as one self-contained binary the agent runs as its side-scorer (agent/src/side_scorer.rs).
+# prompt-scoring patch (POST /v1/prompt_logprobs, a startup memory check, --exit-on-stdin-eof), its
+# loader for the Qwen3.5 GGUFs Ollama publishes (llamacpp-ollama-compat.patch) and tokenizer-only
+# subcommands (llamacpp-token-count.patch), as one self-contained binary the agent runs as its
+# side-scorer (agent/src/side_scorer.rs) and a gateway counts tokens with (agent/src/token_count.rs).
 #
 #   scorer/build.sh <out-path>
 #
@@ -16,6 +18,8 @@ COMMIT="$(tr -d ' \r\n' < "$HERE/LLAMACPP_COMMIT")"
 PATCH="$HERE/llamacpp-prompt-scoring.patch"
 # Loads the Qwen3.5 GGUFs Ollama publishes (its own layout; see the patch), applied after PATCH.
 COMPAT_PATCH="$HERE/llamacpp-ollama-compat.patch"
+# --export-vocab / --count-tokens: a verifier's tokenizer, without the model's weights.
+COUNT_PATCH="$HERE/llamacpp-token-count.patch"
 WORK="${SCORER_WORK:-$HERE/.build}"
 SRC="$WORK/llama.cpp"
 mkdir -p "$WORK"
@@ -29,7 +33,8 @@ if [[ -n "${LLAMACPP_SRC:-}" ]]; then
     [[ -e "$entry" ]] || continue
     case "$(basename "$entry")" in build*) ;; *) cp -R "$entry" "$SRC/" ;; esac
   done
-  (cd "$SRC" && patch -p1 --forward --silent < "$PATCH" && patch -p1 --forward --silent < "$COMPAT_PATCH")
+  (cd "$SRC" && patch -p1 --forward --silent < "$PATCH" && patch -p1 --forward --silent < "$COMPAT_PATCH" \
+    && patch -p1 --forward --silent < "$COUNT_PATCH")
 else
   if [[ ! -d "$SRC/.git" ]]; then
     git init -q "$SRC"
@@ -40,6 +45,7 @@ else
   git -C "$SRC" clean -qfdx -e 'build-scorer'
   git -C "$SRC" apply "$PATCH"
   git -C "$SRC" apply "$COMPAT_PATCH"
+  git -C "$SRC" apply "$COUNT_PATCH"
 fi
 
 FLAGS=(
@@ -68,8 +74,9 @@ cmake --build "$SRC/build-scorer" --target llama-server --config Release --paral
 
 BIN="$(find "$SRC/build-scorer/bin" -type f \( -name llama-server -o -name llama-server.exe \) | head -n 1)"
 [[ -n "$BIN" ]] || { echo "scorer/build.sh: no llama-server built (see $WORK/build.log)" >&2; exit 1; }
-# The patch must be in (the agent starts it with these flags) before it replaces $OUT.
+# The patches must be in (the agent starts it with these flags) before it replaces $OUT.
 "$BIN" --help 2>&1 | grep -q -- '--exit-on-stdin-eof' || { echo "scorer/build.sh: $BIN lacks the OpenHydra patch" >&2; exit 1; }
+{ "$BIN" --count-tokens 2>&1 || true; } | grep -q -- '--count-tokens <vocab.gguf>' || { echo "scorer/build.sh: $BIN lacks the token-count patch" >&2; exit 1; }
 # Licence notices of everything compiled in, shipped beside it (<out>.notices.txt, without .exe).
 "$(command -v python3 || command -v python)" "$HERE/notices.py" llamacpp "$SRC" "$WORK/notices.txt"
 mkdir -p "$(dirname "$OUT")"

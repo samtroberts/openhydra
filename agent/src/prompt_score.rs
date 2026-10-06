@@ -333,6 +333,10 @@ pub fn request_prompt_scores(
 pub struct LoadedReference {
     pub handles: Vec<String>,
     pub set: ReferenceSet,
+    /// The model's tokenizer, as a vocabulary-only GGUF (`openhydra-scorer --export-vocab`): what a
+    /// gateway counts a provider's delivered tokens with ([`crate::token_count`]). Resolved against
+    /// the reference file's directory by [`load_reference`].
+    pub vocab: Option<std::path::PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +370,9 @@ struct ReferenceFile {
     /// Digest of the weights file the reference was scored from (`sha256:<hex>`).
     #[serde(default)]
     weights: Option<String>,
+    /// The model's vocabulary-only GGUF, relative to the reference file.
+    #[serde(default)]
+    vocab: Option<String>,
     texts: Vec<ReferenceTextFile>,
 }
 
@@ -421,7 +428,7 @@ pub fn parse_reference(json: &str) -> Result<LoadedReference, String> {
     if let Some(t) = set.texts.iter().find(|t| t.token_ids.len() > MAX_CHALLENGE_TOKENS) {
         return Err(format!("reference set {}: text {} exceeds {MAX_CHALLENGE_TOKENS} tokens", set.model_key, t.id));
     }
-    Ok(LoadedReference { handles: f.handles, set })
+    Ok(LoadedReference { handles: f.handles, set, vocab: f.vocab.map(std::path::PathBuf::from) })
 }
 
 /// The reference to check a provider's model against: the one scored from the weights file the
@@ -487,7 +494,15 @@ pub fn reference_tag(set: &ReferenceSet) -> [u8; 16] {
 /// Read and validate a reference-set file.
 pub fn load_reference(path: &std::path::Path) -> Result<LoadedReference, String> {
     let json = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    parse_reference(&json).map_err(|e| format!("{}: {e}", path.display()))
+    let mut r = parse_reference(&json).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(v) = r.vocab.take() {
+        let resolved = if v.is_absolute() { v } else { path.parent().unwrap_or(std::path::Path::new(".")).join(v) };
+        if !resolved.is_file() {
+            return Err(format!("{}: vocab {} not found", path.display(), resolved.display()));
+        }
+        r.vocab = Some(resolved);
+    }
+    Ok(r)
 }
 
 /// How a run of challenges ended.
@@ -1234,6 +1249,28 @@ mod tests {
         assert_eq!(request_model_info(&mut legacy, "x"), Err(ScoreChallengeError::Unsupported));
         // An empty quant means no usable identity.
         assert_eq!(ModelInfo { quant: "".into(), ..q4.clone() }.identity(), None);
+    }
+
+    #[test]
+    fn a_reference_names_its_tokenizer_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let texts: Vec<serde_json::Value> = (0..24)
+            .map(|i| serde_json::json!({"id": format!("t{i}"), "token_ids": (0..17).map(|j| 100 * i + j).collect::<Vec<u32>>(), "logprobs": vec![-0.5f32; 16], "band": 0.1}))
+            .collect();
+        let write = |vocab: &str| {
+            let json = serde_json::json!({"model_key": "m", "handles": ["m"], "vocab": vocab, "texts": texts});
+            let path = dir.path().join("ref.json");
+            std::fs::write(&path, json.to_string()).unwrap();
+            path
+        };
+        // Missing: a startup error, not a silently disabled check.
+        let err = load_reference(&write("m.vocab.gguf")).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        std::fs::write(dir.path().join("m.vocab.gguf"), b"GGUF").unwrap();
+        assert_eq!(load_reference(&write("m.vocab.gguf")).unwrap().vocab, Some(dir.path().join("m.vocab.gguf")));
+        // None named: no tokenizer.
+        let json = serde_json::json!({"model_key": "m", "handles": ["m"], "texts": texts});
+        assert_eq!(parse_reference(&json.to_string()).unwrap().vocab, None);
     }
 
     #[test]

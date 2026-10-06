@@ -189,6 +189,11 @@ struct AssembleArgs {
     /// The same, as a digest (`sha256:<hex>`, Ollama's `sha256-<hex>` blob name, or bare hex).
     #[arg(long)]
     weights_sha256: Option<String>,
+    /// The model's vocabulary-only GGUF (`openhydra-scorer --export-vocab <model.gguf> <out>`): copied
+    /// beside the reference as `<out>.vocab.gguf` and named in it, so gateways can count the tokens
+    /// providers deliver and bill.
+    #[arg(long)]
+    vocab: Option<PathBuf>,
     /// Texts per verification round.
     #[arg(long, default_value_t = openhydra_protocol::logprob::DEFAULT_MIN_TEXTS)]
     min_texts: usize,
@@ -530,6 +535,15 @@ fn assemble(a: AssembleArgs) -> Result<(), String> {
     }
     if let Some(w) = &weights {
         out["weights"] = json!(w);
+    }
+    if let Some(vocab) = &a.vocab {
+        let name = format!(
+            "{}.vocab.gguf",
+            a.out.file_stem().and_then(|s| s.to_str()).ok_or("--out needs a file name")?
+        );
+        let dest = a.out.parent().unwrap_or(std::path::Path::new(".")).join(&name);
+        std::fs::copy(vocab, &dest).map_err(|e| format!("{} → {}: {e}", vocab.display(), dest.display()))?;
+        out["vocab"] = json!(name);
     }
     // Round-trip through the loader the gateway uses, so a file that won't load is never written.
     openhydra_agent::prompt_score::parse_reference(&out.to_string())?;

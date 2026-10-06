@@ -1,0 +1,93 @@
+OpenHydra: tokenizer-only subcommands of llama-server, for a verifier that counts the tokens of text
+a provider delivered without the model's weights (agent/src/token_count.rs).
+  --export-vocab <model.gguf> <out.gguf>  the model's metadata (tokenizer included), no tensors
+  --count-tokens <vocab.gguf>             the token count of the text on stdin
+
+--- a/tools/server/main.cpp
++++ b/tools/server/main.cpp
+@@ -1,5 +1,85 @@
++#include "common.h"
++#include "gguf.h"
++#include "llama.h"
++
++#include <cstdio>
++#include <cstring>
++#include <iostream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#endif
++
+ int llama_server(int argc, char ** argv);
+ 
++// OpenHydra: two tokenizer-only subcommands, handled before the server parses its arguments. A
++// verifier uses them to count the tokens of text a provider delivered, without the model's weights.
++//   --export-vocab <model.gguf> <out.gguf>  write the model's metadata (its tokenizer among it) and no
++//                                            tensors: a few MB, all that --count-tokens needs
++//   --count-tokens <vocab.gguf>             print how many tokens the text on stdin is, as the model
++//                                            generates it: no BOS, special tokens as themselves
++
++static void quiet(ggml_log_level, const char *, void *) {}
++
++static int export_vocab(const char * in, const char * out) {
++    gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
++    gguf_context * src = gguf_init_from_file(in, params);
++    if (!src) {
++        fprintf(stderr, "export-vocab: can't read %s\n", in);
++        return 1;
++    }
++    gguf_context * dst = gguf_init_empty();
++    gguf_set_kv(dst, src);
++    const bool ok = gguf_write_to_file(dst, out, /*only_meta =*/ true);
++    gguf_free(dst);
++    gguf_free(src);
++    if (!ok) {
++        fprintf(stderr, "export-vocab: can't write %s\n", out);
++        return 1;
++    }
++    return 0;
++}
++
++static int count_tokens(const char * path) {
++#ifdef _WIN32
++    _setmode(_fileno(stdin), _O_BINARY);
++#endif
++    llama_log_set(quiet, nullptr);
++    llama_backend_init();
++    llama_model_params mparams = llama_model_default_params();
++    mparams.vocab_only = true;
++    llama_model * model = llama_model_load_from_file(path, mparams);
++    if (!model) {
++        fprintf(stderr, "count-tokens: can't load a vocabulary from %s\n", path);
++        return 1;
++    }
++    const std::string text((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
++    const std::vector<llama_token> tokens =
++        common_tokenize(llama_model_get_vocab(model), text, /*add_special =*/ false, /*parse_special =*/ true);
++    printf("%zu\n", tokens.size());
++    llama_model_free(model);
++    llama_backend_free();
++    return 0;
++}
++
+ int main(int argc, char ** argv) {
++    if (argc >= 2 && strcmp(argv[1], "--export-vocab") == 0) {
++        if (argc != 4) {
++            fprintf(stderr, "usage: %s --export-vocab <model.gguf> <out.gguf>\n", argv[0]);
++            return 2;
++        }
++        return export_vocab(argv[2], argv[3]);
++    }
++    if (argc >= 2 && strcmp(argv[1], "--count-tokens") == 0) {
++        if (argc != 3) {
++            fprintf(stderr, "usage: %s --count-tokens <vocab.gguf> < text\n", argv[0]);
++            return 2;
++        }
++        return count_tokens(argv[2]);
++    }
+     return llama_server(argc, argv);
+ }

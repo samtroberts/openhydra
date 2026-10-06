@@ -54,6 +54,8 @@ pub mod swarms;
 /// P0 introspection: the `--status-bind` endpoint (network snapshot + transfer counters).
 pub mod status;
 pub mod telemetry;
+/// P7: counting a delivered completion's tokens with the model's tokenizer (vocabulary-only GGUF).
+pub mod token_count;
 pub mod weights;
 pub mod workpool;
 

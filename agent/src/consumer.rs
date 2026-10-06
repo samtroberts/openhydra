@@ -255,6 +255,9 @@ struct ProviderLogprob {
     rounds: Mutex<HashMap<String, ChallengeRound>>,
     status: Mutex<HashMap<String, LogprobStatus>>,
     inflight: Mutex<std::collections::HashSet<String>>,
+    /// The scorer binary that counts delivered tokens with a reference's tokenizer (P7), when some
+    /// reference carries one (`vocab`) and the binary is there.
+    count_scorer: Option<std::path::PathBuf>,
 }
 
 impl ProviderLogprob {
@@ -980,6 +983,17 @@ impl ConsumerNode {
                 Err(e) => tracing::warn!(error = %e, "could not load log-prob state"),
             }
         }
+        // P7: count delivered tokens with any reference's tokenizer, given the scorer binary.
+        let count_scorer = if refs.iter().any(|r| r.vocab.is_some()) {
+            let scorer = crate::token_count::locate_count_scorer();
+            match &scorer {
+                Some(p) => tracing::info!(scorer = %p.display(), "checking billed token counts against reference tokenizers"),
+                None => tracing::warn!("a reference carries a tokenizer, but no openhydra-scorer to count with"),
+            }
+            scorer
+        } else {
+            None
+        };
         self.provider_logprob = Some(Arc::new(ProviderLogprob {
             refs: refs.into_iter().map(Arc::new).collect(),
             registry,
@@ -988,8 +1002,54 @@ impl ConsumerNode {
             rounds: Mutex::new(rounds),
             status: Mutex::new(status),
             inflight: Mutex::new(std::collections::HashSet::new()),
+            count_scorer,
         }));
         self
+    }
+
+    /// The tokenizer (vocabulary-only GGUF) and scorer binary to count a provider's delivered tokens
+    /// with (P7): a reference naming the provider's model handle, else the one its latest log-prob
+    /// verdict was against, as long as it carries a vocabulary.
+    fn token_counter_for(&self, provider: &SelectedProvider, model_key: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let lp = self.provider_logprob.as_ref()?;
+        let scorer = lp.count_scorer.clone()?;
+        let with_vocab = || lp.refs.iter().filter(|r| r.vocab.is_some());
+        let by_handle = with_vocab().find(|r| r.handles.iter().any(|h| h == &provider.model_id));
+        let by_verdict = || {
+            let key = reputation_key(&provider.state_id, model_key);
+            let tag = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|st| st.reference)?;
+            with_vocab().find(|r| crate::prompt_score::reference_tag(&r.set) == tag)
+        };
+        let vocab = by_handle.or_else(by_verdict)?.vocab.clone()?;
+        Some((scorer, vocab))
+    }
+
+    /// Count a served completion's tokens with the model's tokenizer and hold a bill above them
+    /// against the provider (P7, detached, off the response path).
+    #[allow(clippy::too_many_arguments)]
+    fn check_billed_tokens(
+        self: &Arc<Self>,
+        counter: (std::path::PathBuf, std::path::PathBuf),
+        text: String,
+        tool_calls: Vec<crate::adapter::ToolCall>,
+        billed: u64,
+        state_id: String,
+        model_key: String,
+    ) {
+        let node = Arc::clone(self);
+        std::thread::spawn(move || {
+            let (scorer, vocab) = counter;
+            let (countable, calls) = crate::token_count::countable_text(&text, &tool_calls);
+            match crate::token_count::count_tokens(&scorer, &vocab, &countable) {
+                Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
+                    tracing::warn!(provider = %state_id, model = %model_key, billed, counted,
+                        "provider billed for more tokens than it delivered");
+                    node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+                }
+                Ok(counted) => tracing::debug!(provider = %state_id, billed, counted, "billed token count checks out"),
+                Err(e) => tracing::debug!(error = %e, "couldn't count delivered tokens"),
+            }
+        });
     }
 
     /// Persist one `(peer, model)`'s log-prob state (best-effort: a failed write is logged, never
@@ -1643,12 +1703,22 @@ impl ConsumerNode {
             // Shared across the (sequential) buffered + streaming transports via a Cell so both
             // can record it without a mutable-borrow conflict. Holds the first-ack / round-trip RTT.
             let proxy_rt = std::cell::Cell::new(0u64);
+            // P7: on a sample of serves, keep the delivered text to count its tokens afterwards.
+            let model_key_now = rep_model_key(&provider.canonical_model_id, &provider.model_id);
+            let counter = (!self.is_self_serve(&provider_libp2p)
+                && rand::random::<f64>() < crate::token_count::COUNT_SAMPLE_RATE)
+                .then(|| self.token_counter_for(&provider, model_key_now))
+                .flatten();
+            let captured = std::cell::RefCell::new(String::new());
             let result = {
                 let mut guarded = |d: &str| {
                     delivered = true;
                     let mut t = delivered_text.get();
                     t.push(d);
                     delivered_text.set(t);
+                    if counter.is_some() {
+                        captured.borrow_mut().push_str(d);
+                    }
                     on_delta(d);
                 };
                 // Buffered (0x10) round-trip with 0x11 reconnect-fetch drop recovery — the proven
@@ -1750,6 +1820,16 @@ impl ConsumerNode {
                             summary.tokens = tokens;
                         }
                         self.settle_receipt(&provider, tokens, nonce);
+                        if let Some(counter) = counter {
+                            self.check_billed_tokens(
+                                counter,
+                                captured.take(),
+                                summary.tool_calls.clone(),
+                                tokens,
+                                provider.state_id.clone(),
+                                model_key_now.to_string(),
+                            );
+                        }
                     }
                     if summary.ok && summary.tokens > 0 {
                         // #7/#5: per-model consumed tracking (pure usage — kept for self too) + a
@@ -2233,7 +2313,7 @@ impl ConsumerNode {
                             if let Some(w) = &set.weights {
                                 lp.registry_weights.lock().unwrap_or_else(|e| e.into_inner()).insert(reference_tag(&set), w.clone());
                             }
-                            Some(Arc::new(LoadedReference { handles: pack.handles, set }))
+                            Some(Arc::new(LoadedReference { handles: pack.handles, set, vocab: None }))
                         }
                         Err(crate::registry_client::RegistryError::NoReference) => None,
                         Err(e) => {
@@ -2298,7 +2378,7 @@ impl ConsumerNode {
                     Ok(more) => {
                         let mut set = reference.set.clone();
                         set.texts.extend(more.texts);
-                        reference = Arc::new(LoadedReference { handles: reference.handles.clone(), set });
+                        reference = Arc::new(LoadedReference { handles: reference.handles.clone(), set, vocab: reference.vocab.clone() });
                     }
                     Err(e) => break RoundOutcome::Incomplete(format!("no continuation pack: {e:?}")),
                 }
