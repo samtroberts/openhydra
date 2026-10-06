@@ -241,34 +241,42 @@ jobs:
           name: openhydra-${{ matrix.triple }}
           path: dist/*
 
-      # Publish a GitHub Release on tag runs — auto-generated notes, marked latest.
-      # Downloads still come from R2; this is purely for GitHub-side visibility.
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        # A tag PUSH is a release; a manual run (even one started from a tag) is not.
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        with:
-          draft: false
-          make_latest: true
-          generate_release_notes: true
-          files: dist/*
-
-  # Publish every platform's artifacts to Cloudflare R2 + write latest.json.
+  # Publish the platforms that built to Cloudflare R2 + write latest.json, then the GitHub Release.
+  # Runs even when a platform's build failed (`always()`): the others still ship, and the failed
+  # platform keeps its previous latest/ files and manifest entries (so latest/ never points at
+  # missing files, and GitHub and R2 never disagree about what was released). Missing platforms are
+  # flagged in the run summary.
   publish-r2:
     needs: desktop
     # A tag push publishes; a manual run only when asked (publish=true), whatever ref it starts from.
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    if: always() && !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
+        continue-on-error: true # no artifacts at all → the next step fails with a clear message
         with:
           path: artifacts
+
+      # The manifests already published: a platform that didn't build this time keeps its entries.
+      - name: Fetch the published manifests
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p prev
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "s3://${R2_BUCKET}/latest.json" prev/latest.json --endpoint-url "$EP" \
+            || echo "no published latest.json yet"
 
       - name: Flatten artifacts
         shell: bash
         run: |
           mkdir -p dist
-          find artifacts -type f -exec cp {} dist/ \;
+          [ -d artifacts ] && find artifacts -type f -exec cp {} dist/ \;
           ls -la dist/
 
       - name: Build R2 tree + latest.json
@@ -286,11 +294,29 @@ jobs:
           vdir = f'pub/v{version}'; ldir = 'pub/latest'
           os.makedirs(vdir, exist_ok=True); os.makedirs(ldir, exist_ok=True)
 
-          # (regex on filename) -> stable "latest/" filename
+          # Each platform's build, and its triple. A platform built this run iff its CLI agent is here
+          # (a leg uploads all its files at the end, or none).
+          PLATFORMS = {
+            'macos':   'aarch64-apple-darwin',
+            'linux':   'x86_64-unknown-linux-gnu',
+            'windows': 'x86_64-pc-windows-msvc',
+          }
+          EXE = {'windows': '.exe'}
+          built = {os_: os.path.exists(f'{src}/openhydra-agent-{t}{EXE.get(os_, "")}') for os_, t in PLATFORMS.items()}
+          missing = [os_ for os_, ok in built.items() if not ok]
+          if not any(built.values()):
+              sys.exit('no platform built: nothing to publish')
+
+          # (regex on filename) -> stable "latest/" filename. The CLI binaries, the prompt scorers
+          # beside them (install.sh puts them next to `openhydra`, where the agent looks) and each
+          # platform's licence notices keep their names.
           STABLE = [
             (re.compile(r'^openhydra-agent-aarch64-apple-darwin$'),        'openhydra-agent-aarch64-apple-darwin'),
             (re.compile(r'^openhydra-agent-x86_64-unknown-linux-gnu$'),    'openhydra-agent-x86_64-unknown-linux-gnu'),
             (re.compile(r'^openhydra-agent-x86_64-pc-windows-msvc\.exe$'), 'openhydra-agent-x86_64-pc-windows-msvc.exe'),
+            (re.compile(r'^openhydra-scorer-[a-z0-9_-]+(\.exe)?$'),        None),
+            (re.compile(r'^openhydra-mlx-scorer-aarch64-apple-darwin$'),   None),
+            (re.compile(r'^THIRD_PARTY_NOTICES-[a-z0-9_-]+\.txt$'),        None),
             (re.compile(r'\.dmg$'),                        'OpenHydra-macos-arm64.dmg'),
             (re.compile(r'x64-setup\.exe$'),               'OpenHydra-windows-x64-setup.exe'),
             (re.compile(r'\.msi$'),                        'OpenHydra-windows-x64.msi'),
@@ -304,26 +330,46 @@ jobs:
               shutil.copy(p, os.path.join(vdir, name))            # immutable archive
               for rx, stable in STABLE:
                   if rx.search(name):
-                      shutil.copy(p, os.path.join(ldir, stable))  # mutable pointer
+                      shutil.copy(p, os.path.join(ldir, stable or name))  # mutable pointer
                       break
 
           def url(stable): return f'{host}/latest/{stable}'
-          manifest = {
-            'version': version,
-            'base': host,
+          def triple_file(prefix, os_): return f'{prefix}-{PLATFORMS[os_]}{EXE.get(os_, "")}'
+          fresh = {
             'app': {
               'macos':   {'name': f'OpenHydra {version} (Apple Silicon)', 'file': 'OpenHydra-macos-arm64.dmg',       'url': url('OpenHydra-macos-arm64.dmg')},
               'windows': {'name': f'OpenHydra {version} (Windows)',       'file': 'OpenHydra-windows-x64-setup.exe', 'url': url('OpenHydra-windows-x64-setup.exe')},
               'linux':   {'name': f'OpenHydra {version} (Linux)',         'file': 'OpenHydra-linux-x64.AppImage',    'url': url('OpenHydra-linux-x64.AppImage')},
             },
-            'cli': {
-              'macos':   url('openhydra-agent-aarch64-apple-darwin'),
-              'linux':   url('openhydra-agent-x86_64-unknown-linux-gnu'),
-              'windows': url('openhydra-agent-x86_64-pc-windows-msvc.exe'),
-            },
+            'cli': {os_: url(triple_file('openhydra-agent', os_)) for os_ in PLATFORMS},
+            # The prompt scorers install.sh puts beside the CLI (macOS also gets the MLX one).
+            'cli_scorer': {os_: url(triple_file('openhydra-scorer', os_)) for os_ in PLATFORMS},
+            'cli_mlx_scorer': {'macos': url('openhydra-mlx-scorer-aarch64-apple-darwin')},
+            'notices': {os_: url(f'THIRD_PARTY_NOTICES-{PLATFORMS[os_]}.txt') for os_ in PLATFORMS},
+            'versions': {os_: version for os_ in PLATFORMS},
           }
+          # A platform that didn't build keeps what was published for it before (its latest/ files are
+          # untouched, so its entries still describe them).
+          prev = {}
+          if os.path.exists('prev/latest.json'):
+              with open('prev/latest.json') as f:
+                  prev = json.load(f)
+          manifest = {'version': version, 'base': host}
+          for section in ('app', 'cli', 'cli_scorer', 'cli_mlx_scorer', 'notices', 'versions'):
+              out = {}
+              for os_ in PLATFORMS:
+                  if built[os_]:
+                      if os_ in fresh[section]:
+                          out[os_] = fresh[section][os_]
+                  elif os_ in prev.get(section, {}):
+                      out[os_] = prev[section][os_]
+                  elif section == 'versions' and prev.get('version'):
+                      out[os_] = prev['version']  # a manifest from before per-platform versions
+              manifest[section] = out
           with open('pub/latest.json', 'w') as f:
               json.dump(manifest, f, indent=2)
+          with open('missing.txt', 'w') as f:
+              f.write(' '.join(missing))
 
           # --- Tauri auto-updater manifest (signed artifacts) ---
           # Tauri v2 signs the shippable artifact itself (a sibling .sig): macOS
@@ -347,6 +393,8 @@ jobs:
                       shutil.copy(p, os.path.join(udir, name))
                       platforms[plat] = {'signature': open(sigp).read().strip(), 'url': f'{host}/updater/v{version}/{name}'}
                       break
+          # A platform that didn't build is left out: listing its old artifact under the new version
+          # would have its app "update" to what it already runs, again and again.
           if platforms:
               upd = {'version': version, 'notes': f'OpenHydra {version}',
                      'pub_date': datetime.now(timezone.utc).isoformat(), 'platforms': platforms}
@@ -406,6 +454,32 @@ jobs:
               --content-type "application/json"
           fi
           echo "Published v${VERSION} to R2 → ${DIST_HOST}"
+
+      - name: Report platforms that didn't build
+        shell: bash
+        run: |
+          MISSING="$(cat missing.txt)"
+          echo "MISSING=$MISSING" >> "$GITHUB_ENV"
+          if [ -n "$MISSING" ]; then
+            echo "::warning::v${VERSION} published WITHOUT: $MISSING (their previous release stays in latest/)"
+            echo "### ⚠️ v${VERSION} published without: $MISSING" >> "$GITHUB_STEP_SUMMARY"
+            echo "Their previous release stays in latest/ and latest.json; fix the build and re-publish." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### v${VERSION} published for every platform" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The GitHub Release, once, after R2 has the same files (it used to be published by each
+      # platform's job, so a failed platform left GitHub "latest" and R2 disagreeing).
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        # A tag PUSH is a release; a manual run (even one started from a tag) is not.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        with:
+          draft: false
+          make_latest: true
+          generate_release_notes: true
+          body: ${{ env.MISSING != '' && format('Not built for this release (the previous one stays current there) — {0}.', env.MISSING) || '' }}
+          files: dist/*
 
   # Auto-trim the R2 bucket to the newest 5 releases after a successful publish.
   # Tag runs only (not manual workflow_dispatch re-publishes, which may target an
