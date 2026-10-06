@@ -58,6 +58,11 @@ const PEER_GATED_ACCRUAL: TableDefinition<&str, &[u8]> =
 /// monotonic high-water mark the provider validates a new receipt's `cumulative_amount` against
 /// before counter-signing. Value = a `u64` (USDC micro-units) little-endian.
 const PROVIDER_SETTLED: TableDefinition<&str, &[u8]> = TableDefinition::new("provider_settled");
+/// Provider-side: the co-signed receipt that set each `(consumer, model)`'s high-water in
+/// [`PROVIDER_SETTLED`] (same key) → its [`CoSignedReceipt::to_bytes`]. Sent back to a consumer
+/// whose cumulative is behind it, so the pair can catch up after a lost reply or a lost voucher.
+const PROVIDER_SETTLED_RECEIPT: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("provider_settled_receipt");
 /// Spent receipt nonces (replay protection). Presence is the only signal → unit value.
 const NONCES: TableDefinition<&[u8], ()> = TableDefinition::new("nonces");
 /// Durable ledger rows for the desktop Ledger view, keyed by a monotonic sequence → a compact
@@ -205,6 +210,7 @@ impl Store {
             wtx.open_table(PEER_LOGPROB).map_err(StoreError::from)?;
             wtx.open_table(PEER_GATED_ACCRUAL).map_err(StoreError::from)?;
             wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
+            wtx.open_table(PROVIDER_SETTLED_RECEIPT).map_err(StoreError::from)?;
             wtx.open_table(NONCES).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_ROWS).map_err(StoreError::from)?;
             wtx.open_table(LEDGER_META).map_err(StoreError::from)?;
@@ -573,6 +579,47 @@ impl Store {
         Ok(quarantined)
     }
 
+    /// Checkpoint a new high-water for a `(consumer, model)` key together with the co-signed receipt
+    /// that set it, in one write transaction (see [`PROVIDER_SETTLED_RECEIPT`]).
+    pub fn put_provider_settled_receipt(
+        &self,
+        key: &str,
+        cumulative: u64,
+        receipt: &CoSignedReceipt,
+    ) -> Result<(), StoreError> {
+        let blob = receipt.to_bytes();
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PROVIDER_SETTLED).map_err(StoreError::from)?;
+            t.insert(key, &cumulative.to_le_bytes()[..]).map_err(StoreError::from)?;
+            let mut r = wtx.open_table(PROVIDER_SETTLED_RECEIPT).map_err(StoreError::from)?;
+            r.insert(key, blob.as_slice()).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Rehydrate the latest co-signed receipt per `(consumer, model)` on boot. A row that doesn't
+    /// decode is skipped (that pair just can't be caught up from it); returns how many were skipped.
+    pub fn load_provider_settled_receipts_into_memory(
+        &self,
+        receipts: &mut HashMap<String, CoSignedReceipt>,
+    ) -> Result<usize, StoreError> {
+        let rtx = self.db.begin_read().map_err(StoreError::from)?;
+        let t = rtx.open_table(PROVIDER_SETTLED_RECEIPT).map_err(StoreError::from)?;
+        let mut skipped = 0usize;
+        for entry in t.iter().map_err(StoreError::from)? {
+            let (key, val) = entry.map_err(StoreError::from)?;
+            match CoSignedReceipt::from_bytes(val.value()) {
+                Ok(r) => {
+                    receipts.insert(key.value().to_string(), r);
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok(skipped)
+    }
+
     // ── NONCES (replay protection) ──
 
     /// Mark a receipt nonce as spent.
@@ -723,6 +770,30 @@ mod tests {
 
     fn entry(ts: u64, kind: &str, model: &str, cp: &str, tokens: u64) -> LedgerEntry {
         LedgerEntry { ts_ms: ts, kind: kind.into(), model: model.into(), counterparty: cp.into(), tokens }
+    }
+
+    #[test]
+    fn a_settled_receipt_is_kept_with_its_high_water() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("s.redb")).unwrap();
+        let consumer = SigningKey::from_bytes(&[7u8; 32]);
+        let provider = SigningKey::from_bytes(&[9u8; 32]);
+        let payload = crate::receipts::payload_from_bytes(
+            provider.verifying_key().as_bytes(), consumer.verifying_key().as_bytes(), "m", 10, &[1u8; 16], 1,
+            None, "", Some(500), None, None,
+        )
+        .unwrap();
+        let consumer_sig = consumer.sign(&payload.canonical_bytes());
+        let provider_sig = provider.sign(&crate::receipts::cosign_bytes(&payload, &consumer_sig));
+        let receipt = CoSignedReceipt { payload, consumer_sig, provider_sig };
+        store.put_provider_settled_receipt("k", 500, &receipt).unwrap();
+        let mut highs = HashMap::new();
+        assert_eq!(store.load_provider_settled_into_memory(&mut highs).unwrap(), 0);
+        assert_eq!(highs.get("k"), Some(&500));
+        let mut receipts = HashMap::new();
+        assert_eq!(store.load_provider_settled_receipts_into_memory(&mut receipts).unwrap(), 0);
+        assert_eq!(receipts["k"].to_bytes(), receipt.to_bytes());
     }
 
     #[test]

@@ -54,7 +54,7 @@ use crate::prompt_score::{
 };
 use openhydra_protocol::logprob::ChallengeRound;
 use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
-use crate::receipt::request_receipt;
+use crate::receipt::{request_receipt, ReceiptFailure};
 use crate::serve::{
     parse_response, DeterministicParams, FetchChunksResponse, FetchResponse, ServeChunk,
     ServeRequest, ServeSummary,
@@ -161,6 +161,45 @@ const MAX_SETTLES_IN_FLIGHT: usize = 64;
 /// a provider that black-holes receipts each waits out [`SETTLE_TIMEOUT`] in turn; more than a few
 /// queued behind it would only wait to fail.
 const MAX_SETTLES_PER_PAIR: usize = 4;
+
+/// What a consumer makes of the co-signed receipt a provider sends back when the consumer's
+/// cumulative is behind its high-water.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BehindReceipt {
+    /// Not a valid receipt between this consumer and provider for this model, with a cumulative.
+    NotOurs,
+    /// Ours, but no further than our voucher already is: nothing to catch up to.
+    Stale,
+    /// This very serve's receipt (same nonce), co-signed before at this cumulative: it settled, and
+    /// only the reply was lost.
+    ThisServe(u64),
+    /// An earlier serve's receipt at this cumulative, past our voucher: adopt it and sign again.
+    Adopt(u64),
+}
+
+/// Judge a provider's "behind" receipt. Only a receipt this consumer signed (and the provider
+/// co-signed) for this pair and model counts: the provider can claim anything we signed, so its
+/// cumulative is safe to adopt; nothing else is.
+fn judge_behind_receipt(
+    latest: &openhydra_protocol::receipts::CoSignedReceipt,
+    consumer_pub: &[u8],
+    provider_pub: &[u8],
+    model_id: &str,
+    nonce: &[u8; 16],
+    own_gross: u64,
+) -> BehindReceipt {
+    let p = &latest.payload;
+    let ours = openhydra_protocol::receipts::verify_receipt(latest).is_ok()
+        && p.consumer.as_bytes() == consumer_pub
+        && p.provider.as_bytes() == provider_pub
+        && p.model_id == model_id;
+    match p.cumulative_amount {
+        Some(c) if ours && &p.nonce == nonce => BehindReceipt::ThisServe(c),
+        Some(c) if ours && c > own_gross => BehindReceipt::Adopt(c),
+        Some(_) if ours => BehindReceipt::Stale,
+        _ => BehindReceipt::NotOurs,
+    }
+}
 
 /// Whether a new settlement may start, given how many are in flight and how many already hold or
 /// wait on its pair's lock.
@@ -1367,14 +1406,11 @@ impl ConsumerNode {
     /// the voucher stays equal to the latest co-signed claim. Off-chain accounting; no value moves.
     /// Advance and persist this `(peer, model)`'s gated voucher after a successful co-sign.
     ///
-    /// ⚠️ LIVENESS GAP (review F-3, pre-crypto-go-live): the voucher is monotonic and the provider
-    /// retains a persisted high-water (`PROVIDER_SETTLED`). If this consumer ever loses its local
-    /// voucher (e.g. an F9 corrupt-row skip resets the base to 0), every subsequent serve signs a
-    /// cumulative below the provider's retained high-water → the provider rejects it `NonMonotonic` →
-    /// no receipt for that pair ever settles again. This is fail-SAFE (never double-pays) but a
-    /// permanent settlement dead-end for the pair, with no re-sync path. Before crypto payout goes
-    /// live, add a signed high-water reconciliation (provider attests its current cumulative; consumer
-    /// adopts it) so a consumer can recover its base after voucher loss.
+    /// The provider keeps a persisted high-water per pair. If this voucher falls behind it (a co-sign
+    /// reply never received, or a voucher lost, e.g. an F9 corrupt-row skip resetting the base to 0),
+    /// the provider answers the next receipt with the co-signed receipt that set its high-water, and
+    /// `settle_receipt` catches up to it ([`judge_behind_receipt`], [`Self::raise_gated_voucher`]),
+    /// so the pair never dead-ends (review F-3).
     fn commit_gated_voucher(&self, key: &str, split: FeeSplit) {
         let snapshot = {
             let mut map = match self.gated_vouchers.lock() {
@@ -1383,6 +1419,25 @@ impl ConsumerNode {
             };
             let voucher = map.entry(key.to_string()).or_default();
             voucher.accrue(split);
+            voucher.to_bytes()
+        };
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put_gated_voucher(key, &snapshot) {
+                tracing::debug!(error = %e, "gated voucher persist failed");
+            }
+        }
+    }
+
+    /// Raise this `(peer, model)`'s voucher to a co-signed cumulative it fell behind (see
+    /// [`judge_behind_receipt`]), and persist it.
+    fn raise_gated_voucher(&self, key: &str, gross: u64) {
+        let snapshot = {
+            let mut map = match self.gated_vouchers.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let voucher = map.entry(key.to_string()).or_default();
+            voucher.raise_to_gross(gross);
             voucher.to_bytes()
         };
         if let Some(store) = &self.store {
@@ -1876,33 +1931,62 @@ impl ConsumerNode {
             // (previous cumulative + this serve's gross), stamped BEFORE the consumer signs so both
             // parties co-sign the same claim. The voucher is committed only after a successful
             // co-sign, keeping it equal to the latest co-signed cumulative. No value moves.
-            let voucher = node.settlement_peg.map(|peg| {
-                let split = node.gated_split_for(&peer_id, &model_key, tokens, now, peg);
-                let cumulative = node
-                    .gated_cumulative_gross(&vkey)
-                    .saturating_add(split.net_to_provider + split.protocol_fee);
-                (split, cumulative)
-            });
+            let compute_voucher = || {
+                node.settlement_peg.map(|peg| {
+                    let split = node.gated_split_for(&peer_id, &model_key, tokens, now, peg);
+                    let cumulative = node
+                        .gated_cumulative_gross(&vkey)
+                        .saturating_add(split.net_to_provider + split.protocol_fee);
+                    (split, cumulative)
+                })
+            };
+            let mut settle = |voucher: Option<(FeeSplit, u64)>| {
+                request_receipt(
+                    &sign,
+                    &mut transport,
+                    &provider_pub,
+                    &consumer_pub,
+                    &model_id,
+                    tokens,
+                    nonce,
+                    now,
+                    &canonical,
+                    voucher.map(|(_, cumulative)| cumulative),
+                    // v5 denomination binding: when the crypto rail is on, stamp the asset (USDC
+                    // today) + the exact peg used, so the provider co-signs — and can reject — the
+                    // claim's units.
+                    voucher.map(|_| SettlementAsset::Usdc),
+                    node.settlement_peg,
+                )
+            };
+            let mut voucher = compute_voucher();
+            let mut outcome = settle(voucher);
+            // Behind the provider's high-water: catch up to the receipt it sent back (ours, by its
+            // signature) and sign again on top of it — once.
+            let mut settled_earlier = false;
+            if let Err(ReceiptFailure::Behind(latest)) = &outcome {
+                let own = node.gated_cumulative_gross(&vkey);
+                match judge_behind_receipt(latest, &consumer_pub, &provider_pub, &model_id, &nonce, own) {
+                    BehindReceipt::ThisServe(c) => {
+                        node.raise_gated_voucher(&vkey, c);
+                        settled_earlier = true;
+                    }
+                    BehindReceipt::Adopt(c) => {
+                        tracing::info!(provider = %peer_id, from = own, to = c,
+                            "settlement was behind the provider's last co-signed receipt; caught up");
+                        node.raise_gated_voucher(&vkey, c);
+                        voucher = compute_voucher();
+                        outcome = settle(voucher);
+                    }
+                    other => tracing::warn!(provider = %peer_id, ?other,
+                        "provider sent back a receipt this consumer can't adopt"),
+                }
+            }
             // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
             // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
-            if request_receipt(
-                &sign,
-                &mut transport,
-                &provider_pub,
-                &consumer_pub,
-                &model_id,
-                tokens,
-                nonce,
-                now,
-                &canonical,
-                voucher.map(|(_, cumulative)| cumulative),
-                // v5 denomination binding: when the crypto rail is on, stamp the asset (USDC today) +
-                // the exact peg used, so the provider co-signs — and can reject — the claim's units.
-                voucher.map(|_| SettlementAsset::Usdc),
-                node.settlement_peg,
-            )
-            .is_ok()
-            {
+            if settled_earlier {
+                node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
+            } else if outcome.is_ok() {
                 node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
                 if let Some((split, _)) = voucher {
                     node.commit_gated_voucher(&vkey, split);
@@ -2496,6 +2580,32 @@ mod tests {
 
     use crate::adapter::{DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
     use crate::provider::handle_serve_inbound;
+
+    #[test]
+    fn a_consumer_adopts_only_its_own_receipt_from_a_provider() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use openhydra_protocol::receipts::{cosign_bytes, payload_from_bytes, CoSignedReceipt};
+        let consumer = SigningKey::from_bytes(&[7u8; 32]);
+        let provider = SigningKey::from_bytes(&[9u8; 32]);
+        let (cpub, ppub) = (consumer.verifying_key().to_bytes(), provider.verifying_key().to_bytes());
+        let receipt = |signer: &SigningKey, nonce: u8, model: &str, cumulative: u64| {
+            let payload = payload_from_bytes(&ppub, &cpub, model, 10, &[nonce; 16], 1, None, "",
+                Some(cumulative), None, None).unwrap();
+            let consumer_sig = signer.sign(&payload.canonical_bytes());
+            let provider_sig = provider.sign(&cosign_bytes(&payload, &consumer_sig));
+            CoSignedReceipt { payload, consumer_sig, provider_sig }
+        };
+        let judge = |r: &CoSignedReceipt, own: u64| judge_behind_receipt(r, &cpub, &ppub, "m", &[2u8; 16], own);
+        // An earlier serve's receipt past our voucher: adopt it.
+        assert_eq!(judge(&receipt(&consumer, 1, "m", 500), 300), BehindReceipt::Adopt(500));
+        // Not past it: nothing to catch up to.
+        assert_eq!(judge(&receipt(&consumer, 1, "m", 500), 500), BehindReceipt::Stale);
+        // This serve's own receipt (its co-sign reply was lost): it settled.
+        assert_eq!(judge(&receipt(&consumer, 2, "m", 500), 300), BehindReceipt::ThisServe(500));
+        // Signed by someone else, or for another model: never adopted.
+        assert_eq!(judge(&receipt(&SigningKey::from_bytes(&[8u8; 32]), 1, "m", 9_999), 0), BehindReceipt::NotOurs);
+        assert_eq!(judge(&receipt(&consumer, 1, "other", 9_999), 0), BehindReceipt::NotOurs);
+    }
 
     #[test]
     fn settlements_are_bounded_overall_and_per_pair() {

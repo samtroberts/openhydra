@@ -279,6 +279,16 @@ impl GatedVoucher {
         self.cumulative_net.saturating_add(self.cumulative_fee)
     }
 
+    /// Catch up to a co-signed cumulative `gross` this voucher fell behind (a co-sign reply never
+    /// received, a voucher lost): re-split it with [`protocol_fee`]. Never lowers the voucher.
+    pub fn raise_to_gross(&mut self, gross: u64) {
+        if gross > self.cumulative_gross() {
+            let split = protocol_fee(gross);
+            self.cumulative_net = split.net_to_provider;
+            self.cumulative_fee = split.protocol_fee;
+        }
+    }
+
     /// Serialize to the 16-byte snapshot (`cumulative_net` LE ‖ `cumulative_fee` LE).
     pub fn to_bytes(&self) -> [u8; 16] {
         let mut b = [0u8; 16];
@@ -464,6 +474,16 @@ mod tests {
         assert_eq!(check_cumulative(100, Some(100 + 999), 50, Some(5)), Ok(()), "above floor is ok");
         // Without a peg, only monotonicity is enforced (no floor) — a tiny delta passes.
         assert_eq!(check_cumulative(100, Some(101), 50, None), Ok(()));
+    }
+
+    #[test]
+    fn a_voucher_catches_up_but_never_goes_back() {
+        let mut v = GatedVoucher { cumulative_net: 960, cumulative_fee: 40 };
+        v.raise_to_gross(500);
+        assert_eq!(v.cumulative_gross(), 1000, "never lowered");
+        v.raise_to_gross(2500);
+        assert_eq!(v.cumulative_gross(), 2500);
+        assert_eq!(v.cumulative_fee, 100);
     }
 
     #[test]

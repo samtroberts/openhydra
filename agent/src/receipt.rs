@@ -14,7 +14,7 @@
 //! so the private key never leaves the node (live: `NetworkHandle::sign`; tests: an
 //! ed25519 `SigningKey`). Nonce + timestamp are injected too, for deterministic tests.
 
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, Verifier};
 
 use openhydra_protocol::crypto_agility::SigAlg;
 use openhydra_protocol::payout::SettlementAsset;
@@ -29,6 +29,49 @@ pub const RECEIPT_REQUEST: u8 = 0x12;
 
 const RESP_OK: u8 = 0x00;
 const RESP_ERR: u8 = 0x01;
+/// The receipt's cumulative is behind the provider's latest co-signed one for the pair, which
+/// follows ([`encode_cosigned`]) so the consumer can catch up.
+const RESP_BEHIND: u8 = 0x02;
+
+/// Why a provider's bind check turned a receipt down.
+#[derive(Debug, Clone)]
+pub enum BindRejection {
+    /// Refused; the reason is sent back.
+    Reject(String),
+    /// The receipt's cumulative is behind the latest one the provider co-signed for this
+    /// `(consumer, model)` — a co-sign reply the consumer never got, or a voucher it lost. That
+    /// receipt goes back: it carries the consumer's own signature, so the consumer can adopt its
+    /// cumulative and sign again on top of it.
+    Behind(Box<CoSignedReceipt>),
+}
+
+impl From<String> for BindRejection {
+    fn from(reason: String) -> Self {
+        BindRejection::Reject(reason)
+    }
+}
+
+impl From<&str> for BindRejection {
+    fn from(reason: &str) -> Self {
+        BindRejection::Reject(reason.to_string())
+    }
+}
+
+/// Why a consumer's settlement attempt didn't produce a co-signed receipt.
+#[derive(Debug)]
+pub enum ReceiptFailure {
+    /// The provider refused it, or the round-trip or the reply was bad.
+    Failed(AdapterError),
+    /// The provider holds a later co-signed receipt for the pair (see [`BindRejection::Behind`]).
+    /// Not yet checked: the consumer verifies it is its own before trusting it.
+    Behind(Box<CoSignedReceipt>),
+}
+
+impl From<AdapterError> for ReceiptFailure {
+    fn from(e: AdapterError) -> Self {
+        ReceiptFailure::Failed(e)
+    }
+}
 
 // Request body after the method byte: provider_pub[32] consumer_pub[32] nonce[16]
 // tokens:u64[8] ts:u64[8] consumer_sig[64] model_len:u16[2] model.
@@ -270,6 +313,25 @@ fn err_response(msg: &str) -> Vec<u8> {
     b
 }
 
+/// A co-signed receipt as bytes: the provider's signature, then the request framing (payload and
+/// consumer signature). What a provider keeps of the latest receipt per pair, and sends back in a
+/// [`RESP_BEHIND`] reply.
+pub fn encode_cosigned(receipt: &CoSignedReceipt) -> Vec<u8> {
+    let mut b = receipt.provider_sig.to_bytes().to_vec();
+    b.extend_from_slice(&encode_request(&receipt.payload, &receipt.consumer_sig));
+    b
+}
+
+/// The inverse of [`encode_cosigned`]. Decodes only; the signatures are not checked.
+pub fn decode_cosigned(bytes: &[u8]) -> Result<CoSignedReceipt, AdapterError> {
+    if bytes.len() < 64 {
+        return Err(AdapterError::Parse("co-signed receipt truncated".into()));
+    }
+    let provider_sig = to_sig(&bytes[..64])?;
+    let (payload, consumer_sig) = decode_request(&bytes[64..])?;
+    Ok(CoSignedReceipt { payload, consumer_sig, provider_sig })
+}
+
 /// Consumer side: build the receipt, sign it, settle with the provider over `transport`,
 /// and verify the returned co-signed receipt. Returns it on success.
 ///
@@ -290,7 +352,7 @@ pub fn request_receipt(
     cumulative_amount: Option<u64>,
     settlement_asset: Option<SettlementAsset>,
     peg_micros_per_credit: Option<u64>,
-) -> Result<CoSignedReceipt, AdapterError> {
+) -> Result<CoSignedReceipt, ReceiptFailure> {
     let payload = payload_from_bytes(
         provider_pub,
         consumer_pub,
@@ -320,9 +382,11 @@ pub fn request_receipt(
             return Err(AdapterError::Http(format!(
                 "provider rejected receipt: {}",
                 String::from_utf8_lossy(&response[1..])
-            )))
+            ))
+            .into())
         }
-        _ => return Err(AdapterError::Parse("receipt response malformed".into())),
+        Some(&RESP_BEHIND) => return Err(ReceiptFailure::Behind(Box::new(decode_cosigned(&response[1..])?))),
+        _ => return Err(AdapterError::Parse("receipt response malformed".into()).into()),
     };
 
     let receipt = CoSignedReceipt { payload, consumer_sig, provider_sig };
@@ -340,7 +404,7 @@ pub fn handle_receipt_inbound(
     data: &[u8],
     sign: &dyn Fn(&[u8]) -> Vec<u8>,
     this_provider_pub: &[u8],
-    bind_check: &dyn Fn(&ReceiptPayload) -> Result<(), String>,
+    bind_check: &dyn Fn(&ReceiptPayload) -> Result<(), BindRejection>,
 ) -> (Vec<u8>, Option<CoSignedReceipt>) {
     if data.first() != Some(&RECEIPT_REQUEST) {
         return (err_response("unsupported method"), None);
@@ -352,10 +416,23 @@ pub fn handle_receipt_inbound(
     if payload.provider.as_bytes() != this_provider_pub {
         return (err_response("receipt names a different provider"), None);
     }
+    // The consumer's signature first: nothing below (a single-use serve commitment consumed, a
+    // pair's latest receipt sent back) may happen for a receipt its consumer didn't sign.
+    if !payload.sig_alg.is_implemented()
+        || payload.consumer.verify(&payload.canonical_bytes(), &consumer_sig).is_err()
+    {
+        return (err_response("bad consumer signature"), None);
+    }
     // B-S1: the receipt must settle against a real serve the provider recorded (right
     // tokens/model, fresh, single-use). Reject before co-signing if the binding fails.
-    if let Err(reason) = bind_check(&payload) {
-        return (err_response(&reason), None);
+    match bind_check(&payload) {
+        Ok(()) => {}
+        Err(BindRejection::Reject(reason)) => return (err_response(&reason), None),
+        Err(BindRejection::Behind(latest)) => {
+            let mut b = vec![RESP_BEHIND];
+            b.extend_from_slice(&encode_cosigned(&latest));
+            return (b, None);
+        }
     }
     let provider_sig = match to_sig(&sign(&cosign_bytes(&payload, &consumer_sig))) {
         Ok(s) => s,
@@ -393,7 +470,7 @@ mod tests {
         let psign = sign_with(&provider);
         // The transport IS the provider's handler — in-process round-trip.
         let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            Ok(handle_receipt_inbound(req, &psign, &provider_pub, &|_: &ReceiptPayload| Ok::<(), String>(())).0)
+            Ok(handle_receipt_inbound(req, &psign, &provider_pub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(())).0)
         };
 
         let receipt = request_receipt(
@@ -421,6 +498,58 @@ mod tests {
         assert_eq!(receipt.payload.peg_micros_per_credit, Some(1_200),
             "the v5 reference-price peg flows end-to-end and is co-signed");
         assert_eq!(verify_receipt(&receipt), Ok(()));
+    }
+
+    /// One settle against a provider that accepts everything, returning the co-signed receipt.
+    fn settle_once(consumer: &SigningKey, provider: &SigningKey, nonce: u8, cumulative: u64) -> CoSignedReceipt {
+        let (csign, psign) = (sign_with(consumer), sign_with(provider));
+        let ppub = pubkey(provider);
+        let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            Ok(handle_receipt_inbound(req, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(())).0)
+        };
+        request_receipt(&csign, &mut transport, &ppub, &pubkey(consumer), "m", 10, [nonce; 16], 1, "",
+            Some(cumulative), Some(SettlementAsset::Usdc), Some(1)).unwrap()
+    }
+
+    #[test]
+    fn a_provider_sends_back_its_latest_receipt_to_a_consumer_behind_it() {
+        let (consumer, provider) = (signer(7), signer(9));
+        let latest = settle_once(&consumer, &provider, 1, 500);
+        // The next receipt is behind: the provider answers with the receipt that set its high-water.
+        let (csign, psign, ppub) = (sign_with(&consumer), sign_with(&provider), pubkey(&provider));
+        let kept = latest.clone();
+        let mut transport = |req: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            let bind = |_: &ReceiptPayload| Err(BindRejection::Behind(Box::new(kept.clone())));
+            Ok(handle_receipt_inbound(req, &psign, &ppub, &bind).0)
+        };
+        let err = request_receipt(&csign, &mut transport, &ppub, &pubkey(&consumer), "m", 10, [2u8; 16], 2, "",
+            Some(300), Some(SettlementAsset::Usdc), Some(1)).unwrap_err();
+        let ReceiptFailure::Behind(back) = err else { panic!("expected the provider's latest receipt") };
+        assert_eq!(back.payload.cumulative_amount, Some(500));
+        assert_eq!(back.payload.nonce, [1u8; 16]);
+        assert_eq!(verify_receipt(&back), Ok(()), "it arrives intact, both signatures valid");
+        assert_eq!(decode_cosigned(&encode_cosigned(&latest)).unwrap().to_bytes(), latest.to_bytes());
+    }
+
+    #[test]
+    fn a_receipt_its_consumer_did_not_sign_never_reaches_the_bind_check() {
+        // Otherwise a forged receipt could burn a real serve's single-use nonce, or be handed a
+        // pair's latest receipt.
+        let (consumer, provider) = (signer(7), signer(9));
+        let payload = payload_from_bytes(&pubkey(&provider), &pubkey(&consumer), "m", 10, &[5u8; 16], 1, None, "",
+            Some(100), None, None).unwrap();
+        let forged = to_sig(&sign_with(&signer(8))(&payload.canonical_bytes())).unwrap();
+        let mut framed = vec![RECEIPT_REQUEST];
+        framed.extend_from_slice(&encode_request(&payload, &forged));
+        let reached = std::cell::Cell::new(false);
+        let bind = |_: &ReceiptPayload| {
+            reached.set(true);
+            Ok::<(), BindRejection>(())
+        };
+        let (resp, accepted) = handle_receipt_inbound(&framed, &sign_with(&provider), &pubkey(&provider), &bind);
+        assert!(accepted.is_none());
+        assert_eq!(resp.first(), Some(&RESP_ERR));
+        assert!(!reached.get());
     }
 
     #[test]
@@ -560,7 +689,7 @@ mod tests {
         let a_pub = pubkey(&provider_a);
         // ...but it's delivered to A's handler.
         let mut transport =
-            |req: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(handle_receipt_inbound(req, &a_sign, &a_pub, &|_: &ReceiptPayload| Ok::<(), String>(())).0) };
+            |req: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(handle_receipt_inbound(req, &a_sign, &a_pub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(())).0) };
 
         let err = request_receipt(
             &csign,
@@ -577,13 +706,13 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(matches!(err, AdapterError::Http(m) if m.contains("different provider")));
+        assert!(matches!(err, ReceiptFailure::Failed(AdapterError::Http(m)) if m.contains("different provider")));
     }
 
     #[test]
     fn provider_handler_ledgers_only_accepted_receipts() {
         let provider = signer(9);
-        let (_, accepted) = handle_receipt_inbound(b"\x99garbage", &sign_with(&provider), &pubkey(&provider), &|_: &ReceiptPayload| Ok::<(), String>(()));
+        let (_, accepted) = handle_receipt_inbound(b"\x99garbage", &sign_with(&provider), &pubkey(&provider), &|_: &ReceiptPayload| Ok::<(), BindRejection>(()));
         assert!(accepted.is_none()); // wrong method byte → no receipt to ledger
     }
 
@@ -607,7 +736,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(matches!(err, AdapterError::Http(m) if m.contains("provider rejected")));
+        assert!(matches!(err, ReceiptFailure::Failed(AdapterError::Http(m)) if m.contains("provider rejected")));
     }
 
     /// Audit F3 (receipt-decoder coverage): the receipt request decoder runs on RAW, UNTRUSTED
@@ -697,10 +826,10 @@ mod tests {
             let _ = decode_request(bytes);
             // Full inbound path incl. the `data.first()` method-byte strip — results ignored,
             // the point is "no panic". Feed both the raw bytes and a 0x12-prefixed variant.
-            let _ = handle_receipt_inbound(bytes, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), String>(()));
+            let _ = handle_receipt_inbound(bytes, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(()));
             let mut framed = vec![RECEIPT_REQUEST];
             framed.extend_from_slice(bytes);
-            let _ = handle_receipt_inbound(&framed, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), String>(()));
+            let _ = handle_receipt_inbound(&framed, &psign, &ppub, &|_: &ReceiptPayload| Ok::<(), BindRejection>(()));
         }
     }
 }
