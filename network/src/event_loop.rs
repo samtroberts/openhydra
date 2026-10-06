@@ -3641,13 +3641,17 @@ fn finalize_discover_fetch(state: &mut LoopState, discover_id: kad::QueryId) {
     maybe_reply_discover(state, discover_id);
 }
 
-/// C7-flicker fix: the `known_peers` cache key. Keyed by **`(peer_id, model_id)`**, not `peer_id`
-/// alone — a single provider node announces one record PER model it serves (all sharing its node
-/// `peer_id`), so keying on `peer_id` made each model clobber the previous one and a multi-model
-/// provider could only ever surface ONE model at a time (it flickered between them). The unit
-/// separator can't appear in a hex peer id or a model handle, so the composite is unambiguous.
+/// C7-flicker fix: the `known_peers` cache key. Keyed by **`(node, model_id)`**, not the node
+/// alone — a single provider node announces one record PER model it serves, so keying on the node
+/// made each model clobber the previous one and a multi-model provider could only ever surface ONE
+/// model at a time (it flickered between them). The node is its **libp2p** peer id: verified
+/// against the record's key and full-length, where the 64-bit OpenHydra id can be shared by two
+/// keys found to collide, which would let one provider's entry shadow the other's. (The OpenHydra
+/// id only if a record somehow has no libp2p id.) The unit separator can't appear in either id or a
+/// model handle, so the composite is unambiguous.
 fn known_peer_key(record: &PeerRecord) -> String {
-    format!("{}\u{1f}{}", record.peer_id, record.model_id)
+    let node = if record.libp2p_peer_id.is_empty() { &record.peer_id } else { &record.libp2p_peer_id };
+    format!("{}\u{1f}{}", node, record.model_id)
 }
 
 /// Convert a PeerRecord into a DiscoveredPeer.
@@ -4363,6 +4367,21 @@ mod tests {
         let mut keys: Vec<String> = cache.keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn two_providers_sharing_an_openhydra_id_keep_separate_entries() {
+        // Two keys whose 64-bit OpenHydra ids collide still have distinct libp2p ids.
+        let rec = |libp2p: &str| PeerRecord {
+            peer_id: "0123456789abcdef".into(),
+            model_id: "qwen".into(),
+            libp2p_peer_id: libp2p.into(),
+            ..Default::default()
+        };
+        let mut known: HashMap<String, PeerRecord> = HashMap::new();
+        known.insert(known_peer_key(&rec("12D3KooWa")), rec("12D3KooWa"));
+        known.insert(known_peer_key(&rec("12D3KooWb")), rec("12D3KooWb"));
+        assert_eq!(known.len(), 2, "neither shadows the other's routing entry");
     }
 
     #[test]
