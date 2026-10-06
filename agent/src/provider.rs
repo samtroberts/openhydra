@@ -285,6 +285,8 @@ struct ServeCommitment {
     model_id: String,
     tokens: u64,
     recorded_ms: u64,
+    /// The libp2p-authenticated peer the serve came from: only it may settle the receipt.
+    served_peer: String,
 }
 
 /// How long a serve commitment stays settleable, and the receipt-freshness window (B-S1/S7).
@@ -322,6 +324,11 @@ fn settlement_floor_units(committed: Option<u64>, receipt_tokens: u64) -> u64 {
 /// Prunes expired commitments, checks the receipt fields against the serve recorded under
 /// `nonce`, and consumes the commitment (single-use) on success. `Err(reason)` rejects the
 /// receipt before it is co-signed.
+///
+/// `consumer_peer` is the libp2p id the receipt's consumer key derives, `source_peer` the
+/// authenticated sender of the receipt: both must be the peer that was served. Otherwise another
+/// key (a throwaway one, whose per-pair high-water starts at zero) could settle someone else's serve.
+#[allow(clippy::too_many_arguments)]
 fn validate_and_consume_commitment(
     map: &mut HashMap<[u8; 16], ServeCommitment>,
     nonce: &[u8; 16],
@@ -329,6 +336,8 @@ fn validate_and_consume_commitment(
     tokens: u64,
     ts_unix_ms: u64,
     now: u64,
+    consumer_peer: &str,
+    source_peer: &str,
 ) -> Result<(), String> {
     // Receipt-timestamp freshness (B-S7): reject stale or far-future receipts.
     if ts_unix_ms + COMMITMENT_TTL_MS < now || ts_unix_ms > now + CLOCK_SKEW_MS {
@@ -336,6 +345,9 @@ fn validate_and_consume_commitment(
     }
     map.retain(|_, c| now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS);
     let c = map.get(nonce).ok_or("no serve commitment for this receipt nonce")?;
+    if consumer_peer != c.served_peer || source_peer != c.served_peer {
+        return Err("receipt is not from the consumer that was served".into());
+    }
     if model_id != c.model_id {
         return Err("receipt model does not match the served model".into());
     }
@@ -1052,14 +1064,14 @@ impl<A: EngineAdapter> Provider<A> {
     /// B-S1: record what we just served under the consumer's committed nonce, so the
     /// settlement receipt can be validated against it. Prunes expired commitments and
     /// enforces a hard cap so the map stays bounded (B-S7).
-    fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64) {
+    fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64, served_peer: &str) {
         let now = now_unix_ms();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, c| now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS);
         if map.len() >= MAX_COMMITMENTS {
             return; // backstop — refuse to grow past the cap (stale entries already pruned)
         }
-        map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now });
+        map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string() });
     }
 
     /// Reconnect-and-fetch: mark a serve in-flight under `nonce` so a fetch that arrives
@@ -1257,7 +1269,7 @@ impl<A: EngineAdapter> Provider<A> {
         // B-S1: record what we served under the committed nonce so its settlement receipt can be
         // validated (right tokens/model, once) — identical to the buffered path.
         if summary.ok && summary.tokens > 0 {
-            self.record_commitment(nonce, model_ref.clone(), summary.tokens);
+            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer);
         }
         if let Some(stats) = &self.stats {
             let e = &summary.metrics.engine;
@@ -1276,7 +1288,9 @@ impl<A: EngineAdapter> Provider<A> {
     fn check_and_consume_commitment(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
+        source_peer: &str,
     ) -> Result<(), String> {
+        let consumer_peer = self.net.peer_id_from_ed25519_pubkey(p.consumer.as_bytes())?;
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         validate_and_consume_commitment(
             &mut map,
@@ -1285,6 +1299,8 @@ impl<A: EngineAdapter> Provider<A> {
             p.tokens,
             p.ts_unix_ms,
             now_unix_ms(),
+            &consumer_peer,
+            source_peer,
         )
     }
 
@@ -1991,7 +2007,7 @@ impl<A: EngineAdapter> Provider<A> {
                 // commitment (so a bad cumulative doesn't burn the single-use nonce).
                 let bind = |p: &openhydra_protocol::receipts::ReceiptPayload| {
                     self.validate_settlement_cumulative(p)?;
-                    self.check_and_consume_commitment(p).map_err(BindRejection::from)
+                    self.check_and_consume_commitment(p, source_peer).map_err(BindRejection::from)
                 };
                 // Validate, co-sign and record as one step (see `receipt_lock`).
                 let _receipt_guard = self.receipt_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2077,7 +2093,7 @@ impl<A: EngineAdapter> Provider<A> {
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once).
                         if summary.ok && summary.tokens > 0 {
-                            self.record_commitment(nonce, model_ref.clone(), summary.tokens);
+                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer);
                         }
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
@@ -2535,7 +2551,7 @@ mod tests {
     // ---- B-S1 / B-S7: serve-commitment binding ---------------------------------------
 
     fn commit(map: &mut HashMap<[u8; 16], ServeCommitment>, n: [u8; 16], model: &str, tokens: u64, now: u64) {
-        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now });
+        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now, served_peer: "c".into() });
     }
 
     #[test]
@@ -2543,9 +2559,9 @@ mod tests {
         let now = 1_000_000u64;
         let mut map = HashMap::new();
         commit(&mut map, [7u8; 16], "qwen2.5:7b", 100, now);
-        assert!(validate_and_consume_commitment(&mut map, &[7u8; 16], "qwen2.5:7b", 100, now, now).is_ok());
+        assert!(validate_and_consume_commitment(&mut map, &[7u8; 16], "qwen2.5:7b", 100, now, now, "c", "c").is_ok());
         // Single-use: the commitment is consumed, so a replay of the same receipt is rejected.
-        assert!(validate_and_consume_commitment(&mut map, &[7u8; 16], "qwen2.5:7b", 100, now, now)
+        assert!(validate_and_consume_commitment(&mut map, &[7u8; 16], "qwen2.5:7b", 100, now, now, "c", "c")
             .unwrap_err()
             .contains("no serve commitment"));
     }
@@ -2556,10 +2572,10 @@ mod tests {
         let mut map = HashMap::new();
         commit(&mut map, [8u8; 16], "m", 100, now);
         // Claiming fewer tokens than served is harmless (only reduces the provider's credit).
-        assert!(validate_and_consume_commitment(&mut map, &[8u8; 16], "m", 40, now, now).is_ok());
+        assert!(validate_and_consume_commitment(&mut map, &[8u8; 16], "m", 40, now, now, "c", "c").is_ok());
         // The B-S1 attack — claiming more than served — is rejected.
         commit(&mut map, [9u8; 16], "m", 100, now);
-        assert!(validate_and_consume_commitment(&mut map, &[9u8; 16], "m", u64::MAX, now, now)
+        assert!(validate_and_consume_commitment(&mut map, &[9u8; 16], "m", u64::MAX, now, now, "c", "c")
             .unwrap_err()
             .contains("exceed"));
     }
@@ -2568,14 +2584,30 @@ mod tests {
     fn commitment_rejects_unknown_nonce_and_model_mismatch() {
         let now = 1_000_000u64;
         let mut map = HashMap::new();
-        assert!(validate_and_consume_commitment(&mut map, &[1u8; 16], "m", 1, now, now)
+        assert!(validate_and_consume_commitment(&mut map, &[1u8; 16], "m", 1, now, now, "c", "c")
             .unwrap_err()
             .contains("no serve commitment"));
         // Right nonce, wrong model → reject (no cross-model misattribution).
         commit(&mut map, [2u8; 16], "cheap-model", 100, now);
-        assert!(validate_and_consume_commitment(&mut map, &[2u8; 16], "expensive-model", 100, now, now)
+        assert!(validate_and_consume_commitment(&mut map, &[2u8; 16], "expensive-model", 100, now, now, "c", "c")
             .unwrap_err()
             .contains("model"));
+    }
+
+    #[test]
+    fn only_the_served_consumer_can_settle_its_serve() {
+        let now = 1_000_000u64;
+        let mut map = HashMap::new();
+        commit(&mut map, [5u8; 16], "m", 100, now);
+        // Another consumer key (say a throwaway one, with no history at this provider)…
+        assert!(validate_and_consume_commitment(&mut map, &[5u8; 16], "m", 100, now, now, "other", "other")
+            .unwrap_err()
+            .contains("not from the consumer"));
+        // …or the right key sent by another peer: refused, and the commitment is still there.
+        assert!(validate_and_consume_commitment(&mut map, &[5u8; 16], "m", 100, now, now, "c", "relay")
+            .unwrap_err()
+            .contains("not from the consumer"));
+        assert!(validate_and_consume_commitment(&mut map, &[5u8; 16], "m", 100, now, now, "c", "c").is_ok());
     }
 
     #[test]
@@ -2584,16 +2616,16 @@ mod tests {
         let mut map = HashMap::new();
         commit(&mut map, [3u8; 16], "m", 100, now);
         // Receipt timestamp older than the window, or far in the future → reject (B-S7).
-        assert!(validate_and_consume_commitment(&mut map, &[3u8; 16], "m", 100, 0, now)
+        assert!(validate_and_consume_commitment(&mut map, &[3u8; 16], "m", 100, 0, now, "c", "c")
             .unwrap_err()
             .contains("freshness"));
-        assert!(validate_and_consume_commitment(&mut map, &[3u8; 16], "m", 100, now + 10 * CLOCK_SKEW_MS, now)
+        assert!(validate_and_consume_commitment(&mut map, &[3u8; 16], "m", 100, now + 10 * CLOCK_SKEW_MS, now, "c", "c")
             .unwrap_err()
             .contains("freshness"));
         // A commitment older than the TTL is pruned on the next validate, bounding the map.
         let mut map2 = HashMap::new();
         commit(&mut map2, [4u8; 16], "m", 100, 0); // recorded at ts 0, now is 10*TTL later
-        assert!(validate_and_consume_commitment(&mut map2, &[4u8; 16], "m", 100, now, now)
+        assert!(validate_and_consume_commitment(&mut map2, &[4u8; 16], "m", 100, now, now, "c", "c")
             .unwrap_err()
             .contains("no serve commitment"));
         assert!(map2.is_empty(), "stale commitment should have been pruned");
