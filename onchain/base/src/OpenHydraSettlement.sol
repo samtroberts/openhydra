@@ -22,8 +22,8 @@ import {ReentrancyGuard} from "openzeppelin-contracts/utils/ReentrancyGuard.sol"
 ///
 /// Non-custodial invariant: no path lets any key remove escrow except `settle` (the fixed 0.96/0.04
 /// split: the channel's payout, and accrued fees the fee recipient withdraws) and `withdraw` (back to the depositing
-/// consumer, after an exit request and `refundDelay`). There is no owner-drains-escrow function. The
-/// fee is fixed at init.
+/// consumer, in the `EXIT_WINDOW` after an exit request and `refundDelay`). There is no
+/// owner-drains-escrow function. The fee is fixed at init.
 ///
 /// Escrow is ring-fenced per provider (a payment channel): a consumer funds `channels[consumer][provider]`
 /// and that balance can only ever be paid to the channel's payout address. So a consumer can't pay
@@ -59,7 +59,12 @@ contract OpenHydraSettlement is ReentrancyGuard {
     uint64 public constant MIN_REFUND_DELAY = 1 days;
     /// How much pausing can delay one exit, in total: time paused after an exit request extends its
     /// window (a pause stops settles), capped so the admin's pause can't lock escrow indefinitely.
+    /// Also the most a pause extends a claim (see `claimGrace`).
     uint64 public constant MAX_PAUSE_EXTENSION = 30 days;
+    /// How long an exit stays open once its delay has passed. One request opens one window, and a
+    /// withdraw closes it: an exit requested once can't be kept armed and used, months later, in one
+    /// transaction ahead of the provider's settle.
+    uint64 public constant EXIT_WINDOW = 3 days;
 
     // ── Config (set once at init; the fee can never be changed to divert funds) ──
     IERC20 public immutable usdc;
@@ -72,8 +77,10 @@ contract OpenHydraSettlement is ReentrancyGuard {
     uint64 public immutable refundDelay; // seconds of consumer inactivity before an unconditional withdraw
     address public admin; // pause only — CANNOT touch funds
     bool public paused;
-    /// When the current pause began (meaningful while `paused`).
+    /// When the current pause began, or the last one (0 = never paused).
     uint64 public pausedAt;
+    /// When the last pause ended (meaningful once a pause has ended).
+    uint64 public lastPauseEnd;
     /// Seconds paused in total over pauses that have ended: with `pausedAt`, how much a pause delays an
     /// exit.
     uint64 public pausedTotal;
@@ -137,6 +144,7 @@ contract OpenHydraSettlement is ReentrancyGuard {
     error PayoutMismatch(); // a claim or deposit naming another payout than the channel's
     error NotPayout(); // only a channel's payout address may move it
     error ClaimExpired();
+    error ExitLapsed(); // the exit window closed: request a new exit
     error BadRefundDelay();
     error NotFeeRecipient();
 
@@ -215,7 +223,9 @@ contract OpenHydraSettlement is ReentrancyGuard {
     /// as the protocol fee. Checks-effects-interactions. A settle never moves an exit's deadline.
     function settle(SettlementClaim calldata claim, bytes calldata sig) external nonReentrant {
         if (paused) revert IsPaused();
-        if (block.timestamp > claim.expiresAt) revert ClaimExpired();
+        if (block.timestamp > claim.expiresAt && block.timestamp - claim.expiresAt > claimGrace(claim.expiresAt)) {
+            revert ClaimExpired();
+        }
 
         // Recover the authorizing EVM signer. OZ ECDSA.recover enforces EIP-2 low-`s` and rejects the
         // zero address / malformed sigs — the on-chain mirror of `recover_evm_signer` (which also
@@ -280,17 +290,21 @@ contract OpenHydraSettlement is ReentrancyGuard {
     }
 
     /// Consumer reclaims unspent escrow from a channel → the non-custodial exit; deposits are never
-    /// trapped. Allowed `refundDelay` after `requestExit`, plus however long the contract has been
+    /// trapped. Opens `refundDelay` after `requestExit`, plus however long the contract has been
     /// paused since (a pause stops settles, so it must not use up the provider's window), at most
     /// `MAX_PAUSE_EXTENSION` — past that, even while paused, so a pause can't lock escrow forever.
+    /// Stays open `EXIT_WINDOW`, for one withdraw: after it, or after a withdraw, a new exit is needed.
     /// This is spec §7 option (a), the timelock, made per channel.
     function withdraw(bytes32 provider, uint256 amount) external nonReentrant {
         Channel storage c = channels[msg.sender][provider];
         if (c.exitRequestedAt == 0) revert RefundLocked();
         uint256 pausedSince = _pausedTotalNow() - c.exitPauseMark;
         if (pausedSince > MAX_PAUSE_EXTENSION) pausedSince = MAX_PAUSE_EXTENSION;
-        if (block.timestamp < uint256(c.exitRequestedAt) + refundDelay + pausedSince) revert RefundLocked();
+        uint256 openAt = uint256(c.exitRequestedAt) + refundDelay + pausedSince;
+        if (block.timestamp < openAt) revert RefundLocked();
+        if (block.timestamp > openAt + EXIT_WINDOW) revert ExitLapsed();
         if (amount > c.balance) revert WithdrawTooLarge();
+        c.exitRequestedAt = 0;
         c.balance -= amount;
         usdc.safeTransfer(msg.sender, amount);
         emit Withdrawn(msg.sender, provider, amount);
@@ -311,10 +325,24 @@ contract OpenHydraSettlement is ReentrancyGuard {
     /// `MAX_PAUSE_EXTENSION` per exit.
     function setPaused(bool _paused) external {
         if (msg.sender != admin) revert NotAdmin();
-        if (!paused && _paused) pausedAt = uint64(block.timestamp);
-        else if (paused && !_paused) pausedTotal += uint64(block.timestamp) - pausedAt;
+        if (!paused && _paused) {
+            pausedAt = uint64(block.timestamp);
+        } else if (paused && !_paused) {
+            pausedTotal += uint64(block.timestamp) - pausedAt;
+            lastPauseEnd = uint64(block.timestamp);
+        }
         paused = _paused;
         emit Paused(_paused);
+    }
+
+    /// How long past its expiry a claim still settles. A pause stops settles, so a claim that was
+    /// still live when the last pause began gets back the time that pause took, at most
+    /// `MAX_PAUSE_EXTENSION` (the same cap as an exit's, so a claim still outlives the exit window it
+    /// was accepted for). Only the last pause counts: a provider settles its claims once one ends.
+    function claimGrace(uint256 expiresAt) public view returns (uint256) {
+        if (pausedAt == 0 || paused || expiresAt < pausedAt) return 0;
+        uint256 took = uint256(lastPauseEnd) - pausedAt;
+        return took > MAX_PAUSE_EXTENSION ? MAX_PAUSE_EXTENSION : took;
     }
 
     /// Seconds paused in total up to now, the current pause included.

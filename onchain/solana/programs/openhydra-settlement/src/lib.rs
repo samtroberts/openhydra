@@ -10,8 +10,8 @@
 // non-custodially, taking the 4% protocol fee on-chain. Escrow is ring-fenced per provider: a consumer
 // funds a vault for ONE provider, and settles from it pay only that provider's bound payout — so a
 // consumer can't pay itself out of escrow committed to a provider (a throwaway provider of its own
-// reaches only its own vault). Exits are "request, then wait `refund_delay_secs`", a window settles
-// can't extend and a pause extends by at most 30 days. It verifies the co-signed receipt's **Ed25519
+// reaches only its own vault). Exits are "request, then wait `refund_delay_secs`", a delay settles
+// can't extend and a pause extends by at most 30 days, then one withdraw within `EXIT_WINDOW_SECS`. It verifies the co-signed receipt's **Ed25519
 // signature natively** (via the Ed25519 SigVerify program + instruction introspection), enforces
 // **monotonic** per-channel settlement, and releases the delta split `0.96 provider / 0.04 platform`.
 // It does NOT re-verify authenticity — that is already baked into the voucher's rate-capped
@@ -45,9 +45,13 @@ pub const MAX_REFUND_DELAY_SECS: i64 = 14 * 24 * 60 * 60;
 /// transaction, ahead of the provider's settle.
 pub const MIN_REFUND_DELAY_SECS: i64 = 24 * 60 * 60;
 /// How much pausing can delay one exit, in total. A pause stops settles, so time paused after an exit
-/// request extends its window (the provider keeps its full window to settle); capped, so the admin's
-/// pause can't lock escrow indefinitely.
+/// request extends its delay; capped, so the admin's pause can't lock escrow indefinitely. Also the
+/// most a pause extends a claim ([`claim_grace`]).
 pub const MAX_PAUSE_EXTENSION_SECS: i64 = 30 * 24 * 60 * 60;
+/// How long an exit stays open once its delay has passed. One request opens one window, and a
+/// withdraw closes it: an exit requested once can't be kept armed and used, months later, in one
+/// transaction ahead of the provider's settle.
+pub const EXIT_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
 /// How far ahead of the cluster clock a payout binding's timestamp may be: a binding stamped far in
 /// the future (say `u64::MAX`, by whoever got the identity key) would be impossible to rotate away from.
 pub const BINDING_CLOCK_SKEW_SECS: i64 = 5 * 60;
@@ -197,6 +201,7 @@ pub mod openhydra_settlement {
         config.refund_delay_secs = refund_delay_secs;
         config.paused = false;
         config.paused_at = 0;
+        config.last_pause_end = 0;
         config.paused_total = 0;
         config.cluster = cluster;
         config.accrued_fees = 0;
@@ -273,7 +278,9 @@ pub mod openhydra_settlement {
         );
         require!(verified.message == expected, SettlementError::MessageMismatch);
         let now = Clock::get()?.unix_timestamp;
-        require!(now >= 0 && (now as u64) <= claim.expires_at, SettlementError::ClaimExpired);
+        require!(now >= 0, SettlementError::ClaimExpired);
+        let late = (now as u64).saturating_sub(claim.expires_at);
+        require!(late <= claim_grace(&ctx.accounts.config, claim.expires_at), SettlementError::ClaimExpired);
 
         // 2. The provider is paid at its currently-bound address, whatever it is: the claim names no
         //    payout, so nobody (the consumer included) can point it elsewhere.
@@ -335,10 +342,12 @@ pub mod openhydra_settlement {
         Ok(())
     }
 
-    /// Consumer reclaims unspent escrow from a provider vault → the non-custodial exit. Allowed
+    /// Consumer reclaims unspent escrow from a provider vault → the non-custodial exit. Opens
     /// `refund_delay_secs` after `request_exit`, plus however long the program has been paused since
     /// (a pause stops settles, so it must not use up the provider's window), at most
     /// `MAX_PAUSE_EXTENSION_SECS` — past that, even while paused, so a pause can't lock escrow forever.
+    /// Stays open `EXIT_WINDOW_SECS`, for one withdraw: after it, or after a withdraw, a new exit is
+    /// needed.
     pub fn withdraw(ctx: Context<Withdraw>, _provider: [u8; 32], amount: u64) -> Result<()> {
         let config = &ctx.accounts.config;
         let vault = &mut ctx.accounts.vault;
@@ -351,8 +360,10 @@ pub mod openhydra_settlement {
             .and_then(|t| t.checked_add(paused_since_request.min(MAX_PAUSE_EXTENSION_SECS)))
             .ok_or(SettlementError::Overflow)?;
         require!(now >= open_at, SettlementError::RefundLocked);
+        require!(now <= open_at.saturating_add(EXIT_WINDOW_SECS), SettlementError::ExitLapsed);
         require!(amount <= vault.balance, SettlementError::WithdrawTooLarge);
         // PRODUCTION SPL: CPI `spl_token::transfer` vault → consumer's USDC ATA.
+        vault.exit_requested_at = 0;
         vault.balance -= amount;
         Ok(())
     }
@@ -376,10 +387,22 @@ pub mod openhydra_settlement {
             config.paused_at = now;
         } else if config.paused && !paused {
             config.paused_total = config.paused_total.saturating_add(now.saturating_sub(config.paused_at).max(0));
+            config.last_pause_end = now;
         }
         config.paused = paused;
         Ok(())
     }
+}
+
+/// How long past its expiry a claim still settles. A pause stops settles, so a claim that was still
+/// live when the last pause began gets back the time that pause took, at most
+/// `MAX_PAUSE_EXTENSION_SECS` (the same cap as an exit's, so a claim still outlives the exit window it
+/// was accepted for). Only the last pause counts: a provider settles its claims once one ends.
+pub fn claim_grace(config: &Config, expires_at: u64) -> u64 {
+    if config.paused_at <= 0 || config.paused || expires_at < config.paused_at as u64 {
+        return 0;
+    }
+    config.last_pause_end.saturating_sub(config.paused_at).clamp(0, MAX_PAUSE_EXTENSION_SECS) as u64
 }
 
 /// How long the program has been paused in total, up to `now` (the current pause included).
@@ -410,8 +433,10 @@ pub struct Config {
     pub fee_bps: u16,
     pub refund_delay_secs: i64,
     pub paused: bool,
-    /// When the current pause began (meaningful while `paused`).
+    /// When the current pause began, or the last one (0 = never paused).
     pub paused_at: i64,
+    /// When the last pause ended (meaningful once a pause has ended).
+    pub last_pause_end: i64,
     /// Seconds paused in total, over pauses that have ended: with `paused_at`, how much a pause delays
     /// an exit.
     pub paused_total: i64,
@@ -643,6 +668,8 @@ pub enum SettlementError {
     NotFeeAuthority,
     #[msg("the payout binding is stamped in the future")]
     BindingFromTheFuture,
+    #[msg("the exit window closed; request a new exit")]
+    ExitLapsed,
 }
 
 // ── Pure-logic unit tests (host `cargo test`, no validator) ────────────────

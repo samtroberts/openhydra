@@ -30,12 +30,17 @@ solana_preimage_cross_language_golden}`) that the on-chain tests reproduce.
   payout address can move; Solana: the provider's Ed25519-signed payout binding). A consumer can't pay
   itself out of escrow committed to a provider — a throwaway provider of its own reaches only what the
   consumer put in *its* channel.
-- **Paid-so-far is per (consumer, provider, model)**, never per payout address, so moving a payout
-  address continues from what was already settled instead of paying the running total again.
-- **Exit = request, then wait.** A consumer calls `requestExit` / `request_exit`, then may withdraw
-  after the refund delay — a fixed window for the provider to settle what it is owed, which settles
-  can't extend. No withdrawals while paused, and the window counts from no earlier than the last
-  unpause. A deposit cancels a pending exit.
+- **Paid-so-far is per (consumer, provider, model)** — on Base per (wallet, provider, consumer id,
+  model) — never per payout address, so moving a payout address continues from what was already
+  settled instead of paying the running total again.
+- **Exit = request, wait, then one withdraw within 3 days.** A consumer calls `requestExit` /
+  `request_exit`, then may withdraw once the refund delay has passed — a fixed time for the provider
+  to settle what it is owed, which settles can't extend. Time paused after the request extends the
+  delay (a pause stops settles), by at most 30 days. The exit then stays open for 3 days
+  (`EXIT_WINDOW`) and one withdraw: after that, or after a withdraw, a new request is needed, so an
+  exit can't be kept armed and used months later ahead of a settle. Withdrawals aren't paused (an
+  open window stays open through a pause), so a pause can never trap escrow. A deposit cancels a
+  pending exit.
 - **Off-chain duty (Base):** a provider relies on a channel only after checking that
   `channels[consumer][provider].payout` is its own payout address (the consumer picks it at open).
 
@@ -49,7 +54,9 @@ pays its own address and holds what it is owed before relying on its claims). Ea
 contract, version `"2"`); Solana by the program id and a **cluster tag** (the cluster's genesis hash)
 kept in the program's config, which only the program's **upgrade authority** can initialize. The Solana
 payout binding carries the same domain. Refund delays are between 1 and 14 days on both chains, and pausing
-extends an exit by at most 30 days (no indefinite lock by pausing). A settle past the escrow pays what it
+extends an exit by at most 30 days (no indefinite lock by pausing). A claim that was still live when the
+last pause began settles for as long again as that pause took, also at most 30 days, so a pause doesn't
+void the claims that expire during it (only the last pause counts: a provider settles once one ends). A settle past the escrow pays what it
 holds and the rest after a top-up. On Base the paid-so-far is keyed by the consumer's Ed25519 id as well
 as its wallet. Solana payout bindings can't be stamped more than 5 minutes ahead. **Fees are pulled:** settles accrue the 4% and the fee recipient / authority
 withdraws it to any address, so a blacklisted or frozen fee account can't stop settlement.

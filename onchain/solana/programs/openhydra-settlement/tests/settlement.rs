@@ -239,6 +239,13 @@ fn set_paused(ctx: &mut Ctx, paused: bool) -> Result<(), String> {
     send(ctx, &[ix], &[&admin])
 }
 
+/// Assert `r` failed with the program's `e`.
+fn fails_with(r: Result<(), String>, e: openhydra_settlement::SettlementError) {
+    let code: u32 = e.into();
+    let err = r.expect_err("expected the instruction to fail");
+    assert!(err.contains(&format!("Custom({code})")), "expected error {code}, got {err}");
+}
+
 /// Move the cluster clock forward.
 fn advance(ctx: &mut Ctx, secs: i64) {
     let mut clock: solana_clock::Clock = ctx.svm.get_sysvar();
@@ -444,6 +451,53 @@ fn an_exit_needs_a_request_and_a_window_settles_cannot_extend() {
 }
 
 #[test]
+fn an_exit_is_one_withdraw_within_its_window() {
+    use openhydra_settlement::{SettlementError, EXIT_WINDOW_SECS};
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    advance(&mut ctx, 86_400);
+    withdraw(&mut ctx, &consumer, provider_id, 100_000).expect("in the window");
+    // A withdraw closes the exit: the next needs a new request.
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), SettlementError::RefundLocked);
+    // Kept armed past its window, an exit can't be used ahead of a settle months later.
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    advance(&mut ctx, 86_400 + EXIT_WINDOW_SECS + 1);
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), SettlementError::ExitLapsed);
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    advance(&mut ctx, 86_400 + EXIT_WINDOW_SECS);
+    withdraw(&mut ctx, &consumer, provider_id, 1).expect("the window's last second");
+}
+
+#[test]
+fn a_claim_live_when_a_pause_began_gets_the_pause_back() {
+    use openhydra_settlement::{SettlementError, MAX_PAUSE_EXTENSION_SECS};
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    let expires = T0 as u64 + 15 * 86_400;
+    // Ten days in, the admin pauses for sixteen, past the claim's expiry.
+    advance(&mut ctx, 10 * 86_400);
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 16 * 86_400);
+    set_paused(&mut ctx, false).unwrap();
+    // The claim has the five days it had left when the pause began…
+    advance(&mut ctx, 5 * 86_400);
+    settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", expires).expect("within the five days");
+    // …and no more.
+    advance(&mut ctx, 1);
+    fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), SettlementError::ClaimExpired);
+    // A long pause gives back at most the cap; a claim expired before it began gets nothing.
+    let config = config_state(&ctx);
+    assert_eq!(openhydra_settlement::claim_grace(&config, expires), 16 * 86_400);
+    let mut long = config.clone();
+    long.last_pause_end = long.paused_at + 2 * MAX_PAUSE_EXTENSION_SECS;
+    assert_eq!(openhydra_settlement::claim_grace(&long, expires), MAX_PAUSE_EXTENSION_SECS as u64);
+    assert_eq!(openhydra_settlement::claim_grace(&config, long.paused_at as u64 - 1), 0);
+}
+
+#[test]
 fn a_deposit_cancels_a_pending_exit() {
     let mut ctx = setup();
     initialize(&mut ctx);
@@ -462,7 +516,7 @@ fn a_pause_does_not_run_out_the_providers_window() {
     request_exit(&mut ctx, &consumer, provider_id).unwrap();
     set_paused(&mut ctx, true).unwrap();
     advance(&mut ctx, 86_400 + 1);
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "no withdrawals while paused");
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "the time paused doesn't count toward the delay");
     set_paused(&mut ctx, false).unwrap();
     assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "the window is extended by the pause");
     advance(&mut ctx, 86_400);

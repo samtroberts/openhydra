@@ -245,14 +245,37 @@ contract OpenHydraSettlementTest is Test {
         settlement.withdraw(PROVIDER_ID, 1);
 
         vm.warp(block.timestamp + 1);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.WithdrawTooLarge.selector);
+        settlement.withdraw(PROVIDER_ID, 500_001);
         uint256 before = usdc.balanceOf(consumer);
         vm.prank(consumer);
         settlement.withdraw(PROVIDER_ID, 200_000);
         assertEq(usdc.balanceOf(consumer), before + 200_000);
         assertEq(_balance(PROVIDER_ID), 300_000);
+        // One withdraw per exit: the next one needs a new request (and its delay).
         vm.prank(consumer);
-        vm.expectRevert(OpenHydraSettlement.WithdrawTooLarge.selector);
-        settlement.withdraw(PROVIDER_ID, 300_001);
+        vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
+        settlement.withdraw(PROVIDER_ID, 1);
+    }
+
+    function test_an_exit_lapses_after_its_window() public {
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        // Kept armed past its window, it can't be used ahead of a settle months later.
+        vm.warp(block.timestamp + REFUND_DELAY + settlement.EXIT_WINDOW() + 1);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.ExitLapsed.selector);
+        settlement.withdraw(PROVIDER_ID, 1);
+        // A new request opens a new window, after the delay again.
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
+        settlement.withdraw(PROVIDER_ID, 1);
+        vm.warp(block.timestamp + REFUND_DELAY + settlement.EXIT_WINDOW());
+        vm.prank(consumer);
+        settlement.withdraw(PROVIDER_ID, 1); // the window's last second
     }
 
     function test_settles_during_the_exit_window_do_not_extend_it() public {
@@ -286,7 +309,7 @@ contract OpenHydraSettlementTest is Test {
         settlement.requestExit(PROVIDER_ID);
         vm.prank(admin);
         settlement.setPaused(true);
-        // No settles and no withdrawals while paused.
+        // A pause stops settles, so the time paused doesn't count toward the delay.
         vm.warp(block.timestamp + REFUND_DELAY + 1);
         vm.prank(consumer);
         vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
@@ -420,6 +443,53 @@ contract OpenHydraSettlementTest is Test {
         bytes memory lateSig = _sign(consumerPk, late);
         vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
         settlement.settle(late, lateSig);
+    }
+
+    function test_a_claim_live_when_a_pause_began_gets_the_pause_back() public {
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 15 days;
+        bytes memory sig = _sign(consumerPk, claim);
+        // Ten days in, the consumer asks to exit and the admin pauses for sixteen, past the claim's expiry.
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(block.timestamp + 16 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        // The exit is still closed, and the claim has the five days it had left when the pause began.
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
+        settlement.withdraw(PROVIDER_ID, 500_000);
+        vm.warp(claim.expiresAt + 16 days);
+        settlement.settle(claim, sig);
+        assertEq(_balance(PROVIDER_ID), 400_000);
+        // Past that, it has expired.
+        OpenHydraSettlement.SettlementClaim memory more = _claim(200_000);
+        more.expiresAt = claim.expiresAt;
+        bytes memory moreSig = _sign(consumerPk, more);
+        vm.warp(claim.expiresAt + 16 days + 1);
+        vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
+        settlement.settle(more, moreSig);
+    }
+
+    function test_a_pause_gives_a_claim_back_at_most_thirty_days() public {
+        vm.warp(10 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 1 days;
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(block.timestamp + 60 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        assertEq(settlement.claimGrace(claim.expiresAt), 30 days);
+        // A claim that had expired before the pause began gets nothing back.
+        assertEq(settlement.claimGrace(claim.expiresAt - 2 days), 0);
+        vm.warp(claim.expiresAt + 30 days + 1);
+        vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
+        settlement.settle(claim, sig);
     }
 
     function test_fees_are_pulled_by_the_fee_recipient_to_any_address() public {
