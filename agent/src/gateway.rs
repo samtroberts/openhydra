@@ -110,6 +110,10 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// OpenAI's current name for the cap (`max_tokens` is deprecated there); see
+    /// [`ChatRequest::effective_max_tokens`].
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f64>,
     /// OpenAI `tools` — function specs the model may call. Forwarded opaquely to the engine;
@@ -144,6 +148,15 @@ impl ChatRequest {
     /// Resolve the caller's thinking preference to one internal flag. Ollama-native `think`
     /// wins; otherwise `chat_template_kwargs.enable_thinking`; `None` ⇒ leave the engine's
     /// default. Threaded to the provider and mapped to each engine's native switch.
+    /// The completion-token cap: `max_completion_tokens` or `max_tokens`, the smaller if both are
+    /// set. It bounds both the generation and the tokens the receipt bills.
+    fn effective_max_tokens(&self) -> Option<u32> {
+        match (self.max_tokens, self.max_completion_tokens) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     fn effective_think(&self) -> Option<bool> {
         self.think
             .or_else(|| self.chat_template_kwargs.as_ref().and_then(|k| k.enable_thinking))
@@ -224,6 +237,13 @@ fn validate(req: &ChatRequest) -> Option<Response> {
         return Some(openai_error(
             StatusCode::BAD_REQUEST,
             "missing or empty field: messages",
+            "invalid_request_error",
+        ));
+    }
+    if req.effective_max_tokens() == Some(0) {
+        return Some(openai_error(
+            StatusCode::BAD_REQUEST,
+            "max_tokens must be at least 1",
             "invalid_request_error",
         ));
     }
@@ -695,6 +715,7 @@ async fn chat_completions(
     // session pin steers the `auto`/default case; the resolved concrete model is echoed back.
     let session_pin = state.sessions.get(&skey);
     let think = req.effective_think();
+    let max_tokens = req.effective_max_tokens();
     let (model, rx, started) = match spawn_dispatch(
         &state,
         &headers,
@@ -702,7 +723,7 @@ async fn chat_completions(
         false,
         session_pin.as_deref(),
         req.messages,
-        req.max_tokens,
+        max_tokens,
         req.temperature,
         req.tools,
         think,
@@ -1299,6 +1320,9 @@ async fn messages(
     }
     if req.messages.is_empty() {
         return anthropic_error(StatusCode::BAD_REQUEST, "missing or empty field: messages", "invalid_request_error");
+    }
+    if req.max_tokens == Some(0) {
+        return anthropic_error(StatusCode::BAD_REQUEST, "max_tokens must be at least 1", "invalid_request_error");
     }
 
     let id = next_msg_id();
@@ -2147,6 +2171,22 @@ mod tests {
     }
 
     #[test]
+    fn the_token_cap_reads_either_openai_name_and_a_zero_cap_is_rejected() {
+        let parse = |j: &str| serde_json::from_str::<ChatRequest>(j).unwrap();
+        assert_eq!(parse(r#"{"model":"m","messages":[]}"#).effective_max_tokens(), None);
+        assert_eq!(parse(r#"{"model":"m","max_tokens":64}"#).effective_max_tokens(), Some(64));
+        assert_eq!(parse(r#"{"model":"m","max_completion_tokens":32}"#).effective_max_tokens(), Some(32));
+        assert_eq!(
+            parse(r#"{"model":"m","max_tokens":64,"max_completion_tokens":32}"#).effective_max_tokens(),
+            Some(32)
+        );
+        let zero = parse(r#"{"model":"m","messages":[{"role":"user","content":"x"}],"max_completion_tokens":0}"#);
+        assert_eq!(validate(&zero).map(|r| r.status()), Some(StatusCode::BAD_REQUEST));
+        let ok = parse(r#"{"model":"m","messages":[{"role":"user","content":"x"}],"max_tokens":1}"#);
+        assert!(validate(&ok).is_none());
+    }
+
+    #[test]
     fn effective_think_resolves_and_prioritises_native_over_kwargs() {
         // No thinking control ⇒ leave the engine default.
         let bare: ChatRequest =
@@ -2172,11 +2212,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_empty_model_and_messages() {
-        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
+        let r = ChatRequest { model: "".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
         assert!(validate(&r).is_some());
-        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
+        let r = ChatRequest { model: "m".into(), messages: vec![ChatMessage { role: "user".into(), content: "x".into(), ..Default::default() }], max_tokens: None, max_completion_tokens: None, temperature: None, tools: Vec::new(), stream: false, stream_options: None, think: None, chat_template_kwargs: None };
         assert!(validate(&r).is_none());
     }
 

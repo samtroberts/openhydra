@@ -40,6 +40,70 @@ pub struct ServeMetrics {
     pub provider_serve_ns: u64,
 }
 
+/// Tokens with no text of their own (end-of-turn and other special markers) allowed on top of the
+/// delivered text in [`billable_tokens`].
+pub const BILLABLE_TOKEN_SLACK: u64 = 16;
+/// Per tool call: the template tokens it is wrapped in (`<tool_call>`, the JSON envelope around the
+/// name and arguments), which the engine generates but neither side sees as text.
+pub const TOOL_CALL_TOKEN_ALLOWANCE: u64 = 32;
+
+/// A measure of generated text that bounds the tokens it could have taken: the UTF-8 bytes of its
+/// non-whitespace characters, plus one per run of whitespace. Every token decodes to at least one
+/// byte, and a run of whitespace counts once, so padding (spaces in tool-call arguments, blank lines
+/// in a reasoning block) adds nothing. Fed delta by delta; a run split across two deltas is one run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliveredText {
+    units: u64,
+    in_whitespace: bool,
+}
+
+impl DeliveredText {
+    pub fn push(&mut self, text: &str) {
+        for c in text.chars() {
+            if c.is_whitespace() {
+                if !self.in_whitespace {
+                    self.units += 1;
+                    self.in_whitespace = true;
+                }
+            } else {
+                self.units += c.len_utf8() as u64;
+                self.in_whitespace = false;
+            }
+        }
+    }
+
+    pub fn units(&self) -> u64 {
+        self.units
+    }
+}
+
+/// [`DeliveredText`] units of `tool_calls` (name and arguments) plus each call's
+/// [`TOOL_CALL_TOKEN_ALLOWANCE`].
+pub fn tool_call_units(tool_calls: &[ToolCall]) -> u64 {
+    tool_calls
+        .iter()
+        .map(|c| {
+            let mut t = DeliveredText::default();
+            t.push(&c.function.name);
+            let mut a = DeliveredText::default();
+            a.push(&c.function.arguments);
+            t.units() + a.units() + TOOL_CALL_TOKEN_ALLOWANCE
+        })
+        .sum()
+}
+
+/// The completion tokens a serve is billed for, which provider and consumer each compute from the
+/// same inputs: the engine's count, but never more than the request allowed (`max_tokens`) nor more
+/// than the delivered text (`delivered`, from [`DeliveredText`] and [`tool_call_units`]) could have
+/// taken, plus [`BILLABLE_TOKEN_SLACK`]. The provider reports this count and commits to it; the
+/// consumer co-signs for the same count from the text it received, so an honest provider's receipt
+/// always matches. Tokens the engine counted but never sent (hidden reasoning, padding) aren't billed.
+pub fn billable_tokens(engine_tokens: u64, max_tokens: Option<u32>, delivered: u64) -> u64 {
+    let by_text = delivered.saturating_add(BILLABLE_TOKEN_SLACK);
+    let by_request = max_tokens.map_or(u64::MAX, u64::from);
+    engine_tokens.min(by_text).min(by_request)
+}
+
 /// A consumer's request for a provider to serve a streaming completion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServeRequest {
@@ -253,6 +317,13 @@ pub fn handle_serve_request_parsed(
 ) -> ServeSummary {
     // A deterministic serve pins temperature to 0 and carries a fixed seed, overriding any
     // temperature the request also set (2b). Otherwise the request's own sampling is used.
+    // Engines disagree on what a zero cap means (some read it as "no limit"), and nothing generated
+    // under it is billable; refuse it before the engine runs.
+    if req.max_tokens == Some(0) {
+        send_chunk(&ServeChunk::Error("max_tokens must be at least 1".into()).encode());
+        return ServeSummary { ok: false, ..Default::default() };
+    }
+    let max_tokens = req.max_tokens;
     let (temperature, seed) = match req.deterministic {
         Some(d) => (Some(0.0), Some(d.seed)),
         None => (req.temperature, None),
@@ -271,8 +342,14 @@ pub fn handle_serve_request_parsed(
     // Done/Error frame is sent. Time the whole serve so the consumer can separate network
     // RTT from provider-side processing.
     let serve_start = std::time::Instant::now();
+    // The text exactly as sent, measured for the billable count (the consumer measures what it
+    // receives the same way).
+    let mut delivered = DeliveredText::default();
     let outcome = {
-        let mut on_delta = |d: &str| send_chunk(&ServeChunk::Delta(d.to_string()).encode());
+        let mut on_delta = |d: &str| {
+            delivered.push(d);
+            send_chunk(&ServeChunk::Delta(d.to_string()).encode())
+        };
         adapter.serve_stream(&infer, &mut on_delta)
     };
     let provider_serve_ns = serve_start.elapsed().as_nanos() as u64;
@@ -285,9 +362,13 @@ pub fn handle_serve_request_parsed(
             if !o.tool_calls.is_empty() {
                 send_chunk(&ServeChunk::ToolCalls(o.tool_calls.clone()).encode());
             }
-            send_chunk(&ServeChunk::Done { tokens: o.tokens, metrics }.encode());
+            // Reported and committed to (and so paid) is the billable count, not the engine's:
+            // the engine's own count stays in `metrics.engine`.
+            let tokens =
+                billable_tokens(o.tokens, max_tokens, delivered.units() + tool_call_units(&o.tool_calls));
+            send_chunk(&ServeChunk::Done { tokens, metrics }.encode());
             ServeSummary {
-                tokens: o.tokens,
+                tokens,
                 ok: true,
                 metrics,
                 discover_ns: 0,
@@ -526,6 +607,80 @@ mod tests {
             frames.push(ServeChunk::decode(bytes).unwrap());
         });
         (frames, summary)
+    }
+
+    #[test]
+    fn the_billable_count_is_bounded_by_the_request_and_the_text() {
+        // An honest count is billed as reported.
+        assert_eq!(billable_tokens(40, Some(64), 150), 40);
+        assert_eq!(billable_tokens(40, None, 150), 40);
+        // A billion tokens claimed for a short reply is held to what the text could have taken…
+        assert_eq!(billable_tokens(1_000_000_000, None, 30), 30 + BILLABLE_TOKEN_SLACK);
+        // …and never past the request's own limit (an engine that runs one over is billed the cap).
+        assert_eq!(billable_tokens(1_000_000_000, Some(8), 10_000), 8);
+        assert_eq!(billable_tokens(65, Some(64), 10_000), 64);
+        // A few textless tokens (end of turn) are allowed for.
+        assert_eq!(billable_tokens(12, None, 10), 12);
+        assert_eq!(billable_tokens(u64::MAX, None, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn padding_with_whitespace_adds_nothing_to_the_measure() {
+        let measure = |parts: &[&str]| {
+            let mut t = DeliveredText::default();
+            parts.iter().for_each(|p| t.push(p));
+            t.units()
+        };
+        assert_eq!(measure(&["héllo"]), 6, "bytes of non-whitespace text");
+        assert_eq!(measure(&["a b"]), 3);
+        assert_eq!(measure(&["a", "                ", "\n\n\n\t", " b"]), 3, "one run, across deltas");
+        assert_eq!(measure(&["<think>", "\n\n\n\n\n\n", "</think>"]), 16);
+        let call = |args: &str| ToolCall {
+            id: "c".into(),
+            kind: "function".into(),
+            function: crate::adapter::ToolCallFunction { name: "ls".into(), arguments: args.into() },
+        };
+        assert_eq!(tool_call_units(&[call(r#"{"p":"/"}"#)]), 2 + 9 + TOOL_CALL_TOKEN_ALLOWANCE);
+        assert_eq!(
+            tool_call_units(&[call(r#"{"p":"/"}"#)]),
+            tool_call_units(&[call("{ \"p\" :                  \"/\" }")]) - 4,
+            "padding in the arguments counts once per run"
+        );
+        assert_eq!(tool_call_units(&[call("{}"), call("{}")]), 2 * (4 + TOOL_CALL_TOKEN_ALLOWANCE));
+    }
+
+    #[test]
+    fn a_provider_reports_the_billable_count_the_consumer_recomputes() {
+        // The engine counts 500 tokens (hidden reasoning, say) for 11 bytes of answer: the provider
+        // reports and commits to the billable count, which is what the consumer computes from the
+        // frames it receives — so the honest provider's receipt matches.
+        let adapter = StubAdapter { deltas: vec!["Hello".into(), "   ".into(), "world".into()], tokens: 500, fail: None };
+        let (frames, summary) = collect_chunks(&req("p").encode(), &adapter);
+        let mut seen = DeliveredText::default();
+        let mut reported = None;
+        for f in &frames {
+            match f {
+                ServeChunk::Delta(d) => seen.push(d),
+                ServeChunk::Done { tokens, .. } => reported = Some(*tokens),
+                _ => {}
+            }
+        }
+        let max_tokens = req("p").max_tokens;
+        let consumer_signs = billable_tokens(reported.unwrap(), max_tokens, seen.units());
+        assert_eq!(summary.tokens, 11 + BILLABLE_TOKEN_SLACK);
+        assert_eq!(reported, Some(summary.tokens));
+        assert_eq!(consumer_signs, summary.tokens);
+    }
+
+    #[test]
+    fn a_zero_token_cap_is_refused_before_the_engine_runs() {
+        let adapter = StubAdapter { deltas: vec!["never".into()], tokens: 5, fail: None };
+        let mut r = req("p");
+        r.max_tokens = Some(0);
+        let (frames, summary) = collect_chunks(&r.encode(), &adapter);
+        assert!(!summary.ok);
+        assert_eq!(summary.tokens, 0);
+        assert!(matches!(frames.as_slice(), [ServeChunk::Error(_)]));
     }
 
     #[test]
