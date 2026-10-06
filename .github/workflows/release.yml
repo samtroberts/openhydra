@@ -175,14 +175,12 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           npm ci || npm install
-          # A missing secret arrives as an EMPTY variable, which Tauri still tries to sign with
-          # (failing the bundle): unset them all so "no secrets" really means an unsigned build.
-          if [ -z "$APPLE_CERTIFICATE" ]; then
-            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
-          fi
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-          fi
+          # A missing secret arrives as an EMPTY variable, which Tauri still acts on (failing the
+          # bundle): unset each empty one, so missing secrets mean an unsigned (or un-notarized) build.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD \
+                   APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then unset "$v"; fi
+          done
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "Apple Developer ID present → macOS build will be SIGNED + NOTARIZED"
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -247,7 +245,8 @@ jobs:
       # Downloads still come from R2; this is purely for GitHub-side visibility.
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        # A tag PUSH is a release; a manual run (even one started from a tag) is not.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         with:
           draft: false
           make_latest: true
@@ -257,7 +256,8 @@ jobs:
   # Publish every platform's artifacts to Cloudflare R2 + write latest.json.
   publish-r2:
     needs: desktop
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    # A tag push publishes; a manual run only when asked (publish=true), whatever ref it starts from.
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -412,7 +412,7 @@ jobs:
   # arbitrary version). Reuses the standalone prune workflow with dry_run=false.
   prune:
     needs: publish-r2
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/prune-r2.yml
     with:
       keep: "5"
