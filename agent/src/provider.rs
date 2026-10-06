@@ -443,9 +443,14 @@ struct KeptClaim {
     sig: Vec<u8>,
 }
 
+/// The first byte of a [`KeptClaim`]'s encoding: rows kept before it (an expiry and a signature) don't
+/// decode as one.
+const KEPT_CLAIM_TAG: u8 = 0xC6;
+
 impl KeptClaim {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut b = self.cumulative.to_le_bytes().to_vec();
+        let mut b = vec![KEPT_CLAIM_TAG];
+        b.extend_from_slice(&self.cumulative.to_le_bytes());
         b.extend_from_slice(&self.expires_at.to_le_bytes());
         match self.signer {
             Some(s) => {
@@ -465,6 +470,7 @@ impl KeptClaim {
     }
 
     fn from_bytes(b: &[u8]) -> Option<Self> {
+        let b = b.strip_prefix(&[KEPT_CLAIM_TAG])?;
         let cumulative = u64::from_le_bytes(b.get(..8)?.try_into().ok()?);
         let expires_at = u64::from_le_bytes(b.get(8..16)?.try_into().ok()?);
         let (signer, rest) = match b.get(16)? {
@@ -474,6 +480,16 @@ impl KeptClaim {
         };
         Some(KeptClaim { cumulative, expires_at, signer, sig: rest.to_vec() })
     }
+}
+
+/// What a receipt request is remembered by for an identical resend: its sender and its bytes.
+fn recent_cosign_key(source_peer: &str, request: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update((source_peer.len() as u64).to_le_bytes());
+    h.update(source_peer.as_bytes());
+    h.update(request);
+    h.finalize().into()
 }
 
 /// A `0x`-prefixed (or bare) hex EVM address.
@@ -931,6 +947,10 @@ pub struct Provider<A: EngineAdapter> {
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
+    /// Replies to receipts co-signed within [`COMMITMENT_TTL_MS`], by sender and request: a consumer
+    /// whose reply was lost sends the identical receipt again, and gets the same co-signature back
+    /// (its serve commitment is spent by then; refusing would leave a paid serve looking unpaid).
+    recent_cosigns: Mutex<HashMap<[u8; 32], (Vec<u8>, u64)>>,
     /// `(peer, model)` → when that peer last passed the swarm gate for a private model, and the
     /// credential it passed with: it may attest the model while still entitled to it (an attestation
     /// challenge carries no credential).
@@ -1086,6 +1106,7 @@ impl<A: EngineAdapter> Provider<A> {
             settled_cumulative: Mutex::new(HashMap::new()),
             settled_receipts: Mutex::new(HashMap::new()),
             receipt_lock: Mutex::new(()),
+            recent_cosigns: Mutex::new(HashMap::new()),
             settled_claims: Mutex::new(HashMap::new()),
             settlement_chain: None,
             self_consumer: None,
@@ -1338,6 +1359,23 @@ impl<A: EngineAdapter> Provider<A> {
         })
     }
 
+    /// The reply to an identical receipt co-signed recently (see `recent_cosigns`).
+    fn recent_cosign(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+        let now = now_unix_ms();
+        let m = self.recent_cosigns.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(key).filter(|(_, at)| now.saturating_sub(*at) <= COMMITMENT_TTL_MS).map(|(r, _)| r.clone())
+    }
+
+    /// Remember the reply to a receipt just co-signed, keeping at most [`MAX_COMMITMENTS`].
+    fn note_cosign(&self, key: [u8; 32], reply: &[u8]) {
+        let now = now_unix_ms();
+        let mut m = self.recent_cosigns.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, (_, at)| now.saturating_sub(*at) <= COMMITMENT_TTL_MS);
+        if m.len() < MAX_COMMITMENTS {
+            m.insert(key, (reply.to_vec(), now));
+        }
+    }
+
     /// Whether `peer` is this node, or our own co-located consumer (the desktop's gateway): it never
     /// settles with us.
     fn is_own_consumer(&self, peer: &str) -> bool {
@@ -1347,12 +1385,12 @@ impl<A: EngineAdapter> Provider<A> {
     /// The consumer got this serve's whole completion (its stream polled to the end, or a fetch by
     /// nonce returned it): mark its commitment delivered, or remember it for when it is recorded.
     fn mark_delivered(&self, nonce: [u8; 16]) {
-        {
-            let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(c) = map.get_mut(&nonce) {
-                c.delivered = true;
-                return;
-            }
+        // Under the commitments lock throughout (as `record_commitment` takes them), so a serve being
+        // recorded meanwhile can't miss the mark.
+        let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = map.get_mut(&nonce) {
+            c.delivered = true;
+            return;
         }
         let now = now_unix_ms();
         let mut d = self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner());
@@ -1527,9 +1565,10 @@ impl<A: EngineAdapter> Provider<A> {
             return;
         }
         let now = now_unix_ms();
-        // A stream polled to its end before we got here was delivered too.
-        let delivered = delivered || self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce).is_some();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+        // A stream polled to its end before we got here was delivered too (read under the commitments
+        // lock, which `mark_delivered` holds while it writes).
+        let delivered = delivered || self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce).is_some();
         self.note_defaults(prune_expired_commitments(&mut map, now), now);
         insert_commitment(
             &mut map,
@@ -2606,8 +2645,15 @@ impl<A: EngineAdapter> Provider<A> {
                 };
                 // Validate, co-sign and record as one step (see `receipt_lock`).
                 let _receipt_guard = self.receipt_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let replay_key = recent_cosign_key(source_peer, data);
+                if let Some(reply) = self.recent_cosign(&replay_key) {
+                    return reply;
+                }
                 let (response, accepted) =
                     handle_receipt_inbound(data, &sign, &provider_pub, &bind);
+                if accepted.is_some() {
+                    self.note_cosign(replay_key, &response);
+                }
                 // Persist the accepted co-signed receipt (best-effort; never fails the reply).
                 ledger_receipt(self.store.as_ref(), accepted.as_ref());
                 // M2.3: accrue the consumer's give/take (it consumed `tokens` from us).
@@ -2668,6 +2714,8 @@ impl<A: EngineAdapter> Provider<A> {
                             Err(refusal) => return refusal,
                         };
                         let mut req = req;
+                        // How long the consumer waits for the reply (by the max_tokens it asked for).
+                        let consumer_waits = crate::consumer::default_attempt_timeout(req.max_tokens);
                         if reservation.is_some() {
                             req.max_tokens = Some(paid_max_tokens(req.max_tokens));
                         }
@@ -2685,18 +2733,22 @@ impl<A: EngineAdapter> Provider<A> {
                         // (which would skip `respond` + `store_result`, leaving no reply and the
                         // nonce stuck `Generating` until the consumer's serve timeout). The panic
                         // path pushes the terminal into `chunks`, which is stored + returned below.
+                        let started = std::time::Instant::now();
                         let summary = generate_guarded(
                             req,
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
                         );
+                        // A reply ready within the consumer's wait reaches it; a later one only if it
+                        // fetches it by nonce (which marks it delivered then).
+                        let in_time = started.elapsed() <= consumer_waits;
                         // Reconnect-and-fetch: buffer the produced frames under the nonce so a
                         // consumer whose connection dropped can fetch them on a fresh circuit.
                         self.store_result(nonce, &reply_to, &chunks);
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once).
                         if summary.ok && summary.tokens > 0 {
-                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, true);
+                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, in_time);
                         }
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
@@ -3282,6 +3334,10 @@ mod tests {
         assert_eq!(KeptClaim::from_bytes(&kc.to_bytes()), Some(kc));
         let ks = KeptClaim { cumulative: 9, expires_at: 10, signer: None, sig: vec![1; 64] };
         assert_eq!(KeptClaim::from_bytes(&ks.to_bytes()), Some(ks));
+        // A row from before the tag (an expiry, then a signature) doesn't decode as a claim.
+        let mut old = 10u64.to_le_bytes().to_vec();
+        old.extend_from_slice(&[0; 64]);
+        assert_eq!(KeptClaim::from_bytes(&old), None);
         // An expired commitment is a receipt that never came: pruned, and its peer reported.
         let mut map = HashMap::new();
         map.insert([1u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "c".into(), delivered: true });

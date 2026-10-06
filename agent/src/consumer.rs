@@ -132,6 +132,11 @@ fn attempt_timeout(max_tokens: Option<u32>) -> std::time::Duration {
     {
         return std::time::Duration::from_secs(secs.clamp(ATTEMPT_TIMEOUT_MIN_SECS, ATTEMPT_TIMEOUT_MAX_SECS));
     }
+    default_attempt_timeout(max_tokens)
+}
+
+/// [`attempt_timeout`] without the ops override: what a provider can expect a consumer to wait.
+pub(crate) fn default_attempt_timeout(max_tokens: Option<u32>) -> std::time::Duration {
     let tokens = max_tokens.map(u64::from).unwrap_or(ATTEMPT_TIMEOUT_DEFAULT_TOKENS);
     let secs = ATTEMPT_TIMEOUT_BASE_SECS + tokens.saturating_mul(ATTEMPT_TIMEOUT_MS_PER_TOKEN) / 1000;
     std::time::Duration::from_secs(secs.clamp(ATTEMPT_TIMEOUT_MIN_SECS, ATTEMPT_TIMEOUT_MAX_SECS))
@@ -1352,10 +1357,19 @@ impl ConsumerNode {
             .gated_vouchers
             .lock()
             .map(|m| {
-                // Vouchers are per provider key ("<peer:model>#<pubkey>"); the view sums them per
-                // (peer, model), the key the rest of the snapshot uses.
+                // Vouchers are per provider key ("<peer:model>#<pubkey>", "@<deployment>" on a
+                // chain); the view sums them per (peer, model), the key the rest of the snapshot
+                // uses, for the deployment we settle on now only.
+                let suffix = self.settlement_chain.as_ref().map(|c| format!("@{}", c.domain.fingerprint()));
                 let mut by_pair = std::collections::HashMap::new();
                 for (k, v) in m.iter() {
+                    let current = match &suffix {
+                        Some(s) => k.ends_with(s.as_str()),
+                        None => !k.contains('@'),
+                    };
+                    if !current {
+                        continue;
+                    }
                     let pair = k.split_once('#').map_or(k.as_str(), |(pair, _)| pair);
                     *by_pair.entry(pair.to_string()).or_insert(0u64) += v.cumulative_net;
                 }
