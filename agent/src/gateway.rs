@@ -888,6 +888,7 @@ fn spawn_byok_worker(
                     metrics: ServeMetrics {
                         engine: outcome.engine,
                         provider_serve_ns: started.elapsed().as_nanos() as u64,
+                        billing: 0,
                     },
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
@@ -1941,6 +1942,7 @@ mod tests {
             metrics: crate::serve::ServeMetrics {
                 engine: EngineMetrics { prompt_eval_count: prompt, eval_count: tokens, ..Default::default() },
                 provider_serve_ns: 500_000_000,
+                billing: 0,
             },
             proxy_roundtrip_ns: 600_000_000,
             discover_ns: 1_000_000,

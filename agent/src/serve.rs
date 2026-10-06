@@ -38,7 +38,15 @@ pub struct ServeMetrics {
     pub engine: EngineMetrics,
     /// Provider wall time inside `serve_stream` (engine HTTP call + reading its stream), ns.
     pub provider_serve_ns: u64,
+    /// The billing rule the provider's token count follows: [`BILLING_VERSION`] when it reports
+    /// [`billable_tokens`] (so a count above what the consumer computes is a false claim), `0` from a
+    /// provider that predates it (which reported the engine's own count).
+    #[serde(default)]
+    pub billing: u8,
 }
+
+/// The billing rule this build follows: the reported count is [`billable_tokens`].
+pub const BILLING_VERSION: u8 = 2;
 
 /// Tokens with no text of their own (end-of-turn and other special markers) allowed on top of the
 /// delivered text in [`billable_tokens`].
@@ -149,6 +157,12 @@ pub struct ServeRequest {
     /// provider ignores it (its adapter simply won't pin the seed).
     #[serde(default)]
     pub deterministic: Option<DeterministicParams>,
+    /// The settlement peg (micro-USDC per credit) the consumer will pay at, when it settles on the
+    /// crypto rail. A provider that charges refuses a serve that doesn't offer its own peg, before
+    /// running the engine, rather than serving and then refusing an unpaid receipt. `None` from a
+    /// consumer that doesn't pay (or predates the field).
+    #[serde(default)]
+    pub settlement_peg: Option<u64>,
 }
 
 /// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
@@ -356,7 +370,7 @@ pub fn handle_serve_request_parsed(
 
     match outcome {
         Ok(o) => {
-            let metrics = ServeMetrics { engine: o.engine, provider_serve_ns };
+            let metrics = ServeMetrics { engine: o.engine, provider_serve_ns, billing: BILLING_VERSION };
             // Tool calls (terminal, structured) go in their own frame just before `Done`, so
             // the consumer sees text deltas → tool_calls → done in order.
             if !o.tool_calls.is_empty() {
@@ -569,6 +583,7 @@ mod tests {
             nonce: [0u8; 16],
             credential: None,
             deterministic: None,
+            settlement_peg: None,
         }
     }
 
@@ -770,6 +785,7 @@ mod tests {
                 metrics: ServeMetrics {
                     engine: EngineMetrics { eval_count: 4096, eval_duration_ns: 1_234_567, ..Default::default() },
                     provider_serve_ns: 9_000,
+                    billing: BILLING_VERSION,
                 },
             },
             ServeChunk::Error("boom".into()),

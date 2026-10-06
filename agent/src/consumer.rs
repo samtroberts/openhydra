@@ -162,6 +162,14 @@ const MAX_SETTLES_IN_FLIGHT: usize = 64;
 /// queued behind it would only wait to fail.
 const MAX_SETTLES_PER_PAIR: usize = 4;
 
+/// Whether a reported count above the billable one (`billable`) counts against the provider: only
+/// from a provider that says it follows the shared billing rule ([`crate::serve::BILLING_VERSION`]),
+/// which never reports more. An older provider reported the engine's own count, which can honestly
+/// be higher (reasoning it didn't stream); it is just signed for less.
+fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64) -> bool {
+    summary.metrics.billing >= crate::serve::BILLING_VERSION && summary.tokens > billable
+}
+
 /// What a consumer makes of the co-signed receipt a provider sends back when the consumer's
 /// cumulative is behind its high-water.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1624,6 +1632,8 @@ impl ConsumerNode {
                 // A user-facing serve keeps the caller's own sampling — deterministic mode is
                 // opt-in (used by the audit probe below), not forced on real generations.
                 deterministic: None,
+                // On the crypto rail, offer to pay at our peg (a provider that charges needs it).
+                settlement_peg: self.settlement_peg,
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
@@ -1722,6 +1732,9 @@ impl ConsumerNode {
                     let self_serve = self.is_self_serve(&provider_libp2p);
                     // Settle the co-signed receipt at EOS (best-effort — tokens already
                     // delivered; a failed/slow settlement must not fail the completion).
+                    // A provider following the shared billing rule that reports more than it is
+                    // computes to is claiming tokens it didn't serve (P7).
+                    let mut over_reported = false;
                     if summary.ok && summary.tokens > 0 && !self_serve {
                         // Sign for what we can vouch for, not whatever the provider reports: the
                         // count it computes from the same text (an honest one reports exactly this).
@@ -1730,7 +1743,9 @@ impl ConsumerNode {
                             + crate::serve::tool_call_units(&summary.tool_calls);
                         let tokens = crate::serve::billable_tokens(summary.tokens, max_tokens, delivered);
                         if tokens < summary.tokens {
+                            over_reported = over_reported_by_billing(&summary, tokens);
                             tracing::warn!(provider = %provider.peer_id, reported = summary.tokens, signable = tokens,
+                                billing = summary.metrics.billing, counted_against = over_reported,
                                 "provider reported more tokens than it could have served; signing for fewer");
                             summary.tokens = tokens;
                         }
@@ -1763,7 +1778,9 @@ impl ConsumerNode {
                     // model (Phase 4a) — but not for a self-serve (no earning off yourself).
                     let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                     if !self_serve {
-                        self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Honored, now);
+                        let outcome =
+                            if over_reported { VerificationOutcome::Rejected } else { VerificationOutcome::Honored };
+                        self.record_outcome(&provider.state_id, model_key, outcome, now);
                     }
                     req_span.record("provider", provider.peer_id.as_str());
                     req_span.record("tokens", summary.tokens);
@@ -2375,7 +2392,7 @@ impl ConsumerNode {
     /// streamed view). Bounded by [`attempt_timeout`] (short — the audit is a 64-token probe)
     /// so a dead provider can't stall the audit.
     fn dispatch_full(
-        &self,
+        self: &Arc<Self>,
         provider: &SelectedProvider,
         challenge: &[ChatMessage],
     ) -> Result<String, AdapterError> {
@@ -2397,13 +2414,15 @@ impl ConsumerNode {
             // (Providers that can't honour `think:false` are still covered by `audit_body`'s
             // leading-`<think>` strip.)
             think: Some(false),
-            // Audit serves are never settled into a receipt, but the field is required.
+            // Settled like any serve (below), so the provider is paid for it and it looks like one.
             nonce: rand::random::<[u8; 16]>(),
             // Audits probe public marketplace providers; no swarm credential.
             credential: None,
             // Pin a fixed seed (2b): a temp=0 probe with a shared seed is reproducible across
             // honest providers, so redundant-exec agreement is exact rather than approximate.
             deterministic: Some(DeterministicParams { seed: AUDIT_SEED }),
+            // Audits are paid for like any serve (and so look like one).
+            settlement_peg: self.settlement_peg,
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -2412,8 +2431,19 @@ impl ConsumerNode {
                 .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
         };
         let mut output = String::new();
-        let mut sink = |delta: &str| output.push_str(delta);
-        request_completion(&mut transport, &request, &mut sink)?;
+        let mut delivered = crate::serve::DeliveredText::default();
+        let mut sink = |delta: &str| {
+            delivered.push(delta);
+            output.push_str(delta)
+        };
+        let summary = request_completion(&mut transport, &request, &mut sink)?;
+        // Pay for the probe as for any serve: the provider did the work, and an unpaid audit would
+        // stand out (and, at a provider that charges, count as a serve never paid for).
+        if summary.ok && summary.tokens > 0 && !self.is_self_serve(&provider.libp2p_peer_id) {
+            let units = delivered.units() + crate::serve::tool_call_units(&summary.tool_calls);
+            let tokens = crate::serve::billable_tokens(summary.tokens, request.max_tokens, units);
+            self.settle_receipt(provider, tokens, request.nonce);
+        }
         Ok(output)
     }
 
@@ -2437,7 +2467,7 @@ impl ConsumerNode {
     /// carries the long-run trust). Reasoning models are a specific case of this — see the
     /// thinking-model limitation documented on [`AUDIT_MAX_TOKENS`].
     pub fn audit_model(
-        &self,
+        self: &Arc<Self>,
         model: &str,
         challenge: &[ChatMessage],
         nonce: &str,
@@ -2620,6 +2650,20 @@ mod tests {
     }
 
     #[test]
+    fn only_a_provider_on_the_shared_billing_rule_is_faulted_for_over_reporting() {
+        let summary = |tokens: u64, billing: u8| crate::serve::ServeSummary {
+            tokens,
+            ok: true,
+            metrics: crate::serve::ServeMetrics { billing, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION), 40));
+        assert!(!over_reported_by_billing(&summary(40, crate::serve::BILLING_VERSION), 40));
+        // An older provider's engine count can honestly be higher: signed for less, not faulted.
+        assert!(!over_reported_by_billing(&summary(500, 0), 40));
+    }
+
+    #[test]
     fn settlements_are_bounded_overall_and_per_pair() {
         assert!(settle_admitted(0, 0));
         assert!(settle_admitted(MAX_SETTLES_IN_FLIGHT - 1, MAX_SETTLES_PER_PAIR - 1));
@@ -2691,6 +2735,7 @@ mod tests {
             nonce: [0u8; 16],
             credential: None,
             deterministic: None,
+            settlement_peg: None,
         }
     }
 

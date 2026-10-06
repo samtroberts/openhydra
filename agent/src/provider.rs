@@ -297,6 +297,51 @@ const CLOCK_SKEW_MS: u64 = 60 * 1000;
 /// receipts never arrive can't grow the map without bound.
 const MAX_COMMITMENTS: usize = 10_000;
 
+/// Credit window (a provider that charges, see [`payment_window`]): how long after a serve its
+/// receipt may stay unsettled before the consumer gets no more serves. A consumer settles right
+/// after the completion; a few queued settlements to one provider take well under this.
+const SETTLE_GRACE_MS: u64 = 2 * 60 * 1000;
+/// …and how many served tokens it may have unsettled at once (a burst of parallel serves).
+const MAX_UNSETTLED_TOKENS: u64 = 65_536;
+/// Serves whose receipt never came, within [`DEFAULT_WINDOW_MS`], after which a consumer is refused.
+const MAX_DEFAULTS: usize = 3;
+const DEFAULT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// Consumers whose defaults a provider remembers (the oldest are forgotten first).
+const MAX_DEFAULT_PEERS: usize = 4096;
+
+/// The credit window: whether a consumer may be served now, given its unsettled serves
+/// (`(served at, tokens)`) and how many of its serves went unpaid within [`DEFAULT_WINDOW_MS`].
+/// Payment is otherwise voluntary (a consumer has its tokens before it signs anything), so this
+/// bounds what one consumer identity can take without paying: about one serve, or what fits in the
+/// grace period. Not a guarantee against a consumer that keeps making new identities; that needs a
+/// check of its on-chain escrow before serving.
+fn payment_window(unsettled: &[(u64, u64)], defaults: usize, now: u64) -> Result<(), String> {
+    if defaults >= MAX_DEFAULTS {
+        return Err(format!("{defaults} recent serves were never paid for; this provider won't serve you for now"));
+    }
+    if unsettled.iter().any(|(at, _)| now.saturating_sub(*at) > SETTLE_GRACE_MS) {
+        return Err("a serve from this provider is still unpaid; settle it before asking for more".into());
+    }
+    if unsettled.iter().map(|(_, t)| t).sum::<u64>() > MAX_UNSETTLED_TOKENS {
+        return Err("too many served tokens are still unpaid; settle them before asking for more".into());
+    }
+    Ok(())
+}
+
+/// Drop expired commitments from `map`, returning the peers whose serves they were: receipts that
+/// never came.
+fn prune_expired_commitments(map: &mut HashMap<[u8; 16], ServeCommitment>, now: u64) -> Vec<String> {
+    let mut unpaid = Vec::new();
+    map.retain(|_, c| {
+        let live = now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS;
+        if !live {
+            unpaid.push(c.served_peer.clone());
+        }
+        live
+    });
+    unpaid
+}
+
 /// E-S8: sustained ceiling on inbound *receipt* settlements processed per second, **per
 /// sending peer**. Each receipt costs an Ed25519 verify + co-sign; unbounded, a peer can flood
 /// them to burn CPU and monopolize the worker pool, starving real serve requests. Honest
@@ -710,6 +755,9 @@ pub struct Provider<A: EngineAdapter> {
     /// The co-signed receipt that set each `settled_cumulative` entry (same key): sent back to a
     /// consumer whose cumulative is behind it ([`BindRejection::Behind`]). Persisted with it.
     settled_receipts: Mutex<HashMap<String, openhydra_protocol::receipts::CoSignedReceipt>>,
+    /// Per consumer (libp2p id): when its serves went unpaid (commitments that expired unsettled),
+    /// for the credit window. Only kept by a provider that charges.
+    payment_defaults: Mutex<HashMap<String, Vec<u64>>>,
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
@@ -813,7 +861,11 @@ fn check_settlement_denomination(
     our_peg: Option<u64>,
 ) -> Result<(), String> {
     if cumulative_amount.is_none() {
-        return Ok(());
+        // A provider that charges co-signs only a receipt that pays.
+        return match our_peg {
+            Some(_) => Err("this provider charges: the receipt carries no payment (cumulative amount)".to_string()),
+            None => Ok(()),
+        };
     }
     let Some(our_peg) = our_peg else {
         return Err(
@@ -847,6 +899,7 @@ impl<A: EngineAdapter> Provider<A> {
             settled_cumulative: Mutex::new(HashMap::new()),
             settled_receipts: Mutex::new(HashMap::new()),
             receipt_lock: Mutex::new(()),
+            payment_defaults: Mutex::new(HashMap::new()),
             settlement_peg: None,
             receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
                 rps: RECEIPT_RATE_RPS,
@@ -955,6 +1008,60 @@ impl<A: EngineAdapter> Provider<A> {
     /// libp2p-authenticated sender). Returns `None` to proceed, or `Some(framed error)` to refuse.
     /// Delegates the decision to the pure [`scope_gate`]; here we just supply this node's identity +
     /// live authorizer, frame the refusal, and bump the swarm-refusal counter.
+    /// Remember serves that went unpaid (a provider that charges only), for the credit window.
+    fn note_defaults(&self, peers: Vec<String>, now: u64) {
+        if self.settlement_peg.is_none() || peers.is_empty() {
+            return;
+        }
+        let mut defaults = self.payment_defaults.lock().unwrap_or_else(|e| e.into_inner());
+        for peer in peers {
+            if defaults.len() >= MAX_DEFAULT_PEERS && !defaults.contains_key(&peer) {
+                defaults.retain(|_, at| at.iter().any(|t| now.saturating_sub(*t) <= DEFAULT_WINDOW_MS));
+                if defaults.len() >= MAX_DEFAULT_PEERS {
+                    let oldest = defaults
+                        .iter()
+                        .min_by_key(|(_, at)| at.iter().max().copied().unwrap_or(0))
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = oldest {
+                        defaults.remove(&k);
+                    }
+                }
+            }
+            let at = defaults.entry(peer).or_default();
+            at.retain(|t| now.saturating_sub(*t) <= DEFAULT_WINDOW_MS);
+            at.push(now);
+        }
+    }
+
+    /// The payment gate of a provider that charges (a settlement peg is configured): the request
+    /// must offer to pay at our peg, and its consumer must be within the credit window
+    /// ([`payment_window`]). Our own (co-located) consumer never settles with us and is exempt.
+    fn payment_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
+        let peg = self.settlement_peg?;
+        if source_peer == self.net.libp2p_peer_id() {
+            return None;
+        }
+        let refuse = |reason: String| Some(frame_response(&[ServeChunk::Error(reason).encode()]));
+        if req.settlement_peg != Some(peg) {
+            return refuse(format!(
+                "this provider charges (settlement peg {peg} micro-USDC per credit); the request doesn't offer to pay it"
+            ));
+        }
+        let now = now_unix_ms();
+        let unsettled: Vec<(u64, u64)> = {
+            let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+            self.note_defaults(prune_expired_commitments(&mut map, now), now);
+            map.values().filter(|c| c.served_peer == source_peer).map(|c| (c.recorded_ms, c.tokens)).collect()
+        };
+        let defaults = self
+            .payment_defaults
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source_peer)
+            .map_or(0, |at| at.iter().filter(|t| now.saturating_sub(**t) <= DEFAULT_WINDOW_MS).count());
+        payment_window(&unsettled, defaults, now).err().and_then(refuse)
+    }
+
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
         // Resolve the effective scope. A `model_ref` that exactly matches a model we actually announce
         // uses that model's scope. A ref that does NOT — yet `is_shared` let it through (e.g. `All`
@@ -1067,7 +1174,7 @@ impl<A: EngineAdapter> Provider<A> {
     fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64, served_peer: &str) {
         let now = now_unix_ms();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, c| now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS);
+        self.note_defaults(prune_expired_commitments(&mut map, now), now);
         if map.len() >= MAX_COMMITMENTS {
             return; // backstop — refuse to grow past the cap (stale entries already pruned)
         }
@@ -1248,6 +1355,11 @@ impl<A: EngineAdapter> Provider<A> {
             respond_done(refusal, 1);
             return;
         }
+        // A provider that charges: the consumer must offer to pay, and have paid for what it had.
+        if let Some(refusal) = self.payment_refusal(&req, &source_peer) {
+            respond_done(refusal, 1);
+            return;
+        }
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -1292,6 +1404,7 @@ impl<A: EngineAdapter> Provider<A> {
     ) -> Result<(), String> {
         let consumer_peer = self.net.peer_id_from_ed25519_pubkey(p.consumer.as_bytes())?;
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+        self.note_defaults(prune_expired_commitments(&mut map, now_unix_ms()), now_unix_ms());
         validate_and_consume_commitment(
             &mut map,
             &p.nonce,
@@ -2068,6 +2181,9 @@ impl<A: EngineAdapter> Provider<A> {
                         if let Some(refusal) = self.scope_refusal(&req, source_peer) {
                             return refusal;
                         }
+                        if let Some(refusal) = self.payment_refusal(&req, source_peer) {
+                            return refusal;
+                        }
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -2411,7 +2527,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
-            credential: None, deterministic: None,
+            credential: None, deterministic: None, settlement_peg: None,
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -2454,8 +2570,8 @@ mod tests {
 
         // Matching asset + peg → accepted.
         assert!(check_settlement_denomination(Some(9_600), usdc, Some(1_200), our).is_ok());
-        // A non-crypto receipt (no cumulative) is not gated, whatever the fields say.
-        assert!(check_settlement_denomination(None, None, None, our).is_ok());
+        // A provider that charges refuses a receipt that pays nothing.
+        assert!(check_settlement_denomination(None, None, None, our).is_err());
         // A non-crypto receipt on a peg-less provider is fine (nothing to settle).
         assert!(check_settlement_denomination(None, None, None, None).is_ok());
 
@@ -2592,6 +2708,28 @@ mod tests {
         assert!(validate_and_consume_commitment(&mut map, &[2u8; 16], "expensive-model", 100, now, now, "c", "c")
             .unwrap_err()
             .contains("model"));
+    }
+
+    #[test]
+    fn the_credit_window_bounds_what_a_consumer_takes_unpaid() {
+        let now = 10 * DEFAULT_WINDOW_MS;
+        assert!(payment_window(&[], 0, now).is_ok());
+        // A serve just finished, its receipt on the way: fine.
+        assert!(payment_window(&[(now - 5_000, 500)], 0, now).is_ok());
+        // One unpaid past the grace period: no more serves.
+        assert!(payment_window(&[(now - SETTLE_GRACE_MS - 1, 500)], 0, now).is_err());
+        // Many parallel serves, none paid yet: capped by tokens.
+        let burst: Vec<(u64, u64)> = (0..40).map(|_| (now - 1_000, 2_000)).collect();
+        assert!(payment_window(&burst, 0, now).is_err());
+        // Repeated defaults.
+        assert!(payment_window(&[], MAX_DEFAULTS - 1, now).is_ok());
+        assert!(payment_window(&[], MAX_DEFAULTS, now).is_err());
+        // An expired commitment is a receipt that never came: pruned, and its peer reported.
+        let mut map = HashMap::new();
+        map.insert([1u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "c".into() });
+        map.insert([2u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: now, served_peer: "d".into() });
+        assert_eq!(prune_expired_commitments(&mut map, now), vec!["c".to_string()]);
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
@@ -2884,7 +3022,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
-            credential: None, deterministic: None,
+            credential: None, deterministic: None, settlement_peg: None,
         };
 
         // Collect the frames the engine produces (the buffered result), then reveal them into the
@@ -2985,7 +3123,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None, deterministic: None,
+            credential: None, deterministic: None, settlement_peg: None,
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
