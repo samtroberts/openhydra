@@ -7,7 +7,11 @@
 // not to ship.
 //
 // The on-chain half of OpenHydra's crypto rail: it settles the authenticity-gated *voucher* in USDC,
-// non-custodially, taking the 4% protocol fee on-chain. It verifies the co-signed receipt's **Ed25519
+// non-custodially, taking the 4% protocol fee on-chain. Escrow is ring-fenced per provider: a consumer
+// funds a vault for ONE provider, and settles from it pay only that provider's bound payout — so a
+// consumer can't pay itself out of escrow committed to a provider (a throwaway provider of its own
+// reaches only its own vault). Exits are "request, then wait `refund_delay_secs`", a window settles
+// can't extend. It verifies the co-signed receipt's **Ed25519
 // signature natively** (via the Ed25519 SigVerify program + instruction introspection), enforces
 // **monotonic** per-channel settlement, and releases the delta split `0.96 provider / 0.04 platform`.
 // It does NOT re-verify authenticity — that is already baked into the voucher's rate-capped
@@ -161,6 +165,7 @@ pub mod openhydra_settlement {
         config.fee_bps = FEE_BPS; // the agreed 4%, fixed at init
         config.refund_delay_secs = refund_delay_secs;
         config.paused = false;
+        config.last_unpaused_at = 0;
         Ok(())
     }
 
@@ -193,22 +198,25 @@ pub mod openhydra_settlement {
         Ok(())
     }
 
-    /// Consumer funds its escrow (the x402 `upto` ceiling). DRAFT: credits the tracked balance.
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    /// Consumer funds its escrow for ONE provider (the x402 `upto` ceiling for that provider). A
+    /// deposit cancels a pending exit. DRAFT: credits the tracked balance.
+    pub fn deposit(ctx: Context<Deposit>, provider: [u8; 32], amount: u64) -> Result<()> {
         require!(!ctx.accounts.config.paused, SettlementError::Paused);
         // PRODUCTION SPL: CPI `spl_token::transfer` (or `receiveWithAuthorization`-equivalent) from the
         // consumer's USDC ATA into the vault's SPL token account owned by the vault PDA. Draft tracks
         // the balance directly.
         let vault = &mut ctx.accounts.vault;
         vault.consumer = ctx.accounts.consumer.key();
+        vault.provider = provider;
         vault.balance = vault.balance.checked_add(amount).ok_or(SettlementError::Overflow)?;
-        vault.last_activity = Clock::get()?.unix_timestamp;
+        vault.exit_requested_at = 0;
         Ok(())
     }
 
     /// Settle a co-signed voucher. Anyone (provider or facilitator) may submit. Requires an Ed25519
     /// SigVerify instruction immediately before this one that proves the **consumer** signed the claim
-    /// preimage. Pays the monotonic delta, split 0.96/0.04, from the consumer's escrow.
+    /// preimage. Pays the monotonic delta, split 0.96/0.04, from the consumer's vault for THIS provider
+    /// (never another provider's), and never moves an exit's deadline.
     pub fn settle(ctx: Context<Settle>, claim: SettleClaimArgs) -> Result<()> {
         require!(!ctx.accounts.config.paused, SettlementError::Paused);
 
@@ -249,7 +257,6 @@ pub mod openhydra_settlement {
         channel.consumer = claim.consumer;
         channel.provider = claim.provider;
         vault.balance -= delta;
-        vault.last_activity = Clock::get()?.unix_timestamp;
 
         // PRODUCTION SPL: CPI `spl_token::transfer` from the vault token account:
         //   provider_net → the provider's bound USDC ATA (`claim.payout`),
@@ -266,24 +273,39 @@ pub mod openhydra_settlement {
         Ok(())
     }
 
-    /// Consumer reclaims unspent escrow after `refund_delay_secs` of inactivity → the non-custodial
-    /// exit; a settle resets the clock, giving a provider holding a signed cumulative a window to claim.
-    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    /// Consumer announces it will reclaim a provider vault's unspent escrow: it can `withdraw` after
+    /// `refund_delay_secs`, a fixed window for the provider to settle what it is owed, which settles
+    /// can't extend (anyone could otherwise keep the escrow locked by settling small steps).
+    pub fn request_exit(ctx: Context<RequestExit>, _provider: [u8; 32]) -> Result<()> {
+        ctx.accounts.vault.exit_requested_at = Clock::get()?.unix_timestamp;
+        Ok(())
+    }
+
+    /// Consumer reclaims unspent escrow from a provider vault → the non-custodial exit. Allowed
+    /// `refund_delay_secs` after `request_exit`, counted from no earlier than the last unpause (a pause
+    /// stops settles, so it must not use up the provider's window), and never while paused.
+    pub fn withdraw(ctx: Context<Withdraw>, _provider: [u8; 32], amount: u64) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(!config.paused, SettlementError::Paused);
         let vault = &mut ctx.accounts.vault;
+        require!(vault.exit_requested_at != 0, SettlementError::RefundLocked);
+        let from = vault.exit_requested_at.max(config.last_unpaused_at);
+        let open_at = from.checked_add(config.refund_delay_secs).ok_or(SettlementError::Overflow)?;
+        require!(Clock::get()?.unix_timestamp >= open_at, SettlementError::RefundLocked);
         require!(amount <= vault.balance, SettlementError::WithdrawTooLarge);
-        let now = Clock::get()?.unix_timestamp;
-        require!(
-            now >= vault.last_activity + ctx.accounts.config.refund_delay_secs,
-            SettlementError::RefundLocked
-        );
         // PRODUCTION SPL: CPI `spl_token::transfer` vault → consumer's USDC ATA.
         vault.balance -= amount;
         Ok(())
     }
 
-    /// Admin pause (halts settle/deposit); no fund authority.
+    /// Admin pause (halts settle/deposit/withdraw); no fund authority. Unpausing restarts every pending
+    /// exit's window, so a pause can't run one out.
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
-        ctx.accounts.config.paused = paused;
+        let config = &mut ctx.accounts.config;
+        if config.paused && !paused {
+            config.last_unpaused_at = Clock::get()?.unix_timestamp;
+        }
+        config.paused = paused;
         Ok(())
     }
 }
@@ -309,14 +331,19 @@ pub struct Config {
     pub fee_bps: u16,
     pub refund_delay_secs: i64,
     pub paused: bool,
+    /// When the program was last unpaused (0 = never paused): exits count from no earlier than this.
+    pub last_unpaused_at: i64,
 }
 
+/// A consumer's escrow for one provider.
 #[account]
 #[derive(InitSpace)]
 pub struct Vault {
     pub consumer: Pubkey,
+    pub provider: [u8; 32],
     pub balance: u64,
-    pub last_activity: i64,
+    /// When the consumer asked to exit (0 = no exit pending).
+    pub exit_requested_at: i64,
 }
 
 #[account]
@@ -377,6 +404,7 @@ pub struct BindPayout<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(provider: [u8; 32])]
 pub struct Deposit<'info> {
     #[account(mut)]
     pub consumer: Signer<'info>,
@@ -386,7 +414,7 @@ pub struct Deposit<'info> {
         init_if_needed,
         payer = consumer,
         space = 8 + Vault::INIT_SPACE,
-        seeds = [b"vault", consumer.key().as_ref()],
+        seeds = [b"vault", consumer.key().as_ref(), provider.as_ref()],
         bump
     )]
     pub vault: Account<'info, Vault>,
@@ -402,7 +430,7 @@ pub struct Settle<'info> {
     pub config: Account<'info, Config>,
     #[account(
         mut,
-        seeds = [b"vault", claim.consumer.as_ref()],
+        seeds = [b"vault", claim.consumer.as_ref(), claim.provider.as_ref()],
         bump
     )]
     pub vault: Account<'info, Vault>,
@@ -423,6 +451,20 @@ pub struct Settle<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(provider: [u8; 32])]
+pub struct RequestExit<'info> {
+    pub consumer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"vault", consumer.key().as_ref(), provider.as_ref()],
+        bump,
+        constraint = vault.consumer == consumer.key() @ SettlementError::SignerMismatch
+    )]
+    pub vault: Account<'info, Vault>,
+}
+
+#[derive(Accounts)]
+#[instruction(provider: [u8; 32])]
 pub struct Withdraw<'info> {
     #[account(mut)]
     pub consumer: Signer<'info>,
@@ -430,7 +472,7 @@ pub struct Withdraw<'info> {
     pub config: Account<'info, Config>,
     #[account(
         mut,
-        seeds = [b"vault", consumer.key().as_ref()],
+        seeds = [b"vault", consumer.key().as_ref(), provider.as_ref()],
         bump,
         constraint = vault.consumer == consumer.key() @ SettlementError::SignerMismatch
     )]
@@ -475,7 +517,7 @@ pub enum SettlementError {
     InsufficientEscrow,
     #[msg("withdraw exceeds the escrow balance")]
     WithdrawTooLarge,
-    #[msg("escrow is refund-locked (inactivity window not elapsed)")]
+    #[msg("escrow is refund-locked (no exit requested, or its window has not elapsed)")]
     RefundLocked,
     #[msg("the program is paused")]
     Paused,

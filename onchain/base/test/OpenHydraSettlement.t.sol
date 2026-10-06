@@ -44,17 +44,25 @@ contract OpenHydraSettlementTest is Test {
         vm.prank(consumer);
         usdc.approve(address(settlement), type(uint256).max);
         vm.prank(consumer);
-        settlement.deposit(500_000); // fund escrow with 0.5 USDC
+        settlement.deposit(PROVIDER_ID, providerPayout, 500_000); // fund the channel with 0.5 USDC
     }
 
-    function _claim(uint256 cumulative) internal view returns (OpenHydraSettlement.SettlementClaim memory) {
+    function _claimTo(bytes32 provider, address payout, uint256 cumulative)
+        internal
+        pure
+        returns (OpenHydraSettlement.SettlementClaim memory)
+    {
         return OpenHydraSettlement.SettlementClaim({
-            provider: PROVIDER_ID,
+            provider: provider,
             consumer: CONSUMER_ID,
-            payoutAddress: providerPayout,
+            payoutAddress: payout,
             cumulativeAmount: cumulative,
             modelId: MODEL
         });
+    }
+
+    function _claim(uint256 cumulative) internal view returns (OpenHydraSettlement.SettlementClaim memory) {
+        return _claimTo(PROVIDER_ID, providerPayout, cumulative);
     }
 
     function _sign(uint256 pk, OpenHydraSettlement.SettlementClaim memory claim) internal view returns (bytes memory) {
@@ -63,8 +71,17 @@ contract OpenHydraSettlementTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    function test_deposit_credits_escrow() public view {
-        assertEq(settlement.escrow(consumer), 500_000);
+    function _balance(bytes32 provider) internal view returns (uint256 bal) {
+        (, bal,) = settlement.channels(consumer, provider);
+    }
+
+    function _payout(bytes32 provider) internal view returns (address payout) {
+        (payout,,) = settlement.channels(consumer, provider);
+    }
+
+    function test_deposit_opens_a_channel_to_the_provider() public view {
+        assertEq(_balance(PROVIDER_ID), 500_000);
+        assertEq(_payout(PROVIDER_ID), providerPayout);
     }
 
     function test_fee_is_fixed_at_four_percent() public view {
@@ -78,40 +95,34 @@ contract OpenHydraSettlementTest is Test {
 
     function test_settle_splits_96_4_and_advances_high_water() public {
         OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000); // 0.1 USDC cumulative
-        bytes memory sig = _sign(consumerPk, claim);
-
-        settlement.settle(claim, sig);
+        settlement.settle(claim, _sign(consumerPk, claim));
 
         // delta = 100_000; fee = 100_000*400/10000 = 4_000; providerNet = 96_000.
         assertEq(usdc.balanceOf(providerPayout), 96_000, "provider gets 0.96");
         assertEq(usdc.balanceOf(feeRecipient), 4_000, "platform gets 0.04");
-        assertEq(settlement.escrow(consumer), 400_000, "escrow debited by delta");
-        bytes32 modelHash = keccak256(bytes(MODEL));
-        assertEq(settlement.settled(consumer, providerPayout, modelHash), 100_000, "high-water advanced");
+        assertEq(_balance(PROVIDER_ID), 400_000, "channel debited by delta");
+        assertEq(settlement.settled(consumer, PROVIDER_ID, keccak256(bytes(MODEL))), 100_000, "high-water advanced");
     }
 
     function test_settle_pays_only_the_delta_on_a_higher_cumulative() public {
-        // First settle at 100_000, then a later voucher at 250_000 pays only the 150_000 delta.
         OpenHydraSettlement.SettlementClaim memory c1 = _claim(100_000);
         settlement.settle(c1, _sign(consumerPk, c1));
         OpenHydraSettlement.SettlementClaim memory c2 = _claim(250_000);
         settlement.settle(c2, _sign(consumerPk, c2));
 
-        // Cumulative fee: floor(250000*0.04)=10_000; provider 240_000. Escrow 500k-250k=250k.
+        // Cumulative fee: floor(250000*0.04)=10_000; provider 240_000. Channel 500k-250k=250k.
         assertEq(usdc.balanceOf(providerPayout), 240_000);
         assertEq(usdc.balanceOf(feeRecipient), 10_000);
-        assertEq(settlement.escrow(consumer), 250_000);
+        assertEq(_balance(PROVIDER_ID), 250_000);
     }
 
     function test_replayed_or_stale_cumulative_reverts() public {
         OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
         bytes memory sig = _sign(consumerPk, claim);
         settlement.settle(claim, sig);
-        // Re-submitting the identical claim → delta 0 → revert (monotonic no-op).
         vm.expectRevert(OpenHydraSettlement.StaleOrReplayedClaim.selector);
         settlement.settle(claim, sig);
-        // A lower cumulative than the high-water also reverts (never claws back). Sign BEFORE
-        // expectRevert — `_sign` makes an external `digestOf` call that would otherwise consume it.
+        // Sign BEFORE expectRevert — `_sign` makes an external `digestOf` call that would consume it.
         OpenHydraSettlement.SettlementClaim memory lower = _claim(50_000);
         bytes memory lowerSig = _sign(consumerPk, lower);
         vm.expectRevert(OpenHydraSettlement.StaleOrReplayedClaim.selector);
@@ -119,48 +130,164 @@ contract OpenHydraSettlementTest is Test {
     }
 
     function test_insufficient_escrow_reverts() public {
-        // Escrow is 500_000; a cumulative delta above it must revert (the x402 ceiling is reached).
         OpenHydraSettlement.SettlementClaim memory claim = _claim(600_000);
         bytes memory sig = _sign(consumerPk, claim);
         vm.expectRevert(OpenHydraSettlement.InsufficientEscrow.selector);
         settlement.settle(claim, sig);
     }
 
-    function test_a_signature_from_a_non_escrow_wallet_draws_its_own_escrow_not_the_victims() public {
-        // A different wallet signs → recovers to THAT wallet, which has no escrow → InsufficientEscrow.
-        // The victim consumer's escrow is untouched: only the escrow owner's own signature can spend it.
-        uint256 attackerPk = 0xBADA55;
+    function test_a_signature_from_another_wallet_cannot_spend_the_consumers_channel() public {
+        // Recovers to the attacker's wallet, which has no channel → NoChannel; the victim's is untouched.
         OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
-        bytes memory sig = _sign(attackerPk, claim);
-        vm.expectRevert(OpenHydraSettlement.InsufficientEscrow.selector);
+        bytes memory sig = _sign(0xBADA55, claim);
+        vm.expectRevert(OpenHydraSettlement.NoChannel.selector);
         settlement.settle(claim, sig);
-        assertEq(settlement.escrow(consumer), 500_000, "victim escrow untouched");
+        assertEq(_balance(PROVIDER_ID), 500_000, "victim channel untouched");
     }
 
-    function test_withdraw_is_refund_delay_locked_then_allowed() public {
-        // Immediately after deposit, the inactivity window has not elapsed → locked.
+    // ── review fix: a new payout address doesn't get the running total paid again ──
+
+    function test_moving_the_payout_address_does_not_pay_the_cumulative_again() public {
+        OpenHydraSettlement.SettlementClaim memory c1 = _claim(100_000);
+        settlement.settle(c1, _sign(consumerPk, c1));
+
+        address rotated = address(0xC0C0);
+        vm.prank(providerPayout);
+        settlement.setPayout(consumer, PROVIDER_ID, rotated);
+
+        // The old cumulative to the new address is stale: it was already paid.
+        OpenHydraSettlement.SettlementClaim memory replay = _claimTo(PROVIDER_ID, rotated, 100_000);
+        bytes memory replaySig = _sign(consumerPk, replay);
+        vm.expectRevert(OpenHydraSettlement.StaleOrReplayedClaim.selector);
+        settlement.settle(replay, replaySig);
+
+        // The next voucher pays only its delta, to the new address.
+        OpenHydraSettlement.SettlementClaim memory c2 = _claimTo(PROVIDER_ID, rotated, 150_000);
+        settlement.settle(c2, _sign(consumerPk, c2));
+        assertEq(usdc.balanceOf(rotated), 48_000, "50_000 delta, 0.96 of it");
+        assertEq(usdc.balanceOf(providerPayout), 96_000, "the old address keeps only its first payment");
+        assertEq(_balance(PROVIDER_ID), 350_000);
+        // And a claim still naming the old address is refused.
+        OpenHydraSettlement.SettlementClaim memory old = _claim(200_000);
+        bytes memory oldSig = _sign(consumerPk, old);
+        vm.expectRevert(OpenHydraSettlement.PayoutMismatch.selector);
+        settlement.settle(old, oldSig);
+    }
+
+    // ── review fix: a consumer can't pay itself out of escrow committed to a provider ──
+
+    function test_a_consumer_cannot_pay_itself_from_a_providers_channel() public {
+        OpenHydraSettlement.SettlementClaim memory selfPay = _claimTo(PROVIDER_ID, consumer, 500_000);
+        bytes memory sig = _sign(consumerPk, selfPay);
+        vm.expectRevert(OpenHydraSettlement.PayoutMismatch.selector);
+        settlement.settle(selfPay, sig);
+        assertEq(_balance(PROVIDER_ID), 500_000);
+        assertEq(usdc.balanceOf(consumer), 500_000, "no escrow came back");
+    }
+
+    function test_a_throwaway_provider_only_reaches_its_own_channel() public {
+        // The consumer opens a channel to a provider id it controls, paying itself: only what it put
+        // in THAT channel is reachable, the honest provider's channel is not.
+        bytes32 throwaway = bytes32(uint256(0xDEAD));
+        vm.prank(consumer);
+        settlement.deposit(throwaway, consumer, 1_000);
+        OpenHydraSettlement.SettlementClaim memory drain = _claimTo(throwaway, consumer, 500_000);
+        bytes memory sig = _sign(consumerPk, drain);
+        vm.expectRevert(OpenHydraSettlement.InsufficientEscrow.selector);
+        settlement.settle(drain, sig);
+        assertEq(_balance(PROVIDER_ID), 500_000, "the honest provider's channel is untouched");
+    }
+
+    function test_only_the_payout_address_can_move_a_channel() public {
+        // The consumer can't redirect it, by deposit or by setPayout.
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.PayoutMismatch.selector);
+        settlement.deposit(PROVIDER_ID, consumer, 1);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.NotPayout.selector);
+        settlement.setPayout(consumer, PROVIDER_ID, consumer);
+        vm.prank(providerPayout);
+        vm.expectRevert(OpenHydraSettlement.ZeroPayout.selector);
+        settlement.setPayout(consumer, PROVIDER_ID, address(0));
+    }
+
+    function test_settling_without_a_channel_reverts() public {
+        OpenHydraSettlement.SettlementClaim memory claim = _claimTo(bytes32(uint256(0x9999)), providerPayout, 1);
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.expectRevert(OpenHydraSettlement.NoChannel.selector);
+        settlement.settle(claim, sig);
+    }
+
+    // ── exit: request, then a fixed delay settles can't extend ──
+
+    function test_withdraw_needs_an_exit_request_then_the_delay() public {
         vm.prank(consumer);
         vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
-        settlement.withdraw(100_000);
+        settlement.withdraw(PROVIDER_ID, 1); // no exit requested
 
-        // After refundDelay of inactivity, the consumer can reclaim unspent escrow.
-        vm.warp(block.timestamp + REFUND_DELAY + 1);
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        vm.warp(block.timestamp + REFUND_DELAY - 1);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
+        settlement.withdraw(PROVIDER_ID, 1);
+
+        vm.warp(block.timestamp + 1);
         uint256 before = usdc.balanceOf(consumer);
         vm.prank(consumer);
-        settlement.withdraw(200_000);
+        settlement.withdraw(PROVIDER_ID, 200_000);
         assertEq(usdc.balanceOf(consumer), before + 200_000);
-        assertEq(settlement.escrow(consumer), 300_000);
+        assertEq(_balance(PROVIDER_ID), 300_000);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.WithdrawTooLarge.selector);
+        settlement.withdraw(PROVIDER_ID, 300_001);
     }
 
-    function test_settle_resets_the_refund_clock() public {
-        // Warp near the window, then a settle resets lastActivity → withdraw is locked again.
-        vm.warp(block.timestamp + REFUND_DELAY - 10);
+    function test_settles_during_the_exit_window_do_not_extend_it() public {
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        uint256 t0 = block.timestamp;
+        // The provider settles what it is owed inside the window…
+        vm.warp(t0 + REFUND_DELAY - 10);
         OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
         settlement.settle(claim, _sign(consumerPk, claim));
-        vm.warp(block.timestamp + 20); // 10s past the ORIGINAL window, but settle moved it
+        // …and the consumer still exits on time with the rest.
+        vm.warp(t0 + REFUND_DELAY);
+        vm.prank(consumer);
+        settlement.withdraw(PROVIDER_ID, 400_000);
+        assertEq(_balance(PROVIDER_ID), 0);
+    }
+
+    function test_a_deposit_cancels_a_pending_exit() public {
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        vm.prank(consumer);
+        settlement.deposit(PROVIDER_ID, providerPayout, 1);
+        vm.warp(block.timestamp + REFUND_DELAY + 1);
         vm.prank(consumer);
         vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
-        settlement.withdraw(1);
+        settlement.withdraw(PROVIDER_ID, 1);
+    }
+
+    function test_a_pause_does_not_run_out_the_providers_window() public {
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        // No settles and no withdrawals while paused.
+        vm.warp(block.timestamp + REFUND_DELAY + 1);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.IsPaused.selector);
+        settlement.withdraw(PROVIDER_ID, 1);
+        // After the unpause, the provider gets a full window again.
+        vm.prank(admin);
+        settlement.setPaused(false);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
+        settlement.withdraw(PROVIDER_ID, 1);
+        vm.warp(block.timestamp + REFUND_DELAY);
+        vm.prank(consumer);
+        settlement.withdraw(PROVIDER_ID, 1);
     }
 
     function test_pause_blocks_settle_and_deposit() public {
@@ -170,6 +297,9 @@ contract OpenHydraSettlementTest is Test {
         settlement.setPaused(true);
         vm.expectRevert(OpenHydraSettlement.IsPaused.selector);
         settlement.settle(claim, sig);
+        vm.prank(consumer);
+        vm.expectRevert(OpenHydraSettlement.IsPaused.selector);
+        settlement.deposit(PROVIDER_ID, providerPayout, 1);
     }
 
     function test_only_admin_can_pause() public {
@@ -178,7 +308,6 @@ contract OpenHydraSettlementTest is Test {
     }
 
     function test_domain_separator_binds_chain_and_contract() public view {
-        // Sanity: the digest changes with the claim (field sensitivity), matching eip712_digest.
         bytes32 d1 = settlement.digestOf(_claim(100_000));
         bytes32 d2 = settlement.digestOf(_claim(100_001));
         assertTrue(d1 != d2, "cumulative is bound into the digest");

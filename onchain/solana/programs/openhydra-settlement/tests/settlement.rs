@@ -81,10 +81,17 @@ fn setup() -> Ctx {
     svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
     let config = Pubkey::find_program_address(&[b"config"], &program_id).0;
     let instr_sysvar = solana_sdk_ids::sysvar::instructions::ID;
+    // A real cluster's clock, not litesvm's genesis 0 (the program uses 0 as "no exit requested").
+    let mut clock: solana_clock::Clock = svm.get_sysvar();
+    clock.unix_timestamp = 1_760_000_000;
+    svm.set_sysvar(&clock);
     Ctx { svm, program_id, payer, admin, config, instr_sysvar }
 }
 
 fn send(ctx: &mut Ctx, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), String> {
+    // A fresh blockhash per transaction, so a repeated instruction (e.g. a retried withdraw) is a new
+    // transaction, never rejected as an already-processed duplicate.
+    ctx.svm.expire_blockhash();
     let blockhash = ctx.svm.latest_blockhash();
     let msg = Message::new_with_blockhash(ixs, Some(&signers[0].pubkey()), &blockhash);
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), signers)
@@ -133,8 +140,12 @@ fn bind_payout(ctx: &mut Ctx, provider: &Keypair, payout: [u8; 32], ts: u64) -> 
     send(ctx, &[ed_ix, bind_ix], &[&payer])
 }
 
-fn deposit(ctx: &mut Ctx, consumer: &Keypair, amount: u64) {
-    let vault = Pubkey::find_program_address(&[b"vault", consumer.pubkey().as_ref()], &ctx.program_id).0;
+fn vault_pda(ctx: &Ctx, consumer: &Keypair, provider_id: [u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"vault", consumer.pubkey().as_ref(), &provider_id], &ctx.program_id).0
+}
+
+fn try_deposit(ctx: &mut Ctx, consumer: &Keypair, provider_id: [u8; 32], amount: u64) -> Result<(), String> {
+    let vault = vault_pda(ctx, consumer, provider_id);
     let ix = Instruction {
         program_id: ctx.program_id,
         accounts: openhydra_settlement::accounts::Deposit {
@@ -144,10 +155,61 @@ fn deposit(ctx: &mut Ctx, consumer: &Keypair, amount: u64) {
             system_program: system_program::ID,
         }
         .to_account_metas(None),
-        data: openhydra_settlement::instruction::Deposit { amount }.data(),
+        data: openhydra_settlement::instruction::Deposit { provider: provider_id, amount }.data(),
     };
     let consumer = consumer.insecure_clone();
-    send(ctx, &[ix], &[&consumer]).expect("deposit");
+    send(ctx, &[ix], &[&consumer])
+}
+
+fn deposit(ctx: &mut Ctx, consumer: &Keypair, provider_id: [u8; 32], amount: u64) {
+    try_deposit(ctx, consumer, provider_id, amount).expect("deposit");
+}
+
+fn request_exit(ctx: &mut Ctx, consumer: &Keypair, provider_id: [u8; 32]) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: ctx.program_id,
+        accounts: openhydra_settlement::accounts::RequestExit {
+            consumer: consumer.pubkey(),
+            vault: vault_pda(ctx, consumer, provider_id),
+        }
+        .to_account_metas(None),
+        data: openhydra_settlement::instruction::RequestExit { _provider: provider_id }.data(),
+    };
+    let consumer = consumer.insecure_clone();
+    send(ctx, &[ix], &[&consumer])
+}
+
+fn withdraw(ctx: &mut Ctx, consumer: &Keypair, provider_id: [u8; 32], amount: u64) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: ctx.program_id,
+        accounts: openhydra_settlement::accounts::Withdraw {
+            consumer: consumer.pubkey(),
+            config: ctx.config,
+            vault: vault_pda(ctx, consumer, provider_id),
+        }
+        .to_account_metas(None),
+        data: openhydra_settlement::instruction::Withdraw { _provider: provider_id, amount }.data(),
+    };
+    let consumer = consumer.insecure_clone();
+    send(ctx, &[ix], &[&consumer])
+}
+
+fn set_paused(ctx: &mut Ctx, paused: bool) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: ctx.program_id,
+        accounts: openhydra_settlement::accounts::SetPaused { admin: ctx.admin.pubkey(), config: ctx.config }
+            .to_account_metas(None),
+        data: openhydra_settlement::instruction::SetPaused { paused }.data(),
+    };
+    let admin = ctx.admin.insecure_clone();
+    send(ctx, &[ix], &[&admin])
+}
+
+/// Move the cluster clock forward.
+fn advance(ctx: &mut Ctx, secs: i64) {
+    let mut clock: solana_clock::Clock = ctx.svm.get_sysvar();
+    clock.unix_timestamp += secs;
+    ctx.svm.set_sysvar(&clock);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,7 +222,7 @@ fn settle(
     model_id: &str,
 ) -> Result<(), String> {
     let consumer_id = consumer.pubkey().to_bytes();
-    let vault = Pubkey::find_program_address(&[b"vault", consumer.pubkey().as_ref()], &ctx.program_id).0;
+    let vault = vault_pda(ctx, consumer, provider_id);
     let channel = Pubkey::find_program_address(
         &[b"channel", &consumer_id, &provider_id, &model_hash(model_id)],
         &ctx.program_id,
@@ -197,8 +259,8 @@ fn settle(
     send(ctx, &[ed_ix, settle_ix], &[&payer])
 }
 
-fn vault_state(ctx: &Ctx, consumer: &Keypair) -> openhydra_settlement::Vault {
-    let vault = Pubkey::find_program_address(&[b"vault", consumer.pubkey().as_ref()], &ctx.program_id).0;
+fn vault_state(ctx: &Ctx, consumer: &Keypair, provider_id: [u8; 32]) -> openhydra_settlement::Vault {
+    let vault = vault_pda(ctx, consumer, provider_id);
     let acct = ctx.svm.get_account(&vault).unwrap();
     openhydra_settlement::Vault::try_deserialize(&mut &acct.data[..]).unwrap()
 }
@@ -225,18 +287,18 @@ fn full_flow_initialize_bind_deposit_settle_monotonic() {
     let payout = provider_id; // self-directed payout
 
     bind_payout(&mut ctx, &provider, payout, 1_000).expect("bind_payout");
-    deposit(&mut ctx, &consumer, 500_000);
-    assert_eq!(vault_state(&ctx, &consumer).balance, 500_000);
+    deposit(&mut ctx, &consumer, provider_id, 500_000);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 500_000);
 
     // Settle a cumulative of 100_000 → high-water advances, escrow debited by the delta.
     settle(&mut ctx, &consumer, provider_id, payout, 100_000, "qwen2.5:7b").expect("settle #1");
     assert_eq!(channel_state(&ctx, &consumer, provider_id, "qwen2.5:7b").settled_amount, 100_000);
-    assert_eq!(vault_state(&ctx, &consumer).balance, 400_000);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 400_000);
 
     // A later cumulative of 250_000 pays only the 150_000 delta (monotonic, batched).
     settle(&mut ctx, &consumer, provider_id, payout, 250_000, "qwen2.5:7b").expect("settle #2");
     assert_eq!(channel_state(&ctx, &consumer, provider_id, "qwen2.5:7b").settled_amount, 250_000);
-    assert_eq!(vault_state(&ctx, &consumer).balance, 250_000);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 250_000);
 }
 
 #[test]
@@ -248,7 +310,7 @@ fn replayed_and_stale_cumulatives_are_rejected() {
     ctx.svm.airdrop(&consumer.pubkey(), 5_000_000_000).unwrap();
     let provider_id = provider.pubkey().to_bytes();
     bind_payout(&mut ctx, &provider, provider_id, 1_000).unwrap();
-    deposit(&mut ctx, &consumer, 500_000);
+    deposit(&mut ctx, &consumer, provider_id, 500_000);
 
     settle(&mut ctx, &consumer, provider_id, provider_id, 100_000, "qwen2.5:7b").unwrap();
     // Replaying the same cumulative → delta 0 → the program rejects it.
@@ -256,7 +318,7 @@ fn replayed_and_stale_cumulatives_are_rejected() {
     // A lower cumulative than the high-water → also rejected (never claws back).
     assert!(settle(&mut ctx, &consumer, provider_id, provider_id, 50_000, "qwen2.5:7b").is_err());
     // The escrow was debited exactly once.
-    assert_eq!(vault_state(&ctx, &consumer).balance, 400_000);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 400_000);
 }
 
 #[test]
@@ -272,9 +334,9 @@ fn settle_rejects_a_tampered_claim_message() {
     let provider_id = provider.pubkey().to_bytes();
     let consumer_id = consumer.pubkey().to_bytes();
     bind_payout(&mut ctx, &provider, provider_id, 1_000).unwrap();
-    deposit(&mut ctx, &consumer, 5_000_000);
+    deposit(&mut ctx, &consumer, provider_id, 5_000_000);
 
-    let vault = Pubkey::find_program_address(&[b"vault", consumer.pubkey().as_ref()], &ctx.program_id).0;
+    let vault = vault_pda(&ctx, &consumer, provider_id);
     let channel = Pubkey::find_program_address(
         &[b"channel", &consumer_id, &provider_id, &model_hash("qwen2.5:7b")],
         &ctx.program_id,
@@ -311,4 +373,80 @@ fn settle_rejects_a_tampered_claim_message() {
     };
     let payer = ctx.payer.insecure_clone();
     assert!(send(&mut ctx, &[ed_ix, settle_ix], &[&payer]).is_err(), "message/claim mismatch rejected");
+}
+
+/// A provider with a payout binding, and a funded consumer with a vault for it.
+fn funded(ctx: &mut Ctx, amount: u64) -> (Keypair, Keypair, [u8; 32]) {
+    let consumer = Keypair::new();
+    let provider = Keypair::new();
+    ctx.svm.airdrop(&consumer.pubkey(), 5_000_000_000).unwrap();
+    let provider_id = provider.pubkey().to_bytes();
+    bind_payout(ctx, &provider, provider_id, 1_000).unwrap();
+    deposit(ctx, &consumer, provider_id, amount);
+    (consumer, provider, provider_id)
+}
+
+#[test]
+fn a_consumer_cannot_pay_itself_out_of_a_providers_vault() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    let own = consumer.pubkey().to_bytes();
+
+    // A claim to the honest provider naming the consumer's own address: not the bound payout.
+    assert!(settle(&mut ctx, &consumer, provider_id, own, 500_000, "qwen2.5:7b").is_err());
+
+    // A throwaway provider the consumer controls, bound to the consumer's own address: it reaches
+    // only its own vault (here 1_000), never the honest provider's.
+    let throwaway = Keypair::new();
+    let throwaway_id = throwaway.pubkey().to_bytes();
+    bind_payout(&mut ctx, &throwaway, own, 1_000).unwrap();
+    deposit(&mut ctx, &consumer, throwaway_id, 1_000);
+    assert!(settle(&mut ctx, &consumer, throwaway_id, own, 500_000, "qwen2.5:7b").is_err(), "beyond its own vault");
+    settle(&mut ctx, &consumer, throwaway_id, own, 1_000, "qwen2.5:7b").expect("its own 1_000 only");
+
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 500_000, "the honest vault is untouched");
+}
+
+#[test]
+fn an_exit_needs_a_request_and_a_window_settles_cannot_extend() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "no exit requested");
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    advance(&mut ctx, 86_400 - 10);
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "window not over");
+    // The provider settles what it is owed inside the window; that doesn't move the deadline.
+    settle(&mut ctx, &consumer, provider_id, provider_id, 100_000, "qwen2.5:7b").unwrap();
+    advance(&mut ctx, 10);
+    withdraw(&mut ctx, &consumer, provider_id, 400_000).expect("exit on time");
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 0);
+}
+
+#[test]
+fn a_deposit_cancels_a_pending_exit() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    deposit(&mut ctx, &consumer, provider_id, 1);
+    advance(&mut ctx, 86_400 + 1);
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err());
+}
+
+#[test]
+fn a_pause_does_not_run_out_the_providers_window() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 86_400 + 1);
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "no withdrawals while paused");
+    set_paused(&mut ctx, false).unwrap();
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "a full window again after the unpause");
+    advance(&mut ctx, 86_400);
+    withdraw(&mut ctx, &consumer, provider_id, 1).expect("then it opens");
 }

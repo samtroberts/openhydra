@@ -21,8 +21,20 @@ import {ReentrancyGuard} from "openzeppelin-contracts/utils/ReentrancyGuard.sol"
 ///       off-chain settles here.
 ///
 /// Non-custodial invariant: no path lets any key remove escrow except `settle` (the fixed 0.96/0.04
-/// split to the claim's bound payout + the fee recipient) and `withdraw` (back to the depositing
-/// consumer). There is no owner-drains-escrow function. The fee is fixed at init.
+/// split to the channel's payout + the fee recipient) and `withdraw` (back to the depositing
+/// consumer, after an exit request and `refundDelay`). There is no owner-drains-escrow function. The
+/// fee is fixed at init.
+///
+/// Escrow is ring-fenced per provider (a payment channel): a consumer funds `channels[consumer][provider]`
+/// and that balance can only ever be paid to the channel's payout address. So a consumer can't pay
+/// itself out of escrow it committed to a provider (by signing a claim to its own wallet, or to a
+/// throwaway provider): a throwaway provider's channel holds only what the consumer put in it. What a
+/// provider has been paid is tracked per (consumer, provider, model) — never per payout address — so
+/// moving a payout address doesn't pay the running total again.
+///
+/// A provider relies on a channel only after checking, off-chain, that `channels[consumer][provider]
+/// .payout` is its own payout address (the consumer picks it when it opens the channel; afterwards only
+/// the current payout address can change it).
 contract OpenHydraSettlement is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -46,14 +58,23 @@ contract OpenHydraSettlement is ReentrancyGuard {
     uint64 public immutable refundDelay; // seconds of consumer inactivity before an unconditional withdraw
     address public admin; // pause only — CANNOT touch funds
     bool public paused;
+    /// When the contract was last unpaused: an exit's delay counts from no earlier than this, so a
+    /// pause (which stops settles) can't run out a provider's window to settle.
+    uint64 public lastUnpausedAt;
 
     // ── State ──
-    /// Consumer EVM address → deposited USDC balance (the x402 `upto` ceiling).
-    mapping(address => uint256) public escrow;
-    /// consumerEvm → providerPayout(EVM) → modelHash → cumulative USDC already settled (monotonic high-water).
-    mapping(address => mapping(address => mapping(bytes32 => uint256))) public settled;
-    /// Consumer EVM address → last deposit/settle timestamp (drives the refund inactivity window).
-    mapping(address => uint64) public lastActivity;
+    /// A consumer's escrow for one provider (the x402 `upto` ceiling for that provider).
+    struct Channel {
+        address payout; // the provider's payout address; set at open, changed only by itself
+        uint256 balance;
+        uint64 exitRequestedAt; // 0 = no exit pending
+    }
+    /// consumerEvm → provider (Ed25519 id) → channel.
+    mapping(address => mapping(bytes32 => Channel)) public channels;
+    /// consumerEvm → provider (Ed25519 id) → modelHash → cumulative USDC already settled (monotonic
+    /// high-water). Keyed by the provider, not its payout address: a new payout address continues
+    /// from what was already paid.
+    mapping(address => mapping(bytes32 => mapping(bytes32 => uint256))) public settled;
 
     /// The claim the consumer's EVM wallet signs (EIP-712). `provider`/`consumer` are the Ed25519
     /// channel ids (the link to the off-chain receipt); `payoutAddress` is the provider's bound EVM
@@ -66,16 +87,19 @@ contract OpenHydraSettlement is ReentrancyGuard {
         string modelId;
     }
 
-    event Deposited(address indexed consumer, uint256 amount);
+    event Deposited(address indexed consumer, bytes32 indexed provider, address payout, uint256 amount);
     event Settled(
         address indexed consumer,
-        address indexed payout,
+        bytes32 indexed provider,
+        address payout,
         bytes32 modelHash,
         uint256 delta,
         uint256 providerNet,
         uint256 fee
     );
-    event Withdrawn(address indexed consumer, uint256 amount);
+    event PayoutChanged(address indexed consumer, bytes32 indexed provider, address payout);
+    event ExitRequested(address indexed consumer, bytes32 indexed provider, uint64 withdrawableAt);
+    event Withdrawn(address indexed consumer, bytes32 indexed provider, uint256 amount);
     event Paused(bool paused);
 
     error NotAdmin();
@@ -87,6 +111,10 @@ contract OpenHydraSettlement is ReentrancyGuard {
     error InsufficientEscrow();
     error WithdrawTooLarge();
     error RefundLocked();
+    error ZeroPayout();
+    error NoChannel();
+    error PayoutMismatch(); // a claim or deposit naming another payout than the channel's
+    error NotPayout(); // only a channel's payout address may move it
 
     constructor(
         IERC20 _usdc,
@@ -136,20 +164,31 @@ contract OpenHydraSettlement is ReentrancyGuard {
 
     // ── Instructions ──
 
-    /// Consumer funds its escrow (the x402 `upto` ceiling). DRAFT: a plain `transferFrom` pull
-    /// (requires a prior `approve`). Production uses USDC EIP-3009 `receiveWithAuthorization` / Permit2
-    /// for a gasless single-tx fund (spec §4.2) — an additive change, same escrow effect.
-    function deposit(uint256 amount) external nonReentrant {
+    /// Consumer funds its channel to `provider` (the x402 `upto` ceiling for that provider), opening it
+    /// with `payout` as the provider's payout address. Later deposits must name the same payout (a
+    /// consumer can't redirect a channel). A deposit also cancels a pending exit. DRAFT: a plain
+    /// `transferFrom` pull (requires a prior `approve`); production uses USDC EIP-3009
+    /// `receiveWithAuthorization` / Permit2 for a gasless single-tx fund (spec §4.2).
+    function deposit(bytes32 provider, address payout, uint256 amount) external nonReentrant {
         if (paused) revert IsPaused();
+        if (payout == address(0)) revert ZeroPayout();
+        Channel storage c = channels[msg.sender][provider];
+        if (c.payout == address(0)) {
+            c.payout = payout;
+        } else if (c.payout != payout) {
+            revert PayoutMismatch();
+        }
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-        escrow[msg.sender] += amount;
-        lastActivity[msg.sender] = uint64(block.timestamp);
-        emit Deposited(msg.sender, amount);
+        c.balance += amount;
+        c.exitRequestedAt = 0;
+        emit Deposited(msg.sender, provider, c.payout, amount);
     }
 
     /// Settle a co-signed voucher: anyone (provider or facilitator) may submit. The consumer's EVM
-    /// signature over the EIP-712 claim authorizes drawing the delta from *its* escrow; the fixed
-    /// 0.96/0.04 split goes to the bound payout + the fee recipient. Checks-effects-interactions.
+    /// signature over the EIP-712 claim authorizes drawing the delta from *its* channel to
+    /// `claim.provider`, which pays only that channel's payout (the claim must name it); the fixed
+    /// 0.96/0.04 split goes to it + the fee recipient. Checks-effects-interactions. A settle never
+    /// moves an exit's deadline.
     function settle(SettlementClaim calldata claim, bytes calldata sig) external nonReentrant {
         if (paused) revert IsPaused();
 
@@ -162,52 +201,80 @@ contract OpenHydraSettlement is ReentrancyGuard {
         // The signer must be the escrow being spent. (`claim.consumer` is the Ed25519 id for the
         // off-chain link; the on-chain authority is the recovered EVM wallet that owns the escrow.)
         address consumerEvm = signer;
+        Channel storage c = channels[consumerEvm][claim.provider];
+        if (c.payout == address(0)) revert NoChannel();
+        // The money goes only where the channel says: a claim naming any other address (the
+        // consumer's own wallet, say) can't spend this channel.
+        if (claim.payoutAddress != c.payout) revert PayoutMismatch();
 
         bytes32 modelHash = keccak256(bytes(claim.modelId));
-        uint256 prior = settled[consumerEvm][claim.payoutAddress][modelHash];
+        uint256 prior = settled[consumerEvm][claim.provider][modelHash];
         // Monotonic: a replayed or stale (<= prior) cumulative is a no-op → revert. Also blocks
         // underflow (a lower cumulative can never claw back).
         if (claim.cumulativeAmount <= prior) revert StaleOrReplayedClaim();
         uint256 delta = claim.cumulativeAmount - prior;
 
-        if (escrow[consumerEvm] < delta) revert InsufficientEscrow();
+        if (c.balance < delta) revert InsufficientEscrow();
 
         // Fixed split, floor the fee (dust to the provider) — matches payout::protocol_fee.
         uint256 fee = (delta * feeBps) / 10_000;
         uint256 providerNet = delta - fee;
 
-        // Effects before interactions (CEI): advance the high-water mark + debit escrow first.
-        settled[consumerEvm][claim.payoutAddress][modelHash] = claim.cumulativeAmount;
-        escrow[consumerEvm] -= delta;
-        lastActivity[consumerEvm] = uint64(block.timestamp); // resets the refund clock (activity)
+        // Effects before interactions (CEI): advance the high-water mark + debit the channel first.
+        settled[consumerEvm][claim.provider][modelHash] = claim.cumulativeAmount;
+        c.balance -= delta;
+        address payout = c.payout;
 
         // Interactions.
-        usdc.safeTransfer(claim.payoutAddress, providerNet);
+        usdc.safeTransfer(payout, providerNet);
         if (fee > 0) usdc.safeTransfer(feeRecipient, fee);
 
-        emit Settled(consumerEvm, claim.payoutAddress, modelHash, delta, providerNet, fee);
+        emit Settled(consumerEvm, claim.provider, payout, modelHash, delta, providerNet, fee);
     }
 
-    /// Consumer reclaims unspent escrow → the non-custodial exit; deposits are never trapped.
-    ///
-    /// DRAFT guard: an unconditional withdraw is allowed only after `refundDelay` of inactivity, so a
-    /// provider holding a signed-but-unsettled cumulative has a window to `settle` first (settling
-    /// resets the clock). This is spec §7 option (a), the timelock — the strongest guarantee an EVM
-    /// contract can enforce without visibility into un-settled off-chain claims. Option (b),
-    /// `escrow − outstanding`, protects only *settled* channels here because an un-settled signed claim
-    /// is invisible on-chain; the timelock covers the gap. Choose the final model at audit.
-    function withdraw(uint256 amount) external nonReentrant {
-        if (amount > escrow[msg.sender]) revert WithdrawTooLarge();
-        if (block.timestamp < uint256(lastActivity[msg.sender]) + refundDelay) revert RefundLocked();
-        escrow[msg.sender] -= amount;
+    /// The channel's payout address moves it (e.g. the provider rotating a wallet). What was already
+    /// settled stays settled: the high-water mark is per provider, not per payout address.
+    function setPayout(address consumer, bytes32 provider, address newPayout) external {
+        Channel storage c = channels[consumer][provider];
+        if (c.payout == address(0)) revert NoChannel();
+        if (msg.sender != c.payout) revert NotPayout();
+        if (newPayout == address(0)) revert ZeroPayout();
+        c.payout = newPayout;
+        emit PayoutChanged(consumer, provider, newPayout);
+    }
+
+    /// Consumer announces it will reclaim a channel's unspent escrow. It can `withdraw` after
+    /// `refundDelay` — a fixed window for the provider to settle what it is owed, which settles can't
+    /// extend (any party could otherwise keep the escrow locked by settling small steps).
+    function requestExit(bytes32 provider) external {
+        Channel storage c = channels[msg.sender][provider];
+        if (c.payout == address(0)) revert NoChannel();
+        c.exitRequestedAt = uint64(block.timestamp);
+        emit ExitRequested(msg.sender, provider, uint64(block.timestamp) + refundDelay);
+    }
+
+    /// Consumer reclaims unspent escrow from a channel → the non-custodial exit; deposits are never
+    /// trapped. Allowed `refundDelay` after `requestExit`, counted from no earlier than the last
+    /// unpause (a pause stops settles, so it must not use up the provider's window), and never while
+    /// paused. This is spec §7 option (a), the timelock, made per channel: the strongest guarantee
+    /// without on-chain visibility into un-settled off-chain claims.
+    function withdraw(bytes32 provider, uint256 amount) external nonReentrant {
+        if (paused) revert IsPaused();
+        Channel storage c = channels[msg.sender][provider];
+        if (c.exitRequestedAt == 0) revert RefundLocked();
+        uint256 from = c.exitRequestedAt > lastUnpausedAt ? c.exitRequestedAt : lastUnpausedAt;
+        if (block.timestamp < from + refundDelay) revert RefundLocked();
+        if (amount > c.balance) revert WithdrawTooLarge();
+        c.balance -= amount;
         usdc.safeTransfer(msg.sender, amount);
-        emit Withdrawn(msg.sender, amount);
+        emit Withdrawn(msg.sender, provider, amount);
     }
 
     // ── Admin (pause only — no fund authority) ──
 
     function setPaused(bool _paused) external {
         if (msg.sender != admin) revert NotAdmin();
+        if (paused && !_paused) lastUnpausedAt = uint64(block.timestamp);
         paused = _paused;
         emit Paused(_paused);
     }
