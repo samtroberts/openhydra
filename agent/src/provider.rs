@@ -304,6 +304,9 @@ const CLOCK_SKEW_MS: u64 = 60 * 1000;
 /// Hard cap on outstanding (un-settled) commitments — a backstop so a flood of serves whose
 /// receipts never arrive can't grow the map without bound.
 const MAX_COMMITMENTS: usize = 10_000;
+/// Outstanding commitments one peer may hold; past it its oldest goes, so one peer can't crowd
+/// everyone else's out of the map.
+const MAX_COMMITMENTS_PER_PEER: usize = 256;
 
 /// Credit window (a provider that charges, see [`payment_window`]): how long after a serve its
 /// receipt may stay unsettled before the consumer gets no more serves. A consumer settles right
@@ -321,8 +324,32 @@ const MAX_DEFAULT_PEERS: usize = 4096;
 const MAX_UNPAID_CONCURRENT: usize = 8;
 /// What a paid serve without `max_tokens` reserves while it runs.
 const DEFAULT_RESERVE_TOKENS: u64 = 8_192;
-/// Delivered, unsettled serves one consumer may have at once.
+/// Unsettled serves one consumer may have at once.
 const MAX_UNSETTLED_SERVES: usize = 64;
+/// The most one paid serve generates: a request asking for more (or naming no limit) is served up to
+/// this, so a single serve can't leave more unpaid than the whole credit window.
+const MAX_PAID_SERVE_TOKENS: u32 = MAX_UNSETTLED_TOKENS as u32;
+
+/// What a paid serve may generate, given the request's `max_tokens` ([`MAX_PAID_SERVE_TOKENS`] at most).
+fn paid_max_tokens(requested: Option<u32>) -> u32 {
+    requested.map_or(MAX_PAID_SERVE_TOKENS, |t| t.min(MAX_PAID_SERVE_TOKENS))
+}
+
+/// What a paid serve reserves against the unpaid-token cap while it runs: its `max_tokens`
+/// ([`paid_max_tokens`]), or [`DEFAULT_RESERVE_TOKENS`] without one.
+fn paid_reservation(requested: Option<u32>) -> u64 {
+    requested.map_or(DEFAULT_RESERVE_TOKENS, |t| u64::from(paid_max_tokens(Some(t))))
+}
+
+/// A consumer's serve not yet paid for, as the credit window sees it.
+#[derive(Debug, Clone, Copy)]
+struct Unsettled {
+    at: u64,
+    tokens: u64,
+    /// Whether the consumer got all of it; a serve it didn't still counts toward its caps (it had the
+    /// output it read), but isn't held against it once the grace period runs out.
+    delivered: bool,
+}
 
 /// The credit window: whether a consumer may be served now, given its unsettled serves
 /// (`(served at, tokens)`) and how many of its serves went unpaid within [`DEFAULT_WINDOW_MS`].
@@ -331,21 +358,29 @@ const MAX_UNSETTLED_SERVES: usize = 64;
 /// grace period. Not a guarantee against a consumer that keeps making new identities; that needs a
 /// check of its on-chain escrow before serving.
 ///
-/// `unsettled` are its delivered serves not yet paid for (`(served at, tokens)`), `generating` the
-/// reservations of its paid serves still running.
-fn payment_window(unsettled: &[(u64, u64)], generating: &[u64], defaults: usize, now: u64) -> Result<(), String> {
+/// `unsettled` are its serves not yet paid for, delivered or not (a stream abandoned just short of
+/// its end was still read), `generating` the reservations of its paid serves still running, and
+/// `reserving` what this request would reserve.
+fn payment_window(unsettled: &[Unsettled], generating: &[u64], reserving: u64, defaults: usize, now: u64) -> Result<(), String> {
     if defaults >= MAX_DEFAULTS {
         return Err(format!("{defaults} recent serves were never paid for; this provider won't serve you for now"));
     }
-    if unsettled.iter().any(|(at, _)| now.saturating_sub(*at) > SETTLE_GRACE_MS) {
+    if unsettled.iter().any(|u| u.delivered && now.saturating_sub(u.at) > SETTLE_GRACE_MS) {
         return Err("a serve from this provider is still unpaid; settle it before asking for more".into());
     }
     if unsettled.len() >= MAX_UNSETTLED_SERVES || generating.len() >= MAX_UNPAID_CONCURRENT {
         return Err("too many serves are still unpaid or running; settle them before asking for more".into());
     }
-    let owed = unsettled.iter().map(|(_, t)| t).sum::<u64>() + generating.iter().sum::<u64>();
-    if owed > MAX_UNSETTLED_TOKENS {
-        return Err("too many served tokens are still unpaid; settle them before asking for more".into());
+    let owed = unsettled.iter().map(|u| u.tokens).sum::<u64>() + generating.iter().sum::<u64>();
+    if owed.saturating_add(reserving) > MAX_UNSETTLED_TOKENS {
+        return Err(if owed == 0 {
+            format!("max_tokens {reserving} is more than this provider serves on credit ({MAX_UNSETTLED_TOKENS})")
+        } else {
+            format!(
+                "{owed} served tokens are still unpaid or running, and this request's max_tokens ({reserving}) \
+                 doesn't fit beside them ({MAX_UNSETTLED_TOKENS} on credit); lower max_tokens, or retry once they settle"
+            )
+        });
     }
     Ok(())
 }
@@ -429,6 +464,22 @@ impl KeptClaim {
         };
         Some(KeptClaim { cumulative, expires_at, signer, sig: rest.to_vec() })
     }
+}
+
+/// Add a commitment to `map`, within [`MAX_COMMITMENTS`] (past it, nothing is added) and
+/// [`MAX_COMMITMENTS_PER_PEER`] (past it, the peer's oldest goes).
+fn insert_commitment(map: &mut HashMap<[u8; 16], ServeCommitment>, nonce: [u8; 16], c: ServeCommitment) {
+    let peers: Vec<([u8; 16], u64)> =
+        map.iter().filter(|(_, o)| o.served_peer == c.served_peer).map(|(n, o)| (*n, o.recorded_ms)).collect();
+    if peers.len() >= MAX_COMMITMENTS_PER_PEER {
+        if let Some((oldest, _)) = peers.iter().min_by_key(|(_, at)| *at) {
+            map.remove(oldest);
+        }
+    }
+    if map.len() >= MAX_COMMITMENTS {
+        return; // backstop — refuse to grow past the cap (stale entries already pruned)
+    }
+    map.insert(nonce, c);
 }
 
 /// Drop expired commitments from `map`, returning the peers whose serves they were: receipts that
@@ -1177,12 +1228,13 @@ impl<A: EngineAdapter> Provider<A> {
     /// The payment gate of a provider that charges (a settlement peg is configured): the request
     /// must offer to pay at our peg (on our deployment), and its consumer must be within the credit
     /// window ([`payment_window`]). An admitted paid serve holds a [`PaymentReservation`] while it
-    /// runs. Our own (co-located) consumer never settles with us and is exempt. `Err` is the refusal.
+    /// runs, and generates at most [`paid_max_tokens`]. Our own (co-located) consumer never settles
+    /// with us and is exempt. `Err` is the refusal.
     fn payment_gate(&self, req: &ServeRequest, source_peer: &str) -> Result<Option<PaymentReservation>, Vec<u8>> {
         let Some(peg) = self.settlement_peg else {
             return Ok(None);
         };
-        if source_peer == self.net.libp2p_peer_id() || self.self_consumer.as_deref() == Some(source_peer) {
+        if self.is_own_consumer(source_peer) {
             return Ok(None);
         }
         let refuse = |reason: String| {
@@ -1203,13 +1255,13 @@ impl<A: EngineAdapter> Provider<A> {
             }
         }
         let now = now_unix_ms();
-        let (unsettled, full): (Vec<(u64, u64)>, bool) = {
+        let (unsettled, full): (Vec<Unsettled>, bool) = {
             let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
             self.note_defaults(prune_expired_commitments(&mut map, now), now);
             let mine = map
                 .values()
-                .filter(|c| c.served_peer == source_peer && c.delivered)
-                .map(|c| (c.recorded_ms, c.tokens))
+                .filter(|c| c.served_peer == source_peer)
+                .map(|c| Unsettled { at: c.recorded_ms, tokens: c.tokens, delivered: c.delivered })
                 .collect();
             (mine, map.len() >= MAX_COMMITMENTS)
         };
@@ -1223,16 +1275,22 @@ impl<A: EngineAdapter> Provider<A> {
             .unwrap_or_else(|e| e.into_inner())
             .get(source_peer)
             .map_or(0, |at| at.iter().filter(|t| now.saturating_sub(**t) <= DEFAULT_WINDOW_MS).count());
-        let tokens = req.max_tokens.map_or(DEFAULT_RESERVE_TOKENS, u64::from);
+        let tokens = paid_reservation(req.max_tokens);
         let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
         let running = generating.get(source_peer).cloned().unwrap_or_default();
-        payment_window(&unsettled, &running, defaults, now).map_err(refuse)?;
+        payment_window(&unsettled, &running, tokens, defaults, now).map_err(refuse)?;
         generating.entry(source_peer.to_string()).or_default().push(tokens);
         Ok(Some(PaymentReservation {
             generating: Arc::clone(&self.paid_generating),
             peer: source_peer.to_string(),
             tokens,
         }))
+    }
+
+    /// Whether `peer` is this node, or our own co-located consumer (the desktop's gateway): it never
+    /// settles with us.
+    fn is_own_consumer(&self, peer: &str) -> bool {
+        peer == self.net.libp2p_peer_id() || self.self_consumer.as_deref() == Some(peer)
     }
 
     /// The consumer got this serve's whole completion (its stream polled to the end, or a fetch by
@@ -1380,15 +1438,20 @@ impl<A: EngineAdapter> Provider<A> {
     /// settlement receipt can be validated against it. Prunes expired commitments and
     /// enforces a hard cap so the map stays bounded (B-S7).
     fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64, served_peer: &str, delivered: bool) {
+        // Our own consumer never settles with us: its serves would only fill the map.
+        if self.is_own_consumer(served_peer) {
+            return;
+        }
         let now = now_unix_ms();
         // A stream polled to its end before we got here was delivered too.
         let delivered = delivered || self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce).is_some();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         self.note_defaults(prune_expired_commitments(&mut map, now), now);
-        if map.len() >= MAX_COMMITMENTS {
-            return; // backstop — refuse to grow past the cap (stale entries already pruned)
-        }
-        map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string(), delivered });
+        insert_commitment(
+            &mut map,
+            nonce,
+            ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string(), delivered },
+        );
     }
 
     /// Reconnect-and-fetch: mark a serve in-flight under `nonce` so a fetch that arrives
@@ -1526,7 +1589,7 @@ impl<A: EngineAdapter> Provider<A> {
                 .net
                 .respond(request_id.clone(), FetchChunksResponse::Chunks { framed, next_offset, done: true }.encode());
         };
-        let req = match ServeRequest::decode(&data[1..]) {
+        let mut req = match ServeRequest::decode(&data[1..]) {
             Ok(r) => r,
             Err(e) => {
                 let framed = frame_response(&[ServeChunk::Error(format!("bad serve request: {e}")).encode()]);
@@ -1579,13 +1642,17 @@ impl<A: EngineAdapter> Provider<A> {
             return;
         }
         // A provider that charges: the consumer must offer to pay, and have paid for what it had.
-        let _reservation = match self.payment_gate(&req, &source_peer) {
+        let reservation = match self.payment_gate(&req, &source_peer) {
             Ok(r) => r,
             Err(refusal) => {
                 respond_done(refusal, 1);
                 return;
             }
         };
+        // Held while it generates; a paid serve generates no more than the credit window holds.
+        if reservation.is_some() {
+            req.max_tokens = Some(paid_max_tokens(req.max_tokens));
+        }
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -2501,10 +2568,14 @@ impl<A: EngineAdapter> Provider<A> {
                         if let Some(refusal) = self.scope_refusal(&req, source_peer) {
                             return refusal;
                         }
-                        let _reservation = match self.payment_gate(&req, source_peer) {
+                        let reservation = match self.payment_gate(&req, source_peer) {
                             Ok(r) => r,
                             Err(refusal) => return refusal,
                         };
+                        let mut req = req;
+                        if reservation.is_some() {
+                            req.max_tokens = Some(paid_max_tokens(req.max_tokens));
+                        }
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -3051,21 +3122,55 @@ mod tests {
     #[test]
     fn the_credit_window_bounds_what_a_consumer_takes_unpaid() {
         let now = 10 * DEFAULT_WINDOW_MS;
-        assert!(payment_window(&[], &[], 0, now).is_ok());
+        let got = |at: u64, tokens: u64| Unsettled { at, tokens, delivered: true };
+        assert!(payment_window(&[], &[], 100, 0, now).is_ok());
         // A serve just finished, its receipt on the way: fine.
-        assert!(payment_window(&[(now - 5_000, 500)], &[], 0, now).is_ok());
+        assert!(payment_window(&[got(now - 5_000, 500)], &[], 100, 0, now).is_ok());
         // One unpaid past the grace period: no more serves.
-        assert!(payment_window(&[(now - SETTLE_GRACE_MS - 1, 500)], &[], 0, now).is_err());
+        assert!(payment_window(&[got(now - SETTLE_GRACE_MS - 1, 500)], &[], 100, 0, now).is_err());
         // Many parallel serves, none paid yet: capped by tokens.
-        let burst: Vec<(u64, u64)> = (0..40).map(|_| (now - 1_000, 2_000)).collect();
-        assert!(payment_window(&burst, &[], 0, now).is_err());
+        let burst: Vec<Unsettled> = (0..40).map(|_| got(now - 1_000, 2_000)).collect();
+        assert!(payment_window(&burst, &[], 100, 0, now).is_err());
+        // Review S2: a stream read but abandoned before its end still counts toward the caps (only
+        // not as unpaid past the grace period: the consumer may never have got it).
+        let read: Vec<Unsettled> =
+            (0..MAX_UNSETTLED_SERVES as u64).map(|_| Unsettled { at: now - 1_000, tokens: 10, delivered: false }).collect();
+        assert!(payment_window(&read, &[], 100, 0, now).is_err());
+        let late = Unsettled { at: now - SETTLE_GRACE_MS - 1, tokens: 500, delivered: false };
+        assert!(payment_window(&[late], &[], 100, 0, now).is_ok());
+        assert!(payment_window(&[Unsettled { tokens: 65_000, ..late }], &[], 1_000, 0, now).is_err());
         // Repeated defaults.
-        assert!(payment_window(&[], &[], MAX_DEFAULTS - 1, now).is_ok());
-        assert!(payment_window(&[], &[], MAX_DEFAULTS, now).is_err());
+        assert!(payment_window(&[], &[], 100, MAX_DEFAULTS - 1, now).is_ok());
+        assert!(payment_window(&[], &[], 100, MAX_DEFAULTS, now).is_err());
         // Paid serves still running count: too many at once, or reserving too many tokens.
-        assert!(payment_window(&[], &[100; MAX_UNPAID_CONCURRENT - 1], 0, now).is_ok());
-        assert!(payment_window(&[], &[100; MAX_UNPAID_CONCURRENT], 0, now).is_err());
-        assert!(payment_window(&[(now, 60_000)], &[8_000], 0, now).is_err());
+        assert!(payment_window(&[], &[100; MAX_UNPAID_CONCURRENT - 1], 100, 0, now).is_ok());
+        assert!(payment_window(&[], &[100; MAX_UNPAID_CONCURRENT], 100, 0, now).is_err());
+        assert!(payment_window(&[got(now, 60_000)], &[8_000], 100, 0, now).is_err());
+        // The request's own reservation counts too, so one huge request can't leave more unpaid than
+        // the window, and a request that fits beside nothing is told so.
+        assert!(payment_window(&[], &[], MAX_UNSETTLED_TOKENS, 0, now).is_ok());
+        assert!(payment_window(&[], &[32_768], 32_768, 0, now).is_ok());
+        let err = payment_window(&[], &[32_768, 32_768], 32_768, 0, now).unwrap_err();
+        assert!(err.contains("lower max_tokens"), "{err}");
+        // A paid serve generates at most the window, and reserves what it may generate.
+        assert_eq!(paid_max_tokens(None), MAX_PAID_SERVE_TOKENS);
+        assert_eq!(paid_max_tokens(Some(u32::MAX)), MAX_PAID_SERVE_TOKENS);
+        assert_eq!(paid_max_tokens(Some(512)), 512);
+        assert_eq!(paid_reservation(None), DEFAULT_RESERVE_TOKENS);
+        assert_eq!(paid_reservation(Some(u32::MAX)), MAX_UNSETTLED_TOKENS);
+        assert!(payment_window(&[], &[], paid_reservation(Some(u32::MAX)), 0, now).is_ok());
+        // Review S3: one peer can't crowd the commitment map; past its cap its oldest goes.
+        let mut map = HashMap::new();
+        let commit = |peer: &str, at: u64| ServeCommitment { model_id: "m".into(), tokens: 1, recorded_ms: at, served_peer: peer.into(), delivered: false };
+        for i in 0..(MAX_COMMITMENTS_PER_PEER as u64 + 10) {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&i.to_le_bytes());
+            insert_commitment(&mut map, nonce, commit("greedy", i));
+        }
+        insert_commitment(&mut map, [0xff; 16], commit("other", 0));
+        assert_eq!(map.values().filter(|c| c.served_peer == "greedy").count(), MAX_COMMITMENTS_PER_PEER);
+        assert!(map.values().all(|c| c.served_peer != "greedy" || c.recorded_ms >= 10), "the oldest went");
+        assert!(map.contains_key(&[0xff; 16]));
         // A kept claim survives its encoding.
         let kc = KeptClaim { cumulative: 9, expires_at: 10, signer: Some([3; 20]), sig: vec![1; 65] };
         assert_eq!(KeptClaim::from_bytes(&kc.to_bytes()), Some(kc));
