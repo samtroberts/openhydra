@@ -54,6 +54,12 @@ contract OpenHydraSettlement is ReentrancyGuard {
     /// The longest refund delay a deployment may set: shorter than a claim's lifetime
     /// (`settlement::CLAIM_LIFETIME_SECS`, 30 days), so a provider's last claim outlives an exit window.
     uint64 public constant MAX_REFUND_DELAY = 14 days;
+    /// The shortest refund delay: with none, a consumer could request an exit and withdraw in one
+    /// transaction, ahead of the provider's settle.
+    uint64 public constant MIN_REFUND_DELAY = 1 days;
+    /// How much pausing can delay one exit, in total: time paused after an exit request extends its
+    /// window (a pause stops settles), capped so the admin's pause can't lock escrow indefinitely.
+    uint64 public constant MAX_PAUSE_EXTENSION = 30 days;
 
     // ── Config (set once at init; the fee can never be changed to divert funds) ──
     IERC20 public immutable usdc;
@@ -66,9 +72,11 @@ contract OpenHydraSettlement is ReentrancyGuard {
     uint64 public immutable refundDelay; // seconds of consumer inactivity before an unconditional withdraw
     address public admin; // pause only — CANNOT touch funds
     bool public paused;
-    /// When the contract was last unpaused: an exit's delay counts from no earlier than this, so a
-    /// pause (which stops settles) can't run out a provider's window to settle.
-    uint64 public lastUnpausedAt;
+    /// When the current pause began (meaningful while `paused`).
+    uint64 public pausedAt;
+    /// Seconds paused in total over pauses that have ended: with `pausedAt`, how much a pause delays an
+    /// exit.
+    uint64 public pausedTotal;
 
     // ── State ──
     /// A consumer's escrow for one provider (the x402 `upto` ceiling for that provider).
@@ -76,13 +84,16 @@ contract OpenHydraSettlement is ReentrancyGuard {
         address payout; // the provider's payout address; set at open, changed only by itself
         uint256 balance;
         uint64 exitRequestedAt; // 0 = no exit pending
+        uint64 exitPauseMark; // total paused time when the exit was requested
     }
     /// consumerEvm → provider (Ed25519 id) → channel.
     mapping(address => mapping(bytes32 => Channel)) public channels;
-    /// consumerEvm → provider (Ed25519 id) → modelHash → cumulative USDC already settled (monotonic
-    /// high-water). Keyed by the provider, not its payout address: a new payout address continues
-    /// from what was already paid.
-    mapping(address => mapping(bytes32 => mapping(bytes32 => uint256))) public settled;
+    /// consumerEvm → provider (Ed25519 id) → consumer (Ed25519 id) → modelHash → cumulative USDC already
+    /// settled (monotonic high-water). Keyed by the provider, not its payout address: a new payout
+    /// address continues from what was already paid. And by the consumer's Ed25519 id as well as its
+    /// wallet, as the provider tracks it: two identities sharing a wallet (or one rotated) don't share
+    /// a running total.
+    mapping(address => mapping(bytes32 => mapping(bytes32 => mapping(bytes32 => uint256)))) public settled;
 
     /// The claim the consumer's EVM wallet signs (EIP-712, claim format v6). `provider`/`consumer` are
     /// the Ed25519 channel ids (the link to the off-chain receipt); the authorizing signer recovered
@@ -137,7 +148,7 @@ contract OpenHydraSettlement is ReentrancyGuard {
         address _admin
     ) {
         if (_feeBps != EXPECTED_FEE_BPS) revert BadFeeBps(); // the agreed 4%, fixed at init
-        if (_refundDelay > MAX_REFUND_DELAY) revert BadRefundDelay();
+        if (_refundDelay < MIN_REFUND_DELAY || _refundDelay > MAX_REFUND_DELAY) revert BadRefundDelay();
         usdc = _usdc;
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
@@ -219,20 +230,23 @@ contract OpenHydraSettlement is ReentrancyGuard {
         if (c.payout == address(0)) revert NoChannel();
 
         bytes32 modelHash = keccak256(bytes(claim.modelId));
-        uint256 prior = settled[consumerEvm][claim.provider][modelHash];
+        uint256 prior = settled[consumerEvm][claim.provider][claim.consumer][modelHash];
         // Monotonic: a replayed or stale (<= prior) cumulative is a no-op → revert. Also blocks
         // underflow (a lower cumulative can never claw back).
         if (claim.cumulativeAmount <= prior) revert StaleOrReplayedClaim();
+        // Pay what the channel covers: a consumer that ran past its escrow still pays all it has, and
+        // the rest settles from the same claim after a top-up (the high-water mark rises by what was
+        // paid, not by the claim).
         uint256 delta = claim.cumulativeAmount - prior;
-
-        if (c.balance < delta) revert InsufficientEscrow();
+        if (delta > c.balance) delta = c.balance;
+        if (delta == 0) revert InsufficientEscrow();
 
         // Fixed split, floor the fee (dust to the provider) — matches payout::protocol_fee.
         uint256 fee = (delta * feeBps) / 10_000;
         uint256 providerNet = delta - fee;
 
         // Effects before interactions (CEI): advance the high-water mark + debit the channel first.
-        settled[consumerEvm][claim.provider][modelHash] = claim.cumulativeAmount;
+        settled[consumerEvm][claim.provider][claim.consumer][modelHash] = prior + delta;
         c.balance -= delta;
         accruedFees += fee;
         address payout = c.payout; // the money goes only where the channel says
@@ -261,20 +275,21 @@ contract OpenHydraSettlement is ReentrancyGuard {
         Channel storage c = channels[msg.sender][provider];
         if (c.payout == address(0)) revert NoChannel();
         c.exitRequestedAt = uint64(block.timestamp);
+        c.exitPauseMark = _pausedTotalNow();
         emit ExitRequested(msg.sender, provider, uint64(block.timestamp) + refundDelay);
     }
 
     /// Consumer reclaims unspent escrow from a channel → the non-custodial exit; deposits are never
-    /// trapped. Allowed `refundDelay` after `requestExit`, counted from no earlier than the last
-    /// unpause (a pause stops settles, so it must not use up the provider's window), and never while
-    /// paused. This is spec §7 option (a), the timelock, made per channel: the strongest guarantee
-    /// without on-chain visibility into un-settled off-chain claims.
+    /// trapped. Allowed `refundDelay` after `requestExit`, plus however long the contract has been
+    /// paused since (a pause stops settles, so it must not use up the provider's window), at most
+    /// `MAX_PAUSE_EXTENSION` — past that, even while paused, so a pause can't lock escrow forever.
+    /// This is spec §7 option (a), the timelock, made per channel.
     function withdraw(bytes32 provider, uint256 amount) external nonReentrant {
-        if (paused) revert IsPaused();
         Channel storage c = channels[msg.sender][provider];
         if (c.exitRequestedAt == 0) revert RefundLocked();
-        uint256 from = c.exitRequestedAt > lastUnpausedAt ? c.exitRequestedAt : lastUnpausedAt;
-        if (block.timestamp < from + refundDelay) revert RefundLocked();
+        uint256 pausedSince = _pausedTotalNow() - c.exitPauseMark;
+        if (pausedSince > MAX_PAUSE_EXTENSION) pausedSince = MAX_PAUSE_EXTENSION;
+        if (block.timestamp < uint256(c.exitRequestedAt) + refundDelay + pausedSince) revert RefundLocked();
         if (amount > c.balance) revert WithdrawTooLarge();
         c.balance -= amount;
         usdc.safeTransfer(msg.sender, amount);
@@ -292,10 +307,18 @@ contract OpenHydraSettlement is ReentrancyGuard {
 
     // ── Admin (pause only — no fund authority) ──
 
+    /// Pause settle and deposit. Time paused extends pending exits (see `withdraw`), at most
+    /// `MAX_PAUSE_EXTENSION` per exit.
     function setPaused(bool _paused) external {
         if (msg.sender != admin) revert NotAdmin();
-        if (paused && !_paused) lastUnpausedAt = uint64(block.timestamp);
+        if (!paused && _paused) pausedAt = uint64(block.timestamp);
+        else if (paused && !_paused) pausedTotal += uint64(block.timestamp) - pausedAt;
         paused = _paused;
         emit Paused(_paused);
+    }
+
+    /// Seconds paused in total up to now, the current pause included.
+    function _pausedTotalNow() internal view returns (uint64) {
+        return paused ? pausedTotal + (uint64(block.timestamp) - pausedAt) : pausedTotal;
     }
 }

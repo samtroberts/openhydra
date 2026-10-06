@@ -11,7 +11,7 @@
 // funds a vault for ONE provider, and settles from it pay only that provider's bound payout — so a
 // consumer can't pay itself out of escrow committed to a provider (a throwaway provider of its own
 // reaches only its own vault). Exits are "request, then wait `refund_delay_secs`", a window settles
-// can't extend. It verifies the co-signed receipt's **Ed25519
+// can't extend and a pause extends by at most 30 days. It verifies the co-signed receipt's **Ed25519
 // signature natively** (via the Ed25519 SigVerify program + instruction introspection), enforces
 // **monotonic** per-channel settlement, and releases the delta split `0.96 provider / 0.04 platform`.
 // It does NOT re-verify authenticity — that is already baked into the voucher's rate-capped
@@ -41,6 +41,16 @@ pub const FEE_BPS: u16 = 400;
 /// The longest refund delay a deployment may set: shorter than a claim's lifetime
 /// (`settlement::CLAIM_LIFETIME_SECS`, 30 days), so a provider's last claim outlives an exit window.
 pub const MAX_REFUND_DELAY_SECS: i64 = 14 * 24 * 60 * 60;
+/// The shortest refund delay: with none, a consumer could request an exit and withdraw in one
+/// transaction, ahead of the provider's settle.
+pub const MIN_REFUND_DELAY_SECS: i64 = 24 * 60 * 60;
+/// How much pausing can delay one exit, in total. A pause stops settles, so time paused after an exit
+/// request extends its window (the provider keeps its full window to settle); capped, so the admin's
+/// pause can't lock escrow indefinitely.
+pub const MAX_PAUSE_EXTENSION_SECS: i64 = 30 * 24 * 60 * 60;
+/// How far ahead of the cluster clock a payout binding's timestamp may be: a binding stamped far in
+/// the future (say `u64::MAX`, by whoever got the identity key) would be impossible to rotate away from.
+pub const BINDING_CLOCK_SKEW_SECS: i64 = 5 * 60;
 
 // ── Pure, testable helpers (no chain state) ───────────────────────────────
 
@@ -174,9 +184,11 @@ pub mod openhydra_settlement {
         // Only the program's upgrade authority initializes (the accounts constraints check it), so
         // nobody can front-run a deployment with their own fee account or an endless refund delay.
         require!(
-            (0..=MAX_REFUND_DELAY_SECS).contains(&refund_delay_secs),
+            (MIN_REFUND_DELAY_SECS..=MAX_REFUND_DELAY_SECS).contains(&refund_delay_secs),
             SettlementError::BadArgument
         );
+        // A real cluster tag (the genesis hash), not an unset one shared by every deployment.
+        require!(cluster != [0u8; 32], SettlementError::BadArgument);
         let config = &mut ctx.accounts.config;
         config.admin = ctx.accounts.admin.key();
         config.fee_account = fee_account;
@@ -184,7 +196,8 @@ pub mod openhydra_settlement {
         config.fee_bps = FEE_BPS; // the agreed 4%, fixed at init
         config.refund_delay_secs = refund_delay_secs;
         config.paused = false;
-        config.last_unpaused_at = 0;
+        config.paused_at = 0;
+        config.paused_total = 0;
         config.cluster = cluster;
         config.accrued_fees = 0;
         Ok(())
@@ -207,6 +220,9 @@ pub mod openhydra_settlement {
                 == binding_preimage(&crate::ID.to_bytes(), &ctx.accounts.config.cluster, &payout_address, ts_unix_ms),
             SettlementError::MessageMismatch
         );
+        let now = Clock::get()?.unix_timestamp;
+        let latest_ms = now.saturating_add(BINDING_CLOCK_SKEW_SECS).max(0) as u64 * 1000;
+        require!(ts_unix_ms <= latest_ms, SettlementError::BindingFromTheFuture);
         let binding = &mut ctx.accounts.payout_binding;
         // Monotonic rotation: reject a binding that is not strictly newer (blocks the rotation replay).
         require!(
@@ -274,16 +290,19 @@ pub mod openhydra_settlement {
         );
         let delta = claim.cumulative_amount - channel.settled_amount;
 
-        // 4. Escrow sufficiency + split.
+        // 4. Pay what the escrow covers: a consumer that ran past its escrow still pays all it has, and
+        //    the rest settles from the same claim after a top-up (the high-water mark rises by what was
+        //    paid, not by the claim).
         let vault = &mut ctx.accounts.vault;
-        require!(vault.balance >= delta, SettlementError::InsufficientEscrow);
-        let (provider_net, fee) = split(delta, ctx.accounts.config.fee_bps);
+        let paid = delta.min(vault.balance);
+        require!(paid > 0, SettlementError::InsufficientEscrow);
+        let (provider_net, fee) = split(paid, ctx.accounts.config.fee_bps);
 
         // 5. Effects before interactions: advance the high-water mark + debit escrow.
-        channel.settled_amount = claim.cumulative_amount;
+        channel.settled_amount += paid;
         channel.consumer = claim.consumer;
         channel.provider = claim.provider;
-        vault.balance -= delta;
+        vault.balance -= paid;
         // The fee stays with the program until the fee authority withdraws it (`withdraw_fees`): paid
         // out on every settle, a fee account the token issuer froze would stop all settles.
         let config = &mut ctx.accounts.config;
@@ -297,7 +316,8 @@ pub mod openhydra_settlement {
             consumer: claim.consumer,
             provider: claim.provider,
             payout,
-            delta,
+            delta: paid,
+            outstanding: delta - paid,
             provider_net,
             fee,
         });
@@ -308,21 +328,29 @@ pub mod openhydra_settlement {
     /// `refund_delay_secs`, a fixed window for the provider to settle what it is owed, which settles
     /// can't extend (anyone could otherwise keep the escrow locked by settling small steps).
     pub fn request_exit(ctx: Context<RequestExit>, _provider: [u8; 32]) -> Result<()> {
-        ctx.accounts.vault.exit_requested_at = Clock::get()?.unix_timestamp;
+        let now = Clock::get()?.unix_timestamp;
+        let vault = &mut ctx.accounts.vault;
+        vault.exit_requested_at = now;
+        vault.exit_pause_mark = paused_total_at(&ctx.accounts.config, now);
         Ok(())
     }
 
     /// Consumer reclaims unspent escrow from a provider vault → the non-custodial exit. Allowed
-    /// `refund_delay_secs` after `request_exit`, counted from no earlier than the last unpause (a pause
-    /// stops settles, so it must not use up the provider's window), and never while paused.
+    /// `refund_delay_secs` after `request_exit`, plus however long the program has been paused since
+    /// (a pause stops settles, so it must not use up the provider's window), at most
+    /// `MAX_PAUSE_EXTENSION_SECS` — past that, even while paused, so a pause can't lock escrow forever.
     pub fn withdraw(ctx: Context<Withdraw>, _provider: [u8; 32], amount: u64) -> Result<()> {
         let config = &ctx.accounts.config;
-        require!(!config.paused, SettlementError::Paused);
         let vault = &mut ctx.accounts.vault;
         require!(vault.exit_requested_at != 0, SettlementError::RefundLocked);
-        let from = vault.exit_requested_at.max(config.last_unpaused_at);
-        let open_at = from.checked_add(config.refund_delay_secs).ok_or(SettlementError::Overflow)?;
-        require!(Clock::get()?.unix_timestamp >= open_at, SettlementError::RefundLocked);
+        let now = Clock::get()?.unix_timestamp;
+        let paused_since_request = paused_total_at(config, now).saturating_sub(vault.exit_pause_mark).max(0);
+        let open_at = vault
+            .exit_requested_at
+            .checked_add(config.refund_delay_secs)
+            .and_then(|t| t.checked_add(paused_since_request.min(MAX_PAUSE_EXTENSION_SECS)))
+            .ok_or(SettlementError::Overflow)?;
+        require!(now >= open_at, SettlementError::RefundLocked);
         require!(amount <= vault.balance, SettlementError::WithdrawTooLarge);
         // PRODUCTION SPL: CPI `spl_token::transfer` vault → consumer's USDC ATA.
         vault.balance -= amount;
@@ -339,16 +367,25 @@ pub mod openhydra_settlement {
         Ok(())
     }
 
-    /// Admin pause (halts settle/deposit/withdraw); no fund authority. Unpausing restarts every pending
-    /// exit's window, so a pause can't run one out.
+    /// Admin pause (halts settle and deposit); no fund authority. Time paused extends pending exits'
+    /// windows (see `withdraw`), at most `MAX_PAUSE_EXTENSION_SECS` per exit.
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
         let config = &mut ctx.accounts.config;
-        if config.paused && !paused {
-            config.last_unpaused_at = Clock::get()?.unix_timestamp;
+        let now = Clock::get()?.unix_timestamp;
+        if !config.paused && paused {
+            config.paused_at = now;
+        } else if config.paused && !paused {
+            config.paused_total = config.paused_total.saturating_add(now.saturating_sub(config.paused_at).max(0));
         }
         config.paused = paused;
         Ok(())
     }
+}
+
+/// How long the program has been paused in total, up to `now` (the current pause included).
+fn paused_total_at(config: &Config, now: i64) -> i64 {
+    let current = if config.paused { now.saturating_sub(config.paused_at).max(0) } else { 0 };
+    config.paused_total.saturating_add(current)
 }
 
 /// The claim the consumer's Ed25519 identity signs (== `settlement::SettlementClaim`, format v6).
@@ -373,8 +410,11 @@ pub struct Config {
     pub fee_bps: u16,
     pub refund_delay_secs: i64,
     pub paused: bool,
-    /// When the program was last unpaused (0 = never paused): exits count from no earlier than this.
-    pub last_unpaused_at: i64,
+    /// When the current pause began (meaningful while `paused`).
+    pub paused_at: i64,
+    /// Seconds paused in total, over pauses that have ended: with `paused_at`, how much a pause delays
+    /// an exit.
+    pub paused_total: i64,
     /// The cluster this deployment runs on (its genesis hash), bound into every claim and binding
     /// with the program id. Set at initialize by the upgrade authority.
     pub cluster: [u8; 32],
@@ -391,6 +431,8 @@ pub struct Vault {
     pub balance: u64,
     /// When the consumer asked to exit (0 = no exit pending).
     pub exit_requested_at: i64,
+    /// The program's total paused time when the exit was requested: pausing after that extends it.
+    pub exit_pause_mark: i64,
 }
 
 #[account]
@@ -415,7 +457,10 @@ pub struct Settled {
     pub consumer: [u8; 32],
     pub provider: [u8; 32],
     pub payout: [u8; 32],
+    /// What this settle paid.
     pub delta: u64,
+    /// What the claim was owed beyond the escrow (settles from the same claim after a top-up).
+    pub outstanding: u64,
     pub provider_net: u64,
     pub fee: u64,
 }
@@ -521,6 +566,8 @@ pub struct Settle<'info> {
 #[instruction(provider: [u8; 32])]
 pub struct RequestExit<'info> {
     pub consumer: Signer<'info>,
+    #[account(seeds = [b"config"], bump)]
+    pub config: Account<'info, Config>,
     #[account(
         mut,
         seeds = [b"vault", consumer.key().as_ref(), provider.as_ref()],
@@ -572,8 +619,6 @@ pub enum SettlementError {
     SignerMismatch,
     #[msg("the verified message does not match the expected preimage")]
     MessageMismatch,
-    #[msg("the payout does not match the provider's bound address")]
-    PayoutMismatch,
     #[msg("the provider has no payout binding")]
     UnboundProvider,
     #[msg("a newer payout binding already exists")]
@@ -596,6 +641,8 @@ pub enum SettlementError {
     NotUpgradeAuthority,
     #[msg("only the fee authority may withdraw fees")]
     NotFeeAuthority,
+    #[msg("the payout binding is stamped in the future")]
+    BindingFromTheFuture,
 }
 
 // ── Pure-logic unit tests (host `cargo test`, no validator) ────────────────

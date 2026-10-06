@@ -203,6 +203,7 @@ fn request_exit(ctx: &mut Ctx, consumer: &Keypair, provider_id: [u8; 32]) -> Res
         program_id: ctx.program_id,
         accounts: openhydra_settlement::accounts::RequestExit {
             consumer: consumer.pubkey(),
+            config: ctx.config,
             vault: vault_pda(ctx, consumer, provider_id),
         }
         .to_account_metas(None),
@@ -418,8 +419,9 @@ fn a_consumer_cannot_pay_itself_out_of_a_providers_vault() {
     let throwaway_id = throwaway.pubkey().to_bytes();
     bind_payout(&mut ctx, &throwaway, own, 1_000).unwrap();
     deposit(&mut ctx, &consumer, throwaway_id, 1_000);
-    assert!(settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b").is_err(), "beyond its own vault");
-    settle(&mut ctx, &consumer, throwaway_id, 1_000, "qwen2.5:7b").expect("its own 1_000 only");
+    settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b").expect("pays what its own vault holds");
+    assert_eq!(vault_state(&ctx, &consumer, throwaway_id).balance, 0, "its own 1_000 only");
+    assert!(settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b").is_err(), "nothing left to pay");
 
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 500_000, "the honest vault is untouched");
 }
@@ -462,9 +464,52 @@ fn a_pause_does_not_run_out_the_providers_window() {
     advance(&mut ctx, 86_400 + 1);
     assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "no withdrawals while paused");
     set_paused(&mut ctx, false).unwrap();
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "a full window again after the unpause");
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "the window is extended by the pause");
     advance(&mut ctx, 86_400);
     withdraw(&mut ctx, &consumer, provider_id, 1).expect("then it opens");
+}
+
+#[test]
+fn a_pause_delays_an_exit_by_at_most_thirty_days() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    request_exit(&mut ctx, &consumer, provider_id).unwrap();
+    set_paused(&mut ctx, true).unwrap();
+    let cap = openhydra_settlement::MAX_PAUSE_EXTENSION_SECS;
+    advance(&mut ctx, 86_400 + cap - 1);
+    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "still within the delay plus the cap");
+    advance(&mut ctx, 1);
+    withdraw(&mut ctx, &consumer, provider_id, 1).expect("past the cap, even while still paused");
+}
+
+#[test]
+fn a_settle_past_the_escrow_pays_what_it_holds_and_the_rest_after_a_top_up() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 100_000);
+    settle(&mut ctx, &consumer, provider_id, 250_000, "m").expect("partial");
+    assert_eq!(channel_state(&ctx, &consumer, provider_id, "m").settled_amount, 100_000);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 0);
+    deposit(&mut ctx, &consumer, provider_id, 500_000);
+    settle(&mut ctx, &consumer, provider_id, 250_000, "m").expect("the same claim, the rest");
+    assert_eq!(channel_state(&ctx, &consumer, provider_id, "m").settled_amount, 250_000);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 350_000);
+    assert_eq!(config_state(&ctx).accrued_fees, 4_000 + 6_000, "4% of each part");
+}
+
+#[test]
+fn a_binding_from_the_future_or_an_unset_cluster_tag_is_refused() {
+    let mut ctx = setup();
+    let admin = ctx.admin.insecure_clone();
+    assert!(try_initialize_on(&mut ctx, &admin, 86_400, [0u8; 32]).is_err(), "all-zero cluster tag");
+    assert!(try_initialize(&mut ctx, &admin, 3_600).is_err(), "a refund delay under a day");
+    initialize(&mut ctx);
+    let provider = Keypair::new();
+    let id = provider.pubkey().to_bytes();
+    let now_ms = T0 as u64 * 1000;
+    assert!(bind_payout(&mut ctx, &provider, id, now_ms + 3_600_000).is_err(), "an hour ahead");
+    bind_payout(&mut ctx, &provider, id, now_ms + 60_000).expect("within the allowed skew");
 }
 
 #[test]
@@ -566,8 +611,8 @@ fn settles_a_claim_made_by_the_agent() {
     try_initialize_on(&mut ctx, &admin, 86_400, cluster).expect("initialize");
     let consumer_key = Pubkey::new_from_array(consumer);
     let vault = Pubkey::find_program_address(&[b"vault", consumer_key.as_ref(), &provider], &ctx.program_id).0;
-    let v = openhydra_settlement::Vault { consumer: consumer_key, provider, balance: 10_000_000, exit_requested_at: 0 };
-    put_program_account(&mut ctx, vault, &v, 8 + 32 + 32 + 8 + 8);
+    let v = openhydra_settlement::Vault { consumer: consumer_key, provider, balance: 10_000_000, exit_requested_at: 0, exit_pause_mark: 0 };
+    put_program_account(&mut ctx, vault, &v, 8 + 32 + 32 + 8 + 8 + 8);
     let binding = Pubkey::find_program_address(&[b"payout", &provider], &ctx.program_id).0;
     let pb = openhydra_settlement::PayoutBinding { provider, payout_address: provider, ts_unix_ms: 1, initialized: true };
     put_program_account(&mut ctx, binding, &pb, 8 + 32 + 32 + 8 + 1);

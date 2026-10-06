@@ -12,9 +12,11 @@
 //! is the off-chain record; what a chain settles is a separate **claim** the consumer signs for that
 //! chain's program ([`SettlementClaim`], format v6): *pay provider P up to `cumulative_amount` for
 //! model M out of consumer C's escrow for P, until `expires_at`*, bound to one deployment (its
-//! [`ChainDomain`]). The program pays only the provider's own payout account (Solana: its
-//! [`PayoutBinding`]; Base: the channel's payout), so the claim names no payout: the consumer needn't
-//! know it, and naming another one would gain nothing.
+//! [`ChainDomain`]). The program pays only the provider's payout account (Solana: its
+//! [`PayoutBinding`]; Base: the channel's payout, which the consumer sets when it opens the channel),
+//! so the claim names no payout. On Base that makes the channel itself what a provider has to trust:
+//! it must check on-chain that the channel to it exists, pays its own address and holds what it is
+//! owed (a claim against a channel paying someone else, or a wallet with none, settles nothing for it).
 //!
 //! - **Solana**: the consumer's OpenHydra Ed25519 identity signs [`SettlementClaim::solana_preimage`]
 //!   (an account address *is* an Ed25519 key, verified natively by the program). The domain is the
@@ -53,8 +55,9 @@ pub const SETTLEMENT_CLAIM_DOMAIN: &[u8] = b"openhydra/solana-settle/v2";
 /// submit the last one. Longer than any program's refund delay, so a claim outlives an exit window.
 pub const CLAIM_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// The least validity left that a provider accepts on a claim, so it has time to submit it.
-pub const MIN_CLAIM_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
+/// The least validity left that a provider accepts on a claim: the longest refund delay a program
+/// allows (14 days) plus a day, so a claim outlives any exit window a consumer can open after it.
+pub const MIN_CLAIM_LIFETIME_SECS: u64 = 15 * 24 * 60 * 60;
 
 /// Why a settlement primitive was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]

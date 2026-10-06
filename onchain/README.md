@@ -42,13 +42,16 @@ solana_preimage_cross_language_golden}`) that the on-chain tests reproduce.
 ## The claim (format v6)
 
 What the consumer signs: provider, consumer, model, cumulative amount and an **expiry** (`expires_at`,
-unix seconds; the agent signs 30 days ahead and providers want at least 7 left). It names **no payout**:
-each chain pays only the provider's own payout (Solana: its binding; Base: the channel's), so naming one
-would add nothing. Each signature is bound to one deployment: Base by the EIP-712 domain (chain id +
+unix seconds; the agent signs 30 days ahead and providers want at least 15 left, more than any refund
+delay). It names **no payout**: each chain pays the provider's payout (Solana: its binding; Base: the
+channel's, which the consumer sets at open — so on Base a provider must check on-chain that the channel
+pays its own address and holds what it is owed before relying on its claims). Each signature is bound to one deployment: Base by the EIP-712 domain (chain id +
 contract, version `"2"`); Solana by the program id and a **cluster tag** (the cluster's genesis hash)
 kept in the program's config, which only the program's **upgrade authority** can initialize. The Solana
-payout binding carries the same domain. Refund delays are capped at 14 days on both chains, under a
-claim's 30-day lifetime. **Fees are pulled:** settles accrue the 4% and the fee recipient / authority
+payout binding carries the same domain. Refund delays are between 1 and 14 days on both chains, and pausing
+extends an exit by at most 30 days (no indefinite lock by pausing). A settle past the escrow pays what it
+holds and the rest after a top-up. On Base the paid-so-far is keyed by the consumer's Ed25519 id as well
+as its wallet. Solana payout bindings can't be stamped more than 5 minutes ahead. **Fees are pulled:** settles accrue the 4% and the fee recipient / authority
 withdraws it to any address, so a blacklisted or frozen fee account can't stop settlement.
 
 ## Toolchains
