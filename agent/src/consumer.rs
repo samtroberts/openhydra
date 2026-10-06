@@ -156,11 +156,21 @@ const FETCH_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_sec
 const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Settlements in flight at once, across all providers. Each is a detached thread; past this a new
 /// one is dropped (logged) rather than spawned, so a burst of serves can't grow threads without bound.
-const MAX_SETTLES_IN_FLIGHT: usize = 64;
+const MAX_SETTLES_IN_FLIGHT: usize = 512;
 /// Settlements running or queued for one `(peer, model)`. They run one at a time (its lock), so with
 /// a provider that black-holes receipts each waits out [`SETTLE_TIMEOUT`] in turn; more than a few
 /// queued behind it would only wait to fail.
-const MAX_SETTLES_PER_PAIR: usize = 4;
+const MAX_SETTLES_PER_PAIR: usize = 32;
+/// Retries of a settlement whose round-trip failed (or the provider asked us to retry), and the wait
+/// before each: a serve that goes unpaid counts against us at a provider that charges.
+const SETTLE_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(8)];
+
+/// Whether a failed settlement is worth sending again: the round-trip failed, or the provider asked
+/// for a retry (rate limited). A provider's considered refusal isn't.
+fn settle_retryable(e: &AdapterError) -> bool {
+    let msg = e.to_string();
+    !msg.contains("provider rejected receipt") || msg.contains("retry")
+}
 
 /// Whether a reported count above the billable one (`billable`) counts against the provider: only
 /// from a provider that says it follows the shared billing rule ([`crate::serve::BILLING_VERSION`]),
@@ -829,6 +839,9 @@ pub struct ConsumerNode {
     /// off-chain accounting; the on-chain claim is a later, legally-gated slice. Persisted like
     /// `audit_stats`.
     gated_vouchers: Mutex<HashMap<String, GatedVoucher>>,
+    /// The highest cumulative signed per voucher key, co-signed or not (persisted): what the next
+    /// receipt builds on, since anything signed can be claimed.
+    signed_highwater: Mutex<HashMap<String, u64>>,
     /// Optional durable backing for `reputation` (M2.2(a)), `credit` (M2.3), and `audit_stats`
     /// (Phase 4). When present, the maps are rehydrated from it at startup and flushed back on each
     /// update, so trust, give/take, and audit history survive a restart. `None` = ephemeral.
@@ -918,6 +931,7 @@ impl ConsumerNode {
             reputation: Mutex::new(HashMap::new()),
             audit_stats: Mutex::new(HashMap::new()),
             gated_vouchers: Mutex::new(HashMap::new()),
+            signed_highwater: Mutex::new(HashMap::new()),
             store: None,
             credit: Mutex::new(HashMap::new()),
             stats: None,
@@ -1181,12 +1195,17 @@ impl ConsumerNode {
             Ok(skipped) => tracing::warn!(skipped, "skipped corrupt gated-voucher rows on rehydrate; kept the rest"),
             Err(e) => tracing::warn!(error = %e, "could not rehydrate gated vouchers from store; starting fresh"),
         }
+        let mut signed_highwater = HashMap::new();
+        if let Err(e) = store.load_consumer_signed_into_memory(&mut signed_highwater) {
+            tracing::warn!(error = %e, "could not rehydrate signed cumulatives from store");
+        }
         Self {
             net,
             tier: 2,
             reputation: Mutex::new(reputation),
             audit_stats: Mutex::new(audit_stats),
             gated_vouchers: Mutex::new(gated_vouchers),
+            signed_highwater: Mutex::new(signed_highwater),
             store: Some(store),
             credit: Mutex::new(credit),
             stats: None,
@@ -1495,29 +1514,28 @@ impl ConsumerNode {
             .unwrap_or(0)
     }
 
-    /// Commit `split` into the `(peer, model)` voucher at composite `key` (accrue + persist). Called
-    /// **only after** the provider co-signs the receipt carrying the resulting cumulative amount, so
-    /// the voucher stays equal to the latest co-signed claim. Off-chain accounting; no value moves.
-    /// Advance and persist this `(peer, model)`'s gated voucher after a successful co-sign.
-    ///
-    /// The provider keeps a persisted high-water per pair. If this voucher falls behind it (a co-sign
-    /// reply never received, or a voucher lost, e.g. an F9 corrupt-row skip resetting the base to 0),
-    /// the provider answers the next receipt with the co-signed receipt that set its high-water, and
-    /// `settle_receipt` catches up to it ([`judge_behind_receipt`], [`Self::raise_gated_voucher`]),
-    /// so the pair never dead-ends (review F-3).
-    fn commit_gated_voucher(&self, key: &str, split: FeeSplit) {
-        let snapshot = {
-            let mut map = match self.gated_vouchers.lock() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            let voucher = map.entry(key.to_string()).or_default();
-            voucher.accrue(split);
-            voucher.to_bytes()
+
+    /// What the next receipt for this voucher key builds on: the higher of its voucher and the highest
+    /// cumulative we have signed for it.
+    fn settle_base(&self, key: &str) -> u64 {
+        let signed = self.signed_highwater.lock().unwrap_or_else(|e| e.into_inner()).get(key).copied().unwrap_or(0);
+        self.gated_cumulative_gross(key).max(signed)
+    }
+
+    /// Remember (and persist) that we are signing `cumulative` for this voucher key, before sending it.
+    fn note_signed(&self, key: &str, cumulative: u64) {
+        let raised = {
+            let mut m = self.signed_highwater.lock().unwrap_or_else(|e| e.into_inner());
+            let e = m.entry(key.to_string()).or_insert(0);
+            let raised = cumulative > *e;
+            *e = (*e).max(cumulative);
+            raised
         };
-        if let Some(store) = &self.store {
-            if let Err(e) = store.put_gated_voucher(key, &snapshot) {
-                tracing::debug!(error = %e, "gated voucher persist failed");
+        if raised {
+            if let Some(store) = &self.store {
+                if let Err(e) = store.put_consumer_signed(key, cumulative) {
+                    tracing::warn!(error = %e, "signed-cumulative persist failed");
+                }
             }
         }
     }
@@ -2034,7 +2052,13 @@ impl ConsumerNode {
         // already-settled amount) is keyed by — not just its 64-bit OpenHydra id: two keys sharing an
         // id (a ~2^32 search) would otherwise share one running total, and each claim all of it
         // on-chain.
-        let vkey = voucher_key(&peer_id, &model_key, &provider_pub);
+        // Scoped to the deployment paying receipts settle on: each deployment's escrow starts from
+        // nothing, so a running total built under one must not carry over (the first claim on another
+        // would re-authorize the whole history).
+        let vkey = match &self.settlement_chain {
+            Some(c) => format!("{}@{}", voucher_key(&peer_id, &model_key, &provider_pub), c.domain.fingerprint()),
+            None => voucher_key(&peer_id, &model_key, &provider_pub),
+        };
         // Review F1: serialize settlement for this `(peer, model)` across the whole
         // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to the
         // same pair can't read the same base and emit non-monotonic / divergent co-signed cumulatives.
@@ -2066,12 +2090,12 @@ impl ConsumerNode {
             // (previous cumulative + this serve's gross), stamped BEFORE the consumer signs so both
             // parties co-sign the same claim. The voucher is committed only after a successful
             // co-sign, keeping it equal to the latest co-signed cumulative. No value moves.
+            // Built on the highest cumulative we ever signed for the pair (co-signed or not: anything
+            // signed can be claimed), so a lost reply or a lost voucher never shortchanges the provider.
             let compute_voucher = || {
                 node.settlement_peg.map(|peg| {
                     let split = node.gated_split_for(&peer_id, &model_key, tokens, now, peg);
-                    let cumulative = node
-                        .gated_cumulative_gross(&vkey)
-                        .saturating_add(split.net_to_provider + split.protocol_fee);
+                    let cumulative = node.settle_base(&vkey).saturating_add(split.net_to_provider + split.protocol_fee);
                     (split, cumulative)
                 })
             };
@@ -2091,10 +2115,14 @@ impl ConsumerNode {
             let claim_signer = chain.as_ref().map(|_| {
                 (expires_at, &sign_claim as &dyn Fn(&openhydra_protocol::settlement::SettlementClaim) -> Vec<u8>)
             });
+            // Sent again (same receipt) when the round-trip fails or the provider asks us to retry.
             let mut settle = |voucher: Option<(FeeSplit, u64)>| {
-                request_receipt(
+                if let Some((_, cumulative)) = voucher {
+                    node.note_signed(&vkey, cumulative);
+                }
+                let attempt = |transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>| request_receipt(
                     &sign,
-                    &mut transport,
+                    transport,
                     &provider_pub,
                     &consumer_pub,
                     &model_id,
@@ -2109,7 +2137,18 @@ impl ConsumerNode {
                     voucher.map(|_| SettlementAsset::Usdc),
                     node.settlement_peg,
                     claim_signer,
-                )
+                );
+                let mut outcome = attempt(&mut transport);
+                for wait in SETTLE_RETRY_WAITS {
+                    match &outcome {
+                        Err(ReceiptFailure::Failed(e)) if settle_retryable(e) => {
+                            std::thread::sleep(wait);
+                            outcome = attempt(&mut transport);
+                        }
+                        _ => break,
+                    }
+                }
+                outcome
             };
             let mut voucher = compute_voucher();
             let mut outcome = settle(voucher);
@@ -2144,14 +2183,17 @@ impl ConsumerNode {
                     tracing::debug!(provider = %peer_id, tokens, cumulative = ?receipt.payload.cumulative_amount,
                         "receipt co-signed");
                     node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
-                    if let Some((split, _)) = voucher {
-                        node.commit_gated_voucher(&vkey, split);
+                    if let Some((_, cumulative)) = voucher {
+                        node.raise_gated_voucher(&vkey, cumulative);
                     }
                 }
                 Err(ReceiptFailure::Failed(e)) => {
                     tracing::warn!(provider = %peer_id, tokens, error = %e, "receipt not co-signed");
                 }
-                Err(ReceiptFailure::Behind(_)) => {} // handled above (logged there)
+                Err(ReceiptFailure::Behind(_)) if !settled_earlier => {
+                    tracing::warn!(provider = %peer_id, tokens, "receipt still behind the provider after catching up");
+                }
+                Err(ReceiptFailure::Behind(_)) => {}
             }
         });
     }

@@ -35,7 +35,7 @@ use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
 use crate::adapter::{AdapterError, DetectedModel, EngineAdapter};
-use crate::attest::{attest_refusal, handle_attest_inbound, Attestor, ATTEST_CHALLENGE};
+use crate::attest::{attest_refusal, Attestor, ATTEST_CHALLENGE};
 use crate::prompt_score::{
     handle_model_info_inbound, handle_prompt_score_inbound, quant_hint_from_name, score_refusal, InflightGate,
     ModelInfo, MODEL_INFO_REQUEST, PROMPT_SCORE_CHALLENGE,
@@ -287,6 +287,9 @@ struct ServeCommitment {
     recorded_ms: u64,
     /// The libp2p-authenticated peer the serve came from: only it may settle the receipt.
     served_peer: String,
+    /// Whether the consumer got the whole completion (a buffered reply, or its stream polled to the
+    /// end): only then is an unsettled serve its fault, and counts against it (credit window).
+    delivered: bool,
 }
 
 /// How long a serve commitment stays settleable, and the receipt-freshness window (B-S1/S7).
@@ -308,6 +311,13 @@ const MAX_DEFAULTS: usize = 3;
 const DEFAULT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 /// Consumers whose defaults a provider remembers (the oldest are forgotten first).
 const MAX_DEFAULT_PEERS: usize = 4096;
+/// Paid serves one consumer may have generating at once (each reserves its `max_tokens` against the
+/// unpaid-token cap while it runs).
+const MAX_UNPAID_CONCURRENT: usize = 8;
+/// What a paid serve without `max_tokens` reserves while it runs.
+const DEFAULT_RESERVE_TOKENS: u64 = 8_192;
+/// Delivered, unsettled serves one consumer may have at once.
+const MAX_UNSETTLED_SERVES: usize = 64;
 
 /// The credit window: whether a consumer may be served now, given its unsettled serves
 /// (`(served at, tokens)`) and how many of its serves went unpaid within [`DEFAULT_WINDOW_MS`].
@@ -315,17 +325,84 @@ const MAX_DEFAULT_PEERS: usize = 4096;
 /// bounds what one consumer identity can take without paying: about one serve, or what fits in the
 /// grace period. Not a guarantee against a consumer that keeps making new identities; that needs a
 /// check of its on-chain escrow before serving.
-fn payment_window(unsettled: &[(u64, u64)], defaults: usize, now: u64) -> Result<(), String> {
+///
+/// `unsettled` are its delivered serves not yet paid for (`(served at, tokens)`), `generating` the
+/// reservations of its paid serves still running.
+fn payment_window(unsettled: &[(u64, u64)], generating: &[u64], defaults: usize, now: u64) -> Result<(), String> {
     if defaults >= MAX_DEFAULTS {
         return Err(format!("{defaults} recent serves were never paid for; this provider won't serve you for now"));
     }
     if unsettled.iter().any(|(at, _)| now.saturating_sub(*at) > SETTLE_GRACE_MS) {
         return Err("a serve from this provider is still unpaid; settle it before asking for more".into());
     }
-    if unsettled.iter().map(|(_, t)| t).sum::<u64>() > MAX_UNSETTLED_TOKENS {
+    if unsettled.len() >= MAX_UNSETTLED_SERVES || generating.len() >= MAX_UNPAID_CONCURRENT {
+        return Err("too many serves are still unpaid or running; settle them before asking for more".into());
+    }
+    let owed = unsettled.iter().map(|(_, t)| t).sum::<u64>() + generating.iter().sum::<u64>();
+    if owed > MAX_UNSETTLED_TOKENS {
         return Err("too many served tokens are still unpaid; settle them before asking for more".into());
     }
     Ok(())
+}
+
+/// A paid serve's reservation against its consumer's unpaid-token cap while it generates; released
+/// when dropped (the serve recorded, or failed).
+struct PaymentReservation {
+    generating: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    peer: String,
+    tokens: u64,
+}
+
+impl Drop for PaymentReservation {
+    fn drop(&mut self) {
+        let mut map = self.generating.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = map.get_mut(&self.peer) {
+            if let Some(i) = v.iter().position(|t| *t == self.tokens) {
+                v.swap_remove(i);
+            }
+            if v.is_empty() {
+                map.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// A verified on-chain claim a provider keeps per `(consumer, model)` to settle: the claim is the
+/// pair's (consumer from the key's receipt, this provider, the model) at `cumulative`, until
+/// `expires_at`; `signer` is the Base wallet that signed it (pinned per pair).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeptClaim {
+    cumulative: u64,
+    expires_at: u64,
+    signer: Option<[u8; 20]>,
+    sig: Vec<u8>,
+}
+
+impl KeptClaim {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut b = self.cumulative.to_le_bytes().to_vec();
+        b.extend_from_slice(&self.expires_at.to_le_bytes());
+        match self.signer {
+            Some(s) => {
+                b.push(1);
+                b.extend_from_slice(&s);
+            }
+            None => b.push(0),
+        }
+        b.extend_from_slice(&self.sig);
+        b
+    }
+
+    fn from_bytes(b: &[u8]) -> Option<Self> {
+        let cumulative = u64::from_le_bytes(b.get(..8)?.try_into().ok()?);
+        let expires_at = u64::from_le_bytes(b.get(8..16)?.try_into().ok()?);
+        let (signer, rest) = match b.get(16)? {
+            0 => (None, b.get(17..)?),
+            1 => (Some(b.get(17..37)?.try_into().ok()?), b.get(37..)?),
+            _ => return None,
+        };
+        Some(KeptClaim { cumulative, expires_at, signer, sig: rest.to_vec() })
+    }
 }
 
 /// Drop expired commitments from `map`, returning the peers whose serves they were: receipts that
@@ -334,7 +411,8 @@ fn prune_expired_commitments(map: &mut HashMap<[u8; 16], ServeCommitment>, now: 
     let mut unpaid = Vec::new();
     map.retain(|_, c| {
         let live = now.saturating_sub(c.recorded_ms) <= COMMITMENT_TTL_MS;
-        if !live {
+        // Only a serve its consumer received is its default; one it never got isn't its fault.
+        if !live && c.delivered {
             unpaid.push(c.served_peer.clone());
         }
         live
@@ -761,11 +839,16 @@ pub struct Provider<A: EngineAdapter> {
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
+    /// Paid serves generating now, per consumer: each one's token reservation (credit window).
+    paid_generating: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    /// Stream nonces whose consumer polled to the end before the serve was recorded (see
+    /// `ServeCommitment::delivered`), with when.
+    delivered_nonces: Mutex<HashMap<[u8; 16], u64>>,
     /// This machine's own gateway, when it runs under another identity (the desktop's): exempt from
     /// the payment gate, like our own peer id (it never settles with us).
     self_consumer: Option<String>,
     /// The on-chain claim kept with each `settled_receipts` entry (same key), on a settlement chain.
-    settled_claims: Mutex<HashMap<String, crate::receipt::ClaimSig>>,
+    settled_claims: Mutex<HashMap<String, KeptClaim>>,
     /// The on-chain deployment paying receipts settle on: a paying receipt is co-signed only with a
     /// valid claim for it (see `with_settlement_chain`).
     settlement_chain: Option<openhydra_protocol::settlement::ChainDomain>,
@@ -910,6 +993,8 @@ impl<A: EngineAdapter> Provider<A> {
             settled_claims: Mutex::new(HashMap::new()),
             settlement_chain: None,
             self_consumer: None,
+            paid_generating: Arc::new(Mutex::new(HashMap::new())),
+            delivered_nonces: Mutex::new(HashMap::new()),
             payment_defaults: Mutex::new(HashMap::new()),
             settlement_peg: None,
             receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
@@ -1058,43 +1143,82 @@ impl<A: EngineAdapter> Provider<A> {
     }
 
     /// The payment gate of a provider that charges (a settlement peg is configured): the request
-    /// must offer to pay at our peg, and its consumer must be within the credit window
-    /// ([`payment_window`]). Our own (co-located) consumer never settles with us and is exempt.
-    fn payment_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
-        let peg = self.settlement_peg?;
+    /// must offer to pay at our peg (on our deployment), and its consumer must be within the credit
+    /// window ([`payment_window`]). An admitted paid serve holds a [`PaymentReservation`] while it
+    /// runs. Our own (co-located) consumer never settles with us and is exempt. `Err` is the refusal.
+    fn payment_gate(&self, req: &ServeRequest, source_peer: &str) -> Result<Option<PaymentReservation>, Vec<u8>> {
+        let Some(peg) = self.settlement_peg else {
+            return Ok(None);
+        };
         if source_peer == self.net.libp2p_peer_id() || self.self_consumer.as_deref() == Some(source_peer) {
-            return None;
+            return Ok(None);
         }
         let refuse = |reason: String| {
-            Some(frame_response(&[ServeChunk::Error(format!("{}{reason}", crate::serve::PAYMENT_REFUSAL)).encode()]))
+            frame_response(&[ServeChunk::Error(format!("{}{reason}", crate::serve::PAYMENT_REFUSAL)).encode()])
         };
         if req.settlement_peg != Some(peg) {
-            return refuse(format!(
+            return Err(refuse(format!(
                 "this provider charges (settlement peg {peg} micro-USDC per credit); the request doesn't offer to pay it"
-            ));
+            )));
         }
         if let Some(chain) = &self.settlement_chain {
             if req.settlement_domain.as_deref() != Some(chain.fingerprint().as_str()) {
-                return refuse(format!(
+                return Err(refuse(format!(
                     "this provider settles on {} deployment {}; the request doesn't settle there",
                     chain.chain().label(),
                     chain.fingerprint()
-                ));
+                )));
             }
         }
         let now = now_unix_ms();
-        let unsettled: Vec<(u64, u64)> = {
+        let (unsettled, full): (Vec<(u64, u64)>, bool) = {
             let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
             self.note_defaults(prune_expired_commitments(&mut map, now), now);
-            map.values().filter(|c| c.served_peer == source_peer).map(|c| (c.recorded_ms, c.tokens)).collect()
+            let mine = map
+                .values()
+                .filter(|c| c.served_peer == source_peer && c.delivered)
+                .map(|c| (c.recorded_ms, c.tokens))
+                .collect();
+            (mine, map.len() >= MAX_COMMITMENTS)
         };
+        // A full commitment map can't record the serve, so it couldn't be paid for or seen.
+        if full {
+            return Err(refuse("this provider has too many unpaid serves outstanding; retry later".into()));
+        }
         let defaults = self
             .payment_defaults
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(source_peer)
             .map_or(0, |at| at.iter().filter(|t| now.saturating_sub(**t) <= DEFAULT_WINDOW_MS).count());
-        payment_window(&unsettled, defaults, now).err().and_then(refuse)
+        let tokens = req.max_tokens.map_or(DEFAULT_RESERVE_TOKENS, u64::from);
+        let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
+        let running = generating.get(source_peer).cloned().unwrap_or_default();
+        payment_window(&unsettled, &running, defaults, now).map_err(refuse)?;
+        generating.entry(source_peer.to_string()).or_default().push(tokens);
+        Ok(Some(PaymentReservation {
+            generating: Arc::clone(&self.paid_generating),
+            peer: source_peer.to_string(),
+            tokens,
+        }))
+    }
+
+    /// The consumer got this serve's whole completion (its stream polled to the end, or a fetch by
+    /// nonce returned it): mark its commitment delivered, or remember it for when it is recorded.
+    fn mark_delivered(&self, nonce: [u8; 16]) {
+        {
+            let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = map.get_mut(&nonce) {
+                c.delivered = true;
+                return;
+            }
+        }
+        let now = now_unix_ms();
+        let mut d = self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|_, at| now.saturating_sub(*at) <= COMMITMENT_TTL_MS);
+        if d.len() < MAX_COMMITMENTS {
+            d.insert(nonce, now);
+        }
     }
 
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
@@ -1206,14 +1330,16 @@ impl<A: EngineAdapter> Provider<A> {
     /// B-S1: record what we just served under the consumer's committed nonce, so the
     /// settlement receipt can be validated against it. Prunes expired commitments and
     /// enforces a hard cap so the map stays bounded (B-S7).
-    fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64, served_peer: &str) {
+    fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64, served_peer: &str, delivered: bool) {
         let now = now_unix_ms();
+        // A stream polled to its end before we got here was delivered too.
+        let delivered = delivered || self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce).is_some();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         self.note_defaults(prune_expired_commitments(&mut map, now), now);
         if map.len() >= MAX_COMMITMENTS {
             return; // backstop — refuse to grow past the cap (stale entries already pruned)
         }
-        map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string() });
+        map.insert(nonce, ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string(), delivered });
     }
 
     /// Reconnect-and-fetch: mark a serve in-flight under `nonce` so a fetch that arrives
@@ -1270,9 +1396,15 @@ impl<A: EngineAdapter> Provider<A> {
             Err(_) => return FetchResponse::NotFound.encode(),
         };
         let now = now_unix_ms();
-        let mut map = self.results.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
-        fetch_from_buffer(&map, &nonce, source_peer).encode()
+        let resp = {
+            let mut map = self.results.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
+            fetch_from_buffer(&map, &nonce, source_peer)
+        };
+        if matches!(resp, FetchResponse::Ready(_)) {
+            self.mark_delivered(nonce);
+        }
+        resp.encode()
     }
 
     /// P1 streaming: admit a new stream under `nonce` (empty, `done=false`). Called at the start
@@ -1312,9 +1444,16 @@ impl<A: EngineAdapter> Provider<A> {
                 .encode();
         }
         let now = now_unix_ms();
-        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
-        fetch_chunks_from(&mut map, &nonce, source_peer, offset, now).encode()
+        let resp = {
+            let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
+            fetch_chunks_from(&mut map, &nonce, source_peer, offset, now)
+        };
+        // The consumer reached the end of the stream: it got the whole completion.
+        if matches!(resp, FetchChunksResponse::Chunks { done: true, .. }) {
+            self.mark_delivered(nonce);
+        }
+        resp.encode()
     }
 
     /// P1 streaming: the single pool job for a `SERVE_STREAM`. It gates (throttle/AUP/share)
@@ -1391,10 +1530,13 @@ impl<A: EngineAdapter> Provider<A> {
             return;
         }
         // A provider that charges: the consumer must offer to pay, and have paid for what it had.
-        if let Some(refusal) = self.payment_refusal(&req, &source_peer) {
-            respond_done(refusal, 1);
-            return;
-        }
+        let _reservation = match self.payment_gate(&req, &source_peer) {
+            Ok(r) => r,
+            Err(refusal) => {
+                respond_done(refusal, 1);
+                return;
+            }
+        };
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -1416,7 +1558,7 @@ impl<A: EngineAdapter> Provider<A> {
         // B-S1: record what we served under the committed nonce so its settlement receipt can be
         // validated (right tokens/model, once) — identical to the buffered path.
         if summary.ok && summary.tokens > 0 {
-            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer);
+            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, false);
         }
         if let Some(stats) = &self.stats {
             let e = &summary.metrics.engine;
@@ -1452,9 +1594,25 @@ impl<A: EngineAdapter> Provider<A> {
         )
     }
 
-    /// The `(consumer, model)` key for the provider-side settled-cumulative map (review F2).
-    fn settled_key(p: &openhydra_protocol::receipts::ReceiptPayload) -> String {
-        openhydra_protocol::verify::reputation_key(&hex::encode(p.consumer.as_bytes()), &p.model_id)
+    /// The `(consumer, model)` key for the provider-side settled-cumulative map (review F2), scoped to
+    /// the deployment paying receipts settle on: each deployment's escrow starts from nothing, so a
+    /// running total built under one must not carry over to another (the first claim there would
+    /// re-authorize the whole history).
+    fn settled_key(&self, p: &openhydra_protocol::receipts::ReceiptPayload) -> String {
+        let key = openhydra_protocol::verify::reputation_key(&hex::encode(p.consumer.as_bytes()), &p.model_id);
+        match &self.settlement_chain {
+            Some(chain) => format!("{key}@{}", chain.fingerprint()),
+            None => key,
+        }
+    }
+
+    /// The receipt must come from its consumer: the peer its key derives, authenticated as the sender.
+    fn check_sender(&self, p: &openhydra_protocol::receipts::ReceiptPayload, source_peer: &str) -> Result<(), String> {
+        let consumer_peer = self.net.peer_id_from_ed25519_pubkey(p.consumer.as_bytes())?;
+        if consumer_peer != source_peer {
+            return Err("receipt is not from the consumer that signed it".into());
+        }
+        Ok(())
     }
 
     /// Review F2: validate a receipt's `cumulative_amount` against the last one we co-signed for this
@@ -1480,7 +1638,7 @@ impl<A: EngineAdapter> Provider<A> {
             p.peg_micros_per_credit,
             self.settlement_peg,
         )?;
-        let key = Self::settled_key(p);
+        let key = self.settled_key(p);
         let last = self
             .settled_cumulative
             .lock()
@@ -1514,31 +1672,48 @@ impl<A: EngineAdapter> Provider<A> {
     /// (review F2). Monotonic `max`, so a concurrent or out-of-order co-sign can't lower it;
     /// best-effort persisted so a restart can't accept a lower/replayed cumulative.
     /// On a settlement chain, a paying receipt must carry the consumer's valid on-chain claim for it.
+    /// Returns the claim to keep (`None` off-chain). On Base the wallet that signs a pair's claims is
+    /// pinned at its first claim: a claim from another wallet (one with no channel, say) would replace
+    /// a settleable claim with a worthless one.
     fn check_settlement_claim(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
         claim: Option<&crate::receipt::ClaimSig>,
-    ) -> Result<(), String> {
-        let (Some(chain), Some(_)) = (&self.settlement_chain, p.cumulative_amount) else {
-            return Ok(());
+    ) -> Result<Option<KeptClaim>, String> {
+        let (Some(chain), Some(cumulative)) = (&self.settlement_chain, p.cumulative_amount) else {
+            return Ok(None);
         };
         let c = claim.ok_or("this provider settles on-chain: the receipt carries no claim")?;
         let settlement = crate::receipt::claim_for(p, c.expires_at).ok_or("no cumulative")?;
-        openhydra_protocol::settlement::verify_claim(chain, &settlement, &c.sig, now_unix_ms() / 1000)
-            .map(|_| ())
-            .map_err(|e| format!("the receipt's on-chain claim is not valid here: {e:?}"))
+        let signer = openhydra_protocol::settlement::verify_claim(chain, &settlement, &c.sig, now_unix_ms() / 1000)
+            .map_err(|e| format!("the receipt's on-chain claim is not valid here: {e:?}"))?;
+        let signer = match signer {
+            openhydra_protocol::settlement::ClaimSigner::Evm(addr) => Some(addr),
+            openhydra_protocol::settlement::ClaimSigner::Solana => None,
+        };
+        let pinned = self.settled_claims.lock().unwrap_or_else(|e| e.into_inner()).get(&self.settled_key(p)).and_then(|k| k.signer);
+        if let (Some(pinned), Some(signer)) = (pinned, signer) {
+            if pinned != signer {
+                return Err(format!(
+                    "this pair's claims are signed by wallet 0x{}, not 0x{}",
+                    hex::encode(pinned),
+                    hex::encode(signer)
+                ));
+            }
+        }
+        Ok(Some(KeptClaim { cumulative, expires_at: c.expires_at, signer, sig: c.sig.clone() }))
     }
 
     fn record_settlement_cumulative(
         &self,
         receipt: &openhydra_protocol::receipts::CoSignedReceipt,
-        claim: Option<&crate::receipt::ClaimSig>,
+        claim: Option<&KeptClaim>,
     ) {
         let p = &receipt.payload;
         let Some(cumulative) = p.cumulative_amount else {
             return;
         };
-        let key = Self::settled_key(p);
+        let key = self.settled_key(p);
         let raised = {
             let mut map = match self.settled_cumulative.lock() {
                 Ok(m) => m,
@@ -1554,21 +1729,16 @@ impl<A: EngineAdapter> Provider<A> {
             return;
         }
         self.settled_receipts.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), receipt.clone());
-        {
-            let mut claims = self.settled_claims.lock().unwrap_or_else(|e| e.into_inner());
-            match claim {
-                Some(c) => {
-                    tracing::debug!(consumer = %hex::encode(p.consumer.as_bytes()), provider = %hex::encode(p.provider.as_bytes()),
-                        model = %p.model_id, cumulative, expires_at = c.expires_at, sig = %hex::encode(&c.sig),
-                        "kept the on-chain claim");
-                    claims.insert(key.clone(), c.clone())
-                }
-                None => claims.remove(&key),
-            };
+        // A verified claim replaces the kept one; a receipt without one leaves it (still settleable).
+        if let Some(c) = claim {
+            tracing::debug!(consumer = %hex::encode(p.consumer.as_bytes()), provider = %hex::encode(p.provider.as_bytes()),
+                model = %p.model_id, cumulative, expires_at = c.expires_at, sig = %hex::encode(&c.sig),
+                "kept the on-chain claim");
+            self.settled_claims.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), c.clone());
         }
         if let Some(store) = &self.store {
-            let claim = claim.map(|c| (c.expires_at, c.sig.as_slice()));
-            if let Err(e) = store.put_provider_settled_receipt(&key, cumulative, receipt, claim) {
+            let blob = claim.map(KeptClaim::to_bytes);
+            if let Err(e) = store.put_provider_settled_receipt(&key, cumulative, receipt, blob.as_deref()) {
                 eprintln!("openhydra-agent: settled-cumulative persist failed: {e}");
             }
         }
@@ -1604,11 +1774,12 @@ impl<A: EngineAdapter> Provider<A> {
         if let Ok(mut map) = self.settled_claims.lock() {
             let mut raw = HashMap::new();
             match store.load_provider_settled_claims_into_memory(&mut raw) {
-                Ok(skipped) => {
-                    if skipped > 0 {
-                        eprintln!("openhydra-agent: skipped {skipped} undecodable settled claim(s) on rehydrate");
+                Ok(()) => {
+                    let total = raw.len();
+                    map.extend(raw.into_iter().filter_map(|(k, b)| KeptClaim::from_bytes(&b).map(|c| (k, c))));
+                    if map.len() < total {
+                        eprintln!("openhydra-agent: skipped {} undecodable settled claim(s) on rehydrate", total - map.len());
                     }
-                    map.extend(raw.into_iter().map(|(k, (expires_at, sig))| (k, crate::receipt::ClaimSig { expires_at, sig })));
                 }
                 Err(e) => eprintln!("openhydra-agent: could not rehydrate settled claims from store: {e}"),
             }
@@ -2146,16 +2317,17 @@ impl<A: EngineAdapter> Provider<A> {
             // signing; only publicly-announced models are attestable (a private or unshared model
             // gets the same refusal, so a challenge can't probe for private models).
             Some(&ATTEST_CHALLENGE) => {
-                if self.attest_rl.try_acquire(source_peer, now_unix_ms()).is_err()
-                    || self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_err()
-                {
-                    return attest_refusal("attestation rate limited, retry");
+                if self.attest_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+                    return attest_refusal(crate::attest::ATTEST_RATE_LIMITED);
                 }
-                handle_attest_inbound(
+                // The provider-wide cap is spent only on a challenge about to be signed, so ones
+                // refused anyway (no attestor, a model not attestable, malformed) can't drain it.
+                crate::attest::handle_attest_inbound_limited(
                     &data[1..],
                     self.attestor.as_deref(),
                     &|model| self.policy.announce_globally(model),
                     now_unix_ms(),
+                    &|| self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok(),
                 )
             }
             // Prompt-scoring challenge (Track A2-Logprob): opt-in, per-peer rate-limited, and capped
@@ -2201,10 +2373,12 @@ impl<A: EngineAdapter> Provider<A> {
                 // The claim that came with the receipt, kept once it is co-signed.
                 let accepted_claim = std::cell::RefCell::new(None);
                 let bind = |p: &openhydra_protocol::receipts::ReceiptPayload, claim: Option<&crate::receipt::ClaimSig>| {
+                    // From its own consumer first: nothing (not even a BEHIND reply) for a replay.
+                    self.check_sender(p, source_peer).map_err(BindRejection::from)?;
                     self.validate_settlement_cumulative(p)?;
-                    self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
+                    let kept = self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
                     self.check_and_consume_commitment(p, source_peer).map_err(BindRejection::from)?;
-                    *accepted_claim.borrow_mut() = claim.cloned();
+                    *accepted_claim.borrow_mut() = kept;
                     Ok(())
                 };
                 // Validate, co-sign and record as one step (see `receipt_lock`).
@@ -2266,9 +2440,10 @@ impl<A: EngineAdapter> Provider<A> {
                         if let Some(refusal) = self.scope_refusal(&req, source_peer) {
                             return refusal;
                         }
-                        if let Some(refusal) = self.payment_refusal(&req, source_peer) {
-                            return refusal;
-                        }
+                        let _reservation = match self.payment_gate(&req, source_peer) {
+                            Ok(r) => r,
+                            Err(refusal) => return refusal,
+                        };
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -2294,7 +2469,7 @@ impl<A: EngineAdapter> Provider<A> {
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once).
                         if summary.ok && summary.tokens > 0 {
-                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer);
+                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, true);
                         }
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
@@ -2752,7 +2927,7 @@ mod tests {
     // ---- B-S1 / B-S7: serve-commitment binding ---------------------------------------
 
     fn commit(map: &mut HashMap<[u8; 16], ServeCommitment>, n: [u8; 16], model: &str, tokens: u64, now: u64) {
-        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now, served_peer: "c".into() });
+        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now, served_peer: "c".into(), delivered: true });
     }
 
     #[test]
@@ -2798,21 +2973,32 @@ mod tests {
     #[test]
     fn the_credit_window_bounds_what_a_consumer_takes_unpaid() {
         let now = 10 * DEFAULT_WINDOW_MS;
-        assert!(payment_window(&[], 0, now).is_ok());
+        assert!(payment_window(&[], &[], 0, now).is_ok());
         // A serve just finished, its receipt on the way: fine.
-        assert!(payment_window(&[(now - 5_000, 500)], 0, now).is_ok());
+        assert!(payment_window(&[(now - 5_000, 500)], &[], 0, now).is_ok());
         // One unpaid past the grace period: no more serves.
-        assert!(payment_window(&[(now - SETTLE_GRACE_MS - 1, 500)], 0, now).is_err());
+        assert!(payment_window(&[(now - SETTLE_GRACE_MS - 1, 500)], &[], 0, now).is_err());
         // Many parallel serves, none paid yet: capped by tokens.
         let burst: Vec<(u64, u64)> = (0..40).map(|_| (now - 1_000, 2_000)).collect();
-        assert!(payment_window(&burst, 0, now).is_err());
+        assert!(payment_window(&burst, &[], 0, now).is_err());
         // Repeated defaults.
-        assert!(payment_window(&[], MAX_DEFAULTS - 1, now).is_ok());
-        assert!(payment_window(&[], MAX_DEFAULTS, now).is_err());
+        assert!(payment_window(&[], &[], MAX_DEFAULTS - 1, now).is_ok());
+        assert!(payment_window(&[], &[], MAX_DEFAULTS, now).is_err());
+        // Paid serves still running count: too many at once, or reserving too many tokens.
+        assert!(payment_window(&[], &[100; MAX_UNPAID_CONCURRENT - 1], 0, now).is_ok());
+        assert!(payment_window(&[], &[100; MAX_UNPAID_CONCURRENT], 0, now).is_err());
+        assert!(payment_window(&[(now, 60_000)], &[8_000], 0, now).is_err());
+        // A kept claim survives its encoding.
+        let kc = KeptClaim { cumulative: 9, expires_at: 10, signer: Some([3; 20]), sig: vec![1; 65] };
+        assert_eq!(KeptClaim::from_bytes(&kc.to_bytes()), Some(kc));
+        let ks = KeptClaim { cumulative: 9, expires_at: 10, signer: None, sig: vec![1; 64] };
+        assert_eq!(KeptClaim::from_bytes(&ks.to_bytes()), Some(ks));
         // An expired commitment is a receipt that never came: pruned, and its peer reported.
         let mut map = HashMap::new();
-        map.insert([1u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "c".into() });
-        map.insert([2u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: now, served_peer: "d".into() });
+        map.insert([1u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "c".into(), delivered: true });
+        map.insert([2u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: now, served_peer: "d".into(), delivered: true });
+        // A serve its consumer never got (a stream it gave up on) expires without counting against it.
+        map.insert([3u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "e".into(), delivered: false });
         assert_eq!(prune_expired_commitments(&mut map, now), vec!["c".to_string()]);
         assert_eq!(map.len(), 1);
     }

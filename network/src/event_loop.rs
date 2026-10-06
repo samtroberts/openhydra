@@ -3148,9 +3148,11 @@ fn handle_kad_event(
                     if let Some(pending) = state.pending_discovers.get_mut(&id) {
                         for provider_pid in providers {
                             let pid_str = provider_pid.to_base58();
-                            // 1. Check known_peers cache (lookup by libp2p_peer_id field)
+                            // 1. Check known_peers cache: this provider's record FOR THIS MODEL (a
+                            //    provider of several models has one record each; another model's
+                            //    would answer this discover with the wrong model).
                             let cached = state.known_peers.values()
-                                .find(|r| r.libp2p_peer_id == pid_str)
+                                .find(|r| r.libp2p_peer_id == pid_str && r.model_id == pending.model_id)
                                 .cloned();
                             if let Some(record) = cached {
                                 // Deduplicate: don't add if already in results

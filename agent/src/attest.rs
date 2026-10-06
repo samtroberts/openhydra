@@ -180,6 +180,22 @@ pub fn handle_attest_inbound(
     attestable: &dyn Fn(&str) -> bool,
     now_unix_ms: u64,
 ) -> Vec<u8> {
+    handle_attest_inbound_limited(body, attestor, attestable, now_unix_ms, &|| true)
+}
+
+/// The refusal text of a challenge declined for load ([`handle_attest_inbound_limited`]): transient,
+/// so a consumer keeps what it had verified rather than dropping the badge.
+pub const ATTEST_RATE_LIMITED: &str = "attestation rate limited, retry";
+
+/// [`handle_attest_inbound`], with `may_sign` asked right before a signature is made (a provider-wide
+/// rate limit): a challenge refused for any other reason doesn't use it up.
+pub fn handle_attest_inbound_limited(
+    body: &[u8],
+    attestor: Option<&Attestor>,
+    attestable: &dyn Fn(&str) -> bool,
+    now_unix_ms: u64,
+    may_sign: &dyn Fn() -> bool,
+) -> Vec<u8> {
     let Some(attestor) = attestor else {
         return attest_response(RESP_REFUSED, b"attestation not offered by this provider");
     };
@@ -188,6 +204,9 @@ pub fn handle_attest_inbound(
     };
     if !attestable(&model) {
         return attest_response(RESP_REFUSED, b"model not attestable here");
+    }
+    if !may_sign() {
+        return attest_response(RESP_REFUSED, ATTEST_RATE_LIMITED.as_bytes());
     }
     match attestor.attest(&model, nonce, now_unix_ms) {
         Ok(att) => attest_response(RESP_OK, &att.to_bytes()),
@@ -465,6 +484,14 @@ pub fn attest_provider(
     let att = match request_attestation(transport, nonce, model_id) {
         Ok(att) => att,
         Err(ChallengeError::Unsupported) => return failed(AttestOutcome::Unsupported),
+        // Declined for load: keep what was verified (it still expires on its own), and try again
+        // when next due rather than dropping the badge.
+        Err(ChallengeError::Refused(r)) if r == ATTEST_RATE_LIMITED => {
+            if let Some(p) = prev {
+                return p.clone();
+            }
+            return failed(AttestOutcome::Failed(bounded_reason(&r)));
+        }
         Err(e) => return failed(AttestOutcome::Failed(bounded_reason(&format!("{e:?}")))),
     };
     let policy = AttestPolicy {
@@ -640,6 +667,31 @@ mod tests {
         insert_record_bounded(&mut full, "new".into(), record(NOW), NOW + 10);
         assert_eq!(full.len(), MAX_ATTEST_RECORDS);
         assert!(!full.contains_key("p0"));
+    }
+
+    #[test]
+    fn a_load_refusal_keeps_the_verified_record_and_spends_nothing_on_other_refusals() {
+        let attestor = software_attestor();
+        let signs = std::cell::Cell::new(0);
+        let limit = || {
+            signs.set(signs.get() + 1);
+            false
+        };
+        // Refused before signing (model not attestable): the limiter isn't consulted.
+        handle_attest_inbound_limited(&encode_challenge(&[1; 32], "private")[1..], Some(&attestor), &|_| false, NOW, &limit);
+        assert_eq!(signs.get(), 0);
+        let reply = handle_attest_inbound_limited(&encode_challenge(&[1; 32], "m")[1..], Some(&attestor), &|_| true, NOW, &limit);
+        assert_eq!(signs.get(), 1);
+        // A consumer that had verified this provider keeps that record through a load refusal.
+        let prev = AttestRecord {
+            last_attempt_ms: NOW - 1,
+            outcome: AttestOutcome::Verified(DeviceTrust::SelfSigned),
+            key: None,
+            key_rotations: 0,
+        };
+        let mut t = |_: &[u8]| Ok(reply.clone());
+        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], Some(&prev));
+        assert_eq!(rec.device_trust(NOW), Some(DeviceTrust::SelfSigned));
     }
 
     #[test]

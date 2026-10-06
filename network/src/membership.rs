@@ -419,7 +419,6 @@ pub fn verify_credential(
     let group_pk = ed_pubkey_from_hex(&cred.swarm_public_key)?;
     let sig = b64_decode(&cred.signature)?;
     verify_with_alg(alg, &group_pk, &cred_canonical_bytes(cred), &sig)?;
-    check_member_id(&cred.member_openhydra_peer_id, &cred.member_public_key)?;
     // Fail-closed on capability bits this build doesn't understand: even with a valid owner signature,
     // a credential granting a future/unknown capability is rejected rather than honoured partially, so
     // an old binary can't be handed a capability it can't reason about. (Schema-1 creds default to the
@@ -454,7 +453,15 @@ pub fn verify_credential(
     if now_ms >= cred.expires_at {
         return Err(MembershipError::Expired { expires_at: cred.expires_at, now_ms });
     }
-    Ok(VerifiedCredential { credential: cred.clone() })
+    // The member id is display only, and an owner may have issued this credential before ids were
+    // derived from keys: accept it, but carry the id the key derives, so nothing shows another
+    // machine's id. (Requests are checked strictly when signed and approved.)
+    let mut credential = cred.clone();
+    if check_member_id(&credential.member_openhydra_peer_id, &credential.member_public_key).is_err() {
+        credential.member_openhydra_peer_id =
+            crate::identity::openhydra_peer_id(&ed_pubkey_from_hex(&credential.member_public_key)?.to_bytes());
+    }
+    Ok(VerifiedCredential { credential })
 }
 
 /// Verify a credential AND bind it to an expected member public key (hex) — the convenience the M4
@@ -1157,13 +1164,12 @@ mod tests {
         // Another machine's id: refused when signing a request…
         let spoof = EnrollmentRequest::new_unsigned(id_of(&other), "", "ok", issued());
         assert!(matches!(sign_enrollment_request(spoof, &member), Err(MembershipError::Malformed(_))));
-        // …and when verifying a credential an owner signed with it anyway.
+        // A credential an owner signed with another id anyway (or before ids were derived): still
+        // valid, but it carries the member's own id.
         let cred = MembershipCredential::new_unsigned(pubkey_hex(&member), id_of(&other), "Home rig", issued(), expires());
         let signed = sign_credential(cred, &group).unwrap();
-        assert!(matches!(
-            verify_credential(&signed, now_before_expiry(), &no_revocations()),
-            Err(MembershipError::Malformed(_))
-        ));
+        let verified = verify_credential(&signed, now_before_expiry(), &no_revocations()).unwrap();
+        assert_eq!(verified.credential.member_openhydra_peer_id, id_of(&member));
     }
 
     #[test]
