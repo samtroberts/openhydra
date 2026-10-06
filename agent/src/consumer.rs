@@ -1985,13 +1985,22 @@ impl ConsumerNode {
             }
             // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
             // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
-            if settled_earlier {
-                node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
-            } else if outcome.is_ok() {
-                node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
-                if let Some((split, _)) = voucher {
-                    node.commit_gated_voucher(&vkey, split);
+            match outcome {
+                _ if settled_earlier => {
+                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
                 }
+                Ok(receipt) => {
+                    tracing::debug!(provider = %peer_id, tokens, cumulative = ?receipt.payload.cumulative_amount,
+                        "receipt co-signed");
+                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
+                    if let Some((split, _)) = voucher {
+                        node.commit_gated_voucher(&vkey, split);
+                    }
+                }
+                Err(ReceiptFailure::Failed(e)) => {
+                    tracing::warn!(provider = %peer_id, tokens, error = %e, "receipt not co-signed");
+                }
+                Err(ReceiptFailure::Behind(_)) => {} // handled above (logged there)
             }
         });
     }
