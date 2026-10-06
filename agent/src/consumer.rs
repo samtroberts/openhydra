@@ -258,6 +258,8 @@ struct ProviderLogprob {
     /// The scorer binary that counts delivered tokens with a reference's tokenizer (P7), when some
     /// reference carries one (`vocab`) and the binary is there.
     count_scorer: Option<std::path::PathBuf>,
+    /// Counts running now (bounded by [`crate::token_count::MAX_CONCURRENT_COUNTS`]).
+    counts_running: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProviderLogprob {
@@ -1006,6 +1008,7 @@ impl ConsumerNode {
             status: Mutex::new(status),
             inflight: Mutex::new(std::collections::HashSet::new()),
             count_scorer,
+            counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }));
         self
     }
@@ -1035,14 +1038,24 @@ impl ConsumerNode {
         counter: (std::path::PathBuf, std::path::PathBuf),
         text: String,
         tool_calls: Vec<crate::adapter::ToolCall>,
+        offered: std::collections::HashSet<String>,
         billed: u64,
         state_id: String,
         model_key: String,
     ) {
+        // Bounded: a busy gateway skips the check rather than piling up scorer processes.
+        let Some(slot) = self
+            .provider_logprob
+            .as_ref()
+            .and_then(|lp| crate::token_count::CountSlot::try_take(&lp.counts_running))
+        else {
+            return;
+        };
         let node = Arc::clone(self);
         std::thread::spawn(move || {
+            let _slot = slot;
             let (scorer, vocab) = counter;
-            let (countable, calls) = crate::token_count::countable_text(&text, &tool_calls);
+            let (countable, calls) = crate::token_count::countable_text(&text, &tool_calls, &offered);
             match crate::token_count::count_tokens(&scorer, &vocab, &countable) {
                 Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
                     tracing::warn!(provider = %state_id, model = %model_key, billed, counted,
@@ -1050,7 +1063,8 @@ impl ConsumerNode {
                     node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
                 }
                 Ok(counted) => tracing::debug!(provider = %state_id, billed, counted, "billed token count checks out"),
-                Err(e) => tracing::debug!(error = %e, "couldn't count delivered tokens"),
+                // Visible: a vocabulary that won't load turns the check off for its model.
+                Err(e) => tracing::warn!(error = %e, vocab = %vocab.display(), "couldn't count delivered tokens"),
             }
         });
     }
@@ -1722,14 +1736,23 @@ impl ConsumerNode {
                 .then(|| self.token_counter_for(&provider, model_key_now))
                 .flatten();
             let captured = std::cell::RefCell::new(String::new());
+            // Set once the text outgrew `MAX_COUNTED_BYTES`: no longer kept, and not checked.
+            let overflowed = std::cell::Cell::new(false);
             let result = {
                 let mut guarded = |d: &str| {
                     delivered = true;
                     let mut t = delivered_text.get();
                     t.push(d);
                     delivered_text.set(t);
-                    if counter.is_some() {
-                        captured.borrow_mut().push_str(d);
+                    if counter.is_some() && !overflowed.get() {
+                        let mut c = captured.borrow_mut();
+                        if c.len() + d.len() <= crate::token_count::MAX_COUNTED_BYTES {
+                            c.push_str(d);
+                        } else {
+                            // Too long to count: stop keeping it, and don't check this serve.
+                            overflowed.set(true);
+                            *c = String::new();
+                        }
                     }
                     on_delta(d);
                 };
@@ -1822,7 +1845,7 @@ impl ConsumerNode {
                         // count it computes from the same text (an honest one reports exactly this).
                         // The usage we report and record is that count too.
                         let delivered = delivered_text.get().units()
-                            + crate::serve::tool_call_units(&summary.tool_calls);
+                            + crate::serve::tool_call_units(&summary.tool_calls, &crate::serve::offered_tool_names(tools));
                         let tokens = crate::serve::billable_tokens(summary.tokens, max_tokens, delivered);
                         if tokens < summary.tokens {
                             over_reported = over_reported_by_billing(&summary, tokens);
@@ -1832,11 +1855,12 @@ impl ConsumerNode {
                             summary.tokens = tokens;
                         }
                         self.settle_receipt(&provider, tokens, nonce);
-                        if let Some(counter) = counter {
+                        if let Some(counter) = counter.filter(|_| !overflowed.get()) {
                             self.check_billed_tokens(
                                 counter,
                                 captured.take(),
                                 summary.tool_calls.clone(),
+                                crate::serve::offered_tool_names(tools),
                                 tokens,
                                 provider.state_id.clone(),
                                 model_key_now.to_string(),
@@ -1895,7 +1919,8 @@ impl ConsumerNode {
                     // M2.2(a): a failed/refused serve attempt costs the provider
                     // reputation, so a dead/erroring one is downranked on the next discover.
                     // #7: never ding our own provider's reputation on a self-serve.
-                    if !self.is_self_serve(&provider.libp2p_peer_id) {
+                    // A provider that charges refusing us over payment did nothing wrong: no penalty.
+                    if !self.is_self_serve(&provider.libp2p_peer_id) && !crate::serve::is_payment_refusal(&e.to_string()) {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                         self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
                     }
@@ -2550,7 +2575,7 @@ impl ConsumerNode {
         // Pay for the probe as for any serve: the provider did the work, and an unpaid audit would
         // stand out (and, at a provider that charges, count as a serve never paid for).
         if summary.ok && summary.tokens > 0 && !self.is_self_serve(&provider.libp2p_peer_id) {
-            let units = delivered.units() + crate::serve::tool_call_units(&summary.tool_calls);
+            let units = delivered.units() + crate::serve::tool_call_units(&summary.tool_calls, &crate::serve::offered_tool_names(&request.tools));
             let tokens = crate::serve::billable_tokens(summary.tokens, request.max_tokens, units);
             self.settle_receipt(provider, tokens, request.nonce);
         }

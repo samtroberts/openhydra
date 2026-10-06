@@ -48,6 +48,15 @@ pub struct ServeMetrics {
 /// The billing rule this build follows: the reported count is [`billable_tokens`].
 pub const BILLING_VERSION: u8 = 2;
 
+/// How a provider that charges starts the error refusing a serve over payment (the consumer's offer
+/// or its unpaid serves). A consumer doesn't hold it against the provider: it is a price, not a fault.
+pub const PAYMENT_REFUSAL: &str = "payment required: ";
+
+/// Whether a serve error is a [`PAYMENT_REFUSAL`].
+pub fn is_payment_refusal(error: &str) -> bool {
+    error.contains(PAYMENT_REFUSAL)
+}
+
 /// Tokens with no text of their own (end-of-turn and other special markers) allowed on top of the
 /// delivered text in [`billable_tokens`].
 pub const BILLABLE_TOKEN_SLACK: u64 = 16;
@@ -55,27 +64,34 @@ pub const BILLABLE_TOKEN_SLACK: u64 = 16;
 /// name and arguments), which the engine generates but neither side sees as text.
 pub const TOOL_CALL_TOKEN_ALLOWANCE: u64 = 32;
 
+/// Whitespace characters one unit of a whitespace run stands for: tokenizers merge runs of spaces
+/// and newlines into tokens of up to about this length, so a long run (deep indentation, a table)
+/// is still paid for, while padding is worth a sixteenth of its size.
+const WHITESPACE_PER_UNIT: u64 = 16;
+
 /// A measure of generated text that bounds the tokens it could have taken: the UTF-8 bytes of its
-/// non-whitespace characters, plus one per run of whitespace. Every token decodes to at least one
-/// byte, and a run of whitespace counts once, so padding (spaces in tool-call arguments, blank lines
-/// in a reasoning block) adds nothing. Fed delta by delta; a run split across two deltas is one run.
+/// non-whitespace characters, plus one per [`WHITESPACE_PER_UNIT`] characters of each run of
+/// whitespace. Every token decodes to at least one byte, and whitespace tokens merge runs, so padding
+/// (spaces in tool-call arguments, blank lines in a reasoning block) adds little. Fed delta by delta;
+/// a run split across two deltas is one run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeliveredText {
     units: u64,
-    in_whitespace: bool,
+    /// Length of the whitespace run the text currently ends in (0 = not in one).
+    run: u64,
 }
 
 impl DeliveredText {
     pub fn push(&mut self, text: &str) {
         for c in text.chars() {
             if c.is_whitespace() {
-                if !self.in_whitespace {
+                if self.run % WHITESPACE_PER_UNIT == 0 {
                     self.units += 1;
-                    self.in_whitespace = true;
                 }
+                self.run += 1;
             } else {
                 self.units += c.len_utf8() as u64;
-                self.in_whitespace = false;
+                self.run = 0;
             }
         }
     }
@@ -85,9 +101,24 @@ impl DeliveredText {
     }
 }
 
-/// [`DeliveredText`] units of `tool_calls` (name and arguments) plus each call's
-/// [`TOOL_CALL_TOKEN_ALLOWANCE`].
-pub fn tool_call_units(tool_calls: &[ToolCall]) -> u64 {
+/// The most tool calls in one completion that earn [`TOOL_CALL_TOKEN_ALLOWANCE`].
+pub const MAX_ALLOWED_TOOL_CALLS: usize = 16;
+
+/// The function names a request's OpenAI `tools` offer.
+pub fn offered_tool_names(tools: &[Value]) -> std::collections::HashSet<String> {
+    tools
+        .iter()
+        .filter_map(|t| t.get("function").and_then(|f| f.get("name")).or_else(|| t.get("name")))
+        .filter_map(|n| n.as_str().map(str::to_string))
+        .collect()
+}
+
+/// [`DeliveredText`] units of `tool_calls` (name and arguments), plus [`TOOL_CALL_TOKEN_ALLOWANCE`]
+/// for each call to a tool the request offered (`offered`, [`offered_tool_names`]), for at most
+/// [`MAX_ALLOWED_TOOL_CALLS`] calls: a call to nothing offered, or past the cap, is billed for its
+/// text only, so made-up calls can't pad a bill.
+pub fn tool_call_units(tool_calls: &[ToolCall], offered: &std::collections::HashSet<String>) -> u64 {
+    let mut allowed = 0usize;
     tool_calls
         .iter()
         .map(|c| {
@@ -95,7 +126,13 @@ pub fn tool_call_units(tool_calls: &[ToolCall]) -> u64 {
             t.push(&c.function.name);
             let mut a = DeliveredText::default();
             a.push(&c.function.arguments);
-            t.units() + a.units() + TOOL_CALL_TOKEN_ALLOWANCE
+            let allowance = if offered.contains(&c.function.name) && allowed < MAX_ALLOWED_TOOL_CALLS {
+                allowed += 1;
+                TOOL_CALL_TOKEN_ALLOWANCE
+            } else {
+                0
+            };
+            t.units() + a.units() + allowance
         })
         .sum()
 }
@@ -343,6 +380,7 @@ pub fn handle_serve_request_parsed(
         return ServeSummary { ok: false, ..Default::default() };
     }
     let max_tokens = req.max_tokens;
+    let offered = offered_tool_names(&req.tools);
     let (temperature, seed) = match req.deterministic {
         Some(d) => (Some(0.0), Some(d.seed)),
         None => (req.temperature, None),
@@ -384,7 +422,7 @@ pub fn handle_serve_request_parsed(
             // Reported and committed to (and so paid) is the billable count, not the engine's:
             // the engine's own count stays in `metrics.engine`.
             let tokens =
-                billable_tokens(o.tokens, max_tokens, delivered.units() + tool_call_units(&o.tool_calls));
+                billable_tokens(o.tokens, max_tokens, delivered.units() + tool_call_units(&o.tool_calls, &offered));
             send_chunk(&ServeChunk::Done { tokens, metrics }.encode());
             ServeSummary {
                 tokens,
@@ -654,20 +692,28 @@ mod tests {
         };
         assert_eq!(measure(&["héllo"]), 6, "bytes of non-whitespace text");
         assert_eq!(measure(&["a b"]), 3);
-        assert_eq!(measure(&["a", "                ", "\n\n\n\t", " b"]), 3, "one run, across deltas");
+        assert_eq!(measure(&["a", "               ", " b"]), 3, "one run of 16, across deltas");
+        assert_eq!(measure(&["a", "                ", "\n\n\n\t", " b"]), 4, "a run of 21: two units");
         assert_eq!(measure(&["<think>", "\n\n\n\n\n\n", "</think>"]), 16);
+        assert_eq!(measure(&[&"\n".repeat(4_000)]), 250, "a long run is still paid for");
         let call = |args: &str| ToolCall {
             id: "c".into(),
             kind: "function".into(),
             function: crate::adapter::ToolCallFunction { name: "ls".into(), arguments: args.into() },
         };
-        assert_eq!(tool_call_units(&[call(r#"{"p":"/"}"#)]), 2 + 9 + TOOL_CALL_TOKEN_ALLOWANCE);
+        let ls = offered_tool_names(&[serde_json::json!({"type": "function", "function": {"name": "ls"}})]);
+        assert_eq!(tool_call_units(&[call(r#"{"p":"/"}"#)], &ls), 2 + 9 + TOOL_CALL_TOKEN_ALLOWANCE);
         assert_eq!(
-            tool_call_units(&[call(r#"{"p":"/"}"#)]),
-            tool_call_units(&[call("{ \"p\" :                  \"/\" }")]) - 4,
-            "padding in the arguments counts once per run"
+            tool_call_units(&[call(r#"{"p":"/"}"#)], &ls),
+            tool_call_units(&[call("{ \"p\" :                  \"/\" }")], &ls) - 5,
+            "padding in the arguments counts little"
         );
-        assert_eq!(tool_call_units(&[call("{}"), call("{}")]), 2 * (4 + TOOL_CALL_TOKEN_ALLOWANCE));
+        assert_eq!(tool_call_units(&[call("{}"), call("{}")], &ls), 2 * (4 + TOOL_CALL_TOKEN_ALLOWANCE));
+        // A call to a tool nobody offered, or past the cap, earns no allowance: made-up calls can't pad.
+        let none = std::collections::HashSet::new();
+        assert_eq!(tool_call_units(&[call("{}")], &none), 4);
+        let many: Vec<ToolCall> = (0..40).map(|_| call("")).collect();
+        assert_eq!(tool_call_units(&many, &ls), 40 * 2 + MAX_ALLOWED_TOOL_CALLS as u64 * TOOL_CALL_TOKEN_ALLOWANCE);
     }
 
     #[test]

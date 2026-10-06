@@ -579,6 +579,12 @@ struct ProvideArgs {
     #[arg(long = "share-policy-file")]
     share_policy_file: Option<std::path::PathBuf>,
 
+    /// This machine's own gateway (consumer) libp2p PeerId, when it runs one under its own identity
+    /// (the desktop app does): its serves are self-serves it never settles, so a provider that charges
+    /// exempts it from the payment gate. Get it from `openhydra-agent peer-id --identity <gateway-key>`.
+    #[arg(long = "self-consumer")]
+    self_consumer: Option<String>,
+
     /// M4-base: directory of owned/joined swarm records (`~/.openhydra/swarms/`). When set, a
     /// `Private`-scope model is served only to a swarm member presenting a valid credential for a
     /// swarm this node owns. Omit ⇒ no swarm auth (a private model is then refused for everyone).
@@ -1417,7 +1423,8 @@ fn run_provider<A: EngineAdapter + Send + Sync + 'static>(
         .with_aup(aup)
         .with_stats(stats)
         .with_settlement_peg(settlement_peg)
-        .with_settlement_chain(settlement_chain.map(|c| c.domain));
+        .with_settlement_chain(settlement_chain.map(|c| c.domain))
+        .with_self_consumer(args.self_consumer.clone());
     // A hot-reloadable policy file (the desktop path) takes precedence over the static
     // `--share-models` list. Only one governs sharing, so we never mix the two.
     if let Some(path) = args.share_policy_file.clone() {

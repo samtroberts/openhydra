@@ -27,6 +27,31 @@ use crate::serve::{BILLABLE_TOKEN_SLACK, TOOL_CALL_TOKEN_ALLOWANCE};
 
 /// Share of a provider's serves whose billed count is checked, when a tokenizer covers its model.
 pub const COUNT_SAMPLE_RATE: f64 = 0.25;
+/// Counts running at once: each is a scorer process loading the vocabulary (~0.25 s); past this a
+/// sampled serve is just not checked, so a busy gateway can't pile them up.
+pub const MAX_CONCURRENT_COUNTS: usize = 4;
+/// The longest delivered text kept for a count; a longer one isn't checked (its copy isn't kept).
+pub const MAX_COUNTED_BYTES: usize = 1 << 20;
+
+/// A place among [`MAX_CONCURRENT_COUNTS`]: given back when dropped.
+pub struct CountSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountSlot {
+    /// A slot, if fewer than [`MAX_CONCURRENT_COUNTS`] counts hold one.
+    pub fn try_take(running: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        running
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_CONCURRENT_COUNTS).then_some(n + 1))
+            .ok()
+            .map(|_| CountSlot(std::sync::Arc::clone(running)))
+    }
+}
+
+impl Drop for CountSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 /// A count takes milliseconds; past this the scorer is stuck and killed.
 const COUNT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The billed count may exceed the tokenized count by this share (an engine's sampled tokens don't
@@ -73,8 +98,9 @@ pub fn count_tokens(scorer: &Path, vocab: &Path, text: &str) -> Result<u64, Stri
 }
 
 /// The text a serve's tokens are counted on: the delivered text, then each tool call's name and
-/// arguments (on lines of their own), and how many tool calls there were.
-pub fn countable_text(delivered: &str, tool_calls: &[ToolCall]) -> (String, usize) {
+/// arguments (on lines of their own), and how many of the calls earn the template allowance (calls to
+/// an `offered` tool, at most [`crate::serve::MAX_ALLOWED_TOOL_CALLS`] — as billing grants it).
+pub fn countable_text(delivered: &str, tool_calls: &[ToolCall], offered: &std::collections::HashSet<String>) -> (String, usize) {
     let mut text = delivered.to_string();
     for c in tool_calls {
         text.push('\n');
@@ -82,7 +108,8 @@ pub fn countable_text(delivered: &str, tool_calls: &[ToolCall]) -> (String, usiz
         text.push('\n');
         text.push_str(&c.function.arguments);
     }
-    (text, tool_calls.len())
+    let allowed = tool_calls.iter().filter(|c| offered.contains(&c.function.name)).count();
+    (text, allowed.min(crate::serve::MAX_ALLOWED_TOOL_CALLS))
 }
 
 /// Whether `billed` tokens is more than `counted` (the delivered text's tokens, `calls` tool calls
@@ -124,8 +151,20 @@ mod tests {
             kind: "function".into(),
             function: crate::adapter::ToolCallFunction { name: "ls".into(), arguments: "{\"p\":\"/\"}".into() },
         };
-        assert_eq!(countable_text("hi", &[call]), ("hi\nls\n{\"p\":\"/\"}".to_string(), 1));
-        assert_eq!(countable_text("hi", &[]), ("hi".to_string(), 0));
+        let ls: std::collections::HashSet<String> = ["ls".to_string()].into();
+        assert_eq!(countable_text("hi", &[call.clone()], &ls), ("hi\nls\n{\"p\":\"/\"}".to_string(), 1));
+        assert_eq!(countable_text("hi", &[call], &Default::default()).1, 0, "a tool nobody offered");
+        assert_eq!(countable_text("hi", &[], &ls), ("hi".to_string(), 0));
+    }
+
+    #[test]
+    fn counts_are_bounded() {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slots: Vec<CountSlot> = (0..MAX_CONCURRENT_COUNTS).filter_map(|_| CountSlot::try_take(&running)).collect();
+        assert_eq!(slots.len(), MAX_CONCURRENT_COUNTS);
+        assert!(CountSlot::try_take(&running).is_none(), "full: the serve just isn't checked");
+        drop(slots);
+        assert!(CountSlot::try_take(&running).is_some());
     }
 
     #[test]

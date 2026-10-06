@@ -761,6 +761,9 @@ pub struct Provider<A: EngineAdapter> {
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
+    /// This machine's own gateway, when it runs under another identity (the desktop's): exempt from
+    /// the payment gate, like our own peer id (it never settles with us).
+    self_consumer: Option<String>,
     /// The on-chain claim kept with each `settled_receipts` entry (same key), on a settlement chain.
     settled_claims: Mutex<HashMap<String, crate::receipt::ClaimSig>>,
     /// The on-chain deployment paying receipts settle on: a paying receipt is co-signed only with a
@@ -906,6 +909,7 @@ impl<A: EngineAdapter> Provider<A> {
             receipt_lock: Mutex::new(()),
             settled_claims: Mutex::new(HashMap::new()),
             settlement_chain: None,
+            self_consumer: None,
             payment_defaults: Mutex::new(HashMap::new()),
             settlement_peg: None,
             receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
@@ -1013,6 +1017,12 @@ impl<A: EngineAdapter> Provider<A> {
         self
     }
 
+    /// Name this machine's own gateway (builder form), exempt from the payment gate.
+    pub fn with_self_consumer(mut self, peer: Option<String>) -> Self {
+        self.self_consumer = peer.filter(|p| !p.trim().is_empty());
+        self
+    }
+
     pub fn with_settlement_peg(mut self, micros_per_credit: u64) -> Self {
         self.settlement_peg = (micros_per_credit > 0).then_some(micros_per_credit);
         self
@@ -1052,10 +1062,12 @@ impl<A: EngineAdapter> Provider<A> {
     /// ([`payment_window`]). Our own (co-located) consumer never settles with us and is exempt.
     fn payment_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
         let peg = self.settlement_peg?;
-        if source_peer == self.net.libp2p_peer_id() {
+        if source_peer == self.net.libp2p_peer_id() || self.self_consumer.as_deref() == Some(source_peer) {
             return None;
         }
-        let refuse = |reason: String| Some(frame_response(&[ServeChunk::Error(reason).encode()]));
+        let refuse = |reason: String| {
+            Some(frame_response(&[ServeChunk::Error(format!("{}{reason}", crate::serve::PAYMENT_REFUSAL)).encode()]))
+        };
         if req.settlement_peg != Some(peg) {
             return refuse(format!(
                 "this provider charges (settlement peg {peg} micro-USDC per credit); the request doesn't offer to pay it"

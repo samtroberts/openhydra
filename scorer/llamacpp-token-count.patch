@@ -5,7 +5,7 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 
 --- a/tools/server/main.cpp
 +++ b/tools/server/main.cpp
-@@ -1,5 +1,85 @@
+@@ -1,5 +1,129 @@
 +#include "common.h"
 +#include "gguf.h"
 +#include "llama.h"
@@ -20,6 +20,9 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +#ifdef _WIN32
 +#include <fcntl.h>
 +#include <io.h>
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <shellapi.h>
 +#endif
 +
  int llama_server(int argc, char ** argv);
@@ -42,6 +45,10 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +    }
 +    gguf_context * dst = gguf_init_empty();
 +    gguf_set_kv(dst, src);
++    // A split model's keys would send the loader looking for the other parts of a file that has none.
++    for (const char * key : { "split.no", "split.count", "split.tensors.count" }) {
++        gguf_remove_key(dst, key);
++    }
 +    const bool ok = gguf_write_to_file(dst, out, /*only_meta =*/ true);
 +    gguf_free(dst);
 +    gguf_free(src);
@@ -49,6 +56,18 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +        fprintf(stderr, "export-vocab: can't write %s\n", out);
 +        return 1;
 +    }
++    // Only a vocabulary that loads is of any use: check it as --count-tokens will load it.
++    llama_log_set(quiet, nullptr);
++    llama_backend_init();
++    llama_model_params mparams = llama_model_default_params();
++    mparams.vocab_only = true;
++    llama_model * model = llama_model_load_from_file(out, mparams);
++    if (!model) {
++        fprintf(stderr, "export-vocab: %s doesn't load as a vocabulary\n", out);
++        return 1;
++    }
++    llama_model_free(model);
++    llama_backend_free();
 +    return 0;
 +}
 +
@@ -75,6 +94,31 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +}
 +
  int main(int argc, char ** argv) {
++#ifdef _WIN32
++    // The ANSI argv mangles non-ASCII paths; llama.cpp reads paths as UTF-8 (common_params_parse
++    // rebuilds argv the same way, but these subcommands run before it).
++    std::vector<std::string> utf8_args;
++    std::vector<char *> utf8_argv;
++    int wargc = 0;
++    if (wchar_t ** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc)) {
++        for (int i = 0; i < wargc; i++) {
++            const int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
++            std::string arg(n > 0 ? n - 1 : 0, '\0');
++            if (n > 1) {
++                WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, arg.data(), n, nullptr, nullptr);
++            }
++            utf8_args.push_back(std::move(arg));
++        }
++        LocalFree(wargv);
++        for (auto & a : utf8_args) {
++            utf8_argv.push_back(a.data());
++        }
++        utf8_argv.push_back(nullptr);
++        if (wargc == argc && argc >= 2 && (strcmp(argv[1], "--export-vocab") == 0 || strcmp(argv[1], "--count-tokens") == 0)) {
++            argv = utf8_argv.data();
++        }
++    }
++#endif
 +    if (argc >= 2 && strcmp(argv[1], "--export-vocab") == 0) {
 +        if (argc != 4) {
 +            fprintf(stderr, "usage: %s --export-vocab <model.gguf> <out.gguf>\n", argv[0]);

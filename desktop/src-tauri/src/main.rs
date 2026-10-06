@@ -911,6 +911,12 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // M4-base: gate Private-scope models on swarm membership (owner-side authorizer reads this dir).
     sub.push("--swarms-dir".into());
     sub.push(swarms_dir().to_string_lossy().into_owned());
+    // Our own gateway runs under the consumer key: it never settles with our provider (a
+    // self-serve), so a provider that charges must not hold that against it.
+    if let Some(id) = peer_id_of("desktop-consumer.key") {
+        sub.push("--self-consumer".into());
+        sub.push(id);
+    }
     spawn_role(
         &state.provider,
         "desktop-provider.key",
@@ -980,8 +986,13 @@ fn read_share_policy(
 /// Runs the agent's `peer-id` subcommand — stable, no swarm; the id is the same whether or not
 /// the provider is currently running. Best-effort: `None` (consumer-only) if it can't resolve.
 fn provider_peer_id() -> Option<String> {
+    peer_id_of("desktop-provider.key")
+}
+
+/// The libp2p PeerId of the desktop identity file `key_name` (in the OpenHydra dir).
+fn peer_id_of(key_name: &str) -> Option<String> {
     let bin = agent_binary()?;
-    let key = openhydra_dir().join("desktop-provider.key");
+    let key = openhydra_dir().join(key_name);
     let out = Command::new(&bin).arg("--identity").arg(&key).arg("peer-id").output().ok()?;
     if !out.status.success() {
         return None;
