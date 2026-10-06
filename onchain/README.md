@@ -39,6 +39,18 @@ solana_preimage_cross_language_golden}`) that the on-chain tests reproduce.
 - **Off-chain duty (Base):** a provider relies on a channel only after checking that
   `channels[consumer][provider].payout` is its own payout address (the consumer picks it at open).
 
+## The claim (format v6)
+
+What the consumer signs: provider, consumer, model, cumulative amount and an **expiry** (`expires_at`,
+unix seconds; the agent signs 30 days ahead and providers want at least 7 left). It names **no payout**:
+each chain pays only the provider's own payout (Solana: its binding; Base: the channel's), so naming one
+would add nothing. Each signature is bound to one deployment: Base by the EIP-712 domain (chain id +
+contract, version `"2"`); Solana by the program id and a **cluster tag** (the cluster's genesis hash)
+kept in the program's config, which only the program's **upgrade authority** can initialize. The Solana
+payout binding carries the same domain. Refund delays are capped at 14 days on both chains, under a
+claim's 30-day lifetime. **Fees are pulled:** settles accrue the 4% and the fee recipient / authority
+withdraws it to any address, so a blacklisted or frozen fee account can't stop settlement.
+
 ## Toolchains
 
 - **Solana:** Agave 4.2.x (`solana`, `cargo-build-sbf`) via the Anza stable installer; Anchor 1.2.0 via `avm`.
@@ -50,7 +62,7 @@ solana_preimage_cross_language_golden}`) that the on-chain tests reproduce.
 ```bash
 cd solana
 anchor build                      # → target/deploy/openhydra_settlement.so (BPF)
-cargo test -p openhydra-settlement # 6 host unit tests + 7 litesvm integration tests
+cargo test -p openhydra-settlement # 6 host unit tests + 10 litesvm integration tests
 ```
 The litesvm integration tests need `litesvm 0.16` with the `precompiles` feature (already in the
 program's `Cargo.toml`) so the Ed25519 SigVerify precompile is registered and actually verified
@@ -63,13 +75,14 @@ Solidity deps are vendored via `git clone` (not committed). Fetch them once, the
 cd base
 git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std
 git clone --depth 1 --branch v5.1.0 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts
-forge test                        # 21 tests
+forge test                        # 25 tests
 ```
 
 ## Audit checklist
 
-Each spec's §8 carries the adversarial-review findings (2026-09-18) the audited version must resolve —
-notably claim freshness (a signed `deadline`), the Solana `initialize` front-run, a Solana claim/binding
-domain that names the program and cluster, and fee payouts a USDC blacklist can't block. See the specs.
-Resolved since (2026-10-06 review): payout-address re-payment on Base, consumer self-pay on both chains
-(per-provider escrow), settles extending the refund window, and `withdraw` vs. `paused`.
+Each spec's §8 carries the adversarial-review findings the audited version must resolve. Resolved since
+the 2026-10-06 review: payout-address re-payment on Base, consumer self-pay on both chains (per-provider
+escrow), settles extending the refund window, `withdraw` vs. `paused`, and with claim format v6: claim
+expiry, the Solana `initialize` front-run (upgrade authority only, capped refund delay), a Solana
+claim/binding domain naming the program and cluster, and pulled fees. Still before any deployment: real
+SPL transfers on Solana (the draft tracks balances), and an external audit of both programs.

@@ -21,7 +21,7 @@ import {ReentrancyGuard} from "openzeppelin-contracts/utils/ReentrancyGuard.sol"
 ///       off-chain settles here.
 ///
 /// Non-custodial invariant: no path lets any key remove escrow except `settle` (the fixed 0.96/0.04
-/// split to the channel's payout + the fee recipient) and `withdraw` (back to the depositing
+/// split: the channel's payout, and accrued fees the fee recipient withdraws) and `withdraw` (back to the depositing
 /// consumer, after an exit request and `refundDelay`). There is no owner-drains-escrow function. The
 /// fee is fixed at init.
 ///
@@ -43,17 +43,25 @@ contract OpenHydraSettlement is ReentrancyGuard {
     bytes32 private constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
     bytes32 private constant DOMAIN_NAME_HASH = keccak256("OpenHydra Settlement");
-    bytes32 private constant DOMAIN_VERSION_HASH = keccak256("1");
+    /// "2": claim format v6 (an expiry; no payout address — a channel pays only its own payout).
+    bytes32 private constant DOMAIN_VERSION_HASH = keccak256("2");
     bytes32 private constant CLAIM_TYPEHASH = keccak256(
-        "SettlementClaim(bytes32 provider,bytes32 consumer,address payoutAddress,uint256 cumulativeAmount,string modelId)"
+        "SettlementClaim(bytes32 provider,bytes32 consumer,uint256 cumulativeAmount,uint256 expiresAt,string modelId)"
     );
 
     /// The 4% protocol fee in basis points — matches `payout::PROTOCOL_FEE_BPS`.
     uint16 public constant EXPECTED_FEE_BPS = 400;
+    /// The longest refund delay a deployment may set: shorter than a claim's lifetime
+    /// (`settlement::CLAIM_LIFETIME_SECS`, 30 days), so a provider's last claim outlives an exit window.
+    uint64 public constant MAX_REFUND_DELAY = 14 days;
 
     // ── Config (set once at init; the fee can never be changed to divert funds) ──
     IERC20 public immutable usdc;
+    /// Takes the accrued protocol fees (`withdrawFees`), to any address it names: fees are pulled,
+    /// not pushed on every settle, so a recipient the token issuer blacklists can't stop settlement.
     address public immutable feeRecipient;
+    /// Protocol fees settled and not yet withdrawn.
+    uint256 public accruedFees;
     uint16 public immutable feeBps;
     uint64 public immutable refundDelay; // seconds of consumer inactivity before an unconditional withdraw
     address public admin; // pause only — CANNOT touch funds
@@ -76,14 +84,15 @@ contract OpenHydraSettlement is ReentrancyGuard {
     /// from what was already paid.
     mapping(address => mapping(bytes32 => mapping(bytes32 => uint256))) public settled;
 
-    /// The claim the consumer's EVM wallet signs (EIP-712). `provider`/`consumer` are the Ed25519
-    /// channel ids (the link to the off-chain receipt); `payoutAddress` is the provider's bound EVM
-    /// address (the payee); the authorizing signer recovered from `sig` must own the escrow drawn from.
+    /// The claim the consumer's EVM wallet signs (EIP-712, claim format v6). `provider`/`consumer` are
+    /// the Ed25519 channel ids (the link to the off-chain receipt); the authorizing signer recovered
+    /// from `sig` must own the escrow drawn from, which pays only the channel's payout. Settles until
+    /// `expiresAt` (unix seconds).
     struct SettlementClaim {
         bytes32 provider;
         bytes32 consumer;
-        address payoutAddress;
         uint256 cumulativeAmount;
+        uint256 expiresAt;
         string modelId;
     }
 
@@ -101,6 +110,7 @@ contract OpenHydraSettlement is ReentrancyGuard {
     event ExitRequested(address indexed consumer, bytes32 indexed provider, uint64 withdrawableAt);
     event Withdrawn(address indexed consumer, bytes32 indexed provider, uint256 amount);
     event Paused(bool paused);
+    event FeesWithdrawn(address indexed to, uint256 amount);
 
     error NotAdmin();
     error IsPaused();
@@ -115,6 +125,9 @@ contract OpenHydraSettlement is ReentrancyGuard {
     error NoChannel();
     error PayoutMismatch(); // a claim or deposit naming another payout than the channel's
     error NotPayout(); // only a channel's payout address may move it
+    error ClaimExpired();
+    error BadRefundDelay();
+    error NotFeeRecipient();
 
     constructor(
         IERC20 _usdc,
@@ -124,6 +137,7 @@ contract OpenHydraSettlement is ReentrancyGuard {
         address _admin
     ) {
         if (_feeBps != EXPECTED_FEE_BPS) revert BadFeeBps(); // the agreed 4%, fixed at init
+        if (_refundDelay > MAX_REFUND_DELAY) revert BadRefundDelay();
         usdc = _usdc;
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
@@ -154,8 +168,8 @@ contract OpenHydraSettlement is ReentrancyGuard {
                 CLAIM_TYPEHASH,
                 claim.provider,
                 claim.consumer,
-                claim.payoutAddress,
                 claim.cumulativeAmount,
+                claim.expiresAt,
                 keccak256(bytes(claim.modelId))
             )
         );
@@ -186,11 +200,11 @@ contract OpenHydraSettlement is ReentrancyGuard {
 
     /// Settle a co-signed voucher: anyone (provider or facilitator) may submit. The consumer's EVM
     /// signature over the EIP-712 claim authorizes drawing the delta from *its* channel to
-    /// `claim.provider`, which pays only that channel's payout (the claim must name it); the fixed
-    /// 0.96/0.04 split goes to it + the fee recipient. Checks-effects-interactions. A settle never
-    /// moves an exit's deadline.
+    /// `claim.provider`, which pays only that channel's payout; 0.96 of it goes there and 0.04 accrues
+    /// as the protocol fee. Checks-effects-interactions. A settle never moves an exit's deadline.
     function settle(SettlementClaim calldata claim, bytes calldata sig) external nonReentrant {
         if (paused) revert IsPaused();
+        if (block.timestamp > claim.expiresAt) revert ClaimExpired();
 
         // Recover the authorizing EVM signer. OZ ECDSA.recover enforces EIP-2 low-`s` and rejects the
         // zero address / malformed sigs — the on-chain mirror of `recover_evm_signer` (which also
@@ -203,9 +217,6 @@ contract OpenHydraSettlement is ReentrancyGuard {
         address consumerEvm = signer;
         Channel storage c = channels[consumerEvm][claim.provider];
         if (c.payout == address(0)) revert NoChannel();
-        // The money goes only where the channel says: a claim naming any other address (the
-        // consumer's own wallet, say) can't spend this channel.
-        if (claim.payoutAddress != c.payout) revert PayoutMismatch();
 
         bytes32 modelHash = keccak256(bytes(claim.modelId));
         uint256 prior = settled[consumerEvm][claim.provider][modelHash];
@@ -223,11 +234,11 @@ contract OpenHydraSettlement is ReentrancyGuard {
         // Effects before interactions (CEI): advance the high-water mark + debit the channel first.
         settled[consumerEvm][claim.provider][modelHash] = claim.cumulativeAmount;
         c.balance -= delta;
-        address payout = c.payout;
+        accruedFees += fee;
+        address payout = c.payout; // the money goes only where the channel says
 
         // Interactions.
         usdc.safeTransfer(payout, providerNet);
-        if (fee > 0) usdc.safeTransfer(feeRecipient, fee);
 
         emit Settled(consumerEvm, claim.provider, payout, modelHash, delta, providerNet, fee);
     }
@@ -268,6 +279,15 @@ contract OpenHydraSettlement is ReentrancyGuard {
         c.balance -= amount;
         usdc.safeTransfer(msg.sender, amount);
         emit Withdrawn(msg.sender, provider, amount);
+    }
+
+    /// The fee recipient takes accrued protocol fees, to any address it names.
+    function withdrawFees(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != feeRecipient) revert NotFeeRecipient();
+        if (amount > accruedFees) revert WithdrawTooLarge();
+        accruedFees -= amount;
+        usdc.safeTransfer(to, amount);
+        emit FeesWithdrawn(to, amount);
     }
 
     // ── Admin (pause only — no fund authority) ──

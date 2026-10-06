@@ -67,8 +67,19 @@ struct Ctx {
     program_id: Pubkey,
     payer: Keypair,
     admin: Keypair,
+    fee_authority: Keypair,
     config: Pubkey,
     instr_sysvar: Pubkey,
+}
+
+/// The cluster tag this test deployment is initialized with (a real one is the genesis hash).
+const CLUSTER: [u8; 32] = [0x55; 32];
+/// Claims in these tests are valid for 30 days from the test clock.
+const T0: i64 = 1_760_000_000;
+const EXPIRES: u64 = T0 as u64 + 30 * 86_400;
+
+fn program_data_address(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[program_id.as_ref()], &solana_sdk_ids::bpf_loader_upgradeable::ID).0
 }
 
 fn setup() -> Ctx {
@@ -83,9 +94,18 @@ fn setup() -> Ctx {
     let instr_sysvar = solana_sdk_ids::sysvar::instructions::ID;
     // A real cluster's clock, not litesvm's genesis 0 (the program uses 0 as "no exit requested").
     let mut clock: solana_clock::Clock = svm.get_sysvar();
-    clock.unix_timestamp = 1_760_000_000;
+    clock.unix_timestamp = T0;
     svm.set_sysvar(&clock);
-    Ctx { svm, program_id, payer, admin, config, instr_sysvar }
+    // litesvm deploys upgradeable with no upgrade authority; make `admin` the authority (the
+    // ProgramData state: tag u32 = 3 ‖ slot u64 ‖ Some(authority) = 1 ‖ pubkey).
+    let pd = program_data_address(&program_id);
+    let mut acct = svm.get_account(&pd).unwrap();
+    acct.data[12] = 1;
+    acct.data[13..45].copy_from_slice(admin.pubkey().as_ref());
+    svm.set_account(pd, acct).unwrap();
+    let fee_authority = Keypair::new();
+    svm.airdrop(&fee_authority.pubkey(), 1_000_000_000).unwrap();
+    Ctx { svm, program_id, payer, admin, fee_authority, config, instr_sysvar }
 }
 
 fn send(ctx: &mut Ctx, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), String> {
@@ -99,36 +119,45 @@ fn send(ctx: &mut Ctx, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), 
     ctx.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e.err))
 }
 
-fn initialize(ctx: &mut Ctx) {
+fn try_initialize(ctx: &mut Ctx, by: &Keypair, refund_delay_secs: i64) -> Result<(), String> {
     let ix = Instruction {
         program_id: ctx.program_id,
         accounts: openhydra_settlement::accounts::Initialize {
-            admin: ctx.admin.pubkey(),
+            admin: by.pubkey(),
             config: ctx.config,
+            program: ctx.program_id,
+            program_data: program_data_address(&ctx.program_id),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
         data: openhydra_settlement::instruction::Initialize {
-            fee_account: Pubkey::new_unique(),
+            fee_account: ctx.fee_authority.pubkey(),
             usdc_mint: Pubkey::new_unique(),
-            refund_delay_secs: 86_400,
+            refund_delay_secs,
+            cluster: CLUSTER,
         }
         .data(),
     };
+    let by = by.insecure_clone();
+    send(ctx, &[ix], &[&by])
+}
+
+fn initialize(ctx: &mut Ctx) {
     let admin = ctx.admin.insecure_clone();
-    send(ctx, &[ix], &[&admin]).expect("initialize");
+    try_initialize(ctx, &admin, 86_400).expect("initialize");
 }
 
 fn bind_payout(ctx: &mut Ctx, provider: &Keypair, payout: [u8; 32], ts: u64) -> Result<(), String> {
     let provider_id = provider.pubkey().to_bytes();
     let binding_pda = Pubkey::find_program_address(&[b"payout", &provider_id], &ctx.program_id).0;
-    let msg = binding_preimage(&payout, ts);
+    let msg = binding_preimage(&ctx.program_id.to_bytes(), &CLUSTER, &payout, ts);
     let sig = sign64(provider, &msg);
     let ed_ix = ed25519_ix(&provider_id, &sig, &msg);
     let bind_ix = Instruction {
         program_id: ctx.program_id,
         accounts: openhydra_settlement::accounts::BindPayout {
             payer: ctx.payer.pubkey(),
+            config: ctx.config,
             payout_binding: binding_pda,
             instructions_sysvar: ctx.instr_sysvar,
             system_program: system_program::ID,
@@ -212,51 +241,66 @@ fn advance(ctx: &mut Ctx, secs: i64) {
     ctx.svm.set_sysvar(&clock);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn settle(
-    ctx: &mut Ctx,
-    consumer: &Keypair,
-    provider_id: [u8; 32],
-    payout: [u8; 32],
-    cumulative: u64,
-    model_id: &str,
-) -> Result<(), String> {
+/// A settle instruction pair: the consumer's Ed25519 signature over `signed` (the claim it signed),
+/// then `settle` with `claim`.
+fn settle_ixs(ctx: &Ctx, consumer: &Keypair, signed: &[u8], claim: openhydra_settlement::SettleClaimArgs) -> [Instruction; 2] {
     let consumer_id = consumer.pubkey().to_bytes();
-    let vault = vault_pda(ctx, consumer, provider_id);
     let channel = Pubkey::find_program_address(
-        &[b"channel", &consumer_id, &provider_id, &model_hash(model_id)],
+        &[b"channel", &consumer_id, &claim.provider, &model_hash(&claim.model_id)],
         &ctx.program_id,
     )
     .0;
-    let binding_pda = Pubkey::find_program_address(&[b"payout", &provider_id], &ctx.program_id).0;
-    let msg = settle_claim_preimage(&provider_id, &consumer_id, &payout, cumulative, model_id);
-    let sig = sign64(consumer, &msg);
-    let ed_ix = ed25519_ix(&consumer_id, &sig, &msg);
+    let binding_pda = Pubkey::find_program_address(&[b"payout", &claim.provider], &ctx.program_id).0;
+    let sig = sign64(consumer, signed);
+    let ed_ix = ed25519_ix(&consumer_id, &sig, signed);
     let settle_ix = Instruction {
         program_id: ctx.program_id,
         accounts: openhydra_settlement::accounts::Settle {
             payer: ctx.payer.pubkey(),
             config: ctx.config,
-            vault,
+            vault: vault_pda(ctx, consumer, claim.provider),
             channel,
             payout_binding: binding_pda,
             instructions_sysvar: ctx.instr_sysvar,
             system_program: system_program::ID,
         }
         .to_account_metas(None),
-        data: openhydra_settlement::instruction::Settle {
-            claim: openhydra_settlement::SettleClaimArgs {
-                provider: provider_id,
-                consumer: consumer_id,
-                payout,
-                cumulative_amount: cumulative,
-                model_id: model_id.to_string(),
-            },
-        }
-        .data(),
+        data: openhydra_settlement::instruction::Settle { claim }.data(),
     };
+    [ed_ix, settle_ix]
+}
+
+fn claim(consumer: &Keypair, provider_id: [u8; 32], cumulative: u64, expires_at: u64, model_id: &str) -> openhydra_settlement::SettleClaimArgs {
+    openhydra_settlement::SettleClaimArgs {
+        provider: provider_id,
+        consumer: consumer.pubkey().to_bytes(),
+        cumulative_amount: cumulative,
+        expires_at,
+        model_id: model_id.to_string(),
+    }
+}
+
+/// Settle `cumulative` for `(consumer, provider, model)`, the consumer signing the claim for this
+/// deployment with `expires_at`.
+fn settle_until(
+    ctx: &mut Ctx,
+    consumer: &Keypair,
+    provider_id: [u8; 32],
+    cumulative: u64,
+    model_id: &str,
+    expires_at: u64,
+) -> Result<(), String> {
+    let c = claim(consumer, provider_id, cumulative, expires_at, model_id);
+    let msg = settle_claim_preimage(
+        &ctx.program_id.to_bytes(), &CLUSTER, &c.provider, &c.consumer, cumulative, expires_at, model_id,
+    );
+    let ixs = settle_ixs(ctx, consumer, &msg, c);
     let payer = ctx.payer.insecure_clone();
-    send(ctx, &[ed_ix, settle_ix], &[&payer])
+    send(ctx, &ixs, &[&payer])
+}
+
+fn settle(ctx: &mut Ctx, consumer: &Keypair, provider_id: [u8; 32], cumulative: u64, model_id: &str) -> Result<(), String> {
+    settle_until(ctx, consumer, provider_id, cumulative, model_id, EXPIRES)
 }
 
 fn vault_state(ctx: &Ctx, consumer: &Keypair, provider_id: [u8; 32]) -> openhydra_settlement::Vault {
@@ -291,12 +335,12 @@ fn full_flow_initialize_bind_deposit_settle_monotonic() {
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 500_000);
 
     // Settle a cumulative of 100_000 → high-water advances, escrow debited by the delta.
-    settle(&mut ctx, &consumer, provider_id, payout, 100_000, "qwen2.5:7b").expect("settle #1");
+    settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").expect("settle #1");
     assert_eq!(channel_state(&ctx, &consumer, provider_id, "qwen2.5:7b").settled_amount, 100_000);
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 400_000);
 
     // A later cumulative of 250_000 pays only the 150_000 delta (monotonic, batched).
-    settle(&mut ctx, &consumer, provider_id, payout, 250_000, "qwen2.5:7b").expect("settle #2");
+    settle(&mut ctx, &consumer, provider_id, 250_000, "qwen2.5:7b").expect("settle #2");
     assert_eq!(channel_state(&ctx, &consumer, provider_id, "qwen2.5:7b").settled_amount, 250_000);
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 250_000);
 }
@@ -312,11 +356,11 @@ fn replayed_and_stale_cumulatives_are_rejected() {
     bind_payout(&mut ctx, &provider, provider_id, 1_000).unwrap();
     deposit(&mut ctx, &consumer, provider_id, 500_000);
 
-    settle(&mut ctx, &consumer, provider_id, provider_id, 100_000, "qwen2.5:7b").unwrap();
+    settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").unwrap();
     // Replaying the same cumulative → delta 0 → the program rejects it.
-    assert!(settle(&mut ctx, &consumer, provider_id, provider_id, 100_000, "qwen2.5:7b").is_err());
+    assert!(settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").is_err());
     // A lower cumulative than the high-water → also rejected (never claws back).
-    assert!(settle(&mut ctx, &consumer, provider_id, provider_id, 50_000, "qwen2.5:7b").is_err());
+    assert!(settle(&mut ctx, &consumer, provider_id, 50_000, "qwen2.5:7b").is_err());
     // The escrow was debited exactly once.
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 400_000);
 }
@@ -336,41 +380,12 @@ fn settle_rejects_a_tampered_claim_message() {
     bind_payout(&mut ctx, &provider, provider_id, 1_000).unwrap();
     deposit(&mut ctx, &consumer, provider_id, 5_000_000);
 
-    let vault = vault_pda(&ctx, &consumer, provider_id);
-    let channel = Pubkey::find_program_address(
-        &[b"channel", &consumer_id, &provider_id, &model_hash("qwen2.5:7b")],
-        &ctx.program_id,
-    )
-    .0;
-    let binding_pda = Pubkey::find_program_address(&[b"payout", &provider_id], &ctx.program_id).0;
-    // Sign the HONEST preimage (100_000)...
-    let honest = settle_claim_preimage(&provider_id, &consumer_id, &provider_id, 100_000, "qwen2.5:7b");
-    let sig = sign64(&consumer, &honest);
-    let ed_ix = ed25519_ix(&consumer_id, &sig, &honest);
+    // Sign the HONEST claim (100_000)...
+    let honest = settle_claim_preimage(
+        &ctx.program_id.to_bytes(), &CLUSTER, &provider_id, &consumer_id, 100_000, EXPIRES, "qwen2.5:7b",
+    );
     // ...but submit a settle claiming 999_999.
-    let settle_ix = Instruction {
-        program_id: ctx.program_id,
-        accounts: openhydra_settlement::accounts::Settle {
-            payer: ctx.payer.pubkey(),
-            config: ctx.config,
-            vault,
-            channel,
-            payout_binding: binding_pda,
-            instructions_sysvar: ctx.instr_sysvar,
-            system_program: system_program::ID,
-        }
-        .to_account_metas(None),
-        data: openhydra_settlement::instruction::Settle {
-            claim: openhydra_settlement::SettleClaimArgs {
-                provider: provider_id,
-                consumer: consumer_id,
-                payout: provider_id,
-                cumulative_amount: 999_999,
-                model_id: "qwen2.5:7b".to_string(),
-            },
-        }
-        .data(),
-    };
+    let [ed_ix, settle_ix] = settle_ixs(&ctx, &consumer, &honest, claim(&consumer, provider_id, 999_999, EXPIRES, "qwen2.5:7b"));
     let payer = ctx.payer.insecure_clone();
     assert!(send(&mut ctx, &[ed_ix, settle_ix], &[&payer]).is_err(), "message/claim mismatch rejected");
 }
@@ -393,17 +408,14 @@ fn a_consumer_cannot_pay_itself_out_of_a_providers_vault() {
     let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
     let own = consumer.pubkey().to_bytes();
 
-    // A claim to the honest provider naming the consumer's own address: not the bound payout.
-    assert!(settle(&mut ctx, &consumer, provider_id, own, 500_000, "qwen2.5:7b").is_err());
-
     // A throwaway provider the consumer controls, bound to the consumer's own address: it reaches
     // only its own vault (here 1_000), never the honest provider's.
     let throwaway = Keypair::new();
     let throwaway_id = throwaway.pubkey().to_bytes();
     bind_payout(&mut ctx, &throwaway, own, 1_000).unwrap();
     deposit(&mut ctx, &consumer, throwaway_id, 1_000);
-    assert!(settle(&mut ctx, &consumer, throwaway_id, own, 500_000, "qwen2.5:7b").is_err(), "beyond its own vault");
-    settle(&mut ctx, &consumer, throwaway_id, own, 1_000, "qwen2.5:7b").expect("its own 1_000 only");
+    assert!(settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b").is_err(), "beyond its own vault");
+    settle(&mut ctx, &consumer, throwaway_id, 1_000, "qwen2.5:7b").expect("its own 1_000 only");
 
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 500_000, "the honest vault is untouched");
 }
@@ -419,7 +431,7 @@ fn an_exit_needs_a_request_and_a_window_settles_cannot_extend() {
     advance(&mut ctx, 86_400 - 10);
     assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "window not over");
     // The provider settles what it is owed inside the window; that doesn't move the deadline.
-    settle(&mut ctx, &consumer, provider_id, provider_id, 100_000, "qwen2.5:7b").unwrap();
+    settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").unwrap();
     advance(&mut ctx, 10);
     withdraw(&mut ctx, &consumer, provider_id, 400_000).expect("exit on time");
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 0);
@@ -449,4 +461,67 @@ fn a_pause_does_not_run_out_the_providers_window() {
     assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "a full window again after the unpause");
     advance(&mut ctx, 86_400);
     withdraw(&mut ctx, &consumer, provider_id, 1).expect("then it opens");
+}
+
+#[test]
+fn only_the_upgrade_authority_initializes_and_the_refund_delay_is_capped() {
+    let mut ctx = setup();
+    let stranger = Keypair::new();
+    ctx.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    assert!(try_initialize(&mut ctx, &stranger, 86_400).is_err(), "a front-runner can't initialize");
+    let admin = ctx.admin.insecure_clone();
+    assert!(
+        try_initialize(&mut ctx, &admin, openhydra_settlement::MAX_REFUND_DELAY_SECS + 1).is_err(),
+        "a refund delay past the cap"
+    );
+    try_initialize(&mut ctx, &admin, openhydra_settlement::MAX_REFUND_DELAY_SECS).expect("the authority, within the cap");
+}
+
+#[test]
+fn an_expired_claim_or_one_for_another_deployment_does_not_settle() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    // Expired.
+    assert!(settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", T0 as u64 - 1).is_err());
+    // Signed for another cluster (say devnet) with this program id.
+    let c = claim(&consumer, provider_id, 100_000, EXPIRES, "m");
+    let devnet = settle_claim_preimage(&ctx.program_id.to_bytes(), &[0x66; 32], &c.provider, &c.consumer, 100_000, EXPIRES, "m");
+    let ixs = settle_ixs(&ctx, &consumer, &devnet, c);
+    let payer = ctx.payer.insecure_clone();
+    assert!(send(&mut ctx, &ixs, &[&payer]).is_err(), "another cluster's claim");
+    // Still valid right up to its expiry.
+    advance(&mut ctx, 1_000);
+    settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", T0 as u64 + 1_000).expect("not yet expired");
+}
+
+fn config_state(ctx: &Ctx) -> openhydra_settlement::Config {
+    let acct = ctx.svm.get_account(&ctx.config).unwrap();
+    openhydra_settlement::Config::try_deserialize(&mut &acct.data[..]).unwrap()
+}
+
+fn withdraw_fees(ctx: &mut Ctx, by: &Keypair, amount: u64) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: ctx.program_id,
+        accounts: openhydra_settlement::accounts::WithdrawFees { fee_authority: by.pubkey(), config: ctx.config }
+            .to_account_metas(None),
+        data: openhydra_settlement::instruction::WithdrawFees { amount }.data(),
+    };
+    let by = by.insecure_clone();
+    send(ctx, &[ix], &[&by])
+}
+
+#[test]
+fn fees_accrue_for_the_fee_authority_to_withdraw() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    settle(&mut ctx, &consumer, provider_id, 100_000, "m").unwrap();
+    assert_eq!(config_state(&ctx).accrued_fees, 4_000, "4% of the delta");
+    let admin = ctx.admin.insecure_clone();
+    assert!(withdraw_fees(&mut ctx, &admin, 1).is_err(), "only the fee authority");
+    let fa = ctx.fee_authority.insecure_clone();
+    assert!(withdraw_fees(&mut ctx, &fa, 4_001).is_err(), "no more than accrued");
+    withdraw_fees(&mut ctx, &fa, 4_000).expect("the fee authority takes its fees");
+    assert_eq!(config_state(&ctx).accrued_fees, 0);
 }

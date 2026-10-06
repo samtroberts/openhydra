@@ -47,22 +47,22 @@ contract OpenHydraSettlementTest is Test {
         settlement.deposit(PROVIDER_ID, providerPayout, 500_000); // fund the channel with 0.5 USDC
     }
 
-    function _claimTo(bytes32 provider, address payout, uint256 cumulative)
+    function _claimTo(bytes32 provider, uint256 cumulative)
         internal
-        pure
+        view
         returns (OpenHydraSettlement.SettlementClaim memory)
     {
         return OpenHydraSettlement.SettlementClaim({
             provider: provider,
             consumer: CONSUMER_ID,
-            payoutAddress: payout,
             cumulativeAmount: cumulative,
+            expiresAt: block.timestamp + 30 days,
             modelId: MODEL
         });
     }
 
     function _claim(uint256 cumulative) internal view returns (OpenHydraSettlement.SettlementClaim memory) {
-        return _claimTo(PROVIDER_ID, providerPayout, cumulative);
+        return _claimTo(PROVIDER_ID, cumulative);
     }
 
     function _sign(uint256 pk, OpenHydraSettlement.SettlementClaim memory claim) internal view returns (bytes memory) {
@@ -99,7 +99,7 @@ contract OpenHydraSettlementTest is Test {
 
         // delta = 100_000; fee = 100_000*400/10000 = 4_000; providerNet = 96_000.
         assertEq(usdc.balanceOf(providerPayout), 96_000, "provider gets 0.96");
-        assertEq(usdc.balanceOf(feeRecipient), 4_000, "platform gets 0.04");
+        assertEq(settlement.accruedFees(), 4_000, "0.04 accrues as the fee");
         assertEq(_balance(PROVIDER_ID), 400_000, "channel debited by delta");
         assertEq(settlement.settled(consumer, PROVIDER_ID, keccak256(bytes(MODEL))), 100_000, "high-water advanced");
     }
@@ -112,7 +112,7 @@ contract OpenHydraSettlementTest is Test {
 
         // Cumulative fee: floor(250000*0.04)=10_000; provider 240_000. Channel 500k-250k=250k.
         assertEq(usdc.balanceOf(providerPayout), 240_000);
-        assertEq(usdc.balanceOf(feeRecipient), 10_000);
+        assertEq(settlement.accruedFees(), 10_000);
         assertEq(_balance(PROVIDER_ID), 250_000);
     }
 
@@ -155,33 +155,27 @@ contract OpenHydraSettlementTest is Test {
         vm.prank(providerPayout);
         settlement.setPayout(consumer, PROVIDER_ID, rotated);
 
-        // The old cumulative to the new address is stale: it was already paid.
-        OpenHydraSettlement.SettlementClaim memory replay = _claimTo(PROVIDER_ID, rotated, 100_000);
+        // The old cumulative is stale at the new address too: it was already paid.
+        OpenHydraSettlement.SettlementClaim memory replay = _claim(100_000);
         bytes memory replaySig = _sign(consumerPk, replay);
         vm.expectRevert(OpenHydraSettlement.StaleOrReplayedClaim.selector);
         settlement.settle(replay, replaySig);
 
         // The next voucher pays only its delta, to the new address.
-        OpenHydraSettlement.SettlementClaim memory c2 = _claimTo(PROVIDER_ID, rotated, 150_000);
+        OpenHydraSettlement.SettlementClaim memory c2 = _claim(150_000);
         settlement.settle(c2, _sign(consumerPk, c2));
         assertEq(usdc.balanceOf(rotated), 48_000, "50_000 delta, 0.96 of it");
         assertEq(usdc.balanceOf(providerPayout), 96_000, "the old address keeps only its first payment");
         assertEq(_balance(PROVIDER_ID), 350_000);
-        // And a claim still naming the old address is refused.
-        OpenHydraSettlement.SettlementClaim memory old = _claim(200_000);
-        bytes memory oldSig = _sign(consumerPk, old);
-        vm.expectRevert(OpenHydraSettlement.PayoutMismatch.selector);
-        settlement.settle(old, oldSig);
     }
 
     // ── review fix: a consumer can't pay itself out of escrow committed to a provider ──
 
     function test_a_consumer_cannot_pay_itself_from_a_providers_channel() public {
-        OpenHydraSettlement.SettlementClaim memory selfPay = _claimTo(PROVIDER_ID, consumer, 500_000);
-        bytes memory sig = _sign(consumerPk, selfPay);
-        vm.expectRevert(OpenHydraSettlement.PayoutMismatch.selector);
-        settlement.settle(selfPay, sig);
-        assertEq(_balance(PROVIDER_ID), 500_000);
+        // A claim names no payout: whatever the consumer signs, the channel pays only its own payout.
+        OpenHydraSettlement.SettlementClaim memory all = _claim(500_000);
+        settlement.settle(all, _sign(consumerPk, all));
+        assertEq(usdc.balanceOf(providerPayout), 480_000, "the provider's payout, not the consumer");
         assertEq(usdc.balanceOf(consumer), 500_000, "no escrow came back");
     }
 
@@ -191,7 +185,7 @@ contract OpenHydraSettlementTest is Test {
         bytes32 throwaway = bytes32(uint256(0xDEAD));
         vm.prank(consumer);
         settlement.deposit(throwaway, consumer, 1_000);
-        OpenHydraSettlement.SettlementClaim memory drain = _claimTo(throwaway, consumer, 500_000);
+        OpenHydraSettlement.SettlementClaim memory drain = _claimTo(throwaway, 500_000);
         bytes memory sig = _sign(consumerPk, drain);
         vm.expectRevert(OpenHydraSettlement.InsufficientEscrow.selector);
         settlement.settle(drain, sig);
@@ -212,7 +206,7 @@ contract OpenHydraSettlementTest is Test {
     }
 
     function test_settling_without_a_channel_reverts() public {
-        OpenHydraSettlement.SettlementClaim memory claim = _claimTo(bytes32(uint256(0x9999)), providerPayout, 1);
+        OpenHydraSettlement.SettlementClaim memory claim = _claimTo(bytes32(uint256(0x9999)), 1);
         bytes memory sig = _sign(consumerPk, claim);
         vm.expectRevert(OpenHydraSettlement.NoChannel.selector);
         settlement.settle(claim, sig);
@@ -322,8 +316,8 @@ contract OpenHydraSettlementTest is Test {
     function test_eip712_digest_matches_rust_golden() public pure {
         bytes32 provider = bytes32(uint256(0x1111111111111111111111111111111111111111111111111111111111111111));
         bytes32 consumer = bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222));
-        address payout = address(bytes20(hex"ABABABABABABABABABABABABABABABABABABABAB"));
         uint256 cumulative = 100_000;
+        uint256 expiresAt = 1_800_000_000;
         string memory modelId = "qwen2.5:7b";
         uint256 chainId = 8453;
         address verifyingContract = address(bytes20(hex"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
@@ -332,25 +326,25 @@ contract OpenHydraSettlementTest is Test {
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256("OpenHydra Settlement"),
-                keccak256("1"),
+                keccak256("2"),
                 chainId,
                 verifyingContract
             )
         );
         bytes32 hashStruct = keccak256(
             abi.encode(
-                keccak256("SettlementClaim(bytes32 provider,bytes32 consumer,address payoutAddress,uint256 cumulativeAmount,string modelId)"),
+                keccak256("SettlementClaim(bytes32 provider,bytes32 consumer,uint256 cumulativeAmount,uint256 expiresAt,string modelId)"),
                 provider,
                 consumer,
-                payout,
                 cumulative,
+                expiresAt,
                 keccak256(bytes(modelId))
             )
         );
         bytes32 digest = keccak256(abi.encodePacked(hex"1901", domainSep, hashStruct));
         assertEq(
             digest,
-            bytes32(0xa3cd9b3cb6dbd590c004a95113e457831526cff559e6707131e7f39c71e80f36),
+            bytes32(0x4e46f39f79c49fdc540cc2be0d73aea9384df29e2fc7b7fb2ccd630e1f2b4fa6),
             "EIP-712 digest must match the Rust settlement.rs golden byte-for-byte"
         );
     }
@@ -365,14 +359,49 @@ contract OpenHydraSettlementTest is Test {
         OpenHydraSettlement.SettlementClaim memory claim = OpenHydraSettlement.SettlementClaim({
             provider: bytes32(uint256(0x1111111111111111111111111111111111111111111111111111111111111111)),
             consumer: bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222)),
-            payoutAddress: address(bytes20(hex"ABABABABABABABABABABABABABABABABABABABAB")),
             cumulativeAmount: 100_000,
+            expiresAt: 1_800_000_000,
             modelId: "qwen2.5:7b"
         });
         assertEq(
             OpenHydraSettlement(at).digestOf(claim),
-            bytes32(0xa3cd9b3cb6dbd590c004a95113e457831526cff559e6707131e7f39c71e80f36),
+            bytes32(0x4e46f39f79c49fdc540cc2be0d73aea9384df29e2fc7b7fb2ccd630e1f2b4fa6),
             "the contract's digestOf must match the Rust settlement.rs golden byte-for-byte"
         );
+    }
+
+    // ── claim format v6: expiry; pulled fees; a capped refund delay ──
+
+    function test_an_expired_claim_does_not_settle() public {
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.warp(claim.expiresAt);
+        settlement.settle(claim, sig); // valid through its expiry second
+        OpenHydraSettlement.SettlementClaim memory late = _claim(200_000);
+        late.expiresAt = block.timestamp - 1;
+        bytes memory lateSig = _sign(consumerPk, late);
+        vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
+        settlement.settle(late, lateSig);
+    }
+
+    function test_fees_are_pulled_by_the_fee_recipient_to_any_address() public {
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        settlement.settle(claim, _sign(consumerPk, claim));
+        assertEq(usdc.balanceOf(feeRecipient), 0, "nothing pushed on settle");
+        vm.expectRevert(OpenHydraSettlement.NotFeeRecipient.selector);
+        settlement.withdrawFees(address(this), 1);
+        vm.prank(feeRecipient);
+        vm.expectRevert(OpenHydraSettlement.WithdrawTooLarge.selector);
+        settlement.withdrawFees(address(0xF00), 4_001);
+        vm.prank(feeRecipient);
+        settlement.withdrawFees(address(0xF00), 4_000);
+        assertEq(usdc.balanceOf(address(0xF00)), 4_000);
+        assertEq(settlement.accruedFees(), 0);
+    }
+
+    function test_the_refund_delay_is_capped() public {
+        vm.expectRevert(OpenHydraSettlement.BadRefundDelay.selector);
+        new OpenHydraSettlement(usdc, feeRecipient, 400, 14 days + 1, admin);
+        new OpenHydraSettlement(usdc, feeRecipient, 400, 14 days, admin);
     }
 }

@@ -31,42 +31,54 @@ use solana_sha256_hasher::hash as sha256;
 
 declare_id!("J168LWSjxuSFFMMWCosn7dYrFcfAmCTGPRQyfqMKVe4H");
 
-/// Domain separator for the settlement claim preimage — byte-for-byte `settlement::SETTLEMENT_CLAIM_DOMAIN`.
-pub const SETTLEMENT_CLAIM_DOMAIN: &[u8] = b"openhydra/solana-settle/v1";
+/// Domain separator for the settlement claim preimage — byte-for-byte `settlement::SETTLEMENT_CLAIM_DOMAIN`
+/// (v2: claim format v6, bound to a deployment, with an expiry).
+pub const SETTLEMENT_CLAIM_DOMAIN: &[u8] = b"openhydra/solana-settle/v2";
 /// Domain separator for the payout binding preimage — byte-for-byte `settlement::PAYOUT_BINDING_DOMAIN`.
-pub const PAYOUT_BINDING_DOMAIN: &[u8] = b"openhydra/solana-payout/v1";
+pub const PAYOUT_BINDING_DOMAIN: &[u8] = b"openhydra/solana-payout/v2";
 /// The 4% protocol fee in basis points — matches `payout::PROTOCOL_FEE_BPS`.
 pub const FEE_BPS: u16 = 400;
+/// The longest refund delay a deployment may set: shorter than a claim's lifetime
+/// (`settlement::CLAIM_LIFETIME_SECS`, 30 days), so a provider's last claim outlives an exit window.
+pub const MAX_REFUND_DELAY_SECS: i64 = 14 * 24 * 60 * 60;
 
 // ── Pure, testable helpers (no chain state) ───────────────────────────────
 
 /// The settlement claim preimage the Ed25519 signature is verified against — a byte-for-byte
-/// reconstruction of `settlement::SettlementClaim::solana_preimage`:
-/// `domain ‖ provider(32) ‖ consumer(32) ‖ payout(32) ‖ cumulative(u64 LE) ‖ model_len(u32 LE) ‖ model`.
+/// reconstruction of `settlement::SettlementClaim::solana_preimage` (claim format v6):
+/// `domain ‖ program_id(32) ‖ cluster(32) ‖ provider(32) ‖ consumer(32) ‖ cumulative(u64 LE) ‖
+/// expires_at(u64 LE) ‖ model_len(u32 LE) ‖ model`. The program id and cluster tag bind a claim to
+/// this deployment, so one signed for devnet or another deployment doesn't settle here.
 pub fn settle_claim_preimage(
+    program_id: &[u8; 32],
+    cluster: &[u8; 32],
     provider: &[u8; 32],
     consumer: &[u8; 32],
-    payout: &[u8; 32],
     cumulative_amount: u64,
+    expires_at: u64,
     model_id: &str,
 ) -> Vec<u8> {
     let model = model_id.as_bytes();
-    let mut b = Vec::with_capacity(SETTLEMENT_CLAIM_DOMAIN.len() + 32 * 3 + 8 + 4 + model.len());
+    let mut b = Vec::with_capacity(SETTLEMENT_CLAIM_DOMAIN.len() + 32 * 4 + 8 + 8 + 4 + model.len());
     b.extend_from_slice(SETTLEMENT_CLAIM_DOMAIN);
+    b.extend_from_slice(program_id);
+    b.extend_from_slice(cluster);
     b.extend_from_slice(provider);
     b.extend_from_slice(consumer);
-    b.extend_from_slice(payout);
     b.extend_from_slice(&cumulative_amount.to_le_bytes());
+    b.extend_from_slice(&expires_at.to_le_bytes());
     b.extend_from_slice(&(model.len() as u32).to_le_bytes());
     b.extend_from_slice(model);
     b
 }
 
 /// The payout-binding preimage — byte-for-byte `settlement::binding_message`:
-/// `domain ‖ payout_address(32) ‖ ts(u64 LE)`.
-pub fn binding_preimage(payout_address: &[u8; 32], ts_unix_ms: u64) -> Vec<u8> {
-    let mut b = Vec::with_capacity(PAYOUT_BINDING_DOMAIN.len() + 32 + 8);
+/// `domain ‖ program_id(32) ‖ cluster(32) ‖ payout_address(32) ‖ ts(u64 LE)`.
+pub fn binding_preimage(program_id: &[u8; 32], cluster: &[u8; 32], payout_address: &[u8; 32], ts_unix_ms: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(PAYOUT_BINDING_DOMAIN.len() + 32 * 3 + 8);
     b.extend_from_slice(PAYOUT_BINDING_DOMAIN);
+    b.extend_from_slice(program_id);
+    b.extend_from_slice(cluster);
     b.extend_from_slice(payout_address);
     b.extend_from_slice(&ts_unix_ms.to_le_bytes());
     b
@@ -150,14 +162,21 @@ fn verified_ed25519_before_current(sysvar: &AccountInfo) -> Result<Ed25519Verifi
 pub mod openhydra_settlement {
     use super::*;
 
-    /// Admin, once. Pins the 4% fee at init (governance-only to change, never a silent admin power).
+    /// The upgrade authority, once. Pins the 4% fee at init (governance-only to change, never a silent
+    /// admin power) and the cluster tag claims are bound to.
     pub fn initialize(
         ctx: Context<Initialize>,
         fee_account: Pubkey,
         usdc_mint: Pubkey,
         refund_delay_secs: i64,
+        cluster: [u8; 32],
     ) -> Result<()> {
-        require!(refund_delay_secs >= 0, SettlementError::BadArgument);
+        // Only the program's upgrade authority initializes (the accounts constraints check it), so
+        // nobody can front-run a deployment with their own fee account or an endless refund delay.
+        require!(
+            (0..=MAX_REFUND_DELAY_SECS).contains(&refund_delay_secs),
+            SettlementError::BadArgument
+        );
         let config = &mut ctx.accounts.config;
         config.admin = ctx.accounts.admin.key();
         config.fee_account = fee_account;
@@ -166,6 +185,8 @@ pub mod openhydra_settlement {
         config.refund_delay_secs = refund_delay_secs;
         config.paused = false;
         config.last_unpaused_at = 0;
+        config.cluster = cluster;
+        config.accrued_fees = 0;
         Ok(())
     }
 
@@ -182,7 +203,8 @@ pub mod openhydra_settlement {
         let verified = verified_ed25519_before_current(&ctx.accounts.instructions_sysvar)?;
         require!(verified.pubkey == provider, SettlementError::SignerMismatch);
         require!(
-            verified.message == binding_preimage(&payout_address, ts_unix_ms),
+            verified.message
+                == binding_preimage(&crate::ID.to_bytes(), &ctx.accounts.config.cluster, &payout_address, ts_unix_ms),
             SettlementError::MessageMismatch
         );
         let binding = &mut ctx.accounts.payout_binding;
@@ -225,19 +247,24 @@ pub mod openhydra_settlement {
         let verified = verified_ed25519_before_current(&ctx.accounts.instructions_sysvar)?;
         require!(verified.pubkey == claim.consumer, SettlementError::SignerMismatch);
         let expected = settle_claim_preimage(
+            &crate::ID.to_bytes(),
+            &ctx.accounts.config.cluster,
             &claim.provider,
             &claim.consumer,
-            &claim.payout,
             claim.cumulative_amount,
+            claim.expires_at,
             &claim.model_id,
         );
         require!(verified.message == expected, SettlementError::MessageMismatch);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= 0 && (now as u64) <= claim.expires_at, SettlementError::ClaimExpired);
 
-        // 2. The payout must be the provider's currently-bound address (nobody can redirect it).
+        // 2. The provider is paid at its currently-bound address, whatever it is: the claim names no
+        //    payout, so nobody (the consumer included) can point it elsewhere.
         let binding = &ctx.accounts.payout_binding;
         require!(binding.initialized, SettlementError::UnboundProvider);
         require!(binding.provider == claim.provider, SettlementError::SignerMismatch);
-        require!(binding.payout_address == claim.payout, SettlementError::PayoutMismatch);
+        let payout = binding.payout_address;
 
         // 3. Monotonic delta.
         let channel = &mut ctx.accounts.channel;
@@ -257,15 +284,19 @@ pub mod openhydra_settlement {
         channel.consumer = claim.consumer;
         channel.provider = claim.provider;
         vault.balance -= delta;
+        // The fee stays with the program until the fee authority withdraws it (`withdraw_fees`): paid
+        // out on every settle, a fee account the token issuer froze would stop all settles.
+        let config = &mut ctx.accounts.config;
+        config.accrued_fees = config.accrued_fees.checked_add(fee).ok_or(SettlementError::Overflow)?;
 
         // PRODUCTION SPL: CPI `spl_token::transfer` from the vault token account:
-        //   provider_net → the provider's bound USDC ATA (`claim.payout`),
-        //   fee          → `config.fee_account`.
+        //   provider_net → the provider's bound USDC ATA (`payout`),
+        //   fee          → the program's fee vault (a PDA token account).
         // Draft records the amounts in the event; no token moves.
         emit!(Settled {
             consumer: claim.consumer,
             provider: claim.provider,
-            payout: claim.payout,
+            payout,
             delta,
             provider_net,
             fee,
@@ -298,6 +329,16 @@ pub mod openhydra_settlement {
         Ok(())
     }
 
+    /// The fee authority (`config.fee_account`) takes accrued protocol fees, to any account it names:
+    /// fees accrue in the program rather than being paid out on each settle.
+    pub fn withdraw_fees(ctx: Context<WithdrawFees>, amount: u64) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(amount <= config.accrued_fees, SettlementError::WithdrawTooLarge);
+        // PRODUCTION SPL: CPI `spl_token::transfer` fee vault → the destination the authority names.
+        config.accrued_fees -= amount;
+        Ok(())
+    }
+
     /// Admin pause (halts settle/deposit/withdraw); no fund authority. Unpausing restarts every pending
     /// exit's window, so a pause can't run one out.
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
@@ -310,13 +351,14 @@ pub mod openhydra_settlement {
     }
 }
 
-/// The claim the consumer's Ed25519 identity signs (== `settlement::SettlementClaim`, Solana target).
+/// The claim the consumer's Ed25519 identity signs (== `settlement::SettlementClaim`, format v6).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct SettleClaimArgs {
     pub provider: [u8; 32],
     pub consumer: [u8; 32],
-    pub payout: [u8; 32],
     pub cumulative_amount: u64,
+    /// Unix seconds after which the claim no longer settles.
+    pub expires_at: u64,
     pub model_id: String,
 }
 
@@ -333,6 +375,11 @@ pub struct Config {
     pub paused: bool,
     /// When the program was last unpaused (0 = never paused): exits count from no earlier than this.
     pub last_unpaused_at: i64,
+    /// The cluster this deployment runs on (its genesis hash), bound into every claim and binding
+    /// with the program id. Set at initialize by the upgrade authority.
+    pub cluster: [u8; 32],
+    /// Protocol fees settled and not yet withdrawn by the fee authority.
+    pub accrued_fees: u64,
 }
 
 /// A consumer's escrow for one provider.
@@ -381,7 +428,25 @@ pub struct Initialize<'info> {
     pub admin: Signer<'info>,
     #[account(init, payer = admin, space = 8 + Config::INIT_SPACE, seeds = [b"config"], bump)]
     pub config: Account<'info, Config>,
+    /// This program, to find its ProgramData account.
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ SettlementError::NotUpgradeAuthority)]
+    pub program: Program<'info, crate::program::OpenhydraSettlement>,
+    /// Only the program's upgrade authority may initialize it.
+    #[account(constraint = program_data.upgrade_authority_address == Some(admin.key()) @ SettlementError::NotUpgradeAuthority)]
+    pub program_data: Account<'info, ProgramData>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFees<'info> {
+    pub fee_authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"config"],
+        bump,
+        constraint = config.fee_account == fee_authority.key() @ SettlementError::NotFeeAuthority
+    )]
+    pub config: Account<'info, Config>,
 }
 
 #[derive(Accounts)]
@@ -389,6 +454,8 @@ pub struct Initialize<'info> {
 pub struct BindPayout<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
+    #[account(seeds = [b"config"], bump)]
+    pub config: Account<'info, Config>,
     #[account(
         init_if_needed,
         payer = payer,
@@ -426,7 +493,7 @@ pub struct Deposit<'info> {
 pub struct Settle<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    #[account(seeds = [b"config"], bump)]
+    #[account(mut, seeds = [b"config"], bump)]
     pub config: Account<'info, Config>,
     #[account(
         mut,
@@ -523,6 +590,12 @@ pub enum SettlementError {
     Paused,
     #[msg("only the admin may call this")]
     NotAdmin,
+    #[msg("the claim has expired")]
+    ClaimExpired,
+    #[msg("only the program's upgrade authority may initialize it")]
+    NotUpgradeAuthority,
+    #[msg("only the fee authority may withdraw fees")]
+    NotFeeAuthority,
 }
 
 // ── Pure-logic unit tests (host `cargo test`, no validator) ────────────────
@@ -537,11 +610,20 @@ mod tests {
     /// this program's Ed25519 introspection matches is exactly the one the off-chain signer produced.
     #[test]
     fn claim_preimage_matches_off_chain_golden() {
-        let pre = settle_claim_preimage(&[0x11; 32], &[0x22; 32], &[0x33; 32], 100_000, "qwen2.5:7b");
+        let pre =
+            settle_claim_preimage(&[0x44; 32], &[0x55; 32], &[0x11; 32], &[0x22; 32], 100_000, 1_800_000_000, "qwen2.5:7b");
         let hex = pre.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(
             hex,
-            "6f70656e68796472612f736f6c616e612d736574746c652f7631111111111111111111111111111111111111111111111111111111111111111122222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333a0860100000000000a0000007177656e322e353a3762"
+            "6f70656e68796472612f736f6c616e612d736574746c652f7632\
+             4444444444444444444444444444444444444444444444444444444444444444\
+             5555555555555555555555555555555555555555555555555555555555555555\
+             1111111111111111111111111111111111111111111111111111111111111111\
+             2222222222222222222222222222222222222222222222222222222222222222\
+             a086010000000000\
+             00d2496b00000000\
+             0a000000\
+             7177656e322e353a3762"
         );
     }
 
@@ -605,9 +687,9 @@ mod tests {
 
     #[test]
     fn binding_preimage_matches_the_domain_layout() {
-        let pre = binding_preimage(&[0x33; 32], 1_000);
+        let pre = binding_preimage(&[0x44; 32], &[0x55; 32], &[0x33; 32], 1_000);
         assert_eq!(&pre[..PAYOUT_BINDING_DOMAIN.len()], PAYOUT_BINDING_DOMAIN);
-        assert_eq!(pre.len(), PAYOUT_BINDING_DOMAIN.len() + 32 + 8);
+        assert_eq!(pre.len(), PAYOUT_BINDING_DOMAIN.len() + 32 * 3 + 8);
         assert_eq!(&pre[pre.len() - 8..], &1_000u64.to_le_bytes());
     }
 }
