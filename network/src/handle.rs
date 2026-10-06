@@ -122,6 +122,13 @@ impl NetworkHandle {
         Ok(libp2p::PeerId::from_public_key(&pk).to_string())
     }
 
+    /// The raw 32-byte ed25519 public key a libp2p PeerId string embeds (the inverse of
+    /// [`Self::peer_id_from_ed25519_pubkey`]). Ed25519 peer ids inline their key, so the
+    /// authenticated sender of a request names the key its receipts are signed with.
+    pub fn ed25519_pubkey_from_peer_id(&self, peer_id: &str) -> Result<[u8; 32], String> {
+        ed25519_pubkey_of_peer(peer_id)
+    }
+
     /// libp2p PeerId (the `proxy_forward` dial target / `reply_to` for serve requests).
     pub fn libp2p_peer_id(&self) -> &str {
         &self.libp2p_peer_id
@@ -262,6 +269,19 @@ impl NetworkHandle {
     }
 }
 
+/// See [`NetworkHandle::ed25519_pubkey_from_peer_id`].
+pub fn ed25519_pubkey_of_peer(peer_id: &str) -> Result<[u8; 32], String> {
+    let peer: libp2p::PeerId = peer_id.parse().map_err(|e| format!("bad peer id: {e}"))?;
+    let mh: &libp2p::multihash::Multihash<64> = peer.as_ref();
+    if mh.code() != 0x00 {
+        return Err("peer id doesn't inline its key".into());
+    }
+    let pk = libp2p::identity::PublicKey::try_decode_protobuf(mh.digest())
+        .map_err(|e| format!("bad public key in peer id: {e}"))?;
+    let ed = pk.try_into_ed25519().map_err(|e| format!("peer key not ed25519: {e}"))?;
+    Ok(ed.to_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +330,14 @@ mod tests {
         let handle = std::thread::spawn(move || client.status().unwrap());
         let snap2 = handle.join().unwrap();
         assert_eq!(snap2.listen_addrs.len(), snap.listen_addrs.len());
+    }
+
+    #[test]
+    fn an_ed25519_peer_id_gives_back_its_key() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = key.public().to_peer_id().to_string();
+        let ed = key.public().try_into_ed25519().unwrap().to_bytes();
+        assert_eq!(super::ed25519_pubkey_of_peer(&peer), Ok(ed));
+        assert!(super::ed25519_pubkey_of_peer("not a peer id").is_err());
     }
 }

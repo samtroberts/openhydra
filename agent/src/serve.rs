@@ -205,6 +205,11 @@ pub struct ServeRequest {
     /// the engine. `None` from a consumer off-chain (or predating the field).
     #[serde(default)]
     pub settlement_domain: Option<String>,
+    /// On Base, the wallet (`0x`-prefixed hex address) whose channel the consumer's claims draw on. A
+    /// provider holding a pair's live claim from another wallet refuses the serve up front, rather
+    /// than serving and then refusing the receipt. `None` elsewhere (or predating the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_wallet: Option<String>,
 }
 
 /// Parameters for a deterministic (reproducible) serve. The model's quantisation is already pinned
@@ -628,6 +633,7 @@ mod tests {
             deterministic: None,
             settlement_peg: None,
             settlement_domain: None,
+            settlement_wallet: None,
         }
     }
 

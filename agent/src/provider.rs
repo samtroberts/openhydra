@@ -454,6 +454,12 @@ impl KeptClaim {
         b
     }
 
+    /// The Base wallet the pair's claims are pinned to: the one that signed this claim, while it can
+    /// still be settled. Once it has expired, nothing is lost by taking claims from another wallet.
+    fn live_signer(&self, now_secs: u64) -> Option<[u8; 20]> {
+        self.signer.filter(|_| self.expires_at > now_secs)
+    }
+
     fn from_bytes(b: &[u8]) -> Option<Self> {
         let cumulative = u64::from_le_bytes(b.get(..8)?.try_into().ok()?);
         let expires_at = u64::from_le_bytes(b.get(8..16)?.try_into().ok()?);
@@ -464,6 +470,11 @@ impl KeptClaim {
         };
         Some(KeptClaim { cumulative, expires_at, signer, sig: rest.to_vec() })
     }
+}
+
+/// A `0x`-prefixed (or bare) hex EVM address.
+fn parse_evm_address(s: &str) -> Option<[u8; 20]> {
+    hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?.try_into().ok()
 }
 
 /// Add a commitment to `map`, within [`MAX_COMMITMENTS`] (past it, nothing is added) and
@@ -1254,6 +1265,9 @@ impl<A: EngineAdapter> Provider<A> {
                 )));
             }
         }
+        if let Some(reason) = self.wallet_refusal(req, source_peer) {
+            return Err(refuse(reason));
+        }
         let now = now_unix_ms();
         let (unsettled, full): (Vec<Unsettled>, bool) = {
             let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
@@ -1285,6 +1299,38 @@ impl<A: EngineAdapter> Provider<A> {
             peer: source_peer.to_string(),
             tokens,
         }))
+    }
+
+    /// On Base, the request must name the wallet its claims will be signed with, and while we hold a
+    /// live claim for the pair from another wallet we take none from this one: it would replace a
+    /// claim we can settle with one drawn on a channel we know nothing about. Refused here, before
+    /// serving, a consumer that changed wallets is told why instead of having its receipts refused
+    /// and its serves counted as unpaid.
+    fn wallet_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<String> {
+        if !matches!(self.settlement_chain, Some(openhydra_protocol::settlement::ChainDomain::Base(_))) {
+            return None;
+        }
+        let Some(wallet) = req.settlement_wallet.as_deref().and_then(parse_evm_address) else {
+            return Some("this provider settles on Base; the request names no wallet to pay from".into());
+        };
+        // A peer id that doesn't inline its key can't sign receipts either: the receipt check refuses it.
+        let consumer = self.net.ed25519_pubkey_from_peer_id(source_peer).ok()?;
+        let now_secs = now_unix_ms() / 1000;
+        let kept = self
+            .settled_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.settled_key_for(&consumer, &req.model_ref))
+            .cloned()?;
+        let pinned = kept.live_signer(now_secs)?;
+        (pinned != wallet).then(|| {
+            format!(
+                "this provider holds your unsettled claim for this model from wallet 0x{}; it takes claims from \
+                 another wallet once that one expires, in {} days",
+                hex::encode(pinned),
+                kept.expires_at.saturating_sub(now_secs).div_ceil(24 * 60 * 60)
+            )
+        })
     }
 
     /// Whether `peer` is this node, or our own co-located consumer (the desktop's gateway): it never
@@ -1715,7 +1761,12 @@ impl<A: EngineAdapter> Provider<A> {
     /// running total built under one must not carry over to another (the first claim there would
     /// re-authorize the whole history).
     fn settled_key(&self, p: &openhydra_protocol::receipts::ReceiptPayload) -> String {
-        let key = openhydra_protocol::verify::reputation_key(&hex::encode(p.consumer.as_bytes()), &p.model_id);
+        self.settled_key_for(p.consumer.as_bytes(), &p.model_id)
+    }
+
+    /// [`Self::settled_key`] for a consumer key and model.
+    fn settled_key_for(&self, consumer: &[u8], model_id: &str) -> String {
+        let key = openhydra_protocol::verify::reputation_key(&hex::encode(consumer), model_id);
         match &self.settlement_chain {
             Some(chain) => format!("{key}@{}", chain.fingerprint()),
             None => key,
@@ -1818,7 +1869,13 @@ impl<A: EngineAdapter> Provider<A> {
             openhydra_protocol::settlement::ClaimSigner::Evm(addr) => Some(addr),
             openhydra_protocol::settlement::ClaimSigner::Solana => None,
         };
-        let pinned = self.settled_claims.lock().unwrap_or_else(|e| e.into_inner()).get(&self.settled_key(p)).and_then(|k| k.signer);
+        let now_secs = now_unix_ms() / 1000;
+        let pinned = self
+            .settled_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.settled_key(p))
+            .and_then(|k| k.live_signer(now_secs));
         if let (Some(pinned), Some(signer)) = (pinned, signer) {
             if pinned != signer {
                 return Err(format!(
@@ -2919,7 +2976,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
         };
         let mut data = vec![SERVE_REQUEST];
         data.extend_from_slice(&req.encode());
@@ -3171,6 +3228,13 @@ mod tests {
         assert_eq!(map.values().filter(|c| c.served_peer == "greedy").count(), MAX_COMMITMENTS_PER_PEER);
         assert!(map.values().all(|c| c.served_peer != "greedy" || c.recorded_ms >= 10), "the oldest went");
         assert!(map.contains_key(&[0xff; 16]));
+        // Review S5: a pair's Base wallet stays pinned only while its claim can still be settled.
+        let pinned = KeptClaim { cumulative: 9, expires_at: 1_000, signer: Some([3; 20]), sig: vec![1; 65] };
+        assert_eq!(pinned.live_signer(999), Some([3; 20]));
+        assert_eq!(pinned.live_signer(1_000), None);
+        assert_eq!(parse_evm_address(&format!("0x{}", "ab".repeat(20))), Some([0xab; 20]));
+        assert_eq!(parse_evm_address(&"ab".repeat(20)), Some([0xab; 20]));
+        assert_eq!(parse_evm_address("0xabcd"), None);
         // A kept claim survives its encoding.
         let kc = KeptClaim { cumulative: 9, expires_at: 10, signer: Some([3; 20]), sig: vec![1; 65] };
         assert_eq!(KeptClaim::from_bytes(&kc.to_bytes()), Some(kc));
@@ -3476,7 +3540,7 @@ mod tests {
             tools: Vec::new(),
             think: None,
             nonce,
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
         };
 
         // Collect the frames the engine produces (the buffered result), then reveal them into the
@@ -3577,7 +3641,7 @@ mod tests {
         let req = ServeRequest {
             reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
-            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.

@@ -1546,6 +1546,12 @@ impl ConsumerNode {
     }
 
 
+    /// On Base, the wallet our claims are signed with, as a serve request names it.
+    fn settlement_wallet(&self) -> Option<String> {
+        let wallet = self.settlement_chain.as_ref()?.evm_wallet.as_ref()?;
+        Some(format!("0x{}", hex::encode(openhydra_protocol::settlement::evm_address(wallet.verifying_key()))))
+    }
+
     /// What the next receipt for this voucher key builds on: the higher of its voucher and the highest
     /// cumulative we have signed for it.
     fn settle_base(&self, key: &str) -> u64 {
@@ -1769,6 +1775,7 @@ impl ConsumerNode {
                 // On the crypto rail, offer to pay at our peg (a provider that charges needs it).
                 settlement_peg: self.settlement_peg,
                 settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
+                settlement_wallet: self.settlement_wallet(),
             };
             let provider_libp2p = provider.libp2p_peer_id.clone();
             // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
@@ -2644,6 +2651,7 @@ impl ConsumerNode {
             // Audits are paid for like any serve (and so look like one).
             settlement_peg: self.settlement_peg,
             settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
+            settlement_wallet: self.settlement_wallet(),
         };
         let provider_libp2p = provider.libp2p_peer_id.clone();
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -3009,6 +3017,7 @@ mod tests {
             deterministic: None,
             settlement_peg: None,
             settlement_domain: None,
+            settlement_wallet: None,
         }
     }
 
