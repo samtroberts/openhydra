@@ -144,14 +144,9 @@ impl Identity {
         // hex secret inside the `json` Value is a transient residual covered by the
         // process-level core-dump/swap hardening applied at agent startup.)
         let mut serialized = serde_json::to_string_pretty(&json)?;
-        std::fs::write(path, &serialized)?;
+        let written = write_new_key_file(path, serialized.as_bytes(), &openhydra_peer_id);
         serialized.zeroize();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        written?;
 
         let libp2p_peer_id = keypair.public().to_peer_id();
         Ok(Identity {
@@ -163,11 +158,20 @@ impl Identity {
 
     /// Load from path if it exists, otherwise generate and save.
     pub fn load_or_create(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let existed = path.exists();
+        let mut existed = path.exists();
         let identity = if existed {
             Self::load(path)?
         } else {
-            Self::generate(path)?
+            match Self::generate(path) {
+                Ok(identity) => identity,
+                // Another process (the desktop's provider and gateway start together) created it
+                // first: use that one, so both agree on the identity.
+                Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {
+                    existed = true;
+                    Self::load(path)?
+                }
+                Err(e) => return Err(e),
+            }
         };
         tracing::info!(
             path = %path.display(),
@@ -180,10 +184,63 @@ impl Identity {
     }
 }
 
+/// Create the key file at `path` with `contents`, never replacing one that exists (an
+/// `AlreadyExists` error then) and never visible half-written or readable by others: written to a
+/// temporary file beside it (owner-only from the start, named by `tag`, unique to this key), then
+/// linked into place.
+fn write_new_key_file(path: &Path, contents: &[u8], tag: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("key");
+    let tmp = dir.join(format!(".{name}.{tag}.tmp"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = opts.open(&tmp).and_then(|mut f| {
+        f.write_all(contents)?;
+        f.sync_all()?;
+        std::fs::hard_link(&tmp, path)
+    });
+    let _ = std::fs::remove_file(&tmp);
+    match result {
+        // A filesystem without hard links: create it in place, still never over an existing one.
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => opts.open(path).and_then(|mut f| {
+            f.write_all(contents)?;
+            f.sync_all()
+        }),
+        r => r,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn concurrent_creators_agree_on_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let ids: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| Identity::load_or_create(&path).unwrap().libp2p_peer_id.to_string())).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "one key, whoever created it: {ids:?}");
+        // Nothing left behind but the key, readable by its owner only.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Creating over an existing key is refused.
+        let err = Identity::generate(&path).err().unwrap();
+        assert_eq!(err.downcast_ref::<std::io::Error>().map(|e| e.kind()), Some(std::io::ErrorKind::AlreadyExists));
+    }
 
     #[test]
     fn test_generate_and_load_roundtrip() {
