@@ -66,7 +66,7 @@ if [ "$VERSION" = "latest" ]; then
   gh_base="https://github.com/$REPO/releases/latest/download"
 else
   DIST_BASE="${OPENHYDRA_DIST_BASE:-https://dl.openhydra.co/v${VERSION#v}}"
-  gh_base="https://github.com/$REPO/releases/download/$VERSION"
+  gh_base="https://github.com/$REPO/releases/download/v${VERSION#v}"
 fi
 primary="${DIST_BASE%/}/$asset"
 # Fallback: GitHub Releases — only resolves while the repo/release is public.
@@ -103,17 +103,20 @@ fetch() {
 }
 
 # --- download + install ---------------------------------------------------
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT INT TERM
+# Temporary files, removed however the script ends (a moved one is already gone).
+tmp="$(mktemp)"; stmp=""; ntmp=""
+trap 'rm -f "$tmp" "$stmp" "$ntmp"' EXIT
+trap 'exit 130' INT TERM
 info "Downloading $BIN_NAME for $os_name ($arch)…"
 tried="$primary"
 [ -z "${OPENHYDRA_DIST_BASE:-}" ] && tried="$tried, $fallback"
 fetch "$asset" "$tmp" || err "download failed. Tried: $tried"
 
-chmod +x "$tmp"
+# mktemp makes files only their owner can read: readable by all, as installed binaries are (the
+# agent hashes its own binary for attestation, which needs read access).
+chmod 755 "$tmp"
 target="$bindir/$BIN_NAME"
 mv "$tmp" "$target" 2>/dev/null || err "cannot write '$target'. Retry with a writable dir, e.g.: OPENHYDRA_BIN_DIR=\"\$HOME/.local/bin\" sh install.sh"
-trap - EXIT INT TERM
 
 # Compatibility: some scripts/docs invoke the binary as `openhydra-agent` (the desktop sidecar's
 # name). Expose that alias next to the primary `openhydra` command — but NEVER clobber a real
@@ -134,34 +137,53 @@ info "Installed → $target"
 # (Ollama, LM Studio, llama.cpp), and on macOS patched mistral.rs for LM Studio's MLX models. The
 # agent finds them next to itself. Optional: without them the CLI works, but a provider's models
 # can't be verified.
+scorers="openhydra-scorer"
+if [ "$os" = "Darwin" ]; then scorers="$scorers openhydra-mlx-scorer"; fi
+# Said when a scorer for this release couldn't be installed: an older one left in place still runs,
+# but may not match this agent.
+no_scorer() {
+  if [ -e "$bindir/$1" ]; then
+    info "WARNING: $2; kept the existing $bindir/$1, which may not match this version."
+  else
+    info "WARNING: $2; authenticity checks of your models will be refused."
+  fi
+}
 if [ "${OPENHYDRA_NO_SCORER:-}" != "1" ]; then
-  scorers="openhydra-scorer"
-  if [ "$os" = "Darwin" ]; then scorers="$scorers openhydra-mlx-scorer"; fi
   for s in $scorers; do
     stmp="$(mktemp)"
     if fetch "$s-$triple" "$stmp" 2>/dev/null; then
-      chmod +x "$stmp"
+      chmod 755 "$stmp"
       if mv "$stmp" "$bindir/$s" 2>/dev/null; then
         if [ "$os" = "Darwin" ]; then xattr -d com.apple.quarantine "$bindir/$s" >/dev/null 2>&1 || true; fi
         info "Installed → $bindir/$s"
       else
         rm -f "$stmp"
-        info "WARNING: couldn't write $bindir/$s; authenticity checks of your models will be refused."
+        no_scorer "$s" "couldn't write $bindir/$s"
       fi
     else
       rm -f "$stmp"
-      info "WARNING: no $s for this release; authenticity checks of your models will be refused."
+      no_scorer "$s" "no $s for this release"
     fi
+  done
+else
+  for s in $scorers; do
+    if [ -e "$bindir/$s" ]; then info "OPENHYDRA_NO_SCORER=1: left the existing $bindir/$s as it was."; fi
   done
 fi
 
 # --- licence notices -------------------------------------------------------
 # The third-party code compiled into the binaries above, and its licences.
-sharedir="$(dirname "$bindir")/share/openhydra"
+# Beside the binaries' prefix when that is a standard one (/usr/local/bin → /usr/local/share), else
+# in the user's own share directory (not a stray ~/share for OPENHYDRA_BIN_DIR=~/bin).
+prefix="$(dirname "$bindir")"
+case "$prefix" in
+  /usr/local|/usr|/opt/homebrew|/opt/local|"$HOME/.local") sharedir="$prefix/share/openhydra" ;;
+  *) sharedir="$HOME/.local/share/openhydra" ;;
+esac
 mkdir -p "$sharedir" 2>/dev/null && [ -w "$sharedir" ] || sharedir="$HOME/.local/share/openhydra"
 mkdir -p "$sharedir" 2>/dev/null || true
 ntmp="$(mktemp)"
-if fetch "THIRD_PARTY_NOTICES-$triple.txt" "$ntmp" 2>/dev/null && mv "$ntmp" "$sharedir/THIRD_PARTY_NOTICES.txt" 2>/dev/null; then
+if fetch "THIRD_PARTY_NOTICES-$triple.txt" "$ntmp" 2>/dev/null && chmod 644 "$ntmp" && mv "$ntmp" "$sharedir/THIRD_PARTY_NOTICES.txt" 2>/dev/null; then
   info "Licence notices → $sharedir/THIRD_PARTY_NOTICES.txt"
 else
   rm -f "$ntmp"

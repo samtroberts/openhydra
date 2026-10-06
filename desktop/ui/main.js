@@ -451,7 +451,11 @@ async function checkUpdates() {
       $("#relaunchver").textContent = "v" + up.version; // Windows: manual apply via the card
     }
     $("#relaunch").style.display = "flex";
-  } catch (e) { console.warn("update check", e); }
+  } catch (e) {
+    // A release that didn't build for this platform has no entry for it: nothing to update to yet.
+    if (/found in the response `platforms` object/.test(String(e))) return;
+    console.warn("update check", e);
+  }
 }
 setTimeout(checkUpdates, 3000);
 setInterval(checkUpdates, 60 * 60 * 1000); // #13: re-check hourly so a running instance stages a new release in the background

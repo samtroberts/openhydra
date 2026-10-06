@@ -35,6 +35,12 @@ on:
         description: "Publish the build to R2 (overwrites latest/ and the updater manifest)"
         type: boolean
         default: false
+      allow_older:
+        # A publish never moves latest/ back to an older version than the one published (a re-run of
+        # an old tag, say) unless this is set.
+        description: "Publish even if this version is older than the one in latest/"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -251,6 +257,10 @@ jobs:
     # A tag push publishes; a manual run only when asked (publish=true), whatever ref it starts from.
     if: always() && !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-22.04
+    # One publish at a time: each reads the published manifests and writes them back merged.
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/download-artifact@v4
         continue-on-error: true # no artifacts at all → the next step fails with a clear message
@@ -269,8 +279,16 @@ jobs:
         run: |
           mkdir -p prev
           EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 cp "s3://${R2_BUCKET}/latest.json" prev/latest.json --endpoint-url "$EP" \
-            || echo "no published latest.json yet"
+          # Only a manifest that isn't there is "none yet": on any other error, publishing would drop
+          # every platform that didn't build this run from it.
+          if out="$(aws s3api head-object --bucket "$R2_BUCKET" --key latest.json --endpoint-url "$EP" 2>&1)"; then
+            aws s3 cp "s3://${R2_BUCKET}/latest.json" prev/latest.json --endpoint-url "$EP"
+          elif echo "$out" | grep -qE '\(404\)|Not Found|NoSuchKey'; then
+            echo "no published latest.json yet"
+          else
+            echo "::error::couldn't read the published latest.json: $out"
+            exit 1
+          fi
 
       - name: Flatten artifacts
         shell: bash
@@ -283,6 +301,7 @@ jobs:
         shell: bash
         env:
           DIST_HOST: ${{ env.DIST_HOST }}
+          ALLOW_OLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_older }}
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
           [ -n "$VERSION" ] || VERSION="${GITHUB_REF_NAME#v}"
@@ -354,6 +373,11 @@ jobs:
           if os.path.exists('prev/latest.json'):
               with open('prev/latest.json') as f:
                   prev = json.load(f)
+          # Never move latest/ back to an older version (a re-run of an old tag) unless asked to.
+          def vkey(v):
+              return [int(x) if x.isdigit() else 0 for x in re.split(r'[.+-]', v)]
+          if prev.get('version') and vkey(version) < vkey(prev['version']) and os.environ.get('ALLOW_OLDER') != 'true':
+              sys.exit(f"refusing to publish {version} over the newer {prev['version']} (set allow_older to force)")
           manifest = {'version': version, 'base': host}
           for section in ('app', 'cli', 'cli_scorer', 'cli_mlx_scorer', 'notices', 'versions'):
               out = {}
