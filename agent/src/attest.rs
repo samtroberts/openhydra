@@ -101,11 +101,20 @@ pub struct Attestor {
     facts: DeviceFacts,
     binary_hash: [u8; 32],
     signer: ClaimSigner,
+    /// This provider's libp2p peer id, signed into every claim (see `AttestationClaim::provider_peer`).
+    provider_peer: String,
 }
 
 impl Attestor {
     pub fn new(facts: DeviceFacts, binary_hash: [u8; 32], signer: ClaimSigner) -> Self {
-        Self { facts, binary_hash, signer }
+        Self { facts, binary_hash, signer, provider_peer: String::new() }
+    }
+
+    /// Name the provider this attestor answers for (its libp2p peer id), so a consumer can tell its
+    /// claims from another provider's relayed through it.
+    pub fn with_provider_peer(mut self, peer: impl Into<String>) -> Self {
+        self.provider_peer = peer.into();
+        self
     }
 
     /// An attestor backed by a fresh Secure Enclave key and this Mac's device facts.
@@ -125,6 +134,7 @@ impl Attestor {
             secure_boot_enabled: self.facts.secure_boot_enabled,
             binary_hash: self.binary_hash,
             model_id: model_id.to_string(),
+            provider_peer: self.provider_peer.clone(),
             // Phase 0: the engine is external, so there is no in-process `active_model_hash`, and the
             // external digest is not bound either — neither would lift a tier (see protocol docs).
             model_digest: None,
@@ -476,6 +486,7 @@ pub fn attest_provider(
     now_unix_ms: u64,
     trusted_binaries: &[[u8; 32]],
     prev: Option<&AttestRecord>,
+    provider_peer: &str,
 ) -> AttestRecord {
     let key = prev.and_then(|p| p.key);
     let key_rotations = prev.map_or(0, |p| p.key_rotations);
@@ -496,6 +507,7 @@ pub fn attest_provider(
     };
     let policy = AttestPolicy {
         expected_nonce: nonce,
+        expected_provider: provider_peer,
         now_unix_ms,
         max_age_ms: ATTEST_MAX_AGE_MS,
         max_skew_ms: ATTEST_MAX_SKEW_MS,
@@ -519,6 +531,8 @@ mod tests {
     use p256::ecdsa::signature::Signer as _;
 
     const NOW: u64 = 1_790_000_000_000;
+    /// The provider the test attestors answer for.
+    const PROV: &str = "12D3KooWProvider";
     const BIN: [u8; 32] = [0xB1; 32];
 
     /// An attestor over a software P-256 key (stands in for the Secure Enclave, so the wire protocol
@@ -540,6 +554,7 @@ mod tests {
                 Ok(Attestation { claim, signing_key: public, signature_der: sig.to_der().as_bytes().to_vec() })
             }),
         )
+        .with_provider_peer(PROV)
     }
 
     fn public_only(model: &str) -> bool {
@@ -570,6 +585,7 @@ mod tests {
         let trusted = [BIN];
         let policy = AttestPolicy {
             expected_nonce: nonce,
+            expected_provider: PROV,
             now_unix_ms: NOW,
             max_age_ms: 60_000,
             max_skew_ms: 5_000,
@@ -647,7 +663,7 @@ mod tests {
         let mut t = |_: &[u8]| Ok(reply.clone());
         let Err(ChallengeError::Refused(reason)) = request_attestation(&mut t, [1; 32], "m") else { panic!() };
         assert!(reason.len() <= MAX_FAILURE_REASON);
-        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], None);
+        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], None, PROV);
         let AttestOutcome::Failed(why) = rec.outcome else { panic!() };
         assert!(why.len() <= MAX_FAILURE_REASON);
 
@@ -690,7 +706,7 @@ mod tests {
             key_rotations: 0,
         };
         let mut t = |_: &[u8]| Ok(reply.clone());
-        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], Some(&prev));
+        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], Some(&prev), PROV);
         assert_eq!(rec.device_trust(NOW), Some(DeviceTrust::SelfSigned));
     }
 
@@ -739,21 +755,31 @@ mod tests {
                 Ok(Attestation { claim, signing_key: public, signature_der: sig.to_der().as_bytes().to_vec() })
             }),
         )
+        .with_provider_peer(PROV)
+    }
+
+    #[test]
+    fn an_attestation_relayed_from_another_provider_fails() {
+        // The challenged peer forwards the challenge to an honest provider and relays its answer.
+        let honest = attestor_with_key(1);
+        let rec = attest_provider(&mut loopback(Some(&honest)), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None, "12D3KooWRelayer");
+        assert_eq!(rec.device_trust(NOW), None);
+        assert!(matches!(rec.outcome, AttestOutcome::Failed(ref why) if why.contains("ProviderMismatch")), "{:?}", rec.outcome);
     }
 
     #[test]
     fn attest_provider_records_verification_and_key_rotation() {
-        let first = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
+        let first = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None, PROV);
         assert_eq!(first.outcome, AttestOutcome::Verified(DeviceTrust::SelfSigned));
         assert_eq!(first.device_trust(NOW), Some(DeviceTrust::SelfSigned));
         assert_eq!(first.key_rotations, 0);
 
         // Same key again: no rotation.
-        let again = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[BIN], Some(&first));
+        let again = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[BIN], Some(&first), PROV);
         assert_eq!(again.key_rotations, 0);
 
         // Provider restarted with a fresh per-process key: still verified, rotation counted.
-        let rotated = attest_provider(&mut loopback(Some(&attestor_with_key(2))), "qwen2.5-0.5b", [3; 32], NOW, &[BIN], Some(&again));
+        let rotated = attest_provider(&mut loopback(Some(&attestor_with_key(2))), "qwen2.5-0.5b", [3; 32], NOW, &[BIN], Some(&again), PROV);
         assert_eq!(rotated.outcome, AttestOutcome::Verified(DeviceTrust::SelfSigned));
         assert_eq!(rotated.key_rotations, 1);
         assert_ne!(rotated.key, first.key);
@@ -761,19 +787,19 @@ mod tests {
 
     #[test]
     fn attest_provider_failures_keep_the_last_verified_key() {
-        let ok = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
+        let ok = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None, PROV);
 
         // Untrusted binary → Failed, but the last verified key and rotation count are kept.
-        let untrusted = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[[0; 32]], Some(&ok));
+        let untrusted = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[[0; 32]], Some(&ok), PROV);
         assert!(matches!(untrusted.outcome, AttestOutcome::Failed(ref e) if e.contains("UntrustedBinary")));
         assert_eq!(untrusted.device_trust(NOW), None);
         assert_eq!(untrusted.key, ok.key);
 
         // Refusal and transport errors are Failed too.
-        let refused = attest_provider(&mut loopback(None), "qwen2.5-0.5b", [3; 32], NOW, &[BIN], Some(&ok));
+        let refused = attest_provider(&mut loopback(None), "qwen2.5-0.5b", [3; 32], NOW, &[BIN], Some(&ok), PROV);
         assert!(matches!(refused.outcome, AttestOutcome::Failed(_)));
         let mut down = |_: &[u8]| Err("timeout".to_string());
-        let dropped = attest_provider(&mut down, "qwen2.5-0.5b", [4; 32], NOW, &[BIN], Some(&ok));
+        let dropped = attest_provider(&mut down, "qwen2.5-0.5b", [4; 32], NOW, &[BIN], Some(&ok), PROV);
         assert!(matches!(dropped.outcome, AttestOutcome::Failed(_)));
         assert_eq!(dropped.key, ok.key);
     }
@@ -782,12 +808,12 @@ mod tests {
     fn retry_timing_backs_off_legacy_providers() {
         let legacy = crate::serve::frame_response(&[crate::serve::ServeChunk::Error("unsupported method".into()).encode()]);
         let mut t = |_: &[u8]| Ok(legacy.clone());
-        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[BIN], None);
+        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[BIN], None, PROV);
         assert_eq!(rec.outcome, AttestOutcome::Unsupported);
         assert!(!rec.due(NOW + ATTEST_REFRESH_MS));
         assert!(rec.due(NOW + ATTEST_UNSUPPORTED_BACKOFF_MS));
 
-        let ok = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
+        let ok = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None, PROV);
         assert!(!ok.due(NOW + ATTEST_REFRESH_MS - 1));
         assert!(ok.due(NOW + ATTEST_REFRESH_MS));
     }
@@ -830,6 +856,7 @@ mod tests {
             secure_boot_enabled: facts.secure_boot_enabled,
             binary_hash: bin,
             model_id: "qwen2.5-0.5b".into(),
+            provider_peer: "12D3KooWThisMac".into(),
             model_digest: None,
             active_model_hash: None,
             session_pubkey: None,
@@ -839,6 +866,7 @@ mod tests {
         let trusted = [bin];
         let policy = AttestPolicy {
             expected_nonce: nonce,
+            expected_provider: "12D3KooWThisMac",
             now_unix_ms: now,
             max_age_ms: 60_000,
             max_skew_ms: 5_000,

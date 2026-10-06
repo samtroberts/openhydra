@@ -119,6 +119,11 @@ const ATTEST_GLOBAL_RPS: f64 = 20.0;
 const ATTEST_GLOBAL_BURST: f64 = 40.0;
 /// The single key the global attestation bucket is kept under.
 const ATTEST_GLOBAL_KEY: &str = "*";
+/// How long a peer that passed a private model's swarm gate may attest that model (see
+/// `Provider::private_attestable`).
+const PRIVATE_ATTEST_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// `(peer, model)` pairs remembered for that (the oldest are forgotten first).
+const MAX_PRIVATE_ATTEST_PAIRS: usize = 4096;
 /// Per-peer cap on prompt-scoring challenges. A verifier round is 24 challenges sent one at a time
 /// (~1 s each on an L4), so this admits a round without queueing but stops one peer hogging the
 /// engine; the provider-wide `InflightGate` is the hard bound.
@@ -343,6 +348,27 @@ fn payment_window(unsettled: &[(u64, u64)], generating: &[u64], defaults: usize,
         return Err("too many served tokens are still unpaid; settle them before asking for more".into());
     }
     Ok(())
+}
+
+/// Record that `peer` passed private `model`'s swarm gate at `now`, keeping at most
+/// [`MAX_PRIVATE_ATTEST_PAIRS`] pairs (expired ones go first, then the oldest).
+fn note_private_member_in(m: &mut HashMap<(String, String), u64>, peer: &str, model: &str, now: u64) {
+    if m.len() >= MAX_PRIVATE_ATTEST_PAIRS {
+        m.retain(|_, at| now.saturating_sub(*at) <= PRIVATE_ATTEST_WINDOW_MS);
+        if m.len() >= MAX_PRIVATE_ATTEST_PAIRS {
+            if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
+    }
+    m.insert((peer.to_string(), model.to_string()), now);
+}
+
+/// Whether `peer` may attest private `model`: it passed that model's swarm gate within
+/// [`PRIVATE_ATTEST_WINDOW_MS`]. Anyone else gets the same refusal as for an unshared model, so a
+/// challenge still can't probe for private models.
+fn private_attestable_in(m: &HashMap<(String, String), u64>, peer: &str, model: &str, now: u64) -> bool {
+    m.get(&(peer.to_string(), model.to_string())).is_some_and(|at| now.saturating_sub(*at) <= PRIVATE_ATTEST_WINDOW_MS)
 }
 
 /// A paid serve's reservation against its consumer's unpaid-token cap while it generates; released
@@ -839,6 +865,9 @@ pub struct Provider<A: EngineAdapter> {
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
+    /// `(peer, model)` → when that peer last passed the swarm gate for a private model: it may attest
+    /// the model it is entitled to (an attestation challenge carries no credential).
+    private_members: Mutex<HashMap<(String, String), u64>>,
     /// Paid serves generating now, per consumer: each one's token reservation (credit window).
     paid_generating: Arc<Mutex<HashMap<String, Vec<u64>>>>,
     /// Stream nonces whose consumer polled to the end before the serve was recorded (see
@@ -994,6 +1023,7 @@ impl<A: EngineAdapter> Provider<A> {
             settlement_chain: None,
             self_consumer: None,
             paid_generating: Arc::new(Mutex::new(HashMap::new())),
+            private_members: Mutex::new(HashMap::new()),
             delivered_nonces: Mutex::new(HashMap::new()),
             payment_defaults: Mutex::new(HashMap::new()),
             settlement_peg: None,
@@ -1054,7 +1084,9 @@ impl<A: EngineAdapter> Provider<A> {
     /// Opt in to device attestation: answer `ATTEST_CHALLENGE` with claims signed by `attestor`
     /// (builder form). Only models this node announces publicly are attestable.
     pub fn with_attestor(mut self, attestor: Attestor) -> Self {
-        self.attestor = Some(Arc::new(attestor));
+        // Its claims name this provider, so a consumer can tell them from a relayed attestation.
+        let peer = self.net.libp2p_peer_id().to_string();
+        self.attestor = Some(Arc::new(attestor.with_provider_peer(peer)));
         self
     }
 
@@ -1248,7 +1280,12 @@ impl<A: EngineAdapter> Provider<A> {
             self.swarm_auth.as_deref(),
             now_unix_ms(),
         ) {
-            Ok(()) => None,
+            Ok(()) => {
+                if scope == crate::share_policy::Scope::Private {
+                    self.note_private_member(source_peer, &req.model_ref);
+                }
+                None
+            }
             Err((reason, is_swarm_refusal)) => {
                 if is_swarm_refusal {
                     if let Some(stats) = &self.stats {
@@ -1258,6 +1295,18 @@ impl<A: EngineAdapter> Provider<A> {
                 Some(frame_response(&[ServeChunk::Error(reason).encode()]))
             }
         }
+    }
+
+    /// Remember that `peer` passed the swarm gate for private `model`, for attestation.
+    fn note_private_member(&self, peer: &str, model: &str) {
+        let mut m = self.private_members.lock().unwrap_or_else(|e| e.into_inner());
+        note_private_member_in(&mut m, peer, model, now_unix_ms());
+    }
+
+    /// Whether `peer` may attest private `model` ([`private_attestable_in`]).
+    fn private_attestable(&self, peer: &str, model: &str) -> bool {
+        let m = self.private_members.lock().unwrap_or_else(|e| e.into_inner());
+        private_attestable_in(&m, peer, model, now_unix_ms())
     }
 
     /// Restrict which models this provider shares (announces + serves) via a **static** legacy
@@ -2314,8 +2363,9 @@ impl<A: EngineAdapter> Provider<A> {
             // M5: an owner-authorised remote-control device flips a model's share scope on this rig.
             Some(&REMOTE_SCOPE_SET) => self.handle_remote_scope_set(source_peer, &data[1..]),
             // Device attestation challenge (Phase 0). Rate-limited per authenticated peer before any
-            // signing; only publicly-announced models are attestable (a private or unshared model
-            // gets the same refusal, so a challenge can't probe for private models).
+            // signing; publicly-announced models are attestable, and a private one by a swarm member
+            // that recently passed its gate. Anyone else gets the same refusal as for an unshared
+            // model, so a challenge can't probe for private models.
             Some(&ATTEST_CHALLENGE) => {
                 if self.attest_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
                     return attest_refusal(crate::attest::ATTEST_RATE_LIMITED);
@@ -2325,7 +2375,7 @@ impl<A: EngineAdapter> Provider<A> {
                 crate::attest::handle_attest_inbound_limited(
                     &data[1..],
                     self.attestor.as_deref(),
-                    &|model| self.policy.announce_globally(model),
+                    &|model| self.policy.announce_globally(model) || self.private_attestable(source_peer, model),
                     now_unix_ms(),
                     &|| self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok(),
                 )
@@ -2968,6 +3018,23 @@ mod tests {
         assert!(validate_and_consume_commitment(&mut map, &[2u8; 16], "expensive-model", 100, now, now, "c", "c")
             .unwrap_err()
             .contains("model"));
+    }
+
+    #[test]
+    fn a_swarm_member_may_attest_the_private_model_it_was_served() {
+        let now = 10 * PRIVATE_ATTEST_WINDOW_MS;
+        let mut m = HashMap::new();
+        assert!(!private_attestable_in(&m, "member", "rig-model", now), "not before passing the gate");
+        note_private_member_in(&mut m, "member", "rig-model", now);
+        assert!(private_attestable_in(&m, "member", "rig-model", now + PRIVATE_ATTEST_WINDOW_MS));
+        assert!(!private_attestable_in(&m, "member", "rig-model", now + PRIVATE_ATTEST_WINDOW_MS + 1), "expires");
+        assert!(!private_attestable_in(&m, "member", "other-model", now), "only the model it passed for");
+        assert!(!private_attestable_in(&m, "stranger", "rig-model", now), "only that peer");
+        // Bounded: a full map forgets expired pairs, then the oldest.
+        for i in 0..MAX_PRIVATE_ATTEST_PAIRS as u64 {
+            note_private_member_in(&mut m, &format!("p{i}"), "m", now + i);
+        }
+        assert_eq!(m.len(), MAX_PRIVATE_ATTEST_PAIRS);
     }
 
     #[test]

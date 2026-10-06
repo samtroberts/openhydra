@@ -2299,6 +2299,8 @@ impl ConsumerNode {
                 now_unix_ms(),
                 &attest.trusted_binaries,
                 prev.as_ref(),
+                // The peer we challenge: its claim must name it, not another provider it relays.
+                &libp2p,
             );
             if record.key_rotations > prev.as_ref().map_or(0, |p| p.key_rotations) {
                 tracing::warn!(provider = %peer_id, rotations = record.key_rotations,

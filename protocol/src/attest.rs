@@ -37,8 +37,11 @@ use crate::trust::MethodFlags;
 
 /// Domain separator for the attestation signing preimage.
 pub const ATTEST_DOMAIN: &[u8] = b"openhydra/attest/v1";
-/// The only attestation format version this build produces and accepts.
-pub const ATTEST_VERSION: u8 = 1;
+/// The only attestation format version this build produces and accepts. 2: the claim names the
+/// provider it is from (`provider_peer`).
+pub const ATTEST_VERSION: u8 = 2;
+/// Domain separator for a [`ServeAttestation`]'s signing preimage.
+pub const SERVE_ATTEST_DOMAIN: &[u8] = b"openhydra/attest-serve/v1";
 /// Length of an uncompressed SEC1 P-256 public key (`0x04 || X || Y`) — the form Apple's
 /// `SecKeyCopyExternalRepresentation` returns for an EC public key.
 pub const P256_SEC1_UNCOMPRESSED_LEN: usize = 65;
@@ -60,6 +63,10 @@ pub struct AttestationClaim {
     pub binary_hash: [u8; 32],
     /// Canonical model id the device says it serves.
     pub model_id: String,
+    /// The libp2p peer id of the provider answering the challenge. A consumer requires it to be the
+    /// peer it challenged: otherwise a provider could relay another (honest, attested) provider's
+    /// answer as its own.
+    pub provider_peer: String,
     /// Weight digest reported by an **external** engine (e.g. Ollama's `sha256-…` blob digest). The
     /// provider's word about a process it doesn't control — never a basis for a tier lift.
     pub model_digest: Option<[u8; 32]>,
@@ -132,6 +139,8 @@ pub enum AttestError {
     UntrustedBinary,
     /// The key differs from the one pinned for this provider.
     KeyChanged,
+    /// The claim names another provider than the one challenged (a relayed attestation).
+    ProviderMismatch,
 }
 
 /// The consumer's acceptance policy for one verification.
@@ -139,6 +148,8 @@ pub enum AttestError {
 pub struct AttestPolicy<'a> {
     /// The nonce the consumer issued for this challenge.
     pub expected_nonce: [u8; 32],
+    /// The libp2p peer id of the provider the consumer challenged (the authenticated responder).
+    pub expected_provider: &'a str,
     /// The consumer's clock (unix ms).
     pub now_unix_ms: u64,
     /// Oldest acceptable claim age.
@@ -168,6 +179,7 @@ impl AttestationClaim {
         b.push(self.secure_boot_enabled as u8);
         b.extend_from_slice(&self.binary_hash);
         put_str(&mut b, &self.model_id);
+        put_str(&mut b, &self.provider_peer);
         put_opt32(&mut b, self.model_digest.as_ref());
         put_opt32(&mut b, self.active_model_hash.as_ref());
         put_opt32(&mut b, self.session_pubkey.as_ref());
@@ -187,6 +199,7 @@ impl AttestationClaim {
             secure_boot_enabled: r.flag()?,
             binary_hash: r.array32()?,
             model_id: r.string()?,
+            provider_peer: r.string()?,
             model_digest: r.opt32()?,
             active_model_hash: r.opt32()?,
             session_pubkey: r.opt32()?,
@@ -249,6 +262,9 @@ pub fn verify_attestation(att: &Attestation, policy: &AttestPolicy<'_>) -> Resul
     if c.nonce != policy.expected_nonce {
         return Err(AttestError::NonceMismatch);
     }
+    if c.provider_peer != policy.expected_provider {
+        return Err(AttestError::ProviderMismatch);
+    }
     if c.ts_unix_ms > policy.now_unix_ms.saturating_add(policy.max_skew_ms) {
         return Err(AttestError::FromFuture);
     }
@@ -272,27 +288,77 @@ pub fn verify_attestation(att: &Attestation, policy: &AttestPolicy<'_>) -> Resul
     Ok(DeviceTrust::SelfSigned)
 }
 
-/// The Proof-of-Inference methods a verified attestation establishes — the single place the A3 lift
-/// is decided. `hardware_attested` is set only when **all three** hold:
+/// A serve signed by the attested key: the device's statement that **this** serve (its receipt nonce)
+/// produced output with this hash, from the engine whose state the attestation describes. A device
+/// attestation alone says what the machine was at challenge time, not that a given serve came from
+/// it; a serve attestation ties the two together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeAttestation {
+    /// The serve's receipt nonce (what the consumer committed to before the serve).
+    pub serve_nonce: [u8; 16],
+    /// SHA-256 of the output the consumer received.
+    pub output_hash: [u8; 32],
+    /// DER ECDSA-P256-SHA256 over [`serve_signing_bytes`], by the attestation's key.
+    pub signature_der: Vec<u8>,
+}
+
+/// The bytes the attested key signs for a serve: `SERVE_ATTEST_DOMAIN || serve_nonce || output_hash
+/// || model_id (u32-LE length-prefixed)`.
+pub fn serve_signing_bytes(serve_nonce: &[u8; 16], output_hash: &[u8; 32], model_id: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(SERVE_ATTEST_DOMAIN.len() + 16 + 32 + 4 + model_id.len());
+    b.extend_from_slice(SERVE_ATTEST_DOMAIN);
+    b.extend_from_slice(serve_nonce);
+    b.extend_from_slice(output_hash);
+    put_str(&mut b, model_id);
+    b
+}
+
+/// What a consumer knows about one serve it is crediting: the nonce it committed and the hash of the
+/// output it received. A [`ServeAttestation`] must match both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeEvidence {
+    pub serve_nonce: [u8; 16],
+    pub output_hash: [u8; 32],
+}
+
+/// Whether `serve` is a valid signature by `att`'s key over this serve (`evidence`) of `att`'s model.
+pub fn verify_serve_attestation(att: &Attestation, serve: &ServeAttestation, evidence: &ServeEvidence) -> bool {
+    if serve.serve_nonce != evidence.serve_nonce || serve.output_hash != evidence.output_hash {
+        return false;
+    }
+    let Ok(key) = VerifyingKey::from_sec1_bytes(&att.signing_key) else { return false };
+    let Ok(sig) = Signature::from_der(&serve.signature_der) else { return false };
+    key.verify(&serve_signing_bytes(&serve.serve_nonce, &serve.output_hash, &att.claim.model_id), &sig).is_ok()
+}
+
+/// The Proof-of-Inference methods a verified attestation establishes **for one serve** — the single
+/// place the A3 lift is decided. `hardware_attested` is set only when **all four** hold:
 ///
 /// 1. the key is vouched for by a hardware chain ([`DeviceTrust::HardwareChain`]);
 /// 2. the claim carries an in-process `active_model_hash` (an external engine's `model_digest` never
 ///    counts — it is the provider's word about a process it doesn't control);
 /// 3. that hash equals the trusted expected hash for the canonical model (the reference anchor);
-///    `None` — no anchor — never lifts.
+///    `None` — no anchor — never lifts;
+/// 4. the serve being credited is signed by the same attested key ([`verify_serve_attestation`]):
+///    the device's state at challenge time says nothing about a serve it didn't sign.
 ///
 /// Anything less returns no methods: a self-signed attestation is identity + liveness, not proof of
 /// which model ran.
 pub fn attested_methods(
     trust: DeviceTrust,
-    claim: &AttestationClaim,
+    att: &Attestation,
     expected_model_hash: Option<&[u8; 32]>,
+    serve: Option<(&ServeAttestation, &ServeEvidence)>,
 ) -> MethodFlags {
     let anchored = matches!(
-        (claim.active_model_hash.as_ref(), expected_model_hash),
+        (att.claim.active_model_hash.as_ref(), expected_model_hash),
         (Some(active), Some(expected)) if active == expected
     );
-    MethodFlags { hardware_attested: trust == DeviceTrust::HardwareChain && anchored, ..MethodFlags::default() }
+    let serve_bound = serve.is_some_and(|(s, e)| verify_serve_attestation(att, s, e));
+    MethodFlags {
+        hardware_attested: trust == DeviceTrust::HardwareChain && anchored && serve_bound,
+        ..MethodFlags::default()
+    }
 }
 
 fn put_str(b: &mut Vec<u8>, s: &str) {
@@ -380,6 +446,7 @@ mod tests {
             secure_boot_enabled: true,
             binary_hash: BIN,
             model_id: "qwen2.5-0.5b".into(),
+            provider_peer: PROVIDER.into(),
             model_digest: Some([0xD1; 32]),
             active_model_hash: None,
             session_pubkey: None,
@@ -387,6 +454,8 @@ mod tests {
             ts_unix_ms: NOW - 1_000,
         }
     }
+
+    const PROVIDER: &str = "12D3KooWProvider";
 
     fn sign(sk: &SigningKey, claim: AttestationClaim) -> Attestation {
         let key = sec1(sk);
@@ -397,6 +466,7 @@ mod tests {
     fn policy<'a>(trusted: &'a [[u8; 32]]) -> AttestPolicy<'a> {
         AttestPolicy {
             expected_nonce: NONCE,
+            expected_provider: PROVIDER,
             now_unix_ms: NOW,
             max_age_ms: 60_000,
             max_skew_ms: 5_000,
@@ -430,6 +500,7 @@ mod tests {
             |c| c.os_build.push('X'),
             |c| c.binary_hash[0] ^= 1,
             |c| c.model_id.push('X'),
+            |c| c.provider_peer.push('X'),
             |c| c.model_digest = None,
             |c| c.active_model_hash = Some([0; 32]),
             |c| c.session_pubkey = Some([0; 32]),
@@ -526,10 +597,12 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert_eq!(Attestation::from_bytes(&long), Err(AttestError::Malformed));
-        // Unknown version.
-        let mut v = bytes.clone();
-        v[0] = 2;
-        assert_eq!(Attestation::from_bytes(&v), Err(AttestError::UnsupportedVersion));
+        // Unknown versions, the earlier one (no provider in the claim) included.
+        for version in [ATTEST_VERSION - 1, ATTEST_VERSION + 1] {
+            let mut v = bytes.clone();
+            v[0] = version;
+            assert_eq!(Attestation::from_bytes(&v), Err(AttestError::UnsupportedVersion));
+        }
         // Huge string length prefix, bad presence flag, oversized signature length.
         assert!(Attestation::from_bytes(&[ATTEST_VERSION, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
         let mut flag = bytes.clone();
@@ -551,40 +624,73 @@ mod tests {
     // ── the H1 rule: what may lift the authenticity tier ──
 
     #[test]
+    fn a_relayed_attestation_names_the_wrong_provider() {
+        // A provider forwarding an honest provider's challenge answers with a claim naming the honest
+        // one: valid signature, but not from the peer the consumer challenged.
+        let att = sign(&signer(2), claim());
+        let mut p = policy(&[BIN]);
+        p.expected_provider = "12D3KooWRelayer";
+        assert_eq!(verify_attestation(&att, &p), Err(AttestError::ProviderMismatch));
+    }
+
+    /// The serve signed by `sk` (output of `model`).
+    fn serve_sig(sk: &SigningKey, evidence: &ServeEvidence, model: &str) -> ServeAttestation {
+        let sig: Signature = sk.sign(&serve_signing_bytes(&evidence.serve_nonce, &evidence.output_hash, model));
+        ServeAttestation {
+            serve_nonce: evidence.serve_nonce,
+            output_hash: evidence.output_hash,
+            signature_der: sig.to_der().as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
     fn a_verified_self_signed_attestation_never_lifts_the_tier() {
+        let sk = signer(5);
         let mut c = claim();
         c.active_model_hash = Some([0xA1; 32]);
+        let att = sign(&sk, c);
         let expected = [0xA1; 32];
-        // Even with a matching in-process hash and an anchor, a self-signed key earns nothing.
-        let m = attested_methods(DeviceTrust::SelfSigned, &c, Some(&expected));
+        let ev = ServeEvidence { serve_nonce: [3; 16], output_hash: [4; 32] };
+        let serve = serve_sig(&sk, &ev, "qwen2.5-0.5b");
+        // Even with a matching in-process hash, an anchor and a signed serve, a self-signed key earns nothing.
+        let m = attested_methods(DeviceTrust::SelfSigned, &att, Some(&expected), Some((&serve, &ev)));
         assert_eq!(m, MethodFlags::default());
         assert_eq!(authenticity_tier_from(0.0, 0.0, 0, m), AuthenticityTier::SelfReported);
     }
 
     #[test]
-    fn hardware_chain_lifts_to_a3_only_with_an_anchored_in_process_hash() {
+    fn hardware_chain_lifts_to_a3_only_with_an_anchored_hash_and_a_signed_serve() {
+        let sk = signer(6);
         let expected = [0xA1; 32];
+        let ev = ServeEvidence { serve_nonce: [3; 16], output_hash: [4; 32] };
+        let with_hash = |hash: Option<[u8; 32]>, digest: Option<[u8; 32]>| {
+            let mut c = claim();
+            c.active_model_hash = hash;
+            c.model_digest = digest;
+            sign(&sk, c)
+        };
+        let serve = serve_sig(&sk, &ev, "qwen2.5-0.5b");
+        let hw = |att: &Attestation, anchor: Option<&[u8; 32]>, s: Option<(&ServeAttestation, &ServeEvidence)>| {
+            attested_methods(DeviceTrust::HardwareChain, att, anchor, s).hardware_attested
+        };
 
-        // External engine only (model_digest set, no active_model_hash): no lift, even if the digest
-        // equals the expected hash.
-        let mut c = claim();
-        c.model_digest = Some(expected);
-        assert!(!attested_methods(DeviceTrust::HardwareChain, &c, Some(&expected)).hardware_attested);
+        // External engine only (model_digest equal to the anchor, no active_model_hash): no lift.
+        assert!(!hw(&with_hash(None, Some(expected)), Some(&expected), Some((&serve, &ev))));
+        // In-process hash but no anchor, or one that doesn't match (substituted weights): no lift.
+        assert!(!hw(&with_hash(Some(expected), None), None, Some((&serve, &ev))));
+        assert!(!hw(&with_hash(Some([0xEE; 32]), None), Some(&expected), Some((&serve, &ev))));
+        // Anchored, but the serve isn't signed by the attested key, isn't this serve, or is missing.
+        let att = with_hash(Some(expected), None);
+        assert!(!hw(&att, Some(&expected), None), "no serve signature");
+        let other_key = serve_sig(&signer(9), &ev, "qwen2.5-0.5b");
+        assert!(!hw(&att, Some(&expected), Some((&other_key, &ev))), "signed by another key");
+        let other_serve = ServeEvidence { serve_nonce: [8; 16], ..ev };
+        assert!(!hw(&att, Some(&expected), Some((&serve, &other_serve))), "another serve's signature");
+        let other_model = serve_sig(&sk, &ev, "another-model");
+        assert!(!hw(&att, Some(&expected), Some((&other_model, &ev))), "signed for another model");
 
-        // In-process hash but no anchor: no lift.
-        let mut c = claim();
-        c.active_model_hash = Some(expected);
-        assert!(!attested_methods(DeviceTrust::HardwareChain, &c, None).hardware_attested);
-
-        // In-process hash that doesn't match the anchor (substituted weights): no lift.
-        let mut c = claim();
-        c.active_model_hash = Some([0xEE; 32]);
-        assert!(!attested_methods(DeviceTrust::HardwareChain, &c, Some(&expected)).hardware_attested);
-
-        // All three conditions: A3.
-        let mut c = claim();
-        c.active_model_hash = Some(expected);
-        let m = attested_methods(DeviceTrust::HardwareChain, &c, Some(&expected));
+        // All four conditions: A3.
+        let m = attested_methods(DeviceTrust::HardwareChain, &att, Some(&expected), Some((&serve, &ev)));
         assert!(m.hardware_attested);
         assert_eq!(authenticity_tier_from(0.0, 0.0, 0, m), AuthenticityTier::HardwareAttested);
     }
