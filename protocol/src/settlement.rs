@@ -414,8 +414,8 @@ impl SettlementClaim {
     }
 }
 
-/// Recover the 20-byte EVM signer address from a 65-byte secp256k1 signature (`r‖s‖v`, `v ∈ {27,28}`
-/// or `{0,1}`) over an EIP-712 `digest` — the on-chain `ecrecover`. `None` on any malformed input.
+/// Recover the 20-byte EVM signer address from a 65-byte secp256k1 signature (`r‖s‖v`, `v ∈ {27,28}`)
+/// over an EIP-712 `digest` — the on-chain `ecrecover`. `None` on any malformed input.
 pub fn recover_evm_signer(digest: &[u8; 32], sig_65: &[u8; 65]) -> Option<[u8; 20]> {
     let signature = EcdsaSignature::from_slice(&sig_65[..64]).ok()?;
     // Reject high-`s` signatures (EIP-2 low-`s` requirement, review F5): `normalize_s` returns
@@ -426,10 +426,13 @@ pub fn recover_evm_signer(digest: &[u8; 32], sig_65: &[u8; 65]) -> Option<[u8; 2
     if signature.normalize_s().is_some() {
         return None;
     }
-    // Accept both Ethereum's `27/28` and the raw `0/1` recovery-id conventions.
-    let v = sig_65[64];
-    let rec_byte = if v >= 27 { v - 27 } else { v };
-    let recovery_id = RecoveryId::from_byte(rec_byte)?;
+    // Exactly Ethereum's `27/28`: the contract's `ecrecover` rejects every other `v` (the raw `0/1`
+    // convention included), so the off-chain check must not accept a signature the chain refuses.
+    let recovery_id = match sig_65[64] {
+        27 => RecoveryId::from_byte(0)?,
+        28 => RecoveryId::from_byte(1)?,
+        _ => return None,
+    };
     let vk = EcdsaVerifyingKey::recover_from_prehash(digest, &signature, recovery_id).ok()?;
     Some(evm_address(&vk))
 }
@@ -740,6 +743,12 @@ mod tests {
         sig65[..64].copy_from_slice(&sig.to_bytes());
         sig65[64] = rec.to_byte() + 27; // Ethereum's v convention
         assert_eq!(recover_evm_signer(&digest, &sig65), Some(expected));
+        // Only 27/28, as `ecrecover` on-chain: the raw 0/1 form and anything else are refused.
+        for v in [0u8, 1, 29, 255] {
+            let mut other = sig65;
+            other[64] = v;
+            assert_eq!(recover_evm_signer(&digest, &other), None, "v = {v}");
+        }
         // A wrong signature recovers a different (or no) address, never the expected one by accident.
         let mut bad = sig65;
         bad[0] ^= 0xFF;
