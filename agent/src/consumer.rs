@@ -1207,6 +1207,7 @@ impl ConsumerNode {
             .unwrap_or_default();
         // Device attestation (Phase 0): the verified device-trust level + key rotations per provider.
         // Snapshotted under its own lock, released before reputation is taken.
+        let attest_now = now_unix_ms();
         let device: std::collections::HashMap<String, (Option<&'static str>, u32)> = self
             .provider_attest
             .as_ref()
@@ -1215,7 +1216,7 @@ impl ConsumerNode {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .map(|(peer, r)| (peer.clone(), (r.device_trust().map(|t| t.label()), r.key_rotations)))
+                    .map(|(peer, r)| (peer.clone(), (r.device_trust(attest_now).map(|t| t.label()), r.key_rotations)))
                     .collect()
             })
             .unwrap_or_default();
@@ -2102,7 +2103,9 @@ impl ConsumerNode {
                     "provider attestation key changed (expected on restart for unsigned builds)");
             }
             tracing::info!(provider = %peer_id, model, outcome = ?record.outcome, "device attestation");
-            attest.records.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.clone(), record);
+            let mut records = attest.records.lock().unwrap_or_else(|e| e.into_inner());
+            crate::attest::insert_record_bounded(&mut records, peer_id.clone(), record, now_unix_ms());
+            drop(records);
             attest.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
         });
     }

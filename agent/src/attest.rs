@@ -24,6 +24,7 @@
 
 use openhydra_protocol::attest::{verify_attestation, AttestPolicy, Attestation, AttestationClaim, DeviceTrust};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 #[cfg(target_os = "macos")]
 pub use macos::{device_facts, SecureEnclaveSigner};
@@ -218,7 +219,9 @@ pub fn request_attestation(
             }
             Ok(att)
         }
-        Some((&RESP_REFUSED, reason)) => Err(ChallengeError::Refused(String::from_utf8_lossy(reason).into_owned())),
+        Some((&RESP_REFUSED, reason)) => Err(ChallengeError::Refused(bounded_reason(&String::from_utf8_lossy(
+            &reason[..reason.len().min(MAX_FAILURE_REASON)],
+        )))),
         _ => Err(ChallengeError::Malformed),
     }
 }
@@ -364,6 +367,38 @@ pub const ATTEST_UNSUPPORTED_BACKOFF_MS: u64 = 60 * 60 * 1000;
 /// Oldest acceptable claim (covers the round-trip plus modest clock drift; the fresh nonce is the
 /// real replay defence).
 const ATTEST_MAX_AGE_MS: u64 = 120_000;
+/// How long a verified attestation counts after it was made. Serves re-attest every
+/// [`ATTEST_REFRESH_MS`], so a provider still being used stays verified; one no longer reached
+/// stops showing a badge it may no longer deserve.
+pub const ATTEST_VALID_MS: u64 = 24 * 60 * 60 * 1000;
+/// Providers whose attestation records a consumer keeps (see [`insert_record_bounded`]).
+pub const MAX_ATTEST_RECORDS: usize = 4096;
+/// Longest failure reason kept in a record, in bytes: a refusal reason is the provider's own text.
+const MAX_FAILURE_REASON: usize = 256;
+
+/// `reason` cut to [`MAX_FAILURE_REASON`] bytes, on a character boundary.
+fn bounded_reason(reason: &str) -> String {
+    let mut end = reason.len().min(MAX_FAILURE_REASON);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
+/// Store `record` under `key`, keeping at most [`MAX_ATTEST_RECORDS`]: when full, records older than
+/// [`ATTEST_VALID_MS`] go first, then the oldest.
+pub fn insert_record_bounded(map: &mut HashMap<String, AttestRecord>, key: String, record: AttestRecord, now_unix_ms: u64) {
+    if map.len() >= MAX_ATTEST_RECORDS && !map.contains_key(&key) {
+        map.retain(|_, r| now_unix_ms.saturating_sub(r.last_attempt_ms) <= ATTEST_VALID_MS);
+        while map.len() >= MAX_ATTEST_RECORDS {
+            let Some(oldest) = map.iter().min_by_key(|(_, r)| r.last_attempt_ms).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            map.remove(&oldest);
+        }
+    }
+    map.insert(key, record);
+}
 /// How far ahead of the consumer's clock a provider's claim may be dated.
 const ATTEST_MAX_SKEW_MS: u64 = 30_000;
 
@@ -400,10 +435,11 @@ impl AttestRecord {
         now_unix_ms.saturating_sub(self.last_attempt_ms) >= wait
     }
 
-    /// The device-trust level this record currently supports — only a verified outcome counts.
-    pub fn device_trust(&self) -> Option<DeviceTrust> {
+    /// The device-trust level this record supports at `now_unix_ms` — only a verified outcome counts,
+    /// and only for [`ATTEST_VALID_MS`] after it was made.
+    pub fn device_trust(&self, now_unix_ms: u64) -> Option<DeviceTrust> {
         match self.outcome {
-            AttestOutcome::Verified(t) => Some(t),
+            AttestOutcome::Verified(t) if now_unix_ms.saturating_sub(self.last_attempt_ms) <= ATTEST_VALID_MS => Some(t),
             _ => None,
         }
     }
@@ -429,7 +465,7 @@ pub fn attest_provider(
     let att = match request_attestation(transport, nonce, model_id) {
         Ok(att) => att,
         Err(ChallengeError::Unsupported) => return failed(AttestOutcome::Unsupported),
-        Err(e) => return failed(AttestOutcome::Failed(format!("{e:?}"))),
+        Err(e) => return failed(AttestOutcome::Failed(bounded_reason(&format!("{e:?}")))),
     };
     let policy = AttestPolicy {
         expected_nonce: nonce,
@@ -446,7 +482,7 @@ pub fn attest_provider(
             key: Some(att.signing_key),
             key_rotations: key_rotations + u32::from(key.is_some_and(|k| k != att.signing_key)),
         },
-        Err(e) => failed(AttestOutcome::Failed(format!("{e:?}"))),
+        Err(e) => failed(AttestOutcome::Failed(bounded_reason(&format!("{e:?}")))),
     }
 }
 
@@ -576,6 +612,49 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_reason_is_cut_short_and_the_records_stay_bounded() {
+        let long = format!("{}{}", "é".repeat(200), "x".repeat(10_000));
+        let mut reply = ATTEST_RESP_MAGIC.to_vec();
+        reply.push(RESP_REFUSED);
+        reply.extend_from_slice(long.as_bytes());
+        let mut t = |_: &[u8]| Ok(reply.clone());
+        let Err(ChallengeError::Refused(reason)) = request_attestation(&mut t, [1; 32], "m") else { panic!() };
+        assert!(reason.len() <= MAX_FAILURE_REASON);
+        let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], None);
+        let AttestOutcome::Failed(why) = rec.outcome else { panic!() };
+        assert!(why.len() <= MAX_FAILURE_REASON);
+
+        let record = |at: u64| AttestRecord { last_attempt_ms: at, outcome: AttestOutcome::Unsupported, key: None, key_rotations: 0 };
+        let mut map = HashMap::new();
+        for i in 0..MAX_ATTEST_RECORDS as u64 {
+            map.insert(format!("p{i}"), record(NOW - ATTEST_VALID_MS + i));
+        }
+        insert_record_bounded(&mut map, "new".into(), record(NOW), NOW + 10);
+        // p0..p9 are past ATTEST_VALID_MS by then: they go, the rest stay.
+        assert_eq!(map.len(), MAX_ATTEST_RECORDS - 10 + 1);
+        assert!(map.contains_key("new") && map.contains_key("p10"));
+        assert!(!map.contains_key("p0") && !map.contains_key("p9"), "the expired ones went first");
+        // Nothing expired: the oldest goes.
+        let mut full: HashMap<String, AttestRecord> =
+            (0..MAX_ATTEST_RECORDS as u64).map(|i| (format!("p{i}"), record(NOW + i))).collect();
+        insert_record_bounded(&mut full, "new".into(), record(NOW), NOW + 10);
+        assert_eq!(full.len(), MAX_ATTEST_RECORDS);
+        assert!(!full.contains_key("p0"));
+    }
+
+    #[test]
+    fn a_verified_attestation_expires() {
+        let rec = AttestRecord {
+            last_attempt_ms: NOW,
+            outcome: AttestOutcome::Verified(DeviceTrust::SelfSigned),
+            key: None,
+            key_rotations: 0,
+        };
+        assert_eq!(rec.device_trust(NOW + ATTEST_VALID_MS), Some(DeviceTrust::SelfSigned));
+        assert_eq!(rec.device_trust(NOW + ATTEST_VALID_MS + 1), None);
+    }
+
+    #[test]
     fn transport_errors_and_garbage_replies_never_panic() {
         let mut down = |_: &[u8]| Err("timeout".to_string());
         assert_eq!(request_attestation(&mut down, [1; 32], "m"), Err(ChallengeError::Transport("timeout".into())));
@@ -614,7 +693,7 @@ mod tests {
     fn attest_provider_records_verification_and_key_rotation() {
         let first = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [1; 32], NOW, &[BIN], None);
         assert_eq!(first.outcome, AttestOutcome::Verified(DeviceTrust::SelfSigned));
-        assert_eq!(first.device_trust(), Some(DeviceTrust::SelfSigned));
+        assert_eq!(first.device_trust(NOW), Some(DeviceTrust::SelfSigned));
         assert_eq!(first.key_rotations, 0);
 
         // Same key again: no rotation.
@@ -635,7 +714,7 @@ mod tests {
         // Untrusted binary → Failed, but the last verified key and rotation count are kept.
         let untrusted = attest_provider(&mut loopback(Some(&attestor_with_key(1))), "qwen2.5-0.5b", [2; 32], NOW, &[[0; 32]], Some(&ok));
         assert!(matches!(untrusted.outcome, AttestOutcome::Failed(ref e) if e.contains("UntrustedBinary")));
-        assert_eq!(untrusted.device_trust(), None);
+        assert_eq!(untrusted.device_trust(NOW), None);
         assert_eq!(untrusted.key, ok.key);
 
         // Refusal and transport errors are Failed too.

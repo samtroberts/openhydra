@@ -113,6 +113,12 @@ const FETCH_RATE_MAX_TRACKED: usize = 4096;
 const ATTEST_RATE_RPS: f64 = 5.0;
 const ATTEST_RATE_BURST: f64 = 10.0;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
+/// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
+/// with many identities) keep the Secure Enclave signing nonstop.
+const ATTEST_GLOBAL_RPS: f64 = 20.0;
+const ATTEST_GLOBAL_BURST: f64 = 40.0;
+/// The single key the global attestation bucket is kept under.
+const ATTEST_GLOBAL_KEY: &str = "*";
 /// Per-peer cap on prompt-scoring challenges. A verifier round is 24 challenges sent one at a time
 /// (~1 s each on an L4), so this admits a round without queueing but stops one peer hogging the
 /// engine; the provider-wide `InflightGate` is the hard bound.
@@ -713,6 +719,8 @@ pub struct Provider<A: EngineAdapter> {
     attestor: Option<Arc<Attestor>>,
     /// Per-peer rate cap on attestation challenges (a separate bucket from receipts/fetches).
     attest_rl: Arc<RateLimiter>,
+    /// The cap on attestation challenges across all peers (one bucket).
+    attest_global_rl: Arc<RateLimiter>,
     /// Prompt-scoring challenges (Track A2-Logprob): answered only when the operator declared the
     /// engine's scoring API (`provide --prompt-scoring`).
     prompt_scoring: bool,
@@ -847,6 +855,12 @@ impl<A: EngineAdapter> Provider<A> {
                 burst: ATTEST_RATE_BURST,
                 max_inflight: 0,
                 max_tracked: ATTEST_RATE_MAX_TRACKED,
+            })),
+            attest_global_rl: Arc::new(RateLimiter::new(RateLimitConfig {
+                rps: ATTEST_GLOBAL_RPS,
+                burst: ATTEST_GLOBAL_BURST,
+                max_inflight: 0,
+                max_tracked: 1,
             })),
             prompt_scoring: false,
             score_gate: InflightGate::new(),
@@ -1923,7 +1937,9 @@ impl<A: EngineAdapter> Provider<A> {
             // signing; only publicly-announced models are attestable (a private or unshared model
             // gets the same refusal, so a challenge can't probe for private models).
             Some(&ATTEST_CHALLENGE) => {
-                if self.attest_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+                if self.attest_rl.try_acquire(source_peer, now_unix_ms()).is_err()
+                    || self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_err()
+                {
                     return attest_refusal("attestation rate limited, retry");
                 }
                 handle_attest_inbound(
