@@ -101,7 +101,14 @@ pub fn binding_preimage(program_id: &[u8; 32], cluster: &[u8; 32], payout_addres
 /// The fixed 0.96/0.04 split of a `delta`, flooring the fee (dust to the provider) — matches
 /// `payout::protocol_fee`. `u128` intermediate so a large delta can't overflow.
 pub fn split(delta: u64, fee_bps: u16) -> (u64, u64) {
-    let fee = ((delta as u128) * (fee_bps as u128) / 10_000u128) as u64;
+    split_after(0, delta, fee_bps)
+}
+
+/// [`split`] of a `delta` paid on top of `prior` already settled: the fee is taken on the running
+/// total, so splitting it into many settles never rounds the fee away.
+pub fn split_after(prior: u64, delta: u64, fee_bps: u16) -> (u64, u64) {
+    let fee_on = |x: u128| x * (fee_bps as u128) / 10_000u128;
+    let fee = (fee_on(prior as u128 + delta as u128) - fee_on(prior as u128)) as u64;
     (delta - fee, fee)
 }
 
@@ -303,7 +310,7 @@ pub mod openhydra_settlement {
         let vault = &mut ctx.accounts.vault;
         let paid = delta.min(vault.balance);
         require!(paid > 0, SettlementError::InsufficientEscrow);
-        let (provider_net, fee) = split(paid, ctx.accounts.config.fee_bps);
+        let (provider_net, fee) = split_after(channel.settled_amount, paid, ctx.accounts.config.fee_bps);
 
         // 5. Effects before interactions: advance the high-water mark + debit escrow.
         channel.settled_amount += paid;
@@ -716,6 +723,25 @@ mod tests {
             // Fee is floored: fee == floor(delta*400/10000).
             assert_eq!(fee as u128, (delta as u128) * 400 / 10_000);
         }
+    }
+
+    #[test]
+    fn the_fee_on_split_settles_matches_one_settle() {
+        // 48 in one settle: a fee of 1. In two of 24, each alone would floor to 0.
+        assert_eq!(split_after(0, 48, FEE_BPS), (47, 1));
+        let (_, first) = split_after(0, 24, FEE_BPS);
+        let (_, second) = split_after(24, 24, FEE_BPS);
+        assert_eq!(first + second, 1);
+        // Any split of a total pays the same fee.
+        let mut prior = 0u64;
+        let mut fees = 0u64;
+        for step in [7u64, 1, 300, 49, 643] {
+            let (net, fee) = split_after(prior, step, FEE_BPS);
+            assert_eq!(net + fee, step);
+            fees += fee;
+            prior += step;
+        }
+        assert_eq!(fees, split(prior, FEE_BPS).1);
     }
 
     #[test]

@@ -115,17 +115,22 @@ contract OpenHydraSettlement is ReentrancyGuard {
     }
 
     event Deposited(address indexed consumer, bytes32 indexed provider, address payout, uint256 amount);
+    /// `consumer` is the paying wallet and `consumerId` the claim's Ed25519 id (with `provider` and
+    /// `modelHash`, the key of `settled`); `outstanding` is what the claim still holds past the escrow.
     event Settled(
         address indexed consumer,
         bytes32 indexed provider,
+        bytes32 consumerId,
         address payout,
         bytes32 modelHash,
         uint256 delta,
+        uint256 outstanding,
         uint256 providerNet,
         uint256 fee
     );
     event PayoutChanged(address indexed consumer, bytes32 indexed provider, address payout);
-    event ExitRequested(address indexed consumer, bytes32 indexed provider, uint64 withdrawableAt);
+    /// The exit's window, at the earliest: time paused from here on moves both later.
+    event ExitRequested(address indexed consumer, bytes32 indexed provider, uint64 withdrawableAt, uint64 lapsesAt);
     event Withdrawn(address indexed consumer, bytes32 indexed provider, uint256 amount);
     event Paused(bool paused);
     event FeesWithdrawn(address indexed to, uint256 amount);
@@ -247,12 +252,13 @@ contract OpenHydraSettlement is ReentrancyGuard {
         // Pay what the channel covers: a consumer that ran past its escrow still pays all it has, and
         // the rest settles from the same claim after a top-up (the high-water mark rises by what was
         // paid, not by the claim).
-        uint256 delta = claim.cumulativeAmount - prior;
-        if (delta > c.balance) delta = c.balance;
+        uint256 owed = claim.cumulativeAmount - prior;
+        uint256 delta = owed > c.balance ? c.balance : owed;
         if (delta == 0) revert InsufficientEscrow();
 
-        // Fixed split, floor the fee (dust to the provider) — matches payout::protocol_fee.
-        uint256 fee = (delta * feeBps) / 10_000;
+        // Fixed split, the fee floored (dust to the provider) — matches payout::protocol_fee. Taken on
+        // the running total, so splitting it into many settles never rounds the fee away.
+        uint256 fee = ((prior + delta) * feeBps) / 10_000 - (prior * feeBps) / 10_000;
         uint256 providerNet = delta - fee;
 
         // Effects before interactions (CEI): advance the high-water mark + debit the channel first.
@@ -264,7 +270,7 @@ contract OpenHydraSettlement is ReentrancyGuard {
         // Interactions.
         usdc.safeTransfer(payout, providerNet);
 
-        emit Settled(consumerEvm, claim.provider, payout, modelHash, delta, providerNet, fee);
+        emit Settled(consumerEvm, claim.provider, claim.consumer, payout, modelHash, delta, owed - delta, providerNet, fee);
     }
 
     /// The channel's payout address moves it (e.g. the provider rotating a wallet). What was already
@@ -286,7 +292,8 @@ contract OpenHydraSettlement is ReentrancyGuard {
         if (c.payout == address(0)) revert NoChannel();
         c.exitRequestedAt = uint64(block.timestamp);
         c.exitPauseMark = _pausedTotalNow();
-        emit ExitRequested(msg.sender, provider, uint64(block.timestamp) + refundDelay);
+        uint64 opens = uint64(block.timestamp) + refundDelay;
+        emit ExitRequested(msg.sender, provider, opens, opens + EXIT_WINDOW);
     }
 
     /// Consumer reclaims unspent escrow from a channel → the non-custodial exit; deposits are never
