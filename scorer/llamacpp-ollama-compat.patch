@@ -2,7 +2,7 @@ diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 43c396f..bcbe9b0
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -714,6 +714,80 @@ llama_model_loader::llama_model_loader(
+@@ -714,6 +714,86 @@ llama_model_loader::llama_model_loader(
          llm_kv = LLM_KV(llm_arch_from_string(arch_name));
      }
  
@@ -35,10 +35,16 @@ index 43c396f..bcbe9b0
 +                const int64_t kid = gguf_find_key(metadata, key.c_str());
 +                if (kid >= 0 && gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY &&
 +                        (gguf_get_arr_type(metadata, kid) == GGUF_TYPE_UINT32 || gguf_get_arr_type(metadata, kid) == GGUF_TYPE_INT32)) {
-+                    const auto * a = static_cast<const uint32_t *>(gguf_get_arr_data(metadata, kid));
++                    const bool is_signed = gguf_get_arr_type(metadata, kid) == GGUF_TYPE_INT32;
++                    const void * data = gguf_get_arr_data(metadata, kid);
 +                    uint32_t mx = 0;
 +                    for (size_t i = 0; i < gguf_get_arr_n(metadata, kid); i++) {
-+                        mx = std::max(mx, a[i]);
++                        // read INT32 entries as signed: a negative (or absurd) count is not a head count
++                        const int64_t v = is_signed ? (int64_t) static_cast<const int32_t *>(data)[i]
++                                                    : (int64_t) static_cast<const uint32_t *>(data)[i];
++                        if (v > 0 && v <= 4096) {
++                            mx = std::max(mx, (uint32_t) v);
++                        }
 +                    }
 +                    if (mx > 0) {
 +                        gguf_remove_key(metadata, key.c_str());

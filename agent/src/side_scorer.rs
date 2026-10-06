@@ -38,6 +38,9 @@ pub const MLX_SCORER_BIN: &str = "openhydra-mlx-scorer";
 pub const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
 /// How long a challenge waits for a starting scorer before it is told to retry.
 const CHALLENGE_WAIT: Duration = Duration::from_secs(20);
+/// What a launcher reports when a scorer process started but never answered.
+const START_TIMED_OUT: &str = "the scorer didn't come up in time";
+
 /// After every way of starting a file's scorer failed, don't try that file again for this long.
 const FAILED_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// A scorer used this recently is not replaced by another file's: a gateway's round sends its texts
@@ -270,7 +273,13 @@ fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path, stamp: Option<Stamp>) 
             }
             Err(e) => {
                 tracing::warn!(weights = %weights.display(), mode = ?extra, error = %e, "prompt scorer failed to start");
+                // A hang isn't a memory fit the next mode could fix; trying it too would keep every
+                // other model's challenges waiting ("busy") for several start timeouts in a row.
+                let hung = e == START_TIMED_OUT;
                 last_error = e;
+                if hung {
+                    break;
+                }
             }
         }
     }
@@ -390,7 +399,7 @@ impl ScorerLauncher for ProcessLauncher {
                 std::thread::sleep(Duration::from_millis(500));
             }
             if !exited {
-                return Err("the scorer didn't come up in time".into());
+                return Err(START_TIMED_OUT.into());
             }
             let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
             let tail = tail.rsplit("== openhydra-agent: starting").next().unwrap_or_default();
@@ -575,6 +584,7 @@ mod tests {
             let n = self.launches.fetch_add(1, Ordering::SeqCst);
             match self.statuses.get(n).copied().unwrap_or(501) {
                 0 => Err("boom".into()),
+                1 => Err(START_TIMED_OUT.into()),
                 status => Ok(Box::new(StubInstance(format!("http://stub/{status}")))),
             }
         }
@@ -652,6 +662,14 @@ mod tests {
         // A scorer that can't start at all says so (not "doesn't fit").
         let (s, _) = scorer(vec![0; n], Duration::ZERO);
         assert!(matches!(score_patiently(&s, "/m.gguf"), Err(AdapterError::Unsupported(m)) if m.contains("failed to start: boom")));
+    }
+
+    #[test]
+    fn a_scorer_that_hangs_on_start_is_not_retried_in_other_modes() {
+        // The first mode hangs (timed out); the next modes are not tried, so the start fails once.
+        let (s, launches) = scorer(vec![1, 405, 405], Duration::ZERO);
+        assert!(matches!(score_patiently(&s, "/m.gguf"), Err(AdapterError::Unsupported(m)) if m.contains("in time")));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
     }
 
     #[test]
