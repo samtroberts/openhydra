@@ -154,6 +154,28 @@ const FETCH_RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// the detached settlement thread — kept well below the serve budget ([`attempt_timeout`]) since credit is
 /// advisory and a dropped settlement never affects the delivered completion.
 const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Settlements in flight at once, across all providers. Each is a detached thread; past this a new
+/// one is dropped (logged) rather than spawned, so a burst of serves can't grow threads without bound.
+const MAX_SETTLES_IN_FLIGHT: usize = 64;
+/// Settlements running or queued for one `(peer, model)`. They run one at a time (its lock), so with
+/// a provider that black-holes receipts each waits out [`SETTLE_TIMEOUT`] in turn; more than a few
+/// queued behind it would only wait to fail.
+const MAX_SETTLES_PER_PAIR: usize = 4;
+
+/// Whether a new settlement may start, given how many are in flight and how many already hold or
+/// wait on its pair's lock.
+fn settle_admitted(in_flight: usize, pair_queue: usize) -> bool {
+    in_flight < MAX_SETTLES_IN_FLIGHT && pair_queue < MAX_SETTLES_PER_PAIR
+}
+
+/// Decrements the in-flight settlement count when a settlement thread ends (however it ends).
+struct SettleSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for SettleSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// Bound on one device-attestation challenge round-trip (detached, off the response path).
 const ATTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -802,6 +824,8 @@ pub struct ConsumerNode {
     /// divergent co-signed cumulatives. Each settle holds its pair's lock across the whole
     /// read→co-sign→commit window. Grows one entry per distinct `(peer, model)` seen.
     settle_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Settlement threads running now (bounded by [`MAX_SETTLES_IN_FLIGHT`]).
+    settles_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// Device attestation of providers (Phase 0). `None` = off (the default).
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
@@ -850,6 +874,7 @@ impl ConsumerNode {
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
             settle_locks: Mutex::new(HashMap::new()),
+            settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_attest: None,
             provider_logprob: None,
         }
@@ -1041,6 +1066,7 @@ impl ConsumerNode {
             assurance: AssurancePolicy::OPEN,
             settlement_peg: None,
             settle_locks: Mutex::new(HashMap::new()),
+            settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_attest: None,
             provider_logprob: None,
         }
@@ -1814,25 +1840,36 @@ impl ConsumerNode {
         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string();
         // The provider's 128-bit state id — keys the per-(peer, model) gated voucher + authenticity lookup.
         let peer_id = provider.state_id.clone();
+        // The voucher is keyed by the provider's full public key — what the on-chain claim (and its
+        // already-settled amount) is keyed by — not just its 64-bit OpenHydra id: two keys sharing an
+        // id (a ~2^32 search) would otherwise share one running total, and each claim all of it
+        // on-chain.
+        let vkey = voucher_key(&peer_id, &model_key, &provider_pub);
+        // Review F1: serialize settlement for this `(peer, model)` across the whole
+        // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to the
+        // same pair can't read the same base and emit non-monotonic / divergent co-signed cumulatives.
+        // Different pairs still settle in parallel. Taken here so its holders (the map's own
+        // reference aside) say how many settlements this pair already has running or queued.
+        let key_lock = node.settle_lock_for(&vkey);
+        let in_flight = node.settles_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let slot = SettleSlot(Arc::clone(&node.settles_in_flight));
+        if !settle_admitted(in_flight, Arc::strong_count(&key_lock).saturating_sub(2)) {
+            tracing::warn!(provider = %provider.peer_id, in_flight, tokens,
+                "too many settlements in flight; dropping this one (the serve stays unpaid)");
+            return;
+        }
         std::thread::spawn(move || {
+            let _slot = slot;
             let sign = |msg: &[u8]| node.net.sign(msg).unwrap_or_default();
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
                 node.net
                     .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), SETTLE_TIMEOUT)
                     .map_err(AdapterError::Http)
             };
-            let now = now_unix_ms();
-            // The voucher is keyed by the provider's full public key — what the on-chain claim (and
-            // its already-settled amount) is keyed by — not just its 64-bit OpenHydra id: two keys
-            // sharing an id (a ~2^32 search) would otherwise share one running total, and each
-            // claim all of it on-chain.
-            let vkey = voucher_key(&peer_id, &model_key, &provider_pub);
-            // Review F1: serialize settlement for this `(peer, model)` across the whole
-            // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to
-            // the same pair can't read the same base and emit non-monotonic / divergent co-signed
-            // cumulatives. Different pairs still settle in parallel.
-            let key_lock = node.settle_lock_for(&vkey);
             let _settle_guard = key_lock.lock().unwrap_or_else(|e| e.into_inner());
+            // Stamped once this settlement's turn comes, not when it was queued: a receipt that
+            // waited behind others for its pair must still be fresh when the provider checks it.
+            let now = now_unix_ms();
 
             // Crypto-rail (off-chain), only when a settlement peg is configured (review F3): compute
             // this serve's authenticity-gated split and the resulting cumulative voucher amount
@@ -2459,6 +2496,18 @@ mod tests {
 
     use crate::adapter::{DetectedModel, EngineAdapter, InferenceRequest, ServeOutcome};
     use crate::provider::handle_serve_inbound;
+
+    #[test]
+    fn settlements_are_bounded_overall_and_per_pair() {
+        assert!(settle_admitted(0, 0));
+        assert!(settle_admitted(MAX_SETTLES_IN_FLIGHT - 1, MAX_SETTLES_PER_PAIR - 1));
+        assert!(!settle_admitted(MAX_SETTLES_IN_FLIGHT, 0), "the global cap");
+        assert!(!settle_admitted(0, MAX_SETTLES_PER_PAIR), "a pair already queued deep enough");
+        // The slot gives its place back however the settlement ends.
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        drop(SettleSlot(Arc::clone(&n)));
+        assert_eq!(n.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
 
     #[test]
     fn prune_idle_settle_locks_evicts_only_unheld_entries() {
