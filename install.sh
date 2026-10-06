@@ -1,19 +1,23 @@
 #!/bin/sh
 # OpenHydra CLI installer — installs the `openhydra` command for your platform (the binary is
 # distributed as `openhydra-agent-<target>`; it's installed as `openhydra`, with an `openhydra-agent`
-# compatibility symlink).
+# compatibility symlink), the prompt scorers beside it (what a provider answers authenticity checks
+# with; the agent looks for them next to itself), and the third-party licence notices.
 #
 # Usage:
 #   curl -fsSL https://openhydra.co/install.sh | sh
 #
 # Environment overrides:
-#   OPENHYDRA_VERSION    release tag to install                (default: latest)
+#   OPENHYDRA_VERSION    release to install, e.g. v0.4.0       (default: latest)
 #   OPENHYDRA_BIN_DIR    install directory                     (default: /usr/local/bin, else ~/.local/bin)
 #   OPENHYDRA_REPO       GitHub owner/repo for releases        (default: samtroberts/openhydra)
 #   OPENHYDRA_DIST_BASE  base URL hosting the per-platform assets
-#                        (default: https://dl.openhydra.co/latest — Cloudflare R2).
-#                        Set this to pin a different origin; GitHub Releases is used as
-#                        an automatic fallback only when this is unset.
+#                        (default: https://dl.openhydra.co/latest, or …/v<VERSION> for a
+#                        pinned version — Cloudflare R2). Set this to pin a different
+#                        origin; GitHub Releases is used as an automatic fallback only
+#                        when this is unset.
+#   OPENHYDRA_NO_SCORER  set to 1 to skip the prompt scorers (a provider then can't answer
+#                        authenticity checks, and stays unverified)
 #
 # Windows: use the .msi / -setup.exe installer or the desktop app instead.
 set -eu
@@ -37,31 +41,36 @@ case "$os" in
   *) err "unsupported OS '$os'. On Windows, use the .msi/-setup.exe installer or the desktop app." ;;
 esac
 
-asset=""
+triple=""
 case "$os:$arch" in
   Darwin:arm64|Darwin:aarch64)
-    asset="openhydra-agent-aarch64-apple-darwin" ;;
+    triple="aarch64-apple-darwin" ;;
   Darwin:x86_64)
     err "Intel Macs have no prebuilt binary (Apple Silicon only). Build from source: https://github.com/$REPO#build-from-source" ;;
   Linux:x86_64|Linux:amd64)
-    asset="openhydra-agent-x86_64-unknown-linux-gnu" ;;
+    triple="x86_64-unknown-linux-gnu" ;;
   Linux:aarch64|Linux:arm64)
     err "Linux arm64 has no prebuilt binary yet. Build from source: https://github.com/$REPO#build-from-source" ;;
   *)
     err "unsupported platform '$os/$arch'. Build from source: https://github.com/$REPO#build-from-source" ;;
 esac
 
+asset="openhydra-agent-$triple"
+
 # --- resolve download URL(s) ---------------------------------------------
 # Primary origin: Cloudflare R2, which serves the binaries whether or not the
-# source repo is public. Override the whole base with OPENHYDRA_DIST_BASE.
-DIST_BASE="${OPENHYDRA_DIST_BASE:-https://dl.openhydra.co/latest}"
+# source repo is public: latest/, or the immutable v<VERSION>/ of a pinned release.
+# Override the whole base with OPENHYDRA_DIST_BASE.
+if [ "$VERSION" = "latest" ]; then
+  DIST_BASE="${OPENHYDRA_DIST_BASE:-https://dl.openhydra.co/latest}"
+  gh_base="https://github.com/$REPO/releases/latest/download"
+else
+  DIST_BASE="${OPENHYDRA_DIST_BASE:-https://dl.openhydra.co/v${VERSION#v}}"
+  gh_base="https://github.com/$REPO/releases/download/$VERSION"
+fi
 primary="${DIST_BASE%/}/$asset"
 # Fallback: GitHub Releases — only resolves while the repo/release is public.
-if [ "$VERSION" = "latest" ]; then
-  fallback="https://github.com/$REPO/releases/latest/download/$asset"
-else
-  fallback="https://github.com/$REPO/releases/download/$VERSION/$asset"
-fi
+fallback="$gh_base/$asset"
 
 # --- pick a downloader ----------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -82,17 +91,24 @@ else
 fi
 mkdir -p "$bindir" || err "cannot create install dir '$bindir'."
 
+# Fetch release file $1 into $2: the primary origin, else (when it isn't pinned) GitHub.
+fetch() {
+  if dl "${DIST_BASE%/}/$1" "$2" && [ -s "$2" ]; then
+    return 0
+  elif [ -z "${OPENHYDRA_DIST_BASE:-}" ] && dl "$gh_base/$1" "$2" && [ -s "$2" ]; then
+    info "(primary origin unavailable — used GitHub fallback for $1)"
+    return 0
+  fi
+  return 1
+}
+
 # --- download + install ---------------------------------------------------
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT INT TERM
 info "Downloading $BIN_NAME for $os_name ($arch)…"
-if dl "$primary" "$tmp" && [ -s "$tmp" ]; then
-  :
-elif [ -z "${OPENHYDRA_DIST_BASE:-}" ] && dl "$fallback" "$tmp" && [ -s "$tmp" ]; then
-  info "(primary origin unavailable — used GitHub fallback)"
-else
-  err "download failed. Tried: $primary"
-fi
+tried="$primary"
+[ -z "${OPENHYDRA_DIST_BASE:-}" ] && tried="$tried, $fallback"
+fetch "$asset" "$tmp" || err "download failed. Tried: $tried"
 
 chmod +x "$tmp"
 target="$bindir/$BIN_NAME"
@@ -112,6 +128,44 @@ if [ "$os" = "Darwin" ]; then
 fi
 
 info "Installed → $target"
+
+# --- prompt scorers --------------------------------------------------------
+# What a provider answers authenticity (log-prob) checks with: patched llama.cpp for GGUF models
+# (Ollama, LM Studio, llama.cpp), and on macOS patched mistral.rs for LM Studio's MLX models. The
+# agent finds them next to itself. Optional: without them the CLI works, but a provider's models
+# can't be verified.
+if [ "${OPENHYDRA_NO_SCORER:-}" != "1" ]; then
+  scorers="openhydra-scorer"
+  if [ "$os" = "Darwin" ]; then scorers="$scorers openhydra-mlx-scorer"; fi
+  for s in $scorers; do
+    stmp="$(mktemp)"
+    if fetch "$s-$triple" "$stmp" 2>/dev/null; then
+      chmod +x "$stmp"
+      if mv "$stmp" "$bindir/$s" 2>/dev/null; then
+        if [ "$os" = "Darwin" ]; then xattr -d com.apple.quarantine "$bindir/$s" >/dev/null 2>&1 || true; fi
+        info "Installed → $bindir/$s"
+      else
+        rm -f "$stmp"
+        info "WARNING: couldn't write $bindir/$s; authenticity checks of your models will be refused."
+      fi
+    else
+      rm -f "$stmp"
+      info "WARNING: no $s for this release; authenticity checks of your models will be refused."
+    fi
+  done
+fi
+
+# --- licence notices -------------------------------------------------------
+# The third-party code compiled into the binaries above, and its licences.
+sharedir="$(dirname "$bindir")/share/openhydra"
+mkdir -p "$sharedir" 2>/dev/null && [ -w "$sharedir" ] || sharedir="$HOME/.local/share/openhydra"
+mkdir -p "$sharedir" 2>/dev/null || true
+ntmp="$(mktemp)"
+if fetch "THIRD_PARTY_NOTICES-$triple.txt" "$ntmp" 2>/dev/null && mv "$ntmp" "$sharedir/THIRD_PARTY_NOTICES.txt" 2>/dev/null; then
+  info "Licence notices → $sharedir/THIRD_PARTY_NOTICES.txt"
+else
+  rm -f "$ntmp"
+fi
 
 # --- PATH hint ------------------------------------------------------------
 case ":$PATH:" in
