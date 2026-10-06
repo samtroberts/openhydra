@@ -354,4 +354,25 @@ contract OpenHydraSettlementTest is Test {
             "EIP-712 digest must match the Rust settlement.rs golden byte-for-byte"
         );
     }
+
+    /// The deployed contract's own `digestOf` (not just the formula above) produces the Rust golden:
+    /// the contract's code placed at the golden's verifying contract, on the golden's chain id.
+    /// `digestOf` reads no storage, so the copied code is all it needs.
+    function test_contract_digestOf_matches_rust_golden() public {
+        address at = address(bytes20(hex"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"));
+        vm.etch(at, address(settlement).code);
+        vm.chainId(8453);
+        OpenHydraSettlement.SettlementClaim memory claim = OpenHydraSettlement.SettlementClaim({
+            provider: bytes32(uint256(0x1111111111111111111111111111111111111111111111111111111111111111)),
+            consumer: bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222)),
+            payoutAddress: address(bytes20(hex"ABABABABABABABABABABABABABABABABABABABAB")),
+            cumulativeAmount: 100_000,
+            modelId: "qwen2.5:7b"
+        });
+        assertEq(
+            OpenHydraSettlement(at).digestOf(claim),
+            bytes32(0xa3cd9b3cb6dbd590c004a95113e457831526cff559e6707131e7f39c71e80f36),
+            "the contract's digestOf must match the Rust settlement.rs golden byte-for-byte"
+        );
+    }
 }
