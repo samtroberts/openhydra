@@ -98,9 +98,18 @@ pub fn count_tokens(scorer: &Path, vocab: &Path, text: &str) -> Result<u64, Stri
 }
 
 /// The text a serve's tokens are counted on: the delivered text, then each tool call's name and
-/// arguments (on lines of their own), and how many of the calls earn the template allowance (calls to
-/// an `offered` tool, at most [`crate::serve::MAX_ALLOWED_TOOL_CALLS`] — as billing grants it).
-pub fn countable_text(delivered: &str, tool_calls: &[ToolCall], offered: &std::collections::HashSet<String>) -> (String, usize) {
+/// arguments (on lines of their own), and how many of the calls earn the template allowance
+/// ([`crate::serve::allowance_earners`], as billing grants it). `None` past [`MAX_COUNTED_BYTES`]
+/// in all: too long to count.
+pub fn countable_text(
+    delivered: &str,
+    tool_calls: &[ToolCall],
+    offered: &std::collections::HashSet<String>,
+) -> Option<(String, usize)> {
+    let calls_len: usize = tool_calls.iter().map(|c| c.function.name.len() + c.function.arguments.len() + 2).sum();
+    if delivered.len().saturating_add(calls_len) > MAX_COUNTED_BYTES {
+        return None;
+    }
     let mut text = delivered.to_string();
     for c in tool_calls {
         text.push('\n');
@@ -108,8 +117,8 @@ pub fn countable_text(delivered: &str, tool_calls: &[ToolCall], offered: &std::c
         text.push('\n');
         text.push_str(&c.function.arguments);
     }
-    let allowed = tool_calls.iter().filter(|c| offered.contains(&c.function.name)).count();
-    (text, allowed.min(crate::serve::MAX_ALLOWED_TOOL_CALLS))
+    let allowed = crate::serve::allowance_earners(tool_calls, offered).into_iter().filter(|e| *e).count();
+    Some((text, allowed))
 }
 
 /// Whether `billed` tokens is more than `counted` (the delivered text's tokens, `calls` tool calls
@@ -152,9 +161,13 @@ mod tests {
             function: crate::adapter::ToolCallFunction { name: "ls".into(), arguments: "{\"p\":\"/\"}".into() },
         };
         let ls: std::collections::HashSet<String> = ["ls".to_string()].into();
-        assert_eq!(countable_text("hi", &[call.clone()], &ls), ("hi\nls\n{\"p\":\"/\"}".to_string(), 1));
-        assert_eq!(countable_text("hi", &[call], &Default::default()).1, 0, "a tool nobody offered");
-        assert_eq!(countable_text("hi", &[], &ls), ("hi".to_string(), 0));
+        assert_eq!(countable_text("hi", &[call.clone()], &ls), Some(("hi\nls\n{\"p\":\"/\"}".to_string(), 1)));
+        assert_eq!(countable_text("hi", &[call.clone()], &Default::default()).unwrap().1, 0, "a tool nobody offered");
+        assert_eq!(countable_text("hi", &[], &ls), Some(("hi".to_string(), 0)));
+        // Text and tool calls together are bounded: a huge argument can't make the count unbounded.
+        let mut big = call;
+        big.function.arguments = "x".repeat(MAX_COUNTED_BYTES);
+        assert_eq!(countable_text("hi", &[big], &ls), None);
     }
 
     #[test]

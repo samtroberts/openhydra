@@ -181,7 +181,8 @@ fn settle_retryable(e: &AdapterError) -> bool {
 /// which never reports more. An older provider reported the engine's own count, which can honestly
 /// be higher (reasoning it didn't stream); it is just signed for less.
 fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64) -> bool {
-    summary.metrics.billing >= crate::serve::BILLING_VERSION && summary.tokens > billable
+    // Only the rule we compute: a newer rule may bill differently, and we can't judge it by ours.
+    summary.metrics.billing == crate::serve::BILLING_VERSION && summary.tokens > billable
 }
 
 /// What a consumer makes of the co-signed receipt a provider sends back when the consumer's
@@ -1109,7 +1110,10 @@ impl ConsumerNode {
         std::thread::spawn(move || {
             let _slot = slot;
             let (scorer, vocab) = counter;
-            let (countable, calls) = crate::token_count::countable_text(&text, &tool_calls, &offered);
+            // Too long to count (text and tool calls together): not checked, as for a long stream.
+            let Some((countable, calls)) = crate::token_count::countable_text(&text, &tool_calls, &offered) else {
+                return;
+            };
             match crate::token_count::count_tokens(&scorer, &vocab, &countable) {
                 Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
                     tracing::warn!(provider = %state_id, model = %model_key, billed, counted,
@@ -2999,6 +3003,8 @@ mod tests {
         assert!(!over_reported_by_billing(&summary(40, crate::serve::BILLING_VERSION), 40));
         // An older provider's engine count can honestly be higher: signed for less, not faulted.
         assert!(!over_reported_by_billing(&summary(500, 0), 40));
+        // Nor is a newer rule, which we can't judge by ours.
+        assert!(!over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION + 1), 40));
     }
 
     #[test]

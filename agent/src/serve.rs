@@ -45,8 +45,10 @@ pub struct ServeMetrics {
     pub billing: u8,
 }
 
-/// The billing rule this build follows: the reported count is [`billable_tokens`].
-pub const BILLING_VERSION: u8 = 2;
+/// The billing rule this build follows: the reported count is [`billable_tokens`]. 3: whitespace
+/// runs count by length, and only real calls to offered tools earn the template allowance
+/// ([`allowance_earners`]).
+pub const BILLING_VERSION: u8 = 3;
 
 /// How a provider that charges starts the error refusing a serve over payment (the consumer's offer
 /// or its unpaid serves). A consumer doesn't hold it against the provider: it is a price, not a fault.
@@ -116,26 +118,37 @@ pub fn offered_tool_names(tools: &[Value]) -> std::collections::HashSet<String> 
         .collect()
 }
 
-/// [`DeliveredText`] units of `tool_calls` (name and arguments), plus [`TOOL_CALL_TOKEN_ALLOWANCE`]
-/// for each call to a tool the request offered (`offered`, [`offered_tool_names`]), for at most
-/// [`MAX_ALLOWED_TOOL_CALLS`] calls: a call to nothing offered, or past the cap, is billed for its
-/// text only, so made-up calls can't pad a bill.
-pub fn tool_call_units(tool_calls: &[ToolCall], offered: &std::collections::HashSet<String>) -> u64 {
-    let mut allowed = 0usize;
+/// Which of `tool_calls` earn [`TOOL_CALL_TOKEN_ALLOWANCE`]: a call to a tool the request offered
+/// (`offered`, [`offered_tool_names`]) whose arguments are a JSON object, as a real call's are, once
+/// per distinct call, for at most [`MAX_ALLOWED_TOOL_CALLS`] calls. A call to nothing offered, with
+/// junk arguments, repeated, or past the cap is billed for its text only, so made-up calls can't pad
+/// a bill. Provider and consumer (and the token-count check) all use this.
+pub fn allowance_earners(tool_calls: &[ToolCall], offered: &std::collections::HashSet<String>) -> Vec<bool> {
+    let mut seen = std::collections::HashSet::new();
     tool_calls
         .iter()
         .map(|c| {
+            let earns = seen.len() < MAX_ALLOWED_TOOL_CALLS
+                && offered.contains(&c.function.name)
+                && serde_json::from_str::<Value>(&c.function.arguments).is_ok_and(|v| v.is_object())
+                && seen.insert((c.function.name.as_str(), c.function.arguments.as_str()));
+            earns
+        })
+        .collect()
+}
+
+/// [`DeliveredText`] units of `tool_calls` (name and arguments), plus [`TOOL_CALL_TOKEN_ALLOWANCE`]
+/// for each call that earns it ([`allowance_earners`]).
+pub fn tool_call_units(tool_calls: &[ToolCall], offered: &std::collections::HashSet<String>) -> u64 {
+    tool_calls
+        .iter()
+        .zip(allowance_earners(tool_calls, offered))
+        .map(|(c, earns)| {
             let mut t = DeliveredText::default();
             t.push(&c.function.name);
             let mut a = DeliveredText::default();
             a.push(&c.function.arguments);
-            let allowance = if offered.contains(&c.function.name) && allowed < MAX_ALLOWED_TOOL_CALLS {
-                allowed += 1;
-                TOOL_CALL_TOKEN_ALLOWANCE
-            } else {
-                0
-            };
-            t.units() + a.units() + allowance
+            t.units() + a.units() + if earns { TOOL_CALL_TOKEN_ALLOWANCE } else { 0 }
         })
         .sum()
 }
@@ -726,12 +739,20 @@ mod tests {
             tool_call_units(&[call("{ \"p\" :                  \"/\" }")], &ls) - 5,
             "padding in the arguments counts little"
         );
-        assert_eq!(tool_call_units(&[call("{}"), call("{}")], &ls), 2 * (4 + TOOL_CALL_TOKEN_ALLOWANCE));
-        // A call to a tool nobody offered, or past the cap, earns no allowance: made-up calls can't pad.
+        assert_eq!(
+            tool_call_units(&[call(r#"{"a":1}"#), call(r#"{"a":2}"#)], &ls),
+            2 * (2 + 7 + TOOL_CALL_TOKEN_ALLOWANCE)
+        );
+        // A call to a tool nobody offered, with arguments that aren't a JSON object, repeated, or past
+        // the cap earns no allowance: made-up calls can't pad.
         let none = std::collections::HashSet::new();
         assert_eq!(tool_call_units(&[call("{}")], &none), 4);
-        let many: Vec<ToolCall> = (0..40).map(|_| call("")).collect();
-        assert_eq!(tool_call_units(&many, &ls), 40 * 2 + MAX_ALLOWED_TOOL_CALLS as u64 * TOOL_CALL_TOKEN_ALLOWANCE);
+        assert_eq!(tool_call_units(&[call("junk")], &ls), 6);
+        assert_eq!(tool_call_units(&[call("[1]")], &ls), 5);
+        assert_eq!(tool_call_units(&[call("{}"), call("{}")], &ls), 2 * 4 + TOOL_CALL_TOKEN_ALLOWANCE);
+        let many: Vec<ToolCall> = (0..40).map(|i| call(&format!(r#"{{"i":{i}}}"#))).collect();
+        let text: u64 = many.iter().map(|c| 2 + c.function.arguments.len() as u64).sum();
+        assert_eq!(tool_call_units(&many, &ls), text + MAX_ALLOWED_TOOL_CALLS as u64 * TOOL_CALL_TOKEN_ALLOWANCE);
     }
 
     #[test]
