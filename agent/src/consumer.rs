@@ -72,8 +72,12 @@ fn now_unix_ms() -> u64 {
 pub struct SelectedProvider {
     /// libp2p id — the `proxy_forward` dial target.
     pub libp2p_peer_id: String,
-    /// OpenHydra id — the peer half of the reputation / receipt key.
+    /// OpenHydra id (64-bit) — what logs and status views show.
     pub peer_id: String,
+    /// The 128-bit id its standing is kept under ([`provider_state_id`]): the peer half of every
+    /// per-`(peer, model)` key — reputation, audits, authenticity, log-prob checks, attestation,
+    /// payment.
+    pub state_id: String,
     /// Provider's ed25519 public key (hex) — for the co-signed receipt at EOS.
     pub public_key: String,
     /// The model id the provider serves.
@@ -98,6 +102,16 @@ const ATTEMPT_TIMEOUT_BASE_SECS: u64 = 45; // discovery jitter + a cold model lo
 const ATTEMPT_TIMEOUT_MS_PER_TOKEN: u64 = 40; // generation + prefill headroom on a slow remote model
 const ATTEMPT_TIMEOUT_MIN_SECS: u64 = 45;
 const ATTEMPT_TIMEOUT_MAX_SECS: u64 = 240; // bound so a dead provider still frees its slot for failover
+/// The id a provider's standing is kept under: [`openhydra_network::identity::openhydra_state_id`] of
+/// its (verified) public key, a 128-bit id whose first 16 hex characters are its 64-bit peer id; a
+/// legacy provider without a key falls back to its peer id.
+pub fn provider_state_id(peer_id: &str, public_key_hex: &str) -> String {
+    match hex::decode(public_key_hex) {
+        Ok(pk) if pk.len() == 32 => openhydra_network::identity::openhydra_state_id(&pk),
+        _ => peer_id.to_string(),
+    }
+}
+
 /// The crypto-rail voucher key of a provider: its `(peer, model)` reputation key plus its full
 /// public key. Payment state follows the key the on-chain claim is made with, so two providers whose
 /// 64-bit OpenHydra ids collide never share (and each claim) one running total.
@@ -365,7 +379,7 @@ pub fn rank_providers_with_assurance(
                 PolicyMode::HardGate => {
                     let achieved = AssuranceTier {
                         authenticity: achieved_authenticity(
-                            &p.peer_id,
+                            &provider_state_id(&p.peer_id, &p.public_key),
                             rep_model_key(&p.canonical_model_id, &p.model_id),
                         ),
                         privacy: PrivacyTier::None,
@@ -382,13 +396,14 @@ pub fn rank_providers_with_assurance(
     let inputs: Vec<PeerScoreInput> = compatible
         .iter()
         .map(|p| PeerScoreInput {
-            peer_id: p.peer_id.clone(),
+            // Ranked (and matched back) by the 128-bit id: two providers sharing a 64-bit id stay apart.
+            peer_id: provider_state_id(&p.peer_id, &p.public_key),
             latency_ms: 1.0, // RTT survey deferred (matches the M1.3 router default)
             load_pct: p.load_pct,
             // Earned reputation (local tracker, per (peer, model)) wins; else the self-reported
             // DHT value; else neutral. A provider that failed *us* on this model ranks below an
             // untried one.
-            reputation: earned_reputation(&p.peer_id, rep_model_key(&p.canonical_model_id, &p.model_id))
+            reputation: earned_reputation(&provider_state_id(&p.peer_id, &p.public_key), rep_model_key(&p.canonical_model_id, &p.model_id))
                 .unwrap_or(if p.reputation_score > 0.0 { p.reputation_score } else { 50.0 }),
             bandwidth_mbps: 0.0,
             s2s_rtt_ms: 0.0,
@@ -401,10 +416,11 @@ pub fn rank_providers_with_assurance(
         .filter_map(|ranked| {
             compatible
                 .iter()
-                .find(|p| p.peer_id == ranked.peer_id)
+                .find(|p| provider_state_id(&p.peer_id, &p.public_key) == ranked.peer_id)
                 .map(|p| SelectedProvider {
                     libp2p_peer_id: p.libp2p_peer_id.clone(),
                     peer_id: p.peer_id.clone(),
+                    state_id: ranked.peer_id.clone(),
                     public_key: p.public_key.clone(),
                     model_id: p.model_id.clone(),
                     canonical_model_id: p.canonical_model_id.clone(),
@@ -418,12 +434,12 @@ pub fn rank_providers_with_assurance(
     // and disconnected groups; this stable partition just floats live providers
     // to the front so a stale-but-still-advertised record is only tried after
     // every connected provider — failover as the exception, not the rule.
-    let connected: std::collections::HashSet<&str> = peers
+    let connected: std::collections::HashSet<String> = peers
         .iter()
         .filter(|p| p.connected)
-        .map(|p| p.peer_id.as_str())
+        .map(|p| provider_state_id(&p.peer_id, &p.public_key))
         .collect();
-    ranked.sort_by_key(|sp| !connected.contains(sp.peer_id.as_str()));
+    ranked.sort_by_key(|sp| !connected.contains(&sp.state_id));
     ranked
 }
 
@@ -1196,7 +1212,9 @@ impl ConsumerNode {
                         let logprob_check = lp.and_then(|st| st.label());
                         let (device_trust, rotations) = device.get(&peer).copied().unwrap_or((None, 0));
                         crate::status::RepEntry {
-                            openhydra_peer_id: peer,
+                            // Shown as the 64-bit peer id (the 128-bit state id's prefix) — the id
+                            // the rest of the app knows the provider by.
+                            openhydra_peer_id: peer.get(..16).unwrap_or(&peer).to_string(),
                             model_id: model,
                             score: (t.raw_score() * 10.0).round() / 10.0,
                             authenticity: Some(tier.label().to_string()),
@@ -1679,14 +1697,14 @@ impl ConsumerNode {
                     // model (Phase 4a) — but not for a self-serve (no earning off yourself).
                     let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                     if !self_serve {
-                        self.record_outcome(&provider.peer_id, model_key, VerificationOutcome::Honored, now);
+                        self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Honored, now);
                     }
                     req_span.record("provider", provider.peer_id.as_str());
                     req_span.record("tokens", summary.tokens);
                     // M2.2(b): sampled background redundant-exec audit of this provider (off
                     // the response path — the caller already has its completion).
                     if !self_serve {
-                        self.maybe_audit(model, model_key, &provider.peer_id);
+                        self.maybe_audit(model, model_key, &provider.state_id);
                         // Phase 0 device attestation (opt-in, detached, rate-limited per provider).
                         self.maybe_attest(&provider);
                         // Track A2-Logprob prompt-scoring round (opt-in, detached, every few hours).
@@ -1704,7 +1722,7 @@ impl ConsumerNode {
                     // #7: never ding our own provider's reputation on a self-serve.
                     if !self.is_self_serve(&provider.libp2p_peer_id) {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
-                        self.record_outcome(&provider.peer_id, model_key, VerificationOutcome::Rejected, now);
+                        self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
                     }
                     if delivered {
                         // Already streamed part of a completion to the client — failing over
@@ -1810,8 +1828,8 @@ impl ConsumerNode {
         // cost-weighted display credit (the identity the audit actually exercises — review H1/H3).
         let canonical = provider.canonical_model_id.clone();
         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string();
-        // The provider's OpenHydra id — keys the per-(peer, model) gated voucher + authenticity lookup.
-        let peer_id = provider.peer_id.clone();
+        // The provider's 128-bit state id — keys the per-(peer, model) gated voucher + authenticity lookup.
+        let peer_id = provider.state_id.clone();
         std::thread::spawn(move || {
             let sign = |msg: &[u8]| node.net.sign(msg).unwrap_or_default();
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
@@ -1951,15 +1969,15 @@ impl ConsumerNode {
     fn maybe_attest(self: &Arc<Self>, provider: &SelectedProvider) {
         let Some(attest) = self.provider_attest.clone() else { return };
         let now = now_unix_ms();
-        let prev = attest.records.lock().unwrap_or_else(|e| e.into_inner()).get(&provider.peer_id).cloned();
+        let prev = attest.records.lock().unwrap_or_else(|e| e.into_inner()).get(&provider.state_id).cloned();
         if prev.as_ref().is_some_and(|r| !r.due(now)) {
             return;
         }
-        if !attest.inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(provider.peer_id.clone()) {
+        if !attest.inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(provider.state_id.clone()) {
             return; // a challenge to this provider is already running
         }
         let node = Arc::clone(self);
-        let peer_id = provider.peer_id.clone();
+        let peer_id = provider.state_id.clone();
         let libp2p = provider.libp2p_peer_id.clone();
         let model = provider.model_id.clone();
         std::thread::spawn(move || {
@@ -1989,7 +2007,7 @@ impl ConsumerNode {
     /// into the audit history + reputation. Never touches the completion.
     fn maybe_logprob_check(self: &Arc<Self>, provider: &SelectedProvider, model_key: &str) {
         let Some(lp) = self.provider_logprob.clone() else { return };
-        let key = reputation_key(&provider.peer_id, model_key);
+        let key = reputation_key(&provider.state_id, model_key);
         let now = now_unix_ms();
         if lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| now < s.next_due_ms) {
             return;
@@ -1998,7 +2016,7 @@ impl ConsumerNode {
             return; // a round for this (peer, model) is already running
         }
         let node = Arc::clone(self);
-        let peer_id = provider.peer_id.clone();
+        let peer_id = provider.state_id.clone();
         let libp2p = provider.libp2p_peer_id.clone();
         let model = provider.model_id.clone();
         let model_key = model_key.to_string();
@@ -2326,7 +2344,7 @@ impl ConsumerNode {
         let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(3);
         for provider in candidates.iter().take(2) {
             let out = self.dispatch_full(provider, challenge).map_err(|e| e.to_string());
-            results.push((provider.peer_id.clone(), out));
+            results.push((provider.state_id.clone(), out));
         }
         // B-S2: gate each response on the required nonce echo and compare only the generated
         // *body* (after the nonce) — a freeloader that parrots the copyable prompt is filtered
@@ -2349,7 +2367,7 @@ impl ConsumerNode {
         if report.verdict == RedundantVerdict::Inconclusive {
             if let Some(third) = candidates.get(2) {
                 let out = self.dispatch_full(third, challenge).map_err(|e| e.to_string());
-                results.push((third.peer_id.clone(), out));
+                results.push((third.state_id.clone(), out));
                 report = resolve_audit(&gate(&results));
             }
         }
@@ -2360,7 +2378,7 @@ impl ConsumerNode {
         // (falling back to the audited `model` handle for safety).
         let key_of: std::collections::HashMap<&str, &str> = candidates
             .iter()
-            .map(|c| (c.peer_id.as_str(), rep_model_key(&c.canonical_model_id, &c.model_id)))
+            .map(|c| (c.state_id.as_str(), rep_model_key(&c.canonical_model_id, &c.model_id)))
             .collect();
         for (peer_id, outcome) in &report.outcomes {
             let model_key = key_of.get(peer_id.as_str()).copied().unwrap_or(model);
@@ -2406,6 +2424,45 @@ pub fn default_challenge() -> (Vec<ChatMessage>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_keys_sharing_a_64_bit_id_keep_separate_standing() {
+        // Two providers whose (verified) records carry the same 64-bit id under different keys — a
+        // ~2^32 collision. Each is ranked as itself, under its own 128-bit state id, and what one
+        // earned is never applied to the other.
+        let (ka, kb) = ([7u8; 32], [9u8; 32]);
+        let (sa, sb) = (
+            openhydra_network::identity::openhydra_state_id(&ka),
+            openhydra_network::identity::openhydra_state_id(&kb),
+        );
+        let mut a = discovered("0123456789abcdef", "", 10.0);
+        a.public_key = hex::encode(ka);
+        a.libp2p_peer_id = "A".into();
+        let mut b = discovered("0123456789abcdef", "", 10.0);
+        b.public_key = hex::encode(kb);
+        b.libp2p_peer_id = "B".into();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ranked = rank_providers_with_reputation(&[a, b], "", 0, &|pid, _| {
+            asked.borrow_mut().push(pid.to_string());
+            (pid == sa).then_some(99.0) // only A has earned anything
+        });
+        assert_eq!(ranked.len(), 2, "both kept, neither shadowing the other");
+        let ids: Vec<(&str, &str)> = ranked.iter().map(|p| (p.libp2p_peer_id.as_str(), p.state_id.as_str())).collect();
+        assert!(ids.contains(&("A", sa.as_str())) && ids.contains(&("B", sb.as_str())), "{ids:?}");
+        assert_eq!(ranked[0].libp2p_peer_id, "A", "A's earned reputation ranks it first; B doesn't inherit it");
+        assert!(asked.borrow().contains(&sb), "B is looked up under its own id");
+    }
+
+    #[test]
+    fn a_state_id_extends_the_peer_id_and_legacy_peers_keep_theirs() {
+        let key = [3u8; 32];
+        let peer = openhydra_network::identity::openhydra_peer_id(&key);
+        let state = provider_state_id(&peer, &hex::encode(key));
+        assert_eq!(state.len(), 32);
+        assert!(state.starts_with(&peer), "the 64-bit id is its prefix");
+        assert_eq!(provider_state_id("legacypeer", ""), "legacypeer");
+        assert_eq!(provider_state_id("legacypeer", "not-hex"), "legacypeer");
+    }
 
     #[test]
     fn vouchers_of_two_keys_with_one_peer_id_are_separate() {

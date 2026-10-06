@@ -32,6 +32,14 @@ pub fn openhydra_peer_id(public_key: &[u8]) -> String {
     hex::encode(&Sha256::digest(public_key)[..8])
 }
 
+/// The 128-bit id a peer's standing is kept under: the first 16 bytes of its public key's SHA-256
+/// (32 hex characters, beginning with its [`openhydra_peer_id`]). The 64-bit peer id is a display
+/// and routing handle; two keys sharing one is a ~2^32 search, so anything a peer earns or is owed —
+/// reputation, verified authenticity, attestation, payment — is keyed by this instead (~2^64).
+pub fn openhydra_state_id(public_key: &[u8]) -> String {
+    hex::encode(&Sha256::digest(public_key)[..16])
+}
+
 pub struct Identity {
     pub keypair: identity::Keypair,
     pub libp2p_peer_id: libp2p::PeerId,
