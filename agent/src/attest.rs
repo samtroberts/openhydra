@@ -40,7 +40,7 @@ pub const ATTEST_RESP_MAGIC: &[u8; 4] = b"OHA1";
 const RESP_OK: u8 = 0x00;
 const RESP_REFUSED: u8 = 0x01;
 /// Longest model id a challenge may carry.
-const MAX_MODEL_ID_LEN: usize = 256;
+pub(crate) const MAX_MODEL_ID_LEN: usize = 256;
 
 /// A request/response round-trip to one provider (a `proxy_forward` in production).
 pub type Transport<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>, String> + 'a;
@@ -242,7 +242,12 @@ pub fn request_attestation(
     };
     match rest.split_first() {
         Some((&RESP_OK, body)) => {
-            let att = Attestation::from_bytes(body).map_err(|_| ChallengeError::Malformed)?;
+            // A claim in a format we don't know is a provider on another version: unsupported, not
+            // failed (which would be retried, costing it a signature each time).
+            let att = Attestation::from_bytes(body).map_err(|e| match e {
+                openhydra_protocol::attest::AttestError::UnsupportedVersion => ChallengeError::Unsupported,
+                _ => ChallengeError::Malformed,
+            })?;
             if att.claim.model_id != model_id {
                 return Err(ChallengeError::WrongModel);
             }
@@ -404,6 +409,9 @@ pub const ATTEST_VALID_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_ATTEST_RECORDS: usize = 4096;
 /// Longest failure reason kept in a record, in bytes: a refusal reason is the provider's own text.
 const MAX_FAILURE_REASON: usize = 256;
+/// Load refusals in a row after which a verified provider loses its badge: a provider can't keep a
+/// badge by answering "rate limited" (an unauthenticated string) instead of attesting.
+pub const MAX_LOAD_REFUSALS: u8 = 6;
 
 /// `reason` cut to [`MAX_FAILURE_REASON`] bytes, on a character boundary.
 fn bounded_reason(reason: &str) -> String {
@@ -445,7 +453,12 @@ pub enum AttestOutcome {
 /// Consumer-side record of the latest challenge to one provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestRecord {
+    /// When it was last challenged.
     pub last_attempt_ms: u64,
+    /// When it last verified (meaningful with a `Verified` outcome): the badge counts from this.
+    pub verified_ms: u64,
+    /// Challenges declined for load since then, in a row.
+    pub load_refusals: u8,
     pub outcome: AttestOutcome,
     /// The key of the last *verified* attestation (kept across failed attempts).
     pub key: Option<[u8; 65]>,
@@ -468,7 +481,7 @@ impl AttestRecord {
     /// and only for [`ATTEST_VALID_MS`] after it was made.
     pub fn device_trust(&self, now_unix_ms: u64) -> Option<DeviceTrust> {
         match self.outcome {
-            AttestOutcome::Verified(t) if now_unix_ms.saturating_sub(self.last_attempt_ms) <= ATTEST_VALID_MS => Some(t),
+            AttestOutcome::Verified(t) if now_unix_ms.saturating_sub(self.verified_ms) <= ATTEST_VALID_MS => Some(t),
             _ => None,
         }
     }
@@ -490,18 +503,29 @@ pub fn attest_provider(
 ) -> AttestRecord {
     let key = prev.and_then(|p| p.key);
     let key_rotations = prev.map_or(0, |p| p.key_rotations);
-    let failed = |outcome| AttestRecord { last_attempt_ms: now_unix_ms, outcome, key, key_rotations };
+    let failed = |outcome| AttestRecord {
+        last_attempt_ms: now_unix_ms,
+        verified_ms: prev.map_or(0, |p| p.verified_ms),
+        load_refusals: 0,
+        outcome,
+        key,
+        key_rotations,
+    };
 
     let att = match request_attestation(transport, nonce, model_id) {
         Ok(att) => att,
         Err(ChallengeError::Unsupported) => return failed(AttestOutcome::Unsupported),
-        // Declined for load: keep what was verified (it still expires on its own), and try again
-        // when next due rather than dropping the badge.
+        // Declined for load: keep what was verified (it still expires on its own) and try again in
+        // the usual time, not on the next serve; a provider that keeps declining loses the badge.
         Err(ChallengeError::Refused(r)) if r == ATTEST_RATE_LIMITED => {
-            if let Some(p) = prev {
-                return p.clone();
-            }
-            return failed(AttestOutcome::Failed(bounded_reason(&r)));
+            return match prev {
+                Some(p) if p.load_refusals + 1 < MAX_LOAD_REFUSALS => AttestRecord {
+                    last_attempt_ms: now_unix_ms,
+                    load_refusals: p.load_refusals + 1,
+                    ..p.clone()
+                },
+                _ => failed(AttestOutcome::Failed(bounded_reason(&r))),
+            };
         }
         Err(e) => return failed(AttestOutcome::Failed(bounded_reason(&format!("{e:?}")))),
     };
@@ -517,6 +541,8 @@ pub fn attest_provider(
     match verify_attestation(&att, &policy) {
         Ok(trust) => AttestRecord {
             last_attempt_ms: now_unix_ms,
+            verified_ms: now_unix_ms,
+            load_refusals: 0,
             outcome: AttestOutcome::Verified(trust),
             key: Some(att.signing_key),
             key_rotations: key_rotations + u32::from(key.is_some_and(|k| k != att.signing_key)),
@@ -667,7 +693,14 @@ mod tests {
         let AttestOutcome::Failed(why) = rec.outcome else { panic!() };
         assert!(why.len() <= MAX_FAILURE_REASON);
 
-        let record = |at: u64| AttestRecord { last_attempt_ms: at, outcome: AttestOutcome::Unsupported, key: None, key_rotations: 0 };
+        let record = |at: u64| AttestRecord {
+            last_attempt_ms: at,
+            verified_ms: 0,
+            load_refusals: 0,
+            outcome: AttestOutcome::Unsupported,
+            key: None,
+            key_rotations: 0,
+        };
         let mut map = HashMap::new();
         for i in 0..MAX_ATTEST_RECORDS as u64 {
             map.insert(format!("p{i}"), record(NOW - ATTEST_VALID_MS + i));
@@ -701,6 +734,8 @@ mod tests {
         // A consumer that had verified this provider keeps that record through a load refusal.
         let prev = AttestRecord {
             last_attempt_ms: NOW - 1,
+            verified_ms: NOW - 1,
+            load_refusals: 0,
             outcome: AttestOutcome::Verified(DeviceTrust::SelfSigned),
             key: None,
             key_rotations: 0,
@@ -708,12 +743,22 @@ mod tests {
         let mut t = |_: &[u8]| Ok(reply.clone());
         let rec = attest_provider(&mut t, "m", [1; 32], NOW, &[], Some(&prev), PROV);
         assert_eq!(rec.device_trust(NOW), Some(DeviceTrust::SelfSigned));
+        // Review S7: the refusal counts as an attempt (not due again on the next serve)…
+        assert!(!rec.due(NOW + 1) && rec.due(NOW + ATTEST_REFRESH_MS));
+        // …and a provider that keeps declining loses the badge.
+        let mut r = rec;
+        for i in 1..MAX_LOAD_REFUSALS as u64 {
+            r = attest_provider(&mut t, "m", [1; 32], NOW + i * ATTEST_REFRESH_MS, &[], Some(&r), PROV);
+        }
+        assert_eq!(r.device_trust(NOW + MAX_LOAD_REFUSALS as u64 * ATTEST_REFRESH_MS), None);
     }
 
     #[test]
     fn a_verified_attestation_expires() {
         let rec = AttestRecord {
             last_attempt_ms: NOW,
+            verified_ms: NOW,
+            load_refusals: 0,
             outcome: AttestOutcome::Verified(DeviceTrust::SelfSigned),
             key: None,
             key_rotations: 0,

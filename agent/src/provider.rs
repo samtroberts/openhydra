@@ -385,25 +385,29 @@ fn payment_window(unsettled: &[Unsettled], generating: &[u64], reserving: u64, d
     Ok(())
 }
 
-/// Record that `peer` passed private `model`'s swarm gate at `now`, keeping at most
-/// [`MAX_PRIVATE_ATTEST_PAIRS`] pairs (expired ones go first, then the oldest).
-fn note_private_member_in(m: &mut HashMap<(String, String), u64>, peer: &str, model: &str, now: u64) {
-    if m.len() >= MAX_PRIVATE_ATTEST_PAIRS {
-        m.retain(|_, at| now.saturating_sub(*at) <= PRIVATE_ATTEST_WINDOW_MS);
+/// Record that `peer` passed private `model`'s swarm gate at `now` (with what it passed with, `v`),
+/// keeping at most [`MAX_PRIVATE_ATTEST_PAIRS`] pairs: a pair already there is refreshed in place;
+/// otherwise, when full, expired ones go first, then the oldest.
+fn note_private_member_in<V>(m: &mut HashMap<(String, String), (u64, V)>, peer: &str, model: &str, now: u64, v: V) {
+    let key = (peer.to_string(), model.to_string());
+    if !m.contains_key(&key) && m.len() >= MAX_PRIVATE_ATTEST_PAIRS {
+        m.retain(|_, (at, _)| now.saturating_sub(*at) <= PRIVATE_ATTEST_WINDOW_MS);
         if m.len() >= MAX_PRIVATE_ATTEST_PAIRS {
-            if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+            if let Some(oldest) = m.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) {
                 m.remove(&oldest);
             }
         }
     }
-    m.insert((peer.to_string(), model.to_string()), now);
+    m.insert(key, (now, v));
 }
 
-/// Whether `peer` may attest private `model`: it passed that model's swarm gate within
+/// What `peer` passed private `model`'s swarm gate with, if it did within
 /// [`PRIVATE_ATTEST_WINDOW_MS`]. Anyone else gets the same refusal as for an unshared model, so a
 /// challenge still can't probe for private models.
-fn private_attestable_in(m: &HashMap<(String, String), u64>, peer: &str, model: &str, now: u64) -> bool {
-    m.get(&(peer.to_string(), model.to_string())).is_some_and(|at| now.saturating_sub(*at) <= PRIVATE_ATTEST_WINDOW_MS)
+fn private_member_in<'a, V>(m: &'a HashMap<(String, String), (u64, V)>, peer: &str, model: &str, now: u64) -> Option<&'a V> {
+    m.get(&(peer.to_string(), model.to_string()))
+        .filter(|(at, _)| now.saturating_sub(*at) <= PRIVATE_ATTEST_WINDOW_MS)
+        .map(|(_, v)| v)
 }
 
 /// A paid serve's reservation against its consumer's unpaid-token cap while it generates; released
@@ -927,9 +931,10 @@ pub struct Provider<A: EngineAdapter> {
     /// Held across a receipt's validate → co-sign → record, so two receipts for one pair can't both
     /// validate against the same high-water and both be co-signed (each is cheap: a verify + a sign).
     receipt_lock: Mutex<()>,
-    /// `(peer, model)` → when that peer last passed the swarm gate for a private model: it may attest
-    /// the model it is entitled to (an attestation challenge carries no credential).
-    private_members: Mutex<HashMap<(String, String), u64>>,
+    /// `(peer, model)` → when that peer last passed the swarm gate for a private model, and the
+    /// credential it passed with: it may attest the model while still entitled to it (an attestation
+    /// challenge carries no credential).
+    private_members: Mutex<HashMap<(String, String), (u64, Option<openhydra_network::membership::MembershipCredential>)>>,
     /// Paid serves generating now, per consumer: each one's token reservation (credit window).
     paid_generating: Arc<Mutex<HashMap<String, Vec<u64>>>>,
     /// Stream nonces whose consumer polled to the end before the serve was recorded (see
@@ -1385,8 +1390,13 @@ impl<A: EngineAdapter> Provider<A> {
             now_unix_ms(),
         ) {
             Ok(()) => {
-                if scope == crate::share_policy::Scope::Private {
-                    self.note_private_member(source_peer, &req.model_ref);
+                // Only a model we announce, under its own name: an alias let through at the strictest
+                // scope could be any string, and isn't a model a challenge names.
+                if announced
+                    && matches!(scope, crate::share_policy::Scope::Private | crate::share_policy::Scope::Unknown)
+                    && req.model_ref.len() <= crate::attest::MAX_MODEL_ID_LEN
+                {
+                    self.note_private_member(source_peer, &req.model_ref, req.credential.clone());
                 }
                 None
             }
@@ -1401,16 +1411,44 @@ impl<A: EngineAdapter> Provider<A> {
         }
     }
 
-    /// Remember that `peer` passed the swarm gate for private `model`, for attestation.
-    fn note_private_member(&self, peer: &str, model: &str) {
+    /// Remember that `peer` passed the swarm gate for private `model` with `credential`, for
+    /// attestation.
+    fn note_private_member(
+        &self,
+        peer: &str,
+        model: &str,
+        credential: Option<openhydra_network::membership::MembershipCredential>,
+    ) {
         let mut m = self.private_members.lock().unwrap_or_else(|e| e.into_inner());
-        note_private_member_in(&mut m, peer, model, now_unix_ms());
+        note_private_member_in(&mut m, peer, model, now_unix_ms(), credential);
     }
 
-    /// Whether `peer` may attest private `model` ([`private_attestable_in`]).
+    /// Whether `peer` may attest private `model`: it passed the model's swarm gate recently
+    /// ([`private_member_in`]) and would still pass it now — the model still shared and private, and
+    /// its credential not revoked or expired since.
     fn private_attestable(&self, peer: &str, model: &str) -> bool {
-        let m = self.private_members.lock().unwrap_or_else(|e| e.into_inner());
-        private_attestable_in(&m, peer, model, now_unix_ms())
+        use crate::share_policy::Scope;
+        let now = now_unix_ms();
+        let credential = {
+            let m = self.private_members.lock().unwrap_or_else(|e| e.into_inner());
+            match private_member_in(&m, peer, model, now) {
+                Some(c) => c.clone(),
+                None => return false,
+            }
+        };
+        let scope = self.policy.scope_of(model);
+        self.model_shared(model)
+            && matches!(scope, Scope::Private | Scope::Unknown)
+            && scope_gate(
+                scope,
+                model,
+                peer,
+                self.net.libp2p_peer_id(),
+                credential.as_ref(),
+                self.swarm_auth.as_deref(),
+                now,
+            )
+            .is_ok()
     }
 
     /// Restrict which models this provider shares (announces + serves) via a **static** legacy
@@ -3163,17 +3201,21 @@ mod tests {
     fn a_swarm_member_may_attest_the_private_model_it_was_served() {
         let now = 10 * PRIVATE_ATTEST_WINDOW_MS;
         let mut m = HashMap::new();
-        assert!(!private_attestable_in(&m, "member", "rig-model", now), "not before passing the gate");
-        note_private_member_in(&mut m, "member", "rig-model", now);
-        assert!(private_attestable_in(&m, "member", "rig-model", now + PRIVATE_ATTEST_WINDOW_MS));
-        assert!(!private_attestable_in(&m, "member", "rig-model", now + PRIVATE_ATTEST_WINDOW_MS + 1), "expires");
-        assert!(!private_attestable_in(&m, "member", "other-model", now), "only the model it passed for");
-        assert!(!private_attestable_in(&m, "stranger", "rig-model", now), "only that peer");
-        // Bounded: a full map forgets expired pairs, then the oldest.
+        assert!(private_member_in(&m, "member", "rig-model", now).is_none(), "not before passing the gate");
+        note_private_member_in(&mut m, "member", "rig-model", now, 7u8);
+        assert_eq!(private_member_in(&m, "member", "rig-model", now + PRIVATE_ATTEST_WINDOW_MS), Some(&7));
+        assert!(private_member_in(&m, "member", "rig-model", now + PRIVATE_ATTEST_WINDOW_MS + 1).is_none(), "expires");
+        assert!(private_member_in(&m, "member", "other-model", now).is_none(), "only the model it passed for");
+        assert!(private_member_in(&m, "stranger", "rig-model", now).is_none(), "only that peer");
+        // Bounded: a full map forgets expired pairs, then the oldest…
         for i in 0..MAX_PRIVATE_ATTEST_PAIRS as u64 {
-            note_private_member_in(&mut m, &format!("p{i}"), "m", now + i);
+            note_private_member_in(&mut m, &format!("p{i}"), "m", now + i, 0);
         }
         assert_eq!(m.len(), MAX_PRIVATE_ATTEST_PAIRS);
+        // …but refreshing a pair already there evicts nobody (review A3).
+        let before: std::collections::HashSet<_> = m.keys().cloned().collect();
+        note_private_member_in(&mut m, "p5", "m", now + 10 * MAX_PRIVATE_ATTEST_PAIRS as u64, 0);
+        assert_eq!(m.keys().cloned().collect::<std::collections::HashSet<_>>(), before);
     }
 
     #[test]
