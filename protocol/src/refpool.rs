@@ -39,7 +39,11 @@ const MAX_CHECKPOINTS: usize = 64;
 /// Bounds enforced when decoding (a pack is attacker-reachable input if the signature check is ever
 /// skipped or the key leaks; decode never allocates without a bound).
 const MAX_PACK_TEXTS: usize = 512;
-const MAX_TEXT_TOKENS: usize = 4096;
+/// The most tokens a text may have: a challenge carries at most this many (the agent's
+/// `MAX_CHALLENGE_TOKENS`), so a longer text could never be sent (review LP11).
+pub const MAX_TEXT_TOKENS: usize = 512;
+/// The most tokens a stored text could have before that cap (older pools).
+const MAX_STORED_TEXT_TOKENS: usize = 4096;
 const MAX_STRING: usize = 1024;
 const MAX_HANDLES: usize = 64;
 
@@ -150,11 +154,16 @@ impl<'a> R<'a> {
         String::from_utf8(self.take(n)?.to_vec()).ok()
     }
     fn text(&mut self) -> Option<ReferenceText> {
+        self.text_up_to(MAX_TEXT_TOKENS)
+    }
+    /// A text of at most `max` tokens: [`MAX_TEXT_TOKENS`] on the wire, [`MAX_STORED_TEXT_TOKENS`]
+    /// reading a pool imported before texts were capped.
+    fn text_up_to(&mut self, max: usize) -> Option<ReferenceText> {
         let id = self.str()?;
         let band = self.f64()?;
-        let n = self.len(MAX_TEXT_TOKENS)?;
+        let n = self.len(max)?;
         let token_ids = (0..n).map(|_| self.u32()).collect::<Option<Vec<_>>>()?;
-        let m = self.len(MAX_TEXT_TOKENS)?;
+        let m = self.len(max)?;
         let logprobs = (0..m).map(|_| self.u32().map(f32::from_bits)).collect::<Option<Vec<_>>>()?;
         Some(ReferenceText { id, token_ids, logprobs, band })
     }
@@ -498,6 +507,9 @@ impl RefPool {
     /// imported twice and issued twice.
     pub fn import(&self, set: &ReferenceSet, handles: &[String], batch_id: [u8; 16], now_ms: u64) -> Result<BatchInfo, PoolError> {
         set.validate().map_err(|e| PoolError::BadBatch(format!("{e:?}")))?;
+        if let Some(t) = set.texts.iter().find(|t| t.token_ids.len() > MAX_TEXT_TOKENS) {
+            return Err(PoolError::BadBatch(format!("text {} has more than {MAX_TEXT_TOKENS} tokens", t.id)));
+        }
         if set.identity.is_none() && handles.is_empty() {
             return Err(PoolError::BadBatch("needs a model identity or a handle".into()));
         }
@@ -761,7 +773,12 @@ fn take_texts(wtx: &redb::WriteTransaction, bid: &str, count: u32) -> Result<Vec
     let mut picked = Vec::with_capacity(count as usize);
     for i in start..start + count {
         let row = texts.get((bid, i)).map_err(db)?.ok_or_else(|| PoolError::Db("missing text".into()))?;
-        picked.push(R(row.value()).text().ok_or_else(|| PoolError::Db("corrupt text".into()))?);
+        let text = R(row.value()).text_up_to(MAX_STORED_TEXT_TOKENS).ok_or_else(|| PoolError::Db("corrupt text".into()))?;
+        // A text too long to send as a challenge (imported before the cap) is used up, not issued:
+        // a gateway couldn't send it, and the pack would fail to decode (review LP11).
+        if text.token_ids.len() <= MAX_TEXT_TOKENS {
+            picked.push(text);
+        }
     }
     next.insert(bid, start + count).map_err(db)?;
     Ok(picked)
@@ -920,6 +937,19 @@ mod tests {
 
     fn q4km() -> Option<ModelIdentity> {
         ModelIdentity::new("qwen3.5", "9b", "q4_k_m")
+    }
+
+    #[test]
+    fn a_text_too_long_to_send_is_refused_at_import() {
+        let pool = RefPool::open_in_memory().unwrap();
+        let mut long = set("q", 6, 0, q4km());
+        long.texts[2].token_ids = (0..(MAX_TEXT_TOKENS as u32 + 1)).collect();
+        long.texts[2].logprobs = vec![-0.5; MAX_TEXT_TOKENS];
+        assert!(matches!(pool.import(&long, &[], [3; 16], 5), Err(PoolError::BadBatch(m)) if m.contains("more than 512 tokens")));
+        // At the limit is fine.
+        long.texts[2].token_ids.pop();
+        long.texts[2].logprobs.pop();
+        assert!(pool.import(&long, &[], [3; 16], 5).is_ok());
     }
 
     #[test]

@@ -1294,13 +1294,16 @@ impl ConsumerNode {
         // Rehydrate: which texts each provider has already been sent, the round in progress, and the
         // latest verdict. A corrupt row is skipped with a warning (its provider then looks fresh to
         // us — the one case a text could be re-sent).
-        let (mut rounds, mut status) = (HashMap::new(), HashMap::new());
+        let (mut rounds, mut status, mut registry_identities) = (HashMap::new(), HashMap::new(), HashMap::new());
         if let Some(store) = &self.store {
             match store.load_logprob_states() {
                 Ok(rows) => {
                     for (key, blob) in rows {
                         match decode_logprob_state(&blob) {
-                            Some((st, round)) => {
+                            Some((st, round, identity)) => {
+                                if let Some(id) = identity {
+                                    registry_identities.insert(st.reference, id);
+                                }
                                 status.insert(key.clone(), st);
                                 rounds.insert(key, round);
                             }
@@ -1326,7 +1329,7 @@ impl ConsumerNode {
         self.provider_logprob = Some(Arc::new(ProviderLogprob {
             refs: refs.into_iter().map(Arc::new).collect(),
             registry,
-            registry_identities: Mutex::new(HashMap::new()),
+            registry_identities: Mutex::new(registry_identities),
             registry_weights: Mutex::new(HashMap::new()),
             rounds: Mutex::new(rounds),
             status: Mutex::new(status),
@@ -1404,7 +1407,11 @@ impl ConsumerNode {
     /// fails the check).
     fn persist_logprob_state(&self, key: &str, status: LogprobStatus, round: &ChallengeRound) {
         if let Some(store) = &self.store {
-            if let Err(e) = store.put_logprob_state(key, &encode_logprob_state(status, round)) {
+            // A registry pack's identity, kept with the row (a local reference names its own).
+            let identity = self.provider_logprob.as_ref().and_then(|lp| {
+                lp.registry_identities.lock().unwrap_or_else(|e| e.into_inner()).get(&status.reference).cloned()
+            });
+            if let Err(e) = store.put_logprob_state(key, &encode_logprob_state(status, round, identity.as_ref())) {
                 tracing::warn!(error = %e, key, "log-prob state persist failed");
             }
         }
@@ -2801,7 +2808,13 @@ impl ConsumerNode {
         let Some(lp) = self.provider_logprob.clone() else { return };
         let key = reputation_key(&provider.state_id, model_key);
         let now = now_unix_ms();
-        if lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| now < s.next_due_ms) {
+        // Not due yet: skip, except for an occasional spot check of a provider that passed (LP7).
+        let skip = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| {
+            now < s.next_due_ms
+                && !(s.verdict.is_some_and(|(v, _)| v.passed())
+                    && rand::random::<f64>() < crate::prompt_score::LOGPROB_SPOT_CHECK_RATE)
+        });
+        if skip {
             return;
         }
         if !lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
@@ -3024,7 +3037,7 @@ impl ConsumerNode {
             }
         };
         let effect = match &outcome {
-            RoundOutcome::Verdict(v) => st.on_verdict_jittered(*v, now, rand::random::<f64>() * 2.0 - 1.0),
+            RoundOutcome::Verdict(v) => st.on_verdict_drawn(*v, now, 1.0 - rand::random::<f64>()),
             RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, retry, now),
             // Busy isn't held against a provider: the text it stalled on waits for it.
             RoundOutcome::Busy => st.on_no_verdict(false, retry, now),

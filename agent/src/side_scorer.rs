@@ -47,6 +47,13 @@ const FAILED_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// back to back, and switching files under it would end the round early — held against the
 /// provider. The other file's challenge is told to retry (its gateway waits several minutes).
 const SWITCH_HOLD: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(30) };
+/// Scorer starts allowed per hour, and the least time between starts on different files (review
+/// LP9): challenges come from the network, so without a limit any peer could keep a scorer loaded,
+/// or keep it reloading, on someone's machine. Past either, a challenge is answered "busy", which a
+/// gateway waits out without holding it against the provider.
+const MAX_STARTS_PER_HOUR: usize = 6;
+const SWITCH_MIN_INTERVAL: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(5 * 60) };
+const START_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// A scorer binary: `explicit` if given, else `name` next to the running agent.
 pub fn locate_scorer(explicit: Option<&Path>, name: &str) -> Option<PathBuf> {
@@ -129,6 +136,25 @@ struct Inner<H> {
     /// Files whose scorer couldn't be started (or kept failing), when, and why; not retried for
     /// [`FAILED_BACKOFF`]. Per file, so a challenge for another model doesn't erase it.
     failed: Mutex<HashMap<PathBuf, (Instant, String)>>,
+    /// Recent scorer starts and their files, for [`MAX_STARTS_PER_HOUR`] / [`SWITCH_MIN_INTERVAL`].
+    starts: Mutex<std::collections::VecDeque<(Instant, PathBuf)>>,
+}
+
+/// Why a scorer start on `weights` must wait, if it must: the hour's starts are spent, or the last
+/// start (on another file) was too recent.
+fn start_refusal(starts: &mut std::collections::VecDeque<(Instant, PathBuf)>, weights: &Path, now: Instant) -> Option<&'static str> {
+    while starts.front().is_some_and(|(at, _)| now.duration_since(*at) > START_WINDOW) {
+        starts.pop_front();
+    }
+    if starts.len() >= MAX_STARTS_PER_HOUR {
+        return Some("prompt scorer start limit reached for this hour");
+    }
+    match starts.back() {
+        Some((at, w)) if w != weights && now.duration_since(*at) < SWITCH_MIN_INTERVAL => {
+            Some("prompt scorer switched models too recently")
+        }
+        _ => None,
+    }
 }
 
 /// Manages one scorer at a time (one weights file); see the module docs.
@@ -146,6 +172,7 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
             state: Mutex::new(State::Idle),
             changed: Condvar::new(),
             failed: Mutex::new(HashMap::new()),
+            starts: Mutex::new(std::collections::VecDeque::new()),
         });
         let weak = Arc::downgrade(&inner);
         std::thread::spawn(move || idle_reaper(weak));
@@ -239,7 +266,15 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                     return Err(AdapterError::Busy("prompt scorer is busy with another model".into()));
                 }
                 _ => {
-                    // Idle, or an idle scorer on another file (or this file before it changed): start.
+                    // Idle, or an idle scorer on another file (or this file before it changed): start,
+                    // within the start limits (LP9).
+                    let now = Instant::now();
+                    let mut starts = inner.starts.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(why) = start_refusal(&mut starts, weights, now) {
+                        return Err(AdapterError::Busy(why.into()));
+                    }
+                    starts.push_back((now, weights.to_path_buf()));
+                    drop(starts);
                     *st = State::Starting(weights.to_path_buf());
                     let (inner2, path) = (Arc::clone(inner), weights.to_path_buf());
                     std::thread::spawn(move || start(&inner2, &path, current));
@@ -629,6 +664,26 @@ mod tests {
             }
         }
         panic!("never became ready")
+    }
+
+    #[test]
+    fn scorer_starts_are_limited_per_hour_and_between_files() {
+        let mut starts = std::collections::VecDeque::new();
+        let (a, b) = (Path::new("/m/a.gguf"), Path::new("/m/b.gguf"));
+        let t0 = Instant::now();
+        assert_eq!(start_refusal(&mut starts, a, t0), None);
+        starts.push_back((t0, a.to_path_buf()));
+        // Another file right away: too soon. The same file (a restart): fine.
+        assert!(start_refusal(&mut starts, b, t0 + Duration::from_millis(10)).is_some());
+        assert_eq!(start_refusal(&mut starts, a, t0 + Duration::from_millis(10)), None);
+        assert_eq!(start_refusal(&mut starts, b, t0 + SWITCH_MIN_INTERVAL), None);
+        // The hour's budget.
+        for i in 1..MAX_STARTS_PER_HOUR {
+            starts.push_back((t0 + Duration::from_secs(i as u64), a.to_path_buf()));
+        }
+        assert_eq!(start_refusal(&mut starts, a, t0 + Duration::from_secs(60)), Some("prompt scorer start limit reached for this hour"));
+        // An hour on, the oldest starts no longer count.
+        assert_eq!(start_refusal(&mut starts, a, t0 + START_WINDOW + Duration::from_secs(2)), None);
     }
 
     #[test]

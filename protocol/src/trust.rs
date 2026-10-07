@@ -415,6 +415,15 @@ pub struct VerifierVerdict {
 impl VerifierVerdict {
     /// Whether this verdict may be cached. A transient / inconclusive verdict returns `false` — the
     /// cache must re-derive it next time rather than freeze an "unknown" into a lasting tier.
+    ///
+    /// None exists today (verdicts are recomputed from evidence on every call). Any cache added in
+    /// front of a [`Verifier`] must also (review T7):
+    /// * **expire**: evidence decays (reputation, audit counts, a log-prob pass's validity), so a
+    ///   cached tier must not outlive the evidence it came from (expire it no later than the shortest
+    ///   of those windows);
+    /// * **be cleared by a new outcome**: a failed audit, a failed or evaded log-prob round, or any
+    ///   new verification outcome for that `(peer, model)` drops its entry at once, so a provider
+    ///   caught now isn't served a cached higher tier.
     pub fn cacheable(&self) -> bool {
         self.determinate
     }

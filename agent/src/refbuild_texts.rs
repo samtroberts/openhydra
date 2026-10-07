@@ -53,9 +53,10 @@ pub struct GenerateArgs {
     /// JSON Lines output: one {"text", "form", "language", "topic", "source"} per line.
     #[arg(long)]
     out: PathBuf,
-    /// Seed for the prompt choices (the sampled text itself is not reproducible, by design).
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
+    /// Seed for the prompt choices (the sampled text itself is not reproducible, by design). Random
+    /// unless given: a known default would let anyone rebuild the prompt list.
+    #[arg(long)]
+    seed: Option<u64>,
     #[arg(long, default_value_t = 320)]
     max_tokens: u32,
     #[arg(long, default_value_t = 1.0)]
@@ -76,8 +77,11 @@ pub struct TextsArgs {
     /// Longest crop / generated text kept, in characters.
     #[arg(long, default_value_t = 1200)]
     max_chars: usize,
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
+    /// Seed for which crops are taken and their order. Random unless given (review LP8): with a known
+    /// default, anyone holding the same public files could rebuild the exact crops. The seed used is
+    /// written only to the (private) manifest.
+    #[arg(long)]
+    seed: Option<u64>,
     /// JSON array of texts (the input to `refbuild tokenize`).
     #[arg(long)]
     out: PathBuf,
@@ -142,7 +146,7 @@ fn completion_text(reply: &str) -> Option<String> {
 
 pub fn generate(a: GenerateArgs) -> Result<(), String> {
     let root = a.engine.trim_end_matches('/').trim_end_matches("/v1").to_string();
-    let mut rng = StdRng::seed_from_u64(a.seed);
+    let mut rng = StdRng::seed_from_u64(a.seed.unwrap_or_else(rand::random));
     let prompts: Vec<_> = (0..a.count).map(|_| prompt(&mut rng)).collect();
     let next = AtomicUsize::new(0);
     let out = Mutex::new(Vec::<Value>::new());
@@ -286,7 +290,8 @@ fn trim_generated(text: &str, max: usize) -> String {
 
 pub fn texts(a: TextsArgs) -> Result<(), String> {
     let sources = a.sources.iter().map(|s| parse_source(s)).collect::<Result<Vec<_>, _>>()?;
-    let mut rng = StdRng::seed_from_u64(a.seed);
+    let seed = a.seed.unwrap_or_else(rand::random);
+    let mut rng = StdRng::seed_from_u64(seed);
     let mut seen = HashSet::new();
     let (mut texts, mut provenance, mut summary) = (Vec::new(), Vec::new(), Vec::new());
     let mut add = |text: String, origin: Value, texts: &mut Vec<String>, provenance: &mut Vec<Value>| -> bool {
@@ -353,7 +358,7 @@ pub fn texts(a: TextsArgs) -> Result<(), String> {
     std::fs::write(&a.out, serde_json::to_vec(&texts_out).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", a.out.display()))?;
     std::fs::write(
         &a.manifest,
-        serde_json::to_vec_pretty(&json!({"seed": a.seed, "min_chars": a.min_chars, "max_chars": a.max_chars,
+        serde_json::to_vec_pretty(&json!({"seed": seed, "min_chars": a.min_chars, "max_chars": a.max_chars,
             "sources": summary, "texts": prov_out}))
         .map_err(|e| e.to_string())?,
     )
@@ -447,7 +452,7 @@ mod tests {
             sources: vec![format!("generated:{}:5", gen.display()), format!("files:{}:10", code.display())],
             min_chars: 200,
             max_chars: 700,
-            seed: 9,
+            seed: Some(9),
             out: out.clone(),
             manifest: manifest.clone(),
         })

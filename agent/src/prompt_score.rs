@@ -67,6 +67,9 @@ pub enum ScoreChallengeError {
     Refused(String),
     /// The reply was malformed, or has the wrong number of scores.
     Malformed,
+    /// We couldn't frame the challenge (a text or handle over the protocol's limits): our side's
+    /// problem, never held against the provider (review LP11).
+    Unsendable,
 }
 
 /// Consumer side: frame a challenge (method byte included). `None` if the model handle or the
@@ -317,7 +320,7 @@ pub fn request_prompt_scores(
     model_ref: &str,
     token_ids: &[u32],
 ) -> Result<Vec<f32>, ScoreChallengeError> {
-    let framed = encode_challenge(model_ref, token_ids).ok_or(ScoreChallengeError::Malformed)?;
+    let framed = encode_challenge(model_ref, token_ids).ok_or(ScoreChallengeError::Unsendable)?;
     let reply = transport(&framed).map_err(ScoreChallengeError::Transport)?;
     let Some(rest) = reply.strip_prefix(SCORE_RESP_MAGIC.as_slice()) else {
         return Err(ScoreChallengeError::Unsupported);
@@ -518,8 +521,10 @@ pub fn identity_in(refs: &[std::sync::Arc<LoadedReference>], tag: [u8; 16]) -> O
     refs.iter().find(|r| reference_tag(&r.set) == tag).and_then(|r| r.set.identity.clone())
 }
 
-/// A 16-byte tag of a reference (its label, and its weights file when it has one), kept in
-/// [`LogprobStatus`] so a verdict stays tied to the reference it was earned against.
+/// A 16-byte tag of a reference (its label, its weights file and its identity when it has them),
+/// kept in [`LogprobStatus`] so a verdict stays tied to the reference it was earned against: two
+/// references under one label for different models (registry packs, say) don't share a tag, so
+/// pricing never reads one's identity for the other's verdict (review LP10).
 pub fn reference_tag(set: &ReferenceSet) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(set.model_key.as_bytes());
@@ -527,7 +532,16 @@ pub fn reference_tag(set: &ReferenceSet) -> [u8; 16] {
         h.update([0]);
         h.update(w.as_bytes());
     }
+    if let Some(id) = &set.identity {
+        h.update([1]);
+        h.update(identity_text(id).as_bytes());
+    }
     h.finalize()[..16].try_into().expect("16 of 32 bytes")
+}
+
+/// `family\0params\0quant`: an identity as one string (it is normalised, so it contains no NUL).
+fn identity_text(id: &ModelIdentity) -> String {
+    format!("{}\0{}\0{}", id.family, id.params, id.quant)
 }
 
 /// Read and validate a reference-set file.
@@ -595,6 +609,10 @@ pub fn run_round(
     pause: &mut dyn FnMut(),
     persist: &mut dyn FnMut(&ChallengeRound),
 ) -> RoundOutcome {
+    // A handle no challenge can carry would make every text unsendable: stop before using any up.
+    if model_ref.len() > MAX_MODEL_REF_LEN {
+        return RoundOutcome::Busy;
+    }
     let mut skipped = 0;
     loop {
         let text = match round.pending_text(set) {
@@ -643,6 +661,13 @@ pub fn run_round(
                 return RoundOutcome::Unsupported;
             }
             Err(ScoreChallengeError::Transport(e)) => return RoundOutcome::Incomplete(format!("transport: {e}")),
+            // The provider never saw it: drop the text and go on, nothing held against anyone.
+            Err(ScoreChallengeError::Unsendable) => {
+                tracing::warn!(text = %id, "a reference text can't be sent as a challenge (over the protocol's limits); skipping it");
+                round.abandon(&id);
+                persist(round);
+                continue;
+            }
             Err(ScoreChallengeError::Refused(r)) => format!("refused: {r}"),
             Err(ScoreChallengeError::Malformed) => "malformed reply".to_string(),
         };
@@ -684,6 +709,8 @@ pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut
             Err(ScoreChallengeError::Refused(r)) => Some(RoundOutcome::Incomplete(format!("refused: {r}"))),
             Err(ScoreChallengeError::Transport(e)) => Some(RoundOutcome::Incomplete(format!("transport: {e}"))),
             Err(ScoreChallengeError::Malformed) => Some(RoundOutcome::Incomplete("malformed reply".into())),
+            // Our own handle is over the limit: wait, rather than blame the provider.
+            Err(ScoreChallengeError::Unsendable) => Some(RoundOutcome::Busy),
         };
     }
 }
@@ -695,8 +722,11 @@ pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut
 pub const LOGPROB_VALID_MS: u64 = 24 * 60 * 60 * 1000;
 /// Re-check a provider this long after a verdict while its pass streak is short.
 pub const LOGPROB_REFRESH_MS: u64 = 6 * 60 * 60 * 1000;
-/// Random spread of every re-check time (±25%), so a provider can't time a model swap between checks.
-pub const LOGPROB_REFRESH_JITTER: f64 = 0.25;
+/// The earliest a re-check comes after a verdict ([`recheck_delay_ms`]).
+pub const LOGPROB_MIN_RECHECK_MS: u64 = 30 * 60 * 1000;
+/// The chance, after any serve, of checking a provider that passed before its re-check is due: a
+/// provider can't count on a quiet stretch after a check (review LP7).
+pub const LOGPROB_SPOT_CHECK_RATE: f64 = 0.02;
 
 /// How long after a verdict to re-check, by pass streak: 6 h until the streak qualifies
 /// (< [`LOGPROB_MIN_PASSES`]), 12 h for a qualified streak, 24 h once it is twice that long. A fail
@@ -709,6 +739,17 @@ pub fn refresh_interval_ms(pass_streak: u32) -> u64 {
     } else {
         LOGPROB_REFRESH_MS
     }
+}
+
+/// When to re-check after a verdict (review LP7): drawn from an exponential distribution with
+/// [`refresh_interval_ms`] as its mean, so knowing when the last check was says nothing about when
+/// the next comes (a fixed interval, even with a spread, left a predictable window). `u` is a
+/// uniform draw in `(0, 1]`. At least [`LOGPROB_MIN_RECHECK_MS`]; at most 1.5× the mean, so a passing
+/// provider is re-checked before its pass stops counting ([`validity_ms`]).
+pub fn recheck_delay_ms(pass_streak: u32, u: f64) -> u64 {
+    let mean = refresh_interval_ms(pass_streak);
+    let drawn = -(mean as f64) * u.clamp(f64::MIN_POSITIVE, 1.0).ln();
+    (drawn as u64).clamp(LOGPROB_MIN_RECHECK_MS, mean * 3 / 2)
 }
 
 /// How long a verdict counts: twice the re-check interval (so a trusted provider doesn't drop out of
@@ -762,25 +803,43 @@ pub enum StatusEffect {
 
 impl LogprobStatus {
     /// Point the status at the reference now in use. A different reference means a different claimed
-    /// model: the verdict, streak and evasion count belong to the old one, so they're cleared, and so
-    /// are the round's in-progress ratios (issued texts stay issued). Returns whether it changed.
+    /// model: a pass and its streak belong to the old one, so they're cleared, and so are the round's
+    /// in-progress ratios (issued texts stay issued). A fail and the evasion record stay until they
+    /// expire: declaring another model or file mustn't wipe a provider's recent failure (review LP6).
+    /// Returns whether it changed.
     pub fn switch_reference(&mut self, tag: [u8; 16], round: &mut ChallengeRound) -> bool {
         if self.reference == tag {
             return false;
         }
-        *self = Self { next_due_ms: self.next_due_ms, reference: tag, ..Self::default() };
+        let failed = self.verdict.filter(|(v, _)| !v.passed());
+        *self = Self {
+            verdict: failed,
+            evasions: self.evasions,
+            evaded_at_ms: self.evaded_at_ms,
+            next_due_ms: self.next_due_ms,
+            reference: tag,
+            ..Self::default()
+        };
         round.reset_progress();
         true
     }
 
-    /// Record a completed round.
+    /// Record a completed round, re-checking after the mean interval ([`refresh_interval_ms`]).
     pub fn on_verdict(&mut self, verdict: LogprobVerdict, now_ms: u64) -> StatusEffect {
-        self.on_verdict_jittered(verdict, now_ms, 0.0)
+        let effect = self.record_verdict(verdict, now_ms);
+        self.next_due_ms = now_ms + refresh_interval_ms(self.pass_streak);
+        effect
     }
 
-    /// As [`on_verdict`](Self::on_verdict), with the re-check time moved by `jitter` (a fraction in
-    /// `[-1, 1]`, scaled by [`LOGPROB_REFRESH_JITTER`]) — the caller supplies the randomness.
-    pub fn on_verdict_jittered(&mut self, verdict: LogprobVerdict, now_ms: u64, jitter: f64) -> StatusEffect {
+    /// As [`on_verdict`](Self::on_verdict), re-checking after a random delay ([`recheck_delay_ms`],
+    /// `u` uniform in `(0, 1]`; the caller supplies the randomness).
+    pub fn on_verdict_drawn(&mut self, verdict: LogprobVerdict, now_ms: u64, u: f64) -> StatusEffect {
+        let effect = self.record_verdict(verdict, now_ms);
+        self.next_due_ms = now_ms + recheck_delay_ms(self.pass_streak, u);
+        effect
+    }
+
+    fn record_verdict(&mut self, verdict: LogprobVerdict, now_ms: u64) -> StatusEffect {
         self.verdict = Some((verdict, now_ms));
         self.evasions = 0;
         let effect = if verdict.passed() {
@@ -794,9 +853,6 @@ impl LogprobStatus {
             self.streak_since_ms = 0;
             StatusEffect::Fail
         };
-        let base = refresh_interval_ms(self.pass_streak) as f64;
-        let factor = 1.0 + LOGPROB_REFRESH_JITTER * jitter.clamp(-1.0, 1.0);
-        self.next_due_ms = now_ms + (base * factor) as u64;
         effect
     }
 
@@ -916,17 +972,41 @@ impl LogprobStatus {
 }
 
 /// One `(peer, model)`'s persisted state: the status followed by the challenge round.
-pub fn encode_logprob_state(status: LogprobStatus, round: &ChallengeRound) -> Vec<u8> {
-    let mut b = status.to_bytes().to_vec();
+/// `identity` is the identity of the reference the status was earned against, when only a registry
+/// pack named it (a local reference file names its own): kept with the row, so after a restart the
+/// verdict still prices at it instead of falling back to the name (review LP10). Stored ahead of the
+/// status as `IDENTITY_MARK ‖ len u16 ‖ family\0params\0quant`.
+pub fn encode_logprob_state(status: LogprobStatus, round: &ChallengeRound, identity: Option<&ModelIdentity>) -> Vec<u8> {
+    let mut b = Vec::new();
+    if let Some(text) = identity.map(identity_text).filter(|t| t.len() <= u16::MAX as usize) {
+        b.push(IDENTITY_MARK);
+        b.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        b.extend_from_slice(text.as_bytes());
+    }
+    b.extend_from_slice(&status.to_bytes());
     b.extend_from_slice(&round.to_bytes());
     b
 }
 
+/// The first byte of a log-prob state row that carries an identity (a status starts with its own
+/// version byte, `0x03`).
+const IDENTITY_MARK: u8 = 0x49;
+
 /// Inverse of [`encode_logprob_state`]; `None` for a corrupt or older-format row.
-pub fn decode_logprob_state(b: &[u8]) -> Option<(LogprobStatus, ChallengeRound)> {
+pub fn decode_logprob_state(b: &[u8]) -> Option<(LogprobStatus, ChallengeRound, Option<ModelIdentity>)> {
+    let (identity, b) = match b.first() {
+        Some(&IDENTITY_MARK) => {
+            let len = u16::from_le_bytes(b.get(1..3)?.try_into().ok()?) as usize;
+            let text = std::str::from_utf8(b.get(3..3 + len)?).ok()?;
+            let mut parts = text.split('\0');
+            let id = ModelIdentity::new(parts.next()?, parts.next()?, parts.next()?)?;
+            (Some(id), &b[3 + len..])
+        }
+        _ => (None, b),
+    };
     let status = LogprobStatus::from_bytes(b.get(..LogprobStatus::LEN)?)?;
     let round = ChallengeRound::from_bytes(&b[LogprobStatus::LEN..]).ok()?;
-    Some((status, round))
+    Some((status, round, identity))
 }
 
 #[cfg(test)]
@@ -1182,6 +1262,19 @@ mod tests {
     }
 
     #[test]
+    fn a_challenge_we_cannot_send_is_never_held_against_the_provider() {
+        let r = parse_reference(&ref_json(4, 4)).unwrap();
+        let mut round = ChallengeRound::new();
+        let mut never = |_: &[u8]| -> Result<Vec<u8>, String> { panic!("nothing can be sent") };
+        // A handle over the protocol's limit can't be framed: our problem, not an evasion (LP11).
+        let long_handle = "x".repeat(MAX_MODEL_REF_LEN + 1);
+        let out = run_round(&mut round, &r.set, &long_handle, &mut never, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {});
+        assert_eq!(out, RoundOutcome::Busy);
+        assert_eq!(round.issued_count(), 0, "no text used up");
+        assert_eq!(probe_scoring(&mut never, &long_handle, &mut || {}), Some(RoundOutcome::Busy));
+    }
+
+    #[test]
     fn busy_refusals_back_off_then_give_up_keeping_progress() {
         let r = parse_reference(&ref_json(12, 4)).unwrap();
         let mut round = ChallengeRound::new();
@@ -1332,11 +1425,17 @@ mod tests {
         st.on_verdict(PASS, 7);
         st.on_no_verdict(true, 9, 8);
         for s in [LogprobStatus::default(), st] {
-            let (back, rd) = decode_logprob_state(&encode_logprob_state(s, &round)).unwrap();
-            assert_eq!(back, s);
+            let (back, rd, id) = decode_logprob_state(&encode_logprob_state(s, &round, None)).unwrap();
+            assert_eq!((back, id), (s, None));
             assert_eq!(rd.issued_count(), 1);
         }
-        let good = encode_logprob_state(st, &round);
+        // A registry pack's identity is kept with the row (LP10).
+        let id = ModelIdentity::new("qwen3.5", "9b", "q4_k_m").unwrap();
+        let (back, rd, got) = decode_logprob_state(&encode_logprob_state(st, &round, Some(&id))).unwrap();
+        assert_eq!((back, rd.issued_count(), got), (st, 1, Some(id.clone())));
+        let with_id = encode_logprob_state(st, &round, Some(&id));
+        assert!(decode_logprob_state(&with_id[..5]).is_none(), "a cut-off identity is corrupt, not misread");
+        let good = encode_logprob_state(st, &round, None);
         assert!(decode_logprob_state(&good[..LogprobStatus::LEN - 1]).is_none());
         let mut bad = good.clone();
         bad[1] = 7;
@@ -1347,6 +1446,16 @@ mod tests {
         let mut long = good;
         long.push(0);
         assert!(decode_logprob_state(&long).is_none());
+    }
+
+    #[test]
+    fn references_for_different_models_under_one_label_have_different_tags() {
+        let base = ref_json(4, 4);
+        let a = with_identity(&base, "qwen3.5", "9b", "q4_k_m", &[]);
+        let mut b = with_identity(&base, "qwen3.5", "9b", "q8_0", &[]).set.clone();
+        b.model_key = a.set.model_key.clone(); // one label, two models
+        assert_ne!(reference_tag(&a.set), reference_tag(&b));
+        assert_eq!(reference_tag(&a.set), reference_tag(&with_identity(&base, "qwen3.5", "9b", "q4_k_m", &[]).set));
     }
 
     // ── identity: model info, reference selection, pricing ──
@@ -1501,6 +1610,13 @@ mod tests {
         assert_eq!(st.pass_streak, 1);
         assert!(st.switch_reference(reference_tag(&b.set), &mut round));
         assert_eq!((st.verdict, st.pass_streak, st.next_due_ms), (None, 0, 99));
+        // A fail and the evasion record survive a switch (LP6): declaring another file doesn't wipe them.
+        st.on_verdict(FAIL, 1_000);
+        st.on_no_verdict(true, 0, 1_001);
+        let failed = st.verdict;
+        assert!(st.switch_reference([0xAB; 16], &mut round));
+        assert_eq!((st.verdict, st.evasions, st.pass_streak), (failed, 1, 0));
+        assert_eq!(st.evidence(1_002).1, Some(VerificationOutcome::Failed), "still floors the tier");
         assert_eq!(round.issued_count(), 2, "texts already sent stay burned");
     }
 
@@ -1572,11 +1688,20 @@ mod tests {
             st.on_verdict(PASS, i * 24 * H);
         }
         assert_eq!(st.next_due_ms, 5 * 24 * H + 24 * H);
-        let mut early = st;
-        early.on_verdict_jittered(PASS, 200 * H, -1.0);
-        let mut late = st;
-        late.on_verdict_jittered(PASS, 200 * H, 1.0);
-        assert_eq!((early.next_due_ms - 200 * H, late.next_due_ms - 200 * H), (18 * H, 30 * H));
+        // Drawn re-checks: memoryless around the mean, never sooner than 30 minutes, never later than
+        // the pass stays valid (LP7).
+        let delay = |u: f64| {
+            let mut s = st;
+            s.on_verdict_drawn(PASS, 200 * H, u);
+            s.next_due_ms - 200 * H
+        };
+        assert_eq!(delay(1.0), LOGPROB_MIN_RECHECK_MS, "u = 1 draws zero");
+        assert_eq!(delay(0.5), (24.0 * H as f64 * std::f64::consts::LN_2) as u64);
+        assert_eq!(delay(1e-9), 36 * H, "capped at 1.5x the mean");
+        assert!(36 * H < validity_ms(7), "re-checked before the pass lapses");
+        let draws: Vec<u64> = (1..100).map(|i| recheck_delay_ms(7, i as f64 / 100.0)).collect();
+        let mean = draws.iter().sum::<u64>() as f64 / draws.len() as f64;
+        assert!(mean > 15.0 * H as f64 && mean < 26.0 * H as f64, "about the 24-hour mean, got {}", mean / H as f64);
         // Still A2 36 hours after a pass on the 24-hour cadence; a fail drops back to 6-hourly.
         assert!(st.evidence(5 * 24 * H + 36 * H).0);
         st.on_verdict(FAIL, 300 * H);
