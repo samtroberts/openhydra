@@ -2302,6 +2302,11 @@ mod tests {
         assert_eq!(classify_error("engine http error: no provider for model 'm'").0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(classify_error("proxy_forward: proxy_forward timed out after 45s").0, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(classify_error("engine http error: connection refused").0, StatusCode::BAD_GATEWAY);
+        // Review E1: routing refusals, provider errors and network failures as now worded.
+        assert_eq!(classify_error("no provider of 'm' is verified at A1-reputation-redundant or above (1 found below it)"), (StatusCode::SERVICE_UNAVAILABLE, "no_provider"));
+        assert_eq!(classify_error("provider: engine http error: ollama: model crashed").0, StatusCode::BAD_GATEWAY);
+        assert_eq!(classify_error("network: stream stalled (no progress before deadline)").0, StatusCode::BAD_GATEWAY);
+        assert_eq!(classify_error("network: proxy_forward timed out after 45s").0, StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

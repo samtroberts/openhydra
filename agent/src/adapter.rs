@@ -29,6 +29,13 @@ pub enum AdapterError {
     Unsupported(String),
     /// Temporarily unable (e.g. a prompt scorer still loading its model); retry shortly.
     Busy(String),
+    /// Nobody to route the request to: no provider of the model, or none meeting the buyer's
+    /// floor. Shown as the message alone (review E1).
+    Route(String),
+    /// An error the serving provider reported (its own message, engine errors included).
+    Provider(String),
+    /// Reaching the provider failed (dial, relay, poll, timeout), not the engine.
+    Network(String),
 }
 
 impl fmt::Display for AdapterError {
@@ -38,6 +45,24 @@ impl fmt::Display for AdapterError {
             AdapterError::Parse(m) => write!(f, "engine response parse error: {m}"),
             AdapterError::Unsupported(m) => write!(f, "engine capability unsupported: {m}"),
             AdapterError::Busy(m) => write!(f, "engine busy: {m}"),
+            AdapterError::Route(m) => f.write_str(m),
+            AdapterError::Provider(m) => write!(f, "provider: {m}"),
+            AdapterError::Network(m) => write!(f, "network: {m}"),
+        }
+    }
+}
+
+impl AdapterError {
+    /// The message without the kind's prefix.
+    pub fn message(&self) -> &str {
+        match self {
+            AdapterError::Http(m)
+            | AdapterError::Parse(m)
+            | AdapterError::Unsupported(m)
+            | AdapterError::Busy(m)
+            | AdapterError::Route(m)
+            | AdapterError::Provider(m)
+            | AdapterError::Network(m) => m,
         }
     }
 }

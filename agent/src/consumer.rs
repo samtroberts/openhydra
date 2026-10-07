@@ -648,7 +648,7 @@ pub fn request_completion(
                     authenticity: None,
                 })
             }
-            ServeChunk::Error(msg) => return Err(AdapterError::Http(msg)),
+            ServeChunk::Error(msg) => return Err(AdapterError::Provider(msg)),
         }
     }
     Err(AdapterError::Parse(
@@ -769,13 +769,13 @@ fn no_route_error(model: &str, policy: &AssurancePolicy, peers: &[DiscoveredPeer
             rank_providers_with_assurance(peers, "", tier, &|_, _| None, &|_, _| AuthenticityTier::SelfReported, &AssurancePolicy::OPEN)
                 .len();
         if below > 0 {
-            return AdapterError::Http(format!(
+            return AdapterError::Route(format!(
                 "no provider of '{model}' is verified at {} or above ({below} found below it)",
                 policy.min_authenticity.label()
             ));
         }
     }
-    AdapterError::Http(format!("no provider for model '{model}'"))
+    AdapterError::Route(format!("no provider for model '{model}'"))
 }
 
 /// One request's trip to a provider ([`ConsumerNode::exchange`]).
@@ -933,7 +933,7 @@ fn dispatch_stream_slice(
                     authenticity: None,
                 }))
             }
-            ServeChunk::Error(msg) => return Err(StreamFail::Error(AdapterError::Http(msg))),
+            ServeChunk::Error(msg) => return Err(StreamFail::Error(AdapterError::Provider(msg))),
         }
     }
     Ok(None)
@@ -969,15 +969,15 @@ fn request_completion_streaming(
     let mut offset: u32 = 0;
     match ack {
         FetchChunksResponse::Overloaded => {
-            return Err(StreamFail::Error(AdapterError::Http(
+            return Err(StreamFail::Error(AdapterError::Network(
                 "provider overloaded (stream shed at open)".into(),
             )))
         }
         FetchChunksResponse::Forbidden => {
-            return Err(StreamFail::Error(AdapterError::Http("stream open forbidden".into())))
+            return Err(StreamFail::Error(AdapterError::Network("stream open forbidden".into())))
         }
         FetchChunksResponse::NotFound => {
-            return Err(StreamFail::Error(AdapterError::Http("stream missing at open".into())))
+            return Err(StreamFail::Error(AdapterError::Network("stream missing at open".into())))
         }
         // The open ack may already carry frames — e.g. a refusal delivered as a complete
         // (done=true) stream, or an eager first slice.
@@ -996,7 +996,7 @@ fn request_completion_streaming(
     loop {
         // F2: absolute backstop — bail if the whole attempt has outrun its (generous) total cap.
         if started.elapsed() > total_cap {
-            return Err(StreamFail::Error(AdapterError::Http(
+            return Err(StreamFail::Error(AdapterError::Network(
                 "stream exceeded max total time".into(),
             )));
         }
@@ -1015,14 +1015,14 @@ fn request_completion_streaming(
                     Err(e) => {
                         attempt += 1;
                         if attempt > STREAM_DROP_RETRIES {
-                            return Err(StreamFail::Error(AdapterError::Http(format!(
-                                "stream poll dropped past retry budget: {e}"
+                            return Err(StreamFail::Error(AdapterError::Network(format!(
+                                "stream poll dropped past retry budget: {}", e.message()
                             ))));
                         }
                         sleep(STREAM_DROP_BACKOFF);
                         idle += STREAM_DROP_BACKOFF;
                         if idle >= STREAM_STALL_TIMEOUT {
-                            return Err(StreamFail::Error(AdapterError::Http(
+                            return Err(StreamFail::Error(AdapterError::Network(
                                 "stream stalled (no progress before deadline)".into(),
                             )));
                         }
@@ -1046,7 +1046,7 @@ fn request_completion_streaming(
                     interval = (interval * 2).min(POLL_MAX);
                     idle += interval;
                     if idle >= STREAM_STALL_TIMEOUT {
-                        return Err(StreamFail::Error(AdapterError::Http(
+                        return Err(StreamFail::Error(AdapterError::Network(
                             "stream stalled (no progress before deadline)".into(),
                         )));
                     }
@@ -1055,15 +1055,15 @@ fn request_completion_streaming(
             }
             // Buffer gone (provider restarted / TTL expired) — the caller re-serves from scratch.
             Ok(FetchChunksResponse::NotFound) => {
-                return Err(StreamFail::Error(AdapterError::Http(
+                return Err(StreamFail::Error(AdapterError::Network(
                     "stream result not found (provider restarted)".into(),
                 )))
             }
             Ok(FetchChunksResponse::Forbidden) => {
-                return Err(StreamFail::Error(AdapterError::Http("stream poll forbidden".into())))
+                return Err(StreamFail::Error(AdapterError::Network("stream poll forbidden".into())))
             }
             Ok(FetchChunksResponse::Overloaded) => {
-                return Err(StreamFail::Error(AdapterError::Http("stream overloaded mid-poll".into())))
+                return Err(StreamFail::Error(AdapterError::Network("stream overloaded mid-poll".into())))
             }
             Err(e) => {
                 return Err(StreamFail::Error(AdapterError::Parse(format!(
@@ -2006,7 +2006,7 @@ impl ConsumerNode {
             match self.net.discover(model) {
                 Ok(p) => p,
                 // A discovery-transport error won't be fixed by a cache bypass → fatal.
-                Err(e) => return AttemptOutcome::Fatal(AdapterError::Http(format!("discover: {e}"))),
+                Err(e) => return AttemptOutcome::Fatal(AdapterError::Network(format!("discover: {e}"))),
             }
         };
         // C7: passive discovery (DHT get_providers + gossip PEX) can come up empty across NATs —
@@ -2263,7 +2263,7 @@ impl ConsumerNode {
         // Every candidate failed, but nothing was streamed → safe for the caller to bypass the
         // discovery cache and retry once.
         AttemptOutcome::Retryable(
-            last_err.unwrap_or_else(|| AdapterError::Http(format!("all providers failed for '{model}'"))),
+            last_err.unwrap_or_else(|| AdapterError::Route(format!("all providers failed for '{model}'"))),
         )
     }
 
@@ -2336,7 +2336,7 @@ impl ConsumerNode {
                 // circuit rather than failing. See RECONNECT_AND_FETCH_PLAN.md.
                 Err(drop_err) => self
                     .reconnect_and_fetch(provider_libp2p, &request.nonce, framed, serve_to)
-                    .map_err(|fe| AdapterError::Http(format!("proxy_forward: {drop_err}; reconnect-fetch: {fe}"))),
+                    .map_err(|fe| AdapterError::Network(format!("proxy_forward: {drop_err}; reconnect-fetch: {fe}"))),
             }
         };
         let result = if self.is_buffered_only(provider_libp2p) {
@@ -2352,7 +2352,7 @@ impl ConsumerNode {
                     if proxy_rt.get() == 0 {
                         proxy_rt.set(t.elapsed().as_nanos() as u64); // first-ack RTT
                     }
-                    r.map_err(AdapterError::Http)
+                    r.map_err(AdapterError::Network)
                 };
                 let mut sleeper = |d: Duration| std::thread::sleep(d);
                 streamed = true;
@@ -3075,7 +3075,7 @@ impl ConsumerNode {
         };
         match probe {
             Some(request) => self.audit_model(model, &request, provider, None).map(|r| ("probe", r)),
-            None => Err(AdapterError::Http(format!(
+            None => Err(AdapterError::Route(format!(
                 "no audit for '{model}': nothing to replay, and too few greedy requests to probe like them"
             ))),
         }
@@ -3178,7 +3178,7 @@ impl ConsumerNode {
         let peers = self
             .net
             .discover(model)
-            .map_err(|e| AdapterError::Http(format!("discover: {e}")))?;
+            .map_err(|e| AdapterError::Network(format!("discover: {e}")))?;
         let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid, mkey| {
             self.earned_reputation(pid, mkey, now)
         });
@@ -3250,7 +3250,7 @@ impl ConsumerNode {
             }
         }
         if results.len() < 2 {
-            return Err(AdapterError::Http(format!(
+            return Err(AdapterError::Route(format!(
                 "redundant-exec audit needs ≥2 providers that serve us '{model}', found {}",
                 results.len()
             )));
@@ -3613,7 +3613,7 @@ mod tests {
         let adapter = StubAdapter { deltas: vec![], tokens: 0, fail: Some("engine down") };
         let mut transport = |req: &[u8]| Ok(handle_serve_inbound(req, &adapter));
         let err = request_completion(&mut transport, &request(), &mut |_| {}).unwrap_err();
-        assert!(matches!(err, AdapterError::Http(m) if m.contains("engine down")));
+        assert!(matches!(err, AdapterError::Provider(m) if m.contains("engine down")));
     }
 
     #[test]
@@ -3746,7 +3746,7 @@ mod tests {
         let mut transport = |_: &[u8]| Ok(FetchChunksResponse::Overloaded.encode());
         let mut sleeper = |_: Duration| {};
         let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
-        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("overloaded")));
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(m))) if m.contains("overloaded")));
     }
 
     #[test]
@@ -3816,7 +3816,7 @@ mod tests {
         };
         let mut sleeper = |_: Duration| {}; // no real time; the stall clock sums injected sleeps
         let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
-        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("stall")));
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(m))) if m.contains("stall")));
     }
 
     #[test]
@@ -3856,7 +3856,7 @@ mod tests {
         };
         let mut sleeper = |_: Duration| {};
         let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
-        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("dropped")));
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(m))) if m.contains("dropped")));
     }
 
     #[test]
@@ -3870,7 +3870,7 @@ mod tests {
         };
         let mut sleeper = |_: Duration| {};
         let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
-        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Http(m))) if m.contains("engine exploded")));
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Provider(m))) if m.contains("engine exploded")));
     }
 
     #[test]
@@ -4343,6 +4343,8 @@ mod tests {
         let gate = |t| AssurancePolicy { min_authenticity: t, mode: PolicyMode::HardGate, ..AssurancePolicy::OPEN };
         let e = no_route_error("m", &gate(AuthenticityTier::ReputationRedundant), &peers, 2).to_string();
         assert!(e.contains("verified at A1-reputation-redundant or above") && e.contains("2 found below it"), "{e}");
+        // Said as what it is, not as an engine failure (review E1).
+        assert!(e.starts_with("no provider of 'm'"), "{e}");
         // Nobody there at all, or no floor: the plain message.
         assert!(no_route_error("m", &gate(AuthenticityTier::ReputationRedundant), &[], 2).to_string().contains("no provider for model 'm'"));
         assert!(no_route_error("m", &AssurancePolicy::OPEN, &peers, 2).to_string().contains("no provider for model 'm'"));

@@ -66,7 +66,7 @@ pub const PAYMENT_REFUSAL: &str = "payment required: ";
 /// can say anything.) Only a refusal before anything was delivered is one; a provider refuses at
 /// admission, never mid-stream.
 pub fn is_payment_refusal(error: &crate::adapter::AdapterError) -> bool {
-    matches!(error, crate::adapter::AdapterError::Http(m) if m.starts_with(PAYMENT_REFUSAL))
+    matches!(error, crate::adapter::AdapterError::Provider(m) | crate::adapter::AdapterError::Http(m) if m.starts_with(PAYMENT_REFUSAL))
 }
 
 /// Tokens with no text of their own (end-of-turn and other special markers) allowed on top of the
