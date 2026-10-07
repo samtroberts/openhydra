@@ -703,8 +703,8 @@ struct ServeArgs {
     /// check). (A3, hardware attestation, isn't reachable at a gateway yet.) With `--assurance verify`
     /// (the default) providers below it are still used, and the tier is reported; with `gate` they
     /// are not. A request can raise it (never lower it) with the `x-openhydra-min-authenticity`
-    /// header, which is always enforced. Our own provider, and private-swarm members we hold a
-    /// credential for, are never held to it (they're never audited).
+    /// header, which is always enforced. Our own provider is never held to it. (A private swarm's
+    /// providers aren't audited, so a floor turns them away.)
     #[arg(long = "min-authenticity", default_value = "A0", value_parser = ["A0", "A1", "A2"])]
     min_authenticity: String,
 
@@ -715,11 +715,11 @@ struct ServeArgs {
 
     /// How audits check providers. `on` (the default): a greedy (temperature 0) request
     /// to a public model may be sent again, as is, to other providers of it (usually one, at most
-    /// three: a third settles a disagreement, or is heard when two are of unknown network), and the
+    /// four: more settle a disagreement, or are heard when some are of unknown network), and the
     /// answers compared, so the audited provider can't tell it was checked. Your prompt then also
-    /// reaches those providers (never a private swarm's prompt; nothing is written to disk, its
-    /// system prompt is kept in memory to shape probes). `off`: audits send generated test prompts
-    /// shaped like your traffic instead.
+    /// reaches those providers (never a private swarm's prompt; nothing is written to disk). The
+    /// system prompt of such a request is kept in memory, and probes carry it. `off`: audits send
+    /// generated test prompts shaped like your traffic instead.
     #[arg(long = "audit-replay", default_value = "on", value_parser = ["on", "off"])]
     audit_replay: String,
 

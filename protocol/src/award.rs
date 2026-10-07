@@ -326,11 +326,14 @@ impl AuditStats {
         self.last_failed_ms().is_some_and(|at| now_ms.saturating_sub(at) <= window_ms)
     }
 
-    /// `n` — recent passing temp=0 audits (the decayed `passes`, rounded), as of `now_ms`. Rounded,
-    /// not floored: a single pass counts as one until it is a half-life old, rather than dropping to
-    /// none the moment after it was recorded (review round 4 G4-5).
+    /// `n` — recent passing temp=0 audits (the decayed `passes`), as of `now_ms`. A single pass counts
+    /// as one until it is a half-life old, rather than dropping to none the moment after it was
+    /// recorded (review round 4 G4-5).
     pub fn recent_passes(&self, now_ms: u64) -> u32 {
-        (self.passes * self.decay_factor(now_ms)).round().max(0.0) as u32
+        let n = (self.passes * self.decay_factor(now_ms)).max(0.0);
+        // Rounded only below one (a single fading pass); above, floored, so a fraction never adds a
+        // pass toward the next step (review round 5, R5T-10).
+        (if n < 1.0 { n.round() } else { n.floor() }) as u32
     }
 
     /// `a` — recency-weighted pass-rate in `[0, 1]` as of `now_ms`. With no clear audits yet,
