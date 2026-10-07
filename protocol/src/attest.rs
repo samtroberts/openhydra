@@ -692,7 +692,8 @@ mod tests {
         // All four conditions: A3.
         let m = attested_methods(DeviceTrust::HardwareChain, &att, Some(&expected), Some((&serve, &ev)));
         assert!(m.hardware_attested);
-        assert_eq!(authenticity_tier_from(0.0, 0.0, 0, m), AuthenticityTier::HardwareAttested);
+        // (No audits yet: a pass rate of 1.0, as `AuditStats` reports with none.)
+        assert_eq!(authenticity_tier_from(0.0, 1.0, 0, m), AuthenticityTier::HardwareAttested);
     }
 
     #[test]

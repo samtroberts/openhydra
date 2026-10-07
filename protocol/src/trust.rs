@@ -84,10 +84,10 @@ impl AuthenticityTier {
         Self::ALL.iter().position(|&t| t == self).expect("every AuthenticityTier is in ALL") as u8
     }
 
-    /// The tier at `index`, saturating at [`HardwareAttested`](Self::HardwareAttested) for an
-    /// out-of-range index (so index arithmetic can be clamped without a bounds panic).
+    /// The tier at `index`; an out-of-range index is the floor ([`SelfReported`](Self::SelfReported)):
+    /// an index nobody knows proves nothing.
     pub fn from_index(index: u8) -> AuthenticityTier {
-        *Self::ALL.get(index as usize).unwrap_or(&AuthenticityTier::HardwareAttested)
+        *Self::ALL.get(index as usize).unwrap_or(&AuthenticityTier::SelfReported)
     }
 
     /// A stable short label for display / telemetry / the disclosed assurance badge.
@@ -129,9 +129,9 @@ impl PrivacyTier {
         Self::ALL.iter().position(|&t| t == self).expect("every PrivacyTier is in ALL") as u8
     }
 
-    /// The tier at `index`, saturating at the top for an out-of-range index.
+    /// The tier at `index`; an out-of-range index is the floor.
     pub fn from_index(index: u8) -> PrivacyTier {
-        *Self::ALL.get(index as usize).unwrap_or(&PrivacyTier::AttestedInProcessEngine)
+        *Self::ALL.get(index as usize).unwrap_or(&PrivacyTier::None)
     }
 
     /// A stable short label for display / telemetry.
@@ -174,9 +174,9 @@ impl SettlementTier {
         Self::ALL.iter().position(|&t| t == self).expect("every SettlementTier is in ALL") as u8
     }
 
-    /// The tier at `index`, saturating at the top for an out-of-range index.
+    /// The tier at `index`; an out-of-range index is the floor.
     pub fn from_index(index: u8) -> SettlementTier {
-        *Self::ALL.get(index as usize).unwrap_or(&SettlementTier::StakedSlashable)
+        *Self::ALL.get(index as usize).unwrap_or(&SettlementTier::CreditsOnly)
     }
 
     /// A stable short label for display / telemetry.
@@ -315,7 +315,8 @@ pub struct AuthenticityEvidence {
 ///
 /// * A live `Failed` outcome → [`SelfReported`](AuthenticityTier::SelfReported) (immediate override).
 /// * Hardware attestation → [`HardwareAttested`](AuthenticityTier::HardwareAttested) (stands on the
-///   attestation; independent of accrued reputation).
+///   attestation, without needing accrued reputation), unless audits are failing it (pass rate
+///   below [`A_MIN`]): an attested box can still run the wrong model.
 /// * Otherwise, when the reputation *and* pass-rate gates ([`R_MIN`] / [`A_MIN`]) are met on real
 ///   passing audits: [`EnergyFingerprintPossession`](AuthenticityTier::EnergyFingerprintPossession)
 ///   if a hard PoI method is present, else
@@ -327,8 +328,8 @@ pub fn authenticity_tier_from(
     passing_audits: u32,
     methods: MethodFlags,
 ) -> AuthenticityTier {
-    // The strongest anchor stands alone.
-    if methods.hardware_attested {
+    // The strongest anchor stands alone, unless audits catch it serving something else.
+    if methods.hardware_attested && audit_pass_rate >= A_MIN {
         return AuthenticityTier::HardwareAttested;
     }
     // Reputation + redundant-exec agreement, both gated like the credit-tier ascension.
@@ -514,7 +515,7 @@ mod tests {
             assert_eq!(AuthenticityTier::from_index(i as u8), *t);
         }
         // Out-of-range saturates at the top.
-        assert_eq!(AuthenticityTier::from_index(99), HardwareAttested);
+        assert_eq!(AuthenticityTier::from_index(99), SelfReported, "an unknown index proves nothing");
     }
 
     #[test]
@@ -523,12 +524,12 @@ mod tests {
             assert_eq!(t.index() as usize, i);
             assert_eq!(PrivacyTier::from_index(i as u8), *t);
         }
-        assert_eq!(PrivacyTier::from_index(99), PrivacyTier::AttestedInProcessEngine);
+        assert_eq!(PrivacyTier::from_index(99), PrivacyTier::None);
         for (i, t) in SettlementTier::ALL.iter().enumerate() {
             assert_eq!(t.index() as usize, i);
             assert_eq!(SettlementTier::from_index(i as u8), *t);
         }
-        assert_eq!(SettlementTier::from_index(99), SettlementTier::StakedSlashable);
+        assert_eq!(SettlementTier::from_index(99), SettlementTier::CreditsOnly);
     }
 
     #[test]
@@ -653,9 +654,13 @@ mod tests {
 
     #[test]
     fn hardware_attestation_stands_alone() {
-        // Even with zero reputation / no audits, a hardware attestation is A3.
+        // Even with zero reputation and no audits (a pass rate of 1.0, as `AuditStats` reports with
+        // none), a hardware attestation is A3.
         let hw = MethodFlags { hardware_attested: true, ..MethodFlags::default() };
-        assert_eq!(authenticity_tier_from(0.0, 0.0, 0, hw), AuthenticityTier::HardwareAttested);
+        assert_eq!(authenticity_tier_from(0.0, 1.0, 0, hw), AuthenticityTier::HardwareAttested);
+        // …but not while audits catch it serving something else: it is judged like anyone.
+        assert_eq!(authenticity_tier_from(0.0, 0.5, 3, hw), AuthenticityTier::SelfReported);
+        assert_eq!(authenticity_tier_from(80.0, 0.5, 3, hw), AuthenticityTier::SelfReported);
     }
 
     // ── resolve_assurance — composition + the live-fail override ──
