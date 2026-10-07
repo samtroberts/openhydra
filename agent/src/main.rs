@@ -700,10 +700,11 @@ struct ServeArgs {
 
     /// The lowest authenticity tier a provider must have reached with this gateway to serve it:
     /// A0 (anyone, the default), A1 (reputation and audits agreeing), A2 (plus a log-prob identity
-    /// check), A3 (hardware attestation). With `--assurance verify` (the default) providers below it
-    /// are still used, and the tier is reported; with `gate` they are not. A request can raise it
-    /// (never lower it) with the `x-openhydra-min-authenticity` header, which is always enforced.
-    #[arg(long = "min-authenticity", default_value = "A0", value_parser = ["A0", "A1", "A2", "A3"])]
+    /// check). (A3, hardware attestation, isn't reachable at a gateway yet.) With `--assurance verify`
+    /// (the default) providers below it are still used, and the tier is reported; with `gate` they
+    /// are not. A request can raise it (never lower it) with the `x-openhydra-min-authenticity`
+    /// header, which is always enforced. Our own provider is never held to it.
+    #[arg(long = "min-authenticity", default_value = "A0", value_parser = ["A0", "A1", "A2"])]
     min_authenticity: String,
 
     /// `verify`: route to any provider and report its tier. `gate`: refuse providers below
@@ -712,10 +713,12 @@ struct ServeArgs {
     assurance: String,
 
     /// How audits check providers. `on` (the default): a greedy (temperature 0) request
-    /// to a public model may be sent again, as is, to a second provider of it, and the two answers
-    /// compared, so the audited provider can't tell it was checked. Your prompt then also reaches
-    /// that second provider (never a private swarm's prompt; nothing is written to disk). `off`:
-    /// audits send generated test prompts shaped like your traffic instead.
+    /// to a public model may be sent again, as is, to other providers of it (usually one, at most
+    /// three: a third settles a disagreement, or is heard when two are of unknown network), and the
+    /// answers compared, so the audited provider can't tell it was checked. Your prompt then also
+    /// reaches those providers (never a private swarm's prompt; nothing is written to disk, its
+    /// system prompt is kept in memory to shape probes). `off`: audits send generated test prompts
+    /// shaped like your traffic instead.
     #[arg(long = "audit-replay", default_value = "on", value_parser = ["on", "off"])]
     audit_replay: String,
 
@@ -1640,7 +1643,7 @@ fn serve(
     };
     let assurance = openhydra_protocol::trust::AssurancePolicy {
         min_authenticity: openhydra_agent::gateway::parse_authenticity_tier(&args.min_authenticity)
-            .expect("clap restricts --min-authenticity to A0..A3"),
+            .expect("clap restricts --min-authenticity to A0..A2"),
         mode: if args.assurance == "gate" {
             openhydra_protocol::trust::PolicyMode::HardGate
         } else {

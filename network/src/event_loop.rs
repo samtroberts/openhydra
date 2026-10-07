@@ -210,8 +210,10 @@ const MAX_PENDING_RELAY_FORWARDS: usize = 512;
 /// on the event loop, so it must be quick and must not wait on the swarm.
 pub type OnSent = Box<dyn FnOnce(bool) + Send>;
 
-/// Responses sent but not yet confirmed that a caller asked to be told about, at most.
+/// Responses sent but not yet confirmed that a caller asked to be told about, at most, and per peer:
+/// one peer that reads its responses slowly can't take every place (review round 4 X4-13).
 const MAX_PENDING_SENT: usize = 4096;
+const MAX_PENDING_SENT_PER_PEER: usize = 256;
 
 /// Commands sent from the Python thread to the swarm event loop.
 pub enum SwarmCommand {
@@ -532,7 +534,9 @@ struct LoopState {
     >,
     /// Responses sent whose caller wants to know they reached the peer, by libp2p request id: told on
     /// `ResponseSent` or an inbound failure.
-    pending_sent: HashMap<request_response::InboundRequestId, OnSent>,
+    /// With the peer it went to and when (swept after [`PROXY_CHANNEL_TTL`], in case libp2p reports
+    /// neither outcome).
+    pending_sent: HashMap<request_response::InboundRequestId, (OnSent, PeerId, std::time::Instant)>,
     /// Counter for generating unique inbound request IDs.
     inbound_proxy_counter: u64,
     /// Proxy forward requests waiting for a relay connection to be established.
@@ -1288,12 +1292,13 @@ pub async fn run_event_loop(
                             if let Some(f) = on_sent {
                                 f(sent);
                             }
-                        } else if let Some((channel, _, _, rid)) = state.inbound_proxy_channels.remove(&request_id) {
+                        } else if let Some((channel, _, peer, rid)) = state.inbound_proxy_channels.remove(&request_id) {
                             match swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
                                 Ok(()) => {
                                     if let Some(f) = on_sent {
-                                        if state.pending_sent.len() < MAX_PENDING_SENT {
-                                            state.pending_sent.insert(rid, f);
+                                        let mine = state.pending_sent.values().filter(|(_, p, _)| *p == peer).count();
+                                        if state.pending_sent.len() < MAX_PENDING_SENT && mine < MAX_PENDING_SENT_PER_PEER {
+                                            state.pending_sent.insert(rid, (f, peer, std::time::Instant::now()));
                                         } else {
                                             f(false); // can't track it: don't claim it arrived
                                         }
@@ -1461,6 +1466,14 @@ pub async fn run_event_loop(
                 // closes it, so the remote peer fails fast instead of hanging.
                 let pc_before = state.inbound_proxy_channels.len();
                 state.inbound_proxy_channels.retain(|_, (_, t, _, _)| t.elapsed() < PROXY_CHANNEL_TTL);
+                // Responses libp2p never reported on: told they didn't arrive (review round 4 S4-12).
+                let stale: Vec<_> =
+                    state.pending_sent.iter().filter(|(_, (_, _, t))| t.elapsed() >= PROXY_CHANNEL_TTL).map(|(k, _)| *k).collect();
+                for k in stale {
+                    if let Some((f, _, _)) = state.pending_sent.remove(&k) {
+                        f(false);
+                    }
+                }
                 let pc_swept = pc_before - state.inbound_proxy_channels.len();
                 if pc_swept > 0 {
                     warn!(swept = pc_swept, remaining = state.inbound_proxy_channels.len(),
@@ -4040,12 +4053,12 @@ fn handle_grpc_proxy_event(
         }
         request_response::Event::InboundFailure { error, request_id, .. } => {
             warn!(?error, "proxy inbound failure");
-            if let Some(f) = state.pending_sent.remove(&request_id) {
+            if let Some((f, _, _)) = state.pending_sent.remove(&request_id) {
                 f(false);
             }
         }
         request_response::Event::ResponseSent { request_id, .. } => {
-            if let Some(f) = state.pending_sent.remove(&request_id) {
+            if let Some((f, _, _)) = state.pending_sent.remove(&request_id) {
                 f(true);
             }
         }

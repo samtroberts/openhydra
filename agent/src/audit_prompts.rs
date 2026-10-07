@@ -190,19 +190,55 @@ pub fn writer_request<R: Rng + ?Sized>(rng: &mut R) -> String {
     )
 }
 
+/// The most questions taken from one writer's answer (as many as it was asked for): a writer that
+/// sends more can't fill the pool with its own (review round 4 H6).
+pub const MAX_QUESTIONS_PER_ANSWER: usize = 8;
+
 /// The questions in a writer's answer: one per line, list marks and quotes dropped, each 15 to 400
-/// characters, no repeats.
+/// characters, no repeats, at most [`MAX_QUESTIONS_PER_ANSWER`]. Only visible text is kept: control
+/// and invisible characters (zero-width marks, say) are dropped, so a writer can't hide a mark in a
+/// question that a colluding provider would spot in the probe (review round 4 H6).
 pub fn parse_questions(text: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     text.lines()
         .map(|l| {
-            l.trim()
+            let visible: String = l.chars().filter(|c| is_visible(*c)).collect();
+            visible
+                .trim()
                 .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | '•' | ' '))
-                .trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace())
+                .trim_matches(|c: char| is_quote(c) || c.is_whitespace())
                 .to_string()
         })
         .filter(|q| (15..=400).contains(&q.chars().count()) && !q.starts_with("Here are") && seen.insert(q.to_lowercase()))
+        .take(MAX_QUESTIONS_PER_ANSWER)
         .collect()
+}
+
+/// Whether `c` shows as text: not a control character, and not one of the invisible format
+/// characters (zero-width spaces and joiners, direction marks, word joiners, the byte-order mark,
+/// tag characters).
+fn is_visible(c: char) -> bool {
+    !c.is_control()
+        && !matches!(c, '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// Quotation marks a question may come wrapped in.
+fn is_quote(c: char) -> bool {
+    matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’' | '«' | '»' | '„' | '‚' | '`')
+}
+
+/// System prompts commonly sent with requests (for probes, where real requests carry one).
+const GENERIC_SYSTEM: &[&str] = &[
+    "You are a helpful assistant.",
+    "You are a helpful, concise assistant.",
+    "You are a knowledgeable assistant. Answer clearly and accurately.",
+    "You are an AI assistant that helps people find information.",
+    "You are a friendly assistant. Keep answers short unless asked for detail.",
+];
+
+/// A system prompt of the kind clients commonly send.
+pub fn generic_system_prompt<R: Rng + ?Sized>(rng: &mut R) -> &'static str {
+    GENERIC_SYSTEM.choose(rng).expect("non-empty")
 }
 
 /// Openings a person might put before a question.
@@ -227,7 +263,10 @@ pub fn finish<R: Rng + ?Sized>(raw: &mut std::collections::VecDeque<String>, rng
     let body = match raw.front() {
         Some(_) if rng.gen_bool(0.35) => {
             let second = raw.pop_front().expect("checked");
-            format!("{first} Also, {}{}", second[..1].to_lowercase(), &second[1..])
+            // Lower-cased by its first character, not byte (it may not be ASCII, review round 4 M7).
+            let mut chars = second.chars();
+            let head: String = chars.next().map(|c| c.to_lowercase().collect()).unwrap_or_default();
+            format!("{first} Also, {head}{}", chars.as_str())
         }
         _ => first,
     };
@@ -284,5 +323,23 @@ mod tests {
         }
         let req = writer_request(&mut rng);
         assert!(req.contains("one per line") && !req.to_lowercase().contains("audit"));
+    }
+
+    /// Review round 4 H6/M7: a writer can't hide marks in its questions or flood the pool, and a
+    /// question starting with a non-ASCII character is joined without a panic.
+    #[test]
+    fn a_writers_answer_is_cleaned_capped_and_joined_safely() {
+        let marked = "How do\u{200B} I sort\u{2060} a list in Rust?\u{FEFF}\n“¿Qué es un cierre en Rust, exactamente?”";
+        let qs = parse_questions(marked);
+        assert_eq!(qs, vec!["How do I sort a list in Rust?", "¿Qué es un cierre en Rust, exactamente?"]);
+        let many: String = (0..50).map(|i| format!("Question number {i} about something?\n")).collect();
+        assert_eq!(parse_questions(&many).len(), MAX_QUESTIONS_PER_ANSWER);
+        let mut rng = rand::thread_rng();
+        for _ in 0..200 {
+            let mut raw: std::collections::VecDeque<String> =
+                ["What is a closure in Rust?".to_string(), "Émile asked: what is ownership?".to_string()].into();
+            let p = finish(&mut raw, &mut rng).unwrap();
+            assert!(!p.is_empty());
+        }
     }
 }

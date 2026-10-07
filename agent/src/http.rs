@@ -58,6 +58,21 @@ impl ReqwestClient {
         let client = Client::builder().connect_timeout(connect).build().map_err(http_err)?;
         Ok(Self { client })
     }
+
+    /// `POST {url}` with a JSON body, returning the status and body whatever the status: for a
+    /// caller that reads an error response's body (a gateway's refusal says why).
+    pub fn post_json_any_status(&self, url: &str, body: &str) -> Result<(u16, String), AdapterError> {
+        let resp = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .timeout(POST_JSON_TIMEOUT)
+            .send()
+            .map_err(http_err)?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.text().map_err(http_err)?))
+    }
 }
 
 impl HttpClient for ReqwestClient {

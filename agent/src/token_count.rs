@@ -136,6 +136,23 @@ pub fn estimate_from_part(counted: u64, part_units: u64, total_units: u64) -> u6
     ((counted as u128 * total_units as u128) / part_units as u128) as u64
 }
 
+/// Cut `text` (a serve's delivered text) so it fits beside `tool_calls` within [`MAX_COUNTED_BYTES`],
+/// at a character boundary; whether it was cut (the count is then estimated from what's left, review
+/// round 4 S4-9: an answer padded past the cap isn't skipped).
+pub fn fit_for_counting(text: &mut String, tool_calls: &[ToolCall]) -> bool {
+    let calls_len: usize = tool_calls.iter().map(|c| c.function.name.len() + c.function.arguments.len() + 2).sum();
+    let room = MAX_COUNTED_BYTES.saturating_sub(calls_len);
+    if text.len() <= room {
+        return false;
+    }
+    let mut cut = room;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    true
+}
+
 /// The text a serve's tokens are counted on: the delivered text, then each tool call's name and
 /// arguments (on lines of their own), and how many of the calls earn the template allowance
 /// ([`crate::serve::allowance_earners`], as billing grants it). `None` past [`MAX_COUNTED_BYTES`]
@@ -204,9 +221,15 @@ mod tests {
         assert_eq!(countable_text("hi", &[call.clone()], &Default::default()).unwrap().1, 0, "a tool nobody offered");
         assert_eq!(countable_text("hi", &[], &ls), Some(("hi".to_string(), 0)));
         // Text and tool calls together are bounded: a huge argument can't make the count unbounded.
-        let mut big = call;
+        let mut big = call.clone();
         big.function.arguments = "x".repeat(MAX_COUNTED_BYTES);
-        assert_eq!(countable_text("hi", &[big], &ls), None);
+        assert_eq!(countable_text("hi", &[big.clone()], &ls), None);
+        // A long answer is cut to fit beside the calls, not skipped.
+        let mut long = "é".repeat(MAX_COUNTED_BYTES);
+        assert!(fit_for_counting(&mut long, &[call.clone()]));
+        assert!(countable_text(&long, &[call.clone()], &ls).is_some());
+        let mut short = "hi".to_string();
+        assert!(!fit_for_counting(&mut short, &[call]));
     }
 
     #[test]

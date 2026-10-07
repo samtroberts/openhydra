@@ -326,9 +326,11 @@ impl AuditStats {
         self.last_failed_ms().is_some_and(|at| now_ms.saturating_sub(at) <= window_ms)
     }
 
-    /// `n` — recent passing temp=0 audits (the decayed `passes`, floored), as of `now_ms`.
+    /// `n` — recent passing temp=0 audits (the decayed `passes`, rounded), as of `now_ms`. Rounded,
+    /// not floored: a single pass counts as one until it is a half-life old, rather than dropping to
+    /// none the moment after it was recorded (review round 4 G4-5).
     pub fn recent_passes(&self, now_ms: u64) -> u32 {
-        (self.passes * self.decay_factor(now_ms)).floor().max(0.0) as u32
+        (self.passes * self.decay_factor(now_ms)).round().max(0.0) as u32
     }
 
     /// `a` — recency-weighted pass-rate in `[0, 1]` as of `now_ms`. With no clear audits yet,
@@ -415,6 +417,16 @@ mod tests {
         // A brand-new (peer, model): n=0, neutral reputation → nano, even claiming mega.
         assert_eq!(max_awardable_tier(Mega, 50.0, 1.0, 0, AUDITS_PER_STEP), Nano);
         assert_eq!(max_awardable_tier(Frontier, 50.0, 1.0, 0, AUDITS_PER_STEP), Nano);
+    }
+
+    /// Review round 4 G4-5: one pass counts as one recent pass until it is a half-life old.
+    #[test]
+    fn a_single_pass_counts_until_it_is_a_half_life_old() {
+        let mut s = AuditStats::with_half_life(0, 1_000);
+        s.record(AuditClass::Pass, 0);
+        assert_eq!(s.recent_passes(1), 1, "not floored away the moment after");
+        assert_eq!(s.recent_passes(900), 1);
+        assert_eq!(s.recent_passes(1_100), 0, "past a half-life it has faded");
     }
 
     #[test]

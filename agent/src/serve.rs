@@ -43,6 +43,11 @@ pub struct ServeMetrics {
     /// provider that predates it (which reported the engine's own count).
     #[serde(default)]
     pub billing: u8,
+    /// The provider stopped generating before the engine finished: its consumer's credit window
+    /// ran out, or nobody was reading. The answer is cut short, and the client is told so
+    /// (`finish_reason: "length"`) rather than shown it as complete (review round 4 H8).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 /// The billing rule this build follows: the reported count is [`billable_tokens`]. 3: whitespace
@@ -160,6 +165,23 @@ pub fn tool_call_units(tool_calls: &[ToolCall], offered: &std::collections::Hash
         .sum()
 }
 
+/// [`tool_call_units`] at their most, whatever tools were offered: every call earns the allowance, up
+/// to [`MAX_ALLOWED_TOOL_CALLS`]. Never less than [`tool_call_units`] for any offered set, so bounding
+/// an honest count by it changes nothing.
+pub fn tool_call_units_at_most(tool_calls: &[ToolCall]) -> u64 {
+    tool_calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut t = DeliveredText::default();
+            t.push(&c.function.name);
+            let mut a = DeliveredText::default();
+            a.push(&c.function.arguments);
+            t.units() + a.units() + if i < MAX_ALLOWED_TOOL_CALLS { TOOL_CALL_TOKEN_ALLOWANCE } else { 0 }
+        })
+        .sum()
+}
+
 /// The completion tokens a serve is billed for, which provider and consumer each compute from the
 /// same inputs: the engine's count, but never more than the request allowed (`max_tokens`) nor more
 /// than the delivered text (`delivered`, from [`DeliveredText`] and [`tool_call_units`]) could have
@@ -178,13 +200,18 @@ pub fn billable_tokens(engine_tokens: u64, max_tokens: Option<u32>, delivered: u
 /// * up to the `Done` frame, a stream that ends early is owed [`billable_tokens`] of its text
 ///   fragments (about one token each, as the engine streams them) for its text: what a stopped serve
 ///   reports too;
-/// * the `Done` frame carries the count for the whole completion, tool calls included.
+/// * the `Done` frame carries the count for the whole completion, tool calls included, bounded as
+///   any count is by [`billable_tokens`]: by `max_tokens`, and by the text and tool calls the frames
+///   carried (a provider can't make its consumer sign for more by putting a bigger number in a
+///   `Done`, review round 4 C1). The tool calls are bounded at their most ([`tool_call_units_at_most`]),
+///   so an honest `Done`, already bounded by the offered tools, passes unchanged on both sides.
 ///
 /// A `ToolCalls` or `Error` frame adds nothing on its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamTally {
     fragments: u64,
     text: DeliveredText,
+    tools: u64,
     done: Option<u64>,
 }
 
@@ -204,13 +231,31 @@ impl StreamTally {
                     self.done = Some(tokens);
                 }
             }
+            Some(&TAG_TOOLCALLS) => {
+                if let Ok(ServeChunk::ToolCalls(calls)) = ServeChunk::decode(frame) {
+                    self.tools = self.tools.saturating_add(tool_call_units_at_most(&calls));
+                }
+            }
             _ => {}
         }
     }
 
+    /// Count the tool calls a stream delivered (the consumer gets them decoded, not as a frame).
+    pub fn push_tool_calls(&mut self, calls: &[ToolCall]) {
+        self.tools = self.tools.saturating_add(tool_call_units_at_most(calls));
+    }
+
     /// What the frames counted so far are billed for, under a request for `max_tokens`.
     pub fn billable(&self, max_tokens: Option<u32>) -> u64 {
-        self.done.unwrap_or_else(|| billable_tokens(self.fragments, max_tokens, self.text.units()))
+        match self.done {
+            Some(done) => billable_tokens(done, max_tokens, self.text.units().saturating_add(self.tools)),
+            None => billable_tokens(self.fragments, max_tokens, self.text.units()),
+        }
+    }
+
+    /// Text fragments counted so far.
+    pub fn fragments(&self) -> u64 {
+        self.fragments
     }
 }
 
@@ -515,7 +560,8 @@ pub fn handle_serve_request_within(
 
     match outcome {
         Ok(o) => {
-            let metrics = ServeMetrics { engine: o.engine, provider_serve_ns, billing: BILLING_VERSION };
+            let metrics =
+                ServeMetrics { engine: o.engine, provider_serve_ns, billing: BILLING_VERSION, stopped: stop.is_set() };
             // Tool calls (terminal, structured) go in their own frame just before `Done`, so
             // the consumer sees text deltas → tool_calls → done in order.
             if !o.tool_calls.is_empty() {
@@ -870,7 +916,33 @@ mod tests {
         enc.push_encoded(&ServeChunk::Error("engine died".into()).encode());
         assert_eq!(enc, t);
         enc.push_encoded(&ServeChunk::Done { tokens: 33, metrics: Default::default() }.encode());
-        assert_eq!(enc.billable(Some(25)), 33, "the Done count stands as reported (the consumer bounds it itself)");
+        assert_eq!(enc.billable(Some(40)), 33, "an honest Done count stands");
+        assert_eq!(enc.billable(Some(25)), 25, "never past max_tokens");
+    }
+
+    /// Review round 4 C1: a `Done` frame can't bill more than the frames carried, so a provider's
+    /// reply to a stream close can't make its consumer sign for an invented count.
+    #[test]
+    fn a_done_count_is_bounded_by_what_the_stream_carried() {
+        let mut t = StreamTally::default();
+        for _ in 0..10 {
+            t.push_encoded(&ServeChunk::Delta("ab".into()).encode());
+        }
+        t.push_encoded(&ServeChunk::Done { tokens: 10_000_000, metrics: Default::default() }.encode());
+        assert_eq!(t.billable(None), 20 + BILLABLE_TOKEN_SLACK, "bounded by the text it carried");
+        assert_eq!(t.billable(Some(15)), 15);
+        // Tool calls raise the bound by at most their units and the allowance.
+        let call = ToolCall {
+            id: "c".into(),
+            kind: "function".into(),
+            function: crate::adapter::ToolCallFunction { name: "f".into(), arguments: "{}".into() },
+        };
+        let mut with_calls = t;
+        with_calls.push_encoded(&ServeChunk::ToolCalls(vec![call.clone()]).encode());
+        assert_eq!(with_calls.billable(None), 20 + 3 + TOOL_CALL_TOKEN_ALLOWANCE + BILLABLE_TOKEN_SLACK);
+        // The bound is never below the exact allowance for any offered set.
+        let offered: std::collections::HashSet<String> = ["f".to_string()].into();
+        assert!(tool_call_units_at_most(&[call.clone()]) >= tool_call_units(&[call], &offered));
     }
 
     #[test]
@@ -1060,6 +1132,7 @@ mod tests {
                     engine: EngineMetrics { eval_count: 4096, eval_duration_ns: 1_234_567, ..Default::default() },
                     provider_serve_ns: 9_000,
                     billing: BILLING_VERSION,
+                    stopped: true,
                 },
             },
             ServeChunk::Error("boom".into()),

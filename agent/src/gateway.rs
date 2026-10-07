@@ -173,8 +173,12 @@ struct StreamOptions {
 enum GatewayEvent {
     Delta(String),
     Done(Box<ServeSummary>),
-    Error(String),
+    /// The error's text, and its HTTP status and OpenAI error `type` ([`error_class`]).
+    Error(String, ErrorClass),
 }
+
+/// An error's HTTP status and OpenAI error `type`.
+type ErrorClass = (StatusCode, &'static str);
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -211,6 +215,25 @@ fn classify_error(msg: &str) -> (StatusCode, &'static str) {
     } else {
         // Engine/transport failure relayed from the provider.
         (StatusCode::BAD_GATEWAY, "upstream_error")
+    }
+}
+
+/// The HTTP status and OpenAI error `type` of a completion error, by its kind (review round 4 G4-8):
+/// a provider's own error is always an upstream error, whatever its text says (it can't pass for a
+/// routing refusal or a timeout). Only our own routing and network messages are read, and errors of
+/// the older kinds fall back to [`classify_error`].
+fn error_class(e: &crate::adapter::AdapterError) -> ErrorClass {
+    use crate::adapter::AdapterError;
+    match e {
+        AdapterError::Route(m) if m.contains("no provider") => (StatusCode::SERVICE_UNAVAILABLE, "no_provider"),
+        AdapterError::Route(_) | AdapterError::Provider(_) | AdapterError::Cancelled(_) => {
+            (StatusCode::BAD_GATEWAY, "upstream_error")
+        }
+        AdapterError::Network(m) if m.contains("timed out") || m.contains("timeout") => {
+            (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
+        }
+        AdapterError::Network(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+        other => classify_error(&other.to_string()),
     }
 }
 
@@ -608,6 +631,19 @@ fn stream_chunk(id: &str, model: &str, created: u64, delta: Value, finish: Optio
     .to_string()
 }
 
+/// The OpenAI `finish_reason` of a completion: `"tool_calls"` when the model requested tools,
+/// `"length"` when the provider stopped it short (out of credit, or a stall it took for the
+/// client leaving), else `"stop"`.
+fn finish_reason(summary: &ServeSummary) -> &'static str {
+    if !summary.tool_calls.is_empty() {
+        "tool_calls"
+    } else if summary.metrics.stopped {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 /// The non-streaming `chat.completion` object. When the model requested tool calls, the
 /// assistant message carries `tool_calls` with `content: null` and `finish_reason` is
 /// `"tool_calls"` (the OpenAI shape a coding agent expects); otherwise it carries the
@@ -622,7 +658,7 @@ fn completion_object(
     ttft: std::time::Duration,
 ) -> Value {
     let (message, finish) = if summary.tool_calls.is_empty() {
-        (json!({ "role": "assistant", "content": content }), "stop")
+        (json!({ "role": "assistant", "content": content }), finish_reason(summary))
     } else {
         (
             json!({ "role": "assistant", "content": Value::Null, "tool_calls": summary.tool_calls }),
@@ -677,13 +713,14 @@ fn spawn_worker(
                 gone.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         };
-        let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed);
+        // Or gone before any delta (during discovery or prefill): its receiver is already dropped.
+        let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed();
         match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, &cancel, &mut on_delta) {
             Ok(summary) => {
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
-                let _ = tx.send(GatewayEvent::Error(e.to_string()));
+                let _ = tx.send(GatewayEvent::Error(e.to_string(), error_class(&e)));
             }
         }
     });
@@ -769,13 +806,15 @@ enum DispatchErr {
 pub const MIN_AUTHENTICITY_HEADER: &str = "x-openhydra-min-authenticity";
 
 /// `A0`…`A3` (any case) as an authenticity tier.
+///
+/// A3 (hardware attestation) isn't accepted yet: nothing feeds it into a provider's tier at the
+/// gateway, so a floor of A3 would refuse every request (review round 4 G4-7).
 pub fn parse_authenticity_tier(s: &str) -> Option<openhydra_protocol::trust::AuthenticityTier> {
     use openhydra_protocol::trust::AuthenticityTier::*;
     match s.trim().to_ascii_uppercase().as_str() {
         "A0" => Some(SelfReported),
         "A1" => Some(ReputationRedundant),
         "A2" => Some(EnergyFingerprintPossession),
-        "A3" => Some(HardwareAttested),
         _ => None,
     }
 }
@@ -931,6 +970,7 @@ fn spawn_byok_worker(
                         engine: outcome.engine,
                         provider_serve_ns: started.elapsed().as_nanos() as u64,
                         billing: 0,
+                        stopped: false,
                     },
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
@@ -940,7 +980,7 @@ fn spawn_byok_worker(
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
-                let _ = tx.send(GatewayEvent::Error(e.to_string()));
+                let _ = tx.send(GatewayEvent::Error(e.to_string(), error_class(&e)));
             }
         }
     });
@@ -987,7 +1027,7 @@ fn stream_response(
                 // (Incremental per-argument streaming of tool_calls is a later refinement —
                 // delivered as one delta here, which OpenAI clients accumulate fine.)
                 let (delta, finish) = if summary.tool_calls.is_empty() {
-                    (json!({}), "stop")
+                    (json!({}), finish_reason(&summary))
                 } else {
                     (json!({ "tool_calls": summary.tool_calls }), "tool_calls")
                 };
@@ -1001,9 +1041,8 @@ fn stream_response(
                 }
                 chunk.to_string()
             }
-            GatewayEvent::Error(m) => {
+            GatewayEvent::Error(m, (_, etype)) => {
                 metrics.record_error();
-                let (_, etype) = classify_error(&m);
                 json!({
                     "id": id_s, "object": "chat.completion.chunk", "created": created, "model": model_s,
                     "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
@@ -1034,7 +1073,7 @@ async fn buffered_response(
     metrics: Arc<Metrics>,
 ) -> Response {
     let mut content = String::new();
-    let mut outcome: Option<Result<Box<ServeSummary>, String>> = None;
+    let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass)>> = None;
     // Time the first delta even though the HTTP body is buffered: with P1 streaming the tokens
     // arrive incrementally over the channel, so this is the real generation time-to-first-token.
     let mut ttft: Option<std::time::Duration> = None;
@@ -1045,7 +1084,7 @@ async fn buffered_response(
                 content.push_str(&t);
             }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
-            GatewayEvent::Error(m) => outcome = Some(Err(m)),
+            GatewayEvent::Error(m, class) => outcome = Some(Err((m, class))),
         }
     }
     match outcome {
@@ -1061,9 +1100,8 @@ async fn buffered_response(
             Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
                 .into_response()
         }
-        Some(Err(m)) => {
+        Some(Err((m, (status, etype)))) => {
             metrics.record_error();
-            let (status, etype) = classify_error(&m);
             openai_error(status, &m, etype)
         }
         None => openai_error(
@@ -1336,20 +1374,35 @@ fn anthropic_message_object(id: &str, model: &str, content: &str, summary: &Serv
         let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| json!({}));
         blocks.push(json!({ "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": input }));
     }
-    let stop_reason = if summary.tool_calls.is_empty() { "end_turn" } else { "tool_use" };
     json!({
         "id": id,
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": blocks,
-        "stop_reason": stop_reason,
+        "stop_reason": anthropic_stop_reason(summary),
         "stop_sequence": Value::Null,
         "usage": {
             "input_tokens": summary.metrics.engine.prompt_eval_count,
             "output_tokens": summary.tokens,
         },
+        "openhydra": anthropic_openhydra(summary),
     })
+}
+
+/// Anthropic's `stop_reason` for a completion ([`finish_reason`] in its words).
+fn anthropic_stop_reason(summary: &ServeSummary) -> &'static str {
+    match finish_reason(summary) {
+        "tool_calls" => "tool_use",
+        "length" => "max_tokens",
+        _ => "end_turn",
+    }
+}
+
+/// The OpenHydra fields an Anthropic-shaped reply carries (clients ignore unknown fields): the tier
+/// the serving provider was verified at, as on the OpenAI surface (review round 4 G4-10).
+fn anthropic_openhydra(summary: &ServeSummary) -> Value {
+    json!({ "provider_authenticity": summary.authenticity.map(|t| t.label()) })
 }
 
 async fn messages(
@@ -1425,12 +1478,12 @@ async fn anthropic_buffered_response(
     metrics: Arc<Metrics>,
 ) -> Response {
     let mut content = String::new();
-    let mut outcome: Option<Result<Box<ServeSummary>, String>> = None;
+    let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass)>> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
             GatewayEvent::Delta(t) => content.push_str(&t),
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
-            GatewayEvent::Error(m) => outcome = Some(Err(m)),
+            GatewayEvent::Error(m, class) => outcome = Some(Err((m, class))),
         }
     }
     match outcome {
@@ -1440,9 +1493,8 @@ async fn anthropic_buffered_response(
             metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
             Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
         }
-        Some(Err(m)) => {
+        Some(Err((m, (status, _)))) => {
             metrics.record_error();
-            let (status, _) = classify_error(&m);
             anthropic_error(status, &m, "api_error")
         }
         None => anthropic_error(
@@ -1497,8 +1549,15 @@ async fn anthropic_stream_worker(
     // warm by the SSE comment keep-alive on the response — NO native `ping` here, because a `ping`
     // before `message_start` makes the official Anthropic SDK `.stream()` accumulator raise
     // "Unexpected event order, got ping before message_start" and abort.
-    let first = match rx.recv().await {
-        Some(GatewayEvent::Error(m)) => {
+    // The client leaving (the SSE body dropped, so `out` closes) ends the worker, which drops `rx`:
+    // the serve then sees its client gone, stops reading and settles for what was read (S8; review
+    // round 4 M1). Watched while waiting too, so a client that leaves during prefill is seen.
+    let first = tokio::select! {
+        f = rx.recv() => f,
+        _ = out.closed() => return,
+    };
+    let first = match first {
+        Some(GatewayEvent::Error(m, _)) => {
             metrics.record_error();
             let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
             return;
@@ -1506,7 +1565,7 @@ async fn anthropic_stream_worker(
         Some(ev) => ev, // a Delta or Done — the message really started
         None => return, // stream closed with nothing
     };
-    let _ = out.send((
+    if out.send((
         "message_start",
         json!({
             "type": "message_start",
@@ -1516,11 +1575,15 @@ async fn anthropic_stream_worker(
                 "usage": { "input_tokens": 0, "output_tokens": 0 },
             }
         }),
-    ));
-    let _ = out.send((
+    )).is_err() {
+        return;
+    }
+    if out.send((
         "content_block_start",
         json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
-    ));
+    )).is_err() {
+        return;
+    }
     // Process the first frame, then drain the rest. A native `ping` is emitted only on a mid-content
     // stall — i.e. AFTER `message_start` (canonical + SDK-safe); `biased` makes a ready frame win, so
     // pings never appear once tokens are flowing.
@@ -1528,41 +1591,56 @@ async fn anthropic_stream_worker(
     'drain: loop {
         match ev {
             GatewayEvent::Delta(t) => {
-                let _ = out.send((
+                if out.send((
                     "content_block_delta",
                     json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } }),
-                ));
+                )).is_err() {
+                    return;
+                }
             }
             GatewayEvent::Done(summary) => {
                 let wall = started.elapsed();
                 log_completion(&summary, wall);
                 metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
-                let _ = out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 })));
+                if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))).is_err() {
+                    return;
+                }
                 // Each tool call → a `tool_use` block whose arguments stream as one
                 // `input_json_delta` (clients accumulate + parse it).
                 for (i, tc) in summary.tool_calls.iter().enumerate() {
                     let idx = i + 1;
-                    let _ = out.send((
+                    if out.send((
                         "content_block_start",
                         json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": {} } }),
-                    ));
-                    let _ = out.send((
+                    )).is_err() {
+                        return;
+                    }
+                    if out.send((
                         "content_block_delta",
                         json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "input_json_delta", "partial_json": tc.function.arguments } }),
-                    ));
-                    let _ = out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": idx })));
+                    )).is_err() {
+                        return;
+                    }
+                    if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": idx }))).is_err() {
+                        return;
+                    }
                 }
-                let stop_reason = if summary.tool_calls.is_empty() { "end_turn" } else { "tool_use" };
-                let _ = out.send((
+                if out.send((
                     "message_delta",
-                    json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens } }),
-                ));
-                let _ = out.send(("message_stop", json!({ "type": "message_stop" })));
+                    json!({ "type": "message_delta", "delta": { "stop_reason": anthropic_stop_reason(&summary), "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens }, "openhydra": anthropic_openhydra(&summary) }),
+                )).is_err() {
+                    return;
+                }
+                if out.send(("message_stop", json!({ "type": "message_stop" }))).is_err() {
+                    return;
+                }
                 break 'drain;
             }
-            GatewayEvent::Error(m) => {
+            GatewayEvent::Error(m, _) => {
                 metrics.record_error();
-                let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
+                if out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } }))).is_err() {
+                    return;
+                }
                 break 'drain;
             }
         }
@@ -1575,8 +1653,11 @@ async fn anthropic_stream_worker(
                     Some(e) => break e,
                     None => break 'drain, // channel closed without a terminal frame (defensive)
                 },
+                _ = out.closed() => return,
                 _ = tokio::time::sleep(PING_INTERVAL) => {
-                    let _ = out.send(("ping", json!({ "type": "ping" })));
+                    if out.send(("ping", json!({ "type": "ping" }))).is_err() {
+                        return;
+                    }
                 }
             }
         };
@@ -1999,7 +2080,7 @@ mod tests {
         assert_eq!(parse_authenticity_tier("A1"), Some(ReputationRedundant));
         assert_eq!(parse_authenticity_tier(" a2 "), Some(EnergyFingerprintPossession));
         assert_eq!(parse_authenticity_tier("A0"), Some(SelfReported));
-        assert_eq!(parse_authenticity_tier("A3"), Some(HardwareAttested));
+        assert_eq!(parse_authenticity_tier("A3"), None, "not reachable yet");
         assert_eq!(parse_authenticity_tier("A4"), None);
         assert_eq!(parse_authenticity_tier("high"), None);
     }
@@ -2023,6 +2104,7 @@ mod tests {
                 engine: EngineMetrics { prompt_eval_count: prompt, eval_count: tokens, ..Default::default() },
                 provider_serve_ns: 500_000_000,
                 billing: 0,
+                stopped: false,
             },
             proxy_roundtrip_ns: 600_000_000,
             discover_ns: 1_000_000,
@@ -2164,7 +2246,7 @@ mod tests {
     #[tokio::test]
     async fn stream_immediate_error_has_no_message_envelope() {
         // An error as the FIRST frame → a single `error` frame, never a `message_start`.
-        let names = stream_names(vec![GatewayEvent::Error("no provider".into())]).await;
+        let names = stream_names(vec![GatewayEvent::Error("no provider".into(), (StatusCode::SERVICE_UNAVAILABLE, "no_provider"))]).await;
         assert_eq!(names, vec!["error"]);
     }
 
@@ -2313,6 +2395,13 @@ mod tests {
         assert_eq!(classify_error("provider: engine http error: ollama: model crashed").0, StatusCode::BAD_GATEWAY);
         assert_eq!(classify_error("network: stream stalled (no progress before deadline)").0, StatusCode::BAD_GATEWAY);
         assert_eq!(classify_error("network: proxy_forward timed out after 45s").0, StatusCode::GATEWAY_TIMEOUT);
+        // By kind (review round 4 G4-8): a provider's error can't pass for a routing refusal or a
+        // timeout, whatever it says.
+        use crate::adapter::AdapterError;
+        assert_eq!(error_class(&AdapterError::Provider("no provider for you, timed out".into())), (StatusCode::BAD_GATEWAY, "upstream_error"));
+        assert_eq!(error_class(&AdapterError::Route("no provider for model 'm'".into())).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_class(&AdapterError::Route("all providers failed for 'm'".into())).0, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_class(&AdapterError::Network("proxy_forward timed out after 45s".into())).0, StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[test]

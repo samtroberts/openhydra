@@ -2011,14 +2011,18 @@ async fn connector_test(state: tauri::State<'_, AppState>) -> Result<String, Str
         "messages": [{ "role": "user", "content": "ping" }],
     });
     tauri::async_runtime::spawn_blocking(move || {
-        use openhydra_agent::adapter::HttpClient;
         let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
-        let resp = client
-            .post_json(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
+        // Read the body whatever the status: a refusal (no provider, none at the authenticity floor
+        // set in Settings) says why, and isn't the gateway being unreachable (review round 4 G4-9).
+        let (status, resp) = client
+            .post_json_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
             .map_err(|e| format!("gateway unreachable on :{port} — is OpenHydra sharing/serving? ({e})"))?;
-        let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&resp).map_err(|_| format!("gateway answered {status}: {resp}"))?;
         if let Some(err) = v.get("error") {
             return Err(err.get("message").and_then(|m| m.as_str()).unwrap_or("gateway error").to_string());
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("gateway answered {status}"));
         }
         Ok(v.get("model").and_then(|m| m.as_str()).unwrap_or("ok").to_string())
     })

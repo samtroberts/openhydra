@@ -135,6 +135,11 @@ const ATTEST_GLOBAL_RPS: f64 = 20.0;
 const ATTEST_GLOBAL_BURST: f64 = 40.0;
 /// The single key the global attestation bucket is kept under.
 const ATTEST_GLOBAL_KEY: &str = "*";
+/// A second provider-wide bucket, for consumers we served recently once the main one is spent: they
+/// still get attested under a flood, but a flood of identities that each took a tiny serve can't use
+/// it to sign without bound (review round 4 X4-12).
+const ATTEST_SERVED_RPS: f64 = 5.0;
+const ATTEST_SERVED_BURST: f64 = 20.0;
 /// How long a peer that passed a private model's swarm gate may attest that model (see
 /// `Provider::private_attestable`).
 const PRIVATE_ATTEST_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
@@ -448,11 +453,36 @@ struct Running {
 }
 
 /// What `peer`'s unsettled commitments owe, leaving out those of serves still running (`running`),
-/// which their reservations count.
-fn unsettled_of(map: &HashMap<[u8; 16], ServeCommitment>, peer: &str, running: &[Running]) -> Vec<Unsettled> {
-    map.iter()
-        .filter(|(n, c)| c.served_peer == peer && !running.iter().any(|r| r.nonce == **n))
-        .map(|(_, c)| Unsettled { at: c.recorded_ms, tokens: c.tokens, delivered: c.delivered })
+/// which their reservations count. A finished stream is counted for all it generated (`generated`,
+/// [`generated_of`]), fetched yet or not: its reservation ended with its generation, and its consumer
+/// can still fetch the rest (review round 4 M4).
+fn unsettled_of(
+    map: &HashMap<[u8; 16], ServeCommitment>,
+    peer: &str,
+    running: &[Running],
+    generated: &HashMap<[u8; 16], u64>,
+) -> Vec<Unsettled> {
+    let is_running = |n: &[u8; 16]| running.iter().any(|r| r.nonce == *n);
+    let committed = map.iter().filter(|(n, c)| c.served_peer == peer && !is_running(n)).map(|(n, c)| Unsettled {
+        at: c.recorded_ms,
+        tokens: c.tokens.max(generated.get(n).copied().unwrap_or(0)),
+        delivered: c.delivered,
+    });
+    let unread = generated
+        .iter()
+        .filter(|(n, _)| !map.contains_key(*n) && !is_running(n))
+        .map(|(_, t)| Unsettled { at: 0, tokens: *t, delivered: false });
+    committed.chain(unread).collect()
+}
+
+/// What each of `peer`'s finished, still-open streams generated, by nonce: the billable count of all
+/// its frames ([`StreamBuffer::tally`]).
+fn generated_of(streams: &HashMap<[u8; 16], StreamBuffer>, peer: &str) -> HashMap<[u8; 16], u64> {
+    streams
+        .iter()
+        .filter(|(_, b)| b.reply_to == peer && b.done && !b.closed)
+        .map(|(n, b)| (*n, b.tally.billable(b.billing.max_tokens)))
+        .filter(|(_, t)| *t > 0)
         .collect()
 }
 
@@ -699,6 +729,30 @@ const MAX_STREAMS_PER_PEER: usize = 128;
 /// Global byte backstop across all live stream tails — a last-resort guard (deltas are small and
 /// pruned, so this rarely bites), evicting the globally-oldest stream if somehow exceeded.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// How long an admitted serve nonce is remembered: well past the commitment it backs
+/// ([`COMMITMENT_TTL_MS`]), allowing for the consumer's clock.
+const NONCE_MEMORY_MS: u64 = 2 * COMMITMENT_TTL_MS;
+/// The most serve nonces remembered; past it the oldest is forgotten (reusing one that old needs
+/// this many serves in between, each one generated).
+const MAX_SEEN_NONCES: usize = 65_536;
+
+/// Note `nonce` as admitted at `now` in `seen`; false (refuse the serve) when it was admitted within
+/// [`NONCE_MEMORY_MS`].
+fn admit_nonce(seen: &mut HashMap<[u8; 16], u64>, nonce: [u8; 16], now: u64) -> bool {
+    if seen.get(&nonce).is_some_and(|at| now.saturating_sub(*at) <= NONCE_MEMORY_MS) {
+        return false;
+    }
+    if seen.len() >= MAX_SEEN_NONCES {
+        seen.retain(|_, at| now.saturating_sub(*at) <= NONCE_MEMORY_MS);
+        if seen.len() >= MAX_SEEN_NONCES {
+            if let Some(oldest) = seen.iter().min_by_key(|(_, at)| **at).map(|(n, _)| *n) {
+                seen.remove(&oldest);
+            }
+        }
+    }
+    seen.insert(nonce, now);
+    true
+}
 
 /// M6/F2 (delivery hardening): how many announce passes a per-model `MODEL_WITHDRAWN` tombstone is
 /// re-published for. A single gossip publish is best-effort — a consumer that was momentarily
@@ -779,10 +833,13 @@ struct Fetched {
     wallet: Option<[u8; 20]>,
 }
 
-/// How long a stream keeps generating with no poll from its consumer. An honest consumer polls at
-/// least every [`crate::consumer`] poll interval (under a second) while it reads, so this only ends
-/// a stream it stopped reading (gone, or settled for what it had).
-const STREAM_ABANDON_MS: u64 = 30_000;
+/// How long a stream keeps generating with no poll from its consumer. An honest consumer polls
+/// every poll interval while it reads, but rides out a dropped connection for up to about 160 s
+/// (its call timeout, retries and stall clock) before giving up, so this stays above that: it only
+/// ends a stream its consumer stopped reading (gone, or settled for what it had). A serve stopped
+/// this way says so in its `Done` (`stopped`), so a consumer that comes back late isn't shown a
+/// cut-off answer as complete (review round 4 H8).
+const STREAM_ABANDON_MS: u64 = 180_000;
 
 /// F1: whether a serve request's `reply_to` is allowed, i.e. equals the libp2p-authenticated
 /// sender. A legitimate consumer always sets `reply_to = its own peer id`, which is the
@@ -928,13 +985,15 @@ fn stream_begin_billed_in(
             None => break,
         }
     }
-    // Global backstops: evict the globally-oldest until within the count + byte caps.
+    // Global backstops: evict until within the count + byte caps, unread streams first (oldest
+    // first): one its consumer read from is owed for what it read, and its consumer may still close
+    // it to settle (S8); evicting it would leave that unprovable (review round 4 S4-11).
     loop {
         let total: usize = map.values().map(|b| b.bytes).sum();
         if map.len() < MAX_STREAM_ENTRIES && total <= MAX_STREAM_BYTES {
             break;
         }
-        match map.iter().min_by_key(|(_, b)| b.recorded_ms).map(|(k, _)| *k) {
+        match map.iter().min_by_key(|(_, b)| (b.fetched_hi > 0, b.recorded_ms)).map(|(k, _)| *k) {
             Some(oldest) => {
                 map.remove(&oldest);
             }
@@ -1144,6 +1203,8 @@ pub struct Provider<A: EngineAdapter> {
     attest_rl: Arc<RateLimiter>,
     /// The cap on attestation challenges across all peers (one bucket).
     attest_global_rl: Arc<RateLimiter>,
+    /// The bucket consumers we served draw on once `attest_global_rl` is spent.
+    attest_served_rl: Arc<RateLimiter>,
     /// Peers we served recently, and when (see [`SERVED_ATTEST_PRIORITY_MS`]).
     recently_served: Mutex<HashMap<String, u64>>,
     /// Prompt-scoring challenges (Track A2-Logprob): answered only when the operator declared the
@@ -1166,6 +1227,10 @@ pub struct Provider<A: EngineAdapter> {
     /// proven reconnect-fetch path is untouched; prune-on-ack keeps per-stream memory bounded to
     /// the un-fetched tail so thousands of concurrent streams don't evict one another.
     streams: Mutex<HashMap<[u8; 16], StreamBuffer>>,
+    /// Serve nonces admitted recently (nonce → when), so none is served twice: a reused nonce would
+    /// rewrite the commitment of the serve that first used it, erasing what that one owes (review
+    /// round 4 C2). Kept for [`NONCE_MEMORY_MS`], at most [`MAX_SEEN_NONCES`].
+    seen_nonces: Mutex<HashMap<[u8; 16], u64>>,
     /// Which models this provider shares (announces + serves), keyed on the engine handle
     /// (`DetectedModel::engine_ref`, the same string a consumer sends as `ServeRequest.model_ref`).
     /// A [`PolicyWatcher`] so the policy can be **hot-reloaded at runtime** — the user can toggle
@@ -1303,6 +1368,12 @@ impl<A: EngineAdapter> Provider<A> {
                 max_inflight: 0,
                 max_tracked: 1,
             })),
+            attest_served_rl: Arc::new(RateLimiter::new(RateLimitConfig {
+                rps: ATTEST_SERVED_RPS,
+                burst: ATTEST_SERVED_BURST,
+                max_inflight: 0,
+                max_tracked: 1,
+            })),
             prompt_scoring: false,
             score_gate: InflightGate::new(),
             scored_recently: Mutex::new(HashMap::new()),
@@ -1315,6 +1386,7 @@ impl<A: EngineAdapter> Provider<A> {
             detected: Mutex::new(HashMap::new()),
             declared_quant: None,
             streams: Mutex::new(HashMap::new()),
+            seen_nonces: Mutex::new(HashMap::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
             last_announced: Mutex::new(BTreeSet::new()),
@@ -1425,6 +1497,18 @@ impl<A: EngineAdapter> Provider<A> {
         }
     }
 
+    /// Refuse a serve whose nonce was used before (see `seen_nonces`). Our own consumer is exempt (it
+    /// never settles with us).
+    fn nonce_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
+        if self.is_own_consumer(source_peer) {
+            return None;
+        }
+        let fresh = admit_nonce(&mut self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()), req.nonce, now_unix_ms());
+        (!fresh).then(|| {
+            frame_response(&[ServeChunk::Error("this request's nonce was already used; send each request with a new one".into()).encode()])
+        })
+    }
+
     /// The payment gate of a provider that charges (a settlement peg is configured): the request
     /// must offer to pay at our peg (on our deployment), and its consumer must be within the credit
     /// window ([`payment_window`]). An admitted paid serve holds a [`PaymentReservation`] while it
@@ -1460,11 +1544,12 @@ impl<A: EngineAdapter> Provider<A> {
         let now = now_unix_ms();
         let running: Vec<Running> =
             self.paid_generating.lock().unwrap_or_else(|e| e.into_inner()).get(source_peer).cloned().unwrap_or_default();
+        let generated = generated_of(&self.streams.lock().unwrap_or_else(|e| e.into_inner()), source_peer);
         let (unsettled, full): (Vec<Unsettled>, bool) = {
             let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
             self.note_defaults(prune_expired_commitments(&mut map, now), now);
             let full = map.len() >= MAX_COMMITMENTS && oldest_undelivered(&map).is_none();
-            (unsettled_of(&map, source_peer, &running), full)
+            (unsettled_of(&map, source_peer, &running, &generated), full)
         };
         // A full commitment map can't record the serve, so it couldn't be paid for or seen.
         if full {
@@ -1497,7 +1582,8 @@ impl<A: EngineAdapter> Provider<A> {
     fn grow_reservation(&self, r: &PaymentReservation, to: u64) -> bool {
         let running: Vec<Running> =
             self.paid_generating.lock().unwrap_or_else(|e| e.into_inner()).get(&r.peer).cloned().unwrap_or_default();
-        let unsettled: u64 = unsettled_of(&self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()), &r.peer, &running)
+        let generated = generated_of(&self.streams.lock().unwrap_or_else(|e| e.into_inner()), &r.peer);
+        let unsettled: u64 = unsettled_of(&self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()), &r.peer, &running, &generated)
             .iter()
             .map(|u| u.tokens)
             .sum();
@@ -1601,6 +1687,8 @@ impl<A: EngineAdapter> Provider<A> {
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = map.get_mut(&nonce).filter(|c| c.served_peer == peer) {
             c.delivered = true;
+            drop(map);
+            self.note_served(peer);
         }
     }
 
@@ -1613,6 +1701,8 @@ impl<A: EngineAdapter> Provider<A> {
         if fetched.tokens == 0 || self.is_own_consumer(peer) {
             return;
         }
+        // It read output from us: served, for attestation priority (output it never read isn't).
+        self.note_served(peer);
         let now = now_unix_ms();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = map.get_mut(&nonce).filter(|c| c.served_peer == peer) {
@@ -1830,7 +1920,9 @@ impl<A: EngineAdapter> Provider<A> {
         delivered: bool,
         wallet: Option<[u8; 20]>,
     ) {
-        self.note_served(served_peer);
+        if delivered {
+            self.note_served(served_peer);
+        }
         // Our own consumer never settles with us: its serves would only fill the map.
         if self.is_own_consumer(served_peer) {
             return;
@@ -1939,14 +2031,9 @@ impl<A: EngineAdapter> Provider<A> {
         // E-S8: shed a poll flood, keyed on the authenticated sender. A shed poll returns
         // "no progress at your offset" so an honest consumer simply backs off and re-polls the
         // same offset — it never re-serves or fails over on a transient rate-limit.
+        // A shed poll doesn't count as reading (review round 4 M4): a consumer that floods polls so
+        // its real ones are shed can't keep a stream generating while it fetches nothing.
         if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
-            // Still a poll: the consumer is reading, so the stream keeps generating.
-            let now = now_unix_ms();
-            if let Some(b) = self.streams.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&nonce) {
-                if b.reply_to == source_peer {
-                    b.last_poll_ms = now;
-                }
-            }
             return FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: offset, done: false }
                 .encode();
         }
@@ -2035,6 +2122,10 @@ impl<A: EngineAdapter> Provider<A> {
             respond_done(refusal, 1);
             return;
         }
+        if let Some(refusal) = self.nonce_refusal(&req, &source_peer) {
+            respond_done(refusal, 1);
+            return;
+        }
         // A provider that charges: the consumer must offer to pay, and have paid for what it had.
         let reservation = match self.payment_gate(&req, &source_peer) {
             Ok(r) => r,
@@ -2073,9 +2164,6 @@ impl<A: EngineAdapter> Provider<A> {
         // B-S1: the serve's commitment (what its settlement receipt is checked against) is what the
         // consumer's polls returned, recorded as they return it (`commit_fetched`): a stream it read
         // only part of is owed for that part, and one it read nothing of is owed nothing.
-        if summary.ok && summary.tokens > 0 {
-            self.note_served(&source_peer);
-        }
         if !self.stream_wanted(&nonce) {
             let owed = self.committed_tokens(&nonce);
             tracing::info!(peer = %source_peer, generated = summary.tokens, owed = ?owed,
@@ -2095,10 +2183,15 @@ impl<A: EngineAdapter> Provider<A> {
     /// B-S1/B-S7: validate a settlement receipt against the serve we recorded under its
     /// nonce, and consume the commitment (single-use). `Err(reason)` rejects the receipt
     /// *before* it is co-signed — closing the token-inflation hole.
+    /// `floor_tokens` is the commitment the payment floor was checked against
+    /// ([`Self::validate_settlement_cumulative`]): if a poll raised it since, the receipt is refused
+    /// (retryable), so a consumer can't pay the lower count while it fetches more (review round 4
+    /// S4-7).
     fn check_and_consume_commitment(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
         source_peer: &str,
+        floor_tokens: Option<u64>,
     ) -> Result<(), String> {
         let consumer_peer = self.net.peer_id_from_ed25519_pubkey(p.consumer.as_bytes())?;
         // The streams lock first, as a poll takes them (see `commit_fetched`): a stream settled here is
@@ -2107,6 +2200,9 @@ impl<A: EngineAdapter> Provider<A> {
         let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         self.note_defaults(prune_expired_commitments(&mut map, now_unix_ms()), now_unix_ms());
+        if map.get(&p.nonce).map(|c| c.tokens) != floor_tokens {
+            return Err("the serve's count changed while this receipt was checked; retry".into());
+        }
         validate_and_consume_commitment(
             &mut map,
             &p.nonce,
@@ -2164,11 +2260,12 @@ impl<A: EngineAdapter> Provider<A> {
         self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).get(nonce).map(|c| c.tokens)
     }
 
+    /// On success, the commitment the floor was taken from (`None`: there was none).
     fn validate_settlement_cumulative(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
         wallet: Option<[u8; 20]>,
-    ) -> Result<(), BindRejection> {
+    ) -> Result<Option<u64>, BindRejection> {
         // v5 denomination binding: reject a crypto-rail receipt whose declared asset/peg we never
         // agreed to, before `check_cumulative` and before the serve-commitment nonce is consumed.
         check_settlement_denomination(
@@ -2188,7 +2285,8 @@ impl<A: EngineAdapter> Provider<A> {
         // completion/prompt split are the consumer's to fill in, so a floor built from them could
         // be talked down to zero. Weighted like the consumer's own step (blended rate, no split).
         // No open commitment → no floor here; the commitment check then rejects the receipt.
-        let units = settlement_floor_units(self.committed_tokens(&p.nonce), p.tokens);
+        let committed = self.committed_tokens(&p.nonce);
+        let units = settlement_floor_units(committed, p.tokens);
         openhydra_protocol::payout::check_cumulative(last, p.cumulative_amount, units, self.settlement_peg)
             .map_err(|e| {
                 // A consumer behind our high-water (a co-sign reply it never got, a voucher it lost)
@@ -2216,6 +2314,7 @@ impl<A: EngineAdapter> Provider<A> {
                     }
                 }
             })
+            .map(|()| committed)
     }
 
     /// Record the co-signed cumulative for this `(consumer, model)` after a successful co-sign
@@ -2689,6 +2788,7 @@ impl<A: EngineAdapter> Provider<A> {
                 let shed_id = request_id.clone();
                 let is_attest = data.first() == Some(&ATTEST_CHALLENGE);
                 let is_score = matches!(data.first(), Some(&PROMPT_SCORE_CHALLENGE) | Some(&MODEL_INFO_REQUEST));
+                let is_stream_poll = matches!(data.first(), Some(&FETCH_CHUNKS) | Some(&STREAM_CLOSE));
                 let accepted = pool.submit(move || {
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
@@ -2751,6 +2851,10 @@ impl<A: EngineAdapter> Provider<A> {
                         attest_refusal("provider overloaded, retry")
                     } else if is_score {
                         score_refusal("provider overloaded, retry")
+                    } else if is_stream_poll {
+                        // A poll or close shed in its own reply shape, so the consumer backs off and
+                        // retries rather than taking it for an older provider (review round 4 M5).
+                        FetchChunksResponse::Overloaded.encode()
                     } else {
                         frame_response(&[ServeChunk::Error("provider overloaded, retry".into()).encode()])
                     };
@@ -2904,11 +3008,13 @@ impl<A: EngineAdapter> Provider<A> {
                     self.attestor.as_deref(),
                     &|model| self.policy.announce_globally(model) || self.private_attestable(source_peer, model),
                     now_unix_ms(),
-                    // A consumer we served recently skips the provider-wide cap (review round 3, B2):
-                    // free identities flooding challenges can't make us refuse the consumers we serve.
+                    // A consumer we served recently has a bucket of its own once the provider-wide one
+                    // is spent (review round 3, B2): free identities flooding challenges can't make us
+                    // refuse the consumers we serve.
                     &|| {
-                        self.served_recently(source_peer)
-                            || self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok()
+                        self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok()
+                            || (self.served_recently(source_peer)
+                                && self.attest_served_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok())
                     },
                 )
             }
@@ -2975,8 +3081,8 @@ impl<A: EngineAdapter> Provider<A> {
                     self.check_sender(p, source_peer).map_err(BindRejection::from)?;
                     // The claim first: on Base its signer picks the running total to check against.
                     let kept = self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
-                    self.validate_settlement_cumulative(p, kept.as_ref().and_then(|k| k.signer))?;
-                    self.check_and_consume_commitment(p, source_peer).map_err(BindRejection::from)?;
+                    let floor = self.validate_settlement_cumulative(p, kept.as_ref().and_then(|k| k.signer))?;
+                    self.check_and_consume_commitment(p, source_peer, floor).map_err(BindRejection::from)?;
                     *accepted_claim.borrow_mut() = kept;
                     Ok(())
                 };
@@ -3044,6 +3150,9 @@ impl<A: EngineAdapter> Provider<A> {
                         // M4-base reach gate (buffered twin of the streaming path): a `Private` model
                         // needs a valid swarm credential bound to `source_peer`; `Device` is loopback-only.
                         if let Some(refusal) = self.scope_refusal(&req, source_peer) {
+                            return refusal;
+                        }
+                        if let Some(refusal) = self.nonce_refusal(&req, source_peer) {
                             return refusal;
                         }
                         let reservation = match self.payment_gate(&req, source_peer) {
@@ -3406,6 +3515,22 @@ mod tests {
         drop(budget);
         drop(r);
         assert!(provider.paid_generating.lock().unwrap().get("c").is_none(), "released when the serve ends");
+    }
+
+    /// Review round 4 M4: a finished stream counts against the window for all it generated, read or
+    /// not (its reservation ended with it); a running one only through its reservation.
+    #[test]
+    fn a_finished_streams_unread_output_counts_against_the_window() {
+        let mut map = HashMap::new();
+        map.insert([1; 16], ServeCommitment {
+            model_id: "m".into(), tokens: 100, recorded_ms: 5, served_peer: "c".into(), delivered: true, wallet: None,
+        });
+        let generated: HashMap<[u8; 16], u64> = [([1; 16], 900), ([2; 16], 700), ([3; 16], 50)].into();
+        let running = [Running { id: 1, tokens: 64, nonce: [3; 16] }];
+        let mut owed: Vec<u64> = unsettled_of(&map, "c", &running, &generated).iter().map(|u| u.tokens).collect();
+        owed.sort();
+        assert_eq!(owed, vec![700, 900], "read 100 of 900: owes for 900; never read: 700; running: by its reservation");
+        assert!(unsettled_of(&map, "other", &[], &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -4156,6 +4281,27 @@ mod tests {
         let last = frames.last().expect("a terminal frame was appended");
         assert!(matches!(ServeChunk::decode(last).unwrap(), ServeChunk::Error(_)));
         assert!(ServeChunk::frame_is_terminal(last), "the appended frame ends the stream");
+    }
+
+    /// Review round 4 C2: a serve nonce is admitted once; reusing it (which would rewrite the first
+    /// serve's commitment) is refused while it is remembered.
+    #[test]
+    fn a_serve_nonce_is_admitted_once() {
+        let mut seen = HashMap::new();
+        assert!(admit_nonce(&mut seen, [1; 16], 1_000));
+        assert!(!admit_nonce(&mut seen, [1; 16], 1_000 + NONCE_MEMORY_MS), "reuse refused");
+        assert!(admit_nonce(&mut seen, [2; 16], 1_000));
+        assert!(admit_nonce(&mut seen, [1; 16], 2_000 + NONCE_MEMORY_MS), "forgotten after the memory");
+        // Bounded: past the cap the oldest goes.
+        let mut full = HashMap::new();
+        for i in 0..MAX_SEEN_NONCES as u32 {
+            let mut n = [0u8; 16];
+            n[..4].copy_from_slice(&i.to_be_bytes());
+            full.insert(n, 5_000 + u64::from(i));
+        }
+        assert!(admit_nonce(&mut full, [9; 16], 6_000));
+        assert_eq!(full.len(), MAX_SEEN_NONCES);
+        assert!(!full.contains_key(&[0u8; 16]), "the oldest was forgotten");
     }
 
     #[test]
