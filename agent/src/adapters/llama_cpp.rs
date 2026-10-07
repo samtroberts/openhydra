@@ -844,7 +844,7 @@ mod tests {
         let mut out = String::new();
         let outcome = adapter
             .serve_stream(
-                &InferenceRequest {
+                &InferenceRequest { stop: Default::default(),
                     model_ref: "Qwen2.5-7B-Instruct-Q4_K_M".into(),
                     messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
                     max_tokens: None,

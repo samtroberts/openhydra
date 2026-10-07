@@ -44,7 +44,7 @@ use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, BindRejection, RECEIPT_REQUEST};
 use crate::serve::{
-    frame_response, handle_serve_request, handle_serve_request_parsed, FetchChunksResponse,
+    frame_response, handle_serve_request, FetchChunksResponse,
     FetchResponse, ServeChunk, ServeRequest, ServeSummary,
 };
 use crate::status::TransferStats;
@@ -329,19 +329,15 @@ const MAX_UNPAID_CONCURRENT: usize = 8;
 const DEFAULT_RESERVE_TOKENS: u64 = 8_192;
 /// Unsettled serves one consumer may have at once.
 const MAX_UNSETTLED_SERVES: usize = 64;
-/// The most one paid serve generates: a request asking for more (or naming no limit) is served up to
-/// this, so a single serve can't leave more unpaid than the whole credit window.
-const MAX_PAID_SERVE_TOKENS: u32 = MAX_UNSETTLED_TOKENS as u32;
+/// How much a paid serve's reservation grows at a time once it has generated what it reserved.
+const RESERVE_STEP_TOKENS: u64 = 1_024;
 
-/// What a paid serve may generate, given the request's `max_tokens` ([`MAX_PAID_SERVE_TOKENS`] at most).
-fn paid_max_tokens(requested: Option<u32>) -> u32 {
-    requested.map_or(MAX_PAID_SERVE_TOKENS, |t| t.min(MAX_PAID_SERVE_TOKENS))
-}
-
-/// What a paid serve reserves against the unpaid-token cap while it runs: its `max_tokens`
-/// ([`paid_max_tokens`]), or [`DEFAULT_RESERVE_TOKENS`] without one.
+/// What a paid serve reserves against the unpaid-token cap when it starts: its `max_tokens`, at most
+/// [`DEFAULT_RESERVE_TOKENS`]. It grows as the serve generates past it, while the credit window
+/// has room ([`Provider::grow_reservation`]); a serve that can't grow stops there. So no serve can
+/// leave more unpaid than the window, and the engine is never sent a cap the client didn't ask for.
 fn paid_reservation(requested: Option<u32>) -> u64 {
-    requested.map_or(DEFAULT_RESERVE_TOKENS, |t| u64::from(paid_max_tokens(Some(t))))
+    requested.map_or(DEFAULT_RESERVE_TOKENS, |t| u64::from(t).min(DEFAULT_RESERVE_TOKENS))
 }
 
 /// A consumer's serve not yet paid for, as the credit window sees it.
@@ -416,16 +412,19 @@ fn private_member_in<'a, V>(m: &'a HashMap<(String, String), (u64, V)>, peer: &s
 /// A paid serve's reservation against its consumer's unpaid-token cap while it generates; released
 /// when dropped (the serve recorded, or failed).
 struct PaymentReservation {
-    generating: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    generating: Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>,
     peer: String,
-    tokens: u64,
+    /// Tells this reservation apart from the consumer's others (`(id, tokens)` in `generating`).
+    id: u64,
+    /// What it reserved at the start ([`paid_reservation`]).
+    initial: u64,
 }
 
 impl Drop for PaymentReservation {
     fn drop(&mut self) {
         let mut map = self.generating.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = map.get_mut(&self.peer) {
-            if let Some(i) = v.iter().position(|t| *t == self.tokens) {
+            if let Some(i) = v.iter().position(|(id, _)| *id == self.id) {
                 v.swap_remove(i);
             }
             if v.is_empty() {
@@ -784,9 +783,10 @@ fn generate_guarded(
     req: ServeRequest,
     adapter: &dyn EngineAdapter,
     on_chunk: &mut dyn FnMut(&[u8]),
+    keep_going: &mut dyn FnMut(u64) -> bool,
 ) -> ServeSummary {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_serve_request_parsed(req, adapter, on_chunk)
+        crate::serve::handle_serve_request_within(req, adapter, on_chunk, keep_going)
     })) {
         Ok(summary) => summary,
         Err(_) => {
@@ -953,7 +953,9 @@ pub struct Provider<A: EngineAdapter> {
     /// challenge carries no credential).
     private_members: Mutex<HashMap<(String, String), (u64, Option<openhydra_network::membership::MembershipCredential>)>>,
     /// Paid serves generating now, per consumer: each one's token reservation (credit window).
-    paid_generating: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    paid_generating: Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>,
+    /// The next [`PaymentReservation::id`].
+    next_reservation: std::sync::atomic::AtomicU64,
     /// Stream nonces whose consumer polled to the end before the serve was recorded (see
     /// `ServeCommitment::delivered`), with when.
     delivered_nonces: Mutex<HashMap<[u8; 16], u64>>,
@@ -1108,6 +1110,7 @@ impl<A: EngineAdapter> Provider<A> {
             settlement_chain: None,
             self_consumer: None,
             paid_generating: Arc::new(Mutex::new(HashMap::new())),
+            next_reservation: std::sync::atomic::AtomicU64::new(0),
             private_members: Mutex::new(HashMap::new()),
             delivered_nonces: Mutex::new(HashMap::new()),
             payment_defaults: Mutex::new(HashMap::new()),
@@ -1262,7 +1265,7 @@ impl<A: EngineAdapter> Provider<A> {
     /// The payment gate of a provider that charges (a settlement peg is configured): the request
     /// must offer to pay at our peg (on our deployment), and its consumer must be within the credit
     /// window ([`payment_window`]). An admitted paid serve holds a [`PaymentReservation`] while it
-    /// runs, and generates at most [`paid_max_tokens`]. Our own (co-located) consumer never settles
+    /// runs, grown as it generates ([`Self::grow_reservation`]). Our own (co-located) consumer never settles
     /// with us and is exempt. `Err` is the refusal.
     fn payment_gate(&self, req: &ServeRequest, source_peer: &str) -> Result<Option<PaymentReservation>, Vec<u8>> {
         let Some(peg) = self.settlement_peg else {
@@ -1314,14 +1317,61 @@ impl<A: EngineAdapter> Provider<A> {
             .map_or(0, |at| at.iter().filter(|t| now.saturating_sub(**t) <= DEFAULT_WINDOW_MS).count());
         let tokens = paid_reservation(req.max_tokens);
         let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
-        let running = generating.get(source_peer).cloned().unwrap_or_default();
+        let running: Vec<u64> = generating.get(source_peer).map_or_else(Vec::new, |v| v.iter().map(|(_, t)| *t).collect());
         payment_window(&unsettled, &running, tokens, defaults, now).map_err(refuse)?;
-        generating.entry(source_peer.to_string()).or_default().push(tokens);
+        let id = self.next_reservation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        generating.entry(source_peer.to_string()).or_default().push((id, tokens));
         Ok(Some(PaymentReservation {
             generating: Arc::clone(&self.paid_generating),
             peer: source_peer.to_string(),
-            tokens,
+            id,
+            initial: tokens,
         }))
+    }
+
+    /// Grow `r` to `to` tokens if its consumer's credit window has room: what it owes on its
+    /// unsettled serves and its other running reservations, plus `to`, within
+    /// [`MAX_UNSETTLED_TOKENS`]. A paid serve calls this as it generates past its reservation, and
+    /// stops when it can't (review round 3, S2).
+    fn grow_reservation(&self, r: &PaymentReservation, to: u64) -> bool {
+        let unsettled: u64 = self
+            .serve_commitments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|c| c.served_peer == r.peer)
+            .map(|c| c.tokens)
+            .sum();
+        let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mine) = generating.get_mut(&r.peer) else {
+            return false;
+        };
+        let others: u64 = mine.iter().filter(|(id, _)| *id != r.id).map(|(_, t)| *t).sum();
+        if unsettled.saturating_add(others).saturating_add(to) > MAX_UNSETTLED_TOKENS {
+            return false;
+        }
+        if let Some(e) = mine.iter_mut().find(|(id, _)| *id == r.id) {
+            e.1 = to;
+        }
+        true
+    }
+
+    /// The budget a serve runs under ([`crate::serve::handle_serve_request_within`]): unlimited for a
+    /// free serve; for a paid one, its reservation, grown a step at a time while the window allows.
+    fn serve_budget<'a>(&'a self, reservation: Option<&'a PaymentReservation>) -> impl FnMut(u64) -> bool + 'a {
+        let mut reserved = reservation.map_or(0, |r| r.initial);
+        move |sent| match reservation {
+            None => true,
+            Some(_) if sent < reserved => true,
+            Some(r) => {
+                let want = reserved + RESERVE_STEP_TOKENS;
+                let ok = self.grow_reservation(r, want);
+                if ok {
+                    reserved = want;
+                }
+                ok
+            }
+        }
     }
 
     /// On Base, the request must name the wallet its claims will be signed with: the receipt's claim
@@ -1697,7 +1747,7 @@ impl<A: EngineAdapter> Provider<A> {
                 .net
                 .respond(request_id.clone(), FetchChunksResponse::Chunks { framed, next_offset, done: true }.encode());
         };
-        let mut req = match ServeRequest::decode(&data[1..]) {
+        let req = match ServeRequest::decode(&data[1..]) {
             Ok(r) => r,
             Err(e) => {
                 let framed = frame_response(&[ServeChunk::Error(format!("bad serve request: {e}")).encode()]);
@@ -1757,10 +1807,6 @@ impl<A: EngineAdapter> Provider<A> {
                 return;
             }
         };
-        // Held while it generates; a paid serve generates no more than the credit window holds.
-        if reservation.is_some() {
-            req.max_tokens = Some(paid_max_tokens(req.max_tokens));
-        }
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -1779,7 +1825,7 @@ impl<A: EngineAdapter> Provider<A> {
         // terminal Error, so a bug can't leave this buffer `done=false` forever (which would stall
         // the consumer ~120s before it re-serves).
         let summary =
-            generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c));
+            generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c), &mut self.serve_budget(reservation.as_ref()));
         // B-S1: record what we served under the committed nonce so its settlement receipt can be
         // validated (right tokens/model, once) — identical to the buffered path.
         if summary.ok && summary.tokens > 0 {
@@ -2701,12 +2747,8 @@ impl<A: EngineAdapter> Provider<A> {
                             Ok(r) => r,
                             Err(refusal) => return refusal,
                         };
-                        let mut req = req;
                         // How long the consumer waits for the reply (by the max_tokens it asked for).
                         let consumer_waits = crate::consumer::default_attempt_timeout(req.max_tokens);
-                        if reservation.is_some() {
-                            req.max_tokens = Some(paid_max_tokens(req.max_tokens));
-                        }
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -2727,6 +2769,7 @@ impl<A: EngineAdapter> Provider<A> {
                             req,
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
+                            &mut self.serve_budget(reservation.as_ref()),
                         );
                         // A reply ready within the consumer's wait reaches it; a later one only if it
                         // fetches it by nonce (which marks it delivered then).
@@ -3024,6 +3067,38 @@ mod tests {
             // `Unknown` scope is gated exactly like `Private` (fail-closed): the same stranger is refused.
             assert!(scope_gate(Scope::Unknown, "m", "12D3KooWStranger", OWN, None, Some(&auth), 4_000).is_err());
         }
+    }
+
+    #[test]
+    fn a_paid_serve_grows_its_reservation_until_the_window_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
+            identity_path: dir.path().join("id.key"),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            bootstrap_peers: vec![],
+            enable_peer_relay: false,
+            enable_connection_reversal: false,
+            pcp_gateway: None,
+        })
+        .unwrap();
+        let provider = Provider::new(StubAdapter, net);
+        // The consumer owes 56,000 tokens on unsettled serves.
+        provider.serve_commitments.lock().unwrap().insert([1; 16], ServeCommitment {
+            model_id: "m".into(), tokens: 56_000, recorded_ms: now_unix_ms(), served_peer: "c".into(), delivered: true, wallet: None,
+        });
+        provider.paid_generating.lock().unwrap().insert("c".into(), vec![(7, 4_096)]);
+        let r = PaymentReservation { generating: Arc::clone(&provider.paid_generating), peer: "c".into(), id: 7, initial: 4_096 };
+        let mut budget = provider.serve_budget(Some(&r));
+        // A stream asks after every token: it grows a step at a time while 56,000 + the
+        // reservation fits in 65,536, so it runs to 9,216 and stops there.
+        let stopped_at = (1..u64::MAX).find(|sent| !budget(*sent)).unwrap();
+        assert_eq!(stopped_at, 9_216);
+        assert_eq!(provider.paid_generating.lock().unwrap()["c"], vec![(7, 9_216)]);
+        // A free serve has no budget to run out of.
+        assert!(provider.serve_budget(None)(u64::MAX));
+        drop(budget);
+        drop(r);
+        assert!(provider.paid_generating.lock().unwrap().get("c").is_none(), "released when the serve ends");
     }
 
     #[test]
@@ -3334,13 +3409,11 @@ mod tests {
         assert!(payment_window(&[], &[32_768], 32_768, 0, now).is_ok());
         let err = payment_window(&[], &[32_768, 32_768], 32_768, 0, now).unwrap_err();
         assert!(err.contains("lower max_tokens"), "{err}");
-        // A paid serve generates at most the window, and reserves what it may generate.
-        assert_eq!(paid_max_tokens(None), MAX_PAID_SERVE_TOKENS);
-        assert_eq!(paid_max_tokens(Some(u32::MAX)), MAX_PAID_SERVE_TOKENS);
-        assert_eq!(paid_max_tokens(Some(512)), 512);
+        // A paid serve starts with a modest reservation and grows it as it generates (see
+        // `a_paid_serve_grows_its_reservation_until_the_window_is_full`).
         assert_eq!(paid_reservation(None), DEFAULT_RESERVE_TOKENS);
-        assert_eq!(paid_reservation(Some(u32::MAX)), MAX_UNSETTLED_TOKENS);
-        assert!(payment_window(&[], &[], paid_reservation(Some(u32::MAX)), 0, now).is_ok());
+        assert_eq!(paid_reservation(Some(u32::MAX)), DEFAULT_RESERVE_TOKENS);
+        assert_eq!(paid_reservation(Some(512)), 512);
         // Review S3: one peer can't crowd the commitment map; past its cap its oldest goes.
         let mut map = HashMap::new();
         let commit = |peer: &str, at: u64| ServeCommitment { model_id: "m".into(), tokens: 1, recorded_ms: at, served_peer: peer.into(), delivered: false, wallet: None };
@@ -3770,7 +3843,7 @@ mod tests {
         };
         let mut frames: Vec<Vec<u8>> = Vec::new();
         // Must NOT propagate the panic; returns a failed summary.
-        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()));
+        let summary = generate_guarded(req, &PanicAdapter, &mut |c| frames.push(c.to_vec()), &mut |_| true);
         assert!(!summary.ok);
         assert_eq!(summary.tokens, 0, "no tokens → no commitment recorded");
         let last = frames.last().expect("a terminal frame was appended");

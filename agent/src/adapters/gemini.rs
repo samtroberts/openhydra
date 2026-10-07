@@ -176,6 +176,11 @@ impl<H: HttpClient> EngineAdapter for GeminiAdapter<H> {
         let mut chunk_tokens = 0u64;
         let (mut prompt, mut output, mut done) = (0u64, 0u64, false);
         for line in lines {
+            // The caller asked to stop (out of budget, or the consumer left): drop the stream, which
+            // makes the engine stop generating, and return what was sent.
+            if request.stop.is_set() {
+                break;
+            }
             let line = line?;
             let Some(payload) = sse_payload(&line) else {
                 continue;
@@ -247,7 +252,7 @@ mod tests {
     }
 
     fn req(messages: Vec<ChatMessage>) -> InferenceRequest {
-        InferenceRequest { model_ref: "gemini-1.5-pro".into(), messages, max_tokens: Some(256), temperature: None, tools: Vec::new(), think: None, seed: None }
+        InferenceRequest { stop: Default::default(), model_ref: "gemini-1.5-pro".into(), messages, max_tokens: Some(256), temperature: None, tools: Vec::new(), think: None, seed: None }
     }
 
     #[test]

@@ -208,6 +208,27 @@ fn tool_call_type_function() -> String {
     "function".to_string()
 }
 
+/// A flag a serve's caller sets to stop it early (see [`InferenceRequest::stop`]). Clones share it.
+#[derive(Debug, Clone, Default)]
+pub struct StopSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl StopSignal {
+    pub fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Requests compare by content: a stop flag is control state, not part of the request.
+impl PartialEq for StopSignal {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// A request to serve a streaming chat completion from an engine.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InferenceRequest {
@@ -233,6 +254,9 @@ pub struct InferenceRequest {
     /// (PROOF_OF_INFERENCE §12 Phase 1). Adapters that support it map it to their native seed
     /// (Ollama `options.seed`, OpenAI-family `seed`); adapters with no seed control ignore it.
     pub seed: Option<u64>,
+    /// Set by the caller to stop the serve early: the adapter stops reading the engine's stream
+    /// (dropping it, so the engine stops generating) and returns what was sent so far.
+    pub stop: StopSignal,
 }
 
 /// Raw counters/timings the engine itself reports for one request — Ollama's

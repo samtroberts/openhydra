@@ -368,7 +368,7 @@ mod tests {
         let mut out = String::new();
         let outcome = adapter
             .serve_stream(
-                &InferenceRequest {
+                &InferenceRequest { stop: Default::default(),
                     model_ref: "mlx-community/Llama-3.2-1B-Instruct-4bit".into(),
                     messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
                     max_tokens: None,

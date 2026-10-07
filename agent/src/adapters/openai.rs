@@ -383,6 +383,11 @@ pub(crate) fn serve_chat_completions<H: HttpClient>(
     // token — reasoning included — instead of a content token that may never arrive.
     let mut reasoning_open = false;
     for line in lines {
+        // The caller asked to stop (out of budget, or the consumer left): drop the stream, which
+        // makes the engine stop generating, and return what was sent.
+        if request.stop.is_set() {
+            break;
+        }
         let line = line?;
         let Some(payload) = sse_payload(&line) else {
             continue; // SSE comment / framing / non-data field
@@ -580,7 +585,7 @@ mod tests {
     }
 
     fn req() -> InferenceRequest {
-        InferenceRequest {
+        InferenceRequest { stop: Default::default(),
             model_ref: "Qwen/Qwen2.5-7B-Instruct".into(),
             messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
             max_tokens: Some(16),

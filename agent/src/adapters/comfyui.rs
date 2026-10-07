@@ -483,7 +483,7 @@ mod tests {
     }
 
     fn request(prompt: &str) -> InferenceRequest {
-        InferenceRequest {
+        InferenceRequest { stop: Default::default(),
             model_ref: "dreamshaper_8.safetensors".into(),
             messages: vec![ChatMessage { role: "user".into(), content: prompt.into(), ..Default::default() }],
             max_tokens: None,

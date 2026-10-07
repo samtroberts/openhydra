@@ -392,6 +392,18 @@ pub fn handle_serve_request_parsed(
     adapter: &dyn EngineAdapter,
     send_chunk: &mut dyn FnMut(&[u8]),
 ) -> ServeSummary {
+    handle_serve_request_within(req, adapter, send_chunk, &mut |_| true)
+}
+
+/// [`handle_serve_request_parsed`] that ends the serve early once `keep_going(tokens)` says no, given
+/// the tokens sent so far (the stream's text fragments, about one token each): the engine stops,
+/// and the serve finishes normally, reported and billed for what was sent.
+pub fn handle_serve_request_within(
+    req: ServeRequest,
+    adapter: &dyn EngineAdapter,
+    send_chunk: &mut dyn FnMut(&[u8]),
+    keep_going: &mut dyn FnMut(u64) -> bool,
+) -> ServeSummary {
     // A deterministic serve pins temperature to 0 and carries a fixed seed, overriding any
     // temperature the request also set (2b). Otherwise the request's own sampling is used.
     // Engines disagree on what a zero cap means (some read it as "no limit"), and nothing generated
@@ -414,7 +426,9 @@ pub fn handle_serve_request_parsed(
         tools: req.tools,
         think: req.think,
         seed,
+        stop: Default::default(),
     };
+    let stop = infer.stop.clone();
 
     // Scope the delta sink so its &mut borrow of `send_chunk` ends before the terminal
     // Done/Error frame is sent. Time the whole serve so the consumer can separate network
@@ -423,13 +437,26 @@ pub fn handle_serve_request_parsed(
     // The text exactly as sent, measured for the billable count (the consumer measures what it
     // receives the same way).
     let mut delivered = DeliveredText::default();
+    let mut fragments = 0u64;
     let outcome = {
         let mut on_delta = |d: &str| {
             delivered.push(d);
-            send_chunk(&ServeChunk::Delta(d.to_string()).encode())
+            fragments += 1;
+            send_chunk(&ServeChunk::Delta(d.to_string()).encode());
+            if !stop.is_set() && !keep_going(fragments) {
+                stop.set();
+            }
         };
         adapter.serve_stream(&infer, &mut on_delta)
     };
+    // Stopped early, the engine never reported its count: what was sent stands in for it.
+    let outcome = outcome.map(|mut o| {
+        if stop.is_set() {
+            o.tokens = fragments;
+            o.done = true;
+        }
+        o
+    });
     let provider_serve_ns = serve_start.elapsed().as_nanos() as u64;
 
     match outcome {
@@ -688,6 +715,43 @@ mod tests {
             frames.push(ServeChunk::decode(bytes).unwrap());
         });
         (frames, summary)
+    }
+
+    #[test]
+    fn a_serve_out_of_budget_stops_the_engine_and_bills_what_was_sent() {
+        struct Long;
+        impl EngineAdapter for Long {
+            fn engine_name(&self) -> &'static str {
+                "long"
+            }
+            fn detect_models(&self) -> Result<Vec<crate::adapter::DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(
+                &self,
+                req: &InferenceRequest,
+                on_delta: &mut dyn FnMut(&str),
+            ) -> Result<crate::adapter::ServeOutcome, AdapterError> {
+                let mut sent = 0;
+                for _ in 0..100 {
+                    if req.stop.is_set() {
+                        break;
+                    }
+                    on_delta("tok ");
+                    sent += 1;
+                }
+                // An engine that ran to the end would report 100.
+                Ok(crate::adapter::ServeOutcome { tokens: if sent == 100 { 100 } else { 0 }, done: sent == 100, ..Default::default() })
+            }
+        }
+        let mut req = req("p");
+        req.max_tokens = Some(1000);
+        let mut frames = Vec::new();
+        let summary = handle_serve_request_within(req, &Long, &mut |c| frames.push(c.to_vec()), &mut |sent| sent < 7);
+        assert!(summary.ok);
+        let deltas = frames.iter().filter(|f| matches!(ServeChunk::decode(f), Ok(ServeChunk::Delta(_)))).count();
+        assert_eq!(deltas, 7, "the engine stopped once the budget said so");
+        assert_eq!(summary.tokens, 7, "billed for what was sent");
     }
 
     #[test]

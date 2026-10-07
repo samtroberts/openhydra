@@ -293,7 +293,7 @@ mod tests {
     }
 
     fn infer(model_ref: &str) -> InferenceRequest {
-        InferenceRequest {
+        InferenceRequest { stop: Default::default(),
             model_ref: model_ref.into(),
             messages: vec![ChatMessage { role: "user".into(), content: "hi".into(), ..Default::default() }],
             max_tokens: None,

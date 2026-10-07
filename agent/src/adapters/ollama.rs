@@ -380,6 +380,11 @@ impl<H: HttpClient> EngineAdapter for OllamaAdapter<H> {
         // decode-TPS timer anchors on the first REAL generated token (reasoning included).
         let mut reasoning_open = false;
         for line in lines {
+            // The caller asked to stop (out of budget, or the consumer left): drop the stream, which
+            // makes the engine stop generating, and return what was sent.
+            if request.stop.is_set() {
+                break;
+            }
             let line = line?;
             if line.trim().is_empty() {
                 continue; // keep-alive / blank framing line
@@ -596,7 +601,7 @@ mod tests {
     }
 
     fn user_req(prompt: &str) -> InferenceRequest {
-        InferenceRequest {
+        InferenceRequest { stop: Default::default(),
             model_ref: "qwen2.5:7b".into(),
             messages: vec![crate::adapter::ChatMessage { role: "user".into(), content: prompt.into(), ..Default::default() }],
             max_tokens: Some(128),
@@ -1004,7 +1009,7 @@ mod tests {
         let models = agent.detect_models().unwrap();
         assert!(!models.is_empty(), "no Ollama models found");
 
-        let req = InferenceRequest {
+        let req = InferenceRequest { stop: Default::default(),
             model_ref: models[0].engine_ref.clone(),
             messages: vec![crate::adapter::ChatMessage {
                 role: "user".into(),

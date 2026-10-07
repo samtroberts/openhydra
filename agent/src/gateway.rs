@@ -870,6 +870,7 @@ fn spawn_byok_worker(
             think: None,
             // The local gateway path does not request a deterministic serve.
             seed: None,
+            stop: Default::default(),
         };
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
