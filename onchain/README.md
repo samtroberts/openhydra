@@ -88,8 +88,10 @@ withdraws it to any address, so a blacklisted or frozen fee account can't stop s
 ```bash
 cd solana
 anchor build                      # → target/deploy/openhydra_settlement.so (BPF)
-cargo test -p openhydra-settlement # 6 host unit tests + 10 litesvm integration tests
+cargo test -p openhydra-settlement # 7 host unit tests + 16 litesvm integration tests
 ```
+`cargo build-sbf` defaults to platform-tools v1.54; one already in `~/.cache/solana` can be used
+instead with `cargo build-sbf --tools-version v1.57` (as tested), saving a ~400 MB download.
 The litesvm integration tests need `litesvm 0.16` with the `precompiles` feature (already in the
 program's `Cargo.toml`) so the Ed25519 SigVerify precompile is registered and actually verified
 in-SVM. (The Anchor scaffold's default `litesvm 0.10` rejects the Agave-4.2 SBF — see the dev-dep
@@ -101,7 +103,7 @@ Solidity deps are vendored via `git clone` (not committed). Fetch them once, the
 cd base
 git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std
 git clone --depth 1 --branch v5.1.0 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts
-forge test                        # 25 tests
+forge test                        # 36 tests
 ```
 
 ## Audit checklist
