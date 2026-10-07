@@ -370,9 +370,9 @@ fn replayed_and_stale_cumulatives_are_rejected() {
 
     settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").unwrap();
     // Replaying the same cumulative → delta 0 → the program rejects it.
-    assert!(settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").is_err());
+    fails_with(settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b"), openhydra_settlement::SettlementError::StaleOrReplayedClaim);
     // A lower cumulative than the high-water → also rejected (never claws back).
-    assert!(settle(&mut ctx, &consumer, provider_id, 50_000, "qwen2.5:7b").is_err());
+    fails_with(settle(&mut ctx, &consumer, provider_id, 50_000, "qwen2.5:7b"), openhydra_settlement::SettlementError::StaleOrReplayedClaim);
     // The escrow was debited exactly once.
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 400_000);
 }
@@ -399,7 +399,7 @@ fn settle_rejects_a_tampered_claim_message() {
     // ...but submit a settle claiming 999_999.
     let [ed_ix, settle_ix] = settle_ixs(&ctx, &consumer, &honest, claim(&consumer, provider_id, 999_999, EXPIRES, "qwen2.5:7b"));
     let payer = ctx.payer.insecure_clone();
-    assert!(send(&mut ctx, &[ed_ix, settle_ix], &[&payer]).is_err(), "message/claim mismatch rejected");
+    fails_with(send(&mut ctx, &[ed_ix, settle_ix], &[&payer]), openhydra_settlement::SettlementError::MessageMismatch); // message/claim mismatch rejected
 }
 
 /// A provider with a payout binding, and a funded consumer with a vault for it.
@@ -428,7 +428,7 @@ fn a_consumer_cannot_pay_itself_out_of_a_providers_vault() {
     deposit(&mut ctx, &consumer, throwaway_id, 1_000);
     settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b").expect("pays what its own vault holds");
     assert_eq!(vault_state(&ctx, &consumer, throwaway_id).balance, 0, "its own 1_000 only");
-    assert!(settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b").is_err(), "nothing left to pay");
+    fails_with(settle(&mut ctx, &consumer, throwaway_id, 500_000, "qwen2.5:7b"), openhydra_settlement::SettlementError::InsufficientEscrow); // nothing left to pay
 
     assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 500_000, "the honest vault is untouched");
 }
@@ -439,10 +439,10 @@ fn an_exit_needs_a_request_and_a_window_settles_cannot_extend() {
     initialize(&mut ctx);
     let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
 
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "no exit requested");
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked); // no exit requested
     request_exit(&mut ctx, &consumer, provider_id).unwrap();
     advance(&mut ctx, 86_400 - 10);
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "window not over");
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked); // window not over
     // The provider settles what it is owed inside the window; that doesn't move the deadline.
     settle(&mut ctx, &consumer, provider_id, 100_000, "qwen2.5:7b").unwrap();
     advance(&mut ctx, 10);
@@ -452,7 +452,7 @@ fn an_exit_needs_a_request_and_a_window_settles_cannot_extend() {
 
 #[test]
 fn an_exit_is_one_withdraw_within_its_window() {
-    use openhydra_settlement::{SettlementError, EXIT_WINDOW_SECS};
+    use openhydra_settlement::EXIT_WINDOW_SECS;
     let mut ctx = setup();
     initialize(&mut ctx);
     let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
@@ -460,11 +460,11 @@ fn an_exit_is_one_withdraw_within_its_window() {
     advance(&mut ctx, 86_400);
     withdraw(&mut ctx, &consumer, provider_id, 100_000).expect("in the window");
     // A withdraw closes the exit: the next needs a new request.
-    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), SettlementError::RefundLocked);
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked);
     // Kept armed past its window, an exit can't be used ahead of a settle months later.
     request_exit(&mut ctx, &consumer, provider_id).unwrap();
     advance(&mut ctx, 86_400 + EXIT_WINDOW_SECS + 1);
-    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), SettlementError::ExitLapsed);
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::ExitLapsed);
     request_exit(&mut ctx, &consumer, provider_id).unwrap();
     advance(&mut ctx, 86_400 + EXIT_WINDOW_SECS);
     withdraw(&mut ctx, &consumer, provider_id, 1).expect("the window's last second");
@@ -472,7 +472,6 @@ fn an_exit_is_one_withdraw_within_its_window() {
 
 #[test]
 fn a_flapped_pause_keeps_the_claims_grace() {
-    use openhydra_settlement::SettlementError;
     let mut ctx = setup();
     initialize(&mut ctx);
     let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
@@ -488,7 +487,7 @@ fn a_flapped_pause_keeps_the_claims_grace() {
     advance(&mut ctx, 14 * 86_400);
     settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", expires).expect("still within the grace");
     advance(&mut ctx, 86_400);
-    fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), SettlementError::ClaimExpired);
+    fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), openhydra_settlement::SettlementError::ClaimExpired);
 }
 
 #[test]
@@ -508,7 +507,7 @@ fn a_claim_live_when_a_pause_began_gets_the_pause_back() {
     settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", expires).expect("within the five days");
     // …and no more.
     advance(&mut ctx, 1);
-    fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), SettlementError::ClaimExpired);
+    fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), openhydra_settlement::SettlementError::ClaimExpired);
     // Every pause in the claim's life counts; one after it ran out revives nothing.
     let config = config_state(&ctx);
     let now = T0 + 26 * 86_400 + 1;
@@ -524,7 +523,7 @@ fn a_deposit_cancels_a_pending_exit() {
     request_exit(&mut ctx, &consumer, provider_id).unwrap();
     deposit(&mut ctx, &consumer, provider_id, 1);
     advance(&mut ctx, 86_400 + 1);
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err());
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked);
 }
 
 #[test]
@@ -535,9 +534,9 @@ fn a_pause_does_not_run_out_the_providers_window() {
     request_exit(&mut ctx, &consumer, provider_id).unwrap();
     set_paused(&mut ctx, true).unwrap();
     advance(&mut ctx, 86_400 + 1);
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "the time paused doesn't count toward the delay");
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked); // the time paused doesn't count toward the delay
     set_paused(&mut ctx, false).unwrap();
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "the window is extended by the pause");
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked); // the window is extended by the pause
     advance(&mut ctx, 86_400);
     withdraw(&mut ctx, &consumer, provider_id, 1).expect("then it opens");
 }
@@ -551,7 +550,7 @@ fn a_pause_delays_an_exit_by_at_most_thirty_days() {
     set_paused(&mut ctx, true).unwrap();
     let cap = openhydra_settlement::MAX_PAUSE_EXTENSION_SECS;
     advance(&mut ctx, 86_400 + cap - 1);
-    assert!(withdraw(&mut ctx, &consumer, provider_id, 1).is_err(), "still within the delay plus the cap");
+    fails_with(withdraw(&mut ctx, &consumer, provider_id, 1), openhydra_settlement::SettlementError::RefundLocked); // still within the delay plus the cap
     advance(&mut ctx, 1);
     withdraw(&mut ctx, &consumer, provider_id, 1).expect("past the cap, even while still paused");
 }
@@ -575,13 +574,13 @@ fn a_settle_past_the_escrow_pays_what_it_holds_and_the_rest_after_a_top_up() {
 fn a_binding_from_the_future_or_an_unset_cluster_tag_is_refused() {
     let mut ctx = setup();
     let admin = ctx.admin.insecure_clone();
-    assert!(try_initialize_on(&mut ctx, &admin, 86_400, [0u8; 32]).is_err(), "all-zero cluster tag");
-    assert!(try_initialize(&mut ctx, &admin, 3_600).is_err(), "a refund delay under a day");
+    fails_with(try_initialize_on(&mut ctx, &admin, 86_400, [0u8; 32]), openhydra_settlement::SettlementError::BadArgument); // all-zero cluster tag
+    fails_with(try_initialize(&mut ctx, &admin, 3_600), openhydra_settlement::SettlementError::BadArgument); // a refund delay under a day
     initialize(&mut ctx);
     let provider = Keypair::new();
     let id = provider.pubkey().to_bytes();
     let now_ms = T0 as u64 * 1000;
-    assert!(bind_payout(&mut ctx, &provider, id, now_ms + 3_600_000).is_err(), "an hour ahead");
+    fails_with(bind_payout(&mut ctx, &provider, id, now_ms + 3_600_000), openhydra_settlement::SettlementError::BindingFromTheFuture); // an hour ahead
     bind_payout(&mut ctx, &provider, id, now_ms + 60_000).expect("within the allowed skew");
 }
 
@@ -590,11 +589,12 @@ fn only_the_upgrade_authority_initializes_and_the_refund_delay_is_capped() {
     let mut ctx = setup();
     let stranger = Keypair::new();
     ctx.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
-    assert!(try_initialize(&mut ctx, &stranger, 86_400).is_err(), "a front-runner can't initialize");
+    fails_with(try_initialize(&mut ctx, &stranger, 86_400), openhydra_settlement::SettlementError::NotUpgradeAuthority); // a front-runner can't initialize
     let admin = ctx.admin.insecure_clone();
-    assert!(
-        try_initialize(&mut ctx, &admin, openhydra_settlement::MAX_REFUND_DELAY_SECS + 1).is_err(),
-        "a refund delay past the cap"
+    // a refund delay past the cap
+    fails_with(
+        try_initialize(&mut ctx, &admin, openhydra_settlement::MAX_REFUND_DELAY_SECS + 1),
+        openhydra_settlement::SettlementError::BadArgument,
     );
     try_initialize(&mut ctx, &admin, openhydra_settlement::MAX_REFUND_DELAY_SECS).expect("the authority, within the cap");
 }
@@ -605,13 +605,13 @@ fn an_expired_claim_or_one_for_another_deployment_does_not_settle() {
     initialize(&mut ctx);
     let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
     // Expired.
-    assert!(settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", T0 as u64 - 1).is_err());
+    fails_with(settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", T0 as u64 - 1), openhydra_settlement::SettlementError::ClaimExpired);
     // Signed for another cluster (say devnet) with this program id.
     let c = claim(&consumer, provider_id, 100_000, EXPIRES, "m");
     let devnet = settle_claim_preimage(&ctx.program_id.to_bytes(), &[0x66; 32], &c.provider, &c.consumer, 100_000, EXPIRES, "m");
     let ixs = settle_ixs(&ctx, &consumer, &devnet, c);
     let payer = ctx.payer.insecure_clone();
-    assert!(send(&mut ctx, &ixs, &[&payer]).is_err(), "another cluster's claim");
+    fails_with(send(&mut ctx, &ixs, &[&payer]), openhydra_settlement::SettlementError::MessageMismatch); // another cluster's claim
     // Still valid right up to its expiry.
     advance(&mut ctx, 1_000);
     settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", T0 as u64 + 1_000).expect("not yet expired");
@@ -641,9 +641,9 @@ fn fees_accrue_for_the_fee_authority_to_withdraw() {
     settle(&mut ctx, &consumer, provider_id, 100_000, "m").unwrap();
     assert_eq!(config_state(&ctx).accrued_fees, 4_000, "4% of the delta");
     let admin = ctx.admin.insecure_clone();
-    assert!(withdraw_fees(&mut ctx, &admin, 1).is_err(), "only the fee authority");
+    fails_with(withdraw_fees(&mut ctx, &admin, 1), openhydra_settlement::SettlementError::NotFeeAuthority); // only the fee authority
     let fa = ctx.fee_authority.insecure_clone();
-    assert!(withdraw_fees(&mut ctx, &fa, 4_001).is_err(), "no more than accrued");
+    fails_with(withdraw_fees(&mut ctx, &fa, 4_001), openhydra_settlement::SettlementError::WithdrawTooLarge); // no more than accrued
     withdraw_fees(&mut ctx, &fa, 4_000).expect("the fee authority takes its fees");
     assert_eq!(config_state(&ctx).accrued_fees, 0);
 }

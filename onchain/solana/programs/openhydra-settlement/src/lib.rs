@@ -337,6 +337,7 @@ pub mod openhydra_settlement {
             consumer: claim.consumer,
             provider: claim.provider,
             payout,
+            model_hash: model_hash(&claim.model_id),
             delta: paid,
             outstanding: delta - paid,
             provider_net,
@@ -459,6 +460,10 @@ pub struct SettleClaimArgs {
 
 // ── State ──
 
+/// The deployment's settings. Its layout is the on-chain account's: a field added later goes at the
+/// **end**, so an account written by the earlier layout still reads its fields in place (a deployed
+/// program upgrading must also reallocate the account for the new size). The pause log and its count
+/// were added this way (review O6).
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
@@ -519,6 +524,9 @@ pub struct Settled {
     pub consumer: [u8; 32],
     pub provider: [u8; 32],
     pub payout: [u8; 32],
+    /// SHA-256 of the claim's model id (the channel's seed): which model this settle paid for, as
+    /// Base's `Settled.modelHash` says (review O4).
+    pub model_hash: [u8; 32],
     /// What this settle paid.
     pub delta: u64,
     /// What the claim was owed beyond the escrow (settles from the same claim after a top-up).
