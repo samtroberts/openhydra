@@ -187,10 +187,25 @@ fn settle_retryable(e: &AdapterError) -> bool {
 /// from a provider that says it follows the shared billing rule ([`crate::serve::BILLING_VERSION`]),
 /// which never reports more. An older provider reported the engine's own count, which can honestly
 /// be higher (reasoning it didn't stream); it is just signed for less.
-fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64) -> bool {
-    // Only a rule that bills a completed serve as ours does: a newer rule may bill differently, and
-    // we can't judge it by ours.
-    crate::serve::same_completed_billing(summary.metrics.billing) && summary.tokens > billable
+/// A provider on an older rule (below 3) is held to the most generous rule there ever was (the
+/// engine's own count, never more than the request's `max_tokens`): above that, it can't be honest
+/// (review B6). A newer rule than ours isn't judged ([`newer_billing_rule`]).
+fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64, max_tokens: Option<u32>) -> bool {
+    let billing = summary.metrics.billing;
+    if crate::serve::same_completed_billing(billing) {
+        summary.tokens > billable
+    } else if billing < 3 {
+        max_tokens.is_some_and(|m| summary.tokens > u64::from(m))
+    } else {
+        false
+    }
+}
+
+/// Whether a provider says it bills by a rule newer than this build knows: not judged, but noted
+/// (logged, and counted in status), since a "newer rule" is also what a provider would claim to
+/// avoid being judged (review B6).
+fn newer_billing_rule(summary: &crate::serve::ServeSummary) -> bool {
+    summary.metrics.billing > crate::serve::BILLING_VERSION
 }
 
 /// The network an address sits on, for telling providers' operators apart: its IPv4 /24 or IPv6 /48.
@@ -633,8 +648,10 @@ pub fn request_completion(
     // Tool calls arrive in their own terminal frame just before `Done`; hold them so the
     // `Done` arm can attach them to the summary the gateway turns into the assistant turn.
     let mut tool_calls: Vec<ToolCall> = Vec::new();
-    for chunk in parse_response(&response)? {
+    for (i, chunk) in parse_response(&response)?.into_iter().enumerate() {
         match chunk {
+            // A refusal is its reply's only frame (B3).
+            ServeChunk::Error(msg) => return Err(provider_error(msg, i == 0)),
             ServeChunk::Delta(text) => on_delta(&text),
             ServeChunk::ToolCalls(tc) => tool_calls = tc,
             ServeChunk::Done { tokens, metrics } => {
@@ -648,7 +665,6 @@ pub fn request_completion(
                     authenticity: None,
                 })
             }
-            ServeChunk::Error(msg) => return Err(AdapterError::Provider(msg)),
         }
     }
     Err(AdapterError::Parse(
@@ -914,11 +930,12 @@ enum StreamFail {
 fn dispatch_stream_slice(
     framed: &[u8],
     tool_calls: &mut Vec<ToolCall>,
+    opening: bool,
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<Option<ServeSummary>, StreamFail> {
     let chunks = parse_response(framed)
         .map_err(|e| StreamFail::Error(AdapterError::Parse(e.to_string())))?;
-    for chunk in chunks {
+    for (i, chunk) in chunks.into_iter().enumerate() {
         match chunk {
             ServeChunk::Delta(text) => on_delta(&text),
             ServeChunk::ToolCalls(tc) => *tool_calls = tc,
@@ -933,10 +950,22 @@ fn dispatch_stream_slice(
                     authenticity: None,
                 }))
             }
-            ServeChunk::Error(msg) => return Err(StreamFail::Error(AdapterError::Provider(msg))),
+            // A refusal is the first frame of the stream's opening reply (B3).
+            ServeChunk::Error(msg) => return Err(StreamFail::Error(provider_error(msg, opening && i == 0))),
         }
     }
     Ok(None)
+}
+
+/// A provider's error frame as an error. A payment refusal stands as one only where a provider
+/// refuses (`at_admission`: before anything else it sends); anywhere else (after empty polls, after
+/// tool calls, mid-stream) it is an ordinary failure, so a provider can't end a serve it took on
+/// without it counting against it (review B3).
+fn provider_error(msg: String, at_admission: bool) -> AdapterError {
+    match msg.strip_prefix(crate::serve::PAYMENT_REFUSAL) {
+        Some(rest) if !at_admission => AdapterError::Provider(format!("refused payment after the serve began: {rest}")),
+        _ => AdapterError::Provider(msg),
+    }
 }
 
 /// Open a stream to a provider and drive the poll loop, delivering each delta to `on_delta`.
@@ -982,7 +1011,7 @@ fn request_completion_streaming(
         // The open ack may already carry frames — e.g. a refusal delivered as a complete
         // (done=true) stream, or an eager first slice.
         FetchChunksResponse::Chunks { framed, next_offset, done } => {
-            if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, on_delta)? {
+            if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, true, on_delta)? {
                 return Ok(summary);
             }
             offset = next_offset.max(offset);
@@ -1034,7 +1063,7 @@ fn request_completion_streaming(
         match FetchChunksResponse::decode(&resp) {
             Ok(FetchChunksResponse::Chunks { framed, next_offset, done }) => {
                 let progressed = next_offset > offset;
-                if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, on_delta)? {
+                if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, false, on_delta)? {
                     return Ok(summary);
                 }
                 let _ = done; // a true `done` always carries a terminal frame → returned above
@@ -2157,8 +2186,15 @@ impl ConsumerNode {
                         let delivered = delivered_text.get().units()
                             + crate::serve::tool_call_units(&summary.tool_calls, &crate::serve::offered_tool_names(tools));
                         let tokens = crate::serve::billable_tokens(summary.tokens, max_tokens, delivered);
+                        if newer_billing_rule(&summary) {
+                            tracing::info!(provider = %provider.peer_id, billing = summary.metrics.billing,
+                                "provider bills by a rule newer than this build knows; its count isn't judged");
+                            if let Some(stats) = &self.stats {
+                                stats.unknown_billing_rules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         if tokens < summary.tokens {
-                            over_reported = over_reported_by_billing(&summary, tokens);
+                            over_reported = over_reported_by_billing(&summary, tokens, max_tokens);
                             tracing::warn!(provider = %provider.peer_id, reported = summary.tokens, signable = tokens,
                                 billing = summary.metrics.billing, counted_against = over_reported,
                                 "provider reported more tokens than it could have served; signing for fewer");
@@ -3443,14 +3479,20 @@ mod tests {
             metrics: crate::serve::ServeMetrics { billing, ..Default::default() },
             ..Default::default()
         };
-        assert!(over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION), 40));
-        assert!(!over_reported_by_billing(&summary(40, crate::serve::BILLING_VERSION), 40));
+        assert!(over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION), 40, None));
+        assert!(!over_reported_by_billing(&summary(40, crate::serve::BILLING_VERSION), 40, None));
         // An older provider's engine count can honestly be higher: signed for less, not faulted.
-        assert!(!over_reported_by_billing(&summary(500, 0), 40));
+        assert!(!over_reported_by_billing(&summary(500, 0), 40, None));
+        assert!(!over_reported_by_billing(&summary(500, 0), 40, Some(500)));
+        // …but not above what the request allowed, which no rule ever billed (B6).
+        assert!(over_reported_by_billing(&summary(501, 0), 40, Some(500)));
+        assert!(over_reported_by_billing(&summary(501, 2), 40, Some(500)));
         // Rule 3 bills a completed serve as 4 does.
-        assert!(over_reported_by_billing(&summary(500, 3), 40));
+        assert!(over_reported_by_billing(&summary(500, 3), 40, None));
         // Nor is a newer rule, which we can't judge by ours.
-        assert!(!over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION + 1), 40));
+        assert!(!over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION + 1), 40, Some(10)));
+        assert!(newer_billing_rule(&summary(500, crate::serve::BILLING_VERSION + 1)));
+        assert!(!newer_billing_rule(&summary(500, crate::serve::BILLING_VERSION)));
     }
 
     #[test]
@@ -4348,6 +4390,32 @@ mod tests {
         // Nobody there at all, or no floor: the plain message.
         assert!(no_route_error("m", &gate(AuthenticityTier::ReputationRedundant), &[], 2).to_string().contains("no provider for model 'm'"));
         assert!(no_route_error("m", &AssurancePolicy::OPEN, &peers, 2).to_string().contains("no provider for model 'm'"));
+    }
+
+    #[test]
+    fn a_payment_refusal_counts_only_where_a_provider_refuses() {
+        let refusal = |s: &str| ServeChunk::Error(format!("{}{s}", crate::serve::PAYMENT_REFUSAL)).encode();
+        let is_refusal = |r: Result<Option<ServeSummary>, StreamFail>| match r {
+            Err(StreamFail::Error(e)) => crate::serve::is_payment_refusal(&e),
+            _ => panic!("expected an error"),
+        };
+        let mut tc = Vec::new();
+        // First frame of the opening reply: a refusal.
+        assert!(is_refusal(dispatch_stream_slice(&crate::serve::frame_response(&[refusal("settle first")]), &mut tc, true, &mut |_| {})));
+        // In a later poll (after empty polls), or after a tool-calls frame: an ordinary failure.
+        assert!(!is_refusal(dispatch_stream_slice(&crate::serve::frame_response(&[refusal("x")]), &mut tc, false, &mut |_| {})));
+        let tools = ServeChunk::ToolCalls(vec![]).encode();
+        assert!(!is_refusal(dispatch_stream_slice(&crate::serve::frame_response(&[tools, refusal("x")]), &mut tc, true, &mut |_| {})));
+        // A buffered reply: only as its only frame.
+        let mut only = |frames: Vec<Vec<u8>>| {
+            let reply = crate::serve::frame_response(&frames);
+            let mut t = |_: &[u8]| -> Result<Vec<u8>, AdapterError> { Ok(reply.clone()) };
+            request_completion(&mut t, &request(), &mut |_| {}).unwrap_err()
+        };
+        assert!(crate::serve::is_payment_refusal(&only(vec![refusal("x")])));
+        let after = only(vec![ServeChunk::Delta("hi".into()).encode(), refusal("x")]);
+        assert!(!crate::serve::is_payment_refusal(&after));
+        assert!(after.to_string().contains("refused payment after the serve began"), "{after}");
     }
 
     #[test]
