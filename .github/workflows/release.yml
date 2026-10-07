@@ -48,8 +48,8 @@ on:
         default: false
       allow_older:
         # A publish never moves latest/ back to an older version than the one published (a re-run of
-        # an old tag, say), nor replaces files a version already published, unless this is set.
-        description: "Publish even if older than latest/, replacing what this version already published"
+        # an old tag, say) unless this is set; files a version already published are never replaced.
+        description: "Publish even if older than latest/ (never replaces files a version already published)"
         type: boolean
         default: false
 
@@ -445,8 +445,10 @@ jobs:
           built = {os_: os.path.exists(f'{src}/openhydra-agent-{t}{EXE.get(os_, "")}') for os_, t in PLATFORMS.items()}
           # Not built, and not published for this version before either (round 8 R8-3).
           missing = [os_ for os_, ok in built.items() if not ok and os_ not in already]
+          # Marked complete after this publish: what it built, and what was already published before
+          # markers existed (so a later re-run can't overwrite it, round 9 C9-4).
           with open('built.txt', 'w') as f:
-              f.write(' '.join(PLATFORMS[os_] for os_, ok in built.items() if ok))
+              f.write(' '.join(PLATFORMS[os_] for os_, ok in built.items() if ok or (os_ in already and not marked)))
           if not any(built.values()):
               sys.exit('every platform is already published for this version, or none built: nothing to publish'
                        if published else 'no platform built: nothing to publish')

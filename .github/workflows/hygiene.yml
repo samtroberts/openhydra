@@ -19,12 +19,25 @@ jobs:
         with:
           persist-credentials: false
       - name: Check tracked source files
+        # Every tracked file but known binary formats (images, fonts, archives): text of any kind,
+        # extensionless pin files included (round 9 C9-7).
         run: |
-          git ls-files -z -- '*.rs' '*.js' '*.ts' '*.html' '*.css' '*.sh' '*.yml' '*.yaml' '*.py' '*.sol' '*.toml' '*.md' '*.patch' \
-            | python3 -c '
+          git ls-files -z | python3 -c '
           import sys
-          bad = [p for p in sys.stdin.buffer.read().split(b"\0") if p and b"\0" in open(p, "rb").read()]
+          BINARY = (".png", ".ico", ".icns", ".jpg", ".jpeg", ".gif", ".webp", ".svgz", ".woff", ".woff2", ".ttf", ".otf",
+                    ".pdf", ".zip", ".gz", ".tgz", ".xz", ".bz2", ".7z", ".so", ".dylib", ".dll", ".exe", ".wasm", ".bin",
+                    ".db", ".redb", ".mp3", ".mp4", ".wav", ".mov", ".gguf", ".safetensors", ".pyc", ".DS_Store")
+          bad = []
+          for p in sys.stdin.buffer.read().split(b"\0"):
+              if not p or p.decode(errors="replace").lower().endswith(BINARY):
+                  continue
+              try:
+                  data = open(p, "rb").read()
+              except (IsADirectoryError, FileNotFoundError):
+                  continue
+              if b"\0" in data:
+                  bad.append(p.decode(errors="replace"))
           for p in bad:
-              print(f"::error file={p.decode()}::raw NUL byte (write it as an escape)")
+              print(f"::error file={p}::raw NUL byte (write it as an escape)")
           sys.exit(1 if bad else 0)
           '

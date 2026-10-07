@@ -600,9 +600,17 @@ mod tests {
         sig[32..].copy_from_slice((k * a).as_bytes());
         assert!(consumer.verifying_key().verify(&msg, &Signature::from_bytes(&sig)).is_ok(), "a lax check accepts it");
         assert_eq!(verify_claim(&d, &claim, &sig, NOW), Err(SettlementError::BadClaimSignature));
-        // A small-order consumer key.
+        // A small-order consumer key (A = identity): R = [s]B, S = s verifies for any message under a
+        // lax check (round 9 C9-5: built so that only the weak-key refusal stops it).
         let weak = SettlementClaim { consumer: EdwardsPoint::identity().compress().to_bytes(), ..claim.clone() };
-        assert_eq!(verify_claim(&d, &weak, &sig, NOW), Err(SettlementError::BadClaimSignature));
+        let weak_msg = d.claim_message(&weak);
+        let s_ = Scalar::from_bytes_mod_order([7u8; 32]);
+        let mut weak_sig = [0u8; 64];
+        weak_sig[..32].copy_from_slice(&EdwardsPoint::mul_base(&s_).compress().to_bytes());
+        weak_sig[32..].copy_from_slice(s_.as_bytes());
+        let weak_key = ed25519_dalek::VerifyingKey::from_bytes(&weak.consumer).unwrap();
+        assert!(weak_key.verify(&weak_msg, &Signature::from_bytes(&weak_sig)).is_ok(), "a lax check accepts it");
+        assert_eq!(verify_claim(&d, &weak, &weak_sig, NOW), Err(SettlementError::BadClaimSignature));
         // An honest signature still verifies.
         assert!(verify_claim(&d, &claim, &consumer.sign(&msg).to_bytes(), NOW).is_ok());
     }
