@@ -847,7 +847,11 @@ impl LogprobStatus {
             reference: tag,
             ..Self::default()
         };
+        // The texts it declined in the round still count: switching what it declares, and back,
+        // doesn't restore the allowance (round 8 L8-6).
+        let skipped = round.skipped();
         round.reset_progress();
+        round.carry_skipped(skipped);
         true
     }
 

@@ -1693,6 +1693,12 @@ impl<A: EngineAdapter> Provider<A> {
         if let Some(reason) = self.wallet_refusal(req) {
             return Err(refuse(reason));
         }
+        if req.model_ref.len() > openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN {
+            return Err(refuse(format!(
+                "this provider can't take payment for a model name longer than {} bytes",
+                openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN
+            )));
+        }
         let now = now_unix_ms();
         // The running serves are held for the whole decision (lock order: reservations, streams,
         // commitments), so one ending meanwhile is counted once, not missed (round 8 S8-4).
@@ -4027,6 +4033,22 @@ mod tests {
         assert!(note_score_model(&mut m, "p", "y".into(), SCORE_SWITCH_MIN_MS), "a switch after the window");
         assert!(!note_score_model(&mut m, "p", "x".into(), SCORE_SWITCH_MIN_MS + 1), "and back: too soon");
         assert!(note_score_model(&mut m, "q", "x".into(), 20), "per peer");
+    }
+
+    /// Round 8 O8-4: a charging provider won't take payment for a handle too long to settle.
+    #[test]
+    fn a_handle_too_long_to_settle_is_not_charged_for() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let provider = provider.with_settlement_peg(10);
+        let req = |model: String| ServeRequest {
+            reply_to: "c".into(), model_ref: model, messages: vec![],
+            max_tokens: Some(16), temperature: None, tools: Vec::new(), think: None, nonce: [5u8; 16],
+            credential: None, deterministic: None, settlement_peg: Some(10), settlement_domain: None, settlement_wallet: None,
+        };
+        let long = "m".repeat(openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN + 1);
+        let refused = provider.payment_gate(&req(long), "c").err().expect("refused");
+        assert!(matches!(&parse_response(&refused).unwrap()[0], ServeChunk::Error(e) if e.contains("longer than")));
+        assert!(provider.payment_gate(&req("qwen2.5:7b".into()), "c").is_ok());
     }
 
     /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.

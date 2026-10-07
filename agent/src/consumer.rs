@@ -421,7 +421,11 @@ impl ProviderLogprob {
     /// or "" when reached through a relay only), if the gateway's ([`FIRST_CONTACT_PACKS_PER_HOUR`])
     /// and that network's ([`FIRST_CONTACT_PER_NETWORK_PER_HOUR`]) allowances both have one left:
     /// throwaway identities on one network can't use up the gateway's (review round 4 L4-6).
-    fn spend_first_contact_pack(&self, network: &str, now_ms: u64) -> bool {
+    /// A relay-only provider with standing here (its reputation with us at R_MIN, which only serving
+    /// us well earns) isn't held to the shared relay allowance, only to the gateway's: throwaway
+    /// relay-only identities can't keep pushing back the first checks of the providers that actually
+    /// serve us (round 8 L8-5).
+    fn spend_first_contact_pack(&self, network: &str, standing: bool, now_ms: u64) -> bool {
         let mut m = self.first_contact_packs.lock().unwrap_or_else(|e| e.into_inner());
         for q in m.values_mut() {
             while q.front().is_some_and(|at| now_ms.saturating_sub(*at) > 60 * 60 * 1000) {
@@ -431,19 +435,26 @@ impl ProviderLogprob {
         m.retain(|_, q| !q.is_empty());
         let net = if network.is_empty() { "relay" } else { network };
         let per_net = if network.is_empty() { FIRST_CONTACT_RELAYED_PER_HOUR } else { FIRST_CONTACT_PER_NETWORK_PER_HOUR };
-        if m.get("*").map_or(0, |q| q.len()) >= FIRST_CONTACT_PACKS_PER_HOUR || m.get(net).map_or(0, |q| q.len()) >= per_net {
+        let net_limited = !(network.is_empty() && standing);
+        if m.get("*").map_or(0, |q| q.len()) >= FIRST_CONTACT_PACKS_PER_HOUR
+            || (net_limited && m.get(net).map_or(0, |q| q.len()) >= per_net)
+        {
             return false;
         }
         m.entry("*".into()).or_default().push_back(now_ms);
-        m.entry(net.into()).or_default().push_back(now_ms);
+        if net_limited {
+            m.entry(net.into()).or_default().push_back(now_ms);
+        }
         true
     }
 
-    /// Give back a first-contact round taken for `network` that never started (no pack came).
-    fn refund_first_contact_pack(&self, network: &str) {
+    /// Give back a first-contact round taken for `network` (with `standing`, as it was spent) that
+    /// never started (no pack came).
+    fn refund_first_contact_pack(&self, network: &str, standing: bool) {
         let mut m = self.first_contact_packs.lock().unwrap_or_else(|e| e.into_inner());
         let net = if network.is_empty() { "relay" } else { network };
-        for k in ["*", net] {
+        let keys: &[&str] = if network.is_empty() && standing { &["*"] } else { &["*", net] };
+        for &k in keys {
             if let Some(q) = m.get_mut(k) {
                 q.pop_back();
             }
@@ -3701,7 +3712,8 @@ impl ConsumerNode {
             // A provider with no verdict yet takes one of this hour's first-contact rounds, local
             // texts included (review round 4 L4-5: a local set is shared gateway-wide too).
             let network = node.observed_networks().get(&libp2p).and_then(|n| n.first().cloned()).unwrap_or_default();
-            let budget_ok = || !first_contact || lp.spend_first_contact_pack(&network, now_unix_ms());
+            let standing = has_writer_standing(node.earned_reputation(&peer_id, &model_key, now_unix_ms()));
+            let budget_ok = || !first_contact || lp.spend_first_contact_pack(&network, standing, now_unix_ms());
             let reference = match resumed {
                 // A registry run stopped with a text pending: carry on with the same pack.
                 Some((r, pack, _)) => {
@@ -3739,13 +3751,13 @@ impl ConsumerNode {
                         // No pack came: the first-contact round wasn't spent.
                         Err(crate::registry_client::RegistryError::NoReference) => {
                             if first_contact {
-                                lp.refund_first_contact_pack(&network);
+                                lp.refund_first_contact_pack(&network, standing);
                             }
                             None
                         }
                         Err(e) => {
                             if first_contact {
-                                lp.refund_first_contact_pack(&network);
+                                lp.refund_first_contact_pack(&network, standing);
                             }
                             tracing::warn!(provider = %peer_id, model, error = ?e, "no round pack from the registry");
                             None
@@ -3842,7 +3854,7 @@ impl ConsumerNode {
             let texts_used = round.issued_count() - issued_before;
             // A first-contact round that issued nothing (busy, gone) didn't use its place (R5L-4).
             if first_contact && texts_used == 0 && first_pack.is_none() && !from_registry {
-                lp.refund_first_contact_pack(&network);
+                lp.refund_first_contact_pack(&network, standing);
             }
             // Stopped with a text still pending on a registry pack: the next run resumes that pack,
             // and can still fetch its continuation.
@@ -5759,6 +5771,25 @@ mod tests {
         assert_eq!(gone.len(), 1);
         assert_ne!(gone[0], oldest, "a kept pair isn't what makes room");
         assert!(m.len() < MAX_TRACKED_PAIRS);
+    }
+
+    /// Round 8 L8-5/L8-6: providers with standing aren't held to the shared relay allowance; a
+    /// reference switch keeps the round's declined texts.
+    #[test]
+    fn relay_allowance_and_skips_hold() {
+        let lp = empty_logprob();
+        let t = 1_000_000;
+        for _ in 0..FIRST_CONTACT_RELAYED_PER_HOUR {
+            assert!(lp.spend_first_contact_pack("", false, t));
+        }
+        assert!(!lp.spend_first_contact_pack("", false, t), "the relay allowance is spent");
+        assert!(lp.spend_first_contact_pack("", true, t), "one with standing still gets its check");
+        lp.refund_first_contact_pack("", true);
+        let mut round = ChallengeRound::default();
+        round.carry_skipped(1);
+        let mut st = LogprobStatus::default();
+        assert!(st.switch_reference([7; 16], &mut round));
+        assert_eq!(round.skipped(), 1, "switching what it declares doesn't restore the allowance");
     }
 
     /// Round 8 L8-1: runs cut short by timeouts or dropped connections never count against a

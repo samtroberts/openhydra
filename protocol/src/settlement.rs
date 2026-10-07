@@ -29,7 +29,7 @@
 //! per pair to submit. Pure: no I/O, no chain SDK. Nothing here moves value — the programs
 //! (`onchain/`) and their legal gates (non-custodial opinion, audit, geofencing) do.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use k256::ecdsa::{
     RecoveryId, Signature as EcdsaSignature, SigningKey as EcdsaSigningKey, VerifyingKey as EcdsaVerifyingKey,
 };
@@ -49,6 +49,11 @@ pub const PAYOUT_BINDING_DOMAIN: &[u8] = b"openhydra/solana-payout/v2";
 
 /// Domain separator for a Solana [`SettlementClaim`] preimage (v2: claim format v6).
 pub const SETTLEMENT_CLAIM_DOMAIN: &[u8] = b"openhydra/solana-settle/v2";
+
+/// The longest model handle a paid serve's claim may name: a Solana settle transaction carries it
+/// twice (the claim and the Ed25519 instruction's message) within the transaction size limit, so a
+/// longer one could never settle (round 8 O8-4).
+pub const MAX_CLAIM_MODEL_ID_LEN: usize = 128;
 
 /// How long a claim a consumer signs stays settleable. A newer claim (higher cumulative) supersedes
 /// it, so this only matters once a consumer stops using a provider: the provider then has this long to
@@ -576,6 +581,7 @@ mod tests {
     #[test]
     fn a_solana_claim_signature_the_chain_refuses_is_refused() {
         use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar, traits::Identity};
+        use ed25519_dalek::Verifier;
         use sha2::{Digest, Sha512};
         let (consumer, _) = keys();
         let claim = a_claim();
