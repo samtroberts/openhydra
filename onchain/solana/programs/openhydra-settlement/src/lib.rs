@@ -52,6 +52,12 @@ pub const MAX_PAUSE_EXTENSION_SECS: i64 = 30 * 24 * 60 * 60;
 /// withdraw closes it: an exit requested once can't be kept armed and used, months later, in one
 /// transaction ahead of the provider's settle.
 pub const EXIT_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
+/// A claim's lifetime as the agent signs it (`settlement::CLAIM_LIFETIME_SECS`): pause time since
+/// `expires_at - CLAIM_LIFETIME_SECS` counts toward its grace ([`claim_grace`]).
+pub const CLAIM_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+/// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within about
+/// the last 60 days can matter.
+pub const PAUSE_LOG: usize = 16;
 /// How far ahead of the cluster clock a payout binding's timestamp may be: a binding stamped far in
 /// the future (say `u64::MAX`, by whoever got the identity key) would be impossible to rotate away from.
 pub const BINDING_CLOCK_SKEW_SECS: i64 = 5 * 60;
@@ -208,7 +214,8 @@ pub mod openhydra_settlement {
         config.refund_delay_secs = refund_delay_secs;
         config.paused = false;
         config.paused_at = 0;
-        config.last_pause_end = 0;
+        config.pause_log = [[0; 2]; PAUSE_LOG];
+        config.pause_count = 0;
         config.paused_total = 0;
         config.cluster = cluster;
         config.accrued_fees = 0;
@@ -287,7 +294,7 @@ pub mod openhydra_settlement {
         let now = Clock::get()?.unix_timestamp;
         require!(now >= 0, SettlementError::ClaimExpired);
         let late = (now as u64).saturating_sub(claim.expires_at);
-        require!(late <= claim_grace(&ctx.accounts.config, claim.expires_at), SettlementError::ClaimExpired);
+        require!(late <= claim_grace(&ctx.accounts.config, claim.expires_at, now), SettlementError::ClaimExpired);
 
         // 2. The provider is paid at its currently-bound address, whatever it is: the claim names no
         //    payout, so nobody (the consumer included) can point it elsewhere.
@@ -392,24 +399,45 @@ pub mod openhydra_settlement {
         let now = Clock::get()?.unix_timestamp;
         if !config.paused && paused {
             config.paused_at = now;
+            let slot = (config.pause_count as usize) % PAUSE_LOG;
+            config.pause_log[slot] = [now, 0];
+            config.pause_count = config.pause_count.saturating_add(1);
         } else if config.paused && !paused {
             config.paused_total = config.paused_total.saturating_add(now.saturating_sub(config.paused_at).max(0));
-            config.last_pause_end = now;
+            let last = (config.pause_count.saturating_sub(1) as usize) % PAUSE_LOG;
+            config.pause_log[last][1] = now;
         }
         config.paused = paused;
         Ok(())
     }
 }
 
-/// How long past its expiry a claim still settles. A pause stops settles, so a claim that was still
-/// live when the last pause began gets back the time that pause took, at most
-/// `MAX_PAUSE_EXTENSION_SECS` (the same cap as an exit's, so a claim still outlives the exit window it
-/// was accepted for). Only the last pause counts: a provider settles its claims once one ends.
-pub fn claim_grace(config: &Config, expires_at: u64) -> u64 {
-    if config.paused_at <= 0 || config.paused || expires_at < config.paused_at as u64 {
-        return 0;
+/// How long past its expiry a claim still settles: the time paused since it was signed (taken as
+/// `expires_at - CLAIM_LIFETIME_SECS`), at most `MAX_PAUSE_EXTENSION_SECS`, the same cap as an
+/// exit's. A pause stops settles, so a claim lives `CLAIM_LIFETIME_SECS` of unpaused time: every
+/// pause in its life counts, and a pause after it ran out can't revive it.
+pub fn claim_grace(config: &Config, expires_at: u64, now: i64) -> u64 {
+    let from = (expires_at as i128 - CLAIM_LIFETIME_SECS as i128).clamp(0, i64::MAX as i128) as i64;
+    paused_between(config, from, now).clamp(0, MAX_PAUSE_EXTENSION_SECS) as u64
+}
+
+/// Seconds paused between `from` and `to`, from the most recent [`PAUSE_LOG`] pauses (a pause still
+/// going counts up to `to`).
+fn paused_between(config: &Config, from: i64, to: i64) -> i64 {
+    let n = (config.pause_count as usize).min(PAUSE_LOG);
+    let mut total: i64 = 0;
+    for i in 0..n {
+        let [start, end] = config.pause_log[((config.pause_count as usize) - 1 - i) % PAUSE_LOG];
+        let end = if end == 0 { to } else { end };
+        if end <= from {
+            break; // older pauses end earlier still
+        }
+        let (lo, hi) = (start.max(from), end.min(to));
+        if hi > lo {
+            total = total.saturating_add(hi - lo);
+        }
     }
-    config.last_pause_end.saturating_sub(config.paused_at).clamp(0, MAX_PAUSE_EXTENSION_SECS) as u64
+    total
 }
 
 /// How long the program has been paused in total, up to `now` (the current pause included).
@@ -442,8 +470,6 @@ pub struct Config {
     pub paused: bool,
     /// When the current pause began, or the last one (0 = never paused).
     pub paused_at: i64,
-    /// When the last pause ended (meaningful once a pause has ended).
-    pub last_pause_end: i64,
     /// Seconds paused in total, over pauses that have ended: with `paused_at`, how much a pause delays
     /// an exit.
     pub paused_total: i64,
@@ -452,6 +478,10 @@ pub struct Config {
     pub cluster: [u8; 32],
     /// Protocol fees settled and not yet withdrawn by the fee authority.
     pub accrued_fees: u64,
+    /// The most recent pauses, oldest overwritten first: `[start, end]`, `end` 0 while it lasts.
+    pub pause_log: [[i64; 2]; PAUSE_LOG],
+    /// How many pauses there have been in all.
+    pub pause_count: u64,
 }
 
 /// A consumer's escrow for one provider.

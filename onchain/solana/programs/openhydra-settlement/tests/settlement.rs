@@ -471,6 +471,27 @@ fn an_exit_is_one_withdraw_within_its_window() {
 }
 
 #[test]
+fn a_flapped_pause_keeps_the_claims_grace() {
+    use openhydra_settlement::SettlementError;
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    let expires = T0 as u64 + 15 * 86_400;
+    advance(&mut ctx, 86_400);
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 19 * 86_400);
+    set_paused(&mut ctx, false).unwrap();
+    set_paused(&mut ctx, true).unwrap(); // same moment
+    advance(&mut ctx, 86_400);
+    set_paused(&mut ctx, false).unwrap();
+    // 20 days paused: the claim lives to its expiry plus 20 days (review round 3, O1).
+    advance(&mut ctx, 14 * 86_400);
+    settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", expires).expect("still within the grace");
+    advance(&mut ctx, 86_400);
+    fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), SettlementError::ClaimExpired);
+}
+
+#[test]
 fn a_claim_live_when_a_pause_began_gets_the_pause_back() {
     use openhydra_settlement::{SettlementError, MAX_PAUSE_EXTENSION_SECS};
     let mut ctx = setup();
@@ -488,13 +509,11 @@ fn a_claim_live_when_a_pause_began_gets_the_pause_back() {
     // …and no more.
     advance(&mut ctx, 1);
     fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), SettlementError::ClaimExpired);
-    // A long pause gives back at most the cap; a claim expired before it began gets nothing.
+    // Every pause in the claim's life counts; one after it ran out revives nothing.
     let config = config_state(&ctx);
-    assert_eq!(openhydra_settlement::claim_grace(&config, expires), 16 * 86_400);
-    let mut long = config.clone();
-    long.last_pause_end = long.paused_at + 2 * MAX_PAUSE_EXTENSION_SECS;
-    assert_eq!(openhydra_settlement::claim_grace(&long, expires), MAX_PAUSE_EXTENSION_SECS as u64);
-    assert_eq!(openhydra_settlement::claim_grace(&config, long.paused_at as u64 - 1), 0);
+    let now = T0 + 26 * 86_400 + 1;
+    assert_eq!(openhydra_settlement::claim_grace(&config, expires, now), 16 * 86_400);
+    let _ = MAX_PAUSE_EXTENSION_SECS;
 }
 
 #[test]

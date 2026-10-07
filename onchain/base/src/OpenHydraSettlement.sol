@@ -65,6 +65,12 @@ contract OpenHydraSettlement is ReentrancyGuard {
     /// withdraw closes it: an exit requested once can't be kept armed and used, months later, in one
     /// transaction ahead of the provider's settle.
     uint64 public constant EXIT_WINDOW = 3 days;
+    /// A claim's lifetime as the agent signs it (`settlement::CLAIM_LIFETIME_SECS`): pause time since
+    /// `expiresAt - CLAIM_LIFETIME` counts toward its grace (`claimGrace`).
+    uint64 public constant CLAIM_LIFETIME = 30 days;
+    /// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within
+    /// about the last 60 days can matter.
+    uint256 public constant PAUSE_LOG = 32;
 
     // ── Config (set once at init; the fee can never be changed to divert funds) ──
     IERC20 public immutable usdc;
@@ -79,8 +85,10 @@ contract OpenHydraSettlement is ReentrancyGuard {
     bool public paused;
     /// When the current pause began, or the last one (0 = never paused).
     uint64 public pausedAt;
-    /// When the last pause ended (meaningful once a pause has ended).
-    uint64 public lastPauseEnd;
+    /// The most recent pauses, oldest overwritten first: `pauseLog[i] = (start, end)`, `end` 0 while
+    /// it lasts. `pauseCount` is how many there have been in all.
+    uint64[2][32] public pauseLog;
+    uint256 public pauseCount;
     /// Seconds paused in total over pauses that have ended: with `pausedAt`, how much a pause delays an
     /// exit.
     uint64 public pausedTotal;
@@ -334,22 +342,39 @@ contract OpenHydraSettlement is ReentrancyGuard {
         if (msg.sender != admin) revert NotAdmin();
         if (!paused && _paused) {
             pausedAt = uint64(block.timestamp);
+            pauseLog[pauseCount % PAUSE_LOG] = [uint64(block.timestamp), 0];
+            pauseCount += 1;
         } else if (paused && !_paused) {
             pausedTotal += uint64(block.timestamp) - pausedAt;
-            lastPauseEnd = uint64(block.timestamp);
+            pauseLog[(pauseCount - 1) % PAUSE_LOG][1] = uint64(block.timestamp);
         }
         paused = _paused;
         emit Paused(_paused);
     }
 
-    /// How long past its expiry a claim still settles. A pause stops settles, so a claim that was
-    /// still live when the last pause began gets back the time that pause took, at most
-    /// `MAX_PAUSE_EXTENSION` (the same cap as an exit's, so a claim still outlives the exit window it
-    /// was accepted for). Only the last pause counts: a provider settles its claims once one ends.
+    /// How long past its expiry a claim still settles: the time paused since it was signed (taken as
+    /// `expiresAt - CLAIM_LIFETIME`), at most `MAX_PAUSE_EXTENSION`, the same cap as an exit's. A pause
+    /// stops settles, so a claim lives `CLAIM_LIFETIME` of unpaused time: every pause in its life
+    /// counts, and a pause after it ran out can't revive it (it must be within the grace to count,
+    /// and that grace only grows with pause time).
     function claimGrace(uint256 expiresAt) public view returns (uint256) {
-        if (pausedAt == 0 || paused || expiresAt < pausedAt) return 0;
-        uint256 took = uint256(lastPauseEnd) - pausedAt;
+        uint256 from = expiresAt > CLAIM_LIFETIME ? expiresAt - CLAIM_LIFETIME : 0;
+        uint256 took = _pausedBetween(from, block.timestamp);
         return took > MAX_PAUSE_EXTENSION ? MAX_PAUSE_EXTENSION : took;
+    }
+
+    /// Seconds paused between `from` and `to`, from the most recent `PAUSE_LOG` pauses (a pause still
+    /// going counts up to `to`).
+    function _pausedBetween(uint256 from, uint256 to) internal view returns (uint256 total) {
+        uint256 n = pauseCount < PAUSE_LOG ? pauseCount : PAUSE_LOG;
+        for (uint256 i = 0; i < n; i++) {
+            uint64[2] memory p = pauseLog[(pauseCount - 1 - i) % PAUSE_LOG];
+            uint256 end = p[1] == 0 ? to : p[1];
+            if (end <= from) break; // older pauses end earlier still
+            uint256 lo = p[0] > from ? p[0] : from;
+            uint256 hi = end < to ? end : to;
+            if (hi > lo) total += hi - lo;
+        }
     }
 
     /// Seconds paused in total up to now, the current pause included.

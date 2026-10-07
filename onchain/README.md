@@ -54,9 +54,10 @@ pays its own address and holds what it is owed before relying on its claims). Ea
 contract, version `"2"`); Solana by the program id and a **cluster tag** (the cluster's genesis hash)
 kept in the program's config, which only the program's **upgrade authority** can initialize. The Solana
 payout binding carries the same domain. Refund delays are between 1 and 14 days on both chains, and pausing
-extends an exit by at most 30 days (no indefinite lock by pausing). A claim that was still live when the
-last pause began settles for as long again as that pause took, also at most 30 days, so a pause doesn't
-void the claims that expire during it (only the last pause counts: a provider settles once one ends). A settle past the escrow pays what it
+extends an exit by at most 30 days (no indefinite lock by pausing). A claim lives 30 days of *unpaused*
+time: every pause since it was signed extends it, up to 30 days in all, so a pause (or several) doesn't
+void the claims that expire during it, and a pause after a claim ran out doesn't revive it. The
+contracts remember the most recent pauses for this (32 on Base, 16 on Solana). A settle past the escrow pays what it
 holds and the rest after a top-up. On Base the paid-so-far is keyed by the consumer's Ed25519 id as well
 as its wallet. Solana payout bindings can't be stamped more than 5 minutes ahead. **Fees are pulled:** settles accrue the 4% and the fee recipient / authority
 withdraws it to any address, so a blacklisted or frozen fee account can't stop settlement.

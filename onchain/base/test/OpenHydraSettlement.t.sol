@@ -485,9 +485,81 @@ contract OpenHydraSettlementTest is Test {
         vm.prank(admin);
         settlement.setPaused(false);
         assertEq(settlement.claimGrace(claim.expiresAt), 30 days);
-        // A claim that had expired before the pause began gets nothing back.
-        assertEq(settlement.claimGrace(claim.expiresAt - 2 days), 0);
+        // A claim that had run out before the pause began isn't revived by it.
+        OpenHydraSettlement.SettlementClaim memory old = _claim(150_000);
+        old.expiresAt = 9 days;
+        bytes memory oldSig = _sign(consumerPk, old);
+        vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
+        settlement.settle(old, oldSig);
         vm.warp(claim.expiresAt + 30 days + 1);
+        vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
+        settlement.settle(claim, sig);
+    }
+
+    /// Review round 3, O1: the admin unpausing and re-pausing in the same block must not cost a claim
+    /// the grace the first pause gave it, while the exit keeps its whole extension.
+    function test_a_flapped_pause_keeps_the_claims_grace() public {
+        vm.warp(100 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 15 days;
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        uint256 r = block.timestamp;
+        vm.warp(r + 1 days);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(r + 20 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        vm.prank(admin);
+        settlement.setPaused(true); // same block
+        vm.warp(r + 21 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        // 20 days paused: the claim lives to r + 35 days, past the exit's opening at r + 1 + 20 days.
+        assertEq(settlement.claimGrace(claim.expiresAt), 20 days);
+        settlement.settle(claim, sig);
+        assertEq(_balance(PROVIDER_ID), 400_000);
+    }
+
+    /// Review round 3, O1: a short second pause after a long one doesn't wipe the first's grace.
+    function test_a_second_pause_adds_to_the_first() public {
+        vm.warp(100 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 15 days;
+        bytes memory sig = _sign(consumerPk, claim);
+        uint256 r = block.timestamp;
+        vm.warp(r + 1 days);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(r + 14 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        vm.warp(r + 15 days + 1);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        assertEq(settlement.claimGrace(claim.expiresAt), 13 days);
+        vm.warp(claim.expiresAt + 13 days);
+        settlement.settle(claim, sig);
+    }
+
+    /// Review round 3, O2: a claim signed after a pause ended gets no grace from it.
+    function test_a_claim_signed_after_a_pause_gets_no_grace_from_it() public {
+        vm.warp(100 days);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(130 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        vm.warp(200 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 1 days;
+        assertEq(settlement.claimGrace(claim.expiresAt), 0);
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.warp(claim.expiresAt + 1);
         vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
         settlement.settle(claim, sig);
     }
@@ -543,9 +615,9 @@ contract OpenHydraSettlementTest is Test {
         vm.prank(consumer);
         vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
         settlement.withdraw(PROVIDER_ID, 1);
-        // The claim, live when the last pause began, settles for two days past its expiry.
-        assertEq(settlement.claimGrace(claim.expiresAt), 2 days);
-        vm.warp(claim.expiresAt + 2 days);
+        // The claim gets back every pause in its life: four days past its expiry.
+        assertEq(settlement.claimGrace(claim.expiresAt), 4 days);
+        vm.warp(claim.expiresAt + 4 days);
         settlement.settle(claim, sig);
     }
 
