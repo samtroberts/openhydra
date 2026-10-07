@@ -828,6 +828,23 @@ mod tests {
         assert_eq!(all.billable(Some(1000)), summary.tokens);
     }
 
+    /// Tool-call template overhead measured per model family (review B4): the tokens of the
+    /// assistant's tool-call turn, as the family's own chat template renders it (end-of-turn
+    /// included), beyond the tokens of the call's name and arguments. Measured with each family's
+    /// tokenizer and template (transformers `apply_chat_template`) on three calls; the worst is kept.
+    /// Families not yet measured: Mistral, Gemma 3, DeepSeek, gpt-oss.
+    const MEASURED_TOOL_CALL_OVERHEAD: &[(&str, u64)] = &[
+        ("Qwen3 0.6B/4B (empty think block included)", 17),
+        ("Llama 3.2 1B", 9),
+    ];
+
+    #[test]
+    fn the_tool_call_allowance_covers_every_measured_template() {
+        for (family, overhead) in MEASURED_TOOL_CALL_OVERHEAD {
+            assert!(TOOL_CALL_TOKEN_ALLOWANCE >= overhead + 4, "{family}: overhead {overhead}");
+        }
+    }
+
     #[test]
     fn a_partial_stream_is_counted_by_fragment_within_the_text_and_request_bounds() {
         let mut t = StreamTally::default();
