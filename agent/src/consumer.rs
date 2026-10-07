@@ -190,6 +190,30 @@ fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64)
     summary.metrics.billing == crate::serve::BILLING_VERSION && summary.tokens > billable
 }
 
+/// The network an address sits on, for telling providers' operators apart: its IPv4 /24 or IPv6 /48.
+fn network_of(ip: &str) -> Option<String> {
+    match ip.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            Some(format!("{}.{}.{}.0/24", o[0], o[1], o[2]))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            Some(format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2]))
+        }
+    }
+}
+
+/// Whether a provider on `nets` (its observed networks; empty = unknown, reached only through a
+/// relay) may join an audit beside those already in it (`chosen`): no network in common with any of
+/// them, and at most one of unknown network, since two of those could be one operator.
+fn independent_of(chosen: &[Vec<String>], nets: &[String]) -> bool {
+    if nets.is_empty() {
+        return chosen.iter().all(|c| !c.is_empty());
+    }
+    chosen.iter().all(|c| !c.iter().any(|n| nets.contains(n)))
+}
+
 /// What a consumer makes of the co-signed receipt a provider sends back when the consumer's
 /// cumulative is behind its high-water.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,9 +423,9 @@ pub fn select_provider(
 /// ranked list so the caller can fail over to the next provider when one is dead or
 /// unreachable (discovery can surface stale-but-still-advertised providers).
 ///
-/// Uses each provider's *self-reported* DHT reputation (always neutral post-v2, since the
-/// signed record excludes `reputation_score`). For **earned** reputation from the
-/// consumer's local [`ReputationTracker`], use [`rank_providers_with_reputation`].
+/// Every provider at neutral reputation (a record's own `reputation_score` isn't signed, so it is
+/// never read). For **earned** reputation from the consumer's local [`ReputationTracker`], use
+/// [`rank_providers_with_reputation`].
 pub fn rank_providers(
     peers: &[DiscoveredPeer],
     request_canonical: &str,
@@ -507,11 +531,12 @@ pub fn rank_providers_with_assurance(
             peer_id: provider_state_id(&p.peer_id, &p.public_key),
             latency_ms: 1.0, // RTT survey deferred (matches the M1.3 router default)
             load_pct: p.load_pct,
-            // Earned reputation (local tracker, per (peer, model)) wins; else the self-reported
-            // DHT value; else neutral. A provider that failed *us* on this model ranks below an
-            // untried one.
+            // Earned reputation (local tracker, per (peer, model)) wins; else neutral. Never the
+            // record's own `reputation_score`: it isn't signed, so any provider could claim the top
+            // and take the audit slots (review T2). A provider that failed *us* on this model ranks
+            // below an untried one.
             reputation: earned_reputation(&provider_state_id(&p.peer_id, &p.public_key), rep_model_key(&p.canonical_model_id, &p.model_id))
-                .unwrap_or(if p.reputation_score > 0.0 { p.reputation_score } else { 50.0 }),
+                .unwrap_or(50.0),
             bandwidth_mbps: 0.0,
             s2s_rtt_ms: 0.0,
             throughput_tok_s: p.throughput_tok_s,
@@ -1573,6 +1598,25 @@ impl ConsumerNode {
             .unwrap_or(0)
     }
 
+
+    /// The networks ([`network_of`]) each connected peer sits on, by libp2p id, from the addresses of
+    /// our direct connections to it (relayed-only peers have none).
+    fn observed_networks(&self) -> HashMap<String, Vec<String>> {
+        self.net
+            .status()
+            .map(|st| {
+                st.peers
+                    .into_iter()
+                    .map(|p| {
+                        let mut nets: Vec<String> = p.direct_ips.iter().filter_map(|ip| network_of(ip)).collect();
+                        nets.sort();
+                        nets.dedup();
+                        (p.peer_id, nets)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     /// Remember that `provider` refused us `model` over payment (see `payment_refusals`).
     fn note_payment_refusal(&self, provider: &str, model: &str, now: u64) {
@@ -2773,17 +2817,35 @@ impl ConsumerNode {
             )));
         }
 
-        // Dispatch to the top two, then escalate to a third only if they can't decide. A provider
-        // that charges and refuses us over payment isn't a non-responder (a price, not a fault): it
-        // is skipped for the next one, and so is one that just refused us.
-        let mut pool = candidates.iter().filter(|c| !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now));
+        // Dispatch to two providers, then escalate to a third only if they can't decide. They are
+        // picked at random, not by rank, and must be independent (review T2): no two on the same
+        // network as we observe it, and at most one we only reach through a relay — otherwise two
+        // identities of one operator could take both slots and confirm each other. A provider that
+        // charges and refuses us over payment isn't a non-responder (a price, not a fault): it is
+        // skipped for the next one, and so is one that just refused us.
+        let networks = self.observed_networks();
+        let mut order: Vec<&SelectedProvider> =
+            candidates.iter().filter(|c| !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now)).collect();
+        {
+            use rand::seq::SliceRandom;
+            order.shuffle(&mut rand::thread_rng());
+        }
+        let mut pool = order.into_iter();
+        let mut chosen: Vec<Vec<String>> = Vec::new();
+        let mut chosen_peers = std::collections::HashSet::new();
         let mut ask = |results: &mut Vec<(String, Result<String, String>)>| {
             for provider in pool.by_ref() {
+                let nets = networks.get(&provider.libp2p_peer_id).cloned().unwrap_or_default();
+                if !independent_of(&chosen, &nets) || chosen_peers.contains(&provider.libp2p_peer_id) {
+                    continue;
+                }
                 match self.dispatch_full(provider, challenge) {
                     Err(e) if crate::serve::is_payment_refusal(&e) => {
                         self.note_payment_refusal(&provider.libp2p_peer_id, &provider.model_id, now);
                     }
                     out => {
+                        chosen.push(nets);
+                        chosen_peers.insert(provider.libp2p_peer_id.clone());
                         results.push((provider.state_id.clone(), out.map_err(|e| e.to_string())));
                         return;
                     }
@@ -2973,6 +3035,23 @@ mod tests {
         assert_eq!(judge(&signed_at(&consumer, 1, "m", 9_999, 2), 0), BehindReceipt::NotOurs);
         // Ours, but not shown to be signed for the deployment we settle on (review S1).
         assert_eq!(judge_where(&receipt(&consumer, 1, "m", 9_999), 0, false), BehindReceipt::NotThisDeployment);
+    }
+
+    #[test]
+    fn audit_partners_come_from_different_networks() {
+        assert_eq!(network_of("203.0.113.7").as_deref(), Some("203.0.113.0/24"));
+        assert_eq!(network_of("2001:db8:abcd:12::1").as_deref(), Some("2001:db8:abcd::/48"));
+        assert_eq!(network_of("[2001:db8:abcd:12::1]").as_deref(), Some("2001:db8:abcd::/48"));
+        assert_eq!(network_of("not an ip"), None);
+        let a = vec!["203.0.113.0/24".to_string()];
+        let b = vec!["198.51.100.0/24".to_string()];
+        assert!(independent_of(&[], &a));
+        assert!(independent_of(&[a.clone()], &b));
+        assert!(!independent_of(&[a.clone()], &a), "same network");
+        // One provider we only reach through a relay may join; a second may not.
+        assert!(independent_of(&[a.clone()], &[]));
+        assert!(!independent_of(&[a.clone(), vec![]], &[]));
+        assert!(independent_of(&[vec![]], &b));
     }
 
     #[test]

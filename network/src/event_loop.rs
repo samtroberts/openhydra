@@ -93,6 +93,9 @@ struct PeerConnectionInfo {
     /// Tracking the v4 ids lets a *stabilized* v6 direct retire them (see
     /// `v4_close_deadline`) so traffic settles on v6.
     quic_v4_conn_ids: Vec<libp2p::swarm::ConnectionId>,
+    /// The remote IP of each *direct* connection to this peer, as we observed it (not what the peer
+    /// advertises): which network it really sits on, for choosing independent audit partners.
+    direct_ips: HashMap<libp2p::swarm::ConnectionId, String>,
 }
 
 impl PeerConnectionInfo {
@@ -1047,6 +1050,12 @@ pub async fn run_event_loop(
                                     quic_direct_v6: info.quic_direct_v6,
                                     tcp_direct: info.tcp_direct,
                                     tcp_relay: info.tcp_relay,
+                                    direct_ips: {
+                                        let mut ips: Vec<String> = info.direct_ips.values().cloned().collect();
+                                        ips.sort();
+                                        ips.dedup();
+                                        ips
+                                    },
                                     failure_streak: state
                                         .proxy_failure_streak
                                         .get(pid)
@@ -2832,6 +2841,11 @@ fn handle_swarm_event(
             }
 
             let info = state.peer_connections.entry(peer_id).or_default();
+            if transport != TransportType::TcpRelay {
+                if let Some(ip) = &endpoint_ip {
+                    info.direct_ips.insert(connection_id, ip.clone());
+                }
+            }
 
             // Fix 2: AF-aware QUIC dedup — if we already have a QUIC-direct
             // connection on the *same* address family, close the new one to
@@ -2950,6 +2964,7 @@ fn handle_swarm_event(
             };
 
             if let Some(info) = state.peer_connections.get_mut(&peer_id) {
+                info.direct_ips.remove(&connection_id);
                 match transport {
                     TransportType::QuicDirect => {
                         let is_ipv6 = endpoint_ip.as_ref().map_or(false, |ip| ip.contains(':'));

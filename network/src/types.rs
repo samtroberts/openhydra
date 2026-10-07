@@ -361,6 +361,9 @@ impl Default for PeerRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub peer_id: String,
+    /// Remote IPs of our direct connections to it, as observed (empty when only relayed).
+    #[serde(default)]
+    pub direct_ips: Vec<String>,
     pub quic_direct_v4: u32,
     pub quic_direct_v6: u32,
     pub tcp_direct: u32,
