@@ -32,6 +32,11 @@ if [[ -n "${LLAMACPP_SRC:-}" ]]; then
     || { echo "scorer/build.sh: LLAMACPP_SRC is at $HEAD_COMMIT, not the pinned $COMMIT" >&2; exit 1; }
   git -C "$LLAMACPP_SRC" diff --quiet HEAD -- \
     || { echo "scorer/build.sh: LLAMACPP_SRC has local changes; use a pristine checkout" >&2; exit 1; }
+  # Nor untracked or ignored files (they'd be copied in), top-level build directories aside, which
+  # aren't copied (review round 4, R4-8).
+  EXTRA="$(git -C "$LLAMACPP_SRC" status --porcelain --untracked-files=all --ignored | grep -Ev '^(\?\?|!!) build[^/]*/' || true)"
+  [[ -z "$EXTRA" ]] \
+    || { echo "scorer/build.sh: LLAMACPP_SRC has files outside the pinned commit; use a pristine checkout:" >&2; echo "$EXTRA" | head -5 >&2; exit 1; }
   rm -rf "$SRC"
   mkdir -p "$SRC"
   # Everything but top-level build directories (a tar --exclude 'build*' would also drop

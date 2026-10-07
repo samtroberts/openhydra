@@ -31,6 +31,10 @@ on:
         default: false
         required: false
 
+# Least privilege: the token only reads the repository (review round 4, R4-5).
+permissions:
+  contents: read
+
 jobs:
   prune:
     runs-on: ubuntu-22.04

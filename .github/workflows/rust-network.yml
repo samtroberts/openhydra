@@ -9,6 +9,10 @@ on:
     paths:
       - 'network/**'
 
+# Least privilege: the token only reads the repository (review round 4, R4-5).
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Rust Tests
@@ -17,13 +21,15 @@ jobs:
       run:
         working-directory: network
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: network
       - run: cargo test
@@ -36,13 +42,15 @@ jobs:
       run:
         working-directory: network
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: network
       - name: Build bootstrap binary
@@ -55,7 +63,7 @@ jobs:
         run: |
           cargo build --release --bin openhydra-bootstrap
           ls -lh target/release/openhydra-bootstrap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: openhydra-bootstrap-linux-x86_64
           # upload-artifact paths are repo-root-relative (working-directory doesn't apply).

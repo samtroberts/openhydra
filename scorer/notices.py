@@ -324,9 +324,14 @@ def no_licence_file_notice(name, licence, pdir):
     if os.path.isfile(override):
         return read(override)
     note = "The crate ships no licence file; it declares the licence above."
-    for pattern, spdx, text in LICENCE_TEMPLATES:
-        if re.search(pattern, licence):
-            return f"{note}\n\n--- {spdx} ---\nCopyright (c) {authors(pdir) or 'the ' + name + ' authors'}\n\n{text()}"
+    matched = [(spdx, text) for pattern, spdx, text in LICENCE_TEMPLATES if re.search(pattern, licence)]
+    # A choice (OR) needs one licence's text; terms that all apply (AND) need each of them
+    # (review round 4, R4-9).
+    if matched and not re.search(r"\bAND\b", licence, re.I):
+        matched = matched[:1]
+    if matched:
+        holder = authors(pdir) or "the " + name + " authors"
+        return note + "".join(f"\n\n--- {spdx} ---\nCopyright (c) {holder}\n\n{text()}" for spdx, text in matched)
     if licence and NO_NOTICE.search(licence):
         return note
     die(f"{name} ships no licence file and declares {licence or 'no licence'}: add its text as licenses/crates/{name}.txt")
@@ -375,20 +380,29 @@ def authors(pdir):
     return ", ".join(a.split("<")[0].strip() for a in re.findall(r'"([^"]+)"', m.group(1))) if m else ""
 
 
+# Files named like licences that are code, not licence text (`src/copying.rs` in objc2-foundation,
+# say): never taken for a package's licence (review round 4, R4-1).
+CODE_EXT = SOURCE_EXT + (".rs", ".toml", ".py", ".js", ".ts", ".json", ".go", ".java", ".swift", ".sh", ".yml", ".yaml")
+
+
+def is_licence_file(name):
+    return bool(LICENSE_FILE.match(name)) and not name.lower().endswith(CODE_EXT)
+
+
 def licence_files(pdir, walk_up_to):
     """Licence files at the top of a package, or (a workspace member without its own) at the
     nearest ancestor up to `walk_up_to` (the workspace or checkout root); plus any deeper in the
     package, for code it bundles under another licence (a vendored C library, say)."""
     d = pdir
     while True:
-        found = sorted(os.path.join(d, f) for f in os.listdir(d) if LICENSE_FILE.match(f) and os.path.isfile(os.path.join(d, f)))
+        found = sorted(os.path.join(d, f) for f in os.listdir(d) if is_licence_file(f) and os.path.isfile(os.path.join(d, f)))
         if found or not walk_up_to or os.path.realpath(d) == os.path.realpath(walk_up_to) or d == os.path.dirname(d):
             break
         d = os.path.dirname(d)
     for sub, dirs, files in os.walk(pdir):
         dirs[:] = sorted(x for x in dirs if x not in NOT_SHIPPED_DIRS)
         if sub != pdir:
-            found += sorted(os.path.join(sub, f) for f in files if LICENSE_FILE.match(f))
+            found += sorted(os.path.join(sub, f) for f in files if is_licence_file(f))
     return found
 
 

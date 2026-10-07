@@ -8,6 +8,10 @@ name: R2 CORS
 on:
   workflow_dispatch:
 
+# Least privilege: the token only reads the repository (review round 4, R4-5).
+permissions:
+  contents: read
+
 jobs:
   set-cors:
     name: Apply CORS policy to the download bucket

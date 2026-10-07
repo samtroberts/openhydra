@@ -156,6 +156,28 @@ impl Identity {
         })
     }
 
+    /// [`load`](Self::load), waiting out a key file another process is still writing: on a
+    /// filesystem without hard links it is created in place, so it can be read half-written
+    /// (review round 4, R4-10). A file that won't load and wasn't written in the last
+    /// [`KEY_WRITE_GRACE`] is an error at once.
+    fn load_settled(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let started = std::time::Instant::now();
+        loop {
+            match Self::load(path) {
+                Ok(identity) => return Ok(identity),
+                Err(e) => {
+                    let fresh = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < KEY_WRITE_GRACE));
+                    if !fresh || started.elapsed() >= KEY_WRITE_GRACE {
+                        return Err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
     /// Load from path if it exists, otherwise generate and save.
     pub fn load_or_create(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         // A symlink to nothing would look absent, then refuse every attempt to create the key
@@ -166,7 +188,7 @@ impl Identity {
         remove_stale_temp_files(path);
         let mut existed = path.exists();
         let identity = if existed {
-            Self::load(path)?
+            Self::load_settled(path)?
         } else {
             match Self::generate(path) {
                 Ok(identity) => identity,
@@ -174,7 +196,7 @@ impl Identity {
                 // first: use that one, so both agree on the identity.
                 Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {
                     existed = true;
-                    Self::load(path)?
+                    Self::load_settled(path)?
                 }
                 Err(e) => return Err(e),
             }
@@ -233,6 +255,9 @@ fn write_new_key_file(path: &Path, contents: &[u8], tag: &str) -> std::io::Resul
         r => r,
     }
 }
+
+/// How long a key file that doesn't load yet may still be being written by another process.
+const KEY_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Temporary key files ([`write_new_key_file`]) older than this are leftovers of a process that
 /// died mid-write.
@@ -314,6 +339,34 @@ mod tests {
         Identity::load_or_create(&path).unwrap();
         assert!(!stale.exists());
         assert!(fresh.exists() && other.exists());
+    }
+
+    /// Review round 4, R4-10: a key file that doesn't load yet, written just now, is waited for (it
+    /// may be another process writing it in place); an old one is an error at once.
+    #[test]
+    fn a_half_written_key_file_is_waited_for_and_a_broken_old_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id.key");
+        std::fs::write(&path, b"partial").unwrap();
+        // Another process finishing its in-place write a moment later.
+        let full = dir.path().join("full.key");
+        let expected = Identity::generate(&full).unwrap();
+        let writer = {
+            let (path, full) = (path.clone(), full.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&path, std::fs::read(&full).unwrap()).unwrap();
+                expected
+            })
+        };
+        let loaded = Identity::load_or_create(&path).expect("waited for the writer");
+        assert_eq!(loaded.libp2p_peer_id, writer.join().unwrap().libp2p_peer_id);
+        std::fs::write(&path, b"broken").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        let t = std::time::Instant::now();
+        assert!(Identity::load_or_create(&path).is_err());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "no wait for an old file");
     }
 
     #[test]

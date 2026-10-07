@@ -5,7 +5,7 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 
 --- a/tools/server/main.cpp
 +++ b/tools/server/main.cpp
-@@ -1,5 +1,151 @@
+@@ -1,5 +1,156 @@
 +#include "common.h"
 +#include "gguf.h"
 +#include "llama.h"
@@ -38,11 +38,19 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +static void quiet(ggml_log_level, const char *, void *) {}
 +
 +static int export_vocab(const char * in, const char * out) {
-+    // Writing over the model it reads would destroy it.
++    // Paths are UTF-8 (the arguments are, on Windows too), as gguf and llama.cpp open them.
++    const std::filesystem::path in_path = std::filesystem::u8path(in);
++    const std::filesystem::path out_path = std::filesystem::u8path(out);
++    // Written beside `out` and moved there only once it loads: a failed export leaves nothing behind.
++    const std::string tmp = std::string(out) + ".tmp";
++    const std::filesystem::path tmp_path = std::filesystem::u8path(tmp);
++    // Writing over the model it reads, either way, would destroy it.
 +    std::error_code ec;
-+    if (std::filesystem::exists(out, ec) && std::filesystem::equivalent(in, out, ec)) {
-+        fprintf(stderr, "export-vocab: %s is the model itself; write the vocabulary elsewhere\n", out);
-+        return 1;
++    for (const std::filesystem::path & p : { out_path, tmp_path }) {
++        if (std::filesystem::exists(p, ec) && std::filesystem::equivalent(in_path, p, ec)) {
++            fprintf(stderr, "export-vocab: %s is the model itself; write the vocabulary elsewhere\n", out);
++            return 1;
++        }
 +    }
 +    gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
 +    gguf_context * src = gguf_init_from_file(in, params);
@@ -56,13 +64,11 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +    for (const char * key : { "split.no", "split.count", "split.tensors.count" }) {
 +        gguf_remove_key(dst, key);
 +    }
-+    // Written beside `out` and moved there only once it loads: a failed export leaves nothing behind.
-+    const std::string tmp = std::string(out) + ".tmp";
 +    const bool ok = gguf_write_to_file(dst, tmp.c_str(), /*only_meta =*/ true);
 +    gguf_free(dst);
 +    gguf_free(src);
 +    if (!ok) {
-+        std::remove(tmp.c_str());
++        std::filesystem::remove(tmp_path, ec);
 +        fprintf(stderr, "export-vocab: can't write %s\n", out);
 +        return 1;
 +    }
@@ -78,15 +84,14 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +    }
 +    llama_backend_free();
 +    if (!loads) {
-+        std::remove(tmp.c_str());
++        std::filesystem::remove(tmp_path, ec);
 +        fprintf(stderr, "export-vocab: %s doesn't load as a vocabulary\n", out);
 +        return 1;
 +    }
-+#ifdef _WIN32
-+    std::remove(out); // rename won't replace a file on Windows (elsewhere it replaces it atomically)
-+#endif
-+    if (std::rename(tmp.c_str(), out) != 0) {
-+        std::remove(tmp.c_str());
++    // Replaces an existing `out` in one step, on Windows too.
++    std::filesystem::rename(tmp_path, out_path, ec);
++    if (ec) {
++        std::filesystem::remove(tmp_path, ec);
 +        fprintf(stderr, "export-vocab: can't write %s\n", out);
 +        return 1;
 +    }

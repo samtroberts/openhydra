@@ -35,9 +35,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version string to publish to R2 (no leading v)"
+        # Needed to publish (no default: a slip can't publish this build under some old number); it
+        # must be the app's own version (desktop/src-tauri/tauri.conf.json).
+        description: "Version to publish to R2 (no leading v); the app's own version"
         required: false
-        default: "0.2.0"
+        default: ""
       publish:
         # Off by default: a manual run builds and checks every platform, and publishes to R2
         # (latest/, the auto-updater manifest) only when asked to.
@@ -73,11 +75,32 @@ jobs:
             triple: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      # A release is the app's own version: a tag (or a manual publish's version) that isn't would
+      # make the updater offer an update the app then reports it doesn't have (review round 4, R4-4).
+      - name: Check the version is the app's
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ -z "$INPUT_VERSION" ]; then
+            echo "::error::a manual publish needs the version input"
+            exit 1
+          fi
+          VERSION="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          VERSION="${VERSION#v}"
+          APP="$(python3 -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')"
+          if [ "$VERSION" != "$APP" ]; then
+            echo "::error::publishing $VERSION, but the app is version $APP (desktop/src-tauri/tauri.conf.json)"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -96,7 +119,7 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         run: choco install -y protoc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             .
@@ -120,7 +143,7 @@ jobs:
       # so it is rebuilt only when scorer/ changes.
       - name: Cache openhydra-scorer
         id: scorer-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: scorer-bin
           key: openhydra-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/**') }}
@@ -148,10 +171,10 @@ jobs:
       - name: Cache openhydra-mlx-scorer (macOS)
         if: startsWith(matrix.platform, 'macos')
         id: mlx-scorer-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: mlx-scorer-bin
-          key: openhydra-mlx-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/mistralrs/**', 'scorer/notices.py') }}
+          key: openhydra-mlx-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/mistralrs/**', 'scorer/notices.py', 'scorer/licenses/**') }}
 
       - name: Build openhydra-mlx-scorer (macOS)
         if: startsWith(matrix.platform, 'macos') && steps.mlx-scorer-cache.outputs.cache-hit != 'true'
@@ -172,11 +195,13 @@ jobs:
         shell: bash
         run: desktop/stage-notices.sh "${{ matrix.triple }}"
 
-      # Dependencies first, in a step of their own: install scripts never run with the signing
-      # secrets in their environment. Exactly the lockfile (no `npm install` fallback).
+      # Dependencies first, in a step of their own, with no install scripts at all (review round 4,
+      # R4-2): one could leave code behind (through GITHUB_ENV / GITHUB_PATH, or node_modules) for
+      # the signing step to run. Exactly the lockfile (no `npm install` fallback). esbuild and the
+      # Tauri CLI take their platform binaries from optional dependencies, not from a script.
       - name: Install desktop dependencies
         working-directory: desktop
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       # 2) The desktop app + installers (signed so the auto-updater accepts them). The signing
       # secrets are on this step only. They can't be narrower: `tauri build` compiles, bundles and
@@ -261,7 +286,7 @@ jobs:
 
       # Always upload so publish-r2 can collect every platform's artifacts.
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: openhydra-${{ matrix.triple }}
           path: dist/*
@@ -275,6 +300,8 @@ jobs:
     needs: desktop
     permissions:
       contents: write # the GitHub Release
+    outputs:
+      skip_latest: ${{ steps.tree.outputs.skip_latest }}
     # A tag push publishes; a manual run only when asked (publish=true), whatever ref it starts from.
     if: always() && !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-22.04
@@ -290,7 +317,7 @@ jobs:
           INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
         run: echo "Publishing ${INPUT_VERSION:-$GITHUB_REF_NAME} (run $GITHUB_RUN_ID, $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         continue-on-error: true # no artifacts at all → the next step fails with a clear message
         with:
           path: artifacts
@@ -326,6 +353,7 @@ jobs:
           ls -la dist/
 
       - name: Build R2 tree + latest.json
+        id: tree
         shell: bash
         env:
           DIST_HOST: ${{ env.DIST_HOST }}
@@ -419,9 +447,15 @@ jobs:
           # GitHub release, but leaves latest/ alone (unless allow_older says otherwise).
           prerelease = '-' in version
           older = bool(prev.get('version')) and semver(version) < semver(prev['version'])
+          # A manual publish of an older version is a slip unless asked for (review round 4, R4-4); a
+          # tag that is older (a hotfix of an earlier line) publishes its own archive and release.
+          if older and os.environ.get('ALLOW_OLDER') != 'true' and os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch':
+              sys.exit(f"::error::{version} is older than the published {prev['version']}: set allow_older to publish it")
           skip_latest = prerelease or (older and os.environ.get('ALLOW_OLDER') != 'true')
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write(f"SKIP_LATEST={'1' if skip_latest else '0'}\nPRERELEASE={'1' if prerelease else '0'}\n")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"skip_latest={'1' if skip_latest else '0'}\n")
           if skip_latest:
               why = 'a pre-release' if prerelease else f"older than the published {prev['version']}"
               print(f"::notice::{version} is {why}: publishing v{version}/ only, latest/ unchanged")
@@ -483,6 +517,7 @@ jobs:
       - name: Publish to R2
         shell: bash
         env:
+          ALLOW_OLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_older }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
@@ -490,6 +525,13 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # An archive is immutable (cached a year): a re-run never replaces one already published
+          # with a rebuild (review round 4, R4-4), unless allow_older says to.
+          if [ "$ALLOW_OLDER" != "true" ] \
+              && [ -n "$(aws s3 ls "s3://${R2_BUCKET}/v${VERSION}/" --endpoint-url "$EP" 2>/dev/null | head -1)" ]; then
+            echo "::error::v${VERSION}/ is already published; a re-run doesn't replace it (allow_older to force)"
+            exit 1
+          fi
           # Immutable versioned archive — cache hard.
           aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
             --endpoint-url "$EP" --cache-control "public, max-age=31536000, immutable"
@@ -552,7 +594,7 @@ jobs:
       # The GitHub Release, once, after R2 has the same files (it used to be published by each
       # platform's job, so a failed platform left GitHub "latest" and R2 disagreeing).
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         # A tag PUSH is a release; a manual run (even one started from a tag) is not.
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         with:
@@ -566,9 +608,11 @@ jobs:
   # Auto-trim the R2 bucket to the newest 5 releases after a successful publish.
   # Tag runs only (not manual workflow_dispatch re-publishes, which may target an
   # arbitrary version). Reuses the standalone prune workflow with dry_run=false.
+  # Not after a publish that left latest/ alone (a pre-release, an older hotfix): it could prune the
+  # archive it just published (review round 4, R4-4).
   prune:
     needs: publish-r2
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.publish-r2.outputs.skip_latest != '1'
     uses: ./.github/workflows/prune-r2.yml
     with:
       keep: "5"
