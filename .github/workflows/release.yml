@@ -302,9 +302,16 @@ jobs:
         env:
           DIST_HOST: ${{ env.DIST_HOST }}
           ALLOW_OLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_older }}
+          # Passed through the environment, never pasted into the script: a version string can't
+          # inject shell or extra GITHUB_ENV lines.
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
         run: |
-          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
-          [ -n "$VERSION" ] || VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          VERSION="${VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::not a version: '$VERSION' (want e.g. 0.4.0 or 0.4.0-rc.1)"
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           python3 - "$VERSION" "$DIST_HOST" <<'PY'
           import sys, os, re, json, shutil
@@ -373,11 +380,23 @@ jobs:
           if os.path.exists('prev/latest.json'):
               with open('prev/latest.json') as f:
                   prev = json.load(f)
-          # Never move latest/ back to an older version (a re-run of an old tag) unless asked to.
-          def vkey(v):
-              return [int(x) if x.isdigit() else 0 for x in re.split(r'[.+-]', v)]
-          if prev.get('version') and vkey(version) < vkey(prev['version']) and os.environ.get('ALLOW_OLDER') != 'true':
-              sys.exit(f"refusing to publish {version} over the newer {prev['version']} (set allow_older to force)")
+          # Semantic-version order: a pre-release ranks below its release (0.4.0-rc.1 < 0.4.0).
+          def semver(v):
+              core, _, pre = v.lstrip('v').split('+')[0].partition('-')
+              nums = ([int(x) if x.isdigit() else 0 for x in core.split('.')] + [0, 0, 0])[:3]
+              tags = tuple((0, int(t), '') if t.isdigit() else (1, 0, t) for t in pre.split('.')) if pre else ()
+              return (nums, 0 if pre else 1, tags)
+          # latest/ (and the manifests that point at it) moves only to a newer final release: a
+          # pre-release, or a re-run of an older tag, still publishes its own v<version>/ archive and
+          # GitHub release, but leaves latest/ alone (unless allow_older says otherwise).
+          prerelease = '-' in version
+          older = bool(prev.get('version')) and semver(version) < semver(prev['version'])
+          skip_latest = prerelease or (older and os.environ.get('ALLOW_OLDER') != 'true')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f"SKIP_LATEST={'1' if skip_latest else '0'}\nPRERELEASE={'1' if prerelease else '0'}\n")
+          if skip_latest:
+              why = 'a pre-release' if prerelease else f"older than the published {prev['version']}"
+              print(f"::notice::{version} is {why}: publishing v{version}/ only, latest/ unchanged")
           manifest = {'version': version, 'base': host}
           for section in ('app', 'cli', 'cli_scorer', 'cli_mlx_scorer', 'notices', 'versions'):
               out = {}
@@ -446,6 +465,16 @@ jobs:
           # Immutable versioned archive — cache hard.
           aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
             --endpoint-url "$EP" --cache-control "public, max-age=31536000, immutable"
+          if [ "${SKIP_LATEST:-0}" = "1" ]; then
+            # Its own archive and updater files only; latest/ and the manifests stay as they are.
+            if [ -d pub/updater ]; then
+              aws s3 cp "pub/updater/" "s3://${R2_BUCKET}/updater/" --recursive \
+                --exclude "latest.json" --endpoint-url "$EP" \
+                --cache-control "public, max-age=31536000, immutable"
+            fi
+            echo "Published v${VERSION} to R2 (latest/ unchanged) → ${DIST_HOST}"
+            exit 0
+          fi
           # Mutable "latest" pointers — do not cache (so a new release is instant).
           aws s3 cp "pub/latest/" "s3://${R2_BUCKET}/latest/" --recursive \
             --endpoint-url "$EP" --cache-control "no-store, max-age=0"
@@ -500,7 +529,8 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         with:
           draft: false
-          make_latest: true
+          make_latest: ${{ env.SKIP_LATEST != '1' }}
+          prerelease: ${{ env.PRERELEASE == '1' }}
           generate_release_notes: true
           body: ${{ env.MISSING != '' && format('Not built for this release (the previous one stays current there) — {0}.', env.MISSING) || '' }}
           files: dist/*
