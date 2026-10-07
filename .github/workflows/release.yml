@@ -408,7 +408,7 @@ jobs:
           EXE = {'windows': '.exe'}
           # A platform already published under this version (a re-run) is left as it is: its files
           # aren't replaced, and it counts as not built this run (review round 5, R5O-3).
-          published = set(open('prev/published.txt').read().split()) if os.path.exists('prev/published.txt') else set()
+          published = set(open('prev/published.txt').read().split()) - {'None'} if os.path.exists('prev/published.txt') else set()
           # Which platform a file belongs to, its signature (".sig") going with it (R6-9).
           def bare(n): return n[:-4] if n.endswith('.sig') else n
           OWN = {

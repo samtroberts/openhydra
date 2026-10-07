@@ -1128,12 +1128,14 @@ fn strike_first_failures(
 fn resolve_against_known(
     results: &[(String, Result<String, String>)],
     nets_of: &HashMap<String, Vec<String>>,
+    subject: &str,
 ) -> Option<AuditReport> {
     let known = |p: &str| nets_of.get(p).is_some_and(|n| !n.is_empty());
     let known_results: Vec<(String, Result<String, String>)> = results.iter().filter(|(p, _)| known(p)).cloned().collect();
     let known_ok = known_results.iter().filter(|(_, r)| r.is_ok()).count();
-    // One known answer: everyone may pass by agreeing with it, but no one fails on it alone (R6-4).
-    if known_ok == 1 {
+    // One known answer, not the subject's (R7-2: a relay-only partner could be its own second node):
+    // everyone may pass by agreeing with it, but no one fails on it alone (R6-4).
+    if known_ok == 1 && known_results.iter().any(|(p, r)| p != subject && r.is_ok()) {
         let answers: Vec<&String> = results.iter().filter_map(|(_, r)| r.as_ref().ok()).collect();
         let all_agree = answers.len() >= 2 && answers.iter().all(|a| openhydra_protocol::verify::agrees(answers[0], a));
         if !all_agree {
@@ -3764,6 +3766,9 @@ impl ConsumerNode {
                 .entry(model.to_string())
                 .or_default()
                 .push_back(now);
+            // A provider left out over a log-prob fail gets a new round too: a pass is its way back
+            // (review round 7, R7-1). Its own schedule (`next_due`) still applies.
+            self.maybe_logprob_check(&provider, rep_model_key(&provider.canonical_model_id, &provider.model_id));
             let node = Arc::clone(self);
             let model = model.to_string();
             std::thread::spawn(move || {
@@ -3851,7 +3856,7 @@ impl ConsumerNode {
         let kept = take_replayable(&mut self.replays.lock().unwrap_or_else(|e| e.into_inner()), &provider.state_id, model, now);
         if let Some(entry) = kept {
             return self
-                .audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str()), strict)
+                .audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str()), strict, false)
                 .map(|r| ("replay", r));
         }
         // A probe only where this consumer's traffic allows one (checked first: writing it costs);
@@ -3862,15 +3867,21 @@ impl ConsumerNode {
             _ if plain => Some(TrafficShape::plain(&mut rand::thread_rng())),
             _ => None,
         };
+        // A question written for this audit and finished here (P1), else a template's. Only a written
+        // one can clear a strike: the templates are public (R7-3).
+        let mut fresh = false;
         let probe = shape.filter(|t| t.probe(String::new()).is_some()).and_then(|t| {
-            // A question written for this audit and finished here (P1), else a template's.
-            let prompt = self
-                .fresh_probe_prompt(model)
-                .unwrap_or_else(|| crate::audit_prompts::random_prompt(&mut rand::thread_rng()));
+            let prompt = match self.fresh_probe_prompt(model) {
+                Some(p) => {
+                    fresh = true;
+                    p
+                }
+                None => crate::audit_prompts::random_prompt(&mut rand::thread_rng()),
+            };
             t.probe(prompt)
         });
         match probe {
-            Some(request) => self.audit_model(model, &request, provider, None, strict).map(|r| ("probe", r)),
+            Some(request) => self.audit_model(model, &request, provider, None, strict, fresh).map(|r| ("probe", r)),
             None => Err(AdapterError::Route(format!(
                 "no audit for '{model}': nothing to replay, and too few greedy requests to probe like them"
             ))),
@@ -4142,6 +4153,7 @@ impl ConsumerNode {
         subject: &SelectedProvider,
         served: Option<&str>,
         strict_subject: bool,
+        fresh_probe: bool,
     ) -> Result<AuditReport, AdapterError> {
         let now = now_unix_ms();
         let peers = self
@@ -4287,10 +4299,10 @@ impl ConsumerNode {
                     break;
                 }
             }
-            let mut report = resolve_against_known(&results, &nets_of);
+            let mut report = resolve_against_known(&results, &nets_of, &subject.state_id);
             if report.is_none() && known_answers(&results, &nets_of) == 2 && results.len() < 4 {
                 ask(&mut results, &mut key_of, &mut nets_of, &mut who, true);
-                report = resolve_against_known(&results, &nets_of);
+                report = resolve_against_known(&results, &nets_of, &subject.state_id);
             }
             report.ok_or_else(|| {
                 AdapterError::Route(format!(
@@ -4303,7 +4315,7 @@ impl ConsumerNode {
                 ask(&mut results, &mut key_of, &mut nets_of, &mut who, true);
                 if results.len() == 3 {
                     report = if unknown_in(&results, &nets_of) {
-                        resolve_against_known(&results, &nets_of).unwrap_or(report)
+                        resolve_against_known(&results, &nets_of, &subject.state_id).unwrap_or(report)
                     } else {
                         resolve_audit(&results)
                     };
@@ -4333,7 +4345,7 @@ impl ConsumerNode {
                 &|peer| reputation_key(peer, key_of.get(peer).map_or(model, String::as_str)),
                 // A replay pass as the one audited, or a passing follow-up (a different, unpredictable
                 // request), clears it: with replay off, follow-ups are the only way (R6-2).
-                &|peer| (served.is_some() || strict_subject) && peer == subject.state_id,
+                &|peer| (served.is_some() || (strict_subject && fresh_probe)) && peer == subject.state_id,
                 &mut strikes,
                 now,
             )
@@ -5610,25 +5622,32 @@ mod tests {
         let r = resolve_against_known(
             &[("S".into(), Ok(odd.clone())), ("U".into(), Ok(odd.clone())), ("K1".into(), Ok(good.clone())), ("K2".into(), Ok(good.clone()))],
             &nets,
+            "S",
         )
         .unwrap();
         assert!(r.outcomes.contains(&("S".into(), VerificationOutcome::Failed)));
         assert!(r.outcomes.contains(&("U".into(), VerificationOutcome::Failed)));
         assert!(r.outcomes.contains(&("K1".into(), VerificationOutcome::Honored)));
         // One known answer (R6-6/R6-4): all agreeing with it pass; any disagreement decides nothing.
-        let one = resolve_against_known(&[("S".into(), Ok(good.clone())), ("U".into(), Ok(good.clone())), ("K1".into(), Ok(good.clone()))], &nets).unwrap();
+        let one = resolve_against_known(&[("S".into(), Ok(good.clone())), ("U".into(), Ok(good.clone())), ("K1".into(), Ok(good.clone()))], &nets, "S").unwrap();
         assert_eq!(one.verdict, RedundantVerdict::Agree);
-        assert!(resolve_against_known(&[("S".into(), Ok(odd.clone())), ("U".into(), Ok(odd.clone())), ("K1".into(), Ok(good.clone()))], &nets).is_none());
+        assert!(resolve_against_known(&[("S".into(), Ok(odd.clone())), ("U".into(), Ok(odd.clone())), ("K1".into(), Ok(good.clone()))], &nets, "S").is_none());
+        // The one known answer being the subject's own doesn't count (R7-2): its relay-only partner
+        // could be its own second node.
+        let k_subject: HashMap<String, Vec<String>> =
+            [("S".to_string(), vec!["5.6.7.0/24".to_string()]), ("U".to_string(), vec![])].into();
+        assert!(resolve_against_known(&[("S".into(), Ok(good.clone())), ("U".into(), Ok(good.clone()))], &k_subject, "S").is_none());
         // Known ones split: no verdict.
         // A known provider that errors doesn't count as an answer: one known answer, all agree.
         let erred = resolve_against_known(
             &[("S".into(), Ok(good.clone())), ("K1".into(), Ok(good.clone())), ("K2".into(), Err("timeout".into()))],
             &nets,
+            "S",
         )
         .unwrap();
         assert!(erred.outcomes.contains(&("K2".into(), VerificationOutcome::Rejected)));
         assert!(erred.outcomes.contains(&("S".into(), VerificationOutcome::Honored)));
-        assert!(resolve_against_known(&[("S".into(), Ok(good.clone())), ("K1".into(), Ok(good)), ("K2".into(), Ok(odd))], &nets).is_none());
+        assert!(resolve_against_known(&[("S".into(), Ok(good.clone())), ("K1".into(), Ok(good)), ("K2".into(), Ok(odd))], &nets, "S").is_none());
     }
 
     /// Review round 4 M8: probes open with a system prompt as often as real requests do; the real

@@ -778,6 +778,9 @@ pub fn recheck_delay_ms(pass_streak: u32, u: f64) -> u64 {
 pub fn validity_ms(pass_streak: u32) -> u64 {
     (2 * refresh_interval_ms(pass_streak)).max(LOGPROB_VALID_MS)
 }
+/// How long a log-prob fail counts at most, unless a later round passes first (a week: past any
+/// stall worth making, and a provider we can no longer check isn't floored for good).
+pub const FAIL_VALID_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Retry an interrupted round after this long.
 pub const LOGPROB_RETRY_MS: u64 = 10 * 60 * 1000;
 /// Back off from a legacy provider, or from one whose unsent texts ran out.
@@ -918,15 +921,18 @@ impl LogprobStatus {
     }
 
     /// `(log-prob method flag, latest outcome)` for the authenticity evidence. The flag needs a fresh
-    /// pass (within [`LOGPROB_VALID_MS`]) at the end of a qualifying streak; a fresh fail forces the
+    /// pass (within [`LOGPROB_VALID_MS`]) at the end of a qualifying streak; a fail (see below) forces the
     /// floor. An evasion penalty just breaks the streak.
     ///
-    /// A fail stands until a later round passes (review round 6): a provider can't wait it out by
-    /// refusing, timing out or answering "busy" (which can't be told from real contention, so it is
-    /// never held against anyone). A pass lapses as before, so stalling only loses it.
+    /// A fail stands until a later round passes, or for [`FAIL_VALID_MS`] (review rounds 6 and 7): a
+    /// provider can't wait it out within a day by refusing, timing out or answering "busy" (which
+    /// can't be told from real contention, so it is never held against anyone), and one that can
+    /// no longer be checked (our texts ran out) isn't floored for good. A pass lapses as before, so
+    /// stalling only loses it.
     pub fn evidence(&self, now_ms: u64) -> (bool, Option<VerificationOutcome>) {
         match self.verdict {
-            Some((v @ LogprobVerdict::Fail { .. }, _)) => (false, Some(v.outcome())),
+            Some((v @ LogprobVerdict::Fail { .. }, at)) if now_ms.saturating_sub(at) < FAIL_VALID_MS => (false, Some(v.outcome())),
+            Some((LogprobVerdict::Fail { .. }, _)) => (false, None),
             Some((v, at)) if now_ms.saturating_sub(at) < validity_ms(self.pass_streak) => {
                 (v.passed() && self.streak_qualifies(), Some(v.outcome()))
             }
@@ -1354,7 +1360,8 @@ mod tests {
     fn a_fail_stands_until_a_pass_but_a_pass_lapses() {
         let mut st = LogprobStatus::default();
         st.on_verdict(LogprobVerdict::Fail { aggregate: 3.0 }, 0);
-        assert_eq!(st.evidence(10 * validity_ms(0)).1, Some(VerificationOutcome::Failed), "not waited out");
+        assert_eq!(st.evidence(validity_ms(0) + 1).1, Some(VerificationOutcome::Failed), "not waited out in a day");
+        assert_eq!(st.evidence(FAIL_VALID_MS).1, None, "but not forever");
         st.on_verdict(LogprobVerdict::Pass { aggregate: 0.5 }, 100);
         assert_eq!(st.evidence(200).1, Some(VerificationOutcome::Honored));
         assert_eq!(st.evidence(100 + validity_ms(st.pass_streak) + 1).1, None, "a pass lapses");

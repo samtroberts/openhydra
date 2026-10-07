@@ -908,7 +908,7 @@ fn dispatch_err_openai(e: DispatchErr) -> Response {
         DispatchErr::NoModels(m) => openai_error(StatusCode::SERVICE_UNAVAILABLE, &m, "no_provider"),
         DispatchErr::BadAuthenticity => openai_error(
             StatusCode::BAD_REQUEST,
-            &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2, A3"),
+            &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2"),
             "invalid_request_error",
         ),
     }
@@ -1358,7 +1358,7 @@ fn dispatch_err_anthropic(e: DispatchErr) -> Response {
         DispatchErr::NoModels(m) => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, &m, "api_error"),
         DispatchErr::BadAuthenticity => anthropic_error(
             StatusCode::BAD_REQUEST,
-            &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2, A3"),
+            &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2"),
             "invalid_request_error",
         ),
     }

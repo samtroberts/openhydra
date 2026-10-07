@@ -786,7 +786,8 @@ impl SeenNonces {
     fn remember(&mut self, nonce: [u8; 16], now: u64) {
         while let Some(&(n, at)) = self.order.front() {
             let stale = self.at.get(&n) != Some(&at);
-            if !stale && now.saturating_sub(at) <= NONCE_MEMORY_MS && self.at.len() < MAX_SEEN_NONCES {
+            let room = self.at.len() < MAX_SEEN_NONCES && self.order.len() < 2 * MAX_SEEN_NONCES;
+            if !stale && now.saturating_sub(at) <= NONCE_MEMORY_MS && room {
                 break;
             }
             self.order.pop_front();
@@ -875,9 +876,9 @@ fn stream_expired(b: &StreamBuffer, now: u64) -> bool {
 
 /// How long a stream nobody has polled at all keeps generating: an honest consumer polls the moment
 /// its open is acknowledged, so this only ends a stream opened and walked away from (R5S-6). Still
-/// past the consumer's whole poll-retry window (~160 s), so lost first polls don't cut an honest
-/// stream short (R6-6).
-const NEVER_POLLED_ABANDON_MS: u64 = 170_000;
+/// past the consumer's whole poll-retry window (6 polls of up to 30 s and their backoffs, ~190 s), so
+/// lost first polls don't cut an honest stream short (R6-6, R7-7).
+const NEVER_POLLED_ABANDON_MS: u64 = 200_000;
 
 /// What a stream's serve commitment is recorded under, taken from its request.
 #[derive(Debug, Clone, Default)]
@@ -1598,7 +1599,13 @@ impl<A: EngineAdapter> Provider<A> {
     /// Give back the nonce of a serve the payment gate refused (see [`Self::nonce_refusal`]).
     fn release_nonce(&self, nonce: [u8; 16], source_peer: &str) {
         if !self.is_own_consumer(source_peer) {
-            self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()).at.remove(&nonce);
+            let mut seen = self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner());
+            seen.at.remove(&nonce);
+            // Its place in the order goes too (it is the newest, unless another came meanwhile): refused
+            // requests mustn't pile up there (R7-5).
+            if seen.order.back().is_some_and(|(n, _)| *n == nonce) {
+                seen.order.pop_back();
+            }
         }
     }
 
@@ -4658,8 +4665,19 @@ mod tests {
         // Last polled over STREAM_ABANDON_MS ago: it stops after the fragment that noticed.
         let gone = [2u8; 16];
         provider.stream_begin(gone, "c", billing(None));
-        provider.streams.lock().unwrap().get_mut(&gone).unwrap().last_poll_ms = now_unix_ms() - STREAM_ABANDON_MS - 1;
+        {
+            let mut streams = provider.streams.lock().unwrap();
+            let b = streams.get_mut(&gone).unwrap();
+            b.polled = true;
+            b.last_poll_ms = now_unix_ms() - STREAM_ABANDON_MS - 1;
+        }
         assert_eq!(run(gone).tokens, 1);
+        assert_eq!(provider.adapter.0.swap(0, Ordering::Relaxed), 1);
+        // Never polled at all, past its own (longer) limit: it stops too.
+        let never = [4u8; 16];
+        provider.stream_begin(never, "c", billing(None));
+        provider.streams.lock().unwrap().get_mut(&never).unwrap().last_poll_ms = now_unix_ms() - NEVER_POLLED_ABANDON_MS - 1;
+        assert_eq!(run(never).tokens, 1);
         assert_eq!(provider.adapter.0.swap(0, Ordering::Relaxed), 1);
         // Closed (settled, or evicted): it stops too.
         let closed = [3u8; 16];

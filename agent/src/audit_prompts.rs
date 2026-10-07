@@ -202,7 +202,8 @@ pub fn parse_questions(text: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     text.lines()
         .map(|l| {
-            let visible: String = l.chars().filter(|c| is_visible(*c)).collect();
+            // Every kind of space becomes a plain one (a run of odd spaces can't carry a mark, R7-6).
+            let visible: String = l.chars().filter(|c| is_visible(*c)).map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
             visible
                 .trim()
                 .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | '•' | ' '))
@@ -228,7 +229,9 @@ fn is_visible(c: char) -> bool {
                 | '\u{061C}'
                 | '\u{115F}'
                 | '\u{1160}'
-                | '\u{180E}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2060}'..='\u{206F}'
@@ -236,6 +239,9 @@ fn is_visible(c: char) -> bool {
                 | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
                 | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFC}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
                 | '\u{E0000}'..='\u{E007F}'
                 | '\u{E0100}'..='\u{E01EF}'
         )
