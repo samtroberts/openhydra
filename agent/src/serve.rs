@@ -259,6 +259,17 @@ impl StreamTally {
     }
 }
 
+/// What a serve that ended in an error is billed for (round 8 S8-2): the text fragments its reply
+/// carried, counted as a stream that ends early is ([`StreamTally`]). The consumer counts the same
+/// fragments as they reach it, so both sides arrive at this count.
+pub fn failed_serve_billable(frames: &[Vec<u8>], max_tokens: Option<u32>) -> u64 {
+    let mut tally = StreamTally::default();
+    for frame in frames.iter().filter(|f| f.first() == Some(&TAG_DELTA)) {
+        tally.push_encoded(frame);
+    }
+    tally.billable(max_tokens)
+}
+
 /// A consumer's request for a provider to serve a streaming completion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServeRequest {
@@ -1199,6 +1210,23 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(matches!(frames[0], ServeChunk::Error(_)));
         assert!(!summary.ok);
+    }
+
+    #[test]
+    fn a_failed_serve_is_billed_for_the_text_it_returned() {
+        // Round 8 S8-2: counted from the text frames, as the consumer counts what reached it.
+        let frames = vec![
+            ServeChunk::Delta("ab".into()).encode(),
+            ServeChunk::Delta("cd".into()).encode(),
+            ServeChunk::Error("engine timed out".into()).encode(),
+        ];
+        assert_eq!(failed_serve_billable(&frames, None), 2);
+        assert_eq!(failed_serve_billable(&frames, Some(1)), 1);
+        let mut consumer = StreamTally::default();
+        consumer.push_delta("ab");
+        consumer.push_delta("cd");
+        assert_eq!(consumer.billable(None), failed_serve_billable(&frames, None));
+        assert_eq!(failed_serve_billable(&[ServeChunk::Error("refused".into()).encode()], None), 0);
     }
 
     #[test]

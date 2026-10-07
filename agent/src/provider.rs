@@ -44,7 +44,7 @@ use crate::aup::{AupDecision, AupPolicy};
 use crate::ratelimit::{RateLimitConfig, RateLimiter};
 use crate::receipt::{handle_receipt_inbound, BindRejection, RECEIPT_REQUEST};
 use crate::serve::{
-    frame_response, handle_serve_request, FetchChunksResponse,
+    failed_serve_billable, frame_response, handle_serve_request, FetchChunksResponse,
     FetchResponse, ServeChunk, ServeRequest, ServeSummary,
 };
 use crate::status::TransferStats;
@@ -1300,6 +1300,9 @@ pub struct Provider<A: EngineAdapter> {
     /// rewrite the commitment of the serve that first used it, erasing what that one owes (review
     /// round 4 C2). Kept for [`NONCE_MEMORY_MS`], at most [`MAX_SEEN_NONCES`].
     seen_nonces: Mutex<SeenNonces>,
+    /// Nonces of buffered serves still generating: held for the whole serve, however long it runs
+    /// (a serve can outlast [`NONCE_MEMORY_MS`]), then remembered from its end (round 8 S8-2).
+    serving_nonces: Mutex<std::collections::HashSet<[u8; 16]>>,
     /// Which models this provider shares (announces + serves), keyed on the engine handle
     /// (`DetectedModel::engine_ref`, the same string a consumer sends as `ServeRequest.model_ref`).
     /// A [`PolicyWatcher`] so the policy can be **hot-reloaded at runtime** — the user can toggle
@@ -1458,6 +1461,7 @@ impl<A: EngineAdapter> Provider<A> {
             declared_quant: None,
             streams: Mutex::new(HashMap::new()),
             seen_nonces: Mutex::new(SeenNonces::default()),
+            serving_nonces: Mutex::new(std::collections::HashSet::new()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
             last_announced: Mutex::new(BTreeSet::new()),
@@ -1585,6 +1589,7 @@ impl<A: EngineAdapter> Provider<A> {
         let mut seen = self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_ms();
         let used = seen.seen(n, now)
+            || self.serving_nonces.lock().unwrap_or_else(|e| e.into_inner()).contains(n)
             || self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n)
             || self.streams.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n)
             || self.results.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n);
@@ -1594,6 +1599,23 @@ impl<A: EngineAdapter> Provider<A> {
         used.then(|| {
             frame_response(&[ServeChunk::Error("this request's nonce was already used; send each request with a new one".into()).encode()])
         })
+    }
+
+    /// Hold `nonce` while its buffered serve generates (see `serving_nonces`).
+    fn hold_nonce(&self, nonce: [u8; 16], source_peer: &str) {
+        if !self.is_own_consumer(source_peer) {
+            self.serving_nonces.lock().unwrap_or_else(|e| e.into_inner()).insert(nonce);
+        }
+    }
+
+    /// The buffered serve under `nonce` ended: its nonce is remembered from now (its commitment, if
+    /// any, holds it meanwhile too).
+    fn end_hold(&self, nonce: [u8; 16], source_peer: &str) {
+        if !self.is_own_consumer(source_peer) {
+            let mut seen = self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner());
+            self.serving_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce);
+            seen.remember(nonce, now_unix_ms());
+        }
     }
 
     /// Give back the nonce of a serve the payment gate refused (see [`Self::nonce_refusal`]).
@@ -3301,7 +3323,9 @@ impl<A: EngineAdapter> Provider<A> {
                         let nonce = req.nonce;
                         let model_ref = req.model_ref.clone();
                         let reply_to = req.reply_to.clone();
+                        let max_tokens = req.max_tokens;
                         let wallet = req.settlement_wallet.as_deref().and_then(parse_evm_address);
+                        self.hold_nonce(nonce, &source_peer);
                         // Reconnect-and-fetch: mark in-flight so a fetch racing this serve gets
                         // Generating (retry), not NotFound (which would re-run the request).
                         self.mark_generating(nonce, &reply_to);
@@ -3321,12 +3345,17 @@ impl<A: EngineAdapter> Provider<A> {
                         // delivered yet: it is once the reply (or a fetch of it by nonce) is sent
                         // to the consumer (`Provider::mark_delivered`). Recorded before the result is
                         // fetchable, so a fetch always finds it.
-                        if summary.ok && summary.tokens > 0 {
-                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, false, wallet);
+                        // A serve that failed part-way (an engine error, its time limit) still
+                        // delivers the text it produced: that is owed, counted as the consumer
+                        // counts it (round 8 S8-2).
+                        let owed = if summary.ok { summary.tokens } else { failed_serve_billable(&chunks, max_tokens) };
+                        if owed > 0 {
+                            self.record_commitment(nonce, model_ref.clone(), owed, &source_peer, false, wallet);
                         }
                         // Reconnect-and-fetch: buffer the produced frames under the nonce so a
                         // consumer whose connection dropped can fetch them on a fresh circuit.
                         self.store_result(nonce, &reply_to, &chunks);
+                        self.end_hold(nonce, &source_peer);
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
                             let native_tps = if e.eval_duration_ns > 0 {
@@ -4507,6 +4536,26 @@ mod tests {
         })
         .unwrap();
         (dir, Provider::new(adapter, net))
+    }
+
+    /// Round 8 S8-2: a buffered serve's nonce is held while it generates, however long, then
+    /// remembered from its end.
+    #[test]
+    fn a_buffered_serves_nonce_is_held_while_it_runs() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let req = ServeRequest {
+            reply_to: "c".into(), model_ref: "m".into(), messages: vec![],
+            max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [3u8; 16],
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+        };
+        assert!(provider.nonce_refusal(&req, "c").is_none(), "admitted");
+        provider.hold_nonce(req.nonce, "c");
+        // The serve outlasted the nonce memory.
+        provider.seen_nonces.lock().unwrap().at.clear();
+        assert!(provider.nonce_refusal(&req, "c").is_some(), "still held while generating");
+        provider.end_hold(req.nonce, "c");
+        assert!(provider.serving_nonces.lock().unwrap().is_empty());
+        assert!(provider.nonce_refusal(&req, "c").is_some(), "remembered from the serve's end");
     }
 
     fn billing(max_tokens: Option<u32>) -> StreamBilling {

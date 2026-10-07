@@ -186,11 +186,30 @@ const CLOSE_RETRY_WAITS: [Duration; 6] = [
     Duration::from_secs(40),
     Duration::from_secs(60),
 ];
-/// Without a `max_tokens`, the most text fragments a stream close's reply may add to what we read (a
-/// provider's credit window, which no honest stream outgrows unpaid). With one, the request's
-/// `max_tokens` bounds it anyway (review round 5, R5S-2: a lower cap would underpay an honest
-/// provider whose long poll reply was lost).
-const CLOSE_TAIL_MAX_FRAGMENTS: u64 = 65_536;
+/// Without a `max_tokens`, the most a stream close's reply may add to what we read, in fragments and
+/// in billed tokens alike (a provider's credit window, which no honest stream outgrows unpaid). With
+/// one, the request's `max_tokens` bounds it (review round 5, R5S-2: a lower cap would underpay an
+/// honest provider whose long poll reply was lost).
+const CLOSE_TAIL_MAX_TOKENS: u64 = 65_536;
+
+/// What a stream close's reply may add to `tally`'s bill: [`CLOSE_TAIL_MAX_TOKENS`], or the request's
+/// `max_tokens`.
+fn close_tail_cap(max_tokens: Option<u32>) -> u64 {
+    max_tokens.map_or(CLOSE_TAIL_MAX_TOKENS, u64::from)
+}
+
+/// Add a stream close's reply (`framed`) to `tally`: at most [`close_tail_cap`] more text fragments
+/// (what we missed is at most a lost poll reply or two), and its other frames.
+fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_tokens: Option<u32>) {
+    let before = tally.fragments();
+    let cap = close_tail_cap(max_tokens);
+    for chunk in parse_response(framed).unwrap_or_default() {
+        if matches!(chunk, crate::serve::ServeChunk::Delta(_)) && tally.fragments() - before >= cap {
+            continue;
+        }
+        tally.push_encoded(&chunk.encode());
+    }
+}
 /// Stream closes running at once (each a detached thread retrying for minutes); past it, what was
 /// read is settled without closing first (R5S-3).
 const MAX_CLOSES_IN_FLIGHT: usize = 256;
@@ -2743,6 +2762,15 @@ impl ConsumerNode {
                         if tokens > 0 {
                             self.record_usage(model, &provider.peer_id, tokens, false, now);
                         }
+                    } else if !opened && !self.is_self_serve(&provider.libp2p_peer_id) {
+                        // A buffered serve that failed after its text reached us: owed for that text,
+                        // which the provider counts the same way (round 8 S8-2).
+                        let tokens = tally.billable(max_tokens);
+                        if tokens > 0 {
+                            tracing::info!(provider = %provider.peer_id, tokens, "serve failed part-way; settling for what was received");
+                            self.settle_receipt(&provider, tokens, nonce);
+                            self.record_usage(model, &provider.peer_id, tokens, false, now);
+                        }
                     }
                     // Its client left: nobody to serve, so no failover.
                     if delivered || cancel() {
@@ -2908,6 +2936,7 @@ impl ConsumerNode {
         let slot = SettleSlot(Arc::clone(&self.closes_in_flight));
         let node = Arc::clone(self);
         let provider = provider.clone();
+        let ceiling = tally.billable(max_tokens).saturating_add(close_tail_cap(max_tokens));
         std::thread::spawn(move || {
             let _slot = slot;
             let mut close = vec![crate::provider::STREAM_CLOSE];
@@ -2918,17 +2947,7 @@ impl ConsumerNode {
                 let reply = node.net.proxy_forward_timeout(provider.libp2p_peer_id.clone(), close.clone(), SETTLE_TIMEOUT);
                 match reply.map(|r| FetchChunksResponse::decode(&r)) {
                     Ok(Ok(FetchChunksResponse::Chunks { framed, .. })) => {
-                        // What we missed is at most a lost poll reply or two; a reply claiming more
-                        // isn't paid past the cap (review round 4 C1).
-                        let before = tally.fragments();
-                        let cap = max_tokens.map_or(CLOSE_TAIL_MAX_FRAGMENTS, u64::from);
-                        for chunk in parse_response(&framed).unwrap_or_default() {
-                            let frame = chunk.encode();
-                            if matches!(chunk, crate::serve::ServeChunk::Delta(_)) && tally.fragments() - before >= cap {
-                                continue;
-                            }
-                            tally.push_encoded(&frame);
-                        }
+                        absorb_close_reply(&mut tally, &framed, max_tokens);
                         break;
                     }
                     // Throttled: try again shortly.
@@ -2940,7 +2959,9 @@ impl ConsumerNode {
                     Err(e) => tracing::debug!(provider = %provider.peer_id, error = %e, "couldn't close the stream yet"),
                 }
             }
-            let tokens = tally.billable(max_tokens);
+            // The close adds at most its cap to the bill, however large the frames it returned (a
+            // `Done` bounds the count by the text's size, and fragments can be any size).
+            let tokens = tally.billable(max_tokens).min(ceiling);
             if tokens > 0 {
                 node.settle_receipt(&provider, tokens, nonce);
             }
@@ -4425,6 +4446,44 @@ impl ConsumerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn close_reply(chunks: &[crate::serve::ServeChunk]) -> Vec<u8> {
+        crate::serve::frame_response(&chunks.iter().map(|c| c.encode()).collect::<Vec<_>>())
+    }
+
+    fn read_deltas(n: usize) -> crate::serve::StreamTally {
+        let mut tally = crate::serve::StreamTally::default();
+        for _ in 0..n {
+            tally.push_encoded(&crate::serve::ServeChunk::Delta("ab".into()).encode());
+        }
+        tally
+    }
+
+    #[test]
+    fn a_close_reply_adds_at_most_its_cap_however_large_its_frames() {
+        use crate::serve::ServeChunk;
+        // Round 8 S8-1: few fragments, each huge, then an inflated Done.
+        for max_tokens in [None, Some(300)] {
+            let mut tally = read_deltas(10);
+            let ceiling = tally.billable(max_tokens).saturating_add(close_tail_cap(max_tokens));
+            let mut chunks: Vec<ServeChunk> = (0..20).map(|_| ServeChunk::Delta("x".repeat(1 << 20))).collect();
+            chunks.push(ServeChunk::Done { tokens: 100_000_000, metrics: Default::default() });
+            absorb_close_reply(&mut tally, &close_reply(&chunks), max_tokens);
+            let billed = tally.billable(max_tokens).min(ceiling);
+            assert_eq!(billed, max_tokens.map_or(10 + CLOSE_TAIL_MAX_TOKENS, |m| u64::from(m).min(10 + u64::from(m))));
+        }
+    }
+
+    #[test]
+    fn an_honest_close_reply_is_paid_in_full() {
+        use crate::serve::ServeChunk;
+        let mut tally = read_deltas(10);
+        let ceiling = tally.billable(None).saturating_add(close_tail_cap(None));
+        let mut chunks: Vec<ServeChunk> = (0..5).map(|_| ServeChunk::Delta("ab".into())).collect();
+        chunks.push(ServeChunk::Done { tokens: 15, metrics: Default::default() });
+        absorb_close_reply(&mut tally, &close_reply(&chunks), None);
+        assert_eq!(tally.billable(None).min(ceiling), 15);
+    }
 
     #[test]
     fn two_keys_sharing_a_64_bit_id_keep_separate_standing() {
