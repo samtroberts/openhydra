@@ -403,6 +403,9 @@ const LOGPROB_PACE: std::time::Duration = std::time::Duration::from_secs(1);
 /// ([`AUDIT_MIN_RATE`]); a fresh / low-reputation one often ([`AUDIT_MAX_RATE`]), since the
 /// audit re-runs the work on a second provider and so costs real compute. Tunable.
 const AUDIT_MIN_RATE: f64 = 0.02;
+/// How long a failed redundant-execution audit holds a provider's authenticity tier at the floor
+/// for that model (review T4).
+const AUDIT_FAIL_FLOOR_MS: u64 = 24 * 60 * 60 * 1000;
 const AUDIT_MAX_RATE: f64 = 0.5;
 
 /// Token budget for an audit challenge completion — kept short to bound the audit's compute
@@ -1382,12 +1385,14 @@ impl ConsumerNode {
     fn authenticity_of(&self, peer_id: &str, model_key: &str, now_ms: u64) -> AuthenticityTier {
         let reputation = self.earned_reputation(peer_id, model_key, now_ms).unwrap_or(NEUTRAL_REPUTATION);
         let key = reputation_key(peer_id, model_key);
-        let (rate, passes) = self
+        let (rate, passes, audit_failed) = self
             .audit_stats
             .lock()
             .ok()
-            .and_then(|m| m.get(&key).map(|s| (s.pass_rate(now_ms), s.recent_passes(now_ms))))
-            .unwrap_or((1.0, 0));
+            .and_then(|m| {
+                m.get(&key).map(|s| (s.pass_rate(now_ms), s.recent_passes(now_ms), s.failed_within(now_ms, AUDIT_FAIL_FLOOR_MS)))
+            })
+            .unwrap_or((1.0, 0, false));
         // Route through the curated redundant-exec verifier (Increment 3b) — the live caller of the
         // Verifier seam. Same core resolution as `economy_snapshot`'s display path. A recent
         // log-prob verdict (Track A2-Logprob) supplies the log-prob method flag and the latest
@@ -1397,6 +1402,9 @@ impl ConsumerNode {
             .as_ref()
             .and_then(|lp| lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied())
             .map_or((false, None), |st| st.evidence(now_ms));
+        // A redundant-execution audit it failed recently is a live failure too (review T4), whatever
+        // a log-prob check said since: it may serve the real model only when it is being checked.
+        let latest_outcome = if audit_failed { Some(VerificationOutcome::Failed) } else { latest_outcome };
         let evidence = AuthenticityEvidence {
             reputation,
             audit_pass_rate: rate,
@@ -3887,6 +3895,57 @@ mod tests {
             latest_outcome: None,
         });
         assert_eq!(unproven.authenticity, AuthenticityTier::SelfReported);
+    }
+
+    #[test]
+    fn a_failed_audit_holds_the_provider_at_the_floor_for_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
+            identity_path: dir.path().join("id.key"),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            bootstrap_peers: vec![],
+            enable_peer_relay: false,
+            enable_connection_reversal: false,
+            pcp_gateway: None,
+        })
+        .unwrap();
+        let node = ConsumerNode::new(net);
+        let t0 = 1_000_000;
+        // A proven provider: reputation earned and audits passed → A1. `q` has the same history
+        // without the failure below.
+        for peer in ["p", "q"] {
+            for i in 0..30 {
+                node.record_outcome(peer, "m", VerificationOutcome::Honored, t0 + i);
+            }
+            for i in 0..12 {
+                node.record_audit(peer, "m", AuditClass::Pass, t0 + i);
+            }
+        }
+        assert_eq!(node.authenticity_of("p", "m", t0 + 100), AuthenticityTier::ReputationRedundant);
+        // One failed audit: the floor, whatever the rest of its history says…
+        node.record_audit("p", "m", AuditClass::Fail, t0 + 200);
+        node.record_audit("p", "m", AuditClass::Pass, t0 + 300);
+        node.record_audit("q", "m", AuditClass::Pass, t0 + 300);
+        assert_eq!(node.authenticity_of("p", "m", t0 + 400), AuthenticityTier::SelfReported);
+        assert_eq!(node.authenticity_of("q", "m", t0 + 400), AuthenticityTier::ReputationRedundant);
+        assert_eq!(node.authenticity_of("p", "m", t0 + 200 + AUDIT_FAIL_FLOOR_MS), AuthenticityTier::SelfReported);
+        // …for a day: then it is judged on its history like anyone (the failure still weighs in its
+        // pass rate, so not necessarily back to where it was).
+        let after = t0 + 201 + AUDIT_FAIL_FLOOR_MS;
+        let without_floor = {
+            let key = reputation_key("p", "m");
+            let st = node.audit_stats.lock().unwrap()[&key].clone();
+            RedundantExecAuthenticity
+                .verify(&AuthenticityEvidence {
+                    reputation: node.earned_reputation("p", "m", after).unwrap_or(NEUTRAL_REPUTATION),
+                    audit_pass_rate: st.pass_rate(after),
+                    passing_audits: st.recent_passes(after),
+                    methods: MethodFlags::default(),
+                    latest_outcome: None,
+                })
+                .authenticity
+        };
+        assert_eq!(node.authenticity_of("p", "m", after), without_floor);
     }
 
     #[test]

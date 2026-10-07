@@ -236,6 +236,9 @@ pub struct AuditStats {
     last_update_ms: u64,
     /// Half-life (ms) of the decay toward zero. 0 = no decay.
     half_life_ms: u64,
+    /// Unix-ms of the most recent failed audit (0 = none): a fresh failure caps the tier outright,
+    /// whatever the decayed counts say.
+    last_failed_ms: u64,
 }
 
 impl AuditStats {
@@ -246,7 +249,7 @@ impl AuditStats {
 
     /// As [`new`](Self::new) but with an explicit decay half-life (`0` = no decay).
     pub fn with_half_life(now_ms: u64, half_life_ms: u64) -> Self {
-        Self { passes: 0.0, total: 0.0, last_update_ms: now_ms, half_life_ms }
+        Self { passes: 0.0, total: 0.0, last_update_ms: now_ms, half_life_ms, last_failed_ms: 0 }
     }
 
     /// Decay multiplier `0.5^(elapsed / half_life)` for reading as of `now_ms` without mutating.
@@ -284,7 +287,19 @@ impl AuditStats {
         self.total += 1.0;
         if class == AuditClass::Pass {
             self.passes += 1.0;
+        } else {
+            self.last_failed_ms = self.last_failed_ms.max(now_ms);
         }
+    }
+
+    /// When the most recent failed audit was, if any.
+    pub fn last_failed_ms(&self) -> Option<u64> {
+        (self.last_failed_ms > 0).then_some(self.last_failed_ms)
+    }
+
+    /// Whether an audit failed within `window_ms` of `now_ms`.
+    pub fn failed_within(&self, now_ms: u64, window_ms: u64) -> bool {
+        self.last_failed_ms().is_some_and(|at| now_ms.saturating_sub(at) <= window_ms)
     }
 
     /// `n` — recent passing temp=0 audits (the decayed `passes`, floored), as of `now_ms`.
@@ -318,21 +333,23 @@ impl AuditStats {
     }
 
     /// Serialize the snapshot for the durable store: `passes:f64[8] ‖ total:f64[8] ‖
-    /// last_update_ms:u64[8] ‖ half_life_ms:u64[8]` little-endian = 32 bytes. f64s stored by exact
-    /// bit pattern so a rehydrated tracker decays identically.
-    pub fn to_bytes(&self) -> [u8; 32] {
-        let mut b = [0u8; 32];
+    /// last_update_ms:u64[8] ‖ half_life_ms:u64[8] ‖ last_failed_ms:u64[8]` little-endian = 40
+    /// bytes. f64s stored by exact bit pattern so a rehydrated tracker decays identically.
+    pub fn to_bytes(&self) -> [u8; 40] {
+        let mut b = [0u8; 40];
         b[0..8].copy_from_slice(&self.passes.to_le_bytes());
         b[8..16].copy_from_slice(&self.total.to_le_bytes());
         b[16..24].copy_from_slice(&self.last_update_ms.to_le_bytes());
         b[24..32].copy_from_slice(&self.half_life_ms.to_le_bytes());
+        b[32..40].copy_from_slice(&self.last_failed_ms.to_le_bytes());
         b
     }
 
-    /// Reconstruct from [`to_bytes`](Self::to_bytes). `Err` if not exactly 32 bytes.
+    /// Reconstruct from [`to_bytes`](Self::to_bytes), or from the 32-byte snapshot written before
+    /// failures were timed (no failure time). `Err` for any other length.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() != 32 {
-            return Err(format!("audit stats snapshot must be 32 bytes, got {}", data.len()));
+        if data.len() != 32 && data.len() != 40 {
+            return Err(format!("audit stats snapshot must be 32 or 40 bytes, got {}", data.len()));
         }
         let f8 = |r: std::ops::Range<usize>| f64::from_le_bytes(data[r].try_into().unwrap());
         let u8_ = |r: std::ops::Range<usize>| u64::from_le_bytes(data[r].try_into().unwrap());
@@ -348,6 +365,7 @@ impl AuditStats {
             total,
             last_update_ms: u8_(16..24),
             half_life_ms: u8_(24..32),
+            last_failed_ms: if data.len() == 40 { u8_(32..40) } else { 0 },
         })
     }
 }
@@ -582,11 +600,31 @@ mod tests {
         assert!((back.pass_rate(1_000) - s.pass_rate(1_000)).abs() < 1e-12);
         // And identical decay a week later → the half-life state round-tripped.
         assert_eq!(back.recent_passes(1_000 + 7 * DAY_MS), s.recent_passes(1_000 + 7 * DAY_MS));
+        assert_eq!(back.last_failed_ms(), Some(1_000));
+        // A snapshot from before failures were timed still reads, with none.
+        let old = AuditStats::from_bytes(&s.to_bytes()[..32]).unwrap();
+        assert_eq!(old.recent_passes(1_000), s.recent_passes(1_000));
+        assert_eq!(old.last_failed_ms(), None);
+    }
+
+    #[test]
+    fn a_failed_audit_is_remembered_for_its_window() {
+        let mut s = AuditStats::with_half_life(0, 7 * DAY_MS);
+        s.record(AuditClass::Pass, 10);
+        assert!(!s.failed_within(10, DAY_MS));
+        s.record(AuditClass::Fail, 100);
+        s.record(AuditClass::Pass, 200);
+        assert!(s.failed_within(200, DAY_MS), "a later pass doesn't erase it");
+        assert!(s.failed_within(100 + DAY_MS, DAY_MS));
+        assert!(!s.failed_within(101 + DAY_MS, DAY_MS));
+        s.record(AuditClass::Inconclusive, 5_000);
+        assert_eq!(s.last_failed_ms(), Some(100));
     }
 
     #[test]
     fn audit_stats_from_bytes_rejects_wrong_length() {
         assert!(AuditStats::from_bytes(&[0u8; 31]).is_err());
         assert!(AuditStats::from_bytes(&[0u8; 33]).is_err());
+        assert!(AuditStats::from_bytes(&[0u8; 41]).is_err());
     }
 }
