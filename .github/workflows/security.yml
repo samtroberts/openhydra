@@ -43,3 +43,6 @@ jobs:
       # advisory outside that baseline fails the job.
       - name: Audit workspace dependencies
         run: cargo audit
+      # The desktop app's own dependency tree ships too (round 8 R8-6).
+      - name: Audit desktop app dependencies
+        run: cargo audit --file desktop/src-tauri/Cargo.lock

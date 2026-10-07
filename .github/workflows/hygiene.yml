@@ -1,0 +1,30 @@
+name: Source Hygiene
+
+# Fails on a raw NUL byte in a tracked source file: git (and GitHub's diff view) treats such a file
+# as binary and shows none of its changes, so a review would never see them (round 8 R8-5).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-nul-bytes:
+    name: No NUL bytes in source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check tracked source files
+        run: |
+          git ls-files -z -- '*.rs' '*.js' '*.ts' '*.html' '*.css' '*.sh' '*.yml' '*.yaml' '*.py' '*.sol' '*.toml' '*.md' '*.patch' \
+            | python3 -c '
+          import sys
+          bad = [p for p in sys.stdin.buffer.read().split(b"\0") if p and b"\0" in open(p, "rb").read()]
+          for p in bad:
+              print(f"::error file={p.decode()}::raw NUL byte (write it as an escape)")
+          sys.exit(1 if bad else 0)
+          '

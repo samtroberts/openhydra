@@ -136,7 +136,7 @@ jobs:
 
       # 1) The CLI agent — release binary, also embedded in the app as its sidecar.
       - name: Build openhydra-agent
-        run: cargo build --release -p openhydra-agent
+        run: cargo build --release --locked -p openhydra-agent
 
       - name: Stage sidecar
         shell: bash
@@ -396,6 +396,12 @@ jobs:
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # A manual publish runs on the version's own tag: published from any other ref, the tag's
+          # own run would then find the version taken by other code (round 8 R8-4).
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$GITHUB_REF" != "refs/tags/v$VERSION" ]; then
+            echo "::error::a manual publish of $VERSION must run on the tag v$VERSION (this run is on $GITHUB_REF)"
+            exit 1
+          fi
           python3 - "$VERSION" "$DIST_HOST" <<'PY'
           import sys, os, re, json, shutil
           version, host = sys.argv[1], sys.argv[2].rstrip('/')
@@ -412,8 +418,17 @@ jobs:
           }
           EXE = {'windows': '.exe'}
           # A platform already published under this version (a re-run) is left as it is: its files
-          # aren't replaced, and it counts as not built this run (review round 5, R5O-3).
+          # aren't replaced (they are cached a year as immutable; a new version replaces them, not an
+          # overwrite, even with allow_older), and it counts as not built this run (review round 5,
+          # R5O-3). "Published" = its completion marker, written after all its files (round 8 R8-2), so
+          # an upload cut short is redone; before markers (no ".publishing"), its CLI agent stood for it.
           published = set(open('prev/published.txt').read().split()) - {'None'} if os.path.exists('prev/published.txt') else set()
+          marked = f'v{version}/.publishing' in published
+          def complete(os_):
+              t = PLATFORMS[os_]
+              if marked:
+                  return f'v{version}/.complete-{t}' in published
+              return f'v{version}/openhydra-agent-{t}{EXE.get(os_, "")}' in published
           # Which platform a file belongs to, its signature (".sig") going with it (R6-9).
           def bare(n): return n[:-4] if n.endswith('.sig') else n
           OWN = {
@@ -421,15 +436,17 @@ jobs:
             'linux':   lambda n: 'x86_64-unknown-linux-gnu' in n or bare(n).endswith(('.AppImage', '.AppImage.tar.gz', '.deb', '.rpm')),
             'windows': lambda n: 'x86_64-pc-windows-msvc' in n or bare(n).endswith(('.exe', '.msi', '.nsis.zip', '.msi.zip')),
           }
-          if os.environ.get('ALLOW_OLDER') != 'true':
-              for os_, t in PLATFORMS.items():
-                  if f'v{version}/openhydra-agent-{t}{EXE.get(os_, "")}' in published:
-                      print(f'::notice::{os_} is already published for {version}: left as it is')
-                      for name in os.listdir(src):
-                          if OWN[os_](name):
-                              os.remove(os.path.join(src, name))
+          already = [os_ for os_ in PLATFORMS if complete(os_)]
+          for os_ in already:
+              print(f'::notice::{os_} is already published for {version}: left as it is')
+              for name in os.listdir(src):
+                  if OWN[os_](name):
+                      os.remove(os.path.join(src, name))
           built = {os_: os.path.exists(f'{src}/openhydra-agent-{t}{EXE.get(os_, "")}') for os_, t in PLATFORMS.items()}
-          missing = [os_ for os_, ok in built.items() if not ok]
+          # Not built, and not published for this version before either (round 8 R8-3).
+          missing = [os_ for os_, ok in built.items() if not ok and os_ not in already]
+          with open('built.txt', 'w') as f:
+              f.write(' '.join(PLATFORMS[os_] for os_, ok in built.items() if ok))
           if not any(built.values()):
               sys.exit('every platform is already published for this version, or none built: nothing to publish'
                        if published else 'no platform built: nothing to publish')
@@ -576,6 +593,15 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Markers (round 8 R8-2): ".publishing" first, so a re-run knows this version uses them;
+          # each platform's ".complete-<triple>" once every file of this publish is up.
+          : > marker
+          mark_complete() {
+            for t in $(cat built.txt); do
+              aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.complete-${t}" --endpoint-url "$EP"
+            done
+          }
+          aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.publishing" --endpoint-url "$EP"
           # Immutable versioned archive — cache hard. (A platform already published for this version
           # was dropped from the tree above, so nothing published is replaced, R5O-3.)
           aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
@@ -587,6 +613,7 @@ jobs:
                 --exclude "latest.json" --endpoint-url "$EP" \
                 --cache-control "public, max-age=31536000, immutable"
             fi
+            mark_complete
             echo "Published v${VERSION} to R2 (latest/ unchanged) → ${DIST_HOST}"
             exit 0
           fi
@@ -621,6 +648,7 @@ jobs:
               --endpoint-url "$EP" --cache-control "no-store, max-age=0" \
               --content-type "application/json"
           fi
+          mark_complete
           echo "Published v${VERSION} to R2 → ${DIST_HOST}"
 
       - name: Report platforms that didn't build

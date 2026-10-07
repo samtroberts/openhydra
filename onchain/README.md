@@ -105,11 +105,13 @@ in-SVM. (The Anchor scaffold's default `litesvm 0.10` rejects the Agave-4.2 SBF 
 comment.)
 
 ### Base (`base/`)
-Solidity deps are vendored via `git clone` (not committed). Fetch them once, then test:
+Solidity deps are vendored via `git` (not committed), each at a pinned commit. Fetch them once,
+then test:
 ```bash
 cd base
-git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std
-git clone --depth 1 --branch v5.1.0 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts
+fetch() { git init -q "$1" && git -C "$1" fetch -q --depth 1 "$2" "$3" && git -C "$1" checkout -q FETCH_HEAD; }
+fetch lib/forge-std https://github.com/foundry-rs/forge-std 0d006dafa09d0b3722575acd29338b79c23e7c2f
+fetch lib/openzeppelin-contracts https://github.com/OpenZeppelin/openzeppelin-contracts 69c8def5f222ff96f2b5beff05dfba996368aa79  # v5.1.0
 forge test                        # 39 tests
 ```
 
