@@ -2669,7 +2669,7 @@ impl ConsumerNode {
 
     /// The redundant-execution audit sampling rate for `peer_id` (M2.2(b)): low for a
     /// trusted provider, high for a fresh / low-reputation one. A background sampler draws
-    /// against this to decide whether to [`audit_model`](Self::audit_model) after serving.
+    /// against this to decide whether to audit a provider after it served.
     /// Pure read of the earned-reputation map — exposed so the trigger policy is testable
     /// and tunable separately from the dispatch.
     pub fn audit_rate_for(&self, peer_id: &str, model_key: &str, now_ms: u64) -> f64 {
@@ -2677,14 +2677,6 @@ impl ConsumerNode {
         sample_rate_for_reputation(rep, AUDIT_MIN_RATE, AUDIT_MAX_RATE)
     }
 
-    /// M2.2(b) trigger: after serving, *sometimes* audit the provider that served. Draws
-    /// against [`audit_rate_for`](Self::audit_rate_for) (rare for a trusted provider, up to
-    /// [`AUDIT_MAX_RATE`] for a fresh/suspect one); on a hit it spawns a **detached
-    /// background thread** that runs [`audit_model`](Self::audit_model) with a fresh
-    /// unpredictable [`default_challenge`], so the redundant-exec cross-check never touches
-    /// the caller's latency path. The audit records its own outcomes (a confirmed outlier →
-    /// `Failed`); here we only log the verdict. A `< 2 providers` error just means the model
-    /// can't be cross-checked right now — logged at debug, not an error.
     /// Device attestation (Phase 0): if enabled and this provider is due, challenge it in a detached
     /// thread (bounded by [`ATTEST_TIMEOUT`]) and record the outcome. Never touches the completion.
     fn maybe_attest(self: &Arc<Self>, provider: &SelectedProvider) {
@@ -3026,24 +3018,26 @@ impl ConsumerNode {
         let model = model.to_string();
         let provider = provider.clone();
         std::thread::spawn(move || match node.audit(&model, &provider) {
-            Ok(report) => tracing::info!(model, verdict = ?report.verdict, "redundant-exec audit complete"),
-            Err(e) => tracing::debug!(model, error = %e, "redundant-exec audit skipped"),
+            Ok((how, report)) => tracing::info!(model, subject = %provider.state_id, how, verdict = ?report.verdict,
+                outcomes = ?report.outcomes, "redundant-exec audit complete"),
+            Err(e) => tracing::debug!(model, subject = %provider.state_id, error = %e, "redundant-exec audit skipped"),
         });
     }
 
-    /// Audit `provider` for `model` (see [`maybe_audit`](Self::maybe_audit)).
-    fn audit(self: &Arc<Self>, model: &str, provider: &SelectedProvider) -> Result<AuditReport, AdapterError> {
+    /// Audit `provider` for `model` (see [`maybe_audit`](Self::maybe_audit)), saying how ("replay" or
+    /// "probe").
+    fn audit(self: &Arc<Self>, model: &str, provider: &SelectedProvider) -> Result<(&'static str, AuditReport), AdapterError> {
         let now = now_unix_ms();
         let kept = take_replayable(&mut self.replays.lock().unwrap_or_else(|e| e.into_inner()), &provider.state_id, model, now);
         if let Some(entry) = kept {
-            return self.audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str()));
+            return self.audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str())).map(|r| ("replay", r));
         }
         let probe = {
             let traffic = self.traffic.lock().unwrap_or_else(|e| e.into_inner());
             traffic.get(model).and_then(|t| t.probe(crate::audit_prompts::random_prompt(&mut rand::thread_rng())))
         };
         match probe {
-            Some(request) => self.audit_model(model, &request, provider, None),
+            Some(request) => self.audit_model(model, &request, provider, None).map(|r| ("probe", r)),
             None => Err(AdapterError::Http(format!(
                 "no audit for '{model}': nothing to replay, and too few greedy requests to probe like them"
             ))),
