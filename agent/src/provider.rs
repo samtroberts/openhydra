@@ -1694,8 +1694,10 @@ impl<A: EngineAdapter> Provider<A> {
             return Err(refuse(reason));
         }
         let now = now_unix_ms();
-        let running: Vec<Running> =
-            self.paid_generating.lock().unwrap_or_else(|e| e.into_inner()).get(source_peer).cloned().unwrap_or_default();
+        // The running serves are held for the whole decision (lock order: reservations, streams,
+        // commitments), so one ending meanwhile is counted once, not missed (round 8 S8-4).
+        let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
+        let running: Vec<Running> = generating.get(source_peer).cloned().unwrap_or_default();
         let generated = generated_of(&self.streams.lock().unwrap_or_else(|e| e.into_inner()), source_peer);
         let (unsettled, full): (Vec<Unsettled>, bool) = {
             let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
@@ -1714,8 +1716,7 @@ impl<A: EngineAdapter> Provider<A> {
             .get(source_peer)
             .map_or(0, |at| at.iter().filter(|t| now.saturating_sub(**t) <= DEFAULT_WINDOW_MS).count());
         let tokens = paid_reservation(req.max_tokens);
-        let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
-        let running: Vec<u64> = generating.get(source_peer).map_or_else(Vec::new, |v| v.iter().map(|r| r.tokens).collect());
+        let running: Vec<u64> = running.iter().map(|r| r.tokens).collect();
         payment_window(&unsettled, &running, tokens, defaults, now).map_err(refuse)?;
         let id = self.next_reservation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         generating.entry(source_peer.to_string()).or_default().push(Running { id, tokens, nonce: req.nonce });
@@ -1732,14 +1733,14 @@ impl<A: EngineAdapter> Provider<A> {
     /// [`MAX_UNSETTLED_TOKENS`]. A paid serve calls this as it generates past its reservation, and
     /// stops when it can't (review round 3, S2).
     fn grow_reservation(&self, r: &PaymentReservation, to: u64) -> bool {
-        let running: Vec<Running> =
-            self.paid_generating.lock().unwrap_or_else(|e| e.into_inner()).get(&r.peer).cloned().unwrap_or_default();
+        // Held throughout, as in `payment_gate` (round 8 S8-4).
+        let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
+        let running: Vec<Running> = generating.get(&r.peer).cloned().unwrap_or_default();
         let generated = generated_of(&self.streams.lock().unwrap_or_else(|e| e.into_inner()), &r.peer);
         let unsettled: u64 = unsettled_of(&self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()), &r.peer, &running, &generated)
             .iter()
             .map(|u| u.tokens)
             .sum();
-        let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mine) = generating.get_mut(&r.peer) else {
             return false;
         };
@@ -1904,7 +1905,17 @@ impl<A: EngineAdapter> Provider<A> {
         let now = now_unix_ms();
         let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, b| !stream_expired(b, now));
-        close_stream_in(&mut map, &nonce, source_peer, offset, now).encode()
+        let reply = close_stream_in(&mut map, &nonce, source_peer, offset, now);
+        // Its consumer is here to settle it: the commitment is kept as long as from a poll, so
+        // closes retried through an outage still find it (round 8 S8-3).
+        if matches!(reply, FetchChunksResponse::Chunks { .. }) {
+            if let Some(c) = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&nonce) {
+                if c.served_peer == source_peer {
+                    c.recorded_ms = now;
+                }
+            }
+        }
+        reply.encode()
     }
 
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
@@ -4909,9 +4920,15 @@ mod tests {
         assert!(provider.stream_wanted(&n));
         let mut close = n.to_vec();
         close.extend_from_slice(&0u32.to_be_bytes());
+        // Its commitment, last stamped long ago, is refreshed by its consumer's close (round 8 S8-3).
+        provider.serve_commitments.lock().unwrap().insert(
+            n,
+            ServeCommitment { model_id: "m".into(), tokens: 1, recorded_ms: 1, served_peer: "c".into(), delivered: true, wallet: None },
+        );
         let resp = FetchChunksResponse::decode(&provider.handle_stream_close("c", &close)).unwrap();
         assert!(matches!(resp, FetchChunksResponse::Chunks { done: true, .. }));
         assert!(!provider.stream_wanted(&n), "closing stops generation");
+        assert!(provider.serve_commitments.lock().unwrap()[&n].recorded_ms > 1, "refreshed by the close");
         // Retention: an unread finished stream goes after the stream TTL, an unread one still
         // generating outlives the abandon window (R5S-6); a read one lasts the commitment's.
         let map = provider.streams.lock().unwrap();
