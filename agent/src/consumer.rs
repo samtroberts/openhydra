@@ -3576,11 +3576,19 @@ impl ConsumerNode {
                 node.net.proxy_forward_timeout(libp2p.clone(), framed.to_vec(), LOGPROB_TIMEOUT)
             };
             // …and which exact weights file: references made from a file apply only to that file.
+            // Whether the provider answered (a busy shed, a rate limit or a lost connection isn't an
+            // answer, round 8 L8-3).
+            let mut info_answered = true;
             let (declared, weights) = match request_model_info(&mut info_transport, &model) {
                 Ok(info) => (info.identity(), info.weights()),
-                Err(ScoreChallengeError::Unsupported) | Err(ScoreChallengeError::Refused(_)) => (None, None),
+                Err(ScoreChallengeError::Unsupported) => (None, None),
+                Err(ScoreChallengeError::Refused(r)) => {
+                    info_answered = !r.contains("retry");
+                    (None, None)
+                }
                 Err(e) => {
                     tracing::debug!(provider = %peer_id, model, error = ?e, "model-info request failed");
+                    info_answered = false;
                     (None, None)
                 }
             };
@@ -3598,8 +3606,8 @@ impl ConsumerNode {
                 if weights.is_none() {
                     // None declared: an agent hashes the file in the background after a restart, so
                     // retry soon (and keep the streak); one that keeps not declaring it is dodging.
-                    tracing::info!(provider = %peer_id, model, verified_on, "provider no longer declares the weights file it was verified on");
-                    let outcome = RoundOutcome::Incomplete("weights file not declared".into());
+                    tracing::info!(provider = %peer_id, model, verified_on, answered = info_answered, "provider no longer declares the weights file it was verified on");
+                    let outcome = if info_answered { RoundOutcome::Undeclared } else { RoundOutcome::Busy };
                     node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, 0, None);
                     return;
                 }
@@ -3849,6 +3857,9 @@ impl ConsumerNode {
             // Out of texts because the provider declined some (L4-4): a stopped run like any other.
             RoundOutcome::Exhausted if round.skipped() > 0 => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS, now),
             RoundOutcome::Exhausted => st.on_no_verdict(false, LOGPROB_BACKOFF_MS, now),
+            // Retried soon (an agent hashes its file in the background after a restart); one that
+            // keeps not declaring it is dodging.
+            RoundOutcome::Undeclared => st.on_no_verdict(answered, retry, now),
         };
         let streak = st.pass_streak;
         let final_status = *st;
@@ -3878,6 +3889,7 @@ impl ConsumerNode {
             RoundOutcome::Exhausted => tracing::warn!(provider = %peer_id, model, reference = reference_key.unwrap_or("?"),
                 "log-prob reference set exhausted for this provider; add fresh texts"),
             RoundOutcome::Busy => tracing::debug!(provider = %peer_id, model, "provider busy; the pending text waits for the next run"),
+            RoundOutcome::Undeclared => tracing::info!(provider = %peer_id, model, "provider no longer declares the weights file it passed on"),
             RoundOutcome::Evasion(reason) => tracing::warn!(provider = %peer_id, model, reason,
                 "provider declined texts mid-round; counted as dodging the check"),
         }
@@ -5673,6 +5685,12 @@ mod tests {
         let st = lp.status.lock().unwrap()["k"];
         assert_eq!(st.pass_streak, 2, "streak kept");
         assert!(node.audit_stats.lock().unwrap().is_empty(), "no failed audit recorded");
+        // Round 8 L8-3: a lost or refused model-info request is "busy"; only an answer without the
+        // file counts.
+        for _ in 0..10 {
+            node.settle_logprob_round(&lp, "k", "p", "m", "m", RoundOutcome::Busy, ChallengeRound::default(), 0, None);
+        }
+        assert_eq!(lp.status.lock().unwrap()["k"].pass_streak, 2);
         node.settle_logprob_round(&lp, "k", "p", "m", "m", RoundOutcome::Evasion("declined".into()), ChallengeRound::default(), 0, None);
         assert_eq!(lp.status.lock().unwrap()["k"].pass_streak, 0, "an evasion still counts");
     }

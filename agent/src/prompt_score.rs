@@ -591,6 +591,9 @@ pub enum RoundOutcome {
     /// The provider stayed busy on a text. Not held against it: the text stays pending and is sent
     /// again first next time, so being busy can delay a text but never skip it.
     Busy,
+    /// The provider answered that it no longer declares the weights file it passed on (round 8
+    /// L8-3: only an answer, never a lost or refused model-info request).
+    Undeclared,
     /// The provider declined or garbled more texts in one round than [`MAX_SKIPPED_TEXTS`]:
     /// choosing which texts count is dodging the check, held against it like a failed round.
     Evasion(String),

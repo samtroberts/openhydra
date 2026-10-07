@@ -128,13 +128,12 @@ const MAX_RECENTLY_SERVED: usize = 4096;
 /// How long after we answered a verifier's challenge it counts as mid-round (see
 /// `Provider::scored_recently`): a round sends its next text within seconds.
 const IN_ROUND_MS: u64 = 2 * 60 * 1000;
-/// One peer's challenges may cover at most [`SCORE_MODELS_PER_PEER`] models within this long: each
-/// model can need a side-scorer (re)load, which a peer must not be able to force back to back
-/// (review round 4 L4-7), while a gateway checking two models of one provider isn't held up
-/// (review round 5, R5L-3). Two in 30 minutes is four an hour at most, within the side-scorer's
-/// six starts an hour (R6-6).
+/// A peer may move its challenges to another model at most once within this long: each switch can
+/// need a side-scorer (re)load, which a peer must not be able to force back to back (review round 4
+/// L4-7; round 8 L8-4 counts switches, not models, so alternating two models doesn't get round it),
+/// while a gateway checking two models of one provider in turn isn't held up (R5L-3). At most two an
+/// hour per peer, within the side-scorer's six starts an hour (R6-6).
 const SCORE_SWITCH_MIN_MS: u64 = 30 * 60 * 1000;
-const SCORE_MODELS_PER_PEER: usize = 2;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 /// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
 /// with many identities) keep the Secure Enclave signing nonstop.
@@ -768,6 +767,24 @@ const NONCE_MEMORY_MS: u64 = 2 * COMMITMENT_TTL_MS;
 /// remembered (a refused one isn't), so reusing one that old needs this many paid-for serves between.
 const MAX_SEEN_NONCES: usize = 65_536;
 
+/// Note that `peer` challenges `model` at `now`, if it may (see [`SCORE_SWITCH_MIN_MS`]): the same
+/// model as its last, or a switch at least that long after its previous one. Bounded by
+/// [`MAX_RECENTLY_SERVED`] peers (past it, peers whose last switch is that old go first).
+fn note_score_model(map: &mut HashMap<String, (String, u64)>, peer: &str, model: String, now: u64) -> bool {
+    match map.get(peer) {
+        Some((m, _)) if *m == model => return true,
+        Some((_, since)) if now.saturating_sub(*since) < SCORE_SWITCH_MIN_MS => return false,
+        _ => {}
+    }
+    if !map.contains_key(peer) && map.len() >= MAX_RECENTLY_SERVED {
+        map.retain(|_, (_, since)| now.saturating_sub(*since) < SCORE_SWITCH_MIN_MS);
+    }
+    if map.contains_key(peer) || map.len() < MAX_RECENTLY_SERVED {
+        map.insert(peer.to_string(), (model, now));
+    }
+    true
+}
+
 /// Workers answering stream polls, closes, result fetches and receipts, apart from the serve workers
 /// (round 8 G8-1).
 const CONTROL_WORKERS: usize = 2;
@@ -1296,7 +1313,7 @@ pub struct Provider<A: EngineAdapter> {
     /// Peers with a prompt-scoring challenge being answered now (one at a time each), and per peer
     /// the model it last challenged and when (see [`SCORE_SWITCH_MIN_MS`]).
     scoring_now: Mutex<std::collections::HashSet<String>>,
-    score_models: Mutex<HashMap<String, Vec<(String, u64)>>>,
+    score_models: Mutex<HashMap<String, (String, u64)>>,
     /// Per-peer rate cap on prompt-scoring challenges (and model-info requests).
     score_rl: Arc<RateLimiter>,
     /// What the engine last reported for each model, keyed by handle — the source of the identity
@@ -3198,20 +3215,8 @@ impl<A: EngineAdapter> Provider<A> {
                 // (one that starts a side-scorer counts though it is told to retry, R6-6).
                 if let Some(model) = crate::prompt_score::challenge_model(&data[1..]) {
                     let mut sm = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
-                    let recent: Vec<&String> = sm
-                        .get(source_peer)
-                        .map(|v| v.iter().filter(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS).map(|(n, _)| n).collect())
-                        .unwrap_or_default();
-                    if !recent.contains(&&model) && recent.len() >= SCORE_MODELS_PER_PEER {
-                        return score_refusal("too many models challenged recently, retry");
-                    }
-                    if !sm.contains_key(source_peer) && sm.len() >= MAX_RECENTLY_SERVED {
-                        sm.retain(|_, v| v.iter().any(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS));
-                    }
-                    if sm.contains_key(source_peer) || sm.len() < MAX_RECENTLY_SERVED {
-                        let v = sm.entry(source_peer.to_string()).or_default();
-                        v.retain(|(n, at)| *n != model && now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS);
-                        v.push((model, now));
+                    if !note_score_model(&mut sm, source_peer, model, now) {
+                        return score_refusal("switched models too recently, retry");
                     }
                 }
                 let reply = handle_prompt_score_inbound(
@@ -3999,6 +4004,18 @@ mod tests {
         let before: std::collections::HashSet<_> = m.keys().cloned().collect();
         note_private_member_in(&mut m, "p5", "m", now + 10 * MAX_PRIVATE_ATTEST_PAIRS as u64, 0);
         assert_eq!(m.keys().cloned().collect::<std::collections::HashSet<_>>(), before);
+    }
+
+    /// Round 8 L8-4: a peer switches models at most once per window, however it alternates.
+    #[test]
+    fn a_peer_switches_models_at_most_once_a_window() {
+        let mut m = HashMap::new();
+        assert!(note_score_model(&mut m, "p", "x".into(), 0));
+        assert!(note_score_model(&mut m, "p", "x".into(), 10), "the same model, again and again");
+        assert!(!note_score_model(&mut m, "p", "y".into(), 20), "a switch too soon");
+        assert!(note_score_model(&mut m, "p", "y".into(), SCORE_SWITCH_MIN_MS), "a switch after the window");
+        assert!(!note_score_model(&mut m, "p", "x".into(), SCORE_SWITCH_MIN_MS + 1), "and back: too soon");
+        assert!(note_score_model(&mut m, "q", "x".into(), 20), "per peer");
     }
 
     /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.
