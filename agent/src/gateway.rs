@@ -237,9 +237,10 @@ fn error_class(e: &crate::adapter::AdapterError) -> ErrorClass {
         AdapterError::Route(_) | AdapterError::Provider(_) | AdapterError::Cancelled(_) => {
             (StatusCode::BAD_GATEWAY, "upstream_error")
         }
-        AdapterError::Network(m) if m.contains("timed out") || m.contains("timeout") => {
+        AdapterError::Network(m) if m.to_ascii_lowercase().contains("timed out") || m.to_ascii_lowercase().contains("timeout") => {
             (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
         }
+        AdapterError::Overloaded(_) => (StatusCode::SERVICE_UNAVAILABLE, "upstream_overloaded"),
         AdapterError::Network(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
         other => classify_error(&other.to_string()),
     }
@@ -2420,6 +2421,9 @@ mod tests {
         assert_eq!(error_class(&AdapterError::Route("no provider for model 'm'".into())).0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error_class(&AdapterError::Route("all providers failed for 'm'".into())).0, StatusCode::BAD_GATEWAY);
         assert_eq!(error_class(&AdapterError::Network("proxy_forward timed out after 45s".into())).0, StatusCode::GATEWAY_TIMEOUT);
+        // Round 8 G8-4: libp2p's "Timeout", whatever its case.
+        assert_eq!(error_class(&AdapterError::Network("proxy_forward: proxy outbound: Timeout".into())).0, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error_class(&AdapterError::Overloaded("stream shed at open".into())).0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

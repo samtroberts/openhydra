@@ -38,6 +38,8 @@ pub enum AdapterError {
     Network(String),
     /// The caller stopped the request (its client left).
     Cancelled(String),
+    /// The provider was too busy to take the request (its serve pool full); try another.
+    Overloaded(String),
 }
 
 impl fmt::Display for AdapterError {
@@ -51,6 +53,7 @@ impl fmt::Display for AdapterError {
             AdapterError::Provider(m) => write!(f, "provider: {m}"),
             AdapterError::Network(m) => write!(f, "network: {m}"),
             AdapterError::Cancelled(m) => write!(f, "cancelled: {m}"),
+            AdapterError::Overloaded(m) => write!(f, "provider overloaded: {m}"),
         }
     }
 }
@@ -66,7 +69,8 @@ impl AdapterError {
             | AdapterError::Route(m)
             | AdapterError::Provider(m)
             | AdapterError::Network(m)
-            | AdapterError::Cancelled(m) => m,
+            | AdapterError::Cancelled(m)
+            | AdapterError::Overloaded(m) => m,
         }
     }
 }

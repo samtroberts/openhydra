@@ -166,6 +166,14 @@ const MAX_SETTLES_IN_FLIGHT: usize = 512;
 const PAYMENT_REFUSAL_TTL_MS: u64 = 10 * 60 * 1000;
 /// Providers whose recent settlements a consumer remembers (for [`ConsumerNode::paid_recently`]).
 const MAX_SETTLE_RECORDS: usize = 4096;
+/// How long a provider that shed our request, or couldn't be reached, is tried last.
+const UNAVAILABLE_RANK_LAST_MS: u64 = 60 * 1000;
+/// A second shed-free failure to reach a provider within this long costs it reputation.
+const UNAVAILABLE_REPEAT_MS: u64 = 10 * 60 * 1000;
+/// How recent a completed serve shows a provider's engine working (for a follow-up's refusal).
+const SERVED_OK_RECENT_MS: u64 = 10 * 60 * 1000;
+/// Times a follow-up audit is tried again after its subject couldn't be heard (engine down, network).
+const FOLLOW_UP_RETRIES: u32 = 3;
 /// Payment refusals remembered at once (the oldest are forgotten first).
 const MAX_PAYMENT_REFUSALS: usize = 1024;
 /// Settlements running or queued for one `(peer, model)`. They run one at a time (its lock), so with
@@ -600,6 +608,8 @@ fn has_writer_standing(earned: Option<f64>) -> bool {
 struct Strike {
     at: u64,
     writer: Option<String>,
+    /// Follow-ups that couldn't hear its subject so far.
+    retries: u32,
 }
 
 /// A model's recent requests a probe takes its shape from (at most, by count).
@@ -1177,7 +1187,7 @@ fn strike_first_failures(
                                 }
                             }
                         }
-                        strikes.insert(key, Strike { at: now, writer: writer.map(str::to_string) });
+                        strikes.insert(key, Strike { at: now, writer: writer.map(str::to_string), retries: 0 });
                         follow_up.push(peer.clone());
                         false
                     }
@@ -1346,9 +1356,14 @@ fn dispatch_stream_slice(
 fn provider_error(msg: String, at_admission: bool) -> AdapterError {
     match msg.strip_prefix(crate::serve::PAYMENT_REFUSAL) {
         Some(rest) if !at_admission => AdapterError::Provider(format!("refused payment after the serve began: {rest}")),
+        // Its serve pool was full (the provider's own shed reply, before anything was served).
+        _ if at_admission && msg == SHED_REPLY => AdapterError::Overloaded(msg),
         _ => AdapterError::Provider(msg),
     }
 }
+
+/// The text of a provider's shed reply to a request its full serve pool couldn't take.
+const SHED_REPLY: &str = "provider overloaded, retry";
 
 /// Open a stream to a provider and drive the poll loop, delivering each delta to `on_delta`.
 ///
@@ -1395,8 +1410,8 @@ fn request_completion_streaming_with(
     let mut offset: u32 = 0;
     match ack {
         FetchChunksResponse::Overloaded => {
-            return Err(StreamFail::Error(AdapterError::Network(
-                "provider overloaded (stream shed at open)".into(),
+            return Err(StreamFail::Error(AdapterError::Overloaded(
+                "stream shed at open".into(),
             )))
         }
         FetchChunksResponse::Forbidden => {
@@ -1598,6 +1613,12 @@ pub struct ConsumerNode {
     /// audited) for [`PAYMENT_REFUSAL_TTL_MS`], so a consumer that doesn't pay its price doesn't ask
     /// it first on every request.
     payment_refusals: Mutex<HashMap<(String, String), u64>>,
+    /// Per `(provider, model)`: when it last shed our request or couldn't be reached before serving
+    /// anything (round 8 T8-3). Tried last for [`UNAVAILABLE_RANK_LAST_MS`]; a second within
+    /// [`UNAVAILABLE_REPEAT_MS`] costs reputation.
+    unavailable: Mutex<HashMap<(String, String), u64>>,
+    /// Per provider (libp2p id): when it last completed a serve for us.
+    served_ok: Mutex<HashMap<String, u64>>,
     /// Device attestation of providers (Phase 0). `None` = off (the default).
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
@@ -1683,6 +1704,8 @@ impl ConsumerNode {
             settle_locks: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             payment_refusals: Mutex::new(HashMap::new()),
+            unavailable: Mutex::new(HashMap::new()),
+            served_ok: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
             audit_replay: false,
@@ -2019,6 +2042,8 @@ impl ConsumerNode {
             settle_locks: Mutex::new(HashMap::new()),
             settles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             payment_refusals: Mutex::new(HashMap::new()),
+            unavailable: Mutex::new(HashMap::new()),
+            served_ok: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
             audit_replay: false,
@@ -2371,6 +2396,46 @@ impl ConsumerNode {
         m.insert((provider.to_string(), model.to_string()), now);
     }
 
+    /// Note that `provider` shed our request for `model`, or couldn't be reached, before serving
+    /// anything. Whether it did so before within [`UNAVAILABLE_REPEAT_MS`].
+    fn note_unavailable(&self, provider: &str, model: &str, now: u64) -> bool {
+        let mut m = self.unavailable.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, at| now.saturating_sub(*at) <= UNAVAILABLE_REPEAT_MS);
+        if m.len() >= MAX_PAYMENT_REFUSALS {
+            if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
+        m.insert((provider.to_string(), model.to_string()), now).is_some_and(|at| now.saturating_sub(at) <= UNAVAILABLE_REPEAT_MS)
+    }
+
+    /// Whether `provider` shed or missed a request of ours for `model` within
+    /// [`UNAVAILABLE_RANK_LAST_MS`] (it is then tried last).
+    fn briefly_unavailable(&self, provider: &str, model: &str, now: u64) -> bool {
+        self.unavailable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(provider.to_string(), model.to_string()))
+            .is_some_and(|at| now.saturating_sub(*at) <= UNAVAILABLE_RANK_LAST_MS)
+    }
+
+    /// Note that `provider` (libp2p id) completed a serve for us.
+    fn note_served_ok(&self, provider: &str, now: u64) {
+        let mut m = self.served_ok.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.contains_key(provider) && m.len() >= MAX_SETTLE_RECORDS {
+            m.retain(|_, at| now.saturating_sub(*at) <= SERVED_OK_RECENT_MS);
+            if m.len() >= MAX_SETTLE_RECORDS {
+                return;
+            }
+        }
+        m.insert(provider.to_string(), now);
+    }
+
+    /// Whether `provider` completed a serve for us within [`SERVED_OK_RECENT_MS`] of `now`.
+    fn served_ok_recently(&self, provider: &str, now: u64) -> bool {
+        self.served_ok.lock().unwrap_or_else(|e| e.into_inner()).get(provider).is_some_and(|at| now.abs_diff(*at) <= SERVED_OK_RECENT_MS)
+    }
+
     /// Whether `provider` refused us `model` over payment within [`PAYMENT_REFUSAL_TTL_MS`].
     fn refused_payment(&self, provider: &str, model: &str, now: u64) -> bool {
         self.payment_refusals
@@ -2594,7 +2659,9 @@ impl ConsumerNode {
             self.maybe_qualify(model, &peers, &candidates, now);
         }
         // Providers that just refused us over payment go last (in their order).
-        candidates.sort_by_key(|c| self.refused_payment(&c.libp2p_peer_id, &c.model_id, now));
+        candidates.sort_by_key(|c| {
+            (self.refused_payment(&c.libp2p_peer_id, &c.model_id, now), self.briefly_unavailable(&c.libp2p_peer_id, &c.model_id, now))
+        });
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
@@ -2749,6 +2816,9 @@ impl ConsumerNode {
                     if summary.ok && summary.tokens > 0 {
                         self.record_usage(model, &provider.peer_id, summary.tokens, self_serve, now);
                     }
+                    if summary.ok && !self_serve {
+                        self.note_served_ok(&provider.libp2p_peer_id, now);
+                    }
                     // M2.2(a): a clean served completion earns the provider reputation for THIS
                     // model (Phase 4a) — but not for a self-serve (no earning off yourself).
                     let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
@@ -2816,7 +2886,15 @@ impl ConsumerNode {
                     if refused {
                         self.note_payment_refusal(&provider.libp2p_peer_id, &provider.model_id, now);
                     }
-                    if !self.is_self_serve(&provider.libp2p_peer_id) && !refused && !cancelled {
+                    // A shed (its pool was full) or a provider we couldn't reach, before anything was
+                    // served, goes last for a minute; only a second miss within ten minutes costs it
+                    // reputation, and a shed never does: load others cause isn't the provider's fault
+                    // (round 8 T8-3).
+                    let shed = !delivered && matches!(e, AdapterError::Overloaded(_));
+                    let unreachable = !delivered && matches!(e, AdapterError::Network(_));
+                    let missed_again = (shed || unreachable) && self.note_unavailable(&provider.libp2p_peer_id, &provider.model_id, now);
+                    let excused = shed || (unreachable && !missed_again);
+                    if !self.is_self_serve(&provider.libp2p_peer_id) && !refused && !cancelled && !excused {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                         self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
                     }
@@ -4349,6 +4427,8 @@ impl ConsumerNode {
         // Whether the subject's non-answer was its own doing (an error it sent, or a payment refusal
         // after serving us at our price), not the network's or a busy pool's (R6-3).
         let mut subject_refused = false;
+        // Whether the subject shed the request (its pool was full): no outcome then (T8-3).
+        let mut subject_shed = false;
         let first = match served {
             Some(answer) => Ok(answer.to_string()),
             None => match self.audit_serve(subject, request) {
@@ -4357,7 +4437,11 @@ impl ConsumerNode {
                     return Err(e);
                 }
                 Err(e) => {
-                    subject_refused = matches!(e, AdapterError::Provider(_)) && !e.message().contains("overloaded");
+                    // An error it sent counts as its own doing only while its engine evidently works:
+                    // it completed a real serve for us around now (round 8 T8-5). An engine outage,
+                    // or a model it stopped sharing, fails our traffic too.
+                    subject_refused = matches!(e, AdapterError::Provider(_)) && self.served_ok_recently(&subject.libp2p_peer_id, now_unix_ms());
+                    subject_shed = matches!(e, AdapterError::Overloaded(_));
                     Err(e)
                 }
                 out => out,
@@ -4400,6 +4484,9 @@ impl ConsumerNode {
                         }
                         Err(e)
                     }
+                    // A partner that shed the request or couldn't be reached is skipped, not held to
+                    // it (T8-3); the next one is asked, within the contact limit.
+                    Err(AdapterError::Overloaded(_)) | Err(AdapterError::Network(_)) => continue,
                     out => out,
                 };
                 let nets = if before.is_empty() { nets_now(&provider.libp2p_peer_id) } else { before };
@@ -4481,6 +4568,27 @@ impl ConsumerNode {
             }
             if results[0].1.is_err() && !report.outcomes.iter().any(|(p, _)| *p == subject.state_id) {
                 report.outcomes.push((subject.state_id.clone(), VerificationOutcome::Failed));
+            }
+        }
+        if subject_shed {
+            report.outcomes.retain(|(peer, outcome)| !(*peer == subject.state_id && *outcome == VerificationOutcome::Rejected));
+        }
+        // A follow-up whose subject couldn't be heard (not its own doing): the strike stands, and it
+        // is asked again later, a few times (T8-5).
+        if strict_subject && results[0].1.is_err() && !subject_refused {
+            let key = reputation_key(&subject.state_id, key_of.get(&subject.state_id).map_or(model, String::as_str));
+            let again = self
+                .strikes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&key)
+                .is_some_and(|s| {
+                    s.retries += 1;
+                    s.retries <= FOLLOW_UP_RETRIES
+                });
+            if again {
+                let delay = Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), FOLLOW_UP_DELAY_MS));
+                self.spawn_follow_up(model, subject, delay);
             }
         }
         // A first divergence is a strike, not a failure (C3): the struck provider is audited again
@@ -5088,7 +5196,7 @@ mod tests {
         let mut transport = |_: &[u8]| Ok(FetchChunksResponse::Overloaded.encode());
         let mut sleeper = |_: Duration| {};
         let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
-        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(m))) if m.contains("overloaded")));
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Overloaded(_)))));
     }
 
     #[test]
@@ -5529,6 +5637,27 @@ mod tests {
             no_verdict_runs: Mutex::new(HashMap::new()),
             first_contact_packs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Round 8 T8-3/T8-5: a shed or a missed provider goes last for a minute and only a second miss
+    /// within ten minutes counts; a recent completed serve shows its engine works.
+    #[test]
+    fn a_missed_provider_goes_last_and_only_a_repeat_counts() {
+        let (_dir, node) = test_node();
+        let t = 1_000_000;
+        assert!(!node.note_unavailable("p", "m", t), "first miss");
+        assert!(node.briefly_unavailable("p", "m", t + UNAVAILABLE_RANK_LAST_MS));
+        assert!(!node.briefly_unavailable("p", "m", t + UNAVAILABLE_RANK_LAST_MS + 1));
+        assert!(!node.briefly_unavailable("p", "other", t));
+        assert!(node.note_unavailable("p", "m", t + UNAVAILABLE_REPEAT_MS), "second within ten minutes");
+        assert!(!node.note_unavailable("p", "m", t + 3 * UNAVAILABLE_REPEAT_MS), "long after: a first miss again");
+        assert!(!node.served_ok_recently("p", t));
+        node.note_served_ok("p", t);
+        assert!(node.served_ok_recently("p", t + SERVED_OK_RECENT_MS));
+        assert!(!node.served_ok_recently("p", t + SERVED_OK_RECENT_MS + 1));
+        assert!(matches!(provider_error(SHED_REPLY.into(), true), AdapterError::Overloaded(_)));
+        assert!(matches!(provider_error(SHED_REPLY.into(), false), AdapterError::Provider(_)));
+        assert!(matches!(provider_error("engine down".into(), true), AdapterError::Provider(_)));
     }
 
     /// Round 8 L8-1: runs cut short by timeouts or dropped connections never count against a
