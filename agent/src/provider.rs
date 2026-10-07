@@ -380,9 +380,8 @@ struct Unsettled {
 /// The credit window: whether a consumer may be served now, given its unsettled serves
 /// (`(served at, tokens)`) and how many of its serves went unpaid within [`DEFAULT_WINDOW_MS`].
 /// Payment is otherwise voluntary (a consumer has its tokens before it signs anything), so this
-/// bounds what one consumer identity can take without paying: about one serve, or what fits in the
-/// grace period. Not a guarantee against a consumer that keeps making new identities; that needs a
-/// check of its on-chain escrow before serving.
+/// bounds what a consumer can take without paying: about one serve, or what fits in the grace
+/// period.
 ///
 /// `unsettled` are its serves not yet paid for, delivered or not (a stream abandoned just short of
 /// its end was still read), `generating` the reservations of its paid serves still running, and

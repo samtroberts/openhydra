@@ -194,9 +194,8 @@ const CLOSE_RETRY_WAITS: [Duration; 6] = [
     Duration::from_secs(40),
     Duration::from_secs(60),
 ];
-/// Without a `max_tokens`, the most a stream close's reply may add to what we read, in fragments and
-/// in billed tokens alike (a provider's credit window, which no honest stream outgrows unpaid). With
-/// one, the request's `max_tokens` bounds it (review round 5, R5S-2: a lower cap would underpay an
+/// The most a stream close's reply may add to what we read, in fragments and in billed tokens alike,
+/// when the request sets no `max_tokens` (review round 5, R5S-2: a lower cap would underpay an
 /// honest provider whose long poll reply was lost).
 const CLOSE_TAIL_MAX_TOKENS: u64 = 65_536;
 
@@ -228,8 +227,7 @@ fn delivered_text_cap(_max_tokens: Option<u32>) -> u64 {
     MAX_DELIVERED_TEXT_UNITS
 }
 
-/// Stream closes running at once (each a detached thread retrying for minutes); past it, what was
-/// read is settled without closing first (R5S-3).
+/// Stream closes running at once (each a detached thread retrying for minutes) (R5S-3).
 const MAX_CLOSES_IN_FLIGHT: usize = 256;
 
 /// Whether a failed settlement is worth sending again: the round-trip failed, or the provider asked

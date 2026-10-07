@@ -48,11 +48,9 @@ solana_preimage_cross_language_golden}`) that the on-chain tests reproduce.
 - **Off-chain duty (both chains): watch exits.** Once a consumer requests an exit (`ExitRequested` /
   `request_exit`), it may withdraw everything left after the refund delay. A provider serving that
   consumer must settle every claim it holds within the delay, or stop serving it while the exit is
-  pending; a claim settled after the withdraw finds the escrow empty. Nothing stops a consumer
-  requesting exits back to back (with a short refund delay its exit is armed most of the time), so
-  the duty is standing, not occasional. The agent doesn't watch exits yet: that comes with the escrow
-  check before serving (P2(a)); until then it is the provider operator's to do. A cooldown between
-  exit requests was considered and not added: settling within the delay is what protects the
+  pending; a claim settled after the withdraw finds the escrow empty. A consumer may request a
+  new exit at any time, so the duty is standing, not occasional; it is the provider operator's to do.
+  A cooldown between exit requests was considered and not added: settling within the delay is what protects the
   provider, whatever the cadence.
 - **Fee dust:** the 4% fee is floored on the running total of each (consumer, provider, model), so
   splitting payments across many keys or models can leave the protocol at most one micro-unit less
@@ -75,9 +73,7 @@ void the claims that expire during it, and a pause after a claim ran out doesn't
 contracts remember the most recent 64 pauses for this. A pause begun within a day of the last one's end
 continues it (the time between counts as paused, for claims and exits alike), so distinct pauses are a
 day apart at least, the log covers every pause a live claim can span, and unpausing and re-pausing can't
-push one out of it. Two consequences of counting that gap: a claim that ran out during it gets the gap
-back (it can settle again, within the 30-day cap), and an exit requested during it is extended by the
-gap before its request too (within its own 30-day cap). A settle past the escrow pays what it
+push one out of it. Claims and exits stay within their 30-day caps either way. A settle past the escrow pays what it
 holds and the rest after a top-up. On Base the paid-so-far is keyed by the consumer's Ed25519 id as well
 as its wallet. Solana payout bindings can't be stamped more than 5 minutes ahead. Solana's `Settled` event names the
 model by its hash, as Base's does (SHA-256 on Solana, keccak-256 on Base: not comparable across chains). Solana's `Config` grows only at its end (a deployed program

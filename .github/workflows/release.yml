@@ -215,9 +215,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       # 2) The desktop app + installers (signed so the auto-updater accepts them). The signing
-      # secrets are on this step only. They can't be narrower: `tauri build` compiles, bundles and
-      # signs in one command (it signs the .app and sidecars before bundling the .dmg, then signs
-      # the updater archives), so the step that builds is the step that signs.
+      # secrets are on this step only.
       - name: Build desktop app
         working-directory: desktop
         env:
