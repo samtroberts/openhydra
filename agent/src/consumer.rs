@@ -4412,6 +4412,8 @@ impl ConsumerNode {
                 if paying && exchange.opened {
                     tally.push_tool_calls(&exchange.tool_calls);
                     self.close_and_settle(writer, exchange.nonce, exchange.stream_offset, tally, request.max_tokens);
+                } else if paying && tally.billable(request.max_tokens) > 0 {
+                    self.settle_receipt(writer, tally.billable(request.max_tokens), exchange.nonce);
                 }
                 tracing::debug!(writer = %writer.peer_id, error = %e, "couldn't get probe questions written");
                 Vec::new()
@@ -4468,6 +4470,9 @@ impl ConsumerNode {
                 if paying && exchange.opened {
                     tally.push_tool_calls(&exchange.tool_calls);
                     self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens);
+                } else if paying && tally.billable(serve.max_tokens) > 0 {
+                    // A buffered serve that failed part-way is owed for its text (round 9 B9-4).
+                    self.settle_receipt(provider, tally.billable(serve.max_tokens), exchange.nonce);
                 }
                 Err(e)
             }
