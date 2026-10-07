@@ -881,8 +881,9 @@ impl LogprobStatus {
     }
 
     /// Record a run that ended without a verdict. `counts_against` is true when the provider has
-    /// answered before and the run stopped on its side (refusal, timeout, a broken reply, or it
-    /// stopped supporting the protocol) — false for a first contact or for our own shortage of texts.
+    /// answered before and the run stopped by its choice (it stopped supporting the protocol, or
+    /// declined texts) — false for a first contact, our own shortage of texts, or a run cut short by
+    /// a timeout or a dropped connection (round 8 L8-1).
     pub fn on_no_verdict(&mut self, counts_against: bool, retry_ms: u64, now_ms: u64) -> StatusEffect {
         self.next_due_ms = now_ms + retry_ms;
         if !counts_against {

@@ -133,9 +133,11 @@ struct Inner<H> {
     http: H,
     state: Mutex<State>,
     changed: Condvar,
-    /// Files whose scorer couldn't be started (or kept failing), when, and why; not retried for
-    /// [`FAILED_BACKOFF`]. Per file, so a challenge for another model doesn't erase it.
-    failed: Mutex<HashMap<PathBuf, (Instant, String)>>,
+    /// Files whose scorer couldn't be started (or kept failing), when, why, and whether it is
+    /// expected to come back (a running scorer that kept failing: challenges meanwhile are answered
+    /// "busy", not "can't score"); not retried for [`FAILED_BACKOFF`]. Per file, so a challenge for
+    /// another model doesn't erase it.
+    failed: Mutex<HashMap<PathBuf, (Instant, String, bool)>>,
     /// Recent scorer starts and their files, for [`MAX_STARTS_PER_HOUR`] / [`SWITCH_MIN_INTERVAL`].
     starts: Mutex<std::collections::VecDeque<(Instant, PathBuf)>>,
 }
@@ -199,8 +201,11 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 *last_used = Instant::now();
                 match &out {
                     Ok(_) => *errors = 0,
-                    // A request the scorer rejected (4xx) is the challenger's doing, not the scorer's.
-                    Err(AdapterError::Http(m)) if m.contains("client error") => {}
+                    // The scorer failing on its own side: a server error, or a reply it got wrong.
+                    Err(AdapterError::Http(m)) if m.contains("server error") => *errors += 1,
+                    // A request it rejected (4xx) is the challenger's doing; one we gave up waiting on
+                    // is the queue's (load an outsider can cause), not the scorer failing (round 8 L8-2).
+                    Err(AdapterError::Http(_)) => {}
                     Err(_) => *errors += 1,
                 }
             }
@@ -210,7 +215,7 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 tracing::warn!(weights = %weights.display(), "the prompt scorer keeps failing; stopping it");
                 self.inner.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(
                     weights.to_path_buf(),
-                    (Instant::now(), "the prompt scorer kept failing (out of memory?)".into()),
+                    (Instant::now(), "the prompt scorer kept failing (out of memory?)".into(), true),
                 );
                 *st = State::Idle;
             }
@@ -224,9 +229,9 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
         if !inner.launcher.can_score(weights) {
             return Err(AdapterError::Unsupported("no prompt scorer for this kind of model here".into()));
         }
-        if let Some((at, why)) = inner.failed.lock().unwrap_or_else(|e| e.into_inner()).get(weights) {
+        if let Some((at, why, transient)) = inner.failed.lock().unwrap_or_else(|e| e.into_inner()).get(weights) {
             if at.elapsed() < FAILED_BACKOFF {
-                return Err(AdapterError::Unsupported(why.clone()));
+                return Err(if *transient { AdapterError::Busy(why.clone()) } else { AdapterError::Unsupported(why.clone()) });
             }
         }
         let current = stamp(weights);
@@ -240,6 +245,11 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 }
             }
             match &mut *st {
+                // One scoring at a time: a second waits its turn as "busy" rather than queueing in the
+                // scorer behind one it can't cancel (round 8 L8-1).
+                State::Ready { weights: w, stamp, active, .. } if w == weights && *stamp == current && *active > 0 => {
+                    return Err(AdapterError::Busy("prompt scorer is busy".into()));
+                }
                 State::Ready { weights: w, stamp, instance, last_used, active, .. } if w == weights && *stamp == current => {
                     *last_used = Instant::now();
                     *active += 1;
@@ -255,7 +265,7 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                         return Err(AdapterError::Busy("prompt scorer is still starting".into()));
                     }
                     st = inner.changed.wait_timeout(st, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
-                    if let Some((_, why)) = inner.failed.lock().unwrap_or_else(|e| e.into_inner()).get(weights) {
+                    if let Some((_, why, _)) = inner.failed.lock().unwrap_or_else(|e| e.into_inner()).get(weights) {
                         if matches!(&*st, State::Idle) {
                             return Err(AdapterError::Unsupported(why.clone())); // this start just failed
                         }
@@ -331,7 +341,7 @@ fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path, stamp: Option<Stamp>) 
                 format!("the prompt scorer failed to start: {last_error}")
             };
             tracing::warn!(weights = %weights.display(), reason = %why, "prompt scoring unavailable for this model");
-            inner.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(weights.to_path_buf(), (Instant::now(), why));
+            inner.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(weights.to_path_buf(), (Instant::now(), why, false));
             State::Idle
         }
     };
@@ -642,6 +652,8 @@ mod tests {
             match v["prompt_token_ids"][0].as_u64() {
                 Some(998) => return Err(AdapterError::Http("HTTP status client error (400 Bad Request)".into())),
                 Some(999) => return Err(AdapterError::Http("HTTP status server error (503 Service Unavailable)".into())),
+                // Token 997: we gave up waiting (the scorer was busy with others' work).
+                Some(997) => return Err(AdapterError::Http("error sending request: operation timed out".into())),
                 _ => {}
             }
             let n = v["prompt_token_ids"].as_array().unwrap().len();
@@ -743,13 +755,26 @@ mod tests {
         assert!(score_patiently(&s, "/m.gguf").is_ok());
         for _ in 0..MAX_SCORER_ERRORS + 2 {
             assert!(s.score(Path::new("/m.gguf"), &[998, 1]).is_err()); // a challenger's bad request
+            assert!(s.score(Path::new("/m.gguf"), &[997, 1]).is_err()); // a timeout (round 8 L8-2)
         }
-        assert!(s.score(Path::new("/m.gguf"), &[1, 2]).is_ok(), "bad requests don't stop the scorer");
+        assert!(s.score(Path::new("/m.gguf"), &[1, 2]).is_ok(), "bad requests and timeouts don't stop the scorer");
         for _ in 0..MAX_SCORER_ERRORS {
             assert!(s.score(Path::new("/m.gguf"), &[999, 1]).is_err());
         }
-        assert!(matches!(s.score(Path::new("/m.gguf"), &[1, 2]), Err(AdapterError::Unsupported(m)) if m.contains("kept failing")));
+        // Backed off, answered "busy" (it is expected back), not "can't score".
+        assert!(matches!(s.score(Path::new("/m.gguf"), &[1, 2]), Err(AdapterError::Busy(m)) if m.contains("kept failing")));
         assert_eq!(launches.load(Ordering::SeqCst), 1, "backed off, not restarted");
+    }
+
+    #[test]
+    fn a_second_scoring_waits_its_turn_as_busy() {
+        // Round 8 L8-1: one at a time, never queued behind a scoring the scorer can't cancel.
+        let (s, _) = scorer(vec![405], Duration::ZERO);
+        assert!(score_patiently(&s, "/m.gguf").is_ok());
+        if let State::Ready { active, .. } = &mut *s.inner.state.lock().unwrap() {
+            *active = 1; // a scoring in progress
+        }
+        assert!(matches!(s.score(Path::new("/m.gguf"), &[1, 2]), Err(AdapterError::Busy(_))));
     }
 
     #[test]

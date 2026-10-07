@@ -3687,7 +3687,10 @@ impl ConsumerNode {
         }
         let effect = match &outcome {
             RoundOutcome::Verdict(v) => st.on_verdict_drawn(*v, now, 1.0 - rand::random::<f64>()),
-            RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, retry, now),
+            // A run cut short by a timeout or a dropped connection isn't held against a provider:
+            // that is what contention others cause looks like, and a provider stalling on purpose
+            // answers "busy" at no cost anyway (round 8 L8-1).
+            RoundOutcome::Incomplete(_) => st.on_no_verdict(false, retry, now),
             // Busy isn't held against a provider (it can't be told from contention others cause): the
             // text it stalled on waits for it. A provider that stays busy gains nothing: a fail stands
             // until a later round passes, and a pass lapses (review round 6).
@@ -5423,6 +5426,41 @@ mod tests {
         })
         .unwrap();
         (dir, ConsumerNode::new(net))
+    }
+
+    fn empty_logprob() -> ProviderLogprob {
+        ProviderLogprob {
+            refs: Vec::new(),
+            registry: None,
+            registry_identities: Mutex::new(HashMap::new()),
+            registry_weights: Mutex::new(HashMap::new()),
+            rounds: Mutex::new(HashMap::new()),
+            status: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(std::collections::HashSet::new()),
+            count_scorer: None,
+            counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            issued_here: Mutex::new(std::collections::HashSet::new()),
+            resume: Mutex::new(HashMap::new()),
+            no_verdict_runs: Mutex::new(HashMap::new()),
+            first_contact_packs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Round 8 L8-1: runs cut short by timeouts or dropped connections never count against a
+    /// provider that has answered before; declining texts mid-round still does.
+    #[test]
+    fn a_run_cut_short_is_never_held_against_a_provider() {
+        let (_dir, node) = test_node();
+        let lp = empty_logprob();
+        lp.status.lock().unwrap().entry("k".into()).or_default().pass_streak = 2;
+        for _ in 0..10 {
+            node.settle_logprob_round(&lp, "k", "p", "m", "m", RoundOutcome::Incomplete("transport: timed out".into()), ChallengeRound::default(), 0, None);
+        }
+        let st = lp.status.lock().unwrap()["k"];
+        assert_eq!(st.pass_streak, 2, "streak kept");
+        assert!(node.audit_stats.lock().unwrap().is_empty(), "no failed audit recorded");
+        node.settle_logprob_round(&lp, "k", "p", "m", "m", RoundOutcome::Evasion("declined".into()), ChallengeRound::default(), 0, None);
+        assert_eq!(lp.status.lock().unwrap()["k"].pass_streak, 0, "an evasion still counts");
     }
 
     fn selected(libp2p: &str) -> SelectedProvider {
