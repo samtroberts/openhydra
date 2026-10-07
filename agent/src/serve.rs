@@ -402,6 +402,10 @@ pub struct ServeSummary {
     /// empty for a plain-text completion. The gateway emits these as the assistant turn's
     /// `tool_calls` with `finish_reason: "tool_calls"`.
     pub tool_calls: Vec<ToolCall>,
+    /// Consumer-side: the authenticity tier this consumer had established for the provider that
+    /// served (shown to the client, which can require a minimum). `None` provider-side and for a
+    /// serve by our own provider.
+    pub authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -427,6 +431,7 @@ pub fn handle_serve_request(
                 discover_ns: 0,
                 proxy_roundtrip_ns: 0,
                 tool_calls: Vec::new(),
+                authenticity: None,
             };
         }
     };
@@ -528,6 +533,7 @@ pub fn handle_serve_request_within(
                 discover_ns: 0,
                 proxy_roundtrip_ns: 0,
                 tool_calls: o.tool_calls,
+                authenticity: None,
             }
         }
         Err(e) => {
@@ -539,6 +545,7 @@ pub fn handle_serve_request_within(
                 discover_ns: 0,
                 proxy_roundtrip_ns: 0,
                 tool_calls: Vec::new(),
+                authenticity: None,
             }
         }
     }

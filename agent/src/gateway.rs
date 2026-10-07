@@ -568,6 +568,8 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
 
     json!({
         "tokens": summary.tokens,
+        // The authenticity tier this gateway had established for the provider that served (D2).
+        "provider_authenticity": summary.authenticity.map(|t| t.label()),
         "engine": {
             "native_tps": r1(tps(e.eval_count, e.eval_duration_ns)),
             "prefill_tps": r1(tps(e.prompt_eval_count, e.prompt_eval_duration_ns)),
@@ -655,6 +657,7 @@ fn spawn_worker(
     temperature: Option<f64>,
     tools: Vec<Value>,
     think: Option<bool>,
+    min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
@@ -669,7 +672,7 @@ fn spawn_worker(
         let mut on_delta = |d: &str| {
             let _ = tx.send(GatewayEvent::Delta(d.to_string()));
         };
-        match node.complete(&model, messages, max_tokens, temperature, tools, think, &mut on_delta) {
+        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, &mut on_delta) {
             Ok(summary) => {
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -751,6 +754,24 @@ enum DispatchErr {
     ByokKeyMissing(String),
     /// Model resolution found nothing to serve (e.g. `auto` with no live models).
     NoModels(String),
+    /// The [`MIN_AUTHENTICITY_HEADER`] isn't one of `A0`–`A3`.
+    BadAuthenticity,
+}
+
+/// The request header a client sets to require a minimum authenticity tier (`A0`–`A3`) for its
+/// request: providers below it aren't used, and a request no provider qualifies for fails saying so.
+pub const MIN_AUTHENTICITY_HEADER: &str = "x-openhydra-min-authenticity";
+
+/// `A0`…`A3` (any case) as an authenticity tier.
+pub fn parse_authenticity_tier(s: &str) -> Option<openhydra_protocol::trust::AuthenticityTier> {
+    use openhydra_protocol::trust::AuthenticityTier::*;
+    match s.trim().to_ascii_uppercase().as_str() {
+        "A0" => Some(SelfReported),
+        "A1" => Some(ReputationRedundant),
+        "A2" => Some(EnergyFingerprintPossession),
+        "A3" => Some(HardwareAttested),
+        _ => None,
+    }
 }
 
 /// Shared route/dispatch used by both `/v1/chat/completions` and `/v1/messages`: apply the AUP
@@ -776,6 +797,15 @@ async fn spawn_dispatch(
     if let AupDecision::Deny(reason) = state.aup.evaluate(&messages, max_tokens) {
         return Err(DispatchErr::Aup(reason));
     }
+    // D2: the client may require a minimum authenticity tier for this request (raising, never
+    // lowering, the gateway's own). Not applied to a BYOK model, which no provider of ours serves.
+    let min_authenticity = match headers.get(MIN_AUTHENTICITY_HEADER) {
+        None => None,
+        Some(v) => match v.to_str().ok().and_then(parse_authenticity_tier) {
+            Some(t) => Some(t),
+            None => return Err(DispatchErr::BadAuthenticity),
+        },
+    };
     // G3b: acquire the global generation slot BEFORE any (blocking) discovery work, so the backstop
     // bounds resolution too.
     let gen_permit = match state.gen_limiter.clone().try_acquire_owned() {
@@ -809,7 +839,7 @@ async fn spawn_dispatch(
             gen_permit,
         )
     } else {
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, gen_permit)
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, gen_permit)
     };
     Ok((model, rx, started))
 }
@@ -831,6 +861,11 @@ fn dispatch_err_openai(e: DispatchErr) -> Response {
             "invalid_request_error",
         ),
         DispatchErr::NoModels(m) => openai_error(StatusCode::SERVICE_UNAVAILABLE, &m, "no_provider"),
+        DispatchErr::BadAuthenticity => openai_error(
+            StatusCode::BAD_REQUEST,
+            &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2, A3"),
+            "invalid_request_error",
+        ),
     }
 }
 
@@ -894,6 +929,7 @@ fn spawn_byok_worker(
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
                     tool_calls: outcome.tool_calls,
+                    authenticity: None,
                 };
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -1276,6 +1312,11 @@ fn dispatch_err_anthropic(e: DispatchErr) -> Response {
             "invalid_request_error",
         ),
         DispatchErr::NoModels(m) => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, &m, "api_error"),
+        DispatchErr::BadAuthenticity => anthropic_error(
+            StatusCode::BAD_REQUEST,
+            &format!("{MIN_AUTHENTICITY_HEADER} must be one of A0, A1, A2, A3"),
+            "invalid_request_error",
+        ),
     }
 }
 
@@ -1819,6 +1860,7 @@ pub fn router(
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
     logprob_registry: Option<crate::registry_client::RegistryClient>,
     audit_replay: bool,
+    assurance: openhydra_protocol::trust::AssurancePolicy,
 ) -> Router {
     let node = match store {
         Some(s) => {
@@ -1859,6 +1901,8 @@ pub fn router(
     let node = node.with_logprob_checks(logprob_refs, logprob_registry);
     // D1: audits may replay users' greedy requests to public models (see `with_audit_replay`).
     let node = node.with_audit_replay(audit_replay);
+    // D2: the buyer's floor for every request (a request can raise it, see MIN_AUTHENTICITY_HEADER).
+    let node = node.with_assurance_policy(assurance);
     let node = Arc::new(node);
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
@@ -1925,13 +1969,14 @@ pub fn serve_http(
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
     logprob_registry: Option<crate::registry_client::RegistryClient>,
     audit_replay: bool,
+    assurance: openhydra_protocol::trust::AssurancePolicy,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, audit_replay)
+        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, audit_replay, assurance)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })
@@ -1941,6 +1986,28 @@ pub fn serve_http(
 mod tests {
     use super::*;
     use crate::adapter::EngineMetrics;
+
+    #[test]
+    fn the_min_authenticity_header_names_a_tier() {
+        use openhydra_protocol::trust::AuthenticityTier::*;
+        assert_eq!(parse_authenticity_tier("A1"), Some(ReputationRedundant));
+        assert_eq!(parse_authenticity_tier(" a2 "), Some(EnergyFingerprintPossession));
+        assert_eq!(parse_authenticity_tier("A0"), Some(SelfReported));
+        assert_eq!(parse_authenticity_tier("A3"), Some(HardwareAttested));
+        assert_eq!(parse_authenticity_tier("A4"), None);
+        assert_eq!(parse_authenticity_tier("high"), None);
+    }
+
+    #[test]
+    fn the_response_reports_the_providers_tier() {
+        let mut s = summary(10, 5);
+        assert!(openhydra_block(&s, std::time::Duration::from_secs(1), std::time::Duration::ZERO)["provider_authenticity"].is_null());
+        s.authenticity = Some(openhydra_protocol::trust::AuthenticityTier::ReputationRedundant);
+        assert_eq!(
+            openhydra_block(&s, std::time::Duration::from_secs(1), std::time::Duration::ZERO)["provider_authenticity"],
+            "A1-reputation-redundant"
+        );
+    }
 
     fn summary(tokens: u64, prompt: u64) -> ServeSummary {
         ServeSummary {
@@ -1954,6 +2021,7 @@ mod tests {
             proxy_roundtrip_ns: 600_000_000,
             discover_ns: 1_000_000,
             tool_calls: Vec::new(),
+            authenticity: None,
         }
     }
 

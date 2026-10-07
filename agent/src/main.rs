@@ -695,6 +695,19 @@ struct ServeArgs {
     #[arg(long = "swarms-dir")]
     swarms_dir: Option<std::path::PathBuf>,
 
+    /// The lowest authenticity tier a provider must have reached with this gateway to serve it:
+    /// A0 (anyone, the default), A1 (reputation and audits agreeing), A2 (plus a log-prob identity
+    /// check), A3 (hardware attestation). With `--assurance verify` (the default) providers below it
+    /// are still used, and the tier is reported; with `gate` they are not. A request can raise it
+    /// (never lower it) with the `x-openhydra-min-authenticity` header, which is always enforced.
+    #[arg(long = "min-authenticity", default_value = "A0", value_parser = ["A0", "A1", "A2", "A3"])]
+    min_authenticity: String,
+
+    /// `verify`: route to any provider and report its tier. `gate`: refuse providers below
+    /// `--min-authenticity`; a request none qualifies for fails, naming the tier.
+    #[arg(long = "assurance", default_value = "verify", value_parser = ["verify", "gate"])]
+    assurance: String,
+
     /// How audits check providers. `on` (the default): a greedy (temperature 0) request
     /// to a public model may be sent again, as is, to a second provider of it, and the two answers
     /// compared, so the audited provider can't tell it was checked. Your prompt then also reaches
@@ -1622,6 +1635,23 @@ fn serve(
         }
         None => None,
     };
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry, args.audit_replay == "on")
+    let assurance = openhydra_protocol::trust::AssurancePolicy {
+        min_authenticity: openhydra_agent::gateway::parse_authenticity_tier(&args.min_authenticity)
+            .expect("clap restricts --min-authenticity to A0..A3"),
+        mode: if args.assurance == "gate" {
+            openhydra_protocol::trust::PolicyMode::HardGate
+        } else {
+            openhydra_protocol::trust::PolicyMode::VerifyButRoute
+        },
+        ..openhydra_protocol::trust::AssurancePolicy::OPEN
+    };
+    if assurance != openhydra_protocol::trust::AssurancePolicy::OPEN {
+        eprintln!(
+            "openhydra-agent: provider floor {} ({})",
+            assurance.min_authenticity.label(),
+            if args.assurance == "gate" { "enforced" } else { "reported, not enforced" }
+        );
+    }
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry, args.audit_replay == "on", assurance)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

@@ -645,6 +645,7 @@ pub fn request_completion(
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
                     tool_calls,
+                    authenticity: None,
                 })
             }
             ServeChunk::Error(msg) => return Err(AdapterError::Http(msg)),
@@ -743,6 +744,38 @@ fn stream_total_cap_scaled(max_tokens: Option<u32>) -> Duration {
     let tokens = max_tokens.map(u64::from).unwrap_or(STREAM_TOTAL_DEFAULT_TOKENS);
     let scaled = STREAM_TOTAL_BASE + Duration::from_secs(tokens.saturating_mul(STREAM_TOTAL_PER_TOKEN_SECS));
     scaled.clamp(STREAM_TOTAL_FLOOR, STREAM_TOTAL_CEILING)
+}
+
+/// The assurance policy one request is routed under (D2): the node's (`base`), with its
+/// authenticity floor raised to `requested` when the request asks for more, and then enforced
+/// (hard gate) whatever the node's mode: a client that names a floor means it. A request never
+/// lowers the node's floor or relaxes its mode.
+pub fn request_policy(base: AssurancePolicy, requested: Option<AuthenticityTier>) -> AssurancePolicy {
+    match requested {
+        Some(t) if t > AuthenticityTier::SelfReported => AssurancePolicy {
+            min_authenticity: base.min_authenticity.max(t),
+            mode: PolicyMode::HardGate,
+            ..base
+        },
+        _ => base,
+    }
+}
+
+/// Why `model` has no provider to route to: none found at all, or (a buyer's floor that left
+/// nobody, D2) none verified at the policy's tier, said so with how many were below it.
+fn no_route_error(model: &str, policy: &AssurancePolicy, peers: &[DiscoveredPeer], tier: u8) -> AdapterError {
+    if policy.mode == PolicyMode::HardGate && policy.min_authenticity > AuthenticityTier::SelfReported {
+        let below =
+            rank_providers_with_assurance(peers, "", tier, &|_, _| None, &|_, _| AuthenticityTier::SelfReported, &AssurancePolicy::OPEN)
+                .len();
+        if below > 0 {
+            return AdapterError::Http(format!(
+                "no provider of '{model}' is verified at {} or above ({below} found below it)",
+                policy.min_authenticity.label()
+            ));
+        }
+    }
+    AdapterError::Http(format!("no provider for model '{model}'"))
 }
 
 /// One request's trip to a provider ([`ConsumerNode::exchange`]).
@@ -897,6 +930,7 @@ fn dispatch_stream_slice(
                     discover_ns: 0,
                     proxy_roundtrip_ns: 0,
                     tool_calls: std::mem::take(tool_calls),
+                    authenticity: None,
                 }))
             }
             ServeChunk::Error(msg) => return Err(StreamFail::Error(AdapterError::Http(msg))),
@@ -1913,6 +1947,7 @@ impl ConsumerNode {
         )
     )]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         self: &Arc<Self>,
         model: &str,
@@ -1921,9 +1956,12 @@ impl ConsumerNode {
         temperature: Option<f64>,
         tools: Vec<Value>,
         think: Option<bool>,
+        min_authenticity: Option<AuthenticityTier>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
+        // The buyer's floor for this request: this node's, raised (never lowered) by the request's.
+        let policy = request_policy(self.assurance, min_authenticity);
         // The `complete` span (from #[instrument]); we fill in `provider`/`tokens` on success.
         let req_span = tracing::Span::current();
         // First pass may discover from the C11 cache. On a "no usable provider" outcome — empty
@@ -1931,14 +1969,14 @@ impl ConsumerNode {
         // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
         // model's discovery cache and retry once with a cold get_providers lookup. The retry is
         // only reached when nothing was streamed, so it can never duplicate delivered output.
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, now, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => return Ok(summary),
             AttemptOutcome::Fatal(e) => return Err(e),
             AttemptOutcome::Retryable(_) => {}
         }
         tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
         let _ = self.net.invalidate_discover(model);
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, now, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => Ok(summary),
             AttemptOutcome::Retryable(e) | AttemptOutcome::Fatal(e) => Err(e),
         }
@@ -1957,6 +1995,7 @@ impl ConsumerNode {
         temperature: Option<f64>,
         tools: &[Value],
         think: Option<bool>,
+        policy: &AssurancePolicy,
         now: u64,
         req_span: &tracing::Span,
         on_delta: &mut dyn FnMut(&str),
@@ -2017,16 +2056,14 @@ impl ConsumerNode {
             self.tier,
             &|pid, mkey| self.earned_reputation(pid, mkey, now),
             &|pid, mkey| self.authenticity_of(pid, mkey, now),
-            &self.assurance,
+            policy,
         );
         // Providers that just refused us over payment go last (in their order).
         candidates.sort_by_key(|c| self.refused_payment(&c.libp2p_peer_id, &c.model_id, now));
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
-            return AttemptOutcome::Retryable(AdapterError::Http(format!(
-                "no provider for model '{model}'"
-            )));
+            return AttemptOutcome::Retryable(no_route_error(model, policy, &peers, self.tier));
         }
         let total = candidates.len();
 
@@ -2099,6 +2136,10 @@ impl ConsumerNode {
                 Ok(mut summary) => {
                     summary.discover_ns = discover_ns;
                     summary.proxy_roundtrip_ns = proxy_roundtrip_ns;
+                    // The tier the routing decision saw for this provider, for the client to see.
+                    if !self.is_self_serve(&provider_libp2p) {
+                        summary.authenticity = Some(self.authenticity_of(&provider.state_id, model_key_now, now));
+                    }
                     tracing::debug!(elapsed = ?t_serve.elapsed(), attempt = i + 1, "serve ok");
                     // #7: a serve routed to our OWN co-located provider is not a market
                     // transaction — skip receipt settlement, credit, reputation, and the audit
@@ -4275,6 +4316,36 @@ mod tests {
         // A settlement that failed since: we may be the ones not paying.
         node.note_settled("P", false);
         assert!(!node.paid_recently("P", now_unix_ms()));
+    }
+
+    #[test]
+    fn a_request_raises_the_floor_and_has_it_enforced_but_never_lowers_it() {
+        use AuthenticityTier::*;
+        let base = AssurancePolicy::OPEN;
+        assert_eq!(request_policy(base, None), base);
+        assert_eq!(request_policy(base, Some(SelfReported)), base, "asking for A0 asks for nothing");
+        let raised = request_policy(base, Some(ReputationRedundant));
+        assert_eq!((raised.min_authenticity, raised.mode), (ReputationRedundant, PolicyMode::HardGate));
+        // A gateway that only reports its A1 floor: a request naming A1 has it enforced.
+        let verify_a1 = AssurancePolicy { min_authenticity: ReputationRedundant, ..base };
+        let r = request_policy(verify_a1, Some(ReputationRedundant));
+        assert_eq!((r.min_authenticity, r.mode), (ReputationRedundant, PolicyMode::HardGate));
+        // A request can't lower an enforced A2 floor, nor relax it to verify.
+        let gate_a2 = AssurancePolicy { min_authenticity: EnergyFingerprintPossession, mode: PolicyMode::HardGate, ..base };
+        assert_eq!(request_policy(gate_a2, Some(ReputationRedundant)), gate_a2);
+        assert_eq!(request_policy(gate_a2, Some(SelfReported)), gate_a2);
+        assert_eq!(request_policy(gate_a2, None), gate_a2);
+    }
+
+    #[test]
+    fn a_floor_that_leaves_nobody_says_which_tier_it_wanted() {
+        let peers = vec![discovered("a", TPL_A, 5.0), discovered("b", TPL_A, 9.0)];
+        let gate = |t| AssurancePolicy { min_authenticity: t, mode: PolicyMode::HardGate, ..AssurancePolicy::OPEN };
+        let e = no_route_error("m", &gate(AuthenticityTier::ReputationRedundant), &peers, 2).to_string();
+        assert!(e.contains("verified at A1-reputation-redundant or above") && e.contains("2 found below it"), "{e}");
+        // Nobody there at all, or no floor: the plain message.
+        assert!(no_route_error("m", &gate(AuthenticityTier::ReputationRedundant), &[], 2).to_string().contains("no provider for model 'm'"));
+        assert!(no_route_error("m", &AssurancePolicy::OPEN, &peers, 2).to_string().contains("no provider for model 'm'"));
     }
 
     #[test]

@@ -170,6 +170,9 @@ struct Settings {
     /// (`--audit-replay on`): the strongest check, but the prompt reaches that provider too. Off by
     /// default: audits then send generated test prompts instead.
     audit_replay: bool,
+    /// Only use providers this gateway has verified at least to this tier: `"off"` (any provider,
+    /// the default), `"A1"` or `"A2"` (`--min-authenticity <tier> --assurance gate`).
+    min_authenticity: String,
     /// Optional SearXNG-compatible search endpoint (e.g. `http://127.0.0.1:8888`) powering
     /// the chat "web" toggle. Empty → the toggle is hidden. The operator brings their own
     /// search backend, same BYO philosophy as engines.
@@ -217,6 +220,7 @@ impl Default for Settings {
             engine_autostart: true,
             authenticity_checks: false,
             audit_replay: false,
+            min_authenticity: "off".into(),
             search_url: String::new(),
             verbose_logs: false,
             device_name: String::new(),
@@ -1468,6 +1472,16 @@ fn forget_swarm(swarm_public_key: String) -> Result<(), String> {
     openhydra_agent::swarms::forget_swarm(&swarms_dir(), &swarm_public_key)
 }
 
+/// The gateway's `--min-authenticity` for the `min_authenticity` setting: `None` for off (or anything
+/// unrecognised, rather than passing the gateway a value it would refuse to start with).
+fn gateway_floor(setting: &str) -> Option<&'static str> {
+    match setting {
+        "A1" => Some("A1"),
+        "A2" => Some("A2"),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
@@ -1497,6 +1511,10 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // D1: the desktop replays prompts for audits only when the user turned it on.
     sub.push("--audit-replay".into());
     sub.push(if settings.audit_replay { "on" } else { "off" }.into());
+    // D2: the user's floor on which providers serve them, enforced.
+    if let Some(tier) = gateway_floor(&settings.min_authenticity) {
+        sub.extend(["--min-authenticity".into(), tier.into(), "--assurance".into(), "gate".into()]);
+    }
     spawn_role(
         &state.gateway,
         "desktop-consumer.key",
@@ -2542,6 +2560,11 @@ mod tests {
         assert!(d.engine_autostart);
         assert!(!d.authenticity_checks, "authenticity checks are opt-in");
         assert!(!d.audit_replay, "replaying prompts for audits is opt-in on the desktop");
+        assert_eq!(d.min_authenticity, "off");
+        assert_eq!(gateway_floor("off"), None);
+        assert_eq!(gateway_floor("A1"), Some("A1"));
+        assert_eq!(gateway_floor("A2"), Some("A2"));
+        assert_eq!(gateway_floor("A9"), None, "an unknown value never reaches the gateway");
         let json = serde_json::to_string(&d).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.gateway_port, 16527);
@@ -2566,6 +2589,7 @@ mod tests {
         assert!(s.engine_autostart);
         assert!(!s.authenticity_checks, "an older config without the field loads as off");
         assert!(!s.audit_replay, "an older config without the field doesn't replay prompts");
+        assert_eq!(s.min_authenticity, "off", "an older config without the field uses any provider");
         // new fields default sanely (unknown at old-schema time)
         assert!(!s.sharing_enabled, "unknown sharing intent defaults off, not a spurious on");
         assert!(s.resume_on_launch, "resume defaults on");
