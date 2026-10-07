@@ -277,7 +277,9 @@ fn judge_behind_receipt(latest: &crate::receipt::LatestReceipt, cx: &BehindConte
         && p.consumer.as_bytes() == cx.consumer_pub
         && p.provider.as_bytes() == cx.provider_pub
         && p.model_id == cx.model_id
-        && p.peg_micros_per_credit == cx.peg
+        // A paid receipt in the asset we pay in. Its amount is in that asset's micro-units whatever
+        // peg it was stamped at, so a peg change doesn't strand the pair behind it (review S7).
+        && p.peg_micros_per_credit.is_some() == cx.peg.is_some()
         && p.settlement_asset == cx.peg.map(|_| SettlementAsset::Usdc);
     match p.cumulative_amount {
         Some(c) if ours && &p.nonce == cx.nonce => BehindReceipt::ThisServe(c),
@@ -3416,10 +3418,11 @@ mod tests {
         assert_eq!(judge(&receipt(&consumer, 1, "m", 400), 500), BehindReceipt::Stale);
         // This serve's own receipt (its co-sign reply was lost): it settled.
         assert_eq!(judge(&receipt(&consumer, 2, "m", 500), 300), BehindReceipt::ThisServe(500));
-        // Signed by someone else, for another model, or at another peg: never adopted.
+        // Signed by someone else, or for another model: never adopted.
         assert_eq!(judge(&receipt(&SigningKey::from_bytes(&[8u8; 32]), 1, "m", 9_999), 0), BehindReceipt::NotOurs);
         assert_eq!(judge(&receipt(&consumer, 1, "other", 9_999), 0), BehindReceipt::NotOurs);
-        assert_eq!(judge(&signed_at(&consumer, 1, "m", 9_999, 2), 0), BehindReceipt::NotOurs);
+        // Stamped at another peg: its amount is still USDC micros, so it is ours to build on (S7).
+        assert_eq!(judge(&signed_at(&consumer, 1, "m", 9_999, 2), 0), BehindReceipt::Adopt(9_999));
         // Ours, but not shown to be signed for the deployment we settle on (review S1).
         assert_eq!(judge_where(&receipt(&consumer, 1, "m", 9_999), 0, false), BehindReceipt::NotThisDeployment);
     }

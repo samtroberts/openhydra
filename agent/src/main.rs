@@ -582,6 +582,8 @@ struct ProvideArgs {
     /// This machine's own gateway (consumer) libp2p PeerId, when it runs one under its own identity
     /// (the desktop app does): its serves are self-serves it never settles, so a provider that charges
     /// exempts it from the payment gate. Get it from `openhydra-agent peer-id --identity <gateway-key>`.
+    /// Set `--self-provider` on that gateway to this provider's id too: otherwise the gateway settles
+    /// self-serves this provider never records, and a provider that charges sees nothing to settle.
     #[arg(long = "self-consumer")]
     self_consumer: Option<String>,
 
@@ -680,7 +682,8 @@ struct ServeArgs {
     /// #7: this gateway's own co-located provider libp2p PeerId. When a request is served by
     /// this peer (the same machine provides *and* consumes), it's a self-serve — no receipt is
     /// settled and no give/take credit moves. Get it from `openhydra-agent peer-id --identity
-    /// <provider-key>`. Omit on a consumer-only node.
+    /// <provider-key>`. Omit on a consumer-only node. Set the provider's `--self-consumer` to this
+    /// gateway's id as well (the desktop app sets both).
     #[arg(long = "self-provider")]
     self_provider: Option<String>,
 
