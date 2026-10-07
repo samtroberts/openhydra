@@ -446,7 +446,9 @@ jobs:
           # Marked complete after this publish: what it built, and what was already published before
           # markers existed (so a later re-run can't overwrite it, round 9 C9-4).
           with open('built.txt', 'w') as f:
-              f.write(' '.join(PLATFORMS[os_] for os_, ok in built.items() if ok or (os_ in already and not marked)))
+              f.write(' '.join(PLATFORMS[os_] for os_, ok in built.items() if ok))
+          with open('legacy.txt', 'w') as f:
+              f.write(' '.join(PLATFORMS[os_] for os_ in already if not marked))
           if not any(built.values()):
               sys.exit('every platform is already published for this version, or none built: nothing to publish'
                        if published else 'no platform built: nothing to publish')
@@ -602,6 +604,11 @@ jobs:
             done
           }
           aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.publishing" --endpoint-url "$EP"
+          # What this version held before markers is complete as it is: marked at once, so a run cut
+          # short from here on still never overwrites it (round 10 X10-7).
+          for t in $(cat legacy.txt); do
+            aws s3 cp marker "s3://${R2_BUCKET}/v${VERSION}/.complete-${t}" --endpoint-url "$EP"
+          done
           # Immutable versioned archive — cache hard. (A platform already published for this version
           # was dropped from the tree above, so nothing published is replaced, R5O-3.)
           aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \

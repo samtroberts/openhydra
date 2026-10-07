@@ -21,7 +21,12 @@ use reqwest::blocking::Client;
 use crate::adapter::{AdapterError, HttpClient};
 
 fn http_err(e: reqwest::Error) -> AdapterError {
-    AdapterError::Http(e.to_string())
+    // reqwest's text for a timeout doesn't say so: callers tell timeouts by "timed out" (round 10).
+    if e.is_timeout() {
+        AdapterError::Http(format!("timed out: {e}"))
+    } else {
+        AdapterError::Http(e.to_string())
+    }
 }
 
 // Per-request total timeouts (A1). reqwest's *blocking* client exposes no idle/read

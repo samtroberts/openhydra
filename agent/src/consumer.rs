@@ -172,6 +172,11 @@ const UNAVAILABLE_RANK_LAST_MS: u64 = 60 * 1000;
 const UNAVAILABLE_REPEAT_MS: u64 = 10 * 60 * 1000;
 /// How recent a completed serve shows a provider's engine working (for a follow-up's refusal).
 const SERVED_OK_RECENT_MS: u64 = 10 * 60 * 1000;
+/// Only one audit shed per provider and model is excused within this long.
+const AUDIT_SHED_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+/// How close to a follow-up's last unheard try our own request of the model must have been served,
+/// for running out of tries to count as avoiding it.
+const AUDIT_SHED_EVIDENCE_MS: u64 = 60 * 1000;
 /// Times a follow-up audit is tried again after its subject couldn't be heard (engine down, network).
 const FOLLOW_UP_RETRIES: u32 = 3;
 /// Payment refusals remembered at once (the oldest are forgotten first).
@@ -1661,6 +1666,8 @@ pub struct ConsumerNode {
     writer_candidates: Mutex<HashMap<(String, String), u64>>,
     /// Per model: until when no outside writer is looked for again, after a search found none.
     no_writer_until: Mutex<HashMap<String, u64>>,
+    /// Per `(provider, model)`: when an audit shed of it was last excused (round 10 X10-2).
+    audit_sheds: Mutex<HashMap<(String, String), u64>>,
     /// Device attestation of providers (Phase 0). `None` = off (the default).
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
@@ -1750,6 +1757,7 @@ impl ConsumerNode {
             served_ok: Mutex::new(HashMap::new()),
             writer_candidates: Mutex::new(HashMap::new()),
             no_writer_until: Mutex::new(HashMap::new()),
+            audit_sheds: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
             audit_replay: false,
@@ -2090,6 +2098,7 @@ impl ConsumerNode {
             served_ok: Mutex::new(HashMap::new()),
             writer_candidates: Mutex::new(HashMap::new()),
             no_writer_until: Mutex::new(HashMap::new()),
+            audit_sheds: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
             audit_replay: false,
@@ -2505,6 +2514,33 @@ impl ConsumerNode {
             }
         }
         m.insert(key, now);
+    }
+
+    /// Note that `provider` shed an audit of `model`: whether it shed one within
+    /// [`AUDIT_SHED_WINDOW_MS`] before (round 10 X10-2: only the first in a day is excused, however
+    /// rare audits are).
+    fn note_audit_shed(&self, provider: &str, model: &str, now: u64) -> bool {
+        let mut m = self.audit_sheds.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, at| now.saturating_sub(*at) <= AUDIT_SHED_WINDOW_MS);
+        let key = (provider.to_string(), model.to_string());
+        match m.get(&key) {
+            Some(_) => true, // the window runs from the excused one
+            None => {
+                if m.len() < MAX_PAYMENT_REFUSALS {
+                    m.insert(key, now);
+                }
+                false
+            }
+        }
+    }
+
+    /// Whether `provider` completed a serve of `model` for us within `window` of `now`.
+    fn served_ok_within(&self, provider: &str, model: &str, now: u64, window: u64) -> bool {
+        self.served_ok
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(provider.to_string(), model.to_string()))
+            .is_some_and(|at| now.abs_diff(*at) <= window)
     }
 
     /// Whether `provider` completed a serve of `model` for us within [`SERVED_OK_RECENT_MS`] of `now`
@@ -4748,7 +4784,7 @@ impl ConsumerNode {
         let drop_subject_rejected = |report: &mut AuditReport| {
             report.outcomes.retain(|(peer, outcome)| !(*peer == subject.state_id && *outcome == VerificationOutcome::Rejected));
         };
-        let shed_excused = subject_shed && !self.note_unavailable(&subject.libp2p_peer_id, &subject.model_id, now);
+        let shed_excused = subject_shed && !self.note_audit_shed(&subject.libp2p_peer_id, &subject.model_id, now);
         if shed_excused && !strict_subject {
             drop_subject_rejected(&mut report);
         }
@@ -4768,7 +4804,10 @@ impl ConsumerNode {
                     let delay = Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), FOLLOW_UP_DELAY_MS));
                     self.spawn_follow_up(model, subject, delay);
                 }
-                Some(_) if self.served_ok_recently(&subject.libp2p_peer_id, &subject.model_id, now_unix_ms()) => {
+                // Our own request of the model got through within a minute of this last try: the
+                // provider was taking requests, just not this one (round 10 X10-3: a busy provider
+                // whose pool happened to be full each time isn't failed on a looser test).
+                Some(_) if self.served_ok_within(&subject.libp2p_peer_id, &subject.model_id, now_unix_ms(), AUDIT_SHED_EVIDENCE_MS) => {
                     report.outcomes.push((subject.state_id.clone(), VerificationOutcome::Failed));
                 }
                 _ => {}

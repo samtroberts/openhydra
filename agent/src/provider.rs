@@ -795,14 +795,15 @@ fn is_control_message(method: Option<u8>) -> bool {
 
 /// Ready fetches of one buffered result answered (round 9 B9-8): a consumer that lost a reply
 /// fetches it once or twice; more is copying a large result over and over.
-const MAX_RESULT_FETCHES: u8 = 4;
+const MAX_RESULT_FETCHES: u8 = 8;
 
-/// Whose turn it is on the prompt scorer (round 9 P9-2): the peer scoring now and its texts in a
-/// row, and a peer turned away "busy" meanwhile (and when).
+/// Whose turn it is on the prompt scorer (round 9 P9-2): the peer scoring now, the model, and its
+/// texts in a row; and a peer turned away "busy" meanwhile for the same model (and when). Only the
+/// same model: one model waiting on another is the side-scorer's turn-taking (round 10 X10-1).
 #[derive(Default)]
 struct ScoreTurn {
-    holder: Option<(String, u32)>,
-    waiting: Option<(String, u64)>,
+    holder: Option<(String, String, u32)>,
+    waiting: Option<(String, String, u64)>,
 }
 
 /// Texts in a row one verifier scores while another waits, before it yields its turn.
@@ -811,24 +812,29 @@ const SCORE_TURN_TEXTS: u32 = 4;
 const SCORE_TURN_WAIT_MS: u64 = 60_000;
 
 impl ScoreTurn {
-    /// Whether `peer` must yield: another verifier has been waiting, and `peer` has had its texts.
-    fn must_yield(&self, peer: &str, now: u64) -> bool {
-        matches!(&self.waiting, Some((w, at)) if w != peer && now.saturating_sub(*at) <= SCORE_TURN_WAIT_MS)
-            && matches!(&self.holder, Some((h, n)) if h == peer && *n >= SCORE_TURN_TEXTS)
+    /// Whether `peer` must yield on `model`: another verifier has been waiting for the same model,
+    /// and `peer` has had its texts on it.
+    fn must_yield(&self, peer: &str, model: &str, now: u64) -> bool {
+        matches!(&self.waiting, Some((w, m, at)) if w != peer && m == model && now.saturating_sub(*at) <= SCORE_TURN_WAIT_MS)
+            && matches!(&self.holder, Some((h, m, n)) if h == peer && m == model && *n >= SCORE_TURN_TEXTS)
     }
 
-    /// Note how `peer`'s challenge went: `scored`, or turned away `busy`.
-    fn note(&mut self, peer: &str, scored: bool, busy: bool, now: u64) {
+    /// Note how `peer`'s challenge on `model` went: `scored`, or turned away `busy` while another
+    /// verifier holds the same model (a yield included, so the yielding one gets its turn back).
+    fn note(&mut self, peer: &str, model: &str, scored: bool, busy: bool, now: u64) {
         if scored {
             match &mut self.holder {
-                Some((h, n)) if h == peer => *n += 1,
-                _ => self.holder = Some((peer.to_string(), 1)),
+                Some((h, m, n)) if h == peer && m == model => *n += 1,
+                _ => self.holder = Some((peer.to_string(), model.to_string(), 1)),
             }
-            if matches!(&self.waiting, Some((w, _)) if w == peer) {
+            if matches!(&self.waiting, Some((w, _, _)) if w == peer) {
                 self.waiting = None;
             }
-        } else if busy && self.waiting.as_ref().is_none_or(|(w, at)| w == peer || now.saturating_sub(*at) > SCORE_TURN_WAIT_MS) {
-            self.waiting = Some((peer.to_string(), now));
+        } else if busy
+            && matches!(&self.holder, Some((h, m, _)) if h != peer && m == model)
+            && self.waiting.as_ref().is_none_or(|(w, _, at)| w == peer || now.saturating_sub(*at) > SCORE_TURN_WAIT_MS)
+        {
+            self.waiting = Some((peer.to_string(), model.to_string(), now));
         }
     }
 }
@@ -2235,7 +2241,9 @@ impl<A: EngineAdapter> Provider<A> {
             let n = fetches.entry(nonce).or_insert(0);
             *n = n.saturating_add(1);
             if *n > MAX_RESULT_FETCHES {
-                return FetchResponse::NotFound.encode();
+                // "Not ready, retry", never "not found" (that would have the consumer serve it again,
+                // round 10 X10-10): a flood just stops getting copies.
+                return FetchResponse::Generating.encode();
             }
         }
         encoded
@@ -3310,15 +3318,19 @@ impl<A: EngineAdapter> Provider<A> {
                 };
                 // A model counts toward the peer's recent ones as soon as its challenge is let through
                 // (one that starts a side-scorer counts though it is told to retry, R6-6).
-                if let Some(model) = crate::prompt_score::challenge_model(&data[1..]) {
+                let challenged = crate::prompt_score::challenge_model(&data[1..]).unwrap_or_default();
+                if !challenged.is_empty() {
                     let mut sm = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
-                    if !note_score_model(&mut sm, source_peer, model, now) {
+                    if !note_score_model(&mut sm, source_peer, challenged.clone(), now) {
                         return score_refusal("switched models too recently, retry");
                     }
                 }
-                // Verifiers take turns: one that has had its texts yields to one waiting.
-                if self.score_turn.lock().unwrap_or_else(|e| e.into_inner()).must_yield(source_peer, now) {
-                    return score_refusal("another verifier's turn, retry");
+                // Verifiers of one model take turns: one that has had its texts yields to one waiting.
+                {
+                    let mut turn = self.score_turn.lock().unwrap_or_else(|e| e.into_inner());
+                    if turn.must_yield(source_peer, &challenged, now) {
+                        return score_refusal("another verifier's turn, retry");
+                    }
                 }
                 let reply = handle_prompt_score_inbound(
                     &data[1..],
@@ -3330,7 +3342,7 @@ impl<A: EngineAdapter> Provider<A> {
                 {
                     let refused = crate::prompt_score::is_score_refusal(&reply);
                     let busy = refused && String::from_utf8_lossy(&reply).contains("retry");
-                    self.score_turn.lock().unwrap_or_else(|e| e.into_inner()).note(source_peer, !refused, busy, now);
+                    self.score_turn.lock().unwrap_or_else(|e| e.into_inner()).note(source_peer, &challenged, !refused, busy, now);
                 }
                 if !crate::prompt_score::is_score_refusal(&reply) {
                     let mut m = self.scored_recently.lock().unwrap_or_else(|e| e.into_inner());
@@ -4146,24 +4158,25 @@ mod tests {
         assert!(off_chain.with_settlement_peg(10).payment_gate(&req(long, None), "c").is_ok(), "off Solana: any length");
     }
 
-    /// Round 9 P9-2: a verifier that has had its texts yields to one waiting.
+    /// Round 9 P9-2 / round 10 X10-1: verifiers of one model take turns; another model's wait
+    /// doesn't count.
     #[test]
     fn verifiers_take_turns_on_the_scorer() {
         let mut t = ScoreTurn::default();
         for i in 0..SCORE_TURN_TEXTS {
-            assert!(!t.must_yield("q", i as u64));
-            t.note("q", true, false, i as u64);
+            assert!(!t.must_yield("q", "x", i as u64));
+            t.note("q", "x", true, false, i as u64);
         }
-        assert!(!t.must_yield("q", 10), "nobody waiting: q goes on");
-        t.note("p", false, true, 10);
-        assert!(t.must_yield("q", 11), "p waits: q yields");
-        assert!(!t.must_yield("p", 11));
-        t.note("p", true, false, 12);
-        assert!(!t.must_yield("q", 13), "p got its turn; nobody waiting now");
-        t.note("q", false, true, 14);
-        assert!(!t.must_yield("p", 15), "p hasn't had its texts yet");
-        t.note("x", false, true, 16 + SCORE_TURN_WAIT_MS);
-        assert_eq!(t.waiting.as_ref().map(|(w, _)| w.as_str()), Some("x"), "a stale claim gives way");
+        t.note("p", "y", false, true, 9);
+        assert!(!t.must_yield("q", "x", 10), "a verifier of another model isn't a waiter here");
+        t.note("p", "x", false, true, 10);
+        assert!(t.must_yield("q", "x", 11), "p waits for x: q yields");
+        assert!(!t.must_yield("p", "x", 11));
+        t.note("p", "x", true, false, 12);
+        assert!(!t.must_yield("q", "x", 13), "p got its turn; nobody waiting now");
+        t.note("q", "x", false, true, 14);
+        assert_eq!(t.waiting.as_ref().map(|(w, _, _)| w.as_str()), Some("q"), "the yielder waits for its turn back");
+        assert!(!t.must_yield("p", "x", 15), "p hasn't had its texts yet");
     }
 
     /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.
