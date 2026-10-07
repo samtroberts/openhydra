@@ -603,8 +603,10 @@ pub enum RoundOutcome {
 /// counts as evasion: one honest hiccup is tolerated, picking and choosing isn't (review round 3, LP1).
 pub const MAX_SKIPPED_TEXTS: usize = 1;
 
-/// Busy / rate-limited refusals tolerated in a row before a run gives up.
-const MAX_BUSY_RETRIES: usize = 6;
+/// Busy / rate-limited refusals tolerated in a row before a run gives up: about two minutes at the
+/// 2 s pause, longer than another verifier's text takes on a CPU scorer, so a verifier waiting its
+/// turn gets it (round 9 P9-2).
+const MAX_BUSY_RETRIES: usize = 60;
 /// Retryable refusals [`probe_scoring`] waits through (with 2 s pauses, ~5 min): a side-scorer
 /// answers "warming up, retry" while it loads the model (a minute or two) and while another of the
 /// provider's models finishes its round first (a scorer holds one model at a time), and that must

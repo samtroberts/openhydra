@@ -181,8 +181,9 @@ enum GatewayEvent {
 type ErrorClass = (StatusCode, &'static str);
 
 /// The most completion text a non-streaming response is assembled from (round 8 G8-3); past it the
-/// request fails rather than the gateway holding whatever an upstream sends.
-const MAX_BUFFERED_COMPLETION_BYTES: usize = 32 * 1024 * 1024;
+/// request fails rather than the gateway holding whatever an upstream sends. Room for a media
+/// result's data URL (round 9 B9-1).
+const MAX_BUFFERED_COMPLETION_BYTES: usize = 128 * 1024 * 1024;
 
 fn too_large_to_buffer() -> (String, ErrorClass) {
     ("the completion is too large to return in one response; use streaming".into(), (StatusCode::BAD_GATEWAY, "upstream_error"))

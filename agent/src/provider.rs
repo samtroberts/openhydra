@@ -788,10 +788,50 @@ fn note_score_model(map: &mut HashMap<String, (String, u64)>, peer: &str, model:
 /// Workers answering stream polls, closes, result fetches and receipts, apart from the serve workers
 /// (round 8 G8-1).
 const CONTROL_WORKERS: usize = 2;
-/// Whether an inbound message (by its first byte) is answered on the control pool: quick work that
-/// must not wait behind generations.
+/// Whether an inbound message (by its first byte) is answered apart from generations (receipts on
+/// a pool of their own, the rest on the control pool): quick work that must not wait behind them.
 fn is_control_message(method: Option<u8>) -> bool {
     matches!(method, Some(FETCH_CHUNKS) | Some(STREAM_CLOSE) | Some(FETCH_RESULT) | Some(RECEIPT_REQUEST))
+}
+
+/// Ready fetches of one buffered result answered (round 9 B9-8): a consumer that lost a reply
+/// fetches it once or twice; more is copying a large result over and over.
+const MAX_RESULT_FETCHES: u8 = 4;
+
+/// Whose turn it is on the prompt scorer (round 9 P9-2): the peer scoring now and its texts in a
+/// row, and a peer turned away "busy" meanwhile (and when).
+#[derive(Default)]
+struct ScoreTurn {
+    holder: Option<(String, u32)>,
+    waiting: Option<(String, u64)>,
+}
+
+/// Texts in a row one verifier scores while another waits, before it yields its turn.
+const SCORE_TURN_TEXTS: u32 = 4;
+/// How long a verifier turned away keeps its claim on the next turn (it retries every few seconds).
+const SCORE_TURN_WAIT_MS: u64 = 60_000;
+
+impl ScoreTurn {
+    /// Whether `peer` must yield: another verifier has been waiting, and `peer` has had its texts.
+    fn must_yield(&self, peer: &str, now: u64) -> bool {
+        matches!(&self.waiting, Some((w, at)) if w != peer && now.saturating_sub(*at) <= SCORE_TURN_WAIT_MS)
+            && matches!(&self.holder, Some((h, n)) if h == peer && *n >= SCORE_TURN_TEXTS)
+    }
+
+    /// Note how `peer`'s challenge went: `scored`, or turned away `busy`.
+    fn note(&mut self, peer: &str, scored: bool, busy: bool, now: u64) {
+        if scored {
+            match &mut self.holder {
+                Some((h, n)) if h == peer => *n += 1,
+                _ => self.holder = Some((peer.to_string(), 1)),
+            }
+            if matches!(&self.waiting, Some((w, _)) if w == peer) {
+                self.waiting = None;
+            }
+        } else if busy && self.waiting.as_ref().is_none_or(|(w, at)| w == peer || now.saturating_sub(*at) > SCORE_TURN_WAIT_MS) {
+            self.waiting = Some((peer.to_string(), now));
+        }
+    }
 }
 
 /// A queued stream open older than this is dropped: its consumer stopped waiting for the open ack
@@ -1314,6 +1354,12 @@ pub struct Provider<A: EngineAdapter> {
     /// the model it last challenged and when (see [`SCORE_SWITCH_MIN_MS`]).
     scoring_now: Mutex<std::collections::HashSet<String>>,
     score_models: Mutex<HashMap<String, (String, u64)>>,
+    /// Whose turn it is on the prompt scorer (round 9 P9-2).
+    score_turn: Mutex<ScoreTurn>,
+    /// Streams whose commitment a close already refreshed (once each, round 9 B9-5).
+    close_refreshed: Mutex<std::collections::HashSet<[u8; 16]>>,
+    /// Ready fetches answered per buffered result (round 9 B9-8).
+    result_fetches: Mutex<HashMap<[u8; 16], u8>>,
     /// Per-peer rate cap on prompt-scoring challenges (and model-info requests).
     score_rl: Arc<RateLimiter>,
     /// What the engine last reported for each model, keyed by handle — the source of the identity
@@ -1481,6 +1527,9 @@ impl<A: EngineAdapter> Provider<A> {
             scored_recently: Mutex::new(HashMap::new()),
             scoring_now: Mutex::new(std::collections::HashSet::new()),
             score_models: Mutex::new(HashMap::new()),
+            score_turn: Mutex::new(ScoreTurn::default()),
+            close_refreshed: Mutex::new(std::collections::HashSet::new()),
+            result_fetches: Mutex::new(HashMap::new()),
             score_rl: Arc::new(RateLimiter::new(RateLimitConfig {
                 rps: SCORE_RATE_RPS,
                 burst: SCORE_RATE_BURST,
@@ -1693,7 +1742,8 @@ impl<A: EngineAdapter> Provider<A> {
         if let Some(reason) = self.wallet_refusal(req) {
             return Err(refuse(reason));
         }
-        if req.model_ref.len() > openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN {
+        let on_solana = matches!(self.settlement_chain, Some(openhydra_protocol::settlement::ChainDomain::Solana(_)));
+        if on_solana && req.model_ref.len() > openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN {
             return Err(refuse(format!(
                 "this provider can't take payment for a model name longer than {} bytes",
                 openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN
@@ -1914,9 +1964,17 @@ impl<A: EngineAdapter> Provider<A> {
         let reply = close_stream_in(&mut map, &nonce, source_peer, offset, now);
         // Its consumer is here to settle it: the commitment is kept as long as from a poll, so
         // closes retried through an outage still find it (round 8 S8-3).
+        // Once per stream (round 9 B9-5): closes sent again can't keep it from ever expiring.
         if matches!(reply, FetchChunksResponse::Chunks { .. }) {
+            let first = {
+                let mut done = self.close_refreshed.lock().unwrap_or_else(|e| e.into_inner());
+                if done.len() >= 2 * MAX_COMMITMENTS {
+                    done.clear();
+                }
+                done.insert(nonce)
+            };
             if let Some(c) = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&nonce) {
-                if c.served_peer == source_peer {
+                if c.served_peer == source_peer && first {
                     c.recorded_ms = now;
                 }
             }
@@ -1936,10 +1994,12 @@ impl<A: EngineAdapter> Provider<A> {
         // all-Global node's strictest is Global, so a purely-public node sees no change.
         let known = self.detected.lock().map(|d| d.contains_key(&req.model_ref)).unwrap_or(false)
             || self.last_announced.lock().map(|s| s.contains(&req.model_ref)).unwrap_or(false);
-        let scope = if known {
-            self.policy.scope_of(&req.model_ref)
-        } else {
-            self.policy.strictest_scope()
+        let scope = match known.then(|| self.policy.scope_of(&req.model_ref)) {
+            // Global without the operator's consent to publish isn't public yet: gated as an unknown
+            // name would be (round 9 C9-6).
+            Some(crate::share_policy::Scope::Global) if !self.policy.announce_globally(&req.model_ref) => self.policy.strictest_scope(),
+            Some(scope) => scope,
+            None => self.policy.strictest_scope(),
         };
         match scope_gate(
             scope,
@@ -2167,7 +2227,19 @@ impl<A: EngineAdapter> Provider<A> {
             map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
             fetch_from_buffer(&map, &nonce, source_peer)
         };
-        resp.encode()
+        let encoded = resp.encode();
+        if FetchResponse::encoded_is_ready(&encoded) {
+            let mut fetches = self.result_fetches.lock().unwrap_or_else(|e| e.into_inner());
+            if fetches.len() >= 2 * MAX_RESULT_ENTRIES {
+                fetches.clear();
+            }
+            let n = fetches.entry(nonce).or_insert(0);
+            *n = n.saturating_add(1);
+            if *n > MAX_RESULT_FETCHES {
+                return FetchResponse::NotFound.encode();
+            }
+        }
+        encoded
     }
 
     /// P1 streaming: admit a new stream under `nonce` (empty, `done=false`). Called at the start
@@ -2917,6 +2989,7 @@ impl<A: EngineAdapter> Provider<A> {
     {
         let pool = WorkerPool::new(max_concurrency);
         let control_pool = WorkerPool::new(CONTROL_WORKERS);
+        let receipt_pool = WorkerPool::new(CONTROL_WORKERS);
         // R6/B2: event-driven share-policy reload. Spawn a filesystem watcher so a desktop toggle
         // applies in ~ms; the poll loop below keeps its periodic `reload_if_changed` as the portable
         // fallback (missed events / flaky-FS platforms). No-op for a static `--share-models` policy.
@@ -2973,7 +3046,15 @@ impl<A: EngineAdapter> Provider<A> {
                 // Polls, closes, fetches and receipts are quick and must never wait behind
                 // generations (each stream holds a serve worker while it generates): they have their
                 // own small pool (round 8 G8-1).
-                let target = if is_control_message(data.first().copied()) { &control_pool } else { &pool };
+                let target = if data.first() == Some(&RECEIPT_REQUEST) {
+                    // Receipts sign and write the store: their own workers, so they never hold up
+                    // polls (round 9 B9-2).
+                    &receipt_pool
+                } else if is_control_message(data.first().copied()) {
+                    &control_pool
+                } else {
+                    &pool
+                };
                 let accepted = target.submit(move || {
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
@@ -3236,6 +3317,10 @@ impl<A: EngineAdapter> Provider<A> {
                         return score_refusal("switched models too recently, retry");
                     }
                 }
+                // Verifiers take turns: one that has had its texts yields to one waiting.
+                if self.score_turn.lock().unwrap_or_else(|e| e.into_inner()).must_yield(source_peer, now) {
+                    return score_refusal("another verifier's turn, retry");
+                }
                 let reply = handle_prompt_score_inbound(
                     &data[1..],
                     self.prompt_scoring.then_some(&self.adapter as &dyn EngineAdapter),
@@ -3243,6 +3328,11 @@ impl<A: EngineAdapter> Provider<A> {
                     &|model| self.policy.announce_globally(model),
                     in_round,
                 );
+                {
+                    let refused = crate::prompt_score::is_score_refusal(&reply);
+                    let busy = refused && String::from_utf8_lossy(&reply).contains("retry");
+                    self.score_turn.lock().unwrap_or_else(|e| e.into_inner()).note(source_peer, !refused, busy, now);
+                }
                 if !crate::prompt_score::is_score_refusal(&reply) {
                     let mut m = self.scored_recently.lock().unwrap_or_else(|e| e.into_inner());
                     m.retain(|_, at| now.saturating_sub(*at) <= IN_ROUND_MS);
@@ -4035,20 +4125,46 @@ mod tests {
         assert!(note_score_model(&mut m, "q", "x".into(), 20), "per peer");
     }
 
-    /// Round 8 O8-4: a charging provider won't take payment for a handle too long to settle.
+    /// Round 8 O8-4 / round 9 B9-7: a provider charging on Solana won't take payment for a handle
+    /// too long to settle there; off Solana the length doesn't matter.
     #[test]
     fn a_handle_too_long_to_settle_is_not_charged_for() {
-        let (_dir, provider) = test_provider(StubAdapter);
-        let provider = provider.with_settlement_peg(10);
-        let req = |model: String| ServeRequest {
+        use openhydra_protocol::settlement::{ChainDomain, SolanaDomain};
+        let long = "m".repeat(openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN + 1);
+        let req = |model: String, domain: Option<String>| ServeRequest {
             reply_to: "c".into(), model_ref: model, messages: vec![],
             max_tokens: Some(16), temperature: None, tools: Vec::new(), think: None, nonce: [5u8; 16],
-            credential: None, deterministic: None, settlement_peg: Some(10), settlement_domain: None, settlement_wallet: None,
+            credential: None, deterministic: None, settlement_peg: Some(10), settlement_domain: domain, settlement_wallet: None,
         };
-        let long = "m".repeat(openhydra_protocol::settlement::MAX_CLAIM_MODEL_ID_LEN + 1);
-        let refused = provider.payment_gate(&req(long), "c").err().expect("refused");
+        let (_dir, provider) = test_provider(StubAdapter);
+        let chain = ChainDomain::Solana(SolanaDomain { program_id: [1; 32], cluster: [2; 32] });
+        let fp = chain.fingerprint();
+        let provider = provider.with_settlement_peg(10).with_settlement_chain(Some(chain));
+        let refused = provider.payment_gate(&req(long.clone(), Some(fp.clone())), "c").err().expect("refused");
         assert!(matches!(&parse_response(&refused).unwrap()[0], ServeChunk::Error(e) if e.contains("longer than")));
-        assert!(provider.payment_gate(&req("qwen2.5:7b".into()), "c").is_ok());
+        assert!(provider.payment_gate(&req("qwen2.5:7b".into(), Some(fp)), "c").is_ok());
+        let (_dir2, off_chain) = test_provider(StubAdapter);
+        assert!(off_chain.with_settlement_peg(10).payment_gate(&req(long, None), "c").is_ok(), "off Solana: any length");
+    }
+
+    /// Round 9 P9-2: a verifier that has had its texts yields to one waiting.
+    #[test]
+    fn verifiers_take_turns_on_the_scorer() {
+        let mut t = ScoreTurn::default();
+        for i in 0..SCORE_TURN_TEXTS {
+            assert!(!t.must_yield("q", i as u64));
+            t.note("q", true, false, i as u64);
+        }
+        assert!(!t.must_yield("q", 10), "nobody waiting: q goes on");
+        t.note("p", false, true, 10);
+        assert!(t.must_yield("q", 11), "p waits: q yields");
+        assert!(!t.must_yield("p", 11));
+        t.note("p", true, false, 12);
+        assert!(!t.must_yield("q", 13), "p got its turn; nobody waiting now");
+        t.note("q", false, true, 14);
+        assert!(!t.must_yield("p", 15), "p hasn't had its texts yet");
+        t.note("x", false, true, 16 + SCORE_TURN_WAIT_MS);
+        assert_eq!(t.waiting.as_ref().map(|(w, _)| w.as_str()), Some("x"), "a stale claim gives way");
     }
 
     /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.

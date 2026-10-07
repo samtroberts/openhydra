@@ -218,11 +218,14 @@ fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_
         tally.push_encoded(&chunk.encode());
     }
 }
-/// The most delivered text (in [`crate::serve::DeliveredText`] units) one attempt reads under a
-/// request for `max_tokens`: far more than any tokenizer turns that many tokens into, so only a
-/// provider sending text it can't be paid for reaches it (round 8 G8-3).
-fn delivered_text_cap(max_tokens: Option<u32>) -> u64 {
-    max_tokens.map_or(CLOSE_TAIL_MAX_TOKENS, u64::from).saturating_mul(64).saturating_add(4096)
+/// The most delivered text (in [`crate::serve::DeliveredText`] units, about bytes) one attempt
+/// reads before failing (round 8 G8-3): a flat bound on what a provider can make the gateway hold.
+/// Not per token: an image or audio result arrives as one large data-URL fragment, whatever
+/// `max_tokens` says (round 9 B9-1); billing is bounded by `max_tokens` regardless.
+const MAX_DELIVERED_TEXT_UNITS: u64 = 128 * 1024 * 1024;
+
+fn delivered_text_cap(_max_tokens: Option<u32>) -> u64 {
+    MAX_DELIVERED_TEXT_UNITS
 }
 
 /// Stream closes running at once (each a detached thread retrying for minutes); past it, what was
@@ -590,21 +593,22 @@ impl Drop for AuditSlot {
     }
 }
 
-/// Who writes probe questions (P1), among `candidates` (providers of one model): our own provider
-/// (`own`, the desktop's) whenever it is one of them, the prompt then never leaving this machine;
-/// otherwise one at random that serves none of the audited model (`audited`), so the writer can't
-/// recognise what it wrote when it later comes to it as an audit.
-fn writer_from(candidates: &[SelectedProvider], own: Option<&str>, audited: &std::collections::HashSet<String>) -> Option<SelectedProvider> {
-    use rand::seq::SliceRandom;
-    if let Some(mine) = candidates.iter().find(|c| Some(c.libp2p_peer_id.as_str()) == own) {
-        return Some(mine.clone());
-    }
-    let outside: Vec<&SelectedProvider> = candidates.iter().filter(|c| !audited.contains(&c.libp2p_peer_id)).collect();
-    outside.choose(&mut rand::thread_rng()).map(|c| (*c).clone())
+/// Whether an agreeing subject's open strike is cleared (C3, R5T-2, R6-2, R7-3, round 8 T8-4): by a
+/// replay of its own traffic (`replayed`), or by a follow-up (`strict`) on written questions, unless
+/// those came from the outside writer whose questions gave the strike (`struck_by`); our own
+/// provider's questions (`writer_is_own`) always count.
+fn strike_cleared_by(replayed: bool, strict: bool, probe_writer: Option<&str>, writer_is_own: bool, struck_by: Option<&str>) -> bool {
+    replayed || (strict && probe_writer.is_some_and(|w| writer_is_own || Some(w) != struck_by))
 }
 
-/// The most other models looked through for a probe writer with standing.
-const MAX_WRITER_MODELS_LOOKED_AT: usize = 256;
+/// How long a provider that served us with standing stays a candidate probe writer.
+const WRITER_CANDIDATE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Candidate probe writers remembered (the oldest go first).
+const MAX_WRITER_CANDIDATES: usize = 256;
+/// Candidate writers tried per probe pool written.
+const MAX_WRITERS_TRIED: usize = 3;
+/// After a search for an outside writer found none, how long until the next one (templates meanwhile).
+const NO_WRITER_RETRY_MS: u64 = 10 * 60 * 1000;
 
 /// Whether a provider whose reputation with us is `earned` may write probe questions: only serving
 /// us well raises a reputation to [`openhydra_protocol::award::R_MIN`], so a provider we don't know
@@ -1651,8 +1655,14 @@ pub struct ConsumerNode {
     /// anything (round 8 T8-3). Tried last for [`UNAVAILABLE_RANK_LAST_MS`]; a second within
     /// [`UNAVAILABLE_REPEAT_MS`] costs reputation.
     unavailable: Mutex<HashMap<(String, String), u64>>,
-    /// Per provider (libp2p id): when it last completed a serve for us.
-    served_ok: Mutex<HashMap<String, u64>>,
+    /// Per `(provider libp2p id, model)`: when it last completed a serve for us.
+    served_ok: Mutex<HashMap<(String, String), u64>>,
+    /// Providers (libp2p id, model) that completed a real serve for us with standing (see
+    /// [`has_writer_standing`]) within [`WRITER_CANDIDATE_TTL_MS`]: the only ones asked to write probe
+    /// questions besides our own (round 9 A9-4/A9-5). At most [`MAX_WRITER_CANDIDATES`].
+    writer_candidates: Mutex<HashMap<(String, String), u64>>,
+    /// Per model: until when no outside writer is looked for again, after a search found none.
+    no_writer_until: Mutex<HashMap<String, u64>>,
     /// Device attestation of providers (Phase 0). `None` = off (the default).
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
@@ -1740,6 +1750,8 @@ impl ConsumerNode {
             payment_refusals: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
             served_ok: Mutex::new(HashMap::new()),
+            writer_candidates: Mutex::new(HashMap::new()),
+            no_writer_until: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
             audit_replay: false,
@@ -2078,6 +2090,8 @@ impl ConsumerNode {
             payment_refusals: Mutex::new(HashMap::new()),
             unavailable: Mutex::new(HashMap::new()),
             served_ok: Mutex::new(HashMap::new()),
+            writer_candidates: Mutex::new(HashMap::new()),
+            no_writer_until: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
             audit_replay: false,
@@ -2306,7 +2320,10 @@ impl ConsumerNode {
         // Persist outside the lock (don't hold the Mutex across the redb write).
         if let Some(store) = &self.store {
             for gone in &evicted {
-                let _ = store.remove_reputation(gone);
+                // Unless recorded again meanwhile (round 9 A9-8).
+                if !self.reputation.lock().is_ok_and(|m| m.contains_key(gone)) {
+                    let _ = store.remove_reputation(gone);
+                }
             }
             if let Err(e) = store.put_reputation(&key, &snapshot) {
                 tracing::debug!(error = %e, peer_id, model = model_key, "reputation persist failed");
@@ -2352,7 +2369,9 @@ impl ConsumerNode {
         };
         if let Some(store) = &self.store {
             for gone in &evicted {
-                let _ = store.remove_audit_stats(gone);
+                if !self.audit_stats.lock().is_ok_and(|m| m.contains_key(gone)) {
+                    let _ = store.remove_audit_stats(gone);
+                }
             }
             if let Err(e) = store.put_audit_stats(&key, &snapshot) {
                 tracing::debug!(error = %e, peer_id, model = model_key, "audit stats persist failed");
@@ -2477,21 +2496,44 @@ impl ConsumerNode {
             .is_some_and(|at| now.saturating_sub(*at) <= UNAVAILABLE_RANK_LAST_MS)
     }
 
-    /// Note that `provider` (libp2p id) completed a serve for us.
-    fn note_served_ok(&self, provider: &str, now: u64) {
+    /// Note that `provider` (libp2p id) completed a serve of `model` for us.
+    fn note_served_ok(&self, provider: &str, model: &str, now: u64) {
+        let key = (provider.to_string(), model.to_string());
         let mut m = self.served_ok.lock().unwrap_or_else(|e| e.into_inner());
-        if !m.contains_key(provider) && m.len() >= MAX_SETTLE_RECORDS {
+        if !m.contains_key(&key) && m.len() >= MAX_SETTLE_RECORDS {
             m.retain(|_, at| now.saturating_sub(*at) <= SERVED_OK_RECENT_MS);
             if m.len() >= MAX_SETTLE_RECORDS {
                 return;
             }
         }
-        m.insert(provider.to_string(), now);
+        m.insert(key, now);
     }
 
-    /// Whether `provider` completed a serve for us within [`SERVED_OK_RECENT_MS`] of `now`.
-    fn served_ok_recently(&self, provider: &str, now: u64) -> bool {
-        self.served_ok.lock().unwrap_or_else(|e| e.into_inner()).get(provider).is_some_and(|at| now.abs_diff(*at) <= SERVED_OK_RECENT_MS)
+    /// Whether `provider` completed a serve of `model` for us within [`SERVED_OK_RECENT_MS`] of `now`
+    /// (that model's engine works: round 9 A9-3, per model, as another may be down or unshared).
+    fn served_ok_recently(&self, provider: &str, model: &str, now: u64) -> bool {
+        self.served_ok
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(provider.to_string(), model.to_string()))
+            .is_some_and(|at| now.abs_diff(*at) <= SERVED_OK_RECENT_MS)
+    }
+
+    /// Note a provider that just completed a real serve of `model` for us, if it has standing: a
+    /// candidate probe writer (round 9 A9-4/A9-5).
+    fn note_writer_candidate(&self, provider: &SelectedProvider, now: u64) {
+        if !has_writer_standing(self.earned_reputation(&provider.state_id, rep_model_key(&provider.canonical_model_id, &provider.model_id), now)) {
+            return;
+        }
+        let key = (provider.libp2p_peer_id.clone(), provider.model_id.clone());
+        let mut m = self.writer_candidates.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, at| now.saturating_sub(*at) <= WRITER_CANDIDATE_TTL_MS);
+        if !m.contains_key(&key) && m.len() >= MAX_WRITER_CANDIDATES {
+            if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                m.remove(&oldest);
+            }
+        }
+        m.insert(key, now);
     }
 
     /// Whether `provider` refused us `model` over payment within [`PAYMENT_REFUSAL_TTL_MS`].
@@ -2875,7 +2917,8 @@ impl ConsumerNode {
                         self.record_usage(model, &provider.peer_id, summary.tokens, self_serve, now);
                     }
                     if summary.ok && !self_serve {
-                        self.note_served_ok(&provider.libp2p_peer_id, now);
+                        self.note_served_ok(&provider.libp2p_peer_id, &provider.model_id, now);
+                        self.note_writer_candidate(&provider, now);
                     }
                     // M2.2(a): a clean served completion earns the provider reputation for THIS
                     // model (Phase 4a) — but not for a self-serve (no earning off yourself).
@@ -3661,6 +3704,13 @@ impl ConsumerNode {
                     (None, None)
                 }
             };
+            // Not answered (shed, rate limited, lost): without its identity the wrong reference could
+            // be picked; the run waits for the next one (round 9 P9-3).
+            if !info_answered {
+                let round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
+                node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, RoundOutcome::Busy, round, 0, None);
+                return;
+            }
             if let (Some(hint), Some(id)) = (quant_hint_from_name(&model), declared.as_ref()) {
                 if hint != id.quant {
                     tracing::warn!(provider = %peer_id, model, name_says = hint, declared = id.quant,
@@ -3675,19 +3725,24 @@ impl ConsumerNode {
                 if weights.is_none() {
                     // None declared: an agent hashes the file in the background after a restart, so
                     // retry soon (and keep the streak); one that keeps not declaring it is dodging.
-                    tracing::info!(provider = %peer_id, model, verified_on, answered = info_answered, "provider no longer declares the weights file it was verified on");
-                    let outcome = if info_answered { RoundOutcome::Undeclared } else { RoundOutcome::Busy };
+                    tracing::info!(provider = %peer_id, model, verified_on, "provider no longer declares the weights file it was verified on");
+                    let outcome = RoundOutcome::Undeclared;
                     node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, 0, None);
                     return;
                 }
                 tracing::info!(provider = %peer_id, model, verified_on, now = weights.as_deref().unwrap_or_default(),
                     "provider declares a different weights file than it was verified on; its pass is void");
+                // A text it was stalling on, dropped by its switch, counts as declined (round 9 P9-5).
+                let dropped = round.pending_id().is_some();
                 let voided = {
                     let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
                     let st = status.entry(key.clone()).or_default();
                     st.switch_reference([0; 16], &mut round);
                     *st
                 };
+                if dropped {
+                    round.carry_skipped(round.skipped() + 1);
+                }
                 node.persist_logprob_state(&key, voided, &round);
                 lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), round);
             }
@@ -4278,21 +4333,33 @@ impl ConsumerNode {
                 .find_map(|m| ranked(&m).into_iter().find(|p| p.libp2p_peer_id == own));
             tried.extend(mine);
         }
-        if tried.is_empty() {
-            let mut others: Vec<String> = self.net.known_models().unwrap_or_default().into_iter().filter(|m| m != model).collect();
+        // Else a provider of another model, serving none of the audited one, that completed a real
+        // serve for us with standing (round 9 A9-4/A9-5): only those, never one picked from what the
+        // network advertises, and no network search when there is none.
+        let mut searched_outside = false;
+        if tried.is_empty() && self.no_writer_until.lock().unwrap_or_else(|e| e.into_inner()).get(model).is_none_or(|t| now >= *t) {
+            searched_outside = true;
+            let mut candidates: Vec<(String, String)> = self
+                .writer_candidates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|((peer, m), at)| m != model && !audited_ids.contains(peer) && now.saturating_sub(**at) <= WRITER_CANDIDATE_TTL_MS)
+                .map(|(k, _)| k.clone())
+                .collect();
             {
                 use rand::seq::SliceRandom;
-                others.shuffle(&mut rand::thread_rng());
+                candidates.shuffle(&mut rand::thread_rng());
             }
-            for other in others.iter().take(MAX_WRITER_MODELS_LOOKED_AT) {
-                if tried.len() >= 3 {
+            for (peer, m) in candidates {
+                if tried.len() >= MAX_WRITERS_TRIED {
                     break;
                 }
-                let standing: Vec<SelectedProvider> = ranked(other)
-                    .into_iter()
-                    .filter(|p| has_writer_standing(self.earned_reputation(&p.state_id, rep_model_key(&p.canonical_model_id, &p.model_id), now)))
-                    .collect();
-                tried.extend(writer_from(&standing, None, &audited_ids));
+                let found = ranked(&m).into_iter().find(|p| {
+                    p.libp2p_peer_id == peer
+                        && has_writer_standing(self.earned_reputation(&p.state_id, rep_model_key(&p.canonical_model_id, &p.model_id), now))
+                });
+                tried.extend(found);
             }
         }
         for writer in tried {
@@ -4300,6 +4367,13 @@ impl ConsumerNode {
             tracing::info!(model, writer = %writer.peer_id, own = self.is_self_serve(&writer.libp2p_peer_id), n = written.len(), "probe questions written");
             if !written.is_empty() {
                 return Some((writer.libp2p_peer_id, written));
+            }
+        }
+        if searched_outside {
+            let mut m = self.no_writer_until.lock().unwrap_or_else(|e| e.into_inner());
+            m.retain(|_, t| now < *t);
+            if m.len() < MAX_WRITER_CANDIDATES {
+                m.insert(model.to_string(), now + NO_WRITER_RETRY_MS);
             }
         }
         None
@@ -4535,7 +4609,8 @@ impl ConsumerNode {
                     // An error it sent counts as its own doing only while its engine evidently works:
                     // it completed a real serve for us around now (round 8 T8-5). An engine outage,
                     // or a model it stopped sharing, fails our traffic too.
-                    subject_refused = matches!(e, AdapterError::Provider(_)) && self.served_ok_recently(&subject.libp2p_peer_id, now_unix_ms());
+                    subject_refused = matches!(e, AdapterError::Provider(_))
+                        && self.served_ok_recently(&subject.libp2p_peer_id, &subject.model_id, now_unix_ms());
                     subject_shed = matches!(e, AdapterError::Overloaded(_));
                     Err(e)
                 }
@@ -4665,25 +4740,35 @@ impl ConsumerNode {
                 report.outcomes.push((subject.state_id.clone(), VerificationOutcome::Failed));
             }
         }
-        if subject_shed {
+        // A shed is the provider's own word that it was busy: excused once in ten minutes, not every
+        // time (round 9 A9-1: else a provider could shed every audit it recognises at no cost).
+        let drop_subject_rejected = |report: &mut AuditReport| {
             report.outcomes.retain(|(peer, outcome)| !(*peer == subject.state_id && *outcome == VerificationOutcome::Rejected));
+        };
+        let shed_excused = subject_shed && !self.note_unavailable(&subject.libp2p_peer_id, &subject.model_id, now);
+        if shed_excused && !strict_subject {
+            drop_subject_rejected(&mut report);
         }
-        // A follow-up whose subject couldn't be heard (not its own doing): the strike stands, and it
-        // is asked again later, a few times (T8-5).
+        // A follow-up whose subject couldn't be heard (not its own doing): no outcome for that (round 9
+        // A9-2: an outage mustn't stack penalties); the strike stands, and it is asked again later, a
+        // few times (T8-5). Unheard on every try while it kept serving our traffic of the model: that
+        // is avoiding the follow-up, a failure (A9-1).
         if strict_subject && results[0].1.is_err() && !subject_refused {
+            drop_subject_rejected(&mut report);
             let key = reputation_key(&subject.state_id, key_of.get(&subject.state_id).map_or(model, String::as_str));
-            let again = self
-                .strikes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&key)
-                .is_some_and(|s| {
-                    s.retries += 1;
-                    s.retries <= FOLLOW_UP_RETRIES
-                });
-            if again {
-                let delay = Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), FOLLOW_UP_DELAY_MS));
-                self.spawn_follow_up(model, subject, delay);
+            let retries = self.strikes.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key).map(|s| {
+                s.retries += 1;
+                s.retries
+            });
+            match retries {
+                Some(n) if n <= FOLLOW_UP_RETRIES => {
+                    let delay = Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), FOLLOW_UP_DELAY_MS));
+                    self.spawn_follow_up(model, subject, delay);
+                }
+                Some(_) if self.served_ok_recently(&subject.libp2p_peer_id, &subject.model_id, now_unix_ms()) => {
+                    report.outcomes.push((subject.state_id.clone(), VerificationOutcome::Failed));
+                }
+                _ => {}
             }
         }
         // A first divergence is a strike, not a failure (C3): the struck provider is audited again
@@ -4699,8 +4784,13 @@ impl ConsumerNode {
                 // way (R6-2). Not questions by the outside writer whose probe gave the strike (T8-4).
                 &|peer, struck_by| {
                     peer == subject.state_id
-                        && (served.is_some()
-                            || (strict_subject && probe_writer.is_some_and(|w| self.is_self_serve(w) || Some(w) != struck_by)))
+                        && strike_cleared_by(
+                            served.is_some(),
+                            strict_subject,
+                            probe_writer,
+                            probe_writer.is_some_and(|w| self.is_self_serve(w)),
+                            struck_by,
+                        )
                 },
                 outside_writer,
                 &mut strikes,
@@ -4811,10 +4901,10 @@ mod tests {
     }
 
     #[test]
-    fn delivered_text_is_capped_far_above_what_a_request_allows() {
-        assert_eq!(delivered_text_cap(Some(100)), 100 * 64 + 4096);
-        assert_eq!(delivered_text_cap(None), CLOSE_TAIL_MAX_TOKENS * 64 + 4096);
-        assert_eq!(delivered_text_cap(Some(u32::MAX)), u64::from(u32::MAX) * 64 + 4096);
+    fn delivered_text_is_capped_flat_so_media_results_fit() {
+        // A 512x512 PNG as a data URL is ~400 KB however small max_tokens is (round 9 B9-1).
+        assert!(delivered_text_cap(Some(2048)) > 100 * 1024 * 1024);
+        assert_eq!(delivered_text_cap(None), delivered_text_cap(Some(1)));
     }
 
     #[test]
@@ -5746,10 +5836,11 @@ mod tests {
         assert!(!node.briefly_unavailable("p", "other", t));
         assert!(node.note_unavailable("p", "m", t + UNAVAILABLE_REPEAT_MS), "second within ten minutes");
         assert!(!node.note_unavailable("p", "m", t + 3 * UNAVAILABLE_REPEAT_MS), "long after: a first miss again");
-        assert!(!node.served_ok_recently("p", t));
-        node.note_served_ok("p", t);
-        assert!(node.served_ok_recently("p", t + SERVED_OK_RECENT_MS));
-        assert!(!node.served_ok_recently("p", t + SERVED_OK_RECENT_MS + 1));
+        assert!(!node.served_ok_recently("p", "m", t));
+        node.note_served_ok("p", "m", t);
+        assert!(node.served_ok_recently("p", "m", t + SERVED_OK_RECENT_MS));
+        assert!(!node.served_ok_recently("p", "other", t), "per model (round 9 A9-3)");
+        assert!(!node.served_ok_recently("p", "m", t + SERVED_OK_RECENT_MS + 1));
         assert!(matches!(provider_error(SHED_REPLY.into(), true), AdapterError::Overloaded(_)));
         assert!(matches!(provider_error(SHED_REPLY.into(), false), AdapterError::Provider(_)));
         assert!(matches!(provider_error("engine down".into(), true), AdapterError::Provider(_)));
@@ -6074,17 +6165,26 @@ mod tests {
         assert!(progress.opened, "the provider acknowledged the open");
     }
 
+    /// Round 9 A9-4/A9-5/A9-6: only providers that served us with standing become writer
+    /// candidates; the clear rule the audit applies refuses the striking writer's questions.
     #[test]
-    fn probe_questions_are_written_locally_or_by_a_provider_outside_the_audit() {
-        let (a, b, c, own) = (selected("A"), selected("B"), selected("C"), selected("OWN"));
-        let audited: std::collections::HashSet<String> = ["A".to_string(), "B".to_string()].into();
-        // Our own provider whenever it is a candidate, even one serving the audited model.
-        assert_eq!(writer_from(&[a.clone(), own.clone()], Some("OWN"), &audited).unwrap().libp2p_peer_id, "OWN");
-        // Otherwise never a provider of the audited model.
-        for _ in 0..50 {
-            assert_eq!(writer_from(&[a.clone(), b.clone(), c.clone()], None, &audited).unwrap().libp2p_peer_id, "C");
+    fn writer_candidates_need_standing_and_the_striking_writer_cant_clear() {
+        let (_dir, node) = test_node();
+        let now = 1_000_000;
+        let p = selected("P");
+        node.note_writer_candidate(&p, now);
+        assert!(node.writer_candidates.lock().unwrap().is_empty(), "no standing: not a candidate");
+        for _ in 0..10 {
+            node.record_outcome(&p.state_id, rep_model_key(&p.canonical_model_id, &p.model_id), VerificationOutcome::Honored, now);
         }
-        assert!(writer_from(&[a, b], Some("OWN"), &audited).is_none(), "nobody outside the audit: fall back to templates");
+        node.note_writer_candidate(&p, now);
+        assert!(node.writer_candidates.lock().unwrap().contains_key(&("P".to_string(), "m".to_string())));
+        assert!(strike_cleared_by(true, false, None, false, Some("W")), "a replay");
+        assert!(strike_cleared_by(false, true, Some("V"), false, Some("W")), "another writer's follow-up");
+        assert!(!strike_cleared_by(false, true, Some("W"), false, Some("W")), "not the striking writer's");
+        assert!(strike_cleared_by(false, true, Some("W"), true, Some("W")), "our own provider's always");
+        assert!(!strike_cleared_by(false, true, None, false, None), "not a template");
+        assert!(!strike_cleared_by(false, false, Some("V"), false, None), "not a sampled probe");
     }
 
     /// Review round 4 C3: a first divergence is a strike (audited again later, on another prompt),

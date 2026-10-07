@@ -106,7 +106,8 @@ enum State {
     /// `active`: challenges being scored right now; the process is never replaced under one.
     /// `stamp`: the weights' size and modification time at start (a file replaced in place gets a
     /// new scorer). `errors`: scorings in a row the live process failed on its side.
-    Ready { weights: PathBuf, stamp: Option<Stamp>, instance: Box<dyn ScorerInstance>, last_used: Instant, active: usize, errors: u32 },
+    /// `since`: when it became ready (a claim for another model's turn waits [`FAIR_TURN_AFTER`]).
+    Ready { weights: PathBuf, stamp: Option<Stamp>, instance: Box<dyn ScorerInstance>, last_used: Instant, active: usize, errors: u32, since: Instant },
 }
 
 /// Size and latest modification time of a weights file, or of an MLX directory's files.
@@ -148,6 +149,17 @@ struct Inner<H> {
 
 /// How long a file turned away keeps its claim on the next turn (challengers retry within seconds).
 const FAIR_TURN_WAIT: Duration = Duration::from_secs(60);
+/// How long a scorer keeps its model before a claim for another may take its turn (round 9 P9-1):
+/// long enough for rounds on it to finish, short of pinning it.
+const FAIR_TURN_AFTER: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(10 * 60) };
+
+/// Whether a scorer start on `weights` would be refused now (see [`start_refusal`]), without
+/// changing anything.
+fn start_would_wait(starts: &std::collections::VecDeque<(Instant, PathBuf)>, weights: &Path, now: Instant) -> bool {
+    let recent: Vec<&(Instant, PathBuf)> = starts.iter().filter(|(at, _)| now.duration_since(*at) <= START_WINDOW).collect();
+    recent.len() >= MAX_STARTS_PER_HOUR
+        || recent.last().is_some_and(|(at, w)| w != weights && now.duration_since(*at) < SWITCH_MIN_INTERVAL)
+}
 
 /// Why a scorer start on `weights` must wait, if it must: the hour's starts are spent, or the last
 /// start (on another file) was too recent.
@@ -201,7 +213,12 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
             }
         }
         let base = self.ready(weights)?;
-        let out = score_prompt(&self.inner.http, &base, ScoringDialect::OpenHydra, "default", token_ids);
+        // A scoring we gave up waiting on is "busy" (the challenger retries), not the scorer failing
+        // and not a refusal (round 9 P9-7).
+        let out = score_prompt(&self.inner.http, &base, ScoringDialect::OpenHydra, "default", token_ids).map_err(|e| match e {
+            AdapterError::Http(m) if m.contains("timed out") => AdapterError::Busy(format!("prompt scorer timed out: {m}")),
+            e => e,
+        });
         let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if let State::Ready { weights: w, instance, active, last_used, errors, .. } = &mut *st {
             if w == weights {
@@ -209,11 +226,12 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 *last_used = Instant::now();
                 match &out {
                     Ok(_) => *errors = 0,
-                    // The scorer failing on its own side: a server error, or a reply it got wrong.
-                    Err(AdapterError::Http(m)) if m.contains("server error") => *errors += 1,
                     // A request it rejected (4xx) is the challenger's doing; one we gave up waiting on
-                    // is the queue's (load an outsider can cause), not the scorer failing (round 8 L8-2).
-                    Err(AdapterError::Http(_)) => {}
+                    // (now `Busy`) is the queue's, load an outsider can cause (round 8 L8-2).
+                    Err(AdapterError::Http(m)) if m.contains("client error") => {}
+                    Err(AdapterError::Busy(_)) => {}
+                    // The scorer failing on its own side: a server error, no connection (alive but not
+                    // serving, round 9 P9-7), or a reply it got wrong.
                     Err(_) => *errors += 1,
                 }
             }
@@ -245,18 +263,20 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
         let current = stamp(weights);
         let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + CHALLENGE_WAIT;
-        let waiting = |mine: bool| {
-            inner
-                .waiting
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_some_and(|(w, at)| (w == weights) == mine && at.elapsed() < FAIR_TURN_WAIT)
+        // A live claim on the next turn: this file's (`mine`), or another's that could start now.
+        let claim = |mine: bool| -> bool {
+            let w = inner.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            match w.as_ref().filter(|(_, at)| at.elapsed() < FAIR_TURN_WAIT) {
+                Some((f, _)) if mine => f == weights,
+                Some((f, _)) => f != weights && !start_would_wait(&inner.starts.lock().unwrap_or_else(|e| e.into_inner()), f, Instant::now()),
+                None => false,
+            }
         };
         let wait_turn = || {
             let mut w = inner.waiting.lock().unwrap_or_else(|e| e.into_inner());
-            // The first file turned away keeps its turn until it gets it (or stops asking).
-            if w.as_ref().is_none_or(|(f, at)| f == weights || at.elapsed() >= FAIR_TURN_WAIT) {
+            // The first file turned away keeps its claim for its fixed time (asking again doesn't
+            // extend it); then whoever asks next claims.
+            if w.as_ref().is_none_or(|(_, at)| at.elapsed() >= FAIR_TURN_WAIT) {
                 *w = Some((weights.to_path_buf(), Instant::now()));
             }
             AdapterError::Busy("prompt scorer is busy with another model".into())
@@ -274,8 +294,11 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 State::Ready { weights: w, stamp, active, .. } if w == weights && *stamp == current && *active > 0 => {
                     return Err(AdapterError::Busy("prompt scorer is busy".into()));
                 }
-                // Another model was turned away: it goes next, once this scorer is idle.
-                State::Ready { weights: w, stamp, .. } if w == weights && *stamp == current && waiting(false) => {
+                // Another model was turned away and could start now, and this one has had the scorer
+                // for its time: the other goes next, once this scorer is idle.
+                State::Ready { weights: w, stamp, since, .. }
+                    if w == weights && *stamp == current && since.elapsed() >= FAIR_TURN_AFTER && claim(false) =>
+                {
                     return Err(AdapterError::Busy("prompt scorer is giving another model a turn".into()));
                 }
                 State::Ready { weights: w, stamp, instance, last_used, active, .. } if w == weights && *stamp == current => {
@@ -283,7 +306,9 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                     *active += 1;
                     return Ok(instance.base_url().to_string());
                 }
-                State::Ready { active, last_used, .. } if *active > 0 || (last_used.elapsed() < SWITCH_HOLD && !waiting(true)) => {
+                State::Ready { active, last_used, since, .. }
+                    if *active > 0 || (last_used.elapsed() < SWITCH_HOLD && !(since.elapsed() >= FAIR_TURN_AFTER && claim(true))) =>
+                {
                     // Another file's scorer (or this file's, replaced on disk) in use: wait for it,
                     // with a claim on the next turn.
                     return Err(wait_turn());
@@ -303,6 +328,10 @@ impl<H: HttpClient + Send + Sync + 'static> SideScorer<H> {
                 State::Starting(_) => {
                     // Another file's scorer is starting; this one waits its turn.
                     return Err(wait_turn());
+                }
+                // Another model holds the claim on the next turn: not a third one first.
+                _ if claim(false) => {
+                    return Err(AdapterError::Busy("prompt scorer is giving another model a turn".into()));
                 }
                 _ => {
                     // Idle, or an idle scorer on another file (or this file before it changed): start,
@@ -369,7 +398,7 @@ fn start<H: HttpClient>(inner: &Inner<H>, weights: &Path, stamp: Option<Stamp>) 
     *st = match outcome {
         Some(instance) => {
             inner.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(weights);
-            State::Ready { weights: weights.to_path_buf(), stamp, instance, last_used: Instant::now(), active: 0, errors: 0 }
+            State::Ready { weights: weights.to_path_buf(), stamp, instance, last_used: Instant::now(), active: 0, errors: 0, since: Instant::now() }
         }
         None => {
             let why = if didnt_fit {
@@ -805,16 +834,25 @@ mod tests {
 
     #[test]
     fn a_model_turned_away_gets_the_next_turn() {
-        // Round 8 L8-4: one challenger keeping "/a" warm can't keep "/b" waiting.
+        // Round 8 L8-4 / round 9 P9-1: one challenger keeping "/a" warm can't keep "/b" waiting
+        // past FAIR_TURN_AFTER, but a round on "/a" isn't cut short before that.
         let (s, launches) = scorer(vec![405, 405], Duration::ZERO);
         assert!(score_patiently(&s, "/a.gguf").is_ok());
-        assert!(matches!(s.score(Path::new("/b.gguf"), &[1, 2]), Err(AdapterError::Busy(_))), "a was just used");
+        let ready_at = Instant::now();
+        assert!(matches!(s.score(Path::new("/b.gguf"), &[1, 2]), Err(AdapterError::Busy(_))), "a was just used: b claims");
+        // a kept warm: its round goes on until it has had FAIR_TURN_AFTER.
+        while ready_at.elapsed() + Duration::from_millis(60) < FAIR_TURN_AFTER.max(SWITCH_MIN_INTERVAL) {
+            assert!(s.score(Path::new("/a.gguf"), &[1, 2]).is_ok(), "a's round goes on while a is young");
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        std::thread::sleep(Duration::from_millis(80));
         assert!(
             matches!(s.score(Path::new("/a.gguf"), &[1, 2]), Err(AdapterError::Busy(m)) if m.contains("turn")),
-            "a waits while b has the next turn"
+            "a has had its time; b, which can start now, goes next"
         );
         assert!(score_patiently(&s, "/b.gguf").is_ok(), "b gets its turn");
         assert_eq!(launches.load(Ordering::SeqCst), 2);
+        // A third model doesn't jump a claim, and a claim doesn't outlive its fixed time.
         assert!(s.inner.waiting.lock().unwrap().as_ref().is_none_or(|(f, _)| f != Path::new("/b.gguf")));
     }
 
