@@ -409,9 +409,11 @@ pub const ATTEST_VALID_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_ATTEST_RECORDS: usize = 4096;
 /// Longest failure reason kept in a record, in bytes: a refusal reason is the provider's own text.
 const MAX_FAILURE_REASON: usize = 256;
-/// Load refusals in a row after which a verified provider loses its badge: a provider can't keep a
-/// badge by answering "rate limited" (an unauthenticated string) instead of attesting.
-pub const MAX_LOAD_REFUSALS: u8 = 6;
+/// How long a verified provider that keeps declining for load keeps its badge: a provider can't keep a
+/// badge by answering "rate limited" (an unauthenticated string) instead of attesting, and an
+/// outsider flooding it with challenges can't strip it in minutes (it keeps answering the consumers
+/// it serves, see the provider's attestation priority).
+pub const LOAD_REFUSAL_GRACE_MS: u64 = 2 * 60 * 60 * 1000;
 
 /// `reason` cut to [`MAX_FAILURE_REASON`] bytes, on a character boundary.
 fn bounded_reason(reason: &str) -> String {
@@ -457,7 +459,8 @@ pub struct AttestRecord {
     pub last_attempt_ms: u64,
     /// When it last verified (meaningful with a `Verified` outcome): the badge counts from this.
     pub verified_ms: u64,
-    /// Challenges declined for load since then, in a row.
+    /// Challenges declined for load since then, in a row (shown; the badge goes by time, see
+    /// [`LOAD_REFUSAL_GRACE_MS`]).
     pub load_refusals: u8,
     pub outcome: AttestOutcome,
     /// The key of the last *verified* attestation (kept across failed attempts).
@@ -519,9 +522,9 @@ pub fn attest_provider(
         // the usual time, not on the next serve; a provider that keeps declining loses the badge.
         Err(ChallengeError::Refused(r)) if r == ATTEST_RATE_LIMITED => {
             return match prev {
-                Some(p) if p.load_refusals + 1 < MAX_LOAD_REFUSALS => AttestRecord {
+                Some(p) if now_unix_ms.saturating_sub(p.verified_ms) <= LOAD_REFUSAL_GRACE_MS => AttestRecord {
                     last_attempt_ms: now_unix_ms,
-                    load_refusals: p.load_refusals + 1,
+                    load_refusals: p.load_refusals.saturating_add(1),
                     ..p.clone()
                 },
                 _ => failed(AttestOutcome::Failed(bounded_reason(&r))),
@@ -746,11 +749,17 @@ mod tests {
         // Review S7: the refusal counts as an attempt (not due again on the next serve)…
         assert!(!rec.due(NOW + 1) && rec.due(NOW + ATTEST_REFRESH_MS));
         // …and a provider that keeps declining loses the badge.
+        // …and a provider that keeps declining loses the badge once 2 h have passed since it last
+        // verified, not after a few refusals (review round 3, B2).
         let mut r = rec;
-        for i in 1..MAX_LOAD_REFUSALS as u64 {
-            r = attest_provider(&mut t, "m", [1; 32], NOW + i * ATTEST_REFRESH_MS, &[], Some(&r), PROV);
+        let mut at = NOW;
+        while at <= NOW - 1 + LOAD_REFUSAL_GRACE_MS {
+            r = attest_provider(&mut t, "m", [1; 32], at, &[], Some(&r), PROV);
+            assert_eq!(r.device_trust(at), Some(DeviceTrust::SelfSigned), "still within the grace at {at}");
+            at += ATTEST_REFRESH_MS;
         }
-        assert_eq!(r.device_trust(NOW + MAX_LOAD_REFUSALS as u64 * ATTEST_REFRESH_MS), None);
+        r = attest_provider(&mut t, "m", [1; 32], at, &[], Some(&r), PROV);
+        assert_eq!(r.device_trust(at), None);
     }
 
     #[test]

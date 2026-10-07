@@ -108,10 +108,15 @@ const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 const FETCH_RATE_RPS: f64 = 50.0;
 const FETCH_RATE_BURST: f64 = 100.0;
 const FETCH_RATE_MAX_TRACKED: usize = 4096;
-/// Per-peer cap on attestation challenges. Each answer is a Secure Enclave signature (slower than
-/// Ed25519), and a consumer re-attests only every few minutes, so a low rate is plenty.
-const ATTEST_RATE_RPS: f64 = 5.0;
-const ATTEST_RATE_BURST: f64 = 10.0;
+/// Per-peer cap on attestation challenges: one a minute. Each answer is a Secure Enclave signature
+/// (slower than Ed25519), and a consumer re-attests only every 5 minutes.
+const ATTEST_RATE_RPS: f64 = 1.0 / 60.0;
+const ATTEST_RATE_BURST: f64 = 2.0;
+/// How long after a serve its consumer's challenges skip the provider-wide attestation cap: a flood
+/// from peers we never served (free identities) can't crowd out the consumers we serve.
+const SERVED_ATTEST_PRIORITY_MS: u64 = 60 * 60 * 1000;
+/// Peers remembered for that (the oldest are forgotten first).
+const MAX_RECENTLY_SERVED: usize = 4096;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 /// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
 /// with many identities) keep the Secure Enclave signing nonstop.
@@ -987,6 +992,8 @@ pub struct Provider<A: EngineAdapter> {
     attest_rl: Arc<RateLimiter>,
     /// The cap on attestation challenges across all peers (one bucket).
     attest_global_rl: Arc<RateLimiter>,
+    /// Peers we served recently, and when (see [`SERVED_ATTEST_PRIORITY_MS`]).
+    recently_served: Mutex<HashMap<String, u64>>,
     /// Prompt-scoring challenges (Track A2-Logprob): answered only when the operator declared the
     /// engine's scoring API (`provide --prompt-scoring`).
     prompt_scoring: bool,
@@ -1135,6 +1142,7 @@ impl<A: EngineAdapter> Provider<A> {
                 max_inflight: 0,
                 max_tracked: ATTEST_RATE_MAX_TRACKED,
             })),
+            recently_served: Mutex::new(HashMap::new()),
             attest_global_rl: Arc::new(RateLimiter::new(RateLimitConfig {
                 rps: ATTEST_GLOBAL_RPS,
                 burst: ATTEST_GLOBAL_BURST,
@@ -1403,6 +1411,31 @@ impl<A: EngineAdapter> Provider<A> {
         }
     }
 
+    /// Remember that we served `peer` now (see [`SERVED_ATTEST_PRIORITY_MS`]).
+    fn note_served(&self, peer: &str) {
+        let now = now_unix_ms();
+        let mut m = self.recently_served.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.contains_key(peer) && m.len() >= MAX_RECENTLY_SERVED {
+            m.retain(|_, at| now.saturating_sub(*at) <= SERVED_ATTEST_PRIORITY_MS);
+            if m.len() >= MAX_RECENTLY_SERVED {
+                if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                    m.remove(&oldest);
+                }
+            }
+        }
+        m.insert(peer.to_string(), now);
+    }
+
+    /// Whether we served `peer` within [`SERVED_ATTEST_PRIORITY_MS`].
+    fn served_recently(&self, peer: &str) -> bool {
+        let now = now_unix_ms();
+        self.recently_served
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+            .is_some_and(|at| now.saturating_sub(*at) <= SERVED_ATTEST_PRIORITY_MS)
+    }
+
     /// Whether `peer` is this node, or our own co-located consumer (the desktop's gateway): it never
     /// settles with us.
     fn is_own_consumer(&self, peer: &str) -> bool {
@@ -1595,6 +1628,7 @@ impl<A: EngineAdapter> Provider<A> {
         delivered: bool,
         wallet: Option<[u8; 20]>,
     ) {
+        self.note_served(served_peer);
         // Our own consumer never settles with us: its serves would only fill the map.
         if self.is_own_consumer(served_peer) {
             return;
@@ -2622,7 +2656,12 @@ impl<A: EngineAdapter> Provider<A> {
                     self.attestor.as_deref(),
                     &|model| self.policy.announce_globally(model) || self.private_attestable(source_peer, model),
                     now_unix_ms(),
-                    &|| self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok(),
+                    // A consumer we served recently skips the provider-wide cap (review round 3, B2):
+                    // free identities flooding challenges can't make us refuse the consumers we serve.
+                    &|| {
+                        self.served_recently(source_peer)
+                            || self.attest_global_rl.try_acquire(ATTEST_GLOBAL_KEY, now_unix_ms()).is_ok()
+                    },
                 )
             }
             // Prompt-scoring challenge (Track A2-Logprob): opt-in, per-peer rate-limited, and capped
