@@ -455,8 +455,10 @@ pub fn select_reference<'a>(
 /// The cost tier a serve is priced at before the authenticity gate. By default the model name's
 /// conservative estimate (its size at 4-bit, [`cost_tier_for_handle`]): a provider's word never
 /// raises its price. With a qualifying, fresh pass streak (`status`) against a reference whose
-/// identity is known, the price follows that **verified** identity instead — its exact size and
-/// quantisation — whether that is higher (an honest BF16 model) or lower (a big name on a small model).
+/// identity is known, a **lower** verified identity (a big name on a small model) lowers it. A
+/// higher one doesn't raise it: a check shows the provider holds that model's weights, not that the
+/// consumer's request was served with them, so it could answer checks with a big model and serve a
+/// small one.
 /// `identity_of(tag)` resolves a [`reference_tag`] to the identity of the reference it names (a
 /// local reference file, or registry packs seen for that label).
 pub fn priced_tier(
@@ -471,7 +473,7 @@ pub fn priced_tier(
     };
     identity_of(st.reference)
         .and_then(|id| cost_tier_for_params_quant(&id.params, &id.quant))
-        .unwrap_or(by_handle)
+        .map_or(by_handle, |verified| verified.min(by_handle))
 }
 
 /// Resolve a reference tag against local reference files.
@@ -1389,7 +1391,9 @@ mod tests {
         assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 1), floor, "one pass is not enough");
         st.on_verdict(PASS, 30 * H);
         st.on_verdict(PASS, 48 * H);
-        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 48 * H + 1), verified);
+        // A bigger verified model doesn't raise the price (review LP4): the check doesn't show the
+        // consumer's serve used it.
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 48 * H + 1), floor);
         // Stale, failed, or against a reference that's no longer loaded → back to the name's price.
         assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 72 * H + 1), floor);
         assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&[], t), 48 * H + 1), floor);
