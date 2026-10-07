@@ -147,20 +147,30 @@ fn encode_request_with_claim(payload: &ReceiptPayload, consumer_sig: &Signature,
     b.extend_from_slice(&consumer_sig.to_bytes());
     b.extend_from_slice(&(model.len() as u16).to_le_bytes());
     b.extend_from_slice(model);
-    // receipt-carries-canonical: append the canonical id (length-prefixed, possibly empty) so the
-    // provider co-signs the same one the consumer weights by. A legacy request that omits this
-    // trailer decodes to an empty canonical (see decode_request).
-    b.extend_from_slice(&(canonical.len() as u16).to_le_bytes());
-    b.extend_from_slice(canonical);
-    // Carry the completion split too (review M3): the consumer signs `canonical_bytes()` including
-    // completion, so the framing MUST transmit it or the provider reconstructs a different preimage
-    // and every settlement fails closed once Phase 2b sets `Some`. `has_completion:u8 [+ u64]`.
-    match payload.completion_tokens {
-        Some(c) => {
-            b.push(1u8);
-            b.extend_from_slice(&c.to_le_bytes());
+    let emit_sig_alg = payload.sig_alg != SigAlg::Ed25519 || claim.is_some();
+    let emit_peg = payload.peg_micros_per_credit.is_some() || emit_sig_alg;
+    let emit_asset = payload.settlement_asset.is_some() || emit_peg;
+    let emit_cumulative = payload.cumulative_amount.is_some() || emit_asset;
+    // A receipt carrying none of the trailers below is framed exactly as before any of them (the
+    // model is the last field), which every older provider decodes (round 8 X8-3).
+    let emit_head = !canonical.is_empty() || payload.completion_tokens.is_some() || emit_cumulative;
+    if emit_head {
+        // receipt-carries-canonical: append the canonical id (length-prefixed, possibly empty) so the
+        // provider co-signs the same one the consumer weights by. A legacy request that omits this
+        // trailer decodes to an empty canonical (see decode_request).
+        b.extend_from_slice(&(canonical.len() as u16).to_le_bytes());
+        b.extend_from_slice(canonical);
+        // Carry the completion split too (review M3): the consumer signs `canonical_bytes()` including
+        // completion, so the framing MUST transmit it or the provider reconstructs a different
+        // preimage and every settlement fails closed once Phase 2b sets `Some`.
+        // `has_completion:u8 [+ u64]`.
+        match payload.completion_tokens {
+            Some(c) => {
+                b.push(1u8);
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+            None => b.push(0u8),
         }
-        None => b.push(0u8),
     }
     // Crypto-rail cumulative voucher amount: the consumer signs it into `canonical_bytes()`, so the
     // framing MUST transmit it or the provider reconstructs a different preimage and settlement fails
@@ -179,10 +189,6 @@ fn encode_request_with_claim(payload: &ReceiptPayload, consumer_sig: &Signature,
     // converted with. Binding + transmitting them lets the provider reject a peg/asset it never agreed
     // to before co-signing, instead of silently co-signing a mis-denominated claim.
     // A claim trailer follows sig_alg, so a claim makes it explicit (positional decode).
-    let emit_sig_alg = payload.sig_alg != SigAlg::Ed25519 || claim.is_some();
-    let emit_peg = payload.peg_micros_per_credit.is_some() || emit_sig_alg;
-    let emit_asset = payload.settlement_asset.is_some() || emit_peg;
-    let emit_cumulative = payload.cumulative_amount.is_some() || emit_asset;
     match payload.cumulative_amount {
         Some(v) => {
             b.push(1u8);
@@ -692,6 +698,38 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_receipt_is_framed_as_older_providers_read_it() {
+        // Round 8 X8-3: v0.3.20's decoder takes exactly the fixed fields and the model.
+        use openhydra_protocol::crypto_agility::SigAlg;
+        use openhydra_protocol::receipts::ReceiptPayload;
+        let consumer = signer(7);
+        let provider = signer(9);
+        let mut payload = ReceiptPayload {
+            sig_alg: SigAlg::Ed25519,
+            provider: provider.verifying_key(),
+            consumer: consumer.verifying_key(),
+            model_id: "qwen2.5:7b".to_string(),
+            tokens: 100,
+            nonce: [3u8; 16],
+            ts_unix_ms: 1_700_000_000_000,
+            completion_tokens: None,
+            canonical_model_id: String::new(),
+            cumulative_amount: None,
+            settlement_asset: None,
+            peg_micros_per_credit: None,
+        };
+        let sig = consumer.sign(&payload.canonical_bytes());
+        let framed = encode_request(&payload, &sig);
+        assert_eq!(framed.len(), REQ_FIXED + payload.model_id.len(), "what a v0.3.20 provider decodes");
+        assert_eq!(decode_request(&framed).unwrap().0.canonical_bytes(), payload.canonical_bytes());
+        // With a canonical id the trailers follow, and still round-trip.
+        payload.canonical_model_id = "qwen2.5/7b/q4_k_m/abcd".into();
+        let framed = encode_request(&payload, &consumer.sign(&payload.canonical_bytes()));
+        assert!(framed.len() > REQ_FIXED + payload.model_id.len());
+        assert_eq!(decode_request(&framed).unwrap().0.canonical_bytes(), payload.canonical_bytes());
+    }
+
+    #[test]
     fn request_framing_round_trips_a_completion_split() {
         // Review M3: the framing must carry `completion_tokens`, else the day Phase 2b signs a
         // `Some` split the provider would reconstruct `None`, the co-sign preimage would differ, and
@@ -758,12 +796,13 @@ mod tests {
         // A non-Ed25519 discriminant is carried through the framing verbatim (forward-compat plumbing
         // for PQC3.1 — we can't verify it yet, but the provider must reconstruct the SAME sig_alg the
         // consumer signed). sig_alg is the LAST trailer, so emitting it forces the preceding optional
-        // trailers' presence flags: cumulative `0`, asset `0`, peg `0`, then the discriminant = +4.
+        // trailers' presence: the canonical length and completion flag (3 bytes a plain receipt
+        // leaves out, round 8 X8-3), then cumulative `0`, asset `0`, peg `0` and the discriminant = +4.
         let mut pqc = base.clone();
         pqc.sig_alg = SigAlg::MlDsa65;
         let pqc_framed = encode_request(&pqc, &sig);
-        assert_eq!(pqc_framed.len(), ed_framed.len() + 4,
-            "cumulative/asset/peg `0` flags (positional decode stays unambiguous) + the discriminant byte");
+        assert_eq!(pqc_framed.len(), ed_framed.len() + 3 + 4,
+            "canonical/completion head + cumulative/asset/peg `0` flags (positional decode stays unambiguous) + the discriminant byte");
         let (pqc_decoded, _) = decode_request(&pqc_framed).unwrap();
         assert_eq!(pqc_decoded.sig_alg, SigAlg::MlDsa65, "the wire-declared algorithm survives the round-trip");
 

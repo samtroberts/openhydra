@@ -3400,6 +3400,17 @@ impl ConsumerNode {
                         "provider sent back a receipt this consumer can't adopt"),
                 }
             }
+            // An older provider (v0.3.20) reads only the original framing, which can't carry the
+            // canonical id: a plain receipt it refused for its length is sent once more without it
+            // (round 8 X8-3).
+            let legacy_framing = |o: &Result<openhydra_protocol::receipts::CoSignedReceipt, ReceiptFailure>| {
+                matches!(o, Err(ReceiptFailure::Failed(e)) if e.message().contains("length mismatch"))
+            };
+            if voucher.is_none() && claim_signer.is_none() && !canonical.is_empty() && legacy_framing(&outcome) {
+                outcome = request_receipt(
+                    &sign, &mut transport, &provider_pub, &consumer_pub, &model_id, tokens, nonce, now, "", None, None, None, None,
+                );
+            }
             // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
             // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
             node.note_settled(&provider_libp2p, settled_earlier || outcome.is_ok());
