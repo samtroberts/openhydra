@@ -31,6 +31,7 @@ import { state, engines, deviceName } from "./state";
     updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
     $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
     $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!p.settings.authenticity_checks);
+    $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!p.settings.audit_replay);
     $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);
     $("#advsw").classList.toggle("on", $("#app").hasAttribute("data-adv"));
     $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4

@@ -28,7 +28,7 @@ use openhydra_protocol::receipts::NonceTracker;
 use openhydra_protocol::router::{rank_peers, PeerScoreInput};
 use openhydra_protocol::store::Store;
 use openhydra_protocol::verify::{
-    audit_body, reputation_key, resolve_audit, sample_rate_for_reputation, split_reputation_key,
+    reputation_key, resolve_audit, sample_rate_for_reputation, split_reputation_key,
     AuditReport, RedundantVerdict,
     ReputationTracker,
     VerificationOutcome, NEUTRAL_REPUTATION,
@@ -56,7 +56,7 @@ use openhydra_protocol::logprob::ChallengeRound;
 use crate::provider::{FETCH_CHUNKS, FETCH_RESULT, SERVE_REQUEST, SERVE_STREAM};
 use crate::receipt::{request_receipt, ReceiptFailure};
 use crate::serve::{
-    parse_response, DeterministicParams, FetchChunksResponse, FetchResponse, ServeChunk,
+    parse_response, FetchChunksResponse, FetchResponse, ServeChunk,
     ServeRequest, ServeSummary,
 };
 
@@ -164,6 +164,8 @@ const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_SETTLES_IN_FLIGHT: usize = 512;
 /// How long a provider that refused us over payment is tried last (see `payment_refusals`).
 const PAYMENT_REFUSAL_TTL_MS: u64 = 10 * 60 * 1000;
+/// Providers whose recent settlements a consumer remembers (for [`ConsumerNode::paid_recently`]).
+const MAX_SETTLE_RECORDS: usize = 4096;
 /// Payment refusals remembered at once (the oldest are forgotten first).
 const MAX_PAYMENT_REFUSALS: usize = 1024;
 /// Settlements running or queued for one `(peer, model)`. They run one at a time (its lock), so with
@@ -408,35 +410,29 @@ const AUDIT_MIN_RATE: f64 = 0.02;
 const AUDIT_FAIL_FLOOR_MS: u64 = 24 * 60 * 60 * 1000;
 const AUDIT_MAX_RATE: f64 = 0.5;
 
-/// Token budget for an audit challenge completion — kept short to bound the audit's compute
-/// cost while leaving enough output to discriminate an honest run from a freeloader.
-///
-/// KNOWN LIMITATION (thinking/reasoning models). The audit probe sets `think:false` (see
-/// [`ConsumerNode::dispatch_full`]) so a reasoning model answers directly within this small
-/// budget and the required nonce echo lands in `audit_body`'s near-the-start window. That holds
-/// once the fleet uniformly honours the switch. During a mixed-version rollout it can misfire
-/// for a provider that does NOT honour `think:false` (a pre-Fix binary, a `/api/show` probe that
-/// failed, or an OpenAI-path template that ignores `enable_thinking`): it still emits a
-/// `<think>…</think>` block, which either (a) spends this whole 64-token budget mid-thought so the
-/// nonce is never reached → recorded as a non-responder, or (b) yields a post-thinking answer that
-/// legitimately diverges (at `temperature 0`, a continuation conditioned on chain-of-thought
-/// differs from one without) from a peer that answered directly → a `common_prefix_ratio` miss.
-/// Deliberately NOT "fixed" by inflating this budget universally: that would 8× the compute of the
-/// (majority) non-thinking audits and *widen* the benign-divergence window, weakening the signal
-/// for everyone. The exposure is bounded and self-correcting — audits are sampled, a 1-vs-1 tie is
-/// `Inconclusive` (no penalty; it escalates to a third), and reputation is long-run — and it
-/// disappears once the fleet converges on honouring `think:false`. If it ever needs an active fix,
-/// the right shape is capability-scoped (down-weight / skip greedy-agreement auditing for
-/// thinking-capable models, whose variable reasoning makes output-agreement the wrong primitive),
-/// not a bigger global budget.
-const AUDIT_MAX_TOKENS: u32 = 64;
+/// How much of two answers an audit compares: their first this many characters (about 64
+/// tokens). Honest greedy runs of one model agree on a long opening; a provider running something
+/// else diverges within it. Later divergence between honest engines (accumulation order, kernels)
+/// isn't held against anyone.
+const AUDIT_COMPARE_CHARS: usize = 256;
 
-/// The fixed RNG seed every audit probe pins (UNIFIED_TRUST_STACK 2b). A single shared value makes
-/// a temp=0 redundant-exec probe reproducible *across* honest providers running the same model +
-/// quant — tightening output agreement (an honest pair should now match to the token, not merely
-/// "agree closely"), which sharpens the A1 authenticity signal. Providers that predate the
-/// `deterministic` field ignore the seed and still serve temp=0 via the request's `temperature`.
-const AUDIT_SEED: u64 = 0;
+/// Serves kept for replay as audits (review round 3, D1), at most, and for how long. In memory
+/// only: a prompt kept for an audit is never written to disk, and goes once replayed or stale.
+const REPLAY_KEEP: usize = 32;
+const REPLAY_TTL_MS: u64 = 60 * 60 * 1000;
+/// A replayable serve's prompt is at most this many bytes (larger ones are left alone).
+const REPLAY_MAX_PROMPT_BYTES: usize = 64 * 1024;
+/// …and its answer is kept up to this many characters, and must reach [`MIN_REPLAY_ANSWER_CHARS`]
+/// to be worth comparing.
+const REPLAY_KEEP_CHARS: usize = AUDIT_COMPARE_CHARS;
+const MIN_REPLAY_ANSWER_CHARS: usize = 64;
+
+/// A model's recent requests a probe takes its shape from (at most, by count).
+const TRAFFIC_WINDOW: u32 = 64;
+/// The share of a model's recent requests that must be greedy (temperature 0) before this consumer
+/// sends greedy probes for it: a probe at temperature 0 from a consumer that never asks for it would
+/// stand out (and comparing answers needs greedy decoding).
+const MIN_GREEDY_SHARE: f64 = 0.1;
 
 // Crypto-rail settlement peg (USDC micro-units per credit unit): **opt-in, no numeric default**
 // (review F3). A node stamps a crypto-rail cumulative voucher on its receipts ONLY when a peg is
@@ -758,6 +754,117 @@ struct Exchange {
     streamed: bool,
 }
 
+/// Append `text` to `kept`, up to `max_chars` characters in all.
+fn keep_prefix(kept: &mut String, text: &str, max_chars: usize) {
+    let room = max_chars.saturating_sub(kept.chars().count());
+    kept.extend(text.chars().take(room));
+}
+
+/// What an audit asks a provider for: a request as a user would send it, always greedy.
+#[derive(Debug, Clone, PartialEq)]
+struct AuditRequest {
+    messages: Vec<ChatMessage>,
+    max_tokens: Option<u32>,
+    tools: Vec<Value>,
+    think: Option<bool>,
+}
+
+/// A serve this consumer could replay as an audit (D1): a user's greedy request to a public model,
+/// and the start of the answer its provider gave.
+#[derive(Debug, Clone)]
+struct Replayable {
+    provider: SelectedProvider,
+    /// The model the user asked for (what discovery finds other providers of).
+    model: String,
+    request: AuditRequest,
+    /// The start of the answer, up to [`REPLAY_KEEP_CHARS`].
+    answer: String,
+    at: u64,
+}
+
+/// Keep `entry` for replay: within [`REPLAY_KEEP`] (the oldest go first) and [`REPLAY_TTL_MS`].
+fn keep_replayable(kept: &mut Vec<Replayable>, entry: Replayable, now: u64) {
+    kept.retain(|r| now.saturating_sub(r.at) <= REPLAY_TTL_MS);
+    if kept.len() >= REPLAY_KEEP {
+        if let Some(i) = kept.iter().enumerate().min_by_key(|(_, r)| r.at).map(|(i, _)| i) {
+            kept.swap_remove(i);
+        }
+    }
+    kept.push(entry);
+}
+
+/// Take one kept serve of `provider_state_id` for `model`, at random among its fresh ones (it is
+/// replayed once).
+fn take_replayable(kept: &mut Vec<Replayable>, provider_state_id: &str, model: &str, now: u64) -> Option<Replayable> {
+    use rand::seq::IteratorRandom;
+    kept.retain(|r| now.saturating_sub(r.at) <= REPLAY_TTL_MS);
+    let i = kept
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.provider.state_id == provider_state_id && r.model == model)
+        .map(|(i, _)| i)
+        .choose(&mut rand::thread_rng())?;
+    Some(kept.swap_remove(i))
+}
+
+/// The shape of a model's recent requests from this consumer, which a probe copies (D1): how many
+/// were greedy, used tools, or set thinking, and the last `max_tokens` asked for.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct TrafficShape {
+    requests: u32,
+    greedy: u32,
+    think_on: u32,
+    think_off: u32,
+    max_tokens: Option<u32>,
+}
+
+impl TrafficShape {
+    fn note(&mut self, temperature: Option<f64>, think: Option<bool>, max_tokens: Option<u32>) {
+        // A sliding window: past it, older requests weigh half.
+        if self.requests >= TRAFFIC_WINDOW {
+            self.requests /= 2;
+            self.greedy /= 2;
+            self.think_on /= 2;
+            self.think_off /= 2;
+        }
+        self.requests += 1;
+        self.greedy += u32::from(temperature == Some(0.0));
+        match think {
+            Some(true) => self.think_on += 1,
+            Some(false) => self.think_off += 1,
+            None => {}
+        }
+        self.max_tokens = max_tokens;
+    }
+
+    /// A probe of `prompt` shaped like these requests, or `None` when too few of them are greedy to
+    /// send a greedy probe.
+    fn probe(&self, prompt: String) -> Option<AuditRequest> {
+        if self.greedy == 0 || f64::from(self.greedy) < MIN_GREEDY_SHARE * f64::from(self.requests) {
+            return None;
+        }
+        let unset = self.requests - self.think_on - self.think_off;
+        let think = if self.think_on > self.think_off.max(unset) {
+            Some(true)
+        } else if self.think_off > self.think_on.max(unset) {
+            Some(false)
+        } else {
+            None
+        };
+        Some(AuditRequest {
+            messages: vec![ChatMessage { role: "user".into(), content: prompt, ..Default::default() }],
+            max_tokens: self.max_tokens,
+            tools: Vec::new(),
+            think,
+        })
+    }
+}
+
+/// The part of an answer an audit compares ([`AUDIT_COMPARE_CHARS`]).
+fn compared(answer: &str) -> String {
+    answer.chars().take(AUDIT_COMPARE_CHARS).collect()
+}
+
 /// Why a streaming attempt didn't complete.
 enum StreamFail {
     /// The provider answered `SERVE_STREAM` with a non-streaming (legacy) reply — the caller
@@ -1018,6 +1125,17 @@ pub struct ConsumerNode {
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
     provider_logprob: Option<Arc<ProviderLogprob>>,
+    /// Whether audits may replay users' greedy requests to public models to another provider (D1,
+    /// see [`with_audit_replay`](Self::with_audit_replay)). Off by default.
+    audit_replay: bool,
+    /// Recent serves kept for replay as audits (in memory only).
+    replays: Mutex<Vec<Replayable>>,
+    /// Per model asked for: the shape of this consumer's recent requests, which a probe copies.
+    traffic: Mutex<HashMap<String, TrafficShape>>,
+    /// Per provider (libp2p id): when a paid settlement with it last succeeded and last failed, so an
+    /// audit can tell a provider that just served us at our price refusing to be paid from one whose
+    /// price we don't meet (review B1).
+    settle_record: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -1068,6 +1186,10 @@ impl ConsumerNode {
             payment_refusals: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
+            audit_replay: false,
+            replays: Mutex::new(Vec::new()),
+            traffic: Mutex::new(HashMap::new()),
+            settle_record: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1242,6 +1364,16 @@ impl ConsumerNode {
     /// cumulative is stamped — so a node can't silently emit mis-denominated vouchers (review F3).
     /// Settle paying receipts on `chain` (builder form): each carries its on-chain claim, signed for
     /// that deployment by our identity (Solana) or wallet (Base).
+    /// Let audits replay users' requests (D1): a greedy (temperature 0) request to a public model is
+    /// sent again, as is, to another provider of the model, and the answers are compared. The
+    /// audited provider can't tell it was checked, and the other sees an ordinary request. It means
+    /// a user's prompt also reaches a second provider: never a private swarm's (those aren't kept),
+    /// never written to disk. Off, audits send probes shaped like this consumer's traffic instead.
+    pub fn with_audit_replay(mut self, on: bool) -> Self {
+        self.audit_replay = on;
+        self
+    }
+
     pub fn with_settlement_chain(mut self, chain: Option<crate::settlement_config::SettlementChain>) -> Self {
         self.settlement_chain = chain;
         self
@@ -1351,6 +1483,10 @@ impl ConsumerNode {
             payment_refusals: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
+            audit_replay: false,
+            replays: Mutex::new(Vec::new()),
+            traffic: Mutex::new(HashMap::new()),
+            settle_record: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1931,6 +2067,9 @@ impl ConsumerNode {
             // What this attempt received, counted as the provider counts what its polls returned: a
             // stream that ends early is settled for it (see `StreamTally`).
             let tally = std::cell::Cell::new(crate::serve::StreamTally::default());
+            // The start of the answer, kept when this serve could be replayed as an audit (D1).
+            let replayable = self.replay_eligible(&provider, temperature, messages);
+            let answer = std::cell::RefCell::new(String::new());
             let exchange = {
                 let mut guarded = |d: &str| {
                     delivered = true;
@@ -1940,6 +2079,9 @@ impl ConsumerNode {
                     let mut n = tally.get();
                     n.push_delta(d);
                     tally.set(n);
+                    if replayable {
+                        keep_prefix(&mut answer.borrow_mut(), d, REPLAY_KEEP_CHARS);
+                    }
                     if counter.is_some() && !overflowed.get() {
                         let mut c = captured.borrow_mut();
                         if c.len() + d.len() <= crate::token_count::MAX_COUNTED_BYTES {
@@ -2013,8 +2155,28 @@ impl ConsumerNode {
                     req_span.record("tokens", summary.tokens);
                     // M2.2(b): sampled background redundant-exec audit of this provider (off
                     // the response path — the caller already has its completion).
+                    if !self_serve && provider.swarm_public_key.is_empty() {
+                        // What its requests look like, for the probes that audit this model (D1).
+                        self.traffic
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(model.to_string())
+                            .or_default()
+                            .note(temperature, think, max_tokens);
+                    }
+                    let answer = answer.into_inner();
+                    if replayable && summary.tool_calls.is_empty() && answer.chars().count() >= MIN_REPLAY_ANSWER_CHARS {
+                        let entry = Replayable {
+                            provider: provider.clone(),
+                            model: model.to_string(),
+                            request: AuditRequest { messages: messages.to_vec(), max_tokens, tools: tools.to_vec(), think },
+                            answer,
+                            at: now,
+                        };
+                        keep_replayable(&mut self.replays.lock().unwrap_or_else(|e| e.into_inner()), entry, now);
+                    }
                     if !self_serve {
-                        self.maybe_audit(model, model_key, &provider.state_id);
+                        self.maybe_audit(model, model_key, &provider);
                         // Phase 0 device attestation (opt-in, detached, rate-limited per provider).
                         self.maybe_attest(&provider);
                         // Track A2-Logprob prompt-scoring round (opt-in, detached, every few hours).
@@ -2425,6 +2587,7 @@ impl ConsumerNode {
             }
             // On a *successfully co-signed* receipt the provider has served us `tokens` — credit
             // its contribution (M2.3 give-side), the mirror of the provider's take-side accrual.
+            node.note_settled(&provider_libp2p, settled_earlier || outcome.is_ok());
             match outcome {
                 _ if settled_earlier => {
                     node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
@@ -2840,109 +3003,145 @@ impl ConsumerNode {
         lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), round);
         lp.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
+    /// Whether a serve at `provider` could be replayed as an audit (D1): replay is on, the user asked
+    /// for greedy decoding (comparing answers needs it), the model is public (a private swarm's
+    /// prompts never leave it), it isn't our own provider, and the prompt isn't huge.
+    fn replay_eligible(&self, provider: &SelectedProvider, temperature: Option<f64>, messages: &[ChatMessage]) -> bool {
+        self.audit_replay
+            && temperature == Some(0.0)
+            && provider.swarm_public_key.is_empty()
+            && !self.is_self_serve(&provider.libp2p_peer_id)
+            && messages.iter().map(|m| m.content.len()).sum::<usize>() <= REPLAY_MAX_PROMPT_BYTES
+    }
 
-    fn maybe_audit(self: &Arc<Self>, model: &str, model_key: &str, provider_peer_id: &str) {
-        let rate = self.audit_rate_for(provider_peer_id, model_key, now_unix_ms());
+    /// Sampled at the provider's audit rate after a serve: audit it in the background (D1), by
+    /// replaying one of its recent serves to another provider when this consumer allows replay and
+    /// has one, or else with a probe shaped like this consumer's requests for the model.
+    fn maybe_audit(self: &Arc<Self>, model: &str, model_key: &str, provider: &SelectedProvider) {
+        let rate = self.audit_rate_for(&provider.state_id, model_key, now_unix_ms());
         if rand::random::<f64>() >= rate {
             return; // not sampled this time
         }
         let node = Arc::clone(self);
         let model = model.to_string();
-        let (challenge, nonce) = default_challenge();
-        std::thread::spawn(move || match node.audit_model(&model, &challenge, &nonce) {
-            Ok(report) => {
-                tracing::info!(model, verdict = ?report.verdict, "redundant-exec audit complete")
-            }
+        let provider = provider.clone();
+        std::thread::spawn(move || match node.audit(&model, &provider) {
+            Ok(report) => tracing::info!(model, verdict = ?report.verdict, "redundant-exec audit complete"),
             Err(e) => tracing::debug!(model, error = %e, "redundant-exec audit skipped"),
         });
     }
 
-    /// Dispatch `challenge` to one specific `provider` deterministically (`temperature = 0`)
-    /// and return its **full** completion text (the audit compares whole outputs, not a
-    /// streamed view). Bounded by [`attempt_timeout`] (short — the audit is a 64-token probe)
-    /// so a dead provider can't stall the audit.
-    fn dispatch_full(
-        self: &Arc<Self>,
-        provider: &SelectedProvider,
-        challenge: &[ChatMessage],
-    ) -> Result<String, AdapterError> {
-        let request = ServeRequest {
-            reply_to: self.net.libp2p_peer_id().to_string(),
-            model_ref: provider.model_id.clone(),
-            messages: challenge.to_vec(),
-            max_tokens: Some(AUDIT_MAX_TOKENS),
-            // Redundant-execution comparison only holds for greedy decoding — a sampled
-            // (temperature > 0) answer would legitimately differ between honest providers.
-            temperature: Some(0.0),
-            // The audit is a plain-text probe — no tools.
-            tools: Vec::new(),
-            // Disable thinking for the probe: a reasoning model would otherwise spend the tiny
-            // 64-token budget on chain-of-thought (and prepend a `<think>…</think>` block that
-            // pushes the required nonce echo out of `audit_body`'s near-the-start window),
-            // making an honest provider look like a non-responder. Off ⇒ the nonce + greedy
-            // continuation come straight out, keeping the redundant-exec comparison deterministic.
-            // (Providers that can't honour `think:false` are still covered by `audit_body`'s
-            // leading-`<think>` strip.)
-            think: Some(false),
-            // Settled like any serve (below), so the provider is paid for it and it looks like one.
-            nonce: rand::random::<[u8; 16]>(),
-            // Audits probe public marketplace providers; no swarm credential.
-            credential: None,
-            // Pin a fixed seed (2b): a temp=0 probe with a shared seed is reproducible across
-            // honest providers, so redundant-exec agreement is exact rather than approximate.
-            deterministic: Some(DeterministicParams { seed: AUDIT_SEED }),
-            // Audits are paid for like any serve (and so look like one).
-            settlement_peg: self.settlement_peg,
-            settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
-            settlement_wallet: self.settlement_wallet(),
-        };
-        let provider_libp2p = provider.libp2p_peer_id.clone();
-        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-            self.net
-                .proxy_forward_timeout(provider_libp2p.clone(), framed.to_vec(), attempt_timeout(Some(AUDIT_MAX_TOKENS)))
-                .map_err(|e| AdapterError::Http(format!("proxy_forward: {e}")))
-        };
-        let mut output = String::new();
-        let mut delivered = crate::serve::DeliveredText::default();
-        let mut sink = |delta: &str| {
-            delivered.push(delta);
-            output.push_str(delta)
-        };
-        let summary = request_completion(&mut transport, &request, &mut sink)?;
-        // Pay for the probe as for any serve: the provider did the work, and an unpaid audit would
-        // stand out (and, at a provider that charges, count as a serve never paid for).
-        if summary.ok && summary.tokens > 0 && !self.is_self_serve(&provider.libp2p_peer_id) {
-            let units = delivered.units() + crate::serve::tool_call_units(&summary.tool_calls, &crate::serve::offered_tool_names(&request.tools));
-            let tokens = crate::serve::billable_tokens(summary.tokens, request.max_tokens, units);
-            self.settle_receipt(provider, tokens, request.nonce);
+    /// Audit `provider` for `model` (see [`maybe_audit`](Self::maybe_audit)).
+    fn audit(self: &Arc<Self>, model: &str, provider: &SelectedProvider) -> Result<AuditReport, AdapterError> {
+        let now = now_unix_ms();
+        let kept = take_replayable(&mut self.replays.lock().unwrap_or_else(|e| e.into_inner()), &provider.state_id, model, now);
+        if let Some(entry) = kept {
+            return self.audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str()));
         }
-        Ok(output)
+        let probe = {
+            let traffic = self.traffic.lock().unwrap_or_else(|e| e.into_inner());
+            traffic.get(model).and_then(|t| t.probe(crate::audit_prompts::random_prompt(&mut rand::thread_rng())))
+        };
+        match probe {
+            Some(request) => self.audit_model(model, &request, provider, None),
+            None => Err(AdapterError::Http(format!(
+                "no audit for '{model}': nothing to replay, and too few greedy requests to probe like them"
+            ))),
+        }
     }
 
-    /// Run one **redundant-execution audit** (M2.2(b)) for `model`: send the same
-    /// deterministic `challenge` to up to two distinct providers of the model, compare
-    /// their full outputs via [`resolve_audit`], and record the resulting reputation
-    /// outcomes (a confirmed outlier → `Failed`; agreeing providers → `Honored`; a
-    /// non-responder → `Rejected`). On a 1-vs-1 `Inconclusive` split, escalates to a third
-    /// provider (if discovery surfaced one) for a majority before recording.
+    /// The serve request an audit sends `provider`: built as a user's is ([`Self::serve_request_for`]),
+    /// greedy.
+    fn audit_request_for(&self, provider: &SelectedProvider, request: &AuditRequest) -> ServeRequest {
+        self.serve_request_for(provider, &request.messages, request.max_tokens, Some(0.0), &request.tools, request.think)
+    }
+
+    /// Serve `request` at `provider` for an audit, exactly as a user's serve goes (the same request
+    /// fields, transport, and settlement), and return the answer's text. It is paid for like any
+    /// serve: the provider did the work, and an unpaid one would stand out (and, at a provider that
+    /// charges, count against us). A stream that breaks after output is settled for what was read.
+    fn audit_serve(self: &Arc<Self>, provider: &SelectedProvider, request: &AuditRequest) -> Result<String, AdapterError> {
+        let serve = self.audit_request_for(provider, request);
+        let mut answer = String::new();
+        let mut delivered = crate::serve::DeliveredText::default();
+        let mut tally = crate::serve::StreamTally::default();
+        let exchange = self.exchange(&provider.libp2p_peer_id, &serve, &mut |d| {
+            delivered.push(d);
+            tally.push_delta(d);
+            answer.push_str(d);
+        });
+        let paying = !self.is_self_serve(&provider.libp2p_peer_id);
+        match exchange.result {
+            Ok(summary) => {
+                if paying && summary.ok && summary.tokens > 0 {
+                    let offered = crate::serve::offered_tool_names(&serve.tools);
+                    let units = delivered.units() + crate::serve::tool_call_units(&summary.tool_calls, &offered);
+                    self.settle_receipt(provider, crate::serve::billable_tokens(summary.tokens, serve.max_tokens, units), serve.nonce);
+                }
+                Ok(answer)
+            }
+            Err(e) => {
+                let read = tally.billable(serve.max_tokens);
+                if paying && exchange.streamed && read > 0 {
+                    self.settle_receipt(provider, read, serve.nonce);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether `provider` (libp2p id) served us at our price recently: a paid settlement with it
+    /// succeeded within [`PAYMENT_REFUSAL_TTL_MS`] and none has failed since. Its payment refusal
+    /// during an audit then isn't about price (review B1).
+    fn paid_recently(&self, provider: &str, now: u64) -> bool {
+        self.settlement_peg.is_some()
+            && self
+                .settle_record
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(provider)
+                .is_some_and(|(ok, failed)| *ok > 0 && now.saturating_sub(*ok) <= PAYMENT_REFUSAL_TTL_MS && failed < ok)
+    }
+
+    /// Note how a settlement with `provider` (libp2p id) went.
+    fn note_settled(&self, provider: &str, ok: bool) {
+        let now = now_unix_ms();
+        let mut m = self.settle_record.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.contains_key(provider) && m.len() >= MAX_SETTLE_RECORDS {
+            m.retain(|_, (o, f)| now.saturating_sub((*o).max(*f)) <= PAYMENT_REFUSAL_TTL_MS);
+        }
+        if m.contains_key(provider) || m.len() < MAX_SETTLE_RECORDS {
+            let e = m.entry(provider.to_string()).or_insert((0, 0));
+            if ok {
+                e.0 = now;
+            } else {
+                e.1 = now;
+            }
+        }
+    }
+
+    /// Run one **redundant-execution audit** (M2.2(b)) of `model`: the same greedy `request` served
+    /// by independent providers, their answers compared by their opening ([`compared`]) via
+    /// [`resolve_audit`], and the outcomes recorded (an outvoted provider → `Failed`; agreeing ones →
+    /// `Honored`; a non-responder → `Rejected`). A 1-vs-1 split goes to a third provider.
     ///
-    /// This is the *audit* path — separate from [`complete`](Self::complete) and off the
-    /// user's latency path (the user already has their answer; a background sampler invokes
-    /// this against a sampled fraction, rate from [`audit_rate_for`](Self::audit_rate_for)).
-    /// Use an unpredictable `challenge` (see [`default_challenge`]) so a provider can't
-    /// pre-cache the answer. Errors only if fewer than two providers are discoverable.
+    /// `subject` is the provider audited, asked first. When `request` is its user's serve being
+    /// replayed, `served` is the answer it gave: it never sees the audit (its serve was real), and
+    /// the others see an ordinary request. Otherwise `request` is a probe, sent to it too.
     ///
-    /// *Caveat:* providers of the same canonical `model_id` may run different quantizations
-    /// / engine builds whose greedy output differs; [`agrees`](openhydra_protocol::verify::agrees)
-    /// absorbs benign late divergence and the `Inconclusive`-on-tie rule avoids punishing on
-    /// ambiguous evidence, but heterogeneous fleets weaken the signal (reputation still
-    /// carries the long-run trust). Reasoning models are a specific case of this — see the
-    /// thinking-model limitation documented on [`AUDIT_MAX_TOKENS`].
-    pub fn audit_model(
+    /// Off the user's latency path (see [`maybe_audit`](Self::maybe_audit)). Errors when fewer than
+    /// two answers can be had.
+    ///
+    /// *Caveat:* providers of the same canonical `model_id` may run different quantizations / engine
+    /// builds whose greedy output differs; comparing only the opening, the `Inconclusive`-on-tie
+    /// rule, and long-run reputation keep that from punishing an honest provider, but heterogeneous
+    /// fleets weaken the signal.
+    fn audit_model(
         self: &Arc<Self>,
         model: &str,
-        challenge: &[ChatMessage],
-        nonce: &str,
+        request: &AuditRequest,
+        subject: &SelectedProvider,
+        served: Option<&str>,
     ) -> Result<AuditReport, AdapterError> {
         let now = now_unix_ms();
         let peers = self
@@ -2952,22 +3151,19 @@ impl ConsumerNode {
         let candidates = rank_providers_with_reputation(&peers, "", self.tier, &|pid, mkey| {
             self.earned_reputation(pid, mkey, now)
         });
-        if candidates.len() < 2 {
-            return Err(AdapterError::Http(format!(
-                "redundant-exec audit needs ≥2 providers for '{model}', found {}",
-                candidates.len()
-            )));
-        }
 
-        // Dispatch to two providers, then escalate to a third only if they can't decide. They are
-        // picked at random, not by rank, and must be independent (review T2): no two on the same
-        // network as we observe it, and at most one we only reach through a relay — otherwise two
-        // identities of one operator could take both slots and confirm each other. A provider that
-        // charges and refuses us over payment isn't a non-responder (a price, not a fault): it is
-        // skipped for the next one, and so is one that just refused us.
+        // Providers are picked at random, not by rank, and must be independent (review T2): no two
+        // on the same network as we observe it, and at most one we only reach through a relay —
+        // otherwise two identities of one operator could take two slots and confirm each other. A
+        // provider that charges and refuses us over payment isn't a non-responder (a price, not a
+        // fault): it is skipped for the next one, and so is one that just refused us. Unless it
+        // served us at our price just now (B1): then refusing is dodging the audit.
         let networks = self.observed_networks();
-        let mut order: Vec<&SelectedProvider> =
-            candidates.iter().filter(|c| !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now)).collect();
+        let mut order: Vec<&SelectedProvider> = candidates
+            .iter()
+            .filter(|c| c.libp2p_peer_id != subject.libp2p_peer_id)
+            .filter(|c| !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now) || self.paid_recently(&c.libp2p_peer_id, now))
+            .collect();
         {
             use rand::seq::SliceRandom;
             order.shuffle(&mut rand::thread_rng());
@@ -2975,75 +3171,75 @@ impl ConsumerNode {
         let mut pool = order.into_iter();
         let mut chosen: Vec<Vec<String>> = Vec::new();
         let mut chosen_peers = std::collections::HashSet::new();
-        let mut ask = |results: &mut Vec<(String, Result<String, String>)>| {
+        let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(3);
+        // Model keys of everyone audited, for recording outcomes.
+        let mut key_of: HashMap<String, String> = HashMap::new();
+        let first = match served {
+            Some(answer) => Ok(answer.to_string()),
+            None => match self.audit_serve(subject, request) {
+                Err(e) if crate::serve::is_payment_refusal(&e) && !self.paid_recently(&subject.libp2p_peer_id, now) => {
+                    self.note_payment_refusal(&subject.libp2p_peer_id, &subject.model_id, now);
+                    return Err(e);
+                }
+                out => out,
+            },
+        };
+        chosen.push(networks.get(&subject.libp2p_peer_id).cloned().unwrap_or_default());
+        chosen_peers.insert(subject.libp2p_peer_id.clone());
+        key_of.insert(subject.state_id.clone(), rep_model_key(&subject.canonical_model_id, &subject.model_id).to_string());
+        results.push((subject.state_id.clone(), first.map(|a| compared(&a)).map_err(|e| e.to_string())));
+        let mut ask = |results: &mut Vec<(String, Result<String, String>)>, key_of: &mut HashMap<String, String>| {
             for provider in pool.by_ref() {
                 let nets = networks.get(&provider.libp2p_peer_id).cloned().unwrap_or_default();
                 if !independent_of(&chosen, &nets) || chosen_peers.contains(&provider.libp2p_peer_id) {
                     continue;
                 }
-                match self.dispatch_full(provider, challenge) {
+                let out = match self.audit_serve(provider, request) {
                     Err(e) if crate::serve::is_payment_refusal(&e) => {
-                        self.note_payment_refusal(&provider.libp2p_peer_id, &provider.model_id, now);
+                        if !self.paid_recently(&provider.libp2p_peer_id, now) {
+                            self.note_payment_refusal(&provider.libp2p_peer_id, &provider.model_id, now);
+                            continue;
+                        }
+                        Err(e)
                     }
-                    out => {
-                        chosen.push(nets);
-                        chosen_peers.insert(provider.libp2p_peer_id.clone());
-                        results.push((provider.state_id.clone(), out.map_err(|e| e.to_string())));
-                        return;
-                    }
-                }
+                    out => out,
+                };
+                chosen.push(nets);
+                chosen_peers.insert(provider.libp2p_peer_id.clone());
+                key_of.insert(provider.state_id.clone(), rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string());
+                results.push((provider.state_id.clone(), out.map(|a| compared(&a)).map_err(|e| e.to_string())));
+                return;
             }
         };
-        let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(3);
-        ask(&mut results);
-        ask(&mut results);
+        while results.len() < 2 {
+            let before = results.len();
+            ask(&mut results, &mut key_of);
+            if results.len() == before {
+                break;
+            }
+        }
         if results.len() < 2 {
             return Err(AdapterError::Http(format!(
                 "redundant-exec audit needs ≥2 providers that serve us '{model}', found {}",
                 results.len()
             )));
         }
-        // B-S2: gate each response on the required nonce echo and compare only the generated
-        // *body* (after the nonce) — a freeloader that parrots the copyable prompt is filtered
-        // to a non-responder rather than agreeing its way to Honored.
-        let gate = |raw: &[(String, Result<String, String>)]| -> Vec<(String, Result<String, String>)> {
-            raw.iter()
-                .map(|(pid, r)| {
-                    let mapped = match r {
-                        Ok(out) => match audit_body(out, nonce) {
-                            Some(body) => Ok(body.to_string()),
-                            None => Err("audit response did not echo the challenge nonce".to_string()),
-                        },
-                        Err(e) => Err(e.clone()),
-                    };
-                    (pid.clone(), mapped)
-                })
-                .collect()
-        };
-        let mut report = resolve_audit(&gate(&results));
+        let mut report = resolve_audit(&results);
         if report.verdict == RedundantVerdict::Inconclusive {
-            ask(&mut results);
+            ask(&mut results, &mut key_of);
             if results.len() == 3 {
-                report = resolve_audit(&gate(&results));
+                report = resolve_audit(&results);
             }
         }
 
         // Phase 4a: record each audit outcome under the SAME per-(peer, model) key the serve path
-        // uses, so an audit `Failed` downranks the provider on this model specifically. Every
-        // peer_id in `report.outcomes` came from `candidates`, so resolve the model key from there
-        // (falling back to the audited `model` handle for safety).
-        let key_of: std::collections::HashMap<&str, &str> = candidates
-            .iter()
-            .map(|c| (c.state_id.as_str(), rep_model_key(&c.canonical_model_id, &c.model_id)))
-            .collect();
+        // uses, so an audit `Failed` downranks the provider on this model specifically.
         for (peer_id, outcome) in &report.outcomes {
-            let model_key = key_of.get(peer_id.as_str()).copied().unwrap_or(model);
+            let model_key = key_of.get(peer_id).map_or(model, String::as_str);
             self.record_outcome(peer_id, model_key, *outcome, now);
             // Phase 4: fold the substantive temp=0 verdicts into the per-(peer,model) audit history
             // — an agreed serve is a Pass (lifts `n`), a clear divergence a Fail. A non-responder
             // (`Rejected`, a timeout) is not model-fraud evidence, so it never touches the history.
-            // (This history feeds the future payout gate; it does not gate any spendable credit
-            // today — the throttle is raw-token and display is handle-weighted.)
             let class = match outcome {
                 VerificationOutcome::Honored => Some(AuditClass::Pass),
                 VerificationOutcome::Failed => Some(AuditClass::Fail),
@@ -3055,26 +3251,6 @@ impl ConsumerNode {
         }
         Ok(report)
     }
-}
-
-/// An unpredictable, deterministic audit challenge (M2.2(b)), returned with its `nonce` so the
-/// verifier can require the echo and compare only the generated body (B-S2). The nonce defeats
-/// answer-caching; the **generative continuation** (not present in the prompt) is what two
-/// honest greedy runs of the same model reproduce and a prompt-parroting freeloader cannot.
-/// Prompt design is heuristic and tunable.
-pub fn default_challenge() -> (Vec<ChatMessage>, String) {
-    let nonce_val: u128 = rand::random();
-    let nonce = format!("{nonce_val:032x}");
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: format!(
-            "Verification probe {nonce}. Respond with no preamble or explanation. \
-             Line 1: output exactly the token {nonce}. From line 2 onward: deterministically \
-             continue this passage — \"A peer joins the distributed network by\""
-        ),
-        ..Default::default()
-    }];
-    (messages, nonce)
 }
 
 #[cfg(test)]
@@ -3948,25 +4124,173 @@ mod tests {
         assert_eq!(node.authenticity_of("p", "m", after), without_floor);
     }
 
+    fn test_node() -> (tempfile::TempDir, ConsumerNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
+            identity_path: dir.path().join("id.key"),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            bootstrap_peers: vec![],
+            enable_peer_relay: false,
+            enable_connection_reversal: false,
+            pcp_gateway: None,
+        })
+        .unwrap();
+        (dir, ConsumerNode::new(net))
+    }
+
+    fn selected(libp2p: &str) -> SelectedProvider {
+        SelectedProvider {
+            peer_id: format!("oh-{libp2p}"),
+            state_id: format!("state-{libp2p}"),
+            libp2p_peer_id: libp2p.into(),
+            model_id: "m".into(),
+            canonical_model_id: String::new(),
+            public_key: String::new(),
+            swarm_public_key: String::new(),
+        }
+    }
+
+    fn user(text: &str) -> Vec<ChatMessage> {
+        vec![ChatMessage { role: "user".into(), content: text.into(), ..Default::default() }]
+    }
+
+    #[test]
+    fn an_audit_asks_exactly_what_a_user_would() {
+        let (_dir, node) = test_node();
+        let node = node.with_settlement_peg(10);
+        let a = selected("A");
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f", "parameters": {}}})];
+        let as_user = node.serve_request_for(&a, &user("hi there"), Some(300), Some(0.0), &tools, Some(true));
+        let audit = node.audit_request_for(
+            &a,
+            &AuditRequest { messages: user("hi there"), max_tokens: Some(300), tools: tools.clone(), think: Some(true) },
+        );
+        assert_ne!(as_user.nonce, audit.nonce, "each serve commits its own nonce");
+        let (mut u, mut v) = (serde_json::to_value(&as_user).unwrap(), serde_json::to_value(&audit).unwrap());
+        u.as_object_mut().unwrap().remove("nonce");
+        v.as_object_mut().unwrap().remove("nonce");
+        assert_eq!(u, v, "field for field the same");
+        // No audit tell on the wire: no deterministic mode, the user's own cap and thinking flag.
+        assert!(v.get("deterministic").is_none_or(|d| d.is_null()));
+        assert_eq!(v["max_tokens"], 300);
+        assert_eq!(v["think"], true);
+        assert_eq!(v["settlement_peg"], 10);
+    }
+
+    #[test]
+    fn only_greedy_public_serves_of_others_are_kept_for_replay() {
+        let (_dir, node) = test_node();
+        let a = selected("A");
+        // Replay is opt-in.
+        assert!(!node.replay_eligible(&a, Some(0.0), &user("x")));
+        let node = node.with_audit_replay(true).with_self_provider(Some("SELF".into()));
+        assert!(node.replay_eligible(&a, Some(0.0), &user("x")));
+        assert!(!node.replay_eligible(&a, Some(0.7), &user("x")), "sampled answers can't be compared");
+        assert!(!node.replay_eligible(&a, None, &user("x")), "the engine's default may sample");
+        let mut private = a.clone();
+        private.swarm_public_key = "swarm".into();
+        assert!(!node.replay_eligible(&private, Some(0.0), &user("x")), "a private swarm's prompt never leaves it");
+        assert!(!node.replay_eligible(&selected("SELF"), Some(0.0), &user("x")), "not our own provider");
+        let huge = "x".repeat(REPLAY_MAX_PROMPT_BYTES + 1);
+        assert!(!node.replay_eligible(&a, Some(0.0), &user(&huge)));
+    }
+
+    #[test]
+    fn kept_serves_are_bounded_fresh_and_replayed_once() {
+        let entry = |p: &str, at: u64| Replayable {
+            provider: selected(p),
+            model: "m".into(),
+            request: AuditRequest { messages: user("q"), max_tokens: None, tools: vec![], think: None },
+            answer: "a".repeat(100),
+            at,
+        };
+        let mut kept = Vec::new();
+        for i in 0..(REPLAY_KEEP as u64 + 10) {
+            keep_replayable(&mut kept, entry(if i % 2 == 0 { "A" } else { "B" }, 1_000 + i), 1_000 + i);
+        }
+        assert_eq!(kept.len(), REPLAY_KEEP);
+        assert!(kept.iter().all(|r| r.at >= 1_010), "the oldest went first");
+        let now = 1_000 + REPLAY_KEEP as u64 + 10;
+        let taken = take_replayable(&mut kept, "state-A", "m", now).unwrap();
+        assert_eq!(taken.provider.libp2p_peer_id, "A");
+        assert_eq!(kept.len(), REPLAY_KEEP - 1, "replayed once");
+        assert!(take_replayable(&mut kept, "state-A", "other", now).is_none());
+        assert!(take_replayable(&mut kept, "state-C", "m", now).is_none());
+        // Stale ones are dropped, not replayed.
+        assert!(take_replayable(&mut kept, "state-B", "m", now + REPLAY_TTL_MS + 100).is_none());
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn a_probe_copies_the_shape_of_greedy_traffic_and_is_skipped_without_it() {
+        let mut t = TrafficShape::default();
+        for _ in 0..20 {
+            t.note(Some(0.8), Some(false), Some(512));
+        }
+        assert_eq!(t.probe("p".into()), None, "no greedy traffic: a greedy probe would stand out");
+        for _ in 0..5 {
+            t.note(Some(0.0), Some(false), Some(700));
+        }
+        let probe = t.probe("Explain DNS.".into()).unwrap();
+        assert_eq!(probe.messages, user("Explain DNS."));
+        assert_eq!((probe.max_tokens, probe.think), (Some(700), Some(false)));
+        assert!(probe.tools.is_empty());
+        // The window slides: old traffic fades.
+        for _ in 0..200 {
+            t.note(Some(1.0), None, None);
+        }
+        assert!(t.requests <= TRAFFIC_WINDOW);
+        assert_eq!(t.probe("p".into()), None);
+        let mut thinking = TrafficShape::default();
+        for _ in 0..3 {
+            thinking.note(Some(0.0), Some(true), None);
+        }
+        thinking.note(Some(0.0), None, None);
+        assert_eq!(thinking.probe("p".into()).unwrap().think, Some(true));
+    }
+
+    #[test]
+    fn replayed_answers_are_compared_by_their_opening() {
+        let opening = "The quick brown fox jumps over the lazy dog. ".repeat(8);
+        assert!(opening.chars().count() >= AUDIT_COMPARE_CHARS);
+        // The served answer was kept up to the window; a second honest run agrees on it even when
+        // their tails part ways.
+        let a = compared(&format!("{opening} and then A's own ending"));
+        let b = compared(&format!("{opening} while B ends differently"));
+        let c = compared("Something else entirely, from a different model, from the first word onward. ");
+        let report = resolve_audit(&[("A".into(), Ok(a.clone())), ("B".into(), Ok(b.clone()))]);
+        assert!(report.outcomes.iter().all(|(_, o)| *o == VerificationOutcome::Honored));
+        let split = resolve_audit(&[("A".into(), Ok(c.clone())), ("B".into(), Ok(b.clone()))]);
+        assert_eq!(split.verdict, RedundantVerdict::Inconclusive, "1 vs 1 goes to a third provider");
+        let decided = resolve_audit(&[("A".into(), Ok(c)), ("B".into(), Ok(b)), ("C".into(), Ok(a))]);
+        assert!(decided.outcomes.contains(&("A".into(), VerificationOutcome::Failed)), "the served answer was outvoted");
+    }
+
+    #[test]
+    fn a_payment_refusal_from_a_provider_we_just_paid_is_not_about_price() {
+        let (_dir, node) = test_node();
+        let now = now_unix_ms();
+        // Without a peg nothing is paid, so no refusal is ever held against anyone.
+        node.note_settled("P", true);
+        assert!(!node.paid_recently("P", now));
+        let (_dir2, node) = test_node();
+        let node = node.with_settlement_peg(10);
+        assert!(!node.paid_recently("P", now));
+        node.note_settled("P", true);
+        assert!(node.paid_recently("P", now_unix_ms()));
+        assert!(!node.paid_recently("Q", now_unix_ms()));
+        assert!(!node.paid_recently("P", now_unix_ms() + PAYMENT_REFUSAL_TTL_MS + 1), "only recently");
+        // A settlement that failed since: we may be the ones not paying.
+        node.note_settled("P", false);
+        assert!(!node.paid_recently("P", now_unix_ms()));
+    }
+
     #[test]
     fn rep_model_key_uses_the_validated_handle_not_the_canonical() {
         // Keyed on the handle (matches KnownProvider.model_id + the commitment-bound identity),
         // regardless of the untrusted self-declared canonical.
         assert_eq!(rep_model_key("qwen3.5/2b/fp16/aa", "qwen2.5:7b"), "qwen2.5:7b");
         assert_eq!(rep_model_key("", "qwen2.5:7b"), "qwen2.5:7b");
-    }
-
-    #[test]
-    fn default_challenge_is_unpredictable_and_well_formed() {
-        // A single user-role message; the random nonce makes successive challenges differ
-        // (so a provider can't pre-cache the answer) and appear twice (echo + restate).
-        let (c1, n1) = default_challenge();
-        let (c2, _) = default_challenge();
-        assert_eq!(c1.len(), 1);
-        assert_eq!(c1[0].role, "user");
-        assert_ne!(c1[0].content, c2[0].content, "challenge nonce must vary");
-        assert!(c1[0].content.contains(&n1), "prompt must echo its nonce");
-        assert!(c1[0].content.contains("continue this passage"));
     }
 
     #[test]

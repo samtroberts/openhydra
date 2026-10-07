@@ -166,6 +166,10 @@ struct Settings {
     /// time (at most 2 at once). Engines that can't score (Ollama, LM Studio, stock llama.cpp) just
     /// refuse.
     authenticity_checks: bool,
+    /// Let the gateway's audits replay a greedy request to a public model to a second provider
+    /// (`--audit-replay on`): the strongest check, but the prompt reaches that provider too. Off by
+    /// default: audits then send generated test prompts instead.
+    audit_replay: bool,
     /// Optional SearXNG-compatible search endpoint (e.g. `http://127.0.0.1:8888`) powering
     /// the chat "web" toggle. Empty → the toggle is hidden. The operator brings their own
     /// search backend, same BYO philosophy as engines.
@@ -212,6 +216,7 @@ impl Default for Settings {
             gateway_port: 16527,
             engine_autostart: true,
             authenticity_checks: false,
+            audit_replay: false,
             search_url: String::new(),
             verbose_logs: false,
             device_name: String::new(),
@@ -1489,6 +1494,9 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // us. The credential is bound to this same `desktop-consumer.key` (see `swarm_identity_path`).
     sub.push("--swarms-dir".into());
     sub.push(swarms_dir().to_string_lossy().into_owned());
+    // D1: the desktop replays prompts for audits only when the user turned it on.
+    sub.push("--audit-replay".into());
+    sub.push(if settings.audit_replay { "on" } else { "off" }.into());
     spawn_role(
         &state.gateway,
         "desktop-consumer.key",
@@ -2533,6 +2541,7 @@ mod tests {
         assert_eq!(d.gateway_port, 16527);
         assert!(d.engine_autostart);
         assert!(!d.authenticity_checks, "authenticity checks are opt-in");
+        assert!(!d.audit_replay, "replaying prompts for audits is opt-in on the desktop");
         let json = serde_json::to_string(&d).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.gateway_port, 16527);
@@ -2556,6 +2565,7 @@ mod tests {
         assert_eq!(s.device_name, "Asus");
         assert!(s.engine_autostart);
         assert!(!s.authenticity_checks, "an older config without the field loads as off");
+        assert!(!s.audit_replay, "an older config without the field doesn't replay prompts");
         // new fields default sanely (unknown at old-schema time)
         assert!(!s.sharing_enabled, "unknown sharing intent defaults off, not a spurious on");
         assert!(s.resume_on_launch, "resume defaults on");

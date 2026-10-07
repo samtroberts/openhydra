@@ -695,6 +695,14 @@ struct ServeArgs {
     #[arg(long = "swarms-dir")]
     swarms_dir: Option<std::path::PathBuf>,
 
+    /// How audits check providers. `on` (the default): a greedy (temperature 0) request
+    /// to a public model may be sent again, as is, to a second provider of it, and the two answers
+    /// compared, so the audited provider can't tell it was checked. Your prompt then also reaches
+    /// that second provider (never a private swarm's prompt; nothing is written to disk). `off`:
+    /// audits send generated test prompts shaped like your traffic instead.
+    #[arg(long = "audit-replay", default_value = "on", value_parser = ["on", "off"])]
+    audit_replay: String,
+
     /// Challenge providers for a device attestation after serving (in the background, at most every
     /// few minutes each) and show the verified level as a device badge in the status view. Off by
     /// default; informational only — it changes neither routing nor the authenticity tier.
@@ -1614,6 +1622,6 @@ fn serve(
         }
         None => None,
     };
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry)
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry, args.audit_replay == "on")
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

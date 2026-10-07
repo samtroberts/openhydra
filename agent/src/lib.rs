@@ -22,6 +22,7 @@
 
 pub mod adapter;
 pub mod attest;
+pub mod audit_prompts;
 pub mod adapters;
 pub mod cards;
 /// Opt-in engine autostart (starts LM Studio / Ollama when down). Feature-gated so the lean
@@ -76,7 +77,7 @@ pub use adapters::llama_cpp::{LlamaCppAdapter, DEFAULT_LLAMACPP_URL};
 pub use adapters::ollama::{OllamaAdapter, DEFAULT_OLLAMA_URL};
 pub use adapters::openai::{OpenAiAdapter, DEFAULT_LM_STUDIO_URL, DEFAULT_VLLM_URL};
 pub use consumer::{
-    default_challenge, rank_providers, rank_providers_with_assurance,
+    rank_providers, rank_providers_with_assurance,
     rank_providers_with_reputation, request_completion, select_provider, ConsumerNode,
     SelectedProvider,
 };

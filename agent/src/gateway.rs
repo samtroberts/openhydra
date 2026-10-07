@@ -1818,6 +1818,7 @@ pub fn router(
     provider_attest: Option<Vec<[u8; 32]>>,
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
     logprob_registry: Option<crate::registry_client::RegistryClient>,
+    audit_replay: bool,
 ) -> Router {
     let node = match store {
         Some(s) => {
@@ -1856,6 +1857,8 @@ pub fn router(
     };
     // Track A2-Logprob prompt-scoring checks of providers (opt-in; no-op with no reference sets).
     let node = node.with_logprob_checks(logprob_refs, logprob_registry);
+    // D1: audits may replay users' greedy requests to public models (see `with_audit_replay`).
+    let node = node.with_audit_replay(audit_replay);
     let node = Arc::new(node);
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
@@ -1921,13 +1924,14 @@ pub fn serve_http(
     provider_attest: Option<Vec<[u8; 32]>>,
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
     logprob_registry: Option<crate::registry_client::RegistryClient>,
+    audit_replay: bool,
 ) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry)
+        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, audit_replay)
             .into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })
