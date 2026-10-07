@@ -210,6 +210,13 @@ fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_
         tally.push_encoded(&chunk.encode());
     }
 }
+/// The most delivered text (in [`crate::serve::DeliveredText`] units) one attempt reads under a
+/// request for `max_tokens`: far more than any tokenizer turns that many tokens into, so only a
+/// provider sending text it can't be paid for reaches it (round 8 G8-3).
+fn delivered_text_cap(max_tokens: Option<u32>) -> u64 {
+    max_tokens.map_or(CLOSE_TAIL_MAX_TOKENS, u64::from).saturating_mul(64).saturating_add(4096)
+}
+
 /// Stream closes running at once (each a detached thread retrying for minutes); past it, what was
 /// read is settled without closing first (R5S-3).
 const MAX_CLOSES_IN_FLIGHT: usize = 256;
@@ -2617,12 +2624,23 @@ impl ConsumerNode {
             // The start of the answer, kept when this serve could be replayed as an audit (D1).
             let replayable = self.replay_eligible(&provider, temperature, messages);
             let answer = std::cell::RefCell::new(String::new());
+            // Set once the provider sent far more text than the request allows: the rest isn't read
+            // (round 8 G8-3).
+            let oversized = std::cell::Cell::new(false);
+            let text_cap = delivered_text_cap(max_tokens);
             let exchange = {
                 let mut guarded = |d: &str| {
+                    if oversized.get() {
+                        return;
+                    }
                     delivered = true;
                     let mut t = delivered_text.get();
                     t.push(d);
                     delivered_text.set(t);
+                    if t.units() > text_cap {
+                        oversized.set(true);
+                        return;
+                    }
                     let mut n = tally.get();
                     n.push_delta(d);
                     tally.set(n);
@@ -2640,7 +2658,8 @@ impl ConsumerNode {
                     }
                     on_delta(d);
                 };
-                self.exchange(&provider_libp2p, &request, cancel, &mut guarded)
+                let cut = || cancel() || oversized.get();
+                self.exchange(&provider_libp2p, &request, &cut, &mut guarded)
             };
             let opened = exchange.opened;
             let stream_offset = exchange.stream_offset;
@@ -2648,7 +2667,11 @@ impl ConsumerNode {
             let nonce = exchange.nonce;
             let mut tally = tally.get();
             tally.push_tool_calls(&exchange.tool_calls);
-            let result = exchange.result;
+            let result = if oversized.get() {
+                Err(AdapterError::Provider("the provider sent far more text than the request allows".into()))
+            } else {
+                exchange.result
+            };
             let proxy_roundtrip_ns = exchange.proxy_roundtrip_ns;
             match result {
                 Ok(mut summary) => {
@@ -2757,7 +2780,7 @@ impl ConsumerNode {
                 }
                 Err(e) => {
                     // Its client left (review round 4 H1): the provider did nothing wrong.
-                    let cancelled = matches!(e, AdapterError::Cancelled(_)) || cancel();
+                    let cancelled = (matches!(e, AdapterError::Cancelled(_)) || cancel()) && !oversized.get();
                     if !cancelled {
                         tracing::warn!(
                             provider = %provider.libp2p_peer_id, attempt = i + 1, total,
@@ -2794,7 +2817,11 @@ impl ConsumerNode {
                         if tokens > 0 {
                             self.record_usage(model, &provider.peer_id, tokens, false, now);
                         }
-                    } else if !opened && !self.is_self_serve(&provider.libp2p_peer_id) {
+                    } else if opened {
+                        // Our own provider: nothing to settle, but it stops generating for nobody
+                        // (round 8 G8-2).
+                        self.close_own_stream(&provider, nonce, stream_offset);
+                    } else if !self.is_self_serve(&provider.libp2p_peer_id) {
                         // A buffered serve that failed after its text reached us: owed for that text,
                         // which the provider counts the same way (round 8 S8-2).
                         let tokens = tally.billable(max_tokens);
@@ -2996,6 +3023,31 @@ impl ConsumerNode {
             let tokens = tally.billable(max_tokens).min(ceiling);
             if tokens > 0 {
                 node.settle_receipt(&provider, tokens, nonce);
+            }
+        });
+    }
+
+    /// Close a stream on our own provider that ended early (its client left): it stops generating.
+    /// Nothing is settled; tried twice, in the background.
+    fn close_own_stream(self: &Arc<Self>, provider: &SelectedProvider, nonce: [u8; 16], offset: u32) {
+        use std::sync::atomic::Ordering;
+        if self.closes_in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_CLOSES_IN_FLIGHT {
+            self.closes_in_flight.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        let slot = SettleSlot(Arc::clone(&self.closes_in_flight));
+        let node = Arc::clone(self);
+        let peer = provider.libp2p_peer_id.clone();
+        std::thread::spawn(move || {
+            let _slot = slot;
+            let mut close = vec![crate::provider::STREAM_CLOSE];
+            close.extend_from_slice(&nonce);
+            close.extend_from_slice(&offset.to_be_bytes());
+            for wait in &CLOSE_RETRY_WAITS[..2] {
+                std::thread::sleep(*wait);
+                if node.net.proxy_forward_timeout(peer.clone(), close.clone(), SETTLE_TIMEOUT).is_ok() {
+                    break;
+                }
             }
         });
     }
@@ -4527,6 +4579,13 @@ mod tests {
             let billed = tally.billable(max_tokens).min(ceiling);
             assert_eq!(billed, max_tokens.map_or(10 + CLOSE_TAIL_MAX_TOKENS, |m| u64::from(m).min(10 + u64::from(m))));
         }
+    }
+
+    #[test]
+    fn delivered_text_is_capped_far_above_what_a_request_allows() {
+        assert_eq!(delivered_text_cap(Some(100)), 100 * 64 + 4096);
+        assert_eq!(delivered_text_cap(None), CLOSE_TAIL_MAX_TOKENS * 64 + 4096);
+        assert_eq!(delivered_text_cap(Some(u32::MAX)), u64::from(u32::MAX) * 64 + 4096);
     }
 
     #[test]

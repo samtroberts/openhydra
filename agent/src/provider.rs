@@ -768,6 +768,19 @@ const NONCE_MEMORY_MS: u64 = 2 * COMMITMENT_TTL_MS;
 /// remembered (a refused one isn't), so reusing one that old needs this many paid-for serves between.
 const MAX_SEEN_NONCES: usize = 65_536;
 
+/// Workers answering stream polls, closes, result fetches and receipts, apart from the serve workers
+/// (round 8 G8-1).
+const CONTROL_WORKERS: usize = 2;
+/// Whether an inbound message (by its first byte) is answered on the control pool: quick work that
+/// must not wait behind generations.
+fn is_control_message(method: Option<u8>) -> bool {
+    matches!(method, Some(FETCH_CHUNKS) | Some(STREAM_CLOSE) | Some(FETCH_RESULT) | Some(RECEIPT_REQUEST))
+}
+
+/// A queued stream open older than this is dropped: its consumer stopped waiting for the open ack
+/// (its call timeout, 30 s).
+const STREAM_OPEN_STALE: Duration = Duration::from_secs(30);
+
 /// Serve nonces admitted recently, oldest first (see `Provider::seen_nonces`).
 #[derive(Default)]
 struct SeenNonces {
@@ -2869,6 +2882,7 @@ impl<A: EngineAdapter> Provider<A> {
         A: Send + Sync + 'static,
     {
         let pool = WorkerPool::new(max_concurrency);
+        let control_pool = WorkerPool::new(CONTROL_WORKERS);
         // R6/B2: event-driven share-policy reload. Spawn a filesystem watcher so a desktop toggle
         // applies in ~ms; the poll loop below keeps its periodic `reload_if_changed` as the portable
         // fallback (missed events / flaky-FS platforms). No-op for a static `--share-models` policy.
@@ -2896,7 +2910,14 @@ impl<A: EngineAdapter> Provider<A> {
                     // request's `reply_to` inside the job so a peer can't attribute streams to
                     // (and evict) a victim via a spoofed `reply_to`.
                     let src = source_peer.clone();
+                    let queued = std::time::Instant::now();
                     let accepted = pool.submit(move || {
+                        // Its consumer gave up waiting for the open while it queued: generating now
+                        // would be for nobody.
+                        if queued.elapsed() > STREAM_OPEN_STALE {
+                            let _ = provider.net.respond(request_id, FetchChunksResponse::Overloaded.encode());
+                            return;
+                        }
                         provider.run_stream_job(request_id, src, data, max_concurrency);
                     });
                     if !accepted {
@@ -2914,7 +2935,12 @@ impl<A: EngineAdapter> Provider<A> {
                 let is_attest = data.first() == Some(&ATTEST_CHALLENGE);
                 let is_score = matches!(data.first(), Some(&PROMPT_SCORE_CHALLENGE) | Some(&MODEL_INFO_REQUEST));
                 let is_stream_poll = matches!(data.first(), Some(&FETCH_CHUNKS) | Some(&STREAM_CLOSE));
-                let accepted = pool.submit(move || {
+                let is_fetch = data.first() == Some(&FETCH_RESULT);
+                // Polls, closes, fetches and receipts are quick and must never wait behind
+                // generations (each stream holds a serve worker while it generates): they have their
+                // own small pool (round 8 G8-1).
+                let target = if is_control_message(data.first().copied()) { &control_pool } else { &pool };
+                let accepted = target.submit(move || {
                     // F-C5: decode the serve request ONCE here and thread it through
                     // throttle / AUP / dispatch, instead of each re-decoding the (possibly
                     // large) prompt. `None` for non-serve or unparseable frames.
@@ -2980,6 +3006,9 @@ impl<A: EngineAdapter> Provider<A> {
                         // A poll or close shed in its own reply shape, so the consumer backs off and
                         // retries rather than taking it for an older provider (review round 4 M5).
                         FetchChunksResponse::Overloaded.encode()
+                    } else if is_fetch {
+                        // A fetch too: "not ready yet, retry", so a finished result isn't abandoned.
+                        FetchResponse::Generating.encode()
                     } else {
                         frame_response(&[ServeChunk::Error("provider overloaded, retry".into()).encode()])
                     };
@@ -3970,6 +3999,18 @@ mod tests {
         let before: std::collections::HashSet<_> = m.keys().cloned().collect();
         note_private_member_in(&mut m, "p5", "m", now + 10 * MAX_PRIVATE_ATTEST_PAIRS as u64, 0);
         assert_eq!(m.keys().cloned().collect::<std::collections::HashSet<_>>(), before);
+    }
+
+    /// Round 8 G8-1: polls, closes, fetches and receipts go to the control pool; serves don't.
+    #[test]
+    fn quick_messages_have_their_own_workers() {
+        for m in [FETCH_CHUNKS, STREAM_CLOSE, FETCH_RESULT, RECEIPT_REQUEST] {
+            assert!(is_control_message(Some(m)));
+        }
+        for m in [SERVE_REQUEST, SERVE_STREAM, ATTEST_CHALLENGE, PROMPT_SCORE_CHALLENGE] {
+            assert!(!is_control_message(Some(m)));
+        }
+        assert!(!is_control_message(None));
     }
 
     /// Round 8 N8-1: a private model is gated at its own scope (not the strictest one this node

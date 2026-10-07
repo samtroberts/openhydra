@@ -180,6 +180,14 @@ enum GatewayEvent {
 /// An error's HTTP status and OpenAI error `type`.
 type ErrorClass = (StatusCode, &'static str);
 
+/// The most completion text a non-streaming response is assembled from (round 8 G8-3); past it the
+/// request fails rather than the gateway holding whatever an upstream sends.
+const MAX_BUFFERED_COMPLETION_BYTES: usize = 32 * 1024 * 1024;
+
+fn too_large_to_buffer() -> (String, ErrorClass) {
+    ("the completion is too large to return in one response; use streaming".into(), (StatusCode::BAD_GATEWAY, "upstream_error"))
+}
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> String {
@@ -1081,6 +1089,10 @@ async fn buffered_response(
         match ev {
             GatewayEvent::Delta(t) => {
                 ttft.get_or_insert_with(|| started.elapsed());
+                if content.len() + t.len() > MAX_BUFFERED_COMPLETION_BYTES {
+                    outcome = Some(Err(too_large_to_buffer()));
+                    break;
+                }
                 content.push_str(&t);
             }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
@@ -1481,7 +1493,13 @@ async fn anthropic_buffered_response(
     let mut outcome: Option<Result<Box<ServeSummary>, (String, ErrorClass)>> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
-            GatewayEvent::Delta(t) => content.push_str(&t),
+            GatewayEvent::Delta(t) => {
+                if content.len() + t.len() > MAX_BUFFERED_COMPLETION_BYTES {
+                    outcome = Some(Err(too_large_to_buffer()));
+                    break;
+                }
+                content.push_str(&t);
+            }
             GatewayEvent::Done(s) => outcome = Some(Ok(s)),
             GatewayEvent::Error(m, class) => outcome = Some(Err((m, class))),
         }
