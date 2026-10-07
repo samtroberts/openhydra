@@ -15,7 +15,7 @@ echo "staged sidecar: openhydra-agent-$TRIPLE$EXT ($(cd target/release && md5 -q
 # Rebuilt only when the pinned llama.cpp commit or the patch changes (a build takes minutes). A failed
 # build stops this script (set -e; not inside an && list, where bash would carry on).
 SCORER="desktop/src-tauri/binaries/openhydra-scorer-$TRIPLE$EXT"
-STAMP="$(cat scorer/LLAMACPP_COMMIT scorer/llamacpp-prompt-scoring.patch scorer/llamacpp-ollama-compat.patch scorer/llamacpp-token-count.patch scorer/build.sh scorer/notices.py scorer/licenses/* | shasum -a 256 | cut -c1-16)"
+STAMP="$(cat scorer/LLAMACPP_COMMIT scorer/llamacpp-prompt-scoring.patch scorer/llamacpp-ollama-compat.patch scorer/llamacpp-token-count.patch scorer/build.sh scorer/notices.py $(find scorer/licenses -type f | sort) | shasum -a 256 | cut -c1-16)"
 if [[ ! -x "$SCORER" || ! -f "${SCORER%.exe}.notices.txt" || "$(cat "$SCORER.stamp" 2>/dev/null)" != "$STAMP" ]]; then
   scorer/build.sh "$SCORER"
   echo "$STAMP" > "$SCORER.stamp"
