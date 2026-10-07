@@ -409,10 +409,12 @@ jobs:
           # A platform already published under this version (a re-run) is left as it is: its files
           # aren't replaced, and it counts as not built this run (review round 5, R5O-3).
           published = set(open('prev/published.txt').read().split()) if os.path.exists('prev/published.txt') else set()
+          # Which platform a file belongs to, its signature (".sig") going with it (R6-9).
+          def bare(n): return n[:-4] if n.endswith('.sig') else n
           OWN = {
-            'macos':   lambda n: 'aarch64-apple-darwin' in n or n.endswith(('.dmg', '.app.tar.gz', '.app.tar.gz.sig')),
-            'linux':   lambda n: 'x86_64-unknown-linux-gnu' in n or n.endswith(('.AppImage', '.AppImage.sig', '.deb', '.rpm')),
-            'windows': lambda n: 'x86_64-pc-windows-msvc' in n or n.endswith(('.exe', '.exe.sig', '.msi', '.msi.sig')),
+            'macos':   lambda n: 'aarch64-apple-darwin' in n or bare(n).endswith(('.dmg', '.app.tar.gz')),
+            'linux':   lambda n: 'x86_64-unknown-linux-gnu' in n or bare(n).endswith(('.AppImage', '.AppImage.tar.gz', '.deb', '.rpm')),
+            'windows': lambda n: 'x86_64-pc-windows-msvc' in n or bare(n).endswith(('.exe', '.msi', '.nsis.zip', '.msi.zip')),
           }
           if os.environ.get('ALLOW_OLDER') != 'true':
               for os_, t in PLATFORMS.items():
@@ -424,7 +426,8 @@ jobs:
           built = {os_: os.path.exists(f'{src}/openhydra-agent-{t}{EXE.get(os_, "")}') for os_, t in PLATFORMS.items()}
           missing = [os_ for os_, ok in built.items() if not ok]
           if not any(built.values()):
-              sys.exit('no platform built: nothing to publish')
+              sys.exit('every platform is already published for this version, or none built: nothing to publish'
+                       if published else 'no platform built: nothing to publish')
 
           # (regex on filename) -> stable "latest/" filename. The CLI binaries, the prompt scorers
           # beside them (install.sh puts them next to `openhydra`, where the agent looks) and each

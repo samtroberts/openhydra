@@ -130,10 +130,11 @@ const MAX_RECENTLY_SERVED: usize = 4096;
 const IN_ROUND_MS: u64 = 2 * 60 * 1000;
 /// One peer's challenges may cover at most [`SCORE_MODELS_PER_PEER`] models within this long: each
 /// model can need a side-scorer (re)load, which a peer must not be able to force back to back
-/// (review round 4 L4-7), while a gateway checking a few models of one provider isn't held up
-/// (review round 5, R5L-3).
-const SCORE_SWITCH_MIN_MS: u64 = 15 * 60 * 1000;
-const SCORE_MODELS_PER_PEER: usize = 3;
+/// (review round 4 L4-7), while a gateway checking two models of one provider isn't held up
+/// (review round 5, R5L-3). Two in 30 minutes is four an hour at most, within the side-scorer's
+/// six starts an hour (R6-6).
+const SCORE_SWITCH_MIN_MS: u64 = 30 * 60 * 1000;
+const SCORE_MODELS_PER_PEER: usize = 2;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 /// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
 /// with many identities) keep the Secure Enclave signing nonstop.
@@ -873,9 +874,10 @@ fn stream_expired(b: &StreamBuffer, now: u64) -> bool {
 }
 
 /// How long a stream nobody has polled at all keeps generating: an honest consumer polls the moment
-/// its open is acknowledged, so this only ends a stream opened and walked away from (R5S-6: a peer
-/// can't hold a worker and the engine for the whole [`STREAM_ABANDON_MS`] without reading).
-const NEVER_POLLED_ABANDON_MS: u64 = 60_000;
+/// its open is acknowledged, so this only ends a stream opened and walked away from (R5S-6). Still
+/// past the consumer's whole poll-retry window (~160 s), so lost first polls don't cut an honest
+/// stream short (R6-6).
+const NEVER_POLLED_ABANDON_MS: u64 = 170_000;
 
 /// What a stream's serve commitment is recorded under, taken from its request.
 #[derive(Debug, Clone, Default)]
@@ -1569,24 +1571,34 @@ impl<A: EngineAdapter> Provider<A> {
     /// backing a commitment, a stream or a buffered result (review round 5, R5S-1). Our own consumer
     /// is exempt (it never settles with us). An admitted serve's nonce is remembered once the payment
     /// gate lets it through ([`Self::remember_nonce`]).
+    ///
+    /// The check and the reservation are one step under the `seen_nonces` lock (review round 6,
+    /// R6-1): two concurrent serves with one nonce can't both pass. A serve the payment gate then
+    /// refuses gives its nonce back ([`Self::release_nonce`]), so refused requests can't push real
+    /// nonces out of the memory.
     fn nonce_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
         if self.is_own_consumer(source_peer) {
             return None;
         }
         let n = &req.nonce;
-        let used = self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()).seen(n, now_unix_ms())
+        let mut seen = self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_unix_ms();
+        let used = seen.seen(n, now)
             || self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n)
             || self.streams.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n)
             || self.results.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n);
+        if !used {
+            seen.remember(*n, now);
+        }
         used.then(|| {
             frame_response(&[ServeChunk::Error("this request's nonce was already used; send each request with a new one".into()).encode()])
         })
     }
 
-    /// Remember an admitted serve's nonce (see [`Self::nonce_refusal`]).
-    fn remember_nonce(&self, nonce: [u8; 16], source_peer: &str) {
+    /// Give back the nonce of a serve the payment gate refused (see [`Self::nonce_refusal`]).
+    fn release_nonce(&self, nonce: [u8; 16], source_peer: &str) {
         if !self.is_own_consumer(source_peer) {
-            self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()).remember(nonce, now_unix_ms());
+            self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()).at.remove(&nonce);
         }
     }
 
@@ -2214,11 +2226,11 @@ impl<A: EngineAdapter> Provider<A> {
         let reservation = match self.payment_gate(&req, &source_peer) {
             Ok(r) => r,
             Err(refusal) => {
+                self.release_nonce(req.nonce, &source_peer);
                 respond_done(refusal, 1);
                 return;
             }
         };
-        self.remember_nonce(req.nonce, &source_peer);
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -3125,15 +3137,24 @@ impl<A: EngineAdapter> Provider<A> {
                 let Some(_one) = OneAtATime::enter(&self.scoring_now, source_peer) else {
                     return score_refusal("a challenge from you is already being scored, retry");
                 };
-                let model = crate::prompt_score::challenge_model(&data[1..]);
-                if let Some(model) = &model {
-                    let m = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
-                    let recent: Vec<&String> = m
+                // A model counts toward the peer's recent ones as soon as its challenge is let through
+                // (one that starts a side-scorer counts though it is told to retry, R6-6).
+                if let Some(model) = crate::prompt_score::challenge_model(&data[1..]) {
+                    let mut sm = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
+                    let recent: Vec<&String> = sm
                         .get(source_peer)
                         .map(|v| v.iter().filter(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS).map(|(n, _)| n).collect())
                         .unwrap_or_default();
-                    if !recent.contains(&model) && recent.len() >= SCORE_MODELS_PER_PEER {
+                    if !recent.contains(&&model) && recent.len() >= SCORE_MODELS_PER_PEER {
                         return score_refusal("too many models challenged recently, retry");
+                    }
+                    if !sm.contains_key(source_peer) && sm.len() >= MAX_RECENTLY_SERVED {
+                        sm.retain(|_, v| v.iter().any(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS));
+                    }
+                    if sm.contains_key(source_peer) || sm.len() < MAX_RECENTLY_SERVED {
+                        let v = sm.entry(source_peer.to_string()).or_default();
+                        v.retain(|(n, at)| *n != model && now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS);
+                        v.push((model, now));
                     }
                 }
                 let reply = handle_prompt_score_inbound(
@@ -3142,26 +3163,12 @@ impl<A: EngineAdapter> Provider<A> {
                     &self.score_gate,
                     &|model| self.policy.announce_globally(model),
                     in_round,
-                    crate::prompt_score::SCORE_QUEUE_WAIT,
                 );
                 if !crate::prompt_score::is_score_refusal(&reply) {
                     let mut m = self.scored_recently.lock().unwrap_or_else(|e| e.into_inner());
                     m.retain(|_, at| now.saturating_sub(*at) <= IN_ROUND_MS);
                     if m.len() < MAX_RECENTLY_SERVED {
                         m.insert(source_peer.to_string(), now);
-                    }
-                    drop(m);
-                    // A model counts toward the peer's recent ones once it was scored (R5L-3).
-                    if let Some(model) = model {
-                        let mut sm = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
-                        if !sm.contains_key(source_peer) && sm.len() >= MAX_RECENTLY_SERVED {
-                            sm.retain(|_, v| v.iter().any(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS));
-                        }
-                        if sm.contains_key(source_peer) || sm.len() < MAX_RECENTLY_SERVED {
-                            let v = sm.entry(source_peer.to_string()).or_default();
-                            v.retain(|(n, at)| *n != model && now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS);
-                            v.push((model, now));
-                        }
                     }
                 }
                 reply
@@ -3276,9 +3283,11 @@ impl<A: EngineAdapter> Provider<A> {
                         }
                         let reservation = match self.payment_gate(&req, source_peer) {
                             Ok(r) => r,
-                            Err(refusal) => return refusal,
+                            Err(refusal) => {
+                                self.release_nonce(req.nonce, source_peer);
+                                return refusal;
+                            }
                         };
-                        self.remember_nonce(req.nonce, source_peer);
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.

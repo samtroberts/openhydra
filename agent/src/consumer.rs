@@ -374,9 +374,6 @@ struct ProviderLogprob {
     /// With the pack's id when it is a registry first stage, so its continuation can still be
     /// fetched (review round 4 L4-4). At most [`MAX_RESUMES`].
     resume: Mutex<HashMap<String, (Arc<LoadedReference>, Option<[u8; 16]>, u64)>>,
-    /// Per `(peer, model)`: the text a run stopped on as busy, and since when (L4-1): a provider that
-    /// stalls on the same text for [`STALL_EVASION_MS`] is dodging it.
-    stalls: Mutex<HashMap<String, (String, u64)>>,
     /// Per `(peer, model)`: runs in a row that ended without a verdict, which spaces the next ones
     /// out (see [`logprob_retry_ms`]).
     no_verdict_runs: Mutex<HashMap<String, u32>>,
@@ -437,51 +434,10 @@ const FIRST_CONTACT_PACKS_PER_HOUR: usize = 20;
 /// …and per provider network, and for all providers reached only through a relay together.
 const FIRST_CONTACT_PER_NETWORK_PER_HOUR: usize = 2;
 const FIRST_CONTACT_RELAYED_PER_HOUR: usize = 4;
-/// A provider that answers "busy" on the same text for this long is dodging it (review round 4
-/// L4-1): outsiders can't keep a provider busy that long for one verifier (challenges come only
-/// from consumers it served, one at a time each), and a cheater could otherwise stall until its
-/// fail lapsed.
-const STALL_EVASION_MS: u64 = 6 * 60 * 60 * 1000;
 /// Registry runs kept for resuming, at most (each holds its pack).
 const MAX_RESUMES: usize = 256;
-/// What a stall on the probe (no text pending) is recorded as.
-const PROBE_STALL: &str = "\0probe";
 
-/// How a log-prob run that ended `outcome` counts, given the stalls on record (`stalls`, by key: the
-/// text a run stopped on as busy, and since when) and the text this one stopped on (`pending`): busy
-/// on the same text for [`STALL_EVASION_MS`] is dodging it (review round 4 L4-1). Keeps `stalls`.
-fn stall_outcome(
-    stalls: &mut HashMap<String, (String, u64)>,
-    key: &str,
-    outcome: RoundOutcome,
-    pending: Option<&str>,
-    now: u64,
-) -> RoundOutcome {
-    match (&outcome, pending) {
-        (RoundOutcome::Busy, Some(id)) => match stalls.get(key) {
-            Some((on, since)) if on == id && now.saturating_sub(*since) >= STALL_EVASION_MS => {
-                stalls.remove(key);
-                RoundOutcome::Evasion(format!("busy on the same text for {} h", STALL_EVASION_MS / 3_600_000))
-            }
-            Some((on, _)) if on == id => outcome,
-            _ => {
-                if !stalls.contains_key(key) && stalls.len() >= MAX_RESUMES * 16 {
-                    // The oldest goes, not everyone's clock (R5L-6).
-                    if let Some(oldest) = stalls.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()) {
-                        stalls.remove(&oldest);
-                    }
-                }
-                stalls.insert(key.to_string(), (id.to_string(), now));
-                outcome
-            }
-        },
-        (RoundOutcome::Busy, None) => outcome,
-        _ => {
-            stalls.remove(key);
-            outcome
-        }
-    }
-}
+
 
 /// When to try a provider again after `runs` runs in a row ended without a verdict: the usual retry,
 /// doubling with each, at most 12 hours.
@@ -558,6 +514,9 @@ const AUDIT_SERVE_MAX: Duration = Duration::from_secs(300);
 /// Qualifying audits (H2) per model per hour at most, and one running at a time: a crowd of providers
 /// below the floor can't take every audit slot or run up the gateway's costs (R5T-5).
 const QUALIFY_PER_MODEL_PER_HOUR: usize = 6;
+/// The most providers one audit sends its request to, the audited one included (what the replay
+/// disclosure promises).
+const MAX_AUDIT_PROVIDERS: usize = 4;
 
 /// Under a hard authenticity floor, the share of routed requests that also start a qualifying audit
 /// of a provider the floor left out, and how often one provider is audited that way at most: a
@@ -1079,7 +1038,8 @@ impl TrafficShape {
     /// probes don't share one fingerprint (R5T-5).
     fn plain<R: rand::Rng + ?Sized>(rng: &mut R) -> Self {
         use rand::seq::SliceRandom;
-        let max_tokens = *[Some(256), Some(512), Some(1024), Some(2048), None].choose(rng).expect("non-empty");
+        // Always bounded: an unbounded one could run past an audit's time limit on a slow rig (R6-3).
+        let max_tokens = *[Some(256), Some(512), Some(768), Some(1024)].choose(rng).expect("non-empty");
         TrafficShape { requests: 2, greedy: 2, with_system: if rng.gen_bool(0.5) { 2 } else { 0 }, max_tokens, ..Default::default() }
     }
 
@@ -1171,7 +1131,28 @@ fn resolve_against_known(
 ) -> Option<AuditReport> {
     let known = |p: &str| nets_of.get(p).is_some_and(|n| !n.is_empty());
     let known_results: Vec<(String, Result<String, String>)> = results.iter().filter(|(p, _)| known(p)).cloned().collect();
-    if known_results.iter().filter(|(_, r)| r.is_ok()).count() < 2 {
+    let known_ok = known_results.iter().filter(|(_, r)| r.is_ok()).count();
+    // One known answer: everyone may pass by agreeing with it, but no one fails on it alone (R6-4).
+    if known_ok == 1 {
+        let answers: Vec<&String> = results.iter().filter_map(|(_, r)| r.as_ref().ok()).collect();
+        let all_agree = answers.len() >= 2 && answers.iter().all(|a| openhydra_protocol::verify::agrees(answers[0], a));
+        if !all_agree {
+            return None;
+        }
+        let mut outcomes = Vec::new();
+        let mut non_responders = Vec::new();
+        for (peer, r) in results {
+            match r {
+                Ok(_) => outcomes.push((peer.clone(), VerificationOutcome::Honored)),
+                Err(_) => {
+                    outcomes.push((peer.clone(), VerificationOutcome::Rejected));
+                    non_responders.push(peer.clone());
+                }
+            }
+        }
+        return Some(AuditReport { verdict: RedundantVerdict::Agree, outcomes, non_responders });
+    }
+    if known_ok < 2 {
         return None;
     }
     let base = resolve_audit(&known_results);
@@ -1722,7 +1703,6 @@ impl ConsumerNode {
             counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             issued_here: Mutex::new(issued_here),
             resume: Mutex::new(HashMap::new()),
-            stalls: Mutex::new(HashMap::new()),
             no_verdict_runs: Mutex::new(HashMap::new()),
             first_contact_packs: Mutex::new(HashMap::new()),
         }));
@@ -3645,17 +3625,17 @@ impl ConsumerNode {
                 logprob_retry_ms(*n)
             }
         };
-        // Busy on the same text since long enough ago is a stall, not a busy spell (L4-1). Busy on
-        // the probe counts the same way for a provider that has answered us before (R5L-1): a fair
-        // queue now gives each verifier its turn (`InflightGate::enter_waiting`), so a provider that
-        // stays "busy" for hours is choosing to.
-        let stalled_on = round.pending_id().map(str::to_string).or_else(|| answered.then(|| PROBE_STALL.to_string()));
-        let outcome = stall_outcome(&mut lp.stalls.lock().unwrap_or_else(|e| e.into_inner()), key, outcome, stalled_on.as_deref(), now);
+        // An Evasion leaves the next round its full allowance (R6-5).
+        let mut round = round;
+        if matches!(outcome, RoundOutcome::Evasion(_)) {
+            round.carry_skipped(0);
+        }
         let effect = match &outcome {
             RoundOutcome::Verdict(v) => st.on_verdict_drawn(*v, now, 1.0 - rand::random::<f64>()),
             RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, retry, now),
-            // Busy isn't held against a provider: the text it stalled on waits for it (until that
-            // has gone on for hours, above).
+            // Busy isn't held against a provider (it can't be told from contention others cause): the
+            // text it stalled on waits for it. A provider that stays busy gains nothing: a fail stands
+            // until a later round passes, and a pass lapses (review round 6).
             RoundOutcome::Busy => st.on_no_verdict(false, retry, now),
             RoundOutcome::Evasion(_) => st.on_evasion(retry, now),
             RoundOutcome::Unsupported => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS.max(retry), now),
@@ -4061,7 +4041,19 @@ impl ConsumerNode {
             keep_prefix(&mut answer, d, AUDIT_COMPARE_CHARS);
         });
         let paying = !self.is_self_serve(&provider.libp2p_peer_id);
-        match exchange.result {
+        // Stopped at the time limit with the compared opening in hand: that is all an audit needs (R6-3).
+        let result = match exchange.result {
+            Err(AdapterError::Cancelled(_)) if answer.chars().count() >= AUDIT_COMPARE_CHARS => Err(AdapterError::Cancelled(String::new())),
+            other => other,
+        };
+        if matches!(&result, Err(AdapterError::Cancelled(m)) if m.is_empty()) {
+            if paying && exchange.opened {
+                tally.push_tool_calls(&exchange.tool_calls);
+                self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens);
+            }
+            return Ok(answer);
+        }
+        match result {
             Ok(summary) => {
                 if paying && summary.ok && summary.tokens > 0 {
                     let offered = crate::serve::offered_tool_names(&serve.tools);
@@ -4186,19 +4178,28 @@ impl ConsumerNode {
         let mut chosen_peers = std::collections::HashSet::new();
         let mut unknown_partners = 0usize;
         let mut discarded = 0usize;
+        // Every provider sent the request counts toward the "at most four" the disclosure promises,
+        // one that refuses over payment too (R6-5).
+        let mut contacted = 1usize;
         let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(4);
         // Model keys and networks of everyone audited (by state id), and who they are.
         let mut key_of: HashMap<String, String> = HashMap::new();
         let mut nets_of: HashMap<String, Vec<String>> = HashMap::new();
         let mut who: HashMap<String, SelectedProvider> = HashMap::new();
         who.insert(subject.state_id.clone(), subject.clone());
+        // Whether the subject's non-answer was its own doing (an error it sent, or a payment refusal
+        // after serving us at our price), not the network's or a busy pool's (R6-3).
+        let mut subject_refused = false;
         let first = match served {
             Some(answer) => Ok(answer.to_string()),
             None => match self.audit_serve(subject, request) {
-                // A struck provider that won't take its follow-up is held to it (R5T-2).
-                Err(e) if crate::serve::is_payment_refusal(&e) && !self.paid_recently(&subject.libp2p_peer_id, now) && !strict_subject => {
+                Err(e) if crate::serve::is_payment_refusal(&e) && !self.paid_recently(&subject.libp2p_peer_id, now) => {
                     self.note_payment_refusal(&subject.libp2p_peer_id, &subject.model_id, now);
                     return Err(e);
+                }
+                Err(e) => {
+                    subject_refused = matches!(e, AdapterError::Provider(_)) && !e.message().contains("overloaded");
+                    Err(e)
                 }
                 out => out,
             },
@@ -4228,6 +4229,10 @@ impl ConsumerNode {
                 } else if !independent_partner(&chosen, unknown_partners, &before) {
                     continue; // known to share a network: skipped without serving it
                 }
+                if contacted >= MAX_AUDIT_PROVIDERS {
+                    return;
+                }
+                contacted += 1;
                 let out = match self.audit_serve(provider, request) {
                     Err(e) if crate::serve::is_payment_refusal(&e) => {
                         if !self.paid_recently(&provider.libp2p_peer_id, now) {
@@ -4295,7 +4300,7 @@ impl ConsumerNode {
         } else {
             let mut report = resolve_audit(&results);
             if report.verdict == RedundantVerdict::Inconclusive {
-                ask(&mut results, &mut key_of, &mut nets_of, &mut who, false);
+                ask(&mut results, &mut key_of, &mut nets_of, &mut who, true);
                 if results.len() == 3 {
                     report = if unknown_in(&results, &nets_of) {
                         resolve_against_known(&results, &nets_of).unwrap_or(report)
@@ -4306,9 +4311,10 @@ impl ConsumerNode {
             }
             report
         };
-        // A follow-up's subject that didn't answer is held to it like a wrong answer (R5T-2).
+        // A follow-up's subject that refused it is held to that like a wrong answer (R5T-2); one the
+        // network or a busy pool kept from answering isn't (R6-3).
         let mut report = report;
-        if strict_subject {
+        if strict_subject && subject_refused {
             for (peer, outcome) in report.outcomes.iter_mut() {
                 if *peer == subject.state_id && *outcome == VerificationOutcome::Rejected {
                     *outcome = VerificationOutcome::Failed;
@@ -4325,7 +4331,9 @@ impl ConsumerNode {
             strike_first_failures(
                 report,
                 &|peer| reputation_key(peer, key_of.get(peer).map_or(model, String::as_str)),
-                &|peer| served.is_some() && peer == subject.state_id,
+                // A replay pass as the one audited, or a passing follow-up (a different, unpredictable
+                // request), clears it: with replay off, follow-ups are the only way (R6-2).
+                &|peer| (served.is_some() || strict_subject) && peer == subject.state_id,
                 &mut strikes,
                 now,
             )
@@ -5573,24 +5581,6 @@ mod tests {
         assert!(!strikes.contains_key("A@m"));
     }
 
-    /// Review round 4 L4-1: "busy" on the same text for hours is dodging it; a busy spell, or busy on a
-    /// different text each time, isn't.
-    #[test]
-    fn busy_on_the_same_text_for_hours_is_a_stall() {
-        let mut stalls = HashMap::new();
-        let busy = |stalls: &mut HashMap<String, (String, u64)>, text: &str, at: u64| {
-            stall_outcome(stalls, "p@m", RoundOutcome::Busy, Some(text), at)
-        };
-        assert_eq!(busy(&mut stalls, "t1", 0), RoundOutcome::Busy);
-        assert_eq!(busy(&mut stalls, "t1", STALL_EVASION_MS - 1), RoundOutcome::Busy);
-        assert!(matches!(busy(&mut stalls, "t1", STALL_EVASION_MS), RoundOutcome::Evasion(_)));
-        // Another text, or a run that got anywhere, starts the clock again.
-        assert_eq!(busy(&mut stalls, "t2", 0), RoundOutcome::Busy);
-        assert_eq!(busy(&mut stalls, "t3", STALL_EVASION_MS), RoundOutcome::Busy);
-        stall_outcome(&mut stalls, "p@m", RoundOutcome::Exhausted, None, STALL_EVASION_MS);
-        assert_eq!(busy(&mut stalls, "t3", 2 * STALL_EVASION_MS - 1), RoundOutcome::Busy);
-    }
-
     /// Review round 4 H5: a relay-only subject leaves room for a partner of unknown network, and two
     /// of unknown network need a third on a known one.
     #[test]
@@ -5625,13 +5615,19 @@ mod tests {
         assert!(r.outcomes.contains(&("S".into(), VerificationOutcome::Failed)));
         assert!(r.outcomes.contains(&("U".into(), VerificationOutcome::Failed)));
         assert!(r.outcomes.contains(&("K1".into(), VerificationOutcome::Honored)));
-        // Fewer than two known answers, or known ones split: no verdict.
-        assert!(resolve_against_known(&[("S".into(), Ok(good.clone())), ("U".into(), Ok(good.clone())), ("K1".into(), Ok(good.clone()))], &nets).is_none());
-        assert!(resolve_against_known(
+        // One known answer (R6-6/R6-4): all agreeing with it pass; any disagreement decides nothing.
+        let one = resolve_against_known(&[("S".into(), Ok(good.clone())), ("U".into(), Ok(good.clone())), ("K1".into(), Ok(good.clone()))], &nets).unwrap();
+        assert_eq!(one.verdict, RedundantVerdict::Agree);
+        assert!(resolve_against_known(&[("S".into(), Ok(odd.clone())), ("U".into(), Ok(odd.clone())), ("K1".into(), Ok(good.clone()))], &nets).is_none());
+        // Known ones split: no verdict.
+        // A known provider that errors doesn't count as an answer: one known answer, all agree.
+        let erred = resolve_against_known(
             &[("S".into(), Ok(good.clone())), ("K1".into(), Ok(good.clone())), ("K2".into(), Err("timeout".into()))],
-            &nets
+            &nets,
         )
-        .is_none(), "a known provider that errors doesn't count");
+        .unwrap();
+        assert!(erred.outcomes.contains(&("K2".into(), VerificationOutcome::Rejected)));
+        assert!(erred.outcomes.contains(&("S".into(), VerificationOutcome::Honored)));
         assert!(resolve_against_known(&[("S".into(), Ok(good.clone())), ("K1".into(), Ok(good)), ("K2".into(), Ok(odd))], &nets).is_none());
     }
 

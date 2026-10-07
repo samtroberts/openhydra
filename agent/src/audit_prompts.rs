@@ -214,14 +214,31 @@ pub fn parse_questions(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `c` is plain visible text: a letter, a digit, a space, or common punctuation. Everything
-/// else (control and format characters, zero-width marks, variation selectors, fillers, combining
-/// marks) is dropped, so a writer can't hide a mark in a question (review round 5, R5T-9).
+/// Whether `c` shows as text: not a control character, and not one of the invisible characters a
+/// mark could hide in (zero-width spaces and joiners, direction marks, word joiners, the byte-order
+/// mark, the soft hyphen, variation selectors, the combining grapheme joiner, fillers, tag
+/// characters; review rounds 4 and 5). Scripts' own combining signs (a Devanagari virama, say) stay,
+/// so probe questions in any language read normally (R6-9).
 fn is_visible(c: char) -> bool {
-    c == ' '
-        || c.is_ascii_punctuation()
-        || (c.is_alphanumeric() && !matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'))
-        || matches!(c, '¿' | '¡' | '«' | '»' | '“' | '”' | '‘' | '’' | '„' | '‚' | '–' | '—' | '…' | '·' | '€' | '£' | '°')
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
 }
 
 /// Quotation marks a question may come wrapped in.
@@ -334,6 +351,8 @@ mod tests {
         let marked = "How do\u{200B} I sort\u{2060} a list\u{FE0F} in\u{3164} Rust?\u{FEFF}\n“¿Qué es un cierre en Rust, exactamente?”";
         let qs = parse_questions(marked);
         assert_eq!(qs, vec!["How do I sort a list in Rust?", "¿Qué es un cierre en Rust, exactamente?"]);
+        // Scripts' own combining signs stay (a Hindi question reads as written).
+        assert_eq!(parse_questions("क्या आप पायथन में सूची को क्रमबद्ध करना समझा सकते हैं?"), vec!["क्या आप पायथन में सूची को क्रमबद्ध करना समझा सकते हैं?"]);
         let many: String = (0..50).map(|i| format!("Question number {i} about something?\n")).collect();
         assert_eq!(parse_questions(&many).len(), MAX_QUESTIONS_PER_ANSWER);
         let mut rng = rand::thread_rng();
