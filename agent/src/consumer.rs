@@ -1046,10 +1046,18 @@ struct TrafficShape {
     /// Requests that opened with a system prompt.
     with_system: u32,
     max_tokens: Option<u32>,
+    /// The `max_tokens` of the latest greedy requests (at most [`GREEDY_LENGTHS_KEPT`]): a probe asks
+    /// for one of them, as a request like it would (round 8 T8-2).
+    greedy_max_tokens: std::collections::VecDeque<Option<u32>>,
     /// The latest request's system prompt, kept only where audits may replay requests anyway (a
     /// probe then carries the same one a real request does); else probes use a generic one.
     system: Option<String>,
 }
+
+/// How many recent greedy requests' `max_tokens` a [`TrafficShape`] keeps.
+const GREEDY_LENGTHS_KEPT: usize = 16;
+/// Requests a model's traffic needs before a follow-up or qualifying audit takes its shape.
+const MIN_SHAPED_REQUESTS: u32 = 3;
 
 impl TrafficShape {
     fn note(&mut self, temperature: Option<f64>, think: Option<bool>, max_tokens: Option<u32>, system: Option<&str>, keep_system: bool) {
@@ -1063,6 +1071,12 @@ impl TrafficShape {
         }
         self.requests += 1;
         self.greedy += u32::from(temperature == Some(0.0));
+        if temperature == Some(0.0) {
+            if self.greedy_max_tokens.len() >= GREEDY_LENGTHS_KEPT {
+                self.greedy_max_tokens.pop_front();
+            }
+            self.greedy_max_tokens.push_back(max_tokens);
+        }
         match think {
             Some(true) => self.think_on += 1,
             Some(false) => self.think_off += 1,
@@ -1112,7 +1126,12 @@ impl TrafficShape {
             messages.push(ChatMessage { role: "system".into(), content: system, ..Default::default() });
         }
         messages.push(ChatMessage { role: "user".into(), content: prompt, ..Default::default() });
-        Some(AuditRequest { messages, max_tokens: self.max_tokens, tools: Vec::new(), think })
+        let max_tokens = {
+            use rand::seq::SliceRandom;
+            let kept: Vec<Option<u32>> = self.greedy_max_tokens.iter().copied().collect();
+            kept.choose(&mut rand::thread_rng()).copied().unwrap_or(self.max_tokens)
+        };
+        Some(AuditRequest { messages, max_tokens, tools: Vec::new(), think })
     }
 }
 
@@ -3972,6 +3991,13 @@ impl ConsumerNode {
         let shape = self.traffic.lock().unwrap_or_else(|e| e.into_inner()).get(model).cloned();
         let shape = match shape {
             Some(t) if t.probe(String::new()).is_some() => Some(t),
+            // A follow-up or qualifying audit on a model whose traffic is mostly sampled: shaped like
+            // that traffic all the same (thinking, system prompt, lengths), only greedy, which
+            // comparing answers needs (round 8 T8-2).
+            Some(mut t) if plain && t.requests >= MIN_SHAPED_REQUESTS => {
+                t.greedy = t.requests;
+                Some(t)
+            }
             _ if plain => Some(TrafficShape::plain(&mut rand::thread_rng())),
             _ => None,
         };
@@ -5631,6 +5657,37 @@ mod tests {
         }
         thinking.note(Some(0.0), None, None, None, false);
         assert_eq!(thinking.probe("p".into()).unwrap().think, Some(true));
+    }
+
+    /// Round 8 T8-2: probes ask for lengths greedy traffic asked for, and a sampled model's shape is
+    /// still copied (greedy aside) when a follow-up must be sent.
+    #[test]
+    fn probes_ask_for_the_lengths_real_requests_do() {
+        let mut t = TrafficShape::default();
+        for m in [Some(300), Some(2048), None] {
+            t.note(Some(0.0), Some(true), m, Some("sys"), false);
+        }
+        for _ in 0..20 {
+            let probe = t.probe("p".into()).unwrap();
+            assert!([Some(300), Some(2048), None].contains(&probe.max_tokens));
+            assert_eq!(probe.think, Some(true));
+            assert_eq!(probe.messages.len(), 2, "opens with a system prompt, as the traffic does");
+        }
+        for _ in 0..(GREEDY_LENGTHS_KEPT + 4) {
+            t.note(Some(0.0), None, Some(64), None, false);
+        }
+        assert_eq!(t.greedy_max_tokens.len(), GREEDY_LENGTHS_KEPT);
+        assert_eq!(t.probe("p".into()).unwrap().max_tokens, Some(64));
+        // Mostly sampled traffic: no ordinary probe; a follow-up's copy forces greedy only.
+        let mut sampled = TrafficShape::default();
+        for _ in 0..10 {
+            sampled.note(Some(0.7), Some(false), Some(4096), Some("sys"), false);
+        }
+        assert!(sampled.probe("p".into()).is_none());
+        let mut forced = sampled.clone();
+        forced.greedy = forced.requests;
+        let probe = forced.probe("p".into()).unwrap();
+        assert_eq!((probe.max_tokens, probe.think, probe.messages.len()), (Some(4096), Some(false), 2));
     }
 
     #[test]

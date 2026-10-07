@@ -719,7 +719,8 @@ struct ServeArgs {
     /// answers compared, so the audited provider can't tell it was checked. Your prompt then also
     /// reaches those providers (never a private swarm's prompt; nothing is written to disk). The
     /// system prompt of such a request is kept in memory, and probes carry it. `off`: audits send
-    /// generated test prompts shaped like your traffic instead.
+    /// generated test prompts shaped like your traffic instead; they can't carry your own system
+    /// prompt, so they check each provider's model more than every request it serves.
     #[arg(long = "audit-replay", default_value = "on", value_parser = ["on", "off"])]
     audit_replay: String,
 
