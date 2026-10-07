@@ -277,16 +277,25 @@ pub fn weight_for_model_id(model_id: &str) -> f64 {
 /// the **cheapest** packing (`int4`), so the footprint is a floor, never inflated. An unparseable
 /// handle (a bare `:latest` tag, an opaque alias) → [`CostTier::Nano`].
 pub fn cost_tier_for_handle(handle: &str) -> CostTier {
+    // Quant is unknown from a handle → assume the cheapest (int4) so the tier is a floor.
+    size_class_for_handle(handle).unwrap_or(CostTier::Nano)
+}
+
+/// The size class a model name states: its total parameters at 4-bit ([`cost_tier_for_footprint`]),
+/// or `None` when the name gives no size. Comparing it with [`size_class_for_params`] tells whether
+/// a verified model is the size its name says, whatever either's quantisation.
+pub fn size_class_for_handle(handle: &str) -> Option<CostTier> {
     // Strip any directory prefix (llama.cpp serves by file path) to the basename.
     let name = handle.rsplit(['/', '\\']).next().unwrap_or(handle);
     // Ollama handles are `name:tag`; treat ':' like '-' so a size tag (`7b`) reaches the parser.
     let normalized = name.replace(':', "-");
     let (_family, params, _variants) = crate::model_id::parse_hf_model_name(&normalized);
-    match total_params_billions(&params) {
-        // Quant is unknown from a handle → assume the cheapest (int4) so the tier is a floor.
-        Some(billions) => cost_tier_for_footprint(billions * bytes_per_param("int4")),
-        None => CostTier::Nano,
-    }
+    size_class_for_params(&params)
+}
+
+/// The size class of a parameter count (`"7b"`, `"35b-a3b"`), at 4-bit: see [`size_class_for_handle`].
+pub fn size_class_for_params(params: &str) -> Option<CostTier> {
+    total_params_billions(params).map(|billions| cost_tier_for_footprint(billions * bytes_per_param("int4")))
 }
 
 /// The input/output-weighted token count for a request: `prompt·w_in + completion·w_out`

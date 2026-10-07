@@ -466,28 +466,51 @@ pub fn select_reference<'a>(
         .or_else(|| legacy().find(|r| r.handles.iter().any(|h| h == handle)))
 }
 
+/// Passing audits on real traffic ([`openhydra_protocol::award::AuditStats::recent_traffic_passes`])
+/// within [`PRICE_UPLIFT_WINDOW_MS`], none failed since, that let a verified identity raise a
+/// provider's price above its model name's tier.
+pub const PRICE_UPLIFT_AUDITS: usize = 3;
+pub const PRICE_UPLIFT_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// The cost tier a serve is priced at before the authenticity gate. By default the model name's
 /// conservative estimate (its size at 4-bit, [`cost_tier_for_handle`]): a provider's word never
 /// raises its price. With a qualifying, fresh pass streak (`status`) against a reference whose
-/// identity is known, a **lower** verified identity (a big name on a small model) lowers it. A
-/// higher one doesn't raise it: a check shows the provider holds that model's weights, not that the
-/// consumer's request was served with them, so it could answer checks with a big model and serve a
-/// small one.
+/// identity is known:
+/// * a **lower** verified identity (a big name on a small model) lowers it;
+/// * a **higher** one raises it only with `traffic_proven`: [`PRICE_UPLIFT_AUDITS`] recent passing
+///   audits on real traffic, none failed since (review round 3, D3). A check alone shows the
+///   provider holds that model's weights, not that requests are served with them: it could answer
+///   checks with a big model and serve a small one. Audits on replayed user requests show what it
+///   serves.
+///
 /// `identity_of(tag)` resolves a [`reference_tag`] to the identity of the reference it names (a
 /// local reference file, or registry packs seen for that label).
 pub fn priced_tier(
     handle: &str,
     status: Option<&LogprobStatus>,
     identity_of: &dyn Fn([u8; 16]) -> Option<ModelIdentity>,
+    traffic_proven: bool,
     now_ms: u64,
 ) -> CostTier {
     let by_handle = cost_tier_for_handle(handle);
     let Some(st) = status.filter(|st| st.evidence(now_ms).0) else {
         return by_handle;
     };
-    identity_of(st.reference)
-        .and_then(|id| cost_tier_for_params_quant(&id.params, &id.quant))
-        .map_or(by_handle, |verified| verified.min(by_handle))
+    match identity_of(st.reference).and_then(|id| cost_tier_for_params_quant(&id.params, &id.quant)) {
+        Some(verified) if verified <= by_handle || traffic_proven => verified,
+        _ => by_handle,
+    }
+}
+
+/// Whether a model verified as `identity` is the size `handle` names (review T3): the same size
+/// class, whatever either's quantisation. A name that gives no size, or a reference with no
+/// identity (matched to this name itself), doesn't contradict it.
+pub fn identity_matches_name(handle: &str, identity: Option<&ModelIdentity>) -> bool {
+    use openhydra_protocol::weight::{size_class_for_handle, size_class_for_params};
+    match (size_class_for_handle(handle), identity) {
+        (Some(named), Some(id)) => size_class_for_params(&id.params) == Some(named),
+        _ => true,
+    }
 }
 
 /// Resolve a reference tag against local reference files.
@@ -1493,19 +1516,22 @@ mod tests {
         let mut round = ChallengeRound::new();
         let mut st = LogprobStatus::default();
         st.switch_reference(reference_tag(&bf16.set), &mut round);
-        assert_eq!(priced_tier(handle, None, &|t| identity_in(&refs, t), 0), floor);
+        assert_eq!(priced_tier(handle, None, &|t| identity_in(&refs, t), false, 0), floor);
         st.on_verdict(PASS, 0);
-        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 1), floor, "one pass is not enough");
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), false, 1), floor, "one pass is not enough");
         st.on_verdict(PASS, 30 * H);
         st.on_verdict(PASS, 48 * H);
-        // A bigger verified model doesn't raise the price (review LP4): the check doesn't show the
-        // consumer's serve used it.
-        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 48 * H + 1), floor);
-        // Stale, failed, or against a reference that's no longer loaded → back to the name's price.
-        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 72 * H + 1), floor);
-        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&[], t), 48 * H + 1), floor);
+        // A bigger verified model doesn't raise the price on its own (review LP4): the check doesn't
+        // show the consumer's serve used it…
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), false, 48 * H + 1), floor);
+        // …until audits on real traffic do (D3).
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), true, 48 * H + 1), verified);
+        // Stale, failed, or against a reference that's no longer loaded → back to the name's price,
+        // whatever the audits say.
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), true, 72 * H + 1), floor);
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&[], t), true, 48 * H + 1), floor);
         st.on_verdict(FAIL, 49 * H);
-        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), 49 * H + 1), floor);
+        assert_eq!(priced_tier(handle, Some(&st), &|t| identity_in(&refs, t), true, 49 * H + 1), floor);
         // A big name on a small verified model is priced as the small one.
         let small = with_identity(&base, "qwen3.5", "0.8b", "q4_k_m", &[]);
         let mut st = LogprobStatus::default();
@@ -1514,7 +1540,23 @@ mod tests {
             st.on_verdict(PASS, at);
         }
         let smalls = [small];
-        assert_eq!(priced_tier("llama-70b", Some(&st), &|t| identity_in(&smalls, t), 48 * H + 1), cost_tier_for_params_quant("0.8b", "q4_k_m").unwrap());
+        let small_tier = cost_tier_for_params_quant("0.8b", "q4_k_m").unwrap();
+        assert_eq!(priced_tier("llama-70b", Some(&st), &|t| identity_in(&smalls, t), false, 48 * H + 1), small_tier);
+        assert_eq!(priced_tier("llama-70b", Some(&st), &|t| identity_in(&smalls, t), true, 48 * H + 1), small_tier, "audits never raise it past what was verified");
+    }
+
+    #[test]
+    fn a_check_shows_against_a_name_only_for_a_model_of_that_size() {
+        let id = |params: &str, quant: &str| ModelIdentity::new("qwen3.5", params, quant).unwrap();
+        // The same model at another quantisation still matches its name.
+        assert!(identity_matches_name("qwen3.5:9b", Some(&id("9b", "bf16"))));
+        assert!(identity_matches_name("qwen3.5:9b-q4_K_M", Some(&id("9b", "q4_k_m"))));
+        // A check passed with a different-size model doesn't show against this name.
+        assert!(!identity_matches_name("qwen3.5:9b", Some(&id("0.8b", "q4_k_m"))));
+        assert!(!identity_matches_name("tiny-0.5b", Some(&id("70b", "q4_k_m"))));
+        // A name with no size, or a reference without an identity: nothing to contradict.
+        assert!(identity_matches_name("my-model", Some(&id("70b", "q4_k_m"))));
+        assert!(identity_matches_name("qwen3.5:9b", None));
     }
 
     #[test]

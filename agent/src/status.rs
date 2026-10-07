@@ -260,8 +260,12 @@ pub struct RepEntry {
     /// legacy bare-peer snapshot (should not occur after the Phase 4a boot migration).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// Earned reputation in `[0, 100]`, decayed to now (50 = neutral). See `verify.rs`.
+    /// Earned reputation in `[0, 100]`, decayed to now (50 = neutral): the score routing and
+    /// pricing use. See `verify.rs`.
     pub score: f64,
+    /// The score as of the last verification outcome, before decay. `None` from an older snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_score: Option<f64>,
     /// The achieved authenticity tier for this `(peer, model)` (`trust::AuthenticityTier` label,
     /// e.g. `"A1-reputation-redundant"`) — resolved from the redundant-exec audit history this
     /// consumer has for the pair (UNIFIED_TRUST_STACK). A0/A1 today; a verified A2+ awaits a

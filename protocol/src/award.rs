@@ -239,7 +239,14 @@ pub struct AuditStats {
     /// Unix-ms of the most recent failed audit (0 = none): a fresh failure caps the tier outright,
     /// whatever the decayed counts say.
     last_failed_ms: u64,
+    /// When its most recent passing audits **on real traffic** were (newest first, 0 = none): audits
+    /// whose request was a user's own, which a provider can't tell from any other serve. Only these
+    /// show the model it is paid for is the one it serves ([`TRAFFIC_PASSES_KEPT`] kept).
+    traffic_passes: [u64; TRAFFIC_PASSES_KEPT],
 }
+
+/// How many recent real-traffic audit passes an [`AuditStats`] keeps.
+pub const TRAFFIC_PASSES_KEPT: usize = 3;
 
 impl AuditStats {
     /// A fresh, empty history as of `now_ms`, decaying with the reputation half-life.
@@ -249,7 +256,7 @@ impl AuditStats {
 
     /// As [`new`](Self::new) but with an explicit decay half-life (`0` = no decay).
     pub fn with_half_life(now_ms: u64, half_life_ms: u64) -> Self {
-        Self { passes: 0.0, total: 0.0, last_update_ms: now_ms, half_life_ms, last_failed_ms: 0 }
+        Self { passes: 0.0, total: 0.0, last_update_ms: now_ms, half_life_ms, last_failed_ms: 0, traffic_passes: [0; TRAFFIC_PASSES_KEPT] }
     }
 
     /// Decay multiplier `0.5^(elapsed / half_life)` for reading as of `now_ms` without mutating.
@@ -290,6 +297,23 @@ impl AuditStats {
         } else {
             self.last_failed_ms = self.last_failed_ms.max(now_ms);
         }
+    }
+
+    /// Record a passing audit on real traffic at `now_ms` (as well as [`record`](Self::record)ing it
+    /// as a pass).
+    pub fn record_traffic_pass(&mut self, now_ms: u64) {
+        self.record(AuditClass::Pass, now_ms);
+        self.traffic_passes.rotate_right(1);
+        self.traffic_passes[0] = now_ms;
+    }
+
+    /// How many of the kept real-traffic passes fall within `window_ms` of `now_ms` and came after
+    /// the most recent failed audit.
+    pub fn recent_traffic_passes(&self, now_ms: u64, window_ms: u64) -> usize {
+        self.traffic_passes
+            .iter()
+            .filter(|&&at| at > 0 && at > self.last_failed_ms && now_ms.saturating_sub(at) <= window_ms)
+            .count()
     }
 
     /// When the most recent failed audit was, if any.
@@ -333,23 +357,27 @@ impl AuditStats {
     }
 
     /// Serialize the snapshot for the durable store: `passes:f64[8] ‖ total:f64[8] ‖
-    /// last_update_ms:u64[8] ‖ half_life_ms:u64[8] ‖ last_failed_ms:u64[8]` little-endian = 40
-    /// bytes. f64s stored by exact bit pattern so a rehydrated tracker decays identically.
-    pub fn to_bytes(&self) -> [u8; 40] {
-        let mut b = [0u8; 40];
+    /// last_update_ms:u64[8] ‖ half_life_ms:u64[8] ‖ last_failed_ms:u64[8] ‖ traffic_passes:u64[8]×3`
+    /// little-endian = 64 bytes. f64s stored by exact bit pattern so a rehydrated tracker decays
+    /// identically.
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut b = [0u8; 64];
         b[0..8].copy_from_slice(&self.passes.to_le_bytes());
         b[8..16].copy_from_slice(&self.total.to_le_bytes());
         b[16..24].copy_from_slice(&self.last_update_ms.to_le_bytes());
         b[24..32].copy_from_slice(&self.half_life_ms.to_le_bytes());
         b[32..40].copy_from_slice(&self.last_failed_ms.to_le_bytes());
+        for (i, at) in self.traffic_passes.iter().enumerate() {
+            b[40 + 8 * i..48 + 8 * i].copy_from_slice(&at.to_le_bytes());
+        }
         b
     }
 
-    /// Reconstruct from [`to_bytes`](Self::to_bytes), or from the 32-byte snapshot written before
-    /// failures were timed (no failure time). `Err` for any other length.
+    /// Reconstruct from [`to_bytes`](Self::to_bytes), or from an older snapshot: 32 bytes (before
+    /// failures were timed) or 40 (before real-traffic passes were kept). `Err` for any other length.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() != 32 && data.len() != 40 {
-            return Err(format!("audit stats snapshot must be 32 or 40 bytes, got {}", data.len()));
+        if ![32, 40, 64].contains(&data.len()) {
+            return Err(format!("audit stats snapshot must be 32, 40 or 64 bytes, got {}", data.len()));
         }
         let f8 = |r: std::ops::Range<usize>| f64::from_le_bytes(data[r].try_into().unwrap());
         let u8_ = |r: std::ops::Range<usize>| u64::from_le_bytes(data[r].try_into().unwrap());
@@ -365,7 +393,12 @@ impl AuditStats {
             total,
             last_update_ms: u8_(16..24),
             half_life_ms: u8_(24..32),
-            last_failed_ms: if data.len() == 40 { u8_(32..40) } else { 0 },
+            last_failed_ms: if data.len() >= 40 { u8_(32..40) } else { 0 },
+            traffic_passes: if data.len() == 64 {
+                [u8_(40..48), u8_(48..56), u8_(56..64)]
+            } else {
+                [0; TRAFFIC_PASSES_KEPT]
+            },
         })
     }
 }
@@ -602,6 +635,11 @@ mod tests {
         assert_eq!(back.recent_passes(1_000 + 7 * DAY_MS), s.recent_passes(1_000 + 7 * DAY_MS));
         assert_eq!(back.last_failed_ms(), Some(1_000));
         // A snapshot from before failures were timed still reads, with none.
+        let mut s = s;
+        s.record_traffic_pass(2_000);
+        let back = AuditStats::from_bytes(&s.to_bytes()).unwrap();
+        assert_eq!(back.recent_traffic_passes(2_000, DAY_MS), 1);
+        assert_eq!(AuditStats::from_bytes(&s.to_bytes()[..40]).unwrap().recent_traffic_passes(2_000, DAY_MS), 0);
         let old = AuditStats::from_bytes(&s.to_bytes()[..32]).unwrap();
         assert_eq!(old.recent_passes(1_000), s.recent_passes(1_000));
         assert_eq!(old.last_failed_ms(), None);
@@ -626,5 +664,26 @@ mod tests {
         assert!(AuditStats::from_bytes(&[0u8; 31]).is_err());
         assert!(AuditStats::from_bytes(&[0u8; 33]).is_err());
         assert!(AuditStats::from_bytes(&[0u8; 41]).is_err());
+        assert!(AuditStats::from_bytes(&[0u8; 65]).is_err());
+    }
+
+    #[test]
+    fn only_recent_traffic_passes_since_the_last_failure_count() {
+        let mut s = AuditStats::with_half_life(0, 7 * DAY_MS);
+        for t in [100, 200, 300] {
+            s.record_traffic_pass(t);
+        }
+        assert_eq!(s.recent_traffic_passes(300, 7 * DAY_MS), 3);
+        // A pass on a probe isn't traffic evidence.
+        s.record(AuditClass::Pass, 400);
+        assert_eq!(s.recent_traffic_passes(400, 7 * DAY_MS), 3);
+        // Only the last three are kept, and they age out of the window.
+        s.record_traffic_pass(500);
+        assert_eq!(s.recent_traffic_passes(250 + 7 * DAY_MS, 7 * DAY_MS), 2, "100 dropped (only three kept), 200 aged out");
+        // A failure voids every pass before it.
+        s.record(AuditClass::Fail, 600);
+        assert_eq!(s.recent_traffic_passes(600, 7 * DAY_MS), 0);
+        s.record_traffic_pass(700);
+        assert_eq!(s.recent_traffic_passes(700, 7 * DAY_MS), 1);
     }
 }

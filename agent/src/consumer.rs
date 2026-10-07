@@ -1537,7 +1537,10 @@ impl ConsumerNode {
             .provider_logprob
             .as_ref()
             .and_then(|lp| lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied())
-            .map_or((false, None), |st| st.evidence(now_ms));
+            .map_or((false, None), |st| {
+                let (flag, outcome) = st.evidence(now_ms);
+                (flag && self.check_matches_name(model_key, &st), outcome)
+            });
         // A redundant-execution audit it failed recently is a live failure too (review T4), whatever
         // a log-prob check said since: it may serve the real model only when it is being checked.
         let latest_outcome = if audit_failed { Some(VerificationOutcome::Failed) } else { latest_outcome };
@@ -1555,24 +1558,12 @@ impl ConsumerNode {
     /// reputation per provider (OpenHydra-keyed) and give-side credit balance per provider
     /// (libp2p-keyed). Pure reads of both maps; safe to call from a background publisher thread.
     ///
-    /// Reputation reports the **standing (raw) score** — the value as of the last verification
-    /// outcome — NOT the time-decayed `score_at(now)`. The decayed value drifts toward neutral on
-    /// every poll, which made the desktop's reputation flicker and appear to "reset" on a bare
-    /// re-announce (which produces no outcome, so decay is all that changed). The router still
-    /// reads the decayed `score_at` directly from the tracker for ranking; only the human-facing
-    /// display uses the stable standing score, which persists across re-announce and restart.
+    /// Reputation and the authenticity tier are the ones routing and pricing use (review T6): the
+    /// score decayed to now, and the tier from [`authenticity_of`](Self::authenticity_of). With a
+    /// week's half-life the decayed score moves slowly (about a tenth of a point per half hour
+    /// near the top). The standing score as of the last outcome is reported beside it.
     pub fn economy_snapshot(&self) -> (Vec<crate::status::RepEntry>, Vec<crate::status::CreditEntry>) {
         let now = now_unix_ms();
-        // Snapshot the redundant-exec audit history first, under its own lock, released before the
-        // reputation lock is taken — the two maps share the composite `(peer, model)` key, but they
-        // are never held nested, so taking them in sequence avoids any lock-ordering hazard.
-        let audit: std::collections::HashMap<String, (f64, u32)> = self
-            .audit_stats
-            .lock()
-            .map(|m| {
-                m.iter().map(|(k, s)| (k.clone(), (s.pass_rate(now), s.recent_passes(now)))).collect()
-            })
-            .unwrap_or_default();
         // Crypto-rail voucher: cumulative net owed per `(peer, model)`. Snapshotted under its own
         // lock, released before reputation is taken (same composite key, never held nested).
         let gated: std::collections::HashMap<String, u64> = self
@@ -1619,55 +1610,43 @@ impl ConsumerNode {
             .as_ref()
             .map(|lp| lp.status.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .unwrap_or_default();
-        let reputation = self
+        // (key, standing score, decayed score), taken under the reputation lock and released before
+        // the tier is resolved (which takes that lock again).
+        let scores: Vec<(String, f64, f64)> = self
             .reputation
             .lock()
-            .map(|m| {
-                m.iter()
-                    .map(|(key, t)| {
-                        // Phase 4a: the map key is the composite `(peer, model)` — split it back
-                        // for display. A key without the separator (should not occur post-migration)
-                        // degrades gracefully to peer-only with no model.
-                        let (peer, model) = match split_reputation_key(key) {
-                            Some((p, m)) => (p.to_string(), Some(m.to_string())),
-                            None => (key.clone(), None),
-                        };
-                        // The achieved authenticity tier from the redundant-exec evidence already
-                        // tracked for this `(peer, model)` (UNIFIED_TRUST_STACK Increment 2a), plus a
-                        // recent log-prob verdict when checks are on (Track A2-Logprob): a pass is
-                        // the hard method that allows A2, a fail pins the floor. Reputation uses the
-                        // stable standing score (same as `score`), so the tier does not flicker on
-                        // decay between polls.
-                        let (rate, passes) = audit.get(key).copied().unwrap_or((1.0, 0));
-                        let lp = logprob.get(key);
-                        let (lp_flag, latest_outcome) = lp.map_or((false, None), |st| st.evidence(now));
-                        let tier = RedundantExecAuthenticity
-                            .verify(&AuthenticityEvidence {
-                                reputation: t.raw_score(),
-                                audit_pass_rate: rate,
-                                passing_audits: passes,
-                                methods: MethodFlags { logprob_commitment: lp_flag, ..MethodFlags::default() },
-                                latest_outcome,
-                            })
-                            .authenticity;
-                        let logprob_check = lp.and_then(|st| st.label());
-                        let (device_trust, rotations) = device.get(&peer).copied().unwrap_or((None, 0));
-                        crate::status::RepEntry {
-                            // Shown as the 64-bit peer id (the 128-bit state id's prefix) — the id
-                            // the rest of the app knows the provider by.
-                            openhydra_peer_id: peer.get(..16).unwrap_or(&peer).to_string(),
-                            model_id: model,
-                            score: (t.raw_score() * 10.0).round() / 10.0,
-                            authenticity: Some(tier.label().to_string()),
-                            gated_net: gated.get(key).copied().filter(|&n| n > 0),
-                            device_trust: device_trust.map(str::to_string),
-                            device_key_rotations: (rotations > 0).then_some(rotations),
-                            logprob_check,
-                        }
-                    })
-                    .collect()
-            })
+            .map(|m| m.iter().map(|(k, t)| (k.clone(), t.raw_score(), t.score_at(now))).collect())
             .unwrap_or_default();
+        let round = |x: f64| (x * 10.0).round() / 10.0;
+        let reputation = scores
+            .into_iter()
+            .map(|(key, standing, score)| {
+                // Phase 4a: the map key is the composite `(peer, model)` — split it back for display.
+                // A key without the separator (should not occur post-migration) degrades gracefully
+                // to peer-only with no model.
+                let (peer, model) = match split_reputation_key(&key) {
+                    Some((p, m)) => (p.to_string(), Some(m.to_string())),
+                    None => (key.clone(), None),
+                };
+                // The tier routing and pricing see for this `(peer, model)`.
+                let tier = model.as_deref().map(|m| self.authenticity_of(&peer, m, now));
+                let logprob_check = logprob.get(&key).and_then(|st| st.label());
+                let (device_trust, rotations) = device.get(&peer).copied().unwrap_or((None, 0));
+                crate::status::RepEntry {
+                    // Shown as the 64-bit peer id (the 128-bit state id's prefix) — the id the rest
+                    // of the app knows the provider by.
+                    openhydra_peer_id: peer.get(..16).unwrap_or(&peer).to_string(),
+                    model_id: model,
+                    score: round(score),
+                    standing_score: Some(round(standing)),
+                    authenticity: tier.map(|t| t.label().to_string()),
+                    gated_net: gated.get(&key).copied().filter(|&n| n > 0),
+                    device_trust: device_trust.map(str::to_string),
+                    device_key_rotations: (rotations > 0).then_some(rotations),
+                    logprob_check,
+                }
+            })
+            .collect();
         let credit = self
             .credit
             .lock()
@@ -1729,7 +1708,7 @@ impl ConsumerNode {
     /// [`openhydra_protocol::award`] awaiting it. Feeding [`AuditStats`] now keeps the durable audit
     /// history warm for that layer; the ephemeral fault ladder is deferred with it (a log-only
     /// escalation over unpersisted state would reset every restart and mislead — review state-F4).
-    fn record_audit(&self, peer_id: &str, model_key: &str, class: AuditClass, now_ms: u64) {
+    fn record_audit(&self, peer_id: &str, model_key: &str, class: AuditClass, real_traffic: bool, now_ms: u64) {
         let key = reputation_key(peer_id, model_key);
         let snapshot = {
             let mut m = match self.audit_stats.lock() {
@@ -1737,7 +1716,10 @@ impl ConsumerNode {
                 Err(_) => return,
             };
             let s = m.entry(key.clone()).or_insert_with(|| AuditStats::new(now_ms));
-            s.record(class, now_ms);
+            match class {
+                AuditClass::Pass if real_traffic => s.record_traffic_pass(now_ms),
+                class => s.record(class, now_ms),
+            }
             s.to_bytes()
         };
         if let Some(store) = &self.store {
@@ -1778,11 +1760,25 @@ impl ConsumerNode {
         let Some(lp) = &self.provider_logprob else { return cost_tier_for_handle(model_key) };
         let key = reputation_key(peer_id, model_key);
         let status = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
-        let identity_of = |tag: [u8; 16]| {
-            identity_in(&lp.refs, tag)
-                .or_else(|| lp.registry_identities.lock().unwrap_or_else(|e| e.into_inner()).get(&tag).cloned())
-        };
-        priced_tier(model_key, status.as_ref(), &identity_of, now_ms)
+        // A bigger verified model is paid for only once audits on real traffic show it is served (D3).
+        let traffic_proven = self.audit_stats.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some_and(|s| {
+            s.recent_traffic_passes(now_ms, crate::prompt_score::PRICE_UPLIFT_WINDOW_MS) >= crate::prompt_score::PRICE_UPLIFT_AUDITS
+        });
+        priced_tier(model_key, status.as_ref(), &|tag| self.reference_identity(tag), traffic_proven, now_ms)
+    }
+
+    /// The identity of the log-prob reference a [`reference_tag`](crate::prompt_score::reference_tag)
+    /// names: a local reference file, or registry packs seen for that label.
+    fn reference_identity(&self, tag: [u8; 16]) -> Option<openhydra_protocol::logprob::ModelIdentity> {
+        let lp = self.provider_logprob.as_ref()?;
+        identity_in(&lp.refs, tag).or_else(|| lp.registry_identities.lock().unwrap_or_else(|e| e.into_inner()).get(&tag).cloned())
+    }
+
+    /// Whether a passed log-prob check may show as A2 for `handle` (review T3): the verified model is
+    /// the size its name says (when the name gives a size). Otherwise the check only informs pricing:
+    /// a provider can't put an A2 badge on a name by passing checks for a different model.
+    fn check_matches_name(&self, handle: &str, st: &LogprobStatus) -> bool {
+        crate::prompt_score::identity_matches_name(handle, self.reference_identity(st.reference).as_ref())
     }
 
     /// The current cumulative gross (net + fee) of the `(peer, model)` voucher at composite `key`, or
@@ -2965,10 +2961,10 @@ impl ConsumerNode {
         match effect {
             StatusEffect::None => {}
             StatusEffect::Fail => {
-                self.record_audit(peer_id, model_key, AuditClass::Fail, now);
+                self.record_audit(peer_id, model_key, AuditClass::Fail, false, now);
                 self.record_outcome(peer_id, model_key, VerificationOutcome::Failed, now);
             }
-            StatusEffect::Evasion => self.record_audit(peer_id, model_key, AuditClass::Fail, now),
+            StatusEffect::Evasion => self.record_audit(peer_id, model_key, AuditClass::Fail, false, now),
         }
         match outcome {
             RoundOutcome::Verdict(v) if v.passed() => {
@@ -3239,8 +3235,10 @@ impl ConsumerNode {
                 VerificationOutcome::Failed => Some(AuditClass::Fail),
                 VerificationOutcome::Rejected => None,
             };
+            // On a replayed user request every provider in it served a real prompt it couldn't tell
+            // from any other: its pass is evidence about the traffic it serves (D3).
             if let Some(class) = class {
-                self.record_audit(peer_id, model_key, class, now);
+                self.record_audit(peer_id, model_key, class, served.is_some(), now);
             }
         }
         Ok(report)
@@ -4088,14 +4086,14 @@ mod tests {
                 node.record_outcome(peer, "m", VerificationOutcome::Honored, t0 + i);
             }
             for i in 0..12 {
-                node.record_audit(peer, "m", AuditClass::Pass, t0 + i);
+                node.record_audit(peer, "m", AuditClass::Pass, false, t0 + i);
             }
         }
         assert_eq!(node.authenticity_of("p", "m", t0 + 100), AuthenticityTier::ReputationRedundant);
         // One failed audit: the floor, whatever the rest of its history says…
-        node.record_audit("p", "m", AuditClass::Fail, t0 + 200);
-        node.record_audit("p", "m", AuditClass::Pass, t0 + 300);
-        node.record_audit("q", "m", AuditClass::Pass, t0 + 300);
+        node.record_audit("p", "m", AuditClass::Fail, false, t0 + 200);
+        node.record_audit("p", "m", AuditClass::Pass, false, t0 + 300);
+        node.record_audit("q", "m", AuditClass::Pass, false, t0 + 300);
         assert_eq!(node.authenticity_of("p", "m", t0 + 400), AuthenticityTier::SelfReported);
         assert_eq!(node.authenticity_of("q", "m", t0 + 400), AuthenticityTier::ReputationRedundant);
         assert_eq!(node.authenticity_of("p", "m", t0 + 200 + AUDIT_FAIL_FLOOR_MS), AuthenticityTier::SelfReported);
