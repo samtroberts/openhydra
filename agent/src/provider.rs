@@ -1878,19 +1878,18 @@ impl<A: EngineAdapter> Provider<A> {
     }
 
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
-        // Resolve the effective scope. A `model_ref` that exactly matches a model we actually announce
-        // uses that model's scope. A ref that does NOT — yet `is_shared` let it through (e.g. `All`
+        // Resolve the effective scope. A `model_ref` that exactly matches a model our engine serves
+        // (detected, or announced) uses that model's own scope: a private model is never announced
+        // globally, so the announced set alone would gate it at the strictest scope (round 8 N8-1).
+        // A ref that does NOT — yet `is_shared` let it through (e.g. `All`
         // mode says yes to anything, or a single-model engine serves its one model for any name) —
         // could be an alias the engine resolves to any shared model, so it is gated at the STRICTEST
         // scope this node shares (M4 review HIGH: closes an is_shared/scope_of divergence that would
         // otherwise serve a private model under an unrecognised alias with no credential). An
         // all-Global node's strictest is Global, so a purely-public node sees no change.
-        let announced = self
-            .last_announced
-            .lock()
-            .map(|s| s.contains(&req.model_ref))
-            .unwrap_or(false);
-        let scope = if announced {
+        let known = self.detected.lock().map(|d| d.contains_key(&req.model_ref)).unwrap_or(false)
+            || self.last_announced.lock().map(|s| s.contains(&req.model_ref)).unwrap_or(false);
+        let scope = if known {
             self.policy.scope_of(&req.model_ref)
         } else {
             self.policy.strictest_scope()
@@ -1905,9 +1904,9 @@ impl<A: EngineAdapter> Provider<A> {
             now_unix_ms(),
         ) {
             Ok(()) => {
-                // Only a model we announce, under its own name: an alias let through at the strictest
-                // scope could be any string, and isn't a model a challenge names.
-                if announced
+                // Only a model our engine serves, under its own name: an alias let through at the
+                // strictest scope could be any string, and isn't a model a challenge names.
+                if known
                     && matches!(scope, crate::share_policy::Scope::Private | crate::share_policy::Scope::Unknown)
                     && req.model_ref.len() <= crate::attest::MAX_MODEL_ID_LEN
                 {
@@ -3971,6 +3970,43 @@ mod tests {
         let before: std::collections::HashSet<_> = m.keys().cloned().collect();
         note_private_member_in(&mut m, "p5", "m", now + 10 * MAX_PRIVATE_ATTEST_PAIRS as u64, 0);
         assert_eq!(m.keys().cloned().collect::<std::collections::HashSet<_>>(), before);
+    }
+
+    /// Round 8 N8-1: a private model is gated at its own scope (not the strictest one this node
+    /// shares), and a request that passes its gate is remembered for attestation.
+    #[test]
+    fn a_private_model_is_gated_at_its_own_scope() {
+        use crate::share_policy::Scope;
+        let (_dir, mut provider) = test_provider(StubAdapter);
+        let mut policy = SharePolicy::share_all();
+        policy.scopes.insert("rig".into(), Scope::Private);
+        policy.scopes.insert("dev".into(), Scope::Device);
+        provider.policy = PolicyWatcher::r#static(policy);
+        let detected = |r: &str| DetectedModel {
+            engine_ref: r.into(), canonical_id: String::new(), family: String::new(), params: String::new(),
+            quant: String::new(), size_bytes: 0, weight_digest: String::new(),
+        };
+        provider.detected.lock().unwrap().extend([("rig".to_string(), detected("rig")), ("dev".to_string(), detected("dev"))]);
+        let req = |model: &str| ServeRequest {
+            reply_to: "c".into(), model_ref: model.into(), messages: vec![],
+            max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+        };
+        let refusal = |model: &str, from: &str| {
+            provider.scope_refusal(&req(model), from).map(|r| match &parse_response(&r).unwrap()[0] {
+                ServeChunk::Error(e) => e.clone(),
+                other => panic!("{other:?}"),
+            })
+        };
+        // A stranger is refused "rig" as private (needs a credential), not as device-only.
+        let why = refusal("rig", "stranger").expect("refused");
+        assert!(why.contains("private") && !why.contains("device-only"), "{why}");
+        // An unknown alias is still gated at the strictest scope.
+        assert!(refusal("alias", "stranger").expect("refused").contains("device-only"));
+        // Our own request passes, and is remembered as a member of the private model.
+        let own = provider.net.libp2p_peer_id().to_string();
+        assert!(refusal("rig", &own).is_none());
+        assert!(provider.private_members.lock().unwrap().keys().any(|(p, m)| *p == own && m == "rig"));
     }
 
     #[test]
