@@ -326,8 +326,13 @@ def no_licence_file_notice(name, licence, pdir):
     note = "The crate ships no licence file; it declares the licence above."
     matched = [(spdx, text) for pattern, spdx, text in LICENCE_TEMPLATES if re.search(pattern, licence)]
     # A choice (OR) needs one licence's text; terms that all apply (AND) need each of them
-    # (review round 4, R4-9).
-    if matched and not re.search(r"\bAND\b", licence, re.I):
+    # (review round 4, R4-9), and a term with no text of ours stops the build (round 5, R5O-6).
+    if re.search(r"\bAND\b", licence, re.I):
+        for term in re.split(r"\bAND\b", licence.strip("() "), flags=re.I):
+            options = [o.strip("() ") for o in re.split(r"\bOR\b", term, flags=re.I)]
+            if not any(any(re.search(p, o) for p, _, _ in LICENCE_TEMPLATES) or NO_NOTICE.search(o) for o in options):
+                die(f"{name} ships no licence file and declares {licence}, and has no text for {term.strip()}: add licenses/crates/{name}.txt")
+    elif matched:
         matched = matched[:1]
     if matched:
         holder = authors(pdir) or "the " + name + " authors"

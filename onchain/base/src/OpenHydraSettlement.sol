@@ -70,6 +70,8 @@ contract OpenHydraSettlement is ReentrancyGuard {
     uint64 public constant CLAIM_LIFETIME = 30 days;
     /// A pause that starts within this long of the last one's end continues it: the time between
     /// counts as paused, for claims and exits alike. Distinct pauses are then at least a day apart.
+    /// So a claim that ran out in that gap gets it back, and an exit requested in it is extended by
+    /// the gap before its request too; both within their 30-day caps.
     uint64 public constant PAUSE_MERGE_WINDOW = 1 days;
     /// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within a
     /// live claim's span can matter, at most 60 days (its life plus the most a pause adds); pauses a

@@ -169,7 +169,13 @@ impl Identity {
                     let fresh = std::fs::metadata(path)
                         .and_then(|m| m.modified())
                         .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < KEY_WRITE_GRACE));
-                    if !fresh || started.elapsed() >= KEY_WRITE_GRACE {
+                    // Or plainly cut short (empty, or JSON that ends early), whatever its time says: a
+                    // filesystem may keep times coarsely (FAT's 2 s, in local time; review round 5,
+                    // R5O-7).
+                    let cut_short = std::fs::read_to_string(path).is_ok_and(|d| {
+                        d.trim().is_empty() || serde_json::from_str::<serde_json::Value>(&d).is_err_and(|e| e.is_eof())
+                    });
+                    if !(fresh || cut_short) || started.elapsed() >= KEY_WRITE_GRACE {
                         return Err(e);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));

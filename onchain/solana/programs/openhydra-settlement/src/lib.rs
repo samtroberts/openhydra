@@ -56,7 +56,9 @@ pub const EXIT_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
 /// `expires_at - CLAIM_LIFETIME_SECS` counts toward its grace ([`claim_grace`]).
 pub const CLAIM_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
 /// A pause that starts within this long of the last one's end continues it: the time between counts
-/// as paused, for claims and exits alike. Distinct pauses are then at least a day apart.
+/// as paused, for claims and exits alike. Distinct pauses are then at least a day apart. So a claim
+/// that ran out in that gap gets it back, and an exit requested in it is extended by the gap before
+/// its request too; both within their 30-day caps.
 pub const PAUSE_MERGE_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within a live
 /// claim's span can matter, at most 60 days (its life plus the most a pause adds); pauses a day apart

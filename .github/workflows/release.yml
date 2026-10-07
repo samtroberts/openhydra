@@ -48,8 +48,8 @@ on:
         default: false
       allow_older:
         # A publish never moves latest/ back to an older version than the one published (a re-run of
-        # an old tag, say) unless this is set.
-        description: "Publish even if this version is older than the one in latest/"
+        # an old tag, say), nor replaces files a version already published, unless this is set.
+        description: "Publish even if older than latest/, replacing what this version already published"
         type: boolean
         default: false
 
@@ -75,7 +75,7 @@ jobs:
             triple: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       # A release is the app's own version: a tag (or a manual publish's version) that isn't would
@@ -92,15 +92,21 @@ jobs:
           fi
           VERSION="${INPUT_VERSION:-$GITHUB_REF_NAME}"
           VERSION="${VERSION#v}"
-          APP="$(python3 -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')"
+          # node is preinstalled on every hosted runner, Windows included; python3 isn't there (review
+          # round 5, R5O-1).
+          APP="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
+          if [ -z "$APP" ]; then
+            echo "::error::couldn't read the app's version from desktop/src-tauri/tauri.conf.json"
+            exit 1
+          fi
           if [ "$VERSION" != "$APP" ]; then
             echo "::error::publishing $VERSION, but the app is version $APP (desktop/src-tauri/tauri.conf.json)"
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch
         with:
           toolchain: stable
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
@@ -119,7 +125,7 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         run: choco install -y protoc
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
@@ -143,7 +149,7 @@ jobs:
       # so it is rebuilt only when scorer/ changes.
       - name: Cache openhydra-scorer
         id: scorer-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: scorer-bin
           key: openhydra-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/**') }}
@@ -171,7 +177,7 @@ jobs:
       - name: Cache openhydra-mlx-scorer (macOS)
         if: startsWith(matrix.platform, 'macos')
         id: mlx-scorer-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: mlx-scorer-bin
           key: openhydra-mlx-scorer-${{ matrix.triple }}-${{ hashFiles('scorer/mistralrs/**', 'scorer/notices.py', 'scorer/licenses/**') }}
@@ -286,7 +292,7 @@ jobs:
 
       # Always upload so publish-r2 can collect every platform's artifacts.
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: openhydra-${{ matrix.triple }}
           path: dist/*
@@ -317,7 +323,7 @@ jobs:
           INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
         run: echo "Publishing ${INPUT_VERSION:-$GITHUB_REF_NAME} (run $GITHUB_RUN_ID, $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         continue-on-error: true # no artifacts at all → the next step fails with a clear message
         with:
           path: artifacts
@@ -326,6 +332,7 @@ jobs:
       - name: Fetch the published manifests
         shell: bash
         env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
@@ -344,6 +351,21 @@ jobs:
             echo "::error::couldn't read the published latest.json: $out"
             exit 1
           fi
+          # The updater manifest too (a re-run keeps the entries of platforms it doesn't publish), and
+          # what this version's archive already holds: a re-run (after a platform failed, say) never
+          # replaces a file already published (cached a year as immutable), and publishes only the
+          # platforms not there yet (review round 5, R5O-3). Any listing error stops the publish.
+          if out="$(aws s3api head-object --bucket "$R2_BUCKET" --key updater/latest.json --endpoint-url "$EP" 2>&1)"; then
+            aws s3 cp "s3://${R2_BUCKET}/updater/latest.json" prev/updater-latest.json --endpoint-url "$EP"
+          elif ! echo "$out" | grep -qE '\(404\)|Not Found|NoSuchKey'; then
+            echo "::error::couldn't read the published updater/latest.json: $out"
+            exit 1
+          fi
+          V="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          V="${V#v}"
+          aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "v${V}/" --endpoint-url "$EP" \
+            --query 'Contents[].Key' --output text > prev/published.txt \
+            || { echo "::error::couldn't list the published v${V}/"; exit 1; }
 
       - name: Flatten artifacts
         shell: bash
@@ -384,6 +406,21 @@ jobs:
             'windows': 'x86_64-pc-windows-msvc',
           }
           EXE = {'windows': '.exe'}
+          # A platform already published under this version (a re-run) is left as it is: its files
+          # aren't replaced, and it counts as not built this run (review round 5, R5O-3).
+          published = set(open('prev/published.txt').read().split()) if os.path.exists('prev/published.txt') else set()
+          OWN = {
+            'macos':   lambda n: 'aarch64-apple-darwin' in n or n.endswith(('.dmg', '.app.tar.gz', '.app.tar.gz.sig')),
+            'linux':   lambda n: 'x86_64-unknown-linux-gnu' in n or n.endswith(('.AppImage', '.AppImage.sig', '.deb', '.rpm')),
+            'windows': lambda n: 'x86_64-pc-windows-msvc' in n or n.endswith(('.exe', '.exe.sig', '.msi', '.msi.sig')),
+          }
+          if os.environ.get('ALLOW_OLDER') != 'true':
+              for os_, t in PLATFORMS.items():
+                  if f'v{version}/openhydra-agent-{t}{EXE.get(os_, "")}' in published:
+                      print(f'::notice::{os_} is already published for {version}: left as it is')
+                      for name in os.listdir(src):
+                          if OWN[os_](name):
+                              os.remove(os.path.join(src, name))
           built = {os_: os.path.exists(f'{src}/openhydra-agent-{t}{EXE.get(os_, "")}') for os_, t in PLATFORMS.items()}
           missing = [os_ for os_, ok in built.items() if not ok]
           if not any(built.values()):
@@ -499,7 +536,14 @@ jobs:
                       platforms[plat] = {'signature': open(sigp).read().strip(), 'url': f'{host}/updater/v{version}/{name}'}
                       break
           # A platform that didn't build is left out: listing its old artifact under the new version
-          # would have its app "update" to what it already runs, again and again.
+          # would have its app "update" to what it already runs, again and again. One already
+          # published for this same version (a re-run) keeps the entry it has.
+          if os.path.exists('prev/updater-latest.json'):
+              with open('prev/updater-latest.json') as f:
+                  prev_upd = json.load(f)
+              if prev_upd.get('version') == version:
+                  for plat, entry in prev_upd.get('platforms', {}).items():
+                      platforms.setdefault(plat, entry)
           if platforms:
               upd = {'version': version, 'notes': f'OpenHydra {version}',
                      'pub_date': datetime.now(timezone.utc).isoformat(), 'platforms': platforms}
@@ -517,7 +561,6 @@ jobs:
       - name: Publish to R2
         shell: bash
         env:
-          ALLOW_OLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_older }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
@@ -525,14 +568,8 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          # An archive is immutable (cached a year): a re-run never replaces one already published
-          # with a rebuild (review round 4, R4-4), unless allow_older says to.
-          if [ "$ALLOW_OLDER" != "true" ] \
-              && [ -n "$(aws s3 ls "s3://${R2_BUCKET}/v${VERSION}/" --endpoint-url "$EP" 2>/dev/null | head -1)" ]; then
-            echo "::error::v${VERSION}/ is already published; a re-run doesn't replace it (allow_older to force)"
-            exit 1
-          fi
-          # Immutable versioned archive — cache hard.
+          # Immutable versioned archive — cache hard. (A platform already published for this version
+          # was dropped from the tree above, so nothing published is replaced, R5O-3.)
           aws s3 cp "pub/v${VERSION}/" "s3://${R2_BUCKET}/v${VERSION}/" --recursive \
             --endpoint-url "$EP" --cache-control "public, max-age=31536000, immutable"
           if [ "${SKIP_LATEST:-0}" = "1" ]; then
@@ -594,7 +631,7 @@ jobs:
       # The GitHub Release, once, after R2 has the same files (it used to be published by each
       # platform's job, so a failed platform left GitHub "latest" and R2 disagreeing).
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         # A tag PUSH is a release; a manual run (even one started from a tag) is not.
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         with:

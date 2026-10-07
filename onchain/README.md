@@ -73,7 +73,9 @@ void the claims that expire during it, and a pause after a claim ran out doesn't
 contracts remember the most recent 64 pauses for this. A pause begun within a day of the last one's end
 continues it (the time between counts as paused, for claims and exits alike), so distinct pauses are a
 day apart at least, the log covers every pause a live claim can span, and unpausing and re-pausing can't
-push one out of it. A settle past the escrow pays what it
+push one out of it. Two consequences of counting that gap: a claim that ran out during it gets the gap
+back (it can settle again, within the 30-day cap), and an exit requested during it is extended by the
+gap before its request too (within its own 30-day cap). A settle past the escrow pays what it
 holds and the rest after a top-up. On Base the paid-so-far is keyed by the consumer's Ed25519 id as well
 as its wallet. Solana payout bindings can't be stamped more than 5 minutes ahead. Solana's `Settled` event names the
 model by its hash, as Base's does (SHA-256 on Solana, keccak-256 on Base: not comparable across chains). Solana's `Config` grows only at its end (a deployed program
