@@ -89,6 +89,11 @@ pub fn encode_challenge(model_ref: &str, token_ids: &[u32]) -> Option<Vec<u8>> {
     Some(b)
 }
 
+/// The model a challenge body names, if it is well formed.
+pub fn challenge_model(body: &[u8]) -> Option<String> {
+    decode_challenge(body).map(|(model, _)| model)
+}
+
 fn decode_challenge(body: &[u8]) -> Option<(String, Vec<u32>)> {
     let len = u16::from_le_bytes(body.get(..2)?.try_into().ok()?) as usize;
     if len > MAX_MODEL_REF_LEN {
@@ -539,6 +544,19 @@ pub fn reference_tag(set: &ReferenceSet) -> [u8; 16] {
     h.finalize()[..16].try_into().expect("16 of 32 bytes")
 }
 
+/// The tag a reference had before it named its identity (LP10): rows saved then carry it. A status
+/// on it is the same reference, so it moves to the new tag rather than losing its pass streak
+/// (review round 4 L4-8).
+pub fn legacy_reference_tag(set: &ReferenceSet) -> [u8; 16] {
+    let mut h = Sha256::new();
+    h.update(set.model_key.as_bytes());
+    if let Some(w) = &set.weights {
+        h.update([0]);
+        h.update(w.as_bytes());
+    }
+    h.finalize()[..16].try_into().expect("16 of 32 bytes")
+}
+
 /// `family\0params\0quant`: an identity as one string (it is normalised, so it contains no NUL).
 fn identity_text(id: &ModelIdentity) -> String {
     format!("{}\0{}\0{}", id.family, id.params, id.quant)
@@ -613,7 +631,6 @@ pub fn run_round(
     if model_ref.len() > MAX_MODEL_REF_LEN {
         return RoundOutcome::Busy;
     }
-    let mut skipped = 0;
     loop {
         let text = match round.pending_text(set) {
             Some(t) => t,
@@ -671,11 +688,12 @@ pub fn run_round(
             Err(ScoreChallengeError::Refused(r)) => format!("refused: {r}"),
             Err(ScoreChallengeError::Malformed) => "malformed reply".to_string(),
         };
-        // The provider has seen the text: it stays issued, and the round goes on without it.
+        // The provider has seen the text: it stays issued, and the round goes on without it. Counted
+        // on the round, so a new run doesn't restore the allowance (review round 4 L4-3).
         round.abandon(&id);
+        let skipped = round.note_skipped();
         persist(round);
-        skipped += 1;
-        if skipped > MAX_SKIPPED_TEXTS {
+        if skipped as usize > MAX_SKIPPED_TEXTS {
             return RoundOutcome::Evasion(skip);
         }
     }
@@ -706,6 +724,9 @@ pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut
                 pause();
                 continue;
             }
+            // Still busy after all that: not held against it (outsiders can keep a provider busy;
+            // review round 4 L4-2). Stalling on a text it was sent is what counts.
+            Err(ScoreChallengeError::Refused(r)) if r.contains("retry") => Some(RoundOutcome::Busy),
             Err(ScoreChallengeError::Refused(r)) => Some(RoundOutcome::Incomplete(format!("refused: {r}"))),
             Err(ScoreChallengeError::Transport(e)) => Some(RoundOutcome::Incomplete(format!("transport: {e}"))),
             Err(ScoreChallengeError::Malformed) => Some(RoundOutcome::Incomplete("malformed reply".into())),
@@ -999,8 +1020,13 @@ pub fn decode_logprob_state(b: &[u8]) -> Option<(LogprobStatus, ChallengeRound, 
             let len = u16::from_le_bytes(b.get(1..3)?.try_into().ok()?) as usize;
             let text = std::str::from_utf8(b.get(3..3 + len)?).ok()?;
             let mut parts = text.split('\0');
-            let id = ModelIdentity::new(parts.next()?, parts.next()?, parts.next()?)?;
-            (Some(id), &b[3 + len..])
+            // An identity that no longer reads as one is dropped, not the row with it (its verdict
+            // and issued texts stay; review round 4 L4-9).
+            let id = match (parts.next(), parts.next(), parts.next()) {
+                (Some(f), Some(p), Some(q)) => ModelIdentity::new(f, p, q),
+                _ => None,
+            };
+            (id, &b[3 + len..])
         }
         _ => (None, b),
     };
@@ -1316,6 +1342,48 @@ mod tests {
             run_round(&mut round, &r.set, "public", &mut down, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
             RoundOutcome::Incomplete(s) if s.contains("timeout")
         ));
+    }
+
+    /// Review round 4 L4-3/L4-2: the one declined text a round allows is counted across runs (a new
+    /// run doesn't restore it), and a probe still busy after its retries isn't held against anyone.
+    #[test]
+    fn a_rounds_skip_allowance_is_not_restored_by_a_new_run() {
+        let r = parse_reference(&ref_json(8, 4)).unwrap();
+        let gate = InflightGate::new();
+        let mut round = ChallengeRound::new();
+        let mut calls = 0;
+        // Run 1: declines the first text, then the connection drops.
+        let mut first = |_: &[u8]| -> Result<Vec<u8>, String> {
+            calls += 1;
+            if calls == 1 { Ok(score_refusal("no")) } else { Err("timeout".into()) }
+        };
+        let out = run_round(&mut round, &r.set, "public", &mut first, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {});
+        assert!(matches!(out, RoundOutcome::Incomplete(_)));
+        assert_eq!(round.skipped(), 1);
+        // Run 2 (after a restart, too): one more decline is an evasion.
+        let mut round = ChallengeRound::from_bytes(&round.to_bytes()).unwrap();
+        let mut private = provider(0.0, &gate);
+        assert!(matches!(
+            run_round(&mut round, &r.set, "private", &mut private, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
+            RoundOutcome::Evasion(_)
+        ));
+        let mut busy = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(score_refusal("prompt scoring busy, retry")) };
+        assert_eq!(probe_scoring(&mut busy, "public", &mut || {}), Some(RoundOutcome::Busy));
+    }
+
+    /// Review round 4 L4-9: a stored identity that no longer reads as one is dropped, not the row.
+    #[test]
+    fn an_unreadable_stored_identity_keeps_the_row() {
+        let status = LogprobStatus::default();
+        let round = ChallengeRound::new();
+        let mut row = vec![IDENTITY_MARK];
+        let text = "qwen\0\0q4"; // no size
+        row.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        row.extend_from_slice(text.as_bytes());
+        row.extend_from_slice(&encode_logprob_state(status, &round, None));
+        let (st, _, id) = decode_logprob_state(&row).expect("the row still reads");
+        assert_eq!((st, id), (status, None));
+        assert!(openhydra_protocol::logprob::ModelIdentity::new("qw\0en", "9b", "q4").is_none(), "no NUL in an identity");
     }
 
     #[test]

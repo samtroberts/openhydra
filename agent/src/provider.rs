@@ -128,6 +128,9 @@ const MAX_RECENTLY_SERVED: usize = 4096;
 /// How long after we answered a verifier's challenge it counts as mid-round (see
 /// `Provider::scored_recently`): a round sends its next text within seconds.
 const IN_ROUND_MS: u64 = 2 * 60 * 1000;
+/// The least time between one peer's challenges on different models: switching the model scored
+/// can reload a side-scorer, which a peer must not be able to do back to back (review round 4 L4-7).
+const SCORE_SWITCH_MIN_MS: u64 = 15 * 60 * 1000;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 /// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
 /// with many identities) keep the Secure Enclave signing nonstop.
@@ -661,6 +664,25 @@ fn validate_and_consume_commitment(
     }
     map.remove(nonce); // single-use
     Ok(())
+}
+
+/// One entry per key in a shared set while held (see `Provider::scoring_now`).
+struct OneAtATime<'a> {
+    set: &'a Mutex<std::collections::HashSet<String>>,
+    key: String,
+}
+
+impl<'a> OneAtATime<'a> {
+    /// Enter for `key`, or `None` while another holder for it is in.
+    fn enter(set: &'a Mutex<std::collections::HashSet<String>>, key: &str) -> Option<Self> {
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string()).then(|| Self { set, key: key.to_string() })
+    }
+}
+
+impl Drop for OneAtATime<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+    }
 }
 
 /// Pure reconnect-and-fetch lookup, extracted so it is unit-testable without a live
@@ -1215,6 +1237,10 @@ pub struct Provider<A: EngineAdapter> {
     /// Verifiers whose challenge we answered, and when: one answered in the last
     /// [`IN_ROUND_MS`] is mid-round and gets a spare scoring slot.
     scored_recently: Mutex<HashMap<String, u64>>,
+    /// Peers with a prompt-scoring challenge being answered now (one at a time each), and per peer
+    /// the model it last challenged and when (see [`SCORE_SWITCH_MIN_MS`]).
+    scoring_now: Mutex<std::collections::HashSet<String>>,
+    score_models: Mutex<HashMap<String, (String, u64)>>,
     /// Per-peer rate cap on prompt-scoring challenges (and model-info requests).
     score_rl: Arc<RateLimiter>,
     /// What the engine last reported for each model, keyed by handle — the source of the identity
@@ -1377,6 +1403,8 @@ impl<A: EngineAdapter> Provider<A> {
             prompt_scoring: false,
             score_gate: InflightGate::new(),
             scored_recently: Mutex::new(HashMap::new()),
+            scoring_now: Mutex::new(std::collections::HashSet::new()),
+            score_models: Mutex::new(HashMap::new()),
             score_rl: Arc::new(RateLimiter::new(RateLimitConfig {
                 rps: SCORE_RATE_RPS,
                 burst: SCORE_RATE_BURST,
@@ -3031,6 +3059,30 @@ impl<A: EngineAdapter> Provider<A> {
                     .unwrap_or_else(|e| e.into_inner())
                     .get(source_peer)
                     .is_some_and(|at| now.saturating_sub(*at) <= IN_ROUND_MS);
+                // Challenges come from consumers we served (a gateway checks a provider right after
+                // it served it) or one mid-round, one at a time each (review round 4 H3): strangers
+                // can't keep the scoring slots, or a side-scorer, busy to make real checks fail.
+                if !in_round && !self.served_recently(source_peer) && !self.is_own_consumer(source_peer) {
+                    return score_refusal("prompt scoring is for consumers this provider served; retry after a request");
+                }
+                let Some(_one) = OneAtATime::enter(&self.scoring_now, source_peer) else {
+                    return score_refusal("a challenge from you is already being scored, retry");
+                };
+                if let Some(model) = crate::prompt_score::challenge_model(&data[1..]) {
+                    let mut m = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
+                    match m.get(source_peer) {
+                        Some((last, at)) if *last != model && now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS => {
+                            return score_refusal("switched models too recently, retry");
+                        }
+                        _ => {}
+                    }
+                    if !m.contains_key(source_peer) && m.len() >= MAX_RECENTLY_SERVED {
+                        m.retain(|_, (_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS);
+                    }
+                    if m.contains_key(source_peer) || m.len() < MAX_RECENTLY_SERVED {
+                        m.insert(source_peer.to_string(), (model, now));
+                    }
+                }
                 let reply = handle_prompt_score_inbound(
                     &data[1..],
                     self.prompt_scoring.then_some(&self.adapter as &dyn EngineAdapter),
@@ -4281,6 +4333,17 @@ mod tests {
         let last = frames.last().expect("a terminal frame was appended");
         assert!(matches!(ServeChunk::decode(last).unwrap(), ServeChunk::Error(_)));
         assert!(ServeChunk::frame_is_terminal(last), "the appended frame ends the stream");
+    }
+
+    /// Review round 4 H3: one challenge per peer at a time.
+    #[test]
+    fn a_peers_challenges_are_scored_one_at_a_time() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        let a = OneAtATime::enter(&set, "a").unwrap();
+        assert!(OneAtATime::enter(&set, "a").is_none());
+        let _b = OneAtATime::enter(&set, "b").unwrap();
+        drop(a);
+        assert!(OneAtATime::enter(&set, "a").is_some());
     }
 
     /// Review round 4 C2: a serve nonce is admitted once; reusing it (which would rewrite the first

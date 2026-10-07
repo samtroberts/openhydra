@@ -376,27 +376,52 @@ struct ProviderLogprob {
     /// Per `(peer, model)`: the registry reference a run was using when it stopped with a text
     /// still pending (busy, a lost connection), so the next run sends that text again instead of
     /// fetching a new pack.
-    resume: Mutex<HashMap<String, Arc<LoadedReference>>>,
+    /// With the pack's id when it is a registry first stage, so its continuation can still be
+    /// fetched (review round 4 L4-4). At most [`MAX_RESUMES`].
+    resume: Mutex<HashMap<String, (Arc<LoadedReference>, Option<[u8; 16]>)>>,
+    /// Per `(peer, model)`: the text a run stopped on as busy, and since when (L4-1): a provider that
+    /// stalls on the same text for [`STALL_EVASION_MS`] is dodging it.
+    stalls: Mutex<HashMap<String, (String, u64)>>,
     /// Per `(peer, model)`: runs in a row that ended without a verdict, which spaces the next ones
     /// out (see [`logprob_retry_ms`]).
     no_verdict_runs: Mutex<HashMap<String, u32>>,
-    /// When registry packs were fetched for providers with no verdict yet, within the last hour
-    /// (see [`FIRST_CONTACT_PACKS_PER_HOUR`]).
-    first_contact_packs: Mutex<std::collections::VecDeque<u64>>,
+    /// When first-contact rounds were started within the last hour, per provider network ("*": all;
+    /// see [`FIRST_CONTACT_PACKS_PER_HOUR`]).
+    first_contact_packs: Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
 }
 
 impl ProviderLogprob {
-    /// Take one of this hour's [`FIRST_CONTACT_PACKS_PER_HOUR`] packs, if any is left.
-    fn spend_first_contact_pack(&self, now_ms: u64) -> bool {
-        let mut q = self.first_contact_packs.lock().unwrap_or_else(|e| e.into_inner());
-        while q.front().is_some_and(|at| now_ms.saturating_sub(*at) > 60 * 60 * 1000) {
-            q.pop_front();
+    /// Take one of this hour's first-contact rounds for a provider on `network` (its observed network,
+    /// or "" when reached through a relay only), if the gateway's ([`FIRST_CONTACT_PACKS_PER_HOUR`])
+    /// and that network's ([`FIRST_CONTACT_PER_NETWORK_PER_HOUR`]) allowances both have one left:
+    /// throwaway identities on one network can't use up the gateway's (review round 4 L4-6).
+    fn spend_first_contact_pack(&self, network: &str, now_ms: u64) -> bool {
+        let mut m = self.first_contact_packs.lock().unwrap_or_else(|e| e.into_inner());
+        for q in m.values_mut() {
+            while q.front().is_some_and(|at| now_ms.saturating_sub(*at) > 60 * 60 * 1000) {
+                q.pop_front();
+            }
         }
-        if q.len() >= FIRST_CONTACT_PACKS_PER_HOUR {
+        m.retain(|_, q| !q.is_empty());
+        let net = if network.is_empty() { "relay" } else { network };
+        let per_net = if network.is_empty() { FIRST_CONTACT_RELAYED_PER_HOUR } else { FIRST_CONTACT_PER_NETWORK_PER_HOUR };
+        if m.get("*").map_or(0, |q| q.len()) >= FIRST_CONTACT_PACKS_PER_HOUR || m.get(net).map_or(0, |q| q.len()) >= per_net {
             return false;
         }
-        q.push_back(now_ms);
+        m.entry("*".into()).or_default().push_back(now_ms);
+        m.entry(net.into()).or_default().push_back(now_ms);
         true
+    }
+
+    /// Give back a first-contact round taken for `network` that never started (no pack came).
+    fn refund_first_contact_pack(&self, network: &str) {
+        let mut m = self.first_contact_packs.lock().unwrap_or_else(|e| e.into_inner());
+        let net = if network.is_empty() { "relay" } else { network };
+        for k in ["*", net] {
+            if let Some(q) = m.get_mut(k) {
+                q.pop_back();
+            }
+        }
     }
 
     /// The weights file a reference tag was made from, when it names a file-tied reference this
@@ -413,7 +438,50 @@ impl ProviderLogprob {
 /// Registry packs a gateway spends per hour on providers it has no verdict for yet: throwaway
 /// identities that answer the probe and then decline can burn one pack each, and this keeps them from
 /// using up the gateway's registry allowance for the providers it already checks (review round 3, LP2).
-const FIRST_CONTACT_PACKS_PER_HOUR: usize = 10;
+const FIRST_CONTACT_PACKS_PER_HOUR: usize = 20;
+/// …and per provider network, and for all providers reached only through a relay together.
+const FIRST_CONTACT_PER_NETWORK_PER_HOUR: usize = 2;
+const FIRST_CONTACT_RELAYED_PER_HOUR: usize = 4;
+/// A provider that answers "busy" on the same text for this long is dodging it (review round 4
+/// L4-1): outsiders can't keep a provider busy that long for one verifier (challenges come only
+/// from consumers it served, one at a time each), and a cheater could otherwise stall until its
+/// fail lapsed.
+const STALL_EVASION_MS: u64 = 6 * 60 * 60 * 1000;
+/// Registry runs kept for resuming, at most (each holds its pack).
+const MAX_RESUMES: usize = 256;
+
+/// How a log-prob run that ended `outcome` counts, given the stalls on record (`stalls`, by key: the
+/// text a run stopped on as busy, and since when) and the text this one stopped on (`pending`): busy
+/// on the same text for [`STALL_EVASION_MS`] is dodging it (review round 4 L4-1). Keeps `stalls`.
+fn stall_outcome(
+    stalls: &mut HashMap<String, (String, u64)>,
+    key: &str,
+    outcome: RoundOutcome,
+    pending: Option<&str>,
+    now: u64,
+) -> RoundOutcome {
+    match (&outcome, pending) {
+        (RoundOutcome::Busy, Some(id)) => match stalls.get(key) {
+            Some((on, since)) if on == id && now.saturating_sub(*since) >= STALL_EVASION_MS => {
+                stalls.remove(key);
+                RoundOutcome::Evasion(format!("busy on the same text for {} h", STALL_EVASION_MS / 3_600_000))
+            }
+            Some((on, _)) if on == id => outcome,
+            _ => {
+                if stalls.len() >= MAX_RESUMES * 16 {
+                    stalls.clear();
+                }
+                stalls.insert(key.to_string(), (id.to_string(), now));
+                outcome
+            }
+        },
+        (RoundOutcome::Busy, None) => outcome,
+        _ => {
+            stalls.remove(key);
+            outcome
+        }
+    }
+}
 
 /// When to try a provider again after `runs` runs in a row ended without a verdict: the usual retry,
 /// doubling with each, at most 12 hours.
@@ -1558,8 +1626,9 @@ impl ConsumerNode {
             counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             issued_here: Mutex::new(issued_here),
             resume: Mutex::new(HashMap::new()),
+            stalls: Mutex::new(HashMap::new()),
             no_verdict_runs: Mutex::new(HashMap::new()),
-            first_contact_packs: Mutex::new(std::collections::VecDeque::new()),
+            first_contact_packs: Mutex::new(HashMap::new()),
         }));
         self
     }
@@ -3242,16 +3311,25 @@ impl ConsumerNode {
             let mut first_pack = None;
             let resumed = lp.resume.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
             let first_contact = lp.status.lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_none_or(|st| st.verdict.is_none());
+            // A provider with no verdict yet takes one of this hour's first-contact rounds, local
+            // texts included (review round 4 L4-5: a local set is shared gateway-wide too).
+            let network = node.observed_networks().get(&libp2p).and_then(|n| n.first().cloned()).unwrap_or_default();
+            let budget_ok = || !first_contact || lp.spend_first_contact_pack(&network, now_unix_ms());
             let reference = match resumed {
                 // A registry run stopped with a text pending: carry on with the same pack.
-                Some(r) => {
+                Some((r, pack)) => {
                     from_registry = true;
+                    first_pack = pack;
                     Some(r)
                 }
                 None => match select_reference(&lp.refs, &model, declared.as_ref(), weights.as_deref()).cloned() {
+                Some(_) if !budget_ok() => {
+                    tracing::debug!(provider = %peer_id, model, "first-contact budget spent this hour; checking later");
+                    None
+                }
                 Some(r) => Some(r),
                 None => match &lp.registry {
-                    Some(_) if first_contact && !lp.spend_first_contact_pack(now_unix_ms()) => {
+                    Some(_) if !budget_ok() => {
                         tracing::debug!(provider = %peer_id, model, "first-contact pack budget spent this hour; checking later");
                         None
                     }
@@ -3271,8 +3349,17 @@ impl ConsumerNode {
                             }
                             Some(Arc::new(LoadedReference { handles: pack.handles, set, vocab: None }))
                         }
-                        Err(crate::registry_client::RegistryError::NoReference) => None,
+                        // No pack came: the first-contact round wasn't spent.
+                        Err(crate::registry_client::RegistryError::NoReference) => {
+                            if first_contact {
+                                lp.refund_first_contact_pack(&network);
+                            }
+                            None
+                        }
                         Err(e) => {
+                            if first_contact {
+                                lp.refund_first_contact_pack(&network);
+                            }
                             tracing::warn!(provider = %peer_id, model, error = ?e, "no round pack from the registry");
                             None
                         }
@@ -3295,9 +3382,17 @@ impl ConsumerNode {
             if from_registry && round.pending_text(&reference.set).is_none() {
                 round = ChallengeRound::new();
             }
-            if lp.status.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default()
-                .switch_reference(reference_tag(&reference.set), &mut round)
-            {
+            let switched = {
+                let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
+                let st = status.entry(key.clone()).or_default();
+                let tag = reference_tag(&reference.set);
+                // A row saved before tags named the identity is on this same reference (L4-8).
+                if st.reference == crate::prompt_score::legacy_reference_tag(&reference.set) {
+                    st.reference = tag;
+                }
+                st.switch_reference(tag, &mut round)
+            };
+            if switched {
                 tracing::info!(provider = %peer_id, model, reference = reference.set.model_key,
                     "log-prob checks now use this reference");
             }
@@ -3315,6 +3410,7 @@ impl ConsumerNode {
             // A registry pack may be a first stage: if the round is still undecided when its texts run
             // out, ask once for the rest of the round (same batch) and carry on.
             let issued_before = round.issued_count();
+            let resumable_pack = first_pack;
             let mut reference = reference;
             let outcome = loop {
                 let outcome = run_round(
@@ -3348,9 +3444,16 @@ impl ConsumerNode {
                 }
             };
             let texts_used = round.issued_count() - issued_before;
-            // Stopped with a text still pending on a registry pack: the next run resumes that pack.
+            // Stopped with a text still pending on a registry pack: the next run resumes that pack,
+            // and can still fetch its continuation.
             if from_registry && matches!(outcome, RoundOutcome::Busy | RoundOutcome::Incomplete(_)) && round.pending_text(&reference.set).is_some() {
-                lp.resume.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), Arc::clone(&reference));
+                let mut resume = lp.resume.lock().unwrap_or_else(|e| e.into_inner());
+                if resume.len() >= MAX_RESUMES {
+                    if let Some(k) = resume.keys().next().cloned() {
+                        resume.remove(&k);
+                    }
+                }
+                resume.insert(key.clone(), (Arc::clone(&reference), resumable_pack));
             }
             node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, texts_used, Some(&reference.set.model_key));
         });
@@ -3384,18 +3487,26 @@ impl ConsumerNode {
                 runs.remove(key);
                 LOGPROB_RETRY_MS
             } else {
+                if !runs.contains_key(key) && runs.len() >= MAX_RESUMES * 16 {
+                    runs.clear();
+                }
                 let n = runs.entry(key.to_string()).or_insert(0);
                 *n = n.saturating_add(1);
                 logprob_retry_ms(*n)
             }
         };
+        // Busy on the same text since long enough ago is a stall, not a busy spell (L4-1).
+        let outcome = stall_outcome(&mut lp.stalls.lock().unwrap_or_else(|e| e.into_inner()), key, outcome, round.pending_id(), now);
         let effect = match &outcome {
             RoundOutcome::Verdict(v) => st.on_verdict_drawn(*v, now, 1.0 - rand::random::<f64>()),
             RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, retry, now),
-            // Busy isn't held against a provider: the text it stalled on waits for it.
+            // Busy isn't held against a provider: the text it stalled on waits for it (until that
+            // has gone on for hours, above).
             RoundOutcome::Busy => st.on_no_verdict(false, retry, now),
             RoundOutcome::Evasion(_) => st.on_evasion(retry, now),
             RoundOutcome::Unsupported => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS.max(retry), now),
+            // Out of texts because the provider declined some (L4-4): a stopped run like any other.
+            RoundOutcome::Exhausted if round.skipped() > 0 => st.on_no_verdict(answered, LOGPROB_BACKOFF_MS, now),
             RoundOutcome::Exhausted => st.on_no_verdict(false, LOGPROB_BACKOFF_MS, now),
         };
         let streak = st.pass_streak;
@@ -5182,6 +5293,24 @@ mod tests {
         let honest = resolve_audit(&[("A".to_string(), Ok(good.clone())), ("B".to_string(), Ok(good.clone()))]);
         strike_first_failures(honest, &key, &mut strikes, 4_000);
         assert!(!strikes.contains_key("A@m"));
+    }
+
+    /// Review round 4 L4-1: "busy" on the same text for hours is dodging it; a busy spell, or busy on a
+    /// different text each time, isn't.
+    #[test]
+    fn busy_on_the_same_text_for_hours_is_a_stall() {
+        let mut stalls = HashMap::new();
+        let busy = |stalls: &mut HashMap<String, (String, u64)>, text: &str, at: u64| {
+            stall_outcome(stalls, "p@m", RoundOutcome::Busy, Some(text), at)
+        };
+        assert_eq!(busy(&mut stalls, "t1", 0), RoundOutcome::Busy);
+        assert_eq!(busy(&mut stalls, "t1", STALL_EVASION_MS - 1), RoundOutcome::Busy);
+        assert!(matches!(busy(&mut stalls, "t1", STALL_EVASION_MS), RoundOutcome::Evasion(_)));
+        // Another text, or a run that got anywhere, starts the clock again.
+        assert_eq!(busy(&mut stalls, "t2", 0), RoundOutcome::Busy);
+        assert_eq!(busy(&mut stalls, "t3", STALL_EVASION_MS), RoundOutcome::Busy);
+        stall_outcome(&mut stalls, "p@m", RoundOutcome::Exhausted, None, STALL_EVASION_MS);
+        assert_eq!(busy(&mut stalls, "t3", 2 * STALL_EVASION_MS - 1), RoundOutcome::Busy);
     }
 
     /// Review round 4 H5: a relay-only subject leaves room for a partner of unknown network, and two

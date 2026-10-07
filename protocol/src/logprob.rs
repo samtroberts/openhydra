@@ -96,7 +96,8 @@ impl ModelIdentity {
             "f32" | "fp32" | "float32" => "fp32".to_string(),
             q => q.to_string(),
         };
-        if family.is_empty() || params.is_empty() || params == "unknown" || quant.is_empty() {
+        // A NUL can't be in any of them: it separates them where an identity is stored.
+        if family.is_empty() || params.is_empty() || params == "unknown" || quant.is_empty() || [&family, &params, &quant].iter().any(|f| f.contains('\0')) {
             return None;
         }
         Some(Self { family, params, quant })
@@ -351,6 +352,9 @@ pub struct ChallengeRound {
     pending: BTreeSet<String>,
     /// Ratios recorded in the current round.
     ratios: Vec<f64>,
+    /// Texts the provider declined (saw, then refused or answered unusably) in the current round,
+    /// across runs: a fresh run doesn't restore its allowance (review round 4 L4-3).
+    skipped: u32,
 }
 
 impl ChallengeRound {
@@ -427,14 +431,32 @@ impl ChallengeRound {
         };
         if verdict.is_some() {
             self.ratios.clear();
+            self.skipped = 0;
         }
         Ok(verdict)
+    }
+
+    /// Count a text the provider declined in this round; how many it has declined now.
+    pub fn note_skipped(&mut self) -> u32 {
+        self.skipped = self.skipped.saturating_add(1);
+        self.skipped
+    }
+
+    /// Texts declined in the current round so far.
+    pub fn skipped(&self) -> u32 {
+        self.skipped
+    }
+
+    /// The id of a text issued and still awaiting a reply, if any (the one a stalled run stopped on).
+    pub fn pending_id(&self) -> Option<&str> {
+        self.pending.iter().next().map(String::as_str)
     }
 
     /// Drop the ratios of the round in progress (e.g. the provider now declares a different model,
     /// so they were scored against another reference). Issued texts stay issued.
     pub fn reset_progress(&mut self) {
         self.ratios.clear();
+        self.skipped = 0;
     }
 
     /// Ratios recorded so far in the current round.
@@ -458,11 +480,12 @@ impl ChallengeRound {
         self.issued.len()
     }
 
-    /// Serialize for persistence: `0x01 ‖ u32 n ‖ n × digest(32) ‖ u32 m ‖ m × f64` (all LE). Texts
-    /// still pending are not written — after a restart they count as abandoned (still issued).
+    /// Serialize for persistence: `0x02 ‖ u32 n ‖ n × digest(32) ‖ u32 m ‖ m × f64 ‖ u32 skipped`
+    /// (all LE; format 0x01 is the same without `skipped`). Texts still pending are not written —
+    /// after a restart they count as abandoned (still issued).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(9 + 32 * self.issued.len() + 8 * self.ratios.len());
-        b.push(ROUND_FORMAT_V1);
+        let mut b = Vec::with_capacity(13 + 32 * self.issued.len() + 8 * self.ratios.len());
+        b.push(ROUND_FORMAT_V2);
         b.extend_from_slice(&(self.issued.len() as u32).to_le_bytes());
         for d in &self.issued {
             b.extend_from_slice(d);
@@ -471,6 +494,7 @@ impl ChallengeRound {
         for r in &self.ratios {
             b.extend_from_slice(&r.to_le_bytes());
         }
+        b.extend_from_slice(&self.skipped.to_le_bytes());
         b
     }
 
@@ -485,7 +509,8 @@ impl ChallengeRound {
             rest = tail;
             Ok(head)
         };
-        if take(1)?[0] != ROUND_FORMAT_V1 {
+        let format = take(1)?[0];
+        if format != ROUND_FORMAT_V1 && format != ROUND_FORMAT_V2 {
             return Err("challenge round: unknown format".into());
         }
         let n = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
@@ -502,14 +527,16 @@ impl ChallengeRound {
             }
             ratios.push(r);
         }
+        let skipped = if format == ROUND_FORMAT_V2 { u32::from_le_bytes(take(4)?.try_into().unwrap()) } else { 0 };
         if !rest.is_empty() {
             return Err("challenge round: trailing bytes".into());
         }
-        Ok(Self { issued, pending: BTreeSet::new(), ratios })
+        Ok(Self { issued, pending: BTreeSet::new(), ratios, skipped })
     }
 }
 
 const ROUND_FORMAT_V1: u8 = 0x01;
+const ROUND_FORMAT_V2: u8 = 0x02;
 
 // ── Building a reference set from engine runs ──
 //
@@ -1043,9 +1070,37 @@ mod tests {
         bad[0] = 9;
         assert!(ChallengeRound::from_bytes(&bad).is_err());
         let mut nan = good;
-        let at = nan.len() - 8;
-        nan[at..].copy_from_slice(&f64::NAN.to_le_bytes());
+        let at = nan.len() - 12; // the last ratio, before the skip count
+        nan[at..at + 8].copy_from_slice(&f64::NAN.to_le_bytes());
         assert!(ChallengeRound::from_bytes(&nan).is_err());
+    }
+
+    /// Review round 4 L4-3: a round's declined texts are kept with it (and reset by a verdict); a
+    /// round saved before they were (format 0x01) reads with none.
+    #[test]
+    fn a_rounds_declined_texts_survive_saving_and_old_rows_still_read() {
+        let s = set(8, 4);
+        let mut r = ChallengeRound::new();
+        let a = r.next_text(&s, |_| 0).unwrap().clone();
+        r.abandon(&a.id);
+        assert_eq!(r.note_skipped(), 1);
+        let restored = ChallengeRound::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(restored.skipped(), 1);
+        // The same round as format 0x01 (no skip count).
+        let mut v1 = r.to_bytes();
+        v1[0] = 0x01;
+        v1.truncate(v1.len() - 4);
+        let old = ChallengeRound::from_bytes(&v1).unwrap();
+        assert_eq!((old.skipped(), old.issued_count()), (0, 1));
+        // A verdict starts the next round with none.
+        let mut r = ChallengeRound::new();
+        r.note_skipped();
+        let mut verdict = None;
+        while verdict.is_none() {
+            let t = r.next_text(&s, |_| 0).unwrap().clone();
+            verdict = r.record(&s, &t.id, &t.logprobs).unwrap();
+        }
+        assert_eq!(r.skipped(), 0);
     }
 
     #[test]
