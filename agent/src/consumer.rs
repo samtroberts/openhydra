@@ -612,6 +612,29 @@ struct Strike {
     retries: u32,
 }
 
+/// `(peer, model)` pairs whose reputation, or audit history, this consumer keeps (round 8 T8-8).
+const MAX_TRACKED_PAIRS: usize = 8192;
+/// A pair untouched this long has decayed to nothing: the first to go when the cap is reached.
+const STALE_PAIR_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Make room in `map` for a new pair once it holds [`MAX_TRACKED_PAIRS`]: every pair untouched for
+/// [`STALE_PAIR_MS`] (by `last`), else the least recently touched one not `kept`. Returns the keys
+/// removed (to forget them on disk too).
+fn evict_for_new_pair<V>(map: &mut HashMap<String, V>, last: impl Fn(&V) -> u64, kept: impl Fn(&V) -> bool, now: u64) -> Vec<String> {
+    if map.len() < MAX_TRACKED_PAIRS {
+        return Vec::new();
+    }
+    let mut gone: Vec<String> =
+        map.iter().filter(|(_, v)| now.saturating_sub(last(v)) > STALE_PAIR_MS && !kept(v)).map(|(k, _)| k.clone()).collect();
+    if gone.is_empty() {
+        gone.extend(map.iter().filter(|(_, v)| !kept(v)).min_by_key(|(_, v)| last(v)).map(|(k, _)| k.clone()));
+    }
+    for k in &gone {
+        map.remove(k);
+    }
+    gone
+}
+
 /// A model's recent requests a probe takes its shape from (at most, by count).
 const TRAFFIC_WINDOW: u32 = 64;
 /// The share of a model's recent requests that must be greedy (temperature 0) before this consumer
@@ -2085,6 +2108,15 @@ impl ConsumerNode {
         self.reputation.lock().ok()?.get(&key).map(|t| t.score_at(now_ms))
     }
 
+    /// Whether this consumer failed `(peer_id, model_key)` in an audit within [`AUDIT_FAIL_FLOOR_MS`].
+    fn failed_audit_recently(&self, peer_id: &str, model_key: &str, now_ms: u64) -> bool {
+        self.audit_stats
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&reputation_key(peer_id, model_key)).map(|s| s.failed_within(now_ms, AUDIT_FAIL_FLOOR_MS)))
+            .unwrap_or(false)
+    }
+
     /// The achieved [`AuthenticityTier`] this consumer has established for `(peer_id, model_key)`
     /// from its own redundant-exec audit history (UNIFIED_TRUST_STACK Increment 3 — the routing
     /// gate's resolver). Uses the **decayed** earned reputation (the live trust the router already
@@ -2245,11 +2277,15 @@ impl ConsumerNode {
         // Per-(peer, model) since Phase 4a: an outcome moves trust for THIS model only. A provider
         // that farms trust on a cheap model earns nothing toward a bigger one it later claims.
         let key = reputation_key(peer_id, model_key);
+        let mut evicted = Vec::new();
         let snapshot = {
             let mut map = match self.reputation.lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
+            if !map.contains_key(&key) {
+                evicted = evict_for_new_pair(&mut map, |t| t.last_update_ms(), |_| false, now_ms);
+            }
             let tracker = map
                 .entry(key.clone())
                 .or_insert_with(|| ReputationTracker::new(now_ms));
@@ -2258,6 +2294,9 @@ impl ConsumerNode {
         };
         // Persist outside the lock (don't hold the Mutex across the redb write).
         if let Some(store) = &self.store {
+            for gone in &evicted {
+                let _ = store.remove_reputation(gone);
+            }
             if let Err(e) = store.put_reputation(&key, &snapshot) {
                 tracing::debug!(error = %e, peer_id, model = model_key, "reputation persist failed");
             }
@@ -2283,11 +2322,16 @@ impl ConsumerNode {
     /// escalation over unpersisted state would reset every restart and mislead — review state-F4).
     fn record_audit(&self, peer_id: &str, model_key: &str, class: AuditClass, real_traffic: bool, now_ms: u64) {
         let key = reputation_key(peer_id, model_key);
+        let mut evicted = Vec::new();
         let snapshot = {
             let mut m = match self.audit_stats.lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
+            if !m.contains_key(&key) {
+                // A recent failure is never what makes room: it floors that provider.
+                evicted = evict_for_new_pair(&mut m, |s| s.last_update_ms(), |s| s.failed_within(now_ms, AUDIT_FAIL_FLOOR_MS), now_ms);
+            }
             let s = m.entry(key.clone()).or_insert_with(|| AuditStats::new(now_ms));
             match class {
                 AuditClass::Pass if real_traffic => s.record_traffic_pass(now_ms),
@@ -2296,6 +2340,9 @@ impl ConsumerNode {
             s.to_bytes()
         };
         if let Some(store) = &self.store {
+            for gone in &evicted {
+                let _ = store.remove_audit_stats(gone);
+            }
             if let Err(e) = store.put_audit_stats(&key, &snapshot) {
                 tracing::debug!(error = %e, peer_id, model = model_key, "audit stats persist failed");
             }
@@ -3972,13 +4019,7 @@ impl ConsumerNode {
                 .iter()
                 .filter(|p| !last.contains_key(&reputation_key(&p.state_id, rep_model_key(&p.canonical_model_id, &p.model_id))))
                 .collect();
-            let pick = due.choose(&mut rand::thread_rng()).map(|p| (*p).clone());
-            if let Some(p) = &pick {
-                if last.len() < MAX_QUALIFY_RECORDS {
-                    last.insert(reputation_key(&p.state_id, rep_model_key(&p.canonical_model_id, &p.model_id)), now);
-                }
-            }
-            pick
+            due.choose(&mut rand::thread_rng()).map(|p| (*p).clone())
         };
         if let Some(provider) = pick {
             use std::sync::atomic::Ordering;
@@ -3988,6 +4029,14 @@ impl ConsumerNode {
             }
             let running = SettleSlot(Arc::clone(&self.qualifying));
             let Some(slot) = self.audit_slot() else { return };
+            // Its interval starts once its audit does (round 8 T8-6): a pick that found no slot isn't
+            // spent.
+            {
+                let mut last = self.qualified_at.lock().unwrap_or_else(|e| e.into_inner());
+                if last.len() < MAX_QUALIFY_RECORDS {
+                    last.insert(reputation_key(&provider.state_id, rep_model_key(&provider.canonical_model_id, &provider.model_id)), now);
+                }
+            }
             self.qualified_per_model
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4029,7 +4078,7 @@ impl ConsumerNode {
             let _pending = pending;
             std::thread::sleep(delay);
             for _ in 0..FOLLOW_UP_TRIES {
-                if let Some(slot) = node.audit_slot() {
+                if let Some(slot) = node.audit_slot_for(true) {
                     let _slot = slot;
                     match node.audit(&model, &provider, true, true) {
                         Ok((how, report)) => tracing::info!(model, subject = %provider.state_id, how, verdict = ?report.verdict,
@@ -4044,14 +4093,22 @@ impl ConsumerNode {
         });
     }
 
-    /// A slot to run an audit in, while fewer than [`MAX_AUDITS_IN_FLIGHT`] run.
-    fn audit_slot(&self) -> Option<AuditSlot> {
+    /// A slot to run an audit in, while fewer than [`MAX_AUDITS_IN_FLIGHT`] run; the last one is kept
+    /// for follow-ups (`follow_up`), which resolve strikes and must not lose it to sampled audits
+    /// (round 8 T8-7).
+    fn audit_slot_for(&self, follow_up: bool) -> Option<AuditSlot> {
         use std::sync::atomic::Ordering;
-        if self.audits_in_flight.fetch_add(1, Ordering::Relaxed) >= MAX_AUDITS_IN_FLIGHT {
+        let limit = if follow_up { MAX_AUDITS_IN_FLIGHT } else { MAX_AUDITS_IN_FLIGHT - 1 };
+        if self.audits_in_flight.fetch_add(1, Ordering::Relaxed) >= limit {
             self.audits_in_flight.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         Some(AuditSlot(Arc::clone(&self.audits_in_flight)))
+    }
+
+    /// A slot for a sampled or qualifying audit (see [`Self::audit_slot_for`]).
+    fn audit_slot(&self) -> Option<AuditSlot> {
+        self.audit_slot_for(false)
     }
 
     /// Audit `provider` for `model` in the background, if a slot is free (`why` is for the log).
@@ -4428,6 +4485,9 @@ impl ConsumerNode {
             .iter()
             .filter(|c| c.libp2p_peer_id != subject.libp2p_peer_id)
             .filter(|c| !self.refused_payment(&c.libp2p_peer_id, &c.model_id, now) || self.paid_recently(&c.libp2p_peer_id, now))
+            // Not one this consumer failed in an audit within the floor's day: it isn't a partner to
+            // judge others by, nor to send user prompts to (round 8 T8-7).
+            .filter(|c| !self.failed_audit_recently(&c.state_id, rep_model_key(&c.canonical_model_id, &c.model_id), now))
             .collect();
         {
             use rand::seq::SliceRandom;
@@ -5681,6 +5741,24 @@ mod tests {
         assert!(matches!(provider_error(SHED_REPLY.into(), true), AdapterError::Overloaded(_)));
         assert!(matches!(provider_error(SHED_REPLY.into(), false), AdapterError::Provider(_)));
         assert!(matches!(provider_error("engine down".into(), true), AdapterError::Provider(_)));
+    }
+
+    /// Round 8 T8-8: the pair maps are bounded; stale pairs go first, then the least recent one,
+    /// never one kept (a recent failure).
+    #[test]
+    fn tracked_pairs_are_bounded() {
+        let now = 100 * STALE_PAIR_MS;
+        let mut m: HashMap<String, u64> = (0..MAX_TRACKED_PAIRS).map(|i| (format!("p{i}"), now - i as u64)).collect();
+        m.insert("p5".into(), now - 2 * STALE_PAIR_MS); // stale
+        let gone = evict_for_new_pair(&mut m, |v| *v, |_| false, now);
+        assert_eq!(gone, vec!["p5".to_string()]);
+        m.insert("new".into(), now);
+        // None stale: the least recent goes, unless kept.
+        let oldest = format!("p{}", MAX_TRACKED_PAIRS - 1);
+        let gone = evict_for_new_pair(&mut m, |v| *v, |v| *v == now - (MAX_TRACKED_PAIRS as u64 - 1), now);
+        assert_eq!(gone.len(), 1);
+        assert_ne!(gone[0], oldest, "a kept pair isn't what makes room");
+        assert!(m.len() < MAX_TRACKED_PAIRS);
     }
 
     /// Round 8 L8-1: runs cut short by timeouts or dropped connections never count against a

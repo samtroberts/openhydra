@@ -376,6 +376,17 @@ impl Store {
         Ok(got.map(|g| g.value().to_vec()))
     }
 
+    /// Forget the reputation snapshot under `key` (an evicted `(peer, model)`).
+    pub fn remove_reputation(&self, key: &str) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PEER_REPUTATION).map_err(StoreError::from)?;
+            t.remove(key).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
+    }
+
     // ── PEER_CREDIT (M2.3 give/take) ──
 
     /// Checkpoint a peer's give/take credit snapshot blob.
@@ -435,6 +446,17 @@ impl Store {
         let t = rtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
         let got = t.get(key).map_err(StoreError::from)?;
         Ok(got.map(|g| g.value().to_vec()))
+    }
+
+    /// Forget the [`AuditStats`] snapshot under `key` (an evicted `(peer, model)`).
+    pub fn remove_audit_stats(&self, key: &str) -> Result<(), StoreError> {
+        let wtx = self.db.begin_write().map_err(StoreError::from)?;
+        {
+            let mut t = wtx.open_table(PEER_AUDIT_STATS).map_err(StoreError::from)?;
+            t.remove(key).map_err(StoreError::from)?;
+        }
+        wtx.commit().map_err(StoreError::from)?;
+        Ok(())
     }
 
     /// Rehydrate the in-memory per-`(peer, model)` audit-history map on boot (Phase 4), keyed by

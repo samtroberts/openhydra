@@ -961,8 +961,15 @@ fn spawn_byok_worker(
             seed: None,
             stop: Default::default(),
         };
+        // The client left (its channel closed): the hosted call stops too (round 8 G8-5).
+        let stop = request.stop.clone();
+        if tx.is_closed() {
+            stop.set();
+        }
         let mut on_delta = |d: &str| {
-            let _ = tx.send(GatewayEvent::Delta(d.to_string()));
+            if tx.send(GatewayEvent::Delta(d.to_string())).is_err() {
+                stop.set();
+            }
         };
         let result = match provider {
             ByokProvider::Anthropic => crate::live_anthropic(&base_url, &key)

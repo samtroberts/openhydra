@@ -317,6 +317,11 @@ impl AuditStats {
     }
 
     /// When the most recent failed audit was, if any.
+    /// Unix-ms its history was last updated (by an audit recorded, or decayed).
+    pub fn last_update_ms(&self) -> u64 {
+        self.last_update_ms
+    }
+
     pub fn last_failed_ms(&self) -> Option<u64> {
         (self.last_failed_ms > 0).then_some(self.last_failed_ms)
     }
