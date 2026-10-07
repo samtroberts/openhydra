@@ -12,6 +12,11 @@
 //! This is camouflage, not secrecy: the list is public, so a provider that checks every prompt
 //! against it can still spot these. Replaying real traffic (where the consumer allows it) is the
 //! audit a provider can't tell apart.
+//!
+//! Fresher (review P1): questions written for this gateway by a model ([`writer_request`],
+//! [`parse_questions`]), then changed here before use ([`finish`]), so no prompt an audit sends is
+//! on any list, and the model that wrote the raw question never sees the final one. The templates
+//! are the fallback.
 
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -158,6 +163,83 @@ pub fn random_prompt<R: Rng + ?Sized>(rng: &mut R) -> String {
     }
 }
 
+/// Ways a person asks, for [`writer_request`].
+const STYLES: &[&str] = &[
+    "casual and short",
+    "detailed, with some background about their situation",
+    "a beginner's question",
+    "an expert's precise question",
+    "slightly informal, with a typo or two",
+    "polite and formal",
+    "a request for step-by-step help",
+    "a comparison between two options",
+];
+
+/// What a gateway asks a model, to write questions it can audit with: ordinary questions about a
+/// random subject, in random styles, one per line.
+pub fn writer_request<R: Rng + ?Sized>(rng: &mut R) -> String {
+    let subject = if rng.gen_bool(0.4) {
+        format!("programming in {}", LANGS.choose(rng).expect("non-empty"))
+    } else {
+        TOPICS.choose(rng).expect("non-empty").to_string()
+    };
+    let style = STYLES.choose(rng).expect("non-empty");
+    format!(
+        "Write 8 different questions a person might ask an AI assistant about {subject}. Make them {style}, \
+         and vary their length. Write only the questions, one per line, without numbering or quotes."
+    )
+}
+
+/// The questions in a writer's answer: one per line, list marks and quotes dropped, each 15 to 400
+/// characters, no repeats.
+pub fn parse_questions(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .map(|l| {
+            l.trim()
+                .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | '•' | ' '))
+                .trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace())
+                .to_string()
+        })
+        .filter(|q| (15..=400).contains(&q.chars().count()) && !q.starts_with("Here are") && seen.insert(q.to_lowercase()))
+        .collect()
+}
+
+/// Openings a person might put before a question.
+const OPENINGS: &[&str] = &["", "", "", "Quick question: ", "Hi! ", "Hey, ", "Can you help me? ", "I was wondering: "];
+/// Details a person might add after it.
+const DETAILS: &[&str] = &[
+    "",
+    "",
+    " I'm fairly new to this.",
+    " Please keep it short.",
+    " An example would help.",
+    " This is for a project I'm working on.",
+    " I've read a bit about it already.",
+    " Thanks in advance!",
+];
+
+/// A prompt finished here from the raw questions: one of them, or two joined, with an opening and a
+/// detail of our own, so the model that wrote the raw questions never sees the final text. Takes the
+/// questions it uses from `raw`; `None` when it is empty.
+pub fn finish<R: Rng + ?Sized>(raw: &mut std::collections::VecDeque<String>, rng: &mut R) -> Option<String> {
+    let first = raw.pop_front()?;
+    let body = match raw.front() {
+        Some(_) if rng.gen_bool(0.35) => {
+            let second = raw.pop_front().expect("checked");
+            format!("{first} Also, {}{}", second[..1].to_lowercase(), &second[1..])
+        }
+        _ => first,
+    };
+    let opening = OPENINGS.choose(rng).expect("non-empty");
+    let mut detail = *DETAILS.choose(rng).expect("non-empty");
+    // Never exactly what the writer wrote.
+    while opening.is_empty() && detail.is_empty() && !body.contains(" Also, ") {
+        detail = DETAILS.choose(rng).expect("non-empty");
+    }
+    Some(format!("{opening}{body}{detail}"))
+}
+
 /// How many distinct prompts [`random_prompt`] can produce.
 #[cfg(test)]
 fn variations() -> usize {
@@ -178,5 +260,29 @@ mod tests {
             assert!(!p.contains('{') && !p.contains('}'), "unfilled template: {p}");
             assert!(!p.to_lowercase().contains("verification") && !p.to_lowercase().contains("probe"));
         }
+    }
+
+    #[test]
+    fn a_writers_questions_are_parsed_and_finished_into_new_text() {
+        let answer = "Here are 8 questions:\n1. How do I sort a list in Python?\n2) What's a decorator in Python, really?\n\
+                      - \"Why is my loop so slow?\"\n* ok\n1. How do I sort a list in Python?";
+        let qs = parse_questions(answer);
+        assert_eq!(qs, vec!["How do I sort a list in Python?", "What's a decorator in Python, really?", "Why is my loop so slow?"]);
+        let mut rng = rand::thread_rng();
+        let mut raw: std::collections::VecDeque<String> = qs.iter().cloned().collect();
+        let mut finished = Vec::new();
+        while let Some(p) = finish(&mut raw, &mut rng) {
+            finished.push(p);
+        }
+        assert!(!finished.is_empty() && raw.is_empty(), "every raw question used once");
+        // Each finished prompt contains a raw question but is never just one (no prompt the writer saw).
+        for _ in 0..500 {
+            let mut raw: std::collections::VecDeque<String> = qs.iter().cloned().collect();
+            let p = finish(&mut raw, &mut rng).unwrap();
+            assert!(qs.iter().any(|q| p.contains(q.as_str()) || p.contains(&q[1..])));
+            assert!(!qs.contains(&p), "unchanged from the writer's: {p}");
+        }
+        let req = writer_request(&mut rng);
+        assert!(req.contains("one per line") && !req.to_lowercase().contains("audit"));
     }
 }

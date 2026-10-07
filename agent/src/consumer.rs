@@ -444,6 +444,25 @@ const REPLAY_MAX_PROMPT_BYTES: usize = 64 * 1024;
 const REPLAY_KEEP_CHARS: usize = AUDIT_COMPARE_CHARS;
 const MIN_REPLAY_ANSWER_CHARS: usize = 64;
 
+/// The longest answer asked of a probe-question writer (about 8 short questions).
+const WRITER_MAX_TOKENS: u32 = 400;
+/// Finished probe prompts remembered as sent (forgotten all at once past this; the space of
+/// finished prompts is far larger, so a repeat after that is still unlikely).
+const MAX_PROBES_REMEMBERED: usize = 8192;
+
+/// Who writes probe questions (P1), among `candidates` (providers of one model): our own provider
+/// (`own`, the desktop's) whenever it is one of them, the prompt then never leaving this machine;
+/// otherwise one at random that serves none of the audited model (`audited`), so the writer can't
+/// recognise what it wrote when it later comes to it as an audit.
+fn writer_from(candidates: &[SelectedProvider], own: Option<&str>, audited: &std::collections::HashSet<String>) -> Option<SelectedProvider> {
+    use rand::seq::SliceRandom;
+    if let Some(mine) = candidates.iter().find(|c| Some(c.libp2p_peer_id.as_str()) == own) {
+        return Some(mine.clone());
+    }
+    let outside: Vec<&SelectedProvider> = candidates.iter().filter(|c| !audited.contains(&c.libp2p_peer_id)).collect();
+    outside.choose(&mut rand::thread_rng()).map(|c| (*c).clone())
+}
+
 /// A model's recent requests a probe takes its shape from (at most, by count).
 const TRAFFIC_WINDOW: u32 = 64;
 /// The share of a model's recent requests that must be greedy (temperature 0) before this consumer
@@ -913,6 +932,38 @@ impl TrafficShape {
     }
 }
 
+/// Keep only the failures that hold up: each provider an audit outvoted (`Failed`) is asked again
+/// (`rerun`); if its second answer agrees with the majority's, the first was a fluke and it is
+/// neither failed nor honored. A re-ask without an answer leaves the failure (a provider must not
+/// escape by not answering twice).
+fn confirm_failures(
+    mut report: AuditReport,
+    results: &[(String, Result<String, String>)],
+    rerun: &mut dyn FnMut(&str) -> Option<String>,
+) -> AuditReport {
+    let answer_of = |peer: &str| results.iter().find(|(p, _)| p == peer).and_then(|(_, r)| r.as_ref().ok());
+    let majority: Vec<&String> = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| *o == VerificationOutcome::Honored)
+        .filter_map(|(p, _)| answer_of(p))
+        .collect();
+    if majority.is_empty() {
+        return report;
+    }
+    let failed: Vec<String> =
+        report.outcomes.iter().filter(|(_, o)| *o == VerificationOutcome::Failed).map(|(p, _)| p.clone()).collect();
+    for peer in failed {
+        if let Some(again) = rerun(&peer) {
+            if majority.iter().any(|m| openhydra_protocol::verify::agrees(m, &again)) {
+                tracing::info!(peer = %peer, "audit: an outvoted provider agreed when asked again; not held against it");
+                report.outcomes.retain(|(p, _)| p != &peer);
+            }
+        }
+    }
+    report
+}
+
 /// The part of an answer an audit compares ([`AUDIT_COMPARE_CHARS`]).
 fn compared(answer: &str) -> String {
     answer.chars().take(AUDIT_COMPARE_CHARS).collect()
@@ -1227,6 +1278,10 @@ pub struct ConsumerNode {
     /// audit can tell a provider that just served us at our price refusing to be paid from one whose
     /// price we don't meet (review B1).
     settle_record: Mutex<HashMap<String, (u64, u64)>>,
+    /// Questions written for this gateway's probes (P1), not yet used; finished locally before use.
+    probe_pool: Mutex<std::collections::VecDeque<String>>,
+    /// Hashes of the finished probe prompts already sent: none is sent twice.
+    probe_sent: Mutex<std::collections::HashSet<u64>>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -1281,6 +1336,8 @@ impl ConsumerNode {
             replays: Mutex::new(Vec::new()),
             traffic: Mutex::new(HashMap::new()),
             settle_record: Mutex::new(HashMap::new()),
+            probe_pool: Mutex::new(std::collections::VecDeque::new()),
+            probe_sent: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1596,6 +1653,8 @@ impl ConsumerNode {
             replays: Mutex::new(Vec::new()),
             traffic: Mutex::new(HashMap::new()),
             settle_record: Mutex::new(HashMap::new()),
+            probe_pool: Mutex::new(std::collections::VecDeque::new()),
+            probe_sent: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -3219,15 +3278,110 @@ impl ConsumerNode {
         if let Some(entry) = kept {
             return self.audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str())).map(|r| ("replay", r));
         }
-        let probe = {
-            let traffic = self.traffic.lock().unwrap_or_else(|e| e.into_inner());
-            traffic.get(model).and_then(|t| t.probe(crate::audit_prompts::random_prompt(&mut rand::thread_rng())))
-        };
+        // A probe only where this consumer's traffic allows one (checked first: writing it costs).
+        let shape = self.traffic.lock().unwrap_or_else(|e| e.into_inner()).get(model).cloned();
+        let probe = shape.filter(|t| t.probe(String::new()).is_some()).and_then(|t| {
+            // A question written for this audit and finished here (P1), else a template's.
+            let prompt = self
+                .fresh_probe_prompt(model)
+                .unwrap_or_else(|| crate::audit_prompts::random_prompt(&mut rand::thread_rng()));
+            t.probe(prompt)
+        });
         match probe {
             Some(request) => self.audit_model(model, &request, provider, None).map(|r| ("probe", r)),
             None => Err(AdapterError::Route(format!(
                 "no audit for '{model}': nothing to replay, and too few greedy requests to probe like them"
             ))),
+        }
+    }
+
+    /// A probe prompt written for this audit (P1): taken from questions a model wrote for this
+    /// gateway (refilled when low), finished here so the writer never sees it, and never sent twice.
+    /// `None` when no writer could be had (the caller falls back to the templates).
+    fn fresh_probe_prompt(self: &Arc<Self>, model: &str) -> Option<String> {
+        if self.probe_pool.lock().unwrap_or_else(|e| e.into_inner()).len() < 2 {
+            let written = self.write_probe_questions(model);
+            self.probe_pool.lock().unwrap_or_else(|e| e.into_inner()).extend(written);
+        }
+        let mut rng = rand::thread_rng();
+        loop {
+            let prompt = crate::audit_prompts::finish(&mut self.probe_pool.lock().unwrap_or_else(|e| e.into_inner()), &mut rng)?;
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                prompt.hash(&mut h);
+                h.finish()
+            };
+            let mut sent = self.probe_sent.lock().unwrap_or_else(|e| e.into_inner());
+            if sent.len() >= MAX_PROBES_REMEMBERED {
+                sent.clear();
+            }
+            if sent.insert(digest) {
+                return Some(prompt);
+            }
+        }
+    }
+
+    /// Questions to probe `model` with, written by a model (P1). Our own provider when it serves the
+    /// audited model or another one (the prompts never leave this machine, and it costs nothing);
+    /// otherwise a provider of another model that serves none of the audited model, paid like any
+    /// serve. Empty when neither answers.
+    fn write_probe_questions(self: &Arc<Self>, model: &str) -> Vec<String> {
+        let now = now_unix_ms();
+        let ranked = |m: &str| -> Vec<SelectedProvider> {
+            self.net
+                .discover(m)
+                .map(|peers| rank_providers_with_reputation(&peers, "", self.tier, &|pid, mkey| self.earned_reputation(pid, mkey, now)))
+                .unwrap_or_default()
+        };
+        let audited = ranked(model);
+        let audited_ids: std::collections::HashSet<String> = audited.iter().map(|p| p.libp2p_peer_id.clone()).collect();
+        if let Some(writer) = writer_from(&audited, self.self_provider.as_deref(), &audited_ids) {
+            let written = self.write_questions(&writer);
+            tracing::info!(model, writer = %writer.peer_id, own = self.is_self_serve(&writer.libp2p_peer_id), n = written.len(), "probe questions written");
+            return written;
+        }
+        let mut others: Vec<String> = self.net.known_models().unwrap_or_default().into_iter().filter(|m| m != model).collect();
+        {
+            use rand::seq::SliceRandom;
+            others.shuffle(&mut rand::thread_rng());
+        }
+        for other in others.iter().take(3) {
+            if let Some(writer) = writer_from(&ranked(other), self.self_provider.as_deref(), &audited_ids) {
+                let written = self.write_questions(&writer);
+                tracing::info!(model, writer = %writer.peer_id, own = self.is_self_serve(&writer.libp2p_peer_id), via = %other, n = written.len(), "probe questions written");
+                if !written.is_empty() {
+                    return written;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Ask `writer` for a batch of questions ([`crate::audit_prompts::writer_request`]), sampled (not
+    /// greedy: they should vary), paid like any serve unless it is our own provider.
+    fn write_questions(self: &Arc<Self>, writer: &SelectedProvider) -> Vec<String> {
+        let ask = crate::audit_prompts::writer_request(&mut rand::thread_rng());
+        let messages = vec![ChatMessage { role: "user".into(), content: ask, ..Default::default() }];
+        let request = self.serve_request_for(writer, &messages, Some(WRITER_MAX_TOKENS), Some(0.9), &[], Some(false));
+        let mut text = String::new();
+        let mut delivered = crate::serve::DeliveredText::default();
+        let exchange = self.exchange(&writer.libp2p_peer_id, &request, &|| false, &mut |d| {
+            delivered.push(d);
+            text.push_str(d);
+        });
+        match exchange.result {
+            Ok(summary) => {
+                if !self.is_self_serve(&writer.libp2p_peer_id) && summary.ok && summary.tokens > 0 {
+                    let tokens = crate::serve::billable_tokens(summary.tokens, request.max_tokens, delivered.units());
+                    self.settle_receipt(writer, tokens, request.nonce);
+                }
+                crate::audit_prompts::parse_questions(&text)
+            }
+            Err(e) => {
+                tracing::debug!(writer = %writer.peer_id, error = %e, "couldn't get probe questions written");
+                Vec::new()
+            }
         }
     }
 
@@ -3354,6 +3508,9 @@ impl ConsumerNode {
         let mut results: Vec<(String, Result<String, String>)> = Vec::with_capacity(3);
         // Model keys of everyone audited, for recording outcomes.
         let mut key_of: HashMap<String, String> = HashMap::new();
+        // Everyone asked, by state id, for confirming a provider outvoted.
+        let who: std::cell::RefCell<HashMap<String, SelectedProvider>> = std::cell::RefCell::new(HashMap::new());
+        who.borrow_mut().insert(subject.state_id.clone(), subject.clone());
         let first = match served {
             Some(answer) => Ok(answer.to_string()),
             None => match self.audit_serve(subject, request) {
@@ -3387,6 +3544,7 @@ impl ConsumerNode {
                 chosen.push(nets);
                 chosen_peers.insert(provider.libp2p_peer_id.clone());
                 key_of.insert(provider.state_id.clone(), rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string());
+                who.borrow_mut().insert(provider.state_id.clone(), provider.clone());
                 results.push((provider.state_id.clone(), out.map(|a| compared(&a)).map_err(|e| e.to_string())));
                 return;
             }
@@ -3409,6 +3567,19 @@ impl ConsumerNode {
             ask(&mut results, &mut key_of);
             if results.len() == 3 {
                 report = resolve_audit(&results);
+            }
+        }
+        // An outvoted provider is asked once more before it is failed: one divergent answer can be a
+        // fluke (seen live, among honest providers on one engine); a provider serving another model
+        // diverges again. A re-ask that gets no answer leaves the failure standing.
+        let report = confirm_failures(report, &results, &mut |peer| {
+            let provider = who.borrow().get(peer).cloned()?;
+            self.audit_serve(&provider, request).ok().map(|a| compared(&a))
+        });
+        // What disagreed, for whoever looks into an audit that didn't agree.
+        if report.verdict != RedundantVerdict::Agree {
+            for (peer, answer) in &results {
+                tracing::debug!(model, peer = %peer, answer = ?answer, "audit answer");
             }
         }
 
@@ -4552,6 +4723,41 @@ mod tests {
         });
         assert!(matches!(out, Err(StreamFail::Cancelled)));
         assert_eq!((seen.get(), offset), (6, 6), "stopped after the slice that told it to, at its offset");
+    }
+
+    #[test]
+    fn probe_questions_are_written_locally_or_by_a_provider_outside_the_audit() {
+        let (a, b, c, own) = (selected("A"), selected("B"), selected("C"), selected("OWN"));
+        let audited: std::collections::HashSet<String> = ["A".to_string(), "B".to_string()].into();
+        // Our own provider whenever it is a candidate, even one serving the audited model.
+        assert_eq!(writer_from(&[a.clone(), own.clone()], Some("OWN"), &audited).unwrap().libp2p_peer_id, "OWN");
+        // Otherwise never a provider of the audited model.
+        for _ in 0..50 {
+            assert_eq!(writer_from(&[a.clone(), b.clone(), c.clone()], None, &audited).unwrap().libp2p_peer_id, "C");
+        }
+        assert!(writer_from(&[a, b], Some("OWN"), &audited).is_none(), "nobody outside the audit: fall back to templates");
+    }
+
+    #[test]
+    fn an_outvoted_provider_is_failed_only_if_it_diverges_again() {
+        let good = "The quick brown fox jumps over the lazy dog, again and again, all afternoon.".to_string();
+        let odd = "Something else entirely, word after word, from the very first one onward.".to_string();
+        let results = vec![
+            ("A".to_string(), Ok(odd.clone())),
+            ("B".to_string(), Ok(good.clone())),
+            ("C".to_string(), Ok(good.clone())),
+        ];
+        let report = resolve_audit(&results);
+        assert!(report.outcomes.contains(&("A".into(), VerificationOutcome::Failed)));
+        // Agrees when asked again: a fluke, not held against it (and nobody else is affected).
+        let fluke = confirm_failures(report.clone(), &results, &mut |p| (p == "A").then(|| good.clone()));
+        assert!(!fluke.outcomes.iter().any(|(p, _)| p == "A"));
+        assert_eq!(fluke.outcomes.iter().filter(|(_, o)| *o == VerificationOutcome::Honored).count(), 2);
+        // Diverges again, or doesn't answer: the failure stands.
+        let again = confirm_failures(report.clone(), &results, &mut |_| Some(odd.clone()));
+        assert!(again.outcomes.contains(&("A".into(), VerificationOutcome::Failed)));
+        let silent = confirm_failures(report, &results, &mut |_| None);
+        assert!(silent.outcomes.contains(&("A".into(), VerificationOutcome::Failed)));
     }
 
     #[test]
