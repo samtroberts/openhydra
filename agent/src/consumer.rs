@@ -373,7 +373,7 @@ struct ProviderLogprob {
     /// fetching a new pack.
     /// With the pack's id when it is a registry first stage, so its continuation can still be
     /// fetched (review round 4 L4-4). At most [`MAX_RESUMES`].
-    resume: Mutex<HashMap<String, (Arc<LoadedReference>, Option<[u8; 16]>)>>,
+    resume: Mutex<HashMap<String, (Arc<LoadedReference>, Option<[u8; 16]>, u64)>>,
     /// Per `(peer, model)`: the text a run stopped on as busy, and since when (L4-1): a provider that
     /// stalls on the same text for [`STALL_EVASION_MS`] is dodging it.
     stalls: Mutex<HashMap<String, (String, u64)>>,
@@ -444,6 +444,8 @@ const FIRST_CONTACT_RELAYED_PER_HOUR: usize = 4;
 const STALL_EVASION_MS: u64 = 6 * 60 * 60 * 1000;
 /// Registry runs kept for resuming, at most (each holds its pack).
 const MAX_RESUMES: usize = 256;
+/// What a stall on the probe (no text pending) is recorded as.
+const PROBE_STALL: &str = "\0probe";
 
 /// How a log-prob run that ended `outcome` counts, given the stalls on record (`stalls`, by key: the
 /// text a run stopped on as busy, and since when) and the text this one stopped on (`pending`): busy
@@ -463,8 +465,11 @@ fn stall_outcome(
             }
             Some((on, _)) if on == id => outcome,
             _ => {
-                if stalls.len() >= MAX_RESUMES * 16 {
-                    stalls.clear();
+                if !stalls.contains_key(key) && stalls.len() >= MAX_RESUMES * 16 {
+                    // The oldest goes, not everyone's clock (R5L-6).
+                    if let Some(oldest) = stalls.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()) {
+                        stalls.remove(&oldest);
+                    }
                 }
                 stalls.insert(key.to_string(), (id.to_string(), now));
                 outcome
@@ -3449,7 +3454,7 @@ impl ConsumerNode {
             let budget_ok = || !first_contact || lp.spend_first_contact_pack(&network, now_unix_ms());
             let reference = match resumed {
                 // A registry run stopped with a text pending: carry on with the same pack.
-                Some((r, pack)) => {
+                Some((r, pack, _)) => {
                     from_registry = true;
                     first_pack = pack;
                     Some(r)
@@ -3512,14 +3517,23 @@ impl ConsumerNode {
             let mut round = lp.rounds.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).unwrap_or_default();
             // A fresh pack is one round's worth, so its round starts clean; a resumed one carries on.
             if from_registry && round.pending_text(&reference.set).is_none() {
+                // Texts it declined in the round so far still count (R5L-6).
+                let skipped = round.skipped();
                 round = ChallengeRound::new();
+                round.carry_skipped(skipped);
             }
             let switched = {
                 let mut status = lp.status.lock().unwrap_or_else(|e| e.into_inner());
                 let st = status.entry(key.clone()).or_default();
                 let tag = reference_tag(&reference.set);
-                // A row saved before tags named the identity is on this same reference (L4-8).
-                if st.reference == crate::prompt_score::legacy_reference_tag(&reference.set) {
+                // A row saved before tags named the identity is on this same reference (L4-8), unless
+                // another loaded reference shares that old tag with a different identity: then which
+                // one it was earned on can't be told (R5L-5).
+                let legacy = crate::prompt_score::legacy_reference_tag(&reference.set);
+                let ambiguous = lp.refs.iter().any(|r| {
+                    crate::prompt_score::legacy_reference_tag(&r.set) == legacy && r.set.identity != reference.set.identity
+                });
+                if st.reference == legacy && !ambiguous {
                     st.reference = tag;
                 }
                 st.switch_reference(tag, &mut round)
@@ -3576,16 +3590,20 @@ impl ConsumerNode {
                 }
             };
             let texts_used = round.issued_count() - issued_before;
+            // A first-contact round that issued nothing (busy, gone) didn't use its place (R5L-4).
+            if first_contact && texts_used == 0 && first_pack.is_none() && !from_registry {
+                lp.refund_first_contact_pack(&network);
+            }
             // Stopped with a text still pending on a registry pack: the next run resumes that pack,
             // and can still fetch its continuation.
             if from_registry && matches!(outcome, RoundOutcome::Busy | RoundOutcome::Incomplete(_)) && round.pending_text(&reference.set).is_some() {
                 let mut resume = lp.resume.lock().unwrap_or_else(|e| e.into_inner());
                 if resume.len() >= MAX_RESUMES {
-                    if let Some(k) = resume.keys().next().cloned() {
+                    if let Some(k) = resume.iter().min_by_key(|(_, (_, _, at))| *at).map(|(k, _)| k.clone()) {
                         resume.remove(&k);
                     }
                 }
-                resume.insert(key.clone(), (Arc::clone(&reference), resumable_pack));
+                resume.insert(key.clone(), (Arc::clone(&reference), resumable_pack, now_unix_ms()));
             }
             node.settle_logprob_round(&lp, &key, &peer_id, &model, &model_key, outcome, round, texts_used, Some(&reference.set.model_key));
         });
@@ -3627,8 +3645,12 @@ impl ConsumerNode {
                 logprob_retry_ms(*n)
             }
         };
-        // Busy on the same text since long enough ago is a stall, not a busy spell (L4-1).
-        let outcome = stall_outcome(&mut lp.stalls.lock().unwrap_or_else(|e| e.into_inner()), key, outcome, round.pending_id(), now);
+        // Busy on the same text since long enough ago is a stall, not a busy spell (L4-1). Busy on
+        // the probe counts the same way for a provider that has answered us before (R5L-1): a fair
+        // queue now gives each verifier its turn (`InflightGate::enter_waiting`), so a provider that
+        // stays "busy" for hours is choosing to.
+        let stalled_on = round.pending_id().map(str::to_string).or_else(|| answered.then(|| PROBE_STALL.to_string()));
+        let outcome = stall_outcome(&mut lp.stalls.lock().unwrap_or_else(|e| e.into_inner()), key, outcome, stalled_on.as_deref(), now);
         let effect = match &outcome {
             RoundOutcome::Verdict(v) => st.on_verdict_drawn(*v, now, 1.0 - rand::random::<f64>()),
             RoundOutcome::Incomplete(_) => st.on_no_verdict(answered, retry, now),

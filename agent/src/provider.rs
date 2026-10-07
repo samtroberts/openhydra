@@ -128,9 +128,12 @@ const MAX_RECENTLY_SERVED: usize = 4096;
 /// How long after we answered a verifier's challenge it counts as mid-round (see
 /// `Provider::scored_recently`): a round sends its next text within seconds.
 const IN_ROUND_MS: u64 = 2 * 60 * 1000;
-/// The least time between one peer's challenges on different models: switching the model scored
-/// can reload a side-scorer, which a peer must not be able to do back to back (review round 4 L4-7).
+/// One peer's challenges may cover at most [`SCORE_MODELS_PER_PEER`] models within this long: each
+/// model can need a side-scorer (re)load, which a peer must not be able to force back to back
+/// (review round 4 L4-7), while a gateway checking a few models of one provider isn't held up
+/// (review round 5, R5L-3).
 const SCORE_SWITCH_MIN_MS: u64 = 15 * 60 * 1000;
+const SCORE_MODELS_PER_PEER: usize = 3;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 /// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
 /// with many identities) keep the Secure Enclave signing nonstop.
@@ -1277,7 +1280,7 @@ pub struct Provider<A: EngineAdapter> {
     /// Peers with a prompt-scoring challenge being answered now (one at a time each), and per peer
     /// the model it last challenged and when (see [`SCORE_SWITCH_MIN_MS`]).
     scoring_now: Mutex<std::collections::HashSet<String>>,
-    score_models: Mutex<HashMap<String, (String, u64)>>,
+    score_models: Mutex<HashMap<String, Vec<(String, u64)>>>,
     /// Per-peer rate cap on prompt-scoring challenges (and model-info requests).
     score_rl: Arc<RateLimiter>,
     /// What the engine last reported for each model, keyed by handle — the source of the identity
@@ -3122,19 +3125,15 @@ impl<A: EngineAdapter> Provider<A> {
                 let Some(_one) = OneAtATime::enter(&self.scoring_now, source_peer) else {
                     return score_refusal("a challenge from you is already being scored, retry");
                 };
-                if let Some(model) = crate::prompt_score::challenge_model(&data[1..]) {
-                    let mut m = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
-                    match m.get(source_peer) {
-                        Some((last, at)) if *last != model && now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS => {
-                            return score_refusal("switched models too recently, retry");
-                        }
-                        _ => {}
-                    }
-                    if !m.contains_key(source_peer) && m.len() >= MAX_RECENTLY_SERVED {
-                        m.retain(|_, (_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS);
-                    }
-                    if m.contains_key(source_peer) || m.len() < MAX_RECENTLY_SERVED {
-                        m.insert(source_peer.to_string(), (model, now));
+                let model = crate::prompt_score::challenge_model(&data[1..]);
+                if let Some(model) = &model {
+                    let m = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
+                    let recent: Vec<&String> = m
+                        .get(source_peer)
+                        .map(|v| v.iter().filter(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS).map(|(n, _)| n).collect())
+                        .unwrap_or_default();
+                    if !recent.contains(&model) && recent.len() >= SCORE_MODELS_PER_PEER {
+                        return score_refusal("too many models challenged recently, retry");
                     }
                 }
                 let reply = handle_prompt_score_inbound(
@@ -3143,12 +3142,26 @@ impl<A: EngineAdapter> Provider<A> {
                     &self.score_gate,
                     &|model| self.policy.announce_globally(model),
                     in_round,
+                    crate::prompt_score::SCORE_QUEUE_WAIT,
                 );
                 if !crate::prompt_score::is_score_refusal(&reply) {
                     let mut m = self.scored_recently.lock().unwrap_or_else(|e| e.into_inner());
                     m.retain(|_, at| now.saturating_sub(*at) <= IN_ROUND_MS);
                     if m.len() < MAX_RECENTLY_SERVED {
                         m.insert(source_peer.to_string(), now);
+                    }
+                    drop(m);
+                    // A model counts toward the peer's recent ones once it was scored (R5L-3).
+                    if let Some(model) = model {
+                        let mut sm = self.score_models.lock().unwrap_or_else(|e| e.into_inner());
+                        if !sm.contains_key(source_peer) && sm.len() >= MAX_RECENTLY_SERVED {
+                            sm.retain(|_, v| v.iter().any(|(_, at)| now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS));
+                        }
+                        if sm.contains_key(source_peer) || sm.len() < MAX_RECENTLY_SERVED {
+                            let v = sm.entry(source_peer.to_string()).or_default();
+                            v.retain(|(n, at)| *n != model && now.saturating_sub(*at) < SCORE_SWITCH_MIN_MS);
+                            v.push((model, now));
+                        }
                     }
                 }
                 reply

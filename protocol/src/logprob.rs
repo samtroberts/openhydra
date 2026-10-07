@@ -447,6 +447,12 @@ impl ChallengeRound {
         self.skipped
     }
 
+    /// Carry `n` declined texts into a round that replaces one under way (a fresh registry pack
+    /// for the same provider): a new pack doesn't restore the allowance.
+    pub fn carry_skipped(&mut self, n: u32) {
+        self.skipped = n;
+    }
+
     /// The id of a text issued and still awaiting a reply, if any (the one a stalled run stopped on).
     pub fn pending_id(&self) -> Option<&str> {
         self.pending.iter().next().map(String::as_str)
@@ -457,6 +463,8 @@ impl ChallengeRound {
     pub fn reset_progress(&mut self) {
         self.ratios.clear();
         self.skipped = 0;
+        // Texts sent against the old reference are no longer awaited (review round 5, R5L-2).
+        self.pending.clear();
     }
 
     /// Ratios recorded so far in the current round.

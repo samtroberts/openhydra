@@ -128,11 +128,21 @@ fn response(status: u8, body: &[u8]) -> Vec<u8> {
     b
 }
 
-/// Caps how many challenges are scored at once, provider-wide.
+/// Caps how many challenges are scored at once, provider-wide, and queues the ones waiting for a
+/// slot first come, first served (see [`InflightGate::enter_waiting`]).
 #[derive(Debug, Default)]
 pub struct InflightGate {
     current: AtomicUsize,
+    /// Tickets of the challenges waiting for a slot, in arrival order.
+    queue: std::sync::Mutex<std::collections::VecDeque<u64>>,
+    next_ticket: std::sync::atomic::AtomicU64,
+    freed: std::sync::Condvar,
 }
+
+/// Challenges that may wait for a scoring slot at once; past it one is refused "busy" at once.
+pub const MAX_WAITING: usize = 8;
+/// How long a challenge waits in line for a slot before it is refused "busy".
+pub const SCORE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Holds one slot of an [`InflightGate`] until dropped.
 pub struct InflightSlot<'a>(&'a InflightGate);
@@ -140,6 +150,7 @@ pub struct InflightSlot<'a>(&'a InflightGate);
 impl Drop for InflightSlot<'_> {
     fn drop(&mut self) {
         self.0.current.fetch_sub(1, Ordering::AcqRel);
+        self.0.freed.notify_all();
     }
 }
 
@@ -162,6 +173,44 @@ impl InflightGate {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < cap).then_some(n + 1))
             .ok()
             .map(|_| InflightSlot(self))
+    }
+
+    /// [`try_enter_for`](Self::try_enter_for), waiting in line for up to `wait` when the slots are
+    /// taken: challenges get slots in the order they arrived, so challenges from others (each peer
+    /// has one at a time, see `Provider::scoring_now`) can't keep one verifier out (review round 5,
+    /// R5L-2). `None` when the line is full ([`MAX_WAITING`]) or the wait runs out.
+    pub fn enter_waiting(&self, in_round: bool, wait: std::time::Duration) -> Option<InflightSlot<'_>> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            if let Some(slot) = self.try_enter_for(in_round) {
+                return Some(slot);
+            }
+        }
+        if queue.len() >= MAX_WAITING {
+            return None;
+        }
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        queue.push_back(ticket);
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if queue.front() == Some(&ticket) {
+                if let Some(slot) = self.try_enter_for(in_round) {
+                    queue.pop_front();
+                    self.freed.notify_all();
+                    return Some(slot);
+                }
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                queue.retain(|t| *t != ticket);
+                self.freed.notify_all();
+                return None;
+            }
+            // Woken when a slot frees (or the line moves); re-checked at least this often, so a wake
+            // that raced the check is only a short delay.
+            let step = (deadline - now).min(std::time::Duration::from_millis(200));
+            queue = self.freed.wait_timeout(queue, step).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
 }
 
@@ -278,6 +327,7 @@ pub fn handle_prompt_score_inbound(
     gate: &InflightGate,
     scorable: &dyn Fn(&str) -> bool,
     in_round: bool,
+    wait: std::time::Duration,
 ) -> Vec<u8> {
     let Some(engine) = engine else {
         return score_refusal("prompt scoring not offered by this provider");
@@ -288,7 +338,7 @@ pub fn handle_prompt_score_inbound(
     if !scorable(&model) {
         return score_refusal("model not scorable here");
     }
-    let Some(_slot) = gate.try_enter_for(in_round) else {
+    let Some(_slot) = gate.enter_waiting(in_round, wait) else {
         return score_refusal("prompt scoring busy, retry");
     };
     match engine.score_prompt(&model, &ids) {
@@ -601,7 +651,7 @@ pub enum RoundOutcome {
 pub const MAX_SKIPPED_TEXTS: usize = 1;
 
 /// Busy / rate-limited refusals tolerated in a row before a run gives up.
-const MAX_BUSY_RETRIES: usize = 3;
+const MAX_BUSY_RETRIES: usize = 6;
 /// Retryable refusals [`probe_scoring`] waits through (with 2 s pauses, ~5 min): a side-scorer
 /// answers "warming up, retry" while it loads the model (a minute or two) and while another of the
 /// provider's models finishes its round first (a scorer holds one model at a time), and that must
@@ -1068,7 +1118,7 @@ mod tests {
     fn roundtrip(engine: Option<&dyn EngineAdapter>, gate: &InflightGate, model: &str, ids: &[u32]) -> Result<Vec<f32>, ScoreChallengeError> {
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
             assert_eq!(framed[0], PROMPT_SCORE_CHALLENGE);
-            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| m == "public", false))
+            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| m == "public", false, std::time::Duration::ZERO))
         };
         request_prompt_scores(&mut transport, model, ids)
     }
@@ -1108,7 +1158,7 @@ mod tests {
                 // Random ids each time, from the range every common vocabulary has.
                 let ids = decode_challenge(&framed[1..]).unwrap().1;
                 assert!(ids.len() == 16 && ids.iter().all(|&i| (1_000..31_000).contains(&i)));
-                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| m == "public", false))
+                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| m == "public", false, std::time::Duration::ZERO))
             };
             probe_scoring(&mut transport, "public", &mut || {})
         };
@@ -1128,12 +1178,38 @@ mod tests {
                 if sent <= busy_replies {
                     return Ok(score_refusal(if sent % 2 == 0 { "prompt scoring busy, retry" } else { "prompt scoring warming up, retry" }));
                 }
-                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true, false))
+                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true, false, std::time::Duration::ZERO))
             };
             let out = probe_scoring(&mut flaky, "public", &mut || pauses += 1);
             assert_eq!(out.is_none(), expect_ok, "{busy_replies} busy replies: {out:?}");
             assert_eq!(pauses, busy_replies.min(MAX_PROBE_RETRIES - 1));
         }
+    }
+
+    /// Review round 5 R5L-2: a challenge waits in line for a slot (first come, first served) rather
+    /// than being refused while others hold them; the line is bounded.
+    #[test]
+    fn challenges_wait_their_turn_for_a_slot() {
+        let gate = std::sync::Arc::new(InflightGate::new());
+        let a = gate.try_enter().unwrap();
+        let b = gate.try_enter().unwrap();
+        assert!(gate.enter_waiting(false, std::time::Duration::ZERO).is_none(), "no wait: busy");
+        let waiter = {
+            let gate = std::sync::Arc::clone(&gate);
+            std::thread::spawn(move || gate.enter_waiting(false, std::time::Duration::from_secs(5)).is_some())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(a);
+        assert!(waiter.join().unwrap(), "got the freed slot");
+        drop(b);
+        // The line holds MAX_WAITING; one more is refused at once.
+        let full = InflightGate::new();
+        let _x = full.try_enter().unwrap();
+        let _y = full.try_enter().unwrap();
+        full.queue.lock().unwrap().extend(1000..1000 + MAX_WAITING as u64);
+        let t = std::time::Instant::now();
+        assert!(full.enter_waiting(false, std::time::Duration::from_secs(5)).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -1166,13 +1242,13 @@ mod tests {
         let engine = Scorer { mode: "ok" };
         let good = encode_challenge("public", &[1, 2, 3]).unwrap();
         for cut in 0..good.len() - 1 {
-            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|_| true, false);
+            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|_| true, false, std::time::Duration::ZERO);
             assert!(reply.starts_with(SCORE_RESP_MAGIC));
             assert_eq!(reply[4], RESP_REFUSED);
         }
         let mut long = good.clone();
         long.push(0);
-        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|_| true, false)[4], RESP_REFUSED);
+        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|_| true, false, std::time::Duration::ZERO)[4], RESP_REFUSED);
     }
 
     #[test]
@@ -1235,7 +1311,7 @@ mod tests {
                 Ok(ids[1..].iter().map(|&t| -(t as f32) / 10.0 - self.0).collect())
             }
         }
-        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| m == "public", false))
+        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| m == "public", false, std::time::Duration::ZERO))
     }
 
     #[test]
