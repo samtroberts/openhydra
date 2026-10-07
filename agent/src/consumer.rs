@@ -577,6 +577,24 @@ fn writer_from(candidates: &[SelectedProvider], own: Option<&str>, audited: &std
     outside.choose(&mut rand::thread_rng()).map(|c| (*c).clone())
 }
 
+/// The most other models looked through for a probe writer with standing.
+const MAX_WRITER_MODELS_LOOKED_AT: usize = 256;
+
+/// Whether a provider whose reputation with us is `earned` may write probe questions: only serving
+/// us well raises a reputation to [`openhydra_protocol::award::R_MIN`], so a provider we don't know
+/// can't (round 8 T8-1).
+fn has_writer_standing(earned: Option<f64>) -> bool {
+    earned.is_some_and(|r| r >= openhydra_protocol::award::R_MIN)
+}
+
+/// An open strike (C3): when it was given, and the writer of the probe that gave it, when that was a
+/// provider other than ours (whose questions then can neither confirm nor clear it, round 8 T8-1/T8-4).
+#[derive(Debug, Clone, PartialEq)]
+struct Strike {
+    at: u64,
+    writer: Option<String>,
+}
+
 /// A model's recent requests a probe takes its shape from (at most, by count).
 const TRAFFIC_WINDOW: u32 = 64;
 /// The share of a model's recent requests that must be greedy (temperature 0) before this consumer
@@ -1101,8 +1119,9 @@ impl TrafficShape {
 fn strike_first_failures(
     mut report: AuditReport,
     key_of: &dyn Fn(&str) -> String,
-    clears: &dyn Fn(&str) -> bool,
-    strikes: &mut HashMap<String, u64>,
+    clears: &dyn Fn(&str, Option<&str>) -> bool,
+    writer: Option<&str>,
+    strikes: &mut HashMap<String, Strike>,
     now: u64,
 ) -> (AuditReport, Vec<String>) {
     let mut follow_up = Vec::new();
@@ -1110,25 +1129,38 @@ fn strike_first_failures(
         let key = key_of(peer);
         match outcome {
             VerificationOutcome::Failed => {
-                if strikes.remove(&key).is_some_and(|at| now.saturating_sub(at) <= STRIKE_WINDOW_MS) {
-                    return true;
-                }
-                if strikes.len() >= MAX_STRIKES {
-                    strikes.retain(|_, at| now.saturating_sub(*at) <= STRIKE_WINDOW_MS);
-                    if strikes.len() >= MAX_STRIKES {
-                        if let Some(oldest) = strikes.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
-                            strikes.remove(&oldest);
+                let open = strikes.get(&key).filter(|s| now.saturating_sub(s.at) <= STRIKE_WINDOW_MS).cloned();
+                match open {
+                    // Outvoted again on the same outside writer's questions: that writer alone can't
+                    // fail a provider (it could have written questions honest engines disagree on);
+                    // audited again on something else.
+                    Some(s) if s.writer.is_some() && s.writer.as_deref() == writer => {
+                        follow_up.push(peer.clone());
+                        false
+                    }
+                    Some(_) => {
+                        strikes.remove(&key);
+                        true
+                    }
+                    None => {
+                        if strikes.len() >= MAX_STRIKES {
+                            strikes.retain(|_, s| now.saturating_sub(s.at) <= STRIKE_WINDOW_MS);
+                            if strikes.len() >= MAX_STRIKES {
+                                if let Some(oldest) = strikes.iter().min_by_key(|(_, s)| s.at).map(|(k, _)| k.clone()) {
+                                    strikes.remove(&oldest);
+                                }
+                            }
                         }
+                        strikes.insert(key, Strike { at: now, writer: writer.map(str::to_string) });
+                        follow_up.push(peer.clone());
+                        false
                     }
                 }
-                strikes.insert(key, now);
-                follow_up.push(peer.clone());
-                false
             }
             // Only agreeing on real traffic, as the one audited, clears a strike (R5T-2): a liar that
             // lies on some requests would otherwise clear it on the next probe it answers honestly.
             VerificationOutcome::Honored => {
-                if clears(peer) {
+                if strikes.get(&key).is_some_and(|s| clears(peer, s.writer.as_deref())) {
                     strikes.remove(&key);
                 }
                 true
@@ -1561,7 +1593,7 @@ pub struct ConsumerNode {
     /// Hashes of the finished probe prompts already sent: none is sent twice.
     probe_sent: Mutex<std::collections::HashSet<u64>>,
     /// Providers an audit outvoted once (reputation key → when), awaiting a second audit (C3).
-    strikes: Mutex<HashMap<String, u64>>,
+    strikes: Mutex<HashMap<String, Strike>>,
     /// Audits running now ([`MAX_AUDITS_IN_FLIGHT`]).
     audits_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// Stream closes running now ([`MAX_CLOSES_IN_FLIGHT`]).
@@ -3313,7 +3345,7 @@ impl ConsumerNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&reputation_key(peer_id, model_key))
-            .is_some_and(|at| now_ms.saturating_sub(*at) <= STRIKE_WINDOW_MS);
+            .is_some_and(|s| now_ms.saturating_sub(s.at) <= STRIKE_WINDOW_MS);
         if struck {
             return AUDIT_MAX_RATE;
         }
@@ -3877,7 +3909,7 @@ impl ConsumerNode {
         let kept = take_replayable(&mut self.replays.lock().unwrap_or_else(|e| e.into_inner()), &provider.state_id, model, now);
         if let Some(entry) = kept {
             return self
-                .audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str()), strict, false)
+                .audit_model(&entry.model, &entry.request, &entry.provider, Some(entry.answer.as_str()), strict, None)
                 .map(|r| ("replay", r));
         }
         // A probe only where this consumer's traffic allows one (checked first: writing it costs);
@@ -3889,12 +3921,19 @@ impl ConsumerNode {
             _ => None,
         };
         // A question written for this audit and finished here (P1), else a template's. Only a written
-        // one can clear a strike: the templates are public (R7-3).
-        let mut fresh = false;
+        // one can clear a strike: the templates are public (R7-3). A follow-up never uses the questions
+        // of the outside writer whose probe gave the strike (round 8 T8-4).
+        let avoid = strict
+            .then(|| {
+                let key = reputation_key(&provider.state_id, rep_model_key(&provider.canonical_model_id, &provider.model_id));
+                self.strikes.lock().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|s| s.writer.clone())
+            })
+            .flatten();
+        let mut writer = None;
         let probe = shape.filter(|t| t.probe(String::new()).is_some()).and_then(|t| {
-            let prompt = match self.fresh_probe_prompt(model) {
-                Some(p) => {
-                    fresh = true;
+            let prompt = match self.fresh_probe_prompt(model, avoid.as_deref()) {
+                Some((p, by)) => {
+                    writer = Some(by);
                     p
                 }
                 None => crate::audit_prompts::random_prompt(&mut rand::thread_rng()),
@@ -3902,7 +3941,7 @@ impl ConsumerNode {
             t.probe(prompt)
         });
         match probe {
-            Some(request) => self.audit_model(model, &request, provider, None, strict, fresh).map(|r| ("probe", r)),
+            Some(request) => self.audit_model(model, &request, provider, None, strict, writer.as_deref()).map(|r| ("probe", r)),
             None => Err(AdapterError::Route(format!(
                 "no audit for '{model}': nothing to replay, and too few greedy requests to probe like them"
             ))),
@@ -3912,9 +3951,9 @@ impl ConsumerNode {
     /// A probe prompt written for this audit (P1): taken from questions a model wrote for this
     /// gateway's probes of `model` (refilled when low or a day old), finished here so the writer never
     /// sees it, and never sent twice. A pool whose writer has come to serve `model` is dropped (it
-    /// would recognise its questions). `None` when no writer could be had (the caller falls back to
-    /// the templates).
-    fn fresh_probe_prompt(self: &Arc<Self>, model: &str) -> Option<String> {
+    /// would recognise its questions). Returns the prompt and its writer. `None` when no writer could
+    /// be had, or the only questions are `avoid`'s (the caller falls back to the templates).
+    fn fresh_probe_prompt(self: &Arc<Self>, model: &str, avoid: Option<&str>) -> Option<(String, String)> {
         let now = now_unix_ms();
         let usable = {
             let pools = self.probe_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -3944,9 +3983,10 @@ impl ConsumerNode {
         }
         let mut rng = rand::thread_rng();
         loop {
-            let prompt = {
+            let (prompt, writer) = {
                 let mut pools = self.probe_pool.lock().unwrap_or_else(|e| e.into_inner());
-                crate::audit_prompts::finish(&mut pools.get_mut(model)?.questions, &mut rng)?
+                let pool = pools.get_mut(model).filter(|p| Some(p.writer.as_str()) != avoid)?;
+                (crate::audit_prompts::finish(&mut pool.questions, &mut rng)?, pool.writer.clone())
             };
             let digest = {
                 use std::hash::{Hash, Hasher};
@@ -3959,15 +3999,16 @@ impl ConsumerNode {
                 sent.clear();
             }
             if sent.insert(digest) {
-                return Some(prompt);
+                return Some((prompt, writer));
             }
         }
     }
 
     /// Questions to probe `model` with, written by a model (P1), and who wrote them (libp2p id). Our
     /// own provider whenever it serves any model (the prompts never leave this machine, and it costs
-    /// nothing, review round 4 H6); otherwise a provider of another model that serves none of the
-    /// audited model, paid like any serve. `None` when nobody answers.
+    /// nothing, review round 4 H6), found from its own records; otherwise a provider of another model
+    /// that serves none of the audited model and has standing here (round 8 T8-1), paid like any
+    /// serve. `None` when nobody answers (the caller falls back to the templates).
     fn write_probe_questions(self: &Arc<Self>, model: &str) -> Option<(String, Vec<String>)> {
         let now = now_unix_ms();
         let ranked = |m: &str| -> Vec<SelectedProvider> {
@@ -3978,25 +4019,29 @@ impl ConsumerNode {
         };
         let audited = ranked(model);
         let audited_ids: std::collections::HashSet<String> = audited.iter().map(|p| p.libp2p_peer_id.clone()).collect();
-        let mut others: Vec<String> = self.net.known_models().unwrap_or_default().into_iter().filter(|m| m != model).collect();
-        {
-            use rand::seq::SliceRandom;
-            others.shuffle(&mut rand::thread_rng());
-        }
-        // Our own provider first, under whichever model it serves.
-        let own = self.self_provider.as_deref().and_then(|own| {
-            std::iter::once(audited.clone())
-                .chain(others.iter().take(8).map(|m| ranked(m)))
-                .find_map(|c| c.into_iter().find(|p| p.libp2p_peer_id == own))
-        });
         let mut tried = Vec::new();
-        if let Some(mine) = own {
-            tried.push(mine);
-        } else {
-            for other in others.iter().take(3) {
-                if let Some(writer) = writer_from(&ranked(other), None, &audited_ids) {
-                    tried.push(writer);
+        // Our own provider first, under whichever model it serves: from the records it signed.
+        if let Some(own) = self.self_provider.as_deref() {
+            let mine = std::iter::once(model.to_string())
+                .chain(self.net.models_of(own).unwrap_or_default())
+                .find_map(|m| ranked(&m).into_iter().find(|p| p.libp2p_peer_id == own));
+            tried.extend(mine);
+        }
+        if tried.is_empty() {
+            let mut others: Vec<String> = self.net.known_models().unwrap_or_default().into_iter().filter(|m| m != model).collect();
+            {
+                use rand::seq::SliceRandom;
+                others.shuffle(&mut rand::thread_rng());
+            }
+            for other in others.iter().take(MAX_WRITER_MODELS_LOOKED_AT) {
+                if tried.len() >= 3 {
+                    break;
                 }
+                let standing: Vec<SelectedProvider> = ranked(other)
+                    .into_iter()
+                    .filter(|p| has_writer_standing(self.earned_reputation(&p.state_id, rep_model_key(&p.canonical_model_id, &p.model_id), now)))
+                    .collect();
+                tried.extend(writer_from(&standing, None, &audited_ids));
             }
         }
         for writer in tried {
@@ -4174,7 +4219,7 @@ impl ConsumerNode {
         subject: &SelectedProvider,
         served: Option<&str>,
         strict_subject: bool,
-        fresh_probe: bool,
+        probe_writer: Option<&str>,
     ) -> Result<AuditReport, AdapterError> {
         let now = now_unix_ms();
         let peers = self
@@ -4359,14 +4404,21 @@ impl ConsumerNode {
         }
         // A first divergence is a strike, not a failure (C3): the struck provider is audited again
         // later, on another prompt, and only a second divergence fails it.
+        let outside_writer = probe_writer.filter(|w| !self.is_self_serve(w));
         let (report, follow_up) = {
             let mut strikes = self.strikes.lock().unwrap_or_else(|e| e.into_inner());
             strike_first_failures(
                 report,
                 &|peer| reputation_key(peer, key_of.get(peer).map_or(model, String::as_str)),
-                // A replay pass as the one audited, or a passing follow-up (a different, unpredictable
-                // request), clears it: with replay off, follow-ups are the only way (R6-2).
-                &|peer| (served.is_some() || (strict_subject && fresh_probe)) && peer == subject.state_id,
+                // A replay pass as the one audited, or a passing follow-up on written questions (a
+                // different, unpredictable request), clears it: with replay off, follow-ups are the only
+                // way (R6-2). Not questions by the outside writer whose probe gave the strike (T8-4).
+                &|peer, struck_by| {
+                    peer == subject.state_id
+                        && (served.is_some()
+                            || (strict_subject && probe_writer.is_some_and(|w| self.is_self_serve(w) || Some(w) != struck_by)))
+                },
+                outside_writer,
                 &mut strikes,
                 now,
             )
@@ -5628,28 +5680,61 @@ mod tests {
         let report = resolve_audit(&results);
         assert!(report.outcomes.contains(&("A".into(), VerificationOutcome::Failed)));
         let key = |p: &str| format!("{p}@m");
-        let clears = |p: &str| p == "A";
+        let clears = |p: &str, _: Option<&str>| p == "A";
         let mut strikes = HashMap::new();
         // First divergence: not failed, struck, and audited again.
-        let (first, follow) = strike_first_failures(report.clone(), &key, &clears, &mut strikes, 1_000);
+        let (first, follow) = strike_first_failures(report.clone(), &key, &clears, None, &mut strikes, 1_000);
         assert!(!first.outcomes.iter().any(|(p, _)| p == "A"));
         assert_eq!(first.outcomes.iter().filter(|(_, o)| *o == VerificationOutcome::Honored).count(), 2);
         assert_eq!(follow, vec!["A".to_string()]);
         assert!(strikes.contains_key("A@m"));
         // Diverging again within the window: failed, strike spent.
-        let (second, follow) = strike_first_failures(report.clone(), &key, &clears, &mut strikes, 2_000);
+        let (second, follow) = strike_first_failures(report.clone(), &key, &clears, None, &mut strikes, 2_000);
         assert!(second.outcomes.contains(&("A".into(), VerificationOutcome::Failed)));
         assert!(follow.is_empty() && !strikes.contains_key("A@m"));
         // A strike past the window is a first strike again.
-        strike_first_failures(report.clone(), &key, &clears, &mut strikes, 3_000);
-        let (late, _) = strike_first_failures(report.clone(), &key, &clears, &mut strikes, 3_001 + STRIKE_WINDOW_MS);
+        strike_first_failures(report.clone(), &key, &clears, None, &mut strikes, 3_000);
+        let (late, _) = strike_first_failures(report.clone(), &key, &clears, None, &mut strikes, 3_001 + STRIKE_WINDOW_MS);
         assert!(!late.outcomes.iter().any(|(p, _)| p == "A"));
         // Agreeing in between clears it.
         let honest = resolve_audit(&[("A".to_string(), Ok(good.clone())), ("B".to_string(), Ok(good.clone()))]);
-        strike_first_failures(honest.clone(), &key, &|_| false, &mut strikes, 4_000);
+        strike_first_failures(honest.clone(), &key, &|_, _| false, None, &mut strikes, 4_000);
         assert!(strikes.contains_key("A@m"), "agreeing elsewhere (not a replay pass as the one audited) doesn't clear it");
-        strike_first_failures(honest, &key, &clears, &mut strikes, 4_000);
+        strike_first_failures(honest, &key, &clears, None, &mut strikes, 4_000);
         assert!(!strikes.contains_key("A@m"));
+    }
+
+    /// Round 8 T8-1/T8-4: an outside writer's questions alone can neither fail a provider nor clear
+    /// the strike they gave; anything else can.
+    #[test]
+    fn one_outside_writer_neither_fails_nor_clears_a_provider_alone() {
+        let good = "The quick brown fox jumps over the lazy dog, again and again, all afternoon.".to_string();
+        let odd = "Something else entirely, word after word, from the very first one onward.".to_string();
+        let outvoted = resolve_audit(&[
+            ("A".to_string(), Ok(odd)),
+            ("B".to_string(), Ok(good.clone())),
+            ("C".to_string(), Ok(good.clone())),
+        ]);
+        let honest = resolve_audit(&[("A".to_string(), Ok(good.clone())), ("B".to_string(), Ok(good))]);
+        let key = |p: &str| format!("{p}@m");
+        let mut strikes = HashMap::new();
+        strike_first_failures(outvoted.clone(), &key, &|_, _| false, Some("W"), &mut strikes, 1_000);
+        assert_eq!(strikes["A@m"].writer.as_deref(), Some("W"));
+        // W's questions again: not a failure, audited again on something else.
+        let (again, follow) = strike_first_failures(outvoted.clone(), &key, &|_, _| false, Some("W"), &mut strikes, 2_000);
+        assert!(!again.outcomes.iter().any(|(p, _)| p == "A"));
+        assert_eq!(follow, vec!["A".to_string()]);
+        assert!(strikes.contains_key("A@m"));
+        // A clear that only W's questions would give doesn't (the closure the audit passes refuses it).
+        let by_w = |p: &str, struck_by: Option<&str>| p == "A" && Some("W") != struck_by;
+        strike_first_failures(honest.clone(), &key, &by_w, Some("W"), &mut strikes, 3_000);
+        assert!(strikes.contains_key("A@m"));
+        // Another writer's questions (or a template, a replay) confirm it.
+        let (other, _) = strike_first_failures(outvoted, &key, &|_, _| false, Some("V"), &mut strikes, 4_000);
+        assert!(other.outcomes.contains(&("A".into(), VerificationOutcome::Failed)));
+        assert!(has_writer_standing(Some(openhydra_protocol::award::R_MIN)));
+        assert!(!has_writer_standing(Some(openhydra_protocol::verify::NEUTRAL_REPUTATION)));
+        assert!(!has_writer_standing(None));
     }
 
     /// Review round 4 H5: a relay-only subject leaves room for a partner of unknown network, and two

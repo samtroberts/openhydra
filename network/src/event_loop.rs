@@ -265,6 +265,11 @@ pub enum SwarmCommand {
     KnownModels {
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// The model ids one provider (by libp2p id) is known to serve: from its own signed records.
+    ModelsOf {
+        libp2p_peer_id: String,
+        reply: oneshot::Sender<Vec<String>>,
+    },
     /// Resolve a reachable address for a peer (direct or via relay).
     ResolveAddress {
         peer_id: String,
@@ -1156,6 +1161,18 @@ pub async fn run_event_loop(
                         let mut models: Vec<String> = state
                             .known_peers
                             .values()
+                            .map(|r| r.model_id.clone())
+                            .filter(|m| !m.is_empty())
+                            .collect();
+                        models.sort();
+                        models.dedup();
+                        let _ = reply.send(models);
+                    }
+                    Some(SwarmCommand::ModelsOf { libp2p_peer_id, reply }) => {
+                        let mut models: Vec<String> = state
+                            .known_peers
+                            .values()
+                            .filter(|r| r.libp2p_peer_id == libp2p_peer_id)
                             .map(|r| r.model_id.clone())
                             .filter(|m| !m.is_empty())
                             .collect();

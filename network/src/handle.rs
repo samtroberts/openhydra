@@ -206,6 +206,12 @@ impl NetworkHandle {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::KnownModels { reply })
     }
 
+    /// The model ids the provider `libp2p_peer_id` is known to serve, from its own signed records
+    /// (nobody else can publish one for it).
+    pub fn models_of(&self, libp2p_peer_id: impl Into<String>) -> Result<Vec<String>, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::ModelsOf { libp2p_peer_id: libp2p_peer_id.into(), reply })
+    }
+
     /// Forward `data` to `peer_id` and block for the one-shot response (the consumer's
     /// serve round-trip: `SERVE_REQUEST` → buffered framed completion).
     pub fn proxy_forward(&self, peer_id: String, data: Vec<u8>) -> Result<Vec<u8>, String> {
