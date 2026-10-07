@@ -703,7 +703,8 @@ struct ServeArgs {
     /// check). (A3, hardware attestation, isn't reachable at a gateway yet.) With `--assurance verify`
     /// (the default) providers below it are still used, and the tier is reported; with `gate` they
     /// are not. A request can raise it (never lower it) with the `x-openhydra-min-authenticity`
-    /// header, which is always enforced. Our own provider is never held to it.
+    /// header, which is always enforced. Our own provider, and private-swarm members we hold a
+    /// credential for, are never held to it (they're never audited).
     #[arg(long = "min-authenticity", default_value = "A0", value_parser = ["A0", "A1", "A2"])]
     min_authenticity: String,
 

@@ -2416,10 +2416,16 @@ impl ConsumerNode {
         // buyer's assurance policy hard-gates (or, by default, verify-but-routes) on the achieved
         // authenticity tier this consumer has established from its own audits.
         // Our own provider is never held to the floor (review round 4 H2): it is never audited (it is
-        // us), so it could never meet one, and the floor is about others' engines.
+        // us), so it could never meet one, and the floor is about others' engines. Nor is a member of
+        // a private swarm we hold a credential for (its owner vouches for it; G4-3): its models are
+        // never audited (no replay, no public partners), so it could never meet one either.
         let own: std::collections::HashSet<String> = peers
             .iter()
-            .filter(|p| self.is_self_serve(&p.libp2p_peer_id))
+            .filter(|p| {
+                self.is_self_serve(&p.libp2p_peer_id)
+                    || (!p.swarm_public_key.is_empty()
+                        && self.creds.as_ref().is_some_and(|c| c.credential_for_swarm(&p.swarm_public_key, now).is_some()))
+            })
             .map(|p| provider_state_id(&p.peer_id, &p.public_key))
             .collect();
         let mut candidates = rank_providers_with_assurance(
