@@ -27,3 +27,5 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Building small-order Ed25519 signatures in tests (already in the tree via ed25519-dalek).
+curve25519-dalek = { version = "4", features = ["digest"] }

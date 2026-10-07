@@ -208,7 +208,7 @@ pub fn sign_payout_binding(
 pub fn verify_payout_binding(binding: &PayoutBinding, domain: &SolanaDomain) -> bool {
     binding
         .identity
-        .verify(&binding_message(domain, &binding.payout_address, binding.ts_unix_ms), &binding.signature)
+        .verify_strict(&binding_message(domain, &binding.payout_address, binding.ts_unix_ms), &binding.signature)
         .is_ok()
 }
 
@@ -321,10 +321,15 @@ pub fn verify_claim(
 pub fn claim_signer(domain: &ChainDomain, claim: &SettlementClaim, sig: &[u8]) -> Result<ClaimSigner, SettlementError> {
     match domain {
         ChainDomain::Solana(d) => {
+            // Checked as the chain's Ed25519 program checks it (`verify_strict`: no small-order key or
+            // R), so a claim that verifies here also settles (round 8 O8-1).
             let consumer = VerifyingKey::from_bytes(&claim.consumer).map_err(|_| SettlementError::BadClaimSignature)?;
+            if consumer.is_weak() {
+                return Err(SettlementError::BadClaimSignature);
+            }
             let sig: [u8; 64] = sig.try_into().map_err(|_| SettlementError::BadClaimSignature)?;
             consumer
-                .verify(&claim.solana_preimage(d), &Signature::from_bytes(&sig))
+                .verify_strict(&claim.solana_preimage(d), &Signature::from_bytes(&sig))
                 .map(|_| ClaimSigner::Solana)
                 .map_err(|_| SettlementError::BadClaimSignature)
         }
@@ -381,7 +386,7 @@ pub fn sign_evm_payout_binding(identity_key: &SigningKey, evm_address: [u8; 20],
 pub fn verify_evm_payout_binding(binding: &EvmPayoutBinding) -> bool {
     binding
         .identity
-        .verify(&evm_binding_message(&binding.evm_address, binding.ts_unix_ms), &binding.signature)
+        .verify_strict(&evm_binding_message(&binding.evm_address, binding.ts_unix_ms), &binding.signature)
         .is_ok()
 }
 
@@ -564,6 +569,36 @@ mod tests {
             verify_claim(&d, &claim, &sig, claim.expires_at - MIN_CLAIM_LIFETIME_SECS + 1),
             Err(SettlementError::ClaimExpiresTooSoon)
         );
+    }
+
+    /// Round 8 O8-1: a signature the chain's Ed25519 program refuses (small-order R, which a lax
+    /// check accepts) is refused here, and so is a small-order consumer key.
+    #[test]
+    fn a_solana_claim_signature_the_chain_refuses_is_refused() {
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar, traits::Identity};
+        use sha2::{Digest, Sha512};
+        let (consumer, _) = keys();
+        let claim = a_claim();
+        let d = ChainDomain::Solana(domain());
+        let msg = d.claim_message(&claim);
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&Sha512::digest(consumer.to_bytes())[..32]);
+        a[0] &= 248;
+        a[31] &= 127;
+        a[31] |= 64;
+        let a = Scalar::from_bytes_mod_order(a);
+        let r = EdwardsPoint::identity().compress().to_bytes();
+        let k = Scalar::from_hash(Sha512::new().chain_update(r).chain_update(consumer.verifying_key().as_bytes()).chain_update(&msg));
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r);
+        sig[32..].copy_from_slice((k * a).as_bytes());
+        assert!(consumer.verifying_key().verify(&msg, &Signature::from_bytes(&sig)).is_ok(), "a lax check accepts it");
+        assert_eq!(verify_claim(&d, &claim, &sig, NOW), Err(SettlementError::BadClaimSignature));
+        // A small-order consumer key.
+        let weak = SettlementClaim { consumer: EdwardsPoint::identity().compress().to_bytes(), ..claim.clone() };
+        assert_eq!(verify_claim(&d, &weak, &sig, NOW), Err(SettlementError::BadClaimSignature));
+        // An honest signature still verifies.
+        assert!(verify_claim(&d, &claim, &consumer.sign(&msg).to_bytes(), NOW).is_ok());
     }
 
     #[test]
