@@ -14,11 +14,19 @@ echo "staged sidecar: openhydra-agent-$TRIPLE$EXT ($(cd target/release && md5 -q
 # The prompt scorer (patched llama-server) the agent runs for Ollama models' authenticity checks.
 # Rebuilt only when the pinned llama.cpp commit or the patch changes (a build takes minutes). A failed
 # build stops this script (set -e; not inside an && list, where bash would carry on).
+# A stamp records what a staged scorer was built from AND the SHA-256 of the binary and its notices
+# as staged: a binary or notices file replaced or edited since (a stale copy, a partial write) no
+# longer matches its stamp, and is rebuilt (review N6).
+sha() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
+stamped() { # <binary> <notices> <inputs hash>: whether the stamp vouches for exactly these files
+  [[ -x "$1" && -f "$2" && "$(cat "$1.stamp" 2>/dev/null)" == "$3 $(sha "$1") $(sha "$2")" ]]
+}
+stamp() { echo "$3 $(sha "$1") $(sha "$2")" > "$1.stamp"; }
 SCORER="desktop/src-tauri/binaries/openhydra-scorer-$TRIPLE$EXT"
 STAMP="$(cat scorer/LLAMACPP_COMMIT scorer/llamacpp-prompt-scoring.patch scorer/llamacpp-ollama-compat.patch scorer/llamacpp-token-count.patch scorer/build.sh scorer/notices.py $(find scorer/licenses -type f | sort) | shasum -a 256 | cut -c1-16)"
-if [[ ! -x "$SCORER" || ! -f "${SCORER%.exe}.notices.txt" || "$(cat "$SCORER.stamp" 2>/dev/null)" != "$STAMP" ]]; then
+if ! stamped "$SCORER" "${SCORER%.exe}.notices.txt" "$STAMP"; then
   scorer/build.sh "$SCORER"
-  echo "$STAMP" > "$SCORER.stamp"
+  stamp "$SCORER" "${SCORER%.exe}.notices.txt" "$STAMP"
 fi
 echo "staged sidecar: openhydra-scorer-$TRIPLE$EXT"
 # macOS also ships the MLX scorer (patched mistral.rs, for LM Studio's MLX models), bundled via
@@ -26,9 +34,9 @@ echo "staged sidecar: openhydra-scorer-$TRIPLE$EXT"
 if [[ "$TRIPLE" == *apple-darwin ]]; then
   MLX_SCORER="desktop/src-tauri/binaries/openhydra-mlx-scorer-$TRIPLE"
   MLX_STAMP="$(cat scorer/mistralrs/MISTRALRS_COMMIT scorer/mistralrs/mistralrs-openhydra.patch scorer/mistralrs/build.sh scorer/notices.py | shasum -a 256 | cut -c1-16)"
-  if [[ ! -x "$MLX_SCORER" || ! -f "$MLX_SCORER.notices.txt" || "$(cat "$MLX_SCORER.stamp" 2>/dev/null)" != "$MLX_STAMP" ]]; then
+  if ! stamped "$MLX_SCORER" "$MLX_SCORER.notices.txt" "$MLX_STAMP"; then
     scorer/mistralrs/build.sh "$MLX_SCORER"
-    echo "$MLX_STAMP" > "$MLX_SCORER.stamp"
+    stamp "$MLX_SCORER" "$MLX_SCORER.notices.txt" "$MLX_STAMP"
   fi
   echo "staged sidecar: openhydra-mlx-scorer-$TRIPLE"
 fi

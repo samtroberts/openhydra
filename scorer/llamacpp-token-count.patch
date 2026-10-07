@@ -5,13 +5,14 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 
 --- a/tools/server/main.cpp
 +++ b/tools/server/main.cpp
-@@ -1,5 +1,142 @@
+@@ -1,5 +1,151 @@
 +#include "common.h"
 +#include "gguf.h"
 +#include "llama.h"
 +
 +#include <cstdio>
 +#include <cstring>
++#include <filesystem>
 +#include <iostream>
 +#include <iterator>
 +#include <string>
@@ -37,6 +38,12 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +static void quiet(ggml_log_level, const char *, void *) {}
 +
 +static int export_vocab(const char * in, const char * out) {
++    // Writing over the model it reads would destroy it.
++    std::error_code ec;
++    if (std::filesystem::exists(out, ec) && std::filesystem::equivalent(in, out, ec)) {
++        fprintf(stderr, "export-vocab: %s is the model itself; write the vocabulary elsewhere\n", out);
++        return 1;
++    }
 +    gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
 +    gguf_context * src = gguf_init_from_file(in, params);
 +    if (!src) {
@@ -75,7 +82,9 @@ a provider delivered without the model's weights (agent/src/token_count.rs).
 +        fprintf(stderr, "export-vocab: %s doesn't load as a vocabulary\n", out);
 +        return 1;
 +    }
-+    std::remove(out); // rename won't replace a file on Windows
++#ifdef _WIN32
++    std::remove(out); // rename won't replace a file on Windows (elsewhere it replaces it atomically)
++#endif
 +    if (std::rename(tmp.c_str(), out) != 0) {
 +        std::remove(tmp.c_str());
 +        fprintf(stderr, "export-vocab: can't write %s\n", out);

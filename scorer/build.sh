@@ -25,6 +25,13 @@ SRC="$WORK/llama.cpp"
 mkdir -p "$WORK"
 
 if [[ -n "${LLAMACPP_SRC:-}" ]]; then
+  # Only the pinned commit, unmodified: what the notices and the patches were checked against.
+  HEAD_COMMIT="$(git -C "$LLAMACPP_SRC" rev-parse HEAD 2>/dev/null)" \
+    || { echo "scorer/build.sh: LLAMACPP_SRC ($LLAMACPP_SRC) isn't a git checkout" >&2; exit 1; }
+  [[ "$HEAD_COMMIT" == "$COMMIT" ]] \
+    || { echo "scorer/build.sh: LLAMACPP_SRC is at $HEAD_COMMIT, not the pinned $COMMIT" >&2; exit 1; }
+  git -C "$LLAMACPP_SRC" diff --quiet HEAD -- \
+    || { echo "scorer/build.sh: LLAMACPP_SRC has local changes; use a pristine checkout" >&2; exit 1; }
   rm -rf "$SRC"
   mkdir -p "$SRC"
   # Everything but top-level build directories (a tar --exclude 'build*' would also drop
@@ -75,8 +82,12 @@ cmake --build "$SRC/build-scorer" --target llama-server --config Release --paral
 BIN="$(find "$SRC/build-scorer/bin" -type f \( -name llama-server -o -name llama-server.exe \) | head -n 1)"
 [[ -n "$BIN" ]] || { echo "scorer/build.sh: no llama-server built (see $WORK/build.log)" >&2; exit 1; }
 # The patches must be in (the agent starts it with these flags) before it replaces $OUT.
-"$BIN" --help 2>&1 | grep -q -- '--exit-on-stdin-eof' || { echo "scorer/build.sh: $BIN lacks the OpenHydra patch" >&2; exit 1; }
-{ "$BIN" --count-tokens 2>&1 || true; } | grep -q -- '--count-tokens <vocab.gguf>' || { echo "scorer/build.sh: $BIN lacks the token-count patch" >&2; exit 1; }
+# Captured first: piped straight into `grep -q`, the binary can die of SIGPIPE once grep has matched,
+# and pipefail would then fail the check of a binary that passes it.
+HELP="$("$BIN" --help 2>&1 || true)"
+grep -q -- '--exit-on-stdin-eof' <<<"$HELP" || { echo "scorer/build.sh: $BIN lacks the OpenHydra patch" >&2; exit 1; }
+USAGE="$("$BIN" --count-tokens 2>&1 || true)"
+grep -q -- '--count-tokens <vocab.gguf>' <<<"$USAGE" || { echo "scorer/build.sh: $BIN lacks the token-count patch" >&2; exit 1; }
 # Licence notices of everything compiled in, shipped beside it (<out>.notices.txt, without .exe).
 "$(command -v python3 || command -v python)" "$HERE/notices.py" llamacpp "$SRC" "$WORK/notices.txt"
 mkdir -p "$(dirname "$OUT")"

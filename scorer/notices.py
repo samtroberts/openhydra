@@ -10,7 +10,7 @@ a binary, collected from the exact sources it was built from.
 
   notices.py llamacpp <llama.cpp tree> <out>     the patched llama-server (openhydra-scorer)
   notices.py cargo <manifest> <package> <out> [--target T] [--features F] [--no-default-features]
-                   [--own-root DIR]               a Rust binary: every crate it links (cargo tree)
+                   [--own-root DIR] [--locked]    a Rust binary: every crate it links (cargo tree)
   notices.py merge <out> <part>...               one file from several parts
 
 Standard library only. A llama.cpp vendored component this script doesn't know fails the build, so a
@@ -246,7 +246,7 @@ def llamacpp(src, out):
     write(out, "openhydra-scorer (llama.cpp's llama-server with OpenHydra's prompt-scoring patch)", parts)
 
 
-def cargo(manifest, package, out, target=None, features=None, no_default=False, own_root=None):
+def cargo(manifest, package, out, target=None, features=None, no_default=False, own_root=None, locked=False):
     # `cargo tree` resolves for one target and needs only the crates that build uses (offline-capable),
     # unlike `cargo metadata`, which wants every platform's dependencies.
     # Build dependencies too: a build script can compile C code into the binary (e.g. a vendored
@@ -259,6 +259,8 @@ def cargo(manifest, package, out, target=None, features=None, no_default=False, 
         cmd += ["--features", features]
     if no_default:
         cmd += ["--no-default-features"]
+    if locked:
+        cmd += ["--locked"]  # exactly the lockfile the build used; a stale one fails
     run = subprocess.run(cmd, capture_output=True, text=True)
     if run.returncode != 0:
         die(f"cargo tree failed:\n{run.stderr}")
@@ -411,15 +413,17 @@ def main(argv):
         return llamacpp(argv[1], argv[2])
     if len(argv) >= 4 and argv[0] == "cargo":
         opts = {"--target": None, "--features": None, "--own-root": None}
-        rest, no_default, i = argv[4:], False, 0
+        rest, no_default, locked, i = argv[4:], False, False, 0
         while i < len(rest):
             if rest[i] == "--no-default-features":
                 no_default, i = True, i + 1
+            elif rest[i] == "--locked":
+                locked, i = True, i + 1
             elif rest[i] in opts and i + 1 < len(rest):
                 opts[rest[i]], i = rest[i + 1], i + 2
             else:
                 die(f"unknown option {rest[i]}")
-        return cargo(argv[1], argv[2], argv[3], opts["--target"], opts["--features"], no_default, opts["--own-root"])
+        return cargo(argv[1], argv[2], argv[3], opts["--target"], opts["--features"], no_default, opts["--own-root"], locked)
     if len(argv) >= 3 and argv[0] == "merge":
         return merge(argv[1], argv[2:])
     die(__doc__)

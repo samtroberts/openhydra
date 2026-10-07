@@ -45,16 +45,20 @@ if [[ "$(uname -s)" == Darwin ]]; then
   FEATURES=(--features metal)
   export RUSTFLAGS="-C target-cpu=apple-m1" MISTRALRS_METAL_PLATFORMS=macos
 fi
-(cd "$SRC" && cargo build --release -p mistralrs-cli --no-default-features ${FEATURES[@]+"${FEATURES[@]}"}) > "$WORK/build.log" 2>&1 \
+# --locked: exactly mistral.rs's own lockfile at the pinned commit (a stale one fails, not silently re-resolved).
+(cd "$SRC" && cargo build --locked --release -p mistralrs-cli --no-default-features ${FEATURES[@]+"${FEATURES[@]}"}) > "$WORK/build.log" 2>&1 \
   || { tail -20 "$WORK/build.log" >&2; exit 1; }
 # Licence notices of every crate compiled in (same target and features as the build).
 (cd "$SRC" && "$(command -v python3 || command -v python)" "$HERE/../notices.py" cargo Cargo.toml mistralrs-cli "$WORK/notices.txt" \
-  --target "$(rustc -vV | awk '/host:/{print $2}')" --no-default-features ${FEATURES[@]+"${FEATURES[@]}"})
+  --target "$(rustc -vV | awk '/host:/{print $2}')" --no-default-features --locked ${FEATURES[@]+"${FEATURES[@]}"})
 BIN="$WORK/openhydra-mlx-scorer"
 cp "$SRC/target/release/mistralrs" "$BIN"
 strip -x "$BIN" 2>/dev/null || true
 # The patch must be in (the agent starts it with these flags) before it replaces $OUT.
-"$BIN" serve --help 2>&1 | grep -q -- '--exit-on-stdin-eof' || { echo "scorer/mistralrs/build.sh: $BIN lacks the OpenHydra patch" >&2; exit 1; }
+# Captured first: piped straight into `grep -q`, the binary can die of SIGPIPE once grep has matched,
+# and pipefail would then fail the check of a binary that passes it.
+HELP="$("$BIN" serve --help 2>&1 || true)"
+grep -q -- '--exit-on-stdin-eof' <<<"$HELP" || { echo "scorer/mistralrs/build.sh: $BIN lacks the OpenHydra patch" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 mv "$BIN" "$OUT"
 cp "$WORK/notices.txt" "$OUT.notices.txt"
