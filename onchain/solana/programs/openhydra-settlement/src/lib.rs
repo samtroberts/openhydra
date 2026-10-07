@@ -55,9 +55,14 @@ pub const EXIT_WINDOW_SECS: i64 = 3 * 24 * 60 * 60;
 /// A claim's lifetime as the agent signs it (`settlement::CLAIM_LIFETIME_SECS`): pause time since
 /// `expires_at - CLAIM_LIFETIME_SECS` counts toward its grace ([`claim_grace`]).
 pub const CLAIM_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
-/// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within about
-/// the last 60 days can matter.
-pub const PAUSE_LOG: usize = 16;
+/// A pause that starts within this long of the last one's end continues it: the time between counts
+/// as paused, for claims and exits alike. Distinct pauses are then at least a day apart.
+pub const PAUSE_MERGE_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within a live
+/// claim's span can matter, at most 60 days (its life plus the most a pause adds); pauses a day apart
+/// at least, that is at most 61, so none that matters falls out, and unpausing and re-pausing can't
+/// push one out (review round 4 M3).
+pub const PAUSE_LOG: usize = 64;
 /// How far ahead of the cluster clock a payout binding's timestamp may be: a binding stamped far in
 /// the future (say `u64::MAX`, by whoever got the identity key) would be impossible to rotate away from.
 pub const BINDING_CLOCK_SKEW_SECS: i64 = 5 * 60;
@@ -399,10 +404,20 @@ pub mod openhydra_settlement {
         let config = &mut ctx.accounts.config;
         let now = Clock::get()?.unix_timestamp;
         if !config.paused && paused {
-            config.paused_at = now;
-            let slot = (config.pause_count as usize) % PAUSE_LOG;
-            config.pause_log[slot] = [now, 0];
-            config.pause_count = config.pause_count.saturating_add(1);
+            let last = (config.pause_count.saturating_sub(1) as usize) % PAUSE_LOG;
+            let [start, end] = config.pause_log[last];
+            if config.pause_count > 0 && end != 0 && now.saturating_sub(end) < PAUSE_MERGE_WINDOW_SECS {
+                // Within a day of the last pause's end: it continues (its end and duration undone,
+                // so the unpause counts it whole, the time between included).
+                config.paused_total = config.paused_total.saturating_sub(end.saturating_sub(start).max(0));
+                config.paused_at = start;
+                config.pause_log[last][1] = 0;
+            } else {
+                config.paused_at = now;
+                let slot = (config.pause_count as usize) % PAUSE_LOG;
+                config.pause_log[slot] = [now, 0];
+                config.pause_count = config.pause_count.saturating_add(1);
+            }
         } else if config.paused && !paused {
             config.paused_total = config.paused_total.saturating_add(now.saturating_sub(config.paused_at).max(0));
             let last = (config.pause_count.saturating_sub(1) as usize) % PAUSE_LOG;

@@ -70,10 +70,13 @@ payout binding carries the same domain. Refund delays are between 1 and 14 days 
 extends an exit by at most 30 days (no indefinite lock by pausing). A claim lives 30 days of *unpaused*
 time: every pause since it was signed extends it, up to 30 days in all, so a pause (or several) doesn't
 void the claims that expire during it, and a pause after a claim ran out doesn't revive it. The
-contracts remember the most recent pauses for this (32 on Base, 16 on Solana). A settle past the escrow pays what it
+contracts remember the most recent 64 pauses for this. A pause begun within a day of the last one's end
+continues it (the time between counts as paused, for claims and exits alike), so distinct pauses are a
+day apart at least, the log covers every pause a live claim can span, and unpausing and re-pausing can't
+push one out of it. A settle past the escrow pays what it
 holds and the rest after a top-up. On Base the paid-so-far is keyed by the consumer's Ed25519 id as well
 as its wallet. Solana payout bindings can't be stamped more than 5 minutes ahead. Solana's `Settled` event names the
-model (its hash), as Base's does. Solana's `Config` grows only at its end (a deployed program
+model by its hash, as Base's does (SHA-256 on Solana, keccak-256 on Base: not comparable across chains). Solana's `Config` grows only at its end (a deployed program
 upgrading reallocates it). **Fees are pulled:** settles accrue the 4% and the fee recipient / authority
 withdraws it to any address, so a blacklisted or frozen fee account can't stop settlement.
 
@@ -88,7 +91,7 @@ withdraws it to any address, so a blacklisted or frozen fee account can't stop s
 ```bash
 cd solana
 anchor build                      # → target/deploy/openhydra_settlement.so (BPF)
-cargo test -p openhydra-settlement # 7 host unit tests + 16 litesvm integration tests
+cargo test -p openhydra-settlement # 7 host unit tests + 18 litesvm integration tests
 ```
 `cargo build-sbf` defaults to platform-tools v1.54; one already in `~/.cache/solana` can be used
 instead with `cargo build-sbf --tools-version v1.57` (as tested), saving a ~400 MB download.
@@ -103,7 +106,7 @@ Solidity deps are vendored via `git clone` (not committed). Fetch them once, the
 cd base
 git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std
 git clone --depth 1 --branch v5.1.0 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts
-forge test                        # 36 tests
+forge test                        # 39 tests
 ```
 
 ## Audit checklist

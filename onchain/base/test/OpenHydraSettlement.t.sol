@@ -593,31 +593,97 @@ contract OpenHydraSettlementTest is Test {
         settlement.withdraw(PROVIDER_ID, 1);
     }
 
-    function test_repeated_pauses_add_up_for_an_exit_and_the_last_counts_for_a_claim() public {
+    function test_repeated_pauses_add_up_for_an_exit_and_for_a_claim() public {
         OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
         claim.expiresAt = block.timestamp + 3 days;
         bytes memory sig = _sign(consumerPk, claim);
-        vm.prank(consumer);
-        settlement.requestExit(PROVIDER_ID);
         uint256 t0 = block.timestamp;
-        // Two pauses of two days each.
-        for (uint256 i = 0; i < 2; i++) {
-            vm.prank(admin);
-            settlement.setPaused(true);
-            vm.warp(block.timestamp + 2 days);
-            vm.prank(admin);
-            settlement.setPaused(false);
-            vm.warp(block.timestamp + 1 hours);
-        }
-        assertEq(settlement.pausedTotal(), 4 days);
-        // The exit opens after its delay plus both pauses.
-        vm.warp(t0 + REFUND_DELAY + 4 days - 1);
-        vm.prank(consumer);
-        vm.expectRevert(OpenHydraSettlement.RefundLocked.selector);
-        settlement.withdraw(PROVIDER_ID, 1);
+        // Two pauses of two days each, two days apart (separate pauses).
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(t0 + 2 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        vm.warp(t0 + 4 days);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(t0 + 6 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        assertEq(settlement.pauseCount(), 2);
+        assertEq(settlement.pausedTotal(), 4 days, "both count for an exit");
         // The claim gets back every pause in its life: four days past its expiry.
         assertEq(settlement.claimGrace(claim.expiresAt), 4 days);
         vm.warp(claim.expiresAt + 4 days);
+        settlement.settle(claim, sig);
+    }
+
+    /// Review round 4 (O4-5): a pause that begins after a claim ran out doesn't revive it, cap aside.
+    function test_a_pause_after_a_claim_ran_out_does_not_revive_it() public {
+        vm.warp(100 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 1 days;
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.warp(claim.expiresAt + 1 days);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        // Two days of grace, three days late: still expired.
+        assertEq(settlement.claimGrace(claim.expiresAt), 2 days);
+        vm.expectRevert(OpenHydraSettlement.ClaimExpired.selector);
+        settlement.settle(claim, sig);
+    }
+
+    /// Review round 4, M3: a pause begun within a day of the last one's end continues it, the time
+    /// between counting as paused for the exit and the claim alike.
+    function test_a_repause_within_a_day_continues_the_pause() public {
+        vm.warp(100 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 15 days;
+        vm.prank(consumer);
+        settlement.requestExit(PROVIDER_ID);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        vm.warp(block.timestamp + 2 hours);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        assertEq(settlement.pauseCount(), 1, "one pause");
+        assertEq(settlement.pausedTotal(), 4 hours, "the two hours between count");
+        assertEq(settlement.claimGrace(claim.expiresAt), 4 hours);
+    }
+
+    /// Review round 4, M3 (O4-1): unpausing and re-pausing, however often, can't push a long pause out
+    /// of the log and cost a claim its grace.
+    function test_flapping_cannot_push_a_pause_out_of_the_log() public {
+        vm.warp(100 days);
+        OpenHydraSettlement.SettlementClaim memory claim = _claim(100_000);
+        claim.expiresAt = block.timestamp + 6 days;
+        bytes memory sig = _sign(consumerPk, claim);
+        vm.prank(admin);
+        settlement.setPaused(true);
+        vm.warp(block.timestamp + 20 days);
+        vm.prank(admin);
+        settlement.setPaused(false);
+        uint256 grace = settlement.claimGrace(claim.expiresAt);
+        uint64 total = settlement.pausedTotal();
+        assertEq(grace, 20 days);
+        for (uint256 i = 0; i <= settlement.PAUSE_LOG(); i++) {
+            vm.startPrank(admin);
+            settlement.setPaused(true);
+            settlement.setPaused(false);
+            vm.stopPrank();
+        }
+        assertEq(settlement.claimGrace(claim.expiresAt), grace);
+        assertEq(settlement.pausedTotal(), total);
+        vm.warp(claim.expiresAt + 20 days);
         settlement.settle(claim, sig);
     }
 

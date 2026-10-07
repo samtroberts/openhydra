@@ -508,11 +508,69 @@ fn a_claim_live_when_a_pause_began_gets_the_pause_back() {
     // …and no more.
     advance(&mut ctx, 1);
     fails_with(settle_until(&mut ctx, &consumer, provider_id, 200_000, "m", expires), openhydra_settlement::SettlementError::ClaimExpired);
-    // Every pause in the claim's life counts; one after it ran out revives nothing.
+    // Every pause in the claim's life counts.
     let config = config_state(&ctx);
     let now = T0 + 26 * 86_400 + 1;
     assert_eq!(openhydra_settlement::claim_grace(&config, expires, now), 16 * 86_400);
-    let _ = MAX_PAUSE_EXTENSION_SECS;
+    let _ = SettlementError::ClaimExpired;
+    // At most thirty days, however long the pause (review round 4, O4-5).
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 60 * 86_400);
+    set_paused(&mut ctx, false).unwrap();
+    let config = config_state(&ctx);
+    let late = T0 + 87 * 86_400;
+    assert_eq!(openhydra_settlement::claim_grace(&config, late as u64, late), MAX_PAUSE_EXTENSION_SECS as u64);
+}
+
+/// Review round 4, M3: a pause begun within a day of the last one's end continues it, the time
+/// between counting as paused for the exit and the claim alike.
+#[test]
+fn a_repause_within_a_day_continues_the_pause() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 3_600);
+    set_paused(&mut ctx, false).unwrap();
+    advance(&mut ctx, 2 * 3_600);
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 3_600);
+    set_paused(&mut ctx, false).unwrap();
+    let config = config_state(&ctx);
+    assert_eq!((config.pause_count, config.paused_total), (1, 4 * 3_600), "one pause; the two hours between count");
+    let expires = (T0 + 15 * 86_400) as u64;
+    assert_eq!(openhydra_settlement::claim_grace(&config, expires, T0 + 4 * 3_600), 4 * 3_600);
+    // A day or more after, it is a pause of its own.
+    advance(&mut ctx, 86_400);
+    set_paused(&mut ctx, true).unwrap();
+    set_paused(&mut ctx, false).unwrap();
+    assert_eq!(config_state(&ctx).pause_count, 2);
+}
+
+/// Review round 4, M3 (O4-1): unpausing and re-pausing, however often, can't push a long pause out of
+/// the log and cost a claim its grace.
+#[test]
+fn flapping_cannot_push_a_pause_out_of_the_log() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 500_000);
+    let expires = T0 as u64 + 6 * 86_400;
+    set_paused(&mut ctx, true).unwrap();
+    advance(&mut ctx, 20 * 86_400);
+    set_paused(&mut ctx, false).unwrap();
+    let before = config_state(&ctx);
+    let now = T0 + 20 * 86_400;
+    let grace = openhydra_settlement::claim_grace(&before, expires, now);
+    assert_eq!(grace, 20 * 86_400);
+    for _ in 0..=openhydra_settlement::PAUSE_LOG {
+        advance(&mut ctx, 1); // a new transaction each time
+        set_paused(&mut ctx, true).unwrap();
+        set_paused(&mut ctx, false).unwrap();
+    }
+    let after = config_state(&ctx);
+    assert_eq!(after.pause_count, before.pause_count);
+    assert!(openhydra_settlement::claim_grace(&after, expires, now) >= grace);
+    advance(&mut ctx, 6 * 86_400 - (openhydra_settlement::PAUSE_LOG as i64 + 1));
+    settle_until(&mut ctx, &consumer, provider_id, 100_000, "m", expires).expect("within the grace");
 }
 
 #[test]

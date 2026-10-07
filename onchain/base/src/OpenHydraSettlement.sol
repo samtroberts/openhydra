@@ -68,9 +68,14 @@ contract OpenHydraSettlement is ReentrancyGuard {
     /// A claim's lifetime as the agent signs it (`settlement::CLAIM_LIFETIME_SECS`): pause time since
     /// `expiresAt - CLAIM_LIFETIME` counts toward its grace (`claimGrace`).
     uint64 public constant CLAIM_LIFETIME = 30 days;
-    /// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within
-    /// about the last 60 days can matter.
-    uint256 public constant PAUSE_LOG = 32;
+    /// A pause that starts within this long of the last one's end continues it: the time between
+    /// counts as paused, for claims and exits alike. Distinct pauses are then at least a day apart.
+    uint64 public constant PAUSE_MERGE_WINDOW = 1 days;
+    /// Pauses remembered for claim grace (the most recent; older ones fall out). Only pauses within a
+    /// live claim's span can matter, at most 60 days (its life plus the most a pause adds); pauses a
+    /// day apart at least, that is at most 61, so none that matters falls out, and unpausing and
+    /// re-pausing can't push one out (review round 4 M3).
+    uint256 public constant PAUSE_LOG = 64;
 
     // ── Config (set once at init; the fee can never be changed to divert funds) ──
     IERC20 public immutable usdc;
@@ -87,7 +92,7 @@ contract OpenHydraSettlement is ReentrancyGuard {
     uint64 public pausedAt;
     /// The most recent pauses, oldest overwritten first: `pauseLog[i] = (start, end)`, `end` 0 while
     /// it lasts. `pauseCount` is how many there have been in all.
-    uint64[2][32] public pauseLog;
+    uint64[2][64] public pauseLog;
     uint256 public pauseCount;
     /// Seconds paused in total over pauses that have ended: with `pausedAt`, how much a pause delays an
     /// exit.
@@ -341,9 +346,18 @@ contract OpenHydraSettlement is ReentrancyGuard {
     function setPaused(bool _paused) external {
         if (msg.sender != admin) revert NotAdmin();
         if (!paused && _paused) {
-            pausedAt = uint64(block.timestamp);
-            pauseLog[pauseCount % PAUSE_LOG] = [uint64(block.timestamp), 0];
-            pauseCount += 1;
+            uint256 last = (pauseCount + PAUSE_LOG - 1) % PAUSE_LOG;
+            if (pauseCount > 0 && block.timestamp - pauseLog[last][1] < PAUSE_MERGE_WINDOW) {
+                // Within a day of the last pause's end: it continues (its end and duration undone,
+                // so the unpause counts it whole, the time between included).
+                pausedTotal -= pauseLog[last][1] - pauseLog[last][0];
+                pausedAt = pauseLog[last][0];
+                pauseLog[last][1] = 0;
+            } else {
+                pausedAt = uint64(block.timestamp);
+                pauseLog[pauseCount % PAUSE_LOG] = [uint64(block.timestamp), 0];
+                pauseCount += 1;
+            }
         } else if (paused && !_paused) {
             pausedTotal += uint64(block.timestamp) - pausedAt;
             pauseLog[(pauseCount - 1) % PAUSE_LOG][1] = uint64(block.timestamp);
