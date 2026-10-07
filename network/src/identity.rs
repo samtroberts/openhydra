@@ -158,6 +158,12 @@ impl Identity {
 
     /// Load from path if it exists, otherwise generate and save.
     pub fn load_or_create(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        // A symlink to nothing would look absent, then refuse every attempt to create the key
+        // (review R6): say what it is.
+        if !path.exists() && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("identity path {} is a symlink to a missing file", path.display()).into());
+        }
+        remove_stale_temp_files(path);
         let mut existed = path.exists();
         let identity = if existed {
             Self::load(path)?
@@ -200,19 +206,60 @@ fn write_new_key_file(path: &Path, contents: &[u8], tag: &str) -> std::io::Resul
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let result = opts.open(&tmp).and_then(|mut f| {
+    let written = opts.open(&tmp).and_then(|mut f| {
         f.write_all(contents)?;
-        f.sync_all()?;
-        std::fs::hard_link(&tmp, path)
+        f.sync_all()
     });
+    // Writing the temporary file failed (no space, no permission): that is the error, and there is
+    // nothing to fall back to (review R5).
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
-    match result {
-        // A filesystem without hard links: create it in place, still never over an existing one.
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => opts.open(path).and_then(|mut f| {
-            f.write_all(contents)?;
-            f.sync_all()
-        }),
+    match linked {
+        // Only a filesystem without hard links: create it in place, still never over an existing
+        // one, and never left half-written.
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            let mut f = opts.open(path)?;
+            if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
+                drop(f);
+                let _ = std::fs::remove_file(path);
+                return Err(e);
+            }
+            Ok(())
+        }
         r => r,
+    }
+}
+
+/// Temporary key files ([`write_new_key_file`]) older than this are leftovers of a process that
+/// died mid-write.
+const STALE_TEMP_KEY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove leftover temporary files of the key at `path` (`.<name>.*.tmp` beside it) older than
+/// [`STALE_TEMP_KEY`] (review R8). Best effort: a file that can't be read or removed is left.
+fn remove_stale_temp_files(path: &Path) {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return };
+    let prefix = format!(".{name}.");
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        if !(file.starts_with(&prefix) && file.ends_with(".tmp")) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_TEMP_KEY);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -240,6 +287,33 @@ mod tests {
         // Creating over an existing key is refused.
         let err = Identity::generate(&path).err().unwrap();
         assert_eq!(err.downcast_ref::<std::io::Error>().map(|e| e.kind()), Some(std::io::ErrorKind::AlreadyExists));
+    }
+
+    #[test]
+    fn a_dangling_symlink_is_reported_and_stale_temp_files_are_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("gone.key"), &path).unwrap();
+            let err = Identity::load_or_create(&path).err().unwrap().to_string();
+            assert!(err.contains("symlink to a missing file"), "{err}");
+            std::fs::remove_file(&path).unwrap();
+        }
+        // A leftover temp file from long ago goes; a fresh one (a writer at work) and others stay.
+        let stale = dir.path().join(".identity.key.old.tmp");
+        let fresh = dir.path().join(".identity.key.new.tmp");
+        let other = dir.path().join(".other.key.x.tmp");
+        for f in [&stale, &fresh, &other] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - STALE_TEMP_KEY - std::time::Duration::from_secs(60);
+        for f in [&stale, &other] {
+            std::fs::File::options().write(true).open(f).unwrap().set_modified(long_ago).unwrap();
+        }
+        Identity::load_or_create(&path).unwrap();
+        assert!(!stale.exists());
+        assert!(fresh.exists() && other.exists());
     }
 
     #[test]
