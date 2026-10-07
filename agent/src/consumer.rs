@@ -1385,7 +1385,7 @@ impl ConsumerNode {
                 // Vouchers are per provider key ("<peer:model>#<pubkey>", "@<deployment>" on a
                 // chain); the view sums them per (peer, model), the key the rest of the snapshot
                 // uses, for the deployment we settle on now only.
-                let suffix = self.settlement_chain.as_ref().map(|c| format!("@{}", c.domain.fingerprint()));
+                let suffix = self.settlement_chain.as_ref().map(|_| self.voucher_scope());
                 let mut by_pair = std::collections::HashMap::new();
                 for (k, v) in m.iter() {
                     let current = match &suffix {
@@ -1637,6 +1637,18 @@ impl ConsumerNode {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(provider.to_string(), model.to_string()))
             .is_some_and(|at| now.saturating_sub(*at) <= PAYMENT_REFUSAL_TTL_MS)
+    }
+
+    /// What a voucher key carries after the provider's: the deployment we settle on and, on Base, our
+    /// wallet (`""` off-chain). See `settle_receipt`.
+    fn voucher_scope(&self) -> String {
+        match &self.settlement_chain {
+            Some(c) => match self.settlement_wallet() {
+                Some(w) => format!("@{}@{w}", c.domain.fingerprint()),
+                None => format!("@{}", c.domain.fingerprint()),
+            },
+            None => String::new(),
+        }
     }
 
     /// On Base, the wallet our claims are signed with, as a serve request names it.
@@ -2194,10 +2206,9 @@ impl ConsumerNode {
         // Scoped to the deployment paying receipts settle on: each deployment's escrow starts from
         // nothing, so a running total built under one must not carry over (the first claim on another
         // would re-authorize the whole history).
-        let vkey = match &self.settlement_chain {
-            Some(c) => format!("{}@{}", voucher_key(&peer_id, &model_key, &provider_pub), c.domain.fingerprint()),
-            None => voucher_key(&peer_id, &model_key, &provider_pub),
-        };
+        // On Base, by our wallet too: on-chain, what was paid so far is kept per wallet, so a new
+        // wallet's running total starts from nothing (review round 3, S1).
+        let vkey = format!("{}{}", voucher_key(&peer_id, &model_key, &provider_pub), self.voucher_scope());
         // Review F1: serialize settlement for this `(peer, model)` across the whole
         // read→co-sign→commit window (which spans a network round-trip), so concurrent settles to the
         // same pair can't read the same base and emit non-monotonic / divergent co-signed cumulatives.

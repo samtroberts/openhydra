@@ -295,6 +295,9 @@ struct ServeCommitment {
     /// Whether the consumer got the whole completion (a buffered reply, or its stream polled to the
     /// end): only then is an unsettled serve its fault, and counts against it (credit window).
     delivered: bool,
+    /// On Base, the wallet the serve request said its claims would come from: the receipt's claim
+    /// must be signed by it.
+    wallet: Option<[u8; 20]>,
 }
 
 /// How long a serve commitment stays settleable, and the receipt-freshness window (B-S1/S7).
@@ -461,12 +464,6 @@ impl KeptClaim {
         }
         b.extend_from_slice(&self.sig);
         b
-    }
-
-    /// The Base wallet the pair's claims are pinned to: the one that signed this claim, while it can
-    /// still be settled. Once it has expired, nothing is lost by taking claims from another wallet.
-    fn live_signer(&self, now_secs: u64) -> Option<[u8; 20]> {
-        self.signer.filter(|_| self.expires_at > now_secs)
     }
 
     fn from_bytes(b: &[u8]) -> Option<Self> {
@@ -1291,7 +1288,7 @@ impl<A: EngineAdapter> Provider<A> {
                 )));
             }
         }
-        if let Some(reason) = self.wallet_refusal(req, source_peer) {
+        if let Some(reason) = self.wallet_refusal(req) {
             return Err(refuse(reason));
         }
         let now = now_unix_ms();
@@ -1327,36 +1324,16 @@ impl<A: EngineAdapter> Provider<A> {
         }))
     }
 
-    /// On Base, the request must name the wallet its claims will be signed with, and while we hold a
-    /// live claim for the pair from another wallet we take none from this one: it would replace a
-    /// claim we can settle with one drawn on a channel we know nothing about. Refused here, before
-    /// serving, a consumer that changed wallets is told why instead of having its receipts refused
-    /// and its serves counted as unpaid.
-    fn wallet_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<String> {
+    /// On Base, the request must name the wallet its claims will be signed with: the receipt's claim
+    /// must come from it, and each wallet has its own running total (as on-chain).
+    fn wallet_refusal(&self, req: &ServeRequest) -> Option<String> {
         if !matches!(self.settlement_chain, Some(openhydra_protocol::settlement::ChainDomain::Base(_))) {
             return None;
         }
-        let Some(wallet) = req.settlement_wallet.as_deref().and_then(parse_evm_address) else {
-            return Some("this provider settles on Base; the request names no wallet to pay from".into());
-        };
-        // A peer id that doesn't inline its key can't sign receipts either: the receipt check refuses it.
-        let consumer = self.net.ed25519_pubkey_from_peer_id(source_peer).ok()?;
-        let now_secs = now_unix_ms() / 1000;
-        let kept = self
-            .settled_claims
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&self.settled_key_for(&consumer, &req.model_ref))
-            .cloned()?;
-        let pinned = kept.live_signer(now_secs)?;
-        (pinned != wallet).then(|| {
-            format!(
-                "this provider holds your unsettled claim for this model from wallet 0x{}; it takes claims from \
-                 another wallet once that one expires, in {} days",
-                hex::encode(pinned),
-                kept.expires_at.saturating_sub(now_secs).div_ceil(24 * 60 * 60)
-            )
-        })
+        match req.settlement_wallet.as_deref().and_then(parse_evm_address) {
+            Some(_) => None,
+            None => Some("this provider settles on Base; the request names no wallet to pay from".into()),
+        }
     }
 
     /// The reply to an identical receipt co-signed recently (see `recent_cosigns`).
@@ -1559,7 +1536,15 @@ impl<A: EngineAdapter> Provider<A> {
     /// B-S1: record what we just served under the consumer's committed nonce, so the
     /// settlement receipt can be validated against it. Prunes expired commitments and
     /// enforces a hard cap so the map stays bounded (B-S7).
-    fn record_commitment(&self, nonce: [u8; 16], model_id: String, tokens: u64, served_peer: &str, delivered: bool) {
+    fn record_commitment(
+        &self,
+        nonce: [u8; 16],
+        model_id: String,
+        tokens: u64,
+        served_peer: &str,
+        delivered: bool,
+        wallet: Option<[u8; 20]>,
+    ) {
         // Our own consumer never settles with us: its serves would only fill the map.
         if self.is_own_consumer(served_peer) {
             return;
@@ -1573,7 +1558,7 @@ impl<A: EngineAdapter> Provider<A> {
         insert_commitment(
             &mut map,
             nonce,
-            ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string(), delivered },
+            ServeCommitment { model_id, tokens, recorded_ms: now, served_peer: served_peer.to_string(), delivered, wallet },
         );
     }
 
@@ -1781,6 +1766,7 @@ impl<A: EngineAdapter> Provider<A> {
         let nonce = req.nonce;
         let model_ref = req.model_ref.clone();
         let reply_to = req.reply_to.clone();
+        let wallet = req.settlement_wallet.as_deref().and_then(parse_evm_address);
         // Create the buffer, then ack immediately (before generating), so the consumer starts
         // polling right away and never races an absent buffer (begin happens before the ack).
         self.stream_begin(nonce, &reply_to);
@@ -1797,7 +1783,7 @@ impl<A: EngineAdapter> Provider<A> {
         // B-S1: record what we served under the committed nonce so its settlement receipt can be
         // validated (right tokens/model, once) — identical to the buffered path.
         if summary.ok && summary.tokens > 0 {
-            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, false);
+            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, false, wallet);
         }
         if let Some(stats) = &self.stats {
             let e = &summary.metrics.engine;
@@ -1837,17 +1823,21 @@ impl<A: EngineAdapter> Provider<A> {
     /// the deployment paying receipts settle on: each deployment's escrow starts from nothing, so a
     /// running total built under one must not carry over to another (the first claim there would
     /// re-authorize the whole history).
-    fn settled_key(&self, p: &openhydra_protocol::receipts::ReceiptPayload) -> String {
-        self.settled_key_for(p.consumer.as_bytes(), &p.model_id)
+    /// On Base, also by the wallet that signs the pair's claims (`wallet`): on-chain, what was paid
+    /// so far is kept per wallet, so a new wallet's running total starts from nothing there, and must
+    /// here too, or its first claim would pay the old wallet's history again.
+    fn settled_key(&self, p: &openhydra_protocol::receipts::ReceiptPayload, wallet: Option<[u8; 20]>) -> String {
+        let key = openhydra_protocol::verify::reputation_key(&hex::encode(p.consumer.as_bytes()), &p.model_id);
+        match (&self.settlement_chain, wallet) {
+            (Some(chain), Some(w)) => format!("{key}@{}@0x{}", chain.fingerprint(), hex::encode(w)),
+            (Some(chain), None) => format!("{key}@{}", chain.fingerprint()),
+            (None, _) => key,
+        }
     }
 
-    /// [`Self::settled_key`] for a consumer key and model.
-    fn settled_key_for(&self, consumer: &[u8], model_id: &str) -> String {
-        let key = openhydra_protocol::verify::reputation_key(&hex::encode(consumer), model_id);
-        match &self.settlement_chain {
-            Some(chain) => format!("{key}@{}", chain.fingerprint()),
-            None => key,
-        }
+    /// The wallet the serve under `nonce` was requested with, while its commitment is open.
+    fn committed_wallet(&self, nonce: &[u8; 16]) -> Option<[u8; 20]> {
+        self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).get(nonce).and_then(|c| c.wallet)
     }
 
     /// The receipt must come from its consumer: the peer its key derives, authenticated as the sender.
@@ -1873,6 +1863,7 @@ impl<A: EngineAdapter> Provider<A> {
     fn validate_settlement_cumulative(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
+        wallet: Option<[u8; 20]>,
     ) -> Result<(), BindRejection> {
         // v5 denomination binding: reject a crypto-rail receipt whose declared asset/peg we never
         // agreed to, before `check_cumulative` and before the serve-commitment nonce is consumed.
@@ -1882,7 +1873,7 @@ impl<A: EngineAdapter> Provider<A> {
             p.peg_micros_per_credit,
             self.settlement_peg,
         )?;
-        let key = self.settled_key(p);
+        let key = self.settled_key(p, wallet);
         let last = self
             .settled_cumulative
             .lock()
@@ -1927,9 +1918,8 @@ impl<A: EngineAdapter> Provider<A> {
     /// (review F2). Monotonic `max`, so a concurrent or out-of-order co-sign can't lower it;
     /// best-effort persisted so a restart can't accept a lower/replayed cumulative.
     /// On a settlement chain, a paying receipt must carry the consumer's valid on-chain claim for it.
-    /// Returns the claim to keep (`None` off-chain). On Base the wallet that signs a pair's claims is
-    /// pinned at its first claim: a claim from another wallet (one with no channel, say) would replace
-    /// a settleable claim with a worthless one.
+    /// Returns the claim to keep (`None` off-chain). On Base it must be signed by the wallet the serve
+    /// was requested with, and its running total is that wallet's own ([`Self::settled_key`]).
     fn check_settlement_claim(
         &self,
         p: &openhydra_protocol::receipts::ReceiptPayload,
@@ -1946,20 +1936,17 @@ impl<A: EngineAdapter> Provider<A> {
             openhydra_protocol::settlement::ClaimSigner::Evm(addr) => Some(addr),
             openhydra_protocol::settlement::ClaimSigner::Solana => None,
         };
-        let now_secs = now_unix_ms() / 1000;
-        let pinned = self
-            .settled_claims
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&self.settled_key(p))
-            .and_then(|k| k.live_signer(now_secs));
-        if let (Some(pinned), Some(signer)) = (pinned, signer) {
-            if pinned != signer {
-                return Err(format!(
-                    "this pair's claims are signed by wallet 0x{}, not 0x{}",
-                    hex::encode(pinned),
-                    hex::encode(signer)
-                ));
+        if let Some(signer) = signer {
+            match self.committed_wallet(&p.nonce) {
+                Some(w) if w == signer => {}
+                Some(w) => {
+                    return Err(format!(
+                        "the claim is signed by wallet 0x{}, not 0x{} the serve was requested with",
+                        hex::encode(signer),
+                        hex::encode(w)
+                    ))
+                }
+                None => return Err("the serve named no wallet for this claim".into()),
             }
         }
         Ok(Some(KeptClaim { cumulative, expires_at: c.expires_at, signer, sig: c.sig.clone() }))
@@ -1974,7 +1961,7 @@ impl<A: EngineAdapter> Provider<A> {
         let Some(cumulative) = p.cumulative_amount else {
             return;
         };
-        let key = self.settled_key(p);
+        let key = self.settled_key(p, claim.and_then(|c| c.signer));
         let raised = {
             let mut map = match self.settled_cumulative.lock() {
                 Ok(m) => m,
@@ -2637,8 +2624,9 @@ impl<A: EngineAdapter> Provider<A> {
                 let bind = |p: &openhydra_protocol::receipts::ReceiptPayload, claim: Option<&crate::receipt::ClaimSig>| {
                     // From its own consumer first: nothing (not even a BEHIND reply) for a replay.
                     self.check_sender(p, source_peer).map_err(BindRejection::from)?;
-                    self.validate_settlement_cumulative(p)?;
+                    // The claim first: on Base its signer picks the running total to check against.
                     let kept = self.check_settlement_claim(p, claim).map_err(BindRejection::from)?;
+                    self.validate_settlement_cumulative(p, kept.as_ref().and_then(|k| k.signer))?;
                     self.check_and_consume_commitment(p, source_peer).map_err(BindRejection::from)?;
                     *accepted_claim.borrow_mut() = kept;
                     Ok(())
@@ -2725,6 +2713,7 @@ impl<A: EngineAdapter> Provider<A> {
                         let nonce = req.nonce;
                         let model_ref = req.model_ref.clone();
                         let reply_to = req.reply_to.clone();
+                        let wallet = req.settlement_wallet.as_deref().and_then(parse_evm_address);
                         // Reconnect-and-fetch: mark in-flight so a fetch racing this serve gets
                         // Generating (retry), not NotFound (which would re-run the request).
                         self.mark_generating(nonce, &reply_to);
@@ -2748,7 +2737,7 @@ impl<A: EngineAdapter> Provider<A> {
                         // B-S1: record what we served under the consumer's committed nonce so
                         // its settlement receipt can be validated (right tokens/model, once).
                         if summary.ok && summary.tokens > 0 {
-                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, in_time);
+                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, in_time, wallet);
                         }
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
@@ -3037,6 +3026,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn each_base_wallet_has_its_own_running_total_and_signs_only_its_own_serves() {
+        use openhydra_protocol::settlement::{evm_address, sign_evm_claim, ChainDomain, Eip712Domain};
+        let dir = tempfile::tempdir().unwrap();
+        let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
+            identity_path: dir.path().join("id.key"),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            bootstrap_peers: vec![],
+            enable_peer_relay: false,
+            enable_connection_reversal: false,
+            pcp_gateway: None,
+        })
+        .unwrap();
+        let domain = Eip712Domain { chain_id: 8453, verifying_contract: [7; 20] };
+        let provider = Provider::new(StubAdapter, net).with_settlement_chain(Some(ChainDomain::Base(domain.clone())));
+        let w1 = k256::ecdsa::SigningKey::from_slice(&[1; 32]).unwrap();
+        let w2 = k256::ecdsa::SigningKey::from_slice(&[2; 32]).unwrap();
+        let (a1, a2) = (evm_address(w1.verifying_key()), evm_address(w2.verifying_key()));
+        let consumer = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let payload = openhydra_protocol::receipts::payload_from_bytes(
+            &[9; 32], consumer.verifying_key().as_bytes(), "m", 10, &[3; 16], 1, None, "",
+            Some(500), Some(openhydra_protocol::payout::SettlementAsset::Usdc), Some(1),
+        )
+        .unwrap();
+        let claim_by = |w: &k256::ecdsa::SigningKey| {
+            let expires_at = now_unix_ms() / 1000 + openhydra_protocol::settlement::CLAIM_LIFETIME_SECS;
+            let c = crate::receipt::claim_for(&payload, expires_at).unwrap();
+            crate::receipt::ClaimSig { expires_at, sig: sign_evm_claim(w, &domain, &c).to_vec() }
+        };
+        // The serve was requested with wallet 1.
+        provider.serve_commitments.lock().unwrap().insert([3; 16], ServeCommitment {
+            model_id: "m".into(), tokens: 10, recorded_ms: now_unix_ms(), served_peer: "c".into(), delivered: true, wallet: Some(a1),
+        });
+        let kept = provider.check_settlement_claim(&payload, Some(&claim_by(&w1))).unwrap().unwrap();
+        assert_eq!(kept.signer, Some(a1));
+        // A claim from another wallet is refused: it isn't the one the serve named.
+        assert!(provider.check_settlement_claim(&payload, Some(&claim_by(&w2))).unwrap_err().contains("not 0x"));
+        // Each wallet's running total is its own (review round 3, S1): as on-chain.
+        assert_ne!(provider.settled_key(&payload, Some(a1)), provider.settled_key(&payload, Some(a2)));
+        assert!(provider.settled_key(&payload, Some(a1)).ends_with(&format!("@0x{}", hex::encode(a1))));
+    }
+
     struct StubAdapter;
     impl EngineAdapter for StubAdapter {
         fn engine_name(&self) -> &'static str {
@@ -3206,7 +3237,7 @@ mod tests {
     // ---- B-S1 / B-S7: serve-commitment binding ---------------------------------------
 
     fn commit(map: &mut HashMap<[u8; 16], ServeCommitment>, n: [u8; 16], model: &str, tokens: u64, now: u64) {
-        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now, served_peer: "c".into(), delivered: true });
+        map.insert(n, ServeCommitment { model_id: model.into(), tokens, recorded_ms: now, served_peer: "c".into(), delivered: true, wallet: None });
     }
 
     #[test]
@@ -3312,7 +3343,7 @@ mod tests {
         assert!(payment_window(&[], &[], paid_reservation(Some(u32::MAX)), 0, now).is_ok());
         // Review S3: one peer can't crowd the commitment map; past its cap its oldest goes.
         let mut map = HashMap::new();
-        let commit = |peer: &str, at: u64| ServeCommitment { model_id: "m".into(), tokens: 1, recorded_ms: at, served_peer: peer.into(), delivered: false };
+        let commit = |peer: &str, at: u64| ServeCommitment { model_id: "m".into(), tokens: 1, recorded_ms: at, served_peer: peer.into(), delivered: false, wallet: None };
         for i in 0..(MAX_COMMITMENTS_PER_PEER as u64 + 10) {
             let mut nonce = [0u8; 16];
             nonce[..8].copy_from_slice(&i.to_le_bytes());
@@ -3322,10 +3353,6 @@ mod tests {
         assert_eq!(map.values().filter(|c| c.served_peer == "greedy").count(), MAX_COMMITMENTS_PER_PEER);
         assert!(map.values().all(|c| c.served_peer != "greedy" || c.recorded_ms >= 10), "the oldest went");
         assert!(map.contains_key(&[0xff; 16]));
-        // Review S5: a pair's Base wallet stays pinned only while its claim can still be settled.
-        let pinned = KeptClaim { cumulative: 9, expires_at: 1_000, signer: Some([3; 20]), sig: vec![1; 65] };
-        assert_eq!(pinned.live_signer(999), Some([3; 20]));
-        assert_eq!(pinned.live_signer(1_000), None);
         assert_eq!(parse_evm_address(&format!("0x{}", "ab".repeat(20))), Some([0xab; 20]));
         assert_eq!(parse_evm_address(&"ab".repeat(20)), Some([0xab; 20]));
         assert_eq!(parse_evm_address("0xabcd"), None);
@@ -3340,10 +3367,10 @@ mod tests {
         assert_eq!(KeptClaim::from_bytes(&old), None);
         // An expired commitment is a receipt that never came: pruned, and its peer reported.
         let mut map = HashMap::new();
-        map.insert([1u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "c".into(), delivered: true });
-        map.insert([2u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: now, served_peer: "d".into(), delivered: true });
+        map.insert([1u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "c".into(), delivered: true, wallet: None });
+        map.insert([2u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: now, served_peer: "d".into(), delivered: true, wallet: None });
         // A serve its consumer never got (a stream it gave up on) expires without counting against it.
-        map.insert([3u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "e".into(), delivered: false });
+        map.insert([3u8; 16], ServeCommitment { model_id: "m".into(), tokens: 9, recorded_ms: 0, served_peer: "e".into(), delivered: false, wallet: None });
         assert_eq!(prune_expired_commitments(&mut map, now), vec!["c".to_string()]);
         assert_eq!(map.len(), 1);
     }
