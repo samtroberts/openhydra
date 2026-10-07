@@ -695,6 +695,44 @@ pub const MODEL_WITHDRAWN_MAX_AGE_SECS: u64 = 120;
 /// matching the 300 s DHT record TTL; a provider that stops (re)announcing then
 /// ages out, while a live one is kept refreshed by each gossip.
 const KNOWN_PEER_TTL_MS: u64 = 300_000;
+/// How far in the future a provider record's signed time may be (clock skew) before it is refused:
+/// the reaper ages records by that time, so a far-future one would never expire (round 8 N8-2).
+const MAX_RECORD_SKEW_MS: u64 = 60_000;
+/// Provider records kept per libp2p id (one per model it serves); past it, its oldest goes.
+const MAX_KNOWN_RECORDS_PER_PEER: usize = 64;
+/// Provider records kept overall; past it, the oldest goes.
+const MAX_KNOWN_RECORDS: usize = 16_384;
+
+/// Cache a verified provider record in `known`: refused (`None`) when it is dated too far ahead;
+/// else `Some(whether it is new)`. Bounded per peer and overall, the oldest evicted first.
+fn install_known_peer(known: &mut HashMap<String, PeerRecord>, record: &PeerRecord, now_ms: u64) -> Option<bool> {
+    if record.updated_unix_ms > now_ms.saturating_add(MAX_RECORD_SKEW_MS) {
+        return None;
+    }
+    let key = known_peer_key(record);
+    let is_new = !known.contains_key(&key);
+    if is_new {
+        let oldest = |known: &HashMap<String, PeerRecord>, same_peer: bool| {
+            known
+                .iter()
+                .filter(|(_, r)| !same_peer || r.libp2p_peer_id == record.libp2p_peer_id)
+                .min_by_key(|(_, r)| r.updated_unix_ms)
+                .map(|(k, _)| k.clone())
+        };
+        if known.values().filter(|r| r.libp2p_peer_id == record.libp2p_peer_id).count() >= MAX_KNOWN_RECORDS_PER_PEER {
+            if let Some(k) = oldest(known, true) {
+                known.remove(&k);
+            }
+        }
+        if known.len() >= MAX_KNOWN_RECORDS {
+            if let Some(k) = oldest(known, false) {
+                known.remove(&k);
+            }
+        }
+    }
+    known.insert(key, record.clone());
+    Some(is_new)
+}
 
 /// C11: how long a *completed* `discover` for a model stays fresh enough to answer from the
 /// `known_peers` cache without a new `get_providers` round-trip. Coalesces a request burst (a
@@ -1698,7 +1736,7 @@ fn handle_announce(
                         warn!(model_id = %signed_record.model_id, "start_providing failed: {e:?}");
                     }
                     // Cache locally for fast resolve + discover cache hits
-                    state.known_peers.insert(known_peer_key(&signed_record), signed_record.clone());
+                    install_known_peer(&mut state.known_peers, &signed_record, now_unix_ms());
                     info!(
                         model_id = %signed_record.model_id,
                         peer_id = %signed_record.peer_id,
@@ -1826,8 +1864,10 @@ fn handle_provider_pex(
         warn!(%source_str, %e, "provider_pex: rejected advert (failed authenticity)");
         return;
     }
-    let is_new = !state.known_peers.contains_key(&known_peer_key(&record));
-    state.known_peers.insert(known_peer_key(&record), record.clone());
+    let Some(is_new) = install_known_peer(&mut state.known_peers, &record, now_unix_ms()) else {
+        debug!(%source_str, "provider_pex: rejected advert dated in the future");
+        return;
+    };
     if is_new {
         info!(
             model_id = %record.model_id,
@@ -3253,8 +3293,9 @@ fn handle_kad_event(
                                     // H1: reject unverified records (DHT poisoning).
                                     if let Err(e) = dht::verify_peer_record(&record) {
                                         warn!(%pid_str, %e, "dht_record_rejected: provider-store verify failed");
-                                    } else if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str) {
-                                        state.known_peers.insert(known_peer_key(&record), record.clone());
+                                    } else if !pending.records.iter().any(|r| r.libp2p_peer_id == pid_str)
+                                        && install_known_peer(&mut state.known_peers, &record, now_unix_ms()).is_some()
+                                    {
                                         pending.records.push(record);
                                     }
                                 }
@@ -3608,8 +3649,7 @@ fn accept_and_install_record(
             }
         }
     }
-    state.known_peers.insert(known_peer_key(&peer_record), peer_record.clone());
-    true
+    install_known_peer(&mut state.known_peers, peer_record, now_unix_ms()).is_some()
 }
 
 /// C7 command handler: ask a connected bootstrap "who serves `model_id`?". Picks the first
@@ -4500,6 +4540,31 @@ mod tests {
         // A value-based evict (how disconnect/reap work) drops ALL of the node's models at once.
         known.retain(|_, r| r.libp2p_peer_id != "12D3KooWnodeA");
         assert!(known.is_empty());
+    }
+
+    /// Round 8 N8-2: a record dated far ahead is refused (it would never age out); one peer's
+    /// records, and all of them, are bounded, the oldest going first.
+    #[test]
+    fn known_provider_records_are_bounded_and_never_dated_ahead() {
+        let now = 10_000_000;
+        let rec = |peer: &str, model: &str, at: u64| PeerRecord {
+            peer_id: format!("n-{peer}"),
+            model_id: model.into(),
+            libp2p_peer_id: peer.into(),
+            updated_unix_ms: at,
+            ..Default::default()
+        };
+        let mut known: HashMap<String, PeerRecord> = HashMap::new();
+        assert_eq!(install_known_peer(&mut known, &rec("A", "m", now + MAX_RECORD_SKEW_MS + 1), now), None);
+        assert_eq!(install_known_peer(&mut known, &rec("A", "m", now + MAX_RECORD_SKEW_MS), now), Some(true), "within skew");
+        assert_eq!(install_known_peer(&mut known, &rec("A", "m", now), now), Some(false), "a refresh");
+        for i in 0..MAX_KNOWN_RECORDS_PER_PEER as u64 + 5 {
+            install_known_peer(&mut known, &rec("B", &format!("fake-{i}"), now - 1_000 + i), now);
+        }
+        let of_b: Vec<&PeerRecord> = known.values().filter(|r| r.libp2p_peer_id == "B").collect();
+        assert_eq!(of_b.len(), MAX_KNOWN_RECORDS_PER_PEER);
+        assert!(!known.values().any(|r| r.model_id == "fake-0"), "B's oldest went");
+        assert!(known.values().any(|r| r.libp2p_peer_id == "A"), "other peers untouched");
     }
 
     // ── M6: per-model MODEL_WITHDRAWN tombstone eviction ─────────────────
