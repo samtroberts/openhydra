@@ -103,6 +103,11 @@ fn decode_challenge(body: &[u8]) -> Option<(String, Vec<u32>)> {
 
 /// A refusal reply — also for refusals decided before [`handle_prompt_score_inbound`] runs (the
 /// worker pool shedding), so the consumer reads "refused" rather than "legacy provider".
+/// Whether `reply` (from [`handle_prompt_score_inbound`]) is a refusal.
+pub fn is_score_refusal(reply: &[u8]) -> bool {
+    reply.strip_prefix(SCORE_RESP_MAGIC).and_then(|r| r.first()) == Some(&RESP_REFUSED)
+}
+
 pub fn score_refusal(reason: &str) -> Vec<u8> {
     response(RESP_REFUSED, reason.as_bytes())
 }
@@ -137,8 +142,16 @@ impl InflightGate {
 
     /// Take a slot, or `None` if [`MAX_INFLIGHT`] are already taken.
     pub fn try_enter(&self) -> Option<InflightSlot<'_>> {
+        self.try_enter_for(false)
+    }
+
+    /// [`try_enter`](Self::try_enter), with one more slot for a verifier in the middle of a round
+    /// (`in_round`): others flooding the provider with challenges can't stall a round under way
+    /// (review round 3, LP3).
+    pub fn try_enter_for(&self, in_round: bool) -> Option<InflightSlot<'_>> {
+        let cap = MAX_INFLIGHT + usize::from(in_round);
         self.current
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_INFLIGHT).then_some(n + 1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < cap).then_some(n + 1))
             .ok()
             .map(|_| InflightSlot(self))
     }
@@ -256,6 +269,7 @@ pub fn handle_prompt_score_inbound(
     engine: Option<&dyn EngineAdapter>,
     gate: &InflightGate,
     scorable: &dyn Fn(&str) -> bool,
+    in_round: bool,
 ) -> Vec<u8> {
     let Some(engine) = engine else {
         return score_refusal("prompt scoring not offered by this provider");
@@ -266,7 +280,7 @@ pub fn handle_prompt_score_inbound(
     if !scorable(&model) {
         return score_refusal("model not scorable here");
     }
-    let Some(_slot) = gate.try_enter() else {
+    let Some(_slot) = gate.try_enter_for(in_round) else {
         return score_refusal("prompt scoring busy, retry");
     };
     match engine.score_prompt(&model, &ids) {
@@ -519,7 +533,17 @@ pub enum RoundOutcome {
     Unsupported,
     /// Not enough unsent texts left for this provider — the verifier needs a fresh set.
     Exhausted,
+    /// The provider stayed busy on a text. Not held against it: the text stays pending and is sent
+    /// again first next time, so being busy can delay a text but never skip it.
+    Busy,
+    /// The provider declined or garbled more texts in one round than [`MAX_SKIPPED_TEXTS`]:
+    /// choosing which texts count is dodging the check, held against it like a failed round.
+    Evasion(String),
 }
+
+/// Texts one round may lose to the provider declining them, or answering garbage, before the round
+/// counts as evasion: one honest hiccup is tolerated, picking and choosing isn't (review round 3, LP1).
+pub const MAX_SKIPPED_TEXTS: usize = 1;
 
 /// Busy / rate-limited refusals tolerated in a row before a run gives up.
 const MAX_BUSY_RETRIES: usize = 3;
@@ -530,59 +554,91 @@ const MAX_BUSY_RETRIES: usize = 3;
 const MAX_PROBE_RETRIES: usize = 150;
 
 /// Send challenges one at a time until the round closes or something stops it. `pick(n)` chooses
-/// which unsent text goes next (random in production); `pause()` backs off after a busy refusal.
-/// `persist(round)` runs after each text is issued — **before** it is sent, so a crash can't forget
-/// a text the provider has seen — and after each reply is recorded.
+/// which of `n` unsent texts goes next (random, so the order can't be predicted); `allowed` says
+/// which texts may be issued at all, and `issued` is told each one that is (a verifier sends each of
+/// its own texts to one provider only). A text left pending by an earlier run goes first. A busy
+/// provider is waited for on the same text ([`MAX_BUSY_RETRIES`] pauses), then the run ends
+/// [`RoundOutcome::Busy`] with the text still pending; a declined or garbled text is given up and
+/// counts toward [`MAX_SKIPPED_TEXTS`]; a lost connection ends the run with the text still pending.
+#[allow(clippy::too_many_arguments)]
 pub fn run_round(
     round: &mut ChallengeRound,
     set: &ReferenceSet,
     model_ref: &str,
     transport: &mut Transport<'_>,
     pick: &mut dyn FnMut(usize) -> usize,
+    allowed: &dyn Fn(&ReferenceText) -> bool,
+    issued: &mut dyn FnMut(&ReferenceText),
     pause: &mut dyn FnMut(),
     persist: &mut dyn FnMut(&ChallengeRound),
 ) -> RoundOutcome {
-    let mut busy = 0;
+    let mut skipped = 0;
     loop {
-        // Out of unsent texts: the round can't go on with this set (a first-stage registry pack is
-        // topped up by the caller; a local set needs fresh texts).
-        let Some(text) = round.next_text(set, &mut *pick) else {
-            return RoundOutcome::Exhausted;
+        let text = match round.pending_text(set) {
+            Some(t) => t,
+            // Out of unsent texts: the round can't go on with this set (a first-stage registry pack
+            // is topped up by the caller; a local set needs fresh texts).
+            None => match round.next_text_where(set, &mut *pick, allowed) {
+                Some(t) => {
+                    issued(t);
+                    t
+                }
+                None => return RoundOutcome::Exhausted,
+            },
         };
         let (id, token_ids) = (text.id.clone(), text.token_ids.clone());
         persist(round);
-        let reply = request_prompt_scores(transport, model_ref, &token_ids);
-        let recorded = reply.as_ref().ok().map(|scores| round.record(set, &id, scores));
-        if reply.is_err() {
-            round.abandon(&id);
-        }
-        persist(round);
-        match reply {
-            Ok(_) => match recorded.expect("recorded for Ok") {
-                Ok(Some(verdict)) => return RoundOutcome::Verdict(verdict),
-                Ok(None) => busy = 0,
-                Err(RoundError::Score(e)) => return RoundOutcome::Incomplete(format!("unscorable reply: {e:?}")),
+        let mut busy = 0;
+        let reply = loop {
+            match request_prompt_scores(transport, model_ref, &token_ids) {
+                Err(ScoreChallengeError::Refused(r)) if r.contains("retry") => {
+                    busy += 1;
+                    if busy >= MAX_BUSY_RETRIES {
+                        return RoundOutcome::Busy;
+                    }
+                    pause();
+                }
+                other => break other,
+            }
+        };
+        let skip = match reply {
+            Ok(scores) => match round.record(set, &id, &scores) {
+                Ok(Some(verdict)) => {
+                    persist(round);
+                    return RoundOutcome::Verdict(verdict);
+                }
+                Ok(None) => {
+                    persist(round);
+                    continue;
+                }
+                Err(RoundError::Score(e)) => format!("unscorable reply: {e:?}"),
                 Err(e) => return RoundOutcome::Incomplete(format!("{e:?}")),
             },
-            Err(err) => {
-                match err {
-                    ScoreChallengeError::Unsupported => return RoundOutcome::Unsupported,
-                    ScoreChallengeError::Refused(r) if r.contains("retry") && busy + 1 < MAX_BUSY_RETRIES => {
-                        busy += 1;
-                        pause();
-                    }
-                    ScoreChallengeError::Refused(r) => return RoundOutcome::Incomplete(format!("refused: {r}")),
-                    ScoreChallengeError::Transport(e) => return RoundOutcome::Incomplete(format!("transport: {e}")),
-                    ScoreChallengeError::Malformed => return RoundOutcome::Incomplete("malformed reply".into()),
-                }
+            Err(ScoreChallengeError::Unsupported) => {
+                round.abandon(&id);
+                persist(round);
+                return RoundOutcome::Unsupported;
             }
+            Err(ScoreChallengeError::Transport(e)) => return RoundOutcome::Incomplete(format!("transport: {e}")),
+            Err(ScoreChallengeError::Refused(r)) => format!("refused: {r}"),
+            Err(ScoreChallengeError::Malformed) => "malformed reply".to_string(),
+        };
+        // The provider has seen the text: it stays issued, and the round goes on without it.
+        round.abandon(&id);
+        persist(round);
+        skipped += 1;
+        if skipped > MAX_SKIPPED_TEXTS {
+            return RoundOutcome::Evasion(skip);
         }
     }
 }
 
-/// The throwaway prompt [`probe_scoring`] sends: low token ids, valid in any vocabulary, and not a
-/// reference text (nothing is learned from its scores).
-const PROBE_TOKENS: [u32; 16] = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015];
+/// The throwaway prompt [`probe_scoring`] sends: random token ids from a range valid in any common
+/// vocabulary, different every time, so a provider can't tell a probe from a challenge by its
+/// content (nothing is learned from its scores).
+fn probe_tokens() -> Vec<u32> {
+    (0..16).map(|_| 1_000 + rand::random::<u32>() % 30_000).collect()
+}
 
 /// Send a throwaway prompt before a round, so no reference text — a registry pack's are used up
 /// network-wide the moment they're issued — is spent on a provider that can't score right now
@@ -593,7 +649,7 @@ const PROBE_TOKENS: [u32; 16] = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007,
 pub fn probe_scoring(transport: &mut Transport<'_>, model_ref: &str, pause: &mut dyn FnMut()) -> Option<RoundOutcome> {
     let mut busy = 0;
     loop {
-        return match request_prompt_scores(transport, model_ref, &PROBE_TOKENS) {
+        return match request_prompt_scores(transport, model_ref, &probe_tokens()) {
             Ok(scores) if scores.iter().all(|&lp| lp.is_finite() && lp <= 0.0) => None,
             Ok(_) => Some(RoundOutcome::Incomplete("unscorable reply to the probe".into())),
             Err(ScoreChallengeError::Unsupported) => Some(RoundOutcome::Unsupported),
@@ -740,6 +796,17 @@ impl LogprobStatus {
         StatusEffect::Evasion
     }
 
+    /// Record a round the provider dodged by declining or garbling texts ([`RoundOutcome::Evasion`]):
+    /// held against it at once, first contact or not, like a failed audit, and its streak restarts.
+    pub fn on_evasion(&mut self, retry_ms: u64, now_ms: u64) -> StatusEffect {
+        self.next_due_ms = now_ms + retry_ms;
+        self.evasions = 0;
+        self.pass_streak = 0;
+        self.streak_since_ms = 0;
+        self.evaded_at_ms = now_ms;
+        StatusEffect::Evasion
+    }
+
     /// Whether the pass streak is long enough, and spread over long enough, to count.
     pub fn streak_qualifies(&self) -> bool {
         match self.verdict {
@@ -872,7 +939,7 @@ mod tests {
     fn roundtrip(engine: Option<&dyn EngineAdapter>, gate: &InflightGate, model: &str, ids: &[u32]) -> Result<Vec<f32>, ScoreChallengeError> {
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
             assert_eq!(framed[0], PROMPT_SCORE_CHALLENGE);
-            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| m == "public"))
+            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| m == "public", false))
         };
         request_prompt_scores(&mut transport, model, ids)
     }
@@ -909,8 +976,10 @@ mod tests {
         let gate = InflightGate::new();
         let probe = |engine: Option<&dyn EngineAdapter>| {
             let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
-                assert_eq!(decode_challenge(&framed[1..]).unwrap().1, PROBE_TOKENS.to_vec());
-                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| m == "public"))
+                // Random ids each time, from the range every common vocabulary has.
+                let ids = decode_challenge(&framed[1..]).unwrap().1;
+                assert!(ids.len() == 16 && ids.iter().all(|&i| (1_000..31_000).contains(&i)));
+                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| m == "public", false))
             };
             probe_scoring(&mut transport, "public", &mut || {})
         };
@@ -930,7 +999,7 @@ mod tests {
                 if sent <= busy_replies {
                     return Ok(score_refusal(if sent % 2 == 0 { "prompt scoring busy, retry" } else { "prompt scoring warming up, retry" }));
                 }
-                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true))
+                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true, false))
             };
             let out = probe_scoring(&mut flaky, "public", &mut || pauses += 1);
             assert_eq!(out.is_none(), expect_ok, "{busy_replies} busy replies: {out:?}");
@@ -968,13 +1037,13 @@ mod tests {
         let engine = Scorer { mode: "ok" };
         let good = encode_challenge("public", &[1, 2, 3]).unwrap();
         for cut in 0..good.len() - 1 {
-            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|_| true);
+            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|_| true, false);
             assert!(reply.starts_with(SCORE_RESP_MAGIC));
             assert_eq!(reply[4], RESP_REFUSED);
         }
         let mut long = good.clone();
         long.push(0);
-        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|_| true)[4], RESP_REFUSED);
+        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|_| true, false)[4], RESP_REFUSED);
     }
 
     #[test]
@@ -1037,7 +1106,7 @@ mod tests {
                 Ok(ids[1..].iter().map(|&t| -(t as f32) / 10.0 - self.0).collect())
             }
         }
-        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| m == "public"))
+        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| m == "public", false))
     }
 
     #[test]
@@ -1046,17 +1115,17 @@ mod tests {
         let gate = InflightGate::new();
         let mut round = ChallengeRound::new();
         let mut honest = provider(0.01, &gate);
-        match run_round(&mut round, &r.set, "public", &mut honest, &mut |n| n - 1, &mut || {}, &mut |_| {}) {
+        match run_round(&mut round, &r.set, "public", &mut honest, &mut |n| n - 1, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}) {
             RoundOutcome::Verdict(v) => assert!(v.passed(), "{v:?}"),
             other => panic!("{other:?}"),
         }
         let mut sub = provider(0.05, &gate);
-        match run_round(&mut round, &r.set, "public", &mut sub, &mut |_| 0, &mut || {}, &mut |_| {}) {
+        match run_round(&mut round, &r.set, "public", &mut sub, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}) {
             RoundOutcome::Verdict(v) => assert!(!v.passed(), "{v:?}"),
             other => panic!("{other:?}"),
         }
         // 8 of 10 texts used: a third round plays the last two, then runs out.
-        assert_eq!(run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &mut || {}, &mut |_| {}), RoundOutcome::Exhausted);
+        assert_eq!(run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}), RoundOutcome::Exhausted);
         assert_eq!((round.progress(), round.issued_count()), (2, 10));
     }
 
@@ -1073,7 +1142,7 @@ mod tests {
             honest(f)
         };
         let mut round = ChallengeRound::new();
-        let out = run_round(&mut round, &r.set, "public", &mut transport, &mut |_| 0, &mut || {}, &mut |rd| {
+        let out = run_round(&mut round, &r.set, "public", &mut transport, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |rd| {
             saved.borrow_mut().push(rd.issued_count())
         });
         assert!(matches!(out, RoundOutcome::Verdict(_)));
@@ -1085,7 +1154,7 @@ mod tests {
         let r = parse_reference(&ref_json(4, 4)).unwrap();
         let mut round = ChallengeRound::new();
         let mut legacy = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![0x13, 0, 0, 0]) };
-        assert_eq!(run_round(&mut round, &r.set, "public", &mut legacy, &mut |_| 0, &mut || {}, &mut |_| {}), RoundOutcome::Unsupported);
+        assert_eq!(run_round(&mut round, &r.set, "public", &mut legacy, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}), RoundOutcome::Unsupported);
         assert_eq!(round.in_flight(), 0);
     }
 
@@ -1101,14 +1170,15 @@ mod tests {
             if calls <= 2 { honest(f) } else { Ok(score_refusal("prompt scoring busy, retry")) }
         };
         let mut pauses = 0;
-        let out = run_round(&mut round, &r.set, "public", &mut flaky, &mut |_| 0, &mut || pauses += 1, &mut |_| {});
-        assert!(matches!(out, RoundOutcome::Incomplete(ref s) if s.contains("busy")), "{out:?}");
+        let out = run_round(&mut round, &r.set, "public", &mut flaky, &mut |_| 0, &|_| true, &mut |_| {}, &mut || pauses += 1, &mut |_| {});
+        // Busy isn't a skip (review round 3, LP1): the text it stalled on stays pending.
+        assert_eq!(out, RoundOutcome::Busy);
         assert_eq!(pauses, MAX_BUSY_RETRIES - 1);
-        assert_eq!(round.progress(), 2);
-        // The next attempt picks up where it left off and completes with 2 more texts.
+        assert_eq!((round.progress(), round.in_flight()), (2, 1));
+        // The next attempt sends that same text first, then completes with 1 more.
         let mut honest = provider(0.0, &gate);
         assert!(matches!(
-            run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &mut || {}, &mut |_| {}),
+            run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
             RoundOutcome::Verdict(v) if v.passed()
         ));
     }
@@ -1119,15 +1189,52 @@ mod tests {
         let gate = InflightGate::new();
         let mut round = ChallengeRound::new();
         let mut private = provider(0.0, &gate);
+        // Every text declined: one is tolerated, the second makes the round an evasion.
         assert!(matches!(
-            run_round(&mut round, &r.set, "private", &mut private, &mut |_| 0, &mut || {}, &mut |_| {}),
-            RoundOutcome::Incomplete(s) if s.contains("not scorable")
+            run_round(&mut round, &r.set, "private", &mut private, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
+            RoundOutcome::Evasion(s) if s.contains("not scorable")
         ));
+        assert_eq!(round.issued_count(), MAX_SKIPPED_TEXTS + 1);
         let mut down = |_: &[u8]| -> Result<Vec<u8>, String> { Err("timeout".into()) };
         assert!(matches!(
-            run_round(&mut round, &r.set, "public", &mut down, &mut |_| 0, &mut || {}, &mut |_| {}),
+            run_round(&mut round, &r.set, "public", &mut down, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
             RoundOutcome::Incomplete(s) if s.contains("timeout")
         ));
+    }
+
+    #[test]
+    fn a_provider_cannot_pick_which_texts_count() {
+        use std::cell::{Cell, RefCell};
+        let r = parse_reference(&ref_json(12, 4)).unwrap();
+        let gate = InflightGate::new();
+        // Declining one text is tolerated: the round goes on without it.
+        let mut honest = provider(0.0, &gate);
+        let sent = Cell::new(0);
+        let mut once = |f: &[u8]| -> Result<Vec<u8>, String> {
+            sent.set(sent.get() + 1);
+            if sent.get() == 2 { Ok(score_refusal("not now")) } else { honest(f) }
+        };
+        let mut round = ChallengeRound::new();
+        assert!(matches!(
+            run_round(&mut round, &r.set, "public", &mut once, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
+            RoundOutcome::Verdict(v) if v.passed()
+        ));
+        assert_eq!(round.issued_count(), 5, "4 answered + 1 declined");
+        // A garbled reply counts the same as a refusal.
+        let mut round = ChallengeRound::new();
+        let mut garbled = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(b"OHS1\x00junk".to_vec()) };
+        assert!(matches!(
+            run_round(&mut round, &r.set, "public", &mut garbled, &mut |_| 0, &|_| true, &mut |_| {}, &mut || {}, &mut |_| {}),
+            RoundOutcome::Evasion(_)
+        ));
+        // Texts this verifier sent another provider are never issued again (review round 3, LP5).
+        let mut round = ChallengeRound::new();
+        let seen: RefCell<std::collections::HashSet<[u8; 32]>> = RefCell::new(r.set.texts[..10].iter().map(|t| t.digest()).collect());
+        let mut honest = provider(0.0, &gate);
+        let out = run_round(&mut round, &r.set, "public", &mut honest, &mut |_| 0,
+            &|t| !seen.borrow().contains(&t.digest()), &mut |t| { seen.borrow_mut().insert(t.digest()); }, &mut || {}, &mut |_| {});
+        assert_eq!(out, RoundOutcome::Exhausted, "only 2 texts were left for it");
+        assert_eq!(seen.borrow().len(), 12);
     }
 
     // ── check history (LogprobStatus) ──

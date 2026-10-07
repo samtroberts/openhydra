@@ -117,6 +117,9 @@ const ATTEST_RATE_BURST: f64 = 2.0;
 const SERVED_ATTEST_PRIORITY_MS: u64 = 60 * 60 * 1000;
 /// Peers remembered for that (the oldest are forgotten first).
 const MAX_RECENTLY_SERVED: usize = 4096;
+/// How long after we answered a verifier's challenge it counts as mid-round (see
+/// `Provider::scored_recently`): a round sends its next text within seconds.
+const IN_ROUND_MS: u64 = 2 * 60 * 1000;
 const ATTEST_RATE_MAX_TRACKED: usize = 4096;
 /// Cap on attestation challenges across all peers: the per-peer cap alone lets many peers (or one
 /// with many identities) keep the Secure Enclave signing nonstop.
@@ -999,6 +1002,9 @@ pub struct Provider<A: EngineAdapter> {
     prompt_scoring: bool,
     /// Caps challenges scored at once, provider-wide (engines OOM on concurrent prompt log-probs).
     score_gate: InflightGate,
+    /// Verifiers whose challenge we answered, and when: one answered in the last
+    /// [`IN_ROUND_MS`] is mid-round and gets a spare scoring slot.
+    scored_recently: Mutex<HashMap<String, u64>>,
     /// Per-peer rate cap on prompt-scoring challenges (and model-info requests).
     score_rl: Arc<RateLimiter>,
     /// What the engine last reported for each model, keyed by handle — the source of the identity
@@ -1151,6 +1157,7 @@ impl<A: EngineAdapter> Provider<A> {
             })),
             prompt_scoring: false,
             score_gate: InflightGate::new(),
+            scored_recently: Mutex::new(HashMap::new()),
             score_rl: Arc::new(RateLimiter::new(RateLimitConfig {
                 rps: SCORE_RATE_RPS,
                 burst: SCORE_RATE_BURST,
@@ -2670,12 +2677,28 @@ impl<A: EngineAdapter> Provider<A> {
                 if self.score_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
                     return score_refusal("prompt scoring rate limited, retry");
                 }
-                handle_prompt_score_inbound(
+                let now = now_unix_ms();
+                let in_round = self
+                    .scored_recently
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(source_peer)
+                    .is_some_and(|at| now.saturating_sub(*at) <= IN_ROUND_MS);
+                let reply = handle_prompt_score_inbound(
                     &data[1..],
                     self.prompt_scoring.then_some(&self.adapter as &dyn EngineAdapter),
                     &self.score_gate,
                     &|model| self.policy.announce_globally(model),
-                )
+                    in_round,
+                );
+                if !crate::prompt_score::is_score_refusal(&reply) {
+                    let mut m = self.scored_recently.lock().unwrap_or_else(|e| e.into_inner());
+                    m.retain(|_, at| now.saturating_sub(*at) <= IN_ROUND_MS);
+                    if m.len() < MAX_RECENTLY_SERVED {
+                        m.insert(source_peer.to_string(), now);
+                    }
+                }
+                reply
             }
             // Which exact model a handle is (so the verifier can pick the reference for its quant).
             Some(&MODEL_INFO_REQUEST) => {

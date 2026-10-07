@@ -362,7 +362,19 @@ impl ChallengeRound {
     /// caller supplies the randomness, so the order is unpredictable to the provider). `None` when
     /// the set is exhausted for this provider — the verifier needs fresh texts.
     pub fn next_text<'a>(&mut self, set: &'a ReferenceSet, pick: impl FnOnce(usize) -> usize) -> Option<&'a ReferenceText> {
-        let fresh: Vec<&ReferenceText> = set.texts.iter().filter(|t| !self.issued.contains(&t.digest())).collect();
+        self.next_text_where(set, pick, |_| true)
+    }
+
+    /// [`next_text`](Self::next_text) among the texts `allowed` lets through as well (e.g. ones this
+    /// verifier has sent no other provider either).
+    pub fn next_text_where<'a>(
+        &mut self,
+        set: &'a ReferenceSet,
+        pick: impl FnOnce(usize) -> usize,
+        allowed: impl Fn(&ReferenceText) -> bool,
+    ) -> Option<&'a ReferenceText> {
+        let fresh: Vec<&ReferenceText> =
+            set.texts.iter().filter(|t| !self.issued.contains(&t.digest()) && allowed(t)).collect();
         if fresh.is_empty() {
             return None;
         }
@@ -370,6 +382,17 @@ impl ChallengeRound {
         self.issued.insert(text.digest());
         self.pending.insert(text.id.clone());
         Some(text)
+    }
+
+    /// A text from `set` issued and not yet answered or given up on: sent again before any new one,
+    /// so a provider can't skip a text by stalling on it.
+    pub fn pending_text<'a>(&self, set: &'a ReferenceSet) -> Option<&'a ReferenceText> {
+        set.texts.iter().find(|t| self.pending.contains(&t.id))
+    }
+
+    /// The digests of every text ever issued to this provider.
+    pub fn issued_digests(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.issued.iter()
     }
 
     /// Give up on an issued text (timeout, refusal, transport error). It stays issued — the provider
