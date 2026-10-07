@@ -256,7 +256,21 @@ impl NetworkHandle {
     /// body is delivered separately via [`push`](Self::push)).
     pub fn respond(&self, request_id: String, data: Vec<u8>) -> Result<(), String> {
         self.cmd_tx
-            .blocking_send(SwarmCommand::RespondProxy { request_id, data })
+            .blocking_send(SwarmCommand::RespondProxy { request_id, data, on_sent: None })
+            .map_err(|_| "swarm not running".to_string())
+    }
+
+    /// [`respond`](Self::respond), then call `on_sent` once with whether the response reached the
+    /// peer (libp2p reported it sent) or not. It runs on the swarm's event loop: keep it short, and
+    /// never call back into this handle from it.
+    pub fn respond_then(
+        &self,
+        request_id: String,
+        data: Vec<u8>,
+        on_sent: crate::event_loop::OnSent,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .blocking_send(SwarmCommand::RespondProxy { request_id, data, on_sent: Some(on_sent) })
             .map_err(|_| "swarm not running".to_string())
     }
 

@@ -186,8 +186,9 @@ fn settle_retryable(e: &AdapterError) -> bool {
 /// which never reports more. An older provider reported the engine's own count, which can honestly
 /// be higher (reasoning it didn't stream); it is just signed for less.
 fn over_reported_by_billing(summary: &crate::serve::ServeSummary, billable: u64) -> bool {
-    // Only the rule we compute: a newer rule may bill differently, and we can't judge it by ours.
-    summary.metrics.billing == crate::serve::BILLING_VERSION && summary.tokens > billable
+    // Only a rule that bills a completed serve as ours does: a newer rule may bill differently, and
+    // we can't judge it by ours.
+    crate::serve::same_completed_billing(summary.metrics.billing) && summary.tokens > billable
 }
 
 /// The network an address sits on, for telling providers' operators apart: its IPv4 /24 or IPv6 /48.
@@ -743,6 +744,15 @@ fn stream_total_cap_scaled(max_tokens: Option<u32>) -> Duration {
     let tokens = max_tokens.map(u64::from).unwrap_or(STREAM_TOTAL_DEFAULT_TOKENS);
     let scaled = STREAM_TOTAL_BASE + Duration::from_secs(tokens.saturating_mul(STREAM_TOTAL_PER_TOKEN_SECS));
     scaled.clamp(STREAM_TOTAL_FLOOR, STREAM_TOTAL_CEILING)
+}
+
+/// One request's trip to a provider ([`ConsumerNode::exchange`]).
+struct Exchange {
+    result: Result<ServeSummary, AdapterError>,
+    /// The first-ack (stream) or round-trip (buffered) time, ns.
+    proxy_roundtrip_ns: u64,
+    /// Whether it was read as a stream (a stream that breaks after output is settled for what was read).
+    streamed: bool,
 }
 
 /// Why a streaming attempt didn't complete.
@@ -1895,46 +1905,12 @@ impl ConsumerNode {
                 provider = %provider.libp2p_peer_id,
             )
             .entered();
-            // B-S1: commit the receipt nonce up front so the provider records what it serves
-            // under it; the settlement receipt then reuses this exact nonce.
-            let nonce = rand::random::<[u8; 16]>();
-            let request = ServeRequest {
-                reply_to: self.net.libp2p_peer_id().to_string(),
-                model_ref: provider.model_id.clone(),
-                messages: messages.to_vec(),
-                max_tokens,
-                temperature,
-                tools: tools.to_vec(),
-                think,
-                nonce,
-                // M4-base: present our swarm membership credential ONLY on a private route — a
-                // candidate that came from a private card names the swarm it's gated on
-                // (`provider.swarm_public_key`), and we attach the matching credential. This both
-                // reaches the private model AND avoids leaking swarm membership to public/global
-                // providers (we never attach a credential to a public serve). `None` otherwise.
-                credential: if provider.swarm_public_key.is_empty() {
-                    None
-                } else {
-                    self.creds
-                        .as_ref()
-                        .and_then(|c| c.credential_for_swarm(&provider.swarm_public_key, now_unix_ms()))
-                },
-                // A user-facing serve keeps the caller's own sampling — deterministic mode is
-                // opt-in (used by the audit probe below), not forced on real generations.
-                deterministic: None,
-                // On the crypto rail, offer to pay at our peg (a provider that charges needs it).
-                settlement_peg: self.settlement_peg,
-                settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
-                settlement_wallet: self.settlement_wallet(),
-            };
+            // B-S1: the request commits a fresh receipt nonce up front, so the provider records
+            // what it serves under it; the settlement receipt then reuses this exact nonce.
+            let request = self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think);
+            let nonce = request.nonce;
             let provider_libp2p = provider.libp2p_peer_id.clone();
-            // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
-            // agentic completion on a slow remote model isn't abandoned mid-generation.
-            let serve_to = attempt_timeout(max_tokens);
             let t_serve = std::time::Instant::now();
-            // Shared across the (sequential) buffered + streaming transports via a Cell so both
-            // can record it without a mutable-borrow conflict. Holds the first-ack / round-trip RTT.
-            let proxy_rt = std::cell::Cell::new(0u64);
             // P7: on a sample of serves, keep the delivered text to count its tokens afterwards.
             let model_key_now = rep_model_key(&provider.canonical_model_id, &provider.model_id);
             let counter = (!self.is_self_serve(&provider_libp2p)
@@ -1944,12 +1920,18 @@ impl ConsumerNode {
             let captured = std::cell::RefCell::new(String::new());
             // Set once the text outgrew `MAX_COUNTED_BYTES`: no longer kept, and not checked.
             let overflowed = std::cell::Cell::new(false);
-            let result = {
+            // What this attempt received, counted as the provider counts what its polls returned: a
+            // stream that ends early is settled for it (see `StreamTally`).
+            let tally = std::cell::Cell::new(crate::serve::StreamTally::default());
+            let exchange = {
                 let mut guarded = |d: &str| {
                     delivered = true;
                     let mut t = delivered_text.get();
                     t.push(d);
                     delivered_text.set(t);
+                    let mut n = tally.get();
+                    n.push_delta(d);
+                    tally.set(n);
                     if counter.is_some() && !overflowed.get() {
                         let mut c = captured.borrow_mut();
                         if c.len() + d.len() <= crate::token_count::MAX_COUNTED_BYTES {
@@ -1962,76 +1944,11 @@ impl ConsumerNode {
                     }
                     on_delta(d);
                 };
-                // Buffered (0x10) round-trip with 0x11 reconnect-fetch drop recovery — the proven
-                // path, used directly when a provider is known buffered-only and as the fallback
-                // when a streaming probe reveals a legacy provider.
-                let mut buffered = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-                    let t = std::time::Instant::now();
-                    let r = self.net.proxy_forward_timeout(
-                        provider_libp2p.clone(),
-                        framed.to_vec(),
-                        serve_to,
-                    );
-                    proxy_rt.set(t.elapsed().as_nanos() as u64);
-                    match r {
-                        Ok(bytes) => Ok(bytes),
-                        // The serve connection dropped (e.g. relay/NAT eviction during a long
-                        // generation). The response is single-shot, so nothing was delivered
-                        // yet — recover the completed work by fetching it by nonce on a fresh
-                        // circuit rather than failing. See RECONNECT_AND_FETCH_PLAN.md.
-                        Err(drop_err) => self
-                            .reconnect_and_fetch(&provider_libp2p, &nonce, framed, serve_to)
-                            .map_err(|fe| {
-                                AdapterError::Http(format!(
-                                    "proxy_forward: {drop_err}; reconnect-fetch: {fe}"
-                                ))
-                            }),
-                    }
-                };
-                if self.is_buffered_only(&provider_libp2p) {
-                    request_completion(&mut buffered, &request, &mut guarded)
-                } else {
-                    // P1c: try streaming first. A raw round-trip (no 0x11 — streaming re-polls the
-                    // same offset itself for drop-resume); the first-ack RTT is recorded as
-                    // proxy_roundtrip_ns. Real thread::sleep paces the poll loop live.
-                    let stream_out = {
-                        let mut stream_transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
-                            let t = std::time::Instant::now();
-                            let r = self.net.proxy_forward_timeout(
-                                provider_libp2p.clone(),
-                                framed.to_vec(),
-                                STREAM_CALL_TIMEOUT,
-                            );
-                            if proxy_rt.get() == 0 {
-                                proxy_rt.set(t.elapsed().as_nanos() as u64); // first-ack RTT
-                            }
-                            r.map_err(AdapterError::Http)
-                        };
-                        let mut sleeper = |d: Duration| std::thread::sleep(d);
-                        request_completion_streaming(
-                            &mut stream_transport,
-                            &mut sleeper,
-                            &request,
-                            &mut guarded,
-                        )
-                    };
-                    match stream_out {
-                        Ok(s) => Ok(s),
-                        Err(StreamFail::Error(e)) => Err(e),
-                        // A legacy provider — remember it and fall back to buffered this same
-                        // attempt (the probe ran no generation, so no work is wasted).
-                        Err(StreamFail::Legacy) => {
-                            self.mark_buffered_only(&provider_libp2p);
-                            tracing::debug!(
-                                provider = %provider_libp2p,
-                                "provider is buffered-only; falling back to SERVE_REQUEST"
-                            );
-                            request_completion(&mut buffered, &request, &mut guarded)
-                        }
-                    }
-                }
+                self.exchange(&provider_libp2p, &request, &mut guarded)
             };
-            let proxy_roundtrip_ns = proxy_rt.get();
+            let streamed = exchange.streamed;
+            let result = exchange.result;
+            let proxy_roundtrip_ns = exchange.proxy_roundtrip_ns;
             match result {
                 Ok(mut summary) => {
                     summary.discover_ns = discover_ns;
@@ -2074,27 +1991,7 @@ impl ConsumerNode {
                         }
                     }
                     if summary.ok && summary.tokens > 0 {
-                        // #7/#5: per-model consumed tracking (pure usage — kept for self too) + a
-                        // `used` give/take ledger row (only for a real counterparty, not self).
-                        if let Some(stats) = &self.stats {
-                            stats.record_consume(model, summary.tokens);
-                            if !self_serve {
-                                stats.record_ledger(now, "used", model, &provider.peer_id, summary.tokens);
-                            }
-                        }
-                        // Durable Ledger row (consumer's `used` side — not a receipt, so it lives
-                        // only here) so the view + totals survive a restart. Best-effort.
-                        if !self_serve {
-                            if let Some(store) = &self.store {
-                                let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
-                                    ts_ms: now,
-                                    kind: "used".to_string(),
-                                    model: model.to_string(),
-                                    counterparty: provider.peer_id.clone(),
-                                    tokens: summary.tokens,
-                                });
-                            }
-                        }
+                        self.record_usage(model, &provider.peer_id, summary.tokens, self_serve, now);
                     }
                     // M2.2(a): a clean served completion earns the provider reputation for THIS
                     // model (Phase 4a) — but not for a self-serve (no earning off yourself).
@@ -2136,6 +2033,17 @@ impl ConsumerNode {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                         self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
                     }
+                    // A stream that broke after output arrived is still owed for what we read: the
+                    // provider counts what its polls returned the same way, and holds an unpaid
+                    // part against us like an unpaid whole.
+                    if delivered && streamed && !self.is_self_serve(&provider.libp2p_peer_id) {
+                        let tokens = tally.get().billable(max_tokens);
+                        if tokens > 0 {
+                            tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; settling for what was received");
+                            self.settle_receipt(&provider, tokens, nonce);
+                            self.record_usage(model, &provider.peer_id, tokens, false, now);
+                        }
+                    }
                     if delivered {
                         // Already streamed part of a completion to the client — failing over
                         // (or a cache-bypass retry) would duplicate output. Surface it as fatal.
@@ -2150,6 +2058,136 @@ impl ConsumerNode {
         AttemptOutcome::Retryable(
             last_err.unwrap_or_else(|| AdapterError::Http(format!("all providers failed for '{model}'"))),
         )
+    }
+
+    /// The request a serve of `messages` at `provider` sends, with a fresh receipt nonce. Every serve
+    /// is built here, a user's and an audit's alike, so an audit can't differ from a user's request
+    /// in any field (review round 3, D1).
+    fn serve_request_for(
+        &self,
+        provider: &SelectedProvider,
+        messages: &[ChatMessage],
+        max_tokens: Option<u32>,
+        temperature: Option<f64>,
+        tools: &[Value],
+        think: Option<bool>,
+    ) -> ServeRequest {
+        ServeRequest {
+            reply_to: self.net.libp2p_peer_id().to_string(),
+            model_ref: provider.model_id.clone(),
+            messages: messages.to_vec(),
+            max_tokens,
+            temperature,
+            tools: tools.to_vec(),
+            think,
+            nonce: rand::random::<[u8; 16]>(),
+            // M4-base: present our swarm membership credential ONLY on a private route — a
+            // candidate that came from a private card names the swarm it's gated on
+            // (`provider.swarm_public_key`), and we attach the matching credential. This both
+            // reaches the private model AND avoids leaking swarm membership to public/global
+            // providers (we never attach a credential to a public serve). `None` otherwise.
+            credential: if provider.swarm_public_key.is_empty() {
+                None
+            } else {
+                self.creds
+                    .as_ref()
+                    .and_then(|c| c.credential_for_swarm(&provider.swarm_public_key, now_unix_ms()))
+            },
+            // Every serve keeps the caller's own sampling; deterministic mode is never sent, so a
+            // request carrying it would stand out.
+            deterministic: None,
+            // On the crypto rail, offer to pay at our peg (a provider that charges needs it).
+            settlement_peg: self.settlement_peg,
+            settlement_domain: self.settlement_chain.as_ref().map(|c| c.domain.fingerprint()),
+            settlement_wallet: self.settlement_wallet(),
+        }
+    }
+
+    /// Send `request` to `provider_libp2p` the way every serve travels: as a stream (polled), or as
+    /// one buffered reply to a provider known not to stream, with reconnect-and-fetch if that reply's
+    /// connection drops. Each text fragment goes to `on_delta` as it arrives.
+    fn exchange(&self, provider_libp2p: &str, request: &ServeRequest, on_delta: &mut dyn FnMut(&str)) -> Exchange {
+        // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
+        // agentic completion on a slow remote model isn't abandoned mid-generation.
+        let serve_to = attempt_timeout(request.max_tokens);
+        // Shared across the (sequential) buffered + streaming transports via a Cell so both
+        // can record it without a mutable-borrow conflict. Holds the first-ack / round-trip RTT.
+        let proxy_rt = std::cell::Cell::new(0u64);
+        let mut streamed = false;
+        // Buffered (0x10) round-trip with 0x11 reconnect-fetch drop recovery — the proven
+        // path, used directly when a provider is known buffered-only and as the fallback
+        // when a streaming probe reveals a legacy provider.
+        let mut buffered = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            let t = std::time::Instant::now();
+            let r = self.net.proxy_forward_timeout(provider_libp2p.to_string(), framed.to_vec(), serve_to);
+            proxy_rt.set(t.elapsed().as_nanos() as u64);
+            match r {
+                Ok(bytes) => Ok(bytes),
+                // The serve connection dropped (e.g. relay/NAT eviction during a long
+                // generation). The response is single-shot, so nothing was delivered
+                // yet — recover the completed work by fetching it by nonce on a fresh
+                // circuit rather than failing. See RECONNECT_AND_FETCH_PLAN.md.
+                Err(drop_err) => self
+                    .reconnect_and_fetch(provider_libp2p, &request.nonce, framed, serve_to)
+                    .map_err(|fe| AdapterError::Http(format!("proxy_forward: {drop_err}; reconnect-fetch: {fe}"))),
+            }
+        };
+        let result = if self.is_buffered_only(provider_libp2p) {
+            request_completion(&mut buffered, request, on_delta)
+        } else {
+            // P1c: try streaming first. A raw round-trip (no 0x11 — streaming re-polls the
+            // same offset itself for drop-resume); the first-ack RTT is recorded as
+            // proxy_roundtrip_ns. Real thread::sleep paces the poll loop live.
+            let stream_out = {
+                let mut stream_transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+                    let t = std::time::Instant::now();
+                    let r = self.net.proxy_forward_timeout(provider_libp2p.to_string(), framed.to_vec(), STREAM_CALL_TIMEOUT);
+                    if proxy_rt.get() == 0 {
+                        proxy_rt.set(t.elapsed().as_nanos() as u64); // first-ack RTT
+                    }
+                    r.map_err(AdapterError::Http)
+                };
+                let mut sleeper = |d: Duration| std::thread::sleep(d);
+                streamed = true;
+                request_completion_streaming(&mut stream_transport, &mut sleeper, request, on_delta)
+            };
+            match stream_out {
+                Ok(s) => Ok(s),
+                Err(StreamFail::Error(e)) => Err(e),
+                // A legacy provider — remember it and fall back to buffered this same
+                // attempt (the probe ran no generation, so no work is wasted).
+                Err(StreamFail::Legacy) => {
+                    streamed = false;
+                    self.mark_buffered_only(provider_libp2p);
+                    tracing::debug!(provider = %provider_libp2p, "provider is buffered-only; falling back to SERVE_REQUEST");
+                    request_completion(&mut buffered, request, on_delta)
+                }
+            }
+        };
+        Exchange { result, proxy_roundtrip_ns: proxy_rt.get(), streamed }
+    }
+
+    /// #7/#5: per-model consumed tracking (pure usage, kept for a self-serve too), and a `used`
+    /// give/take ledger row for a real counterparty (`provider_peer`), in memory and in the store (the
+    /// consumer's side isn't a receipt, so it lives only here) so the totals survive a restart.
+    fn record_usage(&self, model: &str, provider_peer: &str, tokens: u64, self_serve: bool, now: u64) {
+        if let Some(stats) = &self.stats {
+            stats.record_consume(model, tokens);
+            if !self_serve {
+                stats.record_ledger(now, "used", model, provider_peer, tokens);
+            }
+        }
+        if !self_serve {
+            if let Some(store) = &self.store {
+                let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
+                    ts_ms: now,
+                    kind: "used".to_string(),
+                    model: model.to_string(),
+                    counterparty: provider_peer.to_string(),
+                    tokens,
+                });
+            }
+        }
     }
 
     /// Reconnect-and-fetch (RECONNECT_AND_FETCH_PLAN.md): the serve connection to `provider`
@@ -3192,6 +3230,8 @@ mod tests {
         assert!(!over_reported_by_billing(&summary(40, crate::serve::BILLING_VERSION), 40));
         // An older provider's engine count can honestly be higher: signed for less, not faulted.
         assert!(!over_reported_by_billing(&summary(500, 0), 40));
+        // Rule 3 bills a completed serve as 4 does.
+        assert!(over_reported_by_billing(&summary(500, 3), 40));
         // Nor is a newer rule, which we can't judge by ours.
         assert!(!over_reported_by_billing(&summary(500, crate::serve::BILLING_VERSION + 1), 40));
     }

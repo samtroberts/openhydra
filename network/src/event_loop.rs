@@ -206,6 +206,13 @@ const RELAY_FORWARD_TTL: std::time::Duration = std::time::Duration::from_secs(30
 /// grow the queue without bound.
 const MAX_PENDING_RELAY_FORWARDS: usize = 512;
 
+/// Called once with whether a response reached its peer (see [`SwarmCommand::RespondProxy`]). Runs
+/// on the event loop, so it must be quick and must not wait on the swarm.
+pub type OnSent = Box<dyn FnOnce(bool) + Send>;
+
+/// Responses sent but not yet confirmed that a caller asked to be told about, at most.
+const MAX_PENDING_SENT: usize = 4096;
+
 /// Commands sent from the Python thread to the swarm event loop.
 pub enum SwarmCommand {
     /// Publish a peer record to Kademlia DHT.
@@ -288,6 +295,9 @@ pub enum SwarmCommand {
     RespondProxy {
         request_id: String,
         data: Vec<u8>,
+        /// Told whether the response reached the peer (libp2p `ResponseSent`), or didn't (an
+        /// inbound failure, an expired or unknown request). A local reply counts as reached.
+        on_sent: Option<OnSent>,
     },
     /// Check if a peer is currently connected.
     IsConnected {
@@ -516,7 +526,13 @@ struct LoopState {
     // the leak vs relying only on libp2p's timeout); the PeerId lets the request
     // handler enforce a per-peer inflight cap (fairness — one peer can't fill
     // the global PROXY_QUEUE_MAX slots) by counting this peer's live channels.
-    inbound_proxy_channels: HashMap<String, (request_response::ResponseChannel<ProxyResponse>, std::time::Instant, PeerId)>,
+    inbound_proxy_channels: HashMap<
+        String,
+        (request_response::ResponseChannel<ProxyResponse>, std::time::Instant, PeerId, request_response::InboundRequestId),
+    >,
+    /// Responses sent whose caller wants to know they reached the peer, by libp2p request id: told on
+    /// `ResponseSent` or an inbound failure.
+    pending_sent: HashMap<request_response::InboundRequestId, OnSent>,
     /// Counter for generating unique inbound request IDs.
     inbound_proxy_counter: u64,
     /// Proxy forward requests waiting for a relay connection to be established.
@@ -726,6 +742,7 @@ impl LoopState {
             pending_registry: HashMap::new(),
             local_grpc_port: 50051,
             inbound_proxy_channels: HashMap::new(),
+            pending_sent: HashMap::new(),
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
             relay_close_deadline: HashMap::new(),
@@ -1265,15 +1282,35 @@ pub async fn run_event_loop(
                         state.local_grpc_port = local_grpc_port;
                         handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
                     }
-                    Some(SwarmCommand::RespondProxy { request_id, data }) => {
+                    Some(SwarmCommand::RespondProxy { request_id, data, on_sent }) => {
                         if let Some(reply) = state.local_proxy_replies.remove(&request_id) {
-                            let _ = reply.send(Ok(data));
-                        } else if let Some((channel, _, _)) = state.inbound_proxy_channels.remove(&request_id) {
-                            if let Err(e) = swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
-                                warn!("proxy respond failed: {:?}", e);
+                            let sent = reply.send(Ok(data)).is_ok();
+                            if let Some(f) = on_sent {
+                                f(sent);
+                            }
+                        } else if let Some((channel, _, _, rid)) = state.inbound_proxy_channels.remove(&request_id) {
+                            match swarm.behaviour_mut().grpc_proxy.send_response(channel, ProxyResponse(data)) {
+                                Ok(()) => {
+                                    if let Some(f) = on_sent {
+                                        if state.pending_sent.len() < MAX_PENDING_SENT {
+                                            state.pending_sent.insert(rid, f);
+                                        } else {
+                                            f(false); // can't track it: don't claim it arrived
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("proxy respond failed: {:?}", e);
+                                    if let Some(f) = on_sent {
+                                        f(false);
+                                    }
+                                }
                             }
                         } else {
                             warn!("proxy respond: unknown request_id={}", request_id);
+                            if let Some(f) = on_sent {
+                                f(false);
+                            }
                         }
                     }
                     Some(SwarmCommand::OpenTunnel { peer_id, reply }) => {
@@ -1423,7 +1460,7 @@ pub async fn run_event_loop(
                 // bounds that to PROXY_CHANNEL_TTL. Dropping the ResponseChannel
                 // closes it, so the remote peer fails fast instead of hanging.
                 let pc_before = state.inbound_proxy_channels.len();
-                state.inbound_proxy_channels.retain(|_, (_, t, _)| t.elapsed() < PROXY_CHANNEL_TTL);
+                state.inbound_proxy_channels.retain(|_, (_, t, _, _)| t.elapsed() < PROXY_CHANNEL_TTL);
                 let pc_swept = pc_before - state.inbound_proxy_channels.len();
                 if pc_swept > 0 {
                     warn!(swept = pc_swept, remaining = state.inbound_proxy_channels.len(),
@@ -3921,7 +3958,7 @@ fn handle_grpc_proxy_event(
     match event {
         request_response::Event::Message { peer, message } => {
             match message {
-                request_response::Message::Request { request_id: _, request, channel } => {
+                request_response::Message::Request { request_id: rid, request, channel } => {
                     // Phase 2.4: per-peer inflight cap. Count this peer's live
                     // (unanswered) channels; if it already holds the cap, shed the
                     // request by dropping `channel` (the peer's request times out).
@@ -3933,7 +3970,7 @@ fn handle_grpc_proxy_event(
                     let peer_inflight = state
                         .inbound_proxy_channels
                         .values()
-                        .filter(|(_, _, p)| *p == peer)
+                        .filter(|(_, _, p, _)| *p == peer)
                         .count();
                     if peer_inflight >= MAX_INFLIGHT_PER_PEER {
                         warn!(%peer, inflight = peer_inflight, cap = MAX_INFLIGHT_PER_PEER,
@@ -3958,7 +3995,7 @@ fn handle_grpc_proxy_event(
                     // F6b: trace (not info — this fires for EVERY inbound request) for debugging.
                     trace!(%peer, id = %req_id, bytes = request.0.len(), "proxy request queued for the agent");
                     proxy_queue.push((req_id.clone(), peer.to_string(), request.0));
-                    state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone()));
+                    state.inbound_proxy_channels.insert(req_id, (channel, std::time::Instant::now(), peer.clone(), rid));
                 }
                 request_response::Message::Response { request_id, response } => {
                     if let Some(reply) = state.pending_proxy.remove(&request_id) {
@@ -4001,10 +4038,17 @@ fn handle_grpc_proxy_event(
                 }
             }
         }
-        request_response::Event::InboundFailure { error, .. } => {
+        request_response::Event::InboundFailure { error, request_id, .. } => {
             warn!(?error, "proxy inbound failure");
+            if let Some(f) = state.pending_sent.remove(&request_id) {
+                f(false);
+            }
         }
-        _ => {}
+        request_response::Event::ResponseSent { request_id, .. } => {
+            if let Some(f) = state.pending_sent.remove(&request_id) {
+                f(true);
+            }
+        }
     }
 }
 

@@ -47,8 +47,15 @@ pub struct ServeMetrics {
 
 /// The billing rule this build follows: the reported count is [`billable_tokens`]. 3: whitespace
 /// runs count by length, and only real calls to offered tools earn the template allowance
-/// ([`allowance_earners`]).
-pub const BILLING_VERSION: u8 = 3;
+/// ([`allowance_earners`]). 4: a stream that ends early is owed for what the consumer read of it
+/// ([`StreamTally`]); a completed one is billed as in 3.
+pub const BILLING_VERSION: u8 = 4;
+
+/// Whether a provider reporting billing rule `billing` computes a completed serve's count as this
+/// build does: 3 and 4 differ only for streams that end early.
+pub fn same_completed_billing(billing: u8) -> bool {
+    (3..=BILLING_VERSION).contains(&billing)
+}
 
 /// How a provider that charges starts the error refusing a serve over payment (the consumer's offer
 /// or its unpaid serves). A consumer doesn't hold it against the provider: it is a price, not a fault.
@@ -163,6 +170,48 @@ pub fn billable_tokens(engine_tokens: u64, max_tokens: Option<u32>, delivered: u
     let by_text = delivered.saturating_add(BILLABLE_TOKEN_SLACK);
     let by_request = max_tokens.map_or(u64::MAX, u64::from);
     engine_tokens.min(by_text).min(by_request)
+}
+
+/// The billable count of a stream as far as one side has it, frame by frame ([`BILLING_VERSION`] 4).
+/// Provider and consumer feed it the same frames (the provider those a poll returned, the consumer
+/// those it received), so they arrive at the same count:
+/// * up to the `Done` frame, a stream that ends early is owed [`billable_tokens`] of its text
+///   fragments (about one token each, as the engine streams them) for its text: what a stopped serve
+///   reports too;
+/// * the `Done` frame carries the count for the whole completion, tool calls included.
+///
+/// A `ToolCalls` or `Error` frame adds nothing on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamTally {
+    fragments: u64,
+    text: DeliveredText,
+    done: Option<u64>,
+}
+
+impl StreamTally {
+    /// Count one received text fragment.
+    pub fn push_delta(&mut self, text: &str) {
+        self.fragments += 1;
+        self.text.push(text);
+    }
+
+    /// Count one encoded frame ([`ServeChunk::encode`]).
+    pub fn push_encoded(&mut self, frame: &[u8]) {
+        match frame.first() {
+            Some(&TAG_DELTA) => self.push_delta(&String::from_utf8_lossy(&frame[1..])),
+            Some(&TAG_DONE) => {
+                if let Ok(ServeChunk::Done { tokens, .. }) = ServeChunk::decode(frame) {
+                    self.done = Some(tokens);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What the frames counted so far are billed for, under a request for `max_tokens`.
+    pub fn billable(&self, max_tokens: Option<u32>) -> u64 {
+        self.done.unwrap_or_else(|| billable_tokens(self.fragments, max_tokens, self.text.units()))
+    }
 }
 
 /// A consumer's request for a provider to serve a streaming completion.
@@ -534,6 +583,12 @@ const FETCH_NOTFOUND: u8 = 0x03;
 const FETCH_FORBIDDEN: u8 = 0x04;
 
 impl FetchResponse {
+    /// Whether an encoded response is [`FetchResponse::Ready`] (carries the result), without
+    /// decoding it.
+    pub fn encoded_is_ready(bytes: &[u8]) -> bool {
+        bytes.first() == Some(&FETCH_READY)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         match self {
             FetchResponse::Ready(framed) => {
@@ -752,6 +807,46 @@ mod tests {
         let deltas = frames.iter().filter(|f| matches!(ServeChunk::decode(f), Ok(ServeChunk::Delta(_)))).count();
         assert_eq!(deltas, 7, "the engine stopped once the budget said so");
         assert_eq!(summary.tokens, 7, "billed for what was sent");
+        // A consumer that read the stream up to just before Done is owed the same count as the
+        // stopped serve reports (rule 4), and with the Done frame, exactly what it says.
+        let mut before_done = StreamTally::default();
+        let mut all = StreamTally::default();
+        for f in &frames {
+            if matches!(ServeChunk::decode(f), Ok(ServeChunk::Delta(_))) {
+                before_done.push_encoded(f);
+            }
+            all.push_encoded(f);
+        }
+        assert_eq!(before_done.billable(Some(1000)), 7);
+        assert_eq!(all.billable(Some(1000)), summary.tokens);
+    }
+
+    #[test]
+    fn a_partial_stream_is_counted_by_fragment_within_the_text_and_request_bounds() {
+        let mut t = StreamTally::default();
+        assert_eq!(t.billable(None), 0);
+        for _ in 0..40 {
+            t.push_delta("ab");
+        }
+        assert_eq!(t.billable(None), 40, "one per fragment");
+        assert_eq!(t.billable(Some(25)), 25, "never past max_tokens");
+        // Fragments with no text are bounded by the text measure (+ the slack), as any count is.
+        let mut empty = StreamTally::default();
+        for _ in 0..500 {
+            empty.push_delta("");
+        }
+        assert_eq!(empty.billable(None), BILLABLE_TOKEN_SLACK);
+        // Counting encoded frames is the same as counting received fragments; tool calls and errors
+        // add nothing before Done.
+        let mut enc = StreamTally::default();
+        for _ in 0..40 {
+            enc.push_encoded(&ServeChunk::Delta("ab".into()).encode());
+        }
+        enc.push_encoded(&ServeChunk::ToolCalls(vec![]).encode());
+        enc.push_encoded(&ServeChunk::Error("engine died".into()).encode());
+        assert_eq!(enc, t);
+        enc.push_encoded(&ServeChunk::Done { tokens: 33, metrics: Default::default() }.encode());
+        assert_eq!(enc.billable(Some(25)), 33, "the Done count stands as reported (the consumer bounds it itself)");
     }
 
     #[test]

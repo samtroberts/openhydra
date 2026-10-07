@@ -420,19 +420,39 @@ fn private_member_in<'a, V>(m: &'a HashMap<(String, String), (u64, V)>, peer: &s
 /// A paid serve's reservation against its consumer's unpaid-token cap while it generates; released
 /// when dropped (the serve recorded, or failed).
 struct PaymentReservation {
-    generating: Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>,
+    generating: Arc<Mutex<HashMap<String, Vec<Running>>>>,
     peer: String,
-    /// Tells this reservation apart from the consumer's others (`(id, tokens)` in `generating`).
+    /// Tells this reservation apart from the consumer's others in `generating`.
     id: u64,
     /// What it reserved at the start ([`paid_reservation`]).
     initial: u64,
+}
+
+/// A paid serve running now, as its consumer's credit window counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Running {
+    id: u64,
+    /// What it holds against the window: its reservation (grown as it generates).
+    tokens: u64,
+    /// Its receipt nonce: a stream's commitment grows under it while it runs, and is already
+    /// counted by `tokens` (never less than what was sent).
+    nonce: [u8; 16],
+}
+
+/// What `peer`'s unsettled commitments owe, leaving out those of serves still running (`running`),
+/// which their reservations count.
+fn unsettled_of(map: &HashMap<[u8; 16], ServeCommitment>, peer: &str, running: &[Running]) -> Vec<Unsettled> {
+    map.iter()
+        .filter(|(n, c)| c.served_peer == peer && !running.iter().any(|r| r.nonce == **n))
+        .map(|(_, c)| Unsettled { at: c.recorded_ms, tokens: c.tokens, delivered: c.delivered })
+        .collect()
 }
 
 impl Drop for PaymentReservation {
     fn drop(&mut self) {
         let mut map = self.generating.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = map.get_mut(&self.peer) {
-            if let Some(i) = v.iter().position(|(id, _)| *id == self.id) {
+            if let Some(i) = v.iter().position(|r| r.id == self.id) {
                 v.swap_remove(i);
             }
             if v.is_empty() {
@@ -501,8 +521,10 @@ fn parse_evm_address(s: &str) -> Option<[u8; 20]> {
     hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?.try_into().ok()
 }
 
-/// Add a commitment to `map`, within [`MAX_COMMITMENTS`] (past it, nothing is added) and
-/// [`MAX_COMMITMENTS_PER_PEER`] (past it, the peer's oldest goes).
+/// Add a commitment to `map`, within [`MAX_COMMITMENTS`] and [`MAX_COMMITMENTS_PER_PEER`] (past it,
+/// the peer's oldest goes). At [`MAX_COMMITMENTS`] the oldest undelivered commitment makes room
+/// (a reply that never reached its consumer can't be held against it, so it costs only a payment
+/// that wasn't coming); with none, nothing is added.
 fn insert_commitment(map: &mut HashMap<[u8; 16], ServeCommitment>, nonce: [u8; 16], c: ServeCommitment) {
     let peers: Vec<([u8; 16], u64)> =
         map.iter().filter(|(_, o)| o.served_peer == c.served_peer).map(|(n, o)| (*n, o.recorded_ms)).collect();
@@ -512,9 +534,19 @@ fn insert_commitment(map: &mut HashMap<[u8; 16], ServeCommitment>, nonce: [u8; 1
         }
     }
     if map.len() >= MAX_COMMITMENTS {
-        return; // backstop — refuse to grow past the cap (stale entries already pruned)
+        match oldest_undelivered(map) {
+            Some(n) => {
+                map.remove(&n);
+            }
+            None => return, // backstop — refuse to grow past the cap (stale entries already pruned)
+        }
     }
     map.insert(nonce, c);
+}
+
+/// The oldest commitment whose serve hasn't reached its consumer, if any.
+fn oldest_undelivered(map: &HashMap<[u8; 16], ServeCommitment>) -> Option<[u8; 16]> {
+    map.iter().filter(|(_, c)| !c.delivered).min_by_key(|(_, c)| c.recorded_ms).map(|(n, _)| *n)
 }
 
 /// Drop expired commitments from `map`, returning the peers whose serves they were: receipts that
@@ -702,7 +734,37 @@ struct StreamBuffer {
     bytes: usize,
     /// TTL + last-activity stamp (append or poll refreshes it).
     recorded_ms: u64,
+    /// When the consumer last polled (or opened the stream): generation stops once it stops reading
+    /// for [`STREAM_ABANDON_MS`].
+    last_poll_ms: u64,
+    /// The billable count of every frame appended so far ([`crate::serve::StreamTally`]).
+    tally: crate::serve::StreamTally,
+    /// The absolute chunk index a poll has returned frames up to: what the consumer is owed for.
+    fetched_hi: u32,
+    /// What the stream's serve commitment is recorded under.
+    billing: StreamBilling,
 }
+
+/// What a stream's serve commitment is recorded under, taken from its request.
+#[derive(Debug, Clone, Default)]
+struct StreamBilling {
+    model_id: String,
+    max_tokens: Option<u32>,
+    wallet: Option<[u8; 20]>,
+}
+
+/// What a poll returned beyond earlier ones: the stream is now owed `tokens`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fetched {
+    tokens: u64,
+    model_id: String,
+    wallet: Option<[u8; 20]>,
+}
+
+/// How long a stream keeps generating with no poll from its consumer. An honest consumer polls at
+/// least every [`crate::consumer`] poll interval (under a second) while it reads, so this only ends
+/// a stream it stopped reading (gone, or settled for what it had).
+const STREAM_ABANDON_MS: u64 = 30_000;
 
 /// F1: whether a serve request's `reply_to` is allowed, i.e. equals the libp2p-authenticated
 /// sender. A legitimate consumer always sets `reply_to = its own peer id`, which is the
@@ -810,11 +872,23 @@ fn generate_guarded(
 /// cannot evict another's active stream), enforce the global byte/count backstops, then insert
 /// an empty `done=false` buffer. Free fn (no `Self`) so the buffer mechanics are unit-testable
 /// without a live `Provider`.
+#[cfg(test)]
 fn stream_begin_in(
     map: &mut HashMap<[u8; 16], StreamBuffer>,
     nonce: [u8; 16],
     reply_to: &str,
     now: u64,
+) {
+    stream_begin_billed_in(map, nonce, reply_to, now, StreamBilling::default())
+}
+
+/// [`stream_begin_in`] for a serve whose commitment is recorded under `billing`.
+fn stream_begin_billed_in(
+    map: &mut HashMap<[u8; 16], StreamBuffer>,
+    nonce: [u8; 16],
+    reply_to: &str,
+    now: u64,
+    billing: StreamBilling,
 ) {
     map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
     // Per-peer fairness: while this peer already holds the cap, drop its own oldest. Only ever
@@ -851,7 +925,18 @@ fn stream_begin_in(
     }
     map.insert(
         nonce,
-        StreamBuffer { reply_to: reply_to.to_string(), base_offset: 0, chunks: Vec::new(), done: false, bytes: 0, recorded_ms: now },
+        StreamBuffer {
+            reply_to: reply_to.to_string(),
+            base_offset: 0,
+            chunks: Vec::new(),
+            done: false,
+            bytes: 0,
+            recorded_ms: now,
+            last_poll_ms: now,
+            tally: Default::default(),
+            fetched_hi: 0,
+            billing,
+        },
     );
 }
 
@@ -866,6 +951,7 @@ fn stream_append_in(
 ) {
     if let Some(buf) = map.get_mut(nonce) {
         buf.bytes += encoded.len();
+        buf.tally.push_encoded(encoded);
         buf.chunks.push(encoded.to_vec());
         buf.recorded_ms = now;
         if ServeChunk::frame_is_terminal(encoded) {
@@ -878,6 +964,7 @@ fn stream_append_in(
 /// `[offset..]`, prune the acknowledged prefix `[base_offset..offset)`, and report `done`. Pure
 /// (operates on `&mut map`) so it is unit-testable without a live `Provider`; TTL pruning + the
 /// per-peer rate-limit stay in the [`Provider::handle_fetch_chunks`] wrapper.
+#[cfg(test)]
 fn fetch_chunks_from(
     map: &mut HashMap<[u8; 16], StreamBuffer>,
     nonce: &[u8; 16],
@@ -885,10 +972,23 @@ fn fetch_chunks_from(
     offset: u32,
     now: u64,
 ) -> FetchChunksResponse {
+    fetch_chunks_billed(map, nonce, source_peer, offset, now).0
+}
+
+/// [`fetch_chunks_from`], also saying what the stream is owed when this poll returned frames no
+/// earlier one did: every frame up to the end of the log, which the consumer now has (the
+/// commitment is recorded from it, see [`crate::serve::StreamTally`]).
+fn fetch_chunks_billed(
+    map: &mut HashMap<[u8; 16], StreamBuffer>,
+    nonce: &[u8; 16],
+    source_peer: &str,
+    offset: u32,
+    now: u64,
+) -> (FetchChunksResponse, Option<Fetched>) {
     let buf = match map.get_mut(nonce) {
-        None => return FetchChunksResponse::NotFound,
+        None => return (FetchChunksResponse::NotFound, None),
         // Ownership binding: a poll from anyone but the committing consumer is refused.
-        Some(b) if b.reply_to != source_peer => return FetchChunksResponse::Forbidden,
+        Some(b) if b.reply_to != source_peer => return (FetchChunksResponse::Forbidden, None),
         Some(b) => b,
     };
     let have_hi = buf.base_offset + buf.chunks.len() as u32;
@@ -908,7 +1008,16 @@ fn fetch_chunks_from(
         buf.bytes = buf.chunks.iter().map(|c| c.len()).sum();
     }
     buf.recorded_ms = now;
-    FetchChunksResponse::Chunks { framed, next_offset: have_hi, done }
+    buf.last_poll_ms = now;
+    let fetched = (have_hi > buf.fetched_hi).then(|| {
+        buf.fetched_hi = have_hi;
+        Fetched {
+            tokens: buf.tally.billable(buf.billing.max_tokens),
+            model_id: buf.billing.model_id.clone(),
+            wallet: buf.billing.wallet,
+        }
+    });
+    (FetchChunksResponse::Chunks { framed, next_offset: have_hi, done }, fetched)
 }
 
 /// An engine joined to the swarm: advertises its models and serves inbound requests.
@@ -961,12 +1070,9 @@ pub struct Provider<A: EngineAdapter> {
     /// challenge carries no credential).
     private_members: Mutex<HashMap<(String, String), (u64, Option<openhydra_network::membership::MembershipCredential>)>>,
     /// Paid serves generating now, per consumer: each one's token reservation (credit window).
-    paid_generating: Arc<Mutex<HashMap<String, Vec<(u64, u64)>>>>,
+    paid_generating: Arc<Mutex<HashMap<String, Vec<Running>>>>,
     /// The next [`PaymentReservation::id`].
     next_reservation: std::sync::atomic::AtomicU64,
-    /// Stream nonces whose consumer polled to the end before the serve was recorded (see
-    /// `ServeCommitment::delivered`), with when.
-    delivered_nonces: Mutex<HashMap<[u8; 16], u64>>,
     /// This machine's own gateway, when it runs under another identity (the desktop's): exempt from
     /// the payment gate, like our own peer id (it never settles with us).
     self_consumer: Option<String>,
@@ -1125,7 +1231,6 @@ impl<A: EngineAdapter> Provider<A> {
             paid_generating: Arc::new(Mutex::new(HashMap::new())),
             next_reservation: std::sync::atomic::AtomicU64::new(0),
             private_members: Mutex::new(HashMap::new()),
-            delivered_nonces: Mutex::new(HashMap::new()),
             payment_defaults: Mutex::new(HashMap::new()),
             settlement_peg: None,
             receipt_rl: Arc::new(RateLimiter::new(RateLimitConfig {
@@ -1310,15 +1415,13 @@ impl<A: EngineAdapter> Provider<A> {
             return Err(refuse(reason));
         }
         let now = now_unix_ms();
+        let running: Vec<Running> =
+            self.paid_generating.lock().unwrap_or_else(|e| e.into_inner()).get(source_peer).cloned().unwrap_or_default();
         let (unsettled, full): (Vec<Unsettled>, bool) = {
             let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
             self.note_defaults(prune_expired_commitments(&mut map, now), now);
-            let mine = map
-                .values()
-                .filter(|c| c.served_peer == source_peer)
-                .map(|c| Unsettled { at: c.recorded_ms, tokens: c.tokens, delivered: c.delivered })
-                .collect();
-            (mine, map.len() >= MAX_COMMITMENTS)
+            let full = map.len() >= MAX_COMMITMENTS && oldest_undelivered(&map).is_none();
+            (unsettled_of(&map, source_peer, &running), full)
         };
         // A full commitment map can't record the serve, so it couldn't be paid for or seen.
         if full {
@@ -1332,10 +1435,10 @@ impl<A: EngineAdapter> Provider<A> {
             .map_or(0, |at| at.iter().filter(|t| now.saturating_sub(**t) <= DEFAULT_WINDOW_MS).count());
         let tokens = paid_reservation(req.max_tokens);
         let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
-        let running: Vec<u64> = generating.get(source_peer).map_or_else(Vec::new, |v| v.iter().map(|(_, t)| *t).collect());
+        let running: Vec<u64> = generating.get(source_peer).map_or_else(Vec::new, |v| v.iter().map(|r| r.tokens).collect());
         payment_window(&unsettled, &running, tokens, defaults, now).map_err(refuse)?;
         let id = self.next_reservation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        generating.entry(source_peer.to_string()).or_default().push((id, tokens));
+        generating.entry(source_peer.to_string()).or_default().push(Running { id, tokens, nonce: req.nonce });
         Ok(Some(PaymentReservation {
             generating: Arc::clone(&self.paid_generating),
             peer: source_peer.to_string(),
@@ -1349,24 +1452,22 @@ impl<A: EngineAdapter> Provider<A> {
     /// [`MAX_UNSETTLED_TOKENS`]. A paid serve calls this as it generates past its reservation, and
     /// stops when it can't (review round 3, S2).
     fn grow_reservation(&self, r: &PaymentReservation, to: u64) -> bool {
-        let unsettled: u64 = self
-            .serve_commitments
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|c| c.served_peer == r.peer)
-            .map(|c| c.tokens)
+        let running: Vec<Running> =
+            self.paid_generating.lock().unwrap_or_else(|e| e.into_inner()).get(&r.peer).cloned().unwrap_or_default();
+        let unsettled: u64 = unsettled_of(&self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()), &r.peer, &running)
+            .iter()
+            .map(|u| u.tokens)
             .sum();
         let mut generating = self.paid_generating.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mine) = generating.get_mut(&r.peer) else {
             return false;
         };
-        let others: u64 = mine.iter().filter(|(id, _)| *id != r.id).map(|(_, t)| *t).sum();
+        let others: u64 = mine.iter().filter(|o| o.id != r.id).map(|o| o.tokens).sum();
         if unsettled.saturating_add(others).saturating_add(to) > MAX_UNSETTLED_TOKENS {
             return false;
         }
-        if let Some(e) = mine.iter_mut().find(|(id, _)| *id == r.id) {
-            e.1 = to;
+        if let Some(e) = mine.iter_mut().find(|o| o.id == r.id) {
+            e.tokens = to;
         }
         true
     }
@@ -1449,22 +1550,57 @@ impl<A: EngineAdapter> Provider<A> {
         peer == self.net.libp2p_peer_id() || self.self_consumer.as_deref() == Some(peer)
     }
 
-    /// The consumer got this serve's whole completion (its stream polled to the end, or a fetch by
-    /// nonce returned it): mark its commitment delivered, or remember it for when it is recorded.
-    fn mark_delivered(&self, nonce: [u8; 16]) {
-        // Under the commitments lock throughout (as `record_commitment` takes them), so a serve being
-        // recorded meanwhile can't miss the mark.
+    /// `peer` got this buffered serve's completion (the reply reached it, or its fetch by nonce
+    /// did): mark the commitment delivered. A buffered serve's commitment is recorded before its
+    /// reply goes out, so there is always one to mark; a nonce without one (a refusal, a failed
+    /// serve) is left alone.
+    fn mark_delivered(&self, nonce: [u8; 16], peer: &str) {
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = map.get_mut(&nonce) {
+        if let Some(c) = map.get_mut(&nonce).filter(|c| c.served_peer == peer) {
             c.delivered = true;
+        }
+    }
+
+    /// A poll returned stream frames no earlier one did: the consumer now has them, and owes for
+    /// them ([`crate::serve::StreamTally`]). Records the stream's commitment, or raises it, as
+    /// delivered (whatever it read, it had). Called with the streams lock held (see
+    /// [`Self::handle_fetch_chunks`]), so a receipt settling the stream meanwhile can't leave a
+    /// commitment behind it.
+    fn commit_fetched(&self, nonce: [u8; 16], peer: &str, fetched: Fetched) {
+        if fetched.tokens == 0 || self.is_own_consumer(peer) {
             return;
         }
         let now = now_unix_ms();
-        let mut d = self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner());
-        d.retain(|_, at| now.saturating_sub(*at) <= COMMITMENT_TTL_MS);
-        if d.len() < MAX_COMMITMENTS {
-            d.insert(nonce, now);
+        let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = map.get_mut(&nonce).filter(|c| c.served_peer == peer) {
+            c.tokens = fetched.tokens;
+            c.recorded_ms = now;
+            return;
         }
+        self.note_defaults(prune_expired_commitments(&mut map, now), now);
+        insert_commitment(
+            &mut map,
+            nonce,
+            ServeCommitment {
+                model_id: fetched.model_id,
+                tokens: fetched.tokens,
+                recorded_ms: now,
+                served_peer: peer.to_string(),
+                delivered: true,
+                wallet: fetched.wallet,
+            },
+        );
+    }
+
+    /// Whether the stream under `nonce` should keep generating: its consumer still polls it (within
+    /// [`STREAM_ABANDON_MS`]), and it is still open (not settled, evicted, or expired).
+    fn stream_wanted(&self, nonce: &[u8; 16]) -> bool {
+        let now = now_unix_ms();
+        self.streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(nonce)
+            .is_some_and(|b| now.saturating_sub(b.last_poll_ms) <= STREAM_ABANDON_MS)
     }
 
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
@@ -1642,9 +1778,6 @@ impl<A: EngineAdapter> Provider<A> {
         }
         let now = now_unix_ms();
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
-        // A stream polled to its end before we got here was delivered too (read under the commitments
-        // lock, which `mark_delivered` holds while it writes).
-        let delivered = delivered || self.delivered_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce).is_some();
         self.note_defaults(prune_expired_commitments(&mut map, now), now);
         insert_commitment(
             &mut map,
@@ -1712,19 +1845,16 @@ impl<A: EngineAdapter> Provider<A> {
             map.retain(|_, r| now.saturating_sub(r.recorded_ms) <= RESULT_TTL_MS);
             fetch_from_buffer(&map, &nonce, source_peer)
         };
-        if matches!(resp, FetchResponse::Ready(_)) {
-            self.mark_delivered(nonce);
-        }
         resp.encode()
     }
 
     /// P1 streaming: admit a new stream under `nonce` (empty, `done=false`). Called at the start
     /// of an accepted `SERVE_STREAM` generation job, so the buffer exists before the ack is sent
     /// and never lingers without a producer (a shed submit never reaches this).
-    fn stream_begin(&self, nonce: [u8; 16], reply_to: &str) {
+    fn stream_begin(&self, nonce: [u8; 16], reply_to: &str, billing: StreamBilling) {
         let now = now_unix_ms();
         let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
-        stream_begin_in(&mut map, nonce, reply_to, now);
+        stream_begin_billed_in(&mut map, nonce, reply_to, now, billing);
     }
 
     /// P1 streaming: append one encoded frame to the stream (a delta, or the terminal frame which
@@ -1751,19 +1881,25 @@ impl<A: EngineAdapter> Provider<A> {
         // "no progress at your offset" so an honest consumer simply backs off and re-polls the
         // same offset — it never re-serves or fails over on a transient rate-limit.
         if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+            // Still a poll: the consumer is reading, so the stream keeps generating.
+            let now = now_unix_ms();
+            if let Some(b) = self.streams.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&nonce) {
+                if b.reply_to == source_peer {
+                    b.last_poll_ms = now;
+                }
+            }
             return FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: offset, done: false }
                 .encode();
         }
         let now = now_unix_ms();
-        let resp = {
-            let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
-            map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
-            fetch_chunks_from(&mut map, &nonce, source_peer, offset, now)
-        };
-        // The consumer reached the end of the stream: it got the whole completion.
-        if matches!(resp, FetchChunksResponse::Chunks { done: true, .. }) {
-            self.mark_delivered(nonce);
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
+        let (resp, fetched) = fetch_chunks_billed(&mut map, &nonce, source_peer, offset, now);
+        // What it was just sent is owed (streams lock still held: see `commit_fetched`).
+        if let Some(fetched) = fetched {
+            self.commit_fetched(nonce, source_peer, fetched);
         }
+        drop(map);
         resp.encode()
     }
 
@@ -1853,10 +1989,14 @@ impl<A: EngineAdapter> Provider<A> {
         let nonce = req.nonce;
         let model_ref = req.model_ref.clone();
         let reply_to = req.reply_to.clone();
-        let wallet = req.settlement_wallet.as_deref().and_then(parse_evm_address);
+        let billing = StreamBilling {
+            model_id: model_ref.clone(),
+            max_tokens: req.max_tokens,
+            wallet: req.settlement_wallet.as_deref().and_then(parse_evm_address),
+        };
         // Create the buffer, then ack immediately (before generating), so the consumer starts
         // polling right away and never races an absent buffer (begin happens before the ack).
-        self.stream_begin(nonce, &reply_to);
+        self.stream_begin(nonce, &reply_to, billing);
         let _ = self.net.respond(
             request_id,
             FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode(),
@@ -1865,12 +2005,22 @@ impl<A: EngineAdapter> Provider<A> {
         // F5: `generate_guarded` catches a panic in the adapter/engine and appends a synthetic
         // terminal Error, so a bug can't leave this buffer `done=false` forever (which would stall
         // the consumer ~120s before it re-serves).
-        let summary =
-            generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c), &mut self.serve_budget(reservation.as_ref()));
-        // B-S1: record what we served under the committed nonce so its settlement receipt can be
-        // validated (right tokens/model, once) — identical to the buffered path.
+        // It stops once the consumer stops reading, or settles for what it read (the stream is then
+        // closed): nobody would read the rest.
+        let mut budget = self.serve_budget(reservation.as_ref());
+        let summary = generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c), &mut |sent| {
+            self.stream_wanted(&nonce) && budget(sent)
+        });
+        // B-S1: the serve's commitment (what its settlement receipt is checked against) is what the
+        // consumer's polls returned, recorded as they return it (`commit_fetched`): a stream it read
+        // only part of is owed for that part, and one it read nothing of is owed nothing.
         if summary.ok && summary.tokens > 0 {
-            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, false, wallet);
+            self.note_served(&source_peer);
+        }
+        if !self.stream_wanted(&nonce) {
+            let owed = self.committed_tokens(&nonce);
+            tracing::info!(peer = %source_peer, generated = summary.tokens, owed = ?owed,
+                "stream stopped: its consumer stopped reading or settled; owed what it read");
         }
         if let Some(stats) = &self.stats {
             let e = &summary.metrics.engine;
@@ -1892,6 +2042,10 @@ impl<A: EngineAdapter> Provider<A> {
         source_peer: &str,
     ) -> Result<(), String> {
         let consumer_peer = self.net.peer_id_from_ed25519_pubkey(p.consumer.as_bytes())?;
+        // The streams lock first, as a poll takes them (see `commit_fetched`): a stream settled here is
+        // closed in the same step, so no later poll can open a new commitment for it, and it stops
+        // generating (its consumer has what it is paying for).
+        let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         let mut map = self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner());
         self.note_defaults(prune_expired_commitments(&mut map, now_unix_ms()), now_unix_ms());
         validate_and_consume_commitment(
@@ -1903,7 +2057,11 @@ impl<A: EngineAdapter> Provider<A> {
             now_unix_ms(),
             &consumer_peer,
             source_peer,
-        )
+        )?;
+        if streams.get(&p.nonce).is_some_and(|b| b.reply_to == source_peer) {
+            streams.remove(&p.nonce);
+        }
+        Ok(())
     }
 
     /// The `(consumer, model)` key for the provider-side settled-cumulative map (review F2), scoped to
@@ -2481,6 +2639,7 @@ impl<A: EngineAdapter> Provider<A> {
                     } else {
                         None
                     };
+                    let parsed_nonce = parsed.as_ref().map(|r| r.nonce);
                     // M2.3: throttle a leecher first (off the poll thread, budget-capped so
                     // it never stalls the pool); contributors pass straight through.
                     provider.maybe_throttle(parsed.as_ref(), max_concurrency);
@@ -2496,8 +2655,31 @@ impl<A: EngineAdapter> Provider<A> {
                         // rate-limit, so one abusive peer can't shed everyone's settlements.
                         None => provider.dispatch(&source_peer, &data, parsed),
                     };
+                    // A served completion (or its fetch by nonce) is delivered once its reply reaches
+                    // the consumer: only then can an unpaid one be held against it.
+                    let delivers = match data.first() {
+                        Some(&SERVE_REQUEST) => parsed_nonce,
+                        Some(&FETCH_RESULT) if FetchResponse::encoded_is_ready(&response) => {
+                            data.get(1..17).and_then(|n| n.try_into().ok())
+                        }
+                        _ => None,
+                    };
                     // Best-effort reply; if the swarm is gone the next poll will error too.
-                    let _ = provider.net.respond(request_id, response);
+                    let _ = match delivers {
+                        Some(nonce) => {
+                            let (p, peer) = (Arc::clone(&provider), source_peer.clone());
+                            provider.net.respond_then(
+                                request_id,
+                                response,
+                                Box::new(move |sent| {
+                                    if sent {
+                                        p.mark_delivered(nonce, &peer);
+                                    }
+                                }),
+                            )
+                        }
+                        None => provider.net.respond(request_id, response),
+                    };
                 });
                 if !accepted {
                     // A3: the bounded serve queue is full — shed with a retryable error so
@@ -2809,8 +2991,6 @@ impl<A: EngineAdapter> Provider<A> {
                             Ok(r) => r,
                             Err(refusal) => return refusal,
                         };
-                        // How long the consumer waits for the reply (by the max_tokens it asked for).
-                        let consumer_waits = crate::consumer::default_attempt_timeout(req.max_tokens);
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -2826,24 +3006,23 @@ impl<A: EngineAdapter> Provider<A> {
                         // (which would skip `respond` + `store_result`, leaving no reply and the
                         // nonce stuck `Generating` until the consumer's serve timeout). The panic
                         // path pushes the terminal into `chunks`, which is stored + returned below.
-                        let started = std::time::Instant::now();
                         let summary = generate_guarded(
                             req,
                             &self.adapter,
                             &mut |c| chunks.push(c.to_vec()),
                             &mut self.serve_budget(reservation.as_ref()),
                         );
-                        // A reply ready within the consumer's wait reaches it; a later one only if it
-                        // fetches it by nonce (which marks it delivered then).
-                        let in_time = started.elapsed() <= consumer_waits;
+                        // B-S1: record what we served under the consumer's committed nonce so
+                        // its settlement receipt can be validated (right tokens/model, once). Not
+                        // delivered yet: it is once the reply (or a fetch of it by nonce) is sent
+                        // to the consumer (`Provider::mark_delivered`). Recorded before the result is
+                        // fetchable, so a fetch always finds it.
+                        if summary.ok && summary.tokens > 0 {
+                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, false, wallet);
+                        }
                         // Reconnect-and-fetch: buffer the produced frames under the nonce so a
                         // consumer whose connection dropped can fetch them on a fresh circuit.
                         self.store_result(nonce, &reply_to, &chunks);
-                        // B-S1: record what we served under the consumer's committed nonce so
-                        // its settlement receipt can be validated (right tokens/model, once).
-                        if summary.ok && summary.tokens > 0 {
-                            self.record_commitment(nonce, model_ref.clone(), summary.tokens, &source_peer, in_time, wallet);
-                        }
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
                             let native_tps = if e.eval_duration_ns > 0 {
@@ -3148,14 +3327,20 @@ mod tests {
         provider.serve_commitments.lock().unwrap().insert([1; 16], ServeCommitment {
             model_id: "m".into(), tokens: 56_000, recorded_ms: now_unix_ms(), served_peer: "c".into(), delivered: true, wallet: None,
         });
-        provider.paid_generating.lock().unwrap().insert("c".into(), vec![(7, 4_096)]);
+        // The serve itself is a stream whose consumer has read 3,000 tokens of it so far: its
+        // reservation already counts them, so its commitment isn't counted again.
+        provider.serve_commitments.lock().unwrap().insert([9; 16], ServeCommitment {
+            model_id: "m".into(), tokens: 3_000, recorded_ms: now_unix_ms(), served_peer: "c".into(), delivered: true, wallet: None,
+        });
+        let running = |tokens| Running { id: 7, tokens, nonce: [9; 16] };
+        provider.paid_generating.lock().unwrap().insert("c".into(), vec![running(4_096)]);
         let r = PaymentReservation { generating: Arc::clone(&provider.paid_generating), peer: "c".into(), id: 7, initial: 4_096 };
         let mut budget = provider.serve_budget(Some(&r));
         // A stream asks after every token: it grows a step at a time while 56,000 + the
         // reservation fits in 65,536, so it runs to 9,216 and stops there.
         let stopped_at = (1..u64::MAX).find(|sent| !budget(*sent)).unwrap();
         assert_eq!(stopped_at, 9_216);
-        assert_eq!(provider.paid_generating.lock().unwrap()["c"], vec![(7, 9_216)]);
+        assert_eq!(provider.paid_generating.lock().unwrap()["c"], vec![running(9_216)]);
         // A free serve has no budget to run out of.
         assert!(provider.serve_budget(None)(u64::MAX));
         drop(budget);
@@ -3943,5 +4128,229 @@ mod tests {
         assert!(!map.contains_key(&key(0)));
         assert!(!map.contains_key(&key(4)));
         assert!(map.contains_key(&key(MAX_RESULT_ENTRIES + 4)));
+    }
+
+    // ── Review round 3, D4: pay for what was received ─────────────────────
+
+    fn test_provider<A: EngineAdapter>(adapter: A) -> (tempfile::TempDir, Provider<A>) {
+        let dir = tempfile::tempdir().unwrap();
+        let net = openhydra_network::handle::NetworkHandle::start(openhydra_network::node::NodeConfig {
+            identity_path: dir.path().join("id.key"),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            bootstrap_peers: vec![],
+            enable_peer_relay: false,
+            enable_connection_reversal: false,
+            pcp_gateway: None,
+        })
+        .unwrap();
+        (dir, Provider::new(adapter, net))
+    }
+
+    fn billing(max_tokens: Option<u32>) -> StreamBilling {
+        StreamBilling { model_id: "m".into(), max_tokens, wallet: None }
+    }
+
+    /// The consumer's side of a poll: the billable count of the frames it got, as it counts them
+    /// (each text fragment through `on_delta`, the `Done` count when it arrives).
+    fn consumer_count(tally: &mut crate::serve::StreamTally, resp: &FetchChunksResponse) {
+        if let FetchChunksResponse::Chunks { framed, .. } = resp {
+            for chunk in parse_response(framed).unwrap() {
+                match chunk {
+                    ServeChunk::Delta(t) => tally.push_delta(&t),
+                    other => tally.push_encoded(&other.encode()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_is_owed_what_its_polls_returned_and_both_sides_count_it_alike() {
+        let n = [5u8; 16];
+        let mut map = HashMap::new();
+        stream_begin_billed_in(&mut map, n, "c", 0, billing(None));
+        // Nothing generated yet: a poll returns nothing, and nothing is owed.
+        assert_eq!(fetch_chunks_billed(&mut map, &n, "c", 0, 1).1, None);
+        let words = ["Hello", " world", ",", " this", " is", " a", " long", " answer", " that", " stops"];
+        for w in &words[..9] {
+            stream_append_in(&mut map, &n, &delta(w), 2);
+        }
+        let mut consumer = crate::serve::StreamTally::default();
+        let (resp, owed) = fetch_chunks_billed(&mut map, &n, "c", 0, 3);
+        consumer_count(&mut consumer, &resp);
+        let owed = owed.expect("frames returned → owed");
+        // Nine fragments, nine tokens (under the text bound), and the consumer counts the same.
+        assert_eq!(owed.tokens, 9);
+        assert_eq!(consumer.billable(None), owed.tokens);
+        // A re-poll of the same offset (its reply was lost) returns the same frames: nothing more owed.
+        assert_eq!(fetch_chunks_billed(&mut map, &n, "c", 0, 4).1, None);
+        // The consumer stops reading here: the 10th fragment and the Done are never polled, so a
+        // stream read to 90% is owed 90%.
+        stream_append_in(&mut map, &n, &delta(words[9]), 5);
+        stream_append_in(&mut map, &n, &done(10), 5);
+        assert_eq!(owed.model_id, "m");
+
+        // A stream read to its end is owed the Done count, on both sides.
+        let mut map = HashMap::new();
+        stream_begin_billed_in(&mut map, n, "c", 0, billing(Some(8)));
+        let mut consumer = crate::serve::StreamTally::default();
+        let mut offset = 0;
+        let mut last = None;
+        for (i, w) in words.iter().enumerate() {
+            stream_append_in(&mut map, &n, &delta(w), i as u64);
+            if i % 3 == 2 {
+                let (resp, owed) = fetch_chunks_billed(&mut map, &n, "c", offset, i as u64);
+                consumer_count(&mut consumer, &resp);
+                if let FetchChunksResponse::Chunks { next_offset, .. } = resp {
+                    offset = next_offset;
+                }
+                let owed = owed.unwrap();
+                // Mid-stream, capped by the request's max_tokens like any count.
+                assert_eq!(owed.tokens, consumer.billable(Some(8)));
+                assert!(owed.tokens <= 8);
+                last = Some(owed.tokens);
+            }
+        }
+        assert_eq!(last, Some(8));
+        stream_append_in(&mut map, &n, &done(7), 20);
+        let (resp, owed) = fetch_chunks_billed(&mut map, &n, "c", offset, 21);
+        consumer_count(&mut consumer, &resp);
+        assert_eq!(owed.unwrap().tokens, 7, "the Done frame carries the whole completion's count");
+        assert_eq!(consumer.billable(Some(8)), 7);
+        // Nobody else's poll is owed anything.
+        assert_eq!(fetch_chunks_billed(&mut map, &n, "x", 0, 22).1, None);
+    }
+
+    #[test]
+    fn a_partially_read_stream_is_committed_as_delivered_and_an_unread_one_never_is() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let n = [6u8; 16];
+        provider.stream_begin(n, "c", billing(None));
+        for w in ["a", "b", "c"] {
+            provider.stream_append(n, &delta(w));
+        }
+        // An unread stream has no commitment: nothing to pay, nothing to default on.
+        assert!(provider.serve_commitments.lock().unwrap().is_empty());
+        let mut poll = n.to_vec();
+        poll.extend_from_slice(&0u32.to_be_bytes());
+        provider.handle_fetch_chunks("c", &poll);
+        {
+            let map = provider.serve_commitments.lock().unwrap();
+            let c = &map[&n];
+            assert_eq!((c.tokens, c.delivered, c.served_peer.as_str()), (3, true, "c"));
+        }
+        // More read later raises it.
+        provider.stream_append(n, &delta("d"));
+        let mut poll = n.to_vec();
+        poll.extend_from_slice(&3u32.to_be_bytes());
+        provider.handle_fetch_chunks("c", &poll);
+        assert_eq!(provider.serve_commitments.lock().unwrap()[&n].tokens, 4);
+        // Left unpaid, it is a default like an unpaid whole serve.
+        let later = now_unix_ms() + COMMITMENT_TTL_MS + 1;
+        assert_eq!(prune_expired_commitments(&mut provider.serve_commitments.lock().unwrap(), later), vec!["c".to_string()]);
+        // A stream nobody polled leaves nothing behind.
+        let m = [7u8; 16];
+        provider.stream_begin(m, "c", billing(None));
+        provider.stream_append(m, &delta("unread"));
+        provider.stream_append(m, &done(1));
+        assert!(provider.serve_commitments.lock().unwrap().get(&m).is_none());
+    }
+
+    #[test]
+    fn a_stream_stops_generating_once_its_consumer_stops_polling() {
+        /// Streams up to 1,000 fragments, stopping when asked (as every adapter checks `stop`).
+        struct Counting(std::sync::atomic::AtomicU64);
+        impl EngineAdapter for Counting {
+            fn engine_name(&self) -> &'static str {
+                "counting"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                Ok(vec![])
+            }
+            fn serve_stream(&self, req: &InferenceRequest, on_delta: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
+                for _ in 0..1_000 {
+                    if req.stop.is_set() {
+                        break;
+                    }
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    on_delta("x ");
+                }
+                Ok(ServeOutcome { tokens: 1_000, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            }
+        }
+        let (_dir, provider) = test_provider(Counting(Default::default()));
+        let req = |nonce| ServeRequest {
+            reply_to: "c".into(),
+            model_ref: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+            think: None,
+            nonce,
+            credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+        };
+        let run = |nonce: [u8; 16]| {
+            generate_guarded(req(nonce), &provider.adapter, &mut |c| provider.stream_append(nonce, c), &mut |_| {
+                provider.stream_wanted(&nonce)
+            })
+        };
+        // Polled recently: it runs to the end.
+        let live = [1u8; 16];
+        provider.stream_begin(live, "c", billing(None));
+        assert_eq!(run(live).tokens, 1_000);
+        assert_eq!(provider.adapter.0.swap(0, Ordering::Relaxed), 1_000);
+        // Last polled over STREAM_ABANDON_MS ago: it stops after the fragment that noticed.
+        let gone = [2u8; 16];
+        provider.stream_begin(gone, "c", billing(None));
+        provider.streams.lock().unwrap().get_mut(&gone).unwrap().last_poll_ms = now_unix_ms() - STREAM_ABANDON_MS - 1;
+        assert_eq!(run(gone).tokens, 1);
+        assert_eq!(provider.adapter.0.swap(0, Ordering::Relaxed), 1);
+        // Closed (settled, or evicted): it stops too.
+        let closed = [3u8; 16];
+        assert_eq!(run(closed).tokens, 1);
+    }
+
+    #[test]
+    fn a_buffered_reply_counts_as_delivered_only_once_it_reached_its_consumer() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let n = [8u8; 16];
+        provider.record_commitment(n, "m".into(), 5, "c", false, None);
+        // Its reply never went out (or failed): not delivered, so expiring unpaid isn't held against
+        // the consumer (`prune_expired_commitments` counts only delivered ones).
+        assert!(!provider.serve_commitments.lock().unwrap()[&n].delivered);
+        // Another peer's fetch of it reaching that peer marks nothing.
+        provider.mark_delivered(n, "x");
+        assert!(!provider.serve_commitments.lock().unwrap()[&n].delivered);
+        // Its consumer got it: now it is.
+        provider.mark_delivered(n, "c");
+        assert!(provider.serve_commitments.lock().unwrap()[&n].delivered);
+        // A nonce with no commitment (a refusal) is left alone.
+        provider.mark_delivered([9u8; 16], "c");
+        assert_eq!(provider.serve_commitments.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_full_commitment_map_makes_room_from_replies_that_never_arrived() {
+        let commit = |peer: &str, at: u64, delivered: bool| ServeCommitment {
+            model_id: "m".into(), tokens: 1, recorded_ms: at, served_peer: peer.into(), delivered, wallet: None,
+        };
+        let mut map = HashMap::new();
+        for i in 0..MAX_COMMITMENTS {
+            let mut n = [0u8; 16];
+            n[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            // Spread over peers so the per-peer cap doesn't bite; two undelivered, the rest delivered.
+            insert_commitment(&mut map, n, commit(&format!("p{}", i % 100), 10 + i as u64, i != 50 && i != 70));
+        }
+        assert_eq!(map.len(), MAX_COMMITMENTS);
+        insert_commitment(&mut map, [0xAA; 16], commit("new", 1_000_000, true));
+        assert!(map.contains_key(&[0xAA; 16]), "room was made");
+        let mut n50 = [0u8; 16];
+        n50[..8].copy_from_slice(&50u64.to_le_bytes());
+        assert!(!map.contains_key(&n50), "the oldest undelivered one went");
+        insert_commitment(&mut map, [0xBB; 16], commit("new2", 1_000_001, true));
+        insert_commitment(&mut map, [0xCC; 16], commit("new3", 1_000_002, true));
+        assert!(map.contains_key(&[0xBB; 16]));
+        assert!(!map.contains_key(&[0xCC; 16]), "with only delivered ones left, nothing more is added");
+        assert_eq!(map.len(), MAX_COMMITMENTS);
     }
 }
