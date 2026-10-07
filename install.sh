@@ -82,12 +82,16 @@ else
 fi
 
 # --- choose install dir ---------------------------------------------------
+# HOME can be unset (a minimal container, a service account): never rely on it being there.
+home="${HOME:-}"
 if [ -n "${OPENHYDRA_BIN_DIR:-}" ]; then
   bindir="$OPENHYDRA_BIN_DIR"
 elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
   bindir="/usr/local/bin"
+elif [ -n "$home" ]; then
+  bindir="$home/.local/bin"
 else
-  bindir="$HOME/.local/bin"
+  err "no writable install dir: /usr/local/bin isn't writable and HOME is unset. Set OPENHYDRA_BIN_DIR."
 fi
 mkdir -p "$bindir" || err "cannot create install dir '$bindir'."
 
@@ -105,7 +109,8 @@ fetch() {
 # --- download + install ---------------------------------------------------
 # Temporary files, removed however the script ends (a moved one is already gone).
 tmp="$(mktemp)"; stmp=""; ntmp=""
-trap 'rm -f "$tmp" "$stmp" "$ntmp"' EXIT
+# Keeps the script's exit status (a cleanup that succeeded mustn't turn a failure into success).
+trap 'rc=$?; rm -f "$tmp" "$stmp" "$ntmp"; exit $rc' EXIT
 trap 'exit 130' INT TERM
 info "Downloading $BIN_NAME for $os_name ($arch)…"
 tried="$primary"
@@ -176,11 +181,13 @@ fi
 # Beside the binaries' prefix when that is a standard one (/usr/local/bin → /usr/local/share), else
 # in the user's own share directory (not a stray ~/share for OPENHYDRA_BIN_DIR=~/bin).
 prefix="$(dirname "$bindir")"
+# The user's own share directory; without a HOME, the one beside the binaries.
+if [ -n "$home" ]; then usershare="$home/.local/share/openhydra"; else usershare="$prefix/share/openhydra"; fi
 case "$prefix" in
-  /usr/local|/usr|/opt/homebrew|/opt/local|"$HOME/.local") sharedir="$prefix/share/openhydra" ;;
-  *) sharedir="$HOME/.local/share/openhydra" ;;
+  /usr/local|/usr|/opt/homebrew|/opt/local) sharedir="$prefix/share/openhydra" ;;
+  *) if [ -n "$home" ] && [ "$prefix" = "$home/.local" ]; then sharedir="$prefix/share/openhydra"; else sharedir="$usershare"; fi ;;
 esac
-mkdir -p "$sharedir" 2>/dev/null && [ -w "$sharedir" ] || sharedir="$HOME/.local/share/openhydra"
+mkdir -p "$sharedir" 2>/dev/null && [ -w "$sharedir" ] || sharedir="$usershare"
 mkdir -p "$sharedir" 2>/dev/null || true
 ntmp="$(mktemp)"
 if fetch "THIRD_PARTY_NOTICES-$triple.txt" "$ntmp" 2>/dev/null && chmod 644 "$ntmp" && mv "$ntmp" "$sharedir/THIRD_PARTY_NOTICES.txt" 2>/dev/null; then

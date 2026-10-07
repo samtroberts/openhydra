@@ -18,6 +18,15 @@
 #
 # Secrets required for the publish-r2 job (repo → Settings → Secrets → Actions):
 #   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+#
+# Publishes run one at a time (concurrency group `release-publish`). GitHub keeps at most ONE run
+# waiting behind the running one: a newer publish queued while another waits cancels the waiting
+# one before it starts (it shows as cancelled, having published nothing). Each publish run writes
+# the version it publishes to its summary as its first step, so a cancelled one is still
+# identifiable; re-run it once the queue is clear.
+#
+# Permissions: read-only by default; only publish-r2 (the GitHub Release) can write. Checkouts don't
+# keep the token, and the build's dependency install runs without the signing secrets in scope.
 name: Release
 
 on:
@@ -43,7 +52,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   DIST_HOST: https://dl.openhydra.co
@@ -65,6 +74,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -161,7 +172,16 @@ jobs:
         shell: bash
         run: desktop/stage-notices.sh "${{ matrix.triple }}"
 
-      # 2) The desktop app + installers (signed so the auto-updater accepts them).
+      # Dependencies first, in a step of their own: install scripts never run with the signing
+      # secrets in their environment. Exactly the lockfile (no `npm install` fallback).
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      # 2) The desktop app + installers (signed so the auto-updater accepts them). The signing
+      # secrets are on this step only. They can't be narrower: `tauri build` compiles, bundles and
+      # signs in one command (it signs the .app and sidecars before bundling the .dmg, then signs
+      # the updater archives), so the step that builds is the step that signs.
       - name: Build desktop app
         working-directory: desktop
         env:
@@ -180,7 +200,6 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          npm ci || npm install
           # A missing secret arrives as an EMPTY variable, which Tauri still acts on (failing the
           # bundle): unset each empty one, so missing secrets mean an unsigned (or un-notarized) build.
           for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD \
@@ -254,6 +273,8 @@ jobs:
   # flagged in the run summary.
   publish-r2:
     needs: desktop
+    permissions:
+      contents: write # the GitHub Release
     # A tag push publishes; a manual run only when asked (publish=true), whatever ref it starts from.
     if: always() && !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-22.04
@@ -262,6 +283,13 @@ jobs:
       group: release-publish
       cancel-in-progress: false
     steps:
+      # First, so a run cancelled before it publishes still says which version it was (R3).
+      - name: Note the version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: echo "Publishing ${INPUT_VERSION:-$GITHUB_REF_NAME} (run $GITHUB_RUN_ID, $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/download-artifact@v4
         continue-on-error: true # no artifacts at all → the next step fails with a clear message
         with:
