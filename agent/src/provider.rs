@@ -567,6 +567,11 @@ fn parse_evm_address(s: &str) -> Option<[u8; 20]> {
 /// (a reply that never reached its consumer can't be held against it, so it costs only a payment
 /// that wasn't coming); with none, nothing is added.
 fn insert_commitment(map: &mut HashMap<[u8; 16], ServeCommitment>, nonce: [u8; 16], c: ServeCommitment) {
+    // Never over an existing one: a commitment is replaced only by the serve that made it, in place
+    // (review round 5, R5S-1).
+    if map.contains_key(&nonce) {
+        return;
+    }
     let peers: Vec<([u8; 16], u64)> =
         map.iter().filter(|(_, o)| o.served_peer == c.served_peer).map(|(n, o)| (*n, o.recorded_ms)).collect();
     if peers.len() >= MAX_COMMITMENTS_PER_PEER {
@@ -751,29 +756,43 @@ const MAX_STREAMS_PER_PEER: usize = 128;
 /// Global byte backstop across all live stream tails — a last-resort guard (deltas are small and
 /// pruned, so this rarely bites), evicting the globally-oldest stream if somehow exceeded.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
-/// How long an admitted serve nonce is remembered: well past the commitment it backs
-/// ([`COMMITMENT_TTL_MS`]), allowing for the consumer's clock.
+/// How long an admitted serve nonce is remembered once its serve ended: well past the commitment it
+/// backs ([`COMMITMENT_TTL_MS`]), allowing for the consumer's clock. While its serve's commitment,
+/// stream or result is still held, it is refused regardless.
 const NONCE_MEMORY_MS: u64 = 2 * COMMITMENT_TTL_MS;
-/// The most serve nonces remembered; past it the oldest is forgotten (reusing one that old needs
-/// this many serves in between, each one generated).
+/// The most serve nonces remembered; past it the oldest is forgotten. Only admitted serves are
+/// remembered (a refused one isn't), so reusing one that old needs this many paid-for serves between.
 const MAX_SEEN_NONCES: usize = 65_536;
 
-/// Note `nonce` as admitted at `now` in `seen`; false (refuse the serve) when it was admitted within
-/// [`NONCE_MEMORY_MS`].
-fn admit_nonce(seen: &mut HashMap<[u8; 16], u64>, nonce: [u8; 16], now: u64) -> bool {
-    if seen.get(&nonce).is_some_and(|at| now.saturating_sub(*at) <= NONCE_MEMORY_MS) {
-        return false;
+/// Serve nonces admitted recently, oldest first (see `Provider::seen_nonces`).
+#[derive(Default)]
+struct SeenNonces {
+    at: HashMap<[u8; 16], u64>,
+    order: std::collections::VecDeque<([u8; 16], u64)>,
+}
+
+impl SeenNonces {
+    /// Whether `nonce` was admitted within [`NONCE_MEMORY_MS`] of `now`.
+    fn seen(&self, nonce: &[u8; 16], now: u64) -> bool {
+        self.at.get(nonce).is_some_and(|at| now.saturating_sub(*at) <= NONCE_MEMORY_MS)
     }
-    if seen.len() >= MAX_SEEN_NONCES {
-        seen.retain(|_, at| now.saturating_sub(*at) <= NONCE_MEMORY_MS);
-        if seen.len() >= MAX_SEEN_NONCES {
-            if let Some(oldest) = seen.iter().min_by_key(|(_, at)| **at).map(|(n, _)| *n) {
-                seen.remove(&oldest);
+
+    /// Remember `nonce` as admitted at `now`, within [`MAX_SEEN_NONCES`] (expired ones go first,
+    /// then the oldest).
+    fn remember(&mut self, nonce: [u8; 16], now: u64) {
+        while let Some(&(n, at)) = self.order.front() {
+            let stale = self.at.get(&n) != Some(&at);
+            if !stale && now.saturating_sub(at) <= NONCE_MEMORY_MS && self.at.len() < MAX_SEEN_NONCES {
+                break;
+            }
+            self.order.pop_front();
+            if !stale {
+                self.at.remove(&n);
             }
         }
+        self.at.insert(nonce, now);
+        self.order.push_back((nonce, now));
     }
-    seen.insert(nonce, now);
-    true
 }
 
 /// M6/F2 (delivery hardening): how many announce passes a per-model `MODEL_WITHDRAWN` tombstone is
@@ -829,15 +848,31 @@ struct StreamBuffer {
     billing: StreamBilling,
     /// The consumer closed it ([`STREAM_CLOSE`]): generation stops, and no poll returns anything new.
     closed: bool,
+    /// Its consumer has polled it at least once.
+    polled: bool,
 }
 
 /// Whether a stream buffer has outlived its use: [`STREAM_TTL_MS`] after its last activity, or,
 /// once a poll returned frames (the consumer owes for them), [`COMMITMENT_TTL_MS`] so a consumer
 /// can still close it and settle while its commitment is open.
+/// A stream still generating, unread, is kept past [`STREAM_ABANDON_MS`], so a consumer that comes
+/// back within it (a long prefill, a dropped connection) finds it rather than `NotFound` (review
+/// round 5, R5S-6).
 fn stream_expired(b: &StreamBuffer, now: u64) -> bool {
-    let ttl = if b.fetched_hi > 0 { COMMITMENT_TTL_MS.max(STREAM_TTL_MS) } else { STREAM_TTL_MS };
+    let ttl = if b.fetched_hi > 0 {
+        COMMITMENT_TTL_MS.max(STREAM_TTL_MS)
+    } else if !b.done {
+        STREAM_TTL_MS.max(STREAM_ABANDON_MS + 30_000)
+    } else {
+        STREAM_TTL_MS
+    };
     now.saturating_sub(b.recorded_ms) > ttl
 }
+
+/// How long a stream nobody has polled at all keeps generating: an honest consumer polls the moment
+/// its open is acknowledged, so this only ends a stream opened and walked away from (R5S-6: a peer
+/// can't hold a worker and the engine for the whole [`STREAM_ABANDON_MS`] without reading).
+const NEVER_POLLED_ABANDON_MS: u64 = 60_000;
 
 /// What a stream's serve commitment is recorded under, taken from its request.
 #[derive(Debug, Clone, Default)]
@@ -1036,6 +1071,7 @@ fn stream_begin_billed_in(
             fetched_hi: 0,
             billing,
             closed: false,
+            polled: false,
         },
     );
 }
@@ -1111,6 +1147,7 @@ fn fetch_chunks_billed(
     }
     buf.recorded_ms = now;
     buf.last_poll_ms = now;
+    buf.polled = true;
     let fetched = (have_hi > buf.fetched_hi).then(|| {
         buf.fetched_hi = have_hi;
         Fetched {
@@ -1256,7 +1293,7 @@ pub struct Provider<A: EngineAdapter> {
     /// Serve nonces admitted recently (nonce → when), so none is served twice: a reused nonce would
     /// rewrite the commitment of the serve that first used it, erasing what that one owes (review
     /// round 4 C2). Kept for [`NONCE_MEMORY_MS`], at most [`MAX_SEEN_NONCES`].
-    seen_nonces: Mutex<HashMap<[u8; 16], u64>>,
+    seen_nonces: Mutex<SeenNonces>,
     /// Which models this provider shares (announces + serves), keyed on the engine handle
     /// (`DetectedModel::engine_ref`, the same string a consumer sends as `ServeRequest.model_ref`).
     /// A [`PolicyWatcher`] so the policy can be **hot-reloaded at runtime** — the user can toggle
@@ -1414,7 +1451,7 @@ impl<A: EngineAdapter> Provider<A> {
             detected: Mutex::new(HashMap::new()),
             declared_quant: None,
             streams: Mutex::new(HashMap::new()),
-            seen_nonces: Mutex::new(HashMap::new()),
+            seen_nonces: Mutex::new(SeenNonces::default()),
             policy: PolicyWatcher::r#static(SharePolicy::share_all()),
             announce_lock: Mutex::new(()),
             last_announced: Mutex::new(BTreeSet::new()),
@@ -1525,16 +1562,29 @@ impl<A: EngineAdapter> Provider<A> {
         }
     }
 
-    /// Refuse a serve whose nonce was used before (see `seen_nonces`). Our own consumer is exempt (it
-    /// never settles with us).
+    /// Refuse a serve whose nonce was used before: admitted recently (see `seen_nonces`), or still
+    /// backing a commitment, a stream or a buffered result (review round 5, R5S-1). Our own consumer
+    /// is exempt (it never settles with us). An admitted serve's nonce is remembered once the payment
+    /// gate lets it through ([`Self::remember_nonce`]).
     fn nonce_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
         if self.is_own_consumer(source_peer) {
             return None;
         }
-        let fresh = admit_nonce(&mut self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()), req.nonce, now_unix_ms());
-        (!fresh).then(|| {
+        let n = &req.nonce;
+        let used = self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()).seen(n, now_unix_ms())
+            || self.serve_commitments.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n)
+            || self.streams.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n)
+            || self.results.lock().unwrap_or_else(|e| e.into_inner()).contains_key(n);
+        used.then(|| {
             frame_response(&[ServeChunk::Error("this request's nonce was already used; send each request with a new one".into()).encode()])
         })
+    }
+
+    /// Remember an admitted serve's nonce (see [`Self::nonce_refusal`]).
+    fn remember_nonce(&self, nonce: [u8; 16], source_peer: &str) {
+        if !self.is_own_consumer(source_peer) {
+            self.seen_nonces.lock().unwrap_or_else(|e| e.into_inner()).remember(nonce, now_unix_ms());
+        }
     }
 
     /// The payment gate of a provider that charges (a settlement peg is configured): the request
@@ -1761,7 +1811,10 @@ impl<A: EngineAdapter> Provider<A> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(nonce)
-            .is_some_and(|b| !b.closed && now.saturating_sub(b.last_poll_ms) <= STREAM_ABANDON_MS)
+            .is_some_and(|b| {
+                let limit = if b.polled { STREAM_ABANDON_MS } else { NEVER_POLLED_ABANDON_MS };
+                !b.closed && now.saturating_sub(b.last_poll_ms) <= limit
+            })
     }
 
     /// Handle a [`STREAM_CLOSE`]: `payload` = `nonce(16) ‖ offset(4, big-endian)`.
@@ -2162,6 +2215,7 @@ impl<A: EngineAdapter> Provider<A> {
                 return;
             }
         };
+        self.remember_nonce(req.nonce, &source_peer);
         // Capture the small fields needed after `req` is moved into the serve (which consumes
         // `messages`), for the ack, buffer, commitment, and stats.
         let nonce = req.nonce;
@@ -3211,6 +3265,7 @@ impl<A: EngineAdapter> Provider<A> {
                             Ok(r) => r,
                             Err(refusal) => return refusal,
                         };
+                        self.remember_nonce(req.nonce, source_peer);
                         // Capture the small fields we still need after `req` is moved into
                         // the serve (which consumes `messages`), for commitment + stats +
                         // reconnect-and-fetch buffering.
@@ -4346,33 +4401,43 @@ mod tests {
         assert!(OneAtATime::enter(&set, "a").is_some());
     }
 
-    /// Review round 4 C2: a serve nonce is admitted once; reusing it (which would rewrite the first
-    /// serve's commitment) is refused while it is remembered.
+    /// Review round 4 C2 / round 5 R5S-1: a serve nonce is remembered once admitted, and forgotten
+    /// past its memory or its oldest place.
     #[test]
-    fn a_serve_nonce_is_admitted_once() {
-        let mut seen = HashMap::new();
-        assert!(admit_nonce(&mut seen, [1; 16], 1_000));
-        assert!(!admit_nonce(&mut seen, [1; 16], 1_000 + NONCE_MEMORY_MS), "reuse refused");
-        assert!(admit_nonce(&mut seen, [2; 16], 1_000));
-        assert!(admit_nonce(&mut seen, [1; 16], 2_000 + NONCE_MEMORY_MS), "forgotten after the memory");
-        // Bounded: past the cap the oldest goes.
-        let mut full = HashMap::new();
+    fn a_serve_nonce_is_remembered_once_admitted() {
+        let mut seen = SeenNonces::default();
+        assert!(!seen.seen(&[1; 16], 1_000));
+        seen.remember([1; 16], 1_000);
+        assert!(seen.seen(&[1; 16], 1_000 + NONCE_MEMORY_MS), "reuse refused");
+        assert!(!seen.seen(&[1; 16], 1_001 + NONCE_MEMORY_MS), "forgotten after the memory");
+        // Bounded: past the cap the oldest goes, in order.
+        let mut full = SeenNonces::default();
         for i in 0..MAX_SEEN_NONCES as u32 {
             let mut n = [0u8; 16];
             n[..4].copy_from_slice(&i.to_be_bytes());
-            full.insert(n, 5_000 + u64::from(i));
+            full.remember(n, 5_000);
         }
-        assert!(admit_nonce(&mut full, [9; 16], 6_000));
-        assert_eq!(full.len(), MAX_SEEN_NONCES);
-        assert!(!full.contains_key(&[0u8; 16]), "the oldest was forgotten");
+        full.remember([9; 16], 5_001);
+        assert_eq!(full.at.len(), MAX_SEEN_NONCES);
+        assert!(!full.seen(&[0u8; 16], 5_001), "the oldest was forgotten");
+        assert!(full.seen(&[9; 16], 5_001));
+        // A commitment is never replaced by another serve's insert.
+        let mut map = HashMap::new();
+        let c = |tokens| ServeCommitment {
+            model_id: "m".into(), tokens, recorded_ms: 1, served_peer: "c".into(), delivered: true, wallet: None,
+        };
+        insert_commitment(&mut map, [1; 16], c(8_000));
+        insert_commitment(&mut map, [1; 16], c(1));
+        assert_eq!(map[&[1; 16]].tokens, 8_000);
     }
 
     #[test]
     fn stream_begin_ttl_prunes_expired_buffers() {
         let mut map = HashMap::new();
-        stream_begin_in(&mut map, [1u8; 16], "c", 0); // recorded at t=0
-        // A begin far past the TTL prunes the stale buffer as a side effect.
-        stream_begin_in(&mut map, [2u8; 16], "c", STREAM_TTL_MS + 1);
+        stream_begin_in(&mut map, [1u8; 16], "c", 0); // recorded at t=0, never finished
+        // A begin past the TTL (an unfinished stream's: past the abandon window too) prunes the
+        // stale buffer as a side effect.
+        stream_begin_in(&mut map, [2u8; 16], "c", STREAM_TTL_MS.max(STREAM_ABANDON_MS + 30_000) + 1);
         assert!(!map.contains_key(&[1u8; 16]), "expired stream pruned on the next begin");
         assert!(map.contains_key(&[2u8; 16]));
     }
@@ -4664,10 +4729,15 @@ mod tests {
         let resp = FetchChunksResponse::decode(&provider.handle_stream_close("c", &close)).unwrap();
         assert!(matches!(resp, FetchChunksResponse::Chunks { done: true, .. }));
         assert!(!provider.stream_wanted(&n), "closing stops generation");
-        // Retention: an unread stream goes after the stream TTL; a read one lasts the commitment's.
+        // Retention: an unread finished stream goes after the stream TTL, an unread one still
+        // generating outlives the abandon window (R5S-6); a read one lasts the commitment's.
         let map = provider.streams.lock().unwrap();
-        let mut b = StreamBuffer { recorded_ms: 0, fetched_hi: 0, ..clone_buffer(&map[&n]) };
+        let mut b = StreamBuffer { recorded_ms: 0, fetched_hi: 0, done: true, ..clone_buffer(&map[&n]) };
         assert!(stream_expired(&b, STREAM_TTL_MS + 1));
+        b.done = false;
+        assert!(!stream_expired(&b, STREAM_ABANDON_MS));
+        assert!(stream_expired(&b, STREAM_ABANDON_MS + 30_001));
+        b.done = true;
         b.fetched_hi = 1;
         assert!(!stream_expired(&b, STREAM_TTL_MS + 1));
         assert!(stream_expired(&b, COMMITMENT_TTL_MS.max(STREAM_TTL_MS) + 1));
@@ -4686,6 +4756,7 @@ mod tests {
             fetched_hi: b.fetched_hi,
             billing: b.billing.clone(),
             closed: b.closed,
+            polled: b.polled,
         }
     }
 }
