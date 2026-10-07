@@ -38,8 +38,10 @@ solana_preimage_cross_language_golden}`) that the on-chain tests reproduce.
   to settle what it is owed, which settles can't extend. Time paused after the request extends the
   delay (a pause stops settles), by at most 30 days. The exit then stays open for 3 days
   (`EXIT_WINDOW`) and one withdraw: after that, or after a withdraw, a new request is needed, so an
-  exit can't be kept armed and used months later ahead of a settle. Withdrawals aren't paused (an
-  open window stays open through a pause), so a pause can never trap escrow. A deposit cancels a
+  exit can't be kept armed and used months later ahead of a settle. Withdrawals aren't paused, so a pause
+  can never trap escrow; a plain pause leaves an open window where it was, but a re-pause within a
+  day of the last one ending continues that pause, which counts the gap too and can move an open
+  window later (within the same 30-day cap). A deposit cancels a
   pending exit.
 - **Off-chain duty (Base):** a provider relies on a channel only after checking that
   `channels[consumer][provider].payout` is its own payout address (the consumer picks it at open).

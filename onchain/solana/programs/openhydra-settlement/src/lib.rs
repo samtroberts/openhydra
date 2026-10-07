@@ -835,6 +835,18 @@ mod tests {
         }
         data.extend_from_slice(&[0u8; 200]);
         assert!(parse_ed25519_ix(&data).is_none(), "cross-instruction reference rejected");
+        // The same for the public key's and the message's instruction indexes, each on its own
+        // (round 8 O8-2: the message index matters most, the precompile would verify other bytes).
+        for cross in [3usize, 6] {
+            let mut offsets = [16u16, u16::MAX, 48, u16::MAX, 112, 4, u16::MAX];
+            offsets[cross] = 0;
+            let mut data = vec![1u8, 0u8];
+            for v in offsets {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            data.extend_from_slice(&[0u8; 200]);
+            assert!(parse_ed25519_ix(&data).is_none(), "index {cross} pointing elsewhere is rejected");
+        }
         // Too short / wrong count.
         assert!(parse_ed25519_ix(&[]).is_none());
         assert!(parse_ed25519_ix(&[2u8, 0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());

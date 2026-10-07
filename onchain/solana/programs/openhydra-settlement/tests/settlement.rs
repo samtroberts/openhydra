@@ -402,6 +402,32 @@ fn settle_rejects_a_tampered_claim_message() {
     fails_with(send(&mut ctx, &[ed_ix, settle_ix], &[&payer]), openhydra_settlement::SettlementError::MessageMismatch); // message/claim mismatch rejected
 }
 
+/// Round 8 O8-2: a settle signed by someone other than the claim's consumer, a settle with no
+/// Ed25519 instruction before it, and an Ed25519 instruction whose message lives in another
+/// instruction are all refused.
+#[test]
+fn settle_refuses_a_wrong_signer_a_missing_signature_and_a_cross_instruction_message() {
+    let mut ctx = setup();
+    initialize(&mut ctx);
+    let (consumer, _provider, provider_id) = funded(&mut ctx, 5_000_000);
+    let consumer_id = consumer.pubkey().to_bytes();
+    let preimage = settle_claim_preimage(&ctx.program_id.to_bytes(), &CLUSTER, &provider_id, &consumer_id, 100_000, EXPIRES, "qwen2.5:7b");
+    let payer = ctx.payer.insecure_clone();
+    // Signed by another key over the right claim.
+    let attacker = Keypair::new();
+    let [_, settle_ix] = settle_ixs(&ctx, &consumer, &preimage, claim(&consumer, provider_id, 100_000, EXPIRES, "qwen2.5:7b"));
+    let forged = ed25519_ix(&attacker.pubkey().to_bytes(), &sign64(&attacker, &preimage), &preimage);
+    fails_with(send(&mut ctx, &[forged, settle_ix.clone()], &[&payer]), openhydra_settlement::SettlementError::SignerMismatch);
+    // No Ed25519 instruction at all.
+    fails_with(send(&mut ctx, &[settle_ix.clone()], &[&payer]), openhydra_settlement::SettlementError::MissingEd25519Instruction);
+    // A valid signature whose message index names an instruction explicitly (here its own, index 0)
+    // instead of "this instruction": the precompile accepts it, the program must not.
+    let [mut ed_ix, settle_ix] = settle_ixs(&ctx, &consumer, &preimage, claim(&consumer, provider_id, 100_000, EXPIRES, "qwen2.5:7b"));
+    ed_ix.data[14..16].copy_from_slice(&0u16.to_le_bytes());
+    fails_with(send(&mut ctx, &[ed_ix, settle_ix], &[&payer]), openhydra_settlement::SettlementError::MalformedEd25519Instruction);
+    assert_eq!(vault_state(&ctx, &consumer, provider_id).balance, 5_000_000, "nothing was paid");
+}
+
 /// A provider with a payout binding, and a funded consumer with a vault for it.
 fn funded(ctx: &mut Ctx, amount: u64) -> (Keypair, Keypair, [u8; 32]) {
     let consumer = Keypair::new();
