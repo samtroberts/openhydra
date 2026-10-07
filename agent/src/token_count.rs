@@ -30,8 +30,11 @@ pub const COUNT_SAMPLE_RATE: f64 = 0.25;
 /// Counts running at once: each is a scorer process loading the vocabulary (~0.25 s); past this a
 /// sampled serve is just not checked, so a busy gateway can't pile them up.
 pub const MAX_CONCURRENT_COUNTS: usize = 4;
-/// The longest delivered text kept for a count; a longer one isn't checked (its copy isn't kept).
-pub const MAX_COUNTED_BYTES: usize = 1 << 20;
+/// The most delivered text kept for a count. A paid serve can't come near it (at most 65,536
+/// tokens); past it, an unpaid serve's count is estimated from what was kept (review B5).
+pub const MAX_COUNTED_BYTES: usize = 8 << 20;
+/// The text one scorer run counts: a longer text is counted in pieces of at most this, summed.
+pub const COUNT_CHUNK_BYTES: usize = 1 << 20;
 
 /// A place among [`MAX_CONCURRENT_COUNTS`]: given back when dropped.
 pub struct CountSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -95,6 +98,42 @@ pub fn count_tokens(scorer: &Path, vocab: &Path, text: &str) -> Result<u64, Stri
         return Err(format!("count-tokens failed ({status}): {}", err.trim()));
     }
     out.trim().parse().map_err(|_| format!("count-tokens printed {:?}", out.trim()))
+}
+
+/// `text` in pieces of at most `max` bytes, cut at a whitespace where one is near the end (so few
+/// words are split: a split word may count a token more, never fewer).
+pub fn chunks(text: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.len() > max {
+        let mut cut = max;
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(ws) = rest[..cut].rfind(char::is_whitespace).filter(|&i| i > cut / 2) {
+            cut = ws + rest[ws..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    if !rest.is_empty() || out.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
+/// [`count_tokens`] over a text of any length kept for counting, in [`COUNT_CHUNK_BYTES`] pieces.
+pub fn count_tokens_chunked(scorer: &Path, vocab: &Path, text: &str) -> Result<u64, String> {
+    chunks(text, COUNT_CHUNK_BYTES).into_iter().try_fold(0u64, |sum, c| Ok(sum + count_tokens(scorer, vocab, c)?))
+}
+
+/// The tokens of a whole text estimated from a counted part of it: `counted` tokens in `part_units`
+/// ([`crate::serve::DeliveredText`] units), scaled to `total_units`.
+pub fn estimate_from_part(counted: u64, part_units: u64, total_units: u64) -> u64 {
+    if part_units == 0 {
+        return counted;
+    }
+    ((counted as u128 * total_units as u128) / part_units as u128) as u64
 }
 
 /// The text a serve's tokens are counted on: the delivered text, then each tool call's name and
@@ -168,6 +207,22 @@ mod tests {
         let mut big = call;
         big.function.arguments = "x".repeat(MAX_COUNTED_BYTES);
         assert_eq!(countable_text("hi", &[big], &ls), None);
+    }
+
+    #[test]
+    fn long_texts_are_counted_in_pieces_cut_between_words() {
+        let text = "alpha beta gamma delta ".repeat(10);
+        let pieces = chunks(&text, 50);
+        assert!(pieces.iter().all(|p| p.len() <= 50));
+        assert_eq!(pieces.concat(), text, "nothing lost or doubled");
+        assert!(pieces[..pieces.len() - 1].iter().all(|p| p.ends_with(' ')), "cut after a space");
+        // Multi-byte characters are never split.
+        let wide = "日本語のテキスト".repeat(20);
+        assert_eq!(chunks(&wide, 31).concat(), wide);
+        assert_eq!(chunks("", 10), vec![""]);
+        // An estimate scales the counted part to the whole.
+        assert_eq!(estimate_from_part(250, 1_000, 4_000), 1_000);
+        assert_eq!(estimate_from_part(7, 0, 100), 7);
     }
 
     #[test]

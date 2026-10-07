@@ -1394,6 +1394,8 @@ impl ConsumerNode {
         self: &Arc<Self>,
         counter: (std::path::PathBuf, std::path::PathBuf),
         text: String,
+        // The whole answer's text measure when `text` is only its start (too long to keep whole).
+        total_units: Option<u64>,
         tool_calls: Vec<crate::adapter::ToolCall>,
         offered: std::collections::HashSet<String>,
         billed: u64,
@@ -1412,11 +1414,20 @@ impl ConsumerNode {
         std::thread::spawn(move || {
             let _slot = slot;
             let (scorer, vocab) = counter;
-            // Too long to count (text and tool calls together): not checked, as for a long stream.
+            // Tool calls too large to keep: not checked.
             let Some((countable, calls)) = crate::token_count::countable_text(&text, &tool_calls, &offered) else {
                 return;
             };
-            match crate::token_count::count_tokens(&scorer, &vocab, &countable) {
+            // Counted in pieces; an answer too long to keep whole is estimated from its start (B5).
+            let counted = crate::token_count::count_tokens_chunked(&scorer, &vocab, &countable).map(|n| match total_units {
+                Some(total) => {
+                    let mut part = crate::serve::DeliveredText::default();
+                    part.push(&text);
+                    crate::token_count::estimate_from_part(n, part.units(), total)
+                }
+                None => n,
+            });
+            match counted {
                 Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
                     tracing::warn!(provider = %state_id, model = %model_key, billed, counted,
                         "provider billed for more tokens than it delivered");
@@ -2162,7 +2173,8 @@ impl ConsumerNode {
                 .then(|| self.token_counter_for(&provider, model_key_now))
                 .flatten();
             let captured = std::cell::RefCell::new(String::new());
-            // Set once the text outgrew `MAX_COUNTED_BYTES`: no longer kept, and not checked.
+            // Set once the text outgrew `MAX_COUNTED_BYTES`: the rest isn't kept, and the count is
+            // estimated from what was (B5).
             let overflowed = std::cell::Cell::new(false);
             // What this attempt received, counted as the provider counts what its polls returned: a
             // stream that ends early is settled for it (see `StreamTally`).
@@ -2187,9 +2199,8 @@ impl ConsumerNode {
                         if c.len() + d.len() <= crate::token_count::MAX_COUNTED_BYTES {
                             c.push_str(d);
                         } else {
-                            // Too long to count: stop keeping it, and don't check this serve.
+                            // Too long to keep whole: keep what we have, estimate the rest from it.
                             overflowed.set(true);
-                            *c = String::new();
                         }
                     }
                     on_delta(d);
@@ -2240,10 +2251,11 @@ impl ConsumerNode {
                             summary.tokens = tokens;
                         }
                         self.settle_receipt(&provider, tokens, nonce);
-                        if let Some(counter) = counter.filter(|_| !overflowed.get()) {
+                        if let Some(counter) = counter {
                             self.check_billed_tokens(
                                 counter,
                                 captured.take(),
+                                overflowed.get().then(|| delivered_text.get().units()),
                                 summary.tool_calls.clone(),
                                 crate::serve::offered_tool_names(tools),
                                 tokens,
