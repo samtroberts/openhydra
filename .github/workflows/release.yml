@@ -125,7 +125,10 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         run: choco install -y protoc
 
+      # Caches only on check runs: a release (tag push, or a publishing dispatch) builds everything it
+      # ships from source, never from a cache another workflow could have written.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: github.event_name != 'push' && inputs.publish != true
         with:
           workspaces: |
             .
@@ -146,8 +149,9 @@ jobs:
 
       # The prompt scorer the agent runs to answer authenticity checks for Ollama models
       # (agent/src/side_scorer.rs): llama.cpp at a pinned commit + OpenHydra's patch. Takes minutes,
-      # so it is rebuilt only when scorer/ changes.
+      # so check runs reuse a cached build while scorer/ is unchanged; a release always builds it.
       - name: Cache openhydra-scorer
+        if: github.event_name != 'push' && inputs.publish != true
         id: scorer-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -173,9 +177,10 @@ jobs:
              "desktop/src-tauri/binaries/openhydra-scorer-${{ matrix.triple }}.notices.txt"
 
       # macOS also ships the MLX scorer: patched mistral.rs for LM Studio's MLX models
-      # (scorer/mistralrs), bundled through tauri.macos.conf.json. A ~10 min build, so cached.
+      # (scorer/mistralrs), bundled through tauri.macos.conf.json. A ~10 min build, so cached on check
+      # runs; a release always builds it.
       - name: Cache openhydra-mlx-scorer (macOS)
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && github.event_name != 'push' && inputs.publish != true
         id: mlx-scorer-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
