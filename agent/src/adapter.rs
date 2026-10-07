@@ -36,6 +36,8 @@ pub enum AdapterError {
     Provider(String),
     /// Reaching the provider failed (dial, relay, poll, timeout), not the engine.
     Network(String),
+    /// The caller stopped the request (its client left).
+    Cancelled(String),
 }
 
 impl fmt::Display for AdapterError {
@@ -48,6 +50,7 @@ impl fmt::Display for AdapterError {
             AdapterError::Route(m) => f.write_str(m),
             AdapterError::Provider(m) => write!(f, "provider: {m}"),
             AdapterError::Network(m) => write!(f, "network: {m}"),
+            AdapterError::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
 }
@@ -62,7 +65,8 @@ impl AdapterError {
             | AdapterError::Busy(m)
             | AdapterError::Route(m)
             | AdapterError::Provider(m)
-            | AdapterError::Network(m) => m,
+            | AdapterError::Network(m)
+            | AdapterError::Cancelled(m) => m,
         }
     }
 }

@@ -96,6 +96,14 @@ pub const SERVE_STREAM: u8 = 0x13;
 /// `json(RemoteScopeAck)`. (0x14 is [`FETCH_CHUNKS`].)
 pub const REMOTE_SCOPE_SET: u8 = 0x15;
 
+/// libp2p proxy method byte to **close a stream** (consumer → provider): `0x19 ‖ nonce(16) ‖
+/// offset(4, big-endian)`. The consumer is done with it (it broke, or its client left): the provider
+/// replies with the frames from `offset` up to what its polls already returned, and nothing newer
+/// (so the consumer holds exactly what it owes for), stops generating, and keeps the stream until
+/// it is settled or its commitment expires (review S8). An older provider answers with an error
+/// blob that doesn't decode as a [`FetchChunksResponse`].
+pub const STREAM_CLOSE: u8 = 0x19;
+
 /// How long a completed (or in-flight) serve result stays fetchable. Must comfortably exceed
 /// the NAT/relay re-establishment window (~10–70s) so a reconnecting consumer still finds it.
 const RESULT_TTL_MS: u64 = 120_000;
@@ -743,6 +751,16 @@ struct StreamBuffer {
     fetched_hi: u32,
     /// What the stream's serve commitment is recorded under.
     billing: StreamBilling,
+    /// The consumer closed it ([`STREAM_CLOSE`]): generation stops, and no poll returns anything new.
+    closed: bool,
+}
+
+/// Whether a stream buffer has outlived its use: [`STREAM_TTL_MS`] after its last activity, or,
+/// once a poll returned frames (the consumer owes for them), [`COMMITMENT_TTL_MS`] so a consumer
+/// can still close it and settle while its commitment is open.
+fn stream_expired(b: &StreamBuffer, now: u64) -> bool {
+    let ttl = if b.fetched_hi > 0 { COMMITMENT_TTL_MS.max(STREAM_TTL_MS) } else { STREAM_TTL_MS };
+    now.saturating_sub(b.recorded_ms) > ttl
 }
 
 /// What a stream's serve commitment is recorded under, taken from its request.
@@ -890,7 +908,7 @@ fn stream_begin_billed_in(
     now: u64,
     billing: StreamBilling,
 ) {
-    map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
+    map.retain(|_, b| !stream_expired(b, now));
     // Per-peer fairness: while this peer already holds the cap, drop its own oldest. Only ever
     // touches `reply_to`'s streams, so it cannot evict another peer's active stream.
     loop {
@@ -936,6 +954,7 @@ fn stream_begin_billed_in(
             tally: Default::default(),
             fetched_hi: 0,
             billing,
+            closed: false,
         },
     );
 }
@@ -991,14 +1010,16 @@ fn fetch_chunks_billed(
         Some(b) if b.reply_to != source_peer => return (FetchChunksResponse::Forbidden, None),
         Some(b) => b,
     };
-    let have_hi = buf.base_offset + buf.chunks.len() as u32;
+    // A closed stream returns nothing past what polls already returned (review S8).
+    let have_hi = if buf.closed { buf.fetched_hi.max(buf.base_offset) } else { buf.base_offset + buf.chunks.len() as u32 };
     // Clamp the request into the live window: a stale/duplicate poll below base (already pruned)
     // resumes at base; a poll past the end yields an empty slice.
     let start_abs = offset.clamp(buf.base_offset, have_hi);
     let li = (start_abs - buf.base_offset) as usize;
+    let hi = (have_hi - buf.base_offset) as usize;
     // Copy the slice to return BEFORE pruning (frame_response copies, so the drain below is safe).
-    let framed = frame_response(&buf.chunks[li..]);
-    let done = buf.done;
+    let framed = frame_response(&buf.chunks[li..hi]);
+    let done = buf.done || buf.closed;
     // Prune-on-ack: the poll for `offset` proves `[0..offset)` was received, so drop
     // `[base_offset..start_abs)`. We keep `[start_abs..]` (the data just returned) so a transport
     // drop before the consumer processes it re-polls the same offset and gets it again.
@@ -1018,6 +1039,28 @@ fn fetch_chunks_billed(
         }
     });
     (FetchChunksResponse::Chunks { framed, next_offset: have_hi, done }, fetched)
+}
+
+/// Close the stream under `nonce` for its consumer `source_peer` ([`STREAM_CLOSE`]): the frames
+/// from `offset` up to what polls already returned, nothing newer, and the stream marked closed
+/// (generation stops). Pure, like [`fetch_chunks_billed`]. What it returns was already counted, so
+/// the commitment doesn't change.
+fn close_stream_in(
+    map: &mut HashMap<[u8; 16], StreamBuffer>,
+    nonce: &[u8; 16],
+    source_peer: &str,
+    offset: u32,
+    now: u64,
+) -> FetchChunksResponse {
+    match map.get_mut(nonce) {
+        None => return FetchChunksResponse::NotFound,
+        Some(b) if b.reply_to != source_peer => return FetchChunksResponse::Forbidden,
+        Some(b) => {
+            b.closed = true;
+            b.recorded_ms = now;
+        }
+    }
+    fetch_chunks_billed(map, nonce, source_peer, offset, now).0
 }
 
 /// An engine joined to the swarm: advertises its models and serves inbound requests.
@@ -1600,7 +1643,23 @@ impl<A: EngineAdapter> Provider<A> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(nonce)
-            .is_some_and(|b| now.saturating_sub(b.last_poll_ms) <= STREAM_ABANDON_MS)
+            .is_some_and(|b| !b.closed && now.saturating_sub(b.last_poll_ms) <= STREAM_ABANDON_MS)
+    }
+
+    /// Handle a [`STREAM_CLOSE`]: `payload` = `nonce(16) ‖ offset(4, big-endian)`.
+    fn handle_stream_close(&self, source_peer: &str, payload: &[u8]) -> Vec<u8> {
+        if payload.len() != 20 {
+            return FetchChunksResponse::NotFound.encode();
+        }
+        let nonce: [u8; 16] = payload[0..16].try_into().unwrap();
+        let offset = u32::from_be_bytes(payload[16..20].try_into().unwrap());
+        if self.fetch_rl.try_acquire(source_peer, now_unix_ms()).is_err() {
+            return FetchChunksResponse::Overloaded.encode(); // the consumer retries its close
+        }
+        let now = now_unix_ms();
+        let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, b| !stream_expired(b, now));
+        close_stream_in(&mut map, &nonce, source_peer, offset, now).encode()
     }
 
     fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
@@ -1893,7 +1952,7 @@ impl<A: EngineAdapter> Provider<A> {
         }
         let now = now_unix_ms();
         let mut map = self.streams.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, b| now.saturating_sub(b.recorded_ms) <= STREAM_TTL_MS);
+        map.retain(|_, b| !stream_expired(b, now));
         let (resp, fetched) = fetch_chunks_billed(&mut map, &nonce, source_peer, offset, now);
         // What it was just sent is owed (streams lock still held: see `commit_fetched`).
         if let Some(fetched) = fetched {
@@ -3048,6 +3107,7 @@ impl<A: EngineAdapter> Provider<A> {
             // handled earlier in `run_inbound` (it acks early then keeps generating); only the
             // poll reaches `dispatch`.
             Some(&FETCH_CHUNKS) => self.handle_fetch_chunks(source_peer, &data[1..]),
+            Some(&STREAM_CLOSE) => self.handle_stream_close(source_peer, &data[1..]),
             // Unknown method byte → a framed Error from the serve handler.
             _ => handle_serve_inbound(data, &self.adapter),
         }
@@ -4352,5 +4412,71 @@ mod tests {
         assert!(map.contains_key(&[0xBB; 16]));
         assert!(!map.contains_key(&[0xCC; 16]), "with only delivered ones left, nothing more is added");
         assert_eq!(map.len(), MAX_COMMITMENTS);
+    }
+
+    // ── Review round 3, S8: close-and-fetch ──
+
+    #[test]
+    fn a_close_returns_what_was_counted_and_nothing_newer() {
+        let n = [11u8; 16];
+        let mut map = HashMap::new();
+        stream_begin_billed_in(&mut map, n, "c", 0, billing(None));
+        for w in ["a", "b", "c"] {
+            stream_append_in(&mut map, &n, &delta(w), 1);
+        }
+        // The consumer polled from 0; the provider sent 3 frames (counted) but the reply was lost.
+        let owed = fetch_chunks_billed(&mut map, &n, "c", 0, 2).1.unwrap().tokens;
+        // More is generated meanwhile; nobody has polled for it.
+        stream_append_in(&mut map, &n, &delta("d"), 3);
+        // The consumer closes from where it had got to (0): it gets exactly the counted frames.
+        let mut consumer = crate::serve::StreamTally::default();
+        let resp = close_stream_in(&mut map, &n, "c", 0, 4);
+        consumer_count(&mut consumer, &resp);
+        assert!(matches!(resp, FetchChunksResponse::Chunks { next_offset: 3, done: true, .. }), "{resp:?}");
+        assert_eq!(consumer.billable(None), owed, "both sides now count the same");
+        // Closed: a later poll, or close, returns nothing new and owes nothing more.
+        stream_append_in(&mut map, &n, &delta("e"), 5);
+        assert_eq!(fetch_chunks_billed(&mut map, &n, "c", 3, 6).1, None);
+        assert!(matches!(fetch_chunks_billed(&mut map, &n, "c", 3, 6).0, FetchChunksResponse::Chunks { ref framed, .. } if parse_response(framed).unwrap().is_empty()));
+        // Someone else can't close it, and an unknown stream is NotFound.
+        assert_eq!(close_stream_in(&mut map, &n, "x", 0, 7), FetchChunksResponse::Forbidden);
+        assert_eq!(close_stream_in(&mut map, &[0u8; 16], "c", 0, 7), FetchChunksResponse::NotFound);
+    }
+
+    #[test]
+    fn a_read_stream_is_kept_for_its_payment_window_and_closing_stops_generation() {
+        let (_dir, provider) = test_provider(StubAdapter);
+        let n = [12u8; 16];
+        provider.stream_begin(n, "c", billing(None));
+        provider.stream_append(n, &delta("a"));
+        assert!(provider.stream_wanted(&n));
+        let mut close = n.to_vec();
+        close.extend_from_slice(&0u32.to_be_bytes());
+        let resp = FetchChunksResponse::decode(&provider.handle_stream_close("c", &close)).unwrap();
+        assert!(matches!(resp, FetchChunksResponse::Chunks { done: true, .. }));
+        assert!(!provider.stream_wanted(&n), "closing stops generation");
+        // Retention: an unread stream goes after the stream TTL; a read one lasts the commitment's.
+        let map = provider.streams.lock().unwrap();
+        let mut b = StreamBuffer { recorded_ms: 0, fetched_hi: 0, ..clone_buffer(&map[&n]) };
+        assert!(stream_expired(&b, STREAM_TTL_MS + 1));
+        b.fetched_hi = 1;
+        assert!(!stream_expired(&b, STREAM_TTL_MS + 1));
+        assert!(stream_expired(&b, COMMITMENT_TTL_MS.max(STREAM_TTL_MS) + 1));
+    }
+
+    fn clone_buffer(b: &StreamBuffer) -> StreamBuffer {
+        StreamBuffer {
+            reply_to: b.reply_to.clone(),
+            base_offset: b.base_offset,
+            chunks: b.chunks.clone(),
+            done: b.done,
+            bytes: b.bytes,
+            recorded_ms: b.recorded_ms,
+            last_poll_ms: b.last_poll_ms,
+            tally: b.tally,
+            fetched_hi: b.fetched_hi,
+            billing: b.billing.clone(),
+            closed: b.closed,
+        }
     }
 }

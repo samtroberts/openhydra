@@ -803,6 +803,8 @@ struct Exchange {
     proxy_roundtrip_ns: u64,
     /// Whether it was read as a stream (a stream that breaks after output is settled for what was read).
     streamed: bool,
+    /// How far the stream was read (its next poll offset), for closing it.
+    stream_offset: u32,
 }
 
 /// Append `text` to `kept`, up to `max_chars` characters in all.
@@ -924,6 +926,8 @@ enum StreamFail {
     /// A real failure: a provider `Error` frame, a shed (`Overloaded`), a stall, or a dropped
     /// transport past the retry budget. Carries the error for the caller's failover logic.
     Error(AdapterError),
+    /// The caller cancelled it (its client left).
+    Cancelled,
 }
 
 /// Dispatch one incremental slice of serve frames: text deltas → `on_delta`, tool calls held for
@@ -983,6 +987,20 @@ fn request_completion_streaming(
     request: &ServeRequest,
     on_delta: &mut dyn FnMut(&str),
 ) -> Result<ServeSummary, StreamFail> {
+    request_completion_streaming_with(transport, sleep, request, &|| false, &mut 0, on_delta)
+}
+
+/// [`request_completion_streaming`] that stops between polls once `cancel()` says so (its client
+/// left: [`StreamFail::Cancelled`]) and keeps `offset_out` at the offset it has read up to, which a
+/// close of the stream starts from (review S8).
+fn request_completion_streaming_with(
+    transport: &mut dyn FnMut(&[u8]) -> Result<Vec<u8>, AdapterError>,
+    sleep: &mut dyn FnMut(Duration),
+    request: &ServeRequest,
+    cancel: &dyn Fn() -> bool,
+    offset_out: &mut u32,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ServeSummary, StreamFail> {
     // F2: absolute total-time backstop (real wall clock), generous + `max_tokens`-scaled so it
     // never aborts a legitimate long serve — only the pathological never-idle dribble.
     let started = std::time::Instant::now();
@@ -1013,6 +1031,9 @@ fn request_completion_streaming(
         // The open ack may already carry frames — e.g. a refusal delivered as a complete
         // (done=true) stream, or an eager first slice.
         FetchChunksResponse::Chunks { framed, next_offset, done } => {
+            // Received up to here, however the slice's frames are then handled (an error frame ends
+            // it partway): a close starts after it, so nothing counted is counted twice.
+            *offset_out = next_offset.max(offset);
             if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, true, on_delta)? {
                 return Ok(summary);
             }
@@ -1025,6 +1046,10 @@ fn request_completion_streaming(
     let mut interval = POLL_MIN;
     let mut idle = Duration::ZERO;
     loop {
+        // Its client left: stop reading (the caller closes the stream and pays for what was read).
+        if cancel() {
+            return Err(StreamFail::Cancelled);
+        }
         // F2: absolute backstop — bail if the whole attempt has outrun its (generous) total cap.
         if started.elapsed() > total_cap {
             return Err(StreamFail::Error(AdapterError::Network(
@@ -1064,6 +1089,7 @@ fn request_completion_streaming(
 
         match FetchChunksResponse::decode(&resp) {
             Ok(FetchChunksResponse::Chunks { framed, next_offset, done }) => {
+                *offset_out = next_offset.max(offset); // as at the open, before the frames are handled
                 let progressed = next_offset > offset;
                 if let Some(summary) = dispatch_stream_slice(&framed, &mut tool_calls, false, on_delta)? {
                     return Ok(summary);
@@ -1995,6 +2021,7 @@ impl ConsumerNode {
         tools: Vec<Value>,
         think: Option<bool>,
         min_authenticity: Option<AuthenticityTier>,
+        cancel: &dyn Fn() -> bool,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
@@ -2007,14 +2034,15 @@ impl ConsumerNode {
         // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
         // model's discovery cache and retry once with a cold get_providers lookup. The retry is
         // only reached when nothing was streamed, so it can never duplicate delivered output.
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => return Ok(summary),
             AttemptOutcome::Fatal(e) => return Err(e),
+            AttemptOutcome::Retryable(e) if cancel() => return Err(e),
             AttemptOutcome::Retryable(_) => {}
         }
         tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
         let _ = self.net.invalidate_discover(model);
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => Ok(summary),
             AttemptOutcome::Retryable(e) | AttemptOutcome::Fatal(e) => Err(e),
         }
@@ -2034,6 +2062,7 @@ impl ConsumerNode {
         tools: &[Value],
         think: Option<bool>,
         policy: &AssurancePolicy,
+        cancel: &dyn Fn() -> bool,
         now: u64,
         req_span: &tracing::Span,
         on_delta: &mut dyn FnMut(&str),
@@ -2165,9 +2194,10 @@ impl ConsumerNode {
                     }
                     on_delta(d);
                 };
-                self.exchange(&provider_libp2p, &request, &mut guarded)
+                self.exchange(&provider_libp2p, &request, cancel, &mut guarded)
             };
             let streamed = exchange.streamed;
+            let stream_offset = exchange.stream_offset;
             let result = exchange.result;
             let proxy_roundtrip_ns = exchange.proxy_roundtrip_ns;
             match result {
@@ -2288,15 +2318,18 @@ impl ConsumerNode {
                     // A stream that broke after output arrived is still owed for what we read: the
                     // provider counts what its polls returned the same way, and holds an unpaid
                     // part against us like an unpaid whole.
+                    // Closed first (S8): the provider sends back anything it counted that we missed,
+                    // and stops generating; then it is paid for exactly that, in the background.
                     if delivered && streamed && !self.is_self_serve(&provider.libp2p_peer_id) {
                         let tokens = tally.get().billable(max_tokens);
                         if tokens > 0 {
-                            tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; settling for what was received");
-                            self.settle_receipt(&provider, tokens, nonce);
+                            tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; closing it and settling for what was received");
+                            self.close_and_settle(&provider, nonce, stream_offset, tally.get(), max_tokens);
                             self.record_usage(model, &provider.peer_id, tokens, false, now);
                         }
                     }
-                    if delivered {
+                    // Its client left: nobody to serve, so no failover.
+                    if delivered || cancel() {
                         // Already streamed part of a completion to the client — failing over
                         // (or a cache-bypass retry) would duplicate output. Surface it as fatal.
                         return AttemptOutcome::Fatal(e);
@@ -2358,7 +2391,13 @@ impl ConsumerNode {
     /// Send `request` to `provider_libp2p` the way every serve travels: as a stream (polled), or as
     /// one buffered reply to a provider known not to stream, with reconnect-and-fetch if that reply's
     /// connection drops. Each text fragment goes to `on_delta` as it arrives.
-    fn exchange(&self, provider_libp2p: &str, request: &ServeRequest, on_delta: &mut dyn FnMut(&str)) -> Exchange {
+    fn exchange(
+        &self,
+        provider_libp2p: &str,
+        request: &ServeRequest,
+        cancel: &dyn Fn() -> bool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Exchange {
         // Budget the serve by the request's `max_tokens` (see `attempt_timeout`) so a big
         // agentic completion on a slow remote model isn't abandoned mid-generation.
         let serve_to = attempt_timeout(request.max_tokens);
@@ -2366,6 +2405,7 @@ impl ConsumerNode {
         // can record it without a mutable-borrow conflict. Holds the first-ack / round-trip RTT.
         let proxy_rt = std::cell::Cell::new(0u64);
         let mut streamed = false;
+        let mut stream_offset = 0u32;
         // Buffered (0x10) round-trip with 0x11 reconnect-fetch drop recovery — the proven
         // path, used directly when a provider is known buffered-only and as the fallback
         // when a streaming probe reveals a legacy provider.
@@ -2401,11 +2441,12 @@ impl ConsumerNode {
                 };
                 let mut sleeper = |d: Duration| std::thread::sleep(d);
                 streamed = true;
-                request_completion_streaming(&mut stream_transport, &mut sleeper, request, on_delta)
+                request_completion_streaming_with(&mut stream_transport, &mut sleeper, request, cancel, &mut stream_offset, on_delta)
             };
             match stream_out {
                 Ok(s) => Ok(s),
                 Err(StreamFail::Error(e)) => Err(e),
+                Err(StreamFail::Cancelled) => Err(AdapterError::Cancelled("the client stopped reading".into())),
                 // A legacy provider — remember it and fall back to buffered this same
                 // attempt (the probe ran no generation, so no work is wasted).
                 Err(StreamFail::Legacy) => {
@@ -2416,7 +2457,53 @@ impl ConsumerNode {
                 }
             }
         };
-        Exchange { result, proxy_roundtrip_ns: proxy_rt.get(), streamed }
+        Exchange { result, proxy_roundtrip_ns: proxy_rt.get(), streamed, stream_offset }
+    }
+
+    /// Settle a stream that ended early (S8), in the background: first close it (`STREAM_CLOSE`), so
+    /// the provider stops generating and sends back whatever it counted past `offset` that we never
+    /// received (a lost reply), then pay for exactly what we then hold (`tally` plus those frames),
+    /// which is what the provider counted. Retried while the connection recovers, within the
+    /// commitment's lifetime; a provider that doesn't know the close (older build), or no longer
+    /// holds the stream, is paid for `tally` as before.
+    fn close_and_settle(
+        self: &Arc<Self>,
+        provider: &SelectedProvider,
+        nonce: [u8; 16],
+        offset: u32,
+        mut tally: crate::serve::StreamTally,
+        max_tokens: Option<u32>,
+    ) {
+        let node = Arc::clone(self);
+        let provider = provider.clone();
+        std::thread::spawn(move || {
+            let mut close = vec![crate::provider::STREAM_CLOSE];
+            close.extend_from_slice(&nonce);
+            close.extend_from_slice(&offset.to_be_bytes());
+            for wait in std::iter::once(Duration::ZERO).chain(SETTLE_RETRY_WAITS) {
+                std::thread::sleep(wait);
+                let reply = node.net.proxy_forward_timeout(provider.libp2p_peer_id.clone(), close.clone(), SETTLE_TIMEOUT);
+                match reply.map(|r| FetchChunksResponse::decode(&r)) {
+                    Ok(Ok(FetchChunksResponse::Chunks { framed, .. })) => {
+                        for chunk in parse_response(&framed).unwrap_or_default() {
+                            tally.push_encoded(&chunk.encode());
+                        }
+                        break;
+                    }
+                    // Throttled: try again shortly.
+                    Ok(Ok(FetchChunksResponse::Overloaded)) => continue,
+                    // Gone (settled, expired), not ours, or a provider without the close: pay for
+                    // what we have.
+                    Ok(_) => break,
+                    // Unreachable: retry, in case the connection comes back.
+                    Err(e) => tracing::debug!(provider = %provider.peer_id, error = %e, "couldn't close the stream yet"),
+                }
+            }
+            let tokens = tally.billable(max_tokens);
+            if tokens > 0 {
+                node.settle_receipt(&provider, tokens, nonce);
+            }
+        });
     }
 
     /// #7/#5: per-model consumed tracking (pure usage, kept for a self-serve too), and a `used`
@@ -3147,7 +3234,7 @@ impl ConsumerNode {
         let mut answer = String::new();
         let mut delivered = crate::serve::DeliveredText::default();
         let mut tally = crate::serve::StreamTally::default();
-        let exchange = self.exchange(&provider.libp2p_peer_id, &serve, &mut |d| {
+        let exchange = self.exchange(&provider.libp2p_peer_id, &serve, &|| false, &mut |d| {
             delivered.push(d);
             tally.push_delta(d);
             answer.push_str(d);
@@ -3163,9 +3250,8 @@ impl ConsumerNode {
                 Ok(answer)
             }
             Err(e) => {
-                let read = tally.billable(serve.max_tokens);
-                if paying && exchange.streamed && read > 0 {
-                    self.settle_receipt(provider, read, serve.nonce);
+                if paying && exchange.streamed && tally.billable(serve.max_tokens) > 0 {
+                    self.close_and_settle(provider, serve.nonce, exchange.stream_offset, tally, serve.max_tokens);
                 }
                 Err(e)
             }
@@ -4432,6 +4518,28 @@ mod tests {
         let after = only(vec![ServeChunk::Delta("hi".into()).encode(), refusal("x")]);
         assert!(!crate::serve::is_payment_refusal(&after));
         assert!(after.to_string().contains("refused payment after the serve began"), "{after}");
+    }
+
+    #[test]
+    fn a_stream_stops_reading_when_its_client_leaves_and_knows_how_far_it_got() {
+        // An open ack, then one slice of two deltas per poll, forever.
+        let mut polls = 0u32;
+        let mut transport = |framed: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if framed[0] == SERVE_STREAM {
+                return Ok(FetchChunksResponse::Chunks { framed: Vec::new(), next_offset: 0, done: false }.encode());
+            }
+            polls += 1;
+            let frames = [ServeChunk::Delta("ab".into()).encode(), ServeChunk::Delta("cd".into()).encode()];
+            Ok(FetchChunksResponse::Chunks { framed: crate::serve::frame_response(&frames), next_offset: polls * 2, done: false }.encode())
+        };
+        let mut sleeper = |_: Duration| {};
+        let seen = std::cell::Cell::new(0);
+        let mut offset = 0;
+        let out = request_completion_streaming_with(&mut transport, &mut sleeper, &request(), &|| seen.get() >= 6, &mut offset, &mut |_| {
+            seen.set(seen.get() + 1)
+        });
+        assert!(matches!(out, Err(StreamFail::Cancelled)));
+        assert_eq!((seen.get(), offset), (6, 6), "stopped after the slice that told it to, at its offset");
     }
 
     #[test]

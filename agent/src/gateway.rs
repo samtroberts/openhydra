@@ -669,10 +669,16 @@ fn spawn_worker(
         // Hold the global generation permit (G3b) for the worker's whole lifetime; it is
         // released when this thread exits, freeing the slot for the next completion.
         let _gen_permit = gen_permit;
+        // Set once the client is gone (its receiver dropped): the serve stops reading, closes the
+        // stream and pays for what was read, instead of reading (and paying for) the rest (S8).
+        let gone = std::sync::atomic::AtomicBool::new(false);
         let mut on_delta = |d: &str| {
-            let _ = tx.send(GatewayEvent::Delta(d.to_string()));
+            if tx.send(GatewayEvent::Delta(d.to_string())).is_err() {
+                gone.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         };
-        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, &mut on_delta) {
+        let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed);
+        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, &cancel, &mut on_delta) {
             Ok(summary) => {
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
