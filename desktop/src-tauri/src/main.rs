@@ -20,7 +20,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -829,6 +829,21 @@ fn effective_bootstraps(settings: &Settings) -> Vec<String> {
     out
 }
 
+/// `start_provider`'s refusal when the user hasn't confirmed what they share yet.
+const NOT_CONFIRMED: &str = "choose what to share first";
+
+/// Whether the provider accepts `--prompt-scoring auto` for this engine kind: auto-detect and the
+/// engines with their own scoring API do; Ollama and LM Studio need the side-scorer next to the
+/// agent; Exo and ComfyUI can't be scored (the agent refuses to start with the flag).
+fn scoring_supported(kind: &str, side_scorer_present: bool) -> bool {
+    match kind {
+        "vllm" | "llama-cpp" => true,
+        "ollama" | "lm-studio" => side_scorer_present,
+        "exo" | "comfyui" => false,
+        _ => true, // auto
+    }
+}
+
 /// The engine kinds the provider accepts for `--engine-kind` (besides `auto`).
 const ENGINE_KINDS: &[&str] = &["ollama", "vllm", "lm-studio", "llama-cpp", "exo", "comfyui"];
 
@@ -1026,7 +1041,12 @@ fn reveal_path(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let r = Command::new("open").arg("-R").arg(&p).status();
     #[cfg(target_os = "windows")]
-    let r = Command::new("explorer").arg(format!("/select,{}", p.display())).status();
+    let r = {
+        // canonicalize gives a `\\?\C:\…` path, which Explorer doesn't accept.
+        let shown = p.display().to_string();
+        let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_string();
+        Command::new("explorer").arg(format!("/select,{shown}")).status()
+    };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let r = Command::new("xdg-open").arg(p.parent().unwrap_or(&root)).status();
     r.map(|_| ()).map_err(|e| e.to_string())
@@ -1046,14 +1066,26 @@ fn set_sharing_enabled(state: &tauri::State<'_, AppState>, on: bool) {
 #[tauri::command]
 fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    // Sharing starts only after the user has confirmed what they share (the Share dialog), whatever
+    // asks for it — the in-app button, the tray menu. Resume-on-launch counts as confirmed.
+    if !settings.sharing_confirmed {
+        return Err(NOT_CONFIRMED.into());
+    }
     let mut sub = vec!["provide".to_string()];
     sub.extend(engine_args(&settings.engine_kind, &settings.engine_endpoint));
     if settings.engine_autostart {
         sub.push("--engine-autostart".into());
     }
     if settings.authenticity_checks {
-        sub.push("--prompt-scoring".into());
-        sub.push("auto".into());
+        let scorer_next_to_agent = agent_binary()
+            .and_then(|b| b.parent().map(|d| d.to_path_buf()))
+            .is_some_and(|d| d.join("openhydra-scorer").exists() || d.join("openhydra-mlx-scorer").exists());
+        if scoring_supported(&settings.engine_kind, scorer_next_to_agent) {
+            sub.push("--prompt-scoring".into());
+            sub.push("auto".into());
+        } else {
+            eprintln!("openhydra: authenticity checks aren't available for engine '{}'; sharing without them", settings.engine_kind);
+        }
     }
     // Persist the receipt ledger + take-side credit across restarts. Own redb file: redb is
     // single-writer per process, so the gateway role uses a separate file (gateway-ledger.redb).
@@ -1728,16 +1760,24 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
                 base["share"] = share;
             }
         }
-        if prov && gw {
+        if prov {
             // Provider base carries the served side (peers, served counters, `served` ledger
             // rows); the gateway process holds the consumed side + `used` ledger rows. Pull the
             // gateway's full status once and overlay both its economy and its transfers.
-            if let Some(gw) = fetch_status(GATEWAY_STATUS_PORT, "/status") {
+            let gw_status = if gw { fetch_status(GATEWAY_STATUS_PORT, "/status") } else { None };
+            let mut merged = false;
+            if let Some(gw) = gw_status {
                 merge_economy(&mut base, gw.get("economy").cloned().unwrap_or_default());
                 merge_known_providers(&mut base, gw.get("network").cloned().unwrap_or_default());
                 if let Some(gw_transfers) = gw.get("transfers").cloned() {
                     merge_transfers(&mut base, gw_transfers);
+                    merged = true;
                 }
+            }
+            if !merged {
+                // The consumed side lives in the gateway; without its reading, report it as unknown
+                // rather than the provider's zeros, which the UI would take for a counter reset.
+                unknown_consumed_side(&mut base);
             }
         }
         Some(base)
@@ -1816,6 +1856,16 @@ fn merge_economy(base: &mut serde_json::Value, gw_econ: serde_json::Value) {
 /// provider base snapshot's `transfers` block. The provider process only ever fills the served
 /// side, so consumed fields are taken wholesale from the gateway; the two roles' recent-ledger
 /// rings (provider = `served`, gateway = `used`) are concatenated and re-sorted newest-first.
+/// Null out the consumed-side counters (they belong to the gateway process) when its status
+/// couldn't be read this poll.
+fn unknown_consumed_side(base: &mut serde_json::Value) {
+    if let Some(t) = base.get_mut("transfers") {
+        for key in ["requests_consumed", "tokens_consumed", "consumed_per_model", "credits_spent"] {
+            t[key] = serde_json::Value::Null;
+        }
+    }
+}
+
 fn merge_transfers(base: &mut serde_json::Value, gw: serde_json::Value) {
     let Some(t) = base.get_mut("transfers") else { return };
     // The consumed side, including the credits spent on it, lives in the gateway process.
@@ -2051,6 +2101,116 @@ struct ChatMsgIn {
 /// gateway → discover → provider → engine. Returns the gateway's full JSON (including
 /// the `openhydra` metrics block the UI shows under each reply). Rust-side HTTP so the
 /// webview needs no CORS story.
+/// Chats being streamed, by the id the UI gave them: setting the flag stops reading (the gateway
+/// sees the connection close and stops the provider's generation).
+static CHAT_STREAMS: std::sync::LazyLock<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Stream a chat completion through the local gateway: each answer fragment goes to `on_event` as
+/// `{ "kind": "delta", "text" }` as it arrives, then one `{ "kind": "done", "openhydra", "usage",
+/// "model", "finish_reason" }`, or `{ "kind": "error", "message" }` (the gateway's own error text, as
+/// [`gateway_error`] formats it). Resolves when the stream ends. `chat_stop(stream_id)` ends it early.
+#[tauri::command]
+async fn chat_completion_stream(
+    state: tauri::State<'_, AppState>,
+    stream_id: String,
+    model: String,
+    messages: Vec<ChatMsgIn>,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<(), String> {
+    let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages.iter().map(|m| serde_json::json!({ "role": m.role, "content": m.content })).collect::<Vec<_>>(),
+        "max_tokens": max_tokens.unwrap_or(4096),
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    if let Some(t) = temperature.filter(|t| t.is_finite() && (0.0..=2.0).contains(t)) {
+        body["temperature"] = serde_json::json!(t);
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut m) = CHAT_STREAMS.lock() {
+        m.insert(stream_id.clone(), stop.clone());
+    }
+    let id = stream_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let lines = match client
+            .post_stream_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
+            .map_err(|e| format!("gateway: {e}"))?
+        {
+            Ok(lines) => lines,
+            Err((status, text)) => {
+                let _ = on_event.send(serde_json::json!({ "kind": "error", "message": gateway_error(status, &text) }));
+                return Ok(());
+            }
+        };
+        for line in lines {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = on_event.send(serde_json::json!({ "kind": "stopped" }));
+                return Ok(());
+            }
+            let line = line.map_err(|e| format!("gateway: {e}"))?;
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            for ev in stream_events(&chunk) {
+                let _ = on_event.send(ev);
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Ok(mut m) = CHAT_STREAMS.lock() {
+        m.remove(&id);
+    }
+    result
+}
+
+/// The UI events for one SSE chunk of `/v1/chat/completions`: the text delta, and, on the final
+/// chunk, the summary (telemetry, usage, model) or the gateway's error.
+fn stream_events(chunk: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    if let Some(err) = chunk.get("error") {
+        let kind = err["type"].as_str().unwrap_or("");
+        let msg = err["message"].as_str().unwrap_or("the provider stopped with an error");
+        out.push(serde_json::json!({ "kind": "error", "message": format!("gateway 502 {kind}: {msg}") }));
+        return out;
+    }
+    let choice = &chunk["choices"][0];
+    if let Some(t) = choice["delta"]["content"].as_str().filter(|t| !t.is_empty()) {
+        out.push(serde_json::json!({ "kind": "delta", "text": t }));
+    }
+    if let Some(t) = choice["delta"]["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
+        out.push(serde_json::json!({ "kind": "reasoning", "text": t }));
+    }
+    let finish = choice["finish_reason"].as_str();
+    if finish.is_some() || chunk.get("openhydra").is_some() {
+        out.push(serde_json::json!({
+            "kind": "done",
+            "finish_reason": finish,
+            "openhydra": chunk.get("openhydra").cloned().unwrap_or_default(),
+            "usage": chunk.get("usage").cloned().unwrap_or_default(),
+            "model": chunk.get("model").cloned().unwrap_or_default(),
+        }));
+    }
+    out
+}
+
+/// Stop a chat started with `chat_completion_stream`.
+#[tauri::command]
+fn chat_stop(stream_id: String) {
+    if let Some(flag) = CHAT_STREAMS.lock().ok().and_then(|m| m.get(&stream_id).cloned()) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[tauri::command]
 async fn chat_completion(
     state: tauri::State<'_, AppState>,
@@ -2073,8 +2233,8 @@ async fn chat_completion(
             .collect::<Vec<_>>(),
         "max_tokens": max_tokens.unwrap_or(DEFAULT_CHAT_MAX_TOKENS),
     });
-    // Sent only when the user set it: temperature 0 makes answers repeatable, and lets the gateway's
-    // audits replay the request (it needs an explicit 0; an absent temperature may sample).
+    // Sent when the UI passes one (the user set it): temperature 0 makes answers repeatable, and lets
+    // the gateway's audits replay the request (it needs an explicit 0; an absent one may sample).
     if let Some(t) = temperature.filter(|t| t.is_finite() && (0.0..=2.0).contains(t)) {
         body["temperature"] = serde_json::json!(t);
     }
@@ -2523,6 +2683,8 @@ fn main() {
             run_engine,
             gateway_health,
             chat_completion,
+            chat_completion_stream,
+            chat_stop,
             web_search,
             status_snapshot,
             save_settings,
@@ -2620,7 +2782,16 @@ fn main() {
                         if running {
                             stop_provider(app.state());
                         } else if let Err(e) = start_provider(app.state()) {
-                            eprintln!("tray: start provider failed: {e}");
+                            if e == NOT_CONFIRMED {
+                                // Ask in the app: show the window on the Share dialog.
+                                if let Some(w) = app.get_webview_window("main") {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                                let _ = app.emit("open-share-dialog", ());
+                            } else {
+                                eprintln!("tray: start provider failed: {e}");
+                            }
                         }
                         refresh_tray_menu(app);
                     }
@@ -2897,6 +3068,39 @@ mod tests {
         }));
         assert_eq!(base["network"]["known_models"], serde_json::json!(["a", "b"]));
         assert_eq!(base["network"]["known_providers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stream_chunks_become_ui_events() {
+        let delta = serde_json::json!({ "choices": [{ "delta": { "content": "Hel" }, "finish_reason": null }] });
+        assert_eq!(stream_events(&delta), vec![serde_json::json!({ "kind": "delta", "text": "Hel" })]);
+        let role = serde_json::json!({ "choices": [{ "delta": { "role": "assistant" }, "finish_reason": null }] });
+        assert!(stream_events(&role).is_empty());
+        let done = serde_json::json!({ "model": "m", "choices": [{ "delta": {}, "finish_reason": "stop" }],
+            "openhydra": { "provider_authenticity": "A1-reputation-redundant" }, "usage": { "completion_tokens": 3 } });
+        let ev = stream_events(&done);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["kind"], "done");
+        assert_eq!(ev[0]["usage"]["completion_tokens"], 3);
+        let err = serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "error" }], "error": { "message": "provider overloaded", "type": "upstream_overloaded" } });
+        assert_eq!(stream_events(&err)[0]["message"], "gateway 502 upstream_overloaded: provider overloaded");
+    }
+
+    #[test]
+    fn authenticity_checks_only_for_engines_that_can_be_scored() {
+        assert!(scoring_supported("auto", false));
+        assert!(scoring_supported("vllm", false));
+        assert!(!scoring_supported("ollama", false) && scoring_supported("ollama", true));
+        assert!(!scoring_supported("exo", true) && !scoring_supported("comfyui", true));
+    }
+
+    #[test]
+    fn a_missing_gateway_reading_is_unknown_not_zero() {
+        let mut base = serde_json::json!({ "transfers": { "credits_spent": 0, "tokens_consumed": 0, "credits_earned": 5 } });
+        unknown_consumed_side(&mut base);
+        assert!(base["transfers"]["credits_spent"].is_null());
+        assert!(base["transfers"]["tokens_consumed"].is_null());
+        assert_eq!(base["transfers"]["credits_earned"], 5);
     }
 
     #[test]

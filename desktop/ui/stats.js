@@ -42,6 +42,7 @@ import { HOUR_MS, hourKey, slotBuckets } from "./series";
     // agent restarted, so the whole reading is the fresh delta).
     const cr = creditsRec();
     const foldCredit = (raw, totalK, lastK) => {
+      if (raw == null) return;   // unknown this poll (the gateway's reading was missing): not a reset
       raw = Math.max(0, Math.round(raw || 0));
       const delta = raw >= cr[lastK] ? raw - cr[lastK] : raw;
       cr[lastK] = raw;

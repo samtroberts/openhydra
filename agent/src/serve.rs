@@ -462,6 +462,9 @@ pub struct ServeSummary {
     /// served (shown to the client, which can require a minimum). `None` provider-side and for a
     /// serve by our own provider.
     pub authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
+    /// Consumer-side: the provider streamed this serve, so `proxy_roundtrip_ns` is the time to its
+    /// first acknowledgement (sent before it generates), not the whole serve.
+    pub streamed: bool,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -488,6 +491,7 @@ pub fn handle_serve_request(
                 proxy_roundtrip_ns: 0,
                 tool_calls: Vec::new(),
                 authenticity: None,
+                streamed: false,
             };
         }
     };
@@ -591,6 +595,7 @@ pub fn handle_serve_request_within(
                 proxy_roundtrip_ns: 0,
                 tool_calls: o.tool_calls,
                 authenticity: None,
+                streamed: false,
             }
         }
         Err(e) => {
@@ -603,6 +608,7 @@ pub fn handle_serve_request_within(
                 proxy_roundtrip_ns: 0,
                 tool_calls: Vec::new(),
                 authenticity: None,
+                streamed: false,
             }
         }
     }

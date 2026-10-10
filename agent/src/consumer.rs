@@ -874,6 +874,7 @@ pub fn request_completion(
                     proxy_roundtrip_ns: 0,
                     tool_calls,
                     authenticity: None,
+                    streamed: false,
                 })
             }
         }
@@ -1381,6 +1382,7 @@ fn dispatch_stream_slice(
                     proxy_roundtrip_ns: 0,
                     tool_calls: std::mem::take(tool_calls),
                     authenticity: None,
+                    streamed: false,
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -2893,10 +2895,12 @@ impl ConsumerNode {
                 exchange.result
             };
             let proxy_roundtrip_ns = exchange.proxy_roundtrip_ns;
+            let streamed = opened;
             match result {
                 Ok(mut summary) => {
                     summary.discover_ns = discover_ns;
                     summary.proxy_roundtrip_ns = proxy_roundtrip_ns;
+                    summary.streamed = streamed;
                     // The tier the routing decision saw for this provider, for the client to see.
                     if !self.is_self_serve(&provider_libp2p) {
                         summary.authenticity = Some(self.authenticity_of(&provider.state_id, model_key_now, now));
@@ -2904,7 +2908,7 @@ impl ConsumerNode {
                     tracing::debug!(elapsed = ?t_serve.elapsed(), attempt = i + 1, "serve ok");
                     // #7: a serve routed to our OWN co-located provider is not a market
                     // transaction — skip receipt settlement, credit, reputation, and the audit
-                    // (auditing yourself is pointless). Still counts as usage below.
+                    // (auditing yourself is pointless); not counted as usage either (the provider counts it as local).
                     let self_serve = self.is_self_serve(&provider_libp2p);
                     // Settle the co-signed receipt at EOS (best-effort — tokens already
                     // delivered; a failed/slow settlement must not fail the completion).
@@ -2948,7 +2952,7 @@ impl ConsumerNode {
                         }
                     }
                     if summary.ok && summary.tokens > 0 {
-                        self.record_usage(model, model_key_now, &provider.peer_id, summary.tokens, self_serve, now);
+                        self.record_usage(model, summary.tokens, self_serve);
                     }
                     if summary.ok && !self_serve {
                         self.note_served_ok(&provider.libp2p_peer_id, &provider.model_id, now);
@@ -3047,7 +3051,7 @@ impl ConsumerNode {
                         tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; closing it and settling for what was received");
                         self.close_and_settle(&provider, nonce, stream_offset, tally, max_tokens);
                         if tokens > 0 {
-                            self.record_usage(model, &rep_model_key(&provider.canonical_model_id, &provider.model_id), &provider.peer_id, tokens, false, now);
+                            self.record_usage(model, tokens, false);
                         }
                     } else if opened {
                         // Our own provider: nothing to settle, but it stops generating for nobody
@@ -3060,7 +3064,7 @@ impl ConsumerNode {
                         if tokens > 0 {
                             tracing::info!(provider = %provider.peer_id, tokens, "serve failed part-way; settling for what was received");
                             self.settle_receipt(&provider, tokens, nonce);
-                            self.record_usage(model, &rep_model_key(&provider.canonical_model_id, &provider.model_id), &provider.peer_id, tokens, false, now);
+                            self.record_usage(model, tokens, false);
                         }
                     }
                     // Its client left: nobody to serve, so no failover.
@@ -3284,29 +3288,16 @@ impl ConsumerNode {
         });
     }
 
-    /// #7/#5: per-model consumed tracking and a `used` give/take ledger row for a real counterparty
-    /// (`provider_peer`), in memory and in the store (the consumer's side isn't a receipt, so it lives
-    /// only here) so the totals survive a restart. A self-serve (our own co-located provider) is not a
-    /// market transaction: the provider counts it as local, so it isn't counted as used here.
-    /// `model_key` prices the row's credits at the provider's claimed tier, as `credits_spent` does.
-    fn record_usage(&self, model: &str, model_key: &str, provider_peer: &str, tokens: u64, self_serve: bool, now: u64) {
+    /// #7: per-model consumed tracking for a completion from another machine. A self-serve (our own
+    /// co-located provider) is not a market transaction — the provider counts it as local — so it
+    /// isn't counted here. The Ledger's `used` row is written at settlement (`record_contribution`),
+    /// where the credits are known.
+    fn record_usage(&self, model: &str, tokens: u64, self_serve: bool) {
         if self_serve {
             return;
         }
-        let credits = credits_for_receipt(self.claimed_tier(provider_peer, model_key, now).weight(), tokens, None);
         if let Some(stats) = &self.stats {
             stats.record_consume(model, tokens);
-            stats.record_ledger(now, "used", model, provider_peer, tokens, Some(credits));
-        }
-        if let Some(store) = &self.store {
-            let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
-                ts_ms: now,
-                kind: "used".to_string(),
-                model: model.to_string(),
-                counterparty: provider_peer.to_string(),
-                tokens,
-                credits: Some(credits),
-            });
         }
     }
 
@@ -3403,6 +3394,7 @@ impl ConsumerNode {
         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id).to_string();
         // The provider's 128-bit state id — keys the per-(peer, model) gated voucher + authenticity lookup.
         let peer_id = provider.state_id.clone();
+        let ledger_peer = provider.peer_id.clone();
         // The voucher is keyed by the provider's full public key — what the on-chain claim (and its
         // already-settled amount) is keyed by — not just its 64-bit OpenHydra id: two keys sharing an
         // id (a ~2^32 search) would otherwise share one running total, and each claim all of it
@@ -3554,12 +3546,12 @@ impl ConsumerNode {
             node.note_settled(&provider_libp2p, settled_earlier || outcome.is_ok());
             match outcome {
                 _ if settled_earlier => {
-                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
+                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id);
                 }
                 Ok(receipt) => {
                     tracing::debug!(provider = %peer_id, tokens, cumulative = ?receipt.payload.cumulative_amount,
                         "receipt co-signed");
-                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens);
+                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id);
                     if let Some((_, cumulative)) = voucher {
                         node.raise_gated_voucher(&vkey, cumulative);
                     }
@@ -3587,7 +3579,10 @@ impl ConsumerNode {
     /// tier is the ceiling until model-authenticity fingerprinting lands; a self-declared canonical
     /// can't inflate it — review H1/H3). The give-side receipt carries no prompt/completion split
     /// yet (Phase 2b) → the blended in/out rate.
-    fn record_contribution(&self, provider_libp2p_id: &str, peer_id: &str, model_key: &str, tokens: u64) {
+    /// `ledger_peer` / `ledger_model` label the Ledger's `used` row (the provider's OpenHydra id and
+    /// the model it served): the row is written here, on a co-signed settlement, so its credits are
+    /// exactly what `credits_spent` counts.
+    fn record_contribution(&self, provider_libp2p_id: &str, peer_id: &str, model_key: &str, tokens: u64, ledger_peer: &str, ledger_model: &str) {
         let now = now_unix_ms();
         let me = self.net.libp2p_peer_id().to_string();
 
@@ -3607,9 +3602,20 @@ impl ConsumerNode {
         };
         // Display: cost-weighted credit SPENT, weighted by the **validated handle** (`model_key`) —
         // the ceiling that stops a mislabelled canonical inflating the number.
+        let spent = credits_for_receipt(self.claimed_tier(peer_id, model_key, now).weight(), tokens, None);
         if let Some(stats) = &self.stats {
-            let spent = credits_for_receipt(self.claimed_tier(peer_id, model_key, now).weight(), tokens, None);
             stats.add_credits_spent(spent);
+            stats.record_ledger(now, "used", ledger_model, ledger_peer, tokens, Some(spent));
+        }
+        if let Some(store) = &self.store {
+            let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
+                ts_ms: now,
+                kind: "used".to_string(),
+                model: ledger_model.to_string(),
+                counterparty: ledger_peer.to_string(),
+                tokens,
+                credits: Some(spent),
+            });
         }
         if let Some(store) = &self.store {
             if let Err(e) = store.put_credit(provider_libp2p_id, &snapshot) {

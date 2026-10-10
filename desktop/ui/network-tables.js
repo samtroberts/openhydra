@@ -22,7 +22,7 @@ import { menu, toast } from "./chrome";
           // Credits on the same cost-weighted scale as Activity's net balance (rows from before it was
           // recorded have none).
           const served = r.kind === "served", cr = r.credits == null ? "—" : (served ? "+" : "−") + Number(r.credits).toLocaleString();
-          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td title="${esc(displayModelName(r.model))}">${modelIcon(r.model)}${esc(displayModelName(r.model))}</td><td class="mono" title="${esc(r.counterparty)} (the other machine's OpenHydra id)">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
+          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td title="${esc(displayModelName(r.model))}">${modelIcon(r.model)}${esc(displayModelName(r.model))}</td><td class="mono" title="${esc(r.counterparty)} (the other machine's id)">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
         }).join("")
       : `<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`;
   }

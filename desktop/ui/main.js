@@ -160,9 +160,11 @@ $$(".drop").forEach((d) => d.onclick = (e) => {
 $$(".range").forEach((rg) => {
   const mn = +rg.dataset.min, mx = +rg.dataset.max, isInt = rg.dataset.int, fill = rg.querySelector(".fill"), knob = rg.querySelector(".knob"), lab = $("#" + rg.dataset.label);
   function set(v) { v = Math.max(mn, Math.min(mx, v)); const p = (v - mn) / (mx - mn) * 100; fill.style.width = p + "%"; knob.style.left = p + "%"; lab.textContent = rg.dataset.name + " · " + (isInt ? Math.round(v) : Math.round(v * 100) / 100); rg.dataset.val = v; }
-  set(+rg.dataset.val); rg._set = set; let drag = 0;
+  set(+rg.dataset.val); rg._set = (v) => { rg.dataset.touched = "1"; set(v); }; let drag = 0;
+  // Until the user sets the temperature, the provider's default for the model applies.
+  if (rg.dataset.label === "tempk") lab.textContent = "Temperature · model default";
   // Dragging a slider by hand leaves the preset: show "Custom".
-  function fe(e) { const r = rg.getBoundingClientRect(); set(mn + ((e.clientX - r.left) / r.width) * (mx - mn)); const ps = $("#presetdrop span"); if (ps) ps.textContent = "Custom"; }
+  function fe(e) { const r = rg.getBoundingClientRect(); rg.dataset.touched = "1"; set(mn + ((e.clientX - r.left) / r.width) * (mx - mn)); const ps = $("#presetdrop span"); if (ps) ps.textContent = "Custom"; }
   rg.onmousedown = (e) => { drag = 1; fe(e); e.preventDefault(); }; addEventListener("mousemove", (e) => { if (drag) fe(e); }); addEventListener("mouseup", () => drag = 0);
 });
 $("#inftoggle").onclick = () => $("#v-chat .three").classList.toggle("noinf");
@@ -325,9 +327,12 @@ async function doSend(text, fromHome) {
     // and let the Rust command apply its generous default (a reasoning model needs well over the
     // old 512 or it spends the whole budget on hidden thinking and returns nothing).
     const tokLimit = Math.round(+($("[data-label='tokk']")?.dataset.val)) || undefined;
-    const tv = +($("[data-label='tempk']")?.dataset.val);
-    const temperature = Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
-    const resp = await call("chat_completion", { model, messages, maxTokens: tokLimit, temperature });
+    // Temperature: sent once the user has set it (slider or preset); otherwise the provider's own
+    // default for the model applies.
+    const tr = $("[data-label='tempk']"), tv = +(tr?.dataset.val);
+    const temperature = tr?.dataset.touched && Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
+    const resp = await completeChat({ model, messages, maxTokens: tokLimit, temperature }, th, wait, slow);
+    if (resp?.stopped) { s.m.push(["ai", resp.text || "", { model, tok: "—", tps: "—", rtt: "—", tier: null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), stopped: true }, null]); saveSessions(); renderChat(); return; }
     clearTimeout(slow); wait.remove();
     const msg = resp?.choices?.[0]?.message || {};
     const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer
@@ -354,7 +359,50 @@ async function doSend(text, fromHome) {
     th.appendChild(err);
   }
 }
-function send() { const c = $("#composer"); const t = c.textContent.trim(); c.textContent = ""; doSend(t, false); }
+// Run one chat request. In the app it streams: the answer appears as it is generated and Send turns
+// into Stop. Resolves to the same shape as a non-streamed reply (choices / usage / openhydra), or
+// { stopped, text } when the user stopped it. The browser mock (no Tauri channel) asks in one go.
+let activeStream = null;
+async function completeChat(args, th, wait, slow) {
+  const Channel = window.__TAURI__?.core?.Channel;
+  if (!Channel) return call("chat_completion", args);
+  const streamId = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const live = document.createElement("div"); live.className = "msg ai"; live.style.whiteSpace = "pre-wrap";
+  let text = "", reasoning = "", done = null, error = null, stopped = false;
+  const ch = new Channel();
+  ch.onmessage = (ev) => {
+    if (ev.kind === "delta" || ev.kind === "reasoning") {
+      if (ev.kind === "delta") text += ev.text; else reasoning += ev.text;
+      if (wait.isConnected) { clearTimeout(slow); wait.remove(); th.appendChild(live); }
+      // While streaming show the answer so far (any inline <think> part as a muted line).
+      const sp = splitThink(text);
+      live.textContent = sp.answer || (sp.reasoning || reasoning ? "Thinking…" : "");
+      th.scrollTop = th.scrollHeight;
+    } else if (ev.kind === "done") done = ev;
+    else if (ev.kind === "error") error = ev.message;
+    else if (ev.kind === "stopped") stopped = true;
+  };
+  activeStream = streamId; setSendMode(true);
+  try {
+    await call("chat_completion_stream", { streamId, model: args.model, messages: args.messages, maxTokens: args.maxTokens, temperature: args.temperature, onEvent: ch });
+  } finally {
+    activeStream = null; setSendMode(false); live.remove();
+  }
+  if (error) throw error;
+  if (stopped) return { stopped: true, text: splitThink(text).answer };
+  return {
+    choices: [{ message: { content: text, reasoning_content: reasoning || undefined } }],
+    usage: done?.usage || {}, openhydra: done?.openhydra || {}, model: done?.model || args.model,
+  };
+}
+// Send ↔ Stop while a reply is streaming.
+function setSendMode(streaming) {
+  $("#sendlbl").textContent = streaming ? "Stop" : (chatMode === "image" ? "Generate" : "Send");
+  $("#send").classList.toggle("stop", streaming);
+}
+function send() {
+  if (activeStream) { call("chat_stop", { streamId: activeStream }).catch(() => {}); return; }
+  const c = $("#composer"); const t = c.textContent.trim(); c.textContent = ""; doSend(t, false); }
 $("#send").onclick = send;
 $("#composer").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
 function homeSend() { const p = $("#homeprompt"); const t = p.textContent.trim(); p.textContent = ""; doSend(t, true); }
@@ -493,7 +541,12 @@ $("#search").oninput = () => { if (activeView === "providers") renderProviders()
 function openGoto() { menu($("#cmdk"), Object.keys(titles).filter((v) => v !== "peers" || app.hasAttribute("data-adv")).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); }
 $("#cmdk").onclick = (e) => { e.stopPropagation(); openGoto(); };
 document.addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); openGoto(); }
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    if (document.querySelector(".cmodal-back, #installov[style*='flex']")) return;   // not over a dialog
+    document.activeElement?.blur?.();   // so the arrow keys and Enter drive the menu
+    openGoto();
+  }
 });
 // The logo goes Home. (It used to open a "tray menu preview" whose Quit called a command that
 // doesn't exist; the real system tray has Sharing and Quit.)
@@ -722,6 +775,8 @@ function ensureResumeNotice() {
 async function refreshEngines() { try { setEngines(await call("detect_engines_now")); } catch { setEngines([]); } try { setInstalledEngines(await call("installed_engines")); } catch { setInstalledEngines([]); } renderStatusbar(); if (["share", "engines", "providers", "settings"].includes(activeView)) renderView(); }
 on("refresh-engines", refreshEngines);   // installer.js fires this after an install completes
 on("nav", (v) => go(v));                  // feature modules request navigation via the bus
+// The tray's Sharing item asks here when the user hasn't chosen what to share yet.
+try { window.__TAURI__?.event?.listen?.("open-share-dialog", () => { go("share"); openShareDialog(); }); } catch {}
 on("refresh", () => refresh());           // …and a full state refresh
 async function refreshStatus() { try { setSnap(await call("status_snapshot")); } catch { setSnap(null); } noteSeen(); accumulateStats(); renderStatusbar(); if (["peers", "providers", "activity", "ledger", "share"].includes(activeView)) renderView(); }
 on("refresh-status", () => refreshStatus());  // share.js nudges the /status/share poll after a policy save

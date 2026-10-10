@@ -9,6 +9,9 @@ let menuFor = null;
 // Keyboard for an open menu: ↑/↓ move, Enter picks, Escape closes.
 document.addEventListener("keydown", (e) => {
   const m = document.querySelector(".menu"); if (!m) return;
+  // While typing, only Escape reaches the menu (Enter sends the message, arrows move the caret).
+  const a = document.activeElement, typing = a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  if (typing && e.key !== "Escape") return;
   const items = [...m.querySelectorAll(".mi")]; if (!items.length) return;
   let i = items.findIndex((x) => x.classList.contains("kb"));
   if (e.key === "Escape") { e.preventDefault(); closeMenus(); return; }

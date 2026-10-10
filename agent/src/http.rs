@@ -78,6 +78,31 @@ impl ReqwestClient {
         let status = resp.status().as_u16();
         Ok((status, resp.text().map_err(http_err)?))
     }
+
+    /// Streaming `POST {url}` (an SSE response read line by line, like `post_stream`), except a
+    /// non-2xx reply is returned as `Err((status, body))` with its body instead of a bare status
+    /// error, so the caller can show why the server refused.
+    #[allow(clippy::type_complexity)]
+    pub fn post_stream_any_status(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> Result<Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, (u16, String)>, AdapterError> {
+        let resp = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .timeout(STREAM_TIMEOUT)
+            .send()
+            .map_err(http_err)?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Ok(Err((status, resp.text().unwrap_or_default())));
+        }
+        let reader = std::io::BufReader::new(resp);
+        Ok(Ok(Box::new(reader.lines().map(|line| line.map_err(|e| AdapterError::Http(e.to_string()))))))
+    }
 }
 
 impl HttpClient for ReqwestClient {

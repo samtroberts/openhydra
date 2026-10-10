@@ -14,14 +14,15 @@ import { displayModelName } from "./models";
 import { exportCardModal, ensureImportSection } from "./cards";
 
   let sharingBusy = false;
-  export async function setSharing(on) {
+  // `confirmed`: the caller is the share dialog, which just recorded the user's choice.
+  export async function setSharing(on, confirmed = false) {
     if (sharingBusy) return; sharingBusy = true;
     try {
       if (on) {
         if (!engines.some((e) => e.models.length)) { emit("nav", "engines"); toast("No local models found — start or install an engine to share"); return; }
         // Ask what to share first when nothing is chosen yet (a fresh install), or when the user has
         // never confirmed it in this dialog (an older build may have left "share everything" behind).
-        if (!(await anythingShared()) || !state?.settings?.sharing_confirmed) { sharingBusy = false; await openShareDialog(); return; }
+        if (!confirmed && (!(await anythingShared()) || !state?.settings?.sharing_confirmed)) { sharingBusy = false; await openShareDialog(); return; }
         await call("start_provider");
       } else {
         await call("stop_provider");
@@ -330,7 +331,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     await call("confirm_sharing").catch(() => {});
     if (state?.settings) state.settings.sharing_confirmed = true;   // until the next poll brings it
     toast(`Sharing ${picked.models.length} model${picked.models.length === 1 ? "" : "s"} with ${picked.reach === "global" ? "everyone" : "your swarms"}`);
-    if (!running) await setSharing(true);
+    if (!running) await setSharing(true, true);
   }
   export function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;

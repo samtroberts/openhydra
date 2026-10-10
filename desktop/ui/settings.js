@@ -17,7 +17,7 @@ import { call } from "./bridge";
     field.contentEditable = auto ? "false" : "true";
     field.classList.toggle("mut", auto);
     if (document.activeElement === field) return;
-    const saved = (state?.settings?.engine_endpoint || "").trim();
+    const saved = ((pendingSettings.engine_endpoint ?? state?.settings?.engine_endpoint) || "").trim();
     field.textContent = auto
       ? (engines.length ? engines.map((e) => `${e.label} ${e.url}`).join(" · ") : "detected automatically")
       : (saved || ENGINE_ENDPOINTS[sel] || "");

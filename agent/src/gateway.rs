@@ -599,7 +599,7 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
     // On a streamed serve `proxy_roundtrip_ns` is the time to the provider's first acknowledgement
     // (sent before it generates) — already the network round trip, and shorter than the serve. On a
     // buffered serve it spans the whole serve, so the serve time comes off it.
-    let net_rtt_ns = if summary.proxy_roundtrip_ns > 0 && summary.proxy_roundtrip_ns < provider_serve_ns {
+    let net_rtt_ns = if summary.streamed {
         summary.proxy_roundtrip_ns
     } else {
         summary.proxy_roundtrip_ns.saturating_sub(provider_serve_ns)
@@ -1003,6 +1003,7 @@ fn spawn_byok_worker(
                     proxy_roundtrip_ns: 0,
                     tool_calls: outcome.tool_calls,
                     authenticity: None,
+                    streamed: false,
                 };
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -2141,6 +2142,7 @@ mod tests {
         assert_eq!(openhydra_block(&s, one, one)["hops_ms"]["network_rtt"], 100);
         // Streamed: the round trip is the first ack (40 ms), shorter than the serve: that IS the RTT.
         let mut st = summary(10, 5);
+        st.streamed = true;
         st.proxy_roundtrip_ns = 40_000_000;
         assert_eq!(openhydra_block(&st, one, one)["hops_ms"]["network_rtt"], 40);
         // A 1-token reply with no eval time has no meaningful speed: null, not 1,000,000 tok/s.
@@ -2166,6 +2168,7 @@ mod tests {
             discover_ns: 1_000_000,
             tool_calls: Vec::new(),
             authenticity: None,
+            streamed: false,
         }
     }
 

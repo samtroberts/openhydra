@@ -121,7 +121,9 @@ impl TransferStats {
     /// [`record_serve`](Self::record_serve) for a serve to this machine's own gateway (`local`):
     /// its speed still counts towards the model's average, its tokens go to `tokens_local` only.
     pub fn record_serve_for(&self, model: &str, tokens: u64, native_tps: f64, ok: bool, local: bool) {
-        self.requests_served.fetch_add(1, Ordering::Relaxed);
+        if !local {
+            self.requests_served.fetch_add(1, Ordering::Relaxed);
+        }
         if !ok {
             self.serve_errors.fetch_add(1, Ordering::Relaxed);
         }
