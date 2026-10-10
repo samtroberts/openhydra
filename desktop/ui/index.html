@@ -35,7 +35,7 @@
       <div class="nav" data-v="ledger" data-m="network"><span class="icon" data-i="list"></span>Ledger</div>
       <div class="nav" data-v="peers" data-m="network" data-tier="adv"><span class="icon" data-i="users"></span>Diagnostics and Stats</div>
       <div class="navsec">Recents</div>
-      <div id="recsearchwrap" style="padding:0 2px 6px"><input id="recfilter" placeholder="Search chats" style="width:100%;height:26px;border:1px solid hsl(var(--input));border-radius:7px;background:hsl(var(--background));padding:0 8px;font:inherit;font-size:11.5px;color:hsl(var(--foreground));outline:none"/></div>
+      <div id="recsearchwrap" style="padding:0 2px 6px"><input id="recfilter" placeholder="Search chats" spellcheck="false" autocorrect="off" autocapitalize="off" style="width:100%;height:26px;border:1px solid hsl(var(--input));border-radius:7px;background:hsl(var(--background));padding:0 8px;font:inherit;font-size:11.5px;color:hsl(var(--foreground));outline:none"/></div>
       <button class="iconbtn" id="recsearchbtn" title="Search chats" style="display:none"><span class="icon" data-i="search"></span></button>
       <div id="recents" style="overflow:auto;min-height:0">
         <div class="nav recent" data-chat="design"><span class="icon" data-i="chat"></span>Design review</div>
@@ -65,7 +65,7 @@
         <div class="htitle" id="htitle">Home</div>
         <div class="grow"></div>
         <button class="btn brand sm" id="becomeprov" style="display:none"><span class="icon" data-i="zap"></span>Become a Provider</button>
-        <div class="search" id="searchwrap"><span class="icon" data-i="search"></span><input id="search" placeholder="Search…" /></div>
+        <div class="search" id="searchwrap"><span class="icon" data-i="search"></span><input id="search" placeholder="Search…" spellcheck="false" autocorrect="off" autocapitalize="off" /></div>
       </div>
 
       <div class="content">
@@ -117,6 +117,7 @@
           <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:460px;gap:20px">
             <div style="display:flex;align-items:center;gap:13px"><img id="homelogo" src="/logo-mark.png" alt="" style="width:38px;height:38px;object-fit:contain"/><span style="font-size:27px;font-weight:600;letter-spacing:-.02em">Welcome to OpenHydra</span></div>
             <div class="card" id="homecard" style="width:min(640px,94%);padding:12px 12px 10px">
+              <div class="attachrow" id="homeattach" style="display:none"></div>
               <div class="input area" id="homeprompt" contenteditable="true" data-ph="How can I help you today?" style="border:0;min-height:54px;padding:6px 4px"></div>
               <div class="row" style="gap:8px;margin-top:4px">
                 <div class="input select drop" id="homedrop" data-opts="" title="Model · from the network" style="width:auto;height:30px;flex:none;gap:7px;max-width:230px"><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">openhydra/auto</span><span class="icon" data-i="chev"></span></div>
@@ -208,6 +209,7 @@
                 <div class="msg ai">The uplift is a single libp2p 0.54→0.56 bump…</div>
               </div>
               <div class="composer" style="flex-direction:column;gap:8px;align-items:stretch">
+                <div class="attachrow" id="chatattach" style="display:none"></div>
                 <div class="input area" id="composer" contenteditable="true" data-ph="Message…"></div>
                 <div class="row" style="gap:8px">
                   <div class="input select drop" id="modeldrop" data-opts="" title="Model · from the network — pick an image model to generate images here" style="width:auto;height:30px;flex:none;gap:7px;max-width:230px"><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">openhydra/auto</span><span class="icon" data-i="chev"></span></div>
@@ -320,7 +322,7 @@ openclaw config set model.name openhydra/auto</div><div class="connact"><button 
           </div>
 
           <div class="acttab" data-act="dht">
-            <div class="tablecard"><table><thead><tr><th>Key</th><th>Kind</th><th>Providers</th><th>TTL</th></tr></thead><tbody>
+            <div class="tablecard"><table><thead><tr><th>Key</th><th>Kind</th><th>Providers</th></tr></thead><tbody>
               <tr><td class="mono">/oh/model/tinyllama</td><td><span class="badge secondary">provider</span></td><td class="num">1</td><td class="num">241s</td></tr>
               <tr><td class="mono">/oh/model/qwen2.5:7b</td><td><span class="badge secondary">provider</span></td><td class="num">4</td><td class="num">188s</td></tr>
             </tbody></table></div>
@@ -329,7 +331,6 @@ openclaw config set model.name openhydra/auto</div><div class="connact"><button 
 
           <div class="acttab" data-act="swarm">
             <div class="grid g4"><div class="card pad kpi"><div class="lbl">Listeners</div><div class="val num">6</div></div><div class="card pad kpi"><div class="lbl">Reservations</div><div class="val num">3</div></div><div class="card pad kpi"><div class="lbl">DCUtR ok</div><div class="val num">1</div></div><div class="card pad kpi"><div class="lbl">AutoNAT</div><div class="val" style="font-size:17px">private</div></div></div>
-            <div class="card pad spark placeholder" style="margin-top:14px">Connections &amp; transports</div>
           </div>
 
           <div class="acttab" data-act="logs">

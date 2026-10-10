@@ -66,13 +66,17 @@ export function displayModelName(id) {
 // The selected model to route on: the RAW id stored in the span's dataset, not the (prettified)
 // label. Falls back to the label for safety before the first render sets the value.
 export function curModel() { const sp = $("#modeldrop span"); const m = (sp && (sp.dataset.value || sp.textContent)) || ""; return m && m !== "—" && !/no models/i.test(m) ? m : ""; }
+export const AUTO_MODEL = "openhydra/auto";
 export function renderModels() {
-  const models = netModels(); const opts = models.join("|");
+  const models = netModels();
+  // "openhydra/auto" (the gateway picks a live model) heads the list once anything is live.
+  const opts = (models.length ? [AUTO_MODEL, ...models] : []).join("|");
   $("#homedrop").dataset.opts = opts; $("#modeldrop").dataset.opts = opts;
   for (const d of ["#homedrop", "#modeldrop"]) {
     const sp = $(d + " span");
     let cur = sp.dataset.value || sp.textContent;            // raw current selection
-    if (!models.includes(cur)) cur = models[0] || "";        // dropped out → first model
+    if (!models.length) cur = "";                                           // nothing live (auto included)
+    else if (cur !== AUTO_MODEL && !models.includes(cur)) cur = models[0];   // dropped out → first model
     sp.dataset.value = cur;                                  // keep the raw id for routing
     sp.textContent = cur ? displayModelName(cur) : "— no models yet"; // show the clean name
   }

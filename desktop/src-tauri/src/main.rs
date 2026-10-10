@@ -964,6 +964,24 @@ fn get_state(state: tauri::State<'_, AppState>) -> FullState {
     }
 }
 
+/// Open a link from a chat answer in the default browser. Only http(s) and mailto links, passed as a
+/// single argument (no shell), so an answer can't make the app run or open anything else.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")) || u.chars().any(char::is_control) {
+        return Err("only web and email links can be opened".into());
+    }
+    #[cfg(target_os = "macos")]
+    let r = Command::new("open").arg(u).status();
+    #[cfg(target_os = "windows")]
+    let r = Command::new("rundll32").args(["url.dll,FileProtocolHandler", u]).status();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let r = Command::new("xdg-open").arg(u).status();
+    r.map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// The user confirmed what they share in the Share dialog: later starts no longer ask.
 #[tauri::command]
 fn confirm_sharing(state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -2473,6 +2491,7 @@ fn main() {
             identity_info,
             reveal_path,
             confirm_sharing,
+            open_external,
             start_provider,
             start_gateway,
             stop_provider,

@@ -25,7 +25,7 @@ export function mediaEl(src, label) {
   wrap.appendChild(el);
   const bar = document.createElement("div"); bar.style.cssText = "display:flex;gap:12px;margin-top:4px;font-size:12px";
   const cp = document.createElement("button"); cp.textContent = "⎘ copy";
-  cp.style.cssText = "cursor:pointer;color:hsl(var(--muted));background:none;border:none;padding:0;font:inherit";
+  cp.style.cssText = "cursor:pointer;color:hsl(var(--muted-foreground));background:none;border:none;padding:0;font:inherit";
   cp.onclick = async () => {
     try { // copy the image itself to the clipboard when possible; else copy the src/data-URL
       if (kind === "image" && src.startsWith("data:") && window.ClipboardItem) {
@@ -38,7 +38,7 @@ export function mediaEl(src, label) {
   const ext = kind === "image" ? "png" : kind === "video" ? "mp4" : "flac";
   const dl = document.createElement("a"); dl.textContent = "⭳ download";
   dl.href = src; dl.download = (label && label.trim()) || `openhydra-${kind}.${ext}`;
-  dl.style.cssText = "cursor:pointer;color:hsl(var(--muted));text-decoration:none";
+  dl.style.cssText = "cursor:pointer;color:hsl(var(--muted-foreground));text-decoration:none";
   bar.appendChild(cp); bar.appendChild(dl); wrap.appendChild(bar);
   return wrap;
 }

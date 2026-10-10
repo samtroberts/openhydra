@@ -7,9 +7,10 @@ import { store } from "./storage";
 import { fmtNum, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
+import { renderMarkdown } from "./markdown";
 import { toast, menu, closeMenus, confirmModal } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
-import { noteSeen, netModels, curModel, renderModels, displayModelName } from "./models";
+import { noteSeen, netModels, curModel, renderModels, displayModelName, modelIdle, AUTO_MODEL } from "./models";
 import { renderConnectors } from "./connectors";
 import { renderProviders, setProviderSort } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
@@ -38,7 +39,13 @@ document.addEventListener("contextmenu", (e) => {
 injectIcons();
 
 // toast + popover menu live in chrome.js; dismiss-open-menus on any click / resize stays wired here:
-document.addEventListener("click", closeMenus); addEventListener("resize", closeMenus);
+document.addEventListener("click", closeMenus);
+// Links in answers open in the default browser, never inside the app window.
+document.addEventListener("click", (e) => {
+  const a = e.target.closest?.(".msg a[href]"); if (!a) return;
+  e.preventDefault(); e.stopPropagation();
+  call("open_external", { url: a.getAttribute("href") }).catch((err) => toast(`Couldn't open the link: ${err}`));
+}, true); addEventListener("resize", closeMenus);
 
 // ── model family badge ──
 
@@ -145,7 +152,8 @@ $$(".drop").forEach((d) => d.onclick = (e) => {
   const sp = d.querySelector("span");
   const cur = isModel ? (sp.dataset.value || sp.textContent) : sp.textContent;
   const setSel = (el, o) => { if (isModel) { el.dataset.value = o; el.textContent = displayModelName(o); } else { el.textContent = o; } };
-  menu(d, opts.length ? opts.map((o) => ({ label: isModel ? displayModelName(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") { updateEngineEndpoint(); saveSetting({ engine_kind: ENGINE_KIND_OF[o] || "auto", engine_endpoint: "" }); } if (d.id === "presetdrop") applyPreset(o); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
+  const modelLabel = (o) => o === AUTO_MODEL ? "Best available (openhydra/auto)" : displayModelName(o) + (modelIdle(o) ? "  · not seen recently" : "");
+  menu(d, opts.length ? opts.map((o) => ({ label: isModel ? modelLabel(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") { updateEngineEndpoint(); saveSetting({ engine_kind: ENGINE_KIND_OF[o] || "auto", engine_endpoint: "" }); } if (d.id === "presetdrop") applyPreset(o); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
 });
 
 // ── inference range sliders (wireframe verbatim) ──
@@ -177,13 +185,48 @@ function renderRecents() {
     const el = document.createElement("div");
     el.className = "nav recent" + (id === curChat && activeView === "chat" ? " on" : "");
     el.dataset.chat = id;
-    el.innerHTML = `<span class="icon" data-i="chat"></span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(s.t)}</span>`;
+    el.innerHTML = `<span class="icon" data-i="chat"></span><span class="rt" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(s.t)}</span><span class="recmenu" title="Rename or delete">⋯</span>`;
     injectIcons(el);
     el.style.display = q && !s.t.toLowerCase().includes(q) ? "none" : "";
     box.appendChild(el);
   }
 }
-$("#recents").onclick = (e) => { const r = e.target.closest(".recent"); if (r) openChat(r.dataset.chat); };
+$("#recents").onclick = (e) => {
+  const r = e.target.closest(".recent"); if (!r) return;
+  if (e.target.closest(".recmenu")) { e.stopPropagation(); recentMenu(e.target.closest(".recmenu"), r.dataset.chat); return; }
+  openChat(r.dataset.chat);
+};
+// Rename or delete a chat (the ⋯ on hover, or right-click).
+$("#recents").addEventListener("contextmenu", (e) => { const r = e.target.closest(".recent"); if (!r) return; e.preventDefault(); recentMenu(r.querySelector(".recmenu") || r, r.dataset.chat); });
+function recentMenu(anchor, id) {
+  menu(anchor, [
+    { label: "Rename", fn: () => renameChat(id) },
+    { label: "Delete", fn: () => deleteChat(id) },
+  ]);
+}
+function renameChat(id) {
+  const row = $(`#recents .recent[data-chat="${id}"] .rt`), s = sessions[id]; if (!row || !s) return;
+  row.contentEditable = "true"; row.spellcheck = false; row.focus();
+  document.getSelection()?.selectAllChildren(row);
+  const done = (save) => {
+    row.contentEditable = "false";
+    const t = (row.textContent || "").trim();
+    if (save && t) { s.t = t.slice(0, 80); saveSessions(); }
+    renderRecents(); if (curChat === id) renderChat();
+  };
+  row.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); done(true); } else if (e.key === "Escape") { e.preventDefault(); done(false); } };
+  row.onblur = () => done(true);
+  row.onclick = (e) => e.stopPropagation();
+}
+async function deleteChat(id) {
+  const s = sessions[id]; if (!s) return;
+  if (!(await confirmModal(`Delete "${s.t}"?`, "The conversation is removed from this device. This can't be undone.", "Delete"))) return;
+  delete sessions[id];
+  setSessionOrder(sessionOrder.filter((x) => x !== id));
+  saveSessions();
+  if (curChat === id) { setCurChat(null); go("home"); }
+  renderRecents();
+}
 $("#recfilter").oninput = renderRecents;
 function newSession(title) { const id = "c" + Date.now().toString(36); sessions[id] = { t: title || "New chat", m: [] }; sessionOrder.unshift(id); saveSessions(); return id; }
 function openChat(id) { setCurChat(id); renderChat(); go("chat"); renderRecents(); }
@@ -201,13 +244,26 @@ function botEl(content, meta, reasoning) {
   const d = document.createElement("div"); d.className = "msg ai";
   if (reasoning) {
     const det = document.createElement("details"); det.style.cssText = "margin:0 0 6px;font-size:12px";
-    det.innerHTML = `<summary style="cursor:pointer;color:hsl(var(--muted))">🧠 Thinking</summary>`;
-    const b = document.createElement("div"); b.style.cssText = "white-space:pre-wrap;margin-top:4px;padding:6px 10px;border-left:2px solid hsl(var(--border));color:hsl(var(--muted))"; b.textContent = reasoning; det.appendChild(b); d.appendChild(det);
+    det.innerHTML = `<summary style="cursor:pointer;color:hsl(var(--muted-foreground))">🧠 Thinking</summary>`;
+    const b = document.createElement("div"); b.style.cssText = "white-space:pre-wrap;margin-top:4px;padding:6px 10px;border-left:2px solid hsl(var(--border));color:hsl(var(--muted-foreground))"; b.textContent = reasoning; det.appendChild(b); d.appendChild(det);
   }
   if (content && content.trim()) {
     for (const part of parseFences(content)) {
       if (part.code != null) { const c = document.createElement("div"); c.className = "code-card"; c.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span><button class="code-copy">⎘ copy</button></div><pre>${hl(part.code)}</pre>`; c.querySelector(".code-copy").onclick = (ev) => { navigator.clipboard?.writeText(part.code); ev.target.textContent = "✓ copied"; setTimeout(() => ev.target.textContent = "⎘ copy", 1400); }; d.appendChild(c); }
-      else { const pr = document.createElement("div"); pr.style.whiteSpace = "pre-wrap"; const re = /!?\[([^\]]*)\]\(([^)]+)\)/g; let last = 0, m; while ((m = re.exec(part.prose))) { if (m.index > last) pr.appendChild(document.createTextNode(part.prose.slice(last, m.index))); const mel = mediaEl(m[2].trim(), m[1]); if (mel) pr.appendChild(mel); else pr.appendChild(document.createTextNode(m[0])); last = re.lastIndex; } if (last < part.prose.length) pr.appendChild(document.createTextNode(part.prose.slice(last))); d.appendChild(pr); }
+      else {
+        // Prose: inline media (images, audio, video) as players; everything else as markdown.
+        const pr = document.createElement("div"); pr.className = "md";
+        const re = /!?\[([^\]]*)\]\(([^)]+)\)/g; let last = 0, m, buf = "";
+        const flush = () => { if (buf) { const md = document.createElement("div"); md.innerHTML = renderMarkdown(buf); pr.appendChild(md); buf = ""; } };
+        while ((m = re.exec(part.prose))) {
+          const mel = mediaEl(m[2].trim(), m[1]);
+          buf += part.prose.slice(last, m.index);
+          if (mel) { flush(); pr.appendChild(mel); } else buf += m[0];
+          last = re.lastIndex;
+        }
+        buf += part.prose.slice(last); flush();
+        d.appendChild(pr);
+      }
     }
   } else {
     // No visible answer — reasoning-model / thinking-mode case. Say so instead of a blank bubble.
@@ -224,7 +280,19 @@ function renderChat() {
   const s = sessions[curChat]; const th = $("#thread"); if (!s) { th.innerHTML = ""; return; }
   $("#chattitle").textContent = s.t; th.innerHTML = "";
   if (!s.m.length) { th.innerHTML = `<div class="mut" style="margin:auto;text-align:center;font-size:12.5px">Ask anything — requests route through the network to whichever provider serves the model.</div>`; return; }
-  for (const x of s.m) { if (x[0] === "me") { const d = document.createElement("div"); d.className = "msg me"; d.textContent = x[1]; th.appendChild(d); } else th.appendChild(botEl(x[1], x[2], x[3])); }
+  for (const x of s.m) {
+    if (x[0] === "me") {
+      // A message with files shows the file names, not the inlined file text (the model gets both).
+      const d = document.createElement("div"); d.className = "msg me";
+      const files = x[4];
+      if (files?.length) {
+        const chips = document.createElement("div"); chips.className = "msgfiles"; chips.textContent = files.map((n) => `📎 ${n}`).join("  ");
+        d.appendChild(chips);
+        const marker = x[1].lastIndexOf("\n\n"); d.appendChild(document.createTextNode(marker >= 0 ? x[1].slice(marker + 2) : x[1]));
+      } else d.textContent = x[1];
+      th.appendChild(d);
+    } else th.appendChild(botEl(x[1], x[2], x[3]));
+  }
   th.scrollTop = th.scrollHeight;
 }
 
@@ -240,11 +308,14 @@ async function doSend(text, fromHome) {
   if (fromHome || !curChat) { setCurChat(newSession(text.slice(0, 34))); }
   const s = sessions[curChat];
   let content = text;
-  if (attachments.length) { content = attachments.map((a) => `--- file: ${a.name} ---\n${a.text}`).join("\n\n") + `\n\n${text}`; attachments = []; }
-  s.m.push(["me", content]); if (s.t === "New chat") s.t = text.slice(0, 34); saveSessions();
+  let files = null;
+  if (attachments.length) { content = attachments.map((a) => `--- file: ${a.name} ---\n${a.text}`).join("\n\n") + `\n\n${text}`; files = attachments.map((a) => a.name); attachments = []; renderAttachChips(); }
+  s.m.push(["me", content, null, null, files]); if (s.t === "New chat") s.t = text.slice(0, 34); saveSessions();
   if (fromHome) go("chat");
   renderRecents(); renderChat();
   const th = $("#thread"); const wait = document.createElement("div"); wait.className = "mut"; wait.style.fontSize = "12.5px"; wait.textContent = "thinking…"; th.appendChild(wait); th.scrollTop = th.scrollHeight;
+  // A provider loading the model can take ~20 s on the first request: say so instead of a bare wait.
+  const slow = setTimeout(() => { if (wait.isConnected) wait.textContent = "Waiting for the provider — the first request to a model can take up to 20 s while it loads…"; }, 3000);
   if (!(await ensureGateway())) { wait.remove(); return; }
   const messages = s.m.map((x) => ({ role: x[0] === "me" ? "user" : "assistant", content: x[1] }));
   const t0 = Date.now();
@@ -257,7 +328,7 @@ async function doSend(text, fromHome) {
     const tv = +($("[data-label='tempk']")?.dataset.val);
     const temperature = Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
     const resp = await call("chat_completion", { model, messages, maxTokens: tokLimit, temperature });
-    wait.remove();
+    clearTimeout(slow); wait.remove();
     const msg = resp?.choices?.[0]?.message || {};
     const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer
     const reasoning = [msg.reasoning_content, split.reasoning].filter(Boolean).join("\n").trim();
@@ -270,7 +341,7 @@ async function doSend(text, fromHome) {
     // A reply from another machine counts as used; one from this Mac (no provider tier) doesn't.
     if (resp?.usage?.completion_tokens && oh.provider_authenticity) { setUsedTokens(usedTokens + resp.usage.completion_tokens); store.set("oh_used", usedTokens); renderStatusbar(); }
   } catch (e) {
-    wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
+    clearTimeout(slow); wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
     const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
     // A gateway error reply arrives as "gateway <status> <type>: <message>"; anything else is ours.
     const es = String(e), gw = /^gateway (\d{3}) ([a-z_]*): ([\s\S]*)$/.exec(es);
@@ -306,7 +377,24 @@ function setChatMode(model) { chatMode = /flux|sdxl|(^|[^a-z])sd($|[^a-z])/i.tes
 
 // attachments (paperclip → hidden file input)
 $$('button[title="Attach files to context"]').forEach((b) => b.onclick = () => $("#attachfile").click());
-$("#attachfile").onchange = async (e) => { for (const f of e.target.files) { if (f.size > 512 * 1024) { toast(`${f.name}: too large (512 KB max)`); continue; } attachments.push({ name: f.name, text: await f.text() }); } e.target.value = ""; if (attachments.length) toast(`${attachments.length} file(s) attached to next message`); };
+$("#attachfile").onchange = async (e) => {
+  for (const f of e.target.files) {
+    if (f.size > 512 * 1024) { toast(`${f.name}: too large (512 KB max)`); continue; }
+    const text = await f.text();
+    if (text.includes("\u0000")) { toast(`${f.name}: not a text file`); continue; }
+    attachments.push({ name: f.name, text });
+  }
+  e.target.value = ""; renderAttachChips();
+};
+// The files queued for the next message, as removable chips above both composers.
+function renderAttachChips() {
+  for (const host of [$("#homeattach"), $("#chatattach")]) {
+    if (!host) continue;
+    host.innerHTML = attachments.map((a, i) => `<span class="achip" title="${esc(a.name)}">📎 ${esc(a.name)}<button data-i="${i}" title="Remove">×</button></span>`).join("");
+    host.style.display = attachments.length ? "" : "none";
+    host.querySelectorAll("button").forEach((b) => b.onclick = () => { attachments.splice(+b.dataset.i, 1); renderAttachChips(); });
+  }
+}
 
 // ── view renderers (populate the wireframe's exact tables/cards with live data) ──
 function renderView() {

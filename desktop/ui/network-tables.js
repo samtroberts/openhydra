@@ -44,11 +44,13 @@ import { menu, toast } from "./chrome";
     const pm = $("#peermore"); if (pm) { pm.style.display = peers.length > peerLimit ? "" : "none"; pm.onclick = () => { peerLimit += 10; renderPeers(); }; }
     // re-apply the active Direct/Relay/Mixed chip so the 2.5s poll doesn't reset it to All
     const pp = $("#peerchips .chip.on")?.dataset.p || "all";
-    $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) ? "" : "none");
+    // …and the header search, so a filter survives the refresh too.
+    const q = ($("#search")?.value || "").toLowerCase();
+    $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) && (!q || r.textContent.toLowerCase().includes(q)) ? "" : "none");
     $("#actchips .chip .num") && ($("#actchips .chip .num").textContent = peers.length);
     $$("#peertable .rowmenu").forEach((cell) => cell.onclick = (e) => { e.stopPropagation(); menu(cell, [{ label: "Copy peer id", fn: async () => { try { await navigator.clipboard.writeText(cell.dataset.peer); toast("Peer id copied"); } catch (err) { toast(`Copy failed: ${err}`); } } }]); });
     // DHT
-    $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono" title="${esc(displayModelName(m))}">/oh/model/${esc(displayModelName(m))}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td><td class="num">—</td></tr>`).join("") : `<tr><td colspan="4" class="mut">No records yet.</td></tr>`;
+    $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono" title="${esc(displayModelName(m))}">/oh/model/${esc(displayModelName(m))}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td></tr>`).join("") : `<tr><td colspan="3" class="mut">No records yet.</td></tr>`;
     $$("#v-peers .acttab")[1].querySelector(".card.pad").innerHTML = `kad_routing_peers: <span class="num">${n.kad_routing_peers}</span> · server mode: ${n.kad_server_mode ? "yes" : "no"}`;
     // Swarm
     const sw = $$("#v-peers .acttab")[2].querySelectorAll(".kpi .val"); sw[0].textContent = n.listen_addrs.length; sw[1].textContent = n.relay_reservations.length; sw[2].textContent = n.counters.dcutr_successes; sw[3].textContent = n.autonat_private ? "private" : "public";
@@ -56,6 +58,14 @@ import { menu, toast } from "./chrome";
     renderLogs();
   }
   let logTab = "provider";
-  export function renderLogs() { const logs = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || []; $("#logbody").innerHTML = logs.length ? logs.map(esc).join("<br>") : "—"; }
+  // Warnings from the network layer (libp2p, QUIC) are routine on real networks: dimmed, with a note,
+  // so they don't read as faults.
+  const NOISY = /\b(WARN|DEBUG)\b.*\b(libp2p|quinn|quinn_udp|yamux|multistream|kad|mdns|netlink)\b/i;
+  export function renderLogs() {
+    const logs = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || [];
+    $("#logbody").innerHTML = logs.length
+      ? `<div class="mut" style="font-family:var(--sans);margin-bottom:6px">Dimmed lines are routine network-layer warnings.</div>` + logs.map((l) => NOISY.test(l) ? `<span class="mut">${esc(l)}</span>` : esc(l)).join("<br>")
+      : "No log lines yet.";
+  }
 
 export function setLogTab(t) { logTab = t; }

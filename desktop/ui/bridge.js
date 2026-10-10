@@ -52,6 +52,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
   function mock(cmd, args) {
     if (cmd === "identity_info") return { sharing: { key_file: "~/.openhydra/desktop-provider.key", peer_id: "12D3KooWMockProvider1111111111111111111111111" }, chat: { key_file: "~/.openhydra/desktop-consumer.key", peer_id: "12D3KooWMockConsumer2222222222222222222222222" } };
     if (cmd === "reveal_path") return null;
+    if (cmd === "open_external") { window.open(args?.url, "_blank", "noopener"); return null; }
     if (cmd === "confirm_sharing") { mk.sharingConfirmed = true; return null; }
     if (cmd === "start_provider") { mk.provider = true; return null; }
     if (cmd === "stop_provider") { mk.provider = false; return null; }
@@ -286,6 +287,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       if (/busy/.test(q)) return Promise.reject("gateway 503 upstream_overloaded: provider overloaded: stream shed at open");
       if (/empty/.test(q)) content = "";
       else if (/think/.test(q)) content = "<think>\nThe user greeted me. I should respond warmly and briefly.\n</think>\nHey! How can I help?";
+      else if (/markdown/.test(q)) content = "## Summary\n91 is **not** prime: $7 \\times 13$.\n\n- uses `s[::-1]`\n- see [the docs](https://openhydra.co)\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n<script>alert(1)</script>";
       return new Promise((r) => setTimeout(() => r({
         choices: [{ message: { content, role: "assistant" } }],
         usage: { completion_tokens: 42 }, openhydra: { engine: { native_tps: 61 }, hops_ms: { network_rtt: 12 }, provider_authenticity: "A1-reputation-redundant" }, model: "qwen3.5-4b-mlx",

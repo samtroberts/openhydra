@@ -369,11 +369,9 @@ import { exportCardModal, ensureImportSection } from "./cards";
     // (deleted / engine offline). Lifetime tokens come from the durable accumulator (survive restart).
     const per = t?.per_model || {};
     const active = new Set(engines.flatMap((e) => e.models));
-    const activeModels = [...active].sort((a, b) => {
-      const sa = isModelShared(a) ? 1 : 0, sb = isModelShared(b) ? 1 : 0;
-      if (sa !== sb) return sb - sa;                                   // shared first
-      return (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0);      // then by lifetime tokens
-    });
+    // A stable order (by lifetime tokens, then name) so rows don't jump under the pointer when a
+    // model is switched on or off.
+    const activeModels = [...active].sort((a, b) => (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0) || a.localeCompare(b));
     const rows = [];
     for (const m of activeModels) {
       const pm = per[m] || {};
