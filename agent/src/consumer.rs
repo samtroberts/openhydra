@@ -592,6 +592,20 @@ pub struct ConsumerNode {
     creds: Option<Arc<crate::swarms::CredentialStore>>,
 }
 
+/// Inputs to the gateway's `openhydra/auto` choice ([`ConsumerNode::auto_candidates`]).
+#[derive(Debug, Clone, Default)]
+pub struct AutoCandidates {
+    /// Every (model, provider) pair currently known on the network. `openhydra_peer_id` is empty
+    /// when the record's id isn't bound to its key.
+    pub providers: Vec<openhydra_network::types::KnownProvider>,
+    /// This machine's own provider (libp2p id), when it also serves.
+    pub self_provider: Option<String>,
+    /// Models of imported, valid `.openhydra` cards.
+    pub card_models: Vec<String>,
+    /// Reputation this node has earned with each provider (by OpenHydra peer id), decayed to now.
+    pub earned: HashMap<String, f64>,
+}
+
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
 /// to decide whether to bypass the C11 discovery cache and retry.
 enum AttemptOutcome {
@@ -766,6 +780,24 @@ impl ConsumerNode {
                 tracing::debug!(error = %e, peer_id, "reputation persist failed");
             }
         }
+    }
+
+    /// What the gateway's `openhydra/auto` choice draws on: the known (model, provider) pairs, this
+    /// node's own provider, imported cards, and the reputation this node has earned with providers.
+    pub fn auto_candidates(&self) -> Result<AutoCandidates, String> {
+        let now = now_unix_ms();
+        let providers = self.net.known_providers()?;
+        let card_models = self
+            .cards
+            .as_ref()
+            .map(|c| c.valid_cards(now).into_iter().map(|card| card.model_id).collect())
+            .unwrap_or_default();
+        let earned = self
+            .reputation
+            .lock()
+            .map(|m| m.iter().map(|(id, t)| (id.clone(), t.score_at(now))).collect())
+            .unwrap_or_default();
+        Ok(AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned })
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
