@@ -87,7 +87,7 @@ impl ReqwestClient {
         &self,
         url: &str,
         body: &str,
-    ) -> Result<Result<Box<dyn Iterator<Item = Result<String, AdapterError>>>, (u16, String)>, AdapterError> {
+    ) -> Result<Result<Box<dyn Iterator<Item = Result<String, AdapterError>> + Send>, (u16, String)>, AdapterError> {
         let resp = self
             .client
             .post(url)

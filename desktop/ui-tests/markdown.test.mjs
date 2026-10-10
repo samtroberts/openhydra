@@ -31,3 +31,31 @@ test("HTML is escaped and only safe links become links", () => {
   assert.equal(renderMarkdown('**<b onclick="x">**'), "<p><strong>&lt;b onclick=&quot;x&quot;&gt;</strong></p>");
   assert.equal(renderMarkdown("`<i>`"), "<p><code>&lt;i&gt;</code></p>");
 });
+
+test("emphasis never reaches into links or code", () => {
+  assert.equal(
+    renderMarkdown("[x](https://a.com) and foo_ bar"),
+    '<p><a href="https://a.com" target="_blank" rel="noopener noreferrer">x</a> and foo_ bar</p>',
+  );
+  assert.equal(
+    renderMarkdown("[x](https://a.com/**b**)"),
+    '<p><a href="https://a.com/**b**" target="_blank" rel="noopener noreferrer">x</a></p>',
+  );
+  assert.equal(renderMarkdown("a\u00000\u0000b"), "<p>a0b</p>");
+});
+
+test("long hostile inputs render quickly", () => {
+  const inputs = [
+    "[".repeat(100000),
+    "[a](".repeat(25000),
+    "a|b\n" + " ".repeat(100000) + "x",
+    "**a ".repeat(25000),
+    "`".repeat(100000),
+    "_x ".repeat(30000),
+  ];
+  for (const s of inputs) {
+    const t0 = Date.now();
+    renderMarkdown(s);
+    assert.ok(Date.now() - t0 < 500, `took ${Date.now() - t0} ms for ${JSON.stringify(s.slice(0, 12))}…`);
+  }
+});

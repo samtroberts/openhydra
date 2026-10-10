@@ -42,7 +42,7 @@ injectIcons();
 document.addEventListener("click", closeMenus);
 // Links in answers open in the default browser, never inside the app window.
 document.addEventListener("click", (e) => {
-  const a = e.target.closest?.(".msg a[href]"); if (!a) return;
+  const a = e.target.closest?.(".msg .md a[href]:not([download])"); if (!a) return;
   e.preventDefault(); e.stopPropagation();
   call("open_external", { url: a.getAttribute("href") }).catch((err) => toast(`Couldn't open the link: ${err}`));
 }, true); addEventListener("resize", closeMenus);
@@ -210,7 +210,10 @@ function renameChat(id) {
   const row = $(`#recents .recent[data-chat="${id}"] .rt`), s = sessions[id]; if (!row || !s) return;
   row.contentEditable = "true"; row.spellcheck = false; row.focus();
   document.getSelection()?.selectAllChildren(row);
+  let finished = false;
   const done = (save) => {
+    if (finished) return; finished = true;
+    row.onblur = null;
     row.contentEditable = "false";
     const t = (row.textContent || "").trim();
     if (save && t) { s.t = t.slice(0, 80); saveSessions(); }
@@ -226,7 +229,7 @@ async function deleteChat(id) {
   delete sessions[id];
   setSessionOrder(sessionOrder.filter((x) => x !== id));
   saveSessions();
-  if (curChat === id) { setCurChat(null); go("home"); }
+  if (curChat === id) { setCurChat(null); if (activeView === "chat") go("home"); }
   renderRecents();
 }
 $("#recfilter").oninput = renderRecents;
@@ -255,7 +258,8 @@ function botEl(content, meta, reasoning) {
       else {
         // Prose: inline media (images, audio, video) as players; everything else as markdown.
         const pr = document.createElement("div"); pr.className = "md";
-        const re = /!?\[([^\]]*)\]\(([^)]+)\)/g; let last = 0, m, buf = "";
+        // Bounded so a long run of brackets can't make this scan quadratic (data URLs have no "[", "(" or spaces).
+        const re = /!?\[([^\]\n]{0,500})\]\(([^)\s[(]+)\)/g; let last = 0, m, buf = "";
         const flush = () => { if (buf) { const md = document.createElement("div"); md.innerHTML = renderMarkdown(buf); pr.appendChild(md); buf = ""; } };
         while ((m = re.exec(part.prose))) {
           const mel = mediaEl(m[2].trim(), m[1]);
@@ -290,7 +294,7 @@ function renderChat() {
       if (files?.length) {
         const chips = document.createElement("div"); chips.className = "msgfiles"; chips.textContent = files.map((n) => `📎 ${n}`).join("  ");
         d.appendChild(chips);
-        const marker = x[1].lastIndexOf("\n\n"); d.appendChild(document.createTextNode(marker >= 0 ? x[1].slice(marker + 2) : x[1]));
+        const marker = x[1].lastIndexOf("\n\n"); d.appendChild(document.createTextNode(x[5] ?? (marker >= 0 ? x[1].slice(marker + 2) : x[1])));
       } else d.textContent = x[1];
       th.appendChild(d);
     } else th.appendChild(botEl(x[1], x[2], x[3]));
@@ -303,7 +307,13 @@ $("#sharetoggle").onclick = toggleSharing;    // start/stop sharing now lives in
 
 
 // ── send ──
+let chatBusy = false;   // one request at a time, from Home or Chat
 async function doSend(text, fromHome) {
+  if (chatBusy) return;
+  chatBusy = true;
+  try { await sendOne(text, fromHome); } finally { chatBusy = false; }
+}
+async function sendOne(text, fromHome) {
   const model = curModel();
   if (!text) return;
   if (!model) { toast("No routable model yet — connecting to the network…"); return; }
@@ -312,7 +322,7 @@ async function doSend(text, fromHome) {
   let content = text;
   let files = null;
   if (attachments.length) { content = attachments.map((a) => `--- file: ${a.name} ---\n${a.text}`).join("\n\n") + `\n\n${text}`; files = attachments.map((a) => a.name); attachments = []; renderAttachChips(); }
-  s.m.push(["me", content, null, null, files]); if (s.t === "New chat") s.t = text.slice(0, 34); saveSessions();
+  s.m.push(["me", content, null, null, files, files ? text : undefined]); if (s.t === "New chat") s.t = text.slice(0, 34); saveSessions();
   if (fromHome) go("chat");
   renderRecents(); renderChat();
   const th = $("#thread"); const wait = document.createElement("div"); wait.className = "mut"; wait.style.fontSize = "12.5px"; wait.textContent = "thinking…"; th.appendChild(wait); th.scrollTop = th.scrollHeight;
@@ -332,7 +342,7 @@ async function doSend(text, fromHome) {
     const tr = $("[data-label='tempk']"), tv = +(tr?.dataset.val);
     const temperature = tr?.dataset.touched && Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
     const resp = await completeChat({ model, messages, maxTokens: tokLimit, temperature }, th, wait, slow);
-    if (resp?.stopped) { s.m.push(["ai", resp.text || "", { model, tok: "—", tps: "—", rtt: "—", tier: null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), stopped: true }, null]); saveSessions(); renderChat(); return; }
+    if (resp?.stopped) { s.m.push(["ai", resp.text || "", { model, tok: "—", tps: "—", rtt: "—", tier: null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), stopped: resp.why || "stopped" }, resp.reasoning || null]); saveSessions(); renderChat(); return; }
     clearTimeout(slow); wait.remove();
     const msg = resp?.choices?.[0]?.message || {};
     const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer
@@ -368,28 +378,39 @@ async function completeChat(args, th, wait, slow) {
   if (!Channel) return call("chat_completion", args);
   const streamId = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const live = document.createElement("div"); live.className = "msg ai"; live.style.whiteSpace = "pre-wrap";
-  let text = "", reasoning = "", done = null, error = null, stopped = false;
+  let text = "", reasoning = "", done = null, error = null, stopped = false, incomplete = false;
+  // The last event is "end": large messages (an image as a data URL) can arrive after the command
+  // itself has returned, so the reply is complete only once "end" is seen.
+  let ended; const endSeen = new Promise((r) => (ended = r));
   const ch = new Channel();
   ch.onmessage = (ev) => {
     if (ev.kind === "delta" || ev.kind === "reasoning") {
       if (ev.kind === "delta") text += ev.text; else reasoning += ev.text;
       if (wait.isConnected) { clearTimeout(slow); wait.remove(); th.appendChild(live); }
-      // While streaming show the answer so far (any inline <think> part as a muted line).
+      // While streaming show the answer so far ("Thinking…" while only reasoning has arrived).
       const sp = splitThink(text);
       live.textContent = sp.answer || (sp.reasoning || reasoning ? "Thinking…" : "");
       th.scrollTop = th.scrollHeight;
     } else if (ev.kind === "done") done = ev;
     else if (ev.kind === "error") error = ev.message;
     else if (ev.kind === "stopped") stopped = true;
+    else if (ev.kind === "incomplete") incomplete = true;
+    else if (ev.kind === "end") ended();
   };
   activeStream = streamId; setSendMode(true);
   try {
     await call("chat_completion_stream", { streamId, model: args.model, messages: args.messages, maxTokens: args.maxTokens, temperature: args.temperature, onEvent: ch });
+    await Promise.race([endSeen, new Promise((r) => setTimeout(r, 30000))]);
   } finally {
-    activeStream = null; setSendMode(false); live.remove();
+    if (activeStream === streamId) { activeStream = null; setSendMode(false); }
+    live.remove();
+  }
+  const sp = splitThink(text);
+  // A stopped, failed or cut-off reply keeps what arrived (and says so) instead of losing it.
+  if (stopped || ((error || incomplete) && (sp.answer || sp.reasoning || reasoning))) {
+    return { stopped: true, why: stopped ? "stopped" : error ? `ended with an error: ${error}` : "ended early", text: sp.answer, reasoning: [reasoning, sp.reasoning].filter(Boolean).join("\n") };
   }
   if (error) throw error;
-  if (stopped) return { stopped: true, text: splitThink(text).answer };
   return {
     choices: [{ message: { content: text, reasoning_content: reasoning || undefined } }],
     usage: done?.usage || {}, openhydra: done?.openhydra || {}, model: done?.model || args.model,
@@ -400,12 +421,16 @@ function setSendMode(streaming) {
   $("#sendlbl").textContent = streaming ? "Stop" : (chatMode === "image" ? "Generate" : "Send");
   $("#send").classList.toggle("stop", streaming);
 }
-function send() {
-  if (activeStream) { call("chat_stop", { streamId: activeStream }).catch(() => {}); return; }
+function send(fromKey) {
+  if (activeStream || chatBusy) {
+    if (fromKey) { toast("Wait for the reply, or press Stop"); return; }
+    if (activeStream) { $("#sendlbl").textContent = "Stopping…"; call("chat_stop", { streamId: activeStream }).catch(() => {}); }
+    return;
+  }
   const c = $("#composer"); const t = c.textContent.trim(); c.textContent = ""; doSend(t, false); }
-$("#send").onclick = send;
-$("#composer").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
-function homeSend() { const p = $("#homeprompt"); const t = p.textContent.trim(); p.textContent = ""; doSend(t, true); }
+$("#composer").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(true); } };
+$("#send").onclick = () => send(false);
+function homeSend() { if (chatBusy) { toast("Wait for the reply, or press Stop"); return; } const p = $("#homeprompt"); const t = p.textContent.trim(); p.textContent = ""; doSend(t, true); }
 $("#homesend").onclick = homeSend;
 $("#homeprompt").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); homeSend(); } };
 // #2: paste PLAIN text only — a whole rich-HTML page (e.g. Wikipedia) into a contenteditable

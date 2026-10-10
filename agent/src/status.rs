@@ -42,9 +42,12 @@ use openhydra_network::handle::StatusClient;
 pub struct ModelStats {
     pub requests: u64,
     pub tokens: u64,
-    /// Sum of per-request native TPS (divide by `requests` for the mean).
+    /// Sum of per-serve native TPS and how many serves it covers (local ones included: the speed
+    /// is the engine's either way), for the mean.
     #[serde(skip)]
     tps_sum: f64,
+    #[serde(skip)]
+    tps_n: u64,
     /// Mean engine-native generation TPS across serves (0 when unknown).
     pub avg_native_tps: f64,
 }
@@ -123,9 +126,9 @@ impl TransferStats {
     pub fn record_serve_for(&self, model: &str, tokens: u64, native_tps: f64, ok: bool, local: bool) {
         if !local {
             self.requests_served.fetch_add(1, Ordering::Relaxed);
-        }
-        if !ok {
-            self.serve_errors.fetch_add(1, Ordering::Relaxed);
+            if !ok {
+                self.serve_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if local {
             self.tokens_local.fetch_add(tokens, Ordering::Relaxed);
@@ -134,15 +137,15 @@ impl TransferStats {
         }
         if let Ok(mut map) = self.per_model.lock() {
             let entry = map.entry(model.to_string()).or_default();
-            entry.requests += 1;
             if !local {
+                entry.requests += 1;
                 entry.tokens += tokens;
             }
             if native_tps > 0.0 {
                 entry.tps_sum += native_tps;
             }
-            let counted = entry.requests.max(1) as f64;
-            entry.avg_native_tps = (entry.tps_sum / counted * 10.0).round() / 10.0;
+            entry.tps_n += 1;
+            entry.avg_native_tps = (entry.tps_sum / entry.tps_n.max(1) as f64 * 10.0).round() / 10.0;
         }
     }
 

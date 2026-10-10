@@ -1077,9 +1077,11 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
         sub.push("--engine-autostart".into());
     }
     if settings.authenticity_checks {
-        let scorer_next_to_agent = agent_binary()
-            .and_then(|b| b.parent().map(|d| d.to_path_buf()))
-            .is_some_and(|d| d.join("openhydra-scorer").exists() || d.join("openhydra-mlx-scorer").exists());
+        // The same lookup the agent does (it runs next to this binary): the GGUF scorer only where
+        // this CPU can run it, or the MLX scorer.
+        use openhydra_agent::side_scorer::{cpu_runs_gguf_scorer, locate_scorer, MLX_SCORER_BIN, SCORER_BIN};
+        let scorer_next_to_agent = (locate_scorer(None, SCORER_BIN).is_some() && cpu_runs_gguf_scorer())
+            || locate_scorer(None, MLX_SCORER_BIN).is_some();
         if scoring_supported(&settings.engine_kind, scorer_next_to_agent) {
             sub.push("--prompt-scoring".into());
             sub.push("auto".into());
@@ -1852,10 +1854,6 @@ fn merge_economy(base: &mut serde_json::Value, gw_econ: serde_json::Value) {
     }
 }
 
-/// Merge the gateway's transfer counters (the consumed side + `used` ledger rows) into the
-/// provider base snapshot's `transfers` block. The provider process only ever fills the served
-/// side, so consumed fields are taken wholesale from the gateway; the two roles' recent-ledger
-/// rings (provider = `served`, gateway = `used`) are concatenated and re-sorted newest-first.
 /// Null out the consumed-side counters (they belong to the gateway process) when its status
 /// couldn't be read this poll.
 fn unknown_consumed_side(base: &mut serde_json::Value) {
@@ -1866,6 +1864,10 @@ fn unknown_consumed_side(base: &mut serde_json::Value) {
     }
 }
 
+/// Merge the gateway's transfer counters (the consumed side + `used` ledger rows) into the
+/// provider base snapshot's `transfers` block. The provider process only ever fills the served
+/// side, so consumed fields are taken wholesale from the gateway; the two roles' recent-ledger
+/// rings (provider = `served`, gateway = `used`) are concatenated and re-sorted newest-first.
 fn merge_transfers(base: &mut serde_json::Value, gw: serde_json::Value) {
     let Some(t) = base.get_mut("transfers") else { return };
     // The consumed side, including the credits spent on it, lives in the gateway process.
@@ -2096,11 +2098,6 @@ struct ChatMsgIn {
     content: String,
 }
 
-/// Run a (non-streaming) chat completion through the LOCAL gateway — so the Chat/Code
-/// views exercise the same network path as any OpenAI client pointed at this node:
-/// gateway → discover → provider → engine. Returns the gateway's full JSON (including
-/// the `openhydra` metrics block the UI shows under each reply). Rust-side HTTP so the
-/// webview needs no CORS story.
 /// Chats being streamed, by the id the UI gave them: setting the flag stops reading (the gateway
 /// sees the connection close and stops the provider's generation).
 static CHAT_STREAMS: std::sync::LazyLock<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> =
@@ -2136,41 +2133,76 @@ async fn chat_completion_stream(
         m.insert(stream_id.clone(), stop.clone());
     }
     let id = stream_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let joined = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // Every exit sends a final "end", so the UI knows when the last event has arrived: Tauri
+        // delivers large channel messages (an image as a data URL) after the command returns.
+        let end = |on_event: &tauri::ipc::Channel<serde_json::Value>| {
+            let _ = on_event.send(serde_json::json!({ "kind": "end" }));
+        };
         let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
         let lines = match client
             .post_stream_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
-            .map_err(|e| format!("gateway: {e}"))?
         {
-            Ok(lines) => lines,
-            Err((status, text)) => {
-                let _ = on_event.send(serde_json::json!({ "kind": "error", "message": gateway_error(status, &text) }));
+            Err(e) => {
+                let _ = on_event.send(serde_json::json!({ "kind": "error", "message": format!("gateway: {e}") }));
+                end(&on_event);
                 return Ok(());
             }
+            Ok(Err((status, text))) => {
+                let _ = on_event.send(serde_json::json!({ "kind": "error", "message": gateway_error(status, &text) }));
+                end(&on_event);
+                return Ok(());
+            }
+            Ok(Ok(lines)) => lines,
         };
-        for line in lines {
+        // Read lines on their own thread so Stop takes effect at once, even while the stream is
+        // quiet (a model loading sends only a keep-alive every 15 s). The reader ends at the next
+        // line once we stop listening, which drops the connection and stops the generation.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(256);
+        std::thread::spawn(move || {
+            for line in lines {
+                if tx.send(line.map_err(|e| e.to_string())).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut done = false;
+        loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = on_event.send(serde_json::json!({ "kind": "stopped" }));
-                return Ok(());
+                break;
             }
-            let line = line.map_err(|e| format!("gateway: {e}"))?;
+            let line = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => {
+                    let _ = on_event.send(serde_json::json!({ "kind": "error", "message": format!("gateway: {e}") }));
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
             if data == "[DONE]" {
+                done = true;
                 break;
             }
             let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else { continue };
-            for ev in stream_events(&chunk) {
-                let _ = on_event.send(ev);
+            // A window that went away (reload) stops listening: stop reading too.
+            if stream_events(&chunk).into_iter().any(|ev| on_event.send(ev).is_err()) {
+                break;
             }
         }
+        if !done {
+            let _ = on_event.send(serde_json::json!({ "kind": "incomplete" }));
+        }
+        end(&on_event);
         Ok(())
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
     if let Ok(mut m) = CHAT_STREAMS.lock() {
         m.remove(&id);
     }
-    result
+    joined.map_err(|e| e.to_string())?
 }
 
 /// The UI events for one SSE chunk of `/v1/chat/completions`: the text delta, and, on the final
@@ -2211,6 +2243,11 @@ fn chat_stop(stream_id: String) {
     }
 }
 
+/// Run a (non-streaming) chat completion through the LOCAL gateway — so the Chat/Code
+/// views exercise the same network path as any OpenAI client pointed at this node:
+/// gateway → discover → provider → engine. Returns the gateway's full JSON (including
+/// the `openhydra` metrics block the UI shows under each reply). Rust-side HTTP so the
+/// webview needs no CORS story.
 #[tauri::command]
 async fn chat_completion(
     state: tauri::State<'_, AppState>,

@@ -17,23 +17,33 @@ function safeHref(raw) {
 // Inline markup on already-escaped text. Inline code is cut out first so nothing inside it is
 // touched, then restored at the end.
 export function inline(escaped) {
-  const codes = [];
-  let s = escaped.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, href) => {
+  // Code spans and links are cut out first (as numbered placeholders) so emphasis never reaches
+  // inside them — not into code, and not into a link's URL or attributes — then put back.
+  const held = [];
+  const hold = (html) => { held.push(html); return `\u0000${held.length - 1}\u0000`; };
+  let s = escaped.replace(/`([^`\n]{1,2000})`/g, (_, c) => hold(`<code>${c}</code>`));
+  // Bounded lengths, and no "[" or "(" inside, so a long run of brackets can't make this quadratic.
+  s = s.replace(/\[([^\]\n[]{1,500})\]\(([^)\s[(]{1,2048})\)/g, (m, text, href) => {
     const h = safeHref(unescHtml(href));
-    return h ? `<a href="${escHtml(h)}" target="_blank" rel="noopener noreferrer">${text}</a>` : m;
+    return h ? hold(`<a href="${escHtml(h)}" target="_blank" rel="noopener noreferrer">`) + text + hold("</a>") : m;
   });
   s = s.replace(/\*\*(?=\S)([^*\n]+?)\*\*/g, "<strong>$1</strong>").replace(/__(?=\S)([^_\n]+?)__/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*(?=\S)([^*\n]+?)\*(?!\w)/g, "$1<em>$2</em>").replace(/(^|[^_\w])_(?=\S)([^_\n]+?)_(?!\w)/g, "$1<em>$2</em>");
   s = s.replace(/~~(?=\S)([^~\n]+?)~~/g, "<del>$1</del>");
-  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`);
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => held[+i]);
 }
 
-const isTableSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
+// A table's header separator (| --- | :---: |): checked cell by cell, without a nested regex.
+const isTableSep = (l) => {
+  const t = l.trim(); if (!t.includes("-")) return false;
+  const cs = t.replace(/^\|/, "").replace(/\|$/, "").split("|");
+  return cs.length > 0 && cs.every((c) => /^:?-{2,}:?$/.test(c.trim()));
+};
 const cells = (l) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
 
 export function renderMarkdown(text) {
-  const lines = escHtml(text || "").replace(/\r\n?/g, "\n").split("\n");
+  // NUL is the placeholder marker in inline(); a model's own NULs are dropped.
+  const lines = escHtml(String(text || "").replace(/\u0000/g, "")).replace(/\r\n?/g, "\n").split("\n");
   const out = [];
   let i = 0, para = [];
   const flushPara = () => { if (para.length) { out.push(`<p>${para.map(inline).join("<br>")}</p>`); para = []; } };
