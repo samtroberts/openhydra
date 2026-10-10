@@ -19,12 +19,14 @@ import { mean, tpsSamples, rttSamples } from "./telemetry";
     k[2].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[3].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     $$("#v-activity .g4 .kpi .sub")[0].innerHTML = `<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} receipts co-signed`;
-    $$("#v-activity .g4 .kpi .sub")[1].textContent = "this device";
+    // Replies your own Mac served for your own chats aren't a network transaction: shown apart.
+    const local = t?.tokens_local ?? 0;
+    $$("#v-activity .g4 .kpi .sub")[1].textContent = local ? `from the network · ${fmtNum(local)} more answered by this Mac` : "from the network";
     $$("#v-activity .g4 .kpi .sub")[2].textContent = "net credits · cost-weighted, earned − spent";
     $$("#v-activity .g4 .kpi .sub")[3].textContent = "served ÷ used";
     // Rolling per-chat throughput/latency — the only place an aggregated TPS/RTT is honest,
     // since the agent emits these per-request. Uptime rounds out the "your node" picture.
-    const note = $("#v-activity .mut");
+    const note = $("#actnote");
     if (note) {
       const at = mean(tpsSamples), ar = mean(rttSamples);
       const parts = [];

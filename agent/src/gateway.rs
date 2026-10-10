@@ -590,10 +590,20 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let ms = |ns: u64| ns / 1_000_000;
     let tps = |n: u64, dur_ns: u64| if dur_ns > 0 { n as f64 / (dur_ns as f64 / 1e9) } else { 0.0 };
+    // A rate over fewer than 2 tokens or under 1 ms says nothing (a 1-token reply would show as a
+    // million tokens a second): reported as null.
+    let rate = |n: u64, dur_ns: u64| (n >= 2 && dur_ns >= 1_000_000).then(|| r1(tps(n, dur_ns)));
 
     let wall_ns = wall.as_nanos() as u64;
     let provider_serve_ns = summary.metrics.provider_serve_ns;
-    let net_rtt_ns = summary.proxy_roundtrip_ns.saturating_sub(provider_serve_ns);
+    // On a streamed serve `proxy_roundtrip_ns` is the time to the provider's first acknowledgement
+    // (sent before it generates) — already the network round trip, and shorter than the serve. On a
+    // buffered serve it spans the whole serve, so the serve time comes off it.
+    let net_rtt_ns = if summary.proxy_roundtrip_ns > 0 && summary.proxy_roundtrip_ns < provider_serve_ns {
+        summary.proxy_roundtrip_ns
+    } else {
+        summary.proxy_roundtrip_ns.saturating_sub(provider_serve_ns)
+    };
     let gateway_ns = wall_ns
         .saturating_sub(summary.proxy_roundtrip_ns)
         .saturating_sub(summary.discover_ns);
@@ -604,8 +614,8 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
         // The authenticity tier this gateway had established for the provider that served (D2).
         "provider_authenticity": summary.authenticity.map(|t| t.label()),
         "engine": {
-            "native_tps": r1(tps(e.eval_count, e.eval_duration_ns)),
-            "prefill_tps": r1(tps(e.prompt_eval_count, e.prompt_eval_duration_ns)),
+            "native_tps": rate(e.eval_count, e.eval_duration_ns),
+            "prefill_tps": rate(e.prompt_eval_count, e.prompt_eval_duration_ns),
             "prompt_tokens": e.prompt_eval_count,
             "load_ms": ms(e.load_duration_ns),
             "prompt_eval_ms": ms(e.prompt_eval_duration_ns),
@@ -2121,6 +2131,25 @@ mod tests {
             openhydra_block(&s, std::time::Duration::from_secs(1), std::time::Duration::ZERO)["provider_authenticity"],
             "A1-reputation-redundant"
         );
+    }
+
+    #[test]
+    fn network_rtt_and_speeds_are_meaningful() {
+        let one = std::time::Duration::from_secs(1);
+        // Buffered: the round trip spans the serve (600 ms), so the network share is 100 ms.
+        let s = summary(10, 5);
+        assert_eq!(openhydra_block(&s, one, one)["hops_ms"]["network_rtt"], 100);
+        // Streamed: the round trip is the first ack (40 ms), shorter than the serve: that IS the RTT.
+        let mut st = summary(10, 5);
+        st.proxy_roundtrip_ns = 40_000_000;
+        assert_eq!(openhydra_block(&st, one, one)["hops_ms"]["network_rtt"], 40);
+        // A 1-token reply with no eval time has no meaningful speed: null, not 1,000,000 tok/s.
+        let mut t = summary(1, 5);
+        t.metrics.engine.eval_duration_ns = 0;
+        assert!(openhydra_block(&t, one, one)["engine"]["native_tps"].is_null());
+        t.metrics.engine.eval_count = 20;
+        t.metrics.engine.eval_duration_ns = 1_000_000_000;
+        assert_eq!(openhydra_block(&t, one, one)["engine"]["native_tps"], 20.0);
     }
 
     fn summary(tokens: u64, prompt: u64) -> ServeSummary {

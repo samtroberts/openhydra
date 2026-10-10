@@ -361,7 +361,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     k[2].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     k[3].textContent = "—";   // own reputation is held by the peers we serve — not locally knowable
     $$("#v-share .g4 .kpi .sub")[0].innerHTML = `${t?.requests_served ?? 0} requests served`;
-    $$("#v-share .g4 .kpi .sub")[1].textContent = "contribution · served − used (not money)";
+    $$("#v-share .g4 .kpi .sub")[1].textContent = "earned − spent, cost-weighted (not money)";
     $$("#v-share .g4 .kpi .sub")[2].textContent = "served ÷ used";
     $$("#v-share .g4 .kpi .sub")[3].innerHTML = `<span class="mut">earned on the peers you serve</span>`;
     // B4: two tables. Primary = models an engine serves RIGHT NOW, sorted shared-first then by

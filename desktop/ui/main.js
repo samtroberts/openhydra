@@ -8,7 +8,7 @@ import { fmtNum, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
 import { toast, menu, closeMenus, confirmModal } from "./chrome";
-import { accumulateStats, loadStats, totalServed, totalUsed } from "./stats";
+import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName } from "./models";
 import { renderConnectors } from "./connectors";
 import { renderProviders, setProviderSort } from "./providers";
@@ -267,7 +267,8 @@ async function doSend(text, fromHome) {
     pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
     pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
     s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();
-    if (resp?.usage?.completion_tokens) { setUsedTokens(usedTokens + resp.usage.completion_tokens); store.set("oh_used", usedTokens); renderStatusbar(); }
+    // A reply from another machine counts as used; one from this Mac (no provider tier) doesn't.
+    if (resp?.usage?.completion_tokens && oh.provider_authenticity) { setUsedTokens(usedTokens + resp.usage.completion_tokens); store.set("oh_used", usedTokens); renderStatusbar(); }
   } catch (e) {
     wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
     const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
@@ -353,6 +354,8 @@ function renderStatusbar() {
   $("#netdot").className = "dot " + dot; $("#netlabel").textContent = label;
   $("#sbpeers").textContent = `${peers} peer${peers === 1 ? "" : "s"}`;
   $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
+  // Net credits, the same figure as Activity's net balance.
+  if (snap) { const net = Math.round(totalCreditsEarned() - totalCreditsSpent()); $("#sbcredits").textContent = `${net >= 0 ? "+" : ""}${net.toLocaleString()} credits`; }
   $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:16527/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
   // Every place that names the local API uses the configured port.
   const port = state?.settings?.gateway_port || 16527;
@@ -363,7 +366,11 @@ function renderStatusbar() {
   // as status, not an unclicked CTA. Reuses the app's shared `.btn.on` active treatment.
   const shb = $("#sharecta");
   if (shb) {
-    const n = p?.announced ?? 0, running = !!p?.running;
+    // Models being shared, public or swarm-only (the intended set from the live share view; the
+    // announced count alone left swarm-only sharing reading "0 models shared").
+    const sv = snap?.share, running = !!p?.running;
+    const engineModels = new Set(engines.flatMap((e) => e.models));
+    const n = !sv ? (p?.announced ?? 0) : sv.share_mode === "all" ? engineModels.size : (sv.shared_models || []).filter((m) => engineModels.has(m)).length;
     const sharing = running && n > 0;   // actually announcing ≥1 model — not merely "provider process up"
     shb.classList.toggle("brand", !running);   // brand CTA only when there's no provider at all
     shb.classList.toggle("on", sharing);       // green "active" ONLY when a model is really shared

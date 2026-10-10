@@ -2427,7 +2427,8 @@ impl<A: EngineAdapter> Provider<A> {
             } else {
                 0.0
             };
-            stats.record_serve(&model_ref, summary.tokens, native_tps, summary.ok);
+            // A serve to our own gateway isn't a market transaction: counted apart from served.
+            stats.record_serve_for(&model_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
         }
     }
 
@@ -2708,11 +2709,7 @@ impl<A: EngineAdapter> Provider<A> {
         // check validates: a malicious consumer could downgrade it to underpay us — review H1/H3).
         // The handle-implied tier is conservative (assumes cheapest quant) and is the honest ceiling
         // until model-authenticity fingerprinting lands. Uses the signed completion split if present.
-        let earned = openhydra_protocol::weight::credits_for_receipt(
-            openhydra_protocol::weight::cost_tier_for_handle(&accepted.payload.model_id).weight(),
-            accepted.payload.tokens,
-            accepted.payload.completion_tokens,
-        );
+        let earned = receipt_credits(accepted);
         if let Some(stats) = &self.stats {
             stats.add_credits_earned(earned);
         }
@@ -3420,6 +3417,7 @@ impl<A: EngineAdapter> Provider<A> {
                             &receipt.payload.model_id,
                             source_peer,
                             receipt.payload.tokens,
+                            Some(receipt_credits(receipt)),
                         );
                     }
                     // Durable Ledger row so the view + lifetime totals survive a restart
@@ -3431,6 +3429,7 @@ impl<A: EngineAdapter> Provider<A> {
                             model: receipt.payload.model_id.clone(),
                             counterparty: source_peer.to_string(),
                             tokens: receipt.payload.tokens,
+                            credits: Some(receipt_credits(receipt)),
                         });
                     }
                 }
@@ -3514,7 +3513,7 @@ impl<A: EngineAdapter> Provider<A> {
                             } else {
                                 0.0
                             };
-                            stats.record_serve(&model_ref, summary.tokens, native_tps, summary.ok);
+                            stats.record_serve_for(&model_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
                         }
                         summary
                     }
@@ -3537,6 +3536,17 @@ impl<A: EngineAdapter> Provider<A> {
             _ => handle_serve_inbound(data, &self.adapter),
         }
     }
+}
+
+/// Cost-weighted credits a co-signed receipt earns this provider: weighted by the model it actually
+/// served (its own engine handle, bound to the serve commitment), not the consumer-supplied canonical
+/// id (review H1/H3), using the signed completion split when present.
+fn receipt_credits(r: &CoSignedReceipt) -> u64 {
+    openhydra_protocol::weight::credits_for_receipt(
+        openhydra_protocol::weight::cost_tier_for_handle(&r.payload.model_id).weight(),
+        r.payload.tokens,
+        r.payload.completion_tokens,
+    )
 }
 
 #[cfg(test)]

@@ -62,6 +62,9 @@ pub struct LedgerRow {
     /// The counterparty's short peer id (the consumer we served / the provider we used).
     pub counterparty: String,
     pub tokens: u64,
+    /// Cost-weighted credits earned (`served`) or spent (`used`) on this row, on the same scale as
+    /// `credits_earned` / `credits_spent`. `None` when not known (rows from older builds).
+    pub credits: Option<u64>,
 }
 
 /// Agent-side transfer counters, shared between the serving role (writer) and the
@@ -95,6 +98,9 @@ pub struct TransferStats {
     /// Credit-tiering: cost-weighted credit **spent** on consumptions (at the model's claimed tier —
     /// you pay full for what you use). The symmetric half of `credits_earned`.
     pub credits_spent: AtomicU64,
+    /// Provider-side: tokens served to this machine's own gateway (`--self-consumer`). Not a market
+    /// transaction, so kept out of `tokens_served` and the per-model served totals.
+    pub tokens_local: AtomicU64,
     per_model: Mutex<HashMap<String, ModelStats>>,
     /// Per-model consumed aggregates (consumer/gateway side). TPS is not meaningful here.
     consumed_per_model: Mutex<HashMap<String, ModelStats>>,
@@ -109,15 +115,27 @@ pub struct TransferStats {
 impl TransferStats {
     /// Record one completed serve (called by the provider after the engine stream ends).
     pub fn record_serve(&self, model: &str, tokens: u64, native_tps: f64, ok: bool) {
+        self.record_serve_for(model, tokens, native_tps, ok, false);
+    }
+
+    /// [`record_serve`](Self::record_serve) for a serve to this machine's own gateway (`local`):
+    /// its speed still counts towards the model's average, its tokens go to `tokens_local` only.
+    pub fn record_serve_for(&self, model: &str, tokens: u64, native_tps: f64, ok: bool, local: bool) {
         self.requests_served.fetch_add(1, Ordering::Relaxed);
         if !ok {
             self.serve_errors.fetch_add(1, Ordering::Relaxed);
         }
-        self.tokens_served.fetch_add(tokens, Ordering::Relaxed);
+        if local {
+            self.tokens_local.fetch_add(tokens, Ordering::Relaxed);
+        } else {
+            self.tokens_served.fetch_add(tokens, Ordering::Relaxed);
+        }
         if let Ok(mut map) = self.per_model.lock() {
             let entry = map.entry(model.to_string()).or_default();
             entry.requests += 1;
-            entry.tokens += tokens;
+            if !local {
+                entry.tokens += tokens;
+            }
             if native_tps > 0.0 {
                 entry.tps_sum += native_tps;
             }
@@ -155,7 +173,7 @@ impl TransferStats {
 
     /// Push a recent ledger row (newest-first, bounded). `now_ms` is passed in so the caller
     /// owns the clock (keeps this pure/testable).
-    pub fn record_ledger(&self, now_ms: u64, kind: &'static str, model: &str, counterparty: &str, tokens: u64) {
+    pub fn record_ledger(&self, now_ms: u64, kind: &'static str, model: &str, counterparty: &str, tokens: u64, credits: Option<u64>) {
         if let Ok(mut ring) = self.recent.lock() {
             ring.push_front(LedgerRow {
                 ts_ms: now_ms,
@@ -163,6 +181,7 @@ impl TransferStats {
                 model: model.to_string(),
                 counterparty: counterparty.to_string(),
                 tokens,
+                credits,
             });
             while ring.len() > LEDGER_RING_CAP {
                 ring.pop_back();
@@ -209,6 +228,7 @@ impl TransferStats {
                     model: e.model.clone(),
                     counterparty: e.counterparty.clone(),
                     tokens: e.tokens,
+                    credits: e.credits,
                 });
             }
         }
@@ -230,6 +250,7 @@ impl TransferStats {
             requests_consumed: self.requests_consumed.load(Ordering::Relaxed),
             tokens_consumed: self.tokens_consumed.load(Ordering::Relaxed),
             credits_spent: self.credits_spent.load(Ordering::Relaxed),
+            tokens_local: self.tokens_local.load(Ordering::Relaxed),
             per_model: self.per_model.lock().map(|m| m.clone()).unwrap_or_default(),
             consumed_per_model: self.consumed_per_model.lock().map(|m| m.clone()).unwrap_or_default(),
             recent: self.recent.lock().map(|r| r.iter().cloned().collect()).unwrap_or_default(),
@@ -250,6 +271,7 @@ struct TransfersView {
     requests_consumed: u64,
     tokens_consumed: u64,
     credits_spent: u64,
+    tokens_local: u64,
     per_model: HashMap<String, ModelStats>,
     consumed_per_model: HashMap<String, ModelStats>,
     recent: Vec<LedgerRow>,
@@ -622,8 +644,8 @@ mod tests {
         let s = TransferStats::default();
         s.record_consume("qwen2.5:7b", 100);
         s.record_consume("qwen2.5:7b", 50);
-        s.record_ledger(1000, "used", "qwen2.5:7b", "12D3KooWpeer", 100);
-        s.record_ledger(2000, "served", "tinyllama", "12D3KooWother", 40);
+        s.record_ledger(1000, "used", "qwen2.5:7b", "12D3KooWpeer", 100, Some(7));
+        s.record_ledger(2000, "served", "tinyllama", "12D3KooWother", 40, None);
         let v = s.snapshot();
         assert_eq!(v.tokens_consumed, 150);
         assert_eq!(v.requests_consumed, 2);
@@ -635,7 +657,7 @@ mod tests {
         assert_eq!(v.recent[1].kind, "used");
         // The ring is bounded at LEDGER_RING_CAP.
         for i in 0..(LEDGER_RING_CAP + 25) {
-            s.record_ledger(i as u64, "used", "m", "p", 1);
+            s.record_ledger(i as u64, "used", "m", "p", 1, None);
         }
         assert_eq!(s.snapshot().recent.len(), LEDGER_RING_CAP);
     }
@@ -647,9 +669,9 @@ mod tests {
         // Store returns rows NEWEST-FIRST; rehydrate must preserve that in the ring and set the
         // lifetime totals — the whole point of surviving a restart.
         let rows = vec![
-            LedgerEntry { ts_ms: 30, kind: "served".into(), model: "m2".into(), counterparty: "peerC".into(), tokens: 7 },
-            LedgerEntry { ts_ms: 20, kind: "served".into(), model: "m2".into(), counterparty: "peerB".into(), tokens: 30 },
-            LedgerEntry { ts_ms: 10, kind: "used".into(), model: "m1".into(), counterparty: "peerA".into(), tokens: 5 },
+            LedgerEntry { ts_ms: 30, kind: "served".into(), model: "m2".into(), counterparty: "peerC".into(), tokens: 7, credits: None },
+            LedgerEntry { ts_ms: 20, kind: "served".into(), model: "m2".into(), counterparty: "peerB".into(), tokens: 30, credits: None },
+            LedgerEntry { ts_ms: 10, kind: "used".into(), model: "m1".into(), counterparty: "peerA".into(), tokens: 5, credits: None },
         ];
         s.rehydrate_ledger(&rows, 37, 5, 2);
         let v = s.snapshot();
@@ -660,7 +682,7 @@ mod tests {
         assert_eq!(v.tokens_consumed, 5);
         assert_eq!(v.receipts_ledgered, 2);
         // A subsequent live row still lands at the front (newest), atop the rehydrated history.
-        s.record_ledger(40, "served", "m3", "peerD", 3);
+        s.record_ledger(40, "served", "m3", "peerD", 3, None);
         assert_eq!(s.snapshot().recent[0].counterparty, "peerD");
     }
 

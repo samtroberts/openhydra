@@ -1,7 +1,7 @@
 // Network › Models view: the announced-provider table grouped by model, with sticky provider
 // counts, avg TPS + earned reputation, and a per-model expand (#11b) to the individual providers.
 import { $, $$, esc, peerShort } from "./dom";
-import { snap } from "./state";
+import { snap, state, infraPeerIds } from "./state";
 import { netModels, modelIdle, seenCount, displayModelName, localSharedModels } from "./models";
 import { repByPeerModel, repKey, modelReputation, modelAvgTps, trustByPeerModel } from "./econ";
 import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
@@ -15,7 +15,9 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
     const strip = $("#v-providers .card.pad");
     strip.querySelectorAll("b")[0].textContent = (snap?.transfers?.tokens_served ?? 0);  // tokens
     strip.querySelectorAll("b")[1].textContent = models.length;                          // models
-    strip.querySelectorAll("b")[2].textContent = snap?.network?.peers?.length ?? 0;       // peers
+    // Peers = network participants, without infrastructure (bootstraps, relays): the status bar's count.
+    const infra = infraPeerIds();
+    strip.querySelectorAll("b")[2].textContent = (snap?.network?.peers || []).filter((pr) => !infra.has(pr.peer_id)).length;
     // Labels are now correct & honest in the template ("tokens served · models · peers · from your
     // node") — these are all LOCAL counts, so no "network-wide" claim until Tier-C stats land.
     $("#provcount").textContent = models.length;
@@ -32,7 +34,8 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
     };
     // Group the announced providers by model so a model served by several peers can expand (#11b).
     const provsByModel = {};
-    for (const p of (snap?.network?.known_providers || [])) (provsByModel[p.model_id] ||= []).push(p);
+    const own = state?.provider?.status?.peer_id;   // our own advert is shown as "your machine", not a provider row
+    for (const p of (snap?.network?.known_providers || [])) if (!own || p.libp2p_peer_id !== own) (provsByModel[p.model_id] ||= []).push(p);
     // Sort: by reputation (best first), by provider count (most first), or by name.
     const repOf = (m) => modelReputation(m, byPM) ?? -1;
     const cntOf = (m) => (seenCount[m] || 0) + (local.has(m) ? 1 : 0);

@@ -109,11 +109,15 @@ pub struct LedgerEntry {
     pub counterparty: String,
     /// Tokens transferred.
     pub tokens: u64,
+    /// Cost-weighted credits this row earned (`served`) or spent (`used`), as the status totals
+    /// count them. `None` for rows written before it was recorded.
+    pub credits: Option<u64>,
 }
 
 impl LedgerEntry {
     /// Compact little-endian wire form: `ts_ms(8) ‖ tokens(8) ‖ kind_len(1) ‖ kind ‖
-    /// model_len(2) ‖ model ‖ cp_len(2) ‖ counterparty`. Strings are clamped to their
+    /// model_len(2) ‖ model ‖ cp_len(2) ‖ counterparty [‖ credits(8)]`. The trailing credits are
+    /// optional: older rows lack them, and older builds stop reading before them. Strings are clamped to their
     /// length-prefix's max (a 255-byte kind / 64 KiB model or peer id is never reached in
     /// practice).
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -132,6 +136,9 @@ impl LedgerEntry {
         push_str(&mut b, &self.kind, u8::MAX as usize, 1);
         push_str(&mut b, &self.model, u16::MAX as usize, 2);
         push_str(&mut b, &self.counterparty, u16::MAX as usize, 2);
+        if let Some(c) = self.credits {
+            b.extend_from_slice(&c.to_le_bytes());
+        }
         b
     }
 
@@ -152,7 +159,8 @@ impl LedgerEntry {
         let model = std::str::from_utf8(take(data, &mut p, ml)?).ok()?.to_string();
         let cl = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().ok()?) as usize;
         let counterparty = std::str::from_utf8(take(data, &mut p, cl)?).ok()?.to_string();
-        Some(Self { ts_ms, kind, model, counterparty, tokens })
+        let credits = take(data, &mut p, 8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes);
+        Some(Self { ts_ms, kind, model, counterparty, tokens, credits })
     }
 }
 
@@ -846,7 +854,7 @@ mod tests {
     }
 
     fn entry(ts: u64, kind: &str, model: &str, cp: &str, tokens: u64) -> LedgerEntry {
-        LedgerEntry { ts_ms: ts, kind: kind.into(), model: model.into(), counterparty: cp.into(), tokens }
+        LedgerEntry { ts_ms: ts, kind: kind.into(), model: model.into(), counterparty: cp.into(), tokens, credits: None }
     }
 
     #[test]
@@ -890,6 +898,20 @@ mod tests {
         // Unicode model id survives.
         let u = entry(1, "used", "modèle/7b", "peer", 1);
         assert_eq!(LedgerEntry::from_bytes(&u.to_bytes()), Some(u));
+    }
+
+    #[test]
+    fn ledger_credits_round_trip_and_old_rows_still_parse() {
+        let mut e = entry(5, "served", "m", "peer", 40);
+        e.credits = Some(1234);
+        assert_eq!(LedgerEntry::from_bytes(&e.to_bytes()), Some(e.clone()));
+        // A row written before credits were recorded: no trailing bytes → None.
+        let old = entry(6, "used", "m", "peer", 9);
+        assert_eq!(LedgerEntry::from_bytes(&old.to_bytes()).unwrap().credits, None);
+        // An older reader stops before the trailing field (it parses the same prefix).
+        let mut legacy = e.to_bytes();
+        legacy.truncate(legacy.len() - 8);
+        assert_eq!(LedgerEntry::from_bytes(&legacy).unwrap().tokens, 40);
     }
 
     #[test]

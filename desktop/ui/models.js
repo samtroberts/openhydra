@@ -14,9 +14,12 @@ export const seenCount = {};    // model -> last-known provider count
 export function noteSeen() {
   const now = Date.now();
   (snap?.network?.known_models || []).forEach((m) => seenModels[m] = now);
-  const provs = snap?.network?.known_providers || [];
-  const c = {}; for (const p of provs) c[p.model_id] = (c[p.model_id] || 0) + 1;
-  for (const m in c) seenCount[m] = c[m];
+  // Other machines only: our own provider's advert can come back in the list, and the views add
+  // "your machine" themselves (it was counted twice).
+  const own = state?.provider?.status?.peer_id;
+  const all = snap?.network?.known_providers || [];
+  const c = {}; for (const p of all) if (!own || p.libp2p_peer_id !== own) c[p.model_id] = (c[p.model_id] || 0) + 1;
+  for (const p of all) seenCount[p.model_id] = c[p.model_id] || 0;
 }
 // The local engine's models that are actually SHARED on the network — NOT every model the engine
 // has. A model toggled off in Share is neither announced NOR servable (the provider's serve gate

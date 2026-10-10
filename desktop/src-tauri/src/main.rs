@@ -1716,6 +1716,7 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
             // gateway's full status once and overlay both its economy and its transfers.
             if let Some(gw) = fetch_status(GATEWAY_STATUS_PORT, "/status") {
                 merge_economy(&mut base, gw.get("economy").cloned().unwrap_or_default());
+                merge_known_providers(&mut base, gw.get("network").cloned().unwrap_or_default());
                 if let Some(gw_transfers) = gw.get("transfers").cloned() {
                     merge_transfers(&mut base, gw_transfers);
                 }
@@ -1731,6 +1732,38 @@ async fn status_snapshot(state: tauri::State<'_, AppState>) -> Result<Option<ser
 /// Merge the gateway's economy view (earned reputation + give-side credit) into the provider
 /// snapshot's `economy` block: reputation is consumer-only, so it always comes from the
 /// gateway; credit entries are unioned by libp2p id (provider's take-side rate_cap wins).
+/// The models and providers the app shows are the ones its gateway can route to: union the gateway's
+/// view into the provider-based snapshot (the provider role may know of fewer, or none, which left
+/// the Models view without providers, reputation or trust while sharing).
+fn merge_known_providers(base: &mut serde_json::Value, gw_net: serde_json::Value) {
+    let Some(net) = base.get_mut("network") else { return };
+    if let Some(gw_models) = gw_net.get("known_models").and_then(|v| v.as_array()) {
+        let mut models: Vec<serde_json::Value> = net.get("known_models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        for m in gw_models {
+            if !models.contains(m) {
+                models.push(m.clone());
+            }
+        }
+        net["known_models"] = serde_json::Value::Array(models);
+    }
+    if let Some(gw_provs) = gw_net.get("known_providers").and_then(|v| v.as_array()) {
+        let key = |p: &serde_json::Value| {
+            (
+                p.get("libp2p_peer_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                p.get("model_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            )
+        };
+        let mut provs: Vec<serde_json::Value> = net.get("known_providers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut seen: std::collections::HashSet<(String, String)> = provs.iter().map(key).collect();
+        for p in gw_provs {
+            if seen.insert(key(p)) {
+                provs.push(p.clone());
+            }
+        }
+        net["known_providers"] = serde_json::Value::Array(provs);
+    }
+}
+
 fn merge_economy(base: &mut serde_json::Value, gw_econ: serde_json::Value) {
     let Some(econ) = base.get_mut("economy") else { return };
     // Reputation: take the gateway's list wholesale (the provider role never has any).
@@ -1767,7 +1800,8 @@ fn merge_economy(base: &mut serde_json::Value, gw_econ: serde_json::Value) {
 /// rings (provider = `served`, gateway = `used`) are concatenated and re-sorted newest-first.
 fn merge_transfers(base: &mut serde_json::Value, gw: serde_json::Value) {
     let Some(t) = base.get_mut("transfers") else { return };
-    for key in ["requests_consumed", "tokens_consumed", "consumed_per_model"] {
+    // The consumed side, including the credits spent on it, lives in the gateway process.
+    for key in ["requests_consumed", "tokens_consumed", "consumed_per_model", "credits_spent"] {
         if let Some(v) = gw.get(key).cloned() {
             t[key] = v;
         }
@@ -2824,6 +2858,26 @@ mod tests {
         migrate_share_policy_if_absent(&path, &["something-else".into()]);
         let p = SharePolicy::load(&path).unwrap();
         assert!(p.is_shared("only-this") && !p.is_shared("something-else"));
+    }
+
+    #[test]
+    fn merged_transfers_take_the_consumed_side_and_credits_spent_from_the_gateway() {
+        let mut base = serde_json::json!({ "transfers": { "tokens_served": 5, "credits_earned": 9, "credits_spent": 0, "recent": [] } });
+        merge_transfers(&mut base, serde_json::json!({ "tokens_consumed": 7, "credits_spent": 42, "recent": [] }));
+        assert_eq!(base["transfers"]["credits_spent"], 42);
+        assert_eq!(base["transfers"]["credits_earned"], 9);
+        assert_eq!(base["transfers"]["tokens_consumed"], 7);
+    }
+
+    #[test]
+    fn known_providers_union_the_gateways_view() {
+        let mut base = serde_json::json!({ "network": { "known_models": ["a"], "known_providers": [ { "libp2p_peer_id": "P1", "model_id": "a" } ] } });
+        merge_known_providers(&mut base, serde_json::json!({
+            "known_models": ["a", "b"],
+            "known_providers": [ { "libp2p_peer_id": "P1", "model_id": "a" }, { "libp2p_peer_id": "P2", "model_id": "b" } ],
+        }));
+        assert_eq!(base["network"]["known_models"], serde_json::json!(["a", "b"]));
+        assert_eq!(base["network"]["known_providers"].as_array().unwrap().len(), 2);
     }
 
     #[test]

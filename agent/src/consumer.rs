@@ -2948,7 +2948,7 @@ impl ConsumerNode {
                         }
                     }
                     if summary.ok && summary.tokens > 0 {
-                        self.record_usage(model, &provider.peer_id, summary.tokens, self_serve, now);
+                        self.record_usage(model, model_key_now, &provider.peer_id, summary.tokens, self_serve, now);
                     }
                     if summary.ok && !self_serve {
                         self.note_served_ok(&provider.libp2p_peer_id, &provider.model_id, now);
@@ -3047,7 +3047,7 @@ impl ConsumerNode {
                         tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; closing it and settling for what was received");
                         self.close_and_settle(&provider, nonce, stream_offset, tally, max_tokens);
                         if tokens > 0 {
-                            self.record_usage(model, &provider.peer_id, tokens, false, now);
+                            self.record_usage(model, &rep_model_key(&provider.canonical_model_id, &provider.model_id), &provider.peer_id, tokens, false, now);
                         }
                     } else if opened {
                         // Our own provider: nothing to settle, but it stops generating for nobody
@@ -3060,7 +3060,7 @@ impl ConsumerNode {
                         if tokens > 0 {
                             tracing::info!(provider = %provider.peer_id, tokens, "serve failed part-way; settling for what was received");
                             self.settle_receipt(&provider, tokens, nonce);
-                            self.record_usage(model, &provider.peer_id, tokens, false, now);
+                            self.record_usage(model, &rep_model_key(&provider.canonical_model_id, &provider.model_id), &provider.peer_id, tokens, false, now);
                         }
                     }
                     // Its client left: nobody to serve, so no failover.
@@ -3284,26 +3284,29 @@ impl ConsumerNode {
         });
     }
 
-    /// #7/#5: per-model consumed tracking (pure usage, kept for a self-serve too), and a `used`
-    /// give/take ledger row for a real counterparty (`provider_peer`), in memory and in the store (the
-    /// consumer's side isn't a receipt, so it lives only here) so the totals survive a restart.
-    fn record_usage(&self, model: &str, provider_peer: &str, tokens: u64, self_serve: bool, now: u64) {
+    /// #7/#5: per-model consumed tracking and a `used` give/take ledger row for a real counterparty
+    /// (`provider_peer`), in memory and in the store (the consumer's side isn't a receipt, so it lives
+    /// only here) so the totals survive a restart. A self-serve (our own co-located provider) is not a
+    /// market transaction: the provider counts it as local, so it isn't counted as used here.
+    /// `model_key` prices the row's credits at the provider's claimed tier, as `credits_spent` does.
+    fn record_usage(&self, model: &str, model_key: &str, provider_peer: &str, tokens: u64, self_serve: bool, now: u64) {
+        if self_serve {
+            return;
+        }
+        let credits = credits_for_receipt(self.claimed_tier(provider_peer, model_key, now).weight(), tokens, None);
         if let Some(stats) = &self.stats {
             stats.record_consume(model, tokens);
-            if !self_serve {
-                stats.record_ledger(now, "used", model, provider_peer, tokens);
-            }
+            stats.record_ledger(now, "used", model, provider_peer, tokens, Some(credits));
         }
-        if !self_serve {
-            if let Some(store) = &self.store {
-                let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
-                    ts_ms: now,
-                    kind: "used".to_string(),
-                    model: model.to_string(),
-                    counterparty: provider_peer.to_string(),
-                    tokens,
-                });
-            }
+        if let Some(store) = &self.store {
+            let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
+                ts_ms: now,
+                kind: "used".to_string(),
+                model: model.to_string(),
+                counterparty: provider_peer.to_string(),
+                tokens,
+                credits: Some(credits),
+            });
         }
     }
 
