@@ -161,6 +161,11 @@ export async function ensureImportSection() {
     try {
       const c = await call("preview_card", { input: text });
       previewOut.innerHTML = cardPreviewHtml(c);
+      // Your own card adds nothing: your gateway already reaches your own models.
+      const ids = await call("identity_info").catch(() => null);
+      if (ids?.sharing?.peer_id && ids.sharing.peer_id === c.libp2p_peer_id) {
+        previewOut.insertAdjacentHTML("beforeend", `<div class="mut" style="font-size:11.5px;margin-top:6px;color:hsl(var(--warning))">This is your own model's card — you don't need to add it; your chats already reach models you share.</div>`);
+      }
       previewed = text;
       addBtn.style.display = "";
     } catch (e) {

@@ -50,11 +50,14 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     };
   }
   function mock(cmd, args) {
+    if (cmd === "identity_info") return { sharing: { key_file: "~/.openhydra/desktop-provider.key", peer_id: "12D3KooWMockProvider1111111111111111111111111" }, chat: { key_file: "~/.openhydra/desktop-consumer.key", peer_id: "12D3KooWMockConsumer2222222222222222222222222" } };
+    if (cmd === "reveal_path") return null;
+    if (cmd === "confirm_sharing") { mk.sharingConfirmed = true; return null; }
     if (cmd === "start_provider") { mk.provider = true; return null; }
     if (cmd === "stop_provider") { mk.provider = false; return null; }
     if (cmd === "start_gateway") { mk.gateway = true; return null; }
     if (cmd === "stop_gateway") { mk.gateway = false; return null; }
-    if (cmd === "save_settings") { if (args?.settings) mk.sharedModels = args.settings.shared_models || []; return null; }
+    if (cmd === "save_settings") { if (args?.settings) { mk.saved = { ...args.settings }; delete mk.saved.sharing_enabled; delete mk.saved.shared_models; delete mk.saved.sharing_confirmed; } return null; }
     if (cmd === "save_share_policy") { mk.sharePolicy = args?.policy || { version: 1, mode: "all", models: [] }; return null; }
     if (cmd === "read_share_policy") return mk.sharePolicy || { version: 1, mode: "all", models: [] };
     if (cmd === "reset_share_policy") { mk.sharePolicy = { version: 1, mode: "list", models: [] }; return null; }
@@ -172,7 +175,8 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "get_state") return {
       provider: { status: { running: mk.provider, pid: 42, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: "ollama", announced: (() => { if (!mk.provider) return 0; return ["tinyllama:latest", "llama3.2:1b"].filter(mockAnnouncedGlobally).length; })(), relays: 2, exited: null }, logs: ["node up", "announced tinyllama:latest", "announced llama3.2:1b"] },
       gateway: { status: { running: mk.gateway, pid: 43, peer_id: "12D3KooWQvXm4cAsusDEuXRH", engines: null, announced: null, relays: 2, exited: null }, logs: ["gateway listening 127.0.0.1:16527"] },
-      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, authenticity_checks: false, audit_replay: false, min_authenticity: "off", search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, schema_version: 2 },
+      settings: { bootstraps: ["/dns4/bootstrap-us.openhydra.co/tcp/4001"], gateway_port: 16527, engine_autostart: true, authenticity_checks: false, audit_replay: false, min_authenticity: "off", search_url: "", shared_models: mk.sharedModels || [], sharing_enabled: !!mk.provider, resume_on_launch: true, sharing_confirmed: !!mk.sharingConfirmed, peer_relay: !!mk.peerRelay, engine_kind: mk.engineKind || "auto", engine_endpoint: mk.engineEndpoint || "", schema_version: 2, ...(mk.saved || {}) },
+      builtin_bootstraps: 0,
       agent_found: true, gateway_url: "http://127.0.0.1:16527/v1", resumed_on_launch: !!mk.resumedOnLaunch,
       // One-shot reset flag: set localStorage oh_mock_policy_reset=1 to simulate a self-heal toast once.
       share_policy_reset: (() => { if (localStorage.getItem("oh_mock_policy_reset") === "1") { localStorage.removeItem("oh_mock_policy_reset"); return true; } return false; })(),

@@ -115,17 +115,16 @@ import { emit } from "./bus";
       c.querySelectorAll(".mut")[0].textContent = desc;
       const foot = c.querySelectorAll(".row")[1]; const btn = foot.querySelector(".enginst"); const def = foot.querySelector(".badge");
       if (def) def.style.display = d && label === "ollama" ? "" : "none";
-      // Three-state CTA: running → Manage; installed-but-idle → Run (self-serving) or Installed
-      // (needs a model to serve); not installed → Install (drives the Tier-1 installer).
-      let txt, cls, act;
-      if (d) { txt = "Manage"; cls = "outline"; act = () => toast(`${name} is running — manage models from Share`); }
+      // CTA: running → "Share models" (opens Share); installed-but-idle → Run (engines that start
+      // without a model argument), else no button (start it yourself with a model); not installed →
+      // Install (drives the Tier-1 installer).
+      let txt = null, cls, act;
+      if (d) { txt = "Share models"; cls = "outline"; act = () => emit("nav", "share"); }
       else if (installed && runnable) { txt = "Run"; cls = "brand"; act = () => runEngine(label, name); }
-      else if (installed) { txt = "Installed"; cls = "outline"; act = () => toast(`${name} is installed — start it with a model to serve`); }
-      else { txt = "Install"; cls = "brand"; act = () => startInstall(label, name); }
-      btn.textContent = txt; btn.className = "btn " + cls + " sm enginst"; btn.style.marginLeft = "auto"; btn.onclick = act;
+      else if (!installed) { txt = "Install"; cls = "brand"; act = () => startInstall(label, name); }
+      btn.style.display = txt ? "" : "none";
+      if (txt) { btn.textContent = txt; btn.className = "btn " + cls + " sm enginst"; btn.style.marginLeft = "auto"; btn.onclick = act; }
     });
-    // recommended: honest until a model store lands
-    $("#rectable tbody").innerHTML = `<tr><td colspan="5" class="mut">One-click downloads land with the model store — for now, pull with your engine (e.g. <span class="mono">ollama pull</span>) and it appears in Share.</td></tr>`;
   }
 
   // Start an installed-but-idle engine's server, then refresh so the card flips to "running".

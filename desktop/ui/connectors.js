@@ -152,7 +152,9 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     const sig = `${st.installed}|${st.connected}|${isTerminal}`;
     if (act._sig === sig) return;
     act._sig = sig;
-    const runLabel = st.connected ? (isTerminal ? "Run" : "Open") : (isTerminal ? "Connect &amp; Run" : "Connect &amp; Open");
+    // Terminal tools can't be started from here: "Connect & copy" wires it and copies the launch command
+    // (once connected, Copy does that). App/editor tools open for real.
+    const runLabel = st.connected ? (isTerminal ? null : "Open") : (isTerminal ? "Connect &amp; copy command" : "Connect &amp; Open");
     const statusHtml = st.connected
       ? `<span class="cconnected">● Connected</span>`
       : `<span class="cstat ${st.installed ? "on" : "off"}">●</span><span class="cstat-t">${st.installed ? "installed" : "not detected"}</span>`;
@@ -160,10 +162,10 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
       + (isTerminal ? `<button class="btn ghost sm ccopy" style="margin-left:auto">Copy</button>` : `<span style="margin-left:auto"></span>`)
       + `<button class="btn ghost sm ctest">Test</button>`
       + (st.connected ? `<button class="btn ghost sm cdisc">Disconnect</button>` : `<button class="btn ghost sm cwire">Connect</button>`)
-      + `<button class="btn sm crun">${runLabel}</button>`;
+      + (runLabel ? `<button class="btn sm crun">${runLabel}</button>` : "");
     const on = (sel, fn) => { const b = $(sel, act); if (b) b.onclick = fn; };
     on(".ccopy", () => { navigator.clipboard?.writeText(($(".snippet", card)?.textContent || "").trim()); toast("Copied"); });
-    on(".ctest", (e) => testGateway(e.target));
+    on(".ctest", (e) => testGateway(e.target, card));
     on(".cwire", () => connectTool(card, st, false));
     on(".crun", () => connectTool(card, st, true));
     on(".cdisc", () => disconnectTool(card, st));
@@ -182,7 +184,7 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     }
     if (surf === "terminal") {
       const cmd = `openhydra launch ${st.key}`;
-      try { await navigator.clipboard.writeText(cmd); toast(`Wired ✓ — copied "${cmd}". Paste in your terminal to run.`); }
+      try { await navigator.clipboard.writeText(cmd); toast(`Connected — copied "${cmd}". Paste it in your terminal to start ${st.label}.`); }
       catch { toast(`Wired ✓ — run: ${cmd}`); }
     } else {
       try { await call("open_gui", { key: st.key }); toast(`Wired ✓ — opening ${surfLabel(surf)}…`); }
@@ -202,11 +204,24 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     wireConnectors();
   }
 
-  async function testGateway(btn) {
-    const prev = btn.textContent; btn.textContent = "Testing…"; btn.disabled = true;
-    try { const model = await call("connector_test"); toast("Gateway OK → " + model); }
-    catch (e) { toast("Test failed: " + e); }
-    finally { btn.textContent = prev; btn.disabled = false; }
+  // Test: a live 1-token request through the gateway. The result stays on the card for 15 s (a toast
+  // was easy to miss on a slow first request). The button keeps its width while it says "Testing…".
+  async function testGateway(btn, card) {
+    const prev = btn.textContent; btn.style.minWidth = btn.offsetWidth + "px"; btn.textContent = "Testing…"; btn.disabled = true;
+    let out = card && $(".ctestout", card);
+    if (card && !out) { out = document.createElement("div"); out.className = "ctestout mut"; out.style.cssText = "font-size:11.5px;margin-top:6px"; card.appendChild(out); }
+    if (out) out.textContent = "Sending a 1-token test request… the first one can take up to 20 s while a provider loads the model.";
+    const t0 = Date.now();
+    try {
+      const model = await call("connector_test");
+      const msg = `✓ Gateway OK · answered by ${model} · ${((Date.now() - t0) / 1000).toFixed(1)} s`;
+      if (out) { out.textContent = msg; out.style.color = "hsl(var(--success))"; } else toast(msg);
+    } catch (e) {
+      if (out) { out.textContent = `✕ Test failed: ${e}`; out.style.color = "hsl(var(--danger))"; } else toast("Test failed: " + e);
+    } finally {
+      btn.textContent = prev; btn.disabled = false;
+      if (out) { clearTimeout(out._t); out._t = setTimeout(() => out.remove(), 15000); }
+    }
   }
 
 

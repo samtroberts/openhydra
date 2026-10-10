@@ -233,7 +233,14 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # The bootstrap peers a fresh install dials, compiled into the app (desktop main.rs
+          # `builtin_bootstraps`): comma-separated multiaddrs in the repository VARIABLE (not a secret:
+          # they're public addresses, kept out of tracked code). Unset ⇒ no built-in bootstrap.
+          OPENHYDRA_DEFAULT_BOOTSTRAPS: ${{ vars.OPENHYDRA_DEFAULT_BOOTSTRAPS }}
         run: |
+          if [ -z "${OPENHYDRA_DEFAULT_BOOTSTRAPS:-}" ]; then
+            echo "::warning::OPENHYDRA_DEFAULT_BOOTSTRAPS is not set → this app has no built-in bootstrap peer (fresh installs only find peers on their LAN)"
+          fi
           # A missing secret arrives as an EMPTY variable, which Tauri still acts on (failing the
           # bundle): unset each empty one, so missing secrets mean an unsigned (or un-notarized) build.
           for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD \

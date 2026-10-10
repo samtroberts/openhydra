@@ -52,7 +52,8 @@ function literalKeys(text, start) {
     if (depth === 1 && ch === ",") { keys.push(cur); cur = ""; } else if (depth >= 1) cur += ch;
   }
   keys.push(cur);
-  return keys.map((k) => (/^\s*(?:\.\.\.)?\s*([A-Za-z_$][\w$]*)/.exec(k) || [])[1]).filter(Boolean);
+  // A key is an identifier, or a quoted string ("control_credential": x) — both name the argument.
+  return keys.map((k) => (/^\s*(?:\.\.\.)?\s*(?:["']([^"']+)["']|([A-Za-z_$][\w$]*))/.exec(k) || []).slice(1).find(Boolean)).filter(Boolean);
 }
 
 function jsCalls() {
@@ -90,7 +91,7 @@ test("no window.confirm/alert/prompt (they do nothing in the Tauri webview)", ()
   for (const f of readdirSync(uiDir).filter((f) => f.endsWith(".js"))) {
     readFileSync(join(uiDir, f), "utf8").split("\n").forEach((l, i) => {
       const code = l.replace(/\/\/.*$/, "");
-      if (/(^|[^\w.$])(window\.)?(confirm|alert|prompt)\s*\(/.test(code)) problems.push(`${f}:${i + 1}: ${l.trim()}`);
+      if (/(^|[^\w.$])((window|globalThis|self)\.)?(confirm|alert|prompt)\s*\(/.test(code)) problems.push(`${f}:${i + 1}: ${l.trim()}`);
     });
   }
   assert.deepEqual(problems, []);

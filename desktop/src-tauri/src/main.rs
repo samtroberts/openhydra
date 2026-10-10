@@ -151,20 +151,18 @@ fn status_token() -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
-    /// Bootstrap multiaddrs (`/ip4/…/tcp/4001/p2p/<peer-id>`), one per entry. Empty is
-    /// valid on a LAN (mDNS discovers peers), but joining the public network needs at
-    /// least one. Deliberately not baked into the app: bootstrap IPs/peer ids stay out
-    /// of tracked code and are the operator's to configure.
+    /// Extra bootstrap multiaddrs (`/ip4/…/tcp/4001/p2p/<peer-id>`), one per entry, used on top of
+    /// the release build's built-in ones (see [`builtin_bootstraps`]). Empty is valid on a LAN
+    /// (mDNS discovers peers); joining the public network needs at least one, built in or here.
     bootstraps: Vec<String>,
     /// Local port the OpenAI-compatible gateway binds on 127.0.0.1.
     gateway_port: u16,
     /// Pass `--engine-autostart` to the provider (start LM Studio / Ollama if down).
     engine_autostart: bool,
     /// Pass `--prompt-scoring auto`: let gateways run the teacher-forced log-prob identity check on
-    /// this provider's vLLM / SGLang engines, or llama.cpp / mistral.rs builds with the OpenHydra
-    /// scoring endpoint (the route to the A2 authenticity tier). Opt-in — the checks spend engine
-    /// time (at most 2 at once). Engines that can't score (Ollama, LM Studio, stock llama.cpp) just
-    /// refuse.
+    /// this provider's engines (the route to the A2 authenticity tier): vLLM / SGLang, llama.cpp /
+    /// mistral.rs builds with the OpenHydra scoring endpoint, and Ollama / LM Studio models through
+    /// the bundled side-scorer. Opt-in — the checks spend engine time (at most 2 at once).
     authenticity_checks: bool,
     /// Let the gateway's audits replay a greedy request to a public model to a second provider
     /// (`--audit-replay on`): the strongest check, but the prompt reaches that provider too. Off by
@@ -181,8 +179,18 @@ struct Settings {
     /// light; on raises the agent to info/debug for troubleshooting. The essential status lines
     /// are `eprintln!` (not `RUST_LOG`-gated), so quiet mode never breaks the status views.
     verbose_logs: bool,
-    /// #9: user-editable device name shown to peers / in the UI. Empty → derive from the OS.
+    /// #9: user-editable device name, shown in the app and offered as this device's label when it
+    /// joins a swarm. Empty → derive from the OS.
     device_name: String,
+    /// Act as a circuit relay for peers behind strict NATs (`--peer-relay`). Off by default, like
+    /// the agent; it only takes effect when this node is publicly reachable.
+    peer_relay: bool,
+    /// Which local engine the provider serves (`--engine-kind`): `auto` (detect every running
+    /// engine) or one of [`ENGINE_KINDS`].
+    engine_kind: String,
+    /// The engine's base URL (`--engine`), for a specific `engine_kind`. Empty → that engine's
+    /// standard port.
+    engine_endpoint: String,
     /// Legacy per-model share allowlist. Superseded by `~/.openhydra/share-policy.json` (the
     /// hot-reloaded source of truth — see `save_share_policy`); kept as a one-release **mirror** so a
     /// downgrade still reads it. Migrated into the policy file on first run (empty → share-all,
@@ -196,6 +204,14 @@ struct Settings {
     /// Resume sharing automatically on launch when `sharing_enabled` is set (informed opt-out — the UI
     /// can clear it). Default on.
     resume_on_launch: bool,
+    /// Set once this install has written its own share-policy file. From then on a missing policy
+    /// file means "share nothing" (fail closed), never a migration from the legacy list, which
+    /// would share every model globally. Managed by the backend; `save_settings` preserves it.
+    share_policy_initialized: bool,
+    /// The user has confirmed what they share in the Share dialog (or was already sharing when they
+    /// updated). Until then, starting to share opens the dialog, even if an older build left a
+    /// "share everything" policy behind. Managed by `confirm_sharing`; `save_settings` preserves it.
+    sharing_confirmed: bool,
     /// Persisted-settings schema version, for future migrations (see `load_settings`). Files written
     /// before versioning (field absent) parse as 1; fresh installs + re-saves write the current one.
     #[serde(default = "default_schema_version")]
@@ -224,9 +240,14 @@ impl Default for Settings {
             search_url: String::new(),
             verbose_logs: false,
             device_name: String::new(),
+            peer_relay: false,
+            engine_kind: "auto".into(),
+            engine_endpoint: String::new(),
             shared_models: Vec::new(), // empty ⇒ share every detected model (the default)
             sharing_enabled: false,
             resume_on_launch: true,
+            share_policy_initialized: false,
+            sharing_confirmed: false,
             schema_version: SCHEMA_VERSION,
         }
     }
@@ -343,8 +364,10 @@ fn ensure_valid_share_policy(
     reset_flag: &std::sync::atomic::AtomicBool,
 ) -> PathBuf {
     let path = share_policy_path();
-    let fresh_install = !settings_path().exists();
-    ensure_valid_share_policy_at(&path, &settings.shared_models, fresh_install, reset_flag);
+    // Start from "share nothing" on a fresh install (no desktop.json yet), and whenever this install
+    // has had its own policy before (a missing file then is a deletion, not an old-version upgrade).
+    let start_empty = !settings_path().exists() || settings.share_policy_initialized;
+    ensure_valid_share_policy_at(&path, &settings.shared_models, start_empty, reset_flag);
     path
 }
 
@@ -780,6 +803,50 @@ fn agent_binary() -> Option<PathBuf> {
     None
 }
 
+/// Bootstrap peers built into this build: release builds set `OPENHYDRA_DEFAULT_BOOTSTRAPS` (comma
+/// or whitespace separated multiaddrs) at compile time, so the addresses live in CI configuration,
+/// not in tracked code. Dev builds have none and rely on mDNS or the user's own list.
+fn builtin_bootstraps() -> Vec<String> {
+    parse_bootstrap_list(option_env!("OPENHYDRA_DEFAULT_BOOTSTRAPS").unwrap_or(""))
+}
+
+fn parse_bootstrap_list(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// The bootstraps a role dials: the built-in ones plus the user's extras, without duplicates.
+fn effective_bootstraps(settings: &Settings) -> Vec<String> {
+    let mut out = builtin_bootstraps();
+    for b in settings.bootstraps.iter().map(|b| b.trim()).filter(|b| !b.is_empty()) {
+        if !out.iter().any(|x| x == b) {
+            out.push(b.to_string());
+        }
+    }
+    out
+}
+
+/// The engine kinds the provider accepts for `--engine-kind` (besides `auto`).
+const ENGINE_KINDS: &[&str] = &["ollama", "vllm", "lm-studio", "llama-cpp", "exo", "comfyui"];
+
+/// Provider flags for the chosen engine: nothing for `auto` (the agent's default), else
+/// `--engine-kind <kind>` and, when set, `--engine <url>`. An unknown kind falls back to `auto`.
+fn engine_args(kind: &str, endpoint: &str) -> Vec<String> {
+    let kind = kind.trim();
+    if !ENGINE_KINDS.contains(&kind) {
+        return vec!["--engine-kind".into(), "auto".into()];
+    }
+    let mut out = vec!["--engine-kind".into(), kind.into()];
+    let endpoint = endpoint.trim();
+    if !endpoint.is_empty() {
+        out.extend(["--engine".into(), endpoint.into()]);
+    }
+    out
+}
+
 /// Spawn one agent role and wire its output pumps. Global flags before the subcommand
 /// (clap requirement), pinned identity per role, distinct listen port.
 fn spawn_role(
@@ -787,7 +854,7 @@ fn spawn_role(
     identity: &str,
     listen_port: u16,
     status_port: u16,
-    bootstraps: &[String],
+    settings: &Settings,
     subcommand: &[String],
 ) -> Result<(), String> {
     let bin = agent_binary().ok_or_else(|| {
@@ -808,18 +875,18 @@ fn spawn_role(
         // P1: read-only introspection endpoint the app polls, loopback + bearer token.
         .arg("--status-bind")
         .arg(format!("127.0.0.1:{status_port}"));
-    for b in bootstraps {
-        let b = b.trim();
-        if !b.is_empty() {
-            cmd.arg("--bootstrap").arg(b);
-        }
+    for b in effective_bootstraps(settings) {
+        cmd.arg("--bootstrap").arg(b);
+    }
+    if settings.peer_relay {
+        cmd.arg("--peer-relay");
     }
     cmd.args(subcommand)
         // #4: quiet by default (essential status lines are eprintln!, not RUST_LOG-gated, so
         // this never breaks the status views); verbose opt-in raises to info/debug.
         .env(
             "RUST_LOG",
-            if load_settings().verbose_logs { "openhydra_network=info,debug" } else { "warn" },
+            if settings.verbose_logs { "openhydra_network=info,debug" } else { "warn" },
         )
         .env("OPENHYDRA_STATUS_TOKEN", status_token())
         .stdin(Stdio::null())
@@ -866,6 +933,8 @@ struct FullState {
     /// One-shot: the share policy was corrupt and self-healed to a safe default this poll — the UI
     /// toasts the user once that their sharing selection was reset. Read-and-cleared here.
     share_policy_reset: bool,
+    /// How many bootstrap peers this build has built in (release builds; 0 in dev).
+    builtin_bootstraps: usize,
 }
 
 fn view(role: &Arc<Mutex<Role>>) -> RoleView {
@@ -891,7 +960,58 @@ fn get_state(state: tauri::State<'_, AppState>) -> FullState {
         // Read-and-clear (swap) so the reset toast fires exactly once per heal, unlike the
         // session-sticky `resumed_on_launch` load above.
         share_policy_reset: state.share_policy_reset.swap(false, std::sync::atomic::Ordering::Relaxed),
+        builtin_bootstraps: builtin_bootstraps().len(),
     }
+}
+
+/// The user confirmed what they share in the Share dialog: later starts no longer ask.
+#[tauri::command]
+fn confirm_sharing(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    if !s.sharing_confirmed {
+        s.sharing_confirmed = true;
+        store_settings(&s)?;
+    }
+    Ok(())
+}
+
+/// One of this app's two identities: the key file (under ~/.openhydra) and its libp2p peer id.
+#[derive(Serialize)]
+struct IdentityView {
+    key_file: String,
+    peer_id: Option<String>,
+}
+
+/// The app's identities for Settings › Identity: the provider key (sharing) and the consumer key
+/// (chatting, swarm membership). Shown with the real file names instead of a generic path.
+#[tauri::command]
+fn identity_info() -> std::collections::BTreeMap<&'static str, IdentityView> {
+    let mut out = std::collections::BTreeMap::new();
+    for (role, file) in [("sharing", "desktop-provider.key"), ("chat", "desktop-consumer.key")] {
+        out.insert(role, IdentityView {
+            key_file: format!("~/.openhydra/{file}"),
+            peer_id: peer_id_of(file),
+        });
+    }
+    out
+}
+
+/// Show a file the app wrote (e.g. an exported log) in the OS file manager. Only paths inside
+/// ~/.openhydra are accepted, so the UI can't be used to open arbitrary locations.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path).canonicalize().map_err(|e| e.to_string())?;
+    let root = openhydra_dir().canonicalize().map_err(|e| e.to_string())?;
+    if !p.starts_with(&root) {
+        return Err("only files OpenHydra wrote can be shown".into());
+    }
+    #[cfg(target_os = "macos")]
+    let r = Command::new("open").arg("-R").arg(&p).status();
+    #[cfg(target_os = "windows")]
+    let r = Command::new("explorer").arg(format!("/select,{}", p.display())).status();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let r = Command::new("xdg-open").arg(p.parent().unwrap_or(&root)).status();
+    r.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Persist whether the user is sharing, so a restart can resume it (the provider is a child process
@@ -908,7 +1028,8 @@ fn set_sharing_enabled(state: &tauri::State<'_, AppState>, on: bool) {
 #[tauri::command]
 fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
-    let mut sub = vec!["provide".to_string(), "--engine-kind".into(), "auto".into()];
+    let mut sub = vec!["provide".to_string()];
+    sub.extend(engine_args(&settings.engine_kind, &settings.engine_endpoint));
     if settings.engine_autostart {
         sub.push("--engine-autostart".into());
     }
@@ -941,7 +1062,7 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
         "desktop-provider.key",
         PROVIDER_PORT,
         PROVIDER_STATUS_PORT,
-        &settings.bootstraps,
+        &settings,
         &sub,
     )?;
     set_sharing_enabled(&state, true); // remember intent so a restart resumes sharing
@@ -1406,7 +1527,7 @@ fn swarm_remote_scope(
     )?;
     let mut cmd = Command::new(&bin);
     cmd.arg("--identity").arg(identity);
-    for b in load_settings().bootstraps.iter().filter(|b| !b.is_empty()) {
+    for b in effective_bootstraps(&load_settings()) {
         cmd.arg("--bootstrap").arg(b);
     }
     cmd.arg("swarm")
@@ -1540,7 +1661,7 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
         "desktop-consumer.key",
         GATEWAY_PORT,
         GATEWAY_STATUS_PORT,
-        &settings.bootstraps,
+        &settings,
         &sub,
     )
 }
@@ -1884,6 +2005,7 @@ async fn chat_completion(
     model: String,
     messages: Vec<ChatMsgIn>,
     max_tokens: Option<u32>,
+    temperature: Option<f64>,
 ) -> Result<serde_json::Value, String> {
     let port = state.settings.lock().map_err(|e| e.to_string())?.gateway_port;
     // Default when the UI doesn't supply one: a generous chat budget, NOT the engine's own
@@ -1891,7 +2013,7 @@ async fn chat_completion(
     // far too small for a reasoning model, which spends that entirely on hidden chain-of-thought
     // and never reaches the answer ("no visible text"). 4096 lets it finish thinking AND reply.
     const DEFAULT_CHAT_MAX_TOKENS: u32 = 4096;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages
             .iter()
@@ -1899,6 +2021,11 @@ async fn chat_completion(
             .collect::<Vec<_>>(),
         "max_tokens": max_tokens.unwrap_or(DEFAULT_CHAT_MAX_TOKENS),
     });
+    // Sent only when the user set it: temperature 0 makes answers repeatable, and lets the gateway's
+    // audits replay the request (it needs an explicit 0; an absent temperature may sample).
+    if let Some(t) = temperature.filter(|t| t.is_finite() && (0.0..=2.0).contains(t)) {
+        body["temperature"] = serde_json::json!(t);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         use openhydra_agent::adapter::HttpClient;
         let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
@@ -2129,6 +2256,8 @@ fn save_settings(state: tauri::State<'_, AppState>, mut settings: Settings) -> R
     // `resume_on_launch` IS surfaced by the settings toggle now, so its payload value is honoured.
     settings.sharing_enabled = cur.sharing_enabled;
     settings.schema_version = cur.schema_version;
+    settings.share_policy_initialized = cur.share_policy_initialized;
+    settings.sharing_confirmed = cur.sharing_confirmed;
     // `shared_models` is the policy MIRROR now, owned by the Share view (save_share_policy /
     // reset_share_policy), not the settings form. Preserve it so a stale echoed payload from the
     // form can't clobber the freshly-synced mirror (L4). The form no longer sends it either.
@@ -2261,14 +2390,26 @@ fn kill_all(state: &AppState) {
 fn main() {
     // Reap agents a crashed/killed previous instance left behind, then arm the signal
     // path so THIS instance can't leave any (see the pid-registry block above).
-    sweep_stale_agents();
     install_signal_handlers();
     // Settle the share policy before anything can write desktop.json: whether this is a fresh install
     // (→ share nothing until the user chooses) is decided by desktop.json being absent, so it must be
-    // checked first thing, not when the Share view is first opened.
-    let initial_settings = load_settings();
+    // checked first thing, not when the Share view is first opened. Then record that this install
+    // has its own policy, and that a user who was already sharing has confirmed it.
+    let mut initial_settings = load_settings();
     let share_policy_reset = std::sync::atomic::AtomicBool::new(false);
-    ensure_valid_share_policy(&initial_settings, &share_policy_reset);
+    let policy_path = ensure_valid_share_policy(&initial_settings, &share_policy_reset);
+    let mut changed = false;
+    if policy_path.exists() && !initial_settings.share_policy_initialized {
+        initial_settings.share_policy_initialized = true;
+        changed = true;
+    }
+    if initial_settings.sharing_enabled && !initial_settings.sharing_confirmed {
+        initial_settings.sharing_confirmed = true;
+        changed = true;
+    }
+    if changed {
+        let _ = store_settings(&initial_settings);
+    }
     tauri::Builder::default()
         // M2.1: single-instance MUST be first — it forwards a second launch's deep link / opened file
         // to the running instance (Win/Linux spawn a new process; the `deep-link` feature routes the
@@ -2295,6 +2436,9 @@ fn main() {
         .manage(PendingCard(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_state,
+            identity_info,
+            reveal_path,
+            confirm_sharing,
             start_provider,
             start_gateway,
             stop_provider,
@@ -2349,6 +2493,10 @@ fn main() {
             uninstall_cli,
         ])
         .setup(|app| {
+            // Kill agents a crashed previous instance left behind. Here, not at the top of main():
+            // a second launch exits inside the single-instance plugin before `setup` runs, so it
+            // can't kill the running app's agents (their pids are in the same pidfile).
+            sweep_stale_agents();
             // M2.1: card deep links. A cold launch by an `openhydra:` link surfaces via
             // `get_current`; subsequent links (app already running) via `on_open_url`. A `.openhydra`
             // FILE open arrives as `RunEvent::Opened` (below), so the two channels don't overlap.
@@ -2751,6 +2899,32 @@ mod tests {
     }
 
     #[test]
+    fn engine_args_pass_a_known_kind_and_its_endpoint() {
+        assert_eq!(engine_args("auto", ""), vec!["--engine-kind", "auto"]);
+        assert_eq!(engine_args("vllm", ""), vec!["--engine-kind", "vllm"]);
+        assert_eq!(
+            engine_args("llama-cpp", " http://127.0.0.1:8081 "),
+            vec!["--engine-kind", "llama-cpp", "--engine", "http://127.0.0.1:8081"]
+        );
+        // Unknown kinds (or the UI's labels) never reach the agent: fall back to auto-detect.
+        assert_eq!(engine_args("LM Studio", "http://x"), vec!["--engine-kind", "auto"]);
+    }
+
+    #[test]
+    fn bootstrap_lists_split_and_merge_without_duplicates() {
+        assert_eq!(parse_bootstrap_list(" /ip4/1.2.3.4/tcp/4001/p2p/A, /ip4/5.6.7.8/tcp/4001/p2p/B\n"), vec![
+            "/ip4/1.2.3.4/tcp/4001/p2p/A".to_string(),
+            "/ip4/5.6.7.8/tcp/4001/p2p/B".to_string(),
+        ]);
+        assert!(parse_bootstrap_list("").is_empty());
+        let mut s = Settings::default();
+        s.bootstraps = vec![" /ip4/9.9.9.9/tcp/4001/p2p/C ".into(), "".into(), "/ip4/9.9.9.9/tcp/4001/p2p/C".into()];
+        let eff = effective_bootstraps(&s);
+        assert_eq!(eff.iter().filter(|b| b.as_str() == "/ip4/9.9.9.9/tcp/4001/p2p/C").count(), 1);
+        assert_eq!(eff.len(), builtin_bootstraps().len() + 1);
+    }
+
+    #[test]
     fn fresh_install_shares_nothing_until_the_user_chooses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("share-policy.json");
@@ -2761,6 +2935,17 @@ mod tests {
         assert!(!p.is_shared("tinyllama:latest"), "nothing shared on a fresh install");
         assert!(p.default_global_consent.is_none(), "no consent recorded without asking");
         assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_missing_policy_after_this_install_had_one_shares_nothing() {
+        // start_empty = true is what ensure_valid_share_policy passes once share_policy_initialized is set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &["was-private".into()], true, &flag);
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(!p.is_shared("was-private") && p.default_global_consent.is_none());
     }
 
     #[test]

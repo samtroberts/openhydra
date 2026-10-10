@@ -19,8 +19,9 @@ import { exportCardModal, ensureImportSection } from "./cards";
     try {
       if (on) {
         if (!engines.some((e) => e.models.length)) { emit("nav", "engines"); toast("No local models found — start or install an engine to share"); return; }
-        // Nothing chosen yet (a fresh install shares nothing): ask what to share first.
-        if (!(await anythingShared())) { sharingBusy = false; await openShareDialog(); return; }
+        // Ask what to share first when nothing is chosen yet (a fresh install), or when the user has
+        // never confirmed it in this dialog (an older build may have left "share everything" behind).
+        if (!(await anythingShared()) || !state?.settings?.sharing_confirmed) { sharingBusy = false; await openShareDialog(); return; }
         await call("start_provider");
       } else {
         await call("stop_provider");
@@ -99,6 +100,13 @@ import { exportCardModal, ensureImportSection } from "./cards";
     }
     return scopeLoadPromise;
   }
+  // Re-read reach and consent from the file before changing them: the policy file can change outside
+  // this view (a swarm member with rig control flips a model's scope), and saving a stale copy would
+  // undo that — e.g. re-publish a model its owner just made private.
+  async function reloadScope() {
+    if (savingPolicy) return ensureScope();
+    try { loadScope(await call("read_share_policy")); } catch { await ensureScope(); }
+  }
   const effectiveScope = (m) => scope.byModel.get(m) || scope.def;
   // UI reach is BINARY: global vs not-global. `device` (a deferred, not-yet-offered loopback tier) and
   // any unknown value collapse to the Private presentation. `isGlobal` is the one enforced distinction.
@@ -125,16 +133,19 @@ import { exportCardModal, ensureImportSection } from "./cards";
         `</div>` +
         `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Publish globally</button></div></div>`;
       document.body.appendChild(back);
-      const done = (v) => { back.remove(); resolve(v); };
+      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(false); } };
+      const done = (v) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(v); };
+      document.addEventListener("keydown", onKey, true);
       $(".cx", back).onclick = () => done(false);
       $(".cok", back).onclick = () => done(true);
       back.onclick = (e) => { if (e.target === back) done(false); };
+      $(".cx", back).focus();
     });
   }
   // Flip a shared model's reach (binary: `private` or `global`). Global opens the consent gate;
   // declining reverts (a re-render resets the switch). Private clears any recorded consent.
   async function setModelScope(m, next) {
-    ensurePolicy(); await ensureScope();   // never mutate scope on a half-loaded state (race fix)
+    ensurePolicy(); await reloadScope();   // never mutate scope on a half-loaded or stale state
     if (next === effectiveScope(m)) return;
     if (next === "global") {
       const ok = await globalConsentModal(m);
@@ -181,7 +192,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
   }
   // The policy as it is on disk (or live, while sharing), awaited — for decisions, not just display.
   async function policyNow() {
-    if (state?.provider?.status?.running) { ensurePolicy(); await ensureScope(); return policy; }
+    if (state?.provider?.status?.running && policyFromSnap()) { ensurePolicy(); await reloadScope(); return policy; }
     try { const r = await call("read_share_policy"); if (!savingPolicy) policy = { mode: r.mode, models: new Set(r.models || []) }; loadScope(r); }
     catch { ensurePolicy(); }
     return policy;
@@ -206,14 +217,16 @@ import { exportCardModal, ensureImportSection } from "./cards";
       global_consent: Object.fromEntries(scope.consent),
       default_global_consent: scope.defConsent,   // preserve the policy-level consent verbatim
     };
+    let ok = true;
     try { await call("save_share_policy", { policy: payload }); }
-    catch (e) { policy = prev; scope = prevScope; pendingSig = null; toast(`Save failed: ${e}`); }   // L2: roll back
+    catch (e) { ok = false; policy = prev; scope = prevScope; pendingSig = null; toast(`Save failed: ${e}`); }   // L2: roll back
     finally { savingPolicy = false; }
     emit("refresh-status");   // pull the fresh /status/share; the sticky hold clears once it matches
     renderShare();
+    return ok;   // callers stop (no success toast, no start) when the save failed
   }
   async function toggleShareModel(m) {
-    ensurePolicy(); await ensureScope();   // scope must be loaded before we mutate/persist it (race fix)
+    ensurePolicy(); await reloadScope();   // scope must be loaded (and current) before we mutate/persist it
     const wasShared = policy.mode === "all" || policy.models.has(m);
     const running = !!state?.provider?.status?.running;
     let mode = policy.mode, models = new Set(policy.models);
@@ -229,15 +242,16 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // Privacy-first: a newly-shared model reaches only your trust domain until you opt it Global.
       if (!scope.byModel.has(m)) scope.byModel.set(m, "private");
     }
-    await savePolicy(mode, [...models]);
+    if (!(await savePolicy(mode, [...models]))) return;
     if (!running && !wasShared) await setSharing(true); // toggled a model on from a stopped node → begin serving
   }
   // "Share everything" master switch: ON ⇒ mode "all" (new models auto-share); OFF ⇒ freeze to the
   // current active set as an explicit "list" (nothing stops, but future models won't auto-share).
   async function toggleShareAll() {
-    ensurePolicy(); await ensureScope();
+    ensurePolicy(); await reloadScope();
     const running = !!state?.provider?.status?.running;
     if (policy.mode === "all") { await savePolicy("list", shareActiveModels()); return; }
+    if (!state?.settings?.sharing_confirmed) { await openShareDialog(); return; }   // first time: choose explicitly
     const ok = await confirmModal(
       "Share every model, including ones you add later?",
       "Anyone on the OpenHydra network will be able to discover these models and send requests to them, and your machine serves the requests. Models you've set to Private stay private. You can turn this off at any time.",
@@ -245,21 +259,32 @@ import { exportCardModal, ensureImportSection } from "./cards";
     );
     if (!ok) { renderShare(); return; }
     scope.def = "global"; scope.defConsent = Date.now();
-    await savePolicy("all", []);
+    if (!(await savePolicy("all", []))) return;
     if (!running) await setSharing(true);
   }
 
   // Choose what to share and how far it reaches, in one step, with consent recorded only here.
   // `only` limits the dialog to those models and ADDS them to what's already shared ("Add model");
   // without it, the dialog sets the whole selection (first "Start sharing").
+  let shareDialogOpen = false;
   export async function openShareDialog(only) {
+    if (shareDialogOpen) return;
+    shareDialogOpen = true;
+    try { await shareDialog(only); } finally { shareDialogOpen = false; }
+  }
+  async function shareDialog(only) {
     const all = shareActiveModels();
     if (!all.length) { emit("nav", "engines"); toast("No local models found — start or install an engine to share"); return; }
-    await policyNow(); await ensureScope();
+    await policyNow(); await reloadScope();
     const list = only ? only.filter((m) => all.includes(m)) : all;
     if (!list.length) { toast("That model isn't available from your engine right now"); return; }
     const checked = new Set(only ? list : list.filter((m) => isModelShared(m)));
     const one = list.length === 1;
+    // Who can use them: pre-select only what the user already chose (a model already shared keeps
+    // its reach); for new models there's no default — the user picks.
+    const shared = list.filter((m) => isModelShared(m));
+    const reaches = new Set(shared.map((m) => (isGlobal(m) ? "global" : "private")));
+    const preReach = only && shared.length === list.length && reaches.size === 1 ? [...reaches][0] : null;
     const back = document.createElement("div");
     back.className = "cmodal-back";
     const rows = list.map((m) => `<label class="sdrow" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-m="${escapeHtml(m)}"${checked.has(m) ? " checked" : ""}/>${modelIcon(m)}<span>${esc(displayModelName(m))}</span></label>`).join("");
@@ -268,20 +293,25 @@ import { exportCardModal, ensureImportSection } from "./cards";
       `<div class="cmodal-b">` +
       (only && list.length === 1 ? `<input type="checkbox" data-m="${escapeHtml(list[0])}" checked hidden/>` : `<div style="max-height:220px;overflow:auto;margin-bottom:12px">${rows}</div>`) +
       `<div style="font-weight:600;font-size:12.5px;margin-bottom:4px">Who can use ${one ? "it" : "them"}</div>` +
-      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="global" checked/><span><b>Everyone</b> — anyone on the OpenHydra network can discover ${one ? "this model and send requests to it" : "these models and send requests to them"}. Your machine serves the requests; your prompts, files and identity aren't shared.</span></label>` +
-      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="private"/><span><b>Only my swarms</b> — not announced publicly; only members of a swarm you own can use ${one ? "it" : "them"} (set up in Swarms).</span></label>` +
+      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="global"${preReach === "global" ? " checked" : ""}/><span><b>Everyone</b> — anyone on the OpenHydra network can discover ${one ? "this model and send requests to it" : "these models and send requests to them"}. Your machine serves the requests; your prompts, files and identity aren't shared.</span></label>` +
+      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="private"${preReach === "private" ? " checked" : ""}/><span><b>Only my swarms</b> — not announced publicly; only members of a swarm you own can use ${one ? "it" : "them"} (set up in Swarms).</span></label>` +
       `</div>` +
       `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Share</button></div></div>`;
     document.body.appendChild(back);
     const picked = await new Promise((resolve) => {
-      const done = (v) => { back.remove(); resolve(v); };
+      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(null); } };
+      const done = (v) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(v); };
+      document.addEventListener("keydown", onKey, true);
       $(".cx", back).onclick = () => done(null);
       back.onclick = (e) => { if (e.target === back) done(null); };
       $(".cok", back).onclick = () => {
         const ms = $$("input[type=checkbox]", back).filter((c) => c.checked).map((c) => c.dataset.m);
+        const reach = $("input[name=sdreach]:checked", back)?.value;
         if (!ms.length) { toast("Pick at least one model"); return; }
-        done({ models: ms, reach: $("input[name=sdreach]:checked", back).value });
+        if (!reach) { toast(`Choose who can use ${ms.length === 1 ? "it" : "them"}`); return; }
+        done({ models: ms, reach });
       };
+      ($("input[type=checkbox]:not([hidden])", back) || $("input[type=radio]", back))?.focus();
     });
     if (!picked) { renderShare(); return; }
     const running = !!state?.provider?.status?.running;
@@ -296,7 +326,9 @@ import { exportCardModal, ensureImportSection } from "./cards";
       scope.byModel.set(m, picked.reach);
       if (picked.reach === "global") scope.consent.set(m, Date.now()); else scope.consent.delete(m);
     }
-    await savePolicy(mode, mode === "all" ? [] : [...models]);
+    if (!(await savePolicy(mode, mode === "all" ? [] : [...models]))) return;
+    await call("confirm_sharing").catch(() => {});
+    if (state?.settings) state.settings.sharing_confirmed = true;   // until the next poll brings it
     toast(`Sharing ${picked.models.length} model${picked.models.length === 1 ? "" : "s"} with ${picked.reach === "global" ? "everyone" : "your swarms"}`);
     if (!running) await setSharing(true);
   }
@@ -314,7 +346,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const stb = $("#sharetoggle");
     if (stb) { stb.textContent = running ? "Stop sharing" : "Start sharing"; stb.className = "btn sm " + (running ? "outline" : "brand"); stb.style.marginLeft = "12px"; }
     const up = snap?.uptime_secs != null ? ` · up ${fmtUptime(snap.uptime_secs)}` : "";
-    head.querySelector(".mut").textContent = `${running ? announcedCount : 0} models announced · gateway :16527${up}`;
+    head.querySelector(".mut").textContent = `${running ? announcedCount : 0} models announced · gateway :${state?.settings?.gateway_port || 16527}${up}`;
     const k = $$("#v-share .g4 .kpi .val");
     // #7: durable lifetime totals (survive restart; `used` counts external clients too).
     const served = totalServed(), used = totalUsed();
@@ -360,7 +392,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
       else if (!sharedIntent) status = `<span class="badge secondary">off</span>`;
       else if (gl) status = (announcedSet.has(m) || !hasShareView)
         ? `<span class="badge ok">live</span>` : `<span class="badge warn">pending</span>`;
-      else status = `<span class="badge secondary" title="Shared and served on your trust domain, but not announced to the global network.">not announced</span>`;
+      else status = `<span class="badge secondary" title="Not announced publicly. Only members of a swarm you own can use it (set up in Swarms).">swarms only</span>`;
       const swTitle = !running ? "Share this model when you start sharing"
         : sharedIntent ? "Sharing — toggle off to stop" : "Toggle on to share this model";
       // Reach control (binary), only for a shared model: a Private | Global segmented pill. Choosing
@@ -443,5 +475,5 @@ import { exportCardModal, ensureImportSection } from "./cards";
       }
     }
     // wanted table — honest empty state until demand telemetry lands
-    $("#wanttable tbody").innerHTML = `<tr><td colspan="4" class="mut">Fills in as network demand telemetry lands.</td></tr>`;
+    $("#wanttable tbody").innerHTML = `<tr><td colspan="4" class="mut">Not available yet: this fills in once the network reports demand.</td></tr>`;
   }

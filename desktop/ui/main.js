@@ -7,11 +7,11 @@ import { store } from "./storage";
 import { fmtNum, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
-import { toast, menu, closeMenus } from "./chrome";
+import { toast, menu, closeMenus, confirmModal } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName } from "./models";
 import { renderConnectors } from "./connectors";
-import { renderProviders } from "./providers";
+import { renderProviders, setProviderSort } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
 import { renderEngines } from "./installer";
 import { renderShare, setSharing, toggleSharing, ensureGateway, openShareDialog } from "./share";
@@ -73,7 +73,13 @@ function coerceSessions(raw) {
 setSessions(coerceSessions(store.get("oh_sessions", {}))); setSessionOrder(store.get("oh_order", []));
 setDeviceName(store.get("oh_device", ""));   // #9: derived from the OS on boot if unset
 setUsedTokens(store.get("oh_used", 0));
-root.dataset.theme = store.get("oh_theme", "light");
+// Theme choice: "system" follows the OS (live), "light"/"dark" are fixed. An older store holds only the
+// applied theme ("oh_theme"), which reads as that fixed choice.
+let themeChoice = store.get("oh_theme_choice", null) || store.get("oh_theme", "system");
+const osDark = matchMedia("(prefers-color-scheme:dark)");
+function applyTheme() { root.dataset.theme = themeChoice === "system" ? (osDark.matches ? "dark" : "light") : themeChoice; }
+applyTheme();
+osDark.addEventListener?.("change", () => { if (themeChoice === "system") applyTheme(); });
 if (store.get("oh_adv", false)) app.setAttribute("data-adv", "");
 function saveSessions() {
   if (Array.isArray(sessions)) setSessions(coerceSessions(sessions)); // never persist an array (see coerceSessions)
@@ -118,8 +124,16 @@ $("#recsearchbtn").onclick = () => { app.classList.remove("navcol"); $("#recfilt
 $("#gosettings").onclick = () => go("settings");
 
 // ── theme ──
-function setTheme(m) { m = (m || "").toLowerCase(); if (m === "system") m = matchMedia("(prefers-color-scheme:dark)").matches ? "dark" : "light"; if (m !== "dark" && m !== "light") m = root.dataset.theme === "dark" ? "light" : "dark"; root.dataset.theme = m; store.set("oh_theme", m); }
+// m: "system" | "light" | "dark" (any case); no argument flips between light and dark (top-bar button).
+function setTheme(m) {
+  m = (m || "").toLowerCase();
+  themeChoice = m === "system" || m === "light" || m === "dark" ? m : (root.dataset.theme === "dark" ? "light" : "dark");
+  store.set("oh_theme_choice", themeChoice); store.set("oh_theme", themeChoice === "system" ? null : themeChoice);
+  applyTheme();
+  const lbl = $('[data-act="theme"] span'); if (lbl) lbl.textContent = themeChoice[0].toUpperCase() + themeChoice.slice(1);
+}
 $("#theme").onclick = () => setTheme();
+{ const lbl = $('[data-act="theme"] span'); if (lbl) lbl.textContent = themeChoice[0].toUpperCase() + themeChoice.slice(1); }
 
 // ── generic dropdowns (wireframe verbatim) ──
 $$(".drop").forEach((d) => d.onclick = (e) => {
@@ -131,18 +145,28 @@ $$(".drop").forEach((d) => d.onclick = (e) => {
   const sp = d.querySelector("span");
   const cur = isModel ? (sp.dataset.value || sp.textContent) : sp.textContent;
   const setSel = (el, o) => { if (isModel) { el.dataset.value = o; el.textContent = displayModelName(o); } else { el.textContent = o; } };
-  menu(d, opts.length ? opts.map((o) => ({ label: isModel ? displayModelName(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") updateEngineEndpoint(); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
+  menu(d, opts.length ? opts.map((o) => ({ label: isModel ? displayModelName(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") { updateEngineEndpoint(); saveSetting({ engine_kind: ENGINE_KIND_OF[o] || "auto", engine_endpoint: "" }); } if (d.id === "presetdrop") applyPreset(o); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
 });
 
 // ── inference range sliders (wireframe verbatim) ──
 $$(".range").forEach((rg) => {
   const mn = +rg.dataset.min, mx = +rg.dataset.max, isInt = rg.dataset.int, fill = rg.querySelector(".fill"), knob = rg.querySelector(".knob"), lab = $("#" + rg.dataset.label);
   function set(v) { v = Math.max(mn, Math.min(mx, v)); const p = (v - mn) / (mx - mn) * 100; fill.style.width = p + "%"; knob.style.left = p + "%"; lab.textContent = rg.dataset.name + " · " + (isInt ? Math.round(v) : Math.round(v * 100) / 100); rg.dataset.val = v; }
-  set(+rg.dataset.val); let drag = 0;
-  function fe(e) { const r = rg.getBoundingClientRect(); set(mn + ((e.clientX - r.left) / r.width) * (mx - mn)); }
+  set(+rg.dataset.val); rg._set = set; let drag = 0;
+  // Dragging a slider by hand leaves the preset: show "Custom".
+  function fe(e) { const r = rg.getBoundingClientRect(); set(mn + ((e.clientX - r.left) / r.width) * (mx - mn)); const ps = $("#presetdrop span"); if (ps) ps.textContent = "Custom"; }
   rg.onmousedown = (e) => { drag = 1; fe(e); e.preventDefault(); }; addEventListener("mousemove", (e) => { if (drag) fe(e); }); addEventListener("mouseup", () => drag = 0);
 });
 $("#inftoggle").onclick = () => $("#v-chat .three").classList.toggle("noinf");
+// Presets set both sliders (temperature, max tokens).
+const PRESETS = { "Concise · temp 0.3": [0.3, 512], "Creative · temp 1.2": [1.2, 2048], "Deterministic · temp 0": [0, 2048] };
+function applyPreset(name) {
+  const p = PRESETS[name]; if (!p) return;
+  $("[data-label='tempk']")?._set?.(p[0]);
+  $("[data-label='tokk']")?._set?.(p[1]);
+}
+// Settings › Engine labels → the agent's --engine-kind values.
+const ENGINE_KIND_OF = { "auto-detect": "auto", ollama: "ollama", vLLM: "vllm", "LM Studio": "lm-studio", "llama.cpp": "llama-cpp", Exo: "exo", ComfyUI: "comfyui" };
 
 // ── recents (live sessions) ──
 function renderRecents() {
@@ -230,7 +254,9 @@ async function doSend(text, fromHome) {
     // and let the Rust command apply its generous default (a reasoning model needs well over the
     // old 512 or it spends the whole budget on hidden thinking and returns nothing).
     const tokLimit = Math.round(+($("[data-label='tokk']")?.dataset.val)) || undefined;
-    const resp = await call("chat_completion", { model, messages, maxTokens: tokLimit });
+    const tv = +($("[data-label='tempk']")?.dataset.val);
+    const temperature = Number.isFinite(tv) ? Math.round(tv * 100) / 100 : undefined;
+    const resp = await call("chat_completion", { model, messages, maxTokens: tokLimit, temperature });
     wait.remove();
     const msg = resp?.choices?.[0]?.message || {};
     const split = splitThink(msg.content || "");                 // pull inline <think> out of the answer
@@ -328,6 +354,10 @@ function renderStatusbar() {
   $("#sbpeers").textContent = `${peers} peer${peers === 1 ? "" : "s"}`;
   $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
   $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:16527/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
+  // Every place that names the local API uses the configured port.
+  const port = state?.settings?.gateway_port || 16527;
+  $$(".gwbase").forEach((el) => { const t = `http://127.0.0.1:${port}${el.dataset.suffix || ""}`; if (el.textContent !== t) el.textContent = t; });
+  $$("#v-connectors .snippet").forEach((sn) => { const t = sn.textContent.replace(/127\.0\.0\.1:\d+/g, `127.0.0.1:${port}`); if (t !== sn.textContent) sn.textContent = t; });
   // #1: the title-bar CTA reflects state. Off = a brand-filled call-to-action ("Share your
   // models"). Live = a calm green "active" chip with a pulsing dot ("Sharing N models") — it reads
   // as status, not an unclicked CTA. Reuses the app's shared `.btn.on` active treatment.
@@ -361,8 +391,15 @@ $("#provchips").onclick = (e) => { const c = e.target.closest(".chip[data-cat]")
 $("#actchips").onclick = (e) => { const c = e.target.closest(".chip[data-act]"); if (!c) return; $$("#actchips .chip").forEach((x) => x.classList.toggle("on", x === c)); $$("#v-peers .acttab").forEach((t) => t.classList.toggle("on", t.dataset.act === c.dataset.act)); };
 $("#peerchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#peerchips .chip").forEach((x) => x.classList.toggle("on", x === c)); const pp = c.dataset.p; $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) ? "" : "none"); };
 $("#logchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#logchips .chip").forEach((x) => x.classList.toggle("on", x === c)); setLogTab(c.dataset.log === "gateway" ? "gateway" : "provider"); renderLogs(); };
+$("#provsort") && ($("#provsort").onclick = (e) => { e.stopPropagation(); menu($("#provsort"), ["reputation", "providers", "name"].map((v) => ({ label: `Sort by ${v}`, fn: () => setProviderSort(v) }))); });
 $("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); } };
-$("#cmdk").onclick = (e) => { e.stopPropagation(); menu($("#cmdk"), Object.keys(titles).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); };
+// ⌘K (Ctrl+K elsewhere) or the button: a "Go to …" menu. Diagnostics is listed only when advanced
+// views are on (it's hidden otherwise).
+function openGoto() { menu($("#cmdk"), Object.keys(titles).filter((v) => v !== "peers" || app.hasAttribute("data-adv")).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); }
+$("#cmdk").onclick = (e) => { e.stopPropagation(); openGoto(); };
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); openGoto(); }
+});
 // The logo goes Home. (It used to open a "tray menu preview" whose Quit called a command that
 // doesn't exist; the real system tray has Sharing and Quit.)
 $("#traymark").onclick = () => go("home");
@@ -376,6 +413,8 @@ $("#setnav").onclick = (e) => { const s = e.target.closest(".s"); if (!s) return
 const SETTING_SWITCHES = { engineautostartsw: "engine_autostart", authchecksw: "authenticity_checks", auditreplaysw: "audit_replay", resumelaunchsw: "resume_on_launch", verboselogsw: "verbose_logs", relaysw: "peer_relay" };
 const APPLIES = { gateway_port: "gateway", bootstraps: "both", audit_replay: "gateway", min_authenticity: "gateway", authenticity_checks: "sharing", verbose_logs: "both", peer_relay: "both", engine_kind: "sharing", engine_endpoint: "sharing", engine_autostart: "launch" };
 async function saveSetting(patch) {
+  // Never save before the first state load: the payload would reset every other setting to defaults.
+  if (!state?.settings) { toast("Still loading — try again in a moment"); renderSettings(); return; }
   Object.assign(pendingSettings, patch);
   const settings = { ...(state?.settings || {}), ...pendingSettings, device_name: deviceName };
   try {
@@ -398,7 +437,7 @@ $$("[data-sw]").forEach((sw) => {
 });
 $("#minauthsel")?.addEventListener("change", (e) => saveSetting({ min_authenticity: e.target.value }));
 // Text fields: Enter commits single-line fields; blur saves when the value changed.
-function wireTextSetting(el, { multiline = false, read, key, valid }) {
+function wireTextSetting(el, { multiline = false, read, key, valid, skip }) {
   if (!el) return;
   let cancelled = false;
   el.addEventListener("keydown", (e) => {
@@ -407,9 +446,10 @@ function wireTextSetting(el, { multiline = false, read, key, valid }) {
   });
   el.addEventListener("blur", () => {
     if (cancelled) { cancelled = false; renderSettings(); return; }   // Escape: drop the edit
+    if (skip && skip(el)) return;
     const v = read(el);
     if (valid && !valid(v)) { toast("Not saved: " + valid.msg); renderSettings(); return; }
-    const cur = key === "device_name" ? deviceName : state?.settings?.[key];
+    const cur = key === "device_name" ? deviceName : ({ ...(state?.settings || {}), ...pendingSettings })[key];
     if (JSON.stringify(v) === JSON.stringify(cur)) return;
     if (key === "device_name") { setDeviceName(v); store.set("oh_device", v); saveSessions(); }
     saveSetting({ [key]: v });
@@ -418,6 +458,7 @@ function wireTextSetting(el, { multiline = false, read, key, valid }) {
 const portOk = (v) => Number.isInteger(v) && v >= 1024 && v <= 65535; portOk.msg = "the port must be a number from 1024 to 65535";
 wireTextSetting($("#gwport"), { key: "gateway_port", read: (el) => parseInt((el.textContent || "").trim(), 10), valid: portOk });
 wireTextSetting($("#bootstraps"), { key: "bootstraps", multiline: true, read: (el) => (el.innerText || el.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean) });
+wireTextSetting($("#engineendpoint"), { key: "engine_endpoint", skip: (el) => el.contentEditable !== "true", read: (el) => (el.textContent || "").trim() });
 wireTextSetting($('.setpanel[data-p="identity"] [contenteditable]'), { key: "device_name", read: (el) => (el.textContent || "").trim() || deviceName });
 // Restart buttons: apply saved settings to the running roles.
 $("#restartgw")?.addEventListener("click", async (e) => {
@@ -431,9 +472,9 @@ $("#restartshare")?.addEventListener("click", async (e) => {
   try { await call("stop_provider"); await call("start_provider"); toast("Sharing restarted"); } catch (err) { toast(`Restart failed: ${err}`); }
   finally { b.disabled = false; b.textContent = "Restart"; await refresh().catch(() => {}); }
 });
-$('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
 // Reset sharing preferences → clean share-nothing default (hot-reloads; no restart). Non-destructive.
 $("#resetsharebtn")?.addEventListener("click", async () => {
+  if (!(await confirmModal("Reset sharing preferences?", "Stops announcing every model. Nothing is shared until you choose again.", "Reset"))) return;
   try {
     await call("reset_share_policy");
     emit("share-policy-reset");   // invalidate the Share view's cached policy (works even when stopped)
@@ -444,7 +485,14 @@ $("#resetsharebtn")?.addEventListener("click", async () => {
 });
 $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.toggleAttribute("data-adv", on); $("#advsw").classList.toggle("on", on); store.set("oh_adv", on); if (!on && activeView === "peers") go("providers"); };
 // Send-logs export
-$("#sendlogsbtn") && ($("#sendlogsbtn").onclick = async () => { try { const path = await call("export_logs"); toast(path ? `Logs saved: ${path}` : "No logs yet"); } catch (e) { toast(`Export failed: ${e}`); } });
+$("#sendlogsbtn") && ($("#sendlogsbtn").onclick = async () => {
+  try {
+    const path = await call("export_logs");
+    if (!path) { toast("No logs yet"); return; }
+    toast("Logs saved — showing the file");
+    await call("reveal_path", { path }).catch((e) => toast(`Logs saved: ${path} (${e})`));
+  } catch (e) { toast(`Export failed: ${e}`); }
+});
 // CLI-on-PATH (Layer 1): the Settings "Command-line tool" row. Status comes from the shared cliui
 // source, so an install here — or from the Connectors banner — keeps both in sync via "cli-status".
 function renderCliRow() {

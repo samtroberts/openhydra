@@ -6,6 +6,19 @@ let toastEl, toastT;
 export function toast(m) { if (!toastEl) { toastEl = document.createElement("div"); toastEl.className = "toast"; document.body.appendChild(toastEl); } toastEl.textContent = m; toastEl.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove("show"), 1600); }
 
 let menuFor = null;
+// Keyboard for an open menu: ↑/↓ move, Enter picks, Escape closes.
+document.addEventListener("keydown", (e) => {
+  const m = document.querySelector(".menu"); if (!m) return;
+  const items = [...m.querySelectorAll(".mi")]; if (!items.length) return;
+  let i = items.findIndex((x) => x.classList.contains("kb"));
+  if (e.key === "Escape") { e.preventDefault(); closeMenus(); return; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    i = e.key === "ArrowDown" ? (i + 1) % items.length : (i <= 0 ? items.length - 1 : i - 1);
+    items.forEach((x, k) => x.classList.toggle("kb", k === i));
+    items[i].scrollIntoView({ block: "nearest" });
+  } else if (e.key === "Enter" && i >= 0) { e.preventDefault(); items[i].click(); }
+});
 export function closeMenus() { $$(".menu").forEach((m) => m.remove()); menuFor = null; }
 export function menu(anchor, items) {
   if (menuFor === anchor) { closeMenus(); return; }
@@ -13,7 +26,7 @@ export function menu(anchor, items) {
   const m = document.createElement("div"); m.className = "menu";
   items.forEach((it) => { if (it.sep) { const s = document.createElement("div"); s.className = "msep"; m.appendChild(s); return; } const mi = document.createElement("div"); mi.className = "mi"; mi.innerHTML = `<span class="ck">${it.on ? "✓" : ""}</span>${esc(it.label)}`; mi.onclick = (e) => { e.stopPropagation(); closeMenus(); it.fn && it.fn(); }; m.appendChild(mi); });
   document.body.appendChild(m);
-  const r = anchor.getBoundingClientRect(); m.style.left = Math.min(r.left, innerWidth - m.offsetWidth - 10) + "px"; let t = r.bottom + 5; if (t + m.offsetHeight > innerHeight - 8) t = r.top - m.offsetHeight - 5; m.style.top = Math.max(8, t) + "px";
+  const r = anchor.getBoundingClientRect(); m.style.left = Math.max(8, Math.min(r.left, innerWidth - m.offsetWidth - 10)) + "px"; let t = r.bottom + 5; if (t + m.offsetHeight > innerHeight - 8) t = r.top - m.offsetHeight - 5; m.style.top = Math.max(8, t) + "px";
 }
 
 // In-app confirm dialog. window.confirm() does nothing in the Tauri webview, so every "are you sure"
@@ -33,5 +46,6 @@ export function confirmModal(title, body, okLabel) {
     $(".cx", back).onclick = () => done(false);
     $(".cok", back).onclick = () => done(true);
     back.onclick = (e) => { if (e.target === back) done(false); };
+    $(".cx", back).focus();   // a stray Enter/Space cancels instead of re-triggering the button behind
   });
 }

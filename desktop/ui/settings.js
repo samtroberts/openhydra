@@ -1,26 +1,50 @@
 // Settings view + the Engine-endpoint helper (#3: the endpoint follows the selected engine). Settings
 // save as they change (the controller's saveSetting); text fields are not clobbered while focused, and
 // unsaved values in `pendingSettings` win over the poll's re-render. updateEngineEndpoint is also called by the engine dropdown in the controller.
-import { $ } from "./dom";
+import { $, escapeHtml } from "./dom";
 import { state, engines, deviceName } from "./state";
+import { call } from "./bridge";
 
-  // #3: the Settings › Engine endpoint follows the selected engine (was pinned to engines[0]).
+  // Settings › Engine: the saved engine kind (agent `--engine-kind` value) ↔ the dropdown label, and
+  // each engine's standard endpoint (shown as the placeholder when no custom endpoint is saved).
+  const ENGINE_LABEL = { auto: "auto-detect", ollama: "ollama", vllm: "vLLM", "lm-studio": "LM Studio", "llama-cpp": "llama.cpp", exo: "Exo", comfyui: "ComfyUI" };
   const ENGINE_ENDPOINTS = { "auto-detect": "", ollama: "http://127.0.0.1:11434", "vLLM": "http://127.0.0.1:8000", "LM Studio": "http://127.0.0.1:1234", "llama.cpp": "http://127.0.0.1:8080", "Exo": "http://127.0.0.1:52415", "ComfyUI": "http://127.0.0.1:8188" };
   export function updateEngineEndpoint() {
     const drop = $("#enginedrop"), field = $("#engineendpoint"); if (!drop || !field) return;
     const sel = (drop.querySelector("span")?.textContent || "auto-detect").trim();
-    // auto-detect → the first detected engine's live URL; a specific pick → that engine's live URL
-    // if it's currently running, else its standard endpoint.
-    const live = engines.find((e) => (e.label || "").toLowerCase() === sel.toLowerCase());
-    const url = sel === "auto-detect"
-      ? (engines[0]?.url || "http://127.0.0.1:11434")
-      : (live?.url || ENGINE_ENDPOINTS[sel] || "http://127.0.0.1:11434");
-    field.textContent = url;
+    const auto = sel === "auto-detect";
+    // auto-detect serves every running engine at its own address: nothing to edit.
+    field.contentEditable = auto ? "false" : "true";
+    field.classList.toggle("mut", auto);
+    if (document.activeElement === field) return;
+    const saved = (state?.settings?.engine_endpoint || "").trim();
+    field.textContent = auto
+      ? (engines.length ? engines.map((e) => `${e.label} ${e.url}`).join(" · ") : "detected automatically")
+      : (saved || ENGINE_ENDPOINTS[sel] || "");
   }
 
   // Settings changes waiting for save_settings to finish. renderSettings shows these over the saved
   // values, so the 2.5 s poll can't flip a control back while its save is in flight.
   export const pendingSettings = {};
+
+  // Settings › Identity: both keys with their peer ids (identity_info resolves them once).
+  let identities = null, identitiesLoading = false;
+  function renderIdentities() {
+    const host = $("#identrows"); if (!host) return;
+    if (!identities) {
+      if (!identitiesLoading) { identitiesLoading = true; call("identity_info").then((r) => { identities = r; renderIdentities(); }).catch(() => {}).finally(() => { identitiesLoading = false; }); }
+      return;
+    }
+    if (host.dataset.done) return;
+    const row = (title, desc, v) => `<div class="field"><label>${title}</label><div class="desc" style="margin:-2px 0 6px">${desc}</div>` +
+      `<div class="input mono" style="justify-content:space-between;gap:10px;font-size:11.5px"><span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(v?.peer_id || "—")}</span>` +
+      `<button class="btn ghost sm idcopy" data-v="${escapeHtml(v?.peer_id || "")}">Copy</button></div>` +
+      `<div class="desc mono" style="margin-top:4px">${escapeHtml(v?.key_file || "")}</div></div>`;
+    host.innerHTML = row("Sharing identity", "The peer id other machines see when they use your models.", identities.sharing) +
+      row("Chat identity", "Used when you chat, and for swarms you join.", identities.chat);
+    host.dataset.done = "1";
+    host.querySelectorAll(".idcopy").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.v); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1200); } catch {} });
+  }
 
   export function renderSettings() {
     const p = state; if (!p) return;
@@ -29,11 +53,20 @@ import { state, engines, deviceName } from "./state";
     // re-renders Settings; overwriting a focused field was why it "couldn't be changed").
     const id = $('.setpanel[data-p="identity"]'); const dn = id.querySelector('[contenteditable]');
     if (document.activeElement !== dn) dn.textContent = deviceName;
-    id.querySelectorAll(".input")[1].childNodes[0].textContent = (p.provider.status.peer_id || p.gateway.status.peer_id || "—");
+    renderIdentities();
     const netp = $('.setpanel[data-p="network"]');
     const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = s.gateway_port;
     const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (s.bootstraps || []).join("\n");
-    updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
+    // Built-in bootstrap peers exist only in release builds; say which case this is.
+    const builtin = p.builtin_bootstraps || 0;
+    $("#netsub") && ($("#netsub").textContent = builtin
+      ? "Your node joins the network through OpenHydra's bootstrap peers. You can add more and change the local API port."
+      : "This build has no built-in bootstrap peer: add one below to join the public network. Without one, only machines on your local network are found.");
+    $("#bootdesc") && ($("#bootdesc").textContent = builtin ? "Extra bootstrap peer addresses, one per line (used as well as the built-in ones)." : "Bootstrap peer addresses, one per line.");
+    $("#relaysw") && $("#relaysw").classList.toggle("on", !!s.peer_relay);
+    const ed = $("#enginedrop span");
+    if (ed && !document.querySelector(".menu")) ed.textContent = ENGINE_LABEL[s.engine_kind] || "auto-detect";
+    updateEngineEndpoint();
     $("#engineautostartsw").classList.toggle("on", !!s.engine_autostart);
     $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!s.authenticity_checks);
     $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!s.audit_replay);
