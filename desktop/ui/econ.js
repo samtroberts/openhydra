@@ -20,6 +20,14 @@ export function repByPeerModel() {
   return m;
 }
 
+// (peer, model) → what your gateway has verified about it: its authenticity tier label and latest
+// model-check (log-prob) verdict. No entry: never used, so not verified.
+export function trustByPeerModel() {
+  const m = {};
+  (econ().reputation || []).forEach((r) => { m[repKey(r.openhydra_peer_id, r.model_id)] = { tier: r.authenticity, check: r.logprob_check }; });
+  return m;
+}
+
 // OpenHydra peer id → a single earned reputation, aggregated (mean) across that peer's models —
 // for per-peer rows (the Network view) that show one number per connection, not per model.
 export function repByOpenhydra() {

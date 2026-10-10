@@ -237,7 +237,7 @@ async function doSend(text, fromHome) {
     const reasoning = [msg.reasoning_content, split.reasoning].filter(Boolean).join("\n").trim();
     const reply = split.answer;                                  // may be "" — botEl shows a clear note
     const oh = resp?.openhydra || {};
-    const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
+    const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", tier: oh.provider_authenticity || null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
     pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
     pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
     s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();
@@ -245,9 +245,14 @@ async function doSend(text, fromHome) {
   } catch (e) {
     wait.remove(); const secs = Math.round((Date.now() - t0) / 1000);
     const err = document.createElement("div"); err.className = "msg ai"; err.style.color = "hsl(var(--danger))"; err.style.fontSize = "12.5px";
-    err.textContent = /504|timeout|timed out/i.test(String(e)) ? `The provider didn't respond in time (${secs}s). Cold model loads can be slow — try again; it warms up.`
-      : /control character|expected value|invalid|parse|json/i.test(String(e)) ? `The provider's response couldn't be read — some reasoning models emit raw formatting that breaks parsing. Try turning off thinking on the provider (e.g. /no_think).`
-      : `${e}`;
+    // A gateway error reply arrives as "gateway <status> <type>: <message>"; anything else is ours.
+    const es = String(e), gw = /^gateway (\d{3}) ([a-z_]*): ([\s\S]*)$/.exec(es);
+    err.textContent = /is verified at A\d/.test(es) ? "No provider meets your \u2018Only use verified providers\u2019 setting yet. Lower it in Settings, or keep using providers so they build a track record."
+      : /upstream_overloaded|server_overloaded/.test(es) ? "Providers are busy right now. Try again in a moment."
+      : /504|timeout|timed out/i.test(es) ? `The provider didn't respond in time (${secs}s). Cold model loads can be slow — try again; it warms up.`
+      : gw ? gw[3]   // the gateway's own words (a refusal, a bad request): shown as they are
+      : /control character|expected value|invalid|parse|json/i.test(es) ? `The provider's response couldn't be read — some reasoning models emit raw formatting that breaks parsing. Try turning off thinking on the provider (e.g. /no_think).`
+      : es;
     th.appendChild(err);
   }
 }

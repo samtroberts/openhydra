@@ -1473,13 +1473,23 @@ fn forget_swarm(swarm_public_key: String) -> Result<(), String> {
 }
 
 /// The gateway's `--min-authenticity` for the `min_authenticity` setting: `None` for off (or anything
-/// unrecognised, rather than passing the gateway a value it would refuse to start with).
+/// unrecognised, rather than passing the gateway a value it would refuse to start with). A2 needs
+/// log-prob checks, which the desktop's gateway doesn't run (it has no reference source), so no
+/// provider could reach it: a saved "A2" (an unreleased build offered it) is used as A1.
 fn gateway_floor(setting: &str) -> Option<&'static str> {
     match setting {
-        "A1" => Some("A1"),
-        "A2" => Some("A2"),
+        "A1" | "A2" => Some("A1"),
         _ => None,
     }
+}
+
+/// The chat view's error for a gateway reply with a non-success `status` and JSON `body`: the
+/// status, the error's type and its message, so the UI can say what to do (e.g. a floor refusal).
+fn gateway_error(status: u16, body: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let kind = v["error"]["type"].as_str().unwrap_or("");
+    let msg = v["error"]["message"].as_str().unwrap_or(body);
+    format!("gateway {status} {kind}: {msg}")
 }
 
 #[tauri::command]
@@ -1882,9 +1892,12 @@ async fn chat_completion(
     tauri::async_runtime::spawn_blocking(move || {
         use openhydra_agent::adapter::HttpClient;
         let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
-        let resp = client
-            .post_json(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
+        let (status, resp) = client
+            .post_json_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
             .map_err(|e| format!("gateway: {e}"))?;
+        if !(200..300).contains(&status) {
+            return Err(gateway_error(status, &resp));
+        }
         serde_json::from_str::<serde_json::Value>(&resp).map_err(|e| e.to_string())
     })
     .await
@@ -2567,7 +2580,10 @@ mod tests {
         assert_eq!(d.min_authenticity, "off");
         assert_eq!(gateway_floor("off"), None);
         assert_eq!(gateway_floor("A1"), Some("A1"));
-        assert_eq!(gateway_floor("A2"), Some("A2"));
+        assert_eq!(gateway_floor("A2"), Some("A1"), "A2 can't be reached by this gateway: used as A1");
+        let e = gateway_error(503, r#"{"error":{"message":"no provider of 'm' is verified at A1-reputation-redundant or above (1 found below it)","type":"no_provider","code":null}}"#);
+        assert!(e.starts_with("gateway 503 no_provider: no provider of 'm' is verified at A1"), "{e}");
+        assert_eq!(gateway_error(502, "not json"), "gateway 502 : not json");
         assert_eq!(gateway_floor("A9"), None, "an unknown value never reaches the gateway");
         let json = serde_json::to_string(&d).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();

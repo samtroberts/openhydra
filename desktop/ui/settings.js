@@ -32,7 +32,11 @@ import { state, engines, deviceName } from "./state";
     $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
     $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!p.settings.authenticity_checks);
     $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!p.settings.audit_replay);
-    $("#minauthsel") && ($("#minauthsel").value = p.settings.min_authenticity || "off");
+    // A saved "A2" (offered by an unreleased build) is used as A1: this app's gateway can't run the
+    // model checks A2 needs.
+    const floor = p.settings.min_authenticity || "off";
+    $("#minauthsel") && ($("#minauthsel").value = floor === "A2" ? "A1" : floor);
+    $("#minauthnote") && ($("#minauthnote").style.display = floor === "A2" ? "" : "none");
     $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);
     $("#advsw").classList.toggle("on", $("#app").hasAttribute("data-adv"));
     $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4

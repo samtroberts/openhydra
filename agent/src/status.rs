@@ -273,8 +273,8 @@ pub struct RepEntry {
     pub standing_score: Option<f64>,
     /// The achieved authenticity tier for this `(peer, model)` (`trust::AuthenticityTier` label,
     /// e.g. `"A1-reputation-redundant"`) — resolved from the redundant-exec audit history this
-    /// consumer has for the pair (UNIFIED_TRUST_STACK). A0/A1 today; a verified A2+ awaits a
-    /// possession/fingerprint anchor. `None` for a legacy snapshot that carried no such resolution.
+    /// consumer has for the pair (UNIFIED_TRUST_STACK), lifted to A2 by passing log-prob checks
+    /// against this gateway's references. `None` for a legacy snapshot that carried no such resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authenticity: Option<String>,
     /// Cumulative **gated voucher** net owed to this provider for this model — the off-chain

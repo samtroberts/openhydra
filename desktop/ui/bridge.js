@@ -258,7 +258,8 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
         },
         economy: {
           role: "consumer",
-          reputation: [{ openhydra_peer_id: "oh_asus", model_id: "tinyllama:latest", score: 72.5 }, { openhydra_peer_id: "oh_mac2", model_id: "tinyllama:latest", score: 64.0 }, { openhydra_peer_id: "oh_gpu3", model_id: "qwen2.5:7b", score: 58.0 }],
+          // Every trust state the UI shows: A2 with a passed model check, A1, A0 with a failed check.
+          reputation: [{ openhydra_peer_id: "oh_asus", model_id: "tinyllama:latest", score: 72.5, authenticity: "A2-logprob", logprob_check: "pass 0.97x" }, { openhydra_peer_id: "oh_mac2", model_id: "tinyllama:latest", score: 64.0, authenticity: "A1-reputation-redundant" }, { openhydra_peer_id: "oh_gpu3", model_id: "qwen2.5:7b", score: 58.0, authenticity: "A0-self-reported", logprob_check: "fail 1.62x" }],
           credit: [{ libp2p_peer_id: "12D3KooWM2qsVg5WbR6Asusn2XN7", balance: 5123.4, rate_cap: 1.0 }, { libp2p_peer_id: "12D3KooWEzegXr4qcjEW3WT", balance: 4880.1 }],
           avg_reputation: 65.3, total_credit: 10003.5,
         },
@@ -276,11 +277,14 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       // "think" → inline <think> + answer, "empty" → empty content (thinking-mode strip)
       const q = (args?.messages?.slice(-1)[0]?.content || "").toLowerCase();
       let content = "The herd answers: reciprocity beats rent-seeking.\n\n```rust\nfn hi(){ println!(\"herd\"); }\n```";
+      // "floor" / "busy" → the gateway's own error replies (as the Rust command passes them on).
+      if (/floor/.test(q)) return Promise.reject("gateway 503 no_provider: no provider of 'qwen2.5:7b' is verified at A1-reputation-redundant or above (2 found below it)");
+      if (/busy/.test(q)) return Promise.reject("gateway 503 upstream_overloaded: provider overloaded: stream shed at open");
       if (/empty/.test(q)) content = "";
       else if (/think/.test(q)) content = "<think>\nThe user greeted me. I should respond warmly and briefly.\n</think>\nHey! How can I help?";
       return new Promise((r) => setTimeout(() => r({
         choices: [{ message: { content, role: "assistant" } }],
-        usage: { completion_tokens: 42 }, openhydra: { engine: { native_tps: 61 }, hops_ms: { network_rtt: 12 } }, model: "qwen3.5-4b-mlx",
+        usage: { completion_tokens: 42 }, openhydra: { engine: { native_tps: 61 }, hops_ms: { network_rtt: 12 }, provider_authenticity: "A1-reputation-redundant" }, model: "qwen3.5-4b-mlx",
       }), 400));
     }
     if (cmd === "web_search") return [];
