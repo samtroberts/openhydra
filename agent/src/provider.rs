@@ -30,6 +30,7 @@ use crate::share_policy::{PolicyWatcher, SharePolicy};
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
 use openhydra_protocol::credit::{throttle_multiplier, CreditAccount};
+use openhydra_protocol::model_id::{is_valid_canonical_field, is_valid_model_id};
 use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
 
@@ -146,11 +147,32 @@ pub fn build_peer_record(
         model_id: model.engine_ref.clone(),
         host: host.to_string(),
         port,
-        canonical_model_id: model.canonical_id.clone(),
+        // The canonical id is optional; one the network would refuse (a GGUF family name with
+        // spaces or brackets) is left out rather than costing the model its announcement.
+        canonical_model_id: if is_valid_canonical_field(&model.canonical_id) {
+            model.canonical_id.clone()
+        } else {
+            String::new()
+        },
         libp2p_peer_id: libp2p_peer_id.to_string(),
         public_key: public_key_hex.to_string(),
         ..Default::default()
     }
+}
+
+/// Can `engine_ref` be announced? Other nodes refuse a record whose model name has characters
+/// outside `openhydra_protocol::model_id::is_valid_model_id` (quotes, a leading `/`, backslashes,
+/// brackets…), so such a model is not announced. Logged once per name, not on every pass.
+fn announceable(engine_ref: &str) -> bool {
+    if is_valid_model_id(engine_ref) {
+        return true;
+    }
+    static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let mut warned = WARNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if warned.len() < 1024 && warned.insert(engine_ref.to_string()) {
+        tracing::warn!(model = %engine_ref.escape_debug(), "not sharing this model on the network: its name has unsupported characters (use letters, digits, . _ : / @ + - and single spaces; serve it under a plain name, e.g. an engine alias)");
+    }
+    false
 }
 
 /// M6/F2: decide which models' `MODEL_WITHDRAWN` tombstones to (re)publish this announce pass, and
@@ -1251,7 +1273,7 @@ impl<A: EngineAdapter> Provider<A> {
         // published to global discovery, so it must not appear here or get an advert/tombstone.
         let desired: BTreeSet<String> = models
             .iter()
-            .filter(|m| policy.announce_globally(&m.engine_ref))
+            .filter(|m| policy.announce_globally(&m.engine_ref) && is_valid_model_id(&m.engine_ref))
             .map(|m| m.engine_ref.clone())
             .collect();
         let mut announced: Vec<String> = Vec::new();
@@ -1262,7 +1284,7 @@ impl<A: EngineAdapter> Provider<A> {
             // announcing only because `SharePolicy::load` materialises a consent record on migration.
             // `private`/`device` models are skipped here but still served if reached — the serve
             // path enforces `is_shared`, the security boundary; this is discovery hygiene.
-            if !policy.announce_globally(&model.engine_ref) {
+            if !policy.announce_globally(&model.engine_ref) || !announceable(&model.engine_ref) {
                 continue;
             }
             let record = build_peer_record(
@@ -1909,6 +1931,23 @@ mod tests {
         let r = build_peer_record(&detected(""), "oh", "lib", "pk", "", 0);
         assert_eq!(r.model_id, "qwen2.5:7b"); // always the engine handle
         assert_eq!(r.canonical_model_id, "");
+    }
+
+    #[test]
+    fn a_canonical_id_the_network_would_refuse_is_left_out_of_the_record() {
+        let r = build_peer_record(&detected("my model (v2)/7b/int4/abcd0123abcd0123"), "oh", "lib", "pk", "", 0);
+        assert_eq!(r.model_id, "qwen2.5:7b");
+        assert_eq!(r.canonical_model_id, "");
+    }
+
+    #[test]
+    fn only_names_the_network_accepts_are_announceable() {
+        for ok in ["qwen2.5:7b", "Qwen/Qwen2.5-7B-Instruct", "sd_xl_base_1.0.safetensors", "flux1-dev workflow"] {
+            assert!(announceable(ok), "{ok}");
+        }
+        for bad in ["/data/models/Qwen2.5-7B", "SDXL\\juggernaut.safetensors", "Flux (dev)", "x\" onclick=\"y"] {
+            assert!(!announceable(bad), "{bad}");
+        }
     }
 
     // ── per-model share policy ──

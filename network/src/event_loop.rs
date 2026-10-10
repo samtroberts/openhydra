@@ -253,6 +253,10 @@ pub enum SwarmCommand {
     KnownModels {
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// Every (model, provider) pair in `known_peers`, for the gateway's `openhydra/auto` choice.
+    KnownProviders {
+        reply: oneshot::Sender<Vec<KnownProvider>>,
+    },
     /// Resolve a reachable address for a peer (direct or via relay).
     ResolveAddress {
         peer_id: String,
@@ -1066,13 +1070,14 @@ pub async fn run_event_loop(
                             .known_peers
                             .values()
                             .map(|r| r.model_id.clone())
-                            .filter(|m| !m.is_empty())
+                            .filter(|m| openhydra_protocol::model_id::is_valid_model_id(m))
                             .collect();
                         known_models.sort();
                         known_models.dedup();
                         let known_providers = state
                             .known_peers
                             .values()
+                            .filter(|r| openhydra_protocol::model_id::is_valid_model_id(&r.model_id))
                             .map(|r| KnownProvider {
                                 model_id: r.model_id.clone(),
                                 openhydra_peer_id: r.peer_id.clone(),
@@ -1123,15 +1128,34 @@ pub async fn run_event_loop(
                         let _ = reply.send(snapshot);
                     }
                     Some(SwarmCommand::KnownModels { reply }) => {
+                        // Records are checked on the way in (verify_peer_record); filtering
+                        // again here keeps an odd name out of /v1/models if any path missed it.
                         let mut models: Vec<String> = state
                             .known_peers
                             .values()
                             .map(|r| r.model_id.clone())
-                            .filter(|m| !m.is_empty())
+                            .filter(|m| openhydra_protocol::model_id::is_valid_model_id(m))
                             .collect();
                         models.sort();
                         models.dedup();
                         let _ = reply.send(models);
+                    }
+                    Some(SwarmCommand::KnownProviders { reply }) => {
+                        let mut providers: Vec<KnownProvider> = state
+                            .known_peers
+                            .values()
+                            .filter(|r| openhydra_protocol::model_id::is_valid_model_id(&r.model_id))
+                            .map(|r| KnownProvider {
+                                model_id: r.model_id.clone(),
+                                // Reputation is keyed by this id; report it only when it belongs
+                                // to the record's key, so no peer can borrow another's standing.
+                                openhydra_peer_id: if dht::openhydra_id_is_bound(r) { r.peer_id.clone() } else { String::new() },
+                                libp2p_peer_id: r.libp2p_peer_id.clone(),
+                            })
+                            .collect();
+                        providers.sort_by(|a, b| (&a.model_id, &a.libp2p_peer_id).cmp(&(&b.model_id, &b.libp2p_peer_id)));
+                        providers.dedup_by(|a, b| a.model_id == b.model_id && a.libp2p_peer_id == b.libp2p_peer_id);
+                        let _ = reply.send(providers);
                     }
                     Some(SwarmCommand::ResolveAddress { peer_id, reply }) => {
                         handle_resolve(&state, &peer_id, reply);

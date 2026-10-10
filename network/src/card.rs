@@ -326,6 +326,14 @@ fn card_is_wellformed(card: &Card) -> Result<(), CardError> {
             return Err(CardError::Malformed(format!("addr_hint contains a delimiter: {h:?}")));
         }
     }
+    // The same name rules as a network record (dht::check_record_content): a card's model name ends
+    // up in the importer's UI and coding tools.
+    if !openhydra_protocol::model_id::is_valid_model_id(&card.model_id) {
+        return Err(CardError::Malformed("model name has unsupported characters".into()));
+    }
+    if !openhydra_protocol::model_id::is_valid_canonical_field(&card.canonical_id) {
+        return Err(CardError::Malformed("canonical id has unsupported characters".into()));
+    }
     Ok(())
 }
 
@@ -734,6 +742,19 @@ mod tests {
             assert!(!lower.contains(".gguf"), "leak in: {blob}");
             assert!(!lower.contains("\\users\\"), "leak in: {blob}");
         }
+    }
+
+    #[test]
+    fn a_card_with_a_hostile_model_name_is_never_signed_or_trusted() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let mut c = a_card();
+        c.model_id = "x\" onmouseover=\"alert(1)".into();
+        assert!(matches!(sign_card(c, &kp), Err(CardError::Malformed(_))));
+        // A card signed by a build without the check is refused on import before its signature is
+        // even looked at.
+        let mut signed = sign_card(a_card(), &kp).unwrap();
+        signed.model_id = "<b>x</b>".into();
+        assert!(matches!(verify_card(&signed, now_before_expiry()), Err(CardError::Malformed(_))));
     }
 
     #[test]

@@ -324,6 +324,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // "who serves model X?" authoritatively — instead of relying on the D-sized gossip mesh to
     // forward the advert to the right consumer, which it does not do reliably across NATs.
     let mut registry = openhydra_network::registry::ProviderRegistry::new(REGISTRY_TTL_MS);
+    // Peers whose adverts were refused for their content (an odd model name, an oversized record):
+    // warned about once each, so an attempt to push such names through the registry is visible
+    // without flooding the log. Bounded; past the cap only the running count is kept.
+    let mut content_rejected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut content_rejected_total: u64 = 0;
     let mut registry_reaper = tokio::time::interval(Duration::from_secs(REGISTRY_REAP_SECS));
     registry_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -501,6 +506,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let author_str = author.to_base58();
                                             match openhydra_network::dht::pex_record_is_authentic(&rec, &author_str) {
                                                 Ok(()) => registry.insert(rec, now_ms()),
+                                                Err(e) if openhydra_network::dht::check_record_content(&rec).is_err() => {
+                                                    content_rejected_total += 1;
+                                                    if content_rejected.len() < 4096 && content_rejected.insert(author_str.clone()) {
+                                                        warn!(%author_str, %e, total = content_rejected_total, "C7 registry: refused advert with invalid content");
+                                                    }
+                                                }
                                                 Err(e) => debug!(%author_str, %e, "C7 registry: rejected unauthentic advert"),
                                             }
                                         }
