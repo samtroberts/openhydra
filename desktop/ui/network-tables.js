@@ -35,7 +35,7 @@ import { menu, toast } from "./chrome";
     const peers = (n.peers || []).filter((p) => !infra.has(p.peer_id));   // hide bootstraps/relays
     const repL = repByLibp2p();
     const shown = peers.slice(0, peerLimit);
-    $("#peertable tbody").innerHTML = shown.length ? shown.map((p) => `<tr data-p="${p.path}"><td class="mono">${peerShort(p.peer_id)}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${p.path}</span></td><td class="num">${p.quic_direct_v6}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>`).join("") : `<tr><td colspan="5" class="mut">${n.peers.length ? "Only infrastructure connected — waiting for network peers." : "No peers connected yet — connecting."}</td></tr>`;
+    $("#peertable tbody").innerHTML = shown.length ? shown.map((p) => `<tr data-p="${esc(p.path)}"><td class="mono">${esc(peerShort(p.peer_id))}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${esc(p.path)}</span></td><td class="num">${esc(p.quic_direct_v6)}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut"><span class="icon" data-i="more"></span></td></tr>`).join("") : `<tr><td colspan="5" class="mut">${n.peers.length ? "Only infrastructure connected — waiting for network peers." : "No peers connected yet — connecting."}</td></tr>`;
     injectIcons($("#peertable"));
     // dynamic count + View more
     const pc = $("#peercount"); if (pc) pc.textContent = peers.length <= peerLimit ? `${peers.length} peer${peers.length === 1 ? "" : "s"}` : `${shown.length} of ${peers.length} peers`;

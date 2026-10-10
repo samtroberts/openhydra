@@ -1,0 +1,56 @@
+name: Source Hygiene
+
+# Fails on a raw NUL byte in a tracked source file: git (and GitHub's diff view) treats such a file
+# as binary and shows none of its changes, so a review would never see them (round 8 R8-5).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-nul-bytes:
+    name: No NUL bytes in source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check tracked source files
+        # Every tracked file but known binary formats (images, fonts, archives): text of any kind,
+        # extensionless pin files included (round 9 C9-7).
+        run: |
+          git ls-files -z | python3 -c '
+          import sys
+          BINARY = (".png", ".ico", ".icns", ".jpg", ".jpeg", ".gif", ".webp", ".svgz", ".woff", ".woff2", ".ttf", ".otf",
+                    ".pdf", ".zip", ".gz", ".tgz", ".xz", ".bz2", ".7z", ".so", ".dylib", ".dll", ".exe", ".wasm", ".bin",
+                    ".db", ".redb", ".mp3", ".mp4", ".wav", ".mov", ".gguf", ".safetensors", ".pyc", ".DS_Store")
+          bad = []
+          for p in sys.stdin.buffer.read().split(b"\0"):
+              if not p or p.decode(errors="replace").lower().endswith(BINARY):
+                  continue
+              try:
+                  data = open(p, "rb").read()
+              except (IsADirectoryError, FileNotFoundError):
+                  continue
+              if b"\0" in data:
+                  bad.append(p.decode(errors="replace"))
+          for p in bad:
+              print(f"::error file={p}::raw NUL byte (write it as an escape)")
+          sys.exit(1 if bad else 0)
+          '
+
+  desktop-ui-tests:
+    name: Desktop UI tests
+    # Plain `node --test` on the runner's preinstalled Node: no npm install. Checks that every UI call
+    # to the Tauri backend passes argument names the backend accepts, that no UI code relies on
+    # window.confirm/alert/prompt (inert in the Tauri webview), and the pure UI helpers.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: node --test
+        run: node --test desktop/ui-tests/*.test.mjs

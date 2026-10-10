@@ -2183,6 +2183,21 @@ fn kill_all(state: &AppState) {
     state.gateway.lock().expect("role lock").kill();
 }
 
+/// The pages the app window may show: its own bundled UI (`tauri://localhost` on macOS and Linux,
+/// `http(s)://tauri.localhost` on Windows) and, under `tauri dev`, the Vite dev server. A link or a
+/// script can't load any other page into the window.
+fn navigation_allowed(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => {
+            url.host_str() == Some("tauri.localhost")
+                || (cfg!(dev) && url.host_str() == Some("localhost") && url.port() == Some(1420))
+        }
+        "about" => url.as_str() == "about:blank",
+        _ => false,
+    }
+}
+
 fn main() {
     // Reap agents a crashed/killed previous instance left behind, then arm the signal
     // path so THIS instance can't leave any (see the pid-registry block above).
@@ -2268,6 +2283,23 @@ fn main() {
             uninstall_cli,
         ])
         .setup(|app| {
+            // The main window is created here rather than from the config so it can refuse to
+            // navigate away from the app's own pages and refuse to open new windows.
+            if let Some(cfg) = app.config().app.windows.first() {
+                tauri::WebviewWindowBuilder::from_config(app.handle(), cfg)?
+                    .on_navigation(|url| {
+                        let ok = navigation_allowed(url);
+                        if !ok {
+                            eprintln!("openhydra: blocked navigation to {}", url.scheme());
+                        }
+                        ok
+                    })
+                    .on_new_window(|url, _| {
+                        eprintln!("openhydra: blocked a new window ({})", url.scheme());
+                        tauri::webview::NewWindowResponse::Deny
+                    })
+                    .build()?;
+            }
             // M2.1: card deep links. A cold launch by an `openhydra:` link surfaces via
             // `get_current`; subsequent links (app already running) via `on_open_url`. A `.openhydra`
             // FILE open arrives as `RunEvent::Opened` (below), so the two channels don't overlap.
@@ -2418,6 +2450,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_only_navigates_to_the_apps_own_pages() {
+        let ok = |u: &str| navigation_allowed(&u.parse().unwrap());
+        assert!(ok("tauri://localhost/index.html"));
+        assert!(ok("http://tauri.localhost/"));
+        assert!(ok("https://tauri.localhost/"));
+        assert!(ok("about:blank"));
+        for bad in ["https://evil.example/", "http://localhost:16527/", "tauri://evil/", "file:///etc/passwd", "javascript:alert(1)", "data:text/html,<b>x</b>"] {
+            assert!(!ok(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn strips_ansi_sgr_sequences() {
