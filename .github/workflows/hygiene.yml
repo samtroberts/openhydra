@@ -41,3 +41,16 @@ jobs:
               print(f"::error file={p}::raw NUL byte (write it as an escape)")
           sys.exit(1 if bad else 0)
           '
+
+  desktop-ui-tests:
+    name: Desktop UI tests
+    # Plain `node --test` on the runner's preinstalled Node: no npm install. Checks that every UI call
+    # to the Tauri backend passes argument names the backend accepts, that no UI code relies on
+    # window.confirm/alert/prompt (inert in the Tauri webview), and the pure UI helpers.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: node --test
+        run: node --test desktop/ui-tests/*.test.mjs

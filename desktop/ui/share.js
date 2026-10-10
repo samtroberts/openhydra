@@ -4,7 +4,7 @@
 import { $, $$, esc, escapeHtml } from "./dom";
 import { state, snap, engines } from "./state";
 import { call } from "./bridge";
-import { toast } from "./chrome";
+import { toast, confirmModal } from "./chrome";
 import { emit, on } from "./bus";
 import { store } from "./storage";
 import { totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent, lifetimeServed, statModels } from "./stats";
@@ -19,6 +19,8 @@ import { exportCardModal, ensureImportSection } from "./cards";
     try {
       if (on) {
         if (!engines.some((e) => e.models.length)) { emit("nav", "engines"); toast("No local models found — start or install an engine to share"); return; }
+        // Nothing chosen yet (a fresh install shares nothing): ask what to share first.
+        if (!(await anythingShared())) { sharingBusy = false; await openShareDialog(); return; }
         await call("start_provider");
       } else {
         await call("stop_provider");
@@ -172,10 +174,21 @@ import { exportCardModal, ensureImportSection } from "./cards";
       policyLoading = true;
       call("read_share_policy")
         .then((r) => { policy = { mode: r.mode, models: new Set(r.models || []) }; loadScope(r); })
-        .catch(() => { policy = { mode: "all", models: new Set() }; })
+        .catch(() => { policy = { mode: "list", models: new Set() }; })
         .finally(() => { policyLoading = false; renderShare(); });
     }
-    if (!policy) policy = { mode: "all", models: new Set() }; // provisional until the load resolves
+    if (!policy) policy = { mode: "list", models: new Set() }; // provisional (shows nothing shared) until the load resolves
+  }
+  // The policy as it is on disk (or live, while sharing), awaited — for decisions, not just display.
+  async function policyNow() {
+    if (state?.provider?.status?.running) { ensurePolicy(); await ensureScope(); return policy; }
+    try { const r = await call("read_share_policy"); if (!savingPolicy) policy = { mode: r.mode, models: new Set(r.models || []) }; loadScope(r); }
+    catch { ensurePolicy(); }
+    return policy;
+  }
+  async function anythingShared() {
+    const pol = await policyNow();
+    return pol.mode === "all" || pol.models.size > 0;
   }
   function isModelShared(m) { ensurePolicy(); return policy.mode === "all" || policy.models.has(m); }
   async function savePolicy(mode, models) {
@@ -222,10 +235,70 @@ import { exportCardModal, ensureImportSection } from "./cards";
   // "Share everything" master switch: ON ⇒ mode "all" (new models auto-share); OFF ⇒ freeze to the
   // current active set as an explicit "list" (nothing stops, but future models won't auto-share).
   async function toggleShareAll() {
-    ensurePolicy();
+    ensurePolicy(); await ensureScope();
     const running = !!state?.provider?.status?.running;
-    if (policy.mode === "all") { await savePolicy("list", shareActiveModels()); }
-    else { await savePolicy("all", []); if (!running) await setSharing(true); }
+    if (policy.mode === "all") { await savePolicy("list", shareActiveModels()); return; }
+    const ok = await confirmModal(
+      "Share every model, including ones you add later?",
+      "Anyone on the OpenHydra network will be able to discover these models and send requests to them, and your machine serves the requests. Models you've set to Private stay private. You can turn this off at any time.",
+      "Share everything",
+    );
+    if (!ok) { renderShare(); return; }
+    scope.def = "global"; scope.defConsent = Date.now();
+    await savePolicy("all", []);
+    if (!running) await setSharing(true);
+  }
+
+  // Choose what to share and how far it reaches, in one step, with consent recorded only here.
+  // `only` limits the dialog to those models and ADDS them to what's already shared ("Add model");
+  // without it, the dialog sets the whole selection (first "Start sharing").
+  export async function openShareDialog(only) {
+    const all = shareActiveModels();
+    if (!all.length) { emit("nav", "engines"); toast("No local models found — start or install an engine to share"); return; }
+    await policyNow(); await ensureScope();
+    const list = only ? only.filter((m) => all.includes(m)) : all;
+    if (!list.length) { toast("That model isn't available from your engine right now"); return; }
+    const checked = new Set(only ? list : list.filter((m) => isModelShared(m)));
+    const one = list.length === 1;
+    const back = document.createElement("div");
+    back.className = "cmodal-back";
+    const rows = list.map((m) => `<label class="sdrow" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-m="${escapeHtml(m)}"${checked.has(m) ? " checked" : ""}/>${modelIcon(m)}<span>${esc(displayModelName(m))}</span></label>`).join("");
+    back.innerHTML =
+      `<div class="cmodal"><div class="cmodal-h"><b>${only ? `Share ${esc(displayModelName(list[0]))}${list.length > 1 ? ` and ${list.length - 1} more` : ""}` : "Choose what to share"}</b></div>` +
+      `<div class="cmodal-b">` +
+      (only && list.length === 1 ? `<input type="checkbox" data-m="${escapeHtml(list[0])}" checked hidden/>` : `<div style="max-height:220px;overflow:auto;margin-bottom:12px">${rows}</div>`) +
+      `<div style="font-weight:600;font-size:12.5px;margin-bottom:4px">Who can use ${one ? "it" : "them"}</div>` +
+      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="global" checked/><span><b>Everyone</b> — anyone on the OpenHydra network can discover ${one ? "this model and send requests to it" : "these models and send requests to them"}. Your machine serves the requests; your prompts, files and identity aren't shared.</span></label>` +
+      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="private"/><span><b>Only my swarms</b> — not announced publicly; only members of a swarm you own can use ${one ? "it" : "them"} (set up in Swarms).</span></label>` +
+      `</div>` +
+      `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Share</button></div></div>`;
+    document.body.appendChild(back);
+    const picked = await new Promise((resolve) => {
+      const done = (v) => { back.remove(); resolve(v); };
+      $(".cx", back).onclick = () => done(null);
+      back.onclick = (e) => { if (e.target === back) done(null); };
+      $(".cok", back).onclick = () => {
+        const ms = $$("input[type=checkbox]", back).filter((c) => c.checked).map((c) => c.dataset.m);
+        if (!ms.length) { toast("Pick at least one model"); return; }
+        done({ models: ms, reach: $("input[name=sdreach]:checked", back).value });
+      };
+    });
+    if (!picked) { renderShare(); return; }
+    const running = !!state?.provider?.status?.running;
+    let mode = policy.mode, models = new Set(policy.mode === "all" ? all : policy.models);
+    if (!only) {
+      // The dialog's selection replaces the old one.
+      mode = "list";
+      for (const m of all) if (!picked.models.includes(m)) { models.delete(m); scope.byModel.delete(m); scope.consent.delete(m); }
+    }
+    for (const m of picked.models) {
+      models.add(m);
+      scope.byModel.set(m, picked.reach);
+      if (picked.reach === "global") scope.consent.set(m, Date.now()); else scope.consent.delete(m);
+    }
+    await savePolicy(mode, mode === "all" ? [] : [...models]);
+    toast(`Sharing ${picked.models.length} model${picked.models.length === 1 ? "" : "s"} with ${picked.reach === "global" ? "everyone" : "your swarms"}`);
+    if (!running) await setSharing(true);
   }
   export function renderShare() {
     const p = state?.provider?.status, running = !!p?.running, t = snap?.transfers;

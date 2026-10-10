@@ -14,12 +14,12 @@ import { renderConnectors } from "./connectors";
 import { renderProviders } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
 import { renderEngines } from "./installer";
-import { renderShare, setSharing, toggleSharing, ensureGateway } from "./share";
+import { renderShare, setSharing, toggleSharing, ensureGateway, openShareDialog } from "./share";
 import { wireCardDeepLinks } from "./cards";
 import { renderSwarms } from "./swarms";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
-import { renderSettings, updateEngineEndpoint } from "./settings";
+import { renderSettings, updateEngineEndpoint, pendingSettings } from "./settings";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on, emit } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
@@ -363,23 +363,73 @@ $("#peerchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) 
 $("#logchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#logchips .chip").forEach((x) => x.classList.toggle("on", x === c)); setLogTab(c.dataset.log === "gateway" ? "gateway" : "provider"); renderLogs(); };
 $("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); } };
 $("#cmdk").onclick = (e) => { e.stopPropagation(); menu($("#cmdk"), Object.keys(titles).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); };
-$("#traymark").onclick = (e) => { e.stopPropagation(); menu($("#traymark"), [{ label: "Launch OpenHydra", fn: () => {} }, { sep: 1 }, { label: "Sharing", on: !!state?.provider?.status?.running, fn: toggleSharing }, { label: "Model · " + (netModels()[0] || "—"), fn: () => {} }, { sep: 1 }, { label: `▲ ${fmtNum(totalServed())} served`, fn: () => {} }, { label: `▼ ${fmtNum(totalUsed())} used`, fn: () => {} }, { sep: 1 }, { label: "Quit OpenHydra", fn: () => call("quit") }]); };
-$("#addmodel") && ($("#addmodel").onclick = (e) => { e.stopPropagation(); const opts = engines.flatMap((e) => e.models.map((m) => ({ label: `${m} · ${e.label}`, fn: () => toggleSharing() }))); menu($("#addmodel"), opts.length ? opts : [{ label: "No engine models — start an engine", fn: () => go("engines") }]); });
+// The logo goes Home. (It used to open a "tray menu preview" whose Quit called a command that
+// doesn't exist; the real system tray has Sharing and Quit.)
+$("#traymark").onclick = () => go("home");
+$("#addmodel") && ($("#addmodel").onclick = (e) => { e.stopPropagation(); const opts = engines.flatMap((e) => e.models.map((m) => ({ label: `${m} · ${e.label}`, fn: () => openShareDialog([m]) }))); menu($("#addmodel"), opts.length ? opts : [{ label: "No engine models — start an engine", fn: () => go("engines") }]); });
 
 // ── settings ──
 $("#setnav").onclick = (e) => { const s = e.target.closest(".s"); if (!s) return; $$("#setnav .s").forEach((x) => x.classList.toggle("on", x === s)); $$(".setpanel").forEach((pnl) => pnl.classList.toggle("on", pnl.dataset.p === s.dataset.p)); };
-$$("[data-sw]").forEach((sw) => { if (sw.closest("#servetable")) return; sw.onclick = () => sw.classList.toggle("on"); });
-$$(".save").forEach((b) => b.onclick = async () => {
-  setDeviceName(($('.setpanel[data-p="identity"] [contenteditable]').textContent || deviceName).trim()); store.set("oh_device", deviceName);
-  saveSessions();   // #9: persist the (edited) device name to the durable file too
-  const netp = $('.setpanel[data-p="network"]');
-  let gwPort = parseInt((netp.querySelector('#gwport')?.textContent || "").trim(), 10);
-  if (!Number.isInteger(gwPort) || gwPort < 1024 || gwPort > 65535) gwPort = state?.settings?.gateway_port || 16527;
-  const bootstraps = (netp.querySelector('#bootstraps')?.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean);
-  // `shared_models` is intentionally NOT sent: it's the policy mirror, owned by the Share view
-  // (save_share_policy / reset_share_policy). The backend preserves it (L4) regardless.
-  const settings = { bootstraps, gateway_port: gwPort, engine_autostart: $("#engineautostartsw").classList.contains("on"), authenticity_checks: $("#authchecksw")?.classList.contains("on") || false, audit_replay: $("#auditreplaysw")?.classList.contains("on") || false, min_authenticity: $("#minauthsel")?.value || "off", resume_on_launch: $("#resumelaunchsw") ? $("#resumelaunchsw").classList.contains("on") : true, search_url: state?.settings?.search_url || "", verbose_logs: $("#verboselogsw")?.classList.contains("on") || false, device_name: deviceName };
-  try { await call("save_settings", { settings }); toast("Settings saved"); await refresh(); } catch (e) { toast(`Save failed: ${e}`); }
+// Settings save as they change: switches and selects at once, text fields on Enter or when they
+// lose focus. `pendingSettings` keeps the new value on screen until the save lands, so the 2.5 s poll
+// can't flip it back. Each toast says when the change takes effect.
+const SETTING_SWITCHES = { engineautostartsw: "engine_autostart", authchecksw: "authenticity_checks", auditreplaysw: "audit_replay", resumelaunchsw: "resume_on_launch", verboselogsw: "verbose_logs", relaysw: "peer_relay" };
+const APPLIES = { gateway_port: "gateway", bootstraps: "both", audit_replay: "gateway", min_authenticity: "gateway", authenticity_checks: "sharing", verbose_logs: "both", peer_relay: "both", engine_kind: "sharing", engine_endpoint: "sharing", engine_autostart: "launch" };
+async function saveSetting(patch) {
+  Object.assign(pendingSettings, patch);
+  const settings = { ...(state?.settings || {}), ...pendingSettings, device_name: deviceName };
+  try {
+    await call("save_settings", { settings });
+    const when = new Set(Object.keys(patch).map((k) => APPLIES[k]).filter(Boolean));
+    const sharing = !!state?.provider?.status?.running;
+    const parts = [];
+    if (when.has("gateway") || when.has("both")) parts.push("restart the gateway");
+    if ((when.has("sharing") || when.has("both")) && sharing) parts.push("restart sharing");
+    toast(when.has("launch") ? "Saved · applies next launch" : parts.length ? `Saved · ${parts.join(" and ")} to apply` : "Saved");
+  } catch (e) { toast(`Save failed: ${e}`); }
+  await refresh().catch(() => {});
+  for (const k of Object.keys(patch)) if (pendingSettings[k] === patch[k]) delete pendingSettings[k];
+  renderSettings();
+}
+$$("[data-sw]").forEach((sw) => {
+  if (sw.closest("#servetable")) return;
+  const key = SETTING_SWITCHES[sw.id];
+  sw.onclick = () => { const on = !sw.classList.contains("on"); sw.classList.toggle("on", on); if (key) saveSetting({ [key]: on }); };
+});
+$("#minauthsel")?.addEventListener("change", (e) => saveSetting({ min_authenticity: e.target.value }));
+// Text fields: Enter commits single-line fields; blur saves when the value changed.
+function wireTextSetting(el, { multiline = false, read, key, valid }) {
+  if (!el) return;
+  let cancelled = false;
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !multiline) { e.preventDefault(); el.blur(); }
+    if (e.key === "Escape") { cancelled = true; el.blur(); }
+  });
+  el.addEventListener("blur", () => {
+    if (cancelled) { cancelled = false; renderSettings(); return; }   // Escape: drop the edit
+    const v = read(el);
+    if (valid && !valid(v)) { toast("Not saved: " + valid.msg); renderSettings(); return; }
+    const cur = key === "device_name" ? deviceName : state?.settings?.[key];
+    if (JSON.stringify(v) === JSON.stringify(cur)) return;
+    if (key === "device_name") { setDeviceName(v); store.set("oh_device", v); saveSessions(); }
+    saveSetting({ [key]: v });
+  });
+}
+const portOk = (v) => Number.isInteger(v) && v >= 1024 && v <= 65535; portOk.msg = "the port must be a number from 1024 to 65535";
+wireTextSetting($("#gwport"), { key: "gateway_port", read: (el) => parseInt((el.textContent || "").trim(), 10), valid: portOk });
+wireTextSetting($("#bootstraps"), { key: "bootstraps", multiline: true, read: (el) => (el.innerText || el.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean) });
+wireTextSetting($('.setpanel[data-p="identity"] [contenteditable]'), { key: "device_name", read: (el) => (el.textContent || "").trim() || deviceName });
+// Restart buttons: apply saved settings to the running roles.
+$("#restartgw")?.addEventListener("click", async (e) => {
+  const b = e.currentTarget; b.disabled = true; b.textContent = "Restarting…";
+  try { await call("stop_gateway"); await call("start_gateway"); toast("Gateway restarted"); } catch (err) { toast(`Restart failed: ${err}`); }
+  finally { b.disabled = false; b.textContent = "Restart"; await refresh().catch(() => {}); }
+});
+$("#restartshare")?.addEventListener("click", async (e) => {
+  if (!state?.provider?.status?.running) { toast("Not sharing — changes apply when you start sharing"); return; }
+  const b = e.currentTarget; b.disabled = true; b.textContent = "Restarting…";
+  try { await call("stop_provider"); await call("start_provider"); toast("Sharing restarted"); } catch (err) { toast(`Restart failed: ${err}`); }
+  finally { b.disabled = false; b.textContent = "Restart"; await refresh().catch(() => {}); }
 });
 $('.setpanel[data-p="identity"] .cp')?.addEventListener("click", () => { navigator.clipboard?.writeText($('.setpanel[data-p="identity"] .input.mono').textContent.replace("Copy", "").trim()); toast("Peer ID copied"); });
 // Reset sharing preferences → clean share-nothing default (hot-reloads; no restart). Non-destructive.
@@ -393,8 +443,7 @@ $("#resetsharebtn")?.addEventListener("click", async () => {
   } catch (e) { toast(`Reset failed: ${e}`); }
 });
 $("#advsw").onclick = () => { const on = !app.hasAttribute("data-adv"); app.toggleAttribute("data-adv", on); $("#advsw").classList.toggle("on", on); store.set("oh_adv", on); if (!on && activeView === "peers") go("providers"); };
-// #4: verbose-logs toggle (persist on Save) + Send-logs export
-$("#verboselogsw") && ($("#verboselogsw").onclick = () => $("#verboselogsw").classList.toggle("on"));
+// Send-logs export
 $("#sendlogsbtn") && ($("#sendlogsbtn").onclick = async () => { try { const path = await call("export_logs"); toast(path ? `Logs saved: ${path}` : "No logs yet"); } catch (e) { toast(`Export failed: ${e}`); } });
 // CLI-on-PATH (Layer 1): the Settings "Command-line tool" row. Status comes from the shared cliui
 // source, so an install here — or from the Connectors banner — keeps both in sync via "cli-status".

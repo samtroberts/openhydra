@@ -329,7 +329,9 @@ fn share_policy_path() -> PathBuf {
 /// list becomes an explicit `list`. Existing behavior is preserved across the upgrade. Best-effort —
 /// if the write fails, the agent falls back to share-all with a warning rather than sharing nothing.
 /// Ensure a **valid** share-policy file exists before the provider reads it:
-/// - absent → migrate from the legacy list (first run after upgrade);
+/// - absent on a **fresh install** (no `desktop.json` either) → share nothing: the user picks models
+///   and gives consent in the Share dialog, so no model is announced without being asked;
+/// - absent after an **upgrade** (`desktop.json` exists) → migrate from the legacy list;
 /// - present-but-**corrupt** → self-heal: back the bad file up to `.corrupt.bak`, regenerate a safe
 ///   default (share-nothing — fail-closed, never over-shares), and raise `reset_flag` so the UI can
 ///   tell the user their selection was reset;
@@ -341,7 +343,8 @@ fn ensure_valid_share_policy(
     reset_flag: &std::sync::atomic::AtomicBool,
 ) -> PathBuf {
     let path = share_policy_path();
-    ensure_valid_share_policy_at(&path, &settings.shared_models, reset_flag);
+    let fresh_install = !settings_path().exists();
+    ensure_valid_share_policy_at(&path, &settings.shared_models, fresh_install, reset_flag);
     path
 }
 
@@ -350,10 +353,17 @@ fn ensure_valid_share_policy(
 fn ensure_valid_share_policy_at(
     path: &std::path::Path,
     legacy: &[String],
+    fresh_install: bool,
     reset_flag: &std::sync::atomic::AtomicBool,
 ) {
     if !path.exists() {
-        migrate_share_policy_if_absent(path, legacy);
+        if fresh_install {
+            if let Err(e) = openhydra_agent::SharePolicy::share_nothing().write_atomic(path) {
+                eprintln!("openhydra: could not write initial share policy to {}: {e}", path.display());
+            }
+        } else {
+            migrate_share_policy_if_absent(path, legacy);
+        }
         return;
     }
     match openhydra_agent::SharePolicy::load(path) {
@@ -2253,6 +2263,12 @@ fn main() {
     // path so THIS instance can't leave any (see the pid-registry block above).
     sweep_stale_agents();
     install_signal_handlers();
+    // Settle the share policy before anything can write desktop.json: whether this is a fresh install
+    // (→ share nothing until the user chooses) is decided by desktop.json being absent, so it must be
+    // checked first thing, not when the Share view is first opened.
+    let initial_settings = load_settings();
+    let share_policy_reset = std::sync::atomic::AtomicBool::new(false);
+    ensure_valid_share_policy(&initial_settings, &share_policy_reset);
     tauri::Builder::default()
         // M2.1: single-instance MUST be first — it forwards a second launch's deep link / opened file
         // to the running instance (Win/Linux spawn a new process; the `deep-link` feature routes the
@@ -2272,9 +2288,9 @@ fn main() {
         .manage(AppState {
             provider: Arc::new(Mutex::new(Role::new(&PROVIDER_PID))),
             gateway: Arc::new(Mutex::new(Role::new(&GATEWAY_PID))),
-            settings: Mutex::new(load_settings()),
+            settings: Mutex::new(initial_settings),
             resumed_on_launch: std::sync::atomic::AtomicBool::new(false),
-            share_policy_reset: std::sync::atomic::AtomicBool::new(false),
+            share_policy_reset,
         })
         .manage(PendingCard(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
@@ -2695,7 +2711,7 @@ mod tests {
         let path = dir.path().join("share-policy.json");
         std::fs::write(&path, b"garbage").unwrap();
         let flag = AtomicBool::new(false);
-        ensure_valid_share_policy_at(&path, &[], &flag);
+        ensure_valid_share_policy_at(&path, &[], false, &flag);
         assert!(flag.load(Ordering::Relaxed), "reset flag raised on heal");
         assert!(!SharePolicy::load(&path).unwrap().is_shared("x")); // healed to share-nothing
     }
@@ -2706,7 +2722,7 @@ mod tests {
         let path = dir.path().join("share-policy.json");
         SharePolicy::share_list(["keep-me"]).write_atomic(&path).unwrap();
         let flag = AtomicBool::new(false);
-        ensure_valid_share_policy_at(&path, &["ignored".into()], &flag);
+        ensure_valid_share_policy_at(&path, &["ignored".into()], false, &flag);
         assert!(!flag.load(Ordering::Relaxed), "no reset on a valid file");
         assert!(SharePolicy::load(&path).unwrap().is_shared("keep-me")); // untouched
     }
@@ -2719,7 +2735,7 @@ mod tests {
         let path = dir.path().join("share-policy.json");
         std::fs::create_dir(&path).unwrap(); // exists() == true, but load() errors non-InvalidData
         let flag = AtomicBool::new(false);
-        ensure_valid_share_policy_at(&path, &[], &flag);
+        ensure_valid_share_policy_at(&path, &[], false, &flag);
         assert!(!flag.load(Ordering::Relaxed), "transient IO error must not raise the reset flag");
         assert!(path.is_dir(), "the path must be left untouched, not overwritten");
     }
@@ -2729,8 +2745,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("share-policy.json");
         let flag = AtomicBool::new(false);
-        ensure_valid_share_policy_at(&path, &["m1".into()], &flag);
+        ensure_valid_share_policy_at(&path, &["m1".into()], false, &flag);
         assert!(!flag.load(Ordering::Relaxed), "migration is not a reset");
         assert!(SharePolicy::load(&path).unwrap().is_shared("m1"));
+    }
+
+    #[test]
+    fn fresh_install_shares_nothing_until_the_user_chooses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &[], true, &flag);
+        let p = SharePolicy::load(&path).unwrap();
+        assert_eq!(p.mode, ShareMode::List);
+        assert!(!p.is_shared("tinyllama:latest"), "nothing shared on a fresh install");
+        assert!(p.default_global_consent.is_none(), "no consent recorded without asking");
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn upgrade_with_empty_legacy_list_still_shares_everything() {
+        // An existing user whose old settings meant "share everything" keeps sharing after the update.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        let flag = AtomicBool::new(false);
+        ensure_valid_share_policy_at(&path, &[], false, &flag);
+        assert_eq!(SharePolicy::load(&path).unwrap().mode, ShareMode::All);
     }
 }

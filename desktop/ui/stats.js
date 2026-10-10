@@ -4,8 +4,9 @@
 // statsDB (+ dirty/saveT) is module-local; readers import the aggregate getters.
 import { snap, usedTokens } from "./state";
 import { call } from "./bridge";
+import { HOUR_MS, hourKey, slotBuckets } from "./series";
 
-  const HOUR_MS = 3600000, STATS_KEEP_HOURS = 24 * 31;   // ~31 days of hourly buckets
+  const STATS_KEEP_HOURS = 24 * 31;   // ~31 days of hourly buckets
   let statsDB = { models: {} };                          // hydrated on boot from load_stats
   // Credit-tiering: durable lifetime **cost-weighted** credits (earned/spent), accumulated by
   // diffing the agent's since-boot `credits_earned`/`credits_spent` the same restart-aware way as
@@ -13,7 +14,6 @@ import { call } from "./bridge";
   // 30B serve earns far more credit than a 1B one for the same tokens.
   function creditsRec() { return (statsDB.credits ||= { earned: 0, spent: 0, lastEarned: 0, lastSpent: 0 }); }
   let statsDirty = false, statsSaveT = 0;
-  function hourKey(ms) { return Math.floor(ms / HOUR_MS); }
   function statModel(id) {
     return (statsDB.models[id] ||= { firstServed: null, firstUsed: null, servedTotal: 0, usedTotal: 0, lastServed: 0, lastUsed: 0, buckets: {} });
   }
@@ -81,7 +81,7 @@ import { call } from "./bridge";
     for (let i = sp.n - 1; i >= 0; i--) {
       const end = now - i * sp.ms, start = end - sp.ms;
       const slot = { end, models: {} };
-      const kLo = hourKey(start), kHi = hourKey(end);
+      const { lo: kLo, hi: kHi } = slotBuckets(start, end);
       for (const [id, m] of Object.entries(statsDB.models)) {
         let s = 0, u = 0;
         for (let k = kLo; k < kHi; k++) { const b = m.buckets[k]; if (b) { s += b.s; u += b.u; } }

@@ -1,6 +1,6 @@
-// Settings view + the Engine-endpoint helper (#3: the endpoint follows the selected engine). The
-// device-name / gateway-port / bootstraps fields are not clobbered while focused (the poll re-renders
-// Settings). updateEngineEndpoint is also called by the engine dropdown in the controller.
+// Settings view + the Engine-endpoint helper (#3: the endpoint follows the selected engine). Settings
+// save as they change (the controller's saveSetting); text fields are not clobbered while focused, and
+// unsaved values in `pendingSettings` win over the poll's re-render. updateEngineEndpoint is also called by the engine dropdown in the controller.
 import { $ } from "./dom";
 import { state, engines, deviceName } from "./state";
 
@@ -18,26 +18,31 @@ import { state, engines, deviceName } from "./state";
     field.textContent = url;
   }
 
+  // Settings changes waiting for save_settings to finish. renderSettings shows these over the saved
+  // values, so the 2.5 s poll can't flip a control back while its save is in flight.
+  export const pendingSettings = {};
+
   export function renderSettings() {
     const p = state; if (!p) return;
+    const s = { ...p.settings, ...pendingSettings };
     // #9: don't clobber the device-name field while the user is editing it (the 2.5s poll
     // re-renders Settings; overwriting a focused field was why it "couldn't be changed").
     const id = $('.setpanel[data-p="identity"]'); const dn = id.querySelector('[contenteditable]');
     if (document.activeElement !== dn) dn.textContent = deviceName;
     id.querySelectorAll(".input")[1].childNodes[0].textContent = (p.provider.status.peer_id || p.gateway.status.peer_id || "—");
     const netp = $('.setpanel[data-p="network"]');
-    const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = p.settings.gateway_port;
-    const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (p.settings.bootstraps || []).join("\n");
+    const gwp = netp.querySelector('#gwport'); if (gwp && document.activeElement !== gwp) gwp.textContent = s.gateway_port;
+    const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (s.bootstraps || []).join("\n");
     updateEngineEndpoint(); // #3: endpoint follows the selected engine (auto-detect ⇒ engines[0])
-    $("#engineautostartsw").classList.toggle("on", !!p.settings.engine_autostart);
-    $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!p.settings.authenticity_checks);
-    $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!p.settings.audit_replay);
+    $("#engineautostartsw").classList.toggle("on", !!s.engine_autostart);
+    $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!s.authenticity_checks);
+    $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!s.audit_replay);
     // A saved "A2" (offered by an unreleased build) is used as A1: this app's gateway can't run the
     // model checks A2 needs.
-    const floor = p.settings.min_authenticity || "off";
+    const floor = s.min_authenticity || "off";
     $("#minauthsel") && ($("#minauthsel").value = floor === "A2" ? "A1" : floor);
     $("#minauthnote") && ($("#minauthnote").style.display = floor === "A2" ? "" : "none");
-    $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", p.settings.resume_on_launch !== false);
+    $("#resumelaunchsw") && $("#resumelaunchsw").classList.toggle("on", s.resume_on_launch !== false);
     $("#advsw").classList.toggle("on", $("#app").hasAttribute("data-adv"));
-    $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!p.settings.verbose_logs);   // #4
+    $("#verboselogsw") && $("#verboselogsw").classList.toggle("on", !!s.verbose_logs);   // #4
   }

@@ -3,7 +3,7 @@
 // Connect / Connect&Run / Disconnect / Test. renderConnectors is the entry the view dispatcher calls.
 import { $, $$, esc, escapeHtml } from "./dom";
 import { call } from "./bridge";
-import { toast } from "./chrome";
+import { toast, confirmModal } from "./chrome";
 import { liveModels, displayModelName } from "./models";
 import { on } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
@@ -210,20 +210,3 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
   }
 
 
-  // Generic in-app confirm — window.confirm() is a no-op in the Tauri webview, so we can't gate on it.
-  // Resolves true/false.
-  function confirmModal(title, body, okLabel) {
-    return new Promise((resolve) => {
-      const back = document.createElement("div");
-      back.className = "cmodal-back";
-      back.innerHTML =
-        `<div class="cmodal"><div class="cmodal-h"><b>${escapeHtml(title)}</b></div>` +
-        `<div class="cmodal-b"><div class="cmodal-path">${escapeHtml(body)}</div></div>` +
-        `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm cok">${escapeHtml(okLabel || "OK")}</button></div></div>`;
-      document.body.appendChild(back);
-      const done = (v) => { back.remove(); resolve(v); };
-      $(".cx", back).onclick = () => done(false);
-      $(".cok", back).onclick = () => done(true);
-      back.onclick = (e) => { if (e.target === back) done(false); };
-    });
-  }

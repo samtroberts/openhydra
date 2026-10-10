@@ -9,7 +9,7 @@
 // a key out-of-band (voice/in-person) before approving — the anti-mis-enrollment control.
 import { $, $$, escapeHtml, peerShort } from "./dom";
 import { call } from "./bridge";
-import { toast } from "./chrome";
+import { toast, confirmModal } from "./chrome";
 
 // Default credential lifetime the owner grants (matches the agent default; surfaced so it's honest).
 const CRED_TTL_SECS = 90 * 24 * 3600; // 90 days
@@ -107,9 +107,9 @@ function wireSwarmCards(host, swarms) {
   });
   $$(".swrevoke", host).forEach((b) => {
     b.onclick = async () => {
-      if (!confirm(`Revoke "${b.dataset.label}"? They lose access immediately and can't be re-approved without un-revoking.`)) return;
+      if (!(await confirmModal(`Revoke "${b.dataset.label}"?`, "They lose access immediately and can't be re-approved without un-revoking.", "Revoke"))) return;
       try {
-        await call("swarm_revoke_member", { swarm_public_key: b.dataset.swarm, member_public_key: b.dataset.member });
+        await call("swarm_revoke_member", { swarmPublicKey: b.dataset.swarm, memberPublicKey: b.dataset.member });
         toast("Member revoked");
         renderSwarms();
       } catch (e) {
@@ -120,12 +120,12 @@ function wireSwarmCards(host, swarms) {
   $$(".swforget", host).forEach((b) => {
     b.onclick = async () => {
       const owner = b.dataset.owner === "1";
-      const msg = owner
-        ? `Delete "${b.dataset.label}"? This destroys the group key — you can't issue any more credentials for it (existing members keep their credential until it expires).`
-        : `Leave "${b.dataset.label}"? You'll drop your credential for it.`;
-      if (!confirm(msg)) return;
+      const ok = owner
+        ? await confirmModal(`Delete "${b.dataset.label}"?`, "This destroys the group key — you can't issue any more credentials for it (existing members keep their credential until it expires).", "Delete")
+        : await confirmModal(`Leave "${b.dataset.label}"?`, "You'll drop your credential for it.", "Leave");
+      if (!ok) return;
       try {
-        await call("forget_swarm", { swarm_public_key: b.dataset.swarm });
+        await call("forget_swarm", { swarmPublicKey: b.dataset.swarm });
         toast(owner ? "Swarm deleted" : "Left swarm");
         renderSwarms();
       } catch (e) {
@@ -326,11 +326,11 @@ async function doApprove(back, close, swarmPublicKey, grant, request, controlReq
   const memberLabel = ($(".swmlabel", back)?.value || "").trim();
   try {
     const approved = await call("swarm_approve_member", {
-      swarm_public_key: swarmPublicKey,
+      swarmPublicKey,
       request,
-      control_request: grant === "both" ? controlRequest : null,
-      member_label: memberLabel,
-      ttl_secs: CRED_TTL_SECS,
+      controlRequest: grant === "both" ? controlRequest : null,
+      memberLabel,
+      ttlSecs: CRED_TTL_SECS,
       grant,
     });
     const boxes = [];
@@ -401,12 +401,11 @@ function remoteScopeModal(swarmPublicKey, swarmLabel) {
     // M1 consent surface: making a model Global is public exposure — confirm before sending.
     if (
       scope === "global" &&
-      !confirm(
-        `Publish “${model}” GLOBALLY on the rig?\n\n` +
-          `The model becomes discoverable and routable on the public network / marketplace ` +
-          `(the rig serves and earns/spends against it). The rig will refuse if its owner has ` +
-          `disabled remote publishing.`,
-      )
+      !(await confirmModal(
+        `Publish “${model}” globally on the rig?`,
+        "The model becomes discoverable and routable on the public network (the rig serves and earns or spends credits against it). The rig refuses if its owner has turned off remote publishing.",
+        "Publish",
+      ))
     ) {
       return;
     }
@@ -414,7 +413,7 @@ function remoteScopeModal(swarmPublicKey, swarmLabel) {
     out.innerHTML = `<span class="mut" style="font-size:11.5px">Dialing the rig and sending…</span>`;
     try {
       const ack = await call("swarm_remote_scope", {
-        swarm_public_key: swarmPublicKey,
+        swarmPublicKey,
         provider,
         model,
         scope,
@@ -541,7 +540,7 @@ function joinSwarmModal() {
     try {
       const v = await call("swarm_accept_credential", {
         credential: previewed.credential,
-        control_credential: previewed.control_credential,
+        controlCredential: previewed.control_credential,
         label: null,
       });
       toast(`Joined “${v.label || "swarm"}”`);

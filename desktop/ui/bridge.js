@@ -78,7 +78,7 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     if (cmd === "list_cards") return mk.importedCards || [];
     if (cmd === "remove_imported_card") {
       const before = (mk.importedCards || []).length;
-      mk.importedCards = (mk.importedCards || []).filter((x) => !(x.libp2p_peer_id === args?.libp2p_peer_id && x.model_id === args?.model_id));
+      mk.importedCards = (mk.importedCards || []).filter((x) => !(x.libp2p_peer_id === args?.libp2pPeerId && x.model_id === args?.modelId));
       return before - (mk.importedCards || []).length;
     }
     // ── M3 swarms (mock) — enough state to exercise the full create/enroll/approve/accept flow in a
@@ -108,23 +108,23 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
     }
     if (cmd === "swarm_approve_member") {
       // M5: grant-aware — returns { consume, control }, each an ApprovedCredential or null.
-      const s = (mk.swarms || []).find((x) => x.swarm_public_key === args?.swarm_public_key);
-      const exp = Date.now() + (args?.ttl_secs || 90 * 24 * 3600) * 1000;
+      const s = (mk.swarms || []).find((x) => x.swarm_public_key === args?.swarmPublicKey);
+      const exp = Date.now() + (args?.ttlSecs || 90 * 24 * 3600) * 1000;
       const grant = args?.grant || "consume";
       const mkCred = (caps) => {
         const memberKey = mockHex(64);
         if (s) {
-          s.members.push({ member_public_key: memberKey, fingerprint: mockFp(memberKey), member_openhydra_peer_id: "oh_mockmember", label: (args?.member_label || "member") + (caps === 2 ? " (control)" : ""), issued_at: Date.now(), expires_at: exp });
+          s.members.push({ member_public_key: memberKey, fingerprint: mockFp(memberKey), member_openhydra_peer_id: "oh_mockmember", label: (args?.memberLabel || "member") + (caps === 2 ? " (control)" : ""), issued_at: Date.now(), expires_at: exp });
           s.member_count = s.members.length;
         }
-        return { credential: { schema_version: caps > 1 ? 2 : 1, swarm_public_key: args?.swarm_public_key, member_public_key: memberKey, member_openhydra_peer_id: "oh_mockmember", swarm_label: s?.label || "swarm", capabilities: caps, issued_at: Date.now(), expires_at: exp, sig_alg: 1, signature: "mock" }, magnet: "openhydra:cred:" + btoa("mock-cred") + (caps === 2 ? ".control" : ".serve") };
+        return { credential: { schema_version: caps > 1 ? 2 : 1, swarm_public_key: args?.swarmPublicKey, member_public_key: memberKey, member_openhydra_peer_id: "oh_mockmember", swarm_label: s?.label || "swarm", capabilities: caps, issued_at: Date.now(), expires_at: exp, sig_alg: 1, signature: "mock" }, magnet: "openhydra:cred:" + btoa("mock-cred") + (caps === 2 ? ".control" : ".serve") };
       };
       mk._lastReqKey = null;
       return { consume: grant === "control" ? null : mkCred(1), control: grant === "consume" ? null : mkCred(2) };
     }
     if (cmd === "swarm_revoke_member") {
-      const s = (mk.swarms || []).find((x) => x.swarm_public_key === args?.swarm_public_key);
-      if (s) { s.members = s.members.filter((m) => m.member_public_key !== args?.member_public_key); s.member_count = s.members.length; s.revoked_count = (s.revoked_count || 0) + 1; }
+      const s = (mk.swarms || []).find((x) => x.swarm_public_key === args?.swarmPublicKey);
+      if (s) { s.members = s.members.filter((m) => m.member_public_key !== args?.memberPublicKey); s.member_count = s.members.length; s.revoked_count = (s.revoked_count || 0) + 1; }
       return null;
     }
     if (cmd === "preview_swarm_credential") {
@@ -135,13 +135,13 @@ export function mockEmitInstall(ev) { mockInstallCbs.slice().forEach((cb) => cb(
       return { schema_version: isControl ? 2 : 1, swarm_public_key: pk, member_public_key: mockHex(64), member_openhydra_peer_id: "oh_me", swarm_label: "Home rig", capabilities: isControl ? 2 : 1, issued_at: Date.now(), expires_at: Date.now() + 90 * 24 * 3600 * 1000, sig_alg: 1, signature: "mock" };
     }
     if (cmd === "swarm_accept_credential") {
-      const canControl = !!(args?.control_credential && String(args.control_credential).trim()) || /\.control$/.test((args?.credential || "").trim());
+      const canControl = !!(args?.controlCredential && String(args.controlCredential).trim()) || /\.control$/.test((args?.credential || "").trim());
       const pk = mockHex(64);
       const v = { swarm_public_key: pk, fingerprint: mockFp(pk), label: args?.label || "Home rig", role: "member", members: [], member_count: 0, revoked_count: 0, credential_expires_at: Date.now() + 90 * 24 * 3600 * 1000, member_can_control: canControl, control_credential_expires_at: canControl ? Date.now() + 90 * 24 * 3600 * 1000 : null, created_at: Date.now() };
       (mk.swarms || (mk.swarms = [])).push(v);
       return v;
     }
-    if (cmd === "forget_swarm") { mk.swarms = (mk.swarms || []).filter((x) => x.swarm_public_key !== args?.swarm_public_key); return null; }
+    if (cmd === "forget_swarm") { mk.swarms = (mk.swarms || []).filter((x) => x.swarm_public_key !== args?.swarmPublicKey); return null; }
     if (cmd === "gateway_health") return mk.gateway;
     if (cmd === "connector_status") {
       const c = (o) => ({ declared_models: [], ...o, connected: !!(mk.connected && mk.connected[o.key]) });

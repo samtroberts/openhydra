@@ -29,7 +29,7 @@ export async function exportCardModal(model, isPrivate = false) {
   }
   let out;
   try {
-    out = await call("export_card", { model, ttl_secs: CARD_TTL_SECS, region: null, swarm });
+    out = await call("export_card", { model, ttlSecs: CARD_TTL_SECS, region: null, swarm });
   } catch (e) {
     toast(`Export failed: ${e}`);
     return;
@@ -241,7 +241,7 @@ async function renderImportedList() {
   $$(".cardrm", host).forEach((b) => {
     b.onclick = async () => {
       try {
-        await call("remove_imported_card", { libp2p_peer_id: b.dataset.lib, model_id: b.dataset.model });
+        await call("remove_imported_card", { libp2pPeerId: b.dataset.lib, modelId: b.dataset.model });
         toast("Removed");
         await renderImportedList();
         emit("refresh");
