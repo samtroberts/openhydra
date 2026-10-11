@@ -10,7 +10,7 @@
 import { $, $$, peerShort } from "./dom";
 import { html, setHTML } from "./html";
 import { call } from "./bridge";
-import { toast, confirmModal } from "./chrome";
+import { toast, confirmModal, failToast, isCancelled } from "./chrome";
 
 // Default credential lifetime the owner grants (matches the agent default; surfaced so it's honest).
 const CRED_TTL_SECS = 90 * 24 * 3600; // 90 days
@@ -110,17 +110,14 @@ function wireSwarmCards(host, swarms) {
   });
   $$(".swforget", host).forEach((b) => {
     b.onclick = async () => {
+      // The app confirms this in a native dialog (it destroys a key or drops a credential).
       const owner = b.dataset.owner === "1";
-      const ok = owner
-        ? await confirmModal(`Delete "${b.dataset.label}"?`, "This destroys the group key — you can't issue any more credentials for it (existing members keep their credential until it expires).", "Delete")
-        : await confirmModal(`Leave "${b.dataset.label}"?`, "You'll drop your credential for it.", "Leave");
-      if (!ok) return;
       try {
         await call("forget_swarm", { swarmPublicKey: b.dataset.swarm });
         toast(owner ? "Swarm deleted" : "Left swarm");
         renderSwarms();
       } catch (e) {
-        toast(`Failed: ${e}`);
+        failToast("Failed", e);
       }
     };
   });
@@ -334,7 +331,7 @@ async function doApprove(back, close, swarmPublicKey, grant, request, controlReq
       renderSwarms();
     };
   } catch (e) {
-    toast(`Approve failed: ${e}`);
+    failToast("Approve failed", e);
   }
 }
 
@@ -367,17 +364,8 @@ function remoteScopeModal(swarmPublicKey, swarmLabel) {
       toast("Enter the rig peer id and the model");
       return;
     }
-    // M1 consent surface: making a model Global is public exposure — confirm before sending.
-    if (
-      scope === "global" &&
-      !(await confirmModal(
-        `Publish “${model}” globally on the rig?`,
-        "The model becomes discoverable and routable on the public network (the rig serves and earns or spends credits against it). The rig refuses if its owner has turned off remote publishing.",
-        "Publish",
-      ))
-    ) {
-      return;
-    }
+    // M1 consent surface: making a model Global is public exposure — the app confirms it in a native
+    // dialog before sending.
     const out = $(".swrout", back);
     setHTML(out, html`<span class="mut" style="font-size:11.5px">Dialing the rig and sending…</span>`);
     try {
@@ -390,7 +378,7 @@ function remoteScopeModal(swarmPublicKey, swarmLabel) {
       setHTML(out, html`<div class="card pad" style="font-size:11.5px"><span class="badge ok">✔ applied</span> ${ack}</div>`);
       toast("Rig updated");
     } catch (e) {
-      setHTML(out, html`<div class="cardfail">✕ ${String(e)}</div>`);
+      setHTML(out, isCancelled(e) ? html`` : html`<div class="cardfail">✕ ${String(e)}</div>`);
     }
   };
 }

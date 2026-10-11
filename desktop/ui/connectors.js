@@ -4,7 +4,7 @@
 import { $, $$ } from "./dom";
 import { html, setHTML } from "./html";
 import { call } from "./bridge";
-import { toast, confirmModal } from "./chrome";
+import { toast, confirmModal, failToast } from "./chrome";
 import { liveModels, displayModelName } from "./models";
 import { on } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
@@ -175,7 +175,7 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     const models = selectedModels(card), surf = card.dataset.surface;
     let rep;
     try { rep = await call("connector_apply", { key: st.key, models }); }
-    catch (e) { toast("Connect failed: " + e); return; }
+    catch (e) { failToast("Connect failed", e); return; }
     if (!run) {
       toast(`Connected — ${rep.action} config` + (rep.backup ? " (original backed up)" : ""));
       wireConnectors(); return;

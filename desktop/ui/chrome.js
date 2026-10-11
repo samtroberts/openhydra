@@ -23,6 +23,10 @@ document.addEventListener("keydown", (e) => {
     items[i].scrollIntoView({ block: "nearest" });
   } else if (e.key === "Enter" && i >= 0) { e.preventDefault(); items[i].click(); }
 });
+// A command the user declined in its native confirmation dialog rejects with "Cancelled": not an
+// error to report. failToast reports anything else as "<what>: <error>".
+export const isCancelled = (e) => String(e) === "Cancelled";
+export function failToast(what, e) { if (!isCancelled(e)) toast(`${what}: ${e}`); }
 export function closeMenus() { $$(".menu").forEach((m) => m.remove()); menuFor = null; }
 export function menu(anchor, items) {
   if (menuFor === anchor) { closeMenus(); return; }

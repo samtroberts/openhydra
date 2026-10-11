@@ -23,12 +23,18 @@ libp2p-quic = { path = "../../network/patched-deps/libp2p-quic" }
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# ~2.11.6: 2.11.6 fixes GHSA-w28w-mhc8-qvjv (Channel fetch queue readable across webviews); stays on
+# the 2.11 line (2.12 is a larger upgrade, planned separately).
+tauri = { version = "~2.11.6", features = ["tray-icon", "image-png"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 # M2.1: launch OpenHydra when a `.openhydra` file (fileAssociations) or an `openhydra:` magnet link
 # (deep-link scheme) is opened, and route it into the card import flow.
 tauri-plugin-deep-link = "2"
+# Native confirmation dialogs for actions that widen exposure (sharing globally, approving swarm
+# members, …): drawn by the OS, outside the webview, so page script can't click through them.
+# ~2.7.3: the newest line compatible with tauri 2.11 (2.8 needs tauri 2.12).
+tauri-plugin-dialog = "~2.7.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # M2.1: parse opened file:/openhydra: URLs (same version Tauri surfaces in RunEvent::Opened).

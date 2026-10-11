@@ -5,7 +5,7 @@ import { $, $$ } from "./dom";
 import { html, setHTML } from "./html";
 import { state, snap, engines } from "./state";
 import { call } from "./bridge";
-import { toast, confirmModal } from "./chrome";
+import { toast, failToast } from "./chrome";
 import { emit, on } from "./bus";
 import { store } from "./storage";
 import { totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent, lifetimeServed, statModels } from "./stats";
@@ -29,7 +29,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
         await call("stop_provider");
       }
       emit("refresh");
-    } catch (e) { toast(`${on ? "start" : "stop"} sharing failed: ${e}`); }
+    } catch (e) { failToast(`${on ? "Start" : "Stop"} sharing failed`, e); }
     finally { sharingBusy = false; }
   }
   export async function toggleSharing() { await setSharing(!state?.provider?.status?.running); }
@@ -82,6 +82,9 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // a save never clears the migration-materialised record (which would un-announce default-Global
       // models). Phase 3 sets it on a real "Share everything globally" choice; here we only carry it.
       defConsent: r?.default_global_consent ?? null,
+      // Carried verbatim too: a payload without it would read back as `true` (serde's default) and
+      // silently re-allow remote publishing an owner had turned off.
+      allowRemote: r?.allow_remote_publish ?? true,
     };
     scopeLoaded = true;
   }
@@ -123,39 +126,20 @@ import { exportCardModal, ensureImportSection } from "./cards";
   };
   // Consent gate for Global publish. Returns true only if the operator confirms. Reuses the shared
   // `.cmodal` chrome (window.confirm is inert in the Tauri webview).
-  function globalConsentModal(m) {
-    return new Promise((resolve) => {
-      const back = document.createElement("div");
-      back.className = "cmodal-back";
-      setHTML(back, html`<div class="cmodal"><div class="cmodal-h"><b>Publish “${displayModelName(m)}” to the global network?</b></div>
-        <div class="cmodal-b">
-        <div class="cmodal-path">Anyone on the OpenHydra network will be able to <b>discover</b> this model, <b>route inference</b> to it, and <b>earn or spend credits</b> against it. Your machine serves the requests.</div>
-        <div class="cmodal-warn">This exposes an <b>offer</b> for this model (its clean handle + capability) to the public network — not your prompts, files, or identity. You can switch it back to Private at any time.</div>
-        </div>
-        <div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Publish globally</button></div></div>`);
-      document.body.appendChild(back);
-      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(false); } };
-      const done = (v) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(v); };
-      document.addEventListener("keydown", onKey, true);
-      $(".cx", back).onclick = () => done(false);
-      $(".cok", back).onclick = () => done(true);
-      back.onclick = (e) => { if (e.target === back) done(false); };
-      $(".cx", back).focus();
-    });
-  }
   // Flip a shared model's reach (binary: `private` or `global`). Global opens the consent gate;
   // declining reverts (a re-render resets the switch). Private clears any recorded consent.
   async function setModelScope(m, next) {
     ensurePolicy(); await reloadScope();   // never mutate scope on a half-loaded or stale state
     if (next === effectiveScope(m)) return;
+    const before = snapScope();
     if (next === "global") {
-      const ok = await globalConsentModal(m);
-      if (!ok) { renderShare(); return; }                 // declined → revert the switch
+      // Consent is asked in a native dialog when this takes effect: on save while sharing runs, else
+      // when sharing starts. A declined dialog rolls the save back.
       scope.byModel.set(m, "global"); scope.consent.set(m, Date.now());
     } else {
       scope.byModel.set(m, next); scope.consent.delete(m); // Private never carries consent
     }
-    await savePolicy(policy.mode, [...policy.models]);      // scope fields ride along (see savePolicy)
+    await savePolicy(policy.mode, [...policy.models], before);   // scope fields ride along (see savePolicy)
   }
   function policyFromSnap() {
     const s = snap?.share;
@@ -203,10 +187,13 @@ import { exportCardModal, ensureImportSection } from "./cards";
     return pol.mode === "all" || pol.models.size > 0;
   }
   function isModelShared(m) { ensurePolicy(); return policy.mode === "all" || policy.models.has(m); }
-  async function savePolicy(mode, models) {
+  // A copy of the reach/consent state, taken BEFORE a caller changes it, so a declined or failed save
+  // (e.g. the user cancels the native "Share with everyone?" dialog) puts it back exactly.
+  function snapScope() { return { def: scope.def, byModel: new Map(scope.byModel), consent: new Map(scope.consent), defConsent: scope.defConsent, allowRemote: scope.allowRemote }; }
+  async function savePolicy(mode, models, scopeBefore = null) {
     const prev = policy;                                    // L2: rollback target on failure
     // Snapshot scope too so a failed save reverts reach/consent, not just mode/models (M1).
-    const prevScope = { def: scope.def, byModel: new Map(scope.byModel), consent: new Map(scope.consent), defConsent: scope.defConsent };
+    const prevScope = scopeBefore || snapScope();
     policy = { mode, models: new Set(models) };             // optimistic — the row reflects intent at once
     pendingSig = policySig(policy); pendingSince = Date.now();
     savingPolicy = true; renderShare();
@@ -217,10 +204,11 @@ import { exportCardModal, ensureImportSection } from "./cards";
       scopes: Object.fromEntries(scope.byModel),
       global_consent: Object.fromEntries(scope.consent),
       default_global_consent: scope.defConsent,   // preserve the policy-level consent verbatim
+      allow_remote_publish: scope.allowRemote ?? true,
     };
     let ok = true;
     try { await call("save_share_policy", { policy: payload }); }
-    catch (e) { ok = false; policy = prev; scope = prevScope; pendingSig = null; toast(`Save failed: ${e}`); }   // L2: roll back
+    catch (e) { ok = false; policy = prev; scope = prevScope; pendingSig = null; failToast("Save failed", e); }   // L2: roll back
     finally { savingPolicy = false; }
     emit("refresh-status");   // pull the fresh /status/share; the sticky hold clears once it matches
     renderShare();
@@ -231,6 +219,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const wasShared = policy.mode === "all" || policy.models.has(m);
     const running = !!state?.provider?.status?.running;
     let mode = policy.mode, models = new Set(policy.models);
+    const before = snapScope();
     if (wasShared) {
       // Turning OFF. From "all", materialize the current active set first, then drop this one — so
       // the others stay shared. "Share nothing" is now a valid state (list + empty), so we never
@@ -243,7 +232,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // Privacy-first: a newly-shared model reaches only your trust domain until you opt it Global.
       if (!scope.byModel.has(m)) scope.byModel.set(m, "private");
     }
-    if (!(await savePolicy(mode, [...models]))) return;
+    if (!(await savePolicy(mode, [...models], before))) return;
     if (!running && !wasShared) await setSharing(true); // toggled a model on from a stopped node → begin serving
   }
   // "Share everything" master switch: ON ⇒ mode "all" (new models auto-share); OFF ⇒ freeze to the
@@ -253,14 +242,10 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const running = !!state?.provider?.status?.running;
     if (policy.mode === "all") { await savePolicy("list", shareActiveModels()); return; }
     if (!state?.settings?.sharing_confirmed) { await openShareDialog(); return; }   // first time: choose explicitly
-    const ok = await confirmModal(
-      "Share every model, including ones you add later?",
-      "Anyone on the OpenHydra network will be able to discover these models and send requests to them, and your machine serves the requests. Models you've set to Private stay private. You can turn this off at any time.",
-      "Share everything",
-    );
-    if (!ok) { renderShare(); return; }
+    // Consent is asked in a native dialog when this takes effect (see setModelScope).
+    const before = snapScope();
     scope.def = "global"; scope.defConsent = Date.now();
-    if (!(await savePolicy("all", []))) return;
+    if (!(await savePolicy("all", [], before))) return;
     if (!running) await setSharing(true);
   }
 
@@ -317,6 +302,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     if (!picked) { renderShare(); return; }
     const running = !!state?.provider?.status?.running;
     let mode = policy.mode, models = new Set(policy.mode === "all" ? all : policy.models);
+    const before = snapScope();
     if (!only) {
       // The dialog's selection replaces the old one.
       mode = "list";
@@ -327,7 +313,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
       scope.byModel.set(m, picked.reach);
       if (picked.reach === "global") scope.consent.set(m, Date.now()); else scope.consent.delete(m);
     }
-    if (!(await savePolicy(mode, mode === "all" ? [] : [...models]))) return;
+    if (!(await savePolicy(mode, mode === "all" ? [] : [...models], before))) return;
     await call("confirm_sharing").catch(() => {});
     if (state?.settings) state.settings.sharing_confirmed = true;   // until the next poll brings it
     toast(`Sharing ${picked.models.length} model${picked.models.length === 1 ? "" : "s"} with ${picked.reach === "global" ? "everyone" : "your swarms"}`);

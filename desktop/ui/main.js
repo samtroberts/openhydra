@@ -9,7 +9,7 @@ import { fmtNum, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
 import { renderMarkdownMarkup } from "./markdown";
-import { toast, menu, closeMenus, confirmModal } from "./chrome";
+import { toast, menu, closeMenus, confirmModal, failToast } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName, modelIdle, AUTO_MODEL } from "./models";
 import { renderConnectors } from "./connectors";
@@ -599,7 +599,7 @@ async function saveSetting(patch) {
     if (when.has("gateway") || when.has("both")) parts.push("restart the gateway");
     if ((when.has("sharing") || when.has("both")) && sharing) parts.push("restart sharing");
     toast(when.has("launch") ? "Saved · applies next launch" : parts.length ? `Saved · ${parts.join(" and ")} to apply` : "Saved");
-  } catch (e) { toast(`Save failed: ${e}`); }
+  } catch (e) { failToast("Save failed", e); }
   await refresh().catch(() => {});
   for (const k of Object.keys(patch)) if (pendingSettings[k] === patch[k]) delete pendingSettings[k];
   renderSettings();
@@ -643,7 +643,7 @@ $("#restartgw")?.addEventListener("click", async (e) => {
 $("#restartshare")?.addEventListener("click", async (e) => {
   if (!state?.provider?.status?.running) { toast("Not sharing — changes apply when you start sharing"); return; }
   const b = e.currentTarget; b.disabled = true; b.textContent = "Restarting…";
-  try { await call("stop_provider"); await call("start_provider"); toast("Sharing restarted"); } catch (err) { toast(`Restart failed: ${err}`); }
+  try { await call("stop_provider"); await call("start_provider"); toast("Sharing restarted"); } catch (err) { failToast("Restart failed", err); }
   finally { b.disabled = false; b.textContent = "Restart"; await refresh().catch(() => {}); }
 });
 // Reset sharing preferences → clean share-nothing default (hot-reloads; no restart). Non-destructive.

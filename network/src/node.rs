@@ -186,6 +186,12 @@ pub fn start_node(
     Ok((cmd_tx, proxy_queue, thread, net_generation))
 }
 
+/// Check one bootstrap multiaddr the way the node will parse it at startup (a valid multiaddr with a
+/// `/p2p/<peer id>` component), so a settings form can refuse one the node would fail on.
+pub fn check_bootstrap_addr(addr: &str) -> Result<(), String> {
+    parse_bootstrap_peers(&[addr.to_string()]).map(|_| ())
+}
+
 /// Parse bootstrap peer multiaddrs, extracting PeerId from the /p2p/ component.
 fn parse_bootstrap_peers(addrs: &[String]) -> Result<Vec<(PeerId, Multiaddr)>, String> {
     let mut result = Vec::new();

@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 mod cli;
 mod hostinfo;
@@ -703,6 +704,10 @@ struct AppState {
     /// default). Surfaced once via `get_state` (read-and-clear) so the UI can toast the user that
     /// their sharing selection was reset. Transient, not persisted.
     share_policy_reset: std::sync::atomic::AtomicBool,
+    /// What the user approved in a native dialog this session for global announcement (see
+    /// `global_exposure`), so one action asks once: a policy save and the start that follows it
+    /// don't both ask. In memory only: a new session asks again before page-started sharing.
+    global_approval: Mutex<GlobalExposure>,
 }
 
 // ── Log ingestion: strip ANSI, ring-buffer, parse status out of known lines ──
@@ -831,6 +836,108 @@ fn effective_bootstraps(settings: &Settings) -> Vec<String> {
 
 /// `start_provider`'s refusal when the user hasn't confirmed what they share yet.
 const NOT_CONFIRMED: &str = "choose what to share first";
+
+// ── Native confirmations ──
+// Actions that widen what this machine exposes (publishing models to everyone, admitting a swarm
+// member, pointing the node at other peers or endpoints, …) are confirmed in an OS dialog drawn
+// outside the webview. A page can call the command, but only a person can answer the dialog, so even
+// script that got into the page can't take these actions on its own.
+
+/// The error a command returns when the user declines its native dialog.
+const CANCELLED: &str = "Cancelled";
+
+/// Text from the page or a file, made safe to quote in a dialog: one line, no control characters,
+/// at most `max` characters (so it can't impersonate the dialog's own wording).
+fn dialog_text(s: &str, max: usize) -> String {
+    let one_line: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let t = one_line.trim();
+    if t.chars().count() > max {
+        format!("{}…", t.chars().take(max).collect::<String>())
+    } else {
+        t.to_string()
+    }
+}
+
+/// Ask the user in a native dialog; true only if they press `ok`. Blocks until answered, so it must
+/// not run on the main thread: callers are `#[tauri::command(async)]` or run in spawn_blocking.
+fn native_confirm(app: &tauri::AppHandle, title: &str, message: &str, ok: &str) -> bool {
+    let mut d = app
+        .dialog()
+        .message(message)
+        .title(title)
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(ok.to_string(), "Cancel".to_string()));
+    if let Some(w) = app.get_webview_window("main") {
+        d = d.parent(&w);
+    }
+    d.blocking_show()
+}
+
+/// What a share policy announces to everyone: `all` = every shared model (including ones added
+/// later), plus the models announced globally by name.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct GlobalExposure {
+    all: bool,
+    models: std::collections::BTreeSet<String>,
+}
+
+fn global_exposure(p: &openhydra_agent::SharePolicy) -> GlobalExposure {
+    use openhydra_agent::share_policy::Scope;
+    let all = p.mode == openhydra_agent::ShareMode::All
+        && p.default_scope == Scope::Global
+        && p.default_global_consent.is_some();
+    let models = p
+        .models
+        .iter()
+        .chain(p.scopes.keys())
+        .chain(p.global_consent.keys())
+        .filter(|m| p.announce_globally(m))
+        .cloned()
+        .collect();
+    GlobalExposure { all, models }
+}
+
+/// What `next` exposes that `prev` doesn't (empty when nothing widens).
+fn exposure_beyond(next: &GlobalExposure, prev: &GlobalExposure) -> GlobalExposure {
+    GlobalExposure {
+        all: next.all && !prev.all,
+        models: next.models.difference(&prev.models).cloned().collect(),
+    }
+}
+
+impl GlobalExposure {
+    fn is_empty(&self) -> bool {
+        !self.all && self.models.is_empty()
+    }
+    fn absorb(&mut self, more: &GlobalExposure) {
+        self.all |= more.all;
+        self.models.extend(more.models.iter().cloned());
+    }
+    /// "every model you share (including ones you add later)" and/or a short list of names.
+    fn describe(&self) -> String {
+        let mut names: Vec<String> = self.models.iter().take(8).map(|m| dialog_text(m, 80)).collect();
+        if self.models.len() > 8 {
+            names.push(format!("and {} more", self.models.len() - 8));
+        }
+        match (self.all, names.is_empty()) {
+            (true, true) => "every model you share, including ones you add later".to_string(),
+            (true, false) => format!("every model you share, including ones you add later ({})", names.join(", ")),
+            (false, _) => names.join(", "),
+        }
+    }
+}
+
+/// The global-publish dialog: true if the user agrees to announce `what` to everyone.
+fn confirm_global(app: &tauri::AppHandle, what: &GlobalExposure, starting: bool) -> bool {
+    let head = if starting { "Start sharing?" } else { "Share with everyone?" };
+    let msg = format!(
+        "Anyone on the OpenHydra network will be able to discover and send requests to: {}.\n\n\
+         Your machine serves those requests. Your prompts, files and identity are not shared. You can \
+         stop sharing, or make a model private, at any time.",
+        what.describe()
+    );
+    native_confirm(app, head, &msg, if starting { "Start sharing" } else { "Share with everyone" })
+}
 
 /// Whether the provider accepts `--prompt-scoring auto` for this engine kind: auto-detect and the
 /// engines with their own scoring API do; Ollama and LM Studio need the side-scorer next to the
@@ -1063,8 +1170,31 @@ fn set_sharing_enabled(state: &tauri::State<'_, AppState>, on: bool) {
     }
 }
 
-#[tauri::command]
-fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
+/// Start sharing from the app window. Models announced to everyone that the user hasn't approved
+/// in a native dialog this session are confirmed first (the tray and resume-on-launch use
+/// [`start_provider_now`] directly: those are the user's own OS-level actions).
+#[tauri::command(async)]
+fn start_provider(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let confirmed = state.settings.lock().map_err(|e| e.to_string())?.sharing_confirmed;
+    if !confirmed {
+        return Err(NOT_CONFIRMED.into());
+    }
+    let policy = openhydra_agent::SharePolicy::load(&share_policy_path())
+        .unwrap_or_else(|_| openhydra_agent::SharePolicy::share_nothing());
+    let approved = state.global_approval.lock().map(|a| a.clone()).unwrap_or_default();
+    let unapproved = exposure_beyond(&global_exposure(&policy), &approved);
+    if !unapproved.is_empty() {
+        if !confirm_global(&app, &unapproved, true) {
+            return Err(CANCELLED.into());
+        }
+        if let Ok(mut a) = state.global_approval.lock() {
+            a.absorb(&unapproved);
+        }
+    }
+    start_provider_now(state)
+}
+
+fn start_provider_now(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
     // Sharing starts only after the user has confirmed what they share (the Share dialog), whatever
     // asks for it — the in-app button, the tray menu. Resume-on-launch counts as confirmed.
@@ -1124,11 +1254,36 @@ fn start_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// Persist the share policy (called by the UI when the user toggles a model or the master switch).
 /// Written atomically; the running provider **hot-reloads it within ~1s — no restart**. Also mirrors
 /// into `settings.shared_models` for one-release downgrade safety.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_share_policy(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     policy: openhydra_agent::SharePolicy,
 ) -> Result<(), String> {
+    let prev = openhydra_agent::SharePolicy::load(&share_policy_path())
+        .unwrap_or_else(|_| openhydra_agent::SharePolicy::share_nothing());
+    // Publishing more to everyone takes effect at once while sharing runs: ask now. When sharing is
+    // off, the policy is inert and `start_provider` asks before anything is announced.
+    let running = state.provider.lock().map(|r| r.status.running).unwrap_or(false);
+    let widened = exposure_beyond(&global_exposure(&policy), &global_exposure(&prev));
+    if running && !widened.is_empty() {
+        if !confirm_global(&app, &widened, false) {
+            return Err(CANCELLED.into());
+        }
+        if let Ok(mut a) = state.global_approval.lock() {
+            a.absorb(&widened);
+        }
+    }
+    if policy.allow_remote_publish && !prev.allow_remote_publish
+        && !native_confirm(
+            &app,
+            "Allow remote publishing?",
+            "Devices you've given a control credential in your swarms will be able to make your shared models public (announced to everyone).",
+            "Allow",
+        )
+    {
+        return Err(CANCELLED.into());
+    }
     persist_share_policy(&state, &policy)
 }
 
@@ -1411,6 +1566,15 @@ fn list_swarms() -> Result<Vec<openhydra_agent::SwarmView>, String> {
     openhydra_agent::swarms::list_swarms(&swarms_dir())
 }
 
+/// A swarm's label and whether we own it, for a dialog ("this swarm" if it isn't found).
+fn swarm_label_of(swarm_public_key: &str) -> (String, bool) {
+    openhydra_agent::swarms::list_swarms(&swarms_dir())
+        .ok()
+        .and_then(|v| v.into_iter().find(|s| s.swarm_public_key == swarm_public_key.trim()))
+        .map(|s| (dialog_text(&s.label, 60), matches!(s.role, openhydra_agent::SwarmRole::Owner)))
+        .unwrap_or_else(|| ("this swarm".to_string(), false))
+}
+
 /// M3: create a swarm (generate the group keypair, persist an owner record). Returns its view.
 #[tauri::command]
 fn create_swarm(label: String) -> Result<openhydra_agent::SwarmView, String> {
@@ -1501,8 +1665,9 @@ struct ApprovedCredentials {
 /// "both" is two credentials). A control credential lets that device flip this owner's rig models'
 /// scope via `swarm_remote_scope` — grant it only to your own trusted devices; it carries no serve
 /// access.
-#[tauri::command]
+#[tauri::command(async)]
 fn swarm_approve_member(
+    app: tauri::AppHandle,
     swarm_public_key: String,
     request: String,
     control_request: Option<String>,
@@ -1510,6 +1675,30 @@ fn swarm_approve_member(
     ttl_secs: Option<u64>,
     grant: Option<String>,
 ) -> Result<ApprovedCredentials, String> {
+    // Admitting a member lets their key use (or, with control, re-scope) this owner's private models:
+    // confirm who, with the fingerprint the user is told to check out-of-band.
+    let grant_text = match grant.as_deref().unwrap_or("consume") {
+        "control" => "control your rigs' model sharing (no access to the models)",
+        "both" => "use your private models and control your rigs' model sharing",
+        _ => "use your private models",
+    };
+    let (swarm_label, _) = swarm_label_of(&swarm_public_key);
+    let mut keys = Vec::new();
+    for req in std::iter::once(request.as_str()).chain(control_request.as_deref()) {
+        if req.trim().is_empty() {
+            continue;
+        }
+        let r = openhydra_agent::swarms::preview_enrollment_request(req)?;
+        keys.push(format!("{} — key {}", dialog_text(&r.label, 60), openhydra_agent::key_fingerprint(&r.member_public_key)));
+    }
+    let msg = format!(
+        "Approve this member into “{swarm_label}”? They will be able to {grant_text}.\n\n{}\n\n\
+         Check the key fingerprint with them (in person or by voice) before approving.",
+        keys.join("\n")
+    );
+    if !native_confirm(&app, "Approve swarm member?", &msg, "Approve") {
+        return Err(CANCELLED.into());
+    }
     let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ttl = ttl_secs.unwrap_or(90 * 24 * 3600);
     let label = member_label.trim().to_string();
@@ -1555,8 +1744,9 @@ fn swarm_approve_member(
 /// remote-scope` (it needs a live one-shot node to dial the rig), dialing as the **control** key the
 /// stored control credential is bound to (see `swarm_control_identity_path`). Returns the rig's ack
 /// line (`applied: <model> -> <scope>`), or the rig's refusal / a transport error.
-#[tauri::command]
+#[tauri::command(async)]
 fn swarm_remote_scope(
+    app: tauri::AppHandle,
     swarm_public_key: String,
     provider: String,
     model: String,
@@ -1565,6 +1755,20 @@ fn swarm_remote_scope(
     let scope = scope.trim().to_lowercase();
     if !matches!(scope.as_str(), "global" | "private" | "device") {
         return Err(format!("invalid scope '{scope}' (expected global|private|device)"));
+    }
+    if scope == "global"
+        && !native_confirm(
+            &app,
+            "Publish on the rig?",
+            &format!(
+                "Ask the rig {} to publish “{}” to everyone? It becomes discoverable and usable on the public network, served by that rig. The rig refuses if its owner turned remote publishing off.",
+                dialog_text(&provider, 60),
+                dialog_text(&model, 80)
+            ),
+            "Publish",
+        )
+    {
+        return Err(CANCELLED.into());
     }
     let bin = agent_binary().ok_or_else(|| {
         "openhydra-agent binary not found (bundle missing its sidecar, or no dev build)".to_string()
@@ -1649,8 +1853,22 @@ fn swarm_accept_credential(
 }
 
 /// M3: forget a swarm entirely (owner: destroys the group key; member: drops our credential).
-#[tauri::command]
-fn forget_swarm(swarm_public_key: String) -> Result<(), String> {
+#[tauri::command(async)]
+fn forget_swarm(app: tauri::AppHandle, swarm_public_key: String) -> Result<(), String> {
+    let (label, owner) = swarm_label_of(&swarm_public_key);
+    let ok = if owner {
+        native_confirm(
+            &app,
+            "Delete swarm?",
+            &format!("Delete “{label}”? This destroys its group key: you can't issue any more credentials for it (existing members keep theirs until they expire)."),
+            "Delete",
+        )
+    } else {
+        native_confirm(&app, "Leave swarm?", &format!("Leave “{label}”? You'll drop your credential for it."), "Leave")
+    };
+    if !ok {
+        return Err(CANCELLED.into());
+    }
     let _guard = SWARMS_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     openhydra_agent::swarms::forget_swarm(&swarms_dir(), &swarm_public_key)
 }
@@ -2047,6 +2265,16 @@ async fn install_engine(app: tauri::AppHandle, engine: String, accel: Option<Str
                 return Err(e);
             }
         };
+        // Downloads and runs an installer: confirmed natively, outside the page.
+        if !native_confirm(
+            &app,
+            "Install engine?",
+            &format!("Download and install {}? It's fetched from its official source and installed on this machine.", dialog_text(&engine, 40)),
+            "Install",
+        ) {
+            installer::emit_error(&app, &engine, "Install cancelled".to_string());
+            return Err(CANCELLED.into());
+        }
         let default_model = recipe.default_model;
         let done_msg = recipe.completion_message();
         let eng = engine.clone();
@@ -2315,13 +2543,25 @@ fn connector_preview(state: tauri::State<'_, AppState>, key: String) -> Result<c
 /// Write the OpenHydra block into `key`'s config (backs up any existing file first). Called only
 /// after the user confirms the preview. `models` declares specific network model ids in the tool's
 /// own picker (opencode/pi/continue only); omit/empty ⇒ just `openhydra/auto`.
-#[tauri::command]
+#[tauri::command(async)]
 fn connector_apply(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     key: String,
     models: Option<Vec<String>>,
 ) -> Result<connectors::ConnectReport, String> {
     let origin = gateway_origin(&state)?;
+    // Writes into another program's config file: say which one, and that it's backed up first.
+    let preview = connectors::preview(&key, &origin)?;
+    let msg = format!(
+        "Connect {} to OpenHydra? This {} {} so it sends its requests to your local OpenHydra gateway. An existing file is backed up first; Disconnect restores it.",
+        dialog_text(&preview.kind, 40),
+        if preview.action == "create" { "creates" } else { "updates" },
+        dialog_text(&preview.path, 160),
+    );
+    if !native_confirm(&app, "Connect tool?", &msg, "Connect") {
+        return Err(CANCELLED.into());
+    }
     connectors::apply_with_models(&key, &origin, &models.unwrap_or_default())
 }
 
@@ -2499,16 +2739,46 @@ async fn gateway_health(state: tauri::State<'_, AppState>) -> Result<bool, ()> {
 /// Reject settings the app could act on harmfully: they choose who this node talks to (bootstraps),
 /// where the provider sends the network's prompts (engine endpoint) and what the chat fetches
 /// (search URL). Errors are shown to the user as "Save failed: …".
+/// The changes in `next` that send this node's traffic somewhere new or widen what it does for
+/// others, each as a sentence for the confirmation dialog. Empty when nothing widens.
+fn settings_widening(prev: &Settings, next: &Settings) -> Vec<String> {
+    let mut out = Vec::new();
+    let added: Vec<String> = next
+        .bootstraps
+        .iter()
+        .map(|b| b.trim())
+        .filter(|b| !b.is_empty() && !prev.bootstraps.iter().any(|p| p.trim() == *b))
+        .map(|b| dialog_text(b, 120))
+        .collect();
+    if !added.is_empty() {
+        out.push(format!("Connect to new bootstrap peers: {}", added.join(", ")));
+    }
+    let endpoint = next.engine_endpoint.trim();
+    if !endpoint.is_empty() && endpoint != prev.engine_endpoint.trim() {
+        out.push(format!("Send the requests your machine serves to this engine: {}", dialog_text(endpoint, 120)));
+    }
+    let search = next.search_url.trim();
+    if !search.is_empty() && search != prev.search_url.trim() {
+        out.push(format!("Use this web search service: {}", dialog_text(search, 120)));
+    }
+    if next.peer_relay && !prev.peer_relay {
+        out.push("Relay other peers' traffic through your machine.".to_string());
+    }
+    if next.audit_replay && !prev.audit_replay {
+        out.push("Send some of your own requests to a second provider to check answers.".to_string());
+    }
+    out
+}
+
 fn validate_settings(s: &Settings) -> Result<(), String> {
     if s.bootstraps.len() > 32 {
         return Err("at most 32 bootstrap addresses".into());
     }
     for b in &s.bootstraps {
         let b = b.trim();
-        let ok = b.starts_with('/')
-            && b.len() <= 256
-            && b.contains("/p2p/")
-            && b.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'.' | b':' | b'-' | b'_'));
+        // Parsed exactly as the node parses it at startup: a bad one would stop sharing and the
+        // gateway from starting at all.
+        let ok = b.starts_with('/') && b.len() <= 256 && openhydra_agent::check_bootstrap_addr(b).is_ok();
         if !ok {
             return Err(format!(
                 "bootstrap address isn't a multiaddr like /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…: {}",
@@ -2541,9 +2811,21 @@ fn validate_settings(s: &Settings) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn save_settings(state: tauri::State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
+#[tauri::command(async)]
+fn save_settings(app: tauri::AppHandle, state: tauri::State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
     validate_settings(&settings)?;
+    let prev = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let widening = settings_widening(&prev, &settings);
+    if !widening.is_empty()
+        && !native_confirm(
+            &app,
+            "Change network settings?",
+            &format!("{}\n\nOnly continue if you made this change.", widening.join("\n")),
+            "Save",
+        )
+    {
+        return Err(CANCELLED.into());
+    }
     let mut cur = state.settings.lock().map_err(|e| e.to_string())?;
     // Preserve fields the settings FORM doesn't own — taking the payload verbatim would reset them.
     // `sharing_enabled` is managed by start/stop_provider (a save must not clear a live sharing intent
@@ -2736,12 +3018,14 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             provider: Arc::new(Mutex::new(Role::new(&PROVIDER_PID))),
             gateway: Arc::new(Mutex::new(Role::new(&GATEWAY_PID))),
             settings: Mutex::new(initial_settings),
             resumed_on_launch: std::sync::atomic::AtomicBool::new(false),
             share_policy_reset,
+            global_approval: Mutex::new(GlobalExposure::default()),
         })
         .manage(PendingCard(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
@@ -2862,7 +3146,7 @@ fn main() {
                     .map(|s| (s.sharing_enabled, s.resume_on_launch))
                     .unwrap_or((false, true));
                 if enabled && resume {
-                    match start_provider(app.state()) {
+                    match start_provider_now(app.state()) {
                         Ok(()) => {
                             app.state::<AppState>()
                                 .resumed_on_launch
@@ -2896,7 +3180,7 @@ fn main() {
                             .unwrap_or(false);
                         if running {
                             stop_provider(app.state());
-                        } else if let Err(e) = start_provider(app.state()) {
+                        } else if let Err(e) = start_provider_now(app.state()) {
                             if e == NOT_CONFIRMED {
                                 // Ask in the app: show the window on the Share dialog.
                                 if let Some(w) = app.get_webview_window("main") {
@@ -2987,10 +3271,73 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn policy(json: &str) -> openhydra_agent::SharePolicy {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn global_exposure_names_what_is_announced_to_everyone() {
+        let none = policy(r#"{"version":3,"mode":"list","models":[]}"#);
+        assert!(global_exposure(&none).is_empty());
+        // Explicit Global needs a consent record to count.
+        let one = policy(r#"{"version":3,"mode":"list","models":["a","b"],"default_scope":"private","scopes":{"a":"global","b":"private"},"global_consent":{"a":1}}"#);
+        let e = global_exposure(&one);
+        assert!(!e.all);
+        assert_eq!(e.models.iter().cloned().collect::<Vec<_>>(), ["a"]);
+        let unconsented = policy(r#"{"version":3,"mode":"list","models":["a"],"default_scope":"private","scopes":{"a":"global"}}"#);
+        assert!(global_exposure(&unconsented).is_empty());
+        let all = policy(r#"{"version":3,"mode":"all","models":[],"default_scope":"global","default_global_consent":5}"#);
+        assert!(global_exposure(&all).all);
+    }
+
+    #[test]
+    fn only_widening_needs_a_dialog() {
+        let prev = global_exposure(&policy(r#"{"version":3,"mode":"list","models":["a"],"default_scope":"private","scopes":{"a":"global"},"global_consent":{"a":1}}"#));
+        let same = prev.clone();
+        assert!(exposure_beyond(&same, &prev).is_empty());
+        let more = global_exposure(&policy(r#"{"version":3,"mode":"list","models":["a","b"],"default_scope":"private","scopes":{"a":"global","b":"global"},"global_consent":{"a":1,"b":2}}"#));
+        let w = exposure_beyond(&more, &prev);
+        assert_eq!(w.models.iter().cloned().collect::<Vec<_>>(), ["b"]);
+        assert!(exposure_beyond(&prev, &more).is_empty(), "narrowing asks nothing");
+        let mut approved = GlobalExposure::default();
+        approved.absorb(&more);
+        assert!(exposure_beyond(&more, &approved).is_empty(), "approved this session");
+    }
+
+    #[test]
+    fn dialog_text_is_one_short_line() {
+        assert_eq!(dialog_text("a\n\nClick OK, it's safe", 100), "a  Click OK, it's safe");
+        assert_eq!(dialog_text(&"x".repeat(50), 10), format!("{}…", "x".repeat(10)));
+        let e = GlobalExposure { all: false, models: (0..10).map(|i| format!("m{i}")).collect() };
+        assert!(e.describe().ends_with("and 2 more"), "{}", e.describe());
+        let all = GlobalExposure { all: true, models: Default::default() };
+        assert!(all.describe().starts_with("every model you share"));
+    }
+
+    #[test]
+    fn settings_widening_lists_new_reach_only() {
+        let prev = Settings { bootstraps: vec!["/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWa".into()], ..Settings::default() };
+        assert!(settings_widening(&prev, &prev.clone()).is_empty());
+        let mut next = prev.clone();
+        next.device_name = "renamed".into();
+        next.verbose_logs = !prev.verbose_logs;
+        assert!(settings_widening(&prev, &next).is_empty(), "harmless changes ask nothing");
+        next.bootstraps.push("/ip4/5.6.7.8/tcp/4001/p2p/12D3KooWb".into());
+        next.engine_endpoint = "http://10.0.0.9:11434".into();
+        next.search_url = "https://search.example/".into();
+        next.peer_relay = true;
+        next.audit_replay = true;
+        let w = settings_widening(&prev, &next);
+        assert_eq!(w.len(), 5, "{w:?}");
+        // Removing a bootstrap or turning relay off narrows: nothing to confirm.
+        let narrower = Settings { bootstraps: vec![], ..Settings::default() };
+        assert!(settings_widening(&prev, &narrower).is_empty());
+    }
+
     #[test]
     fn settings_validation_accepts_real_values_and_refuses_hostile_ones() {
         let ok = Settings {
-            bootstraps: vec!["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wELabcdef".into(), "/dns4/bootstrap-us.openhydra.co/tcp/4001/p2p/12D3KooWx".into()],
+            bootstraps: vec!["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWJiDwh7X73f87VGyh9dHnyAMsXow93hKiw4K7m1g3uEWr".into(), "/dns4/bootstrap-us.openhydra.co/tcp/4001/p2p/12D3KooWNDk3cfXtqmCKn8vt8fz88xPQe78tqBBJ6rkfU3rn1pis".into()],
             engine_endpoint: "http://127.0.0.1:11434".into(),
             search_url: "https://search.example/".into(),
             device_name: "Sam's MacBook Air".into(),
@@ -3002,6 +3349,7 @@ mod tests {
         assert!(bad(&|s| s.bootstraps = vec!["not a multiaddr".into()]));
         assert!(bad(&|s| s.bootstraps = vec!["/ip4/1.2.3.4/tcp/4001".into()]), "needs a peer id");
         assert!(bad(&|s| s.bootstraps = vec!["/ip4/1.2.3.4/tcp/4001/p2p/x\";rm".into()]));
+        assert!(bad(&|s| s.bootstraps = vec!["/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWTestBootstrapPeer".into()]), "peer id must parse");
         assert!(bad(&|s| s.gateway_port = 80));
         assert!(bad(&|s| s.min_authenticity = "A9".into()));
         assert!(bad(&|s| s.engine_kind = "evil".into()));

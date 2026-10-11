@@ -89,7 +89,7 @@ import { emit } from "./bus";
       else if (ev.kind === "download") { if (typeof ev.percent === "number") setDet(ev.percent); else setIndet(); body.textContent = "Downloading — " + ev.message; }
       else if (ev.kind === "log") append(ev.message);
       else if (ev.kind === "done") { un(); hideBar(); setHTML(body, html`<span class="badge ok">done</span> ${ev.message}`); append("✓ " + ev.message); setHTML(actions, html`<button class="btn brand sm" id="instFin" style="margin-left:auto">Done</button>`); $("#instFin").onclick = () => { $("#installov").style.display = "none"; emit("refresh-engines"); }; emit("refresh-engines"); }
-      else if (ev.kind === "error") { un(); hideBar(); setHTML(body, html`<span class="badge warn">failed</span> ${ev.message}`); append("✗ " + ev.message); setHTML(actions, html`<button class="btn outline sm" id="instFin" style="margin-left:auto">Close</button>`); $("#instFin").onclick = () => $("#installov").style.display = "none"; }
+      else if (ev.kind === "error") { un(); hideBar(); setHTML(body, /^install cancelled$/i.test(ev.message || "") ? html`<span class="badge secondary">cancelled</span> Nothing was installed.` : html`<span class="badge warn">failed</span> ${ev.message}`); append("✗ " + ev.message); setHTML(actions, html`<button class="btn outline sm" id="instFin" style="margin-left:auto">Close</button>`); $("#instFin").onclick = () => $("#installov").style.display = "none"; }
     });
     try { await call("install_engine", { engine: label, accel: null, variant: variant || null }); }
     catch (e) { /* backend already emitted an error event; guard the mock/no-event path */ mockEmitInstall({ engine: label, kind: "error", message: String(e) }); }
