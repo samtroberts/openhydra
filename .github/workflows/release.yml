@@ -112,6 +112,12 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           npm ci || npm install
+          # A missing secret arrives as an EMPTY variable, which Tauri still acts on (failing the
+          # bundle): unset each empty one, so missing secrets mean an unsigned (or un-notarized) build.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD \
+                   APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then unset "$v"; fi
+          done
           if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
             echo "Apple Developer ID present → macOS build will be SIGNED + NOTARIZED"
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
