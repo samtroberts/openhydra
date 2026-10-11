@@ -270,6 +270,10 @@ pub enum SwarmCommand {
         libp2p_peer_id: String,
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// Every (model, provider) pair in `known_peers`, for the gateway's `openhydra/auto` choice.
+    KnownProviders {
+        reply: oneshot::Sender<Vec<KnownProvider>>,
+    },
     /// Resolve a reachable address for a peer (direct or via relay).
     ResolveAddress {
         peer_id: String,
@@ -727,6 +731,11 @@ fn install_known_peer_in(
     if record.updated_unix_ms > now_ms.saturating_add(MAX_RECORD_SKEW_MS) {
         return None;
     }
+    // Callers verify first (dht::verify_peer_record includes this); kept here too so no path can
+    // cache a record with an odd model name.
+    if dht::check_record_content(record).is_err() {
+        return None;
+    }
     let key = known_peer_key(record);
     let is_new = !known.contains_key(&key);
     if is_new {
@@ -1168,17 +1177,19 @@ pub async fn run_event_loop(
                             .known_peers
                             .values()
                             .map(|r| r.model_id.clone())
-                            .filter(|m| !m.is_empty())
+                            .filter(|m| openhydra_protocol::model_id::is_valid_model_id(m))
                             .collect();
                         known_models.sort();
                         known_models.dedup();
                         let known_providers = state
                             .known_peers
                             .values()
+                            .filter(|r| openhydra_protocol::model_id::is_valid_model_id(&r.model_id))
                             .map(|r| KnownProvider {
                                 model_id: r.model_id.clone(),
                                 openhydra_peer_id: r.peer_id.clone(),
                                 libp2p_peer_id: r.libp2p_peer_id.clone(),
+                                public_key: r.public_key.clone(),
                             })
                             .collect();
                         let kad_routing_peers = swarm
@@ -1225,11 +1236,13 @@ pub async fn run_event_loop(
                         let _ = reply.send(snapshot);
                     }
                     Some(SwarmCommand::KnownModels { reply }) => {
+                        // Records are checked on the way in (verify_peer_record); filtering
+                        // again here keeps an odd name out of /v1/models if any path missed it.
                         let mut models: Vec<String> = state
                             .known_peers
                             .values()
                             .map(|r| r.model_id.clone())
-                            .filter(|m| !m.is_empty())
+                            .filter(|m| openhydra_protocol::model_id::is_valid_model_id(m))
                             .collect();
                         models.sort();
                         models.dedup();
@@ -1241,11 +1254,28 @@ pub async fn run_event_loop(
                             .values()
                             .filter(|r| r.libp2p_peer_id == libp2p_peer_id)
                             .map(|r| r.model_id.clone())
-                            .filter(|m| !m.is_empty())
+                            .filter(|m| openhydra_protocol::model_id::is_valid_model_id(m))
                             .collect();
                         models.sort();
                         models.dedup();
                         let _ = reply.send(models);
+                    }
+                    Some(SwarmCommand::KnownProviders { reply }) => {
+                        let mut providers: Vec<KnownProvider> = state
+                            .known_peers
+                            .values()
+                            .filter(|r| openhydra_protocol::model_id::is_valid_model_id(&r.model_id))
+                            .map(|r| KnownProvider {
+                                model_id: r.model_id.clone(),
+                                // Verified records carry their key's own OpenHydra id (dht::verify_peer_record).
+                                openhydra_peer_id: r.peer_id.clone(),
+                                libp2p_peer_id: r.libp2p_peer_id.clone(),
+                                public_key: r.public_key.clone(),
+                            })
+                            .collect();
+                        providers.sort_by(|a, b| (&a.model_id, &a.libp2p_peer_id).cmp(&(&b.model_id, &b.libp2p_peer_id)));
+                        providers.dedup_by(|a, b| a.model_id == b.model_id && a.libp2p_peer_id == b.libp2p_peer_id);
+                        let _ = reply.send(providers);
                     }
                     Some(SwarmCommand::ResolveAddress { peer_id, reply }) => {
                         handle_resolve(&state, &peer_id, reply);
@@ -4598,6 +4628,7 @@ mod tests {
         assert_eq!(put(rec("A", "m", 0), now), Some(true), "an honest record, dated 0");
         assert_eq!(put(rec("A", "m", 0), now + 1), Some(false), "a refresh");
         assert_eq!(put(rec("ME", "mine", 0), now), Some(true));
+        assert_eq!(put(rec("C", "x\" onclick=\"y", 0), now), None, "an odd model name is never cached");
         // A flood of one peer's records, dated "now" by its signer, received after A's: its own
         // least recently received go, nobody else's.
         for i in 0..MAX_KNOWN_RECORDS_PER_PEER as u64 + 5 {

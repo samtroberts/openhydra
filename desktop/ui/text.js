@@ -3,17 +3,12 @@
 import { esc } from "./dom";
 import { tierBadge } from "./format";
 
-// #3/#4: classify a markdown media src as image | video | audio (data: URL or media-file URL),
-// "" if it isn't media (a regular link stays as text). Drives which element we render.
+// #3/#4: classify a markdown media src as image | video | audio, "" if it isn't media (it then
+// stays as text). Only inline `data:` media counts: answers come from network providers, and a
+// remote URL would load on its own (revealing your IP) or carry another scheme into the download link.
 export function mediaKind(src) {
-  const s = (src || "").trim();
-  const dm = s.match(/^data:([a-z]+)\/[a-z0-9.+-]+/i);
-  let m = dm ? dm[1].toLowerCase() : "";
-  if (!m) { const ext = (s.match(/\.([a-z0-9]+)(?:[?#]|$)/i) || [, ""])[1].toLowerCase();
-    m = ["png","jpg","jpeg","gif","webp","svg"].includes(ext) ? "image"
-      : ["mp4","webm","mov","m4v"].includes(ext) ? "video"
-      : ["mp3","wav","flac","ogg","m4a"].includes(ext) ? "audio" : ""; }
-  return (m === "image" || m === "video" || m === "audio") ? m : "";
+  const dm = (src || "").trim().match(/^data:(image|video|audio)\/[a-z0-9.+-]+[;,]/i);
+  return dm ? dm[1].toLowerCase() : "";
 }
 // #4: render inline media; #3: copy + download controls under it. Returns null for non-media.
 export function mediaEl(src, label) {
@@ -45,7 +40,7 @@ export function mediaEl(src, label) {
 const KW = new Set("fn let mut pub use impl struct enum trait match if else for while loop return async await move def class import from as with try except lambda yield pass raise function const var new typeof export default package func go defer chan interface map range type switch case break continue static void int float double char bool".split(" "));
 export function hl(code) { let out = "", i = 0; const push = (c, s) => out += c ? `<span class="${c}">${esc(s)}</span>` : esc(s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return out; }
 export function parseFences(t) { const p = [], re = /```([\w+-]*)\n([\s\S]*?)```/g; let last = 0, m; while ((m = re.exec(t))) { if (m.index > last) p.push({ prose: t.slice(last, m.index).trim() }); p.push({ lang: m[1] || "code", code: m[2] }); last = re.lastIndex; } if (last < t.length) p.push({ prose: t.slice(last).trim() }); return p.filter((x) => x.code != null || x.prose); }
-export function metaRow(m) { if (m.stopped) return `<div class="msgmeta"><span>${esc(m.model)}</span><span>${esc(m.stopped === true ? "stopped" : m.stopped)}</span><span>${m.at}</span></div>`; return `<div class="msgmeta"><span>${esc(m.model)}</span><span class="num">${m.tok} tok</span><span class="num" title="Engine generation speed — decode tokens per second, measured on the provider">${m.tps} tok/s</span><span class="num">${m.rtt} ms RTT</span>${m.tier ? `<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${m.stopped ? `<span>stopped</span>` : ""}<span>${m.at}</span></div>`; }
+export function metaRow(m) { if (m.stopped) return `<div class="msgmeta"><span>${esc(m.model)}</span><span>${esc(m.stopped === true ? "stopped" : m.stopped)}</span><span>${esc(m.at)}</span></div>`; return `<div class="msgmeta"><span>${esc(m.model)}</span><span class="num">${esc(m.tok)} tok</span><span class="num" title="Engine generation speed — decode tokens per second, measured on the provider">${esc(m.tps)} tok/s</span><span class="num">${esc(m.rtt)} ms RTT</span>${m.tier ? `<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${m.stopped ? `<span>stopped</span>` : ""}<span>${esc(m.at)}</span></div>`; }
 // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
 // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand
 // back an EMPTY content. Split any inline thinking out of the answer so the chat shows the

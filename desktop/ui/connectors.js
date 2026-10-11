@@ -96,14 +96,14 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
 
     const renderChips = () => {
       chipsEl.innerHTML = `<span class="mchip auto">${AUTO_MODEL} <span class="mut">· always</span></span>`
-        + [...card._models].map((m) => `<span class="mchip" title="${esc(displayModelName(m))}">${esc(displayModelName(m))} <button class="mrm" data-v="${esc(m)}" title="Remove">×</button></span>`).join("");
+        + [...card._models].map((m) => `<span class="mchip" title="${esc(m)}">${esc(displayModelName(m))} <button class="mrm" data-v="${esc(m)}" title="Remove">×</button></span>`).join("");
       $$(".mrm", chipsEl).forEach((b) => b.onclick = () => { card._models.delete(b.dataset.v); renderChips(); renderSnippet(card, st); if (!opts.hidden) renderOpts(); });
     };
     const add = (v) => { v = (v || "").trim(); if (!v || v === AUTO_MODEL) return; card._models.add(v); input.value = ""; renderChips(); renderOpts(); renderSnippet(card, st); };
     const renderOpts = () => {
       const q = input.value.trim().toLowerCase();
       const avail = liveModels().filter((m) => !card._models.has(m) && m.toLowerCase().includes(q));
-      let html = avail.map((m) => `<div class="mopt" data-v="${esc(m)}" title="${esc(displayModelName(m))}">${esc(displayModelName(m))}</div>`).join("");
+      let html = avail.map((m) => `<div class="mopt" data-v="${esc(m)}" title="${esc(m)}">${esc(displayModelName(m))}</div>`).join("");
       const typed = input.value.trim();
       if (typed && !liveModels().some((m) => m.toLowerCase() === typed.toLowerCase()) && !card._models.has(typed)) {
         html += `<div class="mopt add" data-v="${esc(typed)}">+ Add “${esc(typed)}”</div>`;
@@ -124,6 +124,10 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     renderChips();
   }
 
+  // POSIX single-quoting for the copy-to-terminal command (the same rule as the CLI's shell_quote in
+  // agent/src/launch.rs): a model name from the network can't run anything when the line is pasted.
+  const shellQuote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+
   function selectedModels(card) { return card._models ? [...card._models] : []; }
 
   // The Terminal snippet is the live `openhydra <verb> …` command (reflecting the model selection);
@@ -133,12 +137,12 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     const models = selectedModels(card);
     if (card.dataset.surface === "terminal") {
       const lines = [];
-      if (models.length) lines.push(`openhydra connect ${st.key}` + models.map((m) => ` --model ${m}`).join(""));
+      if (models.length) lines.push(`openhydra connect ${st.key}` + models.map((m) => ` --model ${shellQuote(m)}`).join(""));
       lines.push(`openhydra ${st.natural_verb} ${st.key}`);
       sn.textContent = lines.join("\n");
     } else {
       const where = card.dataset.surface === "editor" ? "your editor" : "the app";
-      const declare = models.length ? `\n# picker models: ${models.join(", ")}` : "";
+      const declare = models.length ? `\n# picker models: ${models.join(", ").replace(/[\u0000-\u001f\u007f]/g, " ")}` : "";
       sn.textContent = `# Connect writes ${st.kind}'s config, then open ${where} — it reads it.${declare}\n# model: ${AUTO_MODEL}`;
     }
   }

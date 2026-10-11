@@ -381,6 +381,9 @@ pub struct KnownProvider {
     pub model_id: String,
     pub openhydra_peer_id: String,
     pub libp2p_peer_id: String,
+    /// The provider's Ed25519 public key (hex): what this node's standing for it is keyed by.
+    #[serde(default)]
+    pub public_key: String,
 }
 
 /// Cumulative connectivity counters (NAT-traversal outcomes since start).

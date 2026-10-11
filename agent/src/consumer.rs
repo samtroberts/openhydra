@@ -1709,6 +1709,20 @@ pub struct ConsumerNode {
     served_paid: Mutex<HashMap<String, u64>>,
 }
 
+/// Inputs to the gateway's `openhydra/auto` choice ([`ConsumerNode::auto_candidates`]).
+#[derive(Debug, Clone, Default)]
+pub struct AutoCandidates {
+    /// Every (model, provider) pair currently known on the network.
+    pub providers: Vec<openhydra_network::types::KnownProvider>,
+    /// This machine's own provider (libp2p id), when it also serves.
+    pub self_provider: Option<String>,
+    /// Models of imported, valid `.openhydra` cards.
+    pub card_models: Vec<String>,
+    /// Reputation this node has earned with a provider on a model, decayed to now, keyed by
+    /// (provider libp2p id, model id). Only pairs with history appear.
+    pub earned: HashMap<(String, String), f64>,
+}
+
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
 /// to decide whether to bypass the C11 discovery cache and retry.
 enum AttemptOutcome {
@@ -2648,6 +2662,34 @@ impl ConsumerNode {
                 tracing::debug!(error = %e, "gated voucher persist failed");
             }
         }
+    }
+
+    /// What the gateway's `openhydra/auto` choice draws on: the known (model, provider) pairs, this
+    /// node's own provider, imported cards, and the reputation this node has earned with providers.
+    pub fn auto_candidates(&self) -> Result<AutoCandidates, String> {
+        let providers = self.net.known_providers()?;
+        Ok(self.auto_candidates_from(providers, now_unix_ms()))
+    }
+
+    /// [`auto_candidates`](Self::auto_candidates) over a given provider list (testable without a
+    /// swarm).
+    fn auto_candidates_from(&self, providers: Vec<openhydra_network::types::KnownProvider>, now: u64) -> AutoCandidates {
+        let card_models = self
+            .cards
+            .as_ref()
+            .map(|c| c.valid_cards(now).into_iter().map(|card| card.model_id).collect())
+            .unwrap_or_default();
+        // Standing is per (provider, model), keyed by the provider's key-derived state id: the same
+        // lookup the router ranks with.
+        let earned = providers
+            .iter()
+            .filter_map(|p| {
+                let state_id = provider_state_id(&p.openhydra_peer_id, &p.public_key);
+                self.earned_reputation(&state_id, rep_model_key("", &p.model_id), now)
+                    .map(|score| ((p.libp2p_peer_id.clone(), p.model_id.clone()), score))
+            })
+            .collect();
+        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned }
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
@@ -5841,6 +5883,31 @@ mod tests {
                 .authenticity
         };
         assert_eq!(node.authenticity_of("p", "m", after), without_floor);
+    }
+
+    #[test]
+    fn auto_candidates_see_the_standing_the_router_keeps() {
+        // The gateway's `openhydra/auto` choice must read reputation under the same
+        // (key-derived state id, model) key that serves record it under.
+        let (_dir, node) = test_node();
+        let pk = [7u8; 32];
+        let provider = openhydra_network::types::KnownProvider {
+            model_id: "qwen2.5:7b".into(),
+            openhydra_peer_id: openhydra_network::identity::openhydra_peer_id(&pk),
+            libp2p_peer_id: "12D3KooWProvider".into(),
+            public_key: hex::encode(pk),
+        };
+        let now = now_unix_ms();
+        let state_id = provider_state_id(&provider.openhydra_peer_id, &provider.public_key);
+        for _ in 0..5 {
+            node.record_outcome(&state_id, "qwen2.5:7b", VerificationOutcome::Honored, now);
+        }
+        let c = node.auto_candidates_from(vec![provider.clone()], now);
+        let score = c.earned.get(&(provider.libp2p_peer_id.clone(), "qwen2.5:7b".to_string())).copied();
+        assert!(score.is_some_and(|s| s > openhydra_protocol::verify::NEUTRAL_REPUTATION), "{score:?}");
+        // Standing on another model doesn't count for this one.
+        let other = openhydra_network::types::KnownProvider { model_id: "llama3.2:1b".into(), ..provider };
+        assert!(node.auto_candidates_from(vec![other], now).earned.is_empty());
     }
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {

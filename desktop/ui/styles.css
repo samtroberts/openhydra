@@ -391,3 +391,6 @@
   /* keep Recents filling the sidebar so the Relaunch card + Settings foot pin to the bottom
      even when the update card is hidden (its margin-top:auto no longer applies) */
   #recents{flex:1 1 auto;min-height:0}
+/* Engine installer progress bar (indeterminate). Kept here, not injected by installer.js, so the CSP needs no inline <style>. */
+@keyframes instIndet{0%{transform:translateX(-100%)}100%{transform:translateX(280%)}}
+#instBarFill.indet{width:36%!important;animation:instIndet 1.15s ease-in-out infinite}

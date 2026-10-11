@@ -212,6 +212,12 @@ impl NetworkHandle {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::ModelsOf { libp2p_peer_id: libp2p_peer_id.into(), reply })
     }
 
+    /// Every (model, provider) pair this node currently knows about, for the gateway's
+    /// `openhydra/auto` choice (which models its own provider serves, how many providers serve each).
+    pub fn known_providers(&self) -> Result<Vec<crate::types::KnownProvider>, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::KnownProviders { reply })
+    }
+
     /// Forward `data` to `peer_id` and block for the one-shot response (the consumer's
     /// serve round-trip: `SERVE_REQUEST` → buffered framed completion).
     pub fn proxy_forward(&self, peer_id: String, data: Vec<u8>) -> Result<Vec<u8>, String> {

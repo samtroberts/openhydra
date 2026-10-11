@@ -238,7 +238,7 @@ function openChat(id) { setCurChat(id); renderChat(); go("chat"); renderRecents(
 
 
 // reply rendering: fenced code cards + inline media (image/video/audio) + metadata line
-// #3/#4: classify a markdown media src as image | video | audio (data: URL or media-file URL),
+// #3/#4: classify a markdown media src as image | video | audio (inline data: URLs only),
 // "" if it isn't media (a regular link stays as text). Drives which element we render.
 // #4: render inline media; #3: copy + download controls under it. Returns null for non-media.
 // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as

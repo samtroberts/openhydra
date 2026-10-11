@@ -287,8 +287,8 @@ fn validate(req: &ChatRequest) -> Option<Response> {
 //
 // Connector snippets advertise `model: openhydra/auto`, but the router resolves a *literal*
 // model id — so `auto` must be turned into a concrete model that actually has a provider
-// before dispatch. Resolution: an operator override (`OPENHYDRA_AUTO_MODEL`) if it's live,
-// else a deterministic pick from the currently-known set; empty set ⇒ a clear "no models yet".
+// before dispatch. Any peer can announce any model name, so the choice is made from sources this
+// node has reason to trust: see [`pick_auto_model`].
 
 /// The canonical meta-model id the connectors advertise.
 const AUTO_MODEL_ID: &str = "openhydra/auto";
@@ -299,15 +299,80 @@ fn is_auto_model(model: &str) -> bool {
     m.eq_ignore_ascii_case("auto") || m.eq_ignore_ascii_case(AUTO_MODEL_ID)
 }
 
-/// Pure selection: an operator-preferred model wins *iff* it's currently served; otherwise the
-/// alphabetically-first known model (stable/deterministic). `None` when nothing is served.
-fn pick_auto_model(known: &[String], preferred: Option<&str>) -> Option<String> {
+/// Pure selection for `openhydra/auto`, most trusted source first:
+/// 1. the operator's preferred model (`OPENHYDRA_AUTO_MODEL`), if it is served;
+/// 2. a model this machine's own provider serves;
+/// 3. a model from an imported card;
+/// 4. a model served by a provider this node has earned reputation with (above neutral);
+/// 5. the model with the most distinct providers, if at least two serve it.
+///
+/// Ties break alphabetically. `None` means nothing qualifies: the caller asks for an explicit
+/// model rather than send the request to a model only one unknown peer claims to serve.
+fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
+    use openhydra_protocol::model_id::is_valid_model_id;
+    use std::collections::{BTreeMap, BTreeSet};
+    let providers: Vec<_> = c.providers.iter().filter(|p| is_valid_model_id(&p.model_id)).collect();
+    let cards: BTreeSet<&str> =
+        c.card_models.iter().map(String::as_str).filter(|m| is_valid_model_id(m)).collect();
     if let Some(p) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
-        if known.iter().any(|m| m == p) {
+        if cards.contains(p) || providers.iter().any(|k| k.model_id == p) {
             return Some(p.to_string());
         }
     }
-    known.iter().min().cloned()
+    if let Some(me) = c.self_provider.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(own) = providers.iter().filter(|k| k.libp2p_peer_id == me).map(|k| &k.model_id).min() {
+            return Some(own.clone());
+        }
+    }
+    if let Some(card) = cards.iter().next() {
+        return Some((*card).to_string());
+    }
+    let neutral = openhydra_protocol::verify::NEUTRAL_REPUTATION;
+    let mut best_rep: Option<(f64, &str)> = None;
+    for k in &providers {
+        let Some(&score) = c.earned.get(&(k.libp2p_peer_id.clone(), k.model_id.clone())) else {
+            continue;
+        };
+        if score > neutral
+            && best_rep.map_or(true, |(s, m)| score > s || (score == s && k.model_id.as_str() < m))
+        {
+            best_rep = Some((score, k.model_id.as_str()));
+        }
+    }
+    if let Some((_, m)) = best_rep {
+        return Some(m.to_string());
+    }
+    let mut counts: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for k in &providers {
+        counts.entry(k.model_id.as_str()).or_default().insert(k.libp2p_peer_id.as_str());
+    }
+    // BTreeMap iterates alphabetically, so keeping only strictly larger counts breaks ties that way.
+    let mut best: Option<(usize, &str)> = None;
+    for (m, peers) in counts {
+        if peers.len() >= 2 && best.map_or(true, |(n, _)| peers.len() > n) {
+            best = Some((peers.len(), m));
+        }
+    }
+    best.map(|(_, m)| m.to_string())
+}
+
+/// The reply when `auto` has nothing it trusts: name the models it could use instead.
+fn no_auto_model_message(known: &[String]) -> String {
+    if known.is_empty() {
+        return "no models available on the network yet — try again once a provider announces, or \
+                request a specific model"
+            .to_string();
+    }
+    let mut list: Vec<&str> = known.iter().map(String::as_str).take(10).collect();
+    if known.len() > list.len() {
+        list.push("…");
+    }
+    format!(
+        "openhydra/auto found no model it can trust (none from your own machine, an imported card, a \
+         provider you've used before, or at least two providers). Choose a model explicitly; \
+         available: {}",
+        list.join(", ")
+    )
 }
 
 /// Resolve the request's `model` to a concrete, served one. `known_models` is a blocking swarm
@@ -353,13 +418,13 @@ async fn resolve_model(
             return Ok(sel.to_string());
         }
     }
-    // …else the auto default: an operator-preferred model if served, else the alphabetically-first.
+    // …else the auto default (see `pick_auto_model` for the order).
     let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
-    pick_auto_model(&known, preferred.as_deref()).ok_or_else(|| {
-        "no models available on the network yet — try again once a provider announces, or request \
-         a specific model"
-            .to_string()
-    })
+    let node = state.node.clone();
+    let candidates = tokio::task::spawn_blocking(move || node.auto_candidates())
+        .await
+        .map_err(|_| "model resolution failed".to_string())??;
+    pick_auto_model(&candidates, preferred.as_deref()).ok_or_else(|| no_auto_model_message(&known))
 }
 
 // ── Slash-commands (`/models`, `/model <id>`, `/help`) ───────────────────────
@@ -705,6 +770,49 @@ fn completion_object(
 /// Spawn the blocking `complete` on a plain OS thread, returning the event channel and the
 /// start instant. The worker forwards each delta, then a terminal `Done`/`Error`.
 #[allow(clippy::too_many_arguments)]
+/// Most tool calls passed on from one reply, and their largest combined argument size.
+const MAX_TOOL_CALLS: usize = 64;
+const MAX_TOOL_CALL_BYTES: usize = 256 * 1024;
+
+/// The names of the tools a request offered (OpenAI shape: `{"type":"function","function":{"name":…}}`).
+fn offered_tool_names(tools: &[Value]) -> std::collections::HashSet<String> {
+    tools
+        .iter()
+        .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Keep only the tool calls a client can safely act on. The provider is a stranger on the network,
+/// and a coding tool runs whatever calls it is handed, so a call is kept only if it names a tool
+/// the request offered and its arguments are a JSON object (empty means `{}`); at most
+/// [`MAX_TOOL_CALLS`] calls and [`MAX_TOOL_CALL_BYTES`] of arguments. Returns the kept calls and
+/// how many were dropped.
+fn filter_tool_calls(
+    calls: Vec<ToolCall>,
+    offered: &std::collections::HashSet<String>,
+) -> (Vec<ToolCall>, usize) {
+    let total = calls.len();
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    for mut c in calls {
+        if kept.len() >= MAX_TOOL_CALLS || !offered.contains(&c.function.name) {
+            continue;
+        }
+        if c.function.arguments.trim().is_empty() {
+            c.function.arguments = "{}".into();
+        }
+        let is_object = serde_json::from_str::<Value>(&c.function.arguments).map(|v| v.is_object()).unwrap_or(false);
+        if !is_object || bytes + c.function.arguments.len() > MAX_TOOL_CALL_BYTES {
+            continue;
+        }
+        bytes += c.function.arguments.len();
+        kept.push(c);
+    }
+    let dropped = total - kept.len();
+    (kept, dropped)
+}
+
 fn spawn_worker(
     node: Arc<ConsumerNode>,
     model: String,
@@ -735,8 +843,14 @@ fn spawn_worker(
         };
         // Or gone before any delta (during discovery or prefill): its receiver is already dropped.
         let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed();
+        let offered = offered_tool_names(&tools);
         match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, &cancel, &mut on_delta) {
-            Ok(summary) => {
+            Ok(mut summary) => {
+                let (kept, dropped) = filter_tool_calls(std::mem::take(&mut summary.tool_calls), &offered);
+                if dropped > 0 {
+                    tracing::warn!(%model, dropped, kept = kept.len(), "dropped tool calls the request didn't offer or that were malformed");
+                }
+                summary.tool_calls = kept;
                 let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
@@ -2075,6 +2189,35 @@ pub fn router(
 /// the process exits. `bind` is e.g. `"127.0.0.1:8080"`; `api_key` optionally protects
 /// `/v1/*`.
 #[allow(clippy::too_many_arguments)]
+/// Is `host` (a `Host` header or URI authority) a loopback name for this gateway's `port`?
+/// `127.0.0.1`, `localhost` or `[::1]`, with this port or none.
+fn is_loopback_host(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    let (name, p) = match host.rsplit_once(':') {
+        Some((n, p)) if !n.is_empty() && (n.starts_with('[') == n.ends_with(']')) && !p.contains(']') => (n, Some(p)),
+        _ => (host, None),
+    };
+    let name_ok = name == "127.0.0.1" || name == "[::1]" || name.eq_ignore_ascii_case("localhost");
+    name_ok && p.map_or(true, |p| p.parse::<u16>().ok() == Some(port))
+}
+
+/// Refuse a request to a loopback-bound gateway whose `Host` isn't a loopback name (403).
+async fn loopback_host_guard(State(port): State<u16>, req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+    match host {
+        Some(h) if !is_loopback_host(&h, port) => {
+            tracing::warn!(host = %h.escape_debug(), "refused a request addressed to a non-loopback host name");
+            openai_error(StatusCode::FORBIDDEN, "this gateway only answers requests to 127.0.0.1 / localhost", "forbidden")
+        }
+        _ => next.run(req).await,
+    }
+}
+
 pub fn serve_http(
     net: NetworkHandle,
     economy: Arc<EconomyStats>,
@@ -2099,10 +2242,18 @@ pub fn serve_http(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
+        let local = listener.local_addr()?;
+        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, audit_replay, assurance);
+        // A loopback-only gateway answers only requests addressed to loopback (DNS rebinding:
+        // a web page can point its own host name at 127.0.0.1, but not change the Host header the
+        // browser sends). A gateway bound to a LAN/public address is reached by other names, so it
+        // relies on --api-key instead.
+        if local.ip().is_loopback() {
+            app = app.layer(middleware::from_fn_with_state(local.port(), loopback_host_guard));
+        }
         // `into_make_service_with_connect_info` surfaces the peer `SocketAddr` to the
         // rate-limit middleware (the unspoofable per-IP key).
-        let app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, audit_replay, assurance)
-            .into_make_service_with_connect_info::<SocketAddr>();
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, app).await
     })
 }
@@ -2184,16 +2335,147 @@ mod tests {
     }
 
     #[test]
-    fn pick_auto_prefers_available_override_else_first() {
-        let known = vec!["qwen2.5:7b".to_string(), "llama3.2:1b".to_string()];
-        // operator override wins when it's actually served
-        assert_eq!(pick_auto_model(&known, Some("qwen2.5:7b")).as_deref(), Some("qwen2.5:7b"));
-        // override that isn't served → fall back to the deterministic (alphabetical) pick
-        assert_eq!(pick_auto_model(&known, Some("not-served")).as_deref(), Some("llama3.2:1b"));
-        // no override → deterministic pick
-        assert_eq!(pick_auto_model(&known, None).as_deref(), Some("llama3.2:1b"));
-        // nothing served → nothing to pick
-        assert_eq!(pick_auto_model(&[], Some("x")), None);
+    fn loopback_host_names_pass_and_rebound_names_do_not() {
+        for ok in ["127.0.0.1:16527", "localhost:16527", "LOCALHOST:16527", "[::1]:16527", "127.0.0.1", "localhost", "[::1]"] {
+            assert!(is_loopback_host(ok, 16527), "{ok}");
+        }
+        for bad in ["evil.example:16527", "evil.example", "127.0.0.1:80", "localhost:1", "127.0.0.1.evil.example:16527", "[::1]:9", "", "localhost.evil:16527"] {
+            assert!(!is_loopback_host(bad, 16527), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_guard_refuses_a_rebound_host_with_403() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(port, loopback_host_guard));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let status_for = |host: String| async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out.lines().next().unwrap_or_default().to_string()
+        };
+        assert!(status_for(format!("evil.example:{port}")).await.contains(" 403 "));
+        assert!(status_for(format!("127.0.0.1:{port}")).await.contains(" 200 "));
+        assert!(status_for(format!("localhost:{port}")).await.contains(" 200 "));
+    }
+
+    fn call(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call_{name}"),
+            kind: "function".into(),
+            function: ToolCallFunction { name: name.into(), arguments: args.into() },
+        }
+    }
+
+    #[test]
+    fn tool_calls_are_kept_only_for_offered_tools_with_object_arguments() {
+        let offered = offered_tool_names(&[
+            json!({ "type": "function", "function": { "name": "read_file" } }),
+            json!({ "type": "function", "function": { "name": "list_dir" } }),
+        ]);
+        assert_eq!(offered.len(), 2);
+        // Nothing offered → nothing passed on.
+        let (kept, dropped) = filter_tool_calls(vec![call("bash", "{\"cmd\":\"rm -rf ~\"}")], &Default::default());
+        assert!(kept.is_empty());
+        assert_eq!(dropped, 1);
+        let (kept, dropped) = filter_tool_calls(
+            vec![
+                call("read_file", "{\"path\":\"a\"}"),
+                call("bash", "{\"cmd\":\"x\"}"),  // not offered
+                call("list_dir", "[1,2]"),            // not an object
+                call("list_dir", "not json"),
+                call("list_dir", ""),                 // no arguments → {}
+            ],
+            &offered,
+        );
+        assert_eq!(dropped, 3);
+        assert_eq!(kept.iter().map(|c| c.function.name.as_str()).collect::<Vec<_>>(), ["read_file", "list_dir"]);
+        assert_eq!(kept[1].function.arguments, "{}");
+    }
+
+    #[test]
+    fn tool_calls_are_capped_in_number_and_size() {
+        let offered = offered_tool_names(&[json!({ "type": "function", "function": { "name": "f" } })]);
+        let (kept, dropped) = filter_tool_calls((0..100).map(|_| call("f", "{}")).collect(), &offered);
+        assert_eq!((kept.len(), dropped), (MAX_TOOL_CALLS, 100 - MAX_TOOL_CALLS));
+        let big = format!("{{\"x\":\"{}\"}}", "a".repeat(MAX_TOOL_CALL_BYTES));
+        let (kept, _) = filter_tool_calls(vec![call("f", &big), call("f", "{}")], &offered);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].function.arguments, "{}");
+    }
+
+    fn kp(model: &str, oh: &str, lib: &str) -> openhydra_network::types::KnownProvider {
+        openhydra_network::types::KnownProvider {
+            model_id: model.into(),
+            openhydra_peer_id: oh.into(),
+            libp2p_peer_id: lib.into(),
+            public_key: String::new(),
+        }
+    }
+
+    fn cands(providers: Vec<openhydra_network::types::KnownProvider>) -> crate::consumer::AutoCandidates {
+        crate::consumer::AutoCandidates { providers, ..Default::default() }
+    }
+
+    #[test]
+    fn auto_never_picks_a_model_only_one_unknown_peer_serves() {
+        let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("qwen2.5:7b", "a", "12D3A")]);
+        assert_eq!(pick_auto_model(&c, None), None);
+        let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("qwen2.5:7b", "a", "12D3A"), kp("qwen2.5:7b", "b", "12D3B")]);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("qwen2.5:7b"));
+        // Several records from ONE peer don't count as several providers.
+        let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("0", "evil2", "12D3Evil")]);
+        assert_eq!(pick_auto_model(&c, None), None);
+        assert_eq!(pick_auto_model(&cands(vec![]), Some("x")), None);
+    }
+
+    #[test]
+    fn auto_prefers_override_then_own_then_cards_then_reputation_then_provider_count() {
+        let mut c = cands(vec![
+            kp("0", "evil", "12D3Evil"),
+            kp("popular", "p1", "12D3P1"),
+            kp("popular", "p2", "12D3P2"),
+            kp("trusted", "t", "12D3T"),
+            kp("mine", "me", "12D3Me"),
+        ]);
+        c.self_provider = Some("12D3Me".into());
+        c.card_models = vec!["carded".into()];
+        c.earned.insert(("12D3T".into(), "trusted".into()), 70.0);
+        // 1. an override that is served wins; one that isn't served is ignored
+        assert_eq!(pick_auto_model(&c, Some("popular")).as_deref(), Some("popular"));
+        assert_eq!(pick_auto_model(&c, Some("carded")).as_deref(), Some("carded"));
+        assert_eq!(pick_auto_model(&c, Some("not-served")).as_deref(), Some("mine"));
+        // 2. own provider
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("mine"));
+        // 3. cards
+        c.self_provider = None;
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("carded"));
+        // 4. earned reputation above neutral
+        c.card_models.clear();
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("trusted"));
+        // …but not at or below neutral, and not from standing earned on another model
+        c.earned.insert(("12D3T".into(), "trusted".into()), 50.0);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("popular"));
+        c.earned.insert(("12D3T".into(), "other-model".into()), 99.0);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("popular"));
+        // 5. most distinct providers, at least two
+        c.providers.retain(|k| k.model_id != "popular");
+        assert_eq!(pick_auto_model(&c, None), None);
+    }
+
+    #[test]
+    fn no_auto_model_message_lists_what_is_available() {
+        assert!(no_auto_model_message(&[]).contains("no models available"));
+        let m = no_auto_model_message(&["a".into(), "b".into()]);
+        assert!(m.contains("Choose a model") && m.contains("a, b"), "{m}");
     }
 
     // ── Anthropic `/v1/messages` translation ──
