@@ -1,7 +1,8 @@
 // #10: self-contained inline-SVG served-vs-used timeline, stacked by model, with a 24h/7d/30d
 // range selector (no chart lib — CSP-safe). Shared by the Share and Activity views; hostKey is
 // "share" | "activity". The selected range per host is persisted in chartRange (module-local).
-import { $, $$, esc } from "./dom";
+import { $, $$ } from "./dom";
+import { html, setHTML } from "./html";
 import { store } from "./storage";
 import { statsSeries } from "./stats";
 import { modelColor } from "./format";
@@ -32,39 +33,37 @@ import { modelColor } from "./format";
         const cx = padL + i * groupW + groupW / 2;
         const end = slots[i].end, d = new Date(end);
         const lbl = range === "24h" ? d.getHours() + "h" : (d.getMonth() + 1) + "/" + d.getDate();
-        out.push(`<text x="${cx.toFixed(1)}" y="${H - 5}" text-anchor="middle" font-size="9" fill="hsl(var(--muted-foreground))">${lbl}</text>`);
+        out.push(html`<text x="${cx.toFixed(1)}" y="${H - 5}" text-anchor="middle" font-size="9" fill="hsl(var(--muted-foreground))">${lbl}</text>`);
       }
-      return out.join("");
+      return out;
     };
-    let bars = "";
+    const bars = [];
     slots.forEach((s, i) => {
       const gx = padL + i * groupW;
       // served bar (left), used bar (right); each stacked by model.
       const stack = (entries, x0, key) => {
-        let acc = 0, seg = "";
+        let acc = 0; const seg = [];
         // stable order: top models first, then others
         const ids = Object.keys(entries).sort((a, b) => (vol[b] || 0) - (vol[a] || 0));
         for (const id of ids) {
           const val = entries[id][key]; if (!val) continue;
           const h = (val / maxV) * plotH, yTop = y(acc + val);
-          seg += `<rect x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, h).toFixed(1)}" fill="${colorOf(id)}" opacity="${key === "u" ? 0.55 : 1}"><title>${esc(id)} · ${key === "s" ? "served" : "used"} ${val}</title></rect>`;
+          seg.push(html`<rect x="${x0.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, h).toFixed(1)}" fill="${colorOf(id)}" opacity="${key === "u" ? 0.55 : 1}"><title>${id} · ${key === "s" ? "served" : "used"} ${val}</title></rect>`);
           acc += val;
         }
         return seg;
       };
       const gap = 2, cx = gx + groupW / 2;
-      bars += stack(s.models, cx - barW - gap / 2, "s");
-      bars += stack(s.models, cx + gap / 2, "u");
+      bars.push(stack(s.models, cx - barW - gap / 2, "s"), stack(s.models, cx + gap / 2, "u"));
     });
     const legend = hasData
-      ? top.map((id) => `<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:hsl(var(--muted-foreground))"><span style="width:9px;height:9px;border-radius:2px;background:${modelColor(id)}"></span>${esc(id)}</span>`).join("")
-        + (Object.keys(vol).length > 6 ? `<span style="font-size:11px;color:hsl(var(--muted-foreground))">+${Object.keys(vol).length - 6} more</span>` : "")
+      ? html`${top.map((id) => html`<span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:hsl(var(--muted-foreground))"><span style="width:9px;height:9px;border-radius:2px;background:${modelColor(id)}"></span>${id}</span>`)}${Object.keys(vol).length > 6 ? html`<span style="font-size:11px;color:hsl(var(--muted-foreground))">+${Object.keys(vol).length - 6} more</span>` : ""}`
       : "";
-    const chip = (r) => `<span class="btn ${range === r ? "outline" : "ghost"} sm chartrange" data-r="${r}" data-host="${hostKey}" style="padding:2px 8px;font-size:11px">${r}</span>`;
-    host.innerHTML = `
+    const chip = (r) => html`<span class="btn ${range === r ? "outline" : "ghost"} sm chartrange" data-r="${r}" data-host="${hostKey}" style="padding:2px 8px;font-size:11px">${r}</span>`;
+    setHTML(host, html`
       <div class="row" style="align-items:center;margin-bottom:6px"><div class="ctitle" style="font-size:13px">Served vs used · ${rangeLabel}</div><div class="grow"></div>${chip("24h")}${chip("7d")}${chip("30d")}</div>
       ${hasData
-        ? `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="display:block">
+        ? html`<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="display:block">
              <line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="hsl(var(--border))" stroke-width="1"/>
              ${bars}${xLabels()}
            </svg>
@@ -72,7 +71,7 @@ import { modelColor } from "./format";
              <span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:hsl(var(--muted-foreground))"><span style="width:9px;height:9px;border-radius:2px;background:hsl(var(--foreground))"></span>served (solid) · used (faded)</span>
              ${legend}
            </div>`
-        : `<div class="mut" style="padding:28px 0;text-align:center;font-size:12.5px">No served or used tokens in the ${rangeLabel} yet.<br/>Serve a model or run a chat — the timeline fills in from your node's activity.</div>`}
-    `;
+        : html`<div class="mut" style="padding:28px 0;text-align:center;font-size:12.5px">No served or used tokens in the ${rangeLabel} yet.<br/>Serve a model or run a chat — the timeline fills in from your node's activity.</div>`}
+    `);
     $$(`${hostSel} .chartrange`).forEach((c) => c.onclick = () => { chartRange[hostKey] = c.dataset.r; store.set("oh_chartrange", chartRange); renderChart(hostSel, hostKey); });
   }

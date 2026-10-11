@@ -1,6 +1,7 @@
 // Network › Models view: the announced-provider table grouped by model, with sticky provider
 // counts, avg TPS + earned reputation, and a per-model expand (#11b) to the individual providers.
-import { $, $$, esc, peerShort } from "./dom";
+import { $, $$, peerShort } from "./dom";
+import { html, setHTML, insertHTML } from "./html";
 import { snap, state, infraPeerIds } from "./state";
 import { netModels, modelIdle, seenCount, displayModelName, localSharedModels } from "./models";
 import { repByPeerModel, repKey, modelReputation, modelAvgTps, trustByPeerModel } from "./econ";
@@ -27,10 +28,10 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
     const trustOf = (p) => trust[repKey(p.openhydra_peer_id, p.model_id)] || {};
     // One provider: its badge (and model check). Several: how many your gateway has verified.
     const modelTrust = (remote) => {
-      if (!remote.length) return '<span class="mut">—</span>';
+      if (!remote.length) return html`<span class="mut">—</span>`;
       if (remote.length === 1) { const t = trustOf(remote[0]); return trustCell(t.tier, t.check); }
       const verified = remote.filter((p) => tierOf(trustOf(p).tier) !== "A0").length;
-      return `<span class="${verified ? "" : "mut"}" title="Providers your gateway has verified (A1 or higher)">${verified} of ${remote.length} verified</span>`;
+      return html`<span class="${verified ? "" : "mut"}" title="Providers your gateway has verified (A1 or higher)">${verified} of ${remote.length} verified</span>`;
     };
     // Group the announced providers by model so a model served by several peers can expand (#11b).
     const provsByModel = {};
@@ -49,24 +50,22 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
       const rep = modelReputation(m, byPM);                        // earned rep of its providers (per (peer,model))
       const canExpand = remote.length > 1;                         // >1 provider → disclosure
       const open = expandedProviders.has(m);
-      const caret = canExpand ? `<span class="prowtog" data-m="${esc(m)}" style="cursor:pointer;display:inline-block;width:14px;color:hsl(var(--muted-foreground));transition:transform .12s;transform:rotate(${open ? 90 : 0}deg)">▸</span>` : '<span style="display:inline-block;width:14px"></span>';
+      const caret = canExpand ? html`<span class="prowtog" data-m="${m}" style="cursor:pointer;display:inline-block;width:14px;color:hsl(var(--muted-foreground));transition:transform .12s;transform:rotate(${open ? 90 : 0}deg)">▸</span>` : html`<span style="display:inline-block;width:14px"></span>`;
       const idle = modelIdle(m);   // W2: seen but quiet → dim, don't drop (rides gossip gaps)
-      let html = `<tr class="prov" data-cat="${modelCat(m)}" data-m="${esc(m)}"${idle ? ' style="opacity:.5"' : ""}><td>${caret}${modelIcon(m)}<b title="${esc(displayModelName(m))}">${esc(displayModelName(m))}</b>${local.has(m) ? ' <span class="mut">· your machine</span>' : idle ? ' <span class="mut" style="font-size:10.5px">· idle</span>' : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td>${modelTrust(remote)}</td></tr>`;
-      if (canExpand && open) {
-        html += remote.map((p) => {
+      const row = html`<tr class="prov" data-cat="${modelCat(m)}" data-m="${m}" style="${idle ? "opacity:.5" : ""}"><td>${caret}${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b>${local.has(m) ? html` <span class="mut">· your machine</span>` : idle ? html` <span class="mut" style="font-size:10.5px">· idle</span>` : ""}</td><td class="num">${cnt || "—"}</td><td class="num${tps == null ? " mut" : ""}">${tps == null ? "—" : tps}</td><td>${repBadge(rep)}</td><td>${modelTrust(remote)}</td></tr>`;
+      if (!(canExpand && open)) return row;
+      return html`${row}${remote.map((p) => {
           const prep = byPM[repKey(p.openhydra_peer_id, p.model_id)];
           const t = trustOf(p);
-          return `<tr class="provsub" data-cat="${modelCat(m)}" data-for="${esc(m)}"><td style="padding-left:34px"><span class="mono mut">${peerShort(p.libp2p_peer_id)}</span></td><td class="num mut">1</td><td class="num mut">—</td><td>${repBadge(prep)}</td><td>${trustCell(t.tier, t.check)}</td></tr>`;
-        }).join("");
-      }
-      return html;
+          return html`<tr class="provsub" data-cat="${modelCat(m)}" data-for="${m}"><td style="padding-left:34px"><span class="mono mut">${peerShort(p.libp2p_peer_id)}</span></td><td class="num mut">1</td><td class="num mut">—</td><td>${repBadge(prep)}</td><td>${trustCell(t.tier, t.check)}</td></tr>`;
+        })}`;
     });
-    $("#provtable tbody").innerHTML = rows.join("") || `<tr><td colspan="5" class="mut">${snap ? (q ? "No models match your search." : "No models discovered yet — they appear as peers announce.") : "Connecting…"}</td></tr>`;
+    setHTML($("#provtable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="5" class="mut">${snap ? (q ? "No models match your search." : "No models discovered yet — they appear as peers announce.") : "Connecting…"}</td></tr>`);
     const cat = $("#provchips .chip.on")?.dataset.cat || "all";
     $$("#provtable .prov, #provtable .provsub").forEach((r) => r.style.display = (cat === "all" || r.dataset.cat === cat) ? "" : "none");
     // A category with nothing in it says so instead of showing an empty table.
     if (rows.length && cat !== "all" && !$$("#provtable .prov").some((r) => r.dataset.cat === cat)) {
-      $("#provtable tbody").insertAdjacentHTML("beforeend", `<tr><td colspan="5" class="mut">No ${esc(cat)} models on the network right now.</td></tr>`);
+      insertHTML($("#provtable tbody"), "beforeend", html`<tr><td colspan="5" class="mut">No ${cat} models on the network right now.</td></tr>`);
     }
     const sc = $("#provsort"); if (sc) sc.firstChild.textContent = `Sort: ${sortBy} `;
     $$("#provtable .prowtog").forEach((tog) => tog.onclick = (e) => {

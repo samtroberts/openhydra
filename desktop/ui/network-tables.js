@@ -1,7 +1,8 @@
 // Network data tables: the Ledger (recent co-signed transactions), the Diagnostics/Peers view
 // (peer list + DHT records + swarm + logs), and the provider/gateway log pane. peerLimit and logTab
 // are module-local; setLogTab lets the log chips switch the pane. infraPeerIds is shared from ./state.
-import { $, $$, esc, peerShort } from "./dom";
+import { $, $$, peerShort } from "./dom";
+import { html, setHTML } from "./html";
 import { state, snap, infraPeerIds } from "./state";
 import { repByLibp2p } from "./econ";
 import { displayModelName } from "./models";
@@ -17,27 +18,27 @@ import { menu, toast } from "./chrome";
     $("#v-ledger .row .mut").textContent = rows.length
       ? `${rows.length} recent · ${t?.receipts_ledgered ?? 0} co-signed · ${t?.tokens_served ?? 0} served / ${t?.tokens_consumed ?? "—"} used tokens`
       : `${t?.receipts_ledgered ?? 0} receipts · ${t?.tokens_served ?? 0} tokens served`;
-    $("#ledgertable tbody").innerHTML = rows.length
-      ? rows.slice(0, 100).map((r) => {
+    setHTML($("#ledgertable tbody"), rows.length
+      ? html`${rows.slice(0, 100).map((r) => {
           // Credits on the same cost-weighted scale as Activity's net balance (rows from before it was
           // recorded have none).
           const served = r.kind === "served", cr = r.credits == null ? "—" : (served ? "+" : "−") + Number(r.credits).toLocaleString();
-          return `<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td title="${esc(displayModelName(r.model))}">${modelIcon(r.model)}${esc(displayModelName(r.model))}</td><td class="mono" title="${esc(r.counterparty)} (the other machine's id)">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}"${served ? "" : ' style="color:hsl(var(--danger))"'}>${cr}</td></tr>`;
-        }).join("")
-      : `<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`;
+          return html`<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td title="${displayModelName(r.model)}">${modelIcon(r.model)}${displayModelName(r.model)}</td><td class="mono" title="${r.counterparty} (the other machine's id)">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}" style="${served ? "" : "color:hsl(var(--danger))"}">${cr}</td></tr>`;
+        })}`
+      : html`<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`);
   }
 
   // infraPeerIds (bootstraps + relay hops we hide from the Peers list) now lives in ./state so the
   // status-bar peer count can share it — see the note there. Keeps the two "peers" counts identical.
   let peerLimit = 10;   // "View more" bumps this
   export function renderPeers() {
-    if (!snap) { $("#peertable tbody").innerHTML = `<tr><td colspan="5" class="mut">Turn on Sharing or chat to connect, then peers appear here.</td></tr>`; const pc = $("#peercount"); if (pc) pc.textContent = "0 peers"; const pm = $("#peermore"); if (pm) pm.style.display = "none"; return; }
+    if (!snap) { setHTML($("#peertable tbody"), html`<tr><td colspan="5" class="mut">Turn on Sharing or chat to connect, then peers appear here.</td></tr>`); const pc = $("#peercount"); if (pc) pc.textContent = "0 peers"; const pm = $("#peermore"); if (pm) pm.style.display = "none"; return; }
     const n = snap.network;
     const infra = infraPeerIds();
     const peers = (n.peers || []).filter((p) => !infra.has(p.peer_id));   // hide bootstraps/relays
     const repL = repByLibp2p();
     const shown = peers.slice(0, peerLimit);
-    $("#peertable tbody").innerHTML = shown.length ? shown.map((p) => `<tr data-p="${esc(p.path)}"><td class="mono">${esc(peerShort(p.peer_id))}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${esc(p.path)}</span></td><td class="num">${esc(p.quic_direct_v6)}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut" data-peer="${esc(p.peer_id)}"><span class="icon" data-i="more"></span></td></tr>`).join("") : `<tr><td colspan="5" class="mut">${n.peers.length ? "Only infrastructure connected — waiting for network peers." : "No peers connected yet — connecting."}</td></tr>`;
+    setHTML($("#peertable tbody"), shown.length ? html`${shown.map((p) => html`<tr data-p="${p.path}"><td class="mono">${peerShort(p.peer_id)}</td><td><span class="badge ${p.path === "direct" ? "ok" : p.path === "relay" ? "warn" : "secondary"}">${p.path}</span></td><td class="num">${p.quic_direct_v6}</td><td>${repBadge(repL[p.peer_id])}</td><td class="rowmenu mut" data-peer="${p.peer_id}"><span class="icon" data-i="more"></span></td></tr>`)}` : html`<tr><td colspan="5" class="mut">${n.peers.length ? "Only infrastructure connected — waiting for network peers." : "No peers connected yet — connecting."}</td></tr>`);
     injectIcons($("#peertable"));
     // dynamic count + View more
     const pc = $("#peercount"); if (pc) pc.textContent = peers.length <= peerLimit ? `${peers.length} peer${peers.length === 1 ? "" : "s"}` : `${shown.length} of ${peers.length} peers`;
@@ -50,8 +51,8 @@ import { menu, toast } from "./chrome";
     $("#actchips .chip .num") && ($("#actchips .chip .num").textContent = peers.length);
     $$("#peertable .rowmenu").forEach((cell) => cell.onclick = (e) => { e.stopPropagation(); menu(cell, [{ label: "Copy peer id", fn: async () => { try { await navigator.clipboard.writeText(cell.dataset.peer); toast("Peer id copied"); } catch (err) { toast(`Copy failed: ${err}`); } } }]); });
     // DHT
-    $$("#v-peers .acttab")[1].querySelector("tbody").innerHTML = (n.known_models || []).length ? (snap.network.known_models).map((m) => `<tr><td class="mono" title="${esc(displayModelName(m))}">/oh/model/${esc(displayModelName(m))}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td></tr>`).join("") : `<tr><td colspan="3" class="mut">No records yet.</td></tr>`;
-    $$("#v-peers .acttab")[1].querySelector(".card.pad").innerHTML = `kad_routing_peers: <span class="num">${n.kad_routing_peers}</span> · server mode: ${n.kad_server_mode ? "yes" : "no"}`;
+    setHTML($$("#v-peers .acttab")[1].querySelector("tbody"), (n.known_models || []).length ? html`${(snap.network.known_models).map((m) => html`<tr><td class="mono" title="${displayModelName(m)}">/oh/model/${displayModelName(m)}</td><td><span class="badge secondary">provider</span></td><td class="num">${(snap.network.known_providers || []).filter((p) => p.model_id === m).length || 1}</td></tr>`)}` : html`<tr><td colspan="3" class="mut">No records yet.</td></tr>`);
+    setHTML($$("#v-peers .acttab")[1].querySelector(".card.pad"), html`kad_routing_peers: <span class="num">${n.kad_routing_peers}</span> · server mode: ${n.kad_server_mode ? "yes" : "no"}`);
     // Swarm
     const sw = $$("#v-peers .acttab")[2].querySelectorAll(".kpi .val"); sw[0].textContent = n.listen_addrs.length; sw[1].textContent = n.relay_reservations.length; sw[2].textContent = n.counters.dcutr_successes; sw[3].textContent = n.autonat_private ? "private" : "public";
     // Logs
@@ -63,9 +64,9 @@ import { menu, toast } from "./chrome";
   const NOISY = /\b(WARN|DEBUG)\b.*\b(libp2p|quinn|quinn_udp|yamux|multistream|kad|mdns|netlink)\b/i;
   export function renderLogs() {
     const logs = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || [];
-    $("#logbody").innerHTML = logs.length
-      ? `<div class="mut" style="font-family:var(--sans);margin-bottom:6px">Dimmed lines are routine network-layer warnings.</div>` + logs.map((l) => NOISY.test(l) ? `<span class="mut">${esc(l)}</span>` : esc(l)).join("<br>")
-      : "No log lines yet.";
+    setHTML($("#logbody"), logs.length
+      ? html`<div class="mut" style="font-family:var(--sans);margin-bottom:6px">Dimmed lines are routine network-layer warnings.</div>${logs.map((l, i) => html`${i ? html`<br>` : ""}${NOISY.test(l) ? html`<span class="mut">${l}</span>` : l}`)}`
+      : html`No log lines yet.`);
   }
 
 export function setLogTab(t) { logTab = t; }

@@ -1,5 +1,6 @@
 // Lucide-style inline SVG icon set (wireframe verbatim) + the injector that fills [data-i] hosts.
 import { $$ } from "./dom";
+import { setHTML, trustedMarkup } from "./html";
 
 const ICONS = {
   zap:'<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
@@ -31,6 +32,7 @@ const ICONS = {
 export function injectIcons(rt = document) {
   $$("[data-i]", rt).forEach((e) => {
     const n = e.dataset.i;
-    if (ICONS[n]) e.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n]}</svg>`;
+    // ICONS are this file's own constant SVG paths (a trusted producer).
+    if (ICONS[n]) setHTML(e, trustedMarkup(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[n]}</svg>`));
   });
 }

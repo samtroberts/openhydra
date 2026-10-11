@@ -1,13 +1,14 @@
 // OpenHydra Desktop — the shadcn wireframe (docs/openhydra_wireframe_shadcn.html) wired to the
 // Rust backend via Tauri IPC. The DOM + CSS are the wireframe verbatim; this file swaps the
 // wireframe's demo data for live network state. In a plain browser it renders a demo mock.
-import { $, $$, esc, shortPeer } from "./dom";
+import { $, $$, shortPeer } from "./dom";
+import { html, setHTML } from "./html";
 import { injectIcons } from "./icons";
 import { store } from "./storage";
 import { fmtNum, fmtGB } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
-import { renderMarkdown } from "./markdown";
+import { renderMarkdownMarkup } from "./markdown";
 import { toast, menu, closeMenus, confirmModal } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName, modelIdle, AUTO_MODEL } from "./models";
@@ -181,13 +182,13 @@ const ENGINE_KIND_OF = { "auto-detect": "auto", ollama: "ollama", vLLM: "vllm", 
 // ── recents (live sessions) ──
 function renderRecents() {
   const box = $("#recents"), q = ($("#recfilter").value || "").toLowerCase();
-  box.innerHTML = "";
+  box.replaceChildren();
   for (const id of sessionOrder) {
     const s = sessions[id]; if (!s) continue;
     const el = document.createElement("div");
     el.className = "nav recent" + (id === curChat && activeView === "chat" ? " on" : "");
     el.dataset.chat = id;
-    el.innerHTML = `<span class="icon" data-i="chat"></span><span class="rt" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${esc(s.t)}</span><span class="recmenu" title="Rename or delete">⋯</span>`;
+    setHTML(el, html`<span class="icon" data-i="chat"></span><span class="rt" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${s.t}</span><span class="recmenu" title="Rename or delete">⋯</span>`);
     injectIcons(el);
     el.style.display = q && !s.t.toLowerCase().includes(q) ? "none" : "";
     box.appendChild(el);
@@ -249,18 +250,18 @@ function botEl(content, meta, reasoning) {
   const d = document.createElement("div"); d.className = "msg ai";
   if (reasoning) {
     const det = document.createElement("details"); det.style.cssText = "margin:0 0 6px;font-size:12px";
-    det.innerHTML = `<summary style="cursor:pointer;color:hsl(var(--muted-foreground))">🧠 Thinking</summary>`;
+    setHTML(det, html`<summary style="cursor:pointer;color:hsl(var(--muted-foreground))">🧠 Thinking</summary>`);
     const b = document.createElement("div"); b.style.cssText = "white-space:pre-wrap;margin-top:4px;padding:6px 10px;border-left:2px solid hsl(var(--border));color:hsl(var(--muted-foreground))"; b.textContent = reasoning; det.appendChild(b); d.appendChild(det);
   }
   if (content && content.trim()) {
     for (const part of parseFences(content)) {
-      if (part.code != null) { const c = document.createElement("div"); c.className = "code-card"; c.innerHTML = `<div class="code-card-head"><span>${esc(part.lang)}</span><button class="code-copy">⎘ copy</button></div><pre>${hl(part.code)}</pre>`; c.querySelector(".code-copy").onclick = (ev) => { navigator.clipboard?.writeText(part.code); ev.target.textContent = "✓ copied"; setTimeout(() => ev.target.textContent = "⎘ copy", 1400); }; d.appendChild(c); }
+      if (part.code != null) { const c = document.createElement("div"); c.className = "code-card"; setHTML(c, html`<div class="code-card-head"><span>${part.lang}</span><button class="code-copy">⎘ copy</button></div><pre>${hl(part.code)}</pre>`); c.querySelector(".code-copy").onclick = (ev) => { navigator.clipboard?.writeText(part.code); ev.target.textContent = "✓ copied"; setTimeout(() => ev.target.textContent = "⎘ copy", 1400); }; d.appendChild(c); }
       else {
         // Prose: inline media (images, audio, video) as players; everything else as markdown.
         const pr = document.createElement("div"); pr.className = "md";
         // Bounded so a long run of brackets can't make this scan quadratic (data URLs have no "[", "(" or spaces).
         const re = /!?\[([^\]\n]{0,500})\]\(([^)\s[(]+)\)/g; let last = 0, m, buf = "";
-        const flush = () => { if (buf) { const md = document.createElement("div"); md.innerHTML = renderMarkdown(buf); pr.appendChild(md); buf = ""; } };
+        const flush = () => { if (buf) { const md = document.createElement("div"); setHTML(md, renderMarkdownMarkup(buf)); pr.appendChild(md); buf = ""; } };
         while ((m = re.exec(part.prose))) {
           const mel = mediaEl(m[2].trim(), m[1]);
           buf += part.prose.slice(last, m.index);
@@ -279,13 +280,13 @@ function botEl(content, meta, reasoning) {
       : "The model returned no visible text — it may be in “thinking” mode. Ask it to answer directly, or turn off reasoning in the provider’s engine (e.g. add /no_think to the prompt).";
     d.appendChild(note);
   }
-  if (meta) { const mm = document.createElement("div"); mm.innerHTML = metaRow(meta); d.appendChild(mm.firstChild); }
+  if (meta) { const mm = document.createElement("div"); setHTML(mm, metaRow(meta)); d.appendChild(mm.firstChild); }
   return d;
 }
 function renderChat() {
-  const s = sessions[curChat]; const th = $("#thread"); if (!s) { th.innerHTML = ""; return; }
-  $("#chattitle").textContent = s.t; th.innerHTML = "";
-  if (!s.m.length) { th.innerHTML = `<div class="mut" style="margin:auto;text-align:center;font-size:12.5px">Ask anything — requests route through the network to whichever provider serves the model.</div>`; return; }
+  const s = sessions[curChat]; const th = $("#thread"); if (!s) { th.replaceChildren(); return; }
+  $("#chattitle").textContent = s.t; th.replaceChildren();
+  if (!s.m.length) { setHTML(th, html`<div class="mut" style="margin:auto;text-align:center;font-size:12.5px">Ask anything — requests route through the network to whichever provider serves the model.</div>`); return; }
   for (const x of s.m) {
     if (x[0] === "me") {
       // A message with files shows the file names, not the inlined file text (the model gets both).
@@ -463,7 +464,7 @@ $("#attachfile").onchange = async (e) => {
 function renderAttachChips() {
   for (const host of [$("#homeattach"), $("#chatattach")]) {
     if (!host) continue;
-    host.innerHTML = attachments.map((a, i) => `<span class="achip" title="${esc(a.name)}">📎 ${esc(a.name)}<button data-i="${i}" title="Remove">×</button></span>`).join("");
+    setHTML(host, html`${attachments.map((a, i) => html`<span class="achip" title="${a.name}">📎 ${a.name}<button data-i="${i}" title="Remove">×</button></span>`)}`);
     host.style.display = attachments.length ? "" : "none";
     host.querySelectorAll("button").forEach((b) => b.onclick = () => { attachments.splice(+b.dataset.i, 1); renderAttachChips(); });
   }
@@ -540,11 +541,11 @@ function renderStatusbar() {
           ? `Sharing ${n} model${n === 1 ? "" : "s"} to the network — click to manage`
           : "Provider on, but 0 models shared — click to choose what to share")
       : "Share your machine's models to the network";
-    shb.innerHTML = running
+    setHTML(shb, running
       ? (n > 0
-          ? `<span class="dot ok pulse"></span>Sharing ${n} model${n === 1 ? "" : "s"}`
-          : `<span class="dot"></span>0 models shared`)   // idle: neutral dot, honest label — not "Sharing…"
-      : "Share your models";
+          ? html`<span class="dot ok pulse"></span>Sharing ${n} model${n === 1 ? "" : "s"}`
+          : html`<span class="dot"></span>0 models shared`)   // idle: neutral dot, honest label — not "Sharing…"
+      : html`Share your models`);
   }
   $("#sidepeer").textContent = `${deviceName} · ${shortPeer(p?.peer_id || g?.peer_id)}`;
   renderModels();
@@ -790,8 +791,7 @@ function ensureResumeNotice() {
   if (document.getElementById("resumenotice")) return;
   const el = document.createElement("div");
   el.id = "resumenotice"; el.className = "resumenotice";
-  el.innerHTML = `<span class="rn-dot">●</span><span class="rn-text">${resumeText()}</span>`
-    + `<button class="btn ghost sm rn-stop">Don't resume</button><button class="rn-x" title="Dismiss">×</button>`;
+  setHTML(el, html`<span class="rn-dot">●</span><span class="rn-text">${resumeText()}</span><button class="btn ghost sm rn-stop">Don't resume</button><button class="rn-x" title="Dismiss">×</button>`);
   document.body.appendChild(el);
   const dismiss = () => { resumeNoticeDismissed = true; el.remove(); };
   el.querySelector(".rn-stop").onclick = async () => { dismiss(); try { await setSharing(false); toast("Sharing stopped"); } catch (e) { toast("Couldn't stop: " + e); } };

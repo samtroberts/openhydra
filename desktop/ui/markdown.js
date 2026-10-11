@@ -2,7 +2,9 @@
 // pattern runs, so only the tags produced here can appear. Covers what models commonly emit:
 // headings, bold, italic, inline code, links, bullet and numbered lists, block quotes, tables and
 // horizontal rules. Fenced code blocks are split out before this (parseFences); maths stays as text.
-// Pure string → string, so it is unit-tested with `node --test`.
+// Pure string → string, so it is unit-tested with `node --test`; renderMarkdownMarkup wraps the
+// result as html`` markup (this renderer is one of the trusted producers).
+import { trustedMarkup } from "./html.js";
 
 const escHtml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -88,3 +90,6 @@ export function renderMarkdown(text) {
   flushPara();
   return out.join("");
 }
+
+/** renderMarkdown as html`` markup, for setHTML. */
+export const renderMarkdownMarkup = (text) => trustedMarkup(renderMarkdown(text));

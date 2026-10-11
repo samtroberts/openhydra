@@ -1,7 +1,8 @@
 // Share view (provider role) + the per-model share allowlist + the sharing/gateway lifecycle.
 // setSharing / ensureGateway signal the controller via the bus (emit "nav"/"refresh") instead of
 // importing its go()/refresh() (which would cycle). renderShare is the view-dispatcher entry.
-import { $, $$, esc, escapeHtml } from "./dom";
+import { $, $$ } from "./dom";
+import { html, setHTML } from "./html";
 import { state, snap, engines } from "./state";
 import { call } from "./bridge";
 import { toast, confirmModal } from "./chrome";
@@ -126,13 +127,12 @@ import { exportCardModal, ensureImportSection } from "./cards";
     return new Promise((resolve) => {
       const back = document.createElement("div");
       back.className = "cmodal-back";
-      back.innerHTML =
-        `<div class="cmodal"><div class="cmodal-h"><b>Publish “${esc(displayModelName(m))}” to the global network?</b></div>` +
-        `<div class="cmodal-b">` +
-        `<div class="cmodal-path">Anyone on the OpenHydra network will be able to <b>discover</b> this model, <b>route inference</b> to it, and <b>earn or spend credits</b> against it. Your machine serves the requests.</div>` +
-        `<div class="cmodal-warn">This exposes an <b>offer</b> for this model (its clean handle + capability) to the public network — not your prompts, files, or identity. You can switch it back to Private at any time.</div>` +
-        `</div>` +
-        `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Publish globally</button></div></div>`;
+      setHTML(back, html`<div class="cmodal"><div class="cmodal-h"><b>Publish “${displayModelName(m)}” to the global network?</b></div>
+        <div class="cmodal-b">
+        <div class="cmodal-path">Anyone on the OpenHydra network will be able to <b>discover</b> this model, <b>route inference</b> to it, and <b>earn or spend credits</b> against it. Your machine serves the requests.</div>
+        <div class="cmodal-warn">This exposes an <b>offer</b> for this model (its clean handle + capability) to the public network — not your prompts, files, or identity. You can switch it back to Private at any time.</div>
+        </div>
+        <div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Publish globally</button></div></div>`);
       document.body.appendChild(back);
       const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(false); } };
       const done = (v) => { document.removeEventListener("keydown", onKey, true); back.remove(); resolve(v); };
@@ -288,16 +288,16 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const preReach = only && shared.length === list.length && reaches.size === 1 ? [...reaches][0] : null;
     const back = document.createElement("div");
     back.className = "cmodal-back";
-    const rows = list.map((m) => `<label class="sdrow" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-m="${escapeHtml(m)}"${checked.has(m) ? " checked" : ""}/>${modelIcon(m)}<span>${esc(displayModelName(m))}</span></label>`).join("");
-    back.innerHTML =
-      `<div class="cmodal"><div class="cmodal-h"><b>${only ? `Share ${esc(displayModelName(list[0]))}${list.length > 1 ? ` and ${list.length - 1} more` : ""}` : "Choose what to share"}</b></div>` +
-      `<div class="cmodal-b">` +
-      (only && list.length === 1 ? `<input type="checkbox" data-m="${escapeHtml(list[0])}" checked hidden/>` : `<div style="max-height:220px;overflow:auto;margin-bottom:12px">${rows}</div>`) +
-      `<div style="font-weight:600;font-size:12.5px;margin-bottom:4px">Who can use ${one ? "it" : "them"}</div>` +
-      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="global"${preReach === "global" ? " checked" : ""}/><span><b>Everyone</b> — anyone on the OpenHydra network can discover ${one ? "this model and send requests to it" : "these models and send requests to them"}. Your machine serves the requests; your prompts, files and identity aren't shared.</span></label>` +
-      `<label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="private"${preReach === "private" ? " checked" : ""}/><span><b>Only my swarms</b> — not announced publicly; only members of a swarm you own can use ${one ? "it" : "them"} (set up in Swarms).</span></label>` +
-      `</div>` +
-      `<div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Share</button></div></div>`;
+    const CHECKED = html` checked`;
+    const rows = list.map((m) => html`<label class="sdrow" style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer"><input type="checkbox" data-m="${m}"${checked.has(m) ? CHECKED : ""}/>${modelIcon(m)}<span>${displayModelName(m)}</span></label>`);
+    setHTML(back, html`<div class="cmodal"><div class="cmodal-h"><b>${only ? html`Share ${displayModelName(list[0])}${list.length > 1 ? ` and ${list.length - 1} more` : ""}` : "Choose what to share"}</b></div>
+      <div class="cmodal-b">
+      ${only && list.length === 1 ? html`<input type="checkbox" data-m="${list[0]}" checked hidden/>` : html`<div style="max-height:220px;overflow:auto;margin-bottom:12px">${rows}</div>`}
+      <div style="font-weight:600;font-size:12.5px;margin-bottom:4px">Who can use ${one ? "it" : "them"}</div>
+      <label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="global"${preReach === "global" ? CHECKED : ""}/><span><b>Everyone</b> — anyone on the OpenHydra network can discover ${one ? "this model and send requests to it" : "these models and send requests to them"}. Your machine serves the requests; your prompts, files and identity aren't shared.</span></label>
+      <label style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer"><input type="radio" name="sdreach" value="private"${preReach === "private" ? CHECKED : ""}/><span><b>Only my swarms</b> — not announced publicly; only members of a swarm you own can use ${one ? "it" : "them"} (set up in Swarms).</span></label>
+      </div>
+      <div class="cmodal-f"><button class="btn ghost sm cx">Cancel</button><button class="btn sm brand cok">Share</button></div></div>`);
     document.body.appendChild(back);
     const picked = await new Promise((resolve) => {
       const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(null); } };
@@ -341,7 +341,7 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const announcedSet = new Set(snap?.share?.announced_models || []);
     const announcedCount = hasShareView ? announcedSet.size : (running ? (p.announced ?? 0) : 0);
     const head = $("#v-share .row .ctitle").parentElement;
-    head.querySelector(".badge").innerHTML = running ? '<span class="dot ok"></span>provider running' : '<span class="dot"></span>not sharing';
+    setHTML(head.querySelector(".badge"), running ? html`<span class="dot ok"></span>provider running` : html`<span class="dot"></span>not sharing`);
     head.querySelector(".badge").className = "badge " + (running ? "ok" : "secondary"); head.querySelector(".badge").style.marginLeft = "8px";
     // #1: start/stop lives here now (the title-bar control became a CTA that routes here).
     const stb = $("#sharetoggle");
@@ -361,10 +361,10 @@ import { exportCardModal, ensureImportSection } from "./cards";
     k[1].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[2].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     k[3].textContent = "—";   // own reputation is held by the peers we serve — not locally knowable
-    $$("#v-share .g4 .kpi .sub")[0].innerHTML = `${t?.requests_served ?? 0} requests served`;
+    $$("#v-share .g4 .kpi .sub")[0].textContent = `${t?.requests_served ?? 0} requests served`;
     $$("#v-share .g4 .kpi .sub")[1].textContent = "earned − spent, cost-weighted (not money)";
     $$("#v-share .g4 .kpi .sub")[2].textContent = "served ÷ used";
-    $$("#v-share .g4 .kpi .sub")[3].innerHTML = `<span class="mut">earned on the peers you serve</span>`;
+    setHTML($$("#v-share .g4 .kpi .sub")[3], html`<span class="mut">earned on the peers you serve</span>`);
     // B4: two tables. Primary = models an engine serves RIGHT NOW, sorted shared-first then by
     // lifetime tokens. Secondary = models with lifetime tokens on record but no longer detected
     // (deleted / engine offline). Lifetime tokens come from the durable accumulator (survive restart).
@@ -387,40 +387,37 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // here): a `global` model shows live/pending; a shared non-global model shows "not announced"
       // (served on the trust domain, absent from the public DHT). `device`/unknown ⇒ non-global.
       let status;
-      if (!running) status = `<span class="badge secondary">ready</span>`;
-      else if (!sharedIntent) status = `<span class="badge secondary">off</span>`;
+      if (!running) status = html`<span class="badge secondary">ready</span>`;
+      else if (!sharedIntent) status = html`<span class="badge secondary">off</span>`;
       else if (gl) status = (announcedSet.has(m) || !hasShareView)
-        ? `<span class="badge ok">live</span>` : `<span class="badge warn">pending</span>`;
-      else status = `<span class="badge secondary" title="Not announced publicly. Only members of a swarm you own can use it (set up in Swarms).">swarms only</span>`;
+        ? html`<span class="badge ok">live</span>` : html`<span class="badge warn">pending</span>`;
+      else status = html`<span class="badge secondary" title="Not announced publicly. Only members of a swarm you own can use it (set up in Swarms).">swarms only</span>`;
       const swTitle = !running ? "Share this model when you start sharing"
         : sharedIntent ? "Sharing — toggle off to stop" : "Toggle on to share this model";
       // Reach control (binary), only for a shared model: a Private | Global segmented pill. Choosing
       // Global opens the consent gate; Private clears the model's consent. Distinct from the on/off
       // share switch so the two are never confused. `device`/unknown highlights Private.
       const reachPill = sharedIntent
-        ? `<span class="reach-pill" title="How far this model reaches">`
-          + `<button class="rp ${gl ? "" : "sel"}" data-reach="${escapeHtml(m)}" data-to="private" title="${SCOPE_META.private.title}">🔒 Private</button>`
-          + `<button class="rp ${gl ? "sel" : ""}" data-reach="${escapeHtml(m)}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button>`
-          + `</span>`
+        ? html`<span class="reach-pill" title="How far this model reaches"><button class="rp ${gl ? "" : "sel"}" data-reach="${m}" data-to="private" title="${SCOPE_META.private.title}">🔒 Private</button><button class="rp ${gl ? "sel" : ""}" data-reach="${m}" data-to="global" title="${SCOPE_META.global.title}">🌐 Global</button></span>`
         : "";
       // M2/M4: export a signed `.openhydra` card. A GLOBAL model → a public card (a link anyone can
       // use). A PRIVATE model (M4) → a private card bound to a swarm you own (only members can serve
       // from it). Shown for any shared model; the private branch prompts for the swarm.
       const cardBtn = sharedIntent
-        ? `<button class="cardbtn" data-export-card="${escapeHtml(m)}" data-private="${gl ? "0" : "1"}" title="${gl ? "Export a public .openhydra card — a link to this model" : "Export a private .openhydra card for a swarm — only members can serve from it"}">🔗</button>`
+        ? html`<button class="cardbtn" data-export-card="${m}" data-private="${gl ? "0" : "1"}" title="${gl ? "Export a public .openhydra card — a link to this model" : "Export a private .openhydra card for a swarm — only members can serve from it"}">🔗</button>`
         : "";
-      rows.push(`<tr><td>${modelIcon(m)}<b title="${escapeHtml(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td>${esc(engineFor(m) || "—")}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${escapeHtml(m)}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
+      rows.push(html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b></td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
     }
-    $("#servetable tbody").innerHTML = rows.join("") || `<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`;
+    setHTML($("#servetable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`);
     // "Previously served" — lifetime tokens on record but NOT currently detected.
     const pastModels = statModels().filter((id) => lifetimeServed(id) > 0 && !active.has(id))
       .sort((a, b) => (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0));
     const pastCard = $("#pastcard");
     if (pastCard) {
       pastCard.style.display = pastModels.length ? "" : "none";
-      $("#pasttable tbody").innerHTML = pastModels.map((m) =>
-        `<tr><td>${modelIcon(m)}<b title="${esc(displayModelName(m))}">${esc(displayModelName(m))}</b></td><td class="num">${fmtNum(lifetimeServed(m))}</td><td><span class="badge secondary">not on device</span></td></tr>`
-      ).join("");
+      setHTML($("#pasttable tbody"), html`${pastModels.map((m) =>
+        html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b></td><td class="num">${fmtNum(lifetimeServed(m))}</td><td><span class="badge secondary">not on device</span></td></tr>`
+      )}`);
       const tbl = $("#pasttable"), foot = pastCard.querySelector(".pager");
       if (tbl) tbl.style.display = hidePast ? "none" : "";
       if (foot) foot.style.display = hidePast ? "none" : "";
@@ -474,5 +471,5 @@ import { exportCardModal, ensureImportSection } from "./cards";
       }
     }
     // wanted table — honest empty state until demand telemetry lands
-    $("#wanttable tbody").innerHTML = `<tr><td colspan="4" class="mut">Not available yet: this fills in once the network reports demand.</td></tr>`;
+    setHTML($("#wanttable tbody"), html`<tr><td colspan="4" class="mut">Not available yet: this fills in once the network reports demand.</td></tr>`);
   }

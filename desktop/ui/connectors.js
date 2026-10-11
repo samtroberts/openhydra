@@ -1,7 +1,8 @@
 // Connectors view: detect installed coding tools, render the surface switcher, live command
 // snippet, searchable model selector, and state-driven actions on each actionable card; wire
 // Connect / Connect&Run / Disconnect / Test. renderConnectors is the entry the view dispatcher calls.
-import { $, $$, esc, escapeHtml } from "./dom";
+import { $, $$ } from "./dom";
+import { html, setHTML } from "./html";
 import { call } from "./bridge";
 import { toast, confirmModal } from "./chrome";
 import { liveModels, displayModelName } from "./models";
@@ -26,13 +27,13 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     // Show ONLY when we've CONFIRMED the CLI is missing/broken — never on error/unknown. A failed check
     // doesn't nag here (the always-present Settings row is the reliable install path).
     const show = s && !s.error && (!s.on_path || s.managed_broken);
-    if (!show) { b.style.display = "none"; b.innerHTML = ""; return; }
+    if (!show) { b.style.display = "none"; b.replaceChildren(); return; }
     const broken = s.managed_broken;
     b.style.display = "flex";
-    b.innerHTML = `<span class="clib-ic">⌨</span><span class="clib-t">${broken
-        ? `The <span class="mono">openhydra</span> command is installed but broken (the app moved) — repair it so the terminal commands below work.`
-        : `The <span class="mono">openhydra</span> command isn't on your PATH yet — the terminal snippets below (and <span class="mono">openhydra launch</span>) won't run until it's installed.`
-      }</span><button class="btn brand sm clib-go">${broken ? "Repair" : "Install the CLI"}</button>`;
+    setHTML(b, html`<span class="clib-ic">⌨</span><span class="clib-t">${broken
+        ? html`The <span class="mono">openhydra</span> command is installed but broken (the app moved) — repair it so the terminal commands below work.`
+        : html`The <span class="mono">openhydra</span> command isn't on your PATH yet — the terminal snippets below (and <span class="mono">openhydra launch</span>) won't run until it's installed.`
+      }</span><button class="btn brand sm clib-go">${broken ? "Repair" : "Install the CLI"}</button>`);
     const go = $(".clib-go", b);
     if (go) go.onclick = async () => {
       go.disabled = true; go.textContent = "Installing…";
@@ -66,8 +67,8 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
   function renderSurfaceSwitcher(card, st) {
     const slot = $(".csurf", card); if (!slot) return;
     const surfaces = st.surfaces && st.surfaces.length ? st.surfaces : ["terminal"];
-    if (surfaces.length < 2) { slot.innerHTML = `<span class="solo">${surfLabel(surfaces[0])}</span>`; return; }
-    slot.innerHTML = surfaces.map((s) => `<button data-s="${s}"${s === card.dataset.surface ? ' class="on"' : ""}>${surfLabel(s)}</button>`).join("");
+    if (surfaces.length < 2) { setHTML(slot, html`<span class="solo">${surfLabel(surfaces[0])}</span>`); return; }
+    setHTML(slot, html`${surfaces.map((s) => html`<button data-s="${s}" class="${s === card.dataset.surface ? "on" : ""}">${surfLabel(s)}</button>`)}`);
     $$("button", slot).forEach((b) => b.onclick = () => {
       card.dataset.surface = b.dataset.s;
       renderSurfaceSwitcher(card, st); renderSnippet(card, st); renderActions(card, st);
@@ -89,26 +90,23 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     if (!card._models) card._models = new Set(st.declared_models || []);
     box = document.createElement("details"); box.className = "cmodels";
     card.insertBefore(box, $(".connact", card));
-    box.innerHTML = `<summary>Models to declare in ${esc(st.label)} ▾</summary>`
-      + `<div class="mchips"></div>`
-      + `<div class="mcombo"><input class="mfilter" type="text" placeholder="add a model — scroll or type to filter…"><div class="mopts" hidden></div></div>`;
+    setHTML(box, html`<summary>Models to declare in ${st.label} ▾</summary><div class="mchips"></div><div class="mcombo"><input class="mfilter" type="text" placeholder="add a model — scroll or type to filter…"><div class="mopts" hidden></div></div>`);
     const chipsEl = $(".mchips", box), input = $(".mfilter", box), opts = $(".mopts", box);
 
     const renderChips = () => {
-      chipsEl.innerHTML = `<span class="mchip auto">${AUTO_MODEL} <span class="mut">· always</span></span>`
-        + [...card._models].map((m) => `<span class="mchip" title="${esc(m)}">${esc(displayModelName(m))} <button class="mrm" data-v="${esc(m)}" title="Remove">×</button></span>`).join("");
+      setHTML(chipsEl, html`<span class="mchip auto">${AUTO_MODEL} <span class="mut">· always</span></span>${[...card._models].map((m) => html`<span class="mchip" title="${m}">${displayModelName(m)} <button class="mrm" data-v="${m}" title="Remove">×</button></span>`)}`);
       $$(".mrm", chipsEl).forEach((b) => b.onclick = () => { card._models.delete(b.dataset.v); renderChips(); renderSnippet(card, st); if (!opts.hidden) renderOpts(); });
     };
     const add = (v) => { v = (v || "").trim(); if (!v || v === AUTO_MODEL) return; card._models.add(v); input.value = ""; renderChips(); renderOpts(); renderSnippet(card, st); };
     const renderOpts = () => {
       const q = input.value.trim().toLowerCase();
       const avail = liveModels().filter((m) => !card._models.has(m) && m.toLowerCase().includes(q));
-      let html = avail.map((m) => `<div class="mopt" data-v="${esc(m)}" title="${esc(m)}">${esc(displayModelName(m))}</div>`).join("");
+      const items = avail.map((m) => html`<div class="mopt" data-v="${m}" title="${m}">${displayModelName(m)}</div>`);
       const typed = input.value.trim();
       if (typed && !liveModels().some((m) => m.toLowerCase() === typed.toLowerCase()) && !card._models.has(typed)) {
-        html += `<div class="mopt add" data-v="${esc(typed)}">+ Add “${esc(typed)}”</div>`;
+        items.push(html`<div class="mopt add" data-v="${typed}">+ Add “${typed}”</div>`);
       }
-      opts.innerHTML = html || `<div class="mopt mut">No matching models on the network</div>`;
+      setHTML(opts, items.length ? html`${items}` : html`<div class="mopt mut">No matching models on the network</div>`);
       // mousedown (not click) + preventDefault so the option registers before the input's blur hides it.
       $$(".mopt[data-v]", opts).forEach((o) => o.onmousedown = (e) => { e.preventDefault(); add(o.dataset.v); });
       box._lastSig = liveModels().join(""); // remember the network's model set at this render
@@ -158,15 +156,11 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     act._sig = sig;
     // Terminal tools can't be started from here: "Connect & copy" wires it and copies the launch command
     // (once connected, Copy does that). App/editor tools open for real.
-    const runLabel = st.connected ? (isTerminal ? null : "Open") : (isTerminal ? "Connect &amp; copy command" : "Connect &amp; Open");
+    const runLabel = st.connected ? (isTerminal ? null : "Open") : (isTerminal ? "Connect & copy command" : "Connect & Open");
     const statusHtml = st.connected
-      ? `<span class="cconnected">● Connected</span>`
-      : `<span class="cstat ${st.installed ? "on" : "off"}">●</span><span class="cstat-t">${st.installed ? "installed" : "not detected"}</span>`;
-    act.innerHTML = statusHtml
-      + (isTerminal ? `<button class="btn ghost sm ccopy" style="margin-left:auto">Copy</button>` : `<span style="margin-left:auto"></span>`)
-      + `<button class="btn ghost sm ctest">Test</button>`
-      + (st.connected ? `<button class="btn ghost sm cdisc">Disconnect</button>` : `<button class="btn ghost sm cwire">Connect</button>`)
-      + (runLabel ? `<button class="btn sm crun">${runLabel}</button>` : "");
+      ? html`<span class="cconnected">● Connected</span>`
+      : html`<span class="cstat ${st.installed ? "on" : "off"}">●</span><span class="cstat-t">${st.installed ? "installed" : "not detected"}</span>`;
+    setHTML(act, html`${statusHtml}${isTerminal ? html`<button class="btn ghost sm ccopy" style="margin-left:auto">Copy</button>` : html`<span style="margin-left:auto"></span>`}<button class="btn ghost sm ctest">Test</button>${st.connected ? html`<button class="btn ghost sm cdisc">Disconnect</button>` : html`<button class="btn ghost sm cwire">Connect</button>`}${runLabel ? html`<button class="btn sm crun">${runLabel}</button>` : ""}`);
     const on = (sel, fn) => { const b = $(sel, act); if (b) b.onclick = fn; };
     on(".ccopy", () => { navigator.clipboard?.writeText(($(".snippet", card)?.textContent || "").trim()); toast("Copied"); });
     on(".ctest", (e) => testGateway(e.target, card));

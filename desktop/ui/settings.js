@@ -1,7 +1,8 @@
 // Settings view + the Engine-endpoint helper (#3: the endpoint follows the selected engine). Settings
 // save as they change (the controller's saveSetting); text fields are not clobbered while focused, and
 // unsaved values in `pendingSettings` win over the poll's re-render. updateEngineEndpoint is also called by the engine dropdown in the controller.
-import { $, escapeHtml } from "./dom";
+import { $ } from "./dom";
+import { html, setHTML } from "./html";
 import { state, engines, deviceName } from "./state";
 import { call } from "./bridge";
 
@@ -36,12 +37,11 @@ import { call } from "./bridge";
       return;
     }
     if (host.dataset.done) return;
-    const row = (title, desc, v) => `<div class="field"><label>${title}</label><div class="desc" style="margin:-2px 0 6px">${desc}</div>` +
-      `<div class="input mono" style="justify-content:space-between;gap:10px;font-size:11.5px"><span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(v?.peer_id || "—")}</span>` +
-      `<button class="btn ghost sm idcopy" data-v="${escapeHtml(v?.peer_id || "")}">Copy</button></div>` +
-      `<div class="desc mono" style="margin-top:4px">${escapeHtml(v?.key_file || "")}</div></div>`;
-    host.innerHTML = row("Sharing identity", "The peer id other machines see when they use your models.", identities.sharing) +
-      row("Chat identity", "Used when you chat, and for swarms you join.", identities.chat);
+    const row = (title, desc, v) => html`<div class="field"><label>${title}</label><div class="desc" style="margin:-2px 0 6px">${desc}</div>
+      <div class="input mono" style="justify-content:space-between;gap:10px;font-size:11.5px"><span style="overflow:hidden;text-overflow:ellipsis">${v?.peer_id || "—"}</span>
+      <button class="btn ghost sm idcopy" data-v="${v?.peer_id || ""}">Copy</button></div>
+      <div class="desc mono" style="margin-top:4px">${v?.key_file || ""}</div></div>`;
+    setHTML(host, html`${row("Sharing identity", "The peer id other machines see when they use your models.", identities.sharing)}${row("Chat identity", "Used when you chat, and for swarms you join.", identities.chat)}`);
     host.dataset.done = "1";
     host.querySelectorAll(".idcopy").forEach((b) => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.v); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1200); } catch {} });
   }
