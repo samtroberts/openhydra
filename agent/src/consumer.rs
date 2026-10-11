@@ -1721,6 +1721,12 @@ pub struct AutoCandidates {
     /// Reputation this node has earned with a provider on a model, decayed to now, keyed by
     /// (provider libp2p id, model id). Only pairs with history appear.
     pub earned: HashMap<(String, String), f64>,
+    /// The authenticity tier this node has established for a provider on a model (the routing
+    /// gate's own resolver), same key. A pair missing here is unproven ([`AuthenticityTier::SelfReported`]).
+    pub tiers: HashMap<(String, String), AuthenticityTier>,
+    /// The authenticity floor routing will hard-gate this request on (the node's policy, raised by
+    /// the request's own), if any: a model whose providers all fall below it would be refused.
+    pub floor: Option<AuthenticityTier>,
 }
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
@@ -2666,14 +2672,20 @@ impl ConsumerNode {
 
     /// What the gateway's `openhydra/auto` choice draws on: the known (model, provider) pairs, this
     /// node's own provider, imported cards, and the reputation this node has earned with providers.
-    pub fn auto_candidates(&self) -> Result<AutoCandidates, String> {
+    /// `requested` is the request's own authenticity floor (the gateway's min-authenticity header).
+    pub fn auto_candidates(&self, requested: Option<AuthenticityTier>) -> Result<AutoCandidates, String> {
         let providers = self.net.known_providers()?;
-        Ok(self.auto_candidates_from(providers, now_unix_ms()))
+        Ok(self.auto_candidates_from(providers, requested, now_unix_ms()))
     }
 
     /// [`auto_candidates`](Self::auto_candidates) over a given provider list (testable without a
     /// swarm).
-    fn auto_candidates_from(&self, providers: Vec<openhydra_network::types::KnownProvider>, now: u64) -> AutoCandidates {
+    fn auto_candidates_from(
+        &self,
+        providers: Vec<openhydra_network::types::KnownProvider>,
+        requested: Option<AuthenticityTier>,
+        now: u64,
+    ) -> AutoCandidates {
         let card_models = self
             .cards
             .as_ref()
@@ -2689,7 +2701,19 @@ impl ConsumerNode {
                     .map(|score| ((p.libp2p_peer_id.clone(), p.model_id.clone()), score))
             })
             .collect();
-        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned }
+        // Tiers as the routing gate resolves them, so `auto` and routing agree on who qualifies.
+        let tiers = providers
+            .iter()
+            .filter_map(|p| {
+                let state_id = provider_state_id(&p.openhydra_peer_id, &p.public_key);
+                let tier = self.authenticity_of(&state_id, rep_model_key("", &p.model_id), now);
+                (tier > AuthenticityTier::SelfReported).then(|| ((p.libp2p_peer_id.clone(), p.model_id.clone()), tier))
+            })
+            .collect();
+        let policy = request_policy(self.assurance, requested);
+        let floor = (policy.mode == PolicyMode::HardGate && policy.min_authenticity > AuthenticityTier::SelfReported)
+            .then_some(policy.min_authenticity);
+        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned, tiers, floor }
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
@@ -5902,12 +5926,41 @@ mod tests {
         for _ in 0..5 {
             node.record_outcome(&state_id, "qwen2.5:7b", VerificationOutcome::Honored, now);
         }
-        let c = node.auto_candidates_from(vec![provider.clone()], now);
+        let c = node.auto_candidates_from(vec![provider.clone()], None, now);
         let score = c.earned.get(&(provider.libp2p_peer_id.clone(), "qwen2.5:7b".to_string())).copied();
         assert!(score.is_some_and(|s| s > openhydra_protocol::verify::NEUTRAL_REPUTATION), "{score:?}");
         // Standing on another model doesn't count for this one.
         let other = openhydra_network::types::KnownProvider { model_id: "llama3.2:1b".into(), ..provider };
-        assert!(node.auto_candidates_from(vec![other], now).earned.is_empty());
+        assert!(node.auto_candidates_from(vec![other], None, now).earned.is_empty());
+    }
+
+    #[test]
+    fn auto_candidates_carry_the_floor_routing_will_enforce() {
+        use AuthenticityTier::*;
+        let (_dir, node) = test_node();
+        let now = now_unix_ms();
+        // An open node with no request floor: nothing gated.
+        assert_eq!(node.auto_candidates_from(vec![], None, now).floor, None);
+        // A request floor is enforced (hard gate) even on an open node.
+        assert_eq!(node.auto_candidates_from(vec![], Some(ReputationRedundant), now).floor, Some(ReputationRedundant));
+        assert_eq!(node.auto_candidates_from(vec![], Some(SelfReported), now).floor, None);
+        // A node that hard-gates at A1 can't be lowered by a request.
+        let gated = node.with_assurance_policy(AssurancePolicy {
+            min_authenticity: ReputationRedundant,
+            mode: PolicyMode::HardGate,
+            ..AssurancePolicy::OPEN
+        });
+        assert_eq!(gated.auto_candidates_from(vec![], None, now).floor, Some(ReputationRedundant));
+        assert_eq!(gated.auto_candidates_from(vec![], Some(EnergyFingerprintPossession), now).floor, Some(EnergyFingerprintPossession));
+        // An untried provider has no tier entry (it is unproven).
+        let pk = [9u8; 32];
+        let p = openhydra_network::types::KnownProvider {
+            model_id: "m".into(),
+            openhydra_peer_id: openhydra_network::identity::openhydra_peer_id(&pk),
+            libp2p_peer_id: "12D3KooWNew".into(),
+            public_key: hex::encode(pk),
+        };
+        assert!(gated.auto_candidates_from(vec![p], None, now).tiers.is_empty());
     }
 
     fn test_node() -> (tempfile::TempDir, ConsumerNode) {

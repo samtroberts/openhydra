@@ -304,18 +304,37 @@ fn is_auto_model(model: &str) -> bool {
 /// 2. a model this machine's own provider serves;
 /// 3. a model from an imported card;
 /// 4. a model served by a provider this node has earned reputation with (above neutral);
-/// 5. the model with the most distinct providers, if at least two serve it.
+/// 5. a model served by a provider this node has verified at A1 or above (its own audits and
+///    checks; a hardware-attested provider needs no history).
 ///
-/// Ties break alphabetically. `None` means nothing qualifies: the caller asks for an explicit
-/// model rather than send the request to a model only one unknown peer claims to serve.
+/// When routing will hard-gate the request at an authenticity floor (`c.floor`), only providers at
+/// or above it count, at every step: picking a model whose providers all fall below it would only
+/// end in a refusal. Ties break alphabetically. `None` means nothing qualifies: the caller asks for
+/// an explicit model. There is no "most providers" step: announcing a model from several peer ids
+/// costs nothing, so a count is not trust.
 fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>) -> Option<String> {
     use openhydra_protocol::model_id::is_valid_model_id;
-    use std::collections::{BTreeMap, BTreeSet};
-    let providers: Vec<_> = c.providers.iter().filter(|p| is_valid_model_id(&p.model_id)).collect();
-    let cards: BTreeSet<&str> =
-        c.card_models.iter().map(String::as_str).filter(|m| is_valid_model_id(m)).collect();
+    use openhydra_protocol::trust::AuthenticityTier;
+    use std::collections::BTreeSet;
+    let tier_of = |k: &openhydra_network::types::KnownProvider| {
+        c.tiers.get(&(k.libp2p_peer_id.clone(), k.model_id.clone())).copied().unwrap_or(AuthenticityTier::SelfReported)
+    };
+    let providers: Vec<_> = c
+        .providers
+        .iter()
+        .filter(|p| is_valid_model_id(&p.model_id) && c.floor.is_none_or(|f| tier_of(p) >= f))
+        .collect();
+    let served = |m: &str| providers.iter().any(|k| k.model_id == m);
+    // A card names its provider, which routing gates like any other: with a floor, a card counts
+    // only when one of its model's providers clears it.
+    let cards: BTreeSet<&str> = c
+        .card_models
+        .iter()
+        .map(String::as_str)
+        .filter(|m| is_valid_model_id(m) && (c.floor.is_none() || served(m)))
+        .collect();
     if let Some(p) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
-        if cards.contains(p) || providers.iter().any(|k| k.model_id == p) {
+        if cards.contains(p) || served(p) {
             return Some(p.to_string());
         }
     }
@@ -342,18 +361,16 @@ fn pick_auto_model(c: &crate::consumer::AutoCandidates, preferred: Option<&str>)
     if let Some((_, m)) = best_rep {
         return Some(m.to_string());
     }
-    let mut counts: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut best_tier: Option<(AuthenticityTier, &str)> = None;
     for k in &providers {
-        counts.entry(k.model_id.as_str()).or_default().insert(k.libp2p_peer_id.as_str());
-    }
-    // BTreeMap iterates alphabetically, so keeping only strictly larger counts breaks ties that way.
-    let mut best: Option<(usize, &str)> = None;
-    for (m, peers) in counts {
-        if peers.len() >= 2 && best.map_or(true, |(n, _)| peers.len() > n) {
-            best = Some((peers.len(), m));
+        let t = tier_of(k);
+        if t >= AuthenticityTier::ReputationRedundant
+            && best_tier.map_or(true, |(bt, m)| t > bt || (t == bt && k.model_id.as_str() < m))
+        {
+            best_tier = Some((t, k.model_id.as_str()));
         }
     }
-    best.map(|(_, m)| m.to_string())
+    best_tier.map(|(_, m)| m.to_string())
 }
 
 /// The reply when `auto` has nothing it trusts: name the models it could use instead.
@@ -368,9 +385,9 @@ fn no_auto_model_message(known: &[String]) -> String {
         list.push("…");
     }
     format!(
-        "openhydra/auto found no model it can trust (none from your own machine, an imported card, a \
-         provider you've used before, or at least two providers). Choose a model explicitly; \
-         available: {}",
+        "openhydra/auto found no model it can trust (none from your own machine, an imported card, or a \
+         provider you've used or verified before). Choose a model explicitly — after one good answer \
+         from a provider, auto can pick it; available: {}",
         list.join(", ")
     )
 }
@@ -389,6 +406,7 @@ async fn resolve_model(
     requested: &str,
     fallback_unservable: bool,
     session_override: Option<&str>,
+    min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
 ) -> Result<String, String> {
     let auto = is_auto_model(requested);
     // A concrete BYOK-mapped model is served directly (never announced on the swarm) — pass it
@@ -421,7 +439,7 @@ async fn resolve_model(
     // …else the auto default (see `pick_auto_model` for the order).
     let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
     let node = state.node.clone();
-    let candidates = tokio::task::spawn_blocking(move || node.auto_candidates())
+    let candidates = tokio::task::spawn_blocking(move || node.auto_candidates(min_authenticity))
         .await
         .map_err(|_| "model resolution failed".to_string())??;
     pick_auto_model(&candidates, preferred.as_deref()).ok_or_else(|| no_auto_model_message(&known))
@@ -996,7 +1014,7 @@ async fn spawn_dispatch(
     };
     // Resolve `openhydra/auto` (and, on the Anthropic surface, an unservable id) to a concrete
     // model. BYOK-mapped ids are recognised inside `resolve_model` so they're never rewritten.
-    let model = resolve_model(state, requested_model, fallback_unservable, session_override)
+    let model = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity)
         .await
         .map_err(DispatchErr::NoModels)?;
     // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
@@ -2426,29 +2444,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_never_picks_a_model_only_one_unknown_peer_serves() {
+    fn auto_never_picks_a_model_only_unknown_peers_serve() {
         let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("qwen2.5:7b", "a", "12D3A")]);
         assert_eq!(pick_auto_model(&c, None), None);
-        let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("qwen2.5:7b", "a", "12D3A"), kp("qwen2.5:7b", "b", "12D3B")]);
-        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("qwen2.5:7b"));
-        // Several records from ONE peer don't count as several providers.
-        let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("0", "evil2", "12D3Evil")]);
+        // Several peer ids announcing one model cost nothing: a count is not trust.
+        let c = cands(vec![kp("0", "evil", "12D3Evil"), kp("0", "evil2", "12D3Evil2"), kp("0", "evil3", "12D3Evil3")]);
         assert_eq!(pick_auto_model(&c, None), None);
         assert_eq!(pick_auto_model(&cands(vec![]), Some("x")), None);
     }
 
     #[test]
-    fn auto_prefers_override_then_own_then_cards_then_reputation_then_provider_count() {
+    fn auto_prefers_override_then_own_then_cards_then_reputation_then_verified() {
+        use openhydra_protocol::trust::AuthenticityTier::*;
         let mut c = cands(vec![
             kp("0", "evil", "12D3Evil"),
+            kp("0", "evil2", "12D3Evil2"),
             kp("popular", "p1", "12D3P1"),
             kp("popular", "p2", "12D3P2"),
             kp("trusted", "t", "12D3T"),
+            kp("verified", "v", "12D3V"),
             kp("mine", "me", "12D3Me"),
         ]);
         c.self_provider = Some("12D3Me".into());
         c.card_models = vec!["carded".into()];
         c.earned.insert(("12D3T".into(), "trusted".into()), 70.0);
+        c.tiers.insert(("12D3V".into(), "verified".into()), HardwareAttested);
         // 1. an override that is served wins; one that isn't served is ignored
         assert_eq!(pick_auto_model(&c, Some("popular")).as_deref(), Some("popular"));
         assert_eq!(pick_auto_model(&c, Some("carded")).as_deref(), Some("carded"));
@@ -2463,11 +2483,39 @@ mod tests {
         assert_eq!(pick_auto_model(&c, None).as_deref(), Some("trusted"));
         // …but not at or below neutral, and not from standing earned on another model
         c.earned.insert(("12D3T".into(), "trusted".into()), 50.0);
-        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("popular"));
         c.earned.insert(("12D3T".into(), "other-model".into()), 99.0);
+        // 5. a provider this node verified (A1+), highest tier first
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("verified"));
+        c.tiers.insert(("12D3P1".into(), "popular".into()), ReputationRedundant);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("verified"));
+        c.tiers.remove(&("12D3V".to_string(), "verified".to_string()));
         assert_eq!(pick_auto_model(&c, None).as_deref(), Some("popular"));
-        // 5. most distinct providers, at least two
-        c.providers.retain(|k| k.model_id != "popular");
+        // Nothing earned or verified: no pick, however many providers announce a model.
+        c.tiers.clear();
+        assert_eq!(pick_auto_model(&c, None), None);
+    }
+
+    #[test]
+    fn auto_only_picks_what_the_authenticity_floor_will_route_to() {
+        use openhydra_protocol::trust::AuthenticityTier::*;
+        let mut c = cands(vec![kp("mine", "me", "12D3Me"), kp("carded", "c", "12D3C"), kp("trusted", "t", "12D3T"), kp("strong", "s", "12D3S")]);
+        c.self_provider = Some("12D3Me".into());
+        c.card_models = vec!["carded".into(), "card-only".into()];
+        c.earned.insert(("12D3T".into(), "trusted".into()), 70.0);
+        c.tiers.insert(("12D3T".into(), "trusted".into()), ReputationRedundant);
+        c.tiers.insert(("12D3S".into(), "strong".into()), EnergyFingerprintPossession);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("mine"));
+        // At A1, own and card providers below it are skipped (routing would refuse them).
+        c.floor = Some(ReputationRedundant);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("trusted"));
+        assert_eq!(pick_auto_model(&c, Some("mine")).as_deref(), Some("trusted"), "a preferred model below the floor is skipped");
+        // A card whose provider clears the floor still comes first.
+        c.tiers.insert(("12D3C".into(), "carded".into()), ReputationRedundant);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("carded"));
+        // At A2 only the strong provider remains.
+        c.floor = Some(EnergyFingerprintPossession);
+        assert_eq!(pick_auto_model(&c, None).as_deref(), Some("strong"));
+        c.floor = Some(HardwareAttested);
         assert_eq!(pick_auto_model(&c, None), None);
     }
 
