@@ -57,7 +57,10 @@ function swarmCardHtml(s) {
     ? `${s.member_count} member${s.member_count === 1 ? "" : "s"}${s.revoked_count ? ` · ${s.revoked_count} revoked` : ""}`
     : s.credential_expires_at
       ? `credential expires ${new Date(Number(s.credential_expires_at)).toLocaleDateString()}`
-      : "no credential";
+      : s.control_credential_expires_at
+        // A control-only device holds no serve credential: say what it does hold.
+        ? `rig control · expires ${new Date(Number(s.control_credential_expires_at)).toLocaleDateString()}`
+        : "no credential";
 
   const memberRows =
     owner && s.members.length

@@ -1385,11 +1385,40 @@ fn export_card(
     }
     let out = cmd.output().map_err(|e| format!("run card export: {e}"))?;
     if !out.status.success() {
-        // The agent prints a clean `openhydra-agent: <reason>` line to stderr on failure.
-        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if msg.is_empty() { "card export failed".into() } else { msg });
+        return Err(agent_failure(&out.stderr, "card export failed"));
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("parse card export output: {e}"))
+}
+
+/// The reason a one-shot agent command failed, from its stderr. The agent ends a failure with one
+/// `openhydra-agent: <reason>` line; a command that brings up a network node (`swarm remote-scope`)
+/// also logs before it (coloured tracing lines), which the user should not have to read through.
+/// Falls back to the last line, then to `fallback`.
+fn agent_failure(stderr: &[u8], fallback: &str) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    // Drop ANSI colour sequences (ESC [ … letter).
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(n) = chars.next() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let lines: Vec<&str> = plain.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines
+        .iter()
+        .rev()
+        .find_map(|l| l.strip_prefix("openhydra-agent: "))
+        .or(lines.last().copied())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// The imported-cards store the gateway reads (`--cards-file`).
@@ -1800,8 +1829,7 @@ fn swarm_remote_scope(
         .arg(swarms_dir());
     let out = cmd.output().map_err(|e| format!("run remote-scope: {e}"))?;
     if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if msg.is_empty() { "remote-scope failed".into() } else { msg });
+        return Err(agent_failure(&out.stderr, "remote-scope failed"));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -3270,6 +3298,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_agent_command_shows_only_its_reason() {
+        // `swarm remote-scope` logs (coloured) while its node runs, then prints the reason last.
+        let stderr = b"openhydra-agent: node up \xe2\x80\x94 libp2p=12D3KooWX; dialing rig 12D3KooWY to set m -> global\n\
+            \x1b[2m2026-10-11T20:54:07Z\x1b[0m \x1b[31mERROR\x1b[0m libp2p_mdns: error sending packet\n\
+            \x1b[33m WARN\x1b[0m listener_closed\n\
+            openhydra-agent: rig refused: remote publish to Global is disabled on this rig (allow_remote_publish=false)\n";
+        assert_eq!(
+            agent_failure(stderr, "x"),
+            "rig refused: remote publish to Global is disabled on this rig (allow_remote_publish=false)"
+        );
+        // A plain failure line (card export) reads the same.
+        assert_eq!(agent_failure(b"openhydra-agent: model \"m\" is not shared\n", "x"), "model \"m\" is not shared");
+        // No prefixed line: the last line, colour removed; nothing at all: the fallback.
+        assert_eq!(agent_failure(b"\x1b[31mboom\x1b[0m\n", "x"), "boom");
+        assert_eq!(agent_failure(b"  \n", "card export failed"), "card export failed");
+    }
 
     fn policy(json: &str) -> openhydra_agent::SharePolicy {
         serde_json::from_str(json).unwrap()
