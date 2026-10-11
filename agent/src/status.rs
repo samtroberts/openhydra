@@ -704,6 +704,7 @@ mod tests {
             share_mode: ShareMode::List,
             shared_models: vec!["qwen3-coder:30b-a3b-q8_0".into(), "qwen3.8:27b-q8_0".into()],
             announced_models: vec!["qwen3-coder:30b-a3b-q8_0".into()],
+            ..Default::default()
         });
         let v = s.share_snapshot();
         assert_eq!(v.shared_models.len(), 2);
@@ -733,6 +734,7 @@ mod tests {
             share_mode: crate::share_policy::ShareMode::List,
             shared_models: vec!["m1".into(), "m2".into()],
             announced_models: vec!["m1".into()],
+            ..Default::default()
         });
         let addr = StatusServer {
             role: "provider",

@@ -30,7 +30,7 @@ use crate::share_policy::{PolicyWatcher, SharePolicy};
 use openhydra_network::handle::NetworkHandle;
 use openhydra_network::types::PeerRecord;
 use openhydra_protocol::credit::{throttle_multiplier, CreditAccount};
-use openhydra_protocol::model_id::{is_valid_canonical_field, is_valid_model_id};
+use openhydra_protocol::model_id::{assign_public_ids, is_valid_canonical_field};
 use openhydra_protocol::payout::SettlementAsset;
 use openhydra_protocol::receipts::CoSignedReceipt;
 use openhydra_protocol::store::Store;
@@ -185,11 +185,15 @@ enum ResultState {
 /// `family/params/quant/template_hash` for the router's `is_compatible` filter.
 /// `host`/`port` are advisory — routing is by `libp2p_peer_id`.
 ///
+/// `public_id` is the name the model is announced under: its engine id when that is a name the
+/// network accepts, else the cleaned-up name from [`PublicNames`] (never a raw path).
+///
 /// MVP-limitation: keying on the engine handle means the same model served via two
 /// different engines (Ollama vs vLLM) advertises under different ids; a normalized
 /// cross-engine discovery key is the model-id-governance refinement (deferred).
 pub fn build_peer_record(
     model: &DetectedModel,
+    public_id: &str,
     openhydra_peer_id: &str,
     libp2p_peer_id: &str,
     public_key_hex: &str,
@@ -198,7 +202,7 @@ pub fn build_peer_record(
 ) -> PeerRecord {
     PeerRecord {
         peer_id: openhydra_peer_id.to_string(),
-        model_id: model.engine_ref.clone(),
+        model_id: public_id.to_string(),
         host: host.to_string(),
         port,
         // The canonical id is optional; one the network would refuse (a GGUF family name with
@@ -214,19 +218,50 @@ pub fn build_peer_record(
     }
 }
 
-/// Can `engine_ref` be announced? Other nodes refuse a record whose model name has characters
-/// outside `openhydra_protocol::model_id::is_valid_model_id` (quotes, a leading `/`, backslashes,
-/// brackets…), so such a model is not announced. Logged once per name, not on every pass.
-fn announceable(engine_ref: &str) -> bool {
-    if is_valid_model_id(engine_ref) {
-        return true;
+/// The names this provider's models go by on the network. Other nodes refuse a record whose model
+/// name is outside `openhydra_protocol::model_id::is_valid_model_id` (a leading `/`, backslashes,
+/// brackets, quotes…), so a model whose engine id is one of those — a vLLM model served from a
+/// directory, a ComfyUI checkpoint named `Flux (dev).safetensors` — is announced under a cleaned-up
+/// name instead ([`assign_public_ids`]), and requests for that name are served by the engine id.
+/// Rebuilt from detection on every announce pass.
+#[derive(Debug, Default, Clone)]
+pub struct PublicNames {
+    /// Public name → engine id, for every detected model whose two names differ.
+    engine_of: HashMap<String, String>,
+    /// Engine id → public name, for the same models.
+    public_of: BTreeMap<String, String>,
+}
+
+impl PublicNames {
+    pub fn from_engine_refs<'a, I: IntoIterator<Item = &'a str>>(engine_refs: I) -> Self {
+        let mut names = Self::default();
+        for (engine, public) in assign_public_ids(engine_refs) {
+            if engine != public {
+                tracing::debug!(engine = %engine.escape_debug(), public = %public, "model announced under a cleaned-up name");
+                names.engine_of.insert(public.clone(), engine.clone());
+                names.public_of.insert(engine, public);
+            }
+        }
+        names
     }
-    static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    let mut warned = WARNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if warned.len() < 1024 && warned.insert(engine_ref.to_string()) {
-        tracing::warn!(model = %engine_ref.escape_debug(), "not sharing this model on the network: its name has unsupported characters (use letters, digits, . _ : / @ + - and single spaces; serve it under a plain name, e.g. an engine alias)");
+
+    /// The engine id a request names. A public name maps to its engine id; any other name is taken
+    /// as the engine id itself (a model whose names agree, or a raw engine id from a local tool).
+    /// Unambiguous: a public name is always a valid name, and a valid engine id is its own public
+    /// name, so no engine id is ever another model's public name.
+    pub fn engine_ref<'a>(&'a self, name: &'a str) -> &'a str {
+        self.engine_of.get(name).map(String::as_str).unwrap_or(name)
     }
-    false
+
+    /// The name `engine_ref` is announced under.
+    pub fn public<'a>(&'a self, engine_ref: &'a str) -> &'a str {
+        self.public_of.get(engine_ref).map(String::as_str).unwrap_or(engine_ref)
+    }
+
+    /// Engine id → public name for the models whose names differ (the Share view's mapping).
+    pub fn renamed(&self) -> &BTreeMap<String, String> {
+        &self.public_of
+    }
 }
 
 /// M6/F2: decide which models' `MODEL_WITHDRAWN` tombstones to (re)publish this announce pass, and
@@ -1407,7 +1442,8 @@ pub struct Provider<A: EngineAdapter> {
     /// (a serve can outlast [`NONCE_MEMORY_MS`]), then remembered from its end (round 8 S8-2).
     serving_nonces: Mutex<std::collections::HashSet<[u8; 16]>>,
     /// Which models this provider shares (announces + serves), keyed on the engine handle
-    /// (`DetectedModel::engine_ref`, the same string a consumer sends as `ServeRequest.model_ref`).
+    /// (`DetectedModel::engine_ref`; a consumer's `ServeRequest.model_ref` is resolved to it through
+    /// [`Self::public_names`] first).
     /// A [`PolicyWatcher`] so the policy can be **hot-reloaded at runtime** — the user can toggle
     /// sharing in the desktop without restarting the node. Both the announce filter and the serve
     /// gate consult it, so a de-selected model is genuinely off (not merely hidden).
@@ -1417,14 +1453,14 @@ pub struct Provider<A: EngineAdapter> {
     /// just-removed model's DHT record). The poll loop yields via `try_lock` so it never blocks the
     /// serve loop; the watcher/startup path takes it blocking.
     announce_lock: Mutex<()>,
-    /// M6: the set of models (engine refs) we advertised on the *previous* announce pass, so the
+    /// M6: the set of models (public names) we advertised on the *previous* announce pass, so the
     /// next pass can diff it against the current intent and publish a `MODEL_WITHDRAWN` tombstone
     /// for each model that dropped out (un-shared, or gone from the engine). Tracks *intent*
     /// (policy ∩ detected), not network-announce success, so a still-shared-but-momentarily-
     /// unannounceable model is never spuriously withdrawn. Guarded by `announce_lock` in practice
     /// (only touched inside `announce_models_inner`), but a `Mutex` keeps it `Sync` on its own.
     last_announced: Mutex<BTreeSet<String>>,
-    /// M6/F2: models with an in-flight `MODEL_WITHDRAWN` re-publish countdown (engine_ref → passes
+    /// M6/F2: models with an in-flight `MODEL_WITHDRAWN` re-publish countdown (public name → passes
     /// remaining). A model un-shared this pass is inserted at [`WITHDRAW_REPUBLISH_PASSES`] and its
     /// tombstone is re-issued (with a fresh timestamp) on each subsequent announce pass until the
     /// count hits zero — covering a consumer that missed the first gossip. Re-sharing the model
@@ -1447,6 +1483,10 @@ pub struct Provider<A: EngineAdapter> {
     /// command can't be re-applied within the replay window (defence-in-depth on top of the Noise
     /// channel + the ±skew bound). Bounded by the number of distinct control members (small).
     remote_cmd_last_applied: Mutex<HashMap<String, u64>>,
+    /// The network name of each detected model ([`PublicNames`]), rebuilt on every announce pass.
+    /// Requests, challenges and remote commands name models by these; the share policy, the engine
+    /// and the Share view's counters use the engine id.
+    public_names: Mutex<PublicNames>,
 }
 
 /// v5 denomination gate (pure): a crypto-rail receipt's declared settlement asset + reference-price
@@ -1575,6 +1615,7 @@ impl<A: EngineAdapter> Provider<A> {
             absence_streak: Mutex::new(BTreeMap::new()),
             swarm_auth: None,
             remote_cmd_last_applied: Mutex::new(HashMap::new()),
+            public_names: Mutex::new(PublicNames::default()),
         }
     }
 
@@ -2009,22 +2050,24 @@ impl<A: EngineAdapter> Provider<A> {
         reply.encode()
     }
 
-    fn scope_refusal(&self, req: &ServeRequest, source_peer: &str) -> Option<Vec<u8>> {
-        // Resolve the effective scope. A `model_ref` that exactly matches a model our engine serves
-        // (detected, or announced) uses that model's own scope: a private model is never announced
-        // globally, so the announced set alone would gate it at the strictest scope (round 8 N8-1).
+    /// `engine_ref` is the engine id `req.model_ref` resolves to ([`Self::engine_ref_of`]).
+    fn scope_refusal(&self, req: &ServeRequest, engine_ref: &str, source_peer: &str) -> Option<Vec<u8>> {
+        // Resolve the effective scope. A `model_ref` that names a model our engine serves (detected)
+        // uses that model's own scope: a private model is never announced globally, so the
+        // announced set alone would gate it at the strictest scope (round 8 N8-1).
         // A ref that does NOT — yet `is_shared` let it through (e.g. `All`
         // mode says yes to anything, or a single-model engine serves its one model for any name) —
         // could be an alias the engine resolves to any shared model, so it is gated at the STRICTEST
         // scope this node shares (M4 review HIGH: closes an is_shared/scope_of divergence that would
         // otherwise serve a private model under an unrecognised alias with no credential). An
         // all-Global node's strictest is Global, so a purely-public node sees no change.
-        let known = self.detected.lock().map(|d| d.contains_key(&req.model_ref)).unwrap_or(false)
-            || self.last_announced.lock().map(|s| s.contains(&req.model_ref)).unwrap_or(false);
-        let scope = match known.then(|| self.policy.scope_of(&req.model_ref)) {
+        // Only the current detection counts: a model that vanished from the engine (still in the
+        // withdrawal grace) has no public-name mapping any more, so its name is gated as unknown.
+        let known = self.detected.lock().map(|d| d.contains_key(engine_ref)).unwrap_or(false);
+        let scope = match known.then(|| self.policy.scope_of(engine_ref)) {
             // Global without the operator's consent to publish isn't public yet: gated as an unknown
             // name would be (round 9 C9-6).
-            Some(crate::share_policy::Scope::Global) if !self.policy.announce_globally(&req.model_ref) => self.policy.strictest_scope(),
+            Some(crate::share_policy::Scope::Global) if !self.policy.announce_globally(engine_ref) => self.policy.strictest_scope(),
             Some(scope) => scope,
             None => self.policy.strictest_scope(),
         };
@@ -2042,9 +2085,9 @@ impl<A: EngineAdapter> Provider<A> {
                 // strictest scope could be any string, and isn't a model a challenge names.
                 if known
                     && matches!(scope, crate::share_policy::Scope::Private | crate::share_policy::Scope::Unknown)
-                    && req.model_ref.len() <= crate::attest::MAX_MODEL_ID_LEN
+                    && engine_ref.len() <= crate::attest::MAX_MODEL_ID_LEN
                 {
-                    self.note_private_member(source_peer, &req.model_ref, req.credential.clone());
+                    self.note_private_member(source_peer, engine_ref, req.credential.clone());
                 }
                 None
             }
@@ -2126,6 +2169,11 @@ impl<A: EngineAdapter> Provider<A> {
     /// policy. Fail-closed (share-nothing) on a poisoned lock — matters for the serve gate.
     fn model_shared(&self, model_ref: &str) -> bool {
         self.policy.is_shared(model_ref)
+    }
+
+    /// The engine id behind a model name from the network (see [`PublicNames::engine_ref`]).
+    fn engine_ref_of(&self, name: &str) -> String {
+        self.public_names.lock().unwrap_or_else(|e| e.into_inner()).engine_ref(name).to_string()
     }
 
     /// Attach shared transfer counters (P0 introspection — the `--status-bind` server
@@ -2342,7 +2390,7 @@ impl<A: EngineAdapter> Provider<A> {
                 .net
                 .respond(request_id.clone(), FetchChunksResponse::Chunks { framed, next_offset, done: true }.encode());
         };
-        let req = match ServeRequest::decode(&data[1..]) {
+        let mut req = match ServeRequest::decode(&data[1..]) {
             Ok(r) => r,
             Err(e) => {
                 let framed = frame_response(&[ServeChunk::Error(format!("bad serve request: {e}")).encode()]);
@@ -2377,9 +2425,12 @@ impl<A: EngineAdapter> Provider<A> {
             respond_done(refusal, 1);
             return;
         }
+        // The request names the model as the network knows it; the policy and the engine go by the
+        // engine id (they differ for a model announced under a cleaned-up name, see PublicNames).
+        let engine_ref = self.engine_ref_of(&req.model_ref);
         // Per-model share gate: the real enforcement point (a consumer could learn the id via
         // cache/PEX/guess), refused before the engine.
-        if !self.model_shared(&req.model_ref) {
+        if !self.model_shared(&engine_ref) {
             let framed = frame_response(&[ServeChunk::Error(format!(
                 "model '{}' is not shared by this provider",
                 req.model_ref
@@ -2390,7 +2441,7 @@ impl<A: EngineAdapter> Provider<A> {
         }
         // M4-base reach gate: a `Private` model needs a valid swarm credential bound to this sender;
         // a `Device` model is loopback-only. Runs after `is_shared` (which-models) — orthogonal.
-        if let Some(refusal) = self.scope_refusal(&req, &source_peer) {
+        if let Some(refusal) = self.scope_refusal(&req, &engine_ref, &source_peer) {
             respond_done(refusal, 1);
             return;
         }
@@ -2431,6 +2482,8 @@ impl<A: EngineAdapter> Provider<A> {
         // It stops once the consumer stops reading, or settles for what it read (the stream is then
         // closed): nobody would read the rest.
         let mut budget = self.serve_budget(reservation.as_ref());
+        // The engine is asked for its own id; the commitment and receipt keep the requested name.
+        req.model_ref = engine_ref.clone();
         let summary = generate_guarded(req, &self.adapter, &mut |c| self.stream_append(nonce, c), &mut |sent| {
             self.stream_wanted(&nonce) && budget(sent)
         });
@@ -2450,7 +2503,7 @@ impl<A: EngineAdapter> Provider<A> {
                 0.0
             };
             // A serve to our own gateway isn't a market transaction: counted apart from served.
-            stats.record_serve_for(&model_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
+            stats.record_serve_for(&engine_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
         }
     }
 
@@ -2857,6 +2910,10 @@ impl<A: EngineAdapter> Provider<A> {
         }
         *self.detected.lock().unwrap_or_else(|e| e.into_inner()) =
             models.iter().map(|m| (m.engine_ref.clone(), m.clone())).collect();
+        // The network name of every detected model (shared or not: a private model is reached by its
+        // public name too, from a card or a swarm member).
+        let names = PublicNames::from_engine_refs(models.iter().map(|m| m.engine_ref.as_str()));
+        *self.public_names.lock().unwrap_or_else(|e| e.into_inner()) = names.clone();
         // M6: the FULL intended global-announce set this pass (policy ∩ detected ∩ globally-shared),
         // computed up-front so it's independent of where the announce loop below might break on a
         // network error — a still-intended model we simply didn't *reach* must not look "withdrawn".
@@ -2864,10 +2921,11 @@ impl<A: EngineAdapter> Provider<A> {
         // *global-announce* set (`announce_globally`), not merely `is_shared` — a `private`/`device`
         // model is still served when reached (the serve gate stays `is_shared`) but is never
         // published to global discovery, so it must not appear here or get an advert/tombstone.
+        // Kept in public names: the tombstones below withdraw what the network knows.
         let desired: BTreeSet<String> = models
             .iter()
-            .filter(|m| policy.announce_globally(&m.engine_ref) && is_valid_model_id(&m.engine_ref))
-            .map(|m| m.engine_ref.clone())
+            .filter(|m| policy.announce_globally(&m.engine_ref))
+            .map(|m| names.public(&m.engine_ref).to_string())
             .collect();
         let mut announced: Vec<String> = Vec::new();
         let mut outcome: Result<(), AdapterError> = Ok(());
@@ -2877,11 +2935,12 @@ impl<A: EngineAdapter> Provider<A> {
             // announcing only because `SharePolicy::load` materialises a consent record on migration.
             // `private`/`device` models are skipped here but still served if reached — the serve
             // path enforces `is_shared`, the security boundary; this is discovery hygiene.
-            if !policy.announce_globally(&model.engine_ref) || !announceable(&model.engine_ref) {
+            if !policy.announce_globally(&model.engine_ref) {
                 continue;
             }
             let record = build_peer_record(
                 model,
+                names.public(&model.engine_ref),
                 self.net.openhydra_peer_id(),
                 self.net.libp2p_peer_id(),
                 self.net.public_key_hex(),
@@ -2905,6 +2964,7 @@ impl<A: EngineAdapter> Provider<A> {
                 share_mode: policy.mode,
                 shared_models: policy.models.iter().cloned().collect(),
                 announced_models: announced,
+                public_ids: names.renamed().clone(),
             });
         }
         // M6: publish a per-model tombstone for every model no longer intended (the operator
@@ -2924,7 +2984,7 @@ impl<A: EngineAdapter> Provider<A> {
             // VANISHED from detection (a possible `auto`-mode partial-`Ok`) is held in `effective` for
             // a short grace so it isn't tombstoned; a model dropped because the POLICY changed (still
             // detected, no longer announceable) is withdrawn at once. Diff/baseline against `effective`.
-            let detected: BTreeSet<String> = models.iter().map(|m| m.engine_ref.clone()).collect();
+            let detected: BTreeSet<String> = models.iter().map(|m| names.public(&m.engine_ref).to_string()).collect();
             let effective = apply_absence_grace(
                 &last,
                 &desired,
@@ -3241,10 +3301,12 @@ impl<A: EngineAdapter> Provider<A> {
         // not a stale hot-reload snapshot (review LOW: closes the ~poll-interval TOCTOU where a
         // Global command could slip through just after the owner set `allow_remote_publish=false`).
         self.policy.reload_if_changed();
+        // The controller names the model as the network does; the policy is keyed by the engine id.
+        let engine_ref = self.engine_ref_of(&cmd.model_id);
         // 5. Only re-scope a model this rig ALREADY shares — remote control adjusts the reach of a
         //    shared model, it never shares a new one (that would let a control device expose a model
         //    the owner never chose to share, and would leave a latent Global+consent record on it).
-        if !self.model_shared(&cmd.model_id) {
+        if !self.model_shared(&engine_ref) {
             return refuse(format!("model '{}' is not shared by this rig", cmd.model_id));
         }
         // 5b. Public exposure gate (M5 review, HIGH/MED): making a model MORE private is always fine,
@@ -3271,7 +3333,7 @@ impl<A: EngineAdapter> Provider<A> {
         let Some(path) = self.policy.watched_path() else {
             return refuse("provider share policy is not file-backed".into());
         };
-        match SharePolicy::set_model_scope(&path, &cmd.model_id, scope, now) {
+        match SharePolicy::set_model_scope(&path, &engine_ref, scope, now) {
             Ok(_) => {
                 tracing::info!(model = %cmd.model_id, scope = %cmd.scope, peer = %source_peer,
                     "remote-scope-set applied (M5)");
@@ -3301,7 +3363,12 @@ impl<A: EngineAdapter> Provider<A> {
                 crate::attest::handle_attest_inbound_limited(
                     &data[1..],
                     self.attestor.as_deref(),
-                    &|model| self.policy.announce_globally(model) || self.private_attestable(source_peer, model),
+                    // The attestation names the model as challenged (its network name); the policy goes
+                    // by the engine id behind it.
+                    &|model| {
+                        let engine_ref = self.engine_ref_of(model);
+                        self.policy.announce_globally(&engine_ref) || self.private_attestable(source_peer, &engine_ref)
+                    },
                     now_unix_ms(),
                     // A consumer we served recently has a bucket of its own once the provider-wide one
                     // is spent (review round 3, B2): free identities flooding challenges can't make us
@@ -3355,7 +3422,7 @@ impl<A: EngineAdapter> Provider<A> {
                     &data[1..],
                     self.prompt_scoring.then_some(&self.adapter as &dyn EngineAdapter),
                     &self.score_gate,
-                    &|model| self.policy.announce_globally(model),
+                    &|model| Some(self.engine_ref_of(model)).filter(|e| self.policy.announce_globally(e)),
                     in_round,
                 );
                 {
@@ -3380,8 +3447,8 @@ impl<A: EngineAdapter> Provider<A> {
                 handle_model_info_inbound(
                     &data[1..],
                     self.prompt_scoring,
-                    &|model| self.policy.announce_globally(model),
-                    &|model| self.model_info(model),
+                    &|model| self.policy.announce_globally(&self.engine_ref_of(model)),
+                    &|model| self.model_info(&self.engine_ref_of(model)),
                 )
             }
             Some(&RECEIPT_REQUEST) => {
@@ -3462,12 +3529,14 @@ impl<A: EngineAdapter> Provider<A> {
             Some(&SERVE_REQUEST) => {
                 let mut chunks: Vec<Vec<u8>> = Vec::new();
                 let summary = match parsed {
-                    Some(req) => {
+                    Some(mut req) => {
+                        // Gates and engine go by the engine id behind the requested name.
+                        let engine_ref = self.engine_ref_of(&req.model_ref);
                         // Per-model share gate: refuse a request for a model the operator hasn't
                         // shared, before touching the engine. This is the real enforcement point —
                         // discovery filtering alone wouldn't stop a consumer that learned the id
                         // some other way (cache, PEX, a direct guess).
-                        if !self.model_shared(&req.model_ref) {
+                        if !self.model_shared(&engine_ref) {
                             return frame_response(&[ServeChunk::Error(format!(
                                 "model '{}' is not shared by this provider",
                                 req.model_ref
@@ -3476,7 +3545,7 @@ impl<A: EngineAdapter> Provider<A> {
                         }
                         // M4-base reach gate (buffered twin of the streaming path): a `Private` model
                         // needs a valid swarm credential bound to `source_peer`; `Device` is loopback-only.
-                        if let Some(refusal) = self.scope_refusal(&req, source_peer) {
+                        if let Some(refusal) = self.scope_refusal(&req, &engine_ref, source_peer) {
                             return refusal;
                         }
                         if let Some(refusal) = self.nonce_refusal(&req, source_peer) {
@@ -3506,6 +3575,7 @@ impl<A: EngineAdapter> Provider<A> {
                         // (which would skip `respond` + `store_result`, leaving no reply and the
                         // nonce stuck `Generating` until the consumer's serve timeout). The panic
                         // path pushes the terminal into `chunks`, which is stored + returned below.
+                        req.model_ref = engine_ref.clone();
                         let summary = generate_guarded(
                             req,
                             &self.adapter,
@@ -3535,7 +3605,7 @@ impl<A: EngineAdapter> Provider<A> {
                             } else {
                                 0.0
                             };
-                            stats.record_serve_for(&model_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
+                            stats.record_serve_for(&engine_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
                         }
                         summary
                     }
@@ -3737,6 +3807,7 @@ mod tests {
     fn peer_record_keys_on_engine_handle_and_carries_canonical_id() {
         let r = build_peer_record(
             &detected("qwen2/7.6b/q4_k_m/abcd0123abcd0123"),
+            "qwen2.5:7b",
             "oh-peer",
             "12D3KooWlibp2p",
             "deadbeef",
@@ -3753,40 +3824,73 @@ mod tests {
 
     #[test]
     fn peer_record_keys_on_engine_handle_even_without_canonical_id() {
-        let r = build_peer_record(&detected(""), "oh", "lib", "pk", "", 0);
+        let r = build_peer_record(&detected(""), "qwen2.5:7b", "oh", "lib", "pk", "", 0);
         assert_eq!(r.model_id, "qwen2.5:7b"); // always the engine handle
         assert_eq!(r.canonical_model_id, "");
     }
 
     #[test]
     fn a_canonical_id_the_network_would_refuse_is_left_out_of_the_record() {
-        let r = build_peer_record(&detected("my model (v2)/7b/int4/abcd0123abcd0123"), "oh", "lib", "pk", "", 0);
+        let r = build_peer_record(&detected("my model (v2)/7b/int4/abcd0123abcd0123"), "qwen2.5:7b", "oh", "lib", "pk", "", 0);
         assert_eq!(r.model_id, "qwen2.5:7b");
         assert_eq!(r.canonical_model_id, "");
     }
 
     #[test]
-    fn only_names_the_network_accepts_are_announceable() {
-        for ok in ["qwen2.5:7b", "Qwen/Qwen2.5-7B-Instruct", "sd_xl_base_1.0.safetensors", "flux1-dev workflow"] {
-            assert!(announceable(ok), "{ok}");
+    fn every_model_is_announced_under_a_name_the_network_accepts() {
+        use openhydra_protocol::model_id::is_valid_model_id;
+        let refs = [
+            "qwen2.5:7b",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "sd_xl_base_1.0.safetensors",
+            "flux1-dev workflow",
+            "/data/models/Qwen2.5-7B",
+            "SDXL\\juggernaut.safetensors",
+            "Flux (dev)",
+            "x\" onclick=\"y",
+        ];
+        let names = PublicNames::from_engine_refs(refs);
+        for r in refs {
+            let public = names.public(r);
+            assert!(is_valid_model_id(public), "{r:?} -> {public:?}");
+            // A request for the announced name is served by the engine id, both ways round.
+            assert_eq!(names.engine_ref(public), r);
+            assert_eq!(names.engine_ref(r), r, "a raw engine id still names its own model");
+            let rec = build_peer_record(&detected(""), public, "oh", "lib", "pk", "", 0);
+            assert_eq!(rec.model_id, public);
         }
-        for bad in ["/data/models/Qwen2.5-7B", "SDXL\\juggernaut.safetensors", "Flux (dev)", "x\" onclick=\"y"] {
-            assert!(!announceable(bad), "{bad}");
-        }
+        // Names the network already accepts are announced unchanged; the others are cleaned up.
+        assert_eq!(names.public("qwen2.5:7b"), "qwen2.5:7b");
+        assert_eq!(names.public("/data/models/Qwen2.5-7B"), "Qwen2.5-7B");
+        assert_eq!(names.public("SDXL\\juggernaut.safetensors"), "SDXL/juggernaut.safetensors");
+        assert_eq!(names.public("Flux (dev)"), "Flux-dev");
+        assert_eq!(names.renamed().len(), 4);
+        // An unknown name maps to itself (the engine refuses it, or the share gate does).
+        assert_eq!(names.engine_ref("nope"), "nope");
     }
 
     // ── per-model share policy ──
     // The policy logic (modes, migration, load/save, hot-reload semantics) is covered in
-    // `crate::share_policy`. This test pins the provider-specific invariant: the string the policy
-    // gates on is the *same* string that gets announced as the record's `model_id` — so an
-    // allowlisted model is announced+servable and a de-selected sibling on the same node is not.
+    // `crate::share_policy`. This test pins the provider-specific invariant: the policy gates on the
+    // engine id that the announced `model_id` resolves back to — so an allowlisted model is
+    // announced+servable (under a path id too) and a de-selected sibling on the same node is not.
 
     #[test]
-    fn share_gate_key_equals_the_announced_model_id() {
-        let policy = SharePolicy::share_list(["qwen2.5:7b"]);
-        let served = build_peer_record(&detected("q/7b/x/y"), "oh", "lib", "pk", "", 0);
-        assert!(policy.is_shared(&served.model_id)); // announced id == gate key → shared
-        assert!(!policy.is_shared("qwen2.5:0.5b")); // a different handle on the same node → refused
+    fn share_gate_key_is_the_engine_id_the_announced_name_resolves_to() {
+        let policy = SharePolicy::share_list(["qwen2.5:7b", "/data/models/Qwen2.5-7B"]);
+        let names = PublicNames::from_engine_refs(["qwen2.5:7b", "qwen2.5:0.5b", "/data/models/Qwen2.5-7B"]);
+        for engine in ["qwen2.5:7b", "/data/models/Qwen2.5-7B"] {
+            let served = build_peer_record(&detected("q/7b/x/y"), names.public(engine), "oh", "lib", "pk", "", 0);
+            assert!(policy.is_shared(names.engine_ref(&served.model_id)), "{engine}");
+        }
+        assert!(!policy.is_shared(names.engine_ref("qwen2.5:0.5b"))); // a different handle on the same node → refused
+        // The policy, as the desktop writes it (engine ids), survives a load: a path id is not
+        // rewritten to a name the gate never checks.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share.json");
+        policy.write_atomic(&path).unwrap();
+        let loaded = SharePolicy::load(&path).unwrap();
+        assert!(loaded.is_shared("/data/models/Qwen2.5-7B"));
     }
 
     // ── M4-base: the pure reach-gate decision ──
@@ -4249,19 +4353,25 @@ mod tests {
         let mut policy = SharePolicy::share_all();
         policy.scopes.insert("rig".into(), Scope::Private);
         policy.scopes.insert("dev".into(), Scope::Device);
+        policy.scopes.insert("/srv/models/Rig 2".into(), Scope::Private);
         provider.policy = PolicyWatcher::r#static(policy);
         let detected = |r: &str| DetectedModel {
             engine_ref: r.into(), canonical_id: String::new(), family: String::new(), params: String::new(),
             quant: String::new(), size_bytes: 0, weight_digest: String::new(),
         };
-        provider.detected.lock().unwrap().extend([("rig".to_string(), detected("rig")), ("dev".to_string(), detected("dev"))]);
+        provider.detected.lock().unwrap().extend([
+            ("rig".to_string(), detected("rig")),
+            ("dev".to_string(), detected("dev")),
+            ("/srv/models/Rig 2".to_string(), detected("/srv/models/Rig 2")),
+        ]);
+        *provider.public_names.lock().unwrap() = PublicNames::from_engine_refs(["rig", "dev", "/srv/models/Rig 2"]);
         let req = |model: &str| ServeRequest {
             reply_to: "c".into(), model_ref: model.into(), messages: vec![],
             max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [0u8; 16],
             credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
         };
         let refusal = |model: &str, from: &str| {
-            provider.scope_refusal(&req(model), from).map(|r| match &parse_response(&r).unwrap()[0] {
+            provider.scope_refusal(&req(model), &provider.engine_ref_of(model), from).map(|r| match &parse_response(&r).unwrap()[0] {
                 ServeChunk::Error(e) => e.clone(),
                 other => panic!("{other:?}"),
             })
@@ -4275,6 +4385,12 @@ mod tests {
         let own = provider.net.libp2p_peer_id().to_string();
         assert!(refusal("rig", &own).is_none());
         assert!(provider.private_members.lock().unwrap().keys().any(|(p, m)| *p == own && m == "rig"));
+        // A private model with a path id is gated at its own scope under its public name, and
+        // remembered by its engine id (what an attestation check resolves to).
+        let why = refusal("Rig 2", "stranger").expect("refused");
+        assert!(why.contains("private") && !why.contains("device-only"), "{why}");
+        assert!(refusal("Rig 2", &own).is_none());
+        assert!(provider.private_members.lock().unwrap().keys().any(|(p, m)| *p == own && m == "/srv/models/Rig 2"));
     }
 
     #[test]
@@ -4840,6 +4956,75 @@ mod tests {
         })
         .unwrap();
         (dir, Provider::new(adapter, net))
+    }
+
+    /// P4: a model whose engine id the network would refuse (a vLLM directory) is announced under a
+    /// clean name, a request for that name is gated and served by the engine id, the commitment keeps
+    /// the requested name, and un-sharing withdraws the name the network knows.
+    #[test]
+    fn a_path_id_model_is_announced_clean_and_served_by_its_engine_id() {
+        struct PathAdapter(Arc<Mutex<Vec<String>>>);
+        impl EngineAdapter for PathAdapter {
+            fn engine_name(&self) -> &'static str {
+                "vllm"
+            }
+            fn detect_models(&self) -> Result<Vec<DetectedModel>, AdapterError> {
+                let m = |r: &str| DetectedModel {
+                    engine_ref: r.into(), canonical_id: String::new(), family: String::new(), params: String::new(),
+                    quant: String::new(), size_bytes: 0, weight_digest: String::new(),
+                };
+                Ok(vec![m("/data/models/Qwen2.5-7B"), m("qwen2.5:0.5b")])
+            }
+            fn serve_stream(&self, req: &InferenceRequest, on_delta: &mut dyn FnMut(&str)) -> Result<ServeOutcome, AdapterError> {
+                self.0.lock().unwrap().push(req.model_ref.clone());
+                on_delta("hi");
+                Ok(ServeOutcome { tokens: 1, done: true, engine: Default::default(), tool_calls: Vec::new() })
+            }
+        }
+        const PATH: &str = "/data/models/Qwen2.5-7B";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stats = Arc::new(TransferStats::default());
+        let (dir, provider) = test_provider(PathAdapter(seen.clone()));
+        let policy_file = dir.path().join("share.json");
+        let mut policy = SharePolicy::share_list([PATH]);
+        policy.default_global_consent = Some(1);
+        policy.write_atomic(&policy_file).unwrap();
+        let provider = provider.with_stats(stats.clone()).with_share_policy_file(policy_file.clone());
+
+        let _ = provider.announce_models_inner();
+        let view = stats.share_snapshot();
+        assert_eq!(view.announced_models, vec![PATH.to_string()], "the Share view lists engine ids");
+        assert_eq!(view.public_ids.get(PATH).map(String::as_str), Some("Qwen2.5-7B"));
+        assert!(provider.last_announced.lock().unwrap().contains("Qwen2.5-7B"), "announced under the clean name");
+
+        let serve = |model: &str, nonce: u8| {
+            let req = ServeRequest {
+                reply_to: "12D3KooWConsumer".into(), model_ref: model.into(), messages: vec![],
+                max_tokens: None, temperature: None, tools: Vec::new(), think: None, nonce: [nonce; 16],
+                credential: None, deterministic: None, settlement_peg: None, settlement_domain: None, settlement_wallet: None,
+            };
+            let mut data = vec![SERVE_REQUEST];
+            data.extend_from_slice(&req.encode());
+            parse_response(&provider.dispatch("12D3KooWConsumer", &data, Some(req))).unwrap()
+        };
+        let chunks = serve("Qwen2.5-7B", 1);
+        assert!(matches!(chunks.last(), Some(ServeChunk::Done { .. })), "{chunks:?}");
+        assert_eq!(*seen.lock().unwrap(), vec![PATH.to_string()], "the engine is asked for its own id");
+        let committed = provider.serve_commitments.lock().unwrap().get(&[1u8; 16]).map(|c| c.model_id.clone());
+        assert_eq!(committed.as_deref(), Some("Qwen2.5-7B"), "the receipt settles the name the consumer asked for");
+        // An unshared sibling is refused, echoing the requested name.
+        match &serve("qwen2.5:0.5b", 2)[0] {
+            ServeChunk::Error(e) => assert!(e.contains("'qwen2.5:0.5b' is not shared"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Un-sharing withdraws the public name (the network never knew the path).
+        SharePolicy::share_nothing().write_atomic(&policy_file).unwrap();
+        provider.policy.reload_if_changed();
+        let _ = provider.announce_models_inner();
+        assert!(stats.share_snapshot().announced_models.is_empty());
+        assert!(provider.pending_withdrawals.lock().unwrap().contains_key("Qwen2.5-7B"));
+        assert!(!provider.pending_withdrawals.lock().unwrap().contains_key(PATH));
     }
 
     /// Round 8 S8-2: a buffered serve's nonce is held while it generates, however long, then

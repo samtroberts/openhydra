@@ -11,7 +11,7 @@ import { store } from "./storage";
 import { totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent, lifetimeServed, statModels } from "./stats";
 import { renderChart } from "./chart";
 import { fmtNum, fmtUptime, modelIcon } from "./format";
-import { displayModelName } from "./models";
+import { displayModelName, publicName } from "./models";
 import { exportCardModal, ensureImportSection } from "./cards";
 
   let sharingBusy = false;
@@ -392,7 +392,13 @@ import { exportCardModal, ensureImportSection } from "./cards";
       const cardBtn = sharedIntent
         ? html`<button class="cardbtn" data-export-card="${m}" data-private="${gl ? "0" : "1"}" title="${gl ? "Export a public .openhydra card — a link to this model" : "Export a private .openhydra card for a swarm — only members can serve from it"}">🔗</button>`
         : "";
-      rows.push(html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b></td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
+      // A model whose engine id the network refuses (a directory path, brackets) goes by a cleaned-up
+      // name there: say which, so the name other machines and connected tools use isn't a surprise.
+      const pub = publicName(m);
+      const netName = pub !== m && pub !== displayModelName(m)
+        ? html` <span class="mut" title="Other machines and connected tools use this name">· on the network as ${pub}</span>`
+        : "";
+      rows.push(html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b>${netName}</td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
     }
     setHTML($("#servetable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`);
     // "Previously served" — lifetime tokens on record but NOT currently detected.

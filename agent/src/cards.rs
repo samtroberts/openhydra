@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use openhydra_network::card::{sign_card, verify_card, Capability, Card, PricingMode};
 use openhydra_network::types::DiscoveredPeer;
 
-use crate::adapter::{normalize_engine_ref, DetectedModel};
+use crate::adapter::DetectedModel;
 
 /// The export envelope printed by `openhydra-agent card export`: the signed card plus its compact
 /// copy-paste magnet string. JSON on stdout; the desktop parses it back into this.
@@ -21,11 +21,14 @@ pub struct CardExport {
 }
 
 /// Build an UNSIGNED card from a detected model + this node's OpenHydra id. Pure + unit-testable.
-/// Defensively runs `model.engine_ref` through [`normalize_engine_ref`] so a raw llama.cpp `-m` path
-/// can never reach `model_id` (belt-and-suspenders with the privacy gate in `sign_card`). Capability
-/// context/output are left 0 (not known at detection — hint fields).
+/// `public_id` is the name the provider announces and serves the model under
+/// ([`crate::provider::PublicNames`]), so a raw engine path never reaches `model_id`
+/// (belt-and-suspenders with the privacy gate in `sign_card`). Capability context/output are left 0
+/// (not known at detection — hint fields).
+#[allow(clippy::too_many_arguments)]
 pub fn build_card(
     model: &DetectedModel,
+    public_id: &str,
     openhydra_peer_id: &str,
     signed_at_ms: u64,
     ttl_secs: u64,
@@ -36,7 +39,7 @@ pub fn build_card(
     let expires_at = signed_at_ms.saturating_add(ttl_secs.saturating_mul(1000));
     let mut card = Card::new_unsigned(
         openhydra_peer_id,
-        normalize_engine_ref(&model.engine_ref),
+        public_id,
         signed_at_ms,
         expires_at,
     );
@@ -147,7 +150,10 @@ pub fn run_export(
         }
     };
 
-    let card = build_card(detected, &id.openhydra_peer_id, now_ms, ttl_secs, pricing, region, swarm_binding);
+    // The name the provider announces: assigned over every detected model, as its announce pass does.
+    let names = crate::provider::PublicNames::from_engine_refs(engines.iter().flat_map(|e| &e.models).map(|m| m.engine_ref.as_str()));
+    let public_id = names.public(&detected.engine_ref).to_string();
+    let card = build_card(detected, &public_id, &id.openhydra_peer_id, now_ms, ttl_secs, pricing, region, swarm_binding);
     let signed = sign_card(card, &id.keypair).map_err(|e| e.to_string())?;
     let magnet = signed.to_magnet().map_err(|e| e.to_string())?;
     Ok(CardExport { card: signed, magnet })
@@ -311,7 +317,7 @@ mod tests {
     #[test]
     fn build_card_maps_fields_and_computes_expiry() {
         let m = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b");
-        let c = build_card(&m, "oh_abc", 1_000, 3600, PricingMode::Reciprocal, Some("in".into()), None);
+        let c = build_card(&m, &m.engine_ref, "oh_abc", 1_000, 3600, PricingMode::Reciprocal, Some("in".into()), None);
         assert_eq!(c.openhydra_peer_id, "oh_abc");
         assert_eq!(c.model_id, "qwen3:1.7b");
         assert_eq!(c.canonical_id, "qwen3/1.7b/int4/deadbeef");
@@ -326,11 +332,11 @@ mod tests {
         // weight_hash…
         let mut m = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b");
         m.weight_digest = "sha256:abc123".into();
-        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        let c = build_card(&m, &m.engine_ref, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
         assert_eq!(c.weight_hash, "sha256:abc123", "digest disclosed on the card");
         // …and an engine that reports none leaves weight_hash empty (byte-identical to before).
         let plain = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b"); // weight_digest = ""
-        let pc = build_card(&plain, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        let pc = build_card(&plain, &plain.engine_ref, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
         assert!(pc.weight_hash.is_empty(), "no digest → empty weight_hash");
     }
 
@@ -338,23 +344,25 @@ mod tests {
     fn build_card_with_a_swarm_binding_is_private() {
         let m = detected("qwen3:1.7b", "qwen3/1.7b/int4/deadbeef", "1.7b");
         let pk = "a".repeat(64);
-        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, Some(pk.clone()));
+        let c = build_card(&m, &m.engine_ref, "oh_abc", 0, 60, PricingMode::Reciprocal, None, Some(pk.clone()));
         assert_eq!(c.swarm_public_key, pk);
         assert!(c.is_private());
         // No binding → public.
-        let pubc = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        let pubc = build_card(&m, &m.engine_ref, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
         assert!(!pubc.is_private());
     }
 
     #[test]
-    fn build_card_normalizes_a_leaky_llama_cpp_path_ref() {
-        // A llama.cpp `-m /home/alice/...gguf` engine_ref must become a clean, path-free handle.
+    fn build_card_uses_the_public_name_never_an_engine_path() {
+        // An engine id that is a path (`-m /home/alice/...gguf`, a vLLM directory) is carded under the
+        // name the provider announces, which is path-free.
         let m = detected(
             "/home/alice/models/Qwen3-1.7B-Q4_K_M.gguf",
             "qwen3/1.7b/int4/deadbeef",
             "1.7b",
         );
-        let c = build_card(&m, "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
+        let names = crate::provider::PublicNames::from_engine_refs([m.engine_ref.as_str()]);
+        let c = build_card(&m, names.public(&m.engine_ref), "oh_abc", 0, 60, PricingMode::Reciprocal, None, None);
         assert_eq!(c.model_id, "Qwen3-1.7B-Q4_K_M");
         assert!(!c.model_id.contains('/') && !c.model_id.to_ascii_lowercase().contains(".gguf"));
         // The card would pass the sign-side privacy gate.

@@ -268,15 +268,15 @@ pub fn quant_hint_from_name(name: &str) -> Option<String> {
 }
 
 /// Provider side: answer a challenge (`body` = the bytes after the method byte). Never panics; every
-/// failure is a refusal. `engine` is `None` unless the operator opted in. `scorable(model)` must be
-/// true only for models this node announces publicly, so a challenge can't probe for a private
-/// model (it gets the same refusal as an unknown one). Engine errors are logged here and replied to
+/// failure is a refusal. `engine` is `None` unless the operator opted in. `scorable(model)` returns
+/// the engine id to score for the challenged name, and only for models this node announces publicly,
+/// so a challenge can't probe for a private model (it gets the same refusal as an unknown one). Engine errors are logged here and replied to
 /// generically, so a challenge can't read engine internals.
 pub fn handle_prompt_score_inbound(
     body: &[u8],
     engine: Option<&dyn EngineAdapter>,
     gate: &InflightGate,
-    scorable: &dyn Fn(&str) -> bool,
+    scorable: &dyn Fn(&str) -> Option<String>,
     in_round: bool,
 ) -> Vec<u8> {
     let Some(engine) = engine else {
@@ -285,13 +285,13 @@ pub fn handle_prompt_score_inbound(
     let Some((model, ids)) = decode_challenge(body) else {
         return score_refusal("malformed challenge");
     };
-    if !scorable(&model) {
+    let Some(engine_ref) = scorable(&model) else {
         return score_refusal("model not scorable here");
-    }
+    };
     let Some(_slot) = gate.try_enter_for(in_round) else {
         return score_refusal("prompt scoring busy, retry");
     };
-    match engine.score_prompt(&model, &ids) {
+    match engine.score_prompt(&engine_ref, &ids) {
         Ok(lps) if lps.len() + 1 == ids.len() => {
             let mut b = Vec::with_capacity(4 + 4 * lps.len());
             b.extend_from_slice(&(lps.len() as u32).to_le_bytes());
@@ -1089,7 +1089,7 @@ mod tests {
     fn roundtrip(engine: Option<&dyn EngineAdapter>, gate: &InflightGate, model: &str, ids: &[u32]) -> Result<Vec<f32>, ScoreChallengeError> {
         let mut transport = |framed: &[u8]| -> Result<Vec<u8>, String> {
             assert_eq!(framed[0], PROMPT_SCORE_CHALLENGE);
-            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| m == "public", false))
+            Ok(handle_prompt_score_inbound(&framed[1..], engine, gate, &|m| (m == "public").then(|| m.to_string()), false))
         };
         request_prompt_scores(&mut transport, model, ids)
     }
@@ -1129,7 +1129,7 @@ mod tests {
                 // Random ids each time, from the range every common vocabulary has.
                 let ids = decode_challenge(&framed[1..]).unwrap().1;
                 assert!(ids.len() == 16 && ids.iter().all(|&i| (1_000..31_000).contains(&i)));
-                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| m == "public", false))
+                Ok(handle_prompt_score_inbound(&framed[1..], engine, &gate, &|m| (m == "public").then(|| m.to_string()), false))
             };
             probe_scoring(&mut transport, "public", &mut || {})
         };
@@ -1149,7 +1149,7 @@ mod tests {
                 if sent <= busy_replies {
                     return Ok(score_refusal(if sent % 2 == 0 { "prompt scoring busy, retry" } else { "prompt scoring warming up, retry" }));
                 }
-                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|_| true, false))
+                Ok(handle_prompt_score_inbound(&framed[1..], Some(&Scorer { mode: "ok" }), &gate, &|m| Some(m.to_string()), false))
             };
             let out = probe_scoring(&mut flaky, "public", &mut || pauses += 1);
             assert_eq!(out.is_none(), expect_ok, "{busy_replies} busy replies: {out:?}");
@@ -1187,13 +1187,13 @@ mod tests {
         let engine = Scorer { mode: "ok" };
         let good = encode_challenge("public", &[1, 2, 3]).unwrap();
         for cut in 0..good.len() - 1 {
-            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|_| true, false);
+            let reply = handle_prompt_score_inbound(&good[1..1 + cut], Some(&engine), &gate, &|m| Some(m.to_string()), false);
             assert!(reply.starts_with(SCORE_RESP_MAGIC));
             assert_eq!(reply[4], RESP_REFUSED);
         }
         let mut long = good.clone();
         long.push(0);
-        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|_| true, false)[4], RESP_REFUSED);
+        assert_eq!(handle_prompt_score_inbound(&long[1..], Some(&engine), &gate, &|m| Some(m.to_string()), false)[4], RESP_REFUSED);
     }
 
     #[test]
@@ -1256,7 +1256,7 @@ mod tests {
                 Ok(ids[1..].iter().map(|&t| -(t as f32) / 10.0 - self.0).collect())
             }
         }
-        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| m == "public", false))
+        move |framed: &[u8]| Ok(handle_prompt_score_inbound(&framed[1..], Some(&Shifted(shift)), gate, &|m| (m == "public").then(|| m.to_string()), false))
     }
 
     #[test]

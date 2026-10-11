@@ -26,13 +26,20 @@ export function noteSeen() {
 // rejects an un-shared model_ref), so it must not appear in the network/browse views as "yours".
 // Gate on the real announced set (`snap.share.announced_models`, correct in both `all` and `list`
 // modes). Falls back to all engine models only when the agent exposes no share view (pre-0.3.16).
+// Returned as NETWORK names (what peers and the gateway use): a model whose engine id the network
+// refuses (a vLLM directory path) is announced under a cleaned-up name (`share.public_ids`).
 export function localSharedModels() {
   if (!state?.provider?.status?.running) return [];
   const all = engines.flatMap((e) => e.models);
   const sv = snap?.share;
   if (!sv) return all; // old agent without /status/share → legacy behavior
   const announced = new Set(sv.announced_models || []);
-  return all.filter((m) => announced.has(m));
+  return all.filter((m) => announced.has(m)).map(publicName);
+}
+// The name the local provider announces engine model `m` under (the engine id unless renamed).
+export function publicName(m) {
+  const renamed = snap?.share?.public_ids;
+  return (renamed && Object.prototype.hasOwnProperty.call(renamed, m)) ? renamed[m] : m;
 }
 // A model still listed only because of stickiness (seen, but not within the last IDLE_MS) — shown
 // dimmed/"idle", an honest "unconfirmed this instant" signal. Locally-SHARED models are always live.
