@@ -1,3 +1,72 @@
+// The app's own commands get permissions generated (allow-<command>), and the main window's
+// capability (capabilities/default.json) grants only the ones the UI calls. Without an app manifest
+// Tauri lets page script call every registered command; with it, a command must be granted.
+// ui-tests/tauri-args.test.mjs keeps this list equal to main.rs's generate_handler!.
+const COMMANDS: &[&str] = &[
+    "get_state",
+    "identity_info",
+    "reveal_path",
+    "confirm_sharing",
+    "open_external",
+    "start_provider",
+    "start_gateway",
+    "stop_provider",
+    "stop_gateway",
+    "save_share_policy",
+    "read_share_policy",
+    "export_card",
+    "preview_card",
+    "import_card",
+    "list_cards",
+    "remove_imported_card",
+    "take_pending_card",
+    "list_swarms",
+    "create_swarm",
+    "swarm_enroll_request",
+    "preview_enroll_request",
+    "swarm_approve_member",
+    "swarm_remote_scope",
+    "swarm_revoke_member",
+    "preview_swarm_credential",
+    "swarm_accept_credential",
+    "forget_swarm",
+    "reset_share_policy",
+    "detect_engines_now",
+    "system_info",
+    "install_plan",
+    "install_engine",
+    "installed_engines",
+    "run_engine",
+    "gateway_health",
+    "chat_completion",
+    "chat_completion_stream",
+    "chat_stop",
+    "web_search",
+    "status_snapshot",
+    "save_settings",
+    "load_sessions",
+    "save_sessions",
+    "load_stats",
+    "save_stats",
+    "device_hostname",
+    "app_version",
+    "appimage_status",
+    "integrate_appimage",
+    "export_logs",
+    "connector_status",
+    "connector_preview",
+    "connector_apply",
+    "connector_disconnect",
+    "open_gui",
+    "connector_test",
+    "cli_status",
+    "install_cli",
+    "uninstall_cli",
+];
+
 fn main() {
-    tauri_build::build()
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),
+    )
+    .expect("tauri-build failed");
 }

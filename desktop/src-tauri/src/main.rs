@@ -2496,8 +2496,54 @@ async fn gateway_health(state: tauri::State<'_, AppState>) -> Result<bool, ()> {
     .unwrap_or(false))
 }
 
+/// Reject settings the app could act on harmfully: they choose who this node talks to (bootstraps),
+/// where the provider sends the network's prompts (engine endpoint) and what the chat fetches
+/// (search URL). Errors are shown to the user as "Save failed: …".
+fn validate_settings(s: &Settings) -> Result<(), String> {
+    if s.bootstraps.len() > 32 {
+        return Err("at most 32 bootstrap addresses".into());
+    }
+    for b in &s.bootstraps {
+        let b = b.trim();
+        let ok = b.starts_with('/')
+            && b.len() <= 256
+            && b.contains("/p2p/")
+            && b.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'.' | b':' | b'-' | b'_'));
+        if !ok {
+            return Err(format!(
+                "bootstrap address isn't a multiaddr like /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo…: {}",
+                b.chars().take(80).collect::<String>().escape_debug()
+            ));
+        }
+    }
+    if s.gateway_port < 1024 {
+        return Err("gateway port must be 1024–65535".into());
+    }
+    if !matches!(s.min_authenticity.as_str(), "off" | "A1" | "A2") {
+        return Err("minimum authenticity must be off, A1 or A2".into());
+    }
+    if s.engine_kind != "auto" && !ENGINE_KINDS.contains(&s.engine_kind.as_str()) {
+        return Err(format!("unknown engine: {}", s.engine_kind.escape_debug()));
+    }
+    for (label, url) in [("engine endpoint", &s.engine_endpoint), ("search URL", &s.search_url)] {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        match tauri::Url::parse(url) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() && u.username().is_empty() && u.password().is_none() => {}
+            _ => return Err(format!("{label} must be an http(s) URL without a user name or password")),
+        }
+    }
+    if s.device_name.chars().count() > 64 || s.device_name.chars().any(char::is_control) {
+        return Err("device name: at most 64 characters, no control characters".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn save_settings(state: tauri::State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
+    validate_settings(&settings)?;
     let mut cur = state.settings.lock().map_err(|e| e.to_string())?;
     // Preserve fields the settings FORM doesn't own — taking the payload verbatim would reset them.
     // `sharing_enabled` is managed by start/stop_provider (a save must not clear a live sharing intent
@@ -2940,6 +2986,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_validation_accepts_real_values_and_refuses_hostile_ones() {
+        let ok = Settings {
+            bootstraps: vec!["/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wELabcdef".into(), "/dns4/bootstrap-us.openhydra.co/tcp/4001/p2p/12D3KooWx".into()],
+            engine_endpoint: "http://127.0.0.1:11434".into(),
+            search_url: "https://search.example/".into(),
+            device_name: "Sam's MacBook Air".into(),
+            ..Settings::default()
+        };
+        validate_settings(&ok).unwrap();
+        validate_settings(&Settings::default()).unwrap();
+        let bad = |f: &dyn Fn(&mut Settings)| { let mut s = ok.clone(); f(&mut s); validate_settings(&s).is_err() };
+        assert!(bad(&|s| s.bootstraps = vec!["not a multiaddr".into()]));
+        assert!(bad(&|s| s.bootstraps = vec!["/ip4/1.2.3.4/tcp/4001".into()]), "needs a peer id");
+        assert!(bad(&|s| s.bootstraps = vec!["/ip4/1.2.3.4/tcp/4001/p2p/x\";rm".into()]));
+        assert!(bad(&|s| s.gateway_port = 80));
+        assert!(bad(&|s| s.min_authenticity = "A9".into()));
+        assert!(bad(&|s| s.engine_kind = "evil".into()));
+        assert!(bad(&|s| s.engine_endpoint = "file:///etc/passwd".into()));
+        assert!(bad(&|s| s.engine_endpoint = "javascript:alert(1)".into()));
+        assert!(bad(&|s| s.search_url = "http://user:pw@host/".into()));
+        assert!(bad(&|s| s.device_name = "x\ny".into()));
+        assert!(bad(&|s| s.device_name = "x".repeat(65)));
+    }
 
     #[test]
     fn the_window_only_navigates_to_the_apps_own_pages() {
