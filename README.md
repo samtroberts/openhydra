@@ -159,7 +159,7 @@ The gateway also serves `GET /v1/models` (model ids discovered on the swarm) and
 
 The gateway checks each provider's billed token count against the model's own
 tokenizer. Which tokenizer that is comes from a signed index (built in, refreshed
-daily from `registry.openhydra.co`); the tokenizer file itself is downloaded from
+daily from `dl.openhydra.co`); the tokenizer file itself is downloaded from
 huggingface.co the first time a listed model is used, hash-checked, and cached in
 `~/.openhydra/tokenizers`. `--no-tokenizer-downloads` turns the download off.
 

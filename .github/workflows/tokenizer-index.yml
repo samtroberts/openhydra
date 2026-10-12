@@ -1,0 +1,59 @@
+name: Tokenizer index
+
+# Publish the signed tokenizer index (agent/data/tokenizer-index.json, built with
+# `openhydra-agent registry index sign`) to the download bucket as tokenizers/index.json, which
+# gateways fetch daily from https://dl.openhydra.co/tokenizers/index.json (W4). Runs when the file
+# changes on main, or by hand. Gateways check the signature against the key built into them and only
+# move to a higher sequence, so this job only has to put the file in place. Same R2 secrets and S3
+# endpoint as the publish-r2 job in release.yml.
+
+on:
+  push:
+    branches: [main]
+    paths: [agent/data/tokenizer-index.json]
+  workflow_dispatch:
+
+# Least privilege: the token only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: tokenizer-index
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish tokenizers/index.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the file is a signed index
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json
+          env = json.load(open("agent/data/tokenizer-index.json"))
+          assert set(env) == {"index", "signature", "key"}, sorted(env)
+          idx = json.loads(base64.b64decode(env["index"]))
+          assert idx["format"] == 1 and isinstance(idx["sequence"], int)
+          pinned = open("agent/src/tokenizer_index.rs").read().split('PINNED_INDEX_KEY: &str = "')[1][:64]
+          assert env["key"] == pinned, "signed by a key this source doesn't pin"
+          print(f"index #{idx['sequence']}: {len(idx['models'])} tokenizers, key {pinned[:12]}…")
+          PY
+      - name: Upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Short cache: gateways revalidate with the ETag (a 304 when unchanged).
+          aws s3 cp agent/data/tokenizer-index.json "s3://${R2_BUCKET}/tokenizers/index.json" \
+            --endpoint-url "$EP" --content-type application/json --cache-control "public, max-age=300"
+          aws s3api head-object --bucket "$R2_BUCKET" --key tokenizers/index.json --endpoint-url "$EP" \
+            --query '{etag: ETag, size: ContentLength}'

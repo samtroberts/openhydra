@@ -29,8 +29,9 @@ use serde::{Deserialize, Serialize};
 /// The OpenHydra registry public key the index must be signed with.
 pub const PINNED_INDEX_KEY: &str = "65d41cba369f39dd8100c273cc3729294f06bc91c84f5d39f5e5c46dd200e034";
 
-/// Where gateways fetch the index from.
-pub const DEFAULT_INDEX_URL: &str = "https://registry.openhydra.co/tokenizers/index.json";
+/// Where gateways fetch the index from: the download bucket, published by
+/// `.github/workflows/tokenizer-index.yml` from `agent/data/tokenizer-index.json`.
+pub const DEFAULT_INDEX_URL: &str = "https://dl.openhydra.co/tokenizers/index.json";
 
 /// How often a gateway checks for a newer index (a conditional request: unchanged costs one 304).
 pub const REFRESH_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
