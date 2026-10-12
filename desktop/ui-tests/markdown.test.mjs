@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderMarkdown } from "../ui/markdown.js";
+import { renderMarkdown, parseFences } from "../ui/markdown.js";
 
 test("common formatting", () => {
   assert.equal(renderMarkdown("91 is **not** prime"), "<p>91 is <strong>not</strong> prime</p>");
@@ -58,4 +58,21 @@ test("long hostile inputs render quickly", () => {
     renderMarkdown(s);
     assert.ok(Date.now() - t0 < 500, `took ${Date.now() - t0} ms for ${JSON.stringify(s.slice(0, 12))}…`);
   }
+});
+
+test("code fences: the forms models write, and ones left open", () => {
+  const code = (t) => parseFences(t).filter((p) => p.code != null);
+  assert.deepEqual(parseFences("hi\n```py\nx = 1\n```\nbye"), [{ prose: "hi" }, { lang: "py", code: "x = 1\n" }, { prose: "bye" }]);
+  // Unclosed (a stopped reply): code to the end, never markdown.
+  assert.deepEqual(code("```python\n# comment\nif __name__ == '__main__':"), [{ lang: "python", code: "# comment\nif __name__ == '__main__':\n" }]);
+  // Tildes, a spaced info string, CRLF, a longer fence holding a shorter one.
+  assert.deepEqual(code("~~~\nA\n~~~"), [{ lang: "code", code: "A\n" }]);
+  assert.deepEqual(code("``` python\nB\n```"), [{ lang: "python", code: "B\n" }]);
+  assert.deepEqual(code("```js\r\nC\r\n```\r\n"), [{ lang: "js", code: "C\n" }]);
+  assert.deepEqual(code("````md\n```\ninner\n```\n````"), [{ lang: "md", code: "```\ninner\n```\n" }]);
+  // A closing fence must be the same character and at least as long; text after it isn't a close.
+  assert.deepEqual(code("```\na\n~~~\n``` not\n```"), [{ lang: "code", code: "a\n~~~\n``` not\n" }]);
+  // Inline backticks in prose aren't fences.
+  assert.deepEqual(parseFences("use ```x``` inline"), [{ prose: "use ```x``` inline" }]);
+  assert.deepEqual(parseFences(""), []);
 });

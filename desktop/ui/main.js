@@ -283,6 +283,9 @@ function botEl(content, meta, reasoning) {
   if (meta) { const mm = document.createElement("div"); setHTML(mm, metaRow(meta)); d.appendChild(mm.firstChild); }
   return d;
 }
+// The reply being streamed, and the chat it belongs to: a redraw of that chat (opening it from
+// Recents, a rename) re-attaches it instead of dropping it until the reply ends (ADVERSARIAL item 8).
+let liveView = null;
 function renderChat() {
   const s = sessions[curChat]; const th = $("#thread"); if (!s) { th.replaceChildren(); return; }
   $("#chattitle").textContent = s.t; th.replaceChildren();
@@ -300,6 +303,8 @@ function renderChat() {
       th.appendChild(d);
     } else th.appendChild(botEl(x[1], x[2], x[3]));
   }
+  // A reply still streaming into this chat: put its bubble (or the wait note) back after a redraw.
+  if (liveView && liveView.chat === curChat) th.appendChild(liveView.started ? liveView.live : liveView.wait);
   th.scrollTop = th.scrollHeight;
 }
 
@@ -379,6 +384,8 @@ async function completeChat(args, th, wait, slow) {
   if (!Channel) return call("chat_completion", args);
   const streamId = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const live = document.createElement("div"); live.className = "msg ai"; live.style.whiteSpace = "pre-wrap";
+  const view = { chat: curChat, live, wait, started: false };
+  liveView = view;
   let text = "", reasoning = "", done = null, error = null, stopped = false, incomplete = false;
   // The last event is "end": large messages (an image as a data URL) can arrive after the command
   // itself has returned, so the reply is complete only once "end" is seen.
@@ -387,7 +394,8 @@ async function completeChat(args, th, wait, slow) {
   ch.onmessage = (ev) => {
     if (ev.kind === "delta" || ev.kind === "reasoning") {
       if (ev.kind === "delta") text += ev.text; else reasoning += ev.text;
-      if (wait.isConnected) { clearTimeout(slow); wait.remove(); th.appendChild(live); }
+      if (!view.started) { view.started = true; clearTimeout(slow); wait.remove(); }
+      if (!live.isConnected && curChat === view.chat) th.appendChild(live);
       // While streaming show the answer so far ("Thinking…" while only reasoning has arrived).
       const sp = splitThink(text);
       live.textContent = sp.answer || (sp.reasoning || reasoning ? "Thinking…" : "");
@@ -404,6 +412,7 @@ async function completeChat(args, th, wait, slow) {
     await Promise.race([endSeen, new Promise((r) => setTimeout(r, 30000))]);
   } finally {
     if (activeStream === streamId) { activeStream = null; setSendMode(false); }
+    if (liveView === view) liveView = null;
     live.remove();
   }
   const sp = splitThink(text);
@@ -447,7 +456,7 @@ function plainPaste(e) {
 
 // image mode (wireframe) — the picker sets it; the network decides if an image model exists
 let chatMode = "text";
-function setChatMode(model) { chatMode = /flux|sdxl|(^|[^a-z])sd($|[^a-z])/i.test(model || "") ? "image" : "text"; const img = chatMode === "image"; $("#composer").dataset.ph = img ? "Describe an image…" : "Message…"; $("#sendlbl").textContent = img ? "Generate" : "Send"; $("#txtparams").style.display = img ? "none" : ""; $("#imgparams").style.display = img ? "" : "none"; }
+function setChatMode(model) { chatMode = /flux|sdxl|(^|[^a-z])sd($|[^a-z])/i.test(model || "") ? "image" : "text"; const img = chatMode === "image"; $("#composer").dataset.ph = img ? "Describe an image…" : "Message…"; setSendMode(!!activeStream); $("#txtparams").style.display = img ? "none" : ""; $("#imgparams").style.display = img ? "" : "none"; }
 
 // attachments (paperclip → hidden file input)
 $$('button[title="Attach files to context"]').forEach((b) => b.onclick = () => $("#attachfile").click());

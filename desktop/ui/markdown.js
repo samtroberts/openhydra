@@ -93,3 +93,38 @@ export function renderMarkdown(text) {
 
 /** renderMarkdown as html`` markup, for setHTML. */
 export const renderMarkdownMarkup = (text) => trustedMarkup(renderMarkdown(text));
+
+// Split a reply into prose and fenced code blocks, CommonMark-style: a fence is three or more
+// backticks or tildes (up to three spaces in), with an optional info string whose first word is the
+// language ("``` python" too); it closes on a line of the same character, at least as long, and
+// nothing else. A fence that never closes runs to the end, as in a reply that was stopped or cut off,
+// so its text stays code instead of being read as markdown (`# comment` as a heading, `__name__` as
+// bold). CRLF line ends count as line ends.
+export function parseFences(t) {
+  const lines = (t || "").replace(/\r\n?/g, "\n").split("\n");
+  const parts = [];
+  let prose = [], code = null, fence = null, lang = "";
+  const flushProse = () => { const p = prose.join("\n").trim(); if (p) parts.push({ prose: p }); prose = []; };
+  for (const line of lines) {
+    if (fence) {
+      const close = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) {
+        parts.push({ lang: lang || "code", code: code.join("\n") + "\n" });
+        fence = null; code = null;
+      } else {
+        code.push(line);
+      }
+      continue;
+    }
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)[^`]*$/) || line.match(/^ {0,3}(~{3,})\s*(\S*).*$/);
+    if (open) {
+      flushProse();
+      fence = open[1]; lang = (open[2] || "").replace(/[^\w+#.-]/g, ""); code = [];
+      continue;
+    }
+    prose.push(line);
+  }
+  if (fence) parts.push({ lang: lang || "code", code: code.join("\n") + (code.length ? "\n" : "") });
+  else flushProse();
+  return parts.filter((x) => x.code != null || x.prose);
+}
