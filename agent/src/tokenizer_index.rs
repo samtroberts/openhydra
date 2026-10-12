@@ -430,7 +430,13 @@ pub(crate) mod tests {
     #[test]
     fn the_built_in_index_verifies_against_the_pinned_key() {
         let text = BUNDLED;
-        verify(text, PINNED_INDEX_KEY).expect("data/tokenizer-index.json must be signed by the pinned registry key");
+        let idx = verify(text, PINNED_INDEX_KEY).expect("data/tokenizer-index.json must be signed by the pinned registry key");
+        // Above the test copies signed while building W4 (#2); covers what the network serves.
+        assert!(idx.sequence >= 10, "{}", idx.sequence);
+        for model in ["qwen2.5-coder:1.5b", "qwen3:8b-q4_K_M", "llama3.2", "gemma3:4b-it-qat", "gpt-oss:20b", "deepseek-r1:8b"] {
+            assert!(idx.lookup(model).is_some(), "{model}");
+        }
+        assert_eq!(bundled(), idx);
     }
 
     #[test]
