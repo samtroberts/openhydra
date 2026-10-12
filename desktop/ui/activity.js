@@ -19,7 +19,7 @@ import { mean, tpsSamples, rttSamples } from "./telemetry";
     k[1].textContent = fmtNum(used);
     k[2].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
     k[3].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
-    setHTML($$("#v-activity .g4 .kpi .sub")[0], html`<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} receipts co-signed`);
+    setHTML($$("#v-activity .g4 .kpi .sub")[0], html`<span class="dot ok"></span>${t?.receipts_ledgered ?? 0} co-signed receipts for tokens served`);
     // Replies your own Mac served for your own chats aren't a network transaction: shown apart.
     const local = t?.tokens_local ?? 0;
     $$("#v-activity .g4 .kpi .sub")[1].textContent = local ? `from the network · ${fmtNum(local)} more answered by this Mac` : "from the network";

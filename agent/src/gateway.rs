@@ -705,6 +705,8 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
 
     json!({
         "tokens": summary.tokens,
+        // What the provider claimed, when more than `tokens` (what this gateway pays); else null.
+        "claimed_tokens": summary.claimed_tokens,
         // The authenticity tier this gateway had established for the provider that served (D2).
         "provider_authenticity": summary.authenticity.map(|t| t.label()),
         "engine": {
@@ -1147,6 +1149,7 @@ fn spawn_byok_worker(
                     tool_calls: outcome.tool_calls,
                     authenticity: None,
                     streamed: false,
+                    claimed_tokens: None,
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -2393,6 +2396,7 @@ mod tests {
             tool_calls: Vec::new(),
             authenticity: None,
             streamed: false,
+            claimed_tokens: None,
         }
     }
 

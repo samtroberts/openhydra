@@ -485,6 +485,9 @@ pub struct ServeSummary {
     /// Consumer-side: the provider streamed this serve, so `proxy_roundtrip_ns` is the time to its
     /// first acknowledgement (sent before it generates), not the whole serve.
     pub streamed: bool,
+    /// Consumer-side: the tokens the provider claimed, when that is more than `tokens` (what this
+    /// consumer signs for and pays, after the delivered-text bound and the tokenizer recount).
+    pub claimed_tokens: Option<u64>,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -512,6 +515,7 @@ pub fn handle_serve_request(
                 tool_calls: Vec::new(),
                 authenticity: None,
                 streamed: false,
+                claimed_tokens: None,
             };
         }
     };
@@ -616,6 +620,7 @@ pub fn handle_serve_request_within(
                 tool_calls: o.tool_calls,
                 authenticity: None,
                 streamed: false,
+                claimed_tokens: None,
             }
         }
         Err(e) => {
@@ -629,6 +634,7 @@ pub fn handle_serve_request_within(
                 tool_calls: Vec::new(),
                 authenticity: None,
                 streamed: false,
+                claimed_tokens: None,
             }
         }
     }

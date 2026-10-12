@@ -358,7 +358,7 @@ async function sendOne(text, fromHome) {
     const reasoning = [msg.reasoning_content, split.reasoning].filter(Boolean).join("\n").trim();
     const reply = split.answer;                                  // may be "" — botEl shows a clear note
     const oh = resp?.openhydra || {};
-    const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", tier: oh.provider_authenticity || null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
+    const meta = { model: resp?.model || model, tok: resp?.usage?.completion_tokens ?? "—", claimed: Number.isFinite(oh.claimed_tokens) ? oh.claimed_tokens : null, tps: oh.engine?.native_tps ? Math.round(oh.engine.native_tps) : "—", rtt: oh.hops_ms?.network_rtt ?? "—", tier: oh.provider_authenticity || null, at: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) };
     pushSample(tpsSamples, oh.engine?.native_tps, "oh_tps");   // rolling throughput for Activity
     pushSample(rttSamples, oh.hops_ms?.network_rtt, "oh_rtt"); // rolling latency for Activity
     s.m.push(["ai", reply, meta, reasoning || null]); saveSessions(); renderChat();

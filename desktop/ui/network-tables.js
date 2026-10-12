@@ -16,7 +16,7 @@ import { menu, toast } from "./chrome";
   export function renderLedger() {
     const t = snap?.transfers, rows = t?.recent || [];
     $("#v-ledger .row .mut").textContent = rows.length
-      ? `${rows.length} recent · ${t?.receipts_ledgered ?? 0} co-signed · ${t?.tokens_served ?? 0} served / ${t?.tokens_consumed ?? "—"} used tokens`
+      ? `${rows.length} recent · ${t?.tokens_served ?? 0} tokens served (${t?.receipts_ledgered ?? 0} co-signed receipts) / ${t?.tokens_consumed ?? "—"} used`
       : `${t?.receipts_ledgered ?? 0} receipts · ${t?.tokens_served ?? 0} tokens served`;
     setHTML($("#ledgertable tbody"), rows.length
       ? html`${rows.slice(0, 100).map((r) => {

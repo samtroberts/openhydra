@@ -884,6 +884,7 @@ pub fn request_completion(
                     tool_calls,
                     authenticity: None,
                     streamed: false,
+                    claimed_tokens: None,
                 })
             }
         }
@@ -1392,6 +1393,7 @@ fn dispatch_stream_slice(
                     tool_calls: std::mem::take(tool_calls),
                     authenticity: None,
                     streamed: false,
+                    claimed_tokens: None,
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -1951,7 +1953,8 @@ impl ConsumerNode {
     }
 
     /// Count a served completion's tokens with the model's tokenizer and hold a bill above them
-    /// against the provider (P7, detached, off the response path).
+    /// against the provider (P7, detached, off the response path): for a scorer count, which runs
+    /// a process. Whether it took the settlement over (false: busy, the caller settles now).
     #[allow(clippy::too_many_arguments)]
     fn check_billed_tokens(
         self: &Arc<Self>,
@@ -1974,58 +1977,33 @@ impl ConsumerNode {
         let node = Arc::clone(self);
         std::thread::spawn(move || {
             let _slot = slot;
-            let allowance = counter.tool_call_allowance();
             let (provider, nonce) = settle;
-            // Counted before paying: a provider that billed more than the text it delivered can hold
-            // (by the model's own tokenizer) is paid what the text holds, and marked down. Without a
-            // count (none possible, an error) it is paid what it billed, as before.
-            let pay = (|| -> u64 {
-                // Text that doesn't fit beside the tool calls is cut, and the count estimated from it.
-                let mut text = text;
-                let mut total_units = total_units;
-                let whole_units = {
-                    let mut t = crate::serve::DeliveredText::default();
-                    t.push(&text);
-                    t.units()
-                };
-                if crate::token_count::fit_for_counting(&mut text, &tool_calls) {
-                    total_units.get_or_insert(whole_units);
-                }
-                // Tool calls too large to keep: not checked.
-                let Some((countable, calls)) = crate::token_count::countable_text(&text, &tool_calls, &offered) else {
-                    return billed;
-                };
-                // Counted in pieces; an answer too long to keep whole is estimated from its start (B5).
-                let counted = counter.count(&countable).map(|n| match total_units {
-                    Some(total) => {
-                        let mut part = crate::serve::DeliveredText::default();
-                        part.push(&text);
-                        crate::token_count::estimate_from_part(n, part.units(), total)
-                    }
-                    None => n,
-                });
-                match counted {
-                    Ok(counted) if crate::token_count::over_billed(billed, counted, calls, allowance) => {
-                        let fair = crate::token_count::billable_by_count(counted, calls, allowance);
-                        tracing::warn!(provider = %state_id, model = %model_key, billed, counted, paying = fair,
-                            "provider billed for more tokens than it delivered; paying what it delivered");
-                        node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
-                        fair.min(billed)
-                    }
-                    Ok(counted) => {
-                        tracing::debug!(provider = %state_id, billed, counted, "billed token count checks out");
-                        billed
-                    }
-                    // Visible: a vocabulary that won't load turns the check off for its model.
-                    Err(e) => {
-                        tracing::warn!(error = %e, tokenizer = %counter.describe(), "couldn't count delivered tokens");
-                        billed
-                    }
-                }
-            })();
+            let (pay, over) = recount_pay(&counter, text, total_units, &tool_calls, &offered, billed, &state_id, &model_key);
+            if over {
+                node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+            }
             node.settle_receipt(&provider, pay, nonce, SettlePurpose::User);
         });
         true
+    }
+
+    /// The same check, here and now, for a count that takes milliseconds (a Hugging Face tokenizer,
+    /// in process): done before the answer's usage goes out, so the client sees the count it pays
+    /// for. `None` when the counters are busy (the bill stands, as when there's no tokenizer).
+    #[allow(clippy::too_many_arguments)]
+    fn recount_now(
+        &self,
+        counter: &crate::token_count::Counter,
+        text: String,
+        total_units: Option<u64>,
+        tool_calls: &[crate::adapter::ToolCall],
+        offered: &std::collections::HashSet<String>,
+        billed: u64,
+        state_id: &str,
+        model_key: &str,
+    ) -> Option<(u64, bool)> {
+        let _slot = crate::token_count::CountSlot::try_take(&self.counts_running)?;
+        Some(recount_pay(counter, text, total_units, tool_calls, offered, billed, state_id, model_key))
     }
 
     /// Persist one `(peer, model)`'s log-prob state (best-effort: a failed write is logged, never
@@ -3058,6 +3036,7 @@ impl ConsumerNode {
                                 stats.unknown_billing_rules.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        let claimed = summary.tokens;
                         if tokens < summary.tokens {
                             over_reported = over_reported_by_billing(&summary, tokens, max_tokens);
                             tracing::warn!(provider = %provider.peer_id, reported = summary.tokens, signable = tokens,
@@ -3065,24 +3044,51 @@ impl ConsumerNode {
                                 "provider reported more tokens than it could have served; signing for fewer");
                             summary.tokens = tokens;
                         }
-                        // With the model's tokenizer at hand, the count is checked before paying (the
-                        // recount settles); otherwise, or when the counters are busy, settle now.
-                        let recounted = counter.is_some_and(|counter| {
-                            self.check_billed_tokens(
-                                counter,
+                        // With the model's tokenizer at hand, the count is checked before paying. A
+                        // Hugging Face count takes milliseconds: done here, so the usage the client
+                        // sees is the count paid. A scorer count runs a process: in the background
+                        // (the recount settles). Without one, or when the counters are busy, the bill
+                        // is settled now.
+                        let offered = crate::serve::offered_tool_names(tools);
+                        let total_units = overflowed.get().then(|| delivered_text.get().units());
+                        let recounted = match counter {
+                            Some(c @ crate::token_count::Counter::Hf(_)) => {
+                                if let Some((pay, over)) = self.recount_now(
+                                    &c,
+                                    captured.take(),
+                                    total_units,
+                                    &summary.tool_calls,
+                                    &offered,
+                                    tokens,
+                                    &provider.state_id,
+                                    model_key_now,
+                                ) {
+                                    over_reported |= over;
+                                    summary.tokens = pay;
+                                    self.settle_receipt(&provider, pay, nonce, SettlePurpose::User);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Some(c) => self.check_billed_tokens(
+                                c,
                                 captured.take(),
-                                overflowed.get().then(|| delivered_text.get().units()),
+                                total_units,
                                 summary.tool_calls.clone(),
-                                crate::serve::offered_tool_names(tools),
+                                offered,
                                 tokens,
                                 provider.state_id.clone(),
                                 model_key_now.to_string(),
                                 (provider.clone(), nonce),
-                            )
-                        });
+                            ),
+                            None => false,
+                        };
                         if !recounted {
                             self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User);
                         }
+                        // What the provider claimed, when it's more than what is paid (shown to the client).
+                        summary.claimed_tokens = (claimed > summary.tokens).then_some(claimed);
                         self.note_served_paid(&provider.libp2p_peer_id, now);
                     }
                     if summary.ok && !self_serve {
@@ -5048,9 +5054,92 @@ impl ConsumerNode {
     }
 }
 
+/// What a serve that billed `billed` tokens is paid, by the model's tokenizer (P7/W4), and whether
+/// it billed more than its delivered text holds. Counted before paying: a provider that billed more
+/// than the text it delivered can hold is paid what the text holds. Without a count (none possible,
+/// an error) it is paid what it billed, as before.
+#[allow(clippy::too_many_arguments)]
+fn recount_pay(
+    counter: &crate::token_count::Counter,
+    text: String,
+    // The whole answer's text measure when `text` is only its start (too long to keep whole).
+    total_units: Option<u64>,
+    tool_calls: &[crate::adapter::ToolCall],
+    offered: &std::collections::HashSet<String>,
+    billed: u64,
+    state_id: &str,
+    model_key: &str,
+) -> (u64, bool) {
+    let allowance = counter.tool_call_allowance();
+    // Text that doesn't fit beside the tool calls is cut, and the count estimated from it.
+    let mut text = text;
+    let mut total_units = total_units;
+    let whole_units = {
+        let mut t = crate::serve::DeliveredText::default();
+        t.push(&text);
+        t.units()
+    };
+    if crate::token_count::fit_for_counting(&mut text, tool_calls) {
+        total_units.get_or_insert(whole_units);
+    }
+    // Tool calls too large to keep: not checked.
+    let Some((countable, calls)) = crate::token_count::countable_text(&text, tool_calls, offered) else {
+        return (billed, false);
+    };
+    // Counted in pieces; an answer too long to keep whole is estimated from its start (B5).
+    let counted = counter.count(&countable).map(|n| match total_units {
+        Some(total) => {
+            let mut part = crate::serve::DeliveredText::default();
+            part.push(&text);
+            crate::token_count::estimate_from_part(n, part.units(), total)
+        }
+        None => n,
+    });
+    match counted {
+        Ok(counted) if crate::token_count::over_billed(billed, counted, calls, allowance) => {
+            let fair = crate::token_count::billable_by_count(counted, calls, allowance);
+            tracing::warn!(provider = %state_id, model = %model_key, billed, counted, paying = fair,
+                "provider billed for more tokens than it delivered; paying what it delivered");
+            (fair.min(billed), true)
+        }
+        Ok(counted) => {
+            tracing::debug!(provider = %state_id, billed, counted, "billed token count checks out");
+            (billed, false)
+        }
+        // Visible: a vocabulary that won't load turns the check off for its model.
+        Err(e) => {
+            tracing::warn!(error = %e, tokenizer = %counter.describe(), "couldn't count delivered tokens");
+            (billed, false)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bill_is_recounted_with_the_models_tokenizer_before_it_is_paid() {
+        use crate::hf_tokenizer::{cached_path, tests::tiny_tokenizer_json, HfTokenizers};
+        use crate::tokenizer_index::{tests::{entry, index}, IndexStore};
+        use sha2::Digest;
+        let json = tiny_tokenizer_json().into_bytes();
+        let sha = hex::encode(sha2::Sha256::digest(&json));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(cached_path(dir.path(), &sha), &json).unwrap();
+        let store = Arc::new(IndexStore::new(index(1, vec![entry(&["qwen3:8b"], &sha, json.len() as u64)]), "00", "https://x", None));
+        let tk = Arc::new(HfTokenizers::new(store, dir.path().to_path_buf(), "https://huggingface.co", None));
+        let counter = crate::token_count::Counter::Hf(tk.counter_for("qwen3:8b").expect("cached"));
+        let text = "hello world ".repeat(20); // 40 tokens
+        let none = std::collections::HashSet::new();
+        // 3x the delivered tokens: paid the count's bound, and flagged.
+        let fair = crate::token_count::billable_by_count(40, 0, crate::serve::TOOL_CALL_TOKEN_ALLOWANCE);
+        assert_eq!(recount_pay(&counter, text.clone(), None, &[], &none, 120, "p", "m"), (fair, true));
+        // An honest bill (an end-of-turn token more) stands.
+        assert_eq!(recount_pay(&counter, text.clone(), None, &[], &none, 41, "p", "m"), (41, false));
+        // A bill under the bound is never raised.
+        assert_eq!(recount_pay(&counter, text, None, &[], &none, 10, "p", "m"), (10, false));
+    }
 
     fn close_reply(chunks: &[crate::serve::ServeChunk]) -> Vec<u8> {
         crate::serve::frame_response(&chunks.iter().map(|c| c.encode()).collect::<Vec<_>>())
