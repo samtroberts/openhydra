@@ -2157,9 +2157,8 @@ impl<A: EngineAdapter> Provider<A> {
 
     /// Back this provider's share policy with a JSON file at `path`, hot-reloaded whenever the file
     /// changes (the desktop rewrites it when the user toggles a model). Loads the current contents
-    /// now; a missing or malformed file falls back to share-everything with a warning, so the node
-    /// never silently shares nothing on a first-run/parse hiccup — the desktop writes a valid file
-    /// before launch in the normal flow.
+    /// now; a missing or malformed file shares nothing (fail-closed) until a valid one is written —
+    /// the desktop writes a valid file before launch in the normal flow.
     pub fn with_share_policy_file(mut self, path: PathBuf) -> Self {
         self.policy = PolicyWatcher::from_file(path);
         self

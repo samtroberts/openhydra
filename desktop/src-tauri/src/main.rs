@@ -1152,7 +1152,9 @@ fn get_state(state: tauri::State<'_, AppState>) -> FullState {
 
 /// Open a link from a chat answer in the default browser. Only http(s) and mailto links, passed as a
 /// single argument (no shell), so an answer can't make the app run or open anything else.
-#[tauri::command]
+// Off the main thread: an opener (xdg-open on Linux) may wait for the program it starts, which
+// would freeze the window until it exits (ADVERSARIAL item 14).
+#[tauri::command(async)]
 fn open_external(url: String) -> Result<(), String> {
     let u = url.trim();
     let lower = u.to_ascii_lowercase();
@@ -1202,7 +1204,9 @@ fn identity_info() -> std::collections::BTreeMap<&'static str, IdentityView> {
 
 /// Show a file the app wrote (e.g. an exported log) in the OS file manager. Only paths inside
 /// ~/.openhydra are accepted, so the UI can't be used to open arbitrary locations.
-#[tauri::command]
+// Off the main thread: an opener (xdg-open on Linux) may wait for the program it starts, which
+// would freeze the window until it exits (ADVERSARIAL item 14).
+#[tauri::command(async)]
 fn reveal_path(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path).canonicalize().map_err(|e| e.to_string())?;
     let root = openhydra_dir().canonicalize().map_err(|e| e.to_string())?;

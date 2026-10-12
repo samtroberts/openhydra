@@ -532,12 +532,14 @@ impl PolicyWatcher {
         let policy = match SharePolicy::load(&path) {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Absent on first run (before the desktop writes it) → share-all default.
+                // Absent: fail CLOSED like a corrupt file (ADVERSARIAL item 12). Whoever pointed the
+                // provider at a policy file decides what it shares by writing it; until then nothing
+                // is shared. The watcher picks the file up as soon as it is written.
                 eprintln!(
-                    "openhydra-agent: share-policy file {} not found — sharing all detected models until it is written",
+                    "openhydra-agent: share-policy file {} not found — sharing NOTHING until it is written",
                     path.display()
                 );
-                SharePolicy::share_all()
+                SharePolicy::share_nothing()
             }
             Err(e) => {
                 // Corrupt (M1): fail CLOSED. A restrictive policy must never silently widen to
@@ -1070,10 +1072,14 @@ mod tests {
     }
 
     #[test]
-    fn from_file_missing_falls_back_to_share_all() {
+    fn from_file_missing_shares_nothing_until_written() {
         let dir = tempfile::tempdir().unwrap();
-        let w = PolicyWatcher::from_file(dir.path().join("absent.json"));
-        assert!(w.is_shared("anything:at-all")); // absent (first run) → share-all
+        let path = dir.path().join("absent.json");
+        let w = PolicyWatcher::from_file(path.clone());
+        assert!(!w.is_shared("anything:at-all")); // absent → fail closed
+        SharePolicy::share_list(["m"]).write_atomic(&path).unwrap();
+        assert!(w.reload_if_changed(), "picked up once written");
+        assert!(w.is_shared("m") && !w.is_shared("other"));
     }
 
     #[test]
