@@ -1870,9 +1870,39 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Is `origin` (a browser's `Origin` header) a page served from this machine's loopback?
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    let name = match host.rsplit_once(':') {
+        Some((n, p)) if !p.contains(']') && p.parse::<u16>().is_ok() => n,
+        _ => host,
+    };
+    name == "127.0.0.1" || name == "[::1]" || name.eq_ignore_ascii_case("localhost")
+}
+
 /// Auth middleware for `/v1/*`: when an API key is configured, require a matching
-/// `Authorization: Bearer <key>`; otherwise pass through (open, for loopback).
+/// `Authorization: Bearer <key>` (or `x-api-key`). Without one (a loopback CLI gateway), refuse
+/// requests a web page sends: a browser always names the page's `Origin`, coding tools send none, so
+/// a site the user visits can't spend their credit through the open gateway. (With a key, a page
+/// can't present it: a cross-site request with that header needs CORS, which the gateway never
+/// grants.)
 async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if state.api_key.is_none() {
+        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
+            let origin = origin.to_str().unwrap_or("");
+            if !is_loopback_origin(origin) {
+                tracing::warn!(origin = %origin.escape_debug(), "refused a browser request from another site");
+                return openai_error(
+                    StatusCode::FORBIDDEN,
+                    "requests from web pages are refused; this gateway serves local programs",
+                    "forbidden",
+                );
+            }
+        }
+    }
     if let Some(key) = &state.api_key {
         // Accept OpenAI-style `Authorization: Bearer <key>` and Anthropic-style `x-api-key: <key>`
         // (so `/v1/messages` clients like Claude Code authenticate with their native header).
@@ -2209,7 +2239,7 @@ pub fn router(
 #[allow(clippy::too_many_arguments)]
 /// Is `host` (a `Host` header or URI authority) a loopback name for this gateway's `port`?
 /// `127.0.0.1`, `localhost` or `[::1]`, with this port or none.
-fn is_loopback_host(host: &str, port: u16) -> bool {
+pub(crate) fn is_loopback_host(host: &str, port: u16) -> bool {
     let host = host.trim();
     let (name, p) = match host.rsplit_once(':') {
         Some((n, p)) if !n.is_empty() && (n.starts_with('[') == n.ends_with(']')) && !p.contains(']') => (n, Some(p)),
@@ -2383,6 +2413,90 @@ mod tests {
         assert!(status_for(format!("evil.example:{port}")).await.contains(" 403 "));
         assert!(status_for(format!("127.0.0.1:{port}")).await.contains(" 200 "));
         assert!(status_for(format!("localhost:{port}")).await.contains(" 200 "));
+    }
+
+    /// Serve the real gateway router on a loopback port; returns the port (the node and its temp dir
+    /// live for the test).
+    async fn serve_test_gateway(api_key: Option<&str>) -> (u16, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let net = NetworkHandle::start(openhydra_network::node::NodeConfig {
+            identity_path: dir.path().join("id.key"),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            bootstrap_peers: vec![],
+            enable_peer_relay: false,
+            enable_connection_reversal: false,
+            pcp_gateway: None,
+        })
+        .unwrap();
+        let app = router(
+            net,
+            Arc::new(EconomyStats::default()),
+            Arc::new(crate::status::TransferStats::default()),
+            api_key.map(str::to_string),
+            None,
+            AupPolicy::default(),
+            RateLimitConfig::disabled(),
+            false,
+            ByokConfig::empty(),
+            EmbeddingConfig::empty(),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            false,
+            openhydra_protocol::trust::AssurancePolicy::OPEN,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+        (port, dir)
+    }
+
+    /// The status line of `GET /v1/models` with `headers` (each "Name: value").
+    async fn models_status(port: u16, headers: &[&str]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+        s.write_all(format!("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}Connection: close\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out.lines().next().unwrap_or_default().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_keyed_gateway_refuses_requests_without_its_key() {
+        let key = format!("oh-{}", "ab".repeat(32));
+        let (port, _dir) = serve_test_gateway(Some(&key)).await;
+        assert!(models_status(port, &[]).await.contains(" 401 "), "no key");
+        assert!(models_status(port, &["Authorization: Bearer oh-local"]).await.contains(" 401 "), "the old placeholder");
+        assert!(models_status(port, &[&format!("Authorization: Bearer {key}")]).await.contains(" 200 "));
+        assert!(models_status(port, &[&format!("x-api-key: {key}")]).await.contains(" 200 "), "Anthropic-style header");
+    }
+
+    #[tokio::test]
+    async fn a_keyless_gateway_refuses_web_pages() {
+        let (port, _dir) = serve_test_gateway(None).await;
+        assert!(models_status(port, &[]).await.contains(" 200 "), "a local tool sends no Origin");
+        assert!(models_status(port, &["Origin: https://evil.example"]).await.contains(" 403 "));
+        assert!(models_status(port, &["Origin: null"]).await.contains(" 403 "), "sandboxed frame / file page");
+        assert!(models_status(port, &["Origin: http://localhost:3000"]).await.contains(" 200 "), "a local dev page");
+        assert!(models_status(port, &["Origin: http://127.0.0.1.evil.example"]).await.contains(" 403 "));
+    }
+
+    #[test]
+    fn loopback_origins_are_only_loopback_pages() {
+        for ok in ["http://localhost", "http://localhost:1420", "https://127.0.0.1:8443", "http://[::1]:3000"] {
+            assert!(is_loopback_origin(ok), "{ok}");
+        }
+        for bad in ["null", "tauri://localhost", "http://localhost.evil.example", "http://127.0.0.1.nip.io", "https://evil.example", ""] {
+            assert!(!is_loopback_origin(bad), "{bad}");
+        }
     }
 
     fn call(name: &str, args: &str) -> ToolCall {

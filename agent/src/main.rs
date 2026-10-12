@@ -1537,7 +1537,7 @@ fn serve(
     args: ServeArgs,
 ) -> Result<(), String> {
     // CLI flag wins; otherwise fall back to the env var (avoids depending on clap's `env`).
-    let api_key = args.api_key.or_else(|| std::env::var("OPENHYDRA_API_KEY").ok());
+    let api_key = args.api_key.or_else(|| std::env::var("OPENHYDRA_API_KEY").ok()).filter(|k| !k.trim().is_empty());
     // M2.2(a): persist earned provider reputation across restarts if --db was given.
     let store = match &args.db {
         Some(path) => {
@@ -1562,6 +1562,13 @@ fn serve(
         .parse::<std::net::SocketAddr>()
         .map(|s| !s.ip().is_loopback())
         .unwrap_or(true); // unparseable → assume exposed
+    if !exposed && api_key.is_none() {
+        eprintln!(
+            "openhydra-agent: note — no API key: any program on this machine can use this gateway \
+             (web pages are refused). Set --api-key (or OPENHYDRA_API_KEY) to require one; the \
+             desktop app does, with ~/.openhydra/gateway.key, which `openhydra connect`/`launch` use."
+        );
+    }
     if exposed && api_key.is_none() {
         eprintln!(
             "openhydra-agent: WARNING — gateway bound to a non-loopback address ({}) with NO API \

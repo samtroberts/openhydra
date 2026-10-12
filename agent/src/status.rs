@@ -438,12 +438,16 @@ impl StatusServer {
         let mut parts = request_line.split_whitespace();
         let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
 
-        // Drain headers, capturing only Authorization.
+        // Drain headers, capturing only Authorization and Host.
         let mut authorized = self.token.is_none();
+        let mut host: Option<String> = None;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line)? == 0 || line.trim().is_empty() {
                 break;
+            }
+            if let Some(h) = strip_ci_prefix(line.trim_end(), "host:") {
+                host = Some(h.trim().to_string());
             }
             if let Some(expected) = &self.token {
                 // The header name and the "Bearer" scheme are case-insensitive, but the token
@@ -463,6 +467,13 @@ impl StatusServer {
 
         if method != "GET" {
             return respond(&mut stream, 405, r#"{"error":"GET only"}"#);
+        }
+        // Bound to loopback: answer only requests addressed to loopback (DNS rebinding, as on the
+        // gateway). A request with no Host (HTTP/1.0) can't come from a browser page.
+        if let (Ok(local), Some(h)) = (stream.local_addr(), host.as_deref()) {
+            if local.ip().is_loopback() && !crate::gateway::is_loopback_host(h, local.port()) {
+                return respond(&mut stream, 403, r#"{"error":"loopback host names only"}"#);
+            }
         }
         if !authorized {
             return respond(&mut stream, 401, r#"{"error":"missing/invalid bearer token"}"#);
@@ -750,12 +761,17 @@ mod tests {
         .spawn("127.0.0.1:0")
         .unwrap();
 
-        let get = |path: &str, auth: Option<&str>| -> String {
+        let get_from = |host: &str, path: &str, auth: Option<&str>| -> String {
             let mut s = TcpStream::connect(addr).unwrap();
             let auth_line = auth.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-            write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n{auth_line}\r\n").unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth_line}\r\n").unwrap();
             read_response(&mut s)
         };
+        let local_host = format!("127.0.0.1:{}", addr.port());
+        let get = |path: &str, auth: Option<&str>| get_from(&local_host, path, auth);
+        // A page that rebound its own host name to 127.0.0.1 is refused, even with the token.
+        assert!(get_from(&format!("evil.example:{}", addr.port()), "/status", Some("s3cret")).starts_with("HTTP/1.1 403"));
+        assert!(get_from(&format!("localhost:{}", addr.port()), "/healthz", Some("s3cret")).starts_with("HTTP/1.1 200"));
 
         // No token → 401; wrong path → 404; happy path → parsed JSON with our data.
         assert!(get("/status", None).starts_with("HTTP/1.1 401"));

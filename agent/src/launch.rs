@@ -37,10 +37,10 @@ pub struct LaunchArgs {
     /// Gateway origin.
     #[arg(long, default_value = "http://127.0.0.1:16527")]
     pub gateway: String,
-    /// API key presented to the gateway. Loopback gateways are open by default; a placeholder
-    /// still satisfies tools that refuse to start without the var set.
-    #[arg(long, default_value = "openhydra-local")]
-    pub api_key: String,
+    /// API key presented to the gateway. Defaults to `OPENHYDRA_API_KEY`, else the local gateway key
+    /// (`~/.openhydra/gateway.key`, which the desktop's gateway requires).
+    #[arg(long)]
+    pub api_key: Option<String>,
     /// Print the wiring it would apply (env / config target) and exit — don't launch or write.
     #[arg(long)]
     pub print_env: bool,
@@ -285,7 +285,8 @@ pub fn run(args: LaunchArgs) -> Result<(), String> {
         format!("unknown tool '{tool}'. Supported: {}", keys.join(", "))
     })?;
     let origin = args.gateway.trim_end_matches('/').to_string();
-    let env = tool_env(spec, &origin, &args.model, &args.api_key);
+    let api_key = args.api_key.clone().unwrap_or_else(openhydra_agent::gateway_key::for_tools);
+    let env = tool_env(spec, &origin, &args.model, &api_key);
 
     // `--print-env` is a dry run — show the wiring without needing the tool installed, a gateway up,
     // or (for config tools) touching any file.

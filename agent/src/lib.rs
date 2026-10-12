@@ -36,6 +36,7 @@ pub mod byok;
 pub mod connect;
 pub mod consumer;
 pub mod gateway;
+pub mod gateway_key;
 pub mod hardening;
 pub mod http;
 pub mod lmstudio;

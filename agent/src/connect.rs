@@ -19,9 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-/// A dummy non-empty key: the loopback gateway is open, but OpenAI/Anthropic clients require a
-/// non-empty key field.
-const LOCAL_KEY: &str = "oh-local";
+use crate::gateway_key;
 /// The meta-model every connector defaults to (the gateway resolves it to a live model). Used where
 /// a FULLY-QUALIFIED reference is expected (Hermes' `name`, Continue's `model`, OpenCode's top-level
 /// `provider/model`).
@@ -173,7 +171,7 @@ fn base_for(kind: Kind, origin: &str) -> String {
 
 /// Merge the `openhydra` provider into OpenCode's JSON config. Idempotent; only touches
 /// `provider.openhydra`, `$schema`, and (when absent) the default `model`.
-pub fn merge_opencode_json(existing: &str, api_base: &str, extra_models: &[String]) -> Result<(String, &'static str), String> {
+pub fn merge_opencode_json(existing: &str, api_base: &str, extra_models: &[String], api_key: &str) -> Result<(String, &'static str), String> {
     let mut root: Value = parse_json_or_empty(existing, "opencode.json")?;
     let obj = root.as_object_mut().ok_or("opencode.json is not a JSON object")?;
     obj.entry("$schema").or_insert_with(|| json!("https://opencode.ai/config.json"));
@@ -192,7 +190,7 @@ pub fn merge_opencode_json(existing: &str, api_base: &str, extra_models: &[Strin
         json!({
             "npm": "@ai-sdk/openai-compatible",
             "name": "OpenHydra",
-            "options": { "baseURL": api_base, "apiKey": LOCAL_KEY },
+            "options": { "baseURL": api_base, "apiKey": api_key },
             "models": Value::Object(models_map),
         }),
     );
@@ -211,14 +209,14 @@ pub fn merge_opencode_json(existing: &str, api_base: &str, extra_models: &[Strin
 
 /// Merge the OpenHydra endpoint into Claude Code's `settings.json` `env` block. Idempotent; only
 /// touches `env.ANTHROPIC_BASE_URL` / `env.ANTHROPIC_API_KEY`.
-pub fn merge_claude_settings(existing: &str, origin: &str) -> Result<(String, &'static str), String> {
+pub fn merge_claude_settings(existing: &str, origin: &str, api_key: &str) -> Result<(String, &'static str), String> {
     let mut root: Value = parse_json_or_empty(existing, "settings.json")?;
     let obj = root.as_object_mut().ok_or("settings.json is not a JSON object")?;
     let had = obj.get("env").and_then(|e| e.get("ANTHROPIC_BASE_URL")).is_some();
     let env = obj.entry("env").or_insert_with(|| json!({}));
     let env = env.as_object_mut().ok_or("`env` in settings.json is not an object")?;
     env.insert("ANTHROPIC_BASE_URL".into(), json!(origin));
-    env.insert("ANTHROPIC_API_KEY".into(), json!(LOCAL_KEY));
+    env.insert("ANTHROPIC_API_KEY".into(), json!(api_key));
     Ok((to_json_pretty(&root)?, if had { "updated" } else { "added" }))
 }
 
@@ -226,7 +224,7 @@ pub fn merge_claude_settings(existing: &str, origin: &str) -> Result<(String, &'
 /// (idempotent — a re-run replaces our entry, never duplicates it, and leaves other models intact).
 /// NOTE: serde_yaml round-trips structure but drops comments/formatting — the caller backs the file
 /// up first and the UI warns.
-pub fn merge_continue_yaml(existing: &str, api_base: &str, extra_models: &[String]) -> Result<(String, &'static str), String> {
+pub fn merge_continue_yaml(existing: &str, api_base: &str, extra_models: &[String], api_key: &str) -> Result<(String, &'static str), String> {
     use serde_yaml::Value as Y;
     let mut root: Y = if existing.trim().is_empty() {
         Y::Mapping(serde_yaml::Mapping::new())
@@ -262,15 +260,15 @@ pub fn merge_continue_yaml(existing: &str, api_base: &str, extra_models: &[Strin
     // NOT match on the prefix alone — a user model merely named e.g. `OpenHydra Local` must survive.
     seq.retain(|item| !is_our_continue_entry(item));
     let had = seq.len() != before;
-    seq.push(continue_model_entry("OpenHydra Auto", AUTO_MODEL, api_base));
+    seq.push(continue_model_entry("OpenHydra Auto", AUTO_MODEL, api_base, api_key));
     for m in extra_models {
-        seq.push(continue_model_entry(&format!("OpenHydra: {m}"), m, api_base));
+        seq.push(continue_model_entry(&format!("OpenHydra: {m}"), m, api_base, api_key));
     }
     let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
     Ok((out, if had { "updated" } else { "added" }))
 }
 
-fn continue_model_entry(name: &str, model: &str, api_base: &str) -> serde_yaml::Value {
+fn continue_model_entry(name: &str, model: &str, api_base: &str, api_key: &str) -> serde_yaml::Value {
     use serde_yaml::Value as Y;
     let s = |x: &str| Y::String(x.to_string());
     let mut m = serde_yaml::Mapping::new();
@@ -278,7 +276,7 @@ fn continue_model_entry(name: &str, model: &str, api_base: &str) -> serde_yaml::
     m.insert(s("provider"), s("openai"));
     m.insert(s("model"), s(model));
     m.insert(s("apiBase"), s(api_base));
-    m.insert(s("apiKey"), s(LOCAL_KEY));
+    m.insert(s("apiKey"), s(api_key));
     m.insert(s("roles"), Y::Sequence(vec![s("chat"), s("edit"), s("apply")]));
     Y::Mapping(m)
 }
@@ -289,7 +287,7 @@ fn continue_model_entry(name: &str, model: &str, api_base: &str) -> serde_yaml::
 /// `/chat/completions` to `base_url`, so `api_base` ends in `/v1`. Schema verified against a live
 /// `~/.hermes/config.yaml` (the model id field is `name`, not `model`). NOTE: serde_yaml drops
 /// comments — the caller backs the file up first and the UI warns.
-pub fn merge_hermes_yaml(existing: &str, api_base: &str) -> Result<(String, &'static str), String> {
+pub fn merge_hermes_yaml(existing: &str, api_base: &str, api_key: &str) -> Result<(String, &'static str), String> {
     use serde_yaml::Value as Y;
     let mut root: Y = if existing.trim().is_empty() {
         Y::Mapping(serde_yaml::Mapping::new())
@@ -309,7 +307,7 @@ pub fn merge_hermes_yaml(existing: &str, api_base: &str) -> Result<(String, &'st
     let had = model.contains_key(&s("base_url"));
     model.insert(s("provider"), s("custom"));
     model.insert(s("base_url"), s(api_base));
-    model.insert(s("api_key"), s(LOCAL_KEY));
+    model.insert(s("api_key"), s(api_key));
     model.insert(s("name"), s(AUTO_MODEL));
     let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
     Ok((out, if had { "updated" } else { "added" }))
@@ -318,7 +316,7 @@ pub fn merge_hermes_yaml(existing: &str, api_base: &str) -> Result<(String, &'st
 /// Merge the OpenHydra provider into Pi's `~/.pi/agent/models.json`. Idempotent; only touches
 /// `providers.openhydra`. Pi hot-reloads this file on `/model` (no restart). Model-entry shape
 /// (`reasoning`/`input`/`cost`/`contextWindow`/`maxTokens`) verified against a live `models.json`.
-pub fn merge_pi_models_json(existing: &str, api_base: &str, extra_models: &[String]) -> Result<(String, &'static str), String> {
+pub fn merge_pi_models_json(existing: &str, api_base: &str, extra_models: &[String], api_key: &str) -> Result<(String, &'static str), String> {
     let mut root: Value = parse_json_or_empty(existing, "models.json")?;
     let obj = root.as_object_mut().ok_or("models.json is not a JSON object")?;
     let had = obj.get("providers").and_then(|p| p.get("openhydra")).is_some();
@@ -333,7 +331,7 @@ pub fn merge_pi_models_json(existing: &str, api_base: &str, extra_models: &[Stri
     }
     providers.insert(
         "openhydra".into(),
-        json!({ "baseUrl": api_base, "apiKey": LOCAL_KEY, "api": "openai-completions", "models": models }),
+        json!({ "baseUrl": api_base, "apiKey": api_key, "api": "openai-completions", "models": models }),
     );
     Ok((to_json_pretty(&root)?, if had { "updated" } else { "added" }))
 }
@@ -365,7 +363,7 @@ fn to_json_pretty(v: &Value) -> Result<String, String> {
 
 /// Merge dispatch: produce the new file content for a tool, given its existing content and the
 /// gateway origin (`http://127.0.0.1:<port>`).
-fn merge_for(kind: Kind, existing: &str, origin: &str, models: &[String]) -> Result<(String, &'static str), String> {
+fn merge_for(kind: Kind, existing: &str, origin: &str, models: &[String], api_key: &str) -> Result<(String, &'static str), String> {
     let base = base_for(kind, origin);
     // De-dupe (order-preserving) and drop the auto meta-model — it's always declared, so a repeated
     // `--model X` or an explicit `--model auto` must not create duplicate entries.
@@ -378,13 +376,13 @@ fn merge_for(kind: Kind, existing: &str, origin: &str, models: &[String]) -> Res
         .map(str::to_string)
         .collect();
     match kind {
-        Kind::OpencodeJson => merge_opencode_json(existing, &base, &models),
-        Kind::ClaudeSettings => merge_claude_settings(existing, &base),
-        Kind::ContinueYaml => merge_continue_yaml(existing, &base, &models),
+        Kind::OpencodeJson => merge_opencode_json(existing, &base, &models, api_key),
+        Kind::ClaudeSettings => merge_claude_settings(existing, &base, api_key),
+        Kind::ContinueYaml => merge_continue_yaml(existing, &base, &models, api_key),
         // Hermes = one active `model:` block (no picker) and Claude = claude-* bridged — neither takes
         // a declared model list; `models` is only for the multi-model tools (opencode/pi/continue).
-        Kind::HermesYaml => merge_hermes_yaml(existing, &base),
-        Kind::PiModelsJson => merge_pi_models_json(existing, &base, &models),
+        Kind::HermesYaml => merge_hermes_yaml(existing, &base, api_key),
+        Kind::PiModelsJson => merge_pi_models_json(existing, &base, &models, api_key),
     }
 }
 
@@ -433,7 +431,7 @@ pub fn preview_with_models(key: &str, origin: &str, models: &[String]) -> Result
     let path = config_path(spec.kind).ok_or("cannot resolve home directory")?;
     let existing = read_existing(&path)?;
     let create = existing.trim().is_empty();
-    let (preview, _action) = merge_for(spec.kind, &existing, origin, models)?;
+    let (preview, _action) = merge_for(spec.kind, &existing, origin, models, &gateway_key::for_tools())?;
     // serde_yaml drops comments/spacing on re-serialize, so any YAML-backed tool loses them on an
     // in-place merge (Continue and Hermes). JSON tools (opencode/pi) and Claude are unaffected.
     let warning = (matches!(spec.kind, Kind::ContinueYaml | Kind::HermesYaml) && !create).then(|| {
@@ -471,7 +469,7 @@ pub fn apply_with_models(key: &str, origin: &str, models: &[String]) -> Result<C
     let spec = spec(key).ok_or_else(|| format!("unknown connector '{key}'"))?;
     let path = config_path(spec.kind).ok_or("cannot resolve home directory")?;
     let existing = read_existing(&path)?;
-    let (new_content, action) = merge_for(spec.kind, &existing, origin, models)?;
+    let (new_content, action) = merge_for(spec.kind, &existing, origin, models, &gateway_key::for_tools())?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -482,6 +480,7 @@ pub fn apply_with_models(key: &str, origin: &str, models: &[String]) -> Result<C
     let bak = backup_path(&path);
     let backup = if !existing.trim().is_empty() && !bak.exists() && !has_openhydra_block(spec.kind, &existing) {
         std::fs::write(&bak, &existing).map_err(|e| format!("backup {}: {e}", bak.display()))?;
+        owner_only(&bak);
         Some(bak.display().to_string())
     } else if bak.exists() {
         Some(bak.display().to_string())
@@ -489,7 +488,41 @@ pub fn apply_with_models(key: &str, origin: &str, models: &[String]) -> Result<C
         None
     };
     std::fs::write(&path, new_content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // The config now carries the gateway key: readable by its owner only.
+    owner_only(&path);
     Ok(ConnectReport { key: key.into(), path: path.display().to_string(), backup, action: action.into() })
+}
+
+/// Restrict `path` to its owner (0600) on unix. Best effort: a tool config the user made unreadable
+/// to us would already have failed to read.
+fn owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Whether `key`'s tool is wired to OpenHydra but its config doesn't carry `api_key` (an older build's
+/// `oh-local` placeholder, or a previous key), so the gateway would refuse its requests.
+pub fn needs_key_refresh(key: &str, api_key: &str) -> bool {
+    let Some(spec) = spec(key) else { return false };
+    let Some(path) = config_path(spec.kind) else { return false };
+    let Ok(content) = read_existing(&path) else { return false };
+    has_openhydra_block(spec.kind, &content) && !content.contains(api_key)
+}
+
+/// Re-apply every connected tool whose config lacks the current gateway key, keeping the models it
+/// declares. Returns (tool, outcome) for each one rewritten.
+pub fn refresh_keys(origin: &str) -> Vec<(String, Result<ConnectReport, String>)> {
+    let api_key = gateway_key::for_tools();
+    TOOLS
+        .iter()
+        .filter(|t| needs_key_refresh(t.key, &api_key))
+        .map(|t| (t.key.to_string(), apply_with_models(t.key, origin, &declared_models(t.key))))
+        .collect()
 }
 
 /// Whether `content` already contains OpenHydra's block for `kind` — mirrors the exact markers each
@@ -508,15 +541,15 @@ fn has_openhydra_block(kind: Kind, content: &str) -> bool {
             .ok()
             .and_then(|v| v.get("providers").and_then(|p| p.get("openhydra")).cloned())
             .is_some(),
-        // Claude shares no provider block — only an `env`. Key off OUR sentinel api key (`oh-local`),
+        // Claude shares no provider block — only an `env`. Key off OUR api key (the gateway key, or the
+        // old `oh-local` placeholder),
         // NOT the mere presence of ANTHROPIC_BASE_URL: a user pointing Claude Code at their own proxy
         // has ANTHROPIC_BASE_URL set but is NOT connected to us — treating that as "connected" would let
         // Disconnect delete their settings.json.
         Kind::ClaudeSettings => serde_json::from_str::<Value>(content)
             .ok()
             .and_then(|v| v.get("env").and_then(|e| e.get("ANTHROPIC_API_KEY")).and_then(|k| k.as_str().map(str::to_string)))
-            .map(|k| k == LOCAL_KEY)
-            .unwrap_or(false),
+            .is_some_and(|k| gateway_key::is_ours(&k)),
         Kind::HermesYaml => serde_yaml::from_str::<serde_yaml::Value>(content)
             .ok()
             .and_then(|v| v.get("model").and_then(|m| m.get("name")).and_then(|n| n.as_str().map(str::to_string)))
@@ -625,7 +658,7 @@ fn strip_openhydra_block(kind: Kind, content: &str) -> Result<String, String> {
                     .get("env")
                     .and_then(|e| e.get("ANTHROPIC_API_KEY"))
                     .and_then(|k| k.as_str())
-                    == Some(LOCAL_KEY);
+                    .is_some_and(gateway_key::is_ours);
                 if ours {
                     if let Some(env) = obj.get_mut("env").and_then(|e| e.as_object_mut()) {
                         env.remove("ANTHROPIC_BASE_URL");
@@ -808,6 +841,47 @@ mod tests {
         std::env::set_var("HOME", &dir);
         std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
         (dir, guard)
+    }
+
+    #[test]
+    fn connected_tools_with_an_old_key_are_rewritten_with_the_gateway_key() {
+        let (sb, _lock) = sandbox_home("key-refresh");
+        std::env::remove_var("OPENHYDRA_API_KEY");
+        let origin = "http://127.0.0.1:16527";
+        // Connected by an older build (placeholder key), OpenCode with a declared model.
+        let claude = config_path(Kind::ClaudeSettings).unwrap();
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(&claude, merge_claude_settings(r#"{"theme":"dark"}"#, origin, "oh-local").unwrap().0).unwrap();
+        let oc = config_path(Kind::OpencodeJson).unwrap();
+        std::fs::create_dir_all(oc.parent().unwrap()).unwrap();
+        std::fs::write(&oc, merge_opencode_json("", "http://127.0.0.1:16527/v1", &["qwen3-coder:30b".into()], "oh-local").unwrap().0).unwrap();
+        assert!(is_connected("claude") && is_connected("opencode"));
+
+        // No gateway key yet: tools keep the placeholder, nothing to refresh.
+        assert!(refresh_keys(origin).is_empty());
+        let key = gateway_key::load_or_create(&sb.join(".openhydra").join("gateway.key")).unwrap();
+        assert!(needs_key_refresh("claude", &key) && needs_key_refresh("opencode", &key));
+        let done = refresh_keys(origin);
+        assert_eq!(done.len(), 2, "{:?}", done.iter().map(|(t, _)| t).collect::<Vec<_>>());
+        assert!(done.iter().all(|(_, r)| r.is_ok()));
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(c["env"]["ANTHROPIC_API_KEY"], key.as_str());
+        assert_eq!(c["theme"], "dark", "the user's own settings are kept");
+        assert!(is_connected("claude"), "a generated key still reads as ours");
+        assert_eq!(declared_models("opencode"), vec!["qwen3-coder:30b".to_string()], "declared models kept");
+        assert!(std::fs::read_to_string(&oc).unwrap().contains(&key));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&claude).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(refresh_keys(origin).is_empty(), "idempotent");
+        // Disconnect still recognises a generated key as ours.
+        disconnect("claude").unwrap();
+        assert!(!is_connected("claude"));
+        // A user's own proxy key is never treated as ours.
+        std::fs::write(&claude, r#"{"env":{"ANTHROPIC_BASE_URL":"https://p.example","ANTHROPIC_API_KEY":"sk-user"}}"#).unwrap();
+        assert!(!is_connected("claude") && !needs_key_refresh("claude", &key));
     }
 
     #[test]
@@ -999,7 +1073,7 @@ mod tests {
 
     #[test]
     fn opencode_merge_adds_provider_and_default_model() {
-        let (out, action) = merge_opencode_json("", "http://127.0.0.1:16527/v1", &[]).unwrap();
+        let (out, action) = merge_opencode_json("", "http://127.0.0.1:16527/v1", &[], "oh-local").unwrap();
         assert_eq!(action, "added");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["provider"]["openhydra"]["npm"], "@ai-sdk/openai-compatible");
@@ -1014,7 +1088,7 @@ mod tests {
     #[test]
     fn opencode_merge_preserves_other_config_and_user_model() {
         let existing = r#"{ "theme": "dark", "model": "anthropic/claude", "provider": { "other": { "x": 1 } } }"#;
-        let (out, action) = merge_opencode_json(existing, "http://h/v1", &[]).unwrap();
+        let (out, action) = merge_opencode_json(existing, "http://h/v1", &[], "oh-local").unwrap();
         assert_eq!(action, "added"); // no prior openhydra provider
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["theme"], "dark"); // untouched
@@ -1022,7 +1096,7 @@ mod tests {
         assert_eq!(v["provider"]["openhydra"]["name"], "OpenHydra"); // added
         assert_eq!(v["model"], "anthropic/claude"); // user's model NOT overridden
         // Idempotent: a second run updates in place.
-        let (out2, action2) = merge_opencode_json(&out, "http://h/v1", &[]).unwrap();
+        let (out2, action2) = merge_opencode_json(&out, "http://h/v1", &[], "oh-local").unwrap();
         assert_eq!(action2, "updated");
         let v2: Value = serde_json::from_str(&out2).unwrap();
         assert_eq!(v2["provider"].as_object().unwrap().len(), 2); // other + openhydra, no dupes
@@ -1033,13 +1107,13 @@ mod tests {
         // A config left by an OLD OpenHydra connect (the buggy `openhydra/openhydra/auto`) must be
         // migrated to `openhydra/auto` — OpenCode couldn't resolve the old one → fell back to kimi.
         let stale = r#"{"model":"openhydra/openhydra/auto","provider":{"openhydra":{"models":{"openhydra/auto":{}}}}}"#;
-        let (out, _) = merge_opencode_json(stale, "http://h/v1", &[]).unwrap();
+        let (out, _) = merge_opencode_json(stale, "http://h/v1", &[], "oh-local").unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["model"], "openhydra/auto", "stale double-scoped default is migrated");
         assert!(v["provider"]["openhydra"]["models"].get("auto").is_some());
         // A real user choice is preserved untouched.
         let user = r#"{"model":"anthropic/claude-sonnet","provider":{}}"#;
-        let (out2, _) = merge_opencode_json(user, "http://h/v1", &[]).unwrap();
+        let (out2, _) = merge_opencode_json(user, "http://h/v1", &[], "oh-local").unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out2).unwrap()["model"], "anthropic/claude-sonnet");
     }
 
@@ -1047,18 +1121,18 @@ mod tests {
     fn declaring_specific_models_puts_them_in_the_picker() {
         let models = vec!["qwen3-coder:30b-a3b-q8_0".to_string()];
         // Pi: the id appears in the models array (so Pi's own /model picker + footer show it).
-        let (pi, _) = merge_pi_models_json("", "http://h/v1", &models).unwrap();
+        let (pi, _) = merge_pi_models_json("", "http://h/v1", &models, "oh-local").unwrap();
         let pv: Value = serde_json::from_str(&pi).unwrap();
         let ids: Vec<_> = pv["providers"]["openhydra"]["models"].as_array().unwrap().iter()
             .map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["auto", "qwen3-coder:30b-a3b-q8_0"], "auto + the declared model");
         // OpenCode: the id becomes a key under the provider's `models` map.
-        let (oc, _) = merge_opencode_json("", "http://h/v1", &models).unwrap();
+        let (oc, _) = merge_opencode_json("", "http://h/v1", &models, "oh-local").unwrap();
         let ov: Value = serde_json::from_str(&oc).unwrap();
         assert!(ov["provider"]["openhydra"]["models"].get("qwen3-coder:30b-a3b-q8_0").is_some());
         assert!(ov["provider"]["openhydra"]["models"].get("auto").is_some());
         // Continue: a distinct-named entry per model (so its picker lists both).
-        let (cn, _) = merge_continue_yaml("", "http://h/v1", &models).unwrap();
+        let (cn, _) = merge_continue_yaml("", "http://h/v1", &models, "oh-local").unwrap();
         let cv: serde_yaml::Value = serde_yaml::from_str(&cn).unwrap();
         let names: Vec<_> = cv["models"].as_sequence().unwrap().iter()
             .map(|m| m["name"].as_str().unwrap().to_string()).collect();
@@ -1071,7 +1145,7 @@ mod tests {
         // A user's own model named "OpenHydra Local" must survive; only OUR entries (old exact
         // "OpenHydra", new "OpenHydra Auto", "OpenHydra: …") get replaced on re-run.
         let existing = "name: a\nversion: 1\nmodels:\n- name: OpenHydra Local\n  provider: openai\n  model: x\n- name: OpenHydra\n  provider: openai\n  model: old\n";
-        let (out, _) = merge_continue_yaml(existing, "http://h/v1", &[]).unwrap();
+        let (out, _) = merge_continue_yaml(existing, "http://h/v1", &[], "oh-local").unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         let names: Vec<_> = v["models"].as_sequence().unwrap().iter()
             .map(|m| m["name"].as_str().unwrap().to_string()).collect();
@@ -1082,21 +1156,21 @@ mod tests {
 
     #[test]
     fn claude_merge_sets_env_block() {
-        let (out, action) = merge_claude_settings(r#"{"model":"sonnet"}"#, "http://127.0.0.1:16527").unwrap();
+        let (out, action) = merge_claude_settings(r#"{"model":"sonnet"}"#, "http://127.0.0.1:16527", "oh-local").unwrap();
         assert_eq!(action, "added");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["model"], "sonnet"); // untouched
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:16527");
         assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "oh-local");
         // Idempotent update.
-        let (_out2, action2) = merge_claude_settings(&out, "http://127.0.0.1:16527").unwrap();
+        let (_out2, action2) = merge_claude_settings(&out, "http://127.0.0.1:16527", "oh-local").unwrap();
         assert_eq!(action2, "updated");
     }
 
     #[test]
     fn continue_merge_appends_and_is_idempotent() {
         let existing = "name: my-assistant\nmodels:\n  - name: Local\n    provider: ollama\n    model: llama3\n";
-        let (out, action) = merge_continue_yaml(existing, "http://127.0.0.1:16527/v1", &[]).unwrap();
+        let (out, action) = merge_continue_yaml(existing, "http://127.0.0.1:16527/v1", &[], "oh-local").unwrap();
         assert_eq!(action, "added");
         let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         let models = v["models"].as_sequence().unwrap();
@@ -1106,7 +1180,7 @@ mod tests {
         assert_eq!(oh["apiBase"].as_str(), Some("http://127.0.0.1:16527/v1"));
         assert_eq!(oh["model"].as_str(), Some("openhydra/auto"));
         // Re-run replaces, doesn't duplicate.
-        let (out2, action2) = merge_continue_yaml(&out, "http://127.0.0.1:16527/v1", &[]).unwrap();
+        let (out2, action2) = merge_continue_yaml(&out, "http://127.0.0.1:16527/v1", &[], "oh-local").unwrap();
         assert_eq!(action2, "updated");
         let v2: serde_yaml::Value = serde_yaml::from_str(&out2).unwrap();
         assert_eq!(v2["models"].as_sequence().unwrap().len(), 2); // still 2, no dupe
@@ -1114,7 +1188,7 @@ mod tests {
 
     #[test]
     fn continue_merge_from_empty_creates_models_list() {
-        let (out, action) = merge_continue_yaml("", "http://h/v1", &[]).unwrap();
+        let (out, action) = merge_continue_yaml("", "http://h/v1", &[], "oh-local").unwrap();
         assert_eq!(action, "added");
         let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         assert_eq!(v["models"].as_sequence().unwrap().len(), 1);
@@ -1137,7 +1211,7 @@ mod tests {
 
     #[test]
     fn hermes_merge_sets_custom_model_block() {
-        let (out, action) = merge_hermes_yaml("", "http://127.0.0.1:16527/v1").unwrap();
+        let (out, action) = merge_hermes_yaml("", "http://127.0.0.1:16527/v1", "oh-local").unwrap();
         assert_eq!(action, "added");
         let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         assert_eq!(v["model"]["provider"].as_str(), Some("custom"));
@@ -1150,7 +1224,7 @@ mod tests {
     fn hermes_merge_preserves_other_keys_and_is_idempotent() {
         // A prior model block (different provider) + an unrelated top-level key.
         let existing = "terminal:\n  backend: local\nmodel:\n  provider: openai\n  name: gpt-4\n  reasoning: high\n";
-        let (out, action) = merge_hermes_yaml(existing, "http://h/v1").unwrap();
+        let (out, action) = merge_hermes_yaml(existing, "http://h/v1", "oh-local").unwrap();
         assert_eq!(action, "added"); // no base_url in the prior model block
         let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         assert_eq!(v["terminal"]["backend"].as_str(), Some("local")); // top-level untouched
@@ -1158,14 +1232,14 @@ mod tests {
         assert_eq!(v["model"]["provider"].as_str(), Some("custom")); // overwritten to custom
         assert_eq!(v["model"]["name"].as_str(), Some("openhydra/auto")); // pointed at OpenHydra
         // Idempotent: base_url now present → second run reports "updated", no dupes.
-        let (_out2, action2) = merge_hermes_yaml(&out, "http://h/v1").unwrap();
+        let (_out2, action2) = merge_hermes_yaml(&out, "http://h/v1", "oh-local").unwrap();
         assert_eq!(action2, "updated");
     }
 
     #[test]
     fn pi_merge_adds_provider_and_preserves_others() {
         let existing = r#"{"providers":{"other":{"baseUrl":"http://x/v1","api":"openai-completions","models":[]}}}"#;
-        let (out, action) = merge_pi_models_json(existing, "http://127.0.0.1:16527/v1", &[]).unwrap();
+        let (out, action) = merge_pi_models_json(existing, "http://127.0.0.1:16527/v1", &[], "oh-local").unwrap();
         assert_eq!(action, "added");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["providers"]["other"]["baseUrl"], "http://x/v1"); // other provider untouched
@@ -1175,7 +1249,7 @@ mod tests {
         assert_eq!(v["providers"]["openhydra"]["models"][0]["id"], "auto");
         assert_eq!(v["providers"]["openhydra"]["models"][0]["cost"]["input"], 0); // rich shape Pi expects
         // Idempotent: replaces our provider, keeps the other.
-        let (out2, action2) = merge_pi_models_json(&out, "http://127.0.0.1:16527/v1", &[]).unwrap();
+        let (out2, action2) = merge_pi_models_json(&out, "http://127.0.0.1:16527/v1", &[], "oh-local").unwrap();
         assert_eq!(action2, "updated");
         let v2: Value = serde_json::from_str(&out2).unwrap();
         assert_eq!(v2["providers"].as_object().unwrap().len(), 2); // other + openhydra, no dupe

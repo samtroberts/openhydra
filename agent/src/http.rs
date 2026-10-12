@@ -55,6 +55,22 @@ impl ReqwestClient {
         Self::with_connect_timeout(Duration::from_secs(5))
     }
 
+    /// Like [`new`](Self::new), presenting `key` as `Authorization: Bearer <key>` on every request:
+    /// for calls to a local gateway that requires its key.
+    pub fn with_bearer(key: &str) -> Result<Self, AdapterError> {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| AdapterError::Http("gateway key is not a valid header value".into()))?;
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .default_headers(headers)
+            .build()
+            .map_err(http_err)?;
+        Ok(Self { client })
+    }
+
     /// Like [`new`](Self::new) but with an explicit connect timeout — used by engine
     /// auto-detection, which probes several ports and wants to fail fast on a dead one.
     /// Per-request timeouts still apply, so an adapter built this way serves long streams

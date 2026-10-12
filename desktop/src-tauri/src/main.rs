@@ -147,6 +147,32 @@ fn status_token() -> &'static str {
     })
 }
 
+/// The local gateway key (`~/.openhydra/gateway.key`, owner-only, created on first use): the
+/// desktop's gateway requires it on `/v1/*`, the app's own calls present it, and Connect / `launch`
+/// write it into the coding tools' configs. `None` only if the file can't be written; the gateway then
+/// runs without one (open to local programs, refusing web pages) and says so.
+fn gateway_api_key() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<Option<String>> = OnceLock::new();
+    KEY.get_or_init(|| match openhydra_agent::gateway_key::load_or_create(&openhydra_dir().join("gateway.key")) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!("openhydra: could not create the local gateway key ({e}); the gateway runs without one");
+            None
+        }
+    })
+    .as_deref()
+}
+
+/// An HTTP client for this app's own gateway (presents the gateway key).
+fn gateway_client() -> Result<openhydra_agent::ReqwestClient, String> {
+    match gateway_api_key() {
+        Some(k) => openhydra_agent::ReqwestClient::with_bearer(k),
+        None => openhydra_agent::ReqwestClient::new(),
+    }
+    .map_err(|e| e.to_string())
+}
+
 // ── Settings (persisted at ~/.openhydra/desktop.json) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1011,10 +1037,18 @@ fn spawn_role(
             if settings.verbose_logs { "openhydra_network=info,debug" } else { "warn" },
         )
         .env("OPENHYDRA_STATUS_TOKEN", status_token())
+        .env_remove("OPENHYDRA_API_KEY")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // The gateway requires the local key (passed in its environment, never on its command line,
+    // which other local users can read).
+    if subcommand.first().map(String::as_str) == Some("serve") {
+        if let Some(key) = gateway_api_key() {
+            cmd.env("OPENHYDRA_API_KEY", key);
+        }
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", bin.display()))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -2395,7 +2429,7 @@ async fn chat_completion_stream(
         let end = |on_event: &tauri::ipc::Channel<serde_json::Value>| {
             let _ = on_event.send(serde_json::json!({ "kind": "end" }));
         };
-        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let client = gateway_client()?;
         let lines = match client
             .post_stream_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
         {
@@ -2533,7 +2567,7 @@ async fn chat_completion(
     }
     tauri::async_runtime::spawn_blocking(move || {
         use openhydra_agent::adapter::HttpClient;
-        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let client = gateway_client()?;
         let (status, resp) = client
             .post_json_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
             .map_err(|e| format!("gateway: {e}"))?;
@@ -2678,7 +2712,7 @@ async fn connector_test(state: tauri::State<'_, AppState>) -> Result<String, Str
         "messages": [{ "role": "user", "content": "ping" }],
     });
     tauri::async_runtime::spawn_blocking(move || {
-        let client = openhydra_agent::ReqwestClient::new().map_err(|e| e.to_string())?;
+        let client = gateway_client()?;
         // Read the body whatever the status: a refusal (no provider, none at the authenticity floor
         // set in Settings) says why, and isn't the gateway being unreachable (review round 4 G4-9).
         let (status, resp) = client
@@ -2756,7 +2790,7 @@ async fn gateway_health(state: tauri::State<'_, AppState>) -> Result<bool, ()> {
     let port = state.settings.lock().expect("settings lock").gateway_port;
     Ok(tauri::async_runtime::spawn_blocking(move || {
         use openhydra_agent::adapter::HttpClient;
-        openhydra_agent::ReqwestClient::new()
+        gateway_client()
             .map(|c| c.get(&format!("http://127.0.0.1:{port}/v1/models")).is_ok())
             .unwrap_or(false)
     })
@@ -3122,6 +3156,20 @@ fn main() {
             // a second launch exits inside the single-instance plugin before `setup` runs, so it
             // can't kill the running app's agents (their pids are in the same pidfile).
             sweep_stale_agents();
+            // The local gateway key, before anything connects a tool or starts the gateway; then
+            // re-wire tools connected by an older build (or with an older key), which the gateway
+            // would now refuse. Off the main thread: it reads and writes a few config files.
+            if gateway_api_key().is_some() {
+                let port = app.state::<AppState>().settings.lock().map(|s| s.gateway_port).unwrap_or(16527);
+                std::thread::spawn(move || {
+                    for (tool, outcome) in openhydra_agent::connect::refresh_keys(&format!("http://127.0.0.1:{port}")) {
+                        match outcome {
+                            Ok(r) => eprintln!("openhydra: {tool} now presents the gateway key ({})", r.path),
+                            Err(e) => eprintln!("openhydra: could not update {tool}'s config with the gateway key: {e}"),
+                        }
+                    }
+                });
+            }
             // The main window is created here rather than from the config so it can refuse to
             // navigate away from the app's own pages and refuse to open new windows.
             if let Some(cfg) = app.config().app.windows.first() {
