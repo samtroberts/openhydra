@@ -374,8 +374,8 @@ pub fn resolve_assurance(
 ///   models can be colluded, so it does not by itself unlock the expensive tiers.
 /// * `A2` / `A3` (a hard PoI method / hardware attestation) → no assurance cap; `claimed` governs.
 ///
-/// Monotonic in the authenticity tier; never exceeds `claimed`. Pure. **Documented, not wired** —
-/// no live credit path calls this yet; the gate belongs at the payout layer (H2 remediation).
+/// Monotonic in the authenticity tier; never exceeds `claimed`. Pure. Used by the crypto rail's
+/// gated accrual (`payout::gated_accrual_asset`) and by the gateway's displayed spend.
 pub fn max_cost_tier_for_authenticity(authenticity: AuthenticityTier, claimed: CostTier) -> CostTier {
     let cap = match authenticity {
         AuthenticityTier::SelfReported => FLOOR_TIER,

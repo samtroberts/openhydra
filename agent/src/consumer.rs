@@ -1946,54 +1946,72 @@ impl ConsumerNode {
         billed: u64,
         state_id: String,
         model_key: String,
-    ) {
-        // Bounded: a busy gateway skips the check rather than piling up scorer processes.
+        settle: (SelectedProvider, [u8; 16]),
+    ) -> bool {
+        // Bounded: a busy gateway skips the check rather than piling up scorer processes (and the
+        // caller settles at once, for the billed count).
         let Some(slot) = self
             .provider_logprob
             .as_ref()
             .and_then(|lp| crate::token_count::CountSlot::try_take(&lp.counts_running))
         else {
-            return;
+            return false;
         };
         let node = Arc::clone(self);
         std::thread::spawn(move || {
             let _slot = slot;
             let (scorer, vocab) = counter;
-            // Text that doesn't fit beside the tool calls is cut, and the count estimated from it.
-            let mut text = text;
-            let mut total_units = total_units;
-            let whole_units = {
-                let mut t = crate::serve::DeliveredText::default();
-                t.push(&text);
-                t.units()
-            };
-            if crate::token_count::fit_for_counting(&mut text, &tool_calls) {
-                total_units.get_or_insert(whole_units);
-            }
-            // Tool calls too large to keep: not checked.
-            let Some((countable, calls)) = crate::token_count::countable_text(&text, &tool_calls, &offered) else {
-                return;
-            };
-            // Counted in pieces; an answer too long to keep whole is estimated from its start (B5).
-            let counted = crate::token_count::count_tokens_chunked(&scorer, &vocab, &countable).map(|n| match total_units {
-                Some(total) => {
-                    let mut part = crate::serve::DeliveredText::default();
-                    part.push(&text);
-                    crate::token_count::estimate_from_part(n, part.units(), total)
+            let (provider, nonce) = settle;
+            // Counted before paying: a provider that billed more than the text it delivered can hold
+            // (by the model's own tokenizer) is paid what the text holds, and marked down. Without a
+            // count (none possible, an error) it is paid what it billed, as before.
+            let pay = (|| -> u64 {
+                // Text that doesn't fit beside the tool calls is cut, and the count estimated from it.
+                let mut text = text;
+                let mut total_units = total_units;
+                let whole_units = {
+                    let mut t = crate::serve::DeliveredText::default();
+                    t.push(&text);
+                    t.units()
+                };
+                if crate::token_count::fit_for_counting(&mut text, &tool_calls) {
+                    total_units.get_or_insert(whole_units);
                 }
-                None => n,
-            });
-            match counted {
-                Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
-                    tracing::warn!(provider = %state_id, model = %model_key, billed, counted,
-                        "provider billed for more tokens than it delivered");
-                    node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+                // Tool calls too large to keep: not checked.
+                let Some((countable, calls)) = crate::token_count::countable_text(&text, &tool_calls, &offered) else {
+                    return billed;
+                };
+                // Counted in pieces; an answer too long to keep whole is estimated from its start (B5).
+                let counted = crate::token_count::count_tokens_chunked(&scorer, &vocab, &countable).map(|n| match total_units {
+                    Some(total) => {
+                        let mut part = crate::serve::DeliveredText::default();
+                        part.push(&text);
+                        crate::token_count::estimate_from_part(n, part.units(), total)
+                    }
+                    None => n,
+                });
+                match counted {
+                    Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
+                        let fair = crate::token_count::billable_by_count(counted, calls);
+                        tracing::warn!(provider = %state_id, model = %model_key, billed, counted, paying = fair,
+                            "provider billed for more tokens than it delivered; paying what it delivered");
+                        node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+                        fair.min(billed)
+                    }
+                    Ok(counted) => {
+                        tracing::debug!(provider = %state_id, billed, counted, "billed token count checks out");
+                        billed
+                    }
+                    // Visible: a vocabulary that won't load turns the check off for its model.
+                    Err(e) => {
+                        tracing::warn!(error = %e, vocab = %vocab.display(), "couldn't count delivered tokens");
+                        billed
+                    }
                 }
-                Ok(counted) => tracing::debug!(provider = %state_id, billed, counted, "billed token count checks out"),
-                // Visible: a vocabulary that won't load turns the check off for its model.
-                Err(e) => tracing::warn!(error = %e, vocab = %vocab.display(), "couldn't count delivered tokens"),
-            }
+            })();
+            node.settle_receipt(&provider, pay, nonce, SettlePurpose::User);
         });
+        true
     }
 
     /// Persist one `(peer, model)`'s log-prob state (best-effort: a failed write is logged, never
@@ -3034,9 +3052,9 @@ impl ConsumerNode {
                                 "provider reported more tokens than it could have served; signing for fewer");
                             summary.tokens = tokens;
                         }
-                        self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User);
-                        self.note_served_paid(&provider.libp2p_peer_id, now);
-                        if let Some(counter) = counter {
+                        // With the model's tokenizer at hand, the count is checked before paying (the
+                        // recount settles); otherwise, or when the counters are busy, settle now.
+                        let recounted = counter.is_some_and(|counter| {
                             self.check_billed_tokens(
                                 counter,
                                 captured.take(),
@@ -3046,8 +3064,13 @@ impl ConsumerNode {
                                 tokens,
                                 provider.state_id.clone(),
                                 model_key_now.to_string(),
-                            );
+                                (provider.clone(), nonce),
+                            )
+                        });
+                        if !recounted {
+                            self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User);
                         }
+                        self.note_served_paid(&provider.libp2p_peer_id, now);
                     }
                     if summary.ok && !self_serve {
                         self.note_served_ok(&provider.libp2p_peer_id, &provider.model_id, now);
@@ -3682,7 +3705,13 @@ impl ConsumerNode {
         };
         // Display: cost-weighted credit SPENT, weighted by the **validated handle** (`model_key`) —
         // the ceiling that stops a mislabelled canonical inflating the number.
-        let spent = credits_for_receipt(self.claimed_tier(peer_id, model_key, now).weight(), tokens, None);
+        // At the tier payments are capped at (what the provider's achieved authenticity allows), not
+        // the tier its model name claims: a renamed model can't make the display say it cost more.
+        let awarded = openhydra_protocol::trust::max_cost_tier_for_authenticity(
+            self.authenticity_of(peer_id, model_key, now),
+            self.claimed_tier(peer_id, model_key, now),
+        );
+        let spent = credits_for_receipt(awarded.weight(), tokens, None);
         // One place for the total and the row, both at settlement: "used" is what the user asked
         // for; a background check (audit, question writer, log-prob probe) is its own kind
         // (ADVERSARIAL item 5).
@@ -5976,6 +6005,20 @@ mod tests {
         // Standing on another model doesn't count for this one.
         let other = openhydra_network::types::KnownProvider { model_id: "llama3.2:1b".into(), ..provider };
         assert!(node.auto_candidates_from(vec![other], None, now).earned.is_empty());
+    }
+
+    #[test]
+    fn displayed_spend_is_at_the_tier_payments_are_capped_at() {
+        use std::sync::atomic::Ordering;
+        let (_dir, node) = test_node();
+        let stats = Arc::new(crate::status::TransferStats::default());
+        let node = node.with_stats(stats.clone());
+        // An unproven provider (A0) whose model name claims a very large model.
+        let big = "llama3.1:405b";
+        assert!(openhydra_protocol::weight::cost_tier_for_handle(big) > openhydra_protocol::award::FLOOR_TIER);
+        node.record_contribution("12D3KooWBig", "state-big", big, 1000, "peer-big", big, SettlePurpose::User);
+        let floor = credits_for_receipt(openhydra_protocol::award::FLOOR_TIER.weight(), 1000, None);
+        assert_eq!(stats.credits_spent.load(Ordering::Relaxed), floor, "shown at the floor tier, not the claimed one");
     }
 
     #[test]

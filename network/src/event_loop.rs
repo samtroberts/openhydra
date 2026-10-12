@@ -587,6 +587,10 @@ struct LoopState {
     tier_connect_success: std::collections::HashMap<&'static str, u64>,
     /// Fix 2: per-peer transport-type-aware connection tracking.
     peer_connections: HashMap<PeerId, PeerConnectionInfo>,
+    /// Peers with a connection to us over a loopback / private-network address (and how many): only
+    /// such a peer's own non-global listen addresses are taken from identify (see
+    /// [`identify_addr_admissible`]).
+    local_link_peers: HashMap<PeerId, u32>,
     /// Reply channels for local proxy forwards (Ouroboros: target == self).
     local_proxy_replies: HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>,
     /// Fix 4: debounce tracking for TriggerRepunch.
@@ -840,6 +844,7 @@ impl LoopState {
             reversal_successes: 0,
             tier_connect_success: std::collections::HashMap::new(),
             peer_connections: HashMap::new(),
+            local_link_peers: HashMap::new(),
             local_proxy_replies: HashMap::new(),
             last_repunch: HashMap::new(),
             peer_quic_addrs: HashMap::new(),
@@ -2509,7 +2514,13 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(OpenHydraBehaviourEvent::Identify(identify_event)) => {
             if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
                 debug!(%peer_id, protocol = %info.protocol_version, "identify received");
-                for addr in &info.listen_addrs {
+                let local_link = state.local_link_peers.contains_key(&peer_id);
+                for addr in info
+                    .listen_addrs
+                    .iter()
+                    .filter(|a| identify_addr_admissible(a, local_link))
+                    .take(MAX_IDENTIFY_ADDRS)
+                {
                     // F-9: skip IPv6 peer addresses on a host with no working
                     // IPv6 — adding them to the routing table only leads libp2p
                     // to later dial unreachable `/ip6/` addresses and eat
@@ -2971,6 +2982,9 @@ fn handle_swarm_event(
             };
             let transport = classify_transport(&addr_str);
             let endpoint_ip = extract_ip_from_multiaddr_str(&addr_str);
+            if is_local_link(&addr_str, endpoint_ip.as_deref()) {
+                *state.local_link_peers.entry(peer_id).or_insert(0) += 1;
+            }
             let is_relay_ip = endpoint_ip
                 .as_ref()
                 .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
@@ -3119,6 +3133,14 @@ fn handle_swarm_event(
             };
             let transport = classify_transport(&addr_str);
             let endpoint_ip = extract_ip_from_multiaddr_str(&addr_str);
+            if is_local_link(&addr_str, endpoint_ip.as_deref()) {
+                if let Some(n) = state.local_link_peers.get_mut(&peer_id) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        state.local_link_peers.remove(&peer_id);
+                    }
+                }
+            }
             let is_relay_ip = endpoint_ip
                 .as_ref()
                 .map(|ip| crate::relay::is_bootstrap_relay_ip(ip))
@@ -4061,6 +4083,59 @@ fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<String> {
 /// Extract an IP string from a multiaddr string representation.
 /// Parses `/ip4/1.2.3.4/...` or `/ip6/::1/...` without requiring
 /// a full Multiaddr parse (which can fail on partial addresses).
+/// The most identify listen addresses taken from one peer (a peer may list any number).
+const MAX_IDENTIFY_ADDRS: usize = 32;
+
+/// An address on this machine or a private network: loopback, unspecified, RFC 1918, CGNAT
+/// (100.64/10), link-local, IPv6 unique-local.
+fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_ip(v4.into()))
+        }
+    }
+}
+
+/// Whether a connection (by its remote address) is over loopback or a private network, not a relay.
+fn is_local_link(addr_str: &str, ip: Option<&str>) -> bool {
+    !addr_str.contains("p2p-circuit") && ip.and_then(|i| i.parse::<std::net::IpAddr>().ok()).is_some_and(is_non_global_ip)
+}
+
+/// Whether a peer's identify listen address goes into the routing table, where other nodes learn it
+/// and dial it. A local-only transport (a Unix socket, memory) never does; an unspecified address
+/// never does; a loopback or private-network address only from a peer we reach over loopback or the
+/// same private network (`local_link`) — from anyone else it would point other nodes at their own
+/// machine or LAN.
+fn identify_addr_admissible(addr: &Multiaddr, local_link: bool) -> bool {
+    use libp2p::multiaddr::Protocol;
+    let mut ip = None;
+    for p in addr.iter() {
+        match p {
+            Protocol::Unix(_) | Protocol::Memory(_) => return false,
+            Protocol::Ip4(v4) if ip.is_none() => ip = Some(std::net::IpAddr::V4(v4)),
+            Protocol::Ip6(v6) if ip.is_none() => ip = Some(std::net::IpAddr::V6(v6)),
+            _ => {}
+        }
+    }
+    match ip {
+        Some(ip) if ip.is_unspecified() => false,
+        Some(ip) if is_non_global_ip(ip) => local_link,
+        _ => true,
+    }
+}
+
 fn extract_ip_from_multiaddr_str(addr_str: &str) -> Option<String> {
     for segment in addr_str.split('/') {
         // The IP follows "/ip4/" or "/ip6/" — grab the next segment.
@@ -4526,6 +4601,29 @@ fn handle_close_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identify_addresses_cannot_point_other_nodes_at_their_own_network() {
+        let a = |s: &str| s.parse::<Multiaddr>().unwrap();
+        // Public addresses always pass; a relay circuit too.
+        assert!(identify_addr_admissible(&a("/ip4/203.0.113.7/tcp/4001"), false));
+        assert!(identify_addr_admissible(&a("/ip4/45.79.190.172/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit"), false));
+        assert!(identify_addr_admissible(&a("/dns4/example.org/tcp/4001"), false));
+        // Loopback / private / CGNAT / link-local / ULA: only from a peer reached that way.
+        for local in ["/ip4/127.0.0.1/tcp/4001", "/ip4/192.168.1.10/tcp/22", "/ip4/10.0.0.1/udp/4001/quic-v1",
+                      "/ip4/100.64.1.1/tcp/1", "/ip4/169.254.1.1/tcp/1", "/ip6/::1/tcp/1", "/ip6/fd00::1/tcp/1", "/ip6/fe80::1/tcp/1"] {
+            assert!(!identify_addr_admissible(&a(local), false), "{local} from a remote peer");
+            assert!(identify_addr_admissible(&a(local), true), "{local} from a LAN peer");
+        }
+        // Never: unspecified, or a local-only transport.
+        assert!(!identify_addr_admissible(&a("/ip4/0.0.0.0/tcp/4001"), true));
+        assert!(!identify_addr_admissible(&a("/unix/tmp%2Fsock"), true));
+        // Connections: a relayed one is never "local link", whatever the relay's address.
+        assert!(is_local_link("/ip4/192.168.1.2/tcp/4001", Some("192.168.1.2")));
+        assert!(!is_local_link("/ip4/192.168.1.2/tcp/4001/p2p/x/p2p-circuit", Some("192.168.1.2")));
+        assert!(!is_local_link("/ip4/8.8.8.8/tcp/4001", Some("8.8.8.8")));
+    }
+
 
     #[test]
     fn c11_discover_cache_fresh_policy() {

@@ -386,9 +386,10 @@ fn no_auto_model_message(known: &[String]) -> String {
                 request a specific model"
             .to_string();
     }
-    let mut list: Vec<&str> = known.iter().map(String::as_str).take(10).collect();
+    // Each name in a code span: names are peers' choices and this text reaches a coding agent.
+    let mut list: Vec<String> = known.iter().take(10).map(|m| format!("`{m}`")).collect();
     if known.len() > list.len() {
-        list.push("…");
+        list.push("…".to_string());
     }
     format!(
         "openhydra/auto found no model it can trust (none from your own machine, an imported card, or a \
@@ -2657,7 +2658,7 @@ mod tests {
     fn no_auto_model_message_lists_what_is_available() {
         assert!(no_auto_model_message(&[]).contains("no models available"));
         let m = no_auto_model_message(&["a".into(), "b".into()]);
-        assert!(m.contains("Choose a model") && m.contains("a, b"), "{m}");
+        assert!(m.contains("Choose a model") && m.contains("`a`, `b`"), "{m}");
     }
 
     // ── Anthropic `/v1/messages` translation ──

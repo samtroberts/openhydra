@@ -181,9 +181,15 @@ pub fn countable_text(
 /// among them) can account for: each tool call's template tokens ([`TOOL_CALL_TOKEN_ALLOWANCE`]),
 /// end-of-turn markers ([`BILLABLE_TOKEN_SLACK`]) and [`COUNT_TOLERANCE`].
 pub fn over_billed(billed: u64, counted: u64, calls: usize) -> bool {
+    billed > billable_by_count(counted, calls)
+}
+
+/// The most a serve may bill given the tokenizer's count of what it delivered (`counted`, plus
+/// `calls` tool calls): the count with [`COUNT_TOLERANCE`] and [`BILLABLE_TOKEN_SLACK`] on top, so an
+/// honest provider's count (a different tokenizer build, a template token) always fits.
+pub fn billable_by_count(counted: u64, calls: usize) -> u64 {
     let expected = counted.saturating_add(calls as u64 * TOOL_CALL_TOKEN_ALLOWANCE);
-    let allowed = expected as f64 * (1.0 + COUNT_TOLERANCE) + BILLABLE_TOKEN_SLACK as f64;
-    billed as f64 > allowed
+    (expected as f64 * (1.0 + COUNT_TOLERANCE) + BILLABLE_TOKEN_SLACK as f64).floor() as u64
 }
 
 /// The scorer binary a gateway counts with: `OPENHYDRA_SCORER` if set, else `openhydra-scorer` next
@@ -207,6 +213,13 @@ mod tests {
         // Tool calls carry template tokens of their own.
         assert!(!over_billed(20 + 2 * TOOL_CALL_TOKEN_ALLOWANCE, 20, 2));
         assert!(over_billed(20 + 2 * TOOL_CALL_TOKEN_ALLOWANCE, 20, 0));
+        // What an over-billing provider is paid instead: the largest count that isn't over-billed.
+        for (counted, calls) in [(120u64, 0usize), (20, 2), (0, 0), (1_000_000, 16)] {
+            let fair = billable_by_count(counted, calls);
+            assert!(!over_billed(fair, counted, calls) && over_billed(fair + 1, counted, calls), "{counted} {calls}");
+        }
+        // The 3-4x a byte-bound bill allows (one token per character) is cut to the count.
+        assert!(billable_by_count(120, 0) < 480 / 3);
     }
 
     #[test]
