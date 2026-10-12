@@ -21,6 +21,13 @@ use std::collections::HashMap;
 pub const MAX_MODELS: usize = 8_192;
 /// Max providers retained per model.
 pub const MAX_PROVIDERS_PER_MODEL: usize = 512;
+/// Max models one provider (OpenHydra id, bound to its key) holds here: above any real machine's
+/// library, so one identity can't fill the model table.
+pub const MAX_MODELS_PER_PEER: usize = 256;
+/// Max records in one query reply. A record is at most 4 KB (`dht::MAX_RECORD_BYTES`), so a reply
+/// stays far below the 1 MB a consumer accepts: a model announced by many (padded) identities can't
+/// make every lookup for it fail.
+pub const MAX_REPLY_RECORDS: usize = 64;
 
 /// Verified provider records the bootstrap has seen, grouped by model, each stamped with the
 /// last time we saw an announce for it (for TTL expiry). Keyed inner by OpenHydra `peer_id`.
@@ -58,6 +65,10 @@ impl ProviderRegistry {
                 self.by_model.remove(&stalest);
             }
         }
+        let is_new_pair = self.by_model.get(&record.model_id).is_none_or(|b| !b.contains_key(&record.peer_id));
+        if is_new_pair && self.models_of(&record.peer_id) >= MAX_MODELS_PER_PEER {
+            return; // refreshes of what it already holds still count; nothing new
+        }
         let bucket = self.by_model.entry(record.model_id.clone()).or_default();
         if !bucket.contains_key(&record.peer_id) && bucket.len() >= MAX_PROVIDERS_PER_MODEL {
             if let Some(stalest) = stalest_peer(bucket) {
@@ -67,10 +78,12 @@ impl ProviderRegistry {
         bucket.insert(record.peer_id.clone(), Entry { record, last_seen_ms: now_ms });
     }
 
-    /// Fresh providers for `model_id` (last seen within `ttl_ms`), newest-announce first. Stale
-    /// entries are skipped here even before the reaper runs, so a query never returns an aged
-    /// record.
+    /// Fresh providers for `model_id` (last seen within `ttl_ms`), at most [`MAX_REPLY_RECORDS`].
+    /// When more are fresh, a random sample: re-announcing faster can't keep a set of identities at
+    /// the top of every reply, and repeated queries see different providers. Stale entries are
+    /// skipped here even before the reaper runs, so a query never returns an aged record.
     pub fn providers_for(&self, model_id: &str, now_ms: u64) -> Vec<PeerRecord> {
+        use rand::seq::SliceRandom;
         let mut out: Vec<&Entry> = match self.by_model.get(model_id) {
             Some(b) => b
                 .values()
@@ -78,8 +91,17 @@ impl ProviderRegistry {
                 .collect(),
             None => return Vec::new(),
         };
+        if out.len() > MAX_REPLY_RECORDS {
+            out.shuffle(&mut rand::thread_rng());
+            out.truncate(MAX_REPLY_RECORDS);
+        }
         out.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms));
         out.into_iter().map(|e| e.record.clone()).collect()
+    }
+
+    /// How many models `peer_id` holds an entry for.
+    fn models_of(&self, peer_id: &str) -> usize {
+        self.by_model.values().filter(|b| b.contains_key(peer_id)).count()
     }
 
     /// Drop entries older than `ttl_ms` (and now-empty model buckets). Returns the number of
@@ -130,6 +152,41 @@ fn stalest_peer(bucket: &HashMap<String, Entry>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_stays_small_however_many_identities_announce() {
+        let mut r = ProviderRegistry::new(1000);
+        for i in 0..MAX_PROVIDERS_PER_MODEL {
+            r.insert(rec("m", &format!("p{i}")), 1);
+        }
+        let a = r.providers_for("m", 2);
+        assert_eq!(a.len(), MAX_REPLY_RECORDS);
+        // A sample, not always the same set.
+        let b = r.providers_for("m", 2);
+        let c = r.providers_for("m", 2);
+        assert!(a.iter().map(|x| &x.peer_id).collect::<Vec<_>>() != b.iter().map(|x| &x.peer_id).collect::<Vec<_>>()
+            || b.iter().map(|x| &x.peer_id).collect::<Vec<_>>() != c.iter().map(|x| &x.peer_id).collect::<Vec<_>>());
+        // Fewer than the cap: everyone.
+        let mut small = ProviderRegistry::new(1000);
+        for i in 0..5 {
+            small.insert(rec("m", &format!("p{i}")), 1);
+        }
+        assert_eq!(small.providers_for("m", 2).len(), 5);
+    }
+
+    #[test]
+    fn one_peer_cannot_fill_the_model_table() {
+        let mut r = ProviderRegistry::new(1000);
+        for i in 0..MAX_MODELS_PER_PEER + 50 {
+            r.insert(rec(&format!("m{i}"), "flood"), 1);
+        }
+        assert_eq!(r.model_count(), MAX_MODELS_PER_PEER);
+        // Its existing entries still refresh; other peers are unaffected.
+        r.insert(rec("m0", "flood"), 5);
+        assert_eq!(r.providers_for("m0", 6).len(), 1);
+        r.insert(rec("m9999", "honest"), 5);
+        assert_eq!(r.providers_for("m9999", 6).len(), 1);
+    }
 
     fn rec(model: &str, peer: &str) -> PeerRecord {
         PeerRecord {
@@ -190,24 +247,23 @@ mod tests {
         for i in 0..MAX_PROVIDERS_PER_MODEL {
             r.insert(rec("m", &format!("p{i}")), 1000 + i as u64);
         }
-        assert_eq!(r.providers_for("m", 2_000_000).len(), MAX_PROVIDERS_PER_MODEL);
+        assert_eq!(r.by_model["m"].len(), MAX_PROVIDERS_PER_MODEL);
         // one more (fresher) → evicts the stalest (p0 @ ts 1000), stays at the cap.
         r.insert(rec("m", "pNEW"), 9_000_000);
-        assert_eq!(r.providers_for("m", 10_000_000).len(), MAX_PROVIDERS_PER_MODEL);
-        let ids: Vec<String> = r.providers_for("m", 10_000_000).into_iter().map(|x| x.peer_id).collect();
-        assert!(ids.contains(&"pNEW".to_string()));
-        assert!(!ids.contains(&"p0".to_string()));
+        assert_eq!(r.by_model["m"].len(), MAX_PROVIDERS_PER_MODEL);
+        assert!(r.by_model["m"].contains_key("pNEW"));
+        assert!(!r.by_model["m"].contains_key("p0"));
     }
 
     #[test]
     fn model_cap_evicts_stalest_model() {
         let mut r = ProviderRegistry::new(u64::MAX); // isolate the cap logic from TTL
         for i in 0..MAX_MODELS {
-            r.insert(rec(&format!("m{i}"), "p"), 1000 + i as u64);
+            r.insert(rec(&format!("m{i}"), &format!("p{}", i / MAX_MODELS_PER_PEER)), 1000 + i as u64);
         }
         assert_eq!(r.model_count(), MAX_MODELS);
         // a new model → evicts the stalest existing model (m0), stays at the cap.
-        r.insert(rec("mNEW", "p"), 9_000_000);
+        r.insert(rec("mNEW", "pNEW"), 9_000_000);
         assert_eq!(r.model_count(), MAX_MODELS);
         assert_eq!(r.providers_for("m0", 10_000_000).len(), 0);
         assert_eq!(r.providers_for("mNEW", 10_000_000).len(), 1);

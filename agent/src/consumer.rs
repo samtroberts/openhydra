@@ -232,6 +232,17 @@ fn delivered_text_cap(_max_tokens: Option<u32>) -> u64 {
     MAX_DELIVERED_TEXT_UNITS
 }
 
+/// The most raw bytes one attempt reads, alongside the unit cap: units count a whitespace run at one
+/// per 16 characters (padding is cheap to bill), so without this a provider could send gigabytes of
+/// whitespace inside the unit cap. Same room as a buffered response (a media data URL fits).
+const MAX_DELIVERED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Whether an attempt that has read `bytes` raw bytes and `units` billing units went past what any
+/// request allows.
+fn delivered_too_much(bytes: u64, units: u64, unit_cap: u64) -> bool {
+    units > unit_cap || bytes > MAX_DELIVERED_BYTES
+}
+
 /// Stream closes running at once (each a detached thread retrying for minutes) (R5S-3).
 const MAX_CLOSES_IN_FLIGHT: usize = 256;
 
@@ -1397,6 +1408,8 @@ fn dispatch_stream_slice(
 /// tool calls, mid-stream) it is an ordinary failure, so a provider can't end a serve it took on
 /// without it counting against it (review B3).
 fn provider_error(msg: String, at_admission: bool) -> AdapterError {
+    // The provider wrote it: shown to the user and logged, so bounded and free of control characters.
+    let msg = crate::serve::clean_remote_text(&msg);
     match msg.strip_prefix(crate::serve::PAYMENT_REFUSAL) {
         Some(rest) if !at_admission => AdapterError::Provider(format!("refused payment after the serve began: {rest}")),
         // Its serve pool was full (the provider's own shed reply, before anything was served).
@@ -2916,6 +2929,7 @@ impl ConsumerNode {
             // (round 8 G8-3).
             let oversized = std::cell::Cell::new(false);
             let text_cap = delivered_text_cap(max_tokens);
+            let delivered_bytes = std::cell::Cell::new(0u64);
             let exchange = {
                 let mut guarded = |d: &str| {
                     if oversized.get() {
@@ -2925,7 +2939,8 @@ impl ConsumerNode {
                     let mut t = delivered_text.get();
                     t.push(d);
                     delivered_text.set(t);
-                    if t.units() > text_cap {
+                    delivered_bytes.set(delivered_bytes.get().saturating_add(d.len() as u64));
+                    if delivered_too_much(delivered_bytes.get(), t.units(), text_cap) {
                         oversized.set(true);
                         return;
                     }
@@ -5021,6 +5036,22 @@ mod tests {
     fn delivered_text_is_capped_flat_so_media_results_fit() {
         // A 512x512 PNG as a data URL is ~400 KB however small max_tokens is (round 9 B9-1).
         assert!(delivered_text_cap(Some(2048)) > 100 * 1024 * 1024);
+        // Whitespace is cheap in units but not in memory: the byte cap stops a padded flood.
+        let mut t = crate::serve::DeliveredText::default();
+        let pad = " ".repeat(1024 * 1024);
+        let mut bytes = 0u64;
+        let mut stopped_at = None;
+        for i in 0..200 {
+            t.push(&pad);
+            bytes += pad.len() as u64;
+            if delivered_too_much(bytes, t.units(), delivered_text_cap(None)) {
+                stopped_at = Some(i);
+                break;
+            }
+        }
+        assert!(t.units() < MAX_DELIVERED_TEXT_UNITS, "the unit cap alone would not have stopped it");
+        assert_eq!(stopped_at, Some(128), "stopped just past 128 MiB of whitespace");
+        assert!(!delivered_too_much(1024, 1024, delivered_text_cap(None)));
         assert_eq!(delivered_text_cap(None), delivered_text_cap(Some(1)));
     }
 
@@ -5366,6 +5397,14 @@ mod tests {
         let mut transport = |req: &[u8]| Ok(handle_serve_inbound(req, &adapter));
         let err = request_completion(&mut transport, &request(), &mut |_| {}).unwrap_err();
         assert!(matches!(err, AdapterError::Provider(m) if m.contains("engine down")));
+        // A hostile provider's error can't forge log lines or flood the reply.
+        let long = format!("x\n2026-10-12 INFO forged\x1b[2J{}", "y".repeat(100_000));
+        match provider_error(long, true) {
+            AdapterError::Provider(m) => {
+                assert!(m.len() <= crate::serve::MAX_REMOTE_TEXT_BYTES + 3 && !m.contains('\n') && !m.contains('\x1b'), "{}", m.len())
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

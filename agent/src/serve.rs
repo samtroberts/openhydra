@@ -118,6 +118,26 @@ impl DeliveredText {
     }
 }
 
+/// The most bytes of a remote peer's message (a provider's error, a rig's refusal) passed on.
+pub const MAX_REMOTE_TEXT_BYTES: usize = 512;
+
+/// A remote peer's message made safe to show and log: control characters (newlines, escapes, ANSI
+/// sequences) become spaces and it is cut to [`MAX_REMOTE_TEXT_BYTES`] on a character boundary, with
+/// an ellipsis when cut. Another node writes this text; it must not forge log lines, recolour a
+/// terminal or bury the gateway's own message.
+pub fn clean_remote_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MAX_REMOTE_TEXT_BYTES + 3));
+    for c in s.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > MAX_REMOTE_TEXT_BYTES {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The most tool calls in one completion that earn [`TOOL_CALL_TOKEN_ALLOWANCE`].
 pub const MAX_ALLOWED_TOOL_CALLS: usize = 16;
 
@@ -777,6 +797,16 @@ pub fn parse_response(buffer: &[u8]) -> Result<Vec<ServeChunk>, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_text_is_cut_and_has_no_control_characters() {
+        assert_eq!(clean_remote_text("engine down"), "engine down");
+        assert_eq!(clean_remote_text("a\nFAKE LOG\r\x1b[31mred\x07"), "a FAKE LOG  [31mred ");
+        let long = "é".repeat(1000);
+        let c = clean_remote_text(&long);
+        assert!(c.len() <= MAX_REMOTE_TEXT_BYTES + '…'.len_utf8() && c.ends_with('…'), "{}", c.len());
+        assert!(c.chars().all(|ch| !ch.is_control()));
+    }
     use crate::adapter::{DetectedModel, ServeOutcome, ToolCallFunction};
 
     fn tool_call(name: &str) -> ToolCall {

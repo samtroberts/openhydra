@@ -14,7 +14,8 @@
 //!
 //! [`ConsumerNode::complete`] is synchronous and blocks on libp2p (`blocking_send`), so the
 //! handler runs it on a **plain OS thread** (outside any tokio context, where
-//! `blocking_send` is valid) and pipes the deltas back through an unbounded channel.
+//! `blocking_send` is valid) and pipes the deltas back through a bounded channel (a client that reads
+//! slowly holds the worker back rather than the gateway buffering whatever the provider sends).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +34,7 @@ use axum::routing::{get, post};
 use axum::{extract::State, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -170,6 +171,11 @@ struct StreamOptions {
 }
 
 /// What the worker thread sends back as the completion progresses.
+/// Events buffered between a generation worker and the response that sends them. Bounded: the
+/// worker blocks (and stops reading from the provider) while the client is behind.
+const STREAM_BACKLOG: usize = 256;
+type EventRx = tokio::sync::mpsc::Receiver<GatewayEvent>;
+
 enum GatewayEvent {
     Delta(String),
     Done(Box<ServeSummary>),
@@ -842,10 +848,10 @@ fn spawn_worker(
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
-    tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    EventRx,
     std::time::Instant,
 ) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<GatewayEvent>(STREAM_BACKLOG);
     let started = std::time::Instant::now();
     std::thread::spawn(move || {
         // Hold the global generation permit (G3b) for the worker's whole lifetime; it is
@@ -855,7 +861,7 @@ fn spawn_worker(
         // stream and pays for what was read, instead of reading (and paying for) the rest (S8).
         let gone = std::sync::atomic::AtomicBool::new(false);
         let mut on_delta = |d: &str| {
-            if tx.send(GatewayEvent::Delta(d.to_string())).is_err() {
+            if tx.blocking_send(GatewayEvent::Delta(d.to_string())).is_err() {
                 gone.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         };
@@ -869,10 +875,10 @@ fn spawn_worker(
                     tracing::warn!(%model, dropped, kept = kept.len(), "dropped tool calls the request didn't offer or that were malformed");
                 }
                 summary.tool_calls = kept;
-                let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
+                let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
-                let _ = tx.send(GatewayEvent::Error(e.to_string(), error_class(&e)));
+                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e)));
             }
         }
     });
@@ -988,7 +994,7 @@ async fn spawn_dispatch(
     temperature: Option<f64>,
     tools: Vec<Value>,
     think: Option<bool>,
-) -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>, std::time::Instant), DispatchErr>
+) -> Result<(String, EventRx, std::time::Instant), DispatchErr>
 {
     // AUP floor: refuse a policy-violating request before spending a discovery/route on it.
     if let AupDecision::Deny(reason) = state.aup.evaluate(&messages, max_tokens) {
@@ -1081,10 +1087,10 @@ fn spawn_byok_worker(
     temperature: Option<f64>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
-    tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    EventRx,
     std::time::Instant,
 ) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<GatewayEvent>(STREAM_BACKLOG);
     let started = std::time::Instant::now();
     std::thread::spawn(move || {
         // Hold the global generation permit (G3b) for the worker's whole lifetime.
@@ -1110,7 +1116,7 @@ fn spawn_byok_worker(
             stop.set();
         }
         let mut on_delta = |d: &str| {
-            if tx.send(GatewayEvent::Delta(d.to_string())).is_err() {
+            if tx.blocking_send(GatewayEvent::Delta(d.to_string())).is_err() {
                 stop.set();
             }
         };
@@ -1137,10 +1143,10 @@ fn spawn_byok_worker(
                     authenticity: None,
                     streamed: false,
                 };
-                let _ = tx.send(GatewayEvent::Done(Box::new(summary)));
+                let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
             Err(e) => {
-                let _ = tx.send(GatewayEvent::Error(e.to_string(), error_class(&e)));
+                let _ = tx.blocking_send(GatewayEvent::Error(e.to_string(), error_class(&e)));
             }
         }
     });
@@ -1155,7 +1161,7 @@ fn stream_response(
     model: String,
     created: u64,
     want_usage: bool,
-    rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    rx: EventRx,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
@@ -1167,7 +1173,7 @@ fn stream_response(
     // P1 streaming: stamp the first delta so `ttft_ms` reflects real time-to-first-token — the
     // whole point of streaming is that this lands far ahead of `wall`.
     let mut ttft: Option<std::time::Duration> = None;
-    let body = UnboundedReceiverStream::new(rx).map(move |ev| {
+    let body = ReceiverStream::new(rx).map(move |ev| {
         let data = match ev {
             GatewayEvent::Delta(t) => {
                 ttft.get_or_insert_with(|| started.elapsed());
@@ -1228,7 +1234,7 @@ async fn buffered_response(
     id: String,
     model: String,
     created: u64,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    mut rx: EventRx,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
@@ -1637,7 +1643,7 @@ async fn messages(
 async fn anthropic_buffered_response(
     id: String,
     model: String,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    mut rx: EventRx,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
@@ -1687,15 +1693,15 @@ fn ant_sse(name: &str, data: Value) -> Event {
 fn anthropic_stream_response(
     id: String,
     model: String,
-    rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    rx: EventRx,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
 ) -> Response {
     // The worker emits `(event_name, json)` frames; convert to axum SSE `Event` only at the boundary
     // so the translation logic stays unit-testable without axum.
-    let (etx, erx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, Value)>();
+    let (etx, erx) = tokio::sync::mpsc::channel::<(&'static str, Value)>(STREAM_BACKLOG);
     tokio::spawn(anthropic_stream_worker(id, model, rx, started, metrics, etx));
-    let body = UnboundedReceiverStream::new(erx)
+    let body = ReceiverStream::new(erx)
         .map(|(name, data)| Ok::<Event, std::convert::Infallible>(ant_sse(name, data)));
     Sse::new(body)
         .keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL))
@@ -1709,10 +1715,10 @@ fn anthropic_stream_response(
 async fn anthropic_stream_worker(
     id: String,
     model: String,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
+    mut rx: EventRx,
     started: std::time::Instant,
     metrics: Arc<Metrics>,
-    out: tokio::sync::mpsc::UnboundedSender<(&'static str, Value)>,
+    out: tokio::sync::mpsc::Sender<(&'static str, Value)>,
 ) {
     // Wait for the first frame before committing to a message envelope. If the generation errors
     // before producing anything, emit ONLY a clean `error` frame. The pre-first-frame gap is kept
@@ -1729,7 +1735,7 @@ async fn anthropic_stream_worker(
     let first = match first {
         Some(GatewayEvent::Error(m, _)) => {
             metrics.record_error();
-            let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } })));
+            let _ = out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } }))).await;
             return;
         }
         Some(ev) => ev, // a Delta or Done — the message really started
@@ -1745,13 +1751,13 @@ async fn anthropic_stream_worker(
                 "usage": { "input_tokens": 0, "output_tokens": 0 },
             }
         }),
-    )).is_err() {
+    )).await.is_err() {
         return;
     }
     if out.send((
         "content_block_start",
         json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
-    )).is_err() {
+    )).await.is_err() {
         return;
     }
     // Process the first frame, then drain the rest. A native `ping` is emitted only on a mid-content
@@ -1764,7 +1770,7 @@ async fn anthropic_stream_worker(
                 if out.send((
                     "content_block_delta",
                     json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } }),
-                )).is_err() {
+                )).await.is_err() {
                     return;
                 }
             }
@@ -1772,7 +1778,7 @@ async fn anthropic_stream_worker(
                 let wall = started.elapsed();
                 log_completion(&summary, wall);
                 metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
-                if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))).is_err() {
+                if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))).await.is_err() {
                     return;
                 }
                 // Each tool call → a `tool_use` block whose arguments stream as one
@@ -1782,33 +1788,33 @@ async fn anthropic_stream_worker(
                     if out.send((
                         "content_block_start",
                         json!({ "type": "content_block_start", "index": idx, "content_block": { "type": "tool_use", "id": tc.id, "name": tc.function.name, "input": {} } }),
-                    )).is_err() {
+                    )).await.is_err() {
                         return;
                     }
                     if out.send((
                         "content_block_delta",
                         json!({ "type": "content_block_delta", "index": idx, "delta": { "type": "input_json_delta", "partial_json": tc.function.arguments } }),
-                    )).is_err() {
+                    )).await.is_err() {
                         return;
                     }
-                    if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": idx }))).is_err() {
+                    if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": idx }))).await.is_err() {
                         return;
                     }
                 }
                 if out.send((
                     "message_delta",
                     json!({ "type": "message_delta", "delta": { "stop_reason": anthropic_stop_reason(&summary), "stop_sequence": Value::Null }, "usage": { "output_tokens": summary.tokens }, "openhydra": anthropic_openhydra(&summary) }),
-                )).is_err() {
+                )).await.is_err() {
                     return;
                 }
-                if out.send(("message_stop", json!({ "type": "message_stop" }))).is_err() {
+                if out.send(("message_stop", json!({ "type": "message_stop" }))).await.is_err() {
                     return;
                 }
                 break 'drain;
             }
             GatewayEvent::Error(m, _) => {
                 metrics.record_error();
-                if out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } }))).is_err() {
+                if out.send(("error", json!({ "type": "error", "error": { "type": "api_error", "message": m } }))).await.is_err() {
                     return;
                 }
                 break 'drain;
@@ -1825,7 +1831,7 @@ async fn anthropic_stream_worker(
                 },
                 _ = out.closed() => return,
                 _ = tokio::time::sleep(PING_INTERVAL) => {
-                    if out.send(("ping", json!({ "type": "ping" }))).is_err() {
+                    if out.send(("ping", json!({ "type": "ping" }))).await.is_err() {
                         return;
                     }
                 }
@@ -2724,12 +2730,12 @@ mod tests {
     /// Drive `anthropic_stream_worker` with a fixed event sequence and return the ordered SSE event
     /// names it emits.
     async fn stream_names(events: Vec<GatewayEvent>) -> Vec<&'static str> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
         for e in events {
-            tx.send(e).unwrap();
+            tx.try_send(e).unwrap();
         }
         drop(tx); // close so the worker's drain loop ends
-        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        let (otx, mut orx) = tokio::sync::mpsc::channel(1024);
         anthropic_stream_worker(
             "msg_x".into(),
             "m".into(),
@@ -2799,8 +2805,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stream_pings_during_a_mid_content_stall_never_before_message_start() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (otx, mut orx) = tokio::sync::mpsc::channel(1024);
         let worker = tokio::spawn(anthropic_stream_worker(
             "id".into(),
             "m".into(),
@@ -2810,13 +2816,13 @@ mod tests {
             otx,
         ));
         // First token opens the message envelope.
-        tx.send(GatewayEvent::Delta("hi".into())).unwrap();
+        tx.send(GatewayEvent::Delta("hi".into())).await.unwrap_or_else(|_| panic!("send"));
         tokio::task::yield_now().await;
         // Then the model stalls: advance past two ping intervals → native pings fire, AFTER
         // message_start (where the Anthropic protocol allows them).
         tokio::time::advance(std::time::Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
-        tx.send(GatewayEvent::Done(Box::new(summary(1, 1)))).unwrap();
+        tx.send(GatewayEvent::Done(Box::new(summary(1, 1)))).await.unwrap_or_else(|_| panic!("send"));
         drop(tx);
         worker.await.unwrap();
         let mut names = Vec::new();

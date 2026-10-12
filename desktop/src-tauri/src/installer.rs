@@ -254,7 +254,7 @@ fn vllm_metal_recipe() -> Result<Recipe, String> {
             program: "sh".into(),
             args: vec![
                 "-c".into(),
-                "curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash".into(),
+                "curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash".into(),
             ],
         }],
         health: Health::Manual {
@@ -380,7 +380,7 @@ fn ollama_recipe(os: Os) -> Recipe {
             summary: "Install Ollama via the official script (ollama.com/install.sh) → starts on :11434".into(),
             steps: vec![Step::Run {
                 program: "sh".into(),
-                args: vec!["-c".into(), "curl -fsSL https://ollama.com/install.sh | sh".into()],
+                args: vec!["-c".into(), "curl -fsSL --proto '=https' --tlsv1.2 https://ollama.com/install.sh | sh".into()],
             }],
             health,
             default_model: Some("qwen2.5:7b"),
@@ -396,7 +396,7 @@ fn ollama_recipe(os: Os) -> Recipe {
             summary: "Install Ollama via the official installer (ollama.com/install.sh, Metal auto) → serves on :11434".into(),
             steps: vec![Step::Run {
                 program: "sh".into(),
-                args: vec!["-c".into(), "curl -fsSL https://ollama.com/install.sh | sh".into()],
+                args: vec!["-c".into(), "curl -fsSL --proto '=https' --tlsv1.2 https://ollama.com/install.sh | sh".into()],
             }],
             health,
             default_model: Some("qwen2.5:7b"),
@@ -569,7 +569,7 @@ fn comfyui_plan(os: Os, p: &crate::hostinfo::Prereqs) -> Result<Recipe, String> 
 fn latest_github_dmg_url(owner_repo: &str) -> Option<String> {
     let api = format!("https://api.github.com/repos/{owner_repo}/releases/latest");
     let out = Command::new("curl")
-        .args(["-sL", "-H", "User-Agent: openhydra-desktop", "-H", "Accept: application/vnd.github+json", &api])
+        .args(["-sL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-H", "User-Agent: openhydra-desktop", "-H", "Accept: application/vnd.github+json", &api])
         .output()
         .ok()?;
     parse_github_dmg_url(&String::from_utf8_lossy(&out.stdout))
@@ -849,6 +849,17 @@ fn install_dmg(app: &AppHandle, engine: &str, dmg: &Path) -> Result<(), String> 
             .find(|p| p.extension().is_some_and(|x| x == "app"))
             .ok_or("no application found in the disk image")?;
         let name = app_bundle.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        // Gatekeeper's verdict on the app as downloaded (copying it removes nothing it would check,
+        // but a curl download is never quarantined, so macOS wouldn't ask on its own).
+        emit(app, engine, "phase", format!("checking {name}'s signature"));
+        let assess = Command::new("spctl")
+            .args(["--assess", "--type", "execute", "-vv"])
+            .arg(&app_bundle)
+            .output()
+            .map_err(|e| format!("spctl: {e}"))?;
+        let origin = gatekeeper_origin(assess.status.success(), &String::from_utf8_lossy(&assess.stderr))
+            .ok_or_else(|| format!("{name} isn't a notarized, signed app; not installing it"))?;
+        emit(app, engine, "log", format!("signature verified: {origin}"));
         let dest = Path::new("/Applications").join(&name);
         emit(app, engine, "phase", format!("copying {name} → /Applications"));
         let _ = std::fs::remove_dir_all(&dest); // replace any stale copy
@@ -897,6 +908,21 @@ fn fmt_eta(secs: u64) -> String {
     }
 }
 
+/// The signer `spctl --assess -vv` reports for an app Gatekeeper accepts as notarized Developer ID
+/// software (`origin=Developer ID Application: …`), or `None` when it rejects it or the app isn't
+/// notarized. Pure, for testing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gatekeeper_origin(accepted: bool, report: &str) -> Option<String> {
+    if !accepted || !report.lines().any(|l| l.trim().ends_with(": accepted")) {
+        return None;
+    }
+    let source = report.lines().find_map(|l| l.trim().strip_prefix("source="))?;
+    if source != "Notarized Developer ID" {
+        return None;
+    }
+    report.lines().find_map(|l| l.trim().strip_prefix("origin=")).map(str::to_string)
+}
+
 /// Download `url` to `path` with a determinate progress bar. Fetches the total via a redirect-
 /// following HEAD, streams the body with `curl` in the background, and polls the growing file to
 /// emit `download` ticks carrying percent + "42% · 5.2 MB/s · ~18s left". Falls back to an
@@ -905,7 +931,7 @@ fn download_with_progress(app: &AppHandle, engine: &str, url: &str, path: &Path)
     let path_s = path.to_string_lossy().into_owned();
     // Total size from a HEAD that follows redirects (`-I -L`); some CDNs omit it → indeterminate.
     let total: Option<u64> = Command::new("curl")
-        .args(["-sIL", url])
+        .args(["-sIL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", url])
         .output()
         .ok()
         .and_then(|o| {
@@ -916,7 +942,7 @@ fn download_with_progress(app: &AppHandle, engine: &str, url: &str, path: &Path)
                 .next_back()
         });
     let mut child = Command::new("curl")
-        .args(["-fL", "--silent", "--show-error", url, "-o", &path_s])
+        .args(["-fL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "--silent", "--show-error", url, "-o", &path_s])
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("curl {url}: {e}"))?;
@@ -1001,8 +1027,10 @@ fn run_step(app: &AppHandle, engine: &str, step: &Step) -> Result<(), String> {
             // a ~1 GB installer in RAM). `-f` fails on an HTTP error instead of saving an error page.
             emit(app, engine, "phase", "downloading".to_string());
             download_with_progress(app, engine, url, &path)?;
-            // Install per OS. The installer/app is signed, so the OS verifies its signature
-            // (macOS Gatekeeper notarization / Windows SmartScreen Authenticode) at run/launch.
+            // Install per OS. A file fetched with curl carries no "downloaded from the internet" mark,
+            // so the OS wouldn't check it when opened: its signature is checked here instead
+            // (macOS: notarized Developer ID, in `install_dmg`; Windows: a valid Authenticode
+            // signature). A Linux AppImage has no standard signature to check.
             emit(app, engine, "phase", "installing".to_string());
             #[cfg(target_os = "macos")]
             {
@@ -1011,6 +1039,17 @@ fn run_step(app: &AppHandle, engine: &str, step: &Step) -> Result<(), String> {
             }
             #[cfg(target_os = "windows")]
             {
+                emit(app, engine, "phase", "checking the installer's signature".to_string());
+                let quoted = path_s.replace('\'', "''");
+                let status = Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-AuthenticodeSignature -LiteralPath '{quoted}').Status")])
+                    .output()
+                    .map_err(|e| format!("check the installer's signature: {e}"))?;
+                let status = String::from_utf8_lossy(&status.stdout).trim().to_string();
+                if status != "Valid" {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("the downloaded installer isn't validly signed ({status}); not running it"));
+                }
                 emit(app, engine, "phase", "launching the installer".to_string());
                 let run = Command::new("cmd")
                     .args(["/C", "start", "", &path_s])
@@ -1292,6 +1331,17 @@ pub fn pull_and_warm(app: &AppHandle, engine: &str, model: &str) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_notarized_developer_id_app_is_installed() {
+        let ok = "/Volumes/LM Studio/LM Studio.app: accepted\nsource=Notarized Developer ID\norigin=Developer ID Application: Element Labs Inc (ABCDE12345)\n";
+        assert_eq!(gatekeeper_origin(true, ok).as_deref(), Some("Developer ID Application: Element Labs Inc (ABCDE12345)"));
+        assert_eq!(gatekeeper_origin(false, ok), None, "spctl failed");
+        let rejected = "/Volumes/x/x.app: rejected\nsource=no usable signature\n";
+        assert_eq!(gatekeeper_origin(false, rejected), None);
+        let unnotarized = "/Volumes/x/x.app: accepted\nsource=Developer ID\norigin=Developer ID Application: Someone\n";
+        assert_eq!(gatekeeper_origin(true, unnotarized), None, "signed but not notarized");
+    }
 
     #[test]
     fn ollama_linux_recipe_is_verified_and_pulls_a_default_model() {

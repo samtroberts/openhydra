@@ -1034,7 +1034,7 @@ fn run() -> Result<(), String> {
                             println!("applied: {model_id} -> {scope}");
                         }
                         Ok(RemoteScopeAck::Refused(reason)) => {
-                            return Err(format!("rig refused: {reason}"));
+                            return Err(format!("rig refused: {}", openhydra_agent::serve::clean_remote_text(&reason)));
                         }
                         Err(e) => return Err(format!("unexpected reply from rig: {e}")),
                     }

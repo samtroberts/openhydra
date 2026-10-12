@@ -2566,7 +2566,6 @@ async fn chat_completion(
         body["temperature"] = serde_json::json!(t);
     }
     tauri::async_runtime::spawn_blocking(move || {
-        use openhydra_agent::adapter::HttpClient;
         let client = gateway_client()?;
         let (status, resp) = client
             .post_json_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
