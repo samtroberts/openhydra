@@ -9,7 +9,14 @@ import { call } from "./bridge";
   // Settings › Engine: the saved engine kind (agent `--engine-kind` value) ↔ the dropdown label, and
   // each engine's standard endpoint (shown as the placeholder when no custom endpoint is saved).
   const ENGINE_LABEL = { auto: "auto-detect", ollama: "ollama", vllm: "vLLM", "lm-studio": "LM Studio", "llama-cpp": "llama.cpp", exo: "Exo", comfyui: "ComfyUI" };
-  const ENGINE_ENDPOINTS = { "auto-detect": "", ollama: "http://127.0.0.1:11434", "vLLM": "http://127.0.0.1:8000", "LM Studio": "http://127.0.0.1:1234", "llama.cpp": "http://127.0.0.1:8080", "Exo": "http://127.0.0.1:52415", "ComfyUI": "http://127.0.0.1:8188" };
+  export const ENGINE_ENDPOINTS = { "auto-detect": "", ollama: "http://127.0.0.1:11434", "vLLM": "http://127.0.0.1:8000", "LM Studio": "http://127.0.0.1:1234", "llama.cpp": "http://127.0.0.1:8080", "Exo": "http://127.0.0.1:52415", "ComfyUI": "http://127.0.0.1:8188" };
+  // The endpoint field's value to save: the engine's default address shown in it isn't a custom
+  // endpoint (saving it would pin the engine to it), so it saves as "use the default".
+  export function engineEndpointValue(el) {
+    const v = (el.textContent || "").trim();
+    const sel = ($("#enginedrop")?.querySelector("span")?.textContent || "").trim();
+    return v === ENGINE_ENDPOINTS[sel] ? "" : v;
+  }
   export function updateEngineEndpoint() {
     const drop = $("#enginedrop"), field = $("#engineendpoint"); if (!drop || !field) return;
     const sel = (drop.querySelector("span")?.textContent || "auto-detect").trim();

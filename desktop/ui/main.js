@@ -21,7 +21,7 @@ import { wireCardDeepLinks } from "./cards";
 import { renderSwarms } from "./swarms";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
-import { renderSettings, updateEngineEndpoint, pendingSettings } from "./settings";
+import { renderSettings, updateEngineEndpoint, pendingSettings, engineEndpointValue } from "./settings";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on, emit } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
@@ -275,7 +275,10 @@ function botEl(content, meta, reasoning) {
   } else {
     // No visible answer — reasoning-model / thinking-mode case. Say so instead of a blank bubble.
     const note = document.createElement("div"); note.className = "mut"; note.style.fontSize = "12.5px";
-    note.textContent = reasoning
+    // A reply stopped (or cut off) before any text says that, not that the model is "thinking".
+    note.textContent = meta?.stopped
+      ? (meta.stopped === true || meta.stopped === "stopped" ? "Stopped before any reply arrived." : `No reply — it ${meta.stopped}.`)
+      : reasoning
       ? "The model produced only reasoning — expand “Thinking” above, or ask it to answer directly."
       : "The model returned no visible text — it may be in “thinking” mode. Ask it to answer directly, or turn off reasoning in the provider’s engine (e.g. add /no_think to the prompt).";
     d.appendChild(note);
@@ -657,7 +660,7 @@ function wireTextSetting(el, { multiline = false, read, key, valid, skip }) {
 const portOk = (v) => Number.isInteger(v) && v >= 1024 && v <= 65535; portOk.msg = "the port must be a number from 1024 to 65535";
 wireTextSetting($("#gwport"), { key: "gateway_port", read: (el) => parseInt((el.textContent || "").trim(), 10), valid: portOk });
 wireTextSetting($("#bootstraps"), { key: "bootstraps", multiline: true, read: (el) => (el.innerText || el.textContent || "").split("\n").map((x) => x.trim()).filter(Boolean) });
-wireTextSetting($("#engineendpoint"), { key: "engine_endpoint", skip: (el) => el.contentEditable !== "true", read: (el) => (el.textContent || "").trim() });
+wireTextSetting($("#engineendpoint"), { key: "engine_endpoint", skip: (el) => el.contentEditable !== "true", read: engineEndpointValue });
 wireTextSetting($('.setpanel[data-p="identity"] [contenteditable]'), { key: "device_name", read: (el) => (el.textContent || "").trim() || deviceName });
 // Restart buttons: apply saved settings to the running roles.
 $("#restartgw")?.addEventListener("click", async (e) => {

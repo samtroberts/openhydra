@@ -76,3 +76,47 @@ test("code fences: the forms models write, and ones left open", () => {
   assert.deepEqual(parseFences("use ```x``` inline"), [{ prose: "use ```x``` inline" }]);
   assert.deepEqual(parseFences(""), []);
 });
+
+test("headings, double-backtick spans and links with parentheses or titles", () => {
+  assert.equal(renderMarkdown("## Title ##"), "<h4>Title</h4>");
+  assert.equal(renderMarkdown("# C# notes"), "<h3>C# notes</h3>", "a # inside the text stays");
+  assert.equal(renderMarkdown("use ``a `b` c`` here"), "<p>use <code>a `b` c</code> here</p>");
+  assert.equal(renderMarkdown("[wiki](https://en.wikipedia.org/wiki/Rust_(programming_language))"),
+    '<p><a href="https://en.wikipedia.org/wiki/Rust_(programming_language)" target="_blank" rel="noopener noreferrer">wiki</a></p>');
+  assert.equal(renderMarkdown('[docs](https://openhydra.co/docs "The \'docs\' & more")'),
+    '<p><a href="https://openhydra.co/docs" title="The \'docs\' &amp; more" target="_blank" rel="noopener noreferrer">docs</a></p>');
+  // A title can't break out of its attribute, and a javascript: link with a title stays text.
+  assert.ok(renderMarkdown('[x](https://a.b "q&quot; onmouseover=&quot;alert(1)")').includes('title="q&amp;quot; onmouseover=&amp;quot;alert(1)" target='));
+  assert.equal(renderMarkdown('[x](javascript:alert(1) "t")'), '<p>[x](javascript:alert(1) &quot;t&quot;)</p>');
+});
+
+test("long runs of backticks and brackets stay fast", () => {
+  for (const s of ["``a".repeat(20000), "`".repeat(40000), "[a](".repeat(10000) + "(".repeat(5000), "[x](h" + "(a)".repeat(20000)]) {
+    const t0 = Date.now(); renderMarkdown(s); assert.ok(Date.now() - t0 < 500, `${s.slice(0, 12)}… took ${Date.now() - t0} ms`);
+  }
+});
+
+test("fuzz: only the expected tags and attributes, and only safe links", () => {
+  const alphabet = ["[", "]", "(", ")", '"', "'", "<", ">", "&", "`", "``", "*", "_", "#", "|", "~", "\n", " ", "a", "javascript:", "https://x.y", "mailto:a@b", "onerror=", "&quot;", "title", "data:"];
+  const tags = new Set(["p", "br", "strong", "em", "del", "code", "a", "h3", "h4", "h5", "h6", "hr", "ul", "ol", "li", "blockquote", "table", "thead", "tbody", "tr", "th", "td"]);
+  let seed = 7; const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+  for (let i = 0; i < 20000; i++) {
+    let t = ""; const len = 1 + rnd(40);
+    for (let j = 0; j < len; j++) t += alphabet[rnd(alphabet.length)];
+    const out = renderMarkdown(t);
+    for (const m of out.matchAll(/<\/?([a-z0-9]+)([^>]*)>/gi)) {
+      assert.ok(tags.has(m[1].toLowerCase()), `tag ${m[1]} from ${JSON.stringify(t)}`);
+      const attrs = [...m[2].matchAll(/\s([a-z-]+)="[^"]*"/gi)].map((a) => a[1]);
+      const rest = m[2].replace(/\s[a-z-]+="[^"]*"/gi, "").trim();
+      assert.equal(rest, "", `stray attribute text in ${m[0]} from ${JSON.stringify(t)}`);
+      for (const a of attrs) assert.ok(["href", "title", "target", "rel"].includes(a), `attribute ${a} from ${JSON.stringify(t)}`);
+      const href = /\shref="([^"]*)"/.exec(m[2]);
+      if (href) assert.match(href[1], /^(https?:\/\/|mailto:)/i, `href ${href[1]} from ${JSON.stringify(t)}`);
+    }
+  }
+});
+
+test("a pipe inside a table cell's code stays in the cell", () => {
+  assert.equal(renderMarkdown("| op | use |\n|---|---|\n| `a | b` | or |"),
+    "<table><thead><tr><th>op</th><th>use</th></tr></thead><tbody><tr><td><code>a | b</code></td><td>or</td></tr></tbody></table>");
+});

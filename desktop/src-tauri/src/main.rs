@@ -398,11 +398,18 @@ fn ensure_valid_share_policy(
     // had its own policy before (a missing file then is a deletion, not an old-version upgrade), and
     // for an upgrade from a user who wasn't sharing: an empty legacy list meant "everything", which
     // they never chose (ADVERSARIAL item 3). A user who was sharing keeps what they shared.
-    let start_empty = !settings_path().exists()
-        || settings.share_policy_initialized
-        || (!settings.sharing_enabled && !settings.sharing_confirmed);
+    let start_empty = policy_starts_empty(settings_path().exists(), settings);
     ensure_valid_share_policy_at(&path, &settings.shared_models, start_empty, reset_flag);
     path
+}
+
+/// Whether a missing share-policy file starts as share-nothing (rather than migrating the legacy
+/// list): a fresh install, an install that has had its own policy before, or an upgrade from a user
+/// who wasn't sharing.
+fn policy_starts_empty(settings_file_exists: bool, settings: &Settings) -> bool {
+    !settings_file_exists
+        || settings.share_policy_initialized
+        || (!settings.sharing_enabled && !settings.sharing_confirmed)
 }
 
 /// Path-parametrized core of [`ensure_valid_share_policy`] (testable without `~/.openhydra`): sets
@@ -999,7 +1006,7 @@ fn confirm_global(app: &tauri::AppHandle, what: &GlobalExposure, starting: bool)
 /// engines with their own scoring API do; Ollama and LM Studio need the side-scorer next to the
 /// agent; Exo and ComfyUI can't be scored (the agent refuses to start with the flag).
 fn scoring_supported(kind: &str, side_scorer_present: bool) -> bool {
-    match kind {
+    match kind.trim() {
         "vllm" | "llama-cpp" => true,
         "ollama" | "lm-studio" => side_scorer_present,
         "exo" | "comfyui" => false,
@@ -1373,8 +1380,11 @@ fn persist_share_policy(
     policy.write_atomic(&share_policy_path()).map_err(|e| e.to_string())?;
     if let Ok(mut s) = state.settings.lock() {
         let mirror = mirror_policy_into_settings(policy);
-        if s.shared_models != mirror {
+        // This install now has its own policy: a missing file later is a deletion (share nothing),
+        // not an upgrade to migrate.
+        if s.shared_models != mirror || !s.share_policy_initialized {
             s.shared_models = mirror;
+            s.share_policy_initialized = true;
             let _ = store_settings(&s);
         }
     }
@@ -2467,9 +2477,34 @@ async fn chat_completion_stream(
             let _ = on_event.send(serde_json::json!({ "kind": "end" }));
         };
         let client = gateway_client()?;
-        let lines = match client
-            .post_stream_any_status(&format!("http://127.0.0.1:{port}/v1/chat/completions"), &body.to_string())
+        // Open the request on its own thread, so Stop works while the gateway is still choosing a
+        // model and provider (before it sends anything back): the chat ends at once, and the
+        // response is dropped (closing the connection) when it arrives.
+        let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
         {
+            let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+            let body = body.to_string();
+            std::thread::spawn(move || {
+                let _ = rtx.send(client.post_stream_any_status(&url, &body));
+            });
+        }
+        let opened = loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = on_event.send(serde_json::json!({ "kind": "stopped" }));
+                end(&on_event);
+                return Ok(());
+            }
+            match rrx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(r) => break r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = on_event.send(serde_json::json!({ "kind": "error", "message": "gateway: the request ended unexpectedly" }));
+                    end(&on_event);
+                    return Ok(());
+                }
+            }
+        };
+        let lines = match opened {
             Err(e) => {
                 let _ = on_event.send(serde_json::json!({ "kind": "error", "message": format!("gateway: {e}") }));
                 end(&on_event);
@@ -3320,9 +3355,14 @@ fn main() {
                             .lock()
                             .map(|r| r.status.running)
                             .unwrap_or(false);
+                        // Nothing chosen to share (never confirmed, or the policy was reset): ask in
+                        // the app instead of starting a provider that shares nothing.
+                        let nothing_chosen = openhydra_agent::SharePolicy::load(&share_policy_path())
+                            .map(|p| p.mode == openhydra_agent::share_policy::ShareMode::List && p.models.is_empty())
+                            .unwrap_or(false);
                         if running {
                             stop_provider(app.state());
-                        } else if let Err(e) = start_provider_now(app.state()) {
+                        } else if let Err(e) = if nothing_chosen { Err(NOT_CONFIRMED.to_string()) } else { start_provider_now(app.state()) } {
                             if e == NOT_CONFIRMED {
                                 // Ask in the app: show the window on the Share dialog.
                                 if let Some(w) = app.get_webview_window("main") {
@@ -3900,6 +3940,18 @@ mod tests {
         assert!(!p.is_shared("tinyllama:latest"), "nothing shared on a fresh install");
         assert!(p.default_global_consent.is_none(), "no consent recorded without asking");
         assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn when_a_missing_policy_starts_empty() {
+        let mut s = Settings::default();
+        assert!(policy_starts_empty(false, &s), "fresh install");
+        s.share_policy_initialized = true;
+        assert!(policy_starts_empty(true, &s), "this install had its own policy: a deletion");
+        s.share_policy_initialized = false;
+        assert!(policy_starts_empty(true, &s), "upgrade from a user who wasn't sharing");
+        s.sharing_enabled = true;
+        assert!(!policy_starts_empty(true, &s), "upgrade from a sharer keeps what they shared");
     }
 
     #[test]

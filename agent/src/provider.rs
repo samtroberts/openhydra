@@ -1105,6 +1105,17 @@ fn scope_gate(
     }
 }
 
+/// A serve's engine speed (decode tokens a second) for the per-model average, or 0 (not averaged)
+/// when the sample is too small to mean anything: under 2 tokens or 1 ms reads as millions of tokens
+/// a second, as the gateway's telemetry already treats it.
+fn sample_tps(e: &crate::adapter::EngineMetrics) -> f64 {
+    if e.eval_count >= 2 && e.eval_duration_ns >= 1_000_000 {
+        e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
+    } else {
+        0.0
+    }
+}
+
 /// F5: run a generation, catching a panic in the adapter/engine and turning it into a terminal
 /// `Error` chunk so a bug can't strand the consumer. Used by **both** serve transports:
 /// - streaming (`SERVE_STREAM`) — the appended terminal flips the stream buffer's `done`, so it
@@ -2496,11 +2507,7 @@ impl<A: EngineAdapter> Provider<A> {
         }
         if let Some(stats) = &self.stats {
             let e = &summary.metrics.engine;
-            let native_tps = if e.eval_duration_ns > 0 {
-                e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
-            } else {
-                0.0
-            };
+            let native_tps = sample_tps(e);
             // A serve to our own gateway isn't a market transaction: counted apart from served.
             stats.record_serve_for(&engine_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
         }
@@ -3599,11 +3606,7 @@ impl<A: EngineAdapter> Provider<A> {
                         self.end_hold(nonce, &source_peer);
                         if let Some(stats) = &self.stats {
                             let e = &summary.metrics.engine;
-                            let native_tps = if e.eval_duration_ns > 0 {
-                                e.eval_count as f64 / (e.eval_duration_ns as f64 / 1e9)
-                            } else {
-                                0.0
-                            };
+                            let native_tps = sample_tps(e);
                             stats.record_serve_for(&engine_ref, summary.tokens, native_tps, summary.ok, self.is_own_consumer(&source_peer));
                         }
                         summary
@@ -4960,6 +4963,14 @@ mod tests {
     /// P4: a model whose engine id the network would refuse (a vLLM directory) is announced under a
     /// clean name, a request for that name is gated and served by the engine id, the commitment keeps
     /// the requested name, and un-sharing withdraws the name the network knows.
+    #[test]
+    fn tiny_serves_do_not_skew_the_speed_average() {
+        let m = |count: u64, ns: u64| crate::adapter::EngineMetrics { eval_count: count, eval_duration_ns: ns, ..Default::default() };
+        assert_eq!(sample_tps(&m(1, 10)), 0.0, "1 token");
+        assert_eq!(sample_tps(&m(50, 500)), 0.0, "sub-millisecond");
+        assert_eq!(sample_tps(&m(100, 2_000_000_000)), 50.0);
+    }
+
     #[test]
     fn a_path_id_model_is_announced_clean_and_served_by_its_engine_id() {
         struct PathAdapter(Arc<Mutex<Vec<String>>>);

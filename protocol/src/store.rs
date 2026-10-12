@@ -912,10 +912,35 @@ mod tests {
         // A row written before credits were recorded: no trailing bytes → None.
         let old = entry(6, "used", "m", "peer", 9);
         assert_eq!(LedgerEntry::from_bytes(&old.to_bytes()).unwrap().credits, None);
-        // An older reader stops before the trailing field (it parses the same prefix).
+        // A row an older build wrote (no trailing credits) still parses here.
         let mut legacy = e.to_bytes();
         legacy.truncate(legacy.len() - 8);
         assert_eq!(LedgerEntry::from_bytes(&legacy).unwrap().tokens, 40);
+        // And v0.3.20's own parser (copied verbatim below) reads a row this build writes, credits
+        // and the newer "check" kind included: it stops before the trailing bytes.
+        let mut newer = entry(7, "check", "m", "peer", 12);
+        newer.credits = Some(99);
+        assert_eq!(v0_3_20_from_bytes(&newer.to_bytes()), Some((7, "check".to_string(), "m".to_string(), "peer".to_string(), 12)));
+        assert_eq!(v0_3_20_from_bytes(&e.to_bytes()).map(|r| r.4), Some(40));
+    }
+
+    /// `LedgerEntry::from_bytes` as shipped in v0.3.20 (fields: ts, kind, model, counterparty, tokens).
+    fn v0_3_20_from_bytes(data: &[u8]) -> Option<(u64, String, String, String, u64)> {
+        let mut p = 0usize;
+        fn take<'a>(data: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
+            let s = data.get(*p..*p + n)?;
+            *p += n;
+            Some(s)
+        }
+        let ts_ms = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().ok()?);
+        let tokens = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().ok()?);
+        let kl = *take(data, &mut p, 1)?.first()? as usize;
+        let kind = std::str::from_utf8(take(data, &mut p, kl)?).ok()?.to_string();
+        let ml = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().ok()?) as usize;
+        let model = std::str::from_utf8(take(data, &mut p, ml)?).ok()?.to_string();
+        let cl = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().ok()?) as usize;
+        let counterparty = std::str::from_utf8(take(data, &mut p, cl)?).ok()?.to_string();
+        Some((ts_ms, kind, model, counterparty, tokens))
     }
 
     #[test]

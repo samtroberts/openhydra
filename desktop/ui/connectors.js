@@ -208,7 +208,8 @@ import { cliState, refreshCliStatus, installCli } from "./cliui";
     const prev = btn.textContent; btn.style.minWidth = btn.offsetWidth + "px"; btn.textContent = "Testing…"; btn.disabled = true;
     let out = card && $(".ctestout", card);
     if (card && !out) { out = document.createElement("div"); out.className = "ctestout mut"; out.style.cssText = "font-size:11.5px;margin-top:6px"; card.appendChild(out); }
-    if (out) out.textContent = "Sending a 1-token test request… the first one can take up to 20 s while a provider loads the model.";
+    // A previous test's removal timer must not take this test's result away while it runs.
+    if (out) { clearTimeout(out._t); out.style.color = ""; out.textContent = "Sending a 1-token test request… the first one can take up to 20 s while a provider loads the model."; }
     const t0 = Date.now();
     try {
       const model = await call("connector_test");

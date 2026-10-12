@@ -23,11 +23,15 @@ export function inline(escaped) {
   // inside them — not into code, and not into a link's URL or attributes — then put back.
   const held = [];
   const hold = (html) => { held.push(html); return `\u0000${held.length - 1}\u0000`; };
-  let s = escaped.replace(/`([^`\n]{1,2000})`/g, (_, c) => hold(`<code>${c}</code>`));
-  // Bounded lengths, and no "[" or "(" inside, so a long run of brackets can't make this quadratic.
-  s = s.replace(/\[([^\]\n[]{1,500})\]\(([^)\s[(]{1,2048})\)/g, (m, text, href) => {
+  // A double-backtick span first (it may hold a single backtick: ``a `b` c``), then single ones.
+  let s = escaped.replace(/``(?!`) ?((?:[^`\n]|`(?!`)){1,1000}?) ?``(?!`)/g, (_, c) => hold(`<code>${c}</code>`));
+  s = s.replace(/`([^`\n]{1,2000})`/g, (_, c) => hold(`<code>${c}</code>`));
+  // Bounded lengths, and no "[" inside, so a long run of brackets can't make this quadratic. The URL
+  // may hold one level of balanced parentheses (Wikipedia links); an optional "title" follows it.
+  s = s.replace(/\[([^\]\n[]{1,500})\]\(((?:[^()\s[]|\([^()\s[]{0,500}\)){1,2048})(?:\s+&quot;((?:(?!&quot;)[^\n]){0,300})&quot;)?\)/g, (m, text, href, title) => {
     const h = safeHref(unescHtml(href));
-    return h ? hold(`<a href="${escHtml(h)}" target="_blank" rel="noopener noreferrer">`) + text + hold("</a>") : m;
+    const t = title ? ` title="${escHtml(unescHtml(title))}"` : "";
+    return h ? hold(`<a href="${escHtml(h)}"${t} target="_blank" rel="noopener noreferrer">`) + text + hold("</a>") : m;
   });
   s = s.replace(/\*\*(?=\S)([^*\n]+?)\*\*/g, "<strong>$1</strong>").replace(/__(?=\S)([^_\n]+?)__/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*(?=\S)([^*\n]+?)\*(?!\w)/g, "$1<em>$2</em>").replace(/(^|[^_\w])_(?=\S)([^_\n]+?)_(?!\w)/g, "$1<em>$2</em>");
@@ -41,7 +45,18 @@ const isTableSep = (l) => {
   const cs = t.replace(/^\|/, "").replace(/\|$/, "").split("|");
   return cs.length > 0 && cs.every((c) => /^:?-{2,}:?$/.test(c.trim()));
 };
-const cells = (l) => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+// A row's cells: split on "|" outside code spans (a "|" in `a | b` is part of the code).
+const cells = (l) => {
+  const t = l.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const out = []; let cur = "", inCode = false;
+  for (const ch of t) {
+    if (ch === "`") inCode = !inCode;
+    if (ch === "|" && !inCode) { out.push(cur.trim()); cur = ""; continue; }
+    cur += ch;
+  }
+  out.push(cur.trim());
+  return out;
+};
 
 export function renderMarkdown(text) {
   // NUL is the placeholder marker in inline(); a model's own NULs are dropped.
@@ -53,7 +68,8 @@ export function renderMarkdown(text) {
     const l = lines[i];
     if (!l.trim()) { flushPara(); i++; continue; }
     let m;
-    if ((m = /^(#{1,6})\s+(.*)$/.exec(l))) { flushPara(); const n = Math.min(m[1].length + 2, 6); out.push(`<h${n}>${inline(m[2])}</h${n}>`); i++; continue; }
+    // A closing run of #s ("## Title ##") isn't part of the heading.
+    if ((m = /^(#{1,6})\s+(.*)$/.exec(l))) { flushPara(); const n = Math.min(m[1].length + 2, 6); out.push(`<h${n}>${inline(m[2].replace(/(^|\s+)#+\s*$/, ""))}</h${n}>`); i++; continue; }
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)) { flushPara(); out.push("<hr>"); i++; continue; }
     if (l.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {
       flushPara();
