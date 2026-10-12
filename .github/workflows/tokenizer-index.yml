@@ -24,6 +24,8 @@ concurrency:
 jobs:
   publish:
     name: Publish tokenizers/index.json
+    # Only the public repository holds the R2 secrets (the private CI mirror has none).
+    if: github.repository == 'samtroberts/openhydra'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
