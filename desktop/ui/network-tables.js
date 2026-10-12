@@ -23,7 +23,9 @@ import { menu, toast } from "./chrome";
           // Credits on the same cost-weighted scale as Activity's net balance (rows from before it was
           // recorded have none).
           const served = r.kind === "served", cr = r.credits == null ? "—" : (served ? "+" : "−") + Number(r.credits).toLocaleString();
-          return html`<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}">${served ? "served" : "used"}</span></td><td title="${displayModelName(r.model)}">${modelIcon(r.model)}${displayModelName(r.model)}</td><td class="mono" title="${r.counterparty} (the other machine's id)">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}" style="${served ? "" : "color:hsl(var(--danger))"}">${cr}</td></tr>`;
+          // "check": a request this node made on its own to verify a provider (paid, not a chat of yours).
+          const label = served ? "served" : r.kind === "check" ? "check" : "used";
+          return html`<tr><td class="mut">${relTime(r.ts_ms)}</td><td><span class="badge ${served ? "ok" : "secondary"}"${r.kind === "check" ? html` title="A request your gateway made on its own to check a provider"` : ""}>${label}</span></td><td title="${displayModelName(r.model)}">${modelIcon(r.model)}${displayModelName(r.model)}</td><td class="mono" title="${r.counterparty} (the other machine's id)">${peerShort(r.counterparty)}</td><td class="num">${r.tokens}</td><td class="num ${served ? "up" : ""}" style="${served ? "" : "color:hsl(var(--danger))"}">${cr}</td></tr>`;
         })}`
       : html`<tr><td colspan="6" class="mut">No transactions yet — serve a model or run a chat, and co-signed receipts appear here. Recent activity is kept in memory (launch the agent with a ledger DB for full history).</td></tr>`);
   }

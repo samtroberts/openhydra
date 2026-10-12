@@ -89,6 +89,9 @@ pub struct Metrics {
     request_duration: Histogram,
     discover_duration: Histogram,
     proxy_roundtrip: Histogram,
+    /// Time to a streamed serve's first acknowledgement (a different quantity from a buffered
+    /// serve's full round trip, so kept apart).
+    stream_first_ack: Histogram,
 }
 
 impl Default for Metrics {
@@ -109,6 +112,7 @@ impl Metrics {
             request_duration: Histogram::new(LATENCY_BUCKETS),
             discover_duration: Histogram::new(LATENCY_BUCKETS),
             proxy_roundtrip: Histogram::new(LATENCY_BUCKETS),
+            stream_first_ack: Histogram::new(LATENCY_BUCKETS),
         }
     }
 
@@ -126,12 +130,18 @@ impl Metrics {
     /// (`wall` end-to-end, plus discovery and proxy round-trip from the [`ServeSummary`]).
     ///
     /// [`ServeSummary`]: crate::serve::ServeSummary
-    pub fn record_completion(&self, tokens: u64, wall: Duration, discover_ns: u64, proxy_ns: u64) {
+    /// `proxy_ns` is a buffered serve's whole round trip, or a streamed serve's time to its first
+    /// acknowledgement (`streamed`); each goes to its own histogram.
+    pub fn record_completion(&self, tokens: u64, wall: Duration, discover_ns: u64, proxy_ns: u64, streamed: bool) {
         self.completions_ok.fetch_add(1, Ordering::Relaxed);
         self.completion_tokens.fetch_add(tokens, Ordering::Relaxed);
         self.request_duration.observe(wall.as_secs_f64());
         self.discover_duration.observe(discover_ns as f64 / 1e9);
-        self.proxy_roundtrip.observe(proxy_ns as f64 / 1e9);
+        if streamed {
+            self.stream_first_ack.observe(proxy_ns as f64 / 1e9);
+        } else {
+            self.proxy_roundtrip.observe(proxy_ns as f64 / 1e9);
+        }
     }
 
     /// A completion failed (route/transport/engine error).
@@ -161,7 +171,8 @@ impl Metrics {
         counter(&mut out, "openhydra_rate_limited_total", "Requests shed by the ingress rate-limiter (429).", &self.rate_limited);
         self.request_duration.render("openhydra_request_duration_seconds", "End-to-end completion wall time.", &mut out);
         self.discover_duration.render("openhydra_discover_seconds", "Provider-discovery latency.", &mut out);
-        self.proxy_roundtrip.render("openhydra_proxy_roundtrip_seconds", "Provider proxy round-trip latency.", &mut out);
+        self.proxy_roundtrip.render("openhydra_proxy_roundtrip_seconds", "Provider proxy round-trip latency (buffered serves).", &mut out);
+        self.stream_first_ack.render("openhydra_stream_first_ack_seconds", "Time to a streamed serve's first acknowledgement.", &mut out);
         out
     }
 }
@@ -185,18 +196,22 @@ mod tests {
     #[test]
     fn completion_records_tokens_and_latencies() {
         let m = Metrics::new();
-        m.record_completion(128, Duration::from_millis(300), 1_000_000, 600_000_000);
+        m.record_completion(128, Duration::from_millis(300), 1_000_000, 600_000_000, false);
+        m.record_completion(64, Duration::from_millis(900), 1_000_000, 40_000_000, true);
         let out = m.render_prometheus();
-        assert!(out.contains("openhydra_completions_total 1"), "{out}");
-        assert!(out.contains("openhydra_completion_tokens_total 128"), "{out}");
-        assert!(out.contains("openhydra_request_duration_seconds_count 1"), "{out}");
+        assert!(out.contains("openhydra_completions_total 2"), "{out}");
+        assert!(out.contains("openhydra_completion_tokens_total 192"), "{out}");
+        assert!(out.contains("openhydra_request_duration_seconds_count 2"), "{out}");
+        // A buffered round trip and a streamed first acknowledgement are kept apart.
+        assert!(out.contains("openhydra_proxy_roundtrip_seconds_count 1"), "{out}");
+        assert!(out.contains("openhydra_stream_first_ack_seconds_count 1"), "{out}");
     }
 
     #[test]
     fn histogram_buckets_are_cumulative_and_correctly_placed() {
         let m = Metrics::new();
         // 0.3s falls in the (0.25, 0.5] bucket: le="0.5" counts it, le="0.25" does not.
-        m.record_completion(1, Duration::from_millis(300), 0, 0);
+        m.record_completion(1, Duration::from_millis(300), 0, 0, false);
         let out = m.render_prometheus();
         assert!(out.contains("openhydra_request_duration_seconds_bucket{le=\"0.25\"} 0"), "{out}");
         assert!(out.contains("openhydra_request_duration_seconds_bucket{le=\"0.5\"} 1"), "{out}");
@@ -206,7 +221,7 @@ mod tests {
     #[test]
     fn observation_above_all_bounds_lands_in_inf_only() {
         let m = Metrics::new();
-        m.record_completion(1, Duration::from_secs(60), 0, 0); // > 30s top bound
+        m.record_completion(1, Duration::from_secs(60), 0, 0, false); // > 30s top bound
         let out = m.render_prometheus();
         assert!(out.contains("openhydra_request_duration_seconds_bucket{le=\"30\"} 0"), "{out}");
         assert!(out.contains("openhydra_request_duration_seconds_bucket{le=\"+Inf\"} 1"), "{out}");

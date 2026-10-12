@@ -45,6 +45,8 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
 /// Production HTTP transport for engine adapters.
 pub struct ReqwestClient {
     client: Client,
+    /// The total cap on one streamed request ([`STREAM_TIMEOUT`] unless set).
+    stream_timeout: Duration,
 }
 
 impl ReqwestClient {
@@ -68,7 +70,14 @@ impl ReqwestClient {
             .default_headers(headers)
             .build()
             .map_err(http_err)?;
-        Ok(Self { client })
+        Ok(Self { client, stream_timeout: STREAM_TIMEOUT })
+    }
+
+    /// The total cap on a streamed request through this client. A local gateway bounds its own
+    /// streams (30 min to 6 h, by `max_tokens`), so its clients wait as long as it does.
+    pub fn with_stream_timeout(mut self, total: Duration) -> Self {
+        self.stream_timeout = total;
+        self
     }
 
     /// Like [`new`](Self::new) but with an explicit connect timeout — used by engine
@@ -77,7 +86,7 @@ impl ReqwestClient {
     /// fine while a stalled request stays bounded.
     pub fn with_connect_timeout(connect: Duration) -> Result<Self, AdapterError> {
         let client = Client::builder().connect_timeout(connect).build().map_err(http_err)?;
-        Ok(Self { client })
+        Ok(Self { client, stream_timeout: STREAM_TIMEOUT })
     }
 
     /// `POST {url}` with a JSON body, returning the status and body whatever the status: for a
@@ -109,7 +118,7 @@ impl ReqwestClient {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string())
-            .timeout(STREAM_TIMEOUT)
+            .timeout(self.stream_timeout)
             .send()
             .map_err(http_err)?;
         let status = resp.status().as_u16();

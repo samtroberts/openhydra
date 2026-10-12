@@ -164,12 +164,15 @@ fn gateway_api_key() -> Option<&'static str> {
     .as_deref()
 }
 
-/// An HTTP client for this app's own gateway (presents the gateway key).
+/// An HTTP client for this app's own gateway (presents the gateway key). A streamed chat may run as
+/// long as the gateway lets it (up to 6 h for a long `max_tokens`), not the client's 10-minute
+/// default, which cut long replies off (ADVERSARIAL item 6).
 fn gateway_client() -> Result<openhydra_agent::ReqwestClient, String> {
     match gateway_api_key() {
         Some(k) => openhydra_agent::ReqwestClient::with_bearer(k),
         None => openhydra_agent::ReqwestClient::new(),
     }
+    .map(|c| c.with_stream_timeout(std::time::Duration::from_secs(6 * 60 * 60 + 10 * 60)))
     .map_err(|e| e.to_string())
 }
 
@@ -2415,6 +2418,9 @@ struct ChatMsgIn {
     content: String,
 }
 
+/// The most a streamed chat reply may carry into the chat view (room for an image as a data URL).
+const MAX_CHAT_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
 /// Chats being streamed, by the id the UI gave them: setting the flag stops reading (the gateway
 /// sees the connection close and stops the provider's generation).
 static CHAT_STREAMS: std::sync::LazyLock<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> =
@@ -2484,6 +2490,7 @@ async fn chat_completion_stream(
             }
         });
         let mut done = false;
+        let mut received = 0usize;
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = on_event.send(serde_json::json!({ "kind": "stopped" }));
@@ -2499,6 +2506,13 @@ async fn chat_completion_stream(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+            // More than the chat view can hold: stop reading (the generation stops with it) and say
+            // why, rather than freeze the window (ADVERSARIAL item 11).
+            received = received.saturating_add(data.len());
+            if received > MAX_CHAT_STREAM_BYTES {
+                let _ = on_event.send(serde_json::json!({ "kind": "error", "message": "the reply is too long to show here (over 64 MB); stopped" }));
+                break;
+            }
             if data == "[DONE]" {
                 done = true;
                 break;

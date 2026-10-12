@@ -1742,6 +1742,23 @@ pub struct AutoCandidates {
     pub floor: Option<AuthenticityTier>,
 }
 
+/// Why a serve is being settled: a request the user made, or a check this node ran on its own (an
+/// audit replay, a question writer, a log-prob probe). Both are paid; only the first is "used".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlePurpose {
+    User,
+    Check,
+}
+
+impl SettlePurpose {
+    fn ledger_kind(self) -> &'static str {
+        match self {
+            SettlePurpose::User => "used",
+            SettlePurpose::Check => "check",
+        }
+    }
+}
+
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
 /// to decide whether to bypass the C11 discovery cache and retry.
 enum AttemptOutcome {
@@ -3017,7 +3034,7 @@ impl ConsumerNode {
                                 "provider reported more tokens than it could have served; signing for fewer");
                             summary.tokens = tokens;
                         }
-                        self.settle_receipt(&provider, tokens, nonce);
+                        self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User);
                         self.note_served_paid(&provider.libp2p_peer_id, now);
                         if let Some(counter) = counter {
                             self.check_billed_tokens(
@@ -3031,9 +3048,6 @@ impl ConsumerNode {
                                 model_key_now.to_string(),
                             );
                         }
-                    }
-                    if summary.ok && summary.tokens > 0 {
-                        self.record_usage(model, summary.tokens, self_serve);
                     }
                     if summary.ok && !self_serve {
                         self.note_served_ok(&provider.libp2p_peer_id, &provider.model_id, now);
@@ -3130,10 +3144,7 @@ impl ConsumerNode {
                     if opened && !self.is_self_serve(&provider.libp2p_peer_id) {
                         let tokens = tally.billable(max_tokens);
                         tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; closing it and settling for what was received");
-                        self.close_and_settle(&provider, nonce, stream_offset, tally, max_tokens);
-                        if tokens > 0 {
-                            self.record_usage(model, tokens, false);
-                        }
+                        self.close_and_settle(&provider, nonce, stream_offset, tally, max_tokens, SettlePurpose::User);
                     } else if opened {
                         // Our own provider: nothing to settle, but it stops generating for nobody
                         // (round 8 G8-2).
@@ -3144,8 +3155,7 @@ impl ConsumerNode {
                         let tokens = tally.billable(max_tokens);
                         if tokens > 0 {
                             tracing::info!(provider = %provider.peer_id, tokens, "serve failed part-way; settling for what was received");
-                            self.settle_receipt(&provider, tokens, nonce);
-                            self.record_usage(model, tokens, false);
+                            self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User);
                         }
                     }
                     // Its client left: nobody to serve, so no failover.
@@ -3299,13 +3309,14 @@ impl ConsumerNode {
         offset: u32,
         mut tally: crate::serve::StreamTally,
         max_tokens: Option<u32>,
+        purpose: SettlePurpose,
     ) {
         use std::sync::atomic::Ordering;
         if self.closes_in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_CLOSES_IN_FLIGHT {
             self.closes_in_flight.fetch_sub(1, Ordering::AcqRel);
             let tokens = tally.billable(max_tokens);
             if tokens > 0 {
-                self.settle_receipt(provider, tokens, nonce);
+                self.settle_receipt(provider, tokens, nonce, purpose);
             }
             return;
         }
@@ -3339,7 +3350,7 @@ impl ConsumerNode {
             // `Done` bounds the count by the text's size, and fragments can be any size).
             let tokens = tally.billable(max_tokens).min(ceiling);
             if tokens > 0 {
-                node.settle_receipt(&provider, tokens, nonce);
+                node.settle_receipt(&provider, tokens, nonce, purpose);
             }
         });
     }
@@ -3369,18 +3380,6 @@ impl ConsumerNode {
         });
     }
 
-    /// #7: per-model consumed tracking for a completion from another machine. A self-serve (our own
-    /// co-located provider) is not a market transaction — the provider counts it as local — so it
-    /// isn't counted here. The Ledger's `used` row is written at settlement (`record_contribution`),
-    /// where the credits are known.
-    fn record_usage(&self, model: &str, tokens: u64, self_serve: bool) {
-        if self_serve {
-            return;
-        }
-        if let Some(stats) = &self.stats {
-            stats.record_consume(model, tokens);
-        }
-    }
 
     /// Reconnect-and-fetch (RECONNECT_AND_FETCH_PLAN.md): the serve connection to `provider`
     /// dropped mid-request (e.g. the relay/NAT mapping was evicted during a long generation).
@@ -3448,7 +3447,7 @@ impl ConsumerNode {
     /// Fire the co-signed receipt for a completed request. Skips a provider that
     /// advertised no usable public key; swallows all errors (trust settlement is
     /// auxiliary to delivering the completion).
-    fn settle_receipt(self: &Arc<Self>, provider: &SelectedProvider, tokens: u64, nonce: [u8; 16]) {
+    fn settle_receipt(self: &Arc<Self>, provider: &SelectedProvider, tokens: u64, nonce: [u8; 16], purpose: SettlePurpose) {
         // Cheap up-front checks on the caller thread so an unkeyed provider costs no thread.
         let provider_pub = match hex::decode(&provider.public_key) {
             Ok(b) if b.len() == 32 => b,
@@ -3627,12 +3626,12 @@ impl ConsumerNode {
             node.note_settled(&provider_libp2p, settled_earlier || outcome.is_ok());
             match outcome {
                 _ if settled_earlier => {
-                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id);
+                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id, purpose);
                 }
                 Ok(receipt) => {
                     tracing::debug!(provider = %peer_id, tokens, cumulative = ?receipt.payload.cumulative_amount,
                         "receipt co-signed");
-                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id);
+                    node.record_contribution(&provider_libp2p, &peer_id, &model_key, tokens, &ledger_peer, &model_id, purpose);
                     if let Some((_, cumulative)) = voucher {
                         node.raise_gated_voucher(&vkey, cumulative);
                     }
@@ -3663,7 +3662,7 @@ impl ConsumerNode {
     /// `ledger_peer` / `ledger_model` label the Ledger's `used` row (the provider's OpenHydra id and
     /// the model it served): the row is written here, on a co-signed settlement, so its credits are
     /// exactly what `credits_spent` counts.
-    fn record_contribution(&self, provider_libp2p_id: &str, peer_id: &str, model_key: &str, tokens: u64, ledger_peer: &str, ledger_model: &str) {
+    fn record_contribution(&self, provider_libp2p_id: &str, peer_id: &str, model_key: &str, tokens: u64, ledger_peer: &str, ledger_model: &str, purpose: SettlePurpose) {
         let now = now_unix_ms();
         let me = self.net.libp2p_peer_id().to_string();
 
@@ -3684,14 +3683,20 @@ impl ConsumerNode {
         // Display: cost-weighted credit SPENT, weighted by the **validated handle** (`model_key`) —
         // the ceiling that stops a mislabelled canonical inflating the number.
         let spent = credits_for_receipt(self.claimed_tier(peer_id, model_key, now).weight(), tokens, None);
+        // One place for the total and the row, both at settlement: "used" is what the user asked
+        // for; a background check (audit, question writer, log-prob probe) is its own kind
+        // (ADVERSARIAL item 5).
         if let Some(stats) = &self.stats {
             stats.add_credits_spent(spent);
-            stats.record_ledger(now, "used", ledger_model, ledger_peer, tokens, Some(spent));
+            if purpose == SettlePurpose::User {
+                stats.record_consume(ledger_model, tokens);
+            }
+            stats.record_ledger(now, purpose.ledger_kind(), ledger_model, ledger_peer, tokens, Some(spent));
         }
         if let Some(store) = &self.store {
             let _ = store.append_ledger_row(&openhydra_protocol::store::LedgerEntry {
                 ts_ms: now,
-                kind: "used".to_string(),
+                kind: purpose.ledger_kind().to_string(),
                 model: ledger_model.to_string(),
                 counterparty: ledger_peer.to_string(),
                 tokens,
@@ -4528,16 +4533,16 @@ impl ConsumerNode {
             Ok(summary) => {
                 if paying && summary.ok && summary.tokens > 0 {
                     let tokens = crate::serve::billable_tokens(summary.tokens, request.max_tokens, delivered.units());
-                    self.settle_receipt(writer, tokens, exchange.nonce);
+                    self.settle_receipt(writer, tokens, exchange.nonce, SettlePurpose::Check);
                 }
                 crate::audit_prompts::parse_questions(&text)
             }
             Err(e) => {
                 if paying && exchange.opened {
                     tally.push_tool_calls(&exchange.tool_calls);
-                    self.close_and_settle(writer, exchange.nonce, exchange.stream_offset, tally, request.max_tokens);
+                    self.close_and_settle(writer, exchange.nonce, exchange.stream_offset, tally, request.max_tokens, SettlePurpose::Check);
                 } else if paying && tally.billable(request.max_tokens) > 0 {
-                    self.settle_receipt(writer, tally.billable(request.max_tokens), exchange.nonce);
+                    self.settle_receipt(writer, tally.billable(request.max_tokens), exchange.nonce, SettlePurpose::Check);
                 }
                 tracing::debug!(writer = %writer.peer_id, error = %e, "couldn't get probe questions written");
                 Vec::new()
@@ -4577,7 +4582,7 @@ impl ConsumerNode {
         if matches!(&result, Err(AdapterError::Cancelled(m)) if m.is_empty()) {
             if paying && exchange.opened {
                 tally.push_tool_calls(&exchange.tool_calls);
-                self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens);
+                self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens, SettlePurpose::Check);
             }
             return Ok(answer);
         }
@@ -4586,17 +4591,17 @@ impl ConsumerNode {
                 if paying && summary.ok && summary.tokens > 0 {
                     let offered = crate::serve::offered_tool_names(&serve.tools);
                     let units = delivered.units() + crate::serve::tool_call_units(&summary.tool_calls, &offered);
-                    self.settle_receipt(provider, crate::serve::billable_tokens(summary.tokens, serve.max_tokens, units), exchange.nonce);
+                    self.settle_receipt(provider, crate::serve::billable_tokens(summary.tokens, serve.max_tokens, units), exchange.nonce, SettlePurpose::Check);
                 }
                 Ok(answer)
             }
             Err(e) => {
                 if paying && exchange.opened {
                     tally.push_tool_calls(&exchange.tool_calls);
-                    self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens);
+                    self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens, SettlePurpose::Check);
                 } else if paying && tally.billable(serve.max_tokens) > 0 {
                     // A buffered serve that failed part-way is owed for its text (round 9 B9-4).
-                    self.settle_receipt(provider, tally.billable(serve.max_tokens), exchange.nonce);
+                    self.settle_receipt(provider, tally.billable(serve.max_tokens), exchange.nonce, SettlePurpose::Check);
                 }
                 Err(e)
             }

@@ -379,6 +379,16 @@ async function sendOne(text, fromHome) {
 // into Stop. Resolves to the same shape as a non-streamed reply (choices / usage / openhydra), or
 // { stopped, text } when the user stopped it. The browser mock (no Tauri channel) asks in one go.
 let activeStream = null;
+// What the live bubble shows while a reply streams: the answer so far ("Thinking…" while only
+// reasoning has arrived). Media arriving as a data URL, or a very long reply, shows its progress
+// instead of megabytes of raw text.
+function livePreview(text, reasoning) {
+  const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+  if (/\]\(data:(image|video|audio)\//i.test(text.slice(0, 4096)) || /\]\(data:(image|video|audio)\//i.test(text.slice(-4096))) return `Receiving media… ${mb(text.length)} MB`;
+  if (text.length > 512 * 1024) return `Receiving a long reply… ${mb(text.length)} MB so far`;
+  const sp = splitThink(text);
+  return sp.answer || (sp.reasoning || reasoning ? "Thinking…" : "");
+}
 async function completeChat(args, th, wait, slow) {
   const Channel = window.__TAURI__?.core?.Channel;
   if (!Channel) return call("chat_completion", args);
@@ -391,15 +401,20 @@ async function completeChat(args, th, wait, slow) {
   // itself has returned, so the reply is complete only once "end" is seen.
   let ended; const endSeen = new Promise((r) => (ended = r));
   const ch = new Channel();
+  // Redraw the live bubble at most once a frame, not on every fragment: re-reading the whole reply
+  // per fragment is quadratic and froze the window on a long one (ADVERSARIAL item 11).
+  let frame = 0;
+  const paint = () => {
+    frame = 0;
+    if (!live.isConnected && curChat === view.chat) th.appendChild(live);
+    live.textContent = livePreview(text, reasoning);
+    th.scrollTop = th.scrollHeight;
+  };
   ch.onmessage = (ev) => {
     if (ev.kind === "delta" || ev.kind === "reasoning") {
       if (ev.kind === "delta") text += ev.text; else reasoning += ev.text;
       if (!view.started) { view.started = true; clearTimeout(slow); wait.remove(); }
-      if (!live.isConnected && curChat === view.chat) th.appendChild(live);
-      // While streaming show the answer so far ("Thinking…" while only reasoning has arrived).
-      const sp = splitThink(text);
-      live.textContent = sp.answer || (sp.reasoning || reasoning ? "Thinking…" : "");
-      th.scrollTop = th.scrollHeight;
+      if (!frame) frame = requestAnimationFrame(paint);
     } else if (ev.kind === "done") done = ev;
     else if (ev.kind === "error") error = ev.message;
     else if (ev.kind === "stopped") stopped = true;
@@ -411,6 +426,7 @@ async function completeChat(args, th, wait, slow) {
     await call("chat_completion_stream", { streamId, model: args.model, messages: args.messages, maxTokens: args.maxTokens, temperature: args.temperature, onEvent: ch });
     await Promise.race([endSeen, new Promise((r) => setTimeout(r, 30000))]);
   } finally {
+    if (frame) cancelAnimationFrame(frame);
     if (activeStream === streamId) { activeStream = null; setSendMode(false); }
     if (liveView === view) liveView = null;
     live.remove();

@@ -229,7 +229,11 @@ impl TransferStats {
             for e in rows.iter().take(LEDGER_RING_CAP) {
                 ring.push_back(LedgerRow {
                     ts_ms: e.ts_ms,
-                    kind: if e.kind == "served" { "served" } else { "used" },
+                    kind: match e.kind.as_str() {
+                        "served" => "served",
+                        "check" => "check",
+                        _ => "used",
+                    },
                     model: e.model.clone(),
                     counterparty: e.counterparty.clone(),
                     tokens: e.tokens,

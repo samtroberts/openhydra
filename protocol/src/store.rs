@@ -304,13 +304,17 @@ impl Store {
             // Bump the monotonic lifetime aggregates (never pruned) so totals stay true even after
             // old rows age out of LEDGER_ROWS. The `.get(...).map(value)` guard drops before the
             // `.insert`, mirroring the seq read above.
-            let (tok_key, count_key) = if entry.kind == "served" {
-                (LEDGER_SERVED_TOKENS_KEY, Some(LEDGER_SERVED_COUNT_KEY))
-            } else {
-                (LEDGER_USED_TOKENS_KEY, None)
+            // A `check` row (a background verification serve) is paid for but isn't "used": only
+            // `served` and `used` rows feed the lifetime totals.
+            let (tok_key, count_key) = match entry.kind.as_str() {
+                "served" => (Some(LEDGER_SERVED_TOKENS_KEY), Some(LEDGER_SERVED_COUNT_KEY)),
+                "check" => (None, None),
+                _ => (Some(LEDGER_USED_TOKENS_KEY), None),
             };
-            let cur = meta.get(tok_key).map_err(StoreError::from)?.map(|v| v.value()).unwrap_or(0);
-            meta.insert(tok_key, cur.saturating_add(entry.tokens)).map_err(StoreError::from)?;
+            if let Some(tok_key) = tok_key {
+                let cur = meta.get(tok_key).map_err(StoreError::from)?.map(|v| v.value()).unwrap_or(0);
+                meta.insert(tok_key, cur.saturating_add(entry.tokens)).map_err(StoreError::from)?;
+            }
             if let Some(ck) = count_key {
                 let c = meta.get(ck).map_err(StoreError::from)?.map(|v| v.value()).unwrap_or(0);
                 meta.insert(ck, c.saturating_add(1)).map_err(StoreError::from)?;
@@ -931,6 +935,11 @@ mod tests {
         assert_eq!(recent[2].counterparty, "peerA"); // oldest last
         // Totals: served 30+7=37 over 2 rows; used 5.
         assert_eq!(store.ledger_totals().unwrap(), (37, 5, 2));
+        // A background check is listed but isn't "used": the total the app shows after a restart
+        // matches what it counted before it.
+        store.append_ledger_row(&entry(40, "check", "m3", "peerD", 900)).unwrap();
+        assert_eq!(store.ledger_totals().unwrap(), (37, 5, 2));
+        assert_eq!(store.recent_ledger_rows(10).unwrap()[0].kind, "check");
     }
 
     #[test]

@@ -693,9 +693,13 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
     } else {
         summary.proxy_roundtrip_ns.saturating_sub(provider_serve_ns)
     };
+    // What's left of the wall time once discovery, the network and the provider's own serve are
+    // taken off: on a buffered serve that is wall − discover − round trip; on a streamed one the
+    // round trip is only the first acknowledgement, so the serve comes off too (ADVERSARIAL 10).
     let gateway_ns = wall_ns
-        .saturating_sub(summary.proxy_roundtrip_ns)
-        .saturating_sub(summary.discover_ns);
+        .saturating_sub(summary.discover_ns)
+        .saturating_sub(net_rtt_ns)
+        .saturating_sub(provider_serve_ns);
     let pipeline_tps = if wall_ns > 0 { summary.tokens as f64 / (wall_ns as f64 / 1e9) } else { 0.0 };
 
     json!({
@@ -1187,6 +1191,7 @@ fn stream_response(
                     wall,
                     summary.discover_ns,
                     summary.proxy_roundtrip_ns,
+                    summary.streamed,
                 );
                 // Tool calls (if any) ride the final chunk's delta with finish_reason
                 // "tool_calls"; a plain completion finishes "stop" with an empty delta.
@@ -1266,6 +1271,7 @@ async fn buffered_response(
                 wall,
                 summary.discover_ns,
                 summary.proxy_roundtrip_ns,
+                summary.streamed,
             );
             Json(completion_object(&id, &model, created, &content, &summary, wall, ttft.unwrap_or(wall)))
                 .into_response()
@@ -1666,7 +1672,7 @@ async fn anthropic_buffered_response(
         Some(Ok(summary)) => {
             let wall = started.elapsed();
             log_completion(&summary, wall);
-            metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
+            metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
             Json(anthropic_message_object(&id, &model, &content, &summary)).into_response()
         }
         Some(Err((m, (status, _)))) => {
@@ -1777,7 +1783,7 @@ async fn anthropic_stream_worker(
             GatewayEvent::Done(summary) => {
                 let wall = started.elapsed();
                 log_completion(&summary, wall);
-                metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns);
+                metrics.record_completion(summary.tokens, wall, summary.discover_ns, summary.proxy_roundtrip_ns, summary.streamed);
                 if out.send(("content_block_stop", json!({ "type": "content_block_stop", "index": 0 }))).await.is_err() {
                     return;
                 }
@@ -2350,6 +2356,14 @@ mod tests {
         st.streamed = true;
         st.proxy_roundtrip_ns = 40_000_000;
         assert_eq!(openhydra_block(&st, one, one)["hops_ms"]["network_rtt"], 40);
+        // The gateway's own share is what's left after discovery, network and serve, on both: a
+        // streamed serve no longer reports its whole generation as gateway overhead.
+        for b in [openhydra_block(&s, one, one), openhydra_block(&st, one, one)] {
+            let h = &b["hops_ms"];
+            let rest = 1000 - h["discover"].as_u64().unwrap() - h["network_rtt"].as_u64().unwrap() - h["provider_serve"].as_u64().unwrap();
+            assert_eq!(h["gateway_overhead"].as_u64().unwrap(), rest, "{h}");
+            assert!(rest < 1000 - h["provider_serve"].as_u64().unwrap());
+        }
         // A 1-token reply with no eval time has no meaningful speed: null, not 1,000,000 tok/s.
         let mut t = summary(1, 5);
         t.metrics.engine.eval_duration_ns = 0;
