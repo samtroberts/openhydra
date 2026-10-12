@@ -157,6 +157,12 @@ curl http://127.0.0.1:16527/v1/chat/completions \
 The gateway also serves `GET /v1/models` (model ids discovered on the swarm) and
 `GET /health`.
 
+The gateway checks each provider's billed token count against the model's own
+tokenizer. Which tokenizer that is comes from a signed index (built in, refreshed
+daily from `registry.openhydra.co`); the tokenizer file itself is downloaded from
+huggingface.co the first time a listed model is used, hash-checked, and cached in
+`~/.openhydra/tokenizers`. `--no-tokenizer-downloads` turns the download off.
+
 ---
 
 ## Supported engines
@@ -210,6 +216,10 @@ overhead (LAN direct ≈ a few ms; relayed cross-NAT paths add a hop).
 - Provider operators choose what their engine exposes; the protocol routes by
   model id and does not require sharing prompts with any third party beyond the
   serving provider.
+- Token-count checks fetch the whole tokenizer index (it says nothing about which
+  models you use), but downloading a model's tokenizer from Hugging Face tells
+  Hugging Face that this gateway uses that model. Prompts and answers are never
+  sent there; `serve --no-tokenizer-downloads` turns the download off.
 
 See [SECURITY.md](SECURITY.md) to report vulnerabilities.
 

@@ -10,9 +10,11 @@
 //! ([`crate::serve::billable_tokens`]), which is about 4× the tokens of typical text; with the
 //! tokenizer a gateway can see whether a provider billed for tokens it didn't deliver.
 //!
-//! The tokenizer is a vocabulary-only GGUF (the model's metadata, no weights; a few MB) made with
-//! `openhydra-scorer --export-vocab` and named by a log-prob reference file (`"vocab"`). Counting
-//! runs `openhydra-scorer --count-tokens <vocab>`, the text on stdin.
+//! The tokenizer is either the model's Hugging Face `tokenizer.json`, named by the signed
+//! [tokenizer index](crate::tokenizer_index) and fetched on first use ([`crate::hf_tokenizer`]; counted
+//! in process), or a vocabulary-only GGUF (the model's metadata, no weights; a few MB) made with
+//! `openhydra-scorer --export-vocab` and named by a log-prob reference file (`"vocab"`); that one is
+//! counted by running `openhydra-scorer --count-tokens <vocab>`, the text on stdin.
 //!
 //! What it can't tell apart: an engine that bills for reasoning it never streams (some hosted
 //! APIs) bills more than its delivered text tokenizes to, as a padded count would.
@@ -25,11 +27,47 @@ use std::time::{Duration, Instant};
 use crate::adapter::ToolCall;
 use crate::serve::{BILLABLE_TOKEN_SLACK, TOOL_CALL_TOKEN_ALLOWANCE};
 
-/// Share of a provider's serves whose billed count is checked, when a tokenizer covers its model.
+/// Share of a provider's serves whose billed count is checked when only a scorer vocabulary covers
+/// its model (each count is a scorer process). With a Hugging Face tokenizer every serve is checked.
 pub const COUNT_SAMPLE_RATE: f64 = 0.25;
-/// Counts running at once: each is a scorer process loading the vocabulary (~0.25 s); past this a
-/// sampled serve is just not checked, so a busy gateway can't pile them up.
+/// Counts running at once; past this a serve is just not checked (and settled for what it billed),
+/// so a busy gateway can't pile them up.
 pub const MAX_CONCURRENT_COUNTS: usize = 4;
+
+/// The tokenizer one serve's delivered tokens are counted with.
+#[derive(Clone)]
+pub enum Counter {
+    /// The model's Hugging Face tokenizer, in process.
+    Hf(crate::hf_tokenizer::HfCounter),
+    /// A vocabulary-only GGUF, counted by the scorer binary.
+    Scorer { scorer: PathBuf, vocab: PathBuf },
+}
+
+impl Counter {
+    /// How many tokens `text` is, counted in [`COUNT_CHUNK_BYTES`] pieces.
+    pub fn count(&self, text: &str) -> Result<u64, String> {
+        match self {
+            Counter::Hf(c) => c.count(text),
+            Counter::Scorer { scorer, vocab } => count_tokens_chunked(scorer, vocab, text),
+        }
+    }
+
+    /// Template tokens each tool call may carry beyond its name and arguments.
+    pub fn tool_call_allowance(&self) -> u64 {
+        match self {
+            Counter::Hf(c) => c.tool_call_allowance(),
+            Counter::Scorer { .. } => TOOL_CALL_TOKEN_ALLOWANCE,
+        }
+    }
+
+    /// What the count is made with, for logs.
+    pub fn describe(&self) -> String {
+        match self {
+            Counter::Hf(c) => format!("{}@{}", c.entry.repo, &c.entry.revision[..12.min(c.entry.revision.len())]),
+            Counter::Scorer { vocab, .. } => vocab.display().to_string(),
+        }
+    }
+}
 /// The most delivered text kept for a count. A paid serve can't come near it (at most 65,536
 /// tokens); past it, an unpaid serve's count is estimated from what was kept (review B5).
 pub const MAX_COUNTED_BYTES: usize = 8 << 20;
@@ -178,17 +216,19 @@ pub fn countable_text(
 }
 
 /// Whether `billed` tokens is more than `counted` (the delivered text's tokens, `calls` tool calls
-/// among them) can account for: each tool call's template tokens ([`TOOL_CALL_TOKEN_ALLOWANCE`]),
-/// end-of-turn markers ([`BILLABLE_TOKEN_SLACK`]) and [`COUNT_TOLERANCE`].
-pub fn over_billed(billed: u64, counted: u64, calls: usize) -> bool {
-    billed > billable_by_count(counted, calls)
+/// among them) can account for: each tool call's template tokens (`allowance`: the model's, else
+/// [`TOOL_CALL_TOKEN_ALLOWANCE`]), end-of-turn markers ([`BILLABLE_TOKEN_SLACK`]) and
+/// [`COUNT_TOLERANCE`].
+pub fn over_billed(billed: u64, counted: u64, calls: usize, allowance: u64) -> bool {
+    billed > billable_by_count(counted, calls, allowance)
 }
 
 /// The most a serve may bill given the tokenizer's count of what it delivered (`counted`, plus
-/// `calls` tool calls): the count with [`COUNT_TOLERANCE`] and [`BILLABLE_TOKEN_SLACK`] on top, so an
-/// honest provider's count (a different tokenizer build, a template token) always fits.
-pub fn billable_by_count(counted: u64, calls: usize) -> u64 {
-    let expected = counted.saturating_add(calls as u64 * TOOL_CALL_TOKEN_ALLOWANCE);
+/// `calls` tool calls of `allowance` template tokens each): the count with [`COUNT_TOLERANCE`] and
+/// [`BILLABLE_TOKEN_SLACK`] on top, so an honest provider's count (a different tokenizer build, a
+/// template token) always fits.
+pub fn billable_by_count(counted: u64, calls: usize, allowance: u64) -> u64 {
+    let expected = counted.saturating_add((calls as u64).saturating_mul(allowance));
     (expected as f64 * (1.0 + COUNT_TOLERANCE) + BILLABLE_TOKEN_SLACK as f64).floor() as u64
 }
 
@@ -206,20 +246,25 @@ mod tests {
     #[test]
     fn a_bill_within_the_counted_tokens_passes_and_padding_does_not() {
         // Engines bill what they generated: the text's tokens, maybe one end-of-turn marker more.
-        assert!(!over_billed(121, 120, 0));
-        assert!(!over_billed(120 + 12 + BILLABLE_TOKEN_SLACK, 120, 0), "within the tolerance");
+        const A: u64 = TOOL_CALL_TOKEN_ALLOWANCE;
+        assert!(!over_billed(121, 120, 0, A));
+        assert!(!over_billed(120 + 12 + BILLABLE_TOKEN_SLACK, 120, 0, A), "within the tolerance");
         // The byte bound allows ~4× typical text: that much is over-billing.
-        assert!(over_billed(480, 120, 0));
+        assert!(over_billed(480, 120, 0, A));
         // Tool calls carry template tokens of their own.
-        assert!(!over_billed(20 + 2 * TOOL_CALL_TOKEN_ALLOWANCE, 20, 2));
-        assert!(over_billed(20 + 2 * TOOL_CALL_TOKEN_ALLOWANCE, 20, 0));
+        assert!(!over_billed(20 + 2 * A, 20, 2, A));
+        assert!(over_billed(20 + 2 * A, 20, 0, A));
+        // A model whose template adds fewer tokens per call allows less.
+        assert!(over_billed(20 + 2 * A, 20, 2, 8));
+        assert!(!over_billed(20 + 2 * 8, 20, 2, 8));
         // What an over-billing provider is paid instead: the largest count that isn't over-billed.
-        for (counted, calls) in [(120u64, 0usize), (20, 2), (0, 0), (1_000_000, 16)] {
-            let fair = billable_by_count(counted, calls);
-            assert!(!over_billed(fair, counted, calls) && over_billed(fair + 1, counted, calls), "{counted} {calls}");
+        for (counted, calls, a) in [(120u64, 0usize, A), (20, 2, A), (20, 2, 9), (0, 0, A), (1_000_000, 16, A)] {
+            let fair = billable_by_count(counted, calls, a);
+            assert!(!over_billed(fair, counted, calls, a) && over_billed(fair + 1, counted, calls, a), "{counted} {calls}");
         }
         // The 3-4x a byte-bound bill allows (one token per character) is cut to the count.
-        assert!(billable_by_count(120, 0) < 480 / 3);
+        assert!(billable_by_count(120, 0, A) < 480 / 3);
+        assert_eq!(billable_by_count(u64::MAX, usize::MAX, u64::MAX), u64::MAX, "no overflow");
     }
 
     #[test]

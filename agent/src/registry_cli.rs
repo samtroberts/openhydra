@@ -28,6 +28,7 @@ use clap::{Args, Subcommand};
 use ed25519_dalek::SigningKey;
 use openhydra_agent::prompt_score::load_reference;
 use openhydra_agent::registry_client::pack_reply;
+use openhydra_agent::tokenizer_index::{self, TokenizerIndex};
 use openhydra_protocol::logprob::{normalize_weights_digest, ModelIdentity};
 use openhydra_protocol::refpool::{sign_pack, BatchStatus, PoolError, RefPool};
 use serde_json::{json, Value};
@@ -63,6 +64,78 @@ enum RegistryAction {
     Keys(KeysArgs),
     /// Serve round packs over HTTP.
     Serve(ServeArgs),
+    /// Build, sign and check the tokenizer index (which Hugging Face tokenizer counts each model's
+    /// tokens; gateways fetch it from the CDN).
+    Index(IndexArgs),
+}
+
+#[derive(Args)]
+struct IndexArgs {
+    #[command(subcommand)]
+    action: IndexAction,
+}
+
+#[derive(Subcommand)]
+enum IndexAction {
+    /// Add (or update) a model: resolves the revision to a commit, downloads its tokenizer.json from
+    /// Hugging Face, records its sha256 and size in the working file (created if missing).
+    Add(IndexAddArgs),
+    /// Sign the working file with the registry key (raising its sequence) into the file to publish.
+    Sign(IndexSignArgs),
+    /// List model names no entry covers: given with --model, or every model a gateway lists.
+    Missing(IndexMissingArgs),
+}
+
+#[derive(Args)]
+struct IndexFileArg {
+    /// The working (unsigned) index file.
+    #[arg(long)]
+    file: PathBuf,
+}
+
+#[derive(Args)]
+struct IndexAddArgs {
+    #[command(flatten)]
+    file: IndexFileArg,
+    /// Hugging Face repo, org/name (an ungated one).
+    #[arg(long)]
+    repo: String,
+    /// Branch, tag or commit to pin (resolved to its commit).
+    #[arg(long, default_value = "main")]
+    revision: String,
+    /// A model name this tokenizer counts for (repeatable): engine ids as providers announce them
+    /// (`qwen3:8b`, `qwen3-8b`); quantisation suffixes and an `org/` prefix are matched anyway.
+    #[arg(long = "name", required = true)]
+    names: Vec<String>,
+    /// Template tokens one tool call adds beyond its name and arguments, if known for this model.
+    #[arg(long)]
+    tool_call_allowance: Option<u64>,
+    /// Hugging Face base URL (a mirror).
+    #[arg(long, default_value = openhydra_agent::hf_tokenizer::HF_BASE)]
+    hf_base: String,
+}
+
+#[derive(Args)]
+struct IndexSignArgs {
+    #[command(flatten)]
+    dir: DirArg,
+    #[command(flatten)]
+    file: IndexFileArg,
+    /// The signed index to write (publish this file).
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct IndexMissingArgs {
+    #[command(flatten)]
+    file: IndexFileArg,
+    /// A model name to check (repeatable).
+    #[arg(long = "model")]
+    models: Vec<String>,
+    /// A gateway whose `/v1/models` to check (its API key from OPENHYDRA_API_KEY, if it needs one).
+    #[arg(long)]
+    gateway: Option<String>,
 }
 
 #[derive(Args)]
@@ -243,6 +316,85 @@ pub fn run(args: RegistryArgs) -> Result<(), String> {
             }
         },
         RegistryAction::Serve(a) => serve(a),
+        RegistryAction::Index(i) => index(i.action),
+    }
+}
+
+// ── tokenizer index ──
+
+fn read_working_index(path: &Path) -> Result<TokenizerIndex, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(TokenizerIndex { format: tokenizer_index::INDEX_FORMAT, sequence: 0, issued_ms: 0, models: Vec::new() })
+        }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn write_json(path: &Path, text: &str) -> Result<(), String> {
+    tokenizer_index::write_atomic(path, format!("{text}\n").as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn index(action: IndexAction) -> Result<(), String> {
+    match action {
+        IndexAction::Add(a) => {
+            let mut idx = read_working_index(&a.file.file)?;
+            let client = openhydra_agent::hf_tokenizer::download_client()?;
+            let entry = openhydra_agent::hf_tokenizer::build_entry(&client, &a.hf_base, &a.repo, &a.revision, &a.names, a.tool_call_allowance)?;
+            eprintln!(
+                "registry: {}@{} tokenizer.json {} bytes sha256 {} — names {}",
+                entry.repo,
+                entry.revision,
+                entry.tokenizer_size,
+                entry.tokenizer_sha256,
+                entry.names.join(", ")
+            );
+            idx.upsert(entry)?;
+            write_json(&a.file.file, &serde_json::to_string_pretty(&idx).map_err(|e| e.to_string())?)
+        }
+        IndexAction::Sign(a) => {
+            let key = load_key(&a.dir.dir)?;
+            let mut idx = read_working_index(&a.file.file)?;
+            // Always above what was published last: gateways never take a lower sequence.
+            let published = std::fs::read_to_string(&a.out)
+                .ok()
+                .and_then(|t| tokenizer_index::verify(&t, &hex::encode(key.verifying_key().to_bytes())).ok())
+                .map_or(0, |p| p.sequence);
+            idx.sequence = idx.sequence.max(published) + 1;
+            idx.issued_ms = now_ms();
+            let signed = tokenizer_index::sign(&idx, &key)?;
+            write_json(&a.file.file, &serde_json::to_string_pretty(&idx).map_err(|e| e.to_string())?)?;
+            write_json(&a.out, &signed)?;
+            let pinned = hex::encode(key.verifying_key().to_bytes());
+            if pinned != tokenizer_index::PINNED_INDEX_KEY {
+                eprintln!("registry: note — this key ({pinned}) isn't the one this build pins; gateways will refuse the index");
+            }
+            eprintln!("registry: signed index #{} ({} models) → {}", idx.sequence, idx.models.len(), a.out.display());
+            Ok(())
+        }
+        IndexAction::Missing(a) => {
+            let idx = read_working_index(&a.file.file)?;
+            let mut models = a.models.clone();
+            if let Some(gw) = &a.gateway {
+                let client = reqwest::blocking::Client::new();
+                let mut req = client.get(format!("{}/v1/models", gw.trim_end_matches('/')));
+                if let Ok(k) = std::env::var("OPENHYDRA_API_KEY") {
+                    req = req.bearer_auth(k.trim());
+                }
+                let body = req.send().and_then(|r| r.error_for_status()).and_then(|r| r.text()).map_err(|e| format!("{gw}: {e}"))?;
+                let v: Value = serde_json::from_str(&body).map_err(|e| format!("{gw}: {e}"))?;
+                models.extend(
+                    v["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str()).filter(|id| !id.starts_with("openhydra/")).map(str::to_string),
+                );
+            }
+            let missing = idx.missing(models.iter().map(String::as_str));
+            for m in &missing {
+                println!("{m}");
+            }
+            eprintln!("registry: {} of {} model names have no tokenizer entry", missing.len(), models.len());
+            Ok(())
+        }
     }
 }
 

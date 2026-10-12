@@ -413,8 +413,6 @@ struct ProviderLogprob {
     /// The scorer binary that counts delivered tokens with a reference's tokenizer (P7), when some
     /// reference carries one (`vocab`) and the binary is there.
     count_scorer: Option<std::path::PathBuf>,
-    /// Counts running now (bounded by [`crate::token_count::MAX_CONCURRENT_COUNTS`]).
-    counts_running: Arc<std::sync::atomic::AtomicUsize>,
     /// Digests of every local reference text this gateway has sent to any provider: each goes to one
     /// provider only, so one that answered it under a throwaway identity can't be sent it again under
     /// a fresh one (review round 3, LP5). Rebuilt on boot from the persisted rounds.
@@ -1687,6 +1685,10 @@ pub struct ConsumerNode {
     provider_attest: Option<Arc<ProviderAttestation>>,
     /// Prompt-scoring (log-prob) checks of providers (Track A2-Logprob). `None` = off (the default).
     provider_logprob: Option<Arc<ProviderLogprob>>,
+    /// Hugging Face tokenizers that count delivered tokens against billed ones (W4). `None` = off.
+    hf_tokenizers: Option<Arc<crate::hf_tokenizer::HfTokenizers>>,
+    /// Token counts running now (bounded by [`crate::token_count::MAX_CONCURRENT_COUNTS`]).
+    counts_running: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether audits may replay users' greedy requests to public models to another provider (D1,
     /// see [`with_audit_replay`](Self::with_audit_replay)). Off by default.
     audit_replay: bool,
@@ -1812,6 +1814,8 @@ impl ConsumerNode {
             audit_sheds: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
+            hf_tokenizers: None,
+            counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             audit_replay: false,
             replays: Mutex::new(Vec::new()),
             traffic: Mutex::new(HashMap::new()),
@@ -1906,7 +1910,6 @@ impl ConsumerNode {
             status: Mutex::new(status),
             inflight: Mutex::new(std::collections::HashSet::new()),
             count_scorer,
-            counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             issued_here: Mutex::new(issued_here),
             resume: Mutex::new(HashMap::new()),
             no_verdict_runs: Mutex::new(HashMap::new()),
@@ -1915,10 +1918,25 @@ impl ConsumerNode {
         self
     }
 
-    /// The tokenizer (vocabulary-only GGUF) and scorer binary to count a provider's delivered tokens
-    /// with (P7): a reference naming the provider's model handle, else the one its latest log-prob
-    /// verdict was against, as long as it carries a vocabulary.
-    fn token_counter_for(&self, provider: &SelectedProvider, model_key: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    /// Count delivered tokens with the model's Hugging Face tokenizer, named by the signed tokenizer
+    /// index (W4; builder form). Without it, only log-prob references that carry a vocabulary count.
+    pub fn with_hf_tokenizers(mut self, tokenizers: Option<Arc<crate::hf_tokenizer::HfTokenizers>>) -> Self {
+        self.hf_tokenizers = tokenizers;
+        self
+    }
+
+    /// What to count a provider's delivered tokens with (P7, W4): the model's Hugging Face tokenizer
+    /// when the index lists it and it is here (every serve is counted); else, on a
+    /// [`COUNT_SAMPLE_RATE`](crate::token_count::COUNT_SAMPLE_RATE) sample, the vocabulary of a
+    /// reference naming the provider's model handle, or of the one its latest log-prob verdict was
+    /// against.
+    fn token_counter_for(&self, provider: &SelectedProvider, model_key: &str) -> Option<crate::token_count::Counter> {
+        if let Some(c) = self.hf_tokenizers.as_ref().and_then(|t| t.counter_for(&provider.model_id)) {
+            return Some(crate::token_count::Counter::Hf(c));
+        }
+        if rand::random::<f64>() >= crate::token_count::COUNT_SAMPLE_RATE {
+            return None;
+        }
         let lp = self.provider_logprob.as_ref()?;
         let scorer = lp.count_scorer.clone()?;
         let with_vocab = || lp.refs.iter().filter(|r| r.vocab.is_some());
@@ -1929,7 +1947,7 @@ impl ConsumerNode {
             with_vocab().find(|r| crate::prompt_score::reference_tag(&r.set) == tag)
         };
         let vocab = by_handle.or_else(by_verdict)?.vocab.clone()?;
-        Some((scorer, vocab))
+        Some(crate::token_count::Counter::Scorer { scorer, vocab })
     }
 
     /// Count a served completion's tokens with the model's tokenizer and hold a bill above them
@@ -1937,7 +1955,7 @@ impl ConsumerNode {
     #[allow(clippy::too_many_arguments)]
     fn check_billed_tokens(
         self: &Arc<Self>,
-        counter: (std::path::PathBuf, std::path::PathBuf),
+        counter: crate::token_count::Counter,
         text: String,
         // The whole answer's text measure when `text` is only its start (too long to keep whole).
         total_units: Option<u64>,
@@ -1948,19 +1966,15 @@ impl ConsumerNode {
         model_key: String,
         settle: (SelectedProvider, [u8; 16]),
     ) -> bool {
-        // Bounded: a busy gateway skips the check rather than piling up scorer processes (and the
-        // caller settles at once, for the billed count).
-        let Some(slot) = self
-            .provider_logprob
-            .as_ref()
-            .and_then(|lp| crate::token_count::CountSlot::try_take(&lp.counts_running))
-        else {
+        // Bounded: a busy gateway skips the check rather than piling up counts (and the caller
+        // settles at once, for the billed count).
+        let Some(slot) = crate::token_count::CountSlot::try_take(&self.counts_running) else {
             return false;
         };
         let node = Arc::clone(self);
         std::thread::spawn(move || {
             let _slot = slot;
-            let (scorer, vocab) = counter;
+            let allowance = counter.tool_call_allowance();
             let (provider, nonce) = settle;
             // Counted before paying: a provider that billed more than the text it delivered can hold
             // (by the model's own tokenizer) is paid what the text holds, and marked down. Without a
@@ -1982,7 +1996,7 @@ impl ConsumerNode {
                     return billed;
                 };
                 // Counted in pieces; an answer too long to keep whole is estimated from its start (B5).
-                let counted = crate::token_count::count_tokens_chunked(&scorer, &vocab, &countable).map(|n| match total_units {
+                let counted = counter.count(&countable).map(|n| match total_units {
                     Some(total) => {
                         let mut part = crate::serve::DeliveredText::default();
                         part.push(&text);
@@ -1991,8 +2005,8 @@ impl ConsumerNode {
                     None => n,
                 });
                 match counted {
-                    Ok(counted) if crate::token_count::over_billed(billed, counted, calls) => {
-                        let fair = crate::token_count::billable_by_count(counted, calls);
+                    Ok(counted) if crate::token_count::over_billed(billed, counted, calls, allowance) => {
+                        let fair = crate::token_count::billable_by_count(counted, calls, allowance);
                         tracing::warn!(provider = %state_id, model = %model_key, billed, counted, paying = fair,
                             "provider billed for more tokens than it delivered; paying what it delivered");
                         node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
@@ -2004,7 +2018,7 @@ impl ConsumerNode {
                     }
                     // Visible: a vocabulary that won't load turns the check off for its model.
                     Err(e) => {
-                        tracing::warn!(error = %e, vocab = %vocab.display(), "couldn't count delivered tokens");
+                        tracing::warn!(error = %e, tokenizer = %counter.describe(), "couldn't count delivered tokens");
                         billed
                     }
                 }
@@ -2171,6 +2185,8 @@ impl ConsumerNode {
             audit_sheds: Mutex::new(HashMap::new()),
             provider_attest: None,
             provider_logprob: None,
+            hf_tokenizers: None,
+            counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             audit_replay: false,
             replays: Mutex::new(Vec::new()),
             traffic: Mutex::new(HashMap::new()),
@@ -2944,12 +2960,9 @@ impl ConsumerNode {
             let request = self.serve_request_for(&provider, messages, max_tokens, temperature, tools, think);
             let provider_libp2p = provider.libp2p_peer_id.clone();
             let t_serve = std::time::Instant::now();
-            // P7: on a sample of serves, keep the delivered text to count its tokens afterwards.
+            // P7/W4: when a tokenizer covers the model, keep the delivered text to count its tokens.
             let model_key_now = rep_model_key(&provider.canonical_model_id, &provider.model_id);
-            let counter = (!self.is_self_serve(&provider_libp2p)
-                && rand::random::<f64>() < crate::token_count::COUNT_SAMPLE_RATE)
-                .then(|| self.token_counter_for(&provider, model_key_now))
-                .flatten();
+            let counter = (!self.is_self_serve(&provider_libp2p)).then(|| self.token_counter_for(&provider, model_key_now)).flatten();
             let captured = std::cell::RefCell::new(String::new());
             // Set once the text outgrew `MAX_COUNTED_BYTES`: the rest isn't kept, and the count is
             // estimated from what was (B5).
@@ -6074,7 +6087,6 @@ mod tests {
             status: Mutex::new(HashMap::new()),
             inflight: Mutex::new(std::collections::HashSet::new()),
             count_scorer: None,
-            counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             issued_here: Mutex::new(std::collections::HashSet::new()),
             resume: Mutex::new(HashMap::new()),
             no_verdict_runs: Mutex::new(HashMap::new()),

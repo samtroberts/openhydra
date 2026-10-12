@@ -759,6 +759,23 @@ struct ServeArgs {
     #[arg(long = "logprob-registry-pubkey")]
     logprob_registry_pubkey: Option<String>,
 
+    /// Don't download tokenizers from Hugging Face. Billed token counts are then checked only for
+    /// models whose tokenizer is already cached (`~/.openhydra/tokenizers`) or covered by a
+    /// `--logprob-reference` vocabulary. With downloads on (the default), the first serve of a model
+    /// the signed tokenizer index lists fetches its `tokenizer.json` from huggingface.co, which tells
+    /// Hugging Face that this gateway uses that model.
+    #[arg(long = "no-tokenizer-downloads")]
+    no_tokenizer_downloads: bool,
+
+    /// Where to fetch the signed tokenizer index from (checked daily; HTTPS, or http:// to
+    /// localhost). `off` keeps the copy built into this binary (and the last one fetched).
+    #[arg(long = "tokenizer-index-url", default_value = openhydra_agent::tokenizer_index::DEFAULT_INDEX_URL)]
+    tokenizer_index_url: String,
+
+    /// Hugging Face base URL tokenizers are downloaded from (a mirror; HTTPS, or http:// to localhost).
+    #[arg(long = "tokenizer-hf-base", default_value = openhydra_agent::hf_tokenizer::HF_BASE, hide = true)]
+    tokenizer_hf_base: String,
+
     #[command(flatten)]
     aup: AupArgs,
 
@@ -767,6 +784,44 @@ struct ServeArgs {
 
     #[command(flatten)]
     byok: ByokArgs,
+}
+
+/// W4: the signed tokenizer index (built-in copy, the last one fetched, refreshed daily) and the
+/// Hugging Face tokenizers it names, downloaded on first use unless `--no-tokenizer-downloads`.
+fn hf_tokenizers(index_url: &str, hf_base: &str, downloads: bool) -> Result<Option<std::sync::Arc<openhydra_agent::hf_tokenizer::HfTokenizers>>, String> {
+    use openhydra_agent::{hf_tokenizer, tokenizer_index};
+    let fetch_index = index_url != "off";
+    if fetch_index && !openhydra_agent::registry_client::registry_url_allowed(index_url) {
+        return Err(format!("--tokenizer-index-url {index_url}: HTTPS, or http:// to localhost"));
+    }
+    if !openhydra_agent::registry_client::registry_url_allowed(hf_base) {
+        return Err(format!("--tokenizer-hf-base {hf_base}: HTTPS, or http:// to localhost"));
+    }
+    let dir = tokenizer_index::openhydra_dir();
+    let store = std::sync::Arc::new(tokenizer_index::IndexStore::new(
+        tokenizer_index::bundled(),
+        tokenizer_index::PINNED_INDEX_KEY,
+        index_url,
+        Some(dir.join("tokenizer-index.json")),
+    ));
+    let client = hf_tokenizer::download_client()?;
+    if fetch_index {
+        store.spawn_refresher(client.clone());
+    }
+    let downloads = downloads.then_some(client);
+    let index = store.current();
+    eprintln!(
+        "openhydra-agent: checking billed tokens with Hugging Face tokenizers ({} models in index #{}{})",
+        index.models.len(),
+        index.sequence,
+        if downloads.is_some() { "; downloaded from huggingface.co on first use" } else { "; cached ones only" },
+    );
+    Ok(Some(std::sync::Arc::new(hf_tokenizer::HfTokenizers::new(
+        store,
+        hf_tokenizer::HfTokenizers::default_dir(),
+        hf_base,
+        downloads,
+    ))))
 }
 
 fn main() {
@@ -1622,6 +1677,7 @@ fn serve(
     // gateway reads it again from the same environment).
     let peg = std::env::var("OPENHYDRA_USDC_MICROS_PER_CREDIT").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     settlement_chain_for(peg, true)?;
+    let hf_tokenizers = hf_tokenizers(&args.tokenizer_index_url, &args.tokenizer_hf_base, !args.no_tokenizer_downloads)?;
     // Track A2-Logprob reference sets (opt-in). A bad file is a startup error, not a silent skip.
     let mut logprob_refs = Vec::new();
     for path in &args.logprob_reference {
@@ -1667,6 +1723,6 @@ fn serve(
             if args.assurance == "gate" { "enforced" } else { "reported, not enforced" }
         );
     }
-    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry, args.audit_replay == "on", assurance)
+    serve_http(net, economy, stats, &args.bind, api_key, store, aup, rate_limit, trusted_proxy, byok, embeddings, args.self_provider.clone(), cards, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, args.audit_replay == "on", assurance)
         .map_err(|e| format!("gateway on {}: {e}", args.bind))
 }

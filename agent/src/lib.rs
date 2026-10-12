@@ -38,6 +38,7 @@ pub mod consumer;
 pub mod gateway;
 pub mod gateway_key;
 pub mod hardening;
+pub mod hf_tokenizer;
 pub mod http;
 pub mod lmstudio;
 pub mod metrics;
@@ -59,6 +60,7 @@ pub mod status;
 pub mod telemetry;
 /// P7: counting a delivered completion's tokens with the model's tokenizer (vocabulary-only GGUF).
 pub mod token_count;
+pub mod tokenizer_index;
 pub mod weights;
 pub mod workpool;
 

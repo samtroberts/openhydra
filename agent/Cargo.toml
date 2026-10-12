@@ -34,6 +34,10 @@ serde_yaml = "0.9"
 # trait; the async gateway will call it via spawn_blocking). rustls-tls (not native-tls)
 # keeps the eventual single static binary free of a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Counting a delivered answer's tokens with the model's own Hugging Face tokenizer (W4: tokenizer.json
+# fetched on first use, pinned by a signed index). The pure-Rust regex backend (fancy-regex) instead of
+# the default Oniguruma C library, no progress bars, no HF hub client (we fetch the file ourselves).
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 # Consumer HTTP/SSE gateway (the front door). axum's SSE + a tokio runtime; ConsumerNode
 # is sync (blocking libp2p), so the handler runs it on spawn_blocking and streams deltas
 # through a channel.

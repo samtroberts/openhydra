@@ -2159,6 +2159,7 @@ pub fn router(
     provider_attest: Option<Vec<[u8; 32]>>,
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
     logprob_registry: Option<crate::registry_client::RegistryClient>,
+    hf_tokenizers: Option<Arc<crate::hf_tokenizer::HfTokenizers>>,
     audit_replay: bool,
     assurance: openhydra_protocol::trust::AssurancePolicy,
 ) -> Router {
@@ -2199,6 +2200,8 @@ pub fn router(
     };
     // Track A2-Logprob prompt-scoring checks of providers (opt-in; no-op with no reference sets).
     let node = node.with_logprob_checks(logprob_refs, logprob_registry);
+    // W4: count delivered tokens with each model's Hugging Face tokenizer, from the signed index.
+    let node = node.with_hf_tokenizers(hf_tokenizers);
     // D1: audits may replay users' greedy requests to public models (see `with_audit_replay`).
     let node = node.with_audit_replay(audit_replay);
     // D2: the buyer's floor for every request (a request can raise it, see MIN_AUTHENTICITY_HEADER).
@@ -2297,6 +2300,7 @@ pub fn serve_http(
     provider_attest: Option<Vec<[u8; 32]>>,
     logprob_refs: Vec<crate::prompt_score::LoadedReference>,
     logprob_registry: Option<crate::registry_client::RegistryClient>,
+    hf_tokenizers: Option<Arc<crate::hf_tokenizer::HfTokenizers>>,
     audit_replay: bool,
     assurance: openhydra_protocol::trust::AssurancePolicy,
 ) -> std::io::Result<()> {
@@ -2304,7 +2308,7 @@ pub fn serve_http(
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let local = listener.local_addr()?;
-        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, audit_replay, assurance);
+        let mut app = router(net, economy, stats, api_key, store, aup, rate_limit_cfg, trusted_proxy, byok, embeddings_cfg, self_provider, cards, creds, provider_attest, logprob_refs, logprob_registry, hf_tokenizers, audit_replay, assurance);
         // A loopback-only gateway answers only requests addressed to loopback (DNS rebinding:
         // a web page can point its own host name at 127.0.0.1, but not change the Host header the
         // browser sends). A gateway bound to a LAN/public address is reached by other names, so it
@@ -2465,6 +2469,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             None,
             false,
             openhydra_protocol::trust::AssurancePolicy::OPEN,
