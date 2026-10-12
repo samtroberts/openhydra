@@ -391,9 +391,13 @@ fn ensure_valid_share_policy(
     reset_flag: &std::sync::atomic::AtomicBool,
 ) -> PathBuf {
     let path = share_policy_path();
-    // Start from "share nothing" on a fresh install (no desktop.json yet), and whenever this install
-    // has had its own policy before (a missing file then is a deletion, not an old-version upgrade).
-    let start_empty = !settings_path().exists() || settings.share_policy_initialized;
+    // Start from "share nothing" on a fresh install (no desktop.json yet), whenever this install has
+    // had its own policy before (a missing file then is a deletion, not an old-version upgrade), and
+    // for an upgrade from a user who wasn't sharing: an empty legacy list meant "everything", which
+    // they never chose (ADVERSARIAL item 3). A user who was sharing keeps what they shared.
+    let start_empty = !settings_path().exists()
+        || settings.share_policy_initialized
+        || (!settings.sharing_enabled && !settings.sharing_confirmed);
     ensure_valid_share_policy_at(&path, &settings.shared_models, start_empty, reset_flag);
     path
 }
@@ -452,6 +456,29 @@ fn heal_corrupt_share_policy(path: &std::path::Path) -> Result<(), String> {
         path.display()
     );
     Ok(())
+}
+
+/// An inherited "share everything" from an older build, for a user who isn't sharing and never chose
+/// it here: v0.3.20 wrote mode `all` (with consent) as soon as its Share view was opened, so starting
+/// to share — or adding one model — would have published every model to everyone (ADVERSARIAL item
+/// 3). Reset to share-nothing; the user then picks models and reach in the Share dialog. Returns
+/// whether it reset. Run once at startup, before anything reads the policy.
+fn drop_inherited_share_all(path: &std::path::Path) -> bool {
+    match openhydra_agent::SharePolicy::load(path) {
+        Ok(p) if p.mode == openhydra_agent::share_policy::ShareMode::All => {
+            match openhydra_agent::SharePolicy::share_nothing().write_atomic(path) {
+                Ok(()) => {
+                    eprintln!("openhydra: reset an inherited share-everything policy (never chosen in this version, not sharing) to share-nothing");
+                    true
+                }
+                Err(e) => {
+                    eprintln!("openhydra: could not reset the inherited share policy at {}: {e}", path.display());
+                    false
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Write a policy file at `path` migrated from a legacy `--share-models` list, but only if the file
@@ -2525,6 +2552,17 @@ fn stream_events(chunk: &serde_json::Value) -> Vec<serde_json::Value> {
     out
 }
 
+/// Stop every chat being streamed. Run when the page (re)loads: a reloaded page doesn't know the
+/// stream ids, and the stream would otherwise read to the end (spending credits) into a channel
+/// nothing listens to (ADVERSARIAL item 4).
+fn stop_all_chat_streams() -> usize {
+    let streams = CHAT_STREAMS.lock().map(|m| m.values().cloned().collect::<Vec<_>>()).unwrap_or_default();
+    for flag in &streams {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    streams.len()
+}
+
 /// Stop a chat started with `chat_completion_stream`.
 #[tauri::command]
 fn chat_stop(stream_id: String) {
@@ -3051,6 +3089,9 @@ fn main() {
     let mut initial_settings = load_settings();
     let share_policy_reset = std::sync::atomic::AtomicBool::new(false);
     let policy_path = ensure_valid_share_policy(&initial_settings, &share_policy_reset);
+    if !initial_settings.sharing_enabled && !initial_settings.sharing_confirmed {
+        drop_inherited_share_all(&policy_path);
+    }
     let mut changed = false;
     if policy_path.exists() && !initial_settings.share_policy_initialized {
         initial_settings.share_policy_initialized = true;
@@ -3183,6 +3224,14 @@ fn main() {
                     .on_new_window(|url, _| {
                         eprintln!("openhydra: blocked a new window ({})", url.scheme());
                         tauri::webview::NewWindowResponse::Deny
+                    })
+                    .on_page_load(|_, payload| {
+                        if payload.event() == tauri::webview::PageLoadEvent::Started {
+                            let n = stop_all_chat_streams();
+                            if n > 0 {
+                                eprintln!("openhydra: page reloaded — stopped {n} chat stream(s) it can no longer show");
+                            }
+                        }
                     })
                     .build()?;
             }
@@ -3721,6 +3770,34 @@ mod tests {
         let p = SharePolicy::load(&path).unwrap();
         assert_eq!(p.mode, ShareMode::List);
         assert!(!p.is_shared("tinyllama:latest"));
+    }
+
+    #[test]
+    fn a_page_load_stops_every_running_chat_stream() {
+        let a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        CHAT_STREAMS.lock().unwrap().insert("test-a".into(), a.clone());
+        CHAT_STREAMS.lock().unwrap().insert("test-b".into(), b.clone());
+        assert!(stop_all_chat_streams() >= 2);
+        assert!(a.load(std::sync::atomic::Ordering::Relaxed) && b.load(std::sync::atomic::Ordering::Relaxed));
+        CHAT_STREAMS.lock().unwrap().retain(|k, _| !k.starts_with("test-"));
+    }
+
+    #[test]
+    fn an_inherited_share_all_is_dropped_but_a_chosen_list_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share-policy.json");
+        // What v0.3.20 wrote when its Share view was opened: everything, globally, with consent.
+        SharePolicy::from_legacy_list(Vec::<String>::new()).write_atomic(&path).unwrap();
+        assert!(SharePolicy::load(&path).unwrap().announce_globally("anything"));
+        assert!(drop_inherited_share_all(&path));
+        let p = SharePolicy::load(&path).unwrap();
+        assert!(!p.is_shared("anything") && !p.announce_globally("anything"));
+        assert!(!drop_inherited_share_all(&path), "nothing left to drop");
+        // A list the user picked stays.
+        SharePolicy::share_list(["qwen2.5:7b"]).write_atomic(&path).unwrap();
+        assert!(!drop_inherited_share_all(&path));
+        assert!(SharePolicy::load(&path).unwrap().is_shared("qwen2.5:7b"));
     }
 
     #[test]

@@ -270,7 +270,10 @@ import { exportCardModal, ensureImportSection } from "./cards";
     // its reach); for new models there's no default — the user picks.
     const shared = list.filter((m) => isModelShared(m));
     const reaches = new Set(shared.map((m) => (isGlobal(m) ? "global" : "private")));
-    const preReach = only && shared.length === list.length && reaches.size === 1 ? [...reaches][0] : null;
+    // Never preselect a reach the user didn't choose in this version: an older build's "everything,
+    // globally" must not arrive here pre-ticked as "Everyone" (ADVERSARIAL item 3).
+    const chosen = !!state?.settings?.sharing_confirmed;
+    const preReach = chosen && only && shared.length === list.length && reaches.size === 1 ? [...reaches][0] : null;
     const back = document.createElement("div");
     back.className = "cmodal-back";
     const CHECKED = html` checked`;
