@@ -3960,6 +3960,7 @@ mod tests {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: openhydra_network::relay::PublicRelays::Off,
         })
         .unwrap();
         let provider = Provider::new(StubAdapter, net);
@@ -4015,6 +4016,7 @@ mod tests {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: openhydra_network::relay::PublicRelays::Off,
         })
         .unwrap();
         let domain = Eip712Domain { chain_id: 8453, verifying_contract: [7; 20] };
@@ -4955,6 +4957,7 @@ mod tests {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: openhydra_network::relay::PublicRelays::Off,
         })
         .unwrap();
         (dir, Provider::new(adapter, net))

@@ -669,6 +669,9 @@ struct LoopState {
     /// them on a network change (the startup list is otherwise consumed by the
     /// run-loop locals). Identity is stable across a roam; only addresses churn.
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    /// The relays this node reserves on and dials others through (`relay::relay_addrs`): its
+    /// bootstraps, plus the production relays on the public network.
+    relays: Vec<Multiaddr>,
     /// Monotonically bumped every time connectivity is rebuilt (`rebootstrap()`).
     /// Read by the provider run-loop (via `NetworkHandle::network_generation`)
     /// to trigger an immediate model re-announce so the DHT record carries the
@@ -901,6 +904,7 @@ impl LoopState {
             // #42: set to the shared handle in run_event_loop; a real interface
             // change or watchdog rebuild bumps it.
             bootstrap_peers: Vec::new(),
+            relays: Vec::new(),
             net_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reserved_circuits: std::collections::HashSet::new(),
             last_rebootstrap: None,
@@ -920,6 +924,8 @@ pub async fn run_event_loop(
     mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     proxy_queue: Arc<SharedProxyQueue>,
     bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+    // The relays to reserve on and dial through (`relay::relay_addrs`).
+    relays: Vec<Multiaddr>,
     keypair: libp2p::identity::Keypair,
     // WS-F F-4: shared leech table for the peer-relay server (None unless this
     // node opted into peer-relay mode). The RelayServer event handler records
@@ -945,6 +951,7 @@ pub async fn run_event_loop(
     // #42: retain the bootstrap list + share the generation counter so
     // `rebootstrap()` can re-dial and signal the provider on a network change.
     state.bootstrap_peers = bootstrap_peers.clone();
+    state.relays = relays;
     state.net_generation = net_generation;
     // Cover the startup window with the rebootstrap cooldown: the inline startup
     // sequence below IS a bootstrap, so a reactive trigger from the initial
@@ -1134,8 +1141,8 @@ pub async fn run_event_loop(
             // (first address wins; v4 is listed first and is universally
             // reachable — and the only option for v6-less peers like cloud T4s).
             let mut seen_relays = std::collections::HashSet::new();
-            for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-                if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+            for relay_multiaddr in state.relays.clone() {
+                {
                     let relay_peer = relay_multiaddr.iter().find_map(|p| match p {
                         libp2p::multiaddr::Protocol::P2p(id) => Some(id),
                         _ => None,
@@ -2392,8 +2399,8 @@ fn rebootstrap(
     // any circuit still in `reserved_circuits`; the F-5 reactive path owns those
     // that genuinely dropped.
     let mut seen_relays = std::collections::HashSet::new();
-    for relay_str in crate::relay::BOOTSTRAP_RELAYS {
-        if let Ok(relay_multiaddr) = relay_str.parse::<Multiaddr>() {
+    for relay_multiaddr in state.relays.clone() {
+        {
             let relay_peer = relay_multiaddr.iter().find_map(|p| match p {
                 libp2p::multiaddr::Protocol::P2p(id) => Some(id),
                 _ => None,
@@ -3723,7 +3730,9 @@ fn handle_kad_event(
 fn trusted_relay_pids(state: &LoopState) -> std::collections::HashSet<PeerId> {
     let mut set: std::collections::HashSet<PeerId> =
         state.bootstrap_peers.iter().map(|(pid, _)| *pid).collect();
-    set.extend(crate::relay::bootstrap_relay_peer_ids());
+    // The relays this node uses (the production ones only on the public network: a private
+    // deployment never dials a circuit through them).
+    set.extend(crate::relay::relay_peer_ids(&state.relays));
     set
 }
 
@@ -4355,7 +4364,7 @@ fn handle_grpc_proxy_event(
                 warn!(%peer, threshold = ZOMBIE_FAILURE_THRESHOLD,
                     "zombie_evict: consecutive proxy path failures — closing presumed-dead connections and redialing via relay");
                 let _ = swarm.disconnect_peer_id(peer);
-                let circuit_addrs = relay_circuit_addrs(peer, state.ipv6_capable);
+                let circuit_addrs = relay_circuit_addrs(&state.relays, peer, state.ipv6_capable);
                 if let Err(e) = swarm.dial(relay_dial_opts(peer, circuit_addrs)) {
                     debug!(%peer, %e, "zombie_evict: relay redial enqueue failed");
                 }
@@ -4457,7 +4466,7 @@ fn handle_proxy_forward(
             let _ = reply.send(Err("proxy_forward: relay queue full".into()));
             return;
         }
-        let circuit_addrs = relay_circuit_addrs(peer_id, state.ipv6_capable);
+        let circuit_addrs = relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable);
         match swarm.dial(relay_dial_opts(peer_id, circuit_addrs)) {
             Ok(()) => {
                 state
@@ -4498,13 +4507,13 @@ pub(crate) fn probe_ipv6_capable() -> bool {
 /// every known bootstrap relay, so a single dial can race all of them. F-9:
 /// when the host has no working IPv6, drop the `/ip6/` relay circuits — dialing
 /// them would only burn timeouts on unreachable addresses.
-fn relay_circuit_addrs(peer_id: PeerId, ipv6_capable: bool) -> Vec<Multiaddr> {
-    crate::relay::BOOTSTRAP_RELAYS
+fn relay_circuit_addrs(relays: &[Multiaddr], peer_id: PeerId, ipv6_capable: bool) -> Vec<Multiaddr> {
+    relays
         .iter()
-        .filter_map(|s| s.parse::<Multiaddr>().ok())
         .filter(|relay| ipv6_capable || !is_ipv6_multiaddr(relay))
         .map(|relay| {
             relay
+                .clone()
                 .with(libp2p::multiaddr::Protocol::P2pCircuit)
                 .with(libp2p::multiaddr::Protocol::P2p(peer_id))
         })
@@ -4594,7 +4603,7 @@ fn handle_proxy_forward_no_wait(
                   "proxy_forward_no_wait: pending_relay_forwards at cap — dropping");
             return;
         }
-        match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(peer_id, state.ipv6_capable))) {
+        match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))) {
             Ok(()) => {
                 let (dummy_tx, _dummy_rx) = oneshot::channel();
                 state
@@ -5076,7 +5085,8 @@ mod tests {
         let target: PeerId =
             "12D3KooWRL36gMob4EcmXGb1wWd1HnzihPd8KBpiNdxF59kDUhCN".parse().unwrap();
 
-        let no_v6 = relay_circuit_addrs(target, false);
+        let relays = crate::relay::relay_addrs(&[], crate::relay::PublicRelays::Auto);
+        let no_v6 = relay_circuit_addrs(&relays, target, false);
         assert!(!no_v6.is_empty(), "should still have v4 relay circuits");
         assert!(
             no_v6.iter().all(|a| !is_ipv6_multiaddr(a)),
@@ -5088,7 +5098,7 @@ mod tests {
             "every entry must be a p2p-circuit",
         );
 
-        let with_v6 = relay_circuit_addrs(target, true);
+        let with_v6 = relay_circuit_addrs(&relays, target, true);
         assert!(with_v6.len() > no_v6.len(), "v6-capable yields more circuits");
         assert!(
             with_v6.iter().any(|a| is_ipv6_multiaddr(a)),

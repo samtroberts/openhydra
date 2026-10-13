@@ -330,6 +330,7 @@ mod tests {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: crate::relay::PublicRelays::Off,
         }
     }
 

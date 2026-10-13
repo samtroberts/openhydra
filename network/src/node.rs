@@ -45,6 +45,9 @@ pub struct NodeConfig {
     /// it — the v6 sibling of R-DHT-4's v4 UPnP/NAT-PMP mapping. Opt-in because
     /// gateway discovery is not yet automatic and PCP is unvalidated live.
     pub pcp_gateway: Option<std::net::IpAddr>,
+    /// Whether to relay through the production relays as well as the bootstraps
+    /// ([`crate::relay::PublicRelays`]; `Auto` by default).
+    pub public_relays: crate::relay::PublicRelays,
 }
 
 impl Default for NodeConfig {
@@ -66,6 +69,7 @@ impl Default for NodeConfig {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: crate::relay::PublicRelays::Auto,
         }
     }
 }
@@ -113,6 +117,10 @@ pub fn start_node(
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
     let bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
+    // The relays this node reserves on and dials others through: its bootstraps, plus the
+    // production relays on the public network (see `PublicRelays`).
+    let relays = crate::relay::relay_addrs(&bootstrap_peers, config.public_relays);
+    info!(relays = relays.len(), mode = ?config.public_relays, "relay set");
     let enable_connection_reversal = config.enable_connection_reversal; // Tier-2 (captured into the thread)
 
     // #43-W2: resolve the opt-in PCP v6-pinhole wiring (gateway + the listen
@@ -166,7 +174,7 @@ pub fn start_node(
                 match swarm::build_swarm(&identity, opts) {
                     Ok((swarm, peer_relay_leech)) => {
                         let _ = startup_tx.send(Ok(()));
-                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
+                        event_loop::run_event_loop(swarm, cmd_rx, proxy_queue_clone, bootstrap_peers_for_dial, relays, keypair_for_loop, peer_relay_leech, routing_cache_path, enable_connection_reversal, net_generation_loop, pcp_bind).await;
                     }
                     Err(e) => {
                         let _ = startup_tx.send(Err(format!("build_swarm: {e}")));

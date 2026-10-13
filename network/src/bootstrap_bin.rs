@@ -12,6 +12,10 @@
 //!     --identity /opt/openhydra/.libp2p_identity.key \
 //!     --listen /ip4/0.0.0.0/tcp/4001
 //! ```
+//!
+//! A bootstrap of a private deployment (on a private network, e.g. `10.0.0.5`) declares the address
+//! its peers reach it at with `--external /ip4/10.0.0.5/tcp/4001` (repeatable): its relay hands that
+//! out in reservations. Globally routable listen addresses are confirmed on their own.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -305,6 +309,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_idle_connection_timeout(Duration::from_secs(300));
 
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
+    // Addresses the operator says peers reach this bootstrap at (a private deployment's bootstrap is
+    // on a private network, which isn't confirmed on its own): its relay puts these in reservations.
+    for addr in parse_flag_multi(&args, "--external").unwrap_or_default() {
+        info!(%addr, "external address (from --external)");
+        swarm.add_external_address(addr);
+    }
 
     for addr in &listen_addrs {
         swarm.listen_on(addr.clone())?;

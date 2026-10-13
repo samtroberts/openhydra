@@ -78,6 +78,12 @@ struct NodeArgs {
     #[arg(long)]
     peer_relay: bool,
 
+    /// Relay through OpenHydra's production relays as well as your bootstraps. `auto` (default):
+    /// yes on the public network (no --bootstrap, or one of them is a production bootstrap), no for
+    /// a private deployment whose bootstraps are all its own. `on` / `off` force it.
+    #[arg(long = "public-relays", default_value = "auto", value_parser = ["auto", "on", "off"])]
+    public_relays: String,
+
     /// Experimental: Tier-2 connection reversal — when this node holds only a relayed
     /// connection to a peer that advertises globally-routable direct addresses, dial
     /// those directly to escape the relay (off by default). The one NAT escape that
@@ -106,6 +112,7 @@ impl NodeArgs {
     fn into_config(self) -> NodeConfig {
         let mut config = NodeConfig {
             enable_peer_relay: self.peer_relay,
+            public_relays: openhydra_network::relay::PublicRelays::parse(&self.public_relays).unwrap_or_default(),
             enable_connection_reversal: self.connection_reversal,
             bootstrap_peers: self.bootstrap,
             pcp_gateway: self.pcp_gateway,

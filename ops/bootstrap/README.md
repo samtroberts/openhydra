@@ -93,6 +93,22 @@ On a LAN, mDNS discovers peers without a bootstrap; across networks, pass one or
 more `--bootstrap` multiaddrs. NAT'd agents reserve a relay slot on a reachable
 bootstrap automatically (Circuit Relay v2) and hole-punch via DCUtR when possible.
 
+### Private deployments
+
+Relays follow the bootstraps. An agent whose `--bootstrap` peers are all your own
+relays only through them and never contacts OpenHydra's production relays; with
+no `--bootstrap`, or with any production bootstrap among them, it also uses the
+production relays (the public network). `--public-relays on|off` forces either way.
+
+A bootstrap on a private network (e.g. `10.0.0.5`) must declare the address its
+peers reach it at, so its relay can hand it out in reservations (globally routable
+listen addresses are confirmed on their own):
+
+```bash
+openhydra-bootstrap --identity /opt/openhydra/.libp2p_identity.key \
+  --listen /ip4/0.0.0.0/tcp/4001 --external /ip4/10.0.0.5/tcp/4001
+```
+
 ## Service Lifecycle
 
 On each bootstrap node:

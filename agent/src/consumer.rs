@@ -6048,6 +6048,7 @@ mod tests {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: openhydra_network::relay::PublicRelays::Off,
         })
         .unwrap();
         let node = ConsumerNode::new(net);
@@ -6166,6 +6167,7 @@ mod tests {
             enable_peer_relay: false,
             enable_connection_reversal: false,
             pcp_gateway: None,
+            public_relays: openhydra_network::relay::PublicRelays::Off,
         })
         .unwrap();
         (dir, ConsumerNode::new(net))

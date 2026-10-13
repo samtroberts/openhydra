@@ -77,6 +77,70 @@ pub const BOOTSTRAP_RELAY_IPS: &[&str] = &[
     "2a03:4000:41:ed1:384a:c3ff:fef1:2c58",   // DE (netcup) IPv6
 ];
 
+/// Whether a node relays through the production relays ([`BOOTSTRAP_RELAYS`]) as well as its own
+/// bootstraps (every OpenHydra bootstrap runs a relay server).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PublicRelays {
+    /// Decide from the bootstraps: none configured, or any of them a production relay, means the
+    /// public network (production relays too); bootstraps that are all its own mean a private
+    /// deployment (only those, so it never contacts production).
+    #[default]
+    Auto,
+    /// Always add the production relays.
+    On,
+    /// Never: relay only through the configured bootstraps.
+    Off,
+}
+
+impl PublicRelays {
+    /// `auto`, `on` or `off`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// The relays a node reserves on and dials others through, each `/…/p2p/<relay id>`: its
+/// bootstraps, plus the production relays when `public` says so (see [`PublicRelays`]).
+pub fn relay_addrs(bootstraps: &[(PeerId, Multiaddr)], public: PublicRelays) -> Vec<Multiaddr> {
+    let production = bootstrap_relay_peer_ids();
+    let use_public = match public {
+        PublicRelays::On => true,
+        PublicRelays::Off => false,
+        PublicRelays::Auto => bootstraps.is_empty() || bootstraps.iter().any(|(pid, _)| production.contains(pid)),
+    };
+    let mut out: Vec<Multiaddr> = Vec::new();
+    if use_public {
+        out.extend(BOOTSTRAP_RELAYS.iter().filter_map(|s| s.parse::<Multiaddr>().ok()));
+    }
+    for (pid, addr) in bootstraps {
+        let with_id = if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_))) {
+            addr.clone()
+        } else {
+            addr.clone().with(libp2p::multiaddr::Protocol::P2p(*pid))
+        };
+        if !out.contains(&with_id) {
+            out.push(with_id);
+        }
+    }
+    out
+}
+
+/// The relay peer ids in a relay list (each address's `/p2p/` component).
+pub fn relay_peer_ids(relays: &[Multiaddr]) -> Vec<PeerId> {
+    relays
+        .iter()
+        .filter_map(|ma| ma.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
+            _ => None,
+        }))
+        .collect()
+}
+
 /// Check if an IP string matches a known bootstrap relay server.
 pub fn is_bootstrap_relay_ip(ip: &str) -> bool {
     BOOTSTRAP_RELAY_IPS.contains(&ip)
@@ -429,6 +493,37 @@ impl CircuitMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relays_follow_the_bootstraps_and_production_only_on_the_public_network() {
+        let production = bootstrap_relay_peer_ids();
+        let us: (PeerId, Multiaddr) = (production[0], "/ip4/45.79.190.172/tcp/4001".parse().unwrap());
+        let own_id = PeerId::random();
+        let own: (PeerId, Multiaddr) = (own_id, "/ip4/10.0.0.5/tcp/4001".parse().unwrap());
+        let ids = |v: &[Multiaddr]| relay_peer_ids(v);
+        // No bootstraps: the public network as before (every production relay).
+        let none = relay_addrs(&[], PublicRelays::Auto);
+        assert_eq!(none.len(), BOOTSTRAP_RELAYS.len());
+        // A production bootstrap among them: still the public network — all production relays (a
+        // provider reserved on another production relay stays reachable), plus our own.
+        let public = relay_addrs(&[us.clone(), own.clone()], PublicRelays::Auto);
+        assert!(production.iter().all(|p| ids(&public).contains(p)));
+        assert!(ids(&public).contains(&own_id));
+        // Only our own bootstraps: a private deployment — never a production relay.
+        let private = relay_addrs(&[own.clone()], PublicRelays::Auto);
+        assert_eq!(ids(&private), vec![own_id]);
+        assert_eq!(private[0].to_string(), format!("/ip4/10.0.0.5/tcp/4001/p2p/{own_id}"));
+        // Overrides: on adds production to a private list; off drops it from a public one.
+        let on = relay_addrs(&[own.clone()], PublicRelays::On);
+        assert!(production.iter().all(|p| ids(&on).contains(p)) && ids(&on).contains(&own_id));
+        let off = relay_addrs(&[us.clone(), own.clone()], PublicRelays::Off);
+        assert_eq!(ids(&off), vec![us.0, own_id]);
+        assert!(relay_addrs(&[], PublicRelays::Off).is_empty());
+        // Parsing the flag.
+        assert_eq!(PublicRelays::parse(" ON "), Some(PublicRelays::On));
+        assert_eq!(PublicRelays::parse("auto"), Some(PublicRelays::Auto));
+        assert_eq!(PublicRelays::parse("maybe"), None);
+    }
 
     #[test]
     fn test_relay_circuit_addr_format() {
