@@ -260,8 +260,10 @@
   .cardbtn:hover{opacity:1}
   .cardfail{font-size:11.5px;color:hsl(0 72% 55%)}
   /* Tri-state master switch: some-but-not-all shared → knob centered, muted-brand track. */
-  .switch.indeterminate{background:hsl(var(--brand) / .45);border-color:transparent}
-  .switch.indeterminate::after{left:11px}
+  /* Mixed ("some shared"): an off-style track with a centred knob carrying a dash, so it can't be
+     read as on. */
+  .switch.indeterminate{background:hsl(var(--muted));border-color:hsl(var(--brand) / .6)}
+  .switch.indeterminate::after{left:10px;background:linear-gradient(hsl(var(--brand)),hsl(var(--brand))) center/8px 2px no-repeat,hsl(var(--background))}
 
   .subnav{display:flex;flex-direction:column;gap:2px;width:172px;flex:none;position:sticky;top:0;align-self:flex-start}
   .subnav .s{height:32px;padding:0 10px;border-radius:8px;cursor:pointer;color:hsl(var(--muted-foreground));font-size:13px;display:flex;align-items:center}

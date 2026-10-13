@@ -589,7 +589,17 @@ $("#actchips").onclick = (e) => { const c = e.target.closest(".chip[data-act]");
 $("#peerchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#peerchips .chip").forEach((x) => x.classList.toggle("on", x === c)); const pp = c.dataset.p; $$("#peertable tbody tr").forEach((r) => r.style.display = (pp === "all" || r.dataset.p === pp) ? "" : "none"); };
 $("#logchips").onclick = (e) => { const c = e.target.closest(".chip"); if (!c) return; $$("#logchips .chip").forEach((x) => x.classList.toggle("on", x === c)); setLogTab(c.dataset.log === "gateway" ? "gateway" : "provider"); renderLogs(); };
 $("#provsort") && ($("#provsort").onclick = (e) => { e.stopPropagation(); menu($("#provsort"), ["reputation", "providers", "name"].map((v) => ({ label: `Sort by ${v}`, fn: () => setProviderSort(v) }))); });
-$("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); } };
+// Keys, peer ids, magnets and addresses (the monospace fields) are typed or pasted exactly: never
+// auto-capitalised, auto-corrected or spell-checked by the OS.
+document.addEventListener("focusin", (e) => {
+  const t = e.target;
+  if (t instanceof HTMLElement && t.matches("input.mono, textarea.mono")) {
+    t.setAttribute("autocapitalize", "off");
+    t.setAttribute("autocorrect", "off");
+    t.setAttribute("spellcheck", "false");
+  }
+});
+$("#search").oninput = () => { if (activeView === "providers") renderProviders(); else if (activeView === "peers") { const q = $("#search").value.toLowerCase(); $$("#peertable tbody tr").forEach((r) => r.style.display = r.textContent.toLowerCase().includes(q) ? "" : "none"); renderLogs(); } };
 // ⌘K (Ctrl+K elsewhere) or the button: a "Go to …" menu. Diagnostics is listed only when advanced
 // views are on (it's hidden otherwise).
 function openGoto() { menu($("#cmdk"), Object.keys(titles).filter((v) => v !== "peers" || app.hasAttribute("data-adv")).map((v) => ({ label: "Go to " + titles[v], on: v === activeView, fn: () => go(v) }))); }

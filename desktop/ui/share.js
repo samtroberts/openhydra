@@ -112,7 +112,10 @@ import { exportCardModal, ensureImportSection } from "./cards";
     if (savingPolicy) return ensureScope();
     try { loadScope(await call("read_share_policy")); } catch { await ensureScope(); }
   }
-  const effectiveScope = (m) => scope.byModel.get(m) || scope.def;
+  // While a Global change waits for its native consent dialog, rows keep showing the reach they had
+  // (a redraw behind the dialog mustn't show a model as Global before the user says yes).
+  let awaitingConsent = null;
+  const effectiveScope = (m) => { const s = awaitingConsent || scope; return s.byModel.get(m) || s.def; };
   // UI reach is BINARY: global vs not-global. `device` (a deferred, not-yet-offered loopback tier) and
   // any unknown value collapse to the Private presentation. `isGlobal` is the one enforced distinction.
   const isGlobal = (m) => effectiveScope(m) === "global";
@@ -136,10 +139,15 @@ import { exportCardModal, ensureImportSection } from "./cards";
       // Consent is asked in a native dialog when this takes effect: on save while sharing runs, else
       // when sharing starts. A declined dialog rolls the save back.
       scope.byModel.set(m, "global"); scope.consent.set(m, Date.now());
+      awaitingConsent = before;
     } else {
       scope.byModel.set(m, next); scope.consent.delete(m); // Private never carries consent
     }
-    await savePolicy(policy.mode, [...policy.models], before);   // scope fields ride along (see savePolicy)
+    try {
+      await savePolicy(policy.mode, [...policy.models], before);   // scope fields ride along (see savePolicy)
+    } finally {
+      if (awaitingConsent) { awaitingConsent = null; renderShare(); }
+    }
   }
   function policyFromSnap() {
     const s = snap?.share;
@@ -433,6 +441,8 @@ import { exportCardModal, ensureImportSection } from "./cards";
       const someShared = allActive.some((m) => isModelShared(m));
       sasw.classList.toggle("on", masterOn);
       sasw.classList.toggle("indeterminate", !masterOn && someShared);
+      sasw.setAttribute("role", "switch");
+      sasw.setAttribute("aria-checked", masterOn ? "true" : someShared ? "mixed" : "false");
       sasw.title = masterOn
         ? "Sharing every model, including ones you add later — click to keep only your current selection"
         : someShared

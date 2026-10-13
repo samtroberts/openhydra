@@ -370,7 +370,8 @@ function remoteScopeModal(swarmPublicKey, swarmLabel) {
     // M1 consent surface: making a model Global is public exposure — the app confirms it in a native
     // dialog before sending.
     const out = $(".swrout", back);
-    setHTML(out, html`<span class="mut" style="font-size:11.5px">Dialing the rig and sending…</span>`);
+    // Going Global asks first (native dialog): the note mustn't claim it's already sending.
+    setHTML(out, html`<span class="mut" style="font-size:11.5px">${scope === "global" ? "Confirm in the dialog; then this dials the rig and sends the change…" : "Dialing the rig and sending…"}</span>`);
     try {
       const ack = await call("swarm_remote_scope", {
         swarmPublicKey,

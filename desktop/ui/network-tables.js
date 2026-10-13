@@ -65,10 +65,14 @@ import { menu, toast } from "./chrome";
   // so they don't read as faults.
   const NOISY = /\b(WARN|DEBUG)\b.*\b(libp2p|quinn|quinn_udp|yamux|multistream|kad|mdns|netlink)\b/i;
   export function renderLogs() {
-    const logs = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || [];
+    const all = (logTab === "provider" ? state?.provider?.logs : state?.gateway?.logs) || [];
+    // The header search filters the log lines too (case-insensitive substring).
+    const q = ($("#search")?.value || "").toLowerCase();
+    const logs = q ? all.filter((l) => l.toLowerCase().includes(q)) : all;
+    const note = q ? `${logs.length} of ${all.length} lines match “${q}”.` : "Dimmed lines are routine network-layer warnings.";
     setHTML($("#logbody"), logs.length
-      ? html`<div class="mut" style="font-family:var(--sans);margin-bottom:6px">Dimmed lines are routine network-layer warnings.</div>${logs.map((l, i) => html`${i ? html`<br>` : ""}${NOISY.test(l) ? html`<span class="mut">${l}</span>` : l}`)}`
-      : html`No log lines yet.`);
+      ? html`<div class="mut" style="font-family:var(--sans);margin-bottom:6px">${note}</div>${logs.map((l, i) => html`${i ? html`<br>` : ""}${NOISY.test(l) ? html`<span class="mut">${l}</span>` : l}`)}`
+      : html`${all.length ? `No log lines match “${q}”.` : "No log lines yet."}`);
   }
 
 export function setLogTab(t) { logTab = t; }
