@@ -198,6 +198,38 @@ const RELAY_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(25
 /// C-N1: how often the grace-window sweep runs to close now-stable relays.
 const RELAY_CLOSE_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long an *inbound* duplicate QUIC connection lives before the dedup closes it. An AutoNAT v2
+/// server tests our address by dialing it back on a fresh port — a second QUIC connection from a
+/// peer we already hold one to. Closing it on arrival kills the test, so a node whose only
+/// connection to the server is QUIC never gets an address confirmed: it stays a Kademlia client,
+/// the bootstrap keeps it out of its routing table, and nobody learns a direct address for it
+/// (gateways fall back to relay circuits). The dial-back takes a few round trips; this leaves room.
+const QUIC_INBOUND_DUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the QUIC dedup does with a new QUIC-direct connection to a peer that already has one on the
+/// same address family: a duplicate we dialed closes at once; one the peer dialed (`is_listener`)
+/// gets [`QUIC_INBOUND_DUP_GRACE`] first, since it may be an AutoNAT dial-back.
+#[derive(Debug, PartialEq, Eq)]
+enum QuicDupAction {
+    CloseNow,
+    CloseAfterGrace,
+}
+
+fn quic_dup_action(is_listener: bool) -> QuicDupAction {
+    if is_listener {
+        QuicDupAction::CloseAfterGrace
+    } else {
+        QuicDupAction::CloseNow
+    }
+}
+
+/// Whether a deferred QUIC duplicate is still redundant when its grace runs out: the peer still
+/// holds another QUIC connection on that address family. If the original closed in the meantime the
+/// "duplicate" is now the only one, and stays.
+fn quic_dup_still_redundant(info: &PeerConnectionInfo, is_ipv6: bool) -> bool {
+    (if is_ipv6 { info.quic_direct_v6 } else { info.quic_direct_v4 }) >= 2
+}
+
 /// C-N2: max age of a queued relay-forward before the reaper fails it and drops
 /// the reply channel + buffered bytes (bounds the leak when a relay dial never
 /// connects). Tied to the reaper tick, so effective sweep is TTL..TTL+reaper.
@@ -568,6 +600,9 @@ struct LoopState {
     /// to the instant at which the v4 may be retired (v6-established-at + grace).
     /// Cleared if the v6 direct drops inside the window (so we keep the v4).
     v4_close_deadline: HashMap<PeerId, std::time::Instant>,
+    /// Inbound duplicate QUIC connections waiting out [`QUIC_INBOUND_DUP_GRACE`] before the dedup
+    /// closes them: connection -> (peer, is_ipv6, deadline).
+    quic_dup_close_deadline: HashMap<libp2p::swarm::ConnectionId, (PeerId, bool, std::time::Instant)>,
     /// DCUtR hole punch counters.
     dcutr_successes: u64,
     dcutr_failures: u64,
@@ -835,6 +870,7 @@ impl LoopState {
             pending_relay_forwards: Vec::new(),
             relay_close_deadline: HashMap::new(),
             v4_close_deadline: HashMap::new(),
+            quic_dup_close_deadline: HashMap::new(),
             dcutr_successes: 0,
             dcutr_failures: 0,
             enable_connection_reversal: false,
@@ -1618,6 +1654,20 @@ pub async fn run_event_loop(
             // longer pin traffic to the relay).
             _ = relay_close_ticker.tick() => {
                 let now = std::time::Instant::now();
+                // QUIC dedup: close inbound duplicates whose grace ran out, if still redundant.
+                let dup_due: Vec<_> = state
+                    .quic_dup_close_deadline
+                    .iter()
+                    .filter(|(_, (_, _, deadline))| now >= *deadline)
+                    .map(|(&cid, &(pid, v6, _))| (cid, pid, v6))
+                    .collect();
+                for (cid, pid, v6) in dup_due {
+                    state.quic_dup_close_deadline.remove(&cid);
+                    if state.peer_connections.get(&pid).is_some_and(|i| quic_dup_still_redundant(i, v6)) {
+                        debug!(%pid, "quic_dedup: closing inbound duplicate QUIC connection after grace");
+                        let _ = swarm.close_connection(cid);
+                    }
+                }
                 let due: Vec<PeerId> = state
                     .relay_close_deadline
                     .iter()
@@ -3041,9 +3091,23 @@ fn handle_swarm_event(
                     } else {
                         info.quic_direct_v4 += 1;
                     }
-                    debug!(%peer_id, %addr_str, v4=info.quic_direct_v4, v6=info.quic_direct_v6,
-                        "quic_dedup: closing duplicate QUIC connection (same AF)");
-                    let _ = swarm.close_connection(connection_id);
+                    let is_listener = matches!(endpoint, libp2p::core::ConnectedPoint::Listener { .. });
+                    match quic_dup_action(is_listener) {
+                        QuicDupAction::CloseNow => {
+                            debug!(%peer_id, %addr_str, v4=info.quic_direct_v4, v6=info.quic_direct_v6,
+                                "quic_dedup: closing duplicate QUIC connection (same AF)");
+                            let _ = swarm.close_connection(connection_id);
+                        }
+                        QuicDupAction::CloseAfterGrace => {
+                            debug!(%peer_id, %addr_str, v4=info.quic_direct_v4, v6=info.quic_direct_v6,
+                                grace_secs = QUIC_INBOUND_DUP_GRACE.as_secs(),
+                                "quic_dedup: inbound duplicate QUIC connection (same AF) — closing after grace (may be an AutoNAT dial-back)");
+                            state.quic_dup_close_deadline.insert(
+                                connection_id,
+                                (peer_id, is_ipv6, std::time::Instant::now() + QUIC_INBOUND_DUP_GRACE),
+                            );
+                        }
+                    }
                 } else {
                     if is_ipv6 {
                         info.quic_direct_v6 += 1;
@@ -3151,6 +3215,7 @@ fn handle_swarm_event(
                 transport
             };
 
+            state.quic_dup_close_deadline.remove(&connection_id);
             if let Some(info) = state.peer_connections.get_mut(&peer_id) {
                 info.direct_ips.remove(&connection_id);
                 match transport {
@@ -4402,6 +4467,10 @@ fn relay_circuit_addrs(peer_id: PeerId, ipv6_capable: bool) -> Vec<Multiaddr> {
 /// Finding A helper: a single multi-address dial to `peer_id` over the given
 /// relay-circuit addresses. `PeerCondition::Disconnected` so we only dial when
 /// there is no established connection (we're in the not-connected branch).
+/// The addresses the behaviours know for the peer (its Kademlia routing-table
+/// entry, i.e. direct listen addresses) are raced alongside the circuits —
+/// without `extend_addresses_through_behaviour` libp2p discards them and a
+/// directly reachable peer is only ever tried through a relay.
 fn relay_dial_opts(
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
@@ -4410,6 +4479,7 @@ fn relay_dial_opts(
     DialOpts::peer_id(peer_id)
         .condition(PeerCondition::Disconnected)
         .addresses(addrs)
+        .extend_addresses_through_behaviour()
         .build()
 }
 
@@ -5268,6 +5338,33 @@ mod tests {
         // v6 dropped in the window → keep the v4, retire nothing.
         info.quic_direct_v6 = 0;
         assert!(v4s_to_close(&info).is_empty());
+    }
+
+    // ── QUIC dedup vs AutoNAT v2 dial-back ─────────────────────────────────
+
+    #[test]
+    fn quic_dedup_defers_inbound_duplicates_so_autonat_dial_backs_complete() {
+        // The AutoNAT server's dial-back arrives as an inbound (listener-side) second QUIC
+        // connection; closing it at once failed every test of a QUIC-only node's address.
+        assert_eq!(quic_dup_action(true), QuicDupAction::CloseAfterGrace);
+        // A duplicate we dialed ourselves still closes immediately.
+        assert_eq!(quic_dup_action(false), QuicDupAction::CloseNow);
+        // Long enough for a dial-back's few round trips, short next to the 300s idle timeout.
+        assert!(QUIC_INBOUND_DUP_GRACE >= std::time::Duration::from_secs(5));
+        assert!(QUIC_INBOUND_DUP_GRACE <= std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn quic_dup_closes_after_grace_only_while_another_same_af_connection_remains() {
+        let mut info = PeerConnectionInfo::default();
+        info.quic_direct_v4 = 2; // original + deferred duplicate
+        assert!(quic_dup_still_redundant(&info, false));
+        assert!(!quic_dup_still_redundant(&info, true), "no v6 connections: nothing to dedup");
+        // The original closed during the grace window: the duplicate is now the only one — keep it.
+        info.quic_direct_v4 = 1;
+        assert!(!quic_dup_still_redundant(&info, false));
+        info.quic_direct_v6 = 2;
+        assert!(quic_dup_still_redundant(&info, true));
     }
 
     // ── C-N2: pending_relay_forwards TTL sweep ─────────────────────────────
