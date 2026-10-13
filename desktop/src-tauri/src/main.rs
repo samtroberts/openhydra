@@ -198,6 +198,11 @@ struct Settings {
     /// (`--audit-replay on`): the strongest check, but the prompt reaches that provider too. Off by
     /// default: audits then send generated test prompts instead.
     audit_replay: bool,
+    /// Let the gateway download a model's tokenizer from Hugging Face the first time it serves a model
+    /// the signed tokenizer index lists, to check billed token counts (W4). On by default; off passes
+    /// `--no-tokenizer-downloads` (only tokenizers already downloaded are used). The download tells
+    /// Hugging Face which models this gateway uses, never what it sends.
+    tokenizer_downloads: bool,
     /// Only use providers this gateway has verified at least to this tier: `"off"` (any provider,
     /// the default), `"A1"` or `"A2"` (`--min-authenticity <tier> --assurance gate`).
     min_authenticity: String,
@@ -266,6 +271,7 @@ impl Default for Settings {
             engine_autostart: true,
             authenticity_checks: false,
             audit_replay: false,
+            tokenizer_downloads: true,
             min_authenticity: "off".into(),
             search_url: String::new(),
             verbose_logs: false,
@@ -2028,6 +2034,10 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // D1: the desktop replays prompts for audits only when the user turned it on.
     sub.push("--audit-replay".into());
     sub.push(if settings.audit_replay { "on" } else { "off" }.into());
+    // W4: tokenizer downloads from Hugging Face for token-count checks, unless the user turned them off.
+    if !settings.tokenizer_downloads {
+        sub.push("--no-tokenizer-downloads".into());
+    }
     // D2: the user's floor on which providers serve them, enforced.
     if let Some(tier) = gateway_floor(&settings.min_authenticity) {
         sub.extend(["--min-authenticity".into(), tier.into(), "--assurance".into(), "gate".into()]);
@@ -3665,6 +3675,7 @@ mod tests {
         assert!(d.engine_autostart);
         assert!(!d.authenticity_checks, "authenticity checks are opt-in");
         assert!(!d.audit_replay, "replaying prompts for audits is opt-in on the desktop");
+        assert!(d.tokenizer_downloads, "token-count checks download tokenizers by default");
         assert_eq!(d.min_authenticity, "off");
         assert_eq!(gateway_floor("off"), None);
         assert_eq!(gateway_floor("A1"), Some("A1"));
@@ -3697,6 +3708,7 @@ mod tests {
         assert!(s.engine_autostart);
         assert!(!s.authenticity_checks, "an older config without the field loads as off");
         assert!(!s.audit_replay, "an older config without the field doesn't replay prompts");
+        assert!(s.tokenizer_downloads, "an older config without the field checks token counts, as the agent does");
         assert_eq!(s.min_authenticity, "off", "an older config without the field uses any provider");
         // new fields default sanely (unknown at old-schema time)
         assert!(!s.sharing_enabled, "unknown sharing intent defaults off, not a spurious on");

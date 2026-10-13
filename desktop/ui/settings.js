@@ -77,6 +77,8 @@ import { call } from "./bridge";
     $("#engineautostartsw").classList.toggle("on", !!s.engine_autostart);
     $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!s.authenticity_checks);
     $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!s.audit_replay);
+    // Absent in a config from before the setting existed: on, as the agent defaults.
+    $("#tokdlsw") && $("#tokdlsw").classList.toggle("on", s.tokenizer_downloads !== false);
     // A saved "A2" (offered by an unreleased build) is used as A1: this app's gateway can't run the
     // model checks A2 needs.
     const floor = s.min_authenticity || "off";

@@ -612,8 +612,8 @@ $("#setnav").onclick = (e) => { const s = e.target.closest(".s"); if (!s) return
 // Settings save as they change: switches and selects at once, text fields on Enter or when they
 // lose focus. `pendingSettings` keeps the new value on screen until the save lands, so the 2.5 s poll
 // can't flip it back. Each toast says when the change takes effect.
-const SETTING_SWITCHES = { engineautostartsw: "engine_autostart", authchecksw: "authenticity_checks", auditreplaysw: "audit_replay", resumelaunchsw: "resume_on_launch", verboselogsw: "verbose_logs", relaysw: "peer_relay" };
-const APPLIES = { gateway_port: "gateway", bootstraps: "both", audit_replay: "gateway", min_authenticity: "gateway", authenticity_checks: "sharing", verbose_logs: "both", peer_relay: "both", engine_kind: "sharing", engine_endpoint: "sharing", engine_autostart: "launch" };
+const SETTING_SWITCHES = { engineautostartsw: "engine_autostart", authchecksw: "authenticity_checks", auditreplaysw: "audit_replay", tokdlsw: "tokenizer_downloads", resumelaunchsw: "resume_on_launch", verboselogsw: "verbose_logs", relaysw: "peer_relay" };
+const APPLIES = { gateway_port: "gateway", bootstraps: "both", audit_replay: "gateway", tokenizer_downloads: "gateway", min_authenticity: "gateway", authenticity_checks: "sharing", verbose_logs: "both", peer_relay: "both", engine_kind: "sharing", engine_endpoint: "sharing", engine_autostart: "launch" };
 async function saveSetting(patch) {
   // Never save before the first state load: the payload would reset every other setting to defaults.
   if (!state?.settings) { toast("Still loading — try again in a moment"); renderSettings(); return; }

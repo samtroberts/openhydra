@@ -161,7 +161,8 @@ The gateway checks each provider's billed token count against the model's own
 tokenizer. Which tokenizer that is comes from a signed index (built in, refreshed
 daily from `dl.openhydra.co`); the tokenizer file itself is downloaded from
 huggingface.co the first time a listed model is used, hash-checked, and cached in
-`~/.openhydra/tokenizers`. `--no-tokenizer-downloads` turns the download off.
+`~/.openhydra/tokenizers`. `--no-tokenizer-downloads` (desktop: Settings → Network →
+"Check billed token counts") turns the download off.
 
 ---
 
@@ -219,7 +220,8 @@ overhead (LAN direct ≈ a few ms; relayed cross-NAT paths add a hop).
 - Token-count checks fetch the whole tokenizer index (it says nothing about which
   models you use), but downloading a model's tokenizer from Hugging Face tells
   Hugging Face that this gateway uses that model. Prompts and answers are never
-  sent there; `serve --no-tokenizer-downloads` turns the download off.
+  sent there; `serve --no-tokenizer-downloads` (or the desktop's "Check billed token
+  counts" switch) turns the download off.
 
 See [SECURITY.md](SECURITY.md) to report vulnerabilities.
 
