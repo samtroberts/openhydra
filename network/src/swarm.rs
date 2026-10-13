@@ -328,6 +328,7 @@ pub fn build_swarm(
         };
 
     let behaviour = OpenHydraBehaviour {
+        connection_limits: libp2p::connection_limits::Behaviour::new(crate::behaviour::peer_connection_limits()),
         kademlia,
         relay_client,
         relay_server,

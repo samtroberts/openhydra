@@ -10,9 +10,43 @@ use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay};
 
 use crate::proxy::GrpcProxyCodec;
 
+/// Connections one remote peer may hold with us at once. Normal use stays well under it: QUIC and
+/// TCP on each address family, a circuit through each production relay, a hole-punched upgrade and an
+/// AutoNAT dial-back (the dedups close extras); past it, a peer is refused more.
+pub const MAX_ESTABLISHED_PER_PEER: u32 = 16;
+/// A peer node: incoming connections still being set up (handshakes), and established ones.
+pub const PEER_MAX_PENDING_INCOMING: u32 = 128;
+pub const PEER_MAX_ESTABLISHED_INCOMING: u32 = 1024;
+/// A peer node: all established connections, both directions.
+pub const PEER_MAX_ESTABLISHED_TOTAL: u32 = 2048;
+/// A bootstrap: every node of the network may connect to it.
+pub const BOOTSTRAP_MAX_PENDING_INCOMING: u32 = 512;
+pub const BOOTSTRAP_MAX_ESTABLISHED_INCOMING: u32 = 8192;
+
+/// Bounds on how many connections other nodes can make a peer node hold (pending handshakes, and
+/// established connections in all and per peer). Without them, connections under fresh identities
+/// would pile up until the idle timeout.
+pub fn peer_connection_limits() -> libp2p::connection_limits::ConnectionLimits {
+    libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(PEER_MAX_PENDING_INCOMING))
+        .with_max_established_incoming(Some(PEER_MAX_ESTABLISHED_INCOMING))
+        .with_max_established(Some(PEER_MAX_ESTABLISHED_TOTAL))
+        .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
+}
+
+/// The same bounds for a bootstrap node, sized for the whole network connecting to it.
+pub fn bootstrap_connection_limits() -> libp2p::connection_limits::ConnectionLimits {
+    libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(BOOTSTRAP_MAX_PENDING_INCOMING))
+        .with_max_established_incoming(Some(BOOTSTRAP_MAX_ESTABLISHED_INCOMING))
+        .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
+}
+
 /// The composed behaviour for an OpenHydra peer node.
 #[derive(NetworkBehaviour)]
 pub struct OpenHydraBehaviour {
+    /// Bounds on the connections other nodes can make us hold ([`peer_connection_limits`]).
+    pub connection_limits: libp2p::connection_limits::Behaviour,
     /// Kademlia DHT for peer discovery.
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     /// Circuit Relay v2 client — connects through relays when behind NAT.
@@ -65,4 +99,92 @@ pub struct OpenHydraBehaviour {
     /// for full/restricted-cone home NATs). Does nothing useful behind CGNAT
     /// (the gateway itself is NATed → ``NonRoutableGateway``).
     pub upnp: libp2p::upnp::tokio::Behaviour,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use libp2p::core::transport::{MemoryTransport, Transport};
+    use libp2p::core::upgrade::Version;
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    use libp2p::swarm::{dummy, Swarm, SwarmEvent};
+    use libp2p::{identity, noise, yamux, Multiaddr, PeerId};
+    use std::time::Duration;
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+    struct Limited {
+        limits: libp2p::connection_limits::Behaviour,
+        keep: dummy::Behaviour,
+    }
+
+    fn node() -> Swarm<Limited> {
+        let key = identity::Keypair::generate_ed25519();
+        let transport = MemoryTransport::default()
+            .upgrade(Version::V1)
+            .authenticate(noise::Config::new(&key).unwrap())
+            .multiplex(yamux::Config::default())
+            .boxed();
+        let behaviour = Limited {
+            limits: libp2p::connection_limits::Behaviour::new(peer_connection_limits()),
+            keep: dummy::Behaviour,
+        };
+        let cfg = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_secs(60));
+        Swarm::new(transport, behaviour, PeerId::from(key.public()), cfg)
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_make_us_hold_more_than_the_per_peer_limit() {
+        let mut a = node();
+        let mut b = node();
+        let addr: Multiaddr = format!("/memory/{}", rand::random::<u64>()).parse().unwrap();
+        a.listen_on(addr.clone()).unwrap();
+        let a_id = *a.local_peer_id();
+        // Wait for the listener before dialing.
+        loop {
+            if let SwarmEvent::NewListenAddr { .. } = a.select_next_some().await {
+                break;
+            }
+        }
+        let attempts = MAX_ESTABLISHED_PER_PEER + 8;
+        for _ in 0..attempts {
+            b.dial(DialOpts::peer_id(a_id).addresses(vec![addr.clone()]).condition(PeerCondition::Always).build()).unwrap();
+        }
+        // Drive both until every dial has resolved one way or the other.
+        let (mut ok, mut refused) = (0u32, 0u32);
+        let deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(deadline);
+        while ok + refused < attempts {
+            tokio::select! {
+                ev = b.select_next_some() => match ev {
+                    SwarmEvent::ConnectionEstablished { .. } => ok += 1,
+                    SwarmEvent::OutgoingConnectionError { .. } => refused += 1,
+                    _ => {}
+                },
+                _ = a.select_next_some() => {}
+                _ = &mut deadline => break,
+            }
+        }
+        // Let A finish closing the ones its limit refused.
+        let settle = tokio::time::sleep(Duration::from_millis(500));
+        tokio::pin!(settle);
+        loop {
+            tokio::select! {
+                _ = a.select_next_some() => {}
+                _ = b.select_next_some() => {}
+                _ = &mut settle => break,
+            }
+        }
+        let held = a.network_info().connection_counters().num_established();
+        assert_eq!(held, MAX_ESTABLISHED_PER_PEER, "dialed {attempts}, b saw {ok} established / {refused} refused");
+    }
+
+    #[test]
+    fn limits_leave_room_for_normal_use() {
+        // QUIC + TCP on both families, four relay circuits, DCUtR, an AutoNAT dial-back.
+        assert!(MAX_ESTABLISHED_PER_PEER >= 2 + 2 + 4 + 1 + 1);
+        assert!(PEER_MAX_ESTABLISHED_INCOMING <= PEER_MAX_ESTABLISHED_TOTAL);
+        assert!(BOOTSTRAP_MAX_ESTABLISHED_INCOMING >= PEER_MAX_ESTABLISHED_INCOMING);
+    }
 }

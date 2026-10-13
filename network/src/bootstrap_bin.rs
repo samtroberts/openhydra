@@ -37,6 +37,8 @@ use openhydra_network::relay::{
 /// and DCUtR for advertising hole-punch support in Identify.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct BootstrapBehaviour {
+    /// Bounds on the connections other nodes can make the bootstrap hold.
+    connection_limits: libp2p::connection_limits::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     relay_server: relay::Behaviour,
     /// R-DHT-11: AutoNAT **v2 server** (the only AutoNAT — v1 retired). Answers a
@@ -286,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let behaviour = BootstrapBehaviour {
+        connection_limits: libp2p::connection_limits::Behaviour::new(openhydra_network::behaviour::bootstrap_connection_limits()),
         kademlia,
         relay_server,
         autonat_v2_server,
