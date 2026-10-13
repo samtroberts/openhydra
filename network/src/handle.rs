@@ -206,6 +206,12 @@ impl NetworkHandle {
         send_and_wait(&self.cmd_tx, |reply| SwarmCommand::KnownModels { reply })
     }
 
+    /// Models whose last known provider withdrew them in the last few minutes and that nobody serves
+    /// now: the gateway drops these from its sticky model list at once.
+    pub fn recently_withdrawn(&self) -> Result<Vec<String>, String> {
+        send_and_wait(&self.cmd_tx, |reply| SwarmCommand::RecentlyWithdrawn { reply })
+    }
+
     /// The model ids the provider `libp2p_peer_id` is known to serve, from its own signed records
     /// (nobody else can publish one for it).
     pub fn models_of(&self, libp2p_peer_id: impl Into<String>) -> Result<Vec<String>, String> {

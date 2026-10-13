@@ -297,6 +297,12 @@ pub enum SwarmCommand {
     KnownModels {
         reply: oneshot::Sender<Vec<String>>,
     },
+    /// Models whose last known provider withdrew them (`MODEL_WITHDRAWN`) within
+    /// [`WITHDRAWN_MODEL_MEMORY`] and that no known provider serves now: lists that smooth over
+    /// churn (the gateway's sticky `/v1/models`) drop these at once instead of keeping them.
+    RecentlyWithdrawn {
+        reply: oneshot::Sender<Vec<String>>,
+    },
     /// The model ids one provider (by libp2p id) is known to serve: from its own signed records.
     ModelsOf {
         libp2p_peer_id: String,
@@ -524,6 +530,8 @@ struct LoopState {
     ipv6_capable: bool,
     /// Known peers from Kademlia queries, keyed by OpenHydra peer_id.
     known_peers: HashMap<String, PeerRecord>,
+    /// Models withdrawn by their last known provider, and when (see `RecentlyWithdrawn`).
+    withdrawn_models: HashMap<String, std::time::Instant>,
     /// When each `known_peers` entry was last received here (local clock): what the cache cap
     /// evicts by, since a record's own signed time isn't set by every node (round 9 C9-1).
     known_received: HashMap<String, u64>,
@@ -851,6 +859,7 @@ impl LoopState {
             },
             ipv6_capable: probe_ipv6_capable(),
             known_peers: HashMap::new(),
+            withdrawn_models: HashMap::new(),
             known_received: HashMap::new(),
             local_libp2p: String::new(),
             discover_cache: HashMap::new(),
@@ -1275,6 +1284,13 @@ pub async fn run_event_loop(
                             },
                         };
                         let _ = reply.send(snapshot);
+                    }
+                    Some(SwarmCommand::RecentlyWithdrawn { reply }) => {
+                        let _ = reply.send(recently_withdrawn(
+                            &mut state.withdrawn_models,
+                            &state.known_peers,
+                            std::time::Instant::now(),
+                        ));
                     }
                     Some(SwarmCommand::KnownModels { reply }) => {
                         // Records are checked on the way in (verify_peer_record); filtering
@@ -2015,6 +2031,36 @@ fn evict_withdrawn_model(
     known_peers
         .retain(|_, record| !(record.libp2p_peer_id == libp2p_peer_id && record.model_id == model_id));
     before - known_peers.len()
+}
+
+/// How long a withdrawn model is remembered (as long as the gateway's sticky model list keeps one).
+pub const WITHDRAWN_MODEL_MEMORY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// After a withdrawal evicted `model` from a provider: remember it if no other known provider
+/// serves it (then it has really left the network, rather than lost one of its providers).
+fn note_withdrawn_model(
+    withdrawn: &mut HashMap<String, std::time::Instant>,
+    known_peers: &HashMap<String, PeerRecord>,
+    model: &str,
+    now: std::time::Instant,
+) {
+    if !known_peers.values().any(|r| r.model_id == model) {
+        withdrawn.insert(model.to_string(), now);
+    }
+}
+
+/// The remembered withdrawals still within [`WITHDRAWN_MODEL_MEMORY`] whose model no known provider
+/// serves now (a re-share brings it back); older ones are forgotten.
+fn recently_withdrawn(
+    withdrawn: &mut HashMap<String, std::time::Instant>,
+    known_peers: &HashMap<String, PeerRecord>,
+    now: std::time::Instant,
+) -> Vec<String> {
+    withdrawn.retain(|_, at| now.duration_since(*at) <= WITHDRAWN_MODEL_MEMORY);
+    let mut out: Vec<String> =
+        withdrawn.keys().filter(|m| !known_peers.values().any(|r| &r.model_id == *m)).cloned().collect();
+    out.sort();
+    out
 }
 
 /// C11: is our last completed discover for `model` still within `ttl_ms` and the same
@@ -2915,6 +2961,7 @@ fn handle_swarm_event(
                                         debug!(%pid, %model, ts, "ignored stale MODEL_WITHDRAWN (replay?)");
                                     } else if evict_withdrawn_model(&mut state.known_peers, id_str, model) > 0 {
                                         info!(%pid, %model, "evicted model via MODEL_WITHDRAWN gossip");
+                                        note_withdrawn_model(&mut state.withdrawn_models, &state.known_peers, model, std::time::Instant::now());
                                     }
                                 }
                                 Ok(pid) => warn!(
@@ -5338,6 +5385,35 @@ mod tests {
         // v6 dropped in the window → keep the v4, retire nothing.
         info.quic_direct_v6 = 0;
         assert!(v4s_to_close(&info).is_empty());
+    }
+
+    // ── withdrawn models (sticky model lists drop them at once) ───────────
+
+    #[test]
+    fn a_model_is_remembered_as_withdrawn_only_when_nobody_serves_it() {
+        let rec = |peer: &str, model: &str| PeerRecord { libp2p_peer_id: peer.into(), model_id: model.into(), ..Default::default() };
+        let mut known: HashMap<String, PeerRecord> = HashMap::new();
+        known.insert("a/m".into(), rec("a", "m"));
+        known.insert("b/m".into(), rec("b", "m"));
+        known.insert("a/n".into(), rec("a", "n"));
+        let mut withdrawn = HashMap::new();
+        let t0 = std::time::Instant::now();
+        // a withdraws m, but b still serves it: m hasn't left the network.
+        assert_eq!(evict_withdrawn_model(&mut known, "a", "m"), 1);
+        note_withdrawn_model(&mut withdrawn, &known, "m", t0);
+        assert!(recently_withdrawn(&mut withdrawn, &known, t0).is_empty());
+        // a withdraws n, its only provider: remembered.
+        evict_withdrawn_model(&mut known, "a", "n");
+        note_withdrawn_model(&mut withdrawn, &known, "n", t0);
+        assert_eq!(recently_withdrawn(&mut withdrawn, &known, t0), vec!["n".to_string()]);
+        // Re-shared: no longer reported (the record is back).
+        known.insert("a/n".into(), rec("a", "n"));
+        assert!(recently_withdrawn(&mut withdrawn, &known, t0).is_empty());
+        known.remove("a/n");
+        // Forgotten after the memory window.
+        let later = t0 + WITHDRAWN_MODEL_MEMORY + std::time::Duration::from_secs(1);
+        assert!(recently_withdrawn(&mut withdrawn, &known, later).is_empty());
+        assert!(withdrawn.is_empty());
     }
 
     // ── QUIC dedup vs AutoNAT v2 dial-back ─────────────────────────────────

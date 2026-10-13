@@ -2764,6 +2764,11 @@ impl ConsumerNode {
         self.net.known_models()
     }
 
+    /// Models their last known provider withdrew in the last few minutes (and nobody serves now).
+    pub fn recently_withdrawn(&self) -> Result<Vec<String>, String> {
+        self.net.recently_withdrawn()
+    }
+
     /// Discover a provider for `model`, pick the best, and stream the completion's text
     /// deltas to `on_delta`. Returns the [`ServeSummary`] (token count → receipt) on
     /// success. `model` is the engine handle / DHT key (e.g. `"qwen2.5:7b"`).

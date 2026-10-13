@@ -536,7 +536,14 @@ async fn known_models_async(state: &AppState) -> Vec<String> {
 /// or falls back — never routes to a dead peer.
 async fn browse_models(state: &AppState) -> Vec<String> {
     let live = known_models_async(state).await;
-    state.model_cache.merge(live)
+    let node = state.node.clone();
+    // A model its last provider withdrew leaves the list at once; smoothing is for churn, not that.
+    let withdrawn = tokio::task::spawn_blocking(move || node.recently_withdrawn())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    state.model_cache.merge(live, &withdrawn)
 }
 
 /// Sticky browse-list cache: a model stays listed for `ttl` after it was last seen live. Decoupled
@@ -553,15 +560,17 @@ impl ModelStickyCache {
         Self { seen: std::sync::Mutex::new(std::collections::HashMap::new()), ttl }
     }
 
-    /// Stamp each currently-live model as seen now, evict entries older than `ttl`, and return the
-    /// sorted union of live + still-fresh models.
-    fn merge(&self, live: Vec<String>) -> Vec<String> {
+    /// Stamp each currently-live model as seen now, evict entries older than `ttl` and models their
+    /// providers withdrew (`withdrawn`, none of them live), and return the sorted union of live +
+    /// still-fresh models.
+    fn merge(&self, live: Vec<String>, withdrawn: &[String]) -> Vec<String> {
         let now = std::time::Instant::now();
         let mut seen = self.seen.lock().unwrap();
-        for m in live {
-            seen.insert(m, now);
+        let live: std::collections::HashSet<String> = live.into_iter().collect();
+        for m in &live {
+            seen.insert(m.clone(), now);
         }
-        seen.retain(|_, t| now.duration_since(*t) <= self.ttl);
+        seen.retain(|m, t| now.duration_since(*t) <= self.ttl && (live.contains(m) || !withdrawn.contains(m)));
         let mut out: Vec<String> = seen.keys().cloned().collect();
         out.sort();
         out
@@ -3077,19 +3086,30 @@ mod tests {
     fn model_sticky_cache_smooths_churn() {
         let c = ModelStickyCache::new(Duration::from_secs(300));
         // Two live models.
-        assert_eq!(c.merge(vec!["m1".into(), "m2".into()]), vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(c.merge(vec!["m1".into(), "m2".into()], &[]), vec!["m1".to_string(), "m2".to_string()]);
         // m2 momentarily gone from the live set → still listed (within TTL).
-        assert_eq!(c.merge(vec!["m1".into()]), vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(c.merge(vec!["m1".into()], &[]), vec!["m1".to_string(), "m2".to_string()]);
         // A new model appears and joins.
         assert_eq!(
-            c.merge(vec!["m1".into(), "m3".into()]),
+            c.merge(vec!["m1".into(), "m3".into()], &[]),
             vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
         );
         // ttl = 0 → a model absent from the next live set drops immediately (no stickiness).
         let z = ModelStickyCache::new(Duration::ZERO);
-        z.merge(vec!["x".into(), "y".into()]);
+        z.merge(vec!["x".into(), "y".into()], &[]);
         std::thread::sleep(Duration::from_millis(2));
-        assert_eq!(z.merge(vec!["x".into()]), vec!["x".to_string()]);
+        assert_eq!(z.merge(vec!["x".into()], &[]), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn a_withdrawn_model_leaves_the_sticky_list_at_once() {
+        let c = ModelStickyCache::new(Duration::from_secs(300));
+        c.merge(vec!["m1".into(), "m2".into()], &[]);
+        // m2's last provider withdrew it: gone now, not in 5 minutes.
+        assert_eq!(c.merge(vec!["m1".into()], &["m2".to_string()]), vec!["m1".to_string()]);
+        assert_eq!(c.merge(vec!["m1".into()], &[]), vec!["m1".to_string()], "and it doesn't come back");
+        // A model that is live again (re-shared) stays, whatever the withdrawal list says.
+        assert_eq!(c.merge(vec!["m1".into(), "m2".into()], &["m2".to_string()]), vec!["m1".to_string(), "m2".to_string()]);
     }
 
     #[tokio::test]
