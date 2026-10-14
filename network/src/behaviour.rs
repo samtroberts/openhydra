@@ -45,6 +45,9 @@ pub fn bootstrap_connection_limits() -> libp2p::connection_limits::ConnectionLim
 /// The composed behaviour for an OpenHydra peer node.
 #[derive(NetworkBehaviour)]
 pub struct OpenHydraBehaviour {
+    /// Bounds on the incoming connections one network address can make us hold (first: a refused
+    /// connection costs nothing further).
+    pub ip_limits: crate::ip_limits::Behaviour,
     /// Bounds on the connections other nodes can make us hold ([`peer_connection_limits`]).
     pub connection_limits: libp2p::connection_limits::Behaviour,
     /// Kademlia DHT for peer discovery.

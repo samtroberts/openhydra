@@ -1,0 +1,295 @@
+//! Limits on the incoming connections one network address can make a node hold (review 2026-10-14,
+//! M8). `connection_limits` bounds the totals and each peer id, but peer ids are free: one host can
+//! fill a node's whole incoming allowance under fresh identities and turn every other peer away. This
+//! counts by the remote address instead: an IPv4 address, or an IPv6 /64 (what one host or one home
+//! network gets). Relayed connections aren't counted here (the relay's own limits bound them), nor,
+//! by default, loopback ones (local agents: the desktop's own gateway and provider, test rigs).
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use libp2p::core::transport::PortUse;
+use libp2p::core::Endpoint;
+use libp2p::multiaddr::Protocol;
+use libp2p::swarm::{
+    dummy, ConnectionClosed, ConnectionDenied, ConnectionId, FromSwarm, ListenFailure, NetworkBehaviour, THandler,
+    THandlerInEvent, THandlerOutEvent, ToSwarm,
+};
+use libp2p::{Multiaddr, PeerId};
+
+/// How many incoming connections one address may have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpLimitsConfig {
+    /// Still being set up (handshakes).
+    pub max_pending_per_ip: u32,
+    /// Established.
+    pub max_established_per_ip: u32,
+    /// Loopback connections aren't counted.
+    pub exempt_loopback: bool,
+}
+
+impl IpLimitsConfig {
+    /// A peer node.
+    pub const PEER: Self = Self { max_pending_per_ip: 8, max_established_per_ip: 32, exempt_loopback: true };
+    /// A bootstrap: carrier-grade NAT puts many users behind one IPv4 address.
+    pub const BOOTSTRAP: Self = Self { max_pending_per_ip: 32, max_established_per_ip: 256, exempt_loopback: true };
+}
+
+/// The network a remote address is counted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Net {
+    V4(Ipv4Addr),
+    /// The /64 prefix.
+    V6([u8; 8]),
+}
+
+/// The network `remote` is counted under: `None` for a relayed connection, or a loopback one when
+/// loopback is exempt.
+fn net_of(remote: &Multiaddr, exempt_loopback: bool) -> Option<Net> {
+    if remote.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        return None;
+    }
+    let v4 = |ip: Ipv4Addr| (!(exempt_loopback && ip.is_loopback())).then_some(Net::V4(ip));
+    match remote.iter().next()? {
+        Protocol::Ip4(ip) => v4(ip),
+        Protocol::Ip6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => v4(mapped),
+            None if exempt_loopback && ip == Ipv6Addr::LOCALHOST => None,
+            None => {
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&ip.octets()[..8]);
+                Some(Net::V6(prefix))
+            }
+        },
+        _ => None,
+    }
+}
+
+/// An address that has as many connections as it may.
+#[derive(Debug)]
+pub struct TooManyFromThisAddress {
+    pending: bool,
+    limit: u32,
+}
+
+impl std::fmt::Display for TooManyFromThisAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.pending { "connections being set up" } else { "connections" };
+        write!(f, "this address already has {} incoming {what}", self.limit)
+    }
+}
+
+impl std::error::Error for TooManyFromThisAddress {}
+
+/// The behaviour: put it first in a node's behaviour, before `connection_limits`.
+pub struct Behaviour {
+    config: IpLimitsConfig,
+    pending: HashMap<ConnectionId, Net>,
+    established: HashMap<ConnectionId, Net>,
+    pending_per_net: HashMap<Net, u32>,
+    established_per_net: HashMap<Net, u32>,
+}
+
+fn bump(counts: &mut HashMap<Net, u32>, net: Net) {
+    *counts.entry(net).or_default() += 1;
+}
+
+fn drop_one(counts: &mut HashMap<Net, u32>, net: Net) {
+    if let Some(n) = counts.get_mut(&net) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            counts.remove(&net);
+        }
+    }
+}
+
+impl Behaviour {
+    pub fn new(config: IpLimitsConfig) -> Self {
+        Self {
+            config,
+            pending: HashMap::new(),
+            established: HashMap::new(),
+            pending_per_net: HashMap::new(),
+            established_per_net: HashMap::new(),
+        }
+    }
+
+    fn forget_pending(&mut self, connection_id: ConnectionId) {
+        if let Some(net) = self.pending.remove(&connection_id) {
+            drop_one(&mut self.pending_per_net, net);
+        }
+    }
+}
+
+impl NetworkBehaviour for Behaviour {
+    type ConnectionHandler = dummy::ConnectionHandler;
+    type ToSwarm = std::convert::Infallible;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        _local: &Multiaddr,
+        remote: &Multiaddr,
+    ) -> Result<(), ConnectionDenied> {
+        let Some(net) = net_of(remote, self.config.exempt_loopback) else { return Ok(()) };
+        let limit = self.config.max_pending_per_ip;
+        if self.pending_per_net.get(&net).copied().unwrap_or(0) >= limit {
+            return Err(ConnectionDenied::new(TooManyFromThisAddress { pending: true, limit }));
+        }
+        bump(&mut self.pending_per_net, net);
+        self.pending.insert(connection_id, net);
+        Ok(())
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        _peer: PeerId,
+        _local: &Multiaddr,
+        remote: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.forget_pending(connection_id);
+        if let Some(net) = net_of(remote, self.config.exempt_loopback) {
+            let limit = self.config.max_established_per_ip;
+            if self.established_per_net.get(&net).copied().unwrap_or(0) >= limit {
+                return Err(ConnectionDenied::new(TooManyFromThisAddress { pending: false, limit }));
+            }
+        }
+        Ok(dummy::ConnectionHandler)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _connection_id: ConnectionId,
+        _peer: PeerId,
+        _addr: &Multiaddr,
+        _role_override: Endpoint,
+        _port_use: PortUse,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(dummy::ConnectionHandler)
+    }
+
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        match event {
+            // Counted once every behaviour accepted it.
+            FromSwarm::ConnectionEstablished(e) => {
+                if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = e.endpoint {
+                    if let Some(net) = net_of(send_back_addr, self.config.exempt_loopback) {
+                        bump(&mut self.established_per_net, net);
+                        self.established.insert(e.connection_id, net);
+                    }
+                }
+            }
+            FromSwarm::ConnectionClosed(ConnectionClosed { connection_id, .. }) => {
+                if let Some(net) = self.established.remove(&connection_id) {
+                    drop_one(&mut self.established_per_net, net);
+                }
+            }
+            FromSwarm::ListenFailure(ListenFailure { connection_id, .. }) => self.forget_pending(connection_id),
+            _ => {}
+        }
+    }
+
+    fn on_connection_handler_event(&mut self, _peer: PeerId, _id: ConnectionId, event: THandlerOutEvent<Self>) {
+        match event {}
+    }
+
+    fn poll(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        std::task::Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
+    use std::time::Duration;
+
+    #[test]
+    fn addresses_are_counted_by_host_and_v6_slash_64() {
+        let m = |s: &str| s.parse::<Multiaddr>().unwrap();
+        let a = net_of(&m("/ip4/203.0.113.7/tcp/4001"), true);
+        assert_eq!(a, Some(Net::V4("203.0.113.7".parse().unwrap())));
+        assert_eq!(net_of(&m("/ip6/2001:db8:1:2:aaaa::1/udp/4001/quic-v1"), true), net_of(&m("/ip6/2001:db8:1:2:bbbb::9/tcp/1"), true));
+        assert_ne!(net_of(&m("/ip6/2001:db8:1:2::1/tcp/1"), true), net_of(&m("/ip6/2001:db8:1:3::1/tcp/1"), true));
+        assert_eq!(net_of(&m("/ip6/::ffff:203.0.113.7/tcp/1"), true), a, "IPv4-mapped counts as the IPv4 address");
+        assert_eq!(net_of(&m("/ip4/127.0.0.1/tcp/1"), true), None, "loopback exempt");
+        assert!(net_of(&m("/ip4/127.0.0.1/tcp/1"), false).is_some());
+        assert_eq!(net_of(&m("/ip6/::1/tcp/1"), true), None);
+        let circuit = m("/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWEL5wEL3foSWUk1E1rXHLbveqTahoHKhAsEYhDsLUkyWb/p2p-circuit");
+        assert_eq!(net_of(&circuit, true), None, "relayed: the relay's limits apply");
+    }
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+    struct Limited {
+        ip: Behaviour,
+        keep: libp2p::swarm::dummy::Behaviour,
+    }
+
+    fn node(config: IpLimitsConfig) -> Swarm<Limited> {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let transport = crate::transport::build_tcp_transport(&key).unwrap();
+        let cfg = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_secs(60));
+        Swarm::new(transport, Limited { ip: Behaviour::new(config), keep: libp2p::swarm::dummy::Behaviour }, PeerId::from(key.public()), cfg)
+    }
+
+    #[tokio::test]
+    async fn one_address_cannot_make_us_hold_more_than_its_share() {
+        // Loopback counted here, so the test's connections (all from 127.0.0.1) are one address.
+        let config = IpLimitsConfig { max_pending_per_ip: 64, max_established_per_ip: 6, exempt_loopback: false };
+        let mut a = node(config);
+        a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = a.select_next_some().await {
+                break address;
+            }
+        };
+        // Ten dialers, fresh identities each (as an attacker would use).
+        let mut dialers: Vec<Swarm<Limited>> = (0..10).map(|_| node(IpLimitsConfig::PEER)).collect();
+        for d in dialers.iter_mut() {
+            d.dial(DialOpts::peer_id(*a.local_peer_id()).addresses(vec![addr.clone()]).condition(PeerCondition::Always).build()).unwrap();
+        }
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        loop {
+            let mut any = futures::future::select_all(dialers.iter_mut().map(|d| Box::pin(d.select_next_some())));
+            tokio::select! {
+                _ = a.select_next_some() => {}
+                _ = &mut any => {}
+                _ = &mut deadline => break,
+            }
+        }
+        assert_eq!(a.network_info().connection_counters().num_established(), 6, "ten identities, one address: six held");
+        // Another address is unaffected: the limit is per address, not in all.
+        assert!(a.behaviour().ip.established_per_net.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn silent_sockets_from_one_address_leave_room_for_others() {
+        let config = IpLimitsConfig { max_pending_per_ip: 3, max_established_per_ip: 32, exempt_loopback: false };
+        let mut a = node(config);
+        a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = a.select_next_some().await {
+                break address;
+            }
+        };
+        let port = addr.iter().find_map(|p| if let Protocol::Tcp(p) = p { Some(p) } else { None }).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..10 {
+            held.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        let settle = tokio::time::sleep(Duration::from_millis(300));
+        tokio::pin!(settle);
+        loop {
+            tokio::select! {
+                _ = a.select_next_some() => {}
+                _ = &mut settle => break,
+            }
+        }
+        assert_eq!(a.behaviour().ip.pending.len(), 3, "only three of ten silent sockets hold a slot");
+    }
+}
