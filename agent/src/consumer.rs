@@ -168,11 +168,9 @@ const PAYMENT_REFUSAL_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_SETTLE_RECORDS: usize = 4096;
 /// How long a provider that shed our request, or couldn't be reached, is tried last.
 const UNAVAILABLE_RANK_LAST_MS: u64 = 60 * 1000;
-/// A second shed-free failure to reach a provider within this long costs it reputation.
+/// A second shed-free failure to reach a provider within this long costs it reputation. A request's
+/// own retries are one miss, however many there are (see [`ConsumerNode::note_unavailable_once`]).
 const UNAVAILABLE_REPEAT_MS: u64 = 10 * 60 * 1000;
-/// Misses closer together than this are one incident (a request's own retries while a provider
-/// becomes reachable), never a "second" miss.
-const UNAVAILABLE_SAME_INCIDENT_MS: u64 = 45 * 1000;
 /// How recent a completed serve shows a provider's engine working (for a follow-up's refusal).
 const SERVED_OK_RECENT_MS: u64 = 10 * 60 * 1000;
 /// Only one audit shed per provider and model is excused within this long.
@@ -1796,6 +1794,36 @@ fn is_unreachable_dial(e: &AdapterError) -> bool {
     matches!(e, AdapterError::Network(m) if m.contains(openhydra_network::event_loop::DIAL_FAILED_UNREACHABLE))
 }
 
+/// Whether a failed attempt failed only because its provider couldn't be reached yet: its dial
+/// failed and nothing was opened. A stream that opened did reach the provider, whatever its later
+/// error says (a poll that lost the connection carries the dial error too).
+fn attempt_not_reachable_yet(opened: bool, e: &AdapterError) -> bool {
+    !opened && is_unreachable_dial(e)
+}
+
+/// How a pass whose candidates all failed (nothing streamed) ends: `NotReachableYet` when every
+/// attempt was [`attempt_not_reachable_yet`], else `Retryable`.
+fn failed_pass_outcome(err: AdapterError, all_not_reachable_yet: bool) -> AttemptOutcome {
+    if all_not_reachable_yet {
+        AttemptOutcome::NotReachableYet(err)
+    } else {
+        AttemptOutcome::Retryable(err)
+    }
+}
+
+/// The back-off before looking again after a pass that ended `NotReachableYet`: the next of the
+/// waits, while it fits the budget and the client is still there.
+fn next_unreachable_wait(
+    waits: &mut std::slice::Iter<'_, std::time::Duration>,
+    elapsed: std::time::Duration,
+    cancelled: bool,
+) -> Option<std::time::Duration> {
+    if cancelled {
+        return None;
+    }
+    waits.next().copied().filter(|w| elapsed + *w <= UNREACHABLE_RETRY_BUDGET)
+}
+
 enum AttemptOutcome {
     /// Served successfully — return this summary.
     Served(ServeSummary),
@@ -1803,6 +1831,12 @@ enum AttemptOutcome {
     /// streamed** yet). Safe to invalidate the discovery cache and retry once — a stale cache
     /// hit (provider moved/died, replacement not yet cached) shouldn't strand the request.
     Retryable(AdapterError),
+    /// Like `Retryable`, but every provider tried was one we couldn't reach yet (its dial failed
+    /// before anything was opened): one that only just joined isn't reachable until its address is
+    /// confirmed, so the caller waits a little and looks again (see [`UNREACHABLE_RETRY_WAITS`]).
+    /// A provider that answered with an error is no reason to wait: sending it the request again
+    /// only costs it reputation each time (review 2026-10-14, M3).
+    NotReachableYet(AdapterError),
     /// Must propagate as-is — e.g. output was already streamed to the client (a retry would
     /// duplicate it), or a discovery-transport error a cache bypass can't fix.
     Fatal(AdapterError),
@@ -2576,21 +2610,33 @@ impl ConsumerNode {
     }
 
     /// Note that `provider` shed our request for `model`, or couldn't be reached, before serving
-    /// anything. Whether it did so before within [`UNAVAILABLE_REPEAT_MS`] — in an earlier incident:
-    /// misses within [`UNAVAILABLE_SAME_INCIDENT_MS`] of the first (one request's retries) count once.
+    /// anything. Whether it did so before within [`UNAVAILABLE_REPEAT_MS`].
     fn note_unavailable(&self, provider: &str, model: &str, now: u64) -> bool {
         let mut m = self.unavailable.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, at| now.saturating_sub(*at) <= UNAVAILABLE_REPEAT_MS);
         let key = (provider.to_string(), model.to_string());
-        if m.get(&key).is_some_and(|at| now.saturating_sub(*at) < UNAVAILABLE_SAME_INCIDENT_MS) {
-            return false;
-        }
         if m.len() >= MAX_PAYMENT_REFUSALS {
             if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
                 m.remove(&oldest);
             }
         }
         m.insert(key, now).is_some_and(|at| now.saturating_sub(at) <= UNAVAILABLE_REPEAT_MS)
+    }
+
+    /// [`note_unavailable`](Self::note_unavailable), once per request: `noted` holds the providers
+    /// this request already noted, so its own retries (while a provider becomes reachable) are one
+    /// miss, never a "second" one. Misses in two requests are two, however close together.
+    fn note_unavailable_once(
+        &self,
+        noted: &std::cell::RefCell<std::collections::HashSet<(String, String)>>,
+        provider: &str,
+        model: &str,
+        now: u64,
+    ) -> bool {
+        if !noted.borrow_mut().insert((provider.to_string(), model.to_string())) {
+            return false;
+        }
+        self.note_unavailable(provider, model, now)
     }
 
     /// Whether `provider` shed or missed a request of ours for `model` within
@@ -2832,6 +2878,8 @@ impl ConsumerNode {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
         let now = now_unix_ms();
+        // Providers this request already noted as unavailable: its retries are one miss (L5).
+        let noted = std::cell::RefCell::new(std::collections::HashSet::new());
         // The buyer's floor for this request: this node's, raised (never lowered) by the request's.
         let policy = request_policy(self.assurance, min_authenticity);
         // The `complete` span (from #[instrument]); we fill in `provider`/`tokens` on success.
@@ -2841,31 +2889,37 @@ impl ConsumerNode {
         // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
         // model's discovery cache and retry once with a cold get_providers lookup. The retry is
         // only reached when nothing was streamed, so it can never duplicate delivered output.
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &noted, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => return Ok(summary),
             AttemptOutcome::Fatal(e) => return Err(e),
-            AttemptOutcome::Retryable(e) if cancel() => return Err(e),
-            AttemptOutcome::Retryable(_) => {}
+            AttemptOutcome::Retryable(e) | AttemptOutcome::NotReachableYet(e) if cancel() => return Err(e),
+            AttemptOutcome::Retryable(_) | AttemptOutcome::NotReachableYet(_) => {}
         }
         tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
         let started = std::time::Instant::now();
         let mut waits = UNREACHABLE_RETRY_WAITS.iter();
         loop {
             let _ = self.net.invalidate_discover(model);
-            match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &req_span, on_delta) {
+            match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &noted, &req_span, on_delta) {
                 AttemptOutcome::Served(summary) => return Ok(summary),
                 AttemptOutcome::Fatal(e) => return Err(e),
-                AttemptOutcome::Retryable(e) => {
+                // A provider answered (with an error): the one cache-bypass retry was enough.
+                AttemptOutcome::Retryable(e) => return Err(e),
+                AttemptOutcome::NotReachableYet(e) => {
                     // A provider that only just joined isn't reachable until its address is confirmed
                     // (a few seconds): its dial fails at once, so wait a little and look again rather
-                    // than fail the request. Only for that error, and nothing has been streamed.
-                    let wait = waits.next().copied().filter(|_| is_unreachable_dial(&e) && !cancel());
-                    match wait {
-                        Some(w) if started.elapsed() + w <= UNREACHABLE_RETRY_BUDGET => {
+                    // than fail the request. Only when no provider could be reached at all, and
+                    // nothing has been streamed.
+                    match next_unreachable_wait(&mut waits, started.elapsed(), cancel()) {
+                        Some(w) => {
                             tracing::info!(model, wait_ms = w.as_millis() as u64, "provider not reachable yet; looking again shortly");
                             std::thread::sleep(w);
+                            // Its client may have left while we waited (L6).
+                            if cancel() {
+                                return Err(e);
+                            }
                         }
-                        _ => return Err(e),
+                        None => return Err(e),
                     }
                 }
             }
@@ -2888,6 +2942,7 @@ impl ConsumerNode {
         policy: &AssurancePolicy,
         cancel: &dyn Fn() -> bool,
         now: u64,
+        noted: &std::cell::RefCell<std::collections::HashSet<(String, String)>>,
         req_span: &tracing::Span,
         on_delta: &mut dyn FnMut(&str),
     ) -> AttemptOutcome {
@@ -2984,7 +3039,16 @@ impl ConsumerNode {
         // measures what it sends: bounds the token count we sign for (see `billable_tokens`).
         let delivered_text = std::cell::Cell::new(crate::serve::DeliveredText::default());
         let mut last_err: Option<AdapterError> = None;
+        // Whether every attempt so far failed only because its provider couldn't be reached yet.
+        let mut all_not_reachable_yet = true;
+        // The last error a provider we reached gave: what the client is told, rather than that
+        // another provider couldn't be reached.
+        let mut answered_err: Option<AdapterError> = None;
         for (i, provider) in candidates.into_iter().enumerate() {
+            // Its client left: don't open anything more at providers (L6).
+            if cancel() {
+                return AttemptOutcome::Fatal(AdapterError::Cancelled("the client left".into()));
+            }
             let _attempt_span = tracing::info_span!(
                 "serve_attempt",
                 attempt = i + 1,
@@ -3226,7 +3290,7 @@ impl ConsumerNode {
                     // (round 8 T8-3).
                     let shed = !delivered && matches!(e, AdapterError::Overloaded(_));
                     let unreachable = !delivered && matches!(e, AdapterError::Network(_));
-                    let missed_again = (shed || unreachable) && self.note_unavailable(&provider.libp2p_peer_id, &provider.model_id, now);
+                    let missed_again = (shed || unreachable) && self.note_unavailable_once(noted, &provider.libp2p_peer_id, &provider.model_id, now);
                     let excused = shed || (unreachable && !missed_again);
                     if !self.is_self_serve(&provider.libp2p_peer_id) && !refused && !cancelled && !excused {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
@@ -3264,14 +3328,21 @@ impl ConsumerNode {
                         // (or a cache-bypass retry) would duplicate output. Surface it as fatal.
                         return AttemptOutcome::Fatal(e);
                     }
+                    if !attempt_not_reachable_yet(opened, &e) {
+                        all_not_reachable_yet = false;
+                        answered_err = Some(e);
+                        continue;
+                    }
                     last_err = Some(e);
                 }
             }
         }
         // Every candidate failed, but nothing was streamed → safe for the caller to bypass the
         // discovery cache and retry once.
-        AttemptOutcome::Retryable(
-            last_err.unwrap_or_else(|| AdapterError::Route(format!("all providers failed for '{model}'"))),
+        let all_not_reachable_yet = all_not_reachable_yet && last_err.is_some();
+        failed_pass_outcome(
+            answered_err.or(last_err).unwrap_or_else(|| AdapterError::Route(format!("all providers failed for '{model}'"))),
+            all_not_reachable_yet,
         )
     }
 
@@ -6257,19 +6328,56 @@ mod tests {
         }
     }
 
+    /// Review 2026-10-14 M3/L4/L6: only a pass where no provider could be reached at all waits and
+    /// looks again; a provider that answered with an error, or a stream that had opened, ends it.
+    #[test]
+    fn only_a_pass_that_reached_no_provider_waits_and_looks_again() {
+        use openhydra_network::event_loop::DIAL_FAILED_UNREACHABLE;
+        let unreachable = || AdapterError::Network(format!("proxy_forward: {DIAL_FAILED_UNREACHABLE}"));
+        let answered = || AdapterError::Provider("the prompt is longer than the context".into());
+        assert!(attempt_not_reachable_yet(false, &unreachable()));
+        assert!(!attempt_not_reachable_yet(false, &answered()));
+        // A stream that opened reached its provider, even though its last poll carries the dial error.
+        let dropped = AdapterError::Network(format!("stream poll dropped past retry budget: proxy_forward: {DIAL_FAILED_UNREACHABLE}"));
+        assert!(!attempt_not_reachable_yet(true, &dropped));
+        assert!(matches!(failed_pass_outcome(unreachable(), true), AttemptOutcome::NotReachableYet(_)));
+        // One provider unreachable, one answering with an error: no waiting, no resending.
+        assert!(matches!(failed_pass_outcome(answered(), false), AttemptOutcome::Retryable(_)));
+        assert!(matches!(failed_pass_outcome(unreachable(), false), AttemptOutcome::Retryable(_)));
+        // The client left: no more waits.
+        let mut waits = UNREACHABLE_RETRY_WAITS.iter();
+        assert_eq!(next_unreachable_wait(&mut waits, std::time::Duration::ZERO, true), None);
+        // Every wait fits the budget, and then they stop.
+        let mut waits = UNREACHABLE_RETRY_WAITS.iter();
+        let (mut total, mut n) = (std::time::Duration::ZERO, 0);
+        while let Some(w) = next_unreachable_wait(&mut waits, total, false) {
+            total += w;
+            n += 1;
+        }
+        assert!(total <= UNREACHABLE_RETRY_BUDGET);
+        assert_eq!(n, UNREACHABLE_RETRY_WAITS.len());
+        // Late in the budget, a wait that wouldn't fit isn't taken.
+        let mut waits = UNREACHABLE_RETRY_WAITS.iter();
+        assert_eq!(next_unreachable_wait(&mut waits, UNREACHABLE_RETRY_BUDGET, false), None);
+    }
+
     /// Round 8 T8-3/T8-5: a shed or a missed provider goes last for a minute and only a second miss
     /// within ten minutes counts; a recent completed serve shows its engine works.
     #[test]
     fn a_missed_provider_goes_last_and_only_a_repeat_counts() {
         let (_dir, node) = test_node();
         let t = 1_000_000;
-        assert!(!node.note_unavailable("p", "m", t), "first miss");
-        // The same request's retries while the provider becomes reachable: one incident.
-        assert!(!node.note_unavailable("p", "m", t), "a retry in the same pass");
-        assert!(!node.note_unavailable("p", "m", t + UNAVAILABLE_SAME_INCIDENT_MS - 1), "a retry seconds later");
+        let noted = std::cell::RefCell::new(std::collections::HashSet::new());
+        assert!(!node.note_unavailable_once(&noted, "p", "m", t), "first miss");
+        // The same request's retries while the provider becomes reachable: one miss.
+        assert!(!node.note_unavailable_once(&noted, "p", "m", t), "a retry in the same pass");
+        assert!(!node.note_unavailable_once(&noted, "p", "m", t + 20_000), "a retry seconds later");
         assert!(node.briefly_unavailable("p", "m", t + UNAVAILABLE_RANK_LAST_MS));
         assert!(!node.briefly_unavailable("p", "m", t + UNAVAILABLE_RANK_LAST_MS + 1));
         assert!(!node.briefly_unavailable("p", "other", t));
+        // Another request, even seconds later, is a second miss (review 2026-10-14, L5).
+        let next = std::cell::RefCell::new(std::collections::HashSet::new());
+        assert!(node.note_unavailable_once(&next, "p", "m", t + 30_000), "a second request's miss counts");
         assert!(node.note_unavailable("p", "m", t + UNAVAILABLE_REPEAT_MS), "second within ten minutes");
         assert!(!node.note_unavailable("p", "m", t + 3 * UNAVAILABLE_REPEAT_MS), "long after: a first miss again");
         assert!(!node.served_ok_recently("p", "m", t));
