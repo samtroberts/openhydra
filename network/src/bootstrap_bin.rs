@@ -308,6 +308,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let swarm_config = SwarmConfig::with_tokio_executor()
         .with_idle_connection_timeout(Duration::from_secs(300));
 
+    let transport = openhydra_network::transport::with_setup_timeouts(
+        transport,
+        openhydra_network::transport::OUTBOUND_SETUP_TIMEOUT,
+        openhydra_network::transport::INBOUND_SETUP_TIMEOUT,
+    );
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
     // Addresses the operator says peers reach this bootstrap at (a private deployment's bootstrap is
     // on a private network, which isn't confirmed on its own): its relay puts these in reservations.

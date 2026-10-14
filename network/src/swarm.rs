@@ -352,6 +352,11 @@ pub fn build_swarm(
     let swarm_config = SwarmConfig::with_tokio_executor()
         .with_idle_connection_timeout(Duration::from_secs(300));
 
+    let combined_transport = crate::transport::with_setup_timeouts(
+        combined_transport,
+        crate::transport::OUTBOUND_SETUP_TIMEOUT,
+        crate::transport::INBOUND_SETUP_TIMEOUT,
+    );
     let mut swarm = Swarm::new(combined_transport, behaviour, peer_id, swarm_config);
 
     // Listen on configured addresses. F-9 cross-peer half: on a host with no
