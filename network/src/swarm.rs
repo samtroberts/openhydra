@@ -214,7 +214,10 @@ pub fn build_swarm(
     // Identify (peer metadata exchange).
     let identify = identify::Behaviour::new(
         identify::Config::new(opts.protocol_version.clone(), keypair.public())
-            .with_push_listen_addr_updates(true),
+            .with_push_listen_addr_updates(true)
+            // No address cache: identify would offer every address a peer claims (its loopback, its
+            // LAN) to our dials. The admissible ones reach Kademlia, which offers those (L10).
+            .with_cache_size(0),
     );
 
     // mDNS (LAN discovery).

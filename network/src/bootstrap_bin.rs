@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let identity_path = parse_flag(&args, "--identity")
         .unwrap_or_else(|| "/opt/openhydra/.libp2p_identity.key".to_string());
-    let listen_addrs: Vec<Multiaddr> = parse_flag_multi(&args, "--listen")
+    let listen_addrs: Vec<Multiaddr> = parse_flag_multi(&args, "--listen")?
         .unwrap_or_else(|| vec![
             "/ip4/0.0.0.0/tcp/4001".parse().unwrap(),
             // QUIC (UDP) — enables UDP-based AutoNAT probing and DCUtR
@@ -155,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kademlia.set_mode(Some(kad::Mode::Server));
 
     // Add other bootstrap peers to the routing table.
-    let bootstrap_peers: Vec<Multiaddr> = parse_flag_multi(&args, "--peer")
+    let bootstrap_peers: Vec<Multiaddr> = parse_flag_multi(&args, "--peer")?
         .unwrap_or_default();
     for peer_addr in &bootstrap_peers {
         // Extract PeerId from /p2p/ component.
@@ -237,7 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Identify.
     let identify = identify::Behaviour::new(
         identify::Config::new("openhydra/0.1.0".to_string(), keypair.public())
-            .with_push_listen_addr_updates(true),
+            .with_push_listen_addr_updates(true)
+            // No address cache: dials use only what Kademlia admitted (see the peer node's).
+            .with_cache_size(0),
     );
 
     // DCUtR — advertises hole-punch support in Identify protocol list.
@@ -319,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = Swarm::new(transport, behaviour, peer_id, swarm_config);
     // Addresses the operator says peers reach this bootstrap at (a private deployment's bootstrap is
     // on a private network, which isn't confirmed on its own): its relay puts these in reservations.
-    for addr in parse_flag_multi(&args, "--external").unwrap_or_default() {
+    for addr in parse_flag_multi(&args, "--external")?.unwrap_or_default() {
         info!(%addr, "external address (from --external)");
         swarm.add_external_address(addr);
     }
@@ -694,24 +696,36 @@ fn parse_flag(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-fn parse_flag_multi(args: &[String], name: &str) -> Option<Vec<Multiaddr>> {
+/// Every value of a repeatable multiaddr flag (`None` when it isn't given). A value that doesn't
+/// parse is an error, not skipped: a typo in `--external` used to start the bootstrap without the
+/// address its relay needs, silently (review 2026-10-14, L12).
+fn parse_flag_multi(args: &[String], name: &str) -> Result<Option<Vec<Multiaddr>>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == name {
-            if let Some(val) = args.get(i + 1) {
-                if let Ok(addr) = val.parse() {
-                    result.push(addr);
-                }
-            }
+            let val = args.get(i + 1).ok_or_else(|| format!("{name} needs a value"))?;
+            result.push(val.parse().map_err(|e| format!("{name} {val}: not a multiaddr ({e})"))?);
             i += 2;
         } else {
             i += 1;
         }
     }
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
+    Ok((!result.is_empty()).then_some(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_multiaddr_flag_that_doesnt_parse_is_an_error() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_flag_multi(&args(&["x"]), "--external"), Ok(None));
+        let two = parse_flag_multi(&args(&["--external", "/ip4/10.0.0.5/tcp/4001", "--external", "/ip4/10.0.0.6/tcp/4001"]), "--external");
+        assert_eq!(two.unwrap().unwrap().len(), 2);
+        let typo = parse_flag_multi(&args(&["--external", "/ip4/10.0.0.5/tpc/4001"]), "--external").unwrap_err();
+        assert!(typo.contains("--external") && typo.contains("tpc"), "{typo}");
+        assert!(parse_flag_multi(&args(&["--external"]), "--external").is_err(), "a missing value");
     }
 }

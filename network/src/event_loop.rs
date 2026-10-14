@@ -291,11 +291,31 @@ fn quic_dup_action(is_listener: bool) -> QuicDupAction {
     }
 }
 
-/// Whether a deferred QUIC duplicate is still redundant when its grace runs out: the peer still
-/// holds another QUIC connection on that address family. If the original closed in the meantime the
-/// "duplicate" is now the only one, and stays.
-fn quic_dup_still_redundant(info: &PeerConnectionInfo, is_ipv6: bool) -> bool {
-    (if is_ipv6 { info.quic_direct_v6 } else { info.quic_direct_v4 }) >= 2
+/// The deferred QUIC duplicates whose grace ran out (`due`: connection, peer, IPv6?): which to close,
+/// and which stay as their peer's QUIC connection on that family. One is still redundant while the
+/// peer holds another QUIC connection on that address family; if the original closed in the meantime
+/// the "duplicate" is the only one, and stays.
+/// Counted together: two duplicates of one peer due in the same sweep, after its original closed,
+/// would each still see two connections, and both would be closed, leaving none (review 2026-10-14,
+/// L11): each one closed here counts as gone for the next.
+fn quic_dups_due(
+    due: &[(libp2p::swarm::ConnectionId, PeerId, bool)],
+    peers: &HashMap<PeerId, PeerConnectionInfo>,
+) -> (Vec<libp2p::swarm::ConnectionId>, Vec<(libp2p::swarm::ConnectionId, PeerId, bool)>) {
+    let mut closing: HashMap<(PeerId, bool), u32> = HashMap::new();
+    let (mut close, mut stay) = (Vec::new(), Vec::new());
+    for &(cid, pid, v6) in due {
+        let Some(info) = peers.get(&pid) else { continue };
+        let open = if v6 { info.quic_direct_v6 } else { info.quic_direct_v4 };
+        let already = closing.entry((pid, v6)).or_default();
+        if open.saturating_sub(*already) >= 2 {
+            *already += 1;
+            close.push(cid);
+        } else {
+            stay.push((cid, pid, v6));
+        }
+    }
+    (close, stay)
 }
 
 /// C-N2: max age of a queued relay-forward before the reaper fails it and drops
@@ -600,6 +620,10 @@ struct LoopState {
     known_peers: HashMap<String, PeerRecord>,
     /// Models withdrawn by their last known provider, and when (see `RecentlyWithdrawn`).
     withdrawn_models: HashMap<String, std::time::Instant>,
+    /// When each (model, provider peer) was last announced to us, for [`WITHDRAWN_MODEL_MEMORY`]:
+    /// a provider's record can lapse here for a while; a withdrawal by another then isn't the model
+    /// leaving the network (review 2026-10-14, L8).
+    model_seen: HashMap<(String, String), std::time::Instant>,
     /// When each `known_peers` entry was last received here (local clock): what the cache cap
     /// evicts by, since a record's own signed time isn't set by every node (round 9 C9-1).
     known_received: HashMap<String, u64>,
@@ -736,6 +760,8 @@ struct LoopState {
     /// for the whole session (the EU-relay gap). Cleared on NewListenAddr /
     /// ReservationReqAccepted for that circuit.
     relay_reservation_retries: HashMap<String, (u32, tokio::time::Instant)>,
+    /// Relays a "couldn't reserve" hint was logged for (once each).
+    relay_hints_given: std::collections::HashSet<String>,
     // ── #42: network-change resilience ────────────────────────────────
     /// User-supplied bootstrap peers, retained so `rebootstrap()` can re-dial
     /// them on a network change (the startup list is otherwise consumed by the
@@ -840,7 +866,11 @@ const MAX_KNOWN_RECORDS: usize = 16_384;
 /// receive time (round 9 C9-1: a record's own time is 0 from most nodes), never evicting this
 /// node's own records.
 fn install_known_peer(state: &mut LoopState, record: &PeerRecord, now_ms: u64) -> Option<bool> {
-    install_known_peer_in(&mut state.known_peers, &mut state.known_received, &state.local_libp2p, record, now_ms)
+    let installed = install_known_peer_in(&mut state.known_peers, &mut state.known_received, &state.local_libp2p, record, now_ms);
+    if installed.is_some() {
+        note_model_seen(&mut state.model_seen, &record.model_id, &record.libp2p_peer_id, std::time::Instant::now());
+    }
+    installed
 }
 
 fn install_known_peer_in(
@@ -935,6 +965,7 @@ impl LoopState {
             ipv6_capable: probe_ipv6_capable(),
             known_peers: HashMap::new(),
             withdrawn_models: HashMap::new(),
+            model_seen: HashMap::new(),
             known_received: HashMap::new(),
             local_libp2p: String::new(),
             discover_cache: HashMap::new(),
@@ -974,6 +1005,7 @@ impl LoopState {
             tunnel_close_queue: VecDeque::new(),
             gossip_inbound_queue: std::collections::VecDeque::new(),
             relay_reservation_retries: HashMap::new(),
+            relay_hints_given: std::collections::HashSet::new(),
             // #42: set to the shared handle in run_event_loop; a real interface
             // change or watchdog rebuild bumps it.
             bootstrap_peers: Vec::new(),
@@ -1757,11 +1789,21 @@ pub async fn run_event_loop(
                     .filter(|(_, (_, _, deadline))| now >= *deadline)
                     .map(|(&cid, &(pid, v6, _))| (cid, pid, v6))
                     .collect();
-                for (cid, pid, v6) in dup_due {
-                    state.quic_dup_close_deadline.remove(&cid);
-                    if state.peer_connections.get(&pid).is_some_and(|i| quic_dup_still_redundant(i, v6)) {
-                        debug!(%pid, "quic_dedup: closing inbound duplicate QUIC connection after grace");
-                        let _ = swarm.close_connection(cid);
+                for (cid, _, _) in &dup_due {
+                    state.quic_dup_close_deadline.remove(cid);
+                }
+                let (close, stay) = quic_dups_due(&dup_due, &state.peer_connections);
+                for cid in close {
+                    debug!(?cid, "quic_dedup: closing inbound duplicate QUIC connection after grace");
+                    let _ = swarm.close_connection(cid);
+                }
+                // A duplicate that outlived the original is the peer's QUIC connection now: a v4 one
+                // is tracked as such, so a stable v6 direct can still retire it (v6-pref).
+                for (cid, pid, v6) in stay {
+                    if let Some(info) = state.peer_connections.get_mut(&pid) {
+                        if !v6 && !info.quic_v4_conn_ids.contains(&cid) {
+                            info.quic_v4_conn_ids.push(cid);
+                        }
                     }
                 }
                 let due: Vec<PeerId> = state
@@ -2116,17 +2158,50 @@ fn evict_withdrawn_model(
 /// How long a withdrawn model is remembered (as long as the gateway's sticky model list keeps one).
 pub const WITHDRAWN_MODEL_MEMORY: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// After a withdrawal evicted `model` from a provider: remember it if no other known provider
-/// serves it (then it has really left the network, rather than lost one of its providers).
+/// At most this many models remembered as withdrawn, and (model, provider) announcements remembered
+/// for it (review 2026-10-14, L7: the map only shrank when a gateway listed its models).
+const MAX_WITHDRAWN_MODELS: usize = 4096;
+const MAX_MODEL_SEEN: usize = 32_768;
+
+/// Note that `peer` announced `model` (now): see `LoopState::model_seen`.
+fn note_model_seen(seen: &mut HashMap<(String, String), std::time::Instant>, model: &str, peer: &str, now: std::time::Instant) {
+    let key = (model.to_string(), peer.to_string());
+    if !seen.contains_key(&key) && seen.len() >= MAX_MODEL_SEEN {
+        seen.retain(|_, at| now.duration_since(*at) <= WITHDRAWN_MODEL_MEMORY);
+        if seen.len() >= MAX_MODEL_SEEN {
+            return; // full of fresh announcements: this one isn't remembered
+        }
+    }
+    seen.insert(key, now);
+}
+
+/// After a withdrawal by `peer` evicted `model`: remember it if no other provider serves it
+/// (then it has really left the network, rather than lost one of its providers) - none known now,
+/// and none announced it within [`WITHDRAWN_MODEL_MEMORY`] (its record may have lapsed here).
 fn note_withdrawn_model(
     withdrawn: &mut HashMap<String, std::time::Instant>,
     known_peers: &HashMap<String, PeerRecord>,
+    seen: &HashMap<(String, String), std::time::Instant>,
     model: &str,
+    peer: &str,
     now: std::time::Instant,
 ) {
-    if !known_peers.values().any(|r| r.model_id == model) {
-        withdrawn.insert(model.to_string(), now);
+    if known_peers.values().any(|r| r.model_id == model) {
+        return;
     }
+    let others_lately = seen
+        .iter()
+        .any(|((m, p), at)| m == model && p != peer && now.duration_since(*at) <= WITHDRAWN_MODEL_MEMORY);
+    if others_lately {
+        return;
+    }
+    withdrawn.retain(|_, at| now.duration_since(*at) <= WITHDRAWN_MODEL_MEMORY);
+    if withdrawn.len() >= MAX_WITHDRAWN_MODELS {
+        if let Some(oldest) = withdrawn.iter().min_by_key(|(_, at)| **at).map(|(m, _)| m.clone()) {
+            withdrawn.remove(&oldest);
+        }
+    }
+    withdrawn.insert(model.to_string(), now);
 }
 
 /// The remembered withdrawals still within [`WITHDRAWN_MODEL_MEMORY`] whose model no known provider
@@ -2293,6 +2368,24 @@ fn reservation_retry_delay_ms(attempt: u32) -> u64 {
 /// F-5: record that a relay reservation for ``circuit_addr`` is lost and
 /// schedule the next retry with backoff. Idempotent-ish: advances the attempt
 /// counter and pushes the next-attempt deadline out per the backoff schedule.
+/// For a node whose relays are only its own bootstraps (not on OpenHydra's public network): when a
+/// reservation on one fails, what to tell its operator (review 2026-10-14, L9). A bootstrap that
+/// doesn't run a relay leaves a node behind NAT unreachable, and nothing said so. `None` on the
+/// public network (OpenHydra's relays are there too).
+fn private_relay_hint(relays: &[Multiaddr], circuit: &Multiaddr, reason: &str) -> Option<String> {
+    let production = crate::relay::bootstrap_relay_peer_ids();
+    if crate::relay::relay_peer_ids(relays).iter().any(|p| production.contains(p)) {
+        return None;
+    }
+    let relay: Multiaddr = circuit.iter().take_while(|p| !matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)).collect();
+    Some(format!(
+        "couldn't reserve a relay slot on {relay} ({reason}). This node relays only through its own bootstraps (none is OpenHydra's): \
+         if they don't run a relay, peers behind NAT can't reach it. Run them as openhydra-bootstrap (which relays; \
+         on a private network give it --external with the address peers reach it at), or pass --public-relays on to use \
+         OpenHydra's relays too."
+    ))
+}
+
 fn schedule_reservation_retry(state: &mut LoopState, circuit_addr: &str) {
     let now = tokio::time::Instant::now();
     let entry = state
@@ -3041,7 +3134,7 @@ fn handle_swarm_event(
                                         debug!(%pid, %model, ts, "ignored stale MODEL_WITHDRAWN (replay?)");
                                     } else if evict_withdrawn_model(&mut state.known_peers, id_str, model) > 0 {
                                         info!(%pid, %model, "evicted model via MODEL_WITHDRAWN gossip");
-                                        note_withdrawn_model(&mut state.withdrawn_models, &state.known_peers, model, std::time::Instant::now());
+                                        note_withdrawn_model(&mut state.withdrawn_models, &state.known_peers, &state.model_seen, model, id_str, std::time::Instant::now());
                                     }
                                 }
                                 Ok(pid) => warn!(
@@ -3512,6 +3605,13 @@ fn handle_swarm_event(
                 if addr.to_string().contains("/p2p-circuit") {
                     // #42: reservation dropped — no longer held.
                     state.reserved_circuits.remove(&addr.to_string());
+                    if let Err(e) = &reason {
+                        if let Some(hint) = private_relay_hint(&state.relays, addr, &e.to_string()) {
+                            if state.relay_hints_given.insert(addr.to_string()) {
+                                warn!("{hint}");
+                            }
+                        }
+                    }
                     // F-5: a closed circuit listener means the reservation
                     // dropped/was rejected. Schedule a backed-off retry instead
                     // of an immediate re-listen — an immediate re-listen against
@@ -4632,8 +4732,18 @@ fn relay_dial_opts(
         .condition(PeerCondition::Disconnected)
         .addresses(addrs)
         .extend_addresses_through_behaviour()
+        // The circuits come first, and on a dual-stack host there are eight (four relays, both
+        // families): at libp2p's default of eight dials at once, the direct addresses only got a turn
+        // after a circuit failed. Room for them to race too (review 2026-10-14, L10).
+        .override_dial_concurrency_factor(RELAY_DIAL_CONCURRENCY)
         .build()
 }
+
+/// How many of a relay dial's addresses are tried at once (see [`relay_dial_opts`]).
+const RELAY_DIAL_CONCURRENCY: std::num::NonZeroU8 = match std::num::NonZeroU8::new(16) {
+    Some(n) => n,
+    None => unreachable!(),
+};
 
 /// Fire-and-forget variant of handle_proxy_forward.
 ///
@@ -5503,14 +5613,15 @@ mod tests {
         known.insert("b/m".into(), rec("b", "m"));
         known.insert("a/n".into(), rec("a", "n"));
         let mut withdrawn = HashMap::new();
+        let seen = HashMap::new();
         let t0 = std::time::Instant::now();
         // a withdraws m, but b still serves it: m hasn't left the network.
         assert_eq!(evict_withdrawn_model(&mut known, "a", "m"), 1);
-        note_withdrawn_model(&mut withdrawn, &known, "m", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &seen, "m", "a", t0);
         assert!(recently_withdrawn(&mut withdrawn, &known, t0).is_empty());
         // a withdraws n, its only provider: remembered.
         evict_withdrawn_model(&mut known, "a", "n");
-        note_withdrawn_model(&mut withdrawn, &known, "n", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &seen, "n", "a", t0);
         assert_eq!(recently_withdrawn(&mut withdrawn, &known, t0), vec!["n".to_string()]);
         // Re-shared: no longer reported (the record is back).
         known.insert("a/n".into(), rec("a", "n"));
@@ -5520,6 +5631,66 @@ mod tests {
         let later = t0 + WITHDRAWN_MODEL_MEMORY + std::time::Duration::from_secs(1);
         assert!(recently_withdrawn(&mut withdrawn, &known, later).is_empty());
         assert!(withdrawn.is_empty());
+    }
+
+    #[test]
+    fn a_withdrawal_doesnt_hide_a_model_another_provider_announced_lately() {
+        // Review 2026-10-14 L8: b's record for m lapsed here, then a withdrew m: b still serves it.
+        let known: HashMap<String, PeerRecord> = HashMap::new();
+        let mut seen = HashMap::new();
+        let mut withdrawn = HashMap::new();
+        let t0 = std::time::Instant::now();
+        note_model_seen(&mut seen, "m", "b", t0);
+        note_model_seen(&mut seen, "m", "a", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &seen, "m", "a", t0 + std::time::Duration::from_secs(60));
+        assert!(withdrawn.is_empty(), "b announced m a minute ago");
+        // Only a ever served n: its withdrawal hides n at once.
+        note_model_seen(&mut seen, "n", "a", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &seen, "n", "a", t0);
+        assert!(withdrawn.contains_key("n"));
+        // b's announcement long past: m's withdrawal counts.
+        let later = t0 + WITHDRAWN_MODEL_MEMORY + std::time::Duration::from_secs(1);
+        note_withdrawn_model(&mut withdrawn, &known, &seen, "m", "a", later);
+        assert!(withdrawn.contains_key("m"));
+        // L7: older withdrawals are pruned as new ones come, and the map is bounded.
+        assert!(!withdrawn.contains_key("n"), "n's was past the memory window");
+        for i in 0..MAX_WITHDRAWN_MODELS + 10 {
+            note_withdrawn_model(&mut withdrawn, &known, &seen, &format!("x{i}"), "a", later);
+        }
+        assert!(withdrawn.len() <= MAX_WITHDRAWN_MODELS);
+    }
+
+    #[test]
+    fn two_due_duplicates_never_close_a_peers_last_quic_connection() {
+        use libp2p::swarm::ConnectionId;
+        let pid = PeerId::random();
+        let mut peers = HashMap::new();
+        // The original v4 connection closed during the grace; two inbound duplicates remain, due together.
+        peers.insert(pid, PeerConnectionInfo { quic_direct_v4: 2, ..Default::default() });
+        let (d1, d2) = (ConnectionId::new_unchecked(11), ConnectionId::new_unchecked(12));
+        let (close, stay) = quic_dups_due(&[(d1, pid, false), (d2, pid, false)], &peers);
+        assert_eq!(close, vec![d1], "one closes, one stays");
+        assert_eq!(stay, vec![(d2, pid, false)]);
+        // With the original still open (three in all), both duplicates close.
+        peers.insert(pid, PeerConnectionInfo { quic_direct_v4: 3, ..Default::default() });
+        let (close, stay) = quic_dups_due(&[(d1, pid, false), (d2, pid, false)], &peers);
+        assert_eq!(close, vec![d1, d2]);
+        assert!(stay.is_empty());
+        // Another family is counted apart.
+        peers.insert(pid, PeerConnectionInfo { quic_direct_v4: 2, quic_direct_v6: 1, ..Default::default() });
+        let (close, _) = quic_dups_due(&[(d1, pid, false), (d2, pid, true)], &peers);
+        assert_eq!(close, vec![d1]);
+    }
+
+    #[test]
+    fn a_private_nodes_failed_reservation_says_what_to_do() {
+        let own: Multiaddr = format!("/ip4/10.0.0.5/tcp/4001/p2p/{}", PeerId::random()).parse().unwrap();
+        let circuit = own.clone().with(libp2p::multiaddr::Protocol::P2pCircuit);
+        let hint = private_relay_hint(&[own.clone()], &circuit, "no reservation").unwrap();
+        assert!(hint.contains(&own.to_string()) && hint.contains("--public-relays on"), "{hint}");
+        // On the public network OpenHydra's relays are there too: nothing to say.
+        let us: Multiaddr = crate::relay::BOOTSTRAP_RELAYS[0].parse().unwrap();
+        assert!(private_relay_hint(&[us, own], &circuit, "no reservation").is_none());
     }
 
     // ── QUIC dedup vs AutoNAT v2 dial-back ─────────────────────────────────
@@ -5538,15 +5709,17 @@ mod tests {
 
     #[test]
     fn quic_dup_closes_after_grace_only_while_another_same_af_connection_remains() {
-        let mut info = PeerConnectionInfo::default();
-        info.quic_direct_v4 = 2; // original + deferred duplicate
-        assert!(quic_dup_still_redundant(&info, false));
-        assert!(!quic_dup_still_redundant(&info, true), "no v6 connections: nothing to dedup");
+        let redundant = |info: PeerConnectionInfo, v6: bool| {
+            let pid = PeerId::random();
+            let peers = HashMap::from([(pid, info)]);
+            !quic_dups_due(&[(libp2p::swarm::ConnectionId::new_unchecked(1), pid, v6)], &peers).0.is_empty()
+        };
+        // original + deferred duplicate
+        assert!(redundant(PeerConnectionInfo { quic_direct_v4: 2, ..Default::default() }, false));
+        assert!(!redundant(PeerConnectionInfo { quic_direct_v4: 2, ..Default::default() }, true), "no v6 connections: nothing to dedup");
         // The original closed during the grace window: the duplicate is now the only one — keep it.
-        info.quic_direct_v4 = 1;
-        assert!(!quic_dup_still_redundant(&info, false));
-        info.quic_direct_v6 = 2;
-        assert!(quic_dup_still_redundant(&info, true));
+        assert!(!redundant(PeerConnectionInfo { quic_direct_v4: 1, ..Default::default() }, false));
+        assert!(redundant(PeerConnectionInfo { quic_direct_v4: 1, quic_direct_v6: 2, ..Default::default() }, true));
     }
 
     // ── queued forwards fail when the last dial to their peer fails ────────

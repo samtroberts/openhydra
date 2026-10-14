@@ -125,6 +125,10 @@ pub fn start_node(
         bootstrap_peers = kept;
     }
     let public_network = crate::relay::uses_public_network(&bootstrap_peers, config.public_relays);
+    if config.public_relays == crate::relay::PublicRelays::Auto && !public_network {
+        // Said once, plainly: a node given only its own bootstraps relays through them alone (L9).
+        info!("none of the bootstraps is OpenHydra's: using them as relays, not OpenHydra's (pass --public-relays on to use OpenHydra's relays too)");
+    }
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
     // The relays this node reserves on and dials others through: its bootstraps, plus the
     // production relays on the public network (see `PublicRelays`).
