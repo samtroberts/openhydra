@@ -913,10 +913,22 @@ const POLL_MAX: Duration = Duration::from_millis(750);
 /// Give up if no new chunk arrives for this much *accumulated idle time* — the "provider wedged"
 /// signal. Reset on every progress, so total generation is unbounded as long as tokens flow.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(120);
-/// Bounded consecutive transport-drop retries at the same offset before giving up (drop-resume).
-const STREAM_DROP_RETRIES: u32 = 5;
-/// Backoff between drop-resume re-polls, tuned to the ~10s relay re-establish window.
-const STREAM_DROP_BACKOFF: Duration = Duration::from_secs(2);
+/// How long a stream that lost its connection keeps trying to resume (drop-resume, at the same
+/// offset) before giving up. A dial to a provider that isn't reachable now fails at once (c96306b),
+/// so this is a time budget, not a number of tries: long enough to ride out a relay reconnect and a
+/// fresh reservation (~10 s, more over CGNAT), as a re-poll waiting 30 s for its forward used to
+/// (review 2026-10-14, M5). Counted in the waits between tries, below the stall clock.
+const STREAM_DROP_BUDGET: Duration = Duration::from_secs(60);
+
+/// The wait before drop-resume try `n` (1 = the first): quick at first, then every 8 s.
+fn stream_drop_wait(n: u32) -> Duration {
+    match n {
+        0 | 1 => Duration::from_secs(1),
+        2 | 3 => Duration::from_secs(2),
+        4 | 5 => Duration::from_secs(4),
+        _ => Duration::from_secs(8),
+    }
+}
 /// Per-round-trip timeout for a streaming call (the open ack or one poll). Each is a quick
 /// provider-side buffer op (the provider acks the open *before* generating), so this is short —
 /// a dead provider fails over fast, while a live stream's long generation is governed by the
@@ -1514,18 +1526,25 @@ fn request_completion_streaming_with(
         // un-fetched tail), bounded by the retry budget + the stall clock.
         let resp = {
             let mut attempt = 0u32;
+            let mut dropped_for = Duration::ZERO;
             loop {
                 match transport(&poll) {
                     Ok(bytes) => break bytes,
                     Err(e) => {
                         attempt += 1;
-                        if attempt > STREAM_DROP_RETRIES {
+                        let wait = stream_drop_wait(attempt);
+                        if dropped_for + wait > STREAM_DROP_BUDGET {
                             return Err(StreamFail::Error(AdapterError::Network(format!(
                                 "stream poll dropped past retry budget: {}", e.message()
                             ))));
                         }
-                        sleep(STREAM_DROP_BACKOFF);
-                        idle += STREAM_DROP_BACKOFF;
+                        sleep(wait);
+                        dropped_for += wait;
+                        idle += wait;
+                        // Its client left while we waited.
+                        if cancel() {
+                            return Err(StreamFail::Cancelled);
+                        }
                         if idle >= STREAM_STALL_TIMEOUT {
                             return Err(StreamFail::Error(AdapterError::Network(
                                 "stream stalled (no progress before deadline)".into(),
@@ -5911,6 +5930,45 @@ mod tests {
                 .unwrap_or_else(|_| panic!("drop-resume should recover"));
         assert_eq!(text, "resume");
         assert_eq!(summary.tokens, 3);
+    }
+
+    #[test]
+    fn streaming_drop_resume_rides_out_a_relay_reconnect() {
+        // Review 2026-10-14 M5: a dial to an unreachable provider now fails at once, so the polls
+        // fail fast; the stream must still wait out a relay reconnect (15 s here) and complete.
+        let adapter = StubAdapter { deltas: vec!["re", "connected"], tokens: 3, fail: None };
+        let frames = serve_frames(&adapter, &request());
+        let mut mock = MockStreamProvider::new(frames, true, 1);
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&FETCH_CHUNKS) && clock.get() < Duration::from_secs(15) {
+                return Err(AdapterError::Network("proxy_forward: dial failed (peer unreachable)".into()));
+            }
+            mock.respond(f)
+        };
+        let mut sleeper = |d: Duration| clock.set(clock.get() + d);
+        let mut text = String::new();
+        let summary =
+            request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |d| text.push_str(d))
+                .unwrap_or_else(|_| panic!("drop-resume should outlast a 15 s reconnect"));
+        assert_eq!(text, "reconnected");
+        assert_eq!(summary.tokens, 3);
+    }
+
+    #[test]
+    fn streaming_drop_resume_gives_up_after_its_time_budget() {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut transport = |f: &[u8]| -> Result<Vec<u8>, AdapterError> {
+            if f.first() == Some(&SERVE_STREAM) {
+                Ok(chunks_reply(&[], 0, false))
+            } else {
+                Err(AdapterError::Network("proxy_forward: dial failed (peer unreachable)".into()))
+            }
+        };
+        let mut sleeper = |d: Duration| clock.set(clock.get() + d);
+        let out = request_completion_streaming(&mut transport, &mut sleeper, &request(), &mut |_| {});
+        assert!(matches!(out, Err(StreamFail::Error(AdapterError::Network(m))) if m.contains("dropped")));
+        assert!(clock.get() <= STREAM_DROP_BUDGET && clock.get() >= STREAM_DROP_BUDGET - Duration::from_secs(8), "waited {:?}", clock.get());
     }
 
     #[test]
