@@ -170,6 +170,9 @@ const MAX_SETTLE_RECORDS: usize = 4096;
 const UNAVAILABLE_RANK_LAST_MS: u64 = 60 * 1000;
 /// A second shed-free failure to reach a provider within this long costs it reputation.
 const UNAVAILABLE_REPEAT_MS: u64 = 10 * 60 * 1000;
+/// Misses closer together than this are one incident (a request's own retries while a provider
+/// becomes reachable), never a "second" miss.
+const UNAVAILABLE_SAME_INCIDENT_MS: u64 = 45 * 1000;
 /// How recent a completed serve shows a provider's engine working (for a follow-up's refusal).
 const SERVED_OK_RECENT_MS: u64 = 10 * 60 * 1000;
 /// Only one audit shed per provider and model is excused within this long.
@@ -1765,6 +1768,34 @@ impl SettlePurpose {
 
 /// Outcome of one serve pass ([`ConsumerNode::serve_once`]), used by [`ConsumerNode::complete`]
 /// to decide whether to bypass the C11 discovery cache and retry.
+/// Waits between fresh lookups when a provider's dial failed because it isn't reachable yet (a
+/// provider that just joined is, once its address is confirmed — a few seconds).
+const UNREACHABLE_RETRY_WAITS: [std::time::Duration; 10] = {
+    use std::time::Duration;
+    [
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+        Duration::from_secs(6),
+        Duration::from_secs(6),
+    ]
+};
+/// The most time those retries may add to a request: as long as one attempt used to wait for its
+/// dial (the relay-forward timeout), so a provider that takes that long to become reachable is still
+/// served, while one that does sooner is served sooner.
+const UNREACHABLE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Did this attempt fail because every provider's dial failed outright (none reachable yet), as
+/// opposed to no provider at all or a provider's own error?
+fn is_unreachable_dial(e: &AdapterError) -> bool {
+    matches!(e, AdapterError::Network(m) if m.contains(openhydra_network::event_loop::DIAL_FAILED_UNREACHABLE))
+}
+
 enum AttemptOutcome {
     /// Served successfully — return this summary.
     Served(ServeSummary),
@@ -2545,16 +2576,21 @@ impl ConsumerNode {
     }
 
     /// Note that `provider` shed our request for `model`, or couldn't be reached, before serving
-    /// anything. Whether it did so before within [`UNAVAILABLE_REPEAT_MS`].
+    /// anything. Whether it did so before within [`UNAVAILABLE_REPEAT_MS`] — in an earlier incident:
+    /// misses within [`UNAVAILABLE_SAME_INCIDENT_MS`] of the first (one request's retries) count once.
     fn note_unavailable(&self, provider: &str, model: &str, now: u64) -> bool {
         let mut m = self.unavailable.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, at| now.saturating_sub(*at) <= UNAVAILABLE_REPEAT_MS);
+        let key = (provider.to_string(), model.to_string());
+        if m.get(&key).is_some_and(|at| now.saturating_sub(*at) < UNAVAILABLE_SAME_INCIDENT_MS) {
+            return false;
+        }
         if m.len() >= MAX_PAYMENT_REFUSALS {
             if let Some(oldest) = m.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
                 m.remove(&oldest);
             }
         }
-        m.insert((provider.to_string(), model.to_string()), now).is_some_and(|at| now.saturating_sub(at) <= UNAVAILABLE_REPEAT_MS)
+        m.insert(key, now).is_some_and(|at| now.saturating_sub(at) <= UNAVAILABLE_REPEAT_MS)
     }
 
     /// Whether `provider` shed or missed a request of ours for `model` within
@@ -2812,10 +2848,27 @@ impl ConsumerNode {
             AttemptOutcome::Retryable(_) => {}
         }
         tracing::info!(model, "C11 bypass: all candidates failed — invalidating discover cache and retrying with a fresh lookup");
-        let _ = self.net.invalidate_discover(model);
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &req_span, on_delta) {
-            AttemptOutcome::Served(summary) => Ok(summary),
-            AttemptOutcome::Retryable(e) | AttemptOutcome::Fatal(e) => Err(e),
+        let started = std::time::Instant::now();
+        let mut waits = UNREACHABLE_RETRY_WAITS.iter();
+        loop {
+            let _ = self.net.invalidate_discover(model);
+            match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &req_span, on_delta) {
+                AttemptOutcome::Served(summary) => return Ok(summary),
+                AttemptOutcome::Fatal(e) => return Err(e),
+                AttemptOutcome::Retryable(e) => {
+                    // A provider that only just joined isn't reachable until its address is confirmed
+                    // (a few seconds): its dial fails at once, so wait a little and look again rather
+                    // than fail the request. Only for that error, and nothing has been streamed.
+                    let wait = waits.next().copied().filter(|_| is_unreachable_dial(&e) && !cancel());
+                    match wait {
+                        Some(w) if started.elapsed() + w <= UNREACHABLE_RETRY_BUDGET => {
+                            tracing::info!(model, wait_ms = w.as_millis() as u64, "provider not reachable yet; looking again shortly");
+                            std::thread::sleep(w);
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            }
         }
     }
 
@@ -5124,6 +5177,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_an_unreachable_dial_is_waited_on() {
+        let dial = AdapterError::Network(format!("proxy_forward: {}", openhydra_network::event_loop::DIAL_FAILED_UNREACHABLE));
+        assert!(is_unreachable_dial(&dial));
+        // No provider at all, a provider's own error, a timeout: answered at once, as before.
+        assert!(!is_unreachable_dial(&AdapterError::Route("no provider for model 'x'".into())));
+        assert!(!is_unreachable_dial(&AdapterError::Provider("engine error".into())));
+        assert!(!is_unreachable_dial(&AdapterError::Network("proxy_forward timed out after 30s".into())));
+        // The waits fit the budget, and start short (a new provider is reachable within seconds).
+        let total: std::time::Duration = UNREACHABLE_RETRY_WAITS.iter().sum();
+        assert!(total <= UNREACHABLE_RETRY_BUDGET);
+        assert!(UNREACHABLE_RETRY_WAITS[0] <= std::time::Duration::from_secs(1));
+    }
+
+    #[test]
     fn a_bill_is_recounted_with_the_models_tokenizer_before_it_is_paid() {
         use crate::hf_tokenizer::{cached_path, tests::tiny_tokenizer_json, HfTokenizers};
         use crate::tokenizer_index::{tests::{entry, index}, IndexStore};
@@ -6197,6 +6264,9 @@ mod tests {
         let (_dir, node) = test_node();
         let t = 1_000_000;
         assert!(!node.note_unavailable("p", "m", t), "first miss");
+        // The same request's retries while the provider becomes reachable: one incident.
+        assert!(!node.note_unavailable("p", "m", t), "a retry in the same pass");
+        assert!(!node.note_unavailable("p", "m", t + UNAVAILABLE_SAME_INCIDENT_MS - 1), "a retry seconds later");
         assert!(node.briefly_unavailable("p", "m", t + UNAVAILABLE_RANK_LAST_MS));
         assert!(!node.briefly_unavailable("p", "m", t + UNAVAILABLE_RANK_LAST_MS + 1));
         assert!(!node.briefly_unavailable("p", "other", t));

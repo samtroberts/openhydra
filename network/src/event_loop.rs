@@ -179,6 +179,50 @@ fn sweep_relay_forwards(
     kept
 }
 
+/// The error a queued forward fails with when its peer's last dial failed (callers match on it to
+/// retry after a short wait: a provider that just joined becomes reachable within seconds).
+pub const DIAL_FAILED_UNREACHABLE: &str = "dial failed (peer unreachable)";
+
+/// A dial to `peer` (connection `conn`) just ended without a connection: forget it, and say whether
+/// that leaves the peer with no dial still in flight and no connection — then nothing can carry the
+/// forwards queued for it, and they fail now rather than wait out [`RELAY_FORWARD_TTL`] (a dial
+/// without a relay reservation or known address fails in milliseconds; the caller then retries with
+/// a fresh lookup). Another dial still pending (a Kademlia query dialing the same peer, say) can
+/// still connect, so then they wait.
+fn dial_ended_unreachable(
+    dials: &mut HashMap<PeerId, std::collections::HashSet<libp2p::swarm::ConnectionId>>,
+    peer: PeerId,
+    conn: libp2p::swarm::ConnectionId,
+    connected: bool,
+) -> bool {
+    let none_left = match dials.get_mut(&peer) {
+        Some(set) => {
+            set.remove(&conn);
+            set.is_empty()
+        }
+        None => true,
+    };
+    if none_left {
+        dials.remove(&peer);
+    }
+    none_left && !connected
+}
+
+/// Fail the forwards queued for `peer` (its dial failed and nothing else can reach it); keep the rest.
+fn fail_relay_forwards_for(forwards: Vec<PendingRelayForward>, peer: PeerId, why: &str) -> (Vec<PendingRelayForward>, usize) {
+    let mut kept = Vec::with_capacity(forwards.len());
+    let mut failed = 0;
+    for (pid, data, reply, enqueued_at) in forwards {
+        if pid == peer {
+            let _ = reply.send(Err(format!("proxy_forward: {why}")));
+            failed += 1;
+        } else {
+            kept.push((pid, data, reply, enqueued_at));
+        }
+    }
+    (kept, failed)
+}
+
 /// Snapshot returned by GetConnectionInfo command (Fix 4).
 pub struct ConnectionInfoSnapshot {
     pub has_quic: bool,
@@ -600,6 +644,10 @@ struct LoopState {
     /// undialable peer would otherwise leak the reply channel + bytes forever).
     pending_relay_forwards:
         Vec<(PeerId, Vec<u8>, oneshot::Sender<Result<Vec<u8>, String>>, std::time::Instant)>,
+    /// Outbound dials in flight, per peer (from `SwarmEvent::Dialing` until the connection is
+    /// established or the dial fails): a failed dial fails the peer's queued forwards only when no
+    /// other dial to it is still pending.
+    dials_in_flight: HashMap<PeerId, std::collections::HashSet<libp2p::swarm::ConnectionId>>,
     /// C-N1: peers with both a direct and a relay connection, mapped to the
     /// instant at which the relay may be closed (direct-established-at + grace).
     /// Cleared if the direct path drops inside the window (so we keep the relay).
@@ -880,6 +928,7 @@ impl LoopState {
             pending_sent: HashMap::new(),
             inbound_proxy_counter: 0,
             pending_relay_forwards: Vec::new(),
+            dials_in_flight: HashMap::new(),
             relay_close_deadline: HashMap::new(),
             v4_close_deadline: HashMap::new(),
             quic_dup_close_deadline: HashMap::new(),
@@ -3080,6 +3129,12 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+            if let Some(set) = state.dials_in_flight.get_mut(&peer_id) {
+                set.remove(&connection_id);
+                if set.is_empty() {
+                    state.dials_in_flight.remove(&peer_id);
+                }
+            }
             let addr_str = match &endpoint {
                 libp2p::core::ConnectedPoint::Dialer { address, .. } => address.to_string(),
                 libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr.to_string(),
@@ -3378,11 +3433,22 @@ fn handle_swarm_event(
         // routing table (dead path). Do NOT wipe `known_peers` here — that collapsed multi-model
         // providers on transient dial failures; the TTL reaper owns cache lifecycle. See
         // [`evict_unreachable_peer`].
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+        SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error } => {
             warn!(?peer_id, %error, "outgoing_connection_error");
             if let Some(pid) = peer_id {
-                if !swarm.is_connected(&pid) {
+                let connected = swarm.is_connected(&pid);
+                if !connected {
                     evict_unreachable_peer(swarm, pid);
+                }
+                // Nothing else can reach it now: fail its queued forwards at once (the caller
+                // retries with a fresh lookup) instead of after RELAY_FORWARD_TTL.
+                if dial_ended_unreachable(&mut state.dials_in_flight, pid, connection_id, connected) {
+                    let drained = std::mem::take(&mut state.pending_relay_forwards);
+                    let (kept, failed) = fail_relay_forwards_for(drained, pid, DIAL_FAILED_UNREACHABLE);
+                    state.pending_relay_forwards = kept;
+                    if failed > 0 {
+                        info!(%pid, failed, "proxy_forward: dial failed, no other dial in flight — failing queued forwards now");
+                    }
                 }
             }
         }
@@ -3443,8 +3509,11 @@ fn handle_swarm_event(
         SwarmEvent::ListenerError { error, .. } => {
             warn!(%error, "listener_error");
         }
-        SwarmEvent::Dialing { peer_id, .. } => {
+        SwarmEvent::Dialing { peer_id, connection_id } => {
             debug!(?peer_id, "dialing");
+            if let Some(pid) = peer_id {
+                state.dials_in_flight.entry(pid).or_default().insert(connection_id);
+            }
         }
         _ => {
             trace!("unhandled_swarm_event");
@@ -5451,6 +5520,44 @@ mod tests {
         assert!(!quic_dup_still_redundant(&info, false));
         info.quic_direct_v6 = 2;
         assert!(quic_dup_still_redundant(&info, true));
+    }
+
+    // ── queued forwards fail when the last dial to their peer fails ────────
+
+    #[test]
+    fn a_failed_dial_fails_queued_forwards_only_when_nothing_else_can_reach_the_peer() {
+        use libp2p::swarm::ConnectionId;
+        let peer = PeerId::random();
+        let (c1, c2) = (ConnectionId::new_unchecked(1), ConnectionId::new_unchecked(2));
+        let mut dials: HashMap<PeerId, std::collections::HashSet<ConnectionId>> = HashMap::new();
+        dials.entry(peer).or_default().extend([c1, c2]);
+        // Our relay dial fails while a second dial (a Kademlia query, say) is still pending: wait.
+        assert!(!dial_ended_unreachable(&mut dials, peer, c1, false));
+        // The last one fails too, no connection: fail the queued forwards now.
+        assert!(dial_ended_unreachable(&mut dials, peer, c2, false));
+        assert!(dials.is_empty(), "nothing left tracked for the peer");
+        // A dial fails but the peer is connected some other way: the forwards ride that connection.
+        dials.entry(peer).or_default().insert(c1);
+        assert!(!dial_ended_unreachable(&mut dials, peer, c1, true));
+        // An error for a dial we never saw start (no Dialing event): judged on the connection alone.
+        assert!(dial_ended_unreachable(&mut dials, PeerId::random(), c2, false));
+    }
+
+    #[tokio::test]
+    async fn failing_a_peers_forwards_answers_them_and_keeps_the_others() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let now = std::time::Instant::now();
+        let (ta, ra) = oneshot::channel();
+        let (ta2, ra2) = oneshot::channel();
+        let (tb, mut rb) = oneshot::channel();
+        let forwards = vec![(a, vec![1], ta, now), (b, vec![2], tb, now), (a, vec![3], ta2, now)];
+        let (kept, failed) = fail_relay_forwards_for(forwards, a, "dial failed");
+        assert_eq!(failed, 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, b);
+        assert!(ra.await.unwrap().unwrap_err().contains("dial failed"));
+        assert!(ra2.await.unwrap().is_err());
+        assert!(rb.try_recv().is_err(), "b's forward is still waiting");
     }
 
     // ── C-N2: pending_relay_forwards TTL sweep ─────────────────────────────
