@@ -5,6 +5,7 @@ import { $ } from "./dom";
 import { html, setHTML } from "./html";
 import { state, engines, deviceName } from "./state";
 import { call } from "./bridge";
+import { tokenizerDownloadsOn, networkRestartPending } from "./netmode.js";
 
   // Settings › Engine: the saved engine kind (agent `--engine-kind` value) ↔ the dropdown label, and
   // each engine's standard endpoint (shown as the placeholder when no custom endpoint is saved).
@@ -68,13 +69,25 @@ import { call } from "./bridge";
     const builtin = p.builtin_bootstraps || 0;
     const publicNet = s.public_network !== false;
     $("#netsub") && ($("#netsub").textContent = !publicNet
-      ? "Private deployment: your node connects only through the bootstrap peers you list below (and machines on your local network). OpenHydra's public servers are never contacted."
+      ? "Private deployment: your node connects only through the bootstrap peers you list below (never OpenHydra's own) and machines on your local network. It doesn't use OpenHydra's relays, tokenizer list or update server."
       : builtin
         ? "Your node joins the network through OpenHydra's bootstrap peers. You can add more and change the local API port."
         : "This build has no built-in bootstrap peer: add one below to join the public network. Without one, only machines on your local network are found.");
     $("#bootdesc") && ($("#bootdesc").textContent = !publicNet
       ? "Your deployment's bootstrap peers, one per line."
       : builtin ? "Extra bootstrap peer addresses, one per line (used as well as the built-in ones)." : "Bootstrap peer addresses, one per line.");
+    // OpenHydra's own bootstraps in the list: used on the public network, never in a private one.
+    const listed = p.openhydra_bootstraps_listed || 0;
+    const bpn = $("#bootpublicnote");
+    if (bpn) {
+      bpn.style.display = listed ? "" : "none";
+      const which = listed === 1 ? "One of these is an OpenHydra public bootstrap peer" : `${listed} of these are OpenHydra public bootstrap peers`;
+      bpn.textContent = !listed ? "" : !publicNet ? `${which}: a private deployment doesn't use ${listed === 1 ? "it" : "them"}.` : `${which}.`;
+    }
+    // A change to the network mode applies when the gateway and sharing restart: until then, say so.
+    const pend = networkRestartPending(p, s);
+    $("#netpending") && ($("#netpending").style.display = pend ? "flex" : "none");
+    $("#netpendingtext") && ($("#netpendingtext").textContent = pend || "");
     $("#relaysw") && $("#relaysw").classList.toggle("on", !!s.peer_relay);
     // Absent in a config from before the setting existed: on (the public network).
     $("#publicnetsw") && $("#publicnetsw").classList.toggle("on", s.public_network !== false);
@@ -85,7 +98,8 @@ import { call } from "./bridge";
     $("#authchecksw") && $("#authchecksw").classList.toggle("on", !!s.authenticity_checks);
     $("#auditreplaysw") && $("#auditreplaysw").classList.toggle("on", !!s.audit_replay);
     // Absent in a config from before the setting existed: on, as the agent defaults.
-    $("#tokdlsw") && $("#tokdlsw").classList.toggle("on", s.tokenizer_downloads !== false);
+    // The switch shows the setting for the mode saved: off by default in a private deployment.
+    $("#tokdlsw") && $("#tokdlsw").classList.toggle("on", tokenizerDownloadsOn(s));
     // A saved "A2" (offered by an unreleased build) is used as A1: this app's gateway can't run the
     // model checks A2 needs.
     const floor = s.min_authenticity || "off";

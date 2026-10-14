@@ -199,13 +199,18 @@ struct Settings {
     /// default: audits then send generated test prompts instead.
     audit_replay: bool,
     /// Let the gateway download a model's tokenizer from Hugging Face the first time it serves a model
-    /// the signed tokenizer index lists, to check billed token counts (W4). On by default; off passes
-    /// `--no-tokenizer-downloads` (only tokenizers already downloaded are used). The download tells
-    /// Hugging Face which models this gateway uses, never what it sends.
+    /// the signed tokenizer index lists, to check billed token counts (W4), on the public network. On
+    /// by default; off passes `--no-tokenizer-downloads` (only tokenizers already downloaded are
+    /// used). The download tells Hugging Face which models this gateway uses, never what it sends.
     tokenizer_downloads: bool,
+    /// The same, in a private deployment (`public_network` off): off by default there, so a private
+    /// deployment contacts no outside service unless the user turns this on (review 2026-10-14, D1).
+    /// See [`tokenizer_downloads_on`].
+    private_tokenizer_downloads: bool,
     /// Join through OpenHydra's public network: the built-in bootstraps and the production relays.
-    /// Off = a private deployment: only the user's own bootstraps (and the LAN), with
-    /// `--public-relays off`, so OpenHydra's public servers are never contacted. On by default.
+    /// Off = a private deployment: only the user's own bootstraps (and the LAN, never OpenHydra's
+    /// own, even listed), with `--public-relays off` and `--tokenizer-index-url off`, and no
+    /// automatic update check. On by default.
     public_network: bool,
     /// Only use providers this gateway has verified at least to this tier: `"off"` (any provider,
     /// the default), `"A1"` or `"A2"` (`--min-authenticity <tier> --assurance gate`).
@@ -276,6 +281,7 @@ impl Default for Settings {
             authenticity_checks: false,
             audit_replay: false,
             tokenizer_downloads: true,
+            private_tokenizer_downloads: false,
             public_network: true,
             min_authenticity: "off".into(),
             search_url: String::new(),
@@ -728,6 +734,11 @@ struct RoleStatus {
     relays: u64,
     /// Exit description if the child died on its own (crash visibility).
     exited: Option<String>,
+    /// The `public_network` setting this role was started with: Settings shows a pending restart
+    /// while the saved one differs (review 2026-10-14, M2).
+    started_public_network: Option<bool>,
+    /// Gateway: whether it was started with tokenizer downloads on.
+    started_tokenizer_downloads: Option<bool>,
 }
 
 struct Role {
@@ -909,6 +920,31 @@ fn effective_bootstraps(settings: &Settings) -> Vec<String> {
     out
 }
 
+/// Whether the gateway downloads tokenizers from Hugging Face: the public network's setting, or the
+/// private deployment's (off unless turned on).
+fn tokenizer_downloads_on(settings: &Settings) -> bool {
+    if settings.public_network {
+        settings.tokenizer_downloads
+    } else {
+        settings.private_tokenizer_downloads
+    }
+}
+
+/// The gateway's W4 flags: no tokenizer downloads from Hugging Face unless they are on (off by
+/// default in a private deployment), and in a private deployment no fetch of the signed tokenizer
+/// list from dl.openhydra.co either: the gateway uses the list built into this release (review
+/// 2026-10-14, M1).
+fn tokenizer_args(settings: &Settings) -> Vec<String> {
+    let mut out = Vec::new();
+    if !tokenizer_downloads_on(settings) {
+        out.push("--no-tokenizer-downloads".to_string());
+    }
+    if !settings.public_network {
+        out.extend(["--tokenizer-index-url".to_string(), "off".to_string()]);
+    }
+    out
+}
+
 /// The agents' `--public-relays`: decided from the bootstraps on the public network (the built-in
 /// ones are OpenHydra's), never in a private deployment.
 fn public_relays_arg(settings: &Settings) -> &'static str {
@@ -942,12 +978,17 @@ fn dialog_text(s: &str, max: usize) -> String {
 /// Ask the user in a native dialog; true only if they press `ok`. Blocks until answered, so it must
 /// not run on the main thread: callers are `#[tauri::command(async)]` or run in spawn_blocking.
 fn native_confirm(app: &tauri::AppHandle, title: &str, message: &str, ok: &str) -> bool {
+    native_choice(app, title, message, ok, "Cancel")
+}
+
+/// [`native_confirm`] with its own label for the other button (when it isn't "cancel the change").
+fn native_choice(app: &tauri::AppHandle, title: &str, message: &str, ok: &str, other: &str) -> bool {
     let mut d = app
         .dialog()
         .message(message)
         .title(title)
         .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(ok.to_string(), "Cancel".to_string()));
+        .buttons(MessageDialogButtons::OkCancelCustom(ok.to_string(), other.to_string()));
     if let Some(w) = app.get_webview_window("main") {
         d = d.parent(&w);
     }
@@ -1009,10 +1050,12 @@ impl GlobalExposure {
 }
 
 /// The global-publish dialog: true if the user agrees to announce `what` to everyone.
-fn confirm_global(app: &tauri::AppHandle, what: &GlobalExposure, starting: bool) -> bool {
+fn confirm_global(app: &tauri::AppHandle, what: &GlobalExposure, starting: bool, public_network: bool) -> bool {
     let head = if starting { "Start sharing?" } else { "Share with everyone?" };
+    // "Everyone" is the network this node is on: OpenHydra's public one, or a private deployment.
+    let who = if public_network { "Anyone on the OpenHydra network" } else { "Anyone on your private deployment" };
     let msg = format!(
-        "Anyone on the OpenHydra network will be able to discover and send requests to: {}.\n\n\
+        "{who} will be able to discover and send requests to: {}.\n\n\
          Your machine serves those requests. Your prompts, files and identity are not shared. You can \
          stop sharing, or make a model private, at any time.",
         what.describe()
@@ -1111,7 +1154,13 @@ fn spawn_role(
 
     let mut guard = role.lock().map_err(|e| e.to_string())?;
     registry_set(guard.pid_slot, child.id());
-    guard.status = RoleStatus { running: true, pid: Some(child.id()), ..Default::default() };
+    guard.status = RoleStatus {
+        running: true,
+        pid: Some(child.id()),
+        started_public_network: Some(settings.public_network),
+        started_tokenizer_downloads: Some(tokenizer_downloads_on(settings)),
+        ..Default::default()
+    };
     guard.logs.clear();
     guard.child = Some(child);
     drop(guard);
@@ -1147,6 +1196,9 @@ struct FullState {
     share_policy_reset: bool,
     /// How many bootstrap peers this build has built in (release builds; 0 in dev).
     builtin_bootstraps: usize,
+    /// How many of the user's own bootstraps are OpenHydra's public ones (a private deployment
+    /// doesn't use them; Settings says so).
+    openhydra_bootstraps_listed: usize,
 }
 
 fn view(role: &Arc<Mutex<Role>>) -> RoleView {
@@ -1162,6 +1214,7 @@ fn view(role: &Arc<Mutex<Role>>) -> RoleView {
 fn get_state(state: tauri::State<'_, AppState>) -> FullState {
     let settings = state.settings.lock().expect("settings lock").clone();
     let gateway_url = format!("http://127.0.0.1:{}/v1", settings.gateway_port);
+    let openhydra_bootstraps_listed = settings.bootstraps.iter().filter(|b| openhydra_agent::is_openhydra_bootstrap(b)).count();
     FullState {
         provider: view(&state.provider),
         gateway: view(&state.gateway),
@@ -1173,6 +1226,7 @@ fn get_state(state: tauri::State<'_, AppState>) -> FullState {
         // session-sticky `resumed_on_launch` load above.
         share_policy_reset: state.share_policy_reset.swap(false, std::sync::atomic::Ordering::Relaxed),
         builtin_bootstraps: builtin_bootstraps().len(),
+        openhydra_bootstraps_listed,
     }
 }
 
@@ -1278,13 +1332,25 @@ fn start_provider(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> R
     let approved = state.global_approval.lock().map(|a| a.clone()).unwrap_or_default();
     let unapproved = exposure_beyond(&global_exposure(&policy), &approved);
     if !unapproved.is_empty() {
-        if !confirm_global(&app, &unapproved, true) {
+        let public = state.settings.lock().map(|s| s.public_network).unwrap_or(true);
+        if !confirm_global(&app, &unapproved, true, public) {
             return Err(CANCELLED.into());
         }
         if let Ok(mut a) = state.global_approval.lock() {
             a.absorb(&unapproved);
         }
     }
+    start_provider_now(state)
+}
+
+/// Restart sharing (to apply saved settings): the same sharing, so no new consent. A restart widens
+/// nothing; a wider audience (joining the public network) is confirmed when it is saved.
+#[tauri::command(async)]
+fn restart_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if !state.provider.lock().map(|r| r.status.running).unwrap_or(false) {
+        return Err("not sharing".into());
+    }
+    state.provider.lock().map_err(|e| e.to_string())?.kill();
     start_provider_now(state)
 }
 
@@ -1361,7 +1427,8 @@ fn save_share_policy(
     let running = state.provider.lock().map(|r| r.status.running).unwrap_or(false);
     let widened = exposure_beyond(&global_exposure(&policy), &global_exposure(&prev));
     if running && !widened.is_empty() {
-        if !confirm_global(&app, &widened, false) {
+        let public = state.settings.lock().map(|s| s.public_network).unwrap_or(true);
+        if !confirm_global(&app, &widened, false, public) {
             return Err(CANCELLED.into());
         }
         if let Ok(mut a) = state.global_approval.lock() {
@@ -2049,10 +2116,7 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // D1: the desktop replays prompts for audits only when the user turned it on.
     sub.push("--audit-replay".into());
     sub.push(if settings.audit_replay { "on" } else { "off" }.into());
-    // W4: tokenizer downloads from Hugging Face for token-count checks, unless the user turned them off.
-    if !settings.tokenizer_downloads {
-        sub.push("--no-tokenizer-downloads".into());
-    }
+    sub.extend(tokenizer_args(&settings));
     // D2: the user's floor on which providers serve them, enforced.
     if let Some(tier) = gateway_floor(&settings.min_authenticity) {
         sub.extend(["--min-authenticity".into(), tier.into(), "--assurance".into(), "gate".into()]);
@@ -2944,6 +3008,9 @@ fn settings_widening(prev: &Settings, next: &Settings) -> Vec<String> {
     if next.public_network && !prev.public_network {
         out.push("Join OpenHydra's public network (its bootstrap nodes and relays).".to_string());
     }
+    if tokenizer_downloads_on(next) && !tokenizer_downloads_on(prev) {
+        out.push("Download model tokenizers from Hugging Face the first time each model is used (huggingface.co then learns which models you use).".to_string());
+    }
     if next.audit_replay && !prev.audit_replay {
         out.push("Send some of your own requests to a second provider to check answers.".to_string());
     }
@@ -2995,16 +3062,46 @@ fn validate_settings(s: &Settings) -> Result<(), String> {
 fn save_settings(app: tauri::AppHandle, state: tauri::State<'_, AppState>, mut settings: Settings) -> Result<(), String> {
     validate_settings(&settings)?;
     let prev = state.settings.lock().map_err(|e| e.to_string())?.clone();
-    let widening = settings_widening(&prev, &settings);
+    let mut widening = settings_widening(&prev, &settings);
+    // Joining the public network makes what is shared with everyone public too: say what.
+    if settings.public_network && !prev.public_network {
+        let policy = openhydra_agent::SharePolicy::load(&share_policy_path()).unwrap_or_else(|_| openhydra_agent::SharePolicy::share_nothing());
+        let shared = global_exposure(&policy);
+        if !shared.is_empty() {
+            widening.push(format!("Make what you share with everyone visible on the public network: {}.", shared.describe()));
+        }
+    }
     if !widening.is_empty()
         && !native_confirm(
             &app,
             "Change network settings?",
-            &format!("{}\n\nOnly continue if you made this change.", widening.join("\n")),
+            &format!(
+                "{}\n\nOnly continue if you made this change.",
+                widening.iter().map(|w| format!("• {w}")).collect::<Vec<_>>().join("\n")
+            ),
             "Save",
         )
     {
         return Err(CANCELLED.into());
+    }
+    // Going private with OpenHydra's own bootstraps in the list: they won't be used (the agent drops
+    // them); offer to take them out of the list too (D3).
+    if prev.public_network && !settings.public_network {
+        let public: Vec<String> = settings.bootstraps.iter().filter(|b| openhydra_agent::is_openhydra_bootstrap(b)).cloned().collect();
+        if !public.is_empty()
+            && native_choice(
+                &app,
+                "Remove OpenHydra's bootstrap peers?",
+                &format!(
+                    "Your list includes OpenHydra's public bootstrap peers. A private deployment doesn't use them either way.\n\n{}",
+                    public.iter().map(|b| dialog_text(b, 120)).collect::<Vec<_>>().join("\n")
+                ),
+                "Remove",
+                "Keep",
+            )
+        {
+            settings.bootstraps.retain(|b| !openhydra_agent::is_openhydra_bootstrap(b));
+        }
     }
     let mut cur = state.settings.lock().map_err(|e| e.to_string())?;
     // Preserve fields the settings FORM doesn't own — taking the payload verbatim would reset them.
@@ -3218,6 +3315,7 @@ fn main() {
             confirm_sharing,
             open_external,
             start_provider,
+            restart_provider,
             start_gateway,
             stop_provider,
             stop_gateway,
@@ -3964,6 +4062,36 @@ mod tests {
         s.public_network = false;
         assert_eq!(effective_bootstraps(&s), vec!["/ip4/9.9.9.9/tcp/4001/p2p/C".to_string()]);
         assert_eq!(public_relays_arg(&s), "off");
+    }
+
+    /// Review 2026-10-14 M1/D1: a private deployment fetches no tokenizer list and downloads no
+    /// tokenizers unless the user turns its own switch on (which asks first).
+    #[test]
+    fn a_private_deployment_contacts_no_tokenizer_service_by_default() {
+        let mut s = Settings::default();
+        assert!(tokenizer_args(&s).is_empty(), "the public network: downloads on, list fetched");
+        s.public_network = false;
+        assert_eq!(tokenizer_args(&s), vec!["--no-tokenizer-downloads", "--tokenizer-index-url", "off"]);
+        s.private_tokenizer_downloads = true;
+        assert_eq!(tokenizer_args(&s), vec!["--tokenizer-index-url", "off"]);
+        // An older config without the private field: off.
+        let old: Settings = serde_json::from_str(r#"{"public_network": false, "tokenizer_downloads": true}"#).unwrap();
+        assert!(!tokenizer_downloads_on(&old));
+        // Turning downloads on asks first, in either mode (L1).
+        let (mut prev, mut next) = (Settings::default(), Settings::default());
+        prev.public_network = false;
+        next.public_network = false;
+        next.private_tokenizer_downloads = true;
+        assert!(settings_widening(&prev, &next).iter().any(|w| w.contains("huggingface.co")));
+        prev.public_network = true;
+        prev.tokenizer_downloads = false;
+        next = prev.clone();
+        next.tokenizer_downloads = true;
+        assert!(settings_widening(&prev, &next).iter().any(|w| w.contains("huggingface.co")));
+        // Going private never asks about downloads.
+        next = prev.clone();
+        next.public_network = false;
+        assert!(!settings_widening(&prev, &next).iter().any(|w| w.contains("huggingface.co")));
     }
 
     #[test]

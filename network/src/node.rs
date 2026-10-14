@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{info, warn};
 
 
 use crate::event_loop::{self, SharedProxyQueue, SwarmCommand};
@@ -115,7 +115,16 @@ pub fn start_node(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Parse bootstrap peers: "/ip4/.../tcp/.../p2p/12D3KooW..."
-    let bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
+    let mut bootstrap_peers = parse_bootstrap_peers(&config.bootstrap_peers)?;
+    // A private deployment never contacts OpenHydra's own bootstraps, even ones it was given.
+    if config.public_relays == crate::relay::PublicRelays::Off {
+        let (kept, dropped) = crate::relay::without_public_bootstraps(bootstrap_peers);
+        for (pid, addr) in &dropped {
+            warn!(%pid, %addr, "--public-relays off: not using OpenHydra's public bootstrap");
+        }
+        bootstrap_peers = kept;
+    }
+    let public_network = crate::relay::uses_public_network(&bootstrap_peers, config.public_relays);
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
     // The relays this node reserves on and dials others through: its bootstraps, plus the
     // production relays on the public network (see `PublicRelays`).
@@ -134,7 +143,9 @@ pub fn start_node(
     // R-DHT-6: persist/reload the routing table beside the identity key. Derived
     // here (config is a borrow that can't move into the thread) and handed to the
     // event loop.
-    let routing_cache_path = Some(crate::routing_cache::cache_path_for(&config.identity_path));
+    // Kept apart for a private deployment: a node that was once on the public network must not dial
+    // the public peers it remembers (M1).
+    let routing_cache_path = Some(crate::routing_cache::cache_path_for(&config.identity_path, !public_network));
 
     // Create the command channel.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(256);
@@ -196,6 +207,17 @@ pub fn start_node(
 
 /// Check one bootstrap multiaddr the way the node will parse it at startup (a valid multiaddr with a
 /// `/p2p/<peer id>` component), so a settings form can refuse one the node would fail on.
+/// Whether `addr` names one of OpenHydra's own public bootstraps (by its `/p2p/` peer id): a
+/// private deployment doesn't use them.
+pub fn is_openhydra_bootstrap(addr: &str) -> bool {
+    let Ok(ma) = addr.trim().parse::<Multiaddr>() else { return false };
+    let pid = ma.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
+        _ => None,
+    });
+    pid.is_some_and(|pid| crate::relay::bootstrap_relay_peer_ids().contains(&pid))
+}
+
 pub fn check_bootstrap_addr(addr: &str) -> Result<(), String> {
     parse_bootstrap_peers(&[addr.to_string()]).map(|_| ())
 }
@@ -238,4 +260,20 @@ pub(crate) fn send_and_wait<T>(
     reply_rx
         .blocking_recv()
         .map_err(|_| "swarm dropped reply channel".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openhydras_own_bootstraps_are_recognised_by_peer_id() {
+        let us = crate::relay::bootstrap_relay_peer_ids()[0];
+        assert!(is_openhydra_bootstrap(&format!("/dns4/bootstrap-us.openhydra.co/tcp/4001/p2p/{us}")));
+        assert!(is_openhydra_bootstrap(&format!(" /ip4/1.2.3.4/tcp/4001/p2p/{us} ")), "any address, by peer id");
+        let other = libp2p::PeerId::random();
+        assert!(!is_openhydra_bootstrap(&format!("/ip4/10.0.0.5/tcp/4001/p2p/{other}")));
+        assert!(!is_openhydra_bootstrap("/dns4/bootstrap-us.openhydra.co/tcp/4001"), "no peer id: not judged");
+        assert!(!is_openhydra_bootstrap("not an address"));
+    }
 }

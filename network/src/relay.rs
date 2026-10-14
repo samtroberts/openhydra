@@ -107,14 +107,8 @@ impl PublicRelays {
 /// The relays a node reserves on and dials others through, each `/…/p2p/<relay id>`: its
 /// bootstraps, plus the production relays when `public` says so (see [`PublicRelays`]).
 pub fn relay_addrs(bootstraps: &[(PeerId, Multiaddr)], public: PublicRelays) -> Vec<Multiaddr> {
-    let production = bootstrap_relay_peer_ids();
-    let use_public = match public {
-        PublicRelays::On => true,
-        PublicRelays::Off => false,
-        PublicRelays::Auto => bootstraps.is_empty() || bootstraps.iter().any(|(pid, _)| production.contains(pid)),
-    };
     let mut out: Vec<Multiaddr> = Vec::new();
-    if use_public {
+    if uses_public_network(bootstraps, public) {
         out.extend(BOOTSTRAP_RELAYS.iter().filter_map(|s| s.parse::<Multiaddr>().ok()));
     }
     for (pid, addr) in bootstraps {
@@ -128,6 +122,28 @@ pub fn relay_addrs(bootstraps: &[(PeerId, Multiaddr)], public: PublicRelays) -> 
         }
     }
     out
+}
+
+/// Whether a node with these bootstraps, in this mode, joins through OpenHydra's public network (its
+/// production relays): `On`; never `Off`; `Auto` when it has no bootstraps or one of them is
+/// OpenHydra's.
+pub fn uses_public_network(bootstraps: &[(PeerId, Multiaddr)], public: PublicRelays) -> bool {
+    match public {
+        PublicRelays::On => true,
+        PublicRelays::Off => false,
+        PublicRelays::Auto => {
+            let production = bootstrap_relay_peer_ids();
+            bootstraps.is_empty() || bootstraps.iter().any(|(pid, _)| production.contains(pid))
+        }
+    }
+}
+
+/// A private deployment's bootstraps (`--public-relays off`): `bootstraps` without OpenHydra's own
+/// (by peer id), which it must not contact (review 2026-10-14, M1: a user who once added
+/// bootstrap-us by hand kept joining through it). Returns those kept and those dropped.
+pub fn without_public_bootstraps(bootstraps: Vec<(PeerId, Multiaddr)>) -> (Vec<(PeerId, Multiaddr)>, Vec<(PeerId, Multiaddr)>) {
+    let production = bootstrap_relay_peer_ids();
+    bootstraps.into_iter().partition(|(pid, _)| !production.contains(pid))
 }
 
 /// The relay peer ids in a relay list (each address's `/p2p/` component).
@@ -523,6 +539,22 @@ mod tests {
         assert_eq!(PublicRelays::parse(" ON "), Some(PublicRelays::On));
         assert_eq!(PublicRelays::parse("auto"), Some(PublicRelays::Auto));
         assert_eq!(PublicRelays::parse("maybe"), None);
+    }
+
+    #[test]
+    fn a_private_deployment_drops_openhydras_own_bootstraps() {
+        let production = bootstrap_relay_peer_ids();
+        let us: (PeerId, Multiaddr) = (production[0], "/dns4/bootstrap-us.openhydra.co/tcp/4001".parse().unwrap());
+        let own: (PeerId, Multiaddr) = (PeerId::random(), "/ip4/10.0.0.5/tcp/4001".parse().unwrap());
+        let (kept, dropped) = without_public_bootstraps(vec![us.clone(), own.clone()]);
+        assert_eq!(kept, vec![own.clone()]);
+        assert_eq!(dropped, vec![us.clone()]);
+        // Which mode is the public network.
+        assert!(!uses_public_network(&[us.clone()], PublicRelays::Off));
+        assert!(uses_public_network(&[own.clone()], PublicRelays::On));
+        assert!(uses_public_network(&[], PublicRelays::Auto));
+        assert!(uses_public_network(&[us, own.clone()], PublicRelays::Auto));
+        assert!(!uses_public_network(&[own], PublicRelays::Auto));
     }
 
     #[test]

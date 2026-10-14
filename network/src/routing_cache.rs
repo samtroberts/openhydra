@@ -38,11 +38,16 @@ const FORMAT_VERSION: u32 = 1;
 
 /// Derive the routing-cache path from the identity-key path: a sibling
 /// `routing_cache.json`. Keeping it next to the identity ties the cache to the
-/// node's own data dir without introducing a new config knob.
-pub fn cache_path_for(identity_path: &Path) -> PathBuf {
+/// node's own data dir without introducing a new config knob. A private
+/// deployment (`private`: no OpenHydra relays) keeps its own,
+/// `routing_cache.private.json`, so it never dials the public peers a node
+/// remembers from the public network, and going back keeps those (review
+/// 2026-10-14, M1).
+pub fn cache_path_for(identity_path: &Path, private: bool) -> PathBuf {
+    let name = if private { "routing_cache.private.json" } else { "routing_cache.json" };
     match identity_path.parent() {
-        Some(dir) => dir.join("routing_cache.json"),
-        None => PathBuf::from("routing_cache.json"),
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
     }
 }
 
@@ -130,8 +135,11 @@ mod tests {
 
     #[test]
     fn test_cache_path_sibling_of_identity() {
-        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"));
+        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), false);
         assert_eq!(p, PathBuf::from("/opt/openhydra/routing_cache.json"));
+        // A private deployment keeps its own.
+        let p = cache_path_for(Path::new("/opt/openhydra/.identity.key"), true);
+        assert_eq!(p, PathBuf::from("/opt/openhydra/routing_cache.private.json"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ import { renderSwarms } from "./swarms";
 import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
 import { renderSettings, updateEngineEndpoint, pendingSettings, engineEndpointValue } from "./settings";
+import { tokenizerDownloadsKey } from "./netmode.js";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on, emit } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
@@ -628,7 +629,7 @@ $("#setnav").onclick = (e) => { const s = e.target.closest(".s"); if (!s) return
 // lose focus. `pendingSettings` keeps the new value on screen until the save lands, so the 2.5 s poll
 // can't flip it back. Each toast says when the change takes effect.
 const SETTING_SWITCHES = { engineautostartsw: "engine_autostart", authchecksw: "authenticity_checks", auditreplaysw: "audit_replay", tokdlsw: "tokenizer_downloads", publicnetsw: "public_network", resumelaunchsw: "resume_on_launch", verboselogsw: "verbose_logs", relaysw: "peer_relay" };
-const APPLIES = { gateway_port: "gateway", bootstraps: "both", audit_replay: "gateway", tokenizer_downloads: "gateway", public_network: "both", min_authenticity: "gateway", authenticity_checks: "sharing", verbose_logs: "both", peer_relay: "both", engine_kind: "sharing", engine_endpoint: "sharing", engine_autostart: "launch" };
+const APPLIES = { gateway_port: "gateway", bootstraps: "both", audit_replay: "gateway", tokenizer_downloads: "gateway", private_tokenizer_downloads: "gateway", public_network: "both", min_authenticity: "gateway", authenticity_checks: "sharing", verbose_logs: "both", peer_relay: "both", engine_kind: "sharing", engine_endpoint: "sharing", engine_autostart: "launch" };
 async function saveSetting(patch) {
   // Never save before the first state load: the payload would reset every other setting to defaults.
   if (!state?.settings) { toast("Still loading — try again in a moment"); renderSettings(); return; }
@@ -649,8 +650,13 @@ async function saveSetting(patch) {
 }
 $$("[data-sw]").forEach((sw) => {
   if (sw.closest("#servetable")) return;
-  const key = SETTING_SWITCHES[sw.id];
-  sw.onclick = () => { const on = !sw.classList.contains("on"); sw.classList.toggle("on", on); if (key) saveSetting({ [key]: on }); };
+  const fixed = SETTING_SWITCHES[sw.id];
+  sw.onclick = () => {
+    const on = !sw.classList.contains("on"); sw.classList.toggle("on", on);
+    // The token-count switch edits the setting for the saved mode (a private deployment has its own).
+    const key = sw.id === "tokdlsw" ? tokenizerDownloadsKey({ ...(state?.settings || {}), ...pendingSettings }) : fixed;
+    if (key) saveSetting({ [key]: on });
+  };
 });
 $("#minauthsel")?.addEventListener("change", (e) => saveSetting({ min_authenticity: e.target.value }));
 // Text fields: Enter commits single-line fields; blur saves when the value changed.
@@ -686,7 +692,7 @@ $("#restartgw")?.addEventListener("click", async (e) => {
 $("#restartshare")?.addEventListener("click", async (e) => {
   if (!state?.provider?.status?.running) { toast("Not sharing — changes apply when you start sharing"); return; }
   const b = e.currentTarget; b.disabled = true; b.textContent = "Restarting…";
-  try { await call("stop_provider"); await call("start_provider"); toast("Sharing restarted"); } catch (err) { failToast("Restart failed", err); }
+  try { await call("restart_provider"); toast("Sharing restarted"); } catch (err) { failToast("Restart failed", err); }
   finally { b.disabled = false; b.textContent = "Restart"; await refresh().catch(() => {}); }
 });
 // Reset sharing preferences → clean share-nothing default (hot-reloads; no restart). Non-destructive.
@@ -741,12 +747,19 @@ $$(".cp").forEach((b) => b.onclick = (e) => { e.stopPropagation(); navigator.cli
 let updateReady = null;   // the checked Update handle
 let updateStaged = false; // true once bytes are downloaded + installed on disk (pending restart)
 $("#relaunch").style.display = "none";
-async function checkUpdates() {
-  const u = window.__TAURI__?.updater; if (!u?.check) return;
-  if (updateStaged) return; // already downloaded + staged this session; waiting on a restart
+// Returns "staged", "found", "none" or "" (nothing checked); `manual` = the user asked (Settings).
+async function checkUpdates(manual = false) {
+  const u = window.__TAURI__?.updater; if (!u?.check) return "";
+  if (updateStaged) return "staged"; // already downloaded + staged this session; waiting on a restart
+  // A private deployment doesn't contact OpenHydra's update server unless the user asks (M1, D2);
+  // before the settings have loaded we don't know which this is, so look again shortly.
+  if (!manual) {
+    if (!state?.settings) { setTimeout(() => checkUpdates(), 5000); return ""; }
+    if (state.settings.public_network === false) return "";
+  }
   try {
     const up = await u.check();
-    if (!up) return;
+    if (!up) return "none";
     updateReady = up;
     // Silent staging is a clean in-place swap on macOS (.app) and Linux (AppImage): the running
     // process is untouched and the update applies on next restart. On Windows the update is an
@@ -770,14 +783,35 @@ async function checkUpdates() {
       $("#relaunchver").textContent = "v" + up.version; // Windows: manual apply via the card
     }
     $("#relaunch").style.display = "flex";
+    return "found";
   } catch (e) {
     // A release that didn't build for this platform has no entry for it: nothing to update to yet.
-    if (/found in the response `platforms` object/.test(String(e))) return;
+    if (/found in the response `platforms` object/.test(String(e))) return "none";
     console.warn("update check", e);
+    if (manual) throw e;
+    return "";
   }
 }
-setTimeout(checkUpdates, 3000);
-setInterval(checkUpdates, 60 * 60 * 1000); // #13: re-check hourly so a running instance stages a new release in the background
+setTimeout(() => checkUpdates(), 3000);
+setInterval(() => checkUpdates(), 60 * 60 * 1000); // #13: re-check hourly so a running instance stages a new release in the background
+$("#checkupd")?.addEventListener("click", async (e) => {
+  const b = e.currentTarget; b.disabled = true; b.textContent = "Checking…";
+  try {
+    const r = await checkUpdates(true);
+    toast(r === "none" ? "OpenHydra is up to date" : r === "" ? "Updates aren't available in this build" : "An update is ready: see the button at the top");
+  } catch (err) { failToast("Update check failed", err); }
+  finally { b.disabled = false; b.textContent = "Check now"; }
+});
+// Settings › Network: restart what still runs with the old network mode.
+$("#netrestartnow")?.addEventListener("click", async (e) => {
+  const b = e.currentTarget; b.disabled = true; b.textContent = "Restarting…";
+  try {
+    if (state?.gateway?.status?.running) { await call("stop_gateway"); await call("start_gateway"); }
+    if (state?.provider?.status?.running) await call("restart_provider");
+    toast("Restarted with the new network settings");
+  } catch (err) { failToast("Restart failed", err); }
+  finally { b.disabled = false; b.textContent = "Restart now"; await refresh().catch(() => {}); renderSettings(); }
+});
 let relaunchBusy = false;
 $("#relaunch").onclick = async () => {
   if (relaunchBusy) return; // guard against a double-click firing two downloadAndInstall calls

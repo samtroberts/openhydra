@@ -19,6 +19,7 @@
     "allow-confirm-sharing",
     "allow-open-external",
     "allow-start-provider",
+    "allow-restart-provider",
     "allow-start-gateway",
     "allow-stop-provider",
     "allow-stop-gateway",

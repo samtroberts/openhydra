@@ -92,7 +92,7 @@ pub use cards::{build_card, CardExport};
 // M2: the signed `.openhydra` card type + crypto live in the network crate; re-export so the desktop
 // (which path-depends only on this crate) and the binary can use them without a direct network dep.
 /// Validate a bootstrap multiaddr exactly as the node parses it at startup.
-pub use openhydra_network::node::check_bootstrap_addr;
+pub use openhydra_network::node::{check_bootstrap_addr, is_openhydra_bootstrap};
 pub use openhydra_network::card::{
     card_is_privacy_safe, sign_card, verify_card, AupFlags, Capability, Card, CardError, PricingMode,
     RateCard, VerifiedCard, CARD_SCHEMA_VERSION,

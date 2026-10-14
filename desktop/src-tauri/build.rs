@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "confirm_sharing",
     "open_external",
     "start_provider",
+    "restart_provider",
     "start_gateway",
     "stop_provider",
     "stop_gateway",
