@@ -4,8 +4,9 @@ name: Tokenizer index
 # `openhydra-agent registry index sign`) to the download bucket as tokenizers/index.json, which
 # gateways fetch daily from https://dl.openhydra.co/tokenizers/index.json (W4). Runs when the file
 # changes on main, or by hand. Gateways check the signature against the key built into them and only
-# move to a higher sequence, so this job only has to put the file in place. Same R2 secrets and S3
-# endpoint as the publish-r2 job in release.yml.
+# move to a higher sequence; the job checks both first (.github/scripts/check-tokenizer-index.sh), so
+# a bad or stale file is never put in place. Same R2 secrets and S3 endpoint as the publish-r2 job in
+# release.yml.
 
 on:
   push:
@@ -26,25 +27,22 @@ jobs:
     name: Publish tokenizers/index.json
     # Only the public repository holds the R2 secrets (the private CI mirror has none).
     if: github.repository == 'samtroberts/openhydra'
-    runs-on: ubuntu-latest
+    # Pinned: the check needs OpenSSL 3 and the upload the aws CLI, both on this image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Check the file is a signed index
+      - name: Check the signature, and that the sequence is above the published one
+        id: check
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import base64, json
-          env = json.load(open("agent/data/tokenizer-index.json"))
-          assert set(env) == {"index", "signature", "key"}, sorted(env)
-          idx = json.loads(base64.b64decode(env["index"]))
-          assert idx["format"] == 1 and isinstance(idx["sequence"], int)
-          pinned = open("agent/src/tokenizer_index.rs").read().split('PINNED_INDEX_KEY: &str = "')[1][:64]
-          assert env["key"] == pinned, "signed by a key this source doesn't pin"
-          print(f"index #{idx['sequence']}: {len(idx['models'])} tokenizers, key {pinned[:12]}…")
-          PY
+          out=$(.github/scripts/check-tokenizer-index.sh agent/data/tokenizer-index.json agent/src/tokenizer_index.rs \
+            https://dl.openhydra.co/tokenizers/index.json)
+          echo "$out"
+          echo "action=$(echo "$out" | tail -1)" >> "$GITHUB_OUTPUT"
       - name: Upload
+        if: steps.check.outputs.action == 'publish'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
