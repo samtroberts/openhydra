@@ -185,8 +185,34 @@ impl TokenizerIndex {
 
     /// The entry that counts `model`'s tokens, if any (see [`lookup_keys`]).
     pub fn lookup(&self, model: &str) -> Option<&IndexEntry> {
-        lookup_keys(model).iter().find_map(|k| self.models.iter().find(|e| e.names.iter().any(|n| n == k)))
+        // A name given with an `org/` prefix (vLLM, Hugging Face, LM Studio) is a repo name: without
+        // its org it may match a sized name (`qwen3-8b`) or the entry's own repo name (`phi-4`), never
+        // a bare family alias (`deepseek-r1`, Ollama's default tag), which names a different model
+        // there: `deepseek-ai/DeepSeek-R1` is the 671B model, not the 8B distill Ollama's
+        // `deepseek-r1` is (review 2026-10-14, M6).
+        let org_given = model.contains('/');
+        lookup_keys(model).iter().find_map(|k| {
+            let org_stripped = org_given && !k.contains('/');
+            self.models.iter().find(|e| {
+                let repo_name = e.repo.rsplit('/').next().unwrap_or("").to_lowercase();
+                e.names.iter().any(|n| n == k && (!org_stripped || !is_bare_alias(n) || *n == repo_name))
+            })
+        })
     }
+}
+
+/// An index name that names a model family without a size or tag (`deepseek-r1`, `qwen3`,
+/// `llama3.2`): Ollama's name for the family's default tag.
+fn is_bare_alias(name: &str) -> bool {
+    !name.contains(':') && !name.split(['-', '_']).skip(1).any(is_size_token)
+}
+
+/// A name part that gives a model's size: `8b`, `1.5b`, `30b`, `a3b`, `e4b`, `8x7b`, `135m`.
+fn is_size_token(t: &str) -> bool {
+    let t = t.strip_prefix(['a', 'e']).filter(|r| r.starts_with(|c: char| c.is_ascii_digit())).unwrap_or(t);
+    let t = t.split_once('x').map_or(t, |(n, rest)| if n.bytes().all(|b| b.is_ascii_digit()) && !n.is_empty() { rest } else { t });
+    let Some(num) = t.strip_suffix(['b', 'm']) else { return false };
+    !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit() || b == b'.') && num.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// A trailing name part that only says how the weights are stored (`q4_k_m`, `fp16`, `4bit`, `gguf`):
@@ -200,6 +226,8 @@ fn is_storage_tag(t: &str) -> bool {
             t,
             "f16" | "bf16" | "fp16" | "f32" | "fp32" | "fp8" | "fp4" | "mxfp4" | "nvfp4" | "int4" | "int8" | "awq" | "gptq"
                 | "gguf" | "mlx" | "ud" | "qat" | "dwq" | "latest"
+                // The instruction-tuned and base models of a size share a tokenizer.
+                | "instruct" | "it" | "chat"
         )
 }
 
@@ -236,6 +264,10 @@ pub fn lookup_keys(model: &str) -> Vec<String> {
 /// Sign `index` with the registry key: the published JSON.
 pub fn sign(index: &TokenizerIndex, key: &SigningKey) -> Result<String, String> {
     index.validate()?;
+    sign_unchecked(index, key)
+}
+
+fn sign_unchecked(index: &TokenizerIndex, key: &SigningKey) -> Result<String, String> {
     let bytes = serde_json::to_vec(index).map_err(|e| e.to_string())?;
     let mut msg = INDEX_DOMAIN.to_vec();
     msg.extend_from_slice(&bytes);
@@ -249,6 +281,14 @@ pub fn sign(index: &TokenizerIndex, key: &SigningKey) -> Result<String, String> 
 
 /// Read a published index, checking its signature against the `pinned` key (hex) and every entry.
 pub fn verify(published: &str, pinned: &str) -> Result<TokenizerIndex, String> {
+    let index = verify_signature(published, pinned)?;
+    index.validate()?;
+    Ok(index)
+}
+
+/// [`verify`] without the content checks: the index the pinned key signed, as published. One that
+/// fails them may be newer than this build (a limit raised since): told apart from a bad one.
+fn verify_signature(published: &str, pinned: &str) -> Result<TokenizerIndex, String> {
     if published.len() > MAX_INDEX_BYTES {
         return Err("index too large".into());
     }
@@ -263,9 +303,7 @@ pub fn verify(published: &str, pinned: &str) -> Result<TokenizerIndex, String> {
     let mut msg = INDEX_DOMAIN.to_vec();
     msg.extend_from_slice(&bytes);
     key.verify_strict(&msg, &Signature::from_bytes(&sig)).map_err(|_| "bad signature")?;
-    let index: TokenizerIndex = serde_json::from_slice(&bytes).map_err(|e| format!("index: {e}"))?;
-    index.validate()?;
-    Ok(index)
+    serde_json::from_slice(&bytes).map_err(|e| format!("index: {e}"))
 }
 
 /// The copy built into this binary (an empty index if it doesn't verify, which a test rules out).
@@ -318,10 +356,20 @@ impl IndexStore {
 
     /// Adopt a published index if it verifies and is newer than the current one. Whether it was.
     pub fn offer(&self, published: &str, etag: Option<String>) -> Result<bool, String> {
-        let index = verify(published, &self.pinned)?;
+        let index = verify_signature(published, &self.pinned)?;
         let mut cur = self.current.write().unwrap_or_else(|e| e.into_inner());
         if index.sequence <= cur.sequence {
+            // The one we have: its ETag makes the next fetch a 304 (it was only kept with a newer one).
+            if index.sequence == cur.sequence && etag.is_some() {
+                *self.etag.write().unwrap_or_else(|e| e.into_inner()) = etag;
+            }
             return Ok(false);
+        }
+        if let Err(e) = index.validate() {
+            return Err(format!(
+                "tokenizer index #{} needs a newer OpenHydra ({e}); keeping #{} - update OpenHydra to use it",
+                index.sequence, cur.sequence
+            ));
         }
         if let Some(path) = &self.cache {
             if let Err(e) = write_atomic(path, published.as_bytes()) {
@@ -358,18 +406,48 @@ impl IndexStore {
         self.offer(&text, etag)
     }
 
-    /// Refresh now and then every [`REFRESH_EVERY`], on a background thread.
+    /// Refresh now and then every [`REFRESH_EVERY`], on a background thread; after a failure,
+    /// sooner (see [`refresh_delay`]), with a warning at most once a day while it keeps failing
+    /// (review 2026-10-14, L13: a failed fetch was retried a day later, logged at debug only).
     pub fn spawn_refresher(self: &Arc<Self>, client: reqwest::blocking::Client) {
         let store = Arc::clone(self);
         std::thread::Builder::new()
             .name("tokenizer-index".into())
-            .spawn(move || loop {
-                if let Err(e) = store.refresh(&client) {
-                    tracing::debug!(error = %e, "tokenizer index not refreshed");
+            .spawn(move || {
+                let mut failures = 0u32;
+                let mut last_warned: Option<std::time::Instant> = None;
+                loop {
+                    match store.refresh(&client) {
+                        Ok(_) => failures = 0,
+                        Err(e) => {
+                            failures = failures.saturating_add(1);
+                            let warn = last_warned.is_none_or(|t| t.elapsed() >= REFRESH_EVERY) || e.contains("needs a newer OpenHydra");
+                            if warn {
+                                last_warned = Some(std::time::Instant::now());
+                                tracing::warn!(error = %e, url = %store.url, sequence = store.current().sequence,
+                                    "couldn't refresh the tokenizer index; using the one this gateway has");
+                            } else {
+                                tracing::debug!(error = %e, "tokenizer index not refreshed");
+                            }
+                        }
+                    }
+                    std::thread::sleep(refresh_delay(failures));
                 }
-                std::thread::sleep(REFRESH_EVERY);
             })
             .ok();
+    }
+}
+
+/// How long the refresher waits after `failures` failed fetches in a row: [`REFRESH_EVERY`] after a
+/// good one; after a failure 5 min, 15 min, 1 h, 6 h, then daily.
+pub fn refresh_delay(failures: u32) -> Duration {
+    match failures {
+        0 => REFRESH_EVERY,
+        1 => Duration::from_secs(5 * 60),
+        2 => Duration::from_secs(15 * 60),
+        3 => Duration::from_secs(60 * 60),
+        4 => Duration::from_secs(6 * 60 * 60),
+        _ => REFRESH_EVERY,
     }
 }
 
@@ -440,6 +518,22 @@ pub(crate) mod tests {
         assert_eq!(bundled(), idx);
     }
 
+    /// The built-in index on names real engines announce (M6): repo names never reach an Ollama alias.
+    #[test]
+    fn the_built_in_index_resolves_real_engine_names() {
+        let idx = bundled();
+        let repo = |m: &str| idx.lookup(m).map(|e| e.repo.as_str());
+        assert_eq!(repo("deepseek-r1:latest"), Some("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"));
+        assert_eq!(repo("deepseek-ai/DeepSeek-R1"), None, "the 671B model has another tokenizer");
+        assert_eq!(repo("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"), Some("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"));
+        assert_eq!(repo("Qwen/Qwen3-8B"), Some("Qwen/Qwen3-8B"));
+        assert_eq!(repo("microsoft/phi-4"), Some("microsoft/phi-4"));
+        assert_eq!(repo("phi4:latest"), Some("microsoft/phi-4"));
+        assert_eq!(repo("mistralai/Mistral-Nemo-Instruct-2407"), Some("mistralai/Mistral-Nemo-Instruct-2407"));
+        assert_eq!(repo("qwen3"), Some("Qwen/Qwen3-8B"), "Ollama's default tag");
+        assert_eq!(repo("Qwen/Qwen3"), None);
+    }
+
     #[test]
     fn only_the_pinned_key_and_untampered_bytes_verify() {
         let idx = index(3, vec![entry(&["qwen3-8b", "qwen3:8b"], &"b".repeat(64), 11_000_000)]);
@@ -506,6 +600,40 @@ pub(crate) mod tests {
         }
         assert_eq!(lookup_keys("qwen3:8b-q4_K_M"), vec!["qwen3:8b-q4_k_m", "qwen3:8b"]);
         assert_eq!(lookup_keys("llama3.2:latest"), vec!["llama3.2:latest", "llama3.2"]);
+        // Ollama's instruct spellings are the same model's tokenizer.
+        for name in ["qwen3:8b-instruct", "qwen3:8b-instruct-q8_0", "qwen3:8b-it-qat", "qwen3:8b-chat"] {
+            assert!(idx.lookup(name).is_some(), "{name}");
+        }
+    }
+
+    /// Review 2026-10-14 M6: an org-prefixed repo name never matches a bare family alias.
+    #[test]
+    fn a_repo_name_doesnt_match_a_bare_family_alias() {
+        let mut r1 = entry(&["deepseek-r1", "deepseek-r1:8b", "deepseek-r1-0528-qwen3-8b"], &"b".repeat(64), 10);
+        r1.repo = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B".into();
+        let idx = index(1, vec![r1]);
+        // Ollama's names: the alias is meant for them.
+        for name in ["deepseek-r1", "deepseek-r1:latest", "deepseek-r1:8b", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF"] {
+            assert!(idx.lookup(name).is_some(), "{name}");
+        }
+        // The full 671B model under its repo names: another tokenizer, so not counted with this one.
+        for name in ["deepseek-ai/DeepSeek-R1", "deepseek/deepseek-r1", "unsloth/DeepSeek-R1-UD-IQ1_S", "deepseek-ai/DeepSeek-R1-0528"] {
+            assert!(idx.lookup(name).is_none(), "{name}");
+        }
+        // A repo whose own name has no size is still found by it.
+        let mut phi4 = entry(&["phi4", "phi-4"], &"c".repeat(64), 10);
+        phi4.repo = "microsoft/phi-4".into();
+        let phi = index(1, vec![phi4]);
+        for name in ["microsoft/phi-4", "unsloth/phi-4-GGUF", "phi4", "phi4:latest"] {
+            assert!(phi.lookup(name).is_some(), "{name}");
+        }
+        // What a bare alias is.
+        for bare in ["deepseek-r1", "qwen3", "llama3.2", "gemma3", "phi4", "gpt-oss"] {
+            assert!(is_bare_alias(bare), "{bare}");
+        }
+        for sized in ["qwen3-8b", "qwen3:8b", "qwen2.5-1.5b", "qwen3-30b-a3b", "gemma-3n-e4b", "mixtral-8x7b", "smollm2-135m", "deepseek-r1-0528-qwen3-8b"] {
+            assert!(!is_bare_alias(sized), "{sized}");
+        }
     }
 
     #[test]
@@ -547,6 +675,27 @@ pub(crate) mod tests {
         // A kept copy that doesn't verify is ignored.
         std::fs::write(&cache, "{}").unwrap();
         assert_eq!(IndexStore::new(index(5, vec![]), &pinned(), "u", Some(cache)).current().sequence, 5);
+    }
+
+    /// Review 2026-10-14 L13 and the ETag note.
+    #[test]
+    fn refreshing_says_when_an_index_is_too_new_and_keeps_the_etag_of_the_one_it_has() {
+        let store = IndexStore::new(index(5, vec![]), &pinned(), "https://example.invalid/x", None);
+        // The server's copy is the one we have: its ETag is kept, so the next fetch is a 304.
+        assert!(!store.offer(&sign(&index(5, vec![]), &key()).unwrap(), Some("\"v5\"".into())).unwrap());
+        assert_eq!(store.etag.read().unwrap().as_deref(), Some("\"v5\""));
+        // A newer index with an entry past this build's limits (a later release raised one): signed by
+        // the pinned key, so not "bad" - it needs a newer OpenHydra, and the current one stays.
+        let mut big = entry(&["qwen3-8b"], &"b".repeat(64), 10);
+        big.tokenizer_size = MAX_TOKENIZER_BYTES + 1;
+        let err = store.offer(&sign_unchecked(&index(7, vec![big]), &key()).unwrap(), None).unwrap_err();
+        assert!(err.contains("needs a newer OpenHydra") && err.contains("#7"), "{err}");
+        assert_eq!(store.current().sequence, 5);
+        // After a failure the refresher looks again soon, then backs off to daily.
+        assert_eq!(refresh_delay(0), REFRESH_EVERY);
+        assert_eq!(refresh_delay(1), Duration::from_secs(300));
+        assert!(refresh_delay(2) < refresh_delay(3) && refresh_delay(3) < refresh_delay(4));
+        assert_eq!(refresh_delay(9), REFRESH_EVERY);
     }
 
     #[test]
