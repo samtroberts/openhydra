@@ -186,16 +186,20 @@ impl TokenizerIndex {
     /// The entry that counts `model`'s tokens, if any (see [`lookup_keys`]).
     pub fn lookup(&self, model: &str) -> Option<&IndexEntry> {
         // A name given with an `org/` prefix (vLLM, Hugging Face, LM Studio) is a repo name: without
-        // its org it may match a sized name (`qwen3-8b`) or the entry's own repo name (`phi-4`), never
-        // a bare family alias (`deepseek-r1`, Ollama's default tag), which names a different model
+        // its org it may match a sized name (`qwen3-8b`) or a repo the entry names (its own, `phi-4`,
+        // or one it lists as `org/name` sharing its file, `deepseek-ai/deepseek-v4-pro`), never a
+        // bare family alias (`deepseek-r1`, Ollama's default tag), which names a different model
         // there: `deepseek-ai/DeepSeek-R1` is the 671B model, not the 8B distill Ollama's
         // `deepseek-r1` is (review 2026-10-14, M6).
         let org_given = model.contains('/');
         lookup_keys(model).iter().find_map(|k| {
             let org_stripped = org_given && !k.contains('/');
             self.models.iter().find(|e| {
-                let repo_name = e.repo.rsplit('/').next().unwrap_or("").to_lowercase();
-                e.names.iter().any(|n| n == k && (!org_stripped || !is_bare_alias(n) || *n == repo_name))
+                let names_repo = |k: &str| {
+                    e.repo.rsplit('/').next().is_some_and(|r| r.eq_ignore_ascii_case(k))
+                        || e.names.iter().any(|n| n.split_once('/').is_some_and(|(_, r)| r == k))
+                };
+                e.names.iter().any(|n| n == k && (!org_stripped || !is_bare_alias(n) || names_repo(k)))
             })
         })
     }
@@ -511,10 +515,13 @@ pub(crate) mod tests {
         let text = BUNDLED;
         let idx = verify(text, PINNED_INDEX_KEY).expect("data/tokenizer-index.json must be signed by the pinned registry key");
         // Above the test copies signed while building W4 (#2); covers what the network serves.
-        assert!(idx.sequence >= 10, "{}", idx.sequence);
-        for model in ["qwen2.5-coder:1.5b", "qwen3:8b-q4_K_M", "llama3.2", "gemma3:4b-it-qat", "gpt-oss:20b", "deepseek-r1:8b"] {
+        assert!(idx.sequence >= 11, "{}", idx.sequence);
+        for model in ["qwen2.5-coder:1.5b", "qwen3:8b-q4_K_M", "llama3.2", "gemma3:4b-it-qat", "gpt-oss:20b", "deepseek-r1:8b-0528-qwen3"] {
             assert!(idx.lookup(model).is_some(), "{model}");
         }
+        // #11: Ollama's deepseek-r1:8b was the Llama distill before 2025-05-28, the Qwen3 one since: by
+        // name alone it can't be told which tokenizer counts it, so it isn't listed.
+        assert!(idx.lookup("deepseek-r1:8b").is_none());
         assert_eq!(bundled(), idx);
     }
 
@@ -532,6 +539,18 @@ pub(crate) mod tests {
         assert_eq!(repo("mistralai/Mistral-Nemo-Instruct-2407"), Some("mistralai/Mistral-Nemo-Instruct-2407"));
         assert_eq!(repo("qwen3"), Some("Qwen/Qwen3-8B"), "Ollama's default tag");
         assert_eq!(repo("Qwen/Qwen3"), None);
+        // #11: DeepSeek V4 (one tokenizer for Flash, Pro, their dated and Base versions) and V4.1.
+        for (name, want) in [
+            ("deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("deepseek-ai/DeepSeek-V4-Pro-0813", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("deepseek-ai/DeepSeek-V4-Flash-0731", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("unsloth/DeepSeek-V4-Pro-GGUF", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("deepseek-v4-pro:cloud", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash"),
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "deepseek-ai/DeepSeek-V4.1-Flash"),
+        ] {
+            assert_eq!(repo(name), Some(want), "{name}");
+        }
     }
 
     #[test]
@@ -626,6 +645,14 @@ pub(crate) mod tests {
         let phi = index(1, vec![phi4]);
         for name in ["microsoft/phi-4", "unsloth/phi-4-GGUF", "phi4", "phi4:latest"] {
             assert!(phi.lookup(name).is_some(), "{name}");
+        }
+        // Repos that share an entry's file are named by their full ids: found by those, and through
+        // a quantiser's copy of them, as the entry's own repo is.
+        let mut v4 = entry(&["deepseek-v4-flash", "deepseek-ai/deepseek-v4-pro", "deepseek-v4-pro"], &"d".repeat(64), 10);
+        v4.repo = "deepseek-ai/DeepSeek-V4-Flash".into();
+        let v4 = index(1, vec![v4]);
+        for name in ["deepseek-ai/DeepSeek-V4-Pro", "unsloth/DeepSeek-V4-Pro-GGUF", "deepseek-ai/DeepSeek-V4-Flash", "deepseek-v4-pro"] {
+            assert!(v4.lookup(name).is_some(), "{name}");
         }
         // What a bare alias is.
         for bare in ["deepseek-r1", "qwen3", "llama3.2", "gemma3", "phi4", "gpt-oss"] {
