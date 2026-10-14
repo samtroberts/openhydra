@@ -183,6 +183,30 @@ fn sweep_relay_forwards(
 /// retry after a short wait: a provider that just joined becomes reachable within seconds).
 pub const DIAL_FAILED_UNREACHABLE: &str = "dial failed (peer unreachable)";
 
+/// Dials in flight per peer: see [`LoopState::dials_in_flight`].
+type DialsInFlight = HashMap<PeerId, std::collections::HashSet<libp2p::swarm::ConnectionId>>;
+
+/// `Swarm::dial`, noting the dial as in flight for its peer. libp2p reports `SwarmEvent::Dialing`
+/// only for dials a behaviour starts (Kademlia, relay, AutoNAT), never for ours, so without this
+/// a dial of ours (a queued forward's own) would be invisible, and another dial to the same peer
+/// failing would fail the forward while its own dial was still running (review 2026-10-14, M4).
+trait DialTracked {
+    fn dial_tracked(&mut self, dials: &mut DialsInFlight, opts: impl Into<libp2p::swarm::dial_opts::DialOpts>) -> Result<(), libp2p::swarm::DialError>;
+}
+
+impl<B: libp2p::swarm::NetworkBehaviour> DialTracked for libp2p::Swarm<B> {
+    fn dial_tracked(&mut self, dials: &mut DialsInFlight, opts: impl Into<libp2p::swarm::dial_opts::DialOpts>) -> Result<(), libp2p::swarm::DialError> {
+        let opts = opts.into();
+        let (peer, conn) = (opts.get_peer_id(), opts.connection_id());
+        // A dial refused here (`Err`) ends without a `SwarmEvent`: its caller handles it.
+        self.dial(opts)?;
+        if let Some(peer) = peer {
+            dials.entry(peer).or_default().insert(conn);
+        }
+        Ok(())
+    }
+}
+
 /// A dial to `peer` (connection `conn`) just ended without a connection: forget it, and say whether
 /// that leaves the peer with no dial still in flight and no connection — then nothing can carry the
 /// forwards queued for it, and they fail now rather than wait out [`RELAY_FORWARD_TTL`] (a dial
@@ -190,7 +214,7 @@ pub const DIAL_FAILED_UNREACHABLE: &str = "dial failed (peer unreachable)";
 /// a fresh lookup). Another dial still pending (a Kademlia query dialing the same peer, say) can
 /// still connect, so then they wait.
 fn dial_ended_unreachable(
-    dials: &mut HashMap<PeerId, std::collections::HashSet<libp2p::swarm::ConnectionId>>,
+    dials: &mut DialsInFlight,
     peer: PeerId,
     conn: libp2p::swarm::ConnectionId,
     connected: bool,
@@ -647,7 +671,7 @@ struct LoopState {
     /// Outbound dials in flight, per peer (from `SwarmEvent::Dialing` until the connection is
     /// established or the dial fails): a failed dial fails the peer's queued forwards only when no
     /// other dial to it is still pending.
-    dials_in_flight: HashMap<PeerId, std::collections::HashSet<libp2p::swarm::ConnectionId>>,
+    dials_in_flight: DialsInFlight,
     /// C-N1: peers with both a direct and a relay connection, mapped to the
     /// instant at which the relay may be closed (direct-established-at + grace).
     /// Cleared if the direct path drops inside the window (so we keep the relay).
@@ -1035,7 +1059,7 @@ pub async fn run_event_loop(
     for (peer_id, addr) in &bootstrap_peers {
         let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
         info!(%peer_id, %dial_addr, "bootstrap_dial: explicitly dialing bootstrap peer");
-        if let Err(e) = swarm.dial(dial_addr.clone()) {
+        if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, dial_addr.clone()) {
             warn!(%peer_id, %dial_addr, %e, "bootstrap_dial: failed");
         }
     }
@@ -1159,7 +1183,7 @@ pub async fn run_event_loop(
                     max = MAX_BOOTSTRAP_RETRIES,
                     "bootstrap_retry: re-dialing (not yet direct)"
                 );
-                if let Err(e) = swarm.dial(dial_addr.clone()) {
+                if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, dial_addr.clone()) {
                     warn!(%peer_id, %e, "bootstrap_retry: dial failed");
                 }
             }
@@ -1478,7 +1502,7 @@ pub async fn run_event_loop(
                                 let opts = DialOpts::peer_id(pid)
                                     .condition(PeerCondition::Always)
                                     .build();
-                                match swarm.dial(opts) {
+                                match swarm.dial_tracked(&mut state.dials_in_flight, opts) {
                                     Ok(()) => {
                                         info!(%pid, "b1_hole_punch_dial_issued");
                                         Ok(())
@@ -1511,7 +1535,7 @@ pub async fn run_event_loop(
                     }
                     Some(SwarmCommand::OpenProxy { target_libp2p_peer_id, local_grpc_port, reply }) => {
                         state.local_grpc_port = local_grpc_port;
-                        handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &state);
+                        handle_open_proxy(&mut swarm, &target_libp2p_peer_id, reply, &mut state);
                     }
                     Some(SwarmCommand::RespondProxy { request_id, data, on_sent }) => {
                         if let Some(reply) = state.local_proxy_replies.remove(&request_id) {
@@ -1566,7 +1590,7 @@ pub async fn run_event_loop(
                                 let opts = DialOpts::unknown_peer_id()
                                     .address(ma.clone())
                                     .build();
-                                match swarm.dial(opts) {
+                                match swarm.dial_tracked(&mut state.dials_in_flight, opts) {
                                     Ok(()) => {
                                         info!(%ma, "manual_dial_address_issued");
                                         Ok(())
@@ -2438,7 +2462,7 @@ fn rebootstrap(
     // links a roam/wake tore down. libp2p dedups if a connection already exists.
     for (peer_id, addr) in &state.bootstrap_peers {
         let dial_addr = addr.clone().with(libp2p::multiaddr::Protocol::P2p(*peer_id));
-        if let Err(e) = swarm.dial(dial_addr.clone()) {
+        if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, dial_addr.clone()) {
             debug!(%peer_id, %dial_addr, %e, "rebootstrap: bootstrap re-dial failed");
         }
     }
@@ -2760,7 +2784,7 @@ fn handle_swarm_event(
                             for addr in &quic_v6_addrs {
                                 use libp2p::swarm::dial_opts::DialOpts;
                                 let ma = addr.clone();
-                                match swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build()) {
+                                match swarm.dial_tracked(&mut state.dials_in_flight, DialOpts::unknown_peer_id().address(addr.clone()).build()) {
                                     Ok(()) => {
                                         state.quic_v6_holepunch_dials += 1;
                                         debug!(%peer_id, %ma, "auto_quic_holepunch_dial");
@@ -2803,7 +2827,7 @@ fn handle_swarm_event(
                                         .addresses(vec![addr.clone()])
                                         .condition(PeerCondition::Always)
                                         .build();
-                                    match swarm.dial(opts) {
+                                    match swarm.dial_tracked(&mut state.dials_in_flight, opts) {
                                         Ok(()) => {
                                             state.reversal_dials += 1;
                                             info!(%peer_id, %addr, "connection_reversal_dial");
@@ -4434,7 +4458,7 @@ fn handle_grpc_proxy_event(
                     "zombie_evict: consecutive proxy path failures — closing presumed-dead connections and redialing via relay");
                 let _ = swarm.disconnect_peer_id(peer);
                 let circuit_addrs = relay_circuit_addrs(&state.relays, peer, state.ipv6_capable);
-                if let Err(e) = swarm.dial(relay_dial_opts(peer, circuit_addrs)) {
+                if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer, circuit_addrs)) {
                     debug!(%peer, %e, "zombie_evict: relay redial enqueue failed");
                 }
             }
@@ -4536,7 +4560,7 @@ fn handle_proxy_forward(
             return;
         }
         let circuit_addrs = relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable);
-        match swarm.dial(relay_dial_opts(peer_id, circuit_addrs)) {
+        match swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer_id, circuit_addrs)) {
             Ok(()) => {
                 state
                     .pending_relay_forwards
@@ -4672,7 +4696,7 @@ fn handle_proxy_forward_no_wait(
                   "proxy_forward_no_wait: pending_relay_forwards at cap — dropping");
             return;
         }
-        match swarm.dial(relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))) {
+        match swarm.dial_tracked(&mut state.dials_in_flight, relay_dial_opts(peer_id, relay_circuit_addrs(&state.relays, peer_id, state.ipv6_capable))) {
             Ok(()) => {
                 let (dummy_tx, _dummy_rx) = oneshot::channel();
                 state
@@ -4691,7 +4715,7 @@ fn handle_open_proxy(
     swarm: &mut libp2p::Swarm<OpenHydraBehaviour>,
     target_peer_id: &str,
     reply: oneshot::Sender<Result<String, String>>,
-    state: &LoopState,
+    state: &mut LoopState,
 ) {
     let target: PeerId = match target_peer_id.parse() {
         Ok(p) => p,
@@ -4702,7 +4726,7 @@ fn handle_open_proxy(
     };
 
     // Dial the peer so the connection is ready when proxy requests arrive.
-    if let Err(e) = swarm.dial(target) {
+    if let Err(e) = swarm.dial_tracked(&mut state.dials_in_flight, target) {
         warn!(%target, error=%e, "proxy dial failed");
     }
 
@@ -4760,7 +4784,7 @@ fn handle_trigger_repunch(
     for addr in addrs {
         use libp2p::swarm::dial_opts::DialOpts;
         let ma = addr.clone();
-        match swarm.dial(DialOpts::unknown_peer_id().address(addr).build()) {
+        match swarm.dial_tracked(&mut state.dials_in_flight, DialOpts::unknown_peer_id().address(addr).build()) {
             Ok(()) => info!(%ma, "repunch_dial_issued"),
             Err(e) => debug!(%ma, %e, "repunch_dial_failed"),
         }
@@ -5541,6 +5565,41 @@ mod tests {
         assert!(!dial_ended_unreachable(&mut dials, peer, c1, true));
         // An error for a dial we never saw start (no Dialing event): judged on the connection alone.
         assert!(dial_ended_unreachable(&mut dials, PeerId::random(), c2, false));
+    }
+
+    #[tokio::test]
+    async fn our_own_dials_are_tracked_so_another_dial_failing_doesnt_fail_the_forward() {
+        use futures::StreamExt;
+        use libp2p::core::transport::{MemoryTransport, Transport};
+        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+        use libp2p::swarm::{dummy, ConnectionId, SwarmEvent};
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let transport = MemoryTransport::default()
+            .upgrade(libp2p::core::upgrade::Version::V1)
+            .authenticate(libp2p::noise::Config::new(&key).unwrap())
+            .multiplex(libp2p::yamux::Config::default())
+            .boxed();
+        let cfg = libp2p::swarm::Config::with_tokio_executor();
+        let mut swarm = libp2p::Swarm::new(transport, dummy::Behaviour, PeerId::from(key.public()), cfg);
+        let peer = PeerId::random();
+        // Nothing listens there: the dial fails, but only after it has started.
+        let nowhere: Multiaddr = format!("/memory/{}", rand::random::<u64>()).parse().unwrap();
+        let opts = DialOpts::peer_id(peer).addresses(vec![nowhere]).condition(PeerCondition::Always).build();
+        let ours = opts.connection_id();
+        let mut dials: DialsInFlight = HashMap::new();
+        swarm.dial_tracked(&mut dials, opts).unwrap();
+        assert!(dials.get(&peer).is_some_and(|s| s.contains(&ours)), "our dial is tracked");
+        // Another dial to the peer (a Kademlia query's) fails first: ours is still running, so wait.
+        assert!(!dial_ended_unreachable(&mut dials, peer, ConnectionId::new_unchecked(999_999), false));
+        // Ours fails: now nothing can reach the peer.
+        let failed = loop {
+            if let SwarmEvent::OutgoingConnectionError { connection_id, peer_id: Some(p), .. } = swarm.select_next_some().await {
+                assert_eq!(p, peer);
+                break connection_id;
+            }
+        };
+        assert_eq!(failed, ours);
+        assert!(dial_ended_unreachable(&mut dials, peer, failed, false));
     }
 
     #[tokio::test]
