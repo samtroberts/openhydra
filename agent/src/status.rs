@@ -89,6 +89,9 @@ pub struct TransferStats {
     /// Consumer-side: serves whose provider said it bills by a rule newer than this build knows, so
     /// its count wasn't judged (review B6). Many of these from one provider are worth a look.
     pub unknown_billing_rules: AtomicU64,
+    /// Consumer-side: bills settled unchecked because the token counters and their queue were full
+    /// (review 2026-10-14, M7). Should stay 0.
+    pub recounts_skipped: AtomicU64,
     pub receipts_ledgered: AtomicU64,
     /// Credit-tiering: **cost-weighted** credit earned on settled serves (`Σ cost_tier.weight ×
     /// weighted_tokens`), the honest replacement for the flat served-token count. Accrued at
@@ -254,6 +257,7 @@ impl TransferStats {
             aup_refusals: self.aup_refusals.load(Ordering::Relaxed),
             swarm_refusals: self.swarm_refusals.load(Ordering::Relaxed),
             unknown_billing_rules: self.unknown_billing_rules.load(Ordering::Relaxed),
+            recounts_skipped: self.recounts_skipped.load(Ordering::Relaxed),
             receipts_ledgered: self.receipts_ledgered.load(Ordering::Relaxed),
             credits_earned: self.credits_earned.load(Ordering::Relaxed),
             requests_consumed: self.requests_consumed.load(Ordering::Relaxed),
@@ -275,6 +279,7 @@ struct TransfersView {
     aup_refusals: u64,
     swarm_refusals: u64,
     unknown_billing_rules: u64,
+    recounts_skipped: u64,
     receipts_ledgered: u64,
     credits_earned: u64,
     requests_consumed: u64,

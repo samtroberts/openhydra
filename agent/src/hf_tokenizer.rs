@@ -46,6 +46,11 @@ pub struct HfTokenizers {
     loaded: Mutex<Vec<(String, Arc<Tokenizer>)>>,
     fetching: Mutex<HashSet<String>>,
     failed: Mutex<HashMap<String, Instant>>,
+    /// One lock per tokenizer, held while it is read from disk: counts that need the same one at
+    /// once wait for one load instead of each reading, hashing and parsing it (review 2026-10-14, M7).
+    load_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Tokenizers read from disk so far.
+    disk_loads: std::sync::atomic::AtomicUsize,
 }
 
 /// What one count needs: the model's entry and where its tokenizer lives.
@@ -97,6 +102,8 @@ impl HfTokenizers {
             loaded: Mutex::new(Vec::new()),
             fetching: Mutex::new(HashSet::new()),
             failed: Mutex::new(HashMap::new()),
+            load_locks: Mutex::new(HashMap::new()),
+            disk_loads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -178,15 +185,16 @@ impl HfTokenizers {
 
     /// The tokenizer with this sha256: loaded already, or read from disk and hash-checked.
     fn load(&self, sha: &str) -> Result<Arc<Tokenizer>, String> {
-        {
-            let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(i) = loaded.iter().position(|(s, _)| s == sha) {
-                let hit = loaded.remove(i);
-                let t = Arc::clone(&hit.1);
-                loaded.push(hit);
-                return Ok(t);
-            }
+        if let Some(t) = self.loaded_now(sha) {
+            return Ok(t);
         }
+        // One load per tokenizer at a time; whoever waited finds it loaded.
+        let gate = Arc::clone(self.load_locks.lock().unwrap_or_else(|e| e.into_inner()).entry(sha.to_string()).or_default());
+        let _loading = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = self.loaded_now(sha) {
+            return Ok(t);
+        }
+        self.disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = self.path_of(sha);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if sha256_hex(&bytes) != sha {
@@ -203,6 +211,18 @@ impl HfTokenizers {
             loaded.push((sha.to_string(), Arc::clone(&t)));
         }
         Ok(t)
+    }
+}
+
+impl HfTokenizers {
+    /// The tokenizer with this sha256 if it is loaded (marked most recently used).
+    fn loaded_now(&self, sha: &str) -> Option<Arc<Tokenizer>> {
+        let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+        let i = loaded.iter().position(|(s, _)| s == sha)?;
+        let hit = loaded.remove(i);
+        let t = Arc::clone(&hit.1);
+        loaded.push(hit);
+        Some(t)
     }
 }
 
@@ -322,6 +342,28 @@ pub(crate) mod tests {
             "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "hello": 1, "world": 2, "!": 3}, "unk_token": "[UNK]"}
         })
         .to_string()
+    }
+
+    #[test]
+    fn counts_that_need_the_same_tokenizer_at_once_load_it_once() {
+        use sha2::Digest;
+        let json = tiny_tokenizer_json().into_bytes();
+        let sha = hex::encode(sha2::Sha256::digest(&json));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(cached_path(dir.path(), &sha), &json).unwrap();
+        let store = Arc::new(IndexStore::new(index(1, vec![entry(&["qwen3:8b"], &sha, json.len() as u64)]), "00", "https://x", None));
+        let tk = Arc::new(HfTokenizers::new(store, dir.path().to_path_buf(), "https://huggingface.co", None));
+        let counter = tk.counter_for("qwen3:8b").expect("cached");
+        let threads: Vec<_> = (0..10)
+            .map(|_| {
+                let c = counter.clone();
+                std::thread::spawn(move || c.count("hello world").unwrap())
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().unwrap(), 2);
+        }
+        assert_eq!(tk.disk_loads.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// A loopback server answering every GET with `body` (or a redirect to `redirect`).

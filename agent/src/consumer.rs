@@ -892,6 +892,7 @@ pub fn request_completion(
                     authenticity: None,
                     streamed: false,
                     claimed_tokens: None,
+                    recount_pending: false,
                 })
             }
         }
@@ -1413,6 +1414,7 @@ fn dispatch_stream_slice(
                     authenticity: None,
                     streamed: false,
                     claimed_tokens: None,
+                    recount_pending: false,
                 }))
             }
             // A refusal is the first frame of the stream's opening reply (B3).
@@ -1717,6 +1719,10 @@ pub struct ConsumerNode {
     hf_tokenizers: Option<Arc<crate::hf_tokenizer::HfTokenizers>>,
     /// Token counts running now (bounded by [`crate::token_count::MAX_CONCURRENT_COUNTS`]).
     counts_running: Arc<std::sync::atomic::AtomicUsize>,
+    /// Hugging Face counts running now (bounded by [`hf_count_limit`]).
+    hf_counts_running: Arc<std::sync::atomic::AtomicUsize>,
+    /// Recounts waiting for a counter (M7).
+    recount_queue: Arc<RecountQueue>,
     /// Whether audits may replay users' greedy requests to public models to another provider (D1,
     /// see [`with_audit_replay`](Self::with_audit_replay)). Off by default.
     audit_replay: bool,
@@ -1908,6 +1914,8 @@ impl ConsumerNode {
             provider_logprob: None,
             hf_tokenizers: None,
             counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hf_counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            recount_queue: Arc::new(RecountQueue::default()),
             audit_replay: false,
             replays: Mutex::new(Vec::new()),
             traffic: Mutex::new(HashMap::new()),
@@ -2042,58 +2050,71 @@ impl ConsumerNode {
         Some(crate::token_count::Counter::Scorer { scorer, vocab })
     }
 
-    /// Count a served completion's tokens with the model's tokenizer and hold a bill above them
-    /// against the provider (P7, detached, off the response path): for a scorer count, which runs
-    /// a process. Whether it took the settlement over (false: busy, the caller settles now).
-    #[allow(clippy::too_many_arguments)]
-    fn check_billed_tokens(
+    /// Check `billed` against the delivered text in `input` with the model's tokenizer, and settle
+    /// what is owed (P7/W4): at most the count's bound.
+    ///
+    /// With a counter free: `inline`, here and now ([`Recounted::Now`]; the caller marks an
+    /// over-bill), else on a thread of its own ([`Recounted::Later`]). With every counter busy, the
+    /// count waits in [`RecountQueue`] ([`Recounted::Later`]): a busy gateway checks a bill late,
+    /// never not at all (review 2026-10-14, M7). Only with the queue full too does the bill stand
+    /// unchecked ([`Recounted::Unchecked`], counted in status as `recounts_skipped`).
+    fn recount(
         self: &Arc<Self>,
-        counter: crate::token_count::Counter,
-        text: String,
-        // The whole answer's text measure when `text` is only its start (too long to keep whole).
-        total_units: Option<u64>,
-        tool_calls: Vec<crate::adapter::ToolCall>,
-        offered: std::collections::HashSet<String>,
+        input: RecountInput,
         billed: u64,
-        state_id: String,
-        model_key: String,
-        settle: (SelectedProvider, [u8; 16]),
-    ) -> bool {
-        // Bounded: a busy gateway skips the check rather than piling up counts (and the caller
-        // settles at once, for the billed count).
-        let Some(slot) = crate::token_count::CountSlot::try_take(&self.counts_running) else {
-            return false;
-        };
-        let node = Arc::clone(self);
-        std::thread::spawn(move || {
-            let _slot = slot;
-            let (provider, nonce) = settle;
-            let (pay, over) = recount_pay(&counter, text, total_units, &tool_calls, &offered, billed, &state_id, &model_key);
-            if over {
-                node.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+        provider: &SelectedProvider,
+        nonce: [u8; 16],
+        purpose: SettlePurpose,
+        inline: bool,
+    ) -> Recounted {
+        let slot = match input.counter {
+            crate::token_count::Counter::Hf(_) => {
+                crate::token_count::CountSlot::try_take_up_to(&self.hf_counts_running, hf_count_limit())
             }
-            node.settle_receipt(&provider, pay, nonce, SettlePurpose::User);
-        });
-        true
+            crate::token_count::Counter::Scorer { .. } => crate::token_count::CountSlot::try_take(&self.counts_running),
+        };
+        match slot {
+            Some(_slot) if inline => {
+                let (pay, over) = input.run(billed);
+                self.settle_receipt(provider, pay, nonce, purpose);
+                Recounted::Now { pay, over }
+            }
+            Some(slot) => {
+                let node = Arc::clone(self);
+                let provider = provider.clone();
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    node.finish_recount(input, billed, &provider, nonce, purpose);
+                });
+                Recounted::Later
+            }
+            None => {
+                let node = Arc::clone(self);
+                let queued_for = provider.clone();
+                let bytes = input.text.len();
+                let job: RecountJob = Box::new(move || node.finish_recount(input, billed, &queued_for, nonce, purpose));
+                if self.recount_queue.push(bytes, job) {
+                    Recounted::Later
+                } else {
+                    tracing::warn!(provider = %provider.peer_id, billed, "token counts are backed up; settling this bill unchecked");
+                    if let Some(stats) = &self.stats {
+                        stats.recounts_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.settle_receipt(provider, billed, nonce, purpose);
+                    Recounted::Unchecked
+                }
+            }
+        }
     }
 
-    /// The same check, here and now, for a count that takes milliseconds (a Hugging Face tokenizer,
-    /// in process): done before the answer's usage goes out, so the client sees the count it pays
-    /// for. `None` when the counters are busy (the bill stands, as when there's no tokenizer).
-    #[allow(clippy::too_many_arguments)]
-    fn recount_now(
-        &self,
-        counter: &crate::token_count::Counter,
-        text: String,
-        total_units: Option<u64>,
-        tool_calls: &[crate::adapter::ToolCall],
-        offered: &std::collections::HashSet<String>,
-        billed: u64,
-        state_id: &str,
-        model_key: &str,
-    ) -> Option<(u64, bool)> {
-        let _slot = crate::token_count::CountSlot::try_take(&self.counts_running)?;
-        Some(recount_pay(counter, text, total_units, tool_calls, offered, billed, state_id, model_key))
+    /// A recount off the request's thread: counted, an over-bill marked, the count's bound settled.
+    fn finish_recount(self: &Arc<Self>, input: RecountInput, billed: u64, provider: &SelectedProvider, nonce: [u8; 16], purpose: SettlePurpose) {
+        let (state_id, model_key, mark_over) = (input.state_id.clone(), input.model_key.clone(), input.mark_over);
+        let (pay, over) = input.run(billed);
+        if over && mark_over {
+            self.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+        }
+        self.settle_receipt(provider, pay, nonce, purpose);
     }
 
     /// Persist one `(peer, model)`'s log-prob state (best-effort: a failed write is logged, never
@@ -2255,6 +2276,8 @@ impl ConsumerNode {
             provider_logprob: None,
             hf_tokenizers: None,
             counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hf_counts_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            recount_queue: Arc::new(RecountQueue::default()),
             audit_replay: false,
             replays: Mutex::new(Vec::new()),
             traffic: Mutex::new(HashMap::new()),
@@ -3194,41 +3217,33 @@ impl ConsumerNode {
                         // With the model's tokenizer at hand, the count is checked before paying. A
                         // Hugging Face count takes milliseconds: done here, so the usage the client
                         // sees is the count paid. A scorer count runs a process: in the background
-                        // (the recount settles). Without one, or when the counters are busy, the bill
-                        // is settled now.
-                        let offered = crate::serve::offered_tool_names(tools);
-                        let total_units = overflowed.get().then(|| delivered_text.get().units());
+                        // (the recount settles), as is any count while the counters are busy (M7).
+                        // Without a tokenizer, the bill is settled now.
                         let recounted = match counter {
-                            Some(c @ crate::token_count::Counter::Hf(_)) => {
-                                if let Some((pay, over)) = self.recount_now(
-                                    &c,
-                                    captured.take(),
-                                    total_units,
-                                    &summary.tool_calls,
-                                    &offered,
-                                    tokens,
-                                    &provider.state_id,
-                                    model_key_now,
-                                ) {
-                                    over_reported |= over;
-                                    summary.tokens = pay;
-                                    self.settle_receipt(&provider, pay, nonce, SettlePurpose::User);
-                                    true
-                                } else {
-                                    false
+                            Some(counter) => {
+                                let hf = matches!(counter, crate::token_count::Counter::Hf(_));
+                                let input = RecountInput {
+                                    counter,
+                                    text: captured.take(),
+                                    overflowed: overflowed.get(),
+                                    delivered: delivered_text.get(),
+                                    tool_calls: summary.tool_calls.clone(),
+                                    offered: crate::serve::offered_tool_names(tools),
+                                    state_id: provider.state_id.clone(),
+                                    model_key: model_key_now.to_string(),
+                                    mark_over: true,
+                                };
+                                match self.recount(input, tokens, &provider, nonce, SettlePurpose::User, hf) {
+                                    Recounted::Now { pay, over } => {
+                                        over_reported |= over;
+                                        summary.tokens = pay;
+                                    }
+                                    // Settled once counted; the usage shows the bill meanwhile.
+                                    Recounted::Later => summary.recount_pending = true,
+                                    Recounted::Unchecked => {}
                                 }
+                                true
                             }
-                            Some(c) => self.check_billed_tokens(
-                                c,
-                                captured.take(),
-                                total_units,
-                                summary.tool_calls.clone(),
-                                offered,
-                                tokens,
-                                provider.state_id.clone(),
-                                model_key_now.to_string(),
-                                (provider.clone(), nonce),
-                            ),
                             None => false,
                         };
                         if !recounted {
@@ -3580,29 +3595,20 @@ impl ConsumerNode {
         });
     }
 
-    /// Settle `billed` for an attempt that ended early, once its delivered text is counted (H1), in
-    /// the background: a count by the scorer takes seconds.
+    /// Settle `billed` for an attempt that ended early, once its delivered text is counted (H1), off
+    /// the request's thread.
     fn settle_recounted(self: &Arc<Self>, provider: &SelectedProvider, billed: u64, nonce: [u8; 16], purpose: SettlePurpose, recount: RecountInput) {
-        let node = Arc::clone(self);
-        let provider = provider.clone();
-        std::thread::spawn(move || node.recount_and_settle(&provider, billed, nonce, purpose, recount));
+        let _ = self.recount(recount, billed, provider, nonce, purpose, false);
     }
 
-    /// [`settle_recounted`](Self::settle_recounted), here and now.
+    /// [`settle_recounted`](Self::settle_recounted) on a thread that is already off the request's.
     fn recount_and_settle(self: &Arc<Self>, provider: &SelectedProvider, billed: u64, nonce: [u8; 16], purpose: SettlePurpose, recount: RecountInput) {
-        let pay = match crate::token_count::CountSlot::try_take(&self.counts_running) {
-            Some(_slot) => {
-                let (state_id, model_key, mark_over) = (recount.state_id.clone(), recount.model_key.clone(), recount.mark_over);
-                let (pay, over) = recount.run(billed);
-                if over && mark_over {
-                    self.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
-                }
-                pay
+        let (state_id, model_key, mark_over) = (recount.state_id.clone(), recount.model_key.clone(), recount.mark_over);
+        if let Recounted::Now { over: true, .. } = self.recount(recount, billed, provider, nonce, purpose, true) {
+            if mark_over {
+                self.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
             }
-            // Busy counters: the bill stands (as for a completed serve).
-            None => billed,
-        };
-        self.settle_receipt(provider, pay, nonce, purpose);
+        }
     }
 
     /// Close a stream on our own provider that ended early (its client left): it stops generating.
@@ -5267,6 +5273,77 @@ impl ConsumerNode {
 /// than the text it delivered can hold is paid what the text holds. Without a count (none possible,
 /// an error) it is paid what it billed, as before.
 #[allow(clippy::too_many_arguments)]
+/// How a recount went ([`ConsumerNode::recount`]).
+enum Recounted {
+    /// Counted here and settled: `pay`, and whether the bill was over the count's bound.
+    Now { pay: u64, over: bool },
+    /// Counted and settled in the background.
+    Later,
+    /// Not counted (the counters and their queue were full): settled for the bill.
+    Unchecked,
+}
+
+/// A recount waiting for a counter.
+type RecountJob = Box<dyn FnOnce() + Send>;
+
+/// Recounts that waited for a counter at most this many at once, and holding at most this much text.
+const RECOUNT_QUEUE_JOBS: usize = 256;
+const RECOUNT_QUEUE_BYTES: usize = 64 << 20;
+/// Threads that run the queued recounts.
+const RECOUNT_WORKERS: usize = 2;
+
+/// Recounts that found every counter busy (review 2026-10-14, M7): run by [`RECOUNT_WORKERS`]
+/// threads, started on first use. Bounded in jobs and in the text they hold.
+#[derive(Default)]
+struct RecountQueue {
+    /// The jobs (with the bytes of text each holds), and the bytes held in all.
+    state: Mutex<(std::collections::VecDeque<(usize, RecountJob)>, usize)>,
+    ready: std::sync::Condvar,
+    started: std::sync::OnceLock<()>,
+}
+
+impl RecountQueue {
+    /// Queue `job`, holding `bytes` of text; `false` when the queue is full.
+    fn push(self: &Arc<Self>, bytes: usize, job: RecountJob) -> bool {
+        self.started.get_or_init(|| {
+            for _ in 0..RECOUNT_WORKERS {
+                let q = Arc::clone(self);
+                let _ = std::thread::Builder::new().name("recount".into()).spawn(move || q.work());
+            }
+        });
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.0.len() >= RECOUNT_QUEUE_JOBS || st.1.saturating_add(bytes) > RECOUNT_QUEUE_BYTES {
+            return false;
+        }
+        st.0.push_back((bytes, job));
+        st.1 += bytes;
+        drop(st);
+        self.ready.notify_one();
+        true
+    }
+
+    fn work(&self) {
+        loop {
+            let job = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some((bytes, job)) = st.0.pop_front() {
+                        st.1 -= bytes;
+                        break job;
+                    }
+                    st = self.ready.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            job();
+        }
+    }
+}
+
+/// Hugging Face counts running at once (in process, milliseconds each): half the cores, at least 2.
+fn hf_count_limit() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(2))
+}
+
 /// What the tokenizer check needs of an attempt that ended early (a stream that broke or was
 /// stopped, a buffered serve that failed part-way): the text it delivered (kept up to
 /// [`crate::token_count::MAX_COUNTED_BYTES`]), and whose bill it checks. Settled through
@@ -5475,6 +5552,60 @@ mod tests {
         let (pay, over) = r.run(billed);
         assert!(over, "billed {billed}");
         assert_eq!(pay, crate::token_count::billable_by_count(40, 0, crate::serve::TOOL_CALL_TOKEN_ALLOWANCE));
+    }
+
+    /// Review 2026-10-14 M7: with every counter busy, a bill is checked late, not skipped.
+    #[test]
+    fn a_busy_gateway_queues_the_recount_instead_of_skipping_it() {
+        let (_dir, node) = test_node();
+        let node = Arc::new(node);
+        let dir = tempfile::tempdir().unwrap();
+        let limit = hf_count_limit();
+        let held: Vec<_> = (0..limit)
+            .map(|_| crate::token_count::CountSlot::try_take_up_to(&node.hf_counts_running, limit).unwrap())
+            .collect();
+        let words: Vec<String> = "hello world ".repeat(20).split_inclusive(' ').map(String::from).collect();
+        let words: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
+        let (mut r, _) = early_end(tiny_counter(dir.path()), &words);
+        r.state_id = "state-A".into();
+        let now = now_unix_ms();
+        assert!(node.earned_reputation("state-A", "m", now).is_none());
+        // Billed 3x what was delivered, every counter busy: queued, not paid unchecked.
+        let out = node.recount(r, 120, &selected("A"), [0; 16], SettlePurpose::User, true);
+        assert!(matches!(out, Recounted::Later));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while node.earned_reputation("state-A", "m", now_unix_ms()).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(node.earned_reputation("state-A", "m", now_unix_ms()).is_some(), "the queued recount ran and marked the over-bill");
+        drop(held);
+    }
+
+    #[test]
+    fn the_recount_queue_is_bounded_in_jobs_and_in_text() {
+        let q = Arc::new(RecountQueue::default());
+        // Hold both workers, so queued jobs stay queued.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..RECOUNT_WORKERS {
+            let (rx, started) = (Arc::clone(&release_rx), started_tx.clone());
+            assert!(q.push(0, Box::new(move || {
+                started.send(()).unwrap();
+                let _ = rx.lock().unwrap().recv();
+            })));
+        }
+        for _ in 0..RECOUNT_WORKERS {
+            started_rx.recv().unwrap();
+        }
+        assert!(!q.push(RECOUNT_QUEUE_BYTES + 1, Box::new(|| {})), "too much text");
+        for _ in 0..RECOUNT_QUEUE_JOBS {
+            assert!(q.push(1, Box::new(|| {})));
+        }
+        assert!(!q.push(1, Box::new(|| {})), "too many jobs");
+        for _ in 0..RECOUNT_WORKERS {
+            release_tx.send(()).unwrap();
+        }
     }
 
     fn close_reply(chunks: &[crate::serve::ServeChunk]) -> Vec<u8> {

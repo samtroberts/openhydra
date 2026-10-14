@@ -80,9 +80,14 @@ pub struct CountSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl CountSlot {
     /// A slot, if fewer than [`MAX_CONCURRENT_COUNTS`] counts hold one.
     pub fn try_take(running: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        Self::try_take_up_to(running, MAX_CONCURRENT_COUNTS)
+    }
+
+    /// A slot, if fewer than `max` counts hold one.
+    pub fn try_take_up_to(running: &std::sync::Arc<std::sync::atomic::AtomicUsize>, max: usize) -> Option<Self> {
         use std::sync::atomic::Ordering;
         running
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_CONCURRENT_COUNTS).then_some(n + 1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1))
             .ok()
             .map(|_| CountSlot(std::sync::Arc::clone(running)))
     }

@@ -488,6 +488,9 @@ pub struct ServeSummary {
     /// Consumer-side: the tokens the provider claimed, when that is more than `tokens` (what this
     /// consumer signs for and pays, after the delivered-text bound and the tokenizer recount).
     pub claimed_tokens: Option<u64>,
+    /// Consumer-side: the tokenizer check of this serve's bill is still running (the counters were
+    /// busy); `tokens` is the bill until it settles.
+    pub recount_pending: bool,
 }
 
 /// Provider-side: decode an inbound `request`, serve it via `adapter`, and emit each
@@ -516,6 +519,7 @@ pub fn handle_serve_request(
                 authenticity: None,
                 streamed: false,
                 claimed_tokens: None,
+                recount_pending: false,
             };
         }
     };
@@ -621,6 +625,7 @@ pub fn handle_serve_request_within(
                 authenticity: None,
                 streamed: false,
                 claimed_tokens: None,
+                recount_pending: false,
             }
         }
         Err(e) => {
@@ -635,6 +640,7 @@ pub fn handle_serve_request_within(
                 authenticity: None,
                 streamed: false,
                 claimed_tokens: None,
+                recount_pending: false,
             }
         }
     }

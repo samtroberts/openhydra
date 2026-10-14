@@ -716,6 +716,9 @@ fn openhydra_block(summary: &ServeSummary, wall: std::time::Duration, ttft: std:
         "tokens": summary.tokens,
         // What the provider claimed, when more than `tokens` (what this gateway pays); else null.
         "claimed_tokens": summary.claimed_tokens,
+        // The bill is still being checked (the gateway's counters were busy): `tokens` is the bill
+        // until then.
+        "recount_pending": summary.recount_pending,
         // The authenticity tier this gateway had established for the provider that served (D2).
         "provider_authenticity": summary.authenticity.map(|t| t.label()),
         "engine": {
@@ -1159,6 +1162,7 @@ fn spawn_byok_worker(
                     authenticity: None,
                     streamed: false,
                     claimed_tokens: None,
+                    recount_pending: false,
                 };
                 let _ = tx.blocking_send(GatewayEvent::Done(Box::new(summary)));
             }
@@ -2406,6 +2410,7 @@ mod tests {
             authenticity: None,
             streamed: false,
             claimed_tokens: None,
+            recount_pending: false,
         }
     }
 
