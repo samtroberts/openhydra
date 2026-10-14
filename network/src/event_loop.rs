@@ -4587,10 +4587,13 @@ pub(crate) fn is_ipv6_multiaddr(addr: &Multiaddr) -> bool {
 /// unroutable). Traffic-free, dependency-free, ~instant.
 pub(crate) fn probe_ipv6_capable() -> bool {
     use std::net::UdpSocket;
-    // 2606:4700:4700::1111 = Cloudflare DNS (stable global v6). Port is
-    // irrelevant for a connectionless UDP connect.
+    // A global address in the IPv6 documentation range (2001:db8::/32, RFC 3849):
+    // the kernel routes it by the default route like any global address, so the
+    // answer is the same as for a real one, and since no packet is sent, nobody
+    // is contacted - nor seems to be in an audit of what this node connects to
+    // (it was Cloudflare's DNS, review 2026-10-14). Port irrelevant.
     let ok = UdpSocket::bind("[::]:0")
-        .and_then(|s| s.connect("[2606:4700:4700::1111]:53"))
+        .and_then(|s| s.connect("[2001:db8::1]:9"))
         .is_ok();
     info!(ipv6_capable = ok, "F-9: outbound IPv6 capability probe");
     ok

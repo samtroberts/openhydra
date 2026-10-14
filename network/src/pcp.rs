@@ -322,9 +322,10 @@ fn is_global_v6(ip: &Ipv6Addr) -> bool {
 pub fn local_global_v6() -> Option<Ipv6Addr> {
     use std::net::UdpSocket;
     let sock = UdpSocket::bind("[::]:0").ok()?;
-    // 2606:4700:4700::1111 = Cloudflare DNS; the connect only picks a source
-    // address, it sends nothing.
-    sock.connect("[2606:4700:4700::1111]:53").ok()?;
+    // A documentation-range address (2001:db8::/32): routed like any global
+    // address, so the same source is chosen; the connect sends nothing, and no
+    // real host is named (review 2026-10-14).
+    sock.connect("[2001:db8::1]:9").ok()?;
     match sock.local_addr().ok()?.ip() {
         IpAddr::V6(v6) if is_global_v6(&v6) => Some(v6),
         _ => None,
