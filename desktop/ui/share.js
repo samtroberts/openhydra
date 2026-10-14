@@ -10,7 +10,7 @@ import { emit, on } from "./bus";
 import { store } from "./storage";
 import { totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent, lifetimeServed, statModels } from "./stats";
 import { renderChart } from "./chart";
-import { fmtNum, fmtUptime, modelIcon } from "./format";
+import { fmtNum, fmtUptime, modelIcon, fmtSigned, CREDITS_NOTE } from "./format";
 import { displayModelName, publicName } from "./models";
 import { exportCardModal, ensureImportSection } from "./cards";
 
@@ -355,11 +355,13 @@ import { exportCardModal, ensureImportSection } from "./cards";
     const netCredits = totalCreditsEarned() - totalCreditsSpent();
     const ratio = used > 0 ? (served / used) : (served > 0 ? null : 0);
     k[0].textContent = fmtNum(served);
-    k[1].textContent = (netCredits >= 0 ? "+" : "") + Math.round(netCredits).toLocaleString();
+    k[1].textContent = fmtSigned(served - used);
     k[2].textContent = ratio == null ? "∞" : ratio ? ratio.toFixed(1) + "×" : "—";
     k[3].textContent = "—";   // own reputation is held by the peers we serve — not locally knowable
     $$("#v-share .g4 .kpi .sub")[0].textContent = `${t?.requests_served ?? 0} requests served`;
-    $$("#v-share .g4 .kpi .sub")[1].textContent = "earned − spent, cost-weighted (not money)";
+    const creditSub = $$("#v-share .g4 .kpi .sub")[1];
+    creditSub.textContent = `tokens served − used · ${fmtSigned(netCredits)} credits`;
+    creditSub.title = CREDITS_NOTE;
     $$("#v-share .g4 .kpi .sub")[2].textContent = "served ÷ used";
     setHTML($$("#v-share .g4 .kpi .sub")[3], html`<span class="mut">earned on the peers you serve</span>`);
     // B4: two tables. Primary = models an engine serves RIGHT NOW, sorted shared-first then by

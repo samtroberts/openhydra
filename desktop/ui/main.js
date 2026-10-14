@@ -5,7 +5,7 @@ import { $, $$, shortPeer } from "./dom";
 import { html, setHTML } from "./html";
 import { injectIcons } from "./icons";
 import { store } from "./storage";
-import { fmtNum, fmtGB } from "./format";
+import { fmtNum, fmtGB, fmtSigned, CREDITS_NOTE } from "./format";
 import { hl, parseFences, splitThink, metaRow, mediaEl } from "./text";
 import { call } from "./bridge";
 import { renderMarkdownMarkup } from "./markdown";
@@ -545,7 +545,12 @@ function renderStatusbar() {
   $("#sbpeers").textContent = `${peers} peer${peers === 1 ? "" : "s"}`;
   $("#sbserved").textContent = fmtNum(totalServed()); $("#sbused").textContent = fmtNum(totalUsed());
   // Net credits, the same figure as Activity's net balance.
-  if (snap) { const net = Math.round(totalCreditsEarned() - totalCreditsSpent()); $("#sbcredits").textContent = `${net >= 0 ? "+" : ""}${net.toLocaleString()} credits`; }
+  // Net tokens (served − used) shown; the cost-weighted credits in the tooltip.
+  if (snap) {
+    const el = $("#sbcredits"), credits = Math.round(totalCreditsEarned() - totalCreditsSpent());
+    el.textContent = `${fmtSigned(totalServed() - totalUsed())} tokens net`;
+    el.title = `Tokens served minus tokens used: ${fmtSigned(credits)} credits. ${CREDITS_NOTE}`;
+  }
   $("#apiendpoint").textContent = (state?.gateway_url || "http://127.0.0.1:16527/v1").replace(/^https?:\/\//, "") + (g?.running ? "" : " · off");
   // Every place that names the local API uses the configured port.
   const port = state?.settings?.gateway_port || 16527;

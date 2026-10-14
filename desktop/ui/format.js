@@ -32,6 +32,10 @@ export function checkBadge(verdict) {
   return html`<span class="badge ${pass ? "ok" : "bad"}" title="${"Model check: " + verdict}">${pass ? "Model check passed" : "Model check failed"}</span>`;
 }
 export function fmtNum(n) { n = Math.round(n); return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n); }
+/** A signed amount (+1.2k / −340 / 0), compact like [`fmtNum`]. */
+export function fmtSigned(n) { n = Math.round(n || 0); return (n > 0 ? "+" : n < 0 ? "−" : "") + fmtNum(Math.abs(n)); }
+/** What a credit is, for tooltips beside every credits figure. */
+export const CREDITS_NOTE = "Credits weight each token by what the model costs to run: ×1 for a model that needs up to 2 GB of memory, ×4 up to 6 GB, ×12 up to 18 GB, ×30 up to 45 GB, ×75 up to 110 GB, ×150 above; an answer's tokens count 4× a prompt's (2.5× each when the split isn't known). Earned by serving, spent on chats. Not money.";
 // Stable per-model hue for the timeline + legend.
 export function modelColor(id) { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 60% 55%)`; }
 // Relative "Nm ago" timestamp for the ledger rows.

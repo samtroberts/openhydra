@@ -6,7 +6,7 @@ import { html, setHTML } from "./html";
 import { state, snap, infraPeerIds } from "./state";
 import { repByLibp2p } from "./econ";
 import { displayModelName } from "./models";
-import { modelIcon, relTime, repBadge } from "./format";
+import { modelIcon, relTime, repBadge, CREDITS_NOTE } from "./format";
 import { injectIcons } from "./icons";
 import { menu, toast } from "./chrome";
 
@@ -15,6 +15,7 @@ import { menu, toast } from "./chrome";
   // is a signed contribution unit (served +, used −; "not money"), not a wallet balance.
   export function renderLedger() {
     const t = snap?.transfers, rows = t?.recent || [];
+    $("#ledgercredits") && ($("#ledgercredits").title = CREDITS_NOTE);
     $("#v-ledger .row .mut").textContent = rows.length
       ? `${rows.length} recent · ${t?.tokens_served ?? 0} tokens served (${t?.receipts_ledgered ?? 0} co-signed receipts) / ${t?.tokens_consumed ?? "—"} used`
       : `${t?.receipts_ledgered ?? 0} receipts · ${t?.tokens_served ?? 0} tokens served`;
