@@ -213,15 +213,21 @@ fn close_tail_cap(max_tokens: Option<u32>) -> u64 {
 
 /// Add a stream close's reply (`framed`) to `tally`: at most [`close_tail_cap`] more text fragments
 /// (what we missed is at most a lost poll reply or two), and its other frames.
-fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_tokens: Option<u32>) {
+fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_tokens: Option<u32>) -> Vec<String> {
     let before = tally.fragments();
     let cap = close_tail_cap(max_tokens);
+    // The text the counted fragments carried (for the tokenizer check).
+    let mut texts = Vec::new();
     for chunk in parse_response(framed).unwrap_or_default() {
         if matches!(chunk, crate::serve::ServeChunk::Delta(_)) && tally.fragments() - before >= cap {
             continue;
         }
         tally.push_encoded(&chunk.encode());
+        if let crate::serve::ServeChunk::Delta(d) = chunk {
+            texts.push(d);
+        }
     }
+    texts
 }
 /// The most delivered text (in [`crate::serve::DeliveredText`] units, about bytes) one attempt
 /// reads before failing (round 8 G8-3): a flat bound on what a provider can make the gateway hold.
@@ -3311,10 +3317,24 @@ impl ConsumerNode {
                     let unreachable = !delivered && matches!(e, AdapterError::Network(_));
                     let missed_again = (shed || unreachable) && self.note_unavailable_once(noted, &provider.libp2p_peer_id, &provider.model_id, now);
                     let excused = shed || (unreachable && !missed_again);
-                    if !self.is_self_serve(&provider.libp2p_peer_id) && !refused && !cancelled && !excused {
+                    let rejected = !self.is_self_serve(&provider.libp2p_peer_id) && !refused && !cancelled && !excused;
+                    if rejected {
                         let model_key = rep_model_key(&provider.canonical_model_id, &provider.model_id);
                         self.record_outcome(&provider.state_id, model_key, VerificationOutcome::Rejected, now);
                     }
+                    // With the model's tokenizer at hand, what this attempt delivered is counted
+                    // before it is paid, as a completed serve's is (H1).
+                    let recount = counter.map(|counter| RecountInput {
+                        counter,
+                        text: captured.take(),
+                        overflowed: overflowed.get(),
+                        delivered: delivered_text.get(),
+                        tool_calls: exchange.tool_calls.clone(),
+                        offered: crate::serve::offered_tool_names(tools),
+                        state_id: provider.state_id.clone(),
+                        model_key: model_key_now.to_string(),
+                        mark_over: !rejected,
+                    });
                     // A stream that broke after output arrived is still owed for what we read: the
                     // provider counts what its polls returned the same way, and holds an unpaid
                     // part against us like an unpaid whole.
@@ -3327,7 +3347,7 @@ impl ConsumerNode {
                     if opened && !self.is_self_serve(&provider.libp2p_peer_id) {
                         let tokens = tally.billable(max_tokens);
                         tracing::info!(provider = %provider.peer_id, tokens, "stream ended early; closing it and settling for what was received");
-                        self.close_and_settle(&provider, nonce, stream_offset, tally, max_tokens, SettlePurpose::User);
+                        self.close_and_settle(&provider, nonce, stream_offset, tally, max_tokens, SettlePurpose::User, recount);
                     } else if opened {
                         // Our own provider: nothing to settle, but it stops generating for nobody
                         // (round 8 G8-2).
@@ -3338,7 +3358,10 @@ impl ConsumerNode {
                         let tokens = tally.billable(max_tokens);
                         if tokens > 0 {
                             tracing::info!(provider = %provider.peer_id, tokens, "serve failed part-way; settling for what was received");
-                            self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User);
+                            match recount {
+                                Some(r) => self.settle_recounted(&provider, tokens, nonce, SettlePurpose::User, r),
+                                None => self.settle_receipt(&provider, tokens, nonce, SettlePurpose::User),
+                            }
                         }
                     }
                     // Its client left: nobody to serve, so no failover.
@@ -3500,13 +3523,17 @@ impl ConsumerNode {
         mut tally: crate::serve::StreamTally,
         max_tokens: Option<u32>,
         purpose: SettlePurpose,
+        mut recount: Option<RecountInput>,
     ) {
         use std::sync::atomic::Ordering;
         if self.closes_in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_CLOSES_IN_FLIGHT {
             self.closes_in_flight.fetch_sub(1, Ordering::AcqRel);
             let tokens = tally.billable(max_tokens);
             if tokens > 0 {
-                self.settle_receipt(provider, tokens, nonce, purpose);
+                match recount {
+                    Some(r) => self.settle_recounted(provider, tokens, nonce, purpose, r),
+                    None => self.settle_receipt(provider, tokens, nonce, purpose),
+                }
             }
             return;
         }
@@ -3524,7 +3551,11 @@ impl ConsumerNode {
                 let reply = node.net.proxy_forward_timeout(provider.libp2p_peer_id.clone(), close.clone(), SETTLE_TIMEOUT);
                 match reply.map(|r| FetchChunksResponse::decode(&r)) {
                     Ok(Ok(FetchChunksResponse::Chunks { framed, .. })) => {
-                        absorb_close_reply(&mut tally, &framed, max_tokens);
+                        for d in absorb_close_reply(&mut tally, &framed, max_tokens) {
+                            if let Some(r) = recount.as_mut() {
+                                r.push(&d);
+                            }
+                        }
                         break;
                     }
                     // Throttled: try again shortly.
@@ -3540,9 +3571,38 @@ impl ConsumerNode {
             // `Done` bounds the count by the text's size, and fragments can be any size).
             let tokens = tally.billable(max_tokens).min(ceiling);
             if tokens > 0 {
-                node.settle_receipt(&provider, tokens, nonce, purpose);
+                match recount {
+                    // Already off the request's thread: counted here.
+                    Some(r) => node.recount_and_settle(&provider, tokens, nonce, purpose, r),
+                    None => node.settle_receipt(&provider, tokens, nonce, purpose),
+                }
             }
         });
+    }
+
+    /// Settle `billed` for an attempt that ended early, once its delivered text is counted (H1), in
+    /// the background: a count by the scorer takes seconds.
+    fn settle_recounted(self: &Arc<Self>, provider: &SelectedProvider, billed: u64, nonce: [u8; 16], purpose: SettlePurpose, recount: RecountInput) {
+        let node = Arc::clone(self);
+        let provider = provider.clone();
+        std::thread::spawn(move || node.recount_and_settle(&provider, billed, nonce, purpose, recount));
+    }
+
+    /// [`settle_recounted`](Self::settle_recounted), here and now.
+    fn recount_and_settle(self: &Arc<Self>, provider: &SelectedProvider, billed: u64, nonce: [u8; 16], purpose: SettlePurpose, recount: RecountInput) {
+        let pay = match crate::token_count::CountSlot::try_take(&self.counts_running) {
+            Some(_slot) => {
+                let (state_id, model_key, mark_over) = (recount.state_id.clone(), recount.model_key.clone(), recount.mark_over);
+                let (pay, over) = recount.run(billed);
+                if over && mark_over {
+                    self.record_outcome(&state_id, &model_key, VerificationOutcome::Rejected, now_unix_ms());
+                }
+                pay
+            }
+            // Busy counters: the bill stands (as for a completed serve).
+            None => billed,
+        };
+        self.settle_receipt(provider, pay, nonce, purpose);
     }
 
     /// Close a stream on our own provider that ended early (its client left): it stops generating.
@@ -4736,7 +4796,7 @@ impl ConsumerNode {
             Err(e) => {
                 if paying && exchange.opened {
                     tally.push_tool_calls(&exchange.tool_calls);
-                    self.close_and_settle(writer, exchange.nonce, exchange.stream_offset, tally, request.max_tokens, SettlePurpose::Check);
+                    self.close_and_settle(writer, exchange.nonce, exchange.stream_offset, tally, request.max_tokens, SettlePurpose::Check, None);
                 } else if paying && tally.billable(request.max_tokens) > 0 {
                     self.settle_receipt(writer, tally.billable(request.max_tokens), exchange.nonce, SettlePurpose::Check);
                 }
@@ -4778,7 +4838,7 @@ impl ConsumerNode {
         if matches!(&result, Err(AdapterError::Cancelled(m)) if m.is_empty()) {
             if paying && exchange.opened {
                 tally.push_tool_calls(&exchange.tool_calls);
-                self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens, SettlePurpose::Check);
+                self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens, SettlePurpose::Check, None);
             }
             return Ok(answer);
         }
@@ -4794,7 +4854,7 @@ impl ConsumerNode {
             Err(e) => {
                 if paying && exchange.opened {
                     tally.push_tool_calls(&exchange.tool_calls);
-                    self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens, SettlePurpose::Check);
+                    self.close_and_settle(provider, exchange.nonce, exchange.stream_offset, tally, serve.max_tokens, SettlePurpose::Check, None);
                 } else if paying && tally.billable(serve.max_tokens) > 0 {
                     // A buffered serve that failed part-way is owed for its text (round 9 B9-4).
                     self.settle_receipt(provider, tally.billable(serve.max_tokens), exchange.nonce, SettlePurpose::Check);
@@ -5207,6 +5267,49 @@ impl ConsumerNode {
 /// than the text it delivered can hold is paid what the text holds. Without a count (none possible,
 /// an error) it is paid what it billed, as before.
 #[allow(clippy::too_many_arguments)]
+/// What the tokenizer check needs of an attempt that ended early (a stream that broke or was
+/// stopped, a buffered serve that failed part-way): the text it delivered (kept up to
+/// [`crate::token_count::MAX_COUNTED_BYTES`]), and whose bill it checks. Settled through
+/// [`ConsumerNode::settle_recounted`], so an early end is paid what was delivered, as a completed
+/// serve is (review 2026-10-14, H1: one fragment per character, then an error or a drop, used to be
+/// paid about one token per character, unchecked).
+struct RecountInput {
+    counter: crate::token_count::Counter,
+    text: String,
+    /// Set once the text outgrew what is kept: the count is estimated from its start.
+    overflowed: bool,
+    /// The whole delivered text's measure (for the estimate).
+    delivered: crate::serve::DeliveredText,
+    tool_calls: Vec<crate::adapter::ToolCall>,
+    offered: std::collections::HashSet<String>,
+    state_id: String,
+    model_key: String,
+    /// Whether an over-bill costs the provider reputation here (not when the failed attempt already
+    /// did: one serve, one mark).
+    mark_over: bool,
+}
+
+impl RecountInput {
+    /// Add text that arrived after the attempt ended (the frames a close brought back).
+    fn push(&mut self, d: &str) {
+        self.delivered.push(d);
+        if self.overflowed {
+            return;
+        }
+        if self.text.len() + d.len() <= crate::token_count::MAX_COUNTED_BYTES {
+            self.text.push_str(d);
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    /// What to pay for `billed`, and whether it was over-billed.
+    fn run(self, billed: u64) -> (u64, bool) {
+        let total_units = self.overflowed.then(|| self.delivered.units());
+        recount_pay(&self.counter, self.text, total_units, &self.tool_calls, &self.offered, billed, &self.state_id, &self.model_key)
+    }
+}
+
 fn recount_pay(
     counter: &crate::token_count::Counter,
     text: String,
@@ -5301,6 +5404,77 @@ mod tests {
         assert_eq!(recount_pay(&counter, text.clone(), None, &[], &none, 41, "p", "m"), (41, false));
         // A bill under the bound is never raised.
         assert_eq!(recount_pay(&counter, text, None, &[], &none, 10, "p", "m"), (10, false));
+    }
+
+    /// The tiny word-level tokenizer behind a counter for "qwen3:8b" (each "hello"/"world" one token).
+    fn tiny_counter(dir: &std::path::Path) -> crate::token_count::Counter {
+        use crate::hf_tokenizer::{cached_path, tests::tiny_tokenizer_json, HfTokenizers};
+        use crate::tokenizer_index::{tests::{entry, index}, IndexStore};
+        use sha2::Digest;
+        let json = tiny_tokenizer_json().into_bytes();
+        let sha = hex::encode(sha2::Sha256::digest(&json));
+        std::fs::write(cached_path(dir, &sha), &json).unwrap();
+        let store = Arc::new(IndexStore::new(index(1, vec![entry(&["qwen3:8b"], &sha, json.len() as u64)]), "00", "https://x", None));
+        let tk = Arc::new(HfTokenizers::new(store, dir.to_path_buf(), "https://huggingface.co", None));
+        crate::token_count::Counter::Hf(tk.counter_for("qwen3:8b").expect("cached"))
+    }
+
+    /// An attempt's recount input, fed `fragments` as the consumer receives them, and their tally.
+    fn early_end(counter: crate::token_count::Counter, fragments: &[&str]) -> (RecountInput, crate::serve::StreamTally) {
+        let mut r = RecountInput {
+            counter,
+            text: String::new(),
+            overflowed: false,
+            delivered: Default::default(),
+            tool_calls: vec![],
+            offered: Default::default(),
+            state_id: "p".into(),
+            model_key: "m".into(),
+            mark_over: true,
+        };
+        let mut tally = crate::serve::StreamTally::default();
+        for f in fragments {
+            tally.push_delta(f);
+            r.push(f);
+        }
+        (r, tally)
+    }
+
+    /// Review 2026-10-14 H1: a stream that ends early (an error, a drop, a stop) is recounted too.
+    #[test]
+    fn a_serve_that_ends_early_is_recounted_before_it_is_paid() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "hello world ".repeat(20); // 40 tokens
+        // One fragment per character, then an error frame: the bill (by fragments) is ~6x the tokens.
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        let chars: Vec<&str> = chars.iter().map(|c| c.as_str()).collect();
+        let (r, tally) = early_end(tiny_counter(dir.path()), &chars);
+        let billed = tally.billable(None);
+        assert!(billed > 200, "the byte bound alone lets {billed} through");
+        let fair = crate::token_count::billable_by_count(40, 0, crate::serve::TOOL_CALL_TOKEN_ALLOWANCE);
+        assert_eq!(r.run(billed), (fair, true));
+
+        // An honest stream that ends early (a fragment per token): paid its fragments, not flagged.
+        let words: Vec<String> = text.split_inclusive(' ').map(String::from).collect();
+        let words: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
+        let (r, tally) = early_end(tiny_counter(dir.path()), &words);
+        let billed = tally.billable(None);
+        assert_eq!(r.run(billed), (billed, false));
+
+        // What a close brings back is counted with the rest: a close that returns per-character
+        // fragments and an inflated Done is paid the count's bound.
+        let (mut r, mut tally) = early_end(tiny_counter(dir.path()), &words[..10]);
+        let ceiling = tally.billable(None).saturating_add(close_tail_cap(None));
+        let mut chunks: Vec<crate::serve::ServeChunk> =
+            "hello world ".repeat(15).chars().map(|c| crate::serve::ServeChunk::Delta(c.to_string())).collect();
+        chunks.push(crate::serve::ServeChunk::Done { tokens: 100_000, metrics: Default::default() });
+        for d in absorb_close_reply(&mut tally, &close_reply(&chunks), None) {
+            r.push(&d);
+        }
+        let billed = tally.billable(None).min(ceiling);
+        let (pay, over) = r.run(billed);
+        assert!(over, "billed {billed}");
+        assert_eq!(pay, crate::token_count::billable_by_count(40, 0, crate::serve::TOOL_CALL_TOKEN_ALLOWANCE));
     }
 
     fn close_reply(chunks: &[crate::serve::ServeChunk]) -> Vec<u8> {
