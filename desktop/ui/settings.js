@@ -66,11 +66,18 @@ import { call } from "./bridge";
     const bsEl = netp.querySelector('#bootstraps'); if (bsEl && document.activeElement !== bsEl) bsEl.textContent = (s.bootstraps || []).join("\n");
     // Built-in bootstrap peers exist only in release builds; say which case this is.
     const builtin = p.builtin_bootstraps || 0;
-    $("#netsub") && ($("#netsub").textContent = builtin
-      ? "Your node joins the network through OpenHydra's bootstrap peers. You can add more and change the local API port."
-      : "This build has no built-in bootstrap peer: add one below to join the public network. Without one, only machines on your local network are found.");
-    $("#bootdesc") && ($("#bootdesc").textContent = builtin ? "Extra bootstrap peer addresses, one per line (used as well as the built-in ones)." : "Bootstrap peer addresses, one per line.");
+    const publicNet = s.public_network !== false;
+    $("#netsub") && ($("#netsub").textContent = !publicNet
+      ? "Private deployment: your node connects only through the bootstrap peers you list below (and machines on your local network). OpenHydra's public servers are never contacted."
+      : builtin
+        ? "Your node joins the network through OpenHydra's bootstrap peers. You can add more and change the local API port."
+        : "This build has no built-in bootstrap peer: add one below to join the public network. Without one, only machines on your local network are found.");
+    $("#bootdesc") && ($("#bootdesc").textContent = !publicNet
+      ? "Your deployment's bootstrap peers, one per line."
+      : builtin ? "Extra bootstrap peer addresses, one per line (used as well as the built-in ones)." : "Bootstrap peer addresses, one per line.");
     $("#relaysw") && $("#relaysw").classList.toggle("on", !!s.peer_relay);
+    // Absent in a config from before the setting existed: on (the public network).
+    $("#publicnetsw") && $("#publicnetsw").classList.toggle("on", s.public_network !== false);
     const ed = $("#enginedrop span");
     if (ed && !document.querySelector(".menu")) ed.textContent = ENGINE_LABEL[s.engine_kind] || "auto-detect";
     updateEngineEndpoint();

@@ -203,6 +203,10 @@ struct Settings {
     /// `--no-tokenizer-downloads` (only tokenizers already downloaded are used). The download tells
     /// Hugging Face which models this gateway uses, never what it sends.
     tokenizer_downloads: bool,
+    /// Join through OpenHydra's public network: the built-in bootstraps and the production relays.
+    /// Off = a private deployment: only the user's own bootstraps (and the LAN), with
+    /// `--public-relays off`, so OpenHydra's public servers are never contacted. On by default.
+    public_network: bool,
     /// Only use providers this gateway has verified at least to this tier: `"off"` (any provider,
     /// the default), `"A1"` or `"A2"` (`--min-authenticity <tier> --assurance gate`).
     min_authenticity: String,
@@ -272,6 +276,7 @@ impl Default for Settings {
             authenticity_checks: false,
             audit_replay: false,
             tokenizer_downloads: true,
+            public_network: true,
             min_authenticity: "off".into(),
             search_url: String::new(),
             verbose_logs: false,
@@ -894,13 +899,20 @@ fn parse_bootstrap_list(raw: &str) -> Vec<String> {
 
 /// The bootstraps a role dials: the built-in ones plus the user's extras, without duplicates.
 fn effective_bootstraps(settings: &Settings) -> Vec<String> {
-    let mut out = builtin_bootstraps();
+    // A private deployment (public network off) uses only the user's own bootstraps.
+    let mut out = if settings.public_network { builtin_bootstraps() } else { Vec::new() };
     for b in settings.bootstraps.iter().map(|b| b.trim()).filter(|b| !b.is_empty()) {
         if !out.iter().any(|x| x == b) {
             out.push(b.to_string());
         }
     }
     out
+}
+
+/// The agents' `--public-relays`: decided from the bootstraps on the public network (the built-in
+/// ones are OpenHydra's), never in a private deployment.
+fn public_relays_arg(settings: &Settings) -> &'static str {
+    if settings.public_network { "auto" } else { "off" }
 }
 
 /// `start_provider`'s refusal when the user hasn't confirmed what they share yet.
@@ -1069,6 +1081,7 @@ fn spawn_role(
     for b in effective_bootstraps(settings) {
         cmd.arg("--bootstrap").arg(b);
     }
+    cmd.arg("--public-relays").arg(public_relays_arg(settings));
     if settings.peer_relay {
         cmd.arg("--peer-relay");
     }
@@ -1896,9 +1909,11 @@ fn swarm_remote_scope(
     )?;
     let mut cmd = Command::new(&bin);
     cmd.arg("--identity").arg(identity);
-    for b in effective_bootstraps(&load_settings()) {
+    let settings = load_settings();
+    for b in effective_bootstraps(&settings) {
         cmd.arg("--bootstrap").arg(b);
     }
+    cmd.arg("--public-relays").arg(public_relays_arg(&settings));
     cmd.arg("swarm")
         .arg("remote-scope")
         .arg("--swarm")
@@ -2926,6 +2941,9 @@ fn settings_widening(prev: &Settings, next: &Settings) -> Vec<String> {
     if next.peer_relay && !prev.peer_relay {
         out.push("Relay other peers' traffic through your machine.".to_string());
     }
+    if next.public_network && !prev.public_network {
+        out.push("Join OpenHydra's public network (its bootstrap nodes and relays).".to_string());
+    }
     if next.audit_replay && !prev.audit_replay {
         out.push("Send some of your own requests to a second provider to check answers.".to_string());
     }
@@ -3676,6 +3694,7 @@ mod tests {
         assert!(!d.authenticity_checks, "authenticity checks are opt-in");
         assert!(!d.audit_replay, "replaying prompts for audits is opt-in on the desktop");
         assert!(d.tokenizer_downloads, "token-count checks download tokenizers by default");
+        assert!(d.public_network, "the public network by default");
         assert_eq!(d.min_authenticity, "off");
         assert_eq!(gateway_floor("off"), None);
         assert_eq!(gateway_floor("A1"), Some("A1"));
@@ -3709,6 +3728,7 @@ mod tests {
         assert!(!s.authenticity_checks, "an older config without the field loads as off");
         assert!(!s.audit_replay, "an older config without the field doesn't replay prompts");
         assert!(s.tokenizer_downloads, "an older config without the field checks token counts, as the agent does");
+        assert!(s.public_network, "an older config without the field stays on the public network");
         assert_eq!(s.min_authenticity, "off", "an older config without the field uses any provider");
         // new fields default sanely (unknown at old-schema time)
         assert!(!s.sharing_enabled, "unknown sharing intent defaults off, not a spurious on");
@@ -3939,6 +3959,11 @@ mod tests {
         let eff = effective_bootstraps(&s);
         assert_eq!(eff.iter().filter(|b| b.as_str() == "/ip4/9.9.9.9/tcp/4001/p2p/C").count(), 1);
         assert_eq!(eff.len(), builtin_bootstraps().len() + 1);
+        assert_eq!(public_relays_arg(&s), "auto");
+        // A private deployment: only its own bootstraps, never the public relays.
+        s.public_network = false;
+        assert_eq!(effective_bootstraps(&s), vec!["/ip4/9.9.9.9/tcp/4001/p2p/C".to_string()]);
+        assert_eq!(public_relays_arg(&s), "off");
     }
 
     #[test]
