@@ -412,9 +412,12 @@ import { exportCardModal, ensureImportSection } from "./cards";
       const netName = pub !== m && pub !== displayModelName(m)
         ? html` <span class="mut" title="Other machines and connected tools use this name">· on the network as ${pub}</span>`
         : "";
-      rows.push(html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b>${netName}</td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
+      rows.push(html`<tr><td>${modelIcon(m)}<b title="${displayModelName(m)}">${displayModelName(m)}</b>${netName}</td><td>${engineFor(m) || "—"}</td><td class="num">${reqs}</td><td class="num">${fmtNum(tokens)}</td><td class="num">${tps}</td><td>${status}</td><td class="shcell"><div class="switch ${sharedIntent ? "on" : ""}" data-share="${m}" data-name="Share ${displayModelName(m)}" title="${swTitle}"></div>${reachPill}${cardBtn}</td></tr>`);
     }
+    // The table is rebuilt on every refresh: a model's switch that had keyboard focus keeps it.
+    const focused = document.activeElement?.closest?.("#servetable [data-share]")?.dataset.share;
     setHTML($("#servetable tbody"), rows.length ? html`${rows}` : html`<tr><td colspan="7" class="mut">No engines answering — start Ollama, LM Studio, vLLM, llama.cpp, or Exo, then rescan.</td></tr>`);
+    if (focused !== undefined) [...$$("#servetable [data-share]")].find((sw) => sw.dataset.share === focused)?.focus();
     // "Previously served" — lifetime tokens on record but NOT currently detected.
     const pastModels = statModels().filter((id) => lifetimeServed(id) > 0 && !active.has(id))
       .sort((a, b) => (lifetimeServed(b) || 0) - (lifetimeServed(a) || 0));

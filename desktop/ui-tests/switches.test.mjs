@@ -50,6 +50,12 @@ test("the share-all switch has three states, so it is a checkbox that can be mix
   assert.equal(two.getAttribute("aria-checked"), "false");
 });
 
+test("a model's switch is named for its model", () => {
+  const sw = new El(["switch"], { "data-name": "Share qwen3:8b", title: "Share this model when you start sharing" });
+  syncSwitch(sw);
+  assert.equal(sw.getAttribute("aria-label"), "Share qwen3:8b");
+});
+
 test("a switch with no label is named by its tooltip; an existing tabindex is kept", () => {
   const sw = new El(["switch"], { title: "Announce on the network", tabindex: "-1" });
   syncSwitch(sw);
@@ -66,12 +72,15 @@ test("Space and Enter toggle the focused switch; other keys and other elements d
   const doc = { body, querySelectorAll: (s) => body.querySelectorAll(s), addEventListener: (t, f) => { if (t === "keydown") keydown = f; } };
   wireSwitches(doc);
   assert.equal(sw.getAttribute("role"), "switch", "existing switches are set up at once");
-  let prevented = 0;
-  const press = (target, key) => keydown({ target, key, preventDefault: () => prevented++ });
+  let prevented = 0, stopped = 0;
+  const press = (target, key, repeat = false) => keydown({ target, key, repeat, preventDefault: () => prevented++, stopPropagation: () => stopped++ });
   press(sw, " "); press(sw, "Enter"); press(sw, "a"); press(other, " ");
   assert.equal(sw.clicks, 2);
   assert.equal(other.clicks, 0);
   assert.equal(prevented, 2, "Space doesn't scroll the page");
+  assert.equal(stopped, 2, "an open menu doesn't also take the Enter");
+  press(sw, " ", true); press(sw, " ", true);
+  assert.equal(sw.clicks, 2, "a held key toggles once");
   assert.ok(isToggleKey({ key: " " }) && isToggleKey({ key: "Enter" }) && !isToggleKey({ key: "Tab" }));
 });
 

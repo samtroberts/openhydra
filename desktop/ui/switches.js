@@ -3,11 +3,11 @@
 // class however the page changes it; Space or Enter toggles the focused one. No imports, so the UI
 // tests can load it.
 
-// What a screen reader calls the switch: the label it sits in, else its row's label in Settings, else
-// its tooltip.
+// What a screen reader calls the switch: its own name (`data-name`, a model's switch: "Share qwen3"),
+// else the label it sits in, else its row's label in Settings, else its tooltip.
 export function switchName(sw) {
   const label = (sw.closest?.("label") || sw.closest?.(".field")?.querySelector?.("label"))?.textContent?.trim();
-  return label || sw.getAttribute("title") || "";
+  return sw.getAttribute("data-name") || label || sw.getAttribute("title") || "";
 }
 
 // Brings one switch's role, tab stop, state and name up to date. A switch with three states (the
@@ -42,10 +42,13 @@ export function wireSwitches(doc) {
       else r.addedNodes.forEach(each);
     }
   }).observe(doc.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["class", "title"] });
+  // Before the page's own key handlers (an open menu's Enter): the focused switch takes the key.
   doc.addEventListener("keydown", (e) => {
     const sw = e.target?.closest?.(".switch");
     if (!sw || !isToggleKey(e)) return;
     e.preventDefault(); // Space would scroll the page
+    e.stopPropagation();
+    if (e.repeat) return; // a held key toggles once (each toggle saves, and may ask to confirm)
     sw.click();
-  });
+  }, true);
 }

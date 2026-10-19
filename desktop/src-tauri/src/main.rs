@@ -1340,6 +1340,7 @@ fn start_provider(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> R
             a.absorb(&unapproved);
         }
     }
+    let _one_at_a_time = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     start_provider_now(state)
 }
 
@@ -1347,12 +1348,18 @@ fn start_provider(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> R
 /// nothing; a wider audience (joining the public network) is confirmed when it is saved.
 #[tauri::command(async)]
 fn restart_provider(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // One start, stop or restart at a time: a Stop pressed mid-restart isn't undone, and two
+    // restarts at once don't start two providers (second review 2026-10-19).
+    let _one_at_a_time = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     if !state.provider.lock().map(|r| r.status.running).unwrap_or(false) {
         return Err("not sharing".into());
     }
     state.provider.lock().map_err(|e| e.to_string())?.kill();
     start_provider_now(state)
 }
+
+/// Held while sharing starts, stops or restarts ([`restart_provider`]).
+static PROVIDER_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 fn start_provider_now(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
@@ -2133,6 +2140,7 @@ fn start_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn stop_provider(state: tauri::State<'_, AppState>) {
+    let _one_at_a_time = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     state.provider.lock().expect("role lock").kill();
     set_sharing_enabled(&state, false); // user turned sharing off — don't resume on next launch
 }
