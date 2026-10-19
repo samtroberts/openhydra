@@ -135,6 +135,9 @@ main() {
       case "$loc" in */tag/v*) ver="${loc##*/tag/v}" ;; esac
     fi
     [ -n "$ver" ] || err "couldn't find the latest version (tried ${DIST_HOST%/}/latest.json and GitHub). Set OPENHYDRA_VERSION."
+    # "latest" never goes back to a release without checksums (a tampered latest.json could
+    # otherwise switch the checks off); ask for an old one by name instead.
+    ver_ge "$ver" "$SUMS_SINCE" || err "the latest release is listed as $ver, older than this installer: refusing. To install $ver anyway: OPENHYDRA_VERSION=$ver"
   fi
   case "$ver" in
     *[!0-9A-Za-z.-]*) err "not a version: '$ver'" ;;
@@ -183,23 +186,34 @@ main() {
     sums_from="$gh_base"
   elif dl "${DIST_BASE%/}/SHA256SUMS-$triple" "$sums" 2>/dev/null && [ -s "$sums" ]; then
     sums_from="${DIST_BASE%/}"
-    if [ -n "$gh_base" ]; then info "(GitHub unavailable — checksums taken from the download origin)"; fi
+  fi
+  # Their signature, when this installer has the release key and minisign is installed: for this
+  # release and this platform (a signature from another release isn't accepted).
+  signed=""
+  if [ -n "$sums_from" ] && [ -n "$MINISIGN_PUBKEY" ]; then
+    if command -v minisign >/dev/null 2>&1; then
+      dl "$sums_from/SHA256SUMS-$triple.minisig" "$tmpdir/SHA256SUMS.minisig" 2>/dev/null \
+        || err "the checksums' signature (SHA256SUMS-$triple.minisig) is missing: refusing to install."
+      verdict="$(minisign -V -P "$MINISIGN_PUBKEY" -m "$sums" -x "$tmpdir/SHA256SUMS.minisig" 2>/dev/null)" \
+        || err "the checksums' signature doesn't verify: refusing to install."
+      if [ -n "$ver" ]; then
+        printf '%s\n' "$verdict" | grep -qxF "Trusted comment: OpenHydra $ver SHA256SUMS-$triple" \
+          || err "the checksums are signed for another release: refusing to install."
+      fi
+      signed=1
+      info "Checksums signed by the OpenHydra release key."
+    else
+      info "(install minisign to also check the release signature)"
+    fi
   fi
   if [ -z "$sums_from" ]; then
     if [ -n "$ver" ] && ver_ge "$ver" "$SUMS_SINCE"; then
       err "release $ver has no checksums (SHA256SUMS-$triple): refusing to install it."
     fi
     info "WARNING: this release has no checksums (it predates them): its files can't be checked."
-  elif [ -n "$MINISIGN_PUBKEY" ]; then
-    if command -v minisign >/dev/null 2>&1; then
-      dl "$sums_from/SHA256SUMS-$triple.minisig" "$tmpdir/SHA256SUMS.minisig" 2>/dev/null \
-        || err "the checksums' signature (SHA256SUMS-$triple.minisig) is missing: refusing to install."
-      minisign -V -q -P "$MINISIGN_PUBKEY" -m "$sums" -x "$tmpdir/SHA256SUMS.minisig" >/dev/null 2>&1 \
-        || err "the checksums' signature doesn't verify: refusing to install."
-      info "Checksums signed by the OpenHydra release key."
-    else
-      info "(install minisign to also check the release signature)"
-    fi
+  elif [ "$sums_from" != "$gh_base" ] && [ -z "${OPENHYDRA_DIST_BASE:-}" ] && [ -z "$signed" ]; then
+    # Unsigned checksums from the download origin only prove what that origin says.
+    err "couldn't fetch the checksums from GitHub ($gh_base): refusing to install unchecked. Try again later (with minisign installed, the download origin's signed copy is enough)."
   fi
 
   # Check downloaded file $1 (published as $2) against the checksums; refuse on any doubt.

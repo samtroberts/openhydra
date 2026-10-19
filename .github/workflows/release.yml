@@ -325,11 +325,17 @@ jobs:
           pattern: openhydra-*
           merge-multiple: true
 
+      # Only a publish is signed: a dry run's checksums (a dev build's, from any ref) never carry the
+      # release key's signature. Installed in a step of its own, without the key in scope.
+      - name: Install minisign
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+
       - name: Write and sign SHA256SUMS
         shell: bash
         env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_SECRET_KEY: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish) && secrets.MINISIGN_SECRET_KEY || '' }}
+          MINISIGN_PASSWORD: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish) && secrets.MINISIGN_PASSWORD || '' }}
           INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
         run: |
           mkdir -p sums
@@ -345,10 +351,9 @@ jobs:
             echo "SHA256SUMS-$t:"; cat "sums/SHA256SUMS-$t"
           done
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            echo "::warning::MINISIGN_SECRET_KEY is not set → the checksums are published unsigned"
+            echo "::warning::not signed (a dry run, or MINISIGN_SECRET_KEY isn't set)"
             exit 0
           fi
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           key="$RUNNER_TEMP/cli.key"
           trap 'rm -f "$key"' EXIT
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"; chmod 600 "$key"
@@ -364,6 +369,7 @@ jobs:
           path: sums/*
           if-no-files-found: ignore
           retention-days: 7
+          overwrite: true # a re-run of the job replaces its own
 
   # Publish the platforms that built to Cloudflare R2 + write latest.json, then the GitHub Release.
   # Runs even when a platform's build failed (`always()`): the others still ship, and the failed
