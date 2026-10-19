@@ -2177,15 +2177,18 @@ fn note_model_seen(seen: &mut HashMap<(String, String), std::time::Instant>, mod
 
 /// After a withdrawal by `peer` evicted `model`: remember it if no other provider serves it
 /// (then it has really left the network, rather than lost one of its providers) - none known now,
-/// and none announced it within [`WITHDRAWN_MODEL_MEMORY`] (its record may have lapsed here).
+/// and none announced it within [`WITHDRAWN_MODEL_MEMORY`] (its record may have lapsed here). The
+/// withdrawing peer's own announcement is forgotten: it no longer serves the model, so when the last
+/// of several providers withdraws, the model goes at once (second review 2026-10-19).
 fn note_withdrawn_model(
     withdrawn: &mut HashMap<String, std::time::Instant>,
     known_peers: &HashMap<String, PeerRecord>,
-    seen: &HashMap<(String, String), std::time::Instant>,
+    seen: &mut HashMap<(String, String), std::time::Instant>,
     model: &str,
     peer: &str,
     now: std::time::Instant,
 ) {
+    seen.remove(&(model.to_string(), peer.to_string()));
     if known_peers.values().any(|r| r.model_id == model) {
         return;
     }
@@ -3134,7 +3137,7 @@ fn handle_swarm_event(
                                         debug!(%pid, %model, ts, "ignored stale MODEL_WITHDRAWN (replay?)");
                                     } else if evict_withdrawn_model(&mut state.known_peers, id_str, model) > 0 {
                                         info!(%pid, %model, "evicted model via MODEL_WITHDRAWN gossip");
-                                        note_withdrawn_model(&mut state.withdrawn_models, &state.known_peers, &state.model_seen, model, id_str, std::time::Instant::now());
+                                        note_withdrawn_model(&mut state.withdrawn_models, &state.known_peers, &mut state.model_seen, model, id_str, std::time::Instant::now());
                                     }
                                 }
                                 Ok(pid) => warn!(
@@ -3568,6 +3571,10 @@ fn handle_swarm_event(
                     }
                 }
             }
+        }
+        // A connection a limit turned away is routine (and can come by the thousand): not a warning.
+        SwarmEvent::IncomingConnectionError { error: error @ libp2p::swarm::ListenError::Denied { .. }, .. } => {
+            debug!(%error, "incoming_connection_denied");
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             warn!(%error, "incoming_connection_error");
@@ -5613,15 +5620,15 @@ mod tests {
         known.insert("b/m".into(), rec("b", "m"));
         known.insert("a/n".into(), rec("a", "n"));
         let mut withdrawn = HashMap::new();
-        let seen = HashMap::new();
+        let mut seen = HashMap::new();
         let t0 = std::time::Instant::now();
         // a withdraws m, but b still serves it: m hasn't left the network.
         assert_eq!(evict_withdrawn_model(&mut known, "a", "m"), 1);
-        note_withdrawn_model(&mut withdrawn, &known, &seen, "m", "a", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "m", "a", t0);
         assert!(recently_withdrawn(&mut withdrawn, &known, t0).is_empty());
         // a withdraws n, its only provider: remembered.
         evict_withdrawn_model(&mut known, "a", "n");
-        note_withdrawn_model(&mut withdrawn, &known, &seen, "n", "a", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "n", "a", t0);
         assert_eq!(recently_withdrawn(&mut withdrawn, &known, t0), vec!["n".to_string()]);
         // Re-shared: no longer reported (the record is back).
         known.insert("a/n".into(), rec("a", "n"));
@@ -5642,22 +5649,37 @@ mod tests {
         let t0 = std::time::Instant::now();
         note_model_seen(&mut seen, "m", "b", t0);
         note_model_seen(&mut seen, "m", "a", t0);
-        note_withdrawn_model(&mut withdrawn, &known, &seen, "m", "a", t0 + std::time::Duration::from_secs(60));
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "m", "a", t0 + std::time::Duration::from_secs(60));
         assert!(withdrawn.is_empty(), "b announced m a minute ago");
         // Only a ever served n: its withdrawal hides n at once.
         note_model_seen(&mut seen, "n", "a", t0);
-        note_withdrawn_model(&mut withdrawn, &known, &seen, "n", "a", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "n", "a", t0);
         assert!(withdrawn.contains_key("n"));
         // b's announcement long past: m's withdrawal counts.
         let later = t0 + WITHDRAWN_MODEL_MEMORY + std::time::Duration::from_secs(1);
-        note_withdrawn_model(&mut withdrawn, &known, &seen, "m", "a", later);
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "m", "a", later);
         assert!(withdrawn.contains_key("m"));
         // L7: older withdrawals are pruned as new ones come, and the map is bounded.
         assert!(!withdrawn.contains_key("n"), "n's was past the memory window");
         for i in 0..MAX_WITHDRAWN_MODELS + 10 {
-            note_withdrawn_model(&mut withdrawn, &known, &seen, &format!("x{i}"), "a", later);
+            note_withdrawn_model(&mut withdrawn, &known, &mut seen, &format!("x{i}"), "a", later);
         }
         assert!(withdrawn.len() <= MAX_WITHDRAWN_MODELS);
+    }
+
+    #[test]
+    fn when_the_last_of_two_providers_withdraws_the_model_goes_at_once() {
+        // Second review 2026-10-19: b withdraws m (a still serves it), then a does: nobody serves it.
+        let known: HashMap<String, PeerRecord> = HashMap::new();
+        let mut seen = HashMap::new();
+        let mut withdrawn = HashMap::new();
+        let t0 = std::time::Instant::now();
+        note_model_seen(&mut seen, "m", "a", t0);
+        note_model_seen(&mut seen, "m", "b", t0);
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "m", "b", t0 + std::time::Duration::from_secs(10));
+        assert!(withdrawn.is_empty(), "a announced m lately");
+        note_withdrawn_model(&mut withdrawn, &known, &mut seen, "m", "a", t0 + std::time::Duration::from_secs(20));
+        assert!(withdrawn.contains_key("m"), "both have withdrawn it");
     }
 
     #[test]

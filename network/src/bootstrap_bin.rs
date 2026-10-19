@@ -646,6 +646,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         warn!(?peer_id, %error, "outgoing connection error");
                     }
+                    // A connection a limit turned away is routine (and can come by the thousand).
+                    libp2p::swarm::SwarmEvent::IncomingConnectionError {
+                        error: error @ libp2p::swarm::ListenError::Denied { .. }, send_back_addr, ..
+                    } => {
+                        debug!(%error, %send_back_addr, "incoming connection denied");
+                    }
                     libp2p::swarm::SwarmEvent::IncomingConnectionError { error, local_addr, send_back_addr, .. } => {
                         warn!(%error, %local_addr, %send_back_addr, "incoming connection error");
                     }

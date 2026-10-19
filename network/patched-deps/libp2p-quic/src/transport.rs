@@ -452,6 +452,44 @@ struct Listener<P: Provider> {
     close_listener_waker: Option<Waker>,
 
     listening_addresses: HashSet<IpAddr>,
+
+    /// OpenHydra: makes new senders prove their address under a burst ([`RetryGate`]).
+    retry_gate: RetryGate,
+}
+
+/// OpenHydra (second review 2026-10-19): a burst of new QUIC senders must prove their address (a
+/// QUIC Retry: one more round trip) before they count as connections being set up. Each first packet
+/// is otherwise taken as a connection from whatever source it names, so packets with forged sources
+/// could keep the node's allowance of connections being set up full and turn real peers away. Below
+/// the burst, nothing changes: no extra round trip in normal use. Tested in the network crate
+/// (`ip_limits`: a burst of QUIC dials all connect).
+#[derive(Debug)]
+struct RetryGate {
+    window_start: std::time::Instant,
+    in_window: u32,
+}
+
+/// New senders a listener takes per second without proving their address.
+const UNPROVEN_PER_SECOND: u32 = 16;
+
+impl RetryGate {
+    fn new(now: std::time::Instant) -> Self {
+        Self { window_start: now, in_window: 0 }
+    }
+
+    /// Whether a sender that hasn't proven its address is taken as it is at `now`.
+    fn take_unproven(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.in_window = 0;
+        }
+        if self.in_window < UNPROVEN_PER_SECOND {
+            self.in_window += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl<P: Provider> Listener<P> {
@@ -494,6 +532,7 @@ impl<P: Provider> Listener<P> {
             pending_event,
             close_listener_waker: None,
             listening_addresses,
+            retry_gate: RetryGate::new(std::time::Instant::now()),
         })
     }
 
@@ -594,6 +633,16 @@ impl<P: Provider> Stream for Listener<P> {
                 Poll::Ready(Some(incoming)) => {
                     let endpoint = self.endpoint.clone();
                     self.accept = async move { endpoint.accept().await }.boxed();
+
+                    // OpenHydra: under a burst, a sender proves its address first (RetryGate).
+                    if !incoming.remote_address_validated() && !self.retry_gate.take_unproven(std::time::Instant::now()) {
+                        if incoming.may_retry() {
+                            let _ = incoming.retry();
+                        } else {
+                            incoming.ignore();
+                        }
+                        continue;
+                    }
 
                     let connecting = match incoming.accept() {
                         Ok(connecting) => connecting,
