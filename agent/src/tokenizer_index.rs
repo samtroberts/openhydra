@@ -191,7 +191,11 @@ impl TokenizerIndex {
         // bare family alias (`deepseek-r1`, Ollama's default tag), which names a different model
         // there: `deepseek-ai/DeepSeek-R1` is the 671B model, not the 8B distill Ollama's
         // `deepseek-r1` is (review 2026-10-14, M6).
+        // Nor is a name that reaches a bare alias only once its storage tags are cut: a GGUF file
+        // name has no org (`DeepSeek-R1-UD-IQ1_S` is the 671B model too), so a bare alias matches
+        // only the name as given (or with `:latest`), or a repo name (second review 2026-10-19).
         let org_given = model.contains('/');
+        let as_given = given_keys(model);
         lookup_keys(model).iter().find_map(|k| {
             let org_stripped = org_given && !k.contains('/');
             self.models.iter().find(|e| {
@@ -199,7 +203,9 @@ impl TokenizerIndex {
                     e.repo.rsplit('/').next().is_some_and(|r| r.eq_ignore_ascii_case(k))
                         || e.names.iter().any(|n| n.split_once('/').is_some_and(|(_, r)| r == k))
                 };
-                e.names.iter().any(|n| n == k && (!org_stripped || !is_bare_alias(n) || names_repo(k)))
+                e.names.iter().any(|n| {
+                    n == k && (!is_bare_alias(n) || names_repo(k) || (!org_stripped && as_given.iter().any(|g| g == k)))
+                })
             })
         })
     }
@@ -263,6 +269,21 @@ pub fn lookup_keys(model: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `model` as given (lower-case), with and without `:latest` and an `org/` prefix: the
+/// [`lookup_keys`] no storage tag was cut from.
+fn given_keys(model: &str) -> Vec<String> {
+    let full = model.trim().to_lowercase();
+    let bare = full.rsplit_once('/').map(|(_, n)| n.to_string());
+    std::iter::once(full.clone())
+        .chain(bare)
+        .flat_map(|b| {
+            let untagged = b.strip_suffix(":latest").unwrap_or(&b).to_string();
+            [b, untagged]
+        })
+        .map(|k| k.trim_end_matches(['-', '_', '.', ':']).to_string())
+        .collect()
 }
 
 /// Sign `index` with the registry key: the published JSON.
@@ -639,11 +660,17 @@ pub(crate) mod tests {
         for name in ["deepseek-ai/DeepSeek-R1", "deepseek/deepseek-r1", "unsloth/DeepSeek-R1-UD-IQ1_S", "deepseek-ai/DeepSeek-R1-0528"] {
             assert!(idx.lookup(name).is_none(), "{name}");
         }
+        // Second review 2026-10-19: nor under a GGUF file's name, which has no org (llama.cpp's
+        // handle): a bare alias isn't reached by cutting storage tags. A sized file name still is.
+        for name in ["DeepSeek-R1-UD-IQ1_S", "DeepSeek-R1-Q4_K_M", "deepseek-r1-fp16"] {
+            assert!(idx.lookup(name).is_none(), "{name}");
+        }
+        assert!(idx.lookup("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M").is_some());
         // A repo whose own name has no size is still found by it.
         let mut phi4 = entry(&["phi4", "phi-4"], &"c".repeat(64), 10);
         phi4.repo = "microsoft/phi-4".into();
         let phi = index(1, vec![phi4]);
-        for name in ["microsoft/phi-4", "unsloth/phi-4-GGUF", "phi4", "phi4:latest"] {
+        for name in ["microsoft/phi-4", "unsloth/phi-4-GGUF", "phi4", "phi4:latest", "phi-4-Q4_K_M"] {
             assert!(phi.lookup(name).is_some(), "{name}");
         }
         // Repos that share an entry's file are named by their full ids: found by those, and through

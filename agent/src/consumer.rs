@@ -213,21 +213,30 @@ fn close_tail_cap(max_tokens: Option<u32>) -> u64 {
 
 /// Add a stream close's reply (`framed`) to `tally`: at most [`close_tail_cap`] more text fragments
 /// (what we missed is at most a lost poll reply or two), and its other frames.
-fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_tokens: Option<u32>) -> Vec<String> {
+fn absorb_close_reply(tally: &mut crate::serve::StreamTally, framed: &[u8], max_tokens: Option<u32>) -> CloseTail {
     let before = tally.fragments();
     let cap = close_tail_cap(max_tokens);
-    // The text the counted fragments carried (for the tokenizer check).
-    let mut texts = Vec::new();
+    // What the counted frames carried (for the tokenizer check): the bill counts tool calls too.
+    let mut tail = CloseTail::default();
     for chunk in parse_response(framed).unwrap_or_default() {
         if matches!(chunk, crate::serve::ServeChunk::Delta(_)) && tally.fragments() - before >= cap {
             continue;
         }
         tally.push_encoded(&chunk.encode());
-        if let crate::serve::ServeChunk::Delta(d) = chunk {
-            texts.push(d);
+        match chunk {
+            crate::serve::ServeChunk::Delta(d) => tail.texts.push(d),
+            crate::serve::ServeChunk::ToolCalls(calls) => tail.tool_calls.extend(calls),
+            _ => {}
         }
     }
-    texts
+    tail
+}
+
+/// The text fragments and tool calls a close brought back ([`absorb_close_reply`]).
+#[derive(Debug, Default)]
+struct CloseTail {
+    texts: Vec<String>,
+    tool_calls: Vec<crate::adapter::ToolCall>,
 }
 /// The most delivered text (in [`crate::serve::DeliveredText`] units, about bytes) one attempt
 /// reads before failing (round 8 G8-3): a flat bound on what a provider can make the gateway hold.
@@ -3566,10 +3575,9 @@ impl ConsumerNode {
                 let reply = node.net.proxy_forward_timeout(provider.libp2p_peer_id.clone(), close.clone(), SETTLE_TIMEOUT);
                 match reply.map(|r| FetchChunksResponse::decode(&r)) {
                     Ok(Ok(FetchChunksResponse::Chunks { framed, .. })) => {
-                        for d in absorb_close_reply(&mut tally, &framed, max_tokens) {
-                            if let Some(r) = recount.as_mut() {
-                                r.push(&d);
-                            }
+                        let tail = absorb_close_reply(&mut tally, &framed, max_tokens);
+                        if let Some(r) = recount.as_mut() {
+                            r.push_tail(tail);
                         }
                         break;
                     }
@@ -5268,11 +5276,6 @@ impl ConsumerNode {
     }
 }
 
-/// What a serve that billed `billed` tokens is paid, by the model's tokenizer (P7/W4), and whether
-/// it billed more than its delivered text holds. Counted before paying: a provider that billed more
-/// than the text it delivered can hold is paid what the text holds. Without a count (none possible,
-/// an error) it is paid what it billed, as before.
-#[allow(clippy::too_many_arguments)]
 /// How a recount went ([`ConsumerNode::recount`]).
 enum Recounted {
     /// Counted here and settled: `pay`, and whether the bill was over the count's bound.
@@ -5334,7 +5337,11 @@ impl RecountQueue {
                     st = self.ready.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            job();
+            // A job that panics loses its own recount, not the worker (second review 2026-10-19):
+            // with no workers left, every later bill would go unchecked.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                tracing::warn!("a queued recount failed; its serve wasn't settled");
+            }
         }
     }
 }
@@ -5367,6 +5374,15 @@ struct RecountInput {
 }
 
 impl RecountInput {
+    /// Add what a close brought back after the attempt ended: its text, and its tool calls, which
+    /// the bill counts too (a tool-call-only answer stopped early is otherwise judged on no text).
+    fn push_tail(&mut self, tail: CloseTail) {
+        for d in &tail.texts {
+            self.push(d);
+        }
+        self.tool_calls.extend(tail.tool_calls);
+    }
+
     /// Add text that arrived after the attempt ended (the frames a close brought back).
     fn push(&mut self, d: &str) {
         self.delivered.push(d);
@@ -5387,6 +5403,11 @@ impl RecountInput {
     }
 }
 
+/// What a serve that billed `billed` tokens is paid, by the model's tokenizer (P7/W4), and whether
+/// it billed more than its delivered text holds. Counted before paying: a provider that billed more
+/// than the text it delivered can hold is paid what the text holds. Without a count (none possible,
+/// an error) it is paid what it billed, as before.
+#[allow(clippy::too_many_arguments)]
 fn recount_pay(
     counter: &crate::token_count::Counter,
     text: String,
@@ -5545,13 +5566,39 @@ mod tests {
         let mut chunks: Vec<crate::serve::ServeChunk> =
             "hello world ".repeat(15).chars().map(|c| crate::serve::ServeChunk::Delta(c.to_string())).collect();
         chunks.push(crate::serve::ServeChunk::Done { tokens: 100_000, metrics: Default::default() });
-        for d in absorb_close_reply(&mut tally, &close_reply(&chunks), None) {
-            r.push(&d);
-        }
+        r.push_tail(absorb_close_reply(&mut tally, &close_reply(&chunks), None));
         let billed = tally.billable(None).min(ceiling);
         let (pay, over) = r.run(billed);
         assert!(over, "billed {billed}");
         assert_eq!(pay, crate::token_count::billable_by_count(40, 0, crate::serve::TOOL_CALL_TOKEN_ALLOWANCE));
+    }
+
+    /// Second review 2026-10-19: a stopped answer that is only a tool call, its call arriving with the
+    /// close, is judged with that call (the bill counts it), not as an empty answer.
+    #[test]
+    fn a_tool_call_the_close_brings_back_is_recounted_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut r, mut tally) = early_end(tiny_counter(dir.path()), &[]);
+        r.offered = ["get_weather".to_string()].into_iter().collect();
+        let call = crate::adapter::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: crate::adapter::ToolCallFunction {
+                name: "get_weather".into(),
+                arguments: r#"{"city":"Paris","units":"celsius","days":3}"#.into(),
+            },
+        };
+        let ceiling = tally.billable(None).saturating_add(close_tail_cap(None));
+        let chunks = vec![
+            crate::serve::ServeChunk::ToolCalls(vec![call]),
+            crate::serve::ServeChunk::Done { tokens: 30, metrics: Default::default() },
+        ];
+        r.push_tail(absorb_close_reply(&mut tally, &close_reply(&chunks), None));
+        let billed = tally.billable(None).min(ceiling);
+        assert!(billed > 16, "billed {billed}: more than an empty answer may be");
+        let (pay, over) = r.run(billed);
+        assert!(!over, "an honest tool call isn't an over-bill");
+        assert_eq!(pay, billed);
     }
 
     /// Review 2026-10-14 M7: with every counter busy, a bill is checked late, not skipped.
