@@ -293,8 +293,9 @@ jobs:
           find "$B" -name "*.AppImage" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.msi" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*setup*.exe" -exec cp {} dist/ \; 2>/dev/null || true
-          # Updater artifacts (createUpdaterArtifacts) + their .sig signatures.
-          find "$B" -name "*.tar.gz" -exec cp {} dist/ \; 2>/dev/null || true
+          # Updater artifacts (createUpdaterArtifacts) + their .sig signatures. Only the app archive:
+          # the bundler's other tarballs (the deb's staging) aren't release files.
+          find "$B" -name "*.app.tar.gz" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.nsis.zip" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.msi.zip" -exec cp {} dist/ \; 2>/dev/null || true
           find "$B" -name "*.sig" -exec cp {} dist/ \; 2>/dev/null || true
@@ -306,6 +307,63 @@ jobs:
         with:
           name: openhydra-${{ matrix.triple }}
           path: dist/*
+          retention-days: 7
+
+  # The CLI files' checksums, one SHA256SUMS-<triple> per platform (a re-run that publishes one more
+  # platform adds its file, never rewrites one already published), signed with the CLI release key
+  # (minisign) when the MINISIGN_SECRET_KEY secret is set. install.sh checks every file against them.
+  # A job of its own: the key is in scope here only, never in a build or the publish.
+  checksums:
+    needs: desktop
+    if: always() && !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04 # minisign is packaged from 24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true # no artifacts at all → nothing to sum (the publish reports it)
+        with:
+          path: artifacts
+          pattern: openhydra-*
+          merge-multiple: true
+
+      - name: Write and sign SHA256SUMS
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          mkdir -p sums
+          V="${INPUT_VERSION:-$GITHUB_REF_NAME}"; V="${V#v}"
+          for t in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            files=()
+            for f in "openhydra-agent-$t" "openhydra-agent-$t.exe" "openhydra-scorer-$t" "openhydra-scorer-$t.exe" \
+                     "openhydra-mlx-scorer-$t" "THIRD_PARTY_NOTICES-$t.txt"; do
+              [ -f "artifacts/$f" ] && files+=("$f")
+            done
+            [ ${#files[@]} -eq 0 ] && continue
+            (cd artifacts && sha256sum "${files[@]}") > "sums/SHA256SUMS-$t"
+            echo "SHA256SUMS-$t:"; cat "sums/SHA256SUMS-$t"
+          done
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY is not set → the checksums are published unsigned"
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/cli.key"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"; chmod 600 "$key"
+          for f in sums/SHA256SUMS-*; do
+            # An encrypted key reads its password from stdin; an unencrypted one ignores it.
+            printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s "$key" -m "$f" -t "OpenHydra $V $(basename "$f")"
+          done
+          ls -la sums/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: checksums
+          path: sums/*
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Publish the platforms that built to Cloudflare R2 + write latest.json, then the GitHub Release.
   # Runs even when a platform's build failed (`always()`): the others still ship, and the failed
@@ -313,13 +371,14 @@ jobs:
   # missing files, and GitHub and R2 never disagree about what was released). Missing platforms are
   # flagged in the run summary.
   publish-r2:
-    needs: desktop
+    needs: [desktop, checksums]
     permissions:
       contents: write # the GitHub Release
     outputs:
       skip_latest: ${{ steps.tree.outputs.skip_latest }}
     # A tag push publishes; a manual run only when asked (publish=true), whatever ref it starts from.
-    if: always() && !cancelled() && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    # Never without the checksums: install.sh refuses a release from 0.3.22 on that has none.
+    if: always() && !cancelled() && needs.checksums.result == 'success' && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-22.04
     # One publish at a time: each reads the published manifests and writes them back merged.
     concurrency:
@@ -470,6 +529,7 @@ jobs:
             (re.compile(r'^openhydra-scorer-[a-z0-9_-]+(\.exe)?$'),        None),
             (re.compile(r'^openhydra-mlx-scorer-aarch64-apple-darwin$'),   None),
             (re.compile(r'^THIRD_PARTY_NOTICES-[a-z0-9_-]+\.txt$'),        None),
+            (re.compile(r'^SHA256SUMS-[a-z0-9_-]+(\.minisig)?$'),          None),
             (re.compile(r'\.dmg$'),                        'OpenHydra-macos-arm64.dmg'),
             (re.compile(r'x64-setup\.exe$'),               'OpenHydra-windows-x64-setup.exe'),
             (re.compile(r'\.msi$'),                        'OpenHydra-windows-x64.msi'),

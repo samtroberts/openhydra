@@ -68,3 +68,4 @@ jobs:
           name: openhydra-bootstrap-linux-x86_64
           # upload-artifact paths are repo-root-relative (working-directory doesn't apply).
           path: target/release/openhydra-bootstrap
+          retention-days: 7
