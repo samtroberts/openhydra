@@ -130,6 +130,8 @@ pub fn start_node(
         info!("none of the bootstraps is OpenHydra's: using them as relays, not OpenHydra's (pass --public-relays on to use OpenHydra's relays too)");
     }
     let enable_peer_relay = config.enable_peer_relay; // WS-F F-4 (captured into the thread)
+    // A private deployment never connects to OpenHydra's own peers, however it hears of them.
+    let fence_openhydra = config.public_relays == crate::relay::PublicRelays::Off;
     // The relays this node reserves on and dials others through: its bootstraps, plus the
     // production relays on the public network (see `PublicRelays`).
     let relays = crate::relay::relay_addrs(&bootstrap_peers, config.public_relays);
@@ -183,6 +185,7 @@ pub fn start_node(
                     bootstrap_peers,
                     protocol_version: "openhydra/0.1.0".into(),
                     enable_peer_relay,
+                    fence_openhydra,
                 };
 
                 let keypair_for_loop = identity.keypair.clone();

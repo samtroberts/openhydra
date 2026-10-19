@@ -15,7 +15,7 @@ pub const OUTBOUND_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// away (adversarial review 2026-10-14, H2). libp2p's own `SwarmBuilder` sets 10 s for both.
 pub const INBOUND_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
-type BoxedTransport = libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>;
+pub type BoxedTransport = libp2p::core::transport::Boxed<(libp2p::PeerId, libp2p::core::muxing::StreamMuxerBox)>;
 
 /// `transport` with time limits on setting up a connection, outgoing and incoming. Every swarm's
 /// transport goes through this (it doesn't use libp2p's `SwarmBuilder`, which adds them itself).

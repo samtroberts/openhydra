@@ -15,6 +15,7 @@ pub mod proto {
 }
 pub mod dht;
 pub mod event_loop;
+pub mod fence;
 pub mod identity;
 pub mod ip_limits;
 pub mod mdns;

@@ -33,6 +33,9 @@ pub struct SwarmOptions {
     /// for NATted peers. Off by default — only publicly-reachable nodes that
     /// explicitly opt in should enable it.
     pub enable_peer_relay: bool,
+    /// A private deployment (`--public-relays off`): never connect to OpenHydra's own bootstraps and
+    /// relays, however the node hears of them ([`crate::fence`]).
+    pub fence_openhydra: bool,
 }
 
 impl Default for SwarmOptions {
@@ -49,6 +52,7 @@ impl Default for SwarmOptions {
             bootstrap_peers: Vec::new(),
             protocol_version: "openhydra/0.1.0".to_string(),
             enable_peer_relay: false,
+            fence_openhydra: false,
         }
     }
 }
@@ -332,6 +336,7 @@ pub fn build_swarm(
 
     let behaviour = OpenHydraBehaviour {
         ip_limits: crate::ip_limits::Behaviour::new(crate::ip_limits::IpLimitsConfig::PEER),
+        fence: crate::fence::Behaviour::new(opts.fence_openhydra.then(crate::fence::Fenced::openhydra)),
         connection_limits: libp2p::connection_limits::Behaviour::new(crate::behaviour::peer_connection_limits()),
         kademlia,
         relay_client,
@@ -356,6 +361,11 @@ pub fn build_swarm(
     let swarm_config = SwarmConfig::with_tokio_executor()
         .with_idle_connection_timeout(Duration::from_secs(300));
 
+    let combined_transport = if opts.fence_openhydra {
+        crate::fence::FenceTransport::new(combined_transport, crate::fence::Fenced::openhydra()).boxed()
+    } else {
+        combined_transport
+    };
     let combined_transport = crate::transport::with_setup_timeouts(
         combined_transport,
         crate::transport::OUTBOUND_SETUP_TIMEOUT,

@@ -48,6 +48,8 @@ pub struct OpenHydraBehaviour {
     /// Bounds on the incoming connections one network address can make us hold (first: a refused
     /// connection costs nothing further).
     pub ip_limits: crate::ip_limits::Behaviour,
+    /// A private deployment refuses OpenHydra's own bootstraps and relays ([`crate::fence`]).
+    pub fence: crate::fence::Behaviour,
     /// Bounds on the connections other nodes can make us hold ([`peer_connection_limits`]).
     pub connection_limits: libp2p::connection_limits::Behaviour,
     /// Kademlia DHT for peer discovery.

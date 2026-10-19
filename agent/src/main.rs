@@ -775,9 +775,11 @@ struct ServeArgs {
     no_tokenizer_downloads: bool,
 
     /// Where to fetch the signed tokenizer index from (checked daily; HTTPS, or http:// to
-    /// localhost). `off` keeps the copy built into this binary (and the last one fetched).
-    #[arg(long = "tokenizer-index-url", default_value = openhydra_agent::tokenizer_index::DEFAULT_INDEX_URL)]
-    tokenizer_index_url: String,
+    /// localhost). `off` keeps the copy built into this binary (and the last one fetched). Default:
+    /// OpenHydra's (dl.openhydra.co), or `off` with `--public-relays off` (a private deployment
+    /// contacts nothing of OpenHydra's).
+    #[arg(long = "tokenizer-index-url")]
+    tokenizer_index_url: Option<String>,
 
     /// Hugging Face base URL tokenizers are downloaded from (a mirror; HTTPS, or http:// to localhost).
     #[arg(long = "tokenizer-hf-base", default_value = openhydra_agent::hf_tokenizer::HF_BASE, hide = true)]
@@ -1108,6 +1110,7 @@ fn run() -> Result<(), String> {
     };
     let status_bind = cli.node.status_bind.clone();
     let config = cli.node.into_config();
+    let private_deployment = config.public_relays == openhydra_network::relay::PublicRelays::Off;
     // Start the swarm first; both roles need the live node.
     let net = NetworkHandle::start(config)?;
     eprintln!(
@@ -1150,7 +1153,13 @@ fn run() -> Result<(), String> {
 
     match role {
         Role::Provide(args) => provide(net, stats, economy, args),
-        Role::Serve(args) => serve(net, stats, economy, args),
+        Role::Serve(mut args) => {
+            // A private deployment fetches no index from OpenHydra unless told where to.
+            if args.tokenizer_index_url.is_none() && private_deployment {
+                args.tokenizer_index_url = Some("off".into());
+            }
+            serve(net, stats, economy, args)
+        }
         _ => unreachable!("no-swarm roles handled before the swarm starts"),
     }
 }
@@ -1684,7 +1693,8 @@ fn serve(
     // gateway reads it again from the same environment).
     let peg = std::env::var("OPENHYDRA_USDC_MICROS_PER_CREDIT").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     settlement_chain_for(peg, true)?;
-    let hf_tokenizers = hf_tokenizers(&args.tokenizer_index_url, &args.tokenizer_hf_base, !args.no_tokenizer_downloads)?;
+    let index_url = args.tokenizer_index_url.as_deref().unwrap_or(openhydra_agent::tokenizer_index::DEFAULT_INDEX_URL);
+    let hf_tokenizers = hf_tokenizers(index_url, &args.tokenizer_hf_base, !args.no_tokenizer_downloads)?;
     // Track A2-Logprob reference sets (opt-in). A bad file is a startup error, not a silent skip.
     let mut logprob_refs = Vec::new();
     for path in &args.logprob_reference {
