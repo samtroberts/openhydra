@@ -41,9 +41,8 @@ BIN_NAME="openhydra"
 # The first release published with SHA256SUMS: from it on, a release without them is refused (so
 # deleting the checksums can't turn the check off).
 SUMS_SINCE="0.3.22"
-# The CLI release key (minisign) the checksums are signed with. Empty until the key exists: then only
-# the checksums are checked.
-MINISIGN_PUBKEY=""
+# The CLI release key (minisign) the checksums are signed with, from 0.3.22 on.
+MINISIGN_PUBKEY="RWT1WCE7c96xPsN2V6HZHspfB29Ucvh6rePhj+Y6bmCSzl54zcIGVMn0"
 
 info() { printf '  %s\n' "$*"; }
 err()  { printf 'error: %s\n' "$*" >&2; exit 1; }

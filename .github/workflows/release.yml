@@ -325,17 +325,19 @@ jobs:
           pattern: openhydra-*
           merge-multiple: true
 
-      # Only a publish is signed: a dry run's checksums (a dev build's, from any ref) never carry the
-      # release key's signature. Installed in a step of its own, without the key in scope.
+      # Only a publish signs the checksums: a dry run's (a dev build's, from any ref) never carry the
+      # release key's signature; a dry run signs a scratch file instead and throws it away, so the key,
+      # its password and minisign are known to work before a release needs them. Installed in a step
+      # of its own, without the key in scope.
       - name: Install minisign
-        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish
         run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign
 
       - name: Write and sign SHA256SUMS
         shell: bash
         env:
-          MINISIGN_SECRET_KEY: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish) && secrets.MINISIGN_SECRET_KEY || '' }}
-          MINISIGN_PASSWORD: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish) && secrets.MINISIGN_PASSWORD || '' }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          PUBLISHING: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || inputs.publish }}
           INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
         run: |
           mkdir -p sums
@@ -351,15 +353,23 @@ jobs:
             echo "SHA256SUMS-$t:"; cat "sums/SHA256SUMS-$t"
           done
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            echo "::warning::not signed (a dry run, or MINISIGN_SECRET_KEY isn't set)"
+            echo "::warning::MINISIGN_SECRET_KEY isn't set → the checksums are published unsigned"
             exit 0
           fi
           key="$RUNNER_TEMP/cli.key"
-          trap 'rm -f "$key"' EXIT
+          scratch="$RUNNER_TEMP/signing-self-test"
+          trap 'rm -f "$key" "$scratch" "$scratch.minisig"' EXIT
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"; chmod 600 "$key"
+          # An encrypted key reads its password from stdin; an unencrypted one ignores it.
+          sign() { printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s "$key" -m "$1" -t "$2"; }
+          if [ "$PUBLISHING" != "true" ]; then
+            echo "not a release: signing self-test only" > "$scratch"
+            sign "$scratch" "OpenHydra signing self-test, not a release"
+            echo "dry run: the key signs (self-test); the checksums are left unsigned"
+            exit 0
+          fi
           for f in sums/SHA256SUMS-*; do
-            # An encrypted key reads its password from stdin; an unencrypted one ignores it.
-            printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s "$key" -m "$f" -t "OpenHydra $V $(basename "$f")"
+            sign "$f" "OpenHydra $V $(basename "$f")"
           done
           ls -la sums/
 
