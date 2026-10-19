@@ -23,6 +23,7 @@ import { coachShow, maybeStartTour } from "./coach";
 import { renderActivity } from "./activity";
 import { renderSettings, updateEngineEndpoint, pendingSettings, engineEndpointValue } from "./settings";
 import { tokenizerDownloadsKey } from "./netmode.js";
+import { wireSwitches } from "./switches.js";
 import { rttSamples, tpsSamples, pushSample } from "./telemetry";
 import { on, emit } from "./bus";
 import { cliState, refreshCliStatus, installCli } from "./cliui";
@@ -658,6 +659,7 @@ $$("[data-sw]").forEach((sw) => {
     if (key) saveSetting({ [key]: on });
   };
 });
+wireSwitches(document); // keyboard and screen reader (L17)
 $("#minauthsel")?.addEventListener("change", (e) => saveSetting({ min_authenticity: e.target.value }));
 // Text fields: Enter commits single-line fields; blur saves when the value changed.
 function wireTextSetting(el, { multiline = false, read, key, valid, skip }) {

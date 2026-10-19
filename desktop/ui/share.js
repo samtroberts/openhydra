@@ -1,6 +1,7 @@
 // Share view (provider role) + the per-model share allowlist + the sharing/gateway lifecycle.
 // setSharing / ensureGateway signal the controller via the bus (emit "nav"/"refresh") instead of
 // importing its go()/refresh() (which would cycle). renderShare is the view-dispatcher entry.
+import { syncSwitch } from "./switches";
 import { $, $$ } from "./dom";
 import { html, setHTML } from "./html";
 import { state, snap, engines } from "./state";
@@ -443,8 +444,10 @@ import { exportCardModal, ensureImportSection } from "./cards";
       const someShared = allActive.some((m) => isModelShared(m));
       sasw.classList.toggle("on", masterOn);
       sasw.classList.toggle("indeterminate", !masterOn && someShared);
-      sasw.setAttribute("role", "switch");
-      sasw.setAttribute("aria-checked", masterOn ? "true" : someShared ? "mixed" : "false");
+      // Three states, so a checkbox to a screen reader (syncSwitch); the observer would catch the class
+      // change too, but not before a screen reader reads the old state.
+      sasw.setAttribute("data-tristate", "");
+      syncSwitch(sasw);
       sasw.title = masterOn
         ? "Sharing every model, including ones you add later — click to keep only your current selection"
         : someShared
