@@ -1675,7 +1675,18 @@ fn deliver_card(app: &tauri::AppHandle, text: String) {
         }
     }
     let _ = app.emit("card-opened", text);
+    show_main_window(app);
+}
+
+/// Bring the main window back: closing it only hides it (sharing keeps running), so whatever
+/// should show the app — the Dock icon, opening the app again, a card, the tray — shows it,
+/// restores it if minimised, and focuses it. Focusing alone left a hidden window hidden.
+fn show_main_window<R: tauri::Runtime>(app: &impl tauri::Manager<R>) {
     if let Some(w) = app.get_webview_window("main") {
+        if w.is_minimized().unwrap_or(false) {
+            let _ = w.unminimize();
+        }
+        let _ = w.show();
         let _ = w.set_focus();
     }
 }
@@ -3296,9 +3307,7 @@ fn main() {
         // URL into `on_open_url`) instead of opening a duplicate window. On macOS the OS delivers to
         // the running app directly; here we just focus it.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_focus();
-            }
+            show_main_window(app);
             // Win/Linux: a second launch by a `.openhydra` file (or an `openhydra:` link the plugin
             // didn't already forward to on_open_url) carries it in argv. macOS: no-op.
             deliver_card_from_args(app, argv);
@@ -3474,12 +3483,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
+                    "open" => show_main_window(app),
                     // Sharing = start/stop the provider role, same as the in-app toggle. Rebuild the
                     // menu right away so the checkmark reflects the new state.
                     "sharing" => {
@@ -3499,10 +3503,7 @@ fn main() {
                         } else if let Err(e) = if nothing_chosen { Err(NOT_CONFIRMED.to_string()) } else { start_provider_now(app.state()) } {
                             if e == NOT_CONFIRMED {
                                 // Ask in the app: show the window on the Share dialog.
-                                if let Some(w) = app.get_webview_window("main") {
-                                    let _ = w.show();
-                                    let _ = w.set_focus();
-                                }
+                                show_main_window(app);
                                 let _ = app.emit("open-share-dialog", ());
                             } else {
                                 eprintln!("tray: start provider failed: {e}");
@@ -3565,6 +3566,14 @@ fn main() {
         .expect("error building OpenHydra app")
         .run(|app, event| match event {
             tauri::RunEvent::Exit => kill_all(&app.state::<AppState>()),
+            // macOS: clicking the Dock icon (or reopening the app) while its window is hidden or
+            // minimised. Without this the click did nothing until the tray's Open.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { has_visible_windows, .. } => {
+                if !has_visible_windows {
+                    show_main_window(app);
+                }
+            }
             // M2.1: a `.openhydra` file was opened (fileAssociations → `file:` URL). `openhydra:`
             // scheme URLs are handled by the deep-link plugin above, so only take `file:` here.
             // `RunEvent::Opened` exists only on macOS/iOS (Win/Linux deliver file opens via argv —
@@ -3586,6 +3595,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every screen was checked at 900×600 (2026-10-19): below it Share and Engines overflow.
+    #[test]
+    fn the_window_cant_shrink_below_the_size_every_screen_fits() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let w = &conf["app"]["windows"][0];
+        let n = |k: &str| w[k].as_u64().unwrap_or_else(|| panic!("{k} missing"));
+        assert!(n("minWidth") >= 900 && n("minHeight") >= 600, "minimum {}×{}", n("minWidth"), n("minHeight"));
+        assert!(n("width") >= n("minWidth") && n("height") >= n("minHeight"), "the default fits the minimum");
+    }
 
     #[test]
     fn a_failed_agent_command_shows_only_its_reason() {
