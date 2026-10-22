@@ -54,6 +54,8 @@ pub const MAX_LIST_BYTES: usize = 256 << 10;
 pub const MAX_SEEDS: usize = 256;
 /// The longest label.
 pub const MAX_LABEL_CHARS: usize = 64;
+/// The most models one seed may list.
+pub const MAX_MODELS_PER_SEED: usize = 32;
 
 /// One provider OpenHydra runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +65,12 @@ pub struct Seed {
     pub public_key: String,
     /// What it is, for logs and the app ("OpenHydra seed, us-east-1").
     pub label: String,
+    /// The models it serves, as it announces them (`qwen3:8b`). A gateway asks the bootstraps for
+    /// these as soon as it starts, so a new user has them in the list within seconds instead of after
+    /// the next round of announcements (~30–60 s). Not a promise: only what's actually announced is
+    /// used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// The list's signed content.
@@ -115,6 +123,12 @@ impl SeedList {
             if !seen.insert(s.public_key.as_str()) {
                 return Err(format!("seed {} listed twice", s.public_key));
             }
+            if s.models.len() > MAX_MODELS_PER_SEED {
+                return Err(format!("seed {} lists more than {MAX_MODELS_PER_SEED} models", s.public_key));
+            }
+            if let Some(m) = s.models.iter().find(|m| !openhydra_protocol::model_id::is_valid_model_id(m)) {
+                return Err(format!("seed {} lists an invalid model name {m:?}", s.public_key));
+            }
         }
         Ok(())
     }
@@ -124,11 +138,20 @@ impl SeedList {
         self.seeds.iter().map(|s| s.public_key.clone()).collect()
     }
 
-    /// Add `seed` (registry tooling), replacing the label of one already listed.
+    /// The models the seeds list, each once, sorted.
+    pub fn models(&self) -> Vec<String> {
+        let set: std::collections::BTreeSet<&str> = self.seeds.iter().flat_map(|s| s.models.iter().map(String::as_str)).collect();
+        set.into_iter().map(str::to_string).collect()
+    }
+
+    /// Add `seed` (registry tooling), replacing the label and models of one already listed.
     pub fn upsert(&mut self, seed: Seed) -> Result<(), String> {
-        let seed = Seed { public_key: seed.public_key.trim().to_ascii_lowercase(), label: seed.label.trim().to_string() };
+        let mut models: Vec<String> = seed.models.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect();
+        models.sort();
+        models.dedup();
+        let seed = Seed { public_key: seed.public_key.trim().to_ascii_lowercase(), label: seed.label.trim().to_string(), models };
         match self.seeds.iter_mut().find(|s| s.public_key == seed.public_key) {
-            Some(s) => s.label = seed.label,
+            Some(s) => *s = seed,
             None => self.seeds.push(seed),
         }
         self.validate()
@@ -305,7 +328,7 @@ mod tests {
     }
 
     fn seed(n: u8, label: &str) -> Seed {
-        Seed { public_key: hex::encode(SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes()), label: label.into() }
+        Seed { public_key: hex::encode(SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes()), label: label.into(), models: vec![] }
     }
 
     fn list(seq: u64, seeds: Vec<Seed>) -> SeedList {
@@ -352,16 +375,22 @@ mod tests {
     fn seeds_are_checked() {
         assert!(list(1, vec![seed(1, "a"), seed(2, "b")]).validate().is_ok());
         assert!(list(1, vec![seed(1, "a"), seed(1, "b")]).validate().is_err(), "twice");
-        assert!(list(1, vec![Seed { public_key: "AB".repeat(32), label: "a".into() }]).validate().is_err(), "upper case");
-        assert!(list(1, vec![Seed { public_key: "ab".into(), label: "a".into() }]).validate().is_err(), "short");
+        assert!(list(1, vec![Seed { public_key: "AB".repeat(32), label: "a".into(), models: vec![] }]).validate().is_err(), "upper case");
+        assert!(list(1, vec![Seed { public_key: "ab".into(), label: "a".into(), models: vec![] }]).validate().is_err(), "short");
         assert!(list(1, vec![seed(1, &"x".repeat(MAX_LABEL_CHARS + 1))]).validate().is_err());
         assert!(list(1, vec![seed(1, "a\nb")]).validate().is_err());
         assert!(SeedList { format: 2, ..list(1, vec![]) }.validate().is_err());
         let mut l = list(1, vec![]);
         let s = seed(3, "first");
-        l.upsert(Seed { public_key: s.public_key.to_uppercase(), label: " first ".into() }).unwrap();
-        l.upsert(Seed { public_key: s.public_key.clone(), label: "renamed".into() }).unwrap();
-        assert_eq!(l.seeds, vec![Seed { public_key: s.public_key.clone(), label: "renamed".into() }]);
+        l.upsert(Seed { public_key: s.public_key.to_uppercase(), label: " first ".into(), models: vec![] }).unwrap();
+        l.upsert(Seed { public_key: s.public_key.clone(), label: "renamed".into(), models: vec!["qwen3:8b".into(), " qwen3:8b ".into()] }).unwrap();
+        assert_eq!(l.seeds, vec![Seed { public_key: s.public_key.clone(), label: "renamed".into(), models: vec!["qwen3:8b".into()] }]);
+        assert_eq!(l.models(), vec!["qwen3:8b".to_string()]);
+        let mut bad = list(1, vec![seed(4, "b")]);
+        bad.seeds[0].models = vec!["/home/me/model.gguf".into()];
+        assert!(bad.validate().is_err(), "a path is not a model name");
+        bad.seeds[0].models = (0..=MAX_MODELS_PER_SEED).map(|i| format!("m{i}")).collect();
+        assert!(bad.validate().is_err());
         assert!(l.remove(&s.public_key.to_uppercase()));
         assert!(!l.remove(&s.public_key));
     }

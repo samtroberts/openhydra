@@ -2239,6 +2239,28 @@ impl ConsumerNode {
         self.seeds.as_ref().map(|s| s.current().public_keys()).unwrap_or_default()
     }
 
+    /// The models the current seed list names.
+    pub fn seed_models(&self) -> Vec<String> {
+        self.seeds.as_ref().map(|s| s.current().models()).unwrap_or_default()
+    }
+
+    /// Ask the bootstraps' registries for the seed models this node doesn't know yet, so they're
+    /// listed, and `openhydra/auto` can pick them, without waiting for the next round of provider
+    /// announcements (a fresh node otherwise lists nothing for ~30–60 s). Returns how many of the
+    /// seed models are known afterwards. Best effort: a failed query just leaves a model missing.
+    /// Blocking (swarm round trips): call it off the async runtime.
+    pub fn warm_seed_models(&self) -> usize {
+        let wanted = self.seed_models();
+        if wanted.is_empty() {
+            return 0;
+        }
+        let known: std::collections::HashSet<String> = self.net.known_models().unwrap_or_default().into_iter().collect();
+        wanted
+            .iter()
+            .filter(|m| known.contains(*m) || self.net.query_registry(m.as_str()).is_ok_and(|found| !found.is_empty()))
+            .count()
+    }
+
     /// M4-base: attach our swarm membership credential store, so `serve_once` presents a credential to
     /// reach a provider's private model (builder form). `None` leaves private routing off.
     pub fn with_credentials(mut self, creds: Option<Arc<crate::swarms::CredentialStore>>) -> Self {

@@ -109,6 +109,9 @@ struct SeedsAddArgs {
     /// What it is ("OpenHydra seed, us-east-1").
     #[arg(long)]
     label: String,
+    /// A model it serves, as it announces it (repeatable): gateways ask for these first.
+    #[arg(long = "model")]
+    models: Vec<String>,
 }
 
 #[derive(Args)]
@@ -486,7 +489,7 @@ fn seeds(action: SeedsAction) -> Result<(), String> {
                 (None, None) => unreachable!("clap requires one"),
             };
             let mut list = read_working_seeds(&a.file.file)?;
-            list.upsert(seed_list::Seed { public_key, label: a.label })?;
+            list.upsert(seed_list::Seed { public_key, label: a.label, models: a.models })?;
             write_json(&a.file.file, &serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?)?;
             eprintln!("registry: {} seed(s) in {}", list.seeds.len(), a.file.file.display());
             Ok(())

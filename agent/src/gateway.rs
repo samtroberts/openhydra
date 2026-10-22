@@ -607,7 +607,20 @@ async fn resolve_model(
     let candidates = tokio::task::spawn_blocking(move || node.auto_candidates(min_authenticity))
         .await
         .map_err(|_| "model resolution failed".to_string())??;
-    match pick_auto(&candidates, preferred.as_deref(), needs) {
+    let mut picked = pick_auto(&candidates, preferred.as_deref(), needs);
+    // Nothing trusted yet (a node that just started hasn't heard the announcements): ask the
+    // bootstraps for the seed models once, then pick again.
+    if picked.is_err() && !state.node.seed_models().is_empty() {
+        let node = state.node.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            node.warm_seed_models();
+            node.auto_candidates(min_authenticity)
+        })
+        .await
+        .map_err(|_| "model resolution failed".to_string())??;
+        picked = pick_auto(&candidates, preferred.as_deref(), needs);
+    }
+    match picked {
         Ok((model, step)) => Ok((model, Route::Auto(step, needs))),
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
         Err(AutoMiss::TooSmallForTools(small)) => Err(too_small_for_tools_message(&small)),
@@ -2392,6 +2405,22 @@ pub fn router(
     // D2: the buyer's floor for every request (a request can raise it, see MIN_AUTHENTICITY_HEADER).
     let node = node.with_assurance_policy(assurance);
     let node = Arc::new(node);
+    // SL1: a new user's model list and first "Best available" shouldn't wait ~30–60 s for provider
+    // announcements: ask the bootstraps for the seed models every few seconds for the first two
+    // minutes, until they're all known (the seed list itself may still be on its way).
+    {
+        let node = Arc::clone(&node);
+        std::thread::spawn(move || {
+            for _ in 0..24 {
+                std::thread::sleep(Duration::from_secs(5));
+                let wanted = node.seed_models().len();
+                if wanted > 0 && node.warm_seed_models() >= wanted {
+                    tracing::info!(models = wanted, "seed models listed");
+                    break;
+                }
+            }
+        });
+    }
     // Publish the consumer's give-to-get view (earned reputation of providers we've used +
     // give-side credit balances) to the status endpoint every 2s. A plain std thread: the
     // reads are sync mutex snapshots, so it never touches the tokio runtime.
