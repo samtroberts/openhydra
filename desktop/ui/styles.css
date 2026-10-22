@@ -211,6 +211,9 @@
   .md hr{border:none;border-top:1px solid hsl(var(--border));margin:10px 0}
   .msgmeta{display:flex;flex-wrap:wrap;gap:5px 12px;align-items:center;font-size:10.5px;color:hsl(var(--muted-foreground));margin-top:8px}
   .msgmeta .num{font-family:var(--mono)}
+  /* SL3: the numbers under an answer show on hover; kept in the layout (and for screen readers), only faded out. */
+  .msgmeta .det{opacity:0;transition:opacity .15s}
+  .msg:hover .msgmeta .det,.msgmeta:focus-within .det{opacity:1}
   /* fenced code blocks in chat replies (parseFences + hl() in text.js) */
   .code-card{margin:8px 0;border:1px solid hsl(var(--border));border-radius:8px;background:hsl(var(--muted)/.5);overflow:hidden}
   .code-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 6px 5px 11px;border-bottom:1px solid hsl(var(--border));background:hsl(var(--muted)/.55)}

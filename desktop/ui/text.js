@@ -1,7 +1,7 @@
 // Reply rendering helpers: syntax highlight, fenced-code split, inline media, reasoning split,
 // metadata row. Pure (build DOM / return html`` markup); no app state.
-import { html } from "./html";
-import { tierBadge } from "./format";
+import { html } from "./html.js";
+import { tierBadge } from "./format.js";
 
 // #3/#4: classify a markdown media src as image | video | audio, "" if it isn't media (it then
 // stays as text). Only inline `data:` media counts: answers come from network providers, and a
@@ -41,7 +41,18 @@ const KW = new Set("fn let mut pub use impl struct enum trait match if else for 
 export function hl(code) { const out = []; let i = 0; const push = (c, s) => out.push(c ? html`<span class="${c}">${s}</span>` : s); while (i < code.length) { const rest = code.slice(i); let m; if ((m = rest.match(/^(\/\/|#(?!\[)|--)[^\n]*/))) push("tk-com", m[0]); else if ((m = rest.match(/^\/\*[\s\S]*?\*\//))) push("tk-com", m[0]); else if ((m = rest.match(/^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/))) push("tk-str", m[0]); else if ((m = rest.match(/^\b\d[\d_]*(\.\d+)?\b/))) push("tk-num", m[0]); else if ((m = rest.match(/^[A-Za-z_]\w*/))) { if (KW.has(m[0])) push("tk-kw", m[0]); else if (code[i + m[0].length] === "(") push("tk-fn", m[0]); else push(null, m[0]); } else { push(null, code[i]); i++; continue; } i += m[0].length; } return html`${out}`; }
 // Fenced code is split out by the markdown module's parser (tested there).
 export { parseFences } from "./markdown.js";
-export function metaRow(m) { if (m.stopped) return html`<div class="msgmeta"><span>${m.model}</span><span>${m.stopped === true ? "stopped" : m.stopped}</span><span>${m.at}</span></div>`; return html`<div class="msgmeta"><span>${m.model}</span><span class="num">${m.tok} tok</span>${m.claimed != null ? html`<span class="num" title="The provider billed more tokens than its answer holds; your gateway pays only what was delivered">provider claimed ${m.claimed}</span>` : ""}<span class="num" title="Engine generation speed — decode tokens per second, measured on the provider">${m.tps} tok/s</span><span class="num">${m.rtt} ms RTT</span>${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${m.stopped ? html`<span>stopped</span>` : ""}<span>${m.at}</span></div>`; }
+// Under an answer (SL3): the model, the time and the provider's trust; the numbers (tokens, speed,
+// network time) appear on hover, and a value that's missing isn't shown at all. A corrected bill is
+// always shown, in words.
+export function metaRow(m) {
+  if (m.stopped) return html`<div class="msgmeta"><span>${m.model}</span><span>${m.stopped === true ? "stopped" : m.stopped}</span><span>${m.at}</span></div>`;
+  const known = (v) => v != null && v !== "" && v !== "—";
+  const details = [known(m.tok) && `${m.tok} tokens`, known(m.tps) && `${m.tps} tok/s`, known(m.rtt) && `${m.rtt} ms network`].filter(Boolean).join(" · ");
+  const charged = m.claimed != null && known(m.tok)
+    ? html`<span class="num" title="The provider billed more tokens than its answer holds; your gateway pays only what was delivered">Charged ${m.tok} tokens (provider asked for ${m.claimed}, corrected)</span>`
+    : "";
+  return html`<div class="msgmeta"><span>${m.model}</span>${known(m.at) ? html`<span>${m.at}</span>` : ""}${m.tier ? html`<span title="How far your gateway has verified the provider that answered">${tierBadge(m.tier)}</span>` : ""}${charged}${details ? html`<span class="num det">${details}</span>` : ""}</div>`;
+}
 // Reasoning models (Qwen3, DeepSeek-R1, …) emit a chain-of-thought. Some inline it as
 // <think>…</think> inside content; some engines (LM Studio serving MLX) strip it and hand
 // back an EMPTY content. Split any inline thinking out of the answer so the chat shows the

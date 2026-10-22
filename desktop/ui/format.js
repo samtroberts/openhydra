@@ -1,5 +1,5 @@
 // Pure formatters + model-family badge. No app state.
-import { html } from "./html";
+import { html } from "./html.js";
 
 // ── model family badge ──
 const FAMILY = [[/qwen/i, "qwen"], [/llama|tinyllama/i, "llama"], [/gemma/i, "gemma"], [/mi(s|x)tral/i, "mistral"], [/phi/i, "phi"], [/deepseek/i, "deepseek"], [/flux|sdxl|stable/i, "flux"], [/nomic|embed/i, "nomic"]];
@@ -11,11 +11,12 @@ export function fmtUptime(s) { if (s == null) return "—"; s = Math.floor(s); i
 export function repBadge(v) { if (v == null) return html`<span class="mut">—</span>`; v = Math.round(v); const cls = v >= 66 ? "ok" : v >= 40 ? "warn" : "secondary"; return html`<span class="badge ${cls}">${v}</span>`; }
 // Authenticity tiers in plain language, from the agent's label (e.g. "A1-reputation-redundant").
 // A missing or unrecognised label reads as not verified: no track record with this gateway yet.
+// One word or two, the same everywhere in the app (SL3): New, Trusted, Verified model, Verified hardware.
 const TIERS = {
-  A0: ["Not verified yet", "secondary", "No track record with your gateway yet: every provider starts here."],
-  A1: ["Track record", "ok", "Agreed with other providers when your gateway checked it, and has built a reputation with you."],
-  A2: ["Model checked", "ok", "Also passed a check that it runs the model it names."],
-  A3: ["Hardware attested", "ok", "Its hardware attested to the model it runs."],
+  A0: ["New", "secondary", "No track record with your gateway yet: every provider starts here."],
+  A1: ["Trusted", "ok", "Agreed with other providers when your gateway checked it, and has built a reputation with you."],
+  A2: ["Verified model", "ok", "Also passed a check that it runs the model it names."],
+  A3: ["Verified hardware", "ok", "Its hardware attested to the model it runs."],
 };
 export function tierOf(label) { const m = /^A([0-3])(?![0-9])/.exec(String(label || "")); return m ? "A" + m[1] : "A0"; }
 export function tierBadge(label) { const t = tierOf(label); const [txt, cls, tip] = TIERS[t]; return html`<span class="badge ${cls}" title="${t + ": " + tip}">${txt}</span>`; }

@@ -12,6 +12,7 @@ import { renderMarkdownMarkup } from "./markdown";
 import { toast, menu, closeMenus, confirmModal, failToast } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName, modelIdle, AUTO_MODEL } from "./models";
+import { pickerLabel } from "./picker.js";
 import { renderConnectors } from "./connectors";
 import { renderProviders, setProviderSort } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
@@ -154,8 +155,8 @@ $$(".drop").forEach((d) => d.onclick = (e) => {
   const isModel = d.id === "modeldrop" || d.id === "homedrop";
   const sp = d.querySelector("span");
   const cur = isModel ? (sp.dataset.value || sp.textContent) : sp.textContent;
-  const setSel = (el, o) => { if (isModel) { el.dataset.value = o; el.textContent = displayModelName(o); } else { el.textContent = o; } };
-  const modelLabel = (o) => o === AUTO_MODEL ? "Best available (openhydra/auto)" : displayModelName(o) + (modelIdle(o) ? "  · not seen recently" : "");
+  const setSel = (el, o) => { if (isModel) { el.dataset.value = o; el.textContent = pickerLabel(o, displayModelName); } else { el.textContent = o; } };
+  const modelLabel = (o) => o === AUTO_MODEL ? "Best available · picks a trusted model for you" : displayModelName(o) + (modelIdle(o) ? "  · not seen recently" : "");
   menu(d, opts.length ? opts.map((o) => ({ label: isModel ? modelLabel(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") { updateEngineEndpoint(); saveSetting({ engine_kind: ENGINE_KIND_OF[o] || "auto", engine_endpoint: "" }); } if (d.id === "presetdrop") applyPreset(o); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
 });
 

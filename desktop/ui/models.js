@@ -6,6 +6,7 @@
 // seenCount is read by the Providers view.
 import { $ } from "./dom";
 import { state, snap, engines } from "./state";
+import { AUTO_MODEL, pickerSelection, pickerLabel } from "./picker.js";
 
 const STICKY_MS = 180000;
 const IDLE_MS = 130000;  // seen within this = "live"; IDLE_MS..STICKY_MS = "idle" (dimmed).
@@ -73,7 +74,7 @@ export function displayModelName(id) {
 // The selected model to route on: the RAW id stored in the span's dataset, not the (prettified)
 // label. Falls back to the label for safety before the first render sets the value.
 export function curModel() { const sp = $("#modeldrop span"); const m = (sp && (sp.dataset.value || sp.textContent)) || ""; return m && m !== "—" && !/no models/i.test(m) ? m : ""; }
-export const AUTO_MODEL = "openhydra/auto";
+export { AUTO_MODEL };
 export function renderModels() {
   const models = netModels();
   // "openhydra/auto" (the gateway picks a live model) heads the list once anything is live.
@@ -81,11 +82,11 @@ export function renderModels() {
   $("#homedrop").dataset.opts = opts; $("#modeldrop").dataset.opts = opts;
   for (const d of ["#homedrop", "#modeldrop"]) {
     const sp = $(d + " span");
-    let cur = sp.dataset.value || sp.textContent;            // raw current selection
-    if (!models.length) cur = "";                                           // nothing live (auto included)
-    else if (cur !== AUTO_MODEL && !models.includes(cur)) cur = models[0];   // dropped out → first model
+    // Raw current selection; nothing live → none; gone or never set → Best available (SL2: never the
+    // alphabetically first model, which anyone can announce).
+    const cur = pickerSelection(sp.dataset.value || "", models);
     sp.dataset.value = cur;                                  // keep the raw id for routing
-    sp.textContent = cur ? displayModelName(cur) : "— no models yet"; // show the clean name
+    sp.textContent = cur ? pickerLabel(cur, displayModelName) : "— no models yet"; // show the clean name
   }
   $("#mcount").textContent = models.length; $("#homelive").textContent = models.length;
   $("#provcount") && ($("#provcount").textContent = models.length);
