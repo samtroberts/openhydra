@@ -13,7 +13,7 @@
 //! * **Disable core dumps** (`RLIMIT_CORE = 0`) — a crash must never write a memory
 //!   image (which would contain the Ed25519 identity secret) to disk.
 //! * **Best-effort `mlockall`** — lock current + future pages so secret material is
-//!   never paged out to swap.
+//!   never paged out to swap, when `RLIMIT_MEMLOCK` is unlimited (see `harden_process`).
 //!
 //! These protect *all* in-memory secrets at once, including the transient hex/string
 //! copies the key loader can't individually scrub. No-op on non-unix targets.
@@ -32,8 +32,14 @@ pub fn harden_process() {
             tracing::warn!("PQC0.2: could not disable core dumps (RLIMIT_CORE)");
         }
         // Keep secret pages off swap. Best-effort — needs CAP_IPC_LOCK or a raised
-        // RLIMIT_MEMLOCK; failure is expected on stock setups, so log at debug.
-        if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
+        // RLIMIT_MEMLOCK; failure is expected on stock setups, so log at debug. Only with an
+        // unlimited RLIMIT_MEMLOCK: under a finite one (64 MiB on stock Ubuntu 24.04) mlockall
+        // can succeed at startup, and MCL_FUTURE then fails every allocation past the limit, so
+        // the process aborts seconds later ("memory allocation of N bytes failed").
+        let mut memlock = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut memlock) != 0 || memlock.rlim_cur != libc::RLIM_INFINITY {
+            tracing::debug!("PQC0.2: RLIMIT_MEMLOCK is finite, so memory isn't locked; secrets may be swappable");
+        } else if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
             tracing::debug!(
                 "PQC0.2: mlockall failed (likely RLIMIT_MEMLOCK); secrets may be swappable"
             );
