@@ -2,7 +2,7 @@
 name = "openhydra-agent"
 version = "0.3.23"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "OpenHydra agent — BYO-engine adapters + the HTTP/SSE gateway. Proxies inference to external engines (Ollama/vLLM/…); never runs a model."
 license = "Apache-2.0"
 
