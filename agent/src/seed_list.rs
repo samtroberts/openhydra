@@ -308,7 +308,9 @@ impl SeedStore {
                             }
                         }
                     }
-                    std::thread::sleep(if failures == 0 { REFRESH_EVERY } else { refresh_delay(failures) });
+                    // Never longer than a normal refresh: the index's back-off reaches a day, and a seed
+                    // the registry removed (a compromised one) must drop out within REFRESH_EVERY.
+                    std::thread::sleep(if failures == 0 { REFRESH_EVERY } else { refresh_delay(failures).min(REFRESH_EVERY) });
                 }
             })
             .ok();
@@ -411,5 +413,12 @@ mod tests {
         assert_eq!(again.current().sequence, 2);
         let plain = SeedStore::new(&pinned(), "http://example.com/seeds.json", None);
         assert!(plain.refresh(&reqwest::blocking::Client::new()).unwrap_err().contains("plain http"));
+    }
+
+    #[test]
+    fn the_list_to_publish_is_signed_by_the_pinned_key_and_valid() {
+        // What the seed-list workflow publishes: a gateway must accept it as is.
+        let list = verify(include_str!("../data/seed-providers.json"), crate::tokenizer_index::PINNED_INDEX_KEY).unwrap();
+        assert!(list.sequence >= 1 && !list.seeds.is_empty());
     }
 }
