@@ -26,12 +26,12 @@ import { modelIcon, modelCat, repBadge, tierOf, trustCell } from "./format";
     const byPM = repByPeerModel();
     const trust = trustByPeerModel();
     const trustOf = (p) => trust[repKey(p.openhydra_peer_id, p.model_id)] || {};
-    // One provider: its badge (and model check). Several: how many your gateway has verified.
+    // One provider: its badge (and model check). Several: how many your gateway trusts (A1 or higher).
     const modelTrust = (remote) => {
       if (!remote.length) return html`<span class="mut">—</span>`;
       if (remote.length === 1) { const t = trustOf(remote[0]); return trustCell(t.tier, t.check); }
-      const verified = remote.filter((p) => tierOf(trustOf(p).tier) !== "A0").length;
-      return html`<span class="${verified ? "" : "mut"}" title="Providers your gateway has verified (A1 or higher)">${verified} of ${remote.length} verified</span>`;
+      const trusted = remote.filter((p) => tierOf(trustOf(p).tier) !== "A0").length;
+      return html`<span class="${trusted ? "" : "mut"}" title="Providers your gateway trusts (Trusted, A1, or higher)">${trusted} of ${remote.length} trusted</span>`;
     };
     // Group the announced providers by model so a model served by several peers can expand (#11b).
     const provsByModel = {};

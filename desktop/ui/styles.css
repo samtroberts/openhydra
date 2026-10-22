@@ -212,7 +212,7 @@
   .md hr{border:none;border-top:1px solid hsl(var(--border));margin:10px 0}
   .msgmeta{display:flex;flex-wrap:wrap;gap:5px 12px;align-items:center;font-size:10.5px;color:hsl(var(--muted-foreground));margin-top:8px}
   .msgmeta .num{font-family:var(--mono)}
-  .menu .mq{padding:4px 10px 6px;font-size:11px;color:hsl(var(--muted-foreground));border-bottom:1px solid hsl(var(--border));margin-bottom:4px}
+  .menu .mq{position:sticky;top:-5px;background:hsl(var(--popover));z-index:1;padding:4px 10px 6px;font-size:11px;color:hsl(var(--muted-foreground));border-bottom:1px solid hsl(var(--border));margin-bottom:4px}
   /* SL3: the numbers under an answer show on hover; kept in the layout (and for screen readers), only faded out. */
   .msgmeta .det{opacity:0;transition:opacity .15s}
   .msg:hover .msgmeta .det,.msgmeta:focus-within .det{opacity:1}
@@ -337,7 +337,7 @@
 
   .menu{position:fixed;z-index:120;min-width:170px;background:hsl(var(--popover));border:1px solid hsl(var(--border));
     border-radius:10px;padding:5px;box-shadow:0 12px 34px -8px hsl(240 10% 3.9% /.32);font-size:13px}
-  .menu{width:max-content;max-width:calc(100vw - 20px);max-height:calc(100vh - 16px);overflow-y:auto}
+  .menu{width:max-content;max-width:calc(100vw - 20px);max-height:calc(100vh - 16px);overflow-y:auto;overflow-x:hidden}
   .menu .mi{display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:6px;cursor:pointer;white-space:nowrap}
   .menu .mi.kb{background:hsl(var(--accentbg))}
   .menu .mi:hover{background:hsl(var(--accentbg))}.menu .mi .ck{width:14px;color:hsl(var(--brand))}
