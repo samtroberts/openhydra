@@ -3154,6 +3154,14 @@ impl ConsumerNode {
         let discover_ns = t_discover.elapsed().as_nanos() as u64;
         tracing::debug!(elapsed = ?t_discover.elapsed(), candidates = candidates.len(), "discover");
         if candidates.is_empty() {
+            // `auto` vouched for providers none of which is reachable: say so, rather than that
+            // nobody serves a model `/v1/models` still lists.
+            if only.is_some() && peers.is_empty() {
+                return AttemptOutcome::Retryable(AdapterError::Route(format!(
+                    "no provider openhydra/auto trusts for '{model}' is reachable right now (it doesn't use \
+                     other providers of it: name the model in the request to use any of them)"
+                )));
+            }
             // Providers were found, and the floor turned them all away: looking again wouldn't
             // change that (review round 4 M11).
             if !peers.is_empty() && policy.mode == PolicyMode::HardGate {

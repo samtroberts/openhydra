@@ -473,6 +473,18 @@ fn pick_auto(
     }
 }
 
+/// Whether a concrete `requested` model is used as named because some provider serves it. Not on
+/// the Anthropic surface (`anthropic`) for a `claude-*` id: that is Claude Code's own placeholder
+/// (it rejects other names), and no open model is called that, so a peer announcing one would be
+/// impersonating it to take every Claude Code request. Such an id routes like `auto` (or a
+/// `/model` pin) instead.
+fn served_as_named(requested: &str, anthropic: bool, known: &[String]) -> bool {
+    if anthropic && requested.trim().to_ascii_lowercase().starts_with("claude") {
+        return false;
+    }
+    known.iter().any(|m| m == requested)
+}
+
 /// The providers that earned `model` its place at `step` of [`pick_auto`]: the only ones the
 /// request may go to. `None` (any provider of the model) for the operator's preferred model,
 /// which they named. Without this a peer announcing the same model name, with better load figures
@@ -625,7 +637,7 @@ async fn resolve_model(
         .map_err(|_| "model resolution failed".to_string())?
         .map_err(|e| e)?;
     // A concrete model that's actually served is used as-is (also wins over a session pin).
-    if !auto && known.iter().any(|m| m == requested) {
+    if !auto && served_as_named(requested, fallback_unservable, &known) {
         return Ok((requested.to_string(), Route::Requested, None));
     }
     // Now we're picking (request said `auto`, or an unservable id on the Anthropic surface):
@@ -2979,6 +2991,18 @@ mod tests {
         // A seed below the request's authenticity floor is skipped like any provider.
         c.floor = Some(openhydra_protocol::trust::AuthenticityTier::ReputationRedundant);
         assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Err(AutoMiss::Nothing));
+    }
+
+    #[test]
+    fn a_peer_announcing_claude_codes_model_id_doesnt_get_its_requests() {
+        let known = vec!["claude-sonnet-4-5-20250929".to_string(), "qwen3:8b".to_string()];
+        // On /v1/messages Claude Code's own id goes through `auto`, however many peers announce it.
+        assert!(!served_as_named("claude-sonnet-4-5-20250929", true, &known));
+        assert!(!served_as_named("Claude-Opus-4", true, &["Claude-Opus-4".to_string()]));
+        // A real model named there, and any model on the OpenAI surface, is used as named.
+        assert!(served_as_named("qwen3:8b", true, &known));
+        assert!(served_as_named("claude-sonnet-4-5-20250929", false, &known));
+        assert!(!served_as_named("llama3.2:1b", true, &known));
     }
 
     #[test]

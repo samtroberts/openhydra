@@ -777,7 +777,7 @@ struct ServeArgs {
     /// Where to fetch the signed tokenizer index from (checked daily; HTTPS, or http:// to
     /// localhost). `off` keeps the copy built into this binary (and the last one fetched). Default:
     /// OpenHydra's (dl.openhydra.co), or `off` on a private deployment (`--public-relays off`, or
-    /// only bootstraps of its own), which contacts nothing of OpenHydra's.
+    /// only bootstraps of its own), which fetches nothing from OpenHydra's servers.
     #[arg(long = "tokenizer-index-url")]
     tokenizer_index_url: Option<String>,
 
