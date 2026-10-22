@@ -74,8 +74,9 @@ jobs:
           - platform: windows-latest
             triple: x86_64-pc-windows-msvc
           # Linux on Arm (Graviton GPU servers, Raspberry Pi-class boxes): the CLI, its prompt scorer
-          # and the notices only. No desktop app for this platform yet.
-          - platform: ubuntu-24.04-arm
+          # and the notices only. No desktop app for this platform yet. 22.04, as for x86: binaries
+          # built on 24.04 need glibc 2.38+ and won't start on Debian 12 / Raspberry Pi OS Bookworm.
+          - platform: ubuntu-22.04-arm
             triple: aarch64-unknown-linux-gnu
             cli_only: true
     runs-on: ${{ matrix.platform }}
