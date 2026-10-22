@@ -201,6 +201,20 @@ pub fn verify(published: &str, pinned: &str) -> Result<SeedList, String> {
     Ok(list)
 }
 
+/// How long to wait before the next fetch after `failures` failed ones in a row (0: a normal
+/// refresh). The first retries come quickly: a gateway started before the network was up (an app
+/// opened at login) has no seed until one works, so a newcomer's `openhydra/auto` finds nothing.
+/// Then the tokenizer index's back-off, never longer than a normal refresh: a seed the registry
+/// removed (a compromised one) must drop out within [`REFRESH_EVERY`].
+fn retry_delay(failures: u32) -> Duration {
+    match failures {
+        0 => REFRESH_EVERY,
+        1 => Duration::from_secs(30),
+        2 => Duration::from_secs(2 * 60),
+        n => refresh_delay(n - 1).min(REFRESH_EVERY),
+    }
+}
+
 /// The gateway's current seed list: the newest of none, the last one fetched (kept in `cache`), and
 /// what [`SeedStore::refresh`] fetches.
 pub struct SeedStore {
@@ -286,7 +300,7 @@ impl SeedStore {
     }
 
     /// Refresh now and then every [`REFRESH_EVERY`], on a background thread; after a failure,
-    /// sooner (the tokenizer index's back-off), warning at most once a day while it keeps failing.
+    /// sooner ([`retry_delay`]), warning at most once a day while it keeps failing.
     pub fn spawn_refresher(self: &Arc<Self>, client: reqwest::blocking::Client) {
         let store = Arc::clone(self);
         std::thread::Builder::new()
@@ -308,9 +322,7 @@ impl SeedStore {
                             }
                         }
                     }
-                    // Never longer than a normal refresh: the index's back-off reaches a day, and a seed
-                    // the registry removed (a compromised one) must drop out within REFRESH_EVERY.
-                    std::thread::sleep(if failures == 0 { REFRESH_EVERY } else { refresh_delay(failures).min(REFRESH_EVERY) });
+                    std::thread::sleep(retry_delay(failures));
                 }
             })
             .ok();
@@ -413,6 +425,13 @@ mod tests {
         assert_eq!(again.current().sequence, 2);
         let plain = SeedStore::new(&pinned(), "http://example.com/seeds.json", None);
         assert!(plain.refresh(&reqwest::blocking::Client::new()).unwrap_err().contains("plain http"));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_retried_soon_and_never_later_than_a_normal_refresh() {
+        assert_eq!(retry_delay(0), REFRESH_EVERY);
+        assert_eq!(retry_delay(1), Duration::from_secs(30));
+        assert!((1..20).all(|n| retry_delay(n) <= REFRESH_EVERY && retry_delay(n) <= retry_delay(n + 1)));
     }
 
     #[test]
