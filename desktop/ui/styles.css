@@ -251,7 +251,7 @@
   .switch.on{background:hsl(var(--brand));border-color:transparent}.switch.on::after{left:18px}
   .switch:focus-visible{outline:2px solid hsl(var(--brand));outline-offset:2px}
   /* Per-model reach (scope) selector in the Share table's control cell (M1). */
-  .shcell{display:flex;align-items:center;gap:10px}
+  .shcell{display:flex;align-items:center;gap:10px;flex-wrap:wrap;row-gap:6px}
   /* Binary reach control: a Private | Global segmented pill, visually distinct from the on/off share
      switch so the two controls are never confused. Selected Private = neutral fill, Global = brand. */
   .reach-pill{display:inline-flex;border:1px solid hsl(var(--border));border-radius:7px;overflow:hidden;user-select:none}
@@ -337,7 +337,7 @@
 
   .menu{position:fixed;z-index:120;min-width:170px;background:hsl(var(--popover));border:1px solid hsl(var(--border));
     border-radius:10px;padding:5px;box-shadow:0 12px 34px -8px hsl(240 10% 3.9% /.32);font-size:13px}
-  .menu{width:max-content;max-width:calc(100vw - 20px)}
+  .menu{width:max-content;max-width:calc(100vw - 20px);max-height:calc(100vh - 16px);overflow-y:auto}
   .menu .mi{display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:6px;cursor:pointer;white-space:nowrap}
   .menu .mi.kb{background:hsl(var(--accentbg))}
   .menu .mi:hover{background:hsl(var(--accentbg))}.menu .mi .ck{width:14px;color:hsl(var(--brand))}
