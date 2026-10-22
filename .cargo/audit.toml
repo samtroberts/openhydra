@@ -19,7 +19,11 @@ ignore = [
     "RUSTSEC-2026-0104", # rustls-webpki 0.101 CRL-parse panic — old rustls transitive; fix = drop 0.101
     "RUSTSEC-2026-0098", # rustls-webpki 0.101 name-constraint incorrectly accepted — old rustls transitive; fix = drop 0.101
     "RUSTSEC-2026-0099", # rustls-webpki 0.101 wildcard name-constraint — old rustls transitive; fix = drop 0.101
+    "RUSTSEC-2026-0382", # rustls-webpki 0.101 distrusted intermediates — via libp2p-tls 0.5, which uses only webpki::Error (no chain building: self-signed libp2p certs); fix = libp2p-tls 0.6 (libp2p uplift)
     "RUSTSEC-2026-0258", # h2 0.3 unbounded empty DATA frames DoS — via igd UPnP's hyper 0.14 CLIENT (HTTP/1.1 to the LAN router; not an h2 server accepting untrusted peers, so the server-side DoS doesn't apply); fix = igd-next→hyper 1.x (needs libp2p uplift)
+    "RUSTSEC-2026-0367", # zip 4 SUID bits kept on extract — desktop only, via tauri-plugin-updater 2.10 (latest), which unzips an update only after verifying its signature against our key; fix = updater on zip >=9
+    "RUSTSEC-2026-0368", # zip 4 symlink targets outside the destination — same path and reason as -0367
+    "RUSTSEC-2026-0369", # zip 4 ZipStreamReader — same path and reason as -0367
     # ---- unmaintained / unsound (informational) ----
     "RUSTSEC-2024-0384", # instant unmaintained (transitive)
     "RUSTSEC-2024-0436", # paste unmaintained (transitive proc-macro)
