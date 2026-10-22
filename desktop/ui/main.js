@@ -12,7 +12,7 @@ import { renderMarkdownMarkup } from "./markdown";
 import { toast, menu, closeMenus, confirmModal, failToast } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName, modelIdle, AUTO_MODEL } from "./models";
-import { pickerLabel } from "./picker.js";
+import { pickerLabel, AUTO_LABEL } from "./picker.js";
 import { reportUrl, KNOWN_ISSUES_URL } from "./feedback.js";
 import { renderConnectors } from "./connectors";
 import { renderProviders, setProviderSort } from "./providers";
@@ -160,7 +160,7 @@ $$(".drop").forEach((d) => d.onclick = (e) => {
   const sp = d.querySelector("span");
   const cur = isModel ? (sp.dataset.value || sp.textContent) : sp.textContent;
   const setSel = (el, o) => { if (isModel) { el.dataset.value = o; el.textContent = pickerLabel(o, displayModelName); } else { el.textContent = o; } };
-  const modelLabel = (o) => o === AUTO_MODEL ? "Best available · picks a trusted model for you" : displayModelName(o) + (modelIdle(o) ? "  · not seen recently" : "");
+  const modelLabel = (o) => o === AUTO_MODEL ? AUTO_LABEL + " · picks a trusted model for you" : displayModelName(o) + (modelIdle(o) ? "  · not seen recently" : "");
   menu(d, opts.length ? opts.map((o) => ({ label: isModel ? modelLabel(o) : o, on: o === cur, fn: () => { setSel(sp, o); if (d.dataset.act === "theme") setTheme(o); if (d.id === "enginedrop") { updateEngineEndpoint(); saveSetting({ engine_kind: ENGINE_KIND_OF[o] || "auto", engine_endpoint: "" }); } if (d.id === "presetdrop") applyPreset(o); if (isModel) { setChatMode(o); const other = $(d.id === "modeldrop" ? "#homedrop" : "#modeldrop"); if (other) setSel(other.querySelector("span"), o); } } })) : [{ label: "No models on the network yet", fn: () => {} }]);
 });
 
@@ -635,7 +635,8 @@ const feedbackItems = () => [
   { label: "Known issues", fn: () => openLink(KNOWN_ISSUES_URL) },
 ];
 $("#feedback").onclick = (e) => { e.stopPropagation(); menu($("#feedback"), feedbackItems()); };
-$("#feedback").onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); menu($("#feedback"), feedbackItems()); } };
+// While its menu is open, keys go to the menu (↑/↓, Enter picks), not back to this opener.
+$("#feedback").onkeydown = (e) => { if (document.querySelector(".menu")) return; if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); menu($("#feedback"), feedbackItems()); } };
 $("#fbreport").onclick = () => openLink(reportUrl(appVersion()));
 $("#fbknown").onclick = () => openLink(KNOWN_ISSUES_URL);
 $("#addmodel") && ($("#addmodel").onclick = (e) => { e.stopPropagation(); const opts = engines.flatMap((e) => e.models.map((m) => ({ label: `${m} · ${e.label}`, fn: () => openShareDialog([m]) }))); menu($("#addmodel"), opts.length ? opts : [{ label: "No engine models — start an engine", fn: () => go("engines") }]); });
