@@ -73,6 +73,11 @@ jobs:
             triple: x86_64-unknown-linux-gnu
           - platform: windows-latest
             triple: x86_64-pc-windows-msvc
+          # Linux on Arm (Graviton GPU servers, Raspberry Pi-class boxes): the CLI, its prompt scorer
+          # and the notices only. No desktop app for this platform yet.
+          - platform: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            cli_only: true
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -114,8 +119,10 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf libssl-dev protobuf-compiler
+          sudo apt-get install -y libssl-dev protobuf-compiler
+          if [ "${{ matrix.cli_only }}" != "true" ]; then
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          fi
 
       - name: Protoc (mac)
         if: startsWith(matrix.platform, 'macos')
@@ -211,12 +218,14 @@ jobs:
       # the signing step to run. Exactly the lockfile (no `npm install` fallback). esbuild and the
       # Tauri CLI take their platform binaries from optional dependencies, not from a script.
       - name: Install desktop dependencies
+        if: ${{ !matrix.cli_only }}
         working-directory: desktop
         run: npm ci --ignore-scripts
 
       # 2) The desktop app + installers (signed so the auto-updater accepts them). The signing
       # secrets are on this step only.
       - name: Build desktop app
+        if: ${{ !matrix.cli_only }}
         working-directory: desktop
         env:
           # Tauri updater signatures (minisign) — the sibling `.sig` the auto-updater verifies.
@@ -342,7 +351,7 @@ jobs:
         run: |
           mkdir -p sums
           V="${INPUT_VERSION:-$GITHUB_REF_NAME}"; V="${V#v}"
-          for t in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+          for t in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-unknown-linux-gnu; do
             files=()
             for f in "openhydra-agent-$t" "openhydra-agent-$t.exe" "openhydra-scorer-$t" "openhydra-scorer-$t.exe" \
                      "openhydra-mlx-scorer-$t" "THIRD_PARTY_NOTICES-$t.txt"; do
@@ -495,6 +504,7 @@ jobs:
             'macos':   'aarch64-apple-darwin',
             'linux':   'x86_64-unknown-linux-gnu',
             'windows': 'x86_64-pc-windows-msvc',
+            'linux-arm64': 'aarch64-unknown-linux-gnu',  # CLI only: no "app" entry
           }
           EXE = {'windows': '.exe'}
           # A platform already published under this version (a re-run) is left as it is: its files
@@ -515,6 +525,7 @@ jobs:
             'macos':   lambda n: 'aarch64-apple-darwin' in n or bare(n).endswith(('.dmg', '.app.tar.gz')),
             'linux':   lambda n: 'x86_64-unknown-linux-gnu' in n or bare(n).endswith(('.AppImage', '.AppImage.tar.gz', '.deb', '.rpm')),
             'windows': lambda n: 'x86_64-pc-windows-msvc' in n or bare(n).endswith(('.exe', '.msi', '.nsis.zip', '.msi.zip')),
+            'linux-arm64': lambda n: 'aarch64-unknown-linux-gnu' in n,
           }
           already = [os_ for os_ in PLATFORMS if complete(os_)]
           for os_ in already:
@@ -542,6 +553,7 @@ jobs:
             (re.compile(r'^openhydra-agent-aarch64-apple-darwin$'),        'openhydra-agent-aarch64-apple-darwin'),
             (re.compile(r'^openhydra-agent-x86_64-unknown-linux-gnu$'),    'openhydra-agent-x86_64-unknown-linux-gnu'),
             (re.compile(r'^openhydra-agent-x86_64-pc-windows-msvc\.exe$'), 'openhydra-agent-x86_64-pc-windows-msvc.exe'),
+            (re.compile(r'^openhydra-agent-aarch64-unknown-linux-gnu$'),   'openhydra-agent-aarch64-unknown-linux-gnu'),
             (re.compile(r'^openhydra-scorer-[a-z0-9_-]+(\.exe)?$'),        None),
             (re.compile(r'^openhydra-mlx-scorer-aarch64-apple-darwin$'),   None),
             (re.compile(r'^THIRD_PARTY_NOTICES-[a-z0-9_-]+\.txt$'),        None),

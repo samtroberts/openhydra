@@ -91,7 +91,9 @@ main() {
     Linux:x86_64|Linux:amd64)
       triple="x86_64-unknown-linux-gnu" ;;
     Linux:aarch64|Linux:arm64)
-      err "Linux arm64 has no prebuilt binary yet. Build from source: https://github.com/$REPO#build-from-source" ;;
+      # Its own entry in latest.json: an Arm build that failed in a release mustn't send it to a
+      # version that has only x86 files.
+      triple="aarch64-unknown-linux-gnu"; os_key="linux-arm64" ;;
     *)
       err "unsupported platform '$os/$arch'. Build from source: https://github.com/$REPO#build-from-source" ;;
   esac
