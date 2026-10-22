@@ -178,6 +178,10 @@ fn gateway_client() -> Result<openhydra_agent::ReqwestClient, String> {
 
 // ── Settings (persisted at ~/.openhydra/desktop.json) ──
 
+/// Whether Settings shows the "Act as a relay for other peers" switch (SL14: not until community
+/// relays ship, plan X14). While it's hidden the saved `peer_relay` is ignored.
+const PEER_RELAY_SWITCH_SHOWN: bool = false;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -1125,7 +1129,9 @@ fn spawn_role(
         cmd.arg("--bootstrap").arg(b);
     }
     cmd.arg("--public-relays").arg(public_relays_arg(settings));
-    if settings.peer_relay {
+    // SL14: the switch is hidden until community relays ship (no other node can find a peer relay
+    // yet), so a setting saved by an earlier version, which can't be turned off now, is ignored.
+    if settings.peer_relay && PEER_RELAY_SWITCH_SHOWN {
         cmd.arg("--peer-relay");
     }
     cmd.args(subcommand)
