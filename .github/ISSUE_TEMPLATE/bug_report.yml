@@ -1,0 +1,101 @@
+name: Bug report
+description: Report a bug in OpenHydra (the agent, the desktop app, or the network)
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much as you can —
+        logs and versions are the two most useful things. Check the
+        [known issues](https://github.com/samtroberts/openhydra/blob/main/KNOWN_ISSUES.md) first.
+
+        For **security issues or anything sensitive**, please email sam@openhydra.co
+        instead of filing a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: When I ..., OpenHydra did ..., but I expected ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce it?
+      placeholder: |
+        1. Start the gateway with `openhydra serve ...` (or in the desktop app: ...)
+        2. Send `POST /v1/chat/completions` with body `...`
+        3. See error
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where does it happen?
+      options:
+        - Desktop app
+        - Agent — serve (OpenAI gateway)
+        - Agent — provide (sharing an engine)
+        - Networking (discovery / relay / NAT traversal)
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: OpenHydra version
+      description: "Desktop: bottom right of the window, or Settings › Appearance › About. CLI: `openhydra --version`."
+      placeholder: e.g. 0.3.23
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Inference engine (if relevant)
+      description: Which external engine were you running?
+      options:
+        - "N/A — used the network / no local engine"
+        - Ollama
+        - llama.cpp
+        - LM Studio
+        - vLLM
+        - Exo
+        - ComfyUI
+        - Other
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Relevant log output. Desktop: Settings › Appearance › Send logs to developer saves them to a file. CLI: run with `RUST_LOG=debug` for more detail. This is automatically formatted as code."
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware (if relevant)
+      placeholder: e.g. M4 Max 128 GB, RTX 4090 24 GB
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help.
+    validations:
+      required: false

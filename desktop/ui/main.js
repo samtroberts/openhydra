@@ -13,6 +13,7 @@ import { toast, menu, closeMenus, confirmModal, failToast } from "./chrome";
 import { accumulateStats, loadStats, totalServed, totalUsed, totalCreditsEarned, totalCreditsSpent } from "./stats";
 import { noteSeen, netModels, curModel, renderModels, displayModelName, modelIdle, AUTO_MODEL } from "./models";
 import { pickerLabel } from "./picker.js";
+import { reportUrl, KNOWN_ISSUES_URL } from "./feedback.js";
 import { renderConnectors } from "./connectors";
 import { renderProviders, setProviderSort } from "./providers";
 import { renderLedger, renderPeers, renderLogs, setLogTab } from "./network-tables";
@@ -626,6 +627,17 @@ document.addEventListener("keydown", (e) => {
 // The logo goes Home. (It used to open a "tray menu preview" whose Quit called a command that
 // doesn't exist; the real system tray has Sharing and Quit.)
 $("#traymark").onclick = () => go("home");
+// SL12: feedback paths — the status bar's "Feedback" and Settings › Appearance › Send feedback.
+const openLink = (url) => call("open_external", { url }).catch((err) => toast(`Couldn't open the link: ${err}`));
+const appVersion = () => ($("#sbver")?.textContent || "").trim();
+const feedbackItems = () => [
+  { label: "Report a problem on GitHub", fn: () => openLink(reportUrl(appVersion())) },
+  { label: "Known issues", fn: () => openLink(KNOWN_ISSUES_URL) },
+];
+$("#feedback").onclick = (e) => { e.stopPropagation(); menu($("#feedback"), feedbackItems()); };
+$("#feedback").onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); menu($("#feedback"), feedbackItems()); } };
+$("#fbreport").onclick = () => openLink(reportUrl(appVersion()));
+$("#fbknown").onclick = () => openLink(KNOWN_ISSUES_URL);
 $("#addmodel") && ($("#addmodel").onclick = (e) => { e.stopPropagation(); const opts = engines.flatMap((e) => e.models.map((m) => ({ label: `${m} · ${e.label}`, fn: () => openShareDialog([m]) }))); menu($("#addmodel"), opts.length ? opts : [{ label: "No engine models — start an engine", fn: () => go("engines") }]); });
 
 // ── settings ──

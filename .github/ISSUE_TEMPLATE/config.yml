@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  # Discord: add the community link here once there is an invite that doesn't expire (the old one did).
+  - name: 📋 Known issues
+    url: https://github.com/samtroberts/openhydra/blob/main/KNOWN_ISSUES.md
+    about: What's already known in the current release, and the workarounds.
+  - name: 🔒 Private or security reports
+    url: mailto:sam@openhydra.co
+    about: Report security issues or anything sensitive privately, not as a public issue.
