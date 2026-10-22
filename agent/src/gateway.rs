@@ -371,9 +371,11 @@ fn size_rank(model: &str) -> u8 {
 /// When routing will hard-gate the request at an authenticity floor (`c.floor`), only providers at
 /// or above it count, at every step: picking a model whose providers all fall below it would only
 /// end in a refusal. A request that offers tools (`needs.tools`) skips models too small to call
-/// them ([`too_small_for_tools`]) at every step but the operator's own preference. Within a step
-/// the larger model wins (by the size its name gives), then the name. There is no "most providers"
-/// step: announcing a model from several peer ids costs nothing, so a count is not trust.
+/// them ([`too_small_for_tools`]) at every step but the operator's own preference and this
+/// machine's own models. Within a step the larger model wins (by the size its name gives), then
+/// the name. There is no "most providers" step: announcing a model from several peer ids costs
+/// nothing, so a count is not trust. The step vouches for providers, not for a model name: the
+/// request goes only to those that earned the pick ([`auto_providers`]).
 fn pick_auto(
     c: &crate::consumer::AutoCandidates,
     preferred: Option<&str>,
@@ -426,8 +428,10 @@ fn pick_auto(
         }
         out.map(|(_, _, m)| m)
     }
+    // This machine's own models aren't held to the tools size rule: like the preferred model, the
+    // user chose to run them, and skipping them would send their code to someone else's machine.
     if let Some(me) = c.self_provider.as_deref().filter(|s| !s.is_empty()) {
-        let own: Vec<&str> = providers.iter().filter(|k| k.libp2p_peer_id == me).map(|k| k.model_id.as_str()).filter(|m| fits(m)).collect();
+        let own: Vec<&str> = providers.iter().filter(|k| k.libp2p_peer_id == me).map(|k| k.model_id.as_str()).collect();
         if let Some(m) = best(own.into_iter().map(|m| ((), m))) {
             return Ok((m.to_string(), AutoStep::OwnMachine));
         }
@@ -467,6 +471,37 @@ fn pick_auto(
     } else {
         Err(AutoMiss::TooSmallForTools(too_small.into_iter().collect()))
     }
+}
+
+/// The providers that earned `model` its place at `step` of [`pick_auto`]: the only ones the
+/// request may go to. `None` (any provider of the model) for the operator's preferred model,
+/// which they named. Without this a peer announcing the same model name, with better load figures
+/// than the seed, would take a newcomer's request that `auto` chose because a seed serves it.
+fn auto_providers(c: &crate::consumer::AutoCandidates, model: &str, step: AutoStep) -> Option<std::collections::HashSet<String>> {
+    use openhydra_protocol::trust::AuthenticityTier;
+    let tier_of = |k: &openhydra_network::types::KnownProvider| {
+        c.tiers.get(&(k.libp2p_peer_id.clone(), k.model_id.clone())).copied().unwrap_or(AuthenticityTier::SelfReported)
+    };
+    let of_model = c.providers.iter().filter(|k| k.model_id == model && c.floor.is_none_or(|f| tier_of(k) >= f));
+    let neutral = openhydra_protocol::verify::NEUTRAL_REPUTATION;
+    let ids: std::collections::HashSet<String> = match step {
+        AutoStep::Preferred => return None,
+        AutoStep::OwnMachine => c.self_provider.iter().cloned().collect(),
+        AutoStep::Card => c.card_providers.get(model).cloned().unwrap_or_default(),
+        AutoStep::Reputation => of_model
+            .filter(|k| c.earned.get(&(k.libp2p_peer_id.clone(), k.model_id.clone())).is_some_and(|&s| s > neutral))
+            .map(|k| k.libp2p_peer_id.clone())
+            .collect(),
+        AutoStep::Verified => of_model
+            .filter(|k| tier_of(k) >= AuthenticityTier::ReputationRedundant)
+            .map(|k| k.libp2p_peer_id.clone())
+            .collect(),
+        AutoStep::Seed => of_model
+            .filter(|k| c.seeds.contains(&k.public_key.to_ascii_lowercase()))
+            .map(|k| k.libp2p_peer_id.clone())
+            .collect(),
+    };
+    Some(ids)
 }
 
 /// [`pick_auto`] for a request with no special needs: just the model.
@@ -572,17 +607,17 @@ async fn resolve_model(
     session_override: Option<&str>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
     needs: AutoNeeds,
-) -> Result<(String, Route), String> {
+) -> Result<(String, Route, Option<std::collections::HashSet<String>>), String> {
     let auto = is_auto_model(requested);
     // A concrete BYOK-mapped model is served directly (never announced on the swarm) — pass it
     // through untouched, and skip the discovery query entirely.
     if !auto && state.byok.provider_for(requested).is_some() {
-        return Ok((requested.to_string(), Route::Byok));
+        return Ok((requested.to_string(), Route::Byok, None));
     }
     // Fast path: a concrete model on the strict (OpenAI) surface needs no discovery query.
     // An explicit concrete model in the request always wins over any `/model` session pin.
     if !auto && !fallback_unservable {
-        return Ok((requested.to_string(), Route::Requested));
+        return Ok((requested.to_string(), Route::Requested, None));
     }
     let node = state.node.clone();
     let known = tokio::task::spawn_blocking(move || node.known_models())
@@ -591,20 +626,20 @@ async fn resolve_model(
         .map_err(|e| e)?;
     // A concrete model that's actually served is used as-is (also wins over a session pin).
     if !auto && known.iter().any(|m| m == requested) {
-        return Ok((requested.to_string(), Route::Requested));
+        return Ok((requested.to_string(), Route::Requested, None));
     }
     // Now we're picking (request said `auto`, or an unservable id on the Anthropic surface):
     // a `/model <id>` session pin wins next — but only if it's a concrete model currently served
     // (a stale/typo'd pin falls through to the auto default rather than erroring).
     if let Some(sel) = session_override.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_auto_model(sel) && known.iter().any(|m| m == sel) {
-            return Ok((sel.to_string(), Route::SessionPin));
+            return Ok((sel.to_string(), Route::SessionPin, None));
         }
     }
     // …else the auto default (see `pick_auto_model` for the order).
     let preferred = std::env::var("OPENHYDRA_AUTO_MODEL").ok();
     let node = state.node.clone();
-    let candidates = tokio::task::spawn_blocking(move || node.auto_candidates(min_authenticity))
+    let mut candidates = tokio::task::spawn_blocking(move || node.auto_candidates(min_authenticity))
         .await
         .map_err(|_| "model resolution failed".to_string())??;
     let mut picked = pick_auto(&candidates, preferred.as_deref(), needs);
@@ -612,7 +647,7 @@ async fn resolve_model(
     // bootstraps for the seed models once, then pick again.
     if picked.is_err() && !state.node.seed_models().is_empty() {
         let node = state.node.clone();
-        let candidates = tokio::task::spawn_blocking(move || {
+        candidates = tokio::task::spawn_blocking(move || {
             node.warm_seed_models();
             node.auto_candidates(min_authenticity)
         })
@@ -621,7 +656,10 @@ async fn resolve_model(
         picked = pick_auto(&candidates, preferred.as_deref(), needs);
     }
     match picked {
-        Ok((model, step)) => Ok((model, Route::Auto(step, needs))),
+        Ok((model, step)) => {
+            let only = auto_providers(&candidates, &model, step);
+            Ok((model, Route::Auto(step, needs), only))
+        }
         Err(AutoMiss::Nothing) => Err(no_auto_model_message(&known)),
         Err(AutoMiss::TooSmallForTools(small)) => Err(too_small_for_tools_message(&small)),
     }
@@ -1040,6 +1078,7 @@ fn spawn_worker(
     tools: Vec<Value>,
     think: Option<bool>,
     min_authenticity: Option<openhydra_protocol::trust::AuthenticityTier>,
+    only: Option<std::collections::HashSet<String>>,
     gen_permit: OwnedSemaphorePermit,
 ) -> (
     EventRx,
@@ -1062,7 +1101,7 @@ fn spawn_worker(
         // Or gone before any delta (during discovery or prefill): its receiver is already dropped.
         let cancel = || gone.load(std::sync::atomic::Ordering::Relaxed) || tx.is_closed();
         let offered = offered_tool_names(&tools);
-        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, &cancel, &mut on_delta) {
+        match node.complete(&model, messages, max_tokens, temperature, tools, think, min_authenticity, only.as_ref(), &cancel, &mut on_delta) {
             Ok(mut summary) => {
                 let (kept, dropped) = filter_tool_calls(std::mem::take(&mut summary.tool_calls), &offered);
                 if dropped > 0 {
@@ -1217,7 +1256,7 @@ async fn spawn_dispatch(
     // Resolve `openhydra/auto` (and, on the Anthropic surface, an unservable id) to a concrete
     // model. BYOK-mapped ids are recognised inside `resolve_model` so they're never rewritten.
     let needs = AutoNeeds { tools: !tools.is_empty() };
-    let (model, route) = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity, needs)
+    let (model, route, only) = resolve_model(state, requested_model, fallback_unservable, session_override, min_authenticity, needs)
         .await
         .map_err(DispatchErr::NoModels)?;
     // BYOK (#34): a mapped model is served by calling the hosted backend directly, bypassing the
@@ -1239,7 +1278,7 @@ async fn spawn_dispatch(
             gen_permit,
         )
     } else {
-        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, gen_permit)
+        spawn_worker(state.node.clone(), model.clone(), messages, max_tokens, temperature, tools, think, min_authenticity, only, gen_permit)
     };
     Ok((model, route, rx, started))
 }
@@ -2900,6 +2939,9 @@ mod tests {
         assert!(!too_small_for_tools("llama3.2") && too_small_for_tools("qwen3:4b") && !too_small_for_tools("qwen3:8b"));
         // The operator's own preference is honoured as asked.
         assert_eq!(pick_auto(&c, Some("llama3.2:1b"), tools), Ok(("llama3.2:1b".into(), AutoStep::Preferred)));
+        // So is a model this machine serves: the request stays here rather than going to another machine.
+        c.self_provider = Some("12D3A".into());
+        assert_eq!(pick_auto(&c, None, tools), Ok(("llama3.2:1b".into(), AutoStep::OwnMachine)));
     }
 
     #[test]
@@ -2937,6 +2979,32 @@ mod tests {
         // A seed below the request's authenticity floor is skipped like any provider.
         c.floor = Some(openhydra_protocol::trust::AuthenticityTier::ReputationRedundant);
         assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Err(AutoMiss::Nothing));
+    }
+
+    #[test]
+    fn auto_only_sends_the_request_to_the_providers_that_earned_the_pick() {
+        let seed_key = "ab".repeat(32);
+        let set = |ids: &[&str]| Some(ids.iter().map(|s| s.to_string()).collect::<std::collections::HashSet<_>>());
+        // A peer announcing the seed's model doesn't share the seed's place.
+        let mut c = cands(vec![seed_kp("qwen3:8b", "12D3Seed", &seed_key), kp("qwen3:8b", "evil", "12D3Evil")]);
+        c.seeds.insert(seed_key);
+        assert_eq!(pick_auto(&c, None, AutoNeeds::default()), Ok(("qwen3:8b".into(), AutoStep::Seed)));
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Seed), set(&["12D3Seed"]));
+        // Reputation: only the provider this node has history with, on that model.
+        c.earned.insert(("12D3Evil".into(), "llama3.2:1b".into()), 90.0);
+        c.earned.insert(("12D3Good".into(), "qwen3:8b".into()), 70.0);
+        c.providers.push(kp("qwen3:8b", "good", "12D3Good"));
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Reputation), set(&["12D3Good"]));
+        // Verified: only providers at A1 or above.
+        c.tiers.insert(("12D3Good".into(), "qwen3:8b".into()), openhydra_protocol::trust::AuthenticityTier::ReputationRedundant);
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Verified), set(&["12D3Good"]));
+        // Own machine and cards name their providers.
+        c.self_provider = Some("12D3Me".into());
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::OwnMachine), set(&["12D3Me"]));
+        c.card_providers.insert("qwen3:8b".into(), ["12D3Card".to_string()].into());
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Card), set(&["12D3Card"]));
+        // The operator's preferred model goes to any of its providers, as a model named in the request does.
+        assert_eq!(auto_providers(&c, "qwen3:8b", AutoStep::Preferred), None);
     }
 
     #[test]

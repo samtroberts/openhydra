@@ -1785,6 +1785,8 @@ pub struct AutoCandidates {
     pub self_provider: Option<String>,
     /// Models of imported, valid `.openhydra` cards.
     pub card_models: Vec<String>,
+    /// The providers (libp2p ids) of those cards, by model.
+    pub card_providers: HashMap<String, std::collections::HashSet<String>>,
     /// Reputation this node has earned with a provider on a model, decayed to now, keyed by
     /// (provider libp2p id, model id). Only pairs with history appear.
     pub earned: HashMap<(String, String), f64>,
@@ -2254,10 +2256,21 @@ impl ConsumerNode {
         if wanted.is_empty() {
             return 0;
         }
-        let known: std::collections::HashSet<String> = self.net.known_models().unwrap_or_default().into_iter().collect();
+        // Only a seed's own advert counts: another provider of the same model doesn't make the seed
+        // routable for `openhydra/auto`, so it mustn't end the warm-up.
+        let keys = self.seed_keys();
+        let is_seed = |key: &str| keys.contains(&key.to_ascii_lowercase());
+        let known: std::collections::HashSet<String> = self
+            .net
+            .known_providers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| is_seed(&p.public_key))
+            .map(|p| p.model_id)
+            .collect();
         wanted
             .iter()
-            .filter(|m| known.contains(*m) || self.net.query_registry(m.as_str()).is_ok_and(|found| !found.is_empty()))
+            .filter(|m| known.contains(*m) || self.net.query_registry(m.as_str()).is_ok_and(|found| found.iter().any(|p| is_seed(&p.public_key))))
             .count()
     }
 
@@ -2913,11 +2926,12 @@ impl ConsumerNode {
         requested: Option<AuthenticityTier>,
         now: u64,
     ) -> AutoCandidates {
-        let card_models = self
-            .cards
-            .as_ref()
-            .map(|c| c.valid_cards(now).into_iter().map(|card| card.model_id).collect())
-            .unwrap_or_default();
+        let cards = self.cards.as_ref().map(|c| c.valid_cards(now)).unwrap_or_default();
+        let card_models = cards.iter().map(|card| card.model_id.clone()).collect();
+        let mut card_providers: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for card in cards {
+            card_providers.entry(card.model_id).or_default().insert(card.libp2p_peer_id);
+        }
         // Standing is per (provider, model), keyed by the provider's key-derived state id: the same
         // lookup the router ranks with.
         let earned = providers
@@ -2940,7 +2954,7 @@ impl ConsumerNode {
         let policy = request_policy(self.assurance, requested);
         let floor = (policy.mode == PolicyMode::HardGate && policy.min_authenticity > AuthenticityTier::SelfReported)
             .then_some(policy.min_authenticity);
-        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, earned, tiers, floor, seeds: self.seed_keys() }
+        AutoCandidates { providers, self_provider: self.self_provider.clone(), card_models, card_providers, earned, tiers, floor, seeds: self.seed_keys() }
     }
 
     /// The distinct model ids this node currently knows about (PEX-learned / discovered).
@@ -2977,6 +2991,7 @@ impl ConsumerNode {
         tools: Vec<Value>,
         think: Option<bool>,
         min_authenticity: Option<AuthenticityTier>,
+        only: Option<&std::collections::HashSet<String>>,
         cancel: &dyn Fn() -> bool,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ServeSummary, AdapterError> {
@@ -2992,7 +3007,7 @@ impl ConsumerNode {
         // stale (a provider moved/died and its replacement isn't cached yet), so invalidate this
         // model's discovery cache and retry once with a cold get_providers lookup. The retry is
         // only reached when nothing was streamed, so it can never duplicate delivered output.
-        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &noted, &req_span, on_delta) {
+        match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, only, cancel, now, &noted, &req_span, on_delta) {
             AttemptOutcome::Served(summary) => return Ok(summary),
             AttemptOutcome::Fatal(e) => return Err(e),
             AttemptOutcome::Retryable(e) | AttemptOutcome::NotReachableYet(e) if cancel() => return Err(e),
@@ -3003,7 +3018,7 @@ impl ConsumerNode {
         let mut waits = UNREACHABLE_RETRY_WAITS.iter();
         loop {
             let _ = self.net.invalidate_discover(model);
-            match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, cancel, now, &noted, &req_span, on_delta) {
+            match self.serve_once(model, &messages, max_tokens, temperature, &tools, think, &policy, only, cancel, now, &noted, &req_span, on_delta) {
                 AttemptOutcome::Served(summary) => return Ok(summary),
                 AttemptOutcome::Fatal(e) => return Err(e),
                 // A provider answered (with an error): the one cache-bypass retry was enough.
@@ -3043,12 +3058,17 @@ impl ConsumerNode {
         tools: &[Value],
         think: Option<bool>,
         policy: &AssurancePolicy,
+        only: Option<&std::collections::HashSet<String>>,
         cancel: &dyn Fn() -> bool,
         now: u64,
         noted: &std::cell::RefCell<std::collections::HashSet<(String, String)>>,
         req_span: &tracing::Span,
         on_delta: &mut dyn FnMut(&str),
     ) -> AttemptOutcome {
+        // `only`: the providers `openhydra/auto` picked this model for (the seeds, say). Anyone else
+        // announcing the same model must not take the request: the step that chose it vouched for
+        // those providers, not for the model name.
+        let allowed = |p: &DiscoveredPeer| only.is_none_or(|o| o.contains(&p.libp2p_peer_id));
         let t_discover = std::time::Instant::now();
         let mut peers = {
             let _span = tracing::info_span!("discover", model = %model).entered();
@@ -3058,6 +3078,7 @@ impl ConsumerNode {
                 Err(e) => return AttemptOutcome::Fatal(AdapterError::Network(format!("discover: {e}"))),
             }
         };
+        peers.retain(allowed);
         // C7: passive discovery (DHT get_providers + gossip PEX) can come up empty across NATs —
         // the D-sized gossip mesh doesn't forward a provider's advert to this specific consumer
         // and a NAT'd provider's DHT put_record times out. Fall back to asking a connected
@@ -3067,9 +3088,9 @@ impl ConsumerNode {
         if peers.is_empty() {
             let _span = tracing::info_span!("registry_query", model = %model).entered();
             match self.net.query_registry(model) {
-                Ok(reg) if !reg.is_empty() => {
-                    tracing::info!(model, n = reg.len(), "C7: bootstrap registry supplied providers passive discovery missed");
-                    peers = reg;
+                Ok(reg) if reg.iter().any(allowed) => {
+                    peers = reg.into_iter().filter(allowed).collect();
+                    tracing::info!(model, n = peers.len(), "C7: bootstrap registry supplied providers passive discovery missed");
                 }
                 Ok(_) => {}
                 Err(e) => tracing::debug!(model, error = %e, "C7: registry query failed (best-effort)"),
@@ -3086,7 +3107,7 @@ impl ConsumerNode {
                     peers.iter().map(|p| p.libp2p_peer_id.as_str()).collect();
                 let fresh: Vec<_> = pinned
                     .into_iter()
-                    .filter(|p| !known.contains(p.libp2p_peer_id.as_str()))
+                    .filter(|p| !known.contains(p.libp2p_peer_id.as_str()) && allowed(p))
                     .collect();
                 if !fresh.is_empty() {
                     tracing::info!(model, n = fresh.len(), "M2: added card-pinned providers");

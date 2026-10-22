@@ -27,7 +27,7 @@ here, please [report it](https://github.com/samtroberts/openhydra/issues/new/cho
 - **"Best available" doesn't give coding tools a very small model.** When a request offers tools
   (Claude Code, OpenCode and other coding agents send them), it skips models of 4B parameters or fewer;
   if only those are online, you get an error that names them. Pick a larger model, or wait for one. A
-  model you name yourself is always used as asked.
+  model you name yourself, or one your own machine shares, is always used as asked.
 
 ## Platforms
 
