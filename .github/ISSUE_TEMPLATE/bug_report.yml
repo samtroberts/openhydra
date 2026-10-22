@@ -81,7 +81,7 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: "Relevant log output. Desktop: Settings › Appearance › Send logs to developer saves them to a file. CLI: run with `RUST_LOG=debug` for more detail. Issues are public and logs show IP addresses and peer ids: remove any you don't want posted. This is automatically formatted as code."
+      description: "Relevant log output. Desktop: Settings › Appearance › Send logs to developer saves them to a file. CLI: run with `RUST_LOG=debug` for more detail. Issues are public and logs show IP addresses, peer ids and file paths (which include your user name): remove any you don't want posted. This is automatically formatted as code."
       render: shell
     validations:
       required: false

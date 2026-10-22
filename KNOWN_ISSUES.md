@@ -36,8 +36,8 @@ here, please [report it](https://github.com/samtroberts/openhydra/issues/new/cho
 - **Linux: `openhydra:` links and `.openhydra` files may not open the app.** The AppImage doesn't
   register them at all; with the `.deb` or `.rpm` it hasn't been tested yet. Paste the card into
   *Add a model by card* instead.
-- **Linux on Arm (Raspberry Pi, Graviton): command line only.** `install.sh` installs `openhydra-agent`;
-  there's no desktop app for Arm Linux yet.
+- **Linux on Arm (64-bit: Raspberry Pi 4/5 on a 64-bit OS, Graviton): command line only.** `install.sh`
+  installs `openhydra-agent`; there's no desktop app for Arm Linux yet, and 32-bit Arm isn't supported.
 - **Behind a strict router, connections may go through a relay** and be slower. This is expected.
 
 ## Reporting security issues
