@@ -14,7 +14,7 @@ import { emit } from "./bus";
     { v: "share", a: "#sharecta", t: "Share when you're ready", d: "Click ‘Share your models’ to open the Share tab and pick what to serve. You're always connected; sharing is your choice." },
   ];
   const TOUR_KEY = "oh_tour_v2";
-  let coachEl = null, coachRing = null, coachOv = [];
+  let coachEl = null, coachRing = null, coachOv = [], coachAt = 0;
   function coachEnd() { coachEl?.remove(); coachEl = null; coachRing?.classList.remove("coachring"); coachRing = null; coachOv.forEach((d) => d.remove()); coachOv = []; store.set(TOUR_KEY, true); }
   function coachSpot(a, r) {
     const p = 5, W = innerWidth, H = innerHeight;
@@ -31,11 +31,21 @@ import { emit } from "./bus";
     if (!coachEl) { coachEl = document.createElement("div"); coachEl.className = "coach"; document.body.appendChild(coachEl); }
     setHTML(coachEl, html`<button class="iconbtn cx" id="coachx" title="Close"><span class="icon" data-i="x"></span></button><div style="font-weight:600;margin-bottom:4px;padding-right:24px">${s.t}</div><div class="mut" style="font-size:12px;line-height:1.55">${s.d}</div><div class="row" style="margin-top:11px;gap:8px">${i > 0 ? html`<button class="btn outline sm" id="coachback">Back</button>` : ""}<span class="mut num" style="font-size:11px">${i + 1} / ${COACH.length}</span><div class="grow"></div><button class="btn primary sm" id="coachnext">${i < COACH.length - 1 ? "Next" : "Done"}</button></div>`);
     injectIcons(coachEl);
-    const r = a ? a.getBoundingClientRect() : { left: innerWidth / 2 - 136, top: innerHeight / 2, right: innerWidth / 2 + 136, bottom: innerHeight / 2 };
-    coachSpot(a, r);
-    let left = Math.min(Math.max(10, r.left), innerWidth - 292), top = r.bottom + 14; if (top + 160 > innerHeight) top = Math.max(10, r.top - 166);
-    coachEl.style.left = left + "px"; coachEl.style.top = top + "px";
+    coachAt = i; coachPlace();
     $("#coachx").onclick = coachEnd; const bk = $("#coachback"); if (bk) bk.onclick = () => coachShow(i - 1); $("#coachnext").onclick = () => (i < COACH.length - 1 ? coachShow(i + 1) : coachEnd());
   }
+
+  // Spotlight the step's target and put the card beside it: below, or above when it doesn't fit (by
+  // its measured height: at a 500 px window it often doesn't). Again whenever the window resizes.
+  function coachPlace() {
+    if (!coachEl) return;
+    const a = $(COACH[coachAt].a);
+    const r = a ? a.getBoundingClientRect() : { left: innerWidth / 2 - 136, top: innerHeight / 2, right: innerWidth / 2 + 136, bottom: innerHeight / 2 };
+    coachSpot(a, r);
+    const h = coachEl.offsetHeight || 160;
+    let left = Math.min(Math.max(10, r.left), innerWidth - 292), top = r.bottom + 14; if (top + h > innerHeight - 10) top = Math.max(10, r.top - h - 14);
+    coachEl.style.left = left + "px"; coachEl.style.top = top + "px";
+  }
+  addEventListener("resize", coachPlace);
 
 export function maybeStartTour() { if (!store.get(TOUR_KEY, false)) setTimeout(() => coachShow(0), 900); }
